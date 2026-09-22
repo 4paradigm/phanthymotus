@@ -179,6 +179,7 @@ def test_a_card_with_no_odometry_says_it_has_no_stuck_protection():
     """Otherwise it looks identical to one that has it, and the difference only
     shows up as a robot leaning into a wall."""
     card = _card()
+    card._running = True
     card._binding = {"objects": "/cam/objects", "depth_map": "/cam/visual_depth",
                      "odom": ""}
     assert any("卡死" in note for note in card._degradations())
@@ -186,6 +187,7 @@ def test_a_card_with_no_odometry_says_it_has_no_stuck_protection():
 
 def test_a_card_with_only_the_summary_says_its_distances_are_coarse():
     card = _card()
+    card._running = True
     card._binding = {"objects": "/cam/objects", "depth_summary": "/cam/sum",
                      "depth_map": "", "odom": "/r1/state/odom"}
     assert any("深度摘要" in note for note in card._degradations())
@@ -193,6 +195,8 @@ def test_a_card_with_only_the_summary_says_its_distances_are_coarse():
 
 def test_a_fully_wired_card_reports_no_degradation():
     card = _card()
+    card._running = True
+    card._descriptor = _descriptor()          # a chassis is wired downstream
     card._binding = {"objects": "/cam/objects", "depth_map": "/cam/visual_depth",
                      "odom": "/r1/state/odom"}
     assert card._degradations() == []
@@ -200,9 +204,11 @@ def test_a_fully_wired_card_reports_no_degradation():
 
 def test_info_carries_the_degradations_and_the_target():
     card = _card()
+    card._running = True
+    card._descriptor = _descriptor()
     card._binding = {"objects": "/o", "depth_map": "", "odom": ""}
     info = card.dispatch("navi", {"action": "info"})
-    assert info["state"] == "idle"
+    assert info["state"] == "running"
     assert len(info["degraded"]) == 2
 
 
@@ -316,6 +322,7 @@ def test_an_unrecognised_string_topic_is_not_guessed():
 
 def test_an_ignored_wire_shows_up_in_the_degradations():
     card = _card()
+    card._running = True
     card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom",
                      "unknown": ["/weird/topic（String，但话题名不符合…）"]}
     assert any("没有被使用" in note for note in card._degradations())
@@ -494,3 +501,26 @@ def test_info_and_the_schema_agree_about_the_output_topic():
     card = _card()
     assert (card.dispatch("navi", {"action": "info"})["topic_out"][0]["topic"]
             == card.get_tools()[0]["topic_out"][0]["topic"])
+
+
+def test_an_idle_card_blames_itself_rather_than_vop():
+    """The card knows its own state; pointing at the upstream sends someone to
+    investigate something that is working. Seen on r1_sz after a container
+    restart: vop was publishing fine and the message said to go check it."""
+    out = _card().dispatch("navi", {"action": "list_visible_objects"})
+    assert "未在运行" in out["message"] and "vop" not in out["message"]
+
+
+def test_a_running_card_with_no_frames_does_point_at_vop():
+    card = _card()
+    card._running = True
+    card._binding = {"objects": "/cam/objects"}
+    assert "/cam/objects" in card.dispatch(
+        "navi", {"action": "list_visible_objects"})["message"]
+
+
+def test_an_idle_card_reports_no_degradations():
+    """"Running, but missing something" is what a degradation means. An idle
+    card has nothing bound because it has not started, and reporting "only the
+    depth summary is wired" there is inventing a fact."""
+    assert _card()._degradations() == []

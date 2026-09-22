@@ -352,8 +352,20 @@ class NaviPlugin:
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
                      if self._depth_ms else None)
         if not frames:
+            # 先说自己的状态，再谈别人的。卡片没在运行时它当然收不到检测结果，
+            # 而早先这里一律回「确认 vop 卡片在运行且相机有画面」—— 把人指向
+            # 上游去查一个没有问题的东西，而答案就在这张卡自己的 state 里。
+            if not self._running:
+                return {"objects": [], "frames": 0,
+                        "message": "本卡片未在运行（state=idle），因此没有订阅任何"
+                                   "输入。请在画布上启动项目 —— 容器重启后卡片不会"
+                                   "自行恢复订阅。"}
+            if not self._binding.get("objects"):
+                return {"objects": [], "frames": 0,
+                        "message": "没有接 vop 的检测结果输入，无从列出物体"}
             return {"objects": [], "frames": 0,
-                    "message": "还没有收到任何检测结果 —— 确认 vop 卡片在运行且相机有画面"}
+                    "message": f"已订阅 {self._binding['objects']}，但还没收到任何"
+                               f"检测结果 —— 确认 vop 卡片在运行且相机有画面"}
 
         need = max(1, int(round(len(frames) * 0.6)))
         items = policy_mod.stable_objects(frames, min_frames=need,
@@ -525,6 +537,11 @@ class NaviPlugin:
             }
 
     def _degradations(self) -> list:
+        # 未运行时不报降级。降级说的是「跑起来了，但少了点什么」；一张没启动的
+        # 卡片什么都没接是正常的，照旧报「只接了深度摘要」纯属无中生有 —— 真机
+        # 上它就在 inputs 为空时报过这一条。
+        if not self._running:
+            return []
         out = []
         if not self._binding.get("depth_map"):
             out.append("只接了深度摘要，没有深度图 —— 距离按目标所在的三分之一"
