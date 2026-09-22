@@ -29,6 +29,11 @@
  * Protocol: phanthymotus-driver/README_dev.md § "Continuous Control".
  */
 
+// motus.control/1 `twist`: a body velocity in this order. Mirrors
+// common/control/descriptor.py's MODES comment and loco_servo's
+// AXIS_NAMES — three places name these, and they must not drift.
+const TWIST_AXES = ['vx', 'vy', 'vz', 'wx', 'wy', 'wz'];
+
 const BAR_COLOUR   = '#4D9EE8';
 const WARN_COLOUR  = '#D97757';
 // Within this fraction of a limit the bar turns warm. Not a threshold the sink
@@ -102,6 +107,13 @@ export const ControlRenderer = {
   _absorbDescriptor(msg) {
     const d = msg.control_interface;
     if (d && Array.isArray(d.joint_names)) this._names = d.joint_names;
+    // `twist` is not a joint space: the six values are a body velocity, and
+    // labelling them joint1..joint6 tells the reader the robot has six joints
+    // it is driving. On a navigating chassis the only non-zero entry sat next
+    // to "joint6", which is the yaw rate — the one name that makes the panel
+    // readable is the one it was not using. Only when the producer has not
+    // named them itself.
+    else if (msg.mode === 'twist') this._names = TWIST_AXES;
     if (d && d.limits && Array.isArray(d.limits.lower) && Array.isArray(d.limits.upper)) {
       this._limits = { lower: d.limits.lower, upper: d.limits.upper, declared: true };
     }

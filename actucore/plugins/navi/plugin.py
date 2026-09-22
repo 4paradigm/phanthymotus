@@ -53,6 +53,15 @@ ACTION_DIM = 6
 # a body twist is the only thing this card knows how to produce.
 TOPIC_FORMAT = "control/velocity"
 
+# 每多少条指令回显一次 descriptor。见 next_command。
+_DESCRIPTOR_EVERY = 50
+
+# twist 六个轴的名字。**轴序由协议定死**（motus.control/1 的 MODES 注释、驱动侧
+# loco_servo 的 AXIS_NAMES、motus.odom/1 的 AXES 都是这一组），所以一个 twist 生
+# 产者不需要下游就知道自己发的六个数叫什么 —— 没接底盘卡片时也能把名字带上，
+# 而不是把「按下标叫 joint1..joint6」的责任推给渲染器。
+TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
+
 
 def _sensor_qos():
     """BEST_EFFORT, to match what every producer this card reads actually uses.
@@ -746,7 +755,7 @@ class NaviPlugin:
 
         self._seq += 1
         obs_ms = self._objects_ms or int(now * 1000)
-        return build_message(
+        message = build_message(
             seq=self._seq,
             values=decision.values,
             mode=CONTROL_MODE,
@@ -760,6 +769,27 @@ class NaviPlugin:
             ttl_ms=self._ttl_ms,
             priority=int(self._cfg.get("priority", 50)),
         )
+
+        # 周期性回显下游的 descriptor，让这条流**自解释**。
+        #
+        # 仪表盘的 control 渲染器会从 `control_interface` 里取 joint_names 和
+        # limits；拿不到就只能按下标叫 joint1..joint6，并且按见过的极值反推量程。
+        # twist 模式下那个命名尤其误导：唯一非零的那一项被标成 "joint6"，而它其
+        # 实是偏航角速度 —— 读的人会以为机器人在驱动六个关节。
+        #
+        # 每 N 条发一次而不是每条都发：descriptor 有上百个数字，10 Hz 全带等于把
+        # 指令流放大一个量级，而它是个常量 —— 协商一次之后就不会变。首条必带，
+        # 这样面板一打开就有名字，不用等一个周期。
+        if self._seq % _DESCRIPTOR_EVERY == 1:
+            # 接了下游就回显它那份（带真实限位，面板的量程条才有刻度）；没接
+            # 下游时至少把轴名带上 —— 轴序是协议定的，不需要问任何人。
+            message["control_interface"] = self._descriptor or {
+                "control_interface": negotiate.SCHEMA,
+                "mode": CONTROL_MODE,
+                "dof": ACTION_DIM,
+                "joint_names": list(TWIST_AXES),
+            }
+        return message
 
     def _tick(self):
         publisher = self._publisher

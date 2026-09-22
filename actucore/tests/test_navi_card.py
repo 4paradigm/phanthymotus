@@ -524,3 +524,43 @@ def test_an_idle_card_reports_no_degradations():
     card has nothing bound because it has not started, and reporting "only the
     depth summary is wired" there is inventing a fact."""
     assert _card()._degradations() == []
+
+
+# ── the stream describes itself ──────────────────────────────────────────────
+
+def _first_command(card):
+    card._running = True
+    card._state = navi_plugin.policy_mod.State(target="chair")
+    card._objects = {"objects": [{"name": "chair", "confidence": 0.9,
+                                  "position": [0.5, 0.0]}]}
+    card._objects_ms = 10 ** 13
+    card._depth_bands = {"left": 5.0, "center": 5.0, "right": 5.0}
+    card._depth_ms = 10 ** 13
+    card._config.max_obs_age_ms = 10 ** 13
+    return card.next_command()
+
+
+def test_the_first_command_names_its_axes_even_with_no_downstream():
+    """A twist producer knows what its six numbers are called: the order is
+    fixed by the protocol. Leaving them unnamed pushes "call them joint1..6"
+    onto the renderer, and on a chassis that labels the yaw rate `joint6`."""
+    message = _first_command(_card())
+    assert message["control_interface"]["joint_names"] == \
+        ["vx", "vy", "vz", "wx", "wy", "wz"]
+
+
+def test_a_downstream_descriptor_is_echoed_in_preference():
+    """The driver's own descriptor carries real limits, which is what gives the
+    dashboard's range bars a scale instead of inferring one from extremes."""
+    card = _card()
+    card._descriptor = _descriptor()
+    assert _first_command(card)["control_interface"] is card._descriptor
+
+
+def test_the_descriptor_is_not_echoed_on_every_command():
+    """It is a constant with a hundred numbers in it; at 10 Hz echoing it every
+    time multiplies the command stream for no new information."""
+    card = _card()
+    first = _first_command(card)
+    assert "control_interface" in first
+    assert "control_interface" not in card.next_command()
