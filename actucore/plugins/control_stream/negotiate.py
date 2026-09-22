@@ -132,6 +132,9 @@ def _group_problems(capabilities: dict, descriptor: dict, label: str = "模型")
     **只有两边都声明了段才逐段比。** 一边有一边没有不算错：今天每个模型都是单一
     空间，没有段是常态，那时候顶层那条检查已经是完整的。这里要抓的是**都声明了却
     对不上**，那是真的分歧。
+
+    逐段比三件事：`mode`、`(offset, count)`，以及 **advisory vs optional** ——
+    最后一条比的不是形状，而是「这一段会不会被丢掉，以及丢它有没有得到许可」。
     """
     model_groups = capabilities.get("control_groups")
     driver_groups = descriptor.get("groups")
@@ -163,6 +166,19 @@ def _group_problems(capabilities: dict, descriptor: dict, label: str = "模型")
                 f"{theirs.get('name')!r}）：{label}输出 {mine_mode!r}，"
                 f"下游接受 {theirs_mode!r}"
             )
+        # **丢维要双方都同意过。** 驱动侧的 `advisory` 是「我收下但不执行」，
+        # 生产者侧的 `optional` 是「任务不要求执行」。只有后者存在，前者才被允许
+        # —— 这一条就是让「静默丢掉几维」在这套协议里不可能发生的那道门。
+        #
+        # 两个名字故意不同：语义不对称，同名会让一次复制粘贴把「可以不执行」变成
+        # 「已经没执行」。缺省都是 false，所以今天每一对声明都落在「必须执行 /
+        # 会执行」上，这条检查对它们是透明的。
+        if theirs.get("advisory") and not mine.get("optional"):
+            problems.append(
+                f"第 {i} 段：下游把 {theirs.get('name')!r} 声明成 advisory"
+                f"（收下但不执行），而{label}没有把 {mine.get('name')!r} 声明成 "
+                "optional —— 这一段会被丢掉，而"f"{label}""认为它必须被执行。"
+                "要么换一台真能执行它的机器人，要么由"f"{label}""声明这一段可以不执行")
         if mine.get("offset") != theirs.get("offset") or \
                 mine.get("count") != theirs.get("count"):
             problems.append(
