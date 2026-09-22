@@ -362,7 +362,11 @@ class NaviPlugin:
             out.append({
                 "key": item["key"],
                 "name": item["name"],
-                "color": item["color"],
+                # 颜色发可读文本，不发原始字段。vop 在 `publish_color: full` 下
+                # 每个对象带 12 个数 —— 真机上这个回复到过 7356 字符，而它每次
+                # 都整份进 LLM 上下文，其中没有一个数字是调用方用得上的：它要的
+                # 是挑一个目标，而挑目标只需要 key 和一句描述。
+                "color": policy_mod.colour_text(item["object"]),
                 "bearing": round(item["bearing"], 3),
                 "distance_m": distance,
                 "confidence": item["confidence"],

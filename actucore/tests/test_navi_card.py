@@ -409,3 +409,26 @@ def test_each_navigate_to_gets_a_fresh_action_id():
     first = card.dispatch("navi", {"action": "navigate_to", "target": "chair"})
     second = card.dispatch("navi", {"action": "navigate_to", "target": "tv"})
     assert first["action_id"] != second["action_id"]
+
+
+def test_the_visible_list_stays_small_under_full_colour():
+    """`publish_color: full` carries twelve numbers per object, and this reply
+    goes into LLM context whole, every time it is called. On r1_sz it reached
+    7356 characters — none of which the caller can use, since choosing a target
+    needs only the key and a description."""
+    import json
+
+    card = _card()
+    full = {"rgb_mean": [79.6, 74.4, 76.3], "rgb_var": [1551.5, 1417.7, 1811.9],
+            "hsv_mean": [59.9, 41, 85.3], "hsv_var": [4327.9, 1200.6, 1571.8],
+            "dominant_hue": "green", "dominant_saturation": "muted",
+            "dominant_brightness": "dim", "color_name": "green"}
+    card._recent.extend([{"objects": [
+        {"name": f"thing{i}", "confidence": 0.9, "position": [0.1 * i, 0],
+         "color": full} for i in range(8)]}] * 10)
+
+    out = card.dispatch("navi", {"action": "list_visible_objects"})
+    assert out["count"] == 8
+    text = json.dumps(out, ensure_ascii=False)
+    assert "rgb_var" not in text
+    assert len(text) < 2000, f"reply is {len(text)} chars"
