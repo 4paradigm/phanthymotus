@@ -92,6 +92,11 @@ class NaviPlugin:
         self._obs_lock = threading.RLock()
         self._objects = None
         self._objects_ms = 0
+        # 最近 N 帧的检测结果，给 list_visible_objects 求交集用。deque 而不是
+        # list：这是热路径上每帧都写的东西，而且必须有界 —— 一个跑了一小时的
+        # 卡片不该攒着三万帧检测结果。
+        from collections import deque
+        self._recent = deque(maxlen=int(self._cfg.get("stable_frames", 10)))
         self._depth_map = None
         self._depth_bands = {}
         self._depth_ms = 0
@@ -113,11 +118,13 @@ class NaviPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["start", "stop", "navigate_to",
-                                        "stop_navigation", "pause", "resume",
-                                        "info", "config"]},
+                               "enum": ["start", "stop", "list_visible_objects",
+                                        "navigate_to", "stop_navigation",
+                                        "pause", "resume", "info", "config"]},
                     "target": {"type": "string",
-                               "description": "要走过去的东西，用 vop 认得的名字"},
+                               "description": "要走过去的东西。用 list_visible_objects "
+                                              "返回的 key（如 chair#azure）最准；"
+                                              "也接受纯名字，但同名多个时挑哪一个不保证"},
                     "stop_distance_m": {"type": "number",
                                         "description": "在目标前多远停下，默认 1.0 m"},
                     # Handed over by agent-core from the card wired downstream.
@@ -127,6 +134,12 @@ class NaviPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
+                    "list_visible_objects": {
+                        "params": [],
+                        "description": "列出当前稳定看到的物体。先调它，再从返回的 "
+                                       "key 里挑一个给 navigate_to —— 单帧检测会闪，"
+                                       "直接凭印象填名字很可能指向一个下一帧就不在的东西",
+                    },
                     "navigate_to": {
                         "params": ["target", "stop_distance_m"],
                         "description": "朝一个看得见的目标走过去；已在导航时即为换目标",
@@ -193,6 +206,8 @@ class NaviPlugin:
             return self._start(args)
         if action == "stop":
             return self._stop()
+        if action == "list_visible_objects":
+            return self._list_visible_objects()
         if action == "navigate_to":
             return self._navigate_to(args)
         if action == "stop_navigation":
@@ -289,6 +304,48 @@ class NaviPlugin:
                 "control_hz": float(self._cfg.get("rate_hz") or 10.0),
                 "chunk_size": 1,
                 "model": "visual-servo/1"}
+
+    def _list_visible_objects(self):
+        """当前稳定看到的东西，按可靠程度排序。
+
+        取最近 N 帧的**交集**而不是最新一帧：单帧检测会闪 —— 一把确实在那里的
+        椅子可能十帧里只出现七帧，而某一帧会凭空多出一个 0.4 置信度的东西。把
+        单帧结果交给 LLM 去挑目标，它迟早会挑到一个下一帧就不存在的，然后卡片
+        立刻进入搜索模式，表现为机器人朝一个从来没有过的方向转圈。
+
+        每一项都带 `key`，那是 navigate_to 应当收到的东西：名字区分不了两把不同
+        颜色的椅子，而 key 可以。
+        """
+        with self._obs_lock:
+            frames = list(self._recent)
+            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
+                     if self._depth_ms else None)
+        if not frames:
+            return {"objects": [], "frames": 0,
+                    "message": "还没有收到任何检测结果 —— 确认 vop 卡片在运行且相机有画面"}
+
+        need = max(1, int(round(len(frames) * 0.6)))
+        items = policy_mod.stable_objects(frames, min_frames=need,
+                                          config=self._config)
+        out = []
+        for item in items:
+            distance = policy_mod.target_distance(item["object"], depth,
+                                                  self._config)
+            out.append({
+                "key": item["key"],
+                "name": item["name"],
+                "color": item["color"],
+                "bearing": round(item["bearing"], 3),
+                "distance_m": distance,
+                "confidence": item["confidence"],
+                "stability": f"{item['seen_in_frames']}/{item['of_frames']} 帧",
+                "description": policy_mod.describe(item["object"], distance),
+            })
+        return {"objects": out, "count": len(out),
+                "frames": len(frames), "min_frames": need,
+                # 降级说明一并带出来：距离是 None 还是个数，取决于接了哪种深度，
+                # 而只看列表是看不出差别的。
+                "degraded": self._degradations()}
 
     def _navigate_to(self, args: dict):
         target = (args.get("target") or "").strip()
@@ -390,6 +447,8 @@ class NaviPlugin:
                        "画面估计，精度明显变差")
         if not self._binding.get("odom"):
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停")
+        for hint in (self._binding.get("unknown") or []):
+            out.append(f"有一路输入没有被使用：{hint}")
         return out
 
     def _error(self, message: str):
@@ -400,35 +459,51 @@ class NaviPlugin:
 
     # ── wiring ───────────────────────────────────────────────────────────────
 
+    # perception 自己定义的输出话题后缀（plugins/vop.py::output_topic_for，
+    # plugins/visual_depth.py::output_topics_for）。角色由它们决定，而不是由
+    # 「这条话题上现在有没有发布者」决定 —— 见 _bind_inputs。
+    #
+    # 顺序有意义：visual_depth_summary 必须排在 visual_depth 前面，否则带
+    # `/visual_depth` 前缀的摘要话题会先被当成深度图。
+    _ROLE_SUFFIXES = (
+        ("/visual_depth_summary", "depth_summary"),
+        ("/visual_depth", "depth_map"),
+        ("/objects", "objects"),
+        ("/state/odom", "odom"),
+    )
+
     def _bind_inputs(self, node, topics):
-        """Assign each connected topic a role by **what is on it**.
+        """把连上来的话题分派到角色。
 
-        agent-core passes topic names and no formats, so a role cannot be
-        guessed from a name — a topic called `/robot/state` may be anything.
-        Message type narrows it to two cases, and for the `String` ones the
-        payload settles it: vop has `objects`, `visual_depth`'s summary has
-        `nearest_by_region`, and `motus.odom/1` says so in `schema`.
+        **上游此刻有没有在发布，不参与这个判断。** 这一条是真机上换来的：
+        perception 的卡片启动时会先回一个 `loading`（TensorRT engine 在后台加
+        载），agent-core 明确支持这种返回并会轮询到 `settled`，但在那之前 ROS
+        图上是空的。早先这里靠查图里的消息类型定角色，于是 visual_depth 还在
+        加载时，它的话题被判成「无发布者、认不出」，navi 启动失败，整个项目按
+        严格模式回滚 —— 而日志的下一行正是 `visual_depth settled: running`。
+        连线完全正确，报错却说没连上。
 
-        Sniffing the first payload rather than trusting a name means a
-        mis-wired canvas shows up as "没认出来" here, at start, instead of as a
-        robot that ignores its depth input.
+        所以角色按**话题名**判定：后缀由 perception 自己的 `output_topic_for` /
+        `output_topics_for` 决定，是个确定的契约，不依赖时序。消息类型只在名字
+        认不出来时作为兜底 —— 那时图里有没有发布者才真的有参考价值。
+
+        还没有数据不是错误：`observation()` 的过期检查已经覆盖它，而那条路径的
+        结论是「什么都不发，让下游 watchdog 停住底盘」，正是此时该做的事。
         """
-        by_type = dict(node.get_topic_names_and_types())
         bound = {"objects": "", "depth_map": "", "depth_summary": "", "odom": ""}
         unknown = []
 
         for topic in topics:
-            types = by_type.get(topic) or []
-            if any(n.endswith(("CompressedImage", "Image")) for n in types):
-                bound["depth_map"] = topic
-            elif any(n.endswith("String") for n in types):
-                role = self._sniff_string_topic(node, topic)
-                if role:
-                    bound[role] = topic
-                else:
-                    unknown.append(f"{topic}(String，载荷认不出)")
-            else:
-                unknown.append(f"{topic}({'/'.join(types) or '无发布者'})")
+            role = self._role_of(topic)
+            if not role:
+                role, hint = self._role_from_graph(node, topic)
+                if not role:
+                    unknown.append(hint)
+                    continue
+            # 同一角色接了多路时保留第一条：多接一路深度图是画布上的手误，
+            # 静默换成后接的那条只会让「为什么距离不对」更难查。
+            if not bound[role]:
+                bound[role] = topic
 
         missing = []
         if not bound["objects"]:
@@ -441,6 +516,11 @@ class NaviPlugin:
                              "连到本卡片的输入端口。"
                            + (f"（无法识别的输入：{'、'.join(unknown)}）"
                               if unknown else ""))
+
+        # 必需的都在，但还有认不出的连线：不拦启动（该有的观测都有了），却也不
+        # 能装作没看见 —— 操作员画那根线是有意图的，而被静默忽略的一路输入在画
+        # 布上和正常工作的一路长得一模一样。记进降级说明里。
+        bound["unknown"] = unknown
 
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
@@ -455,24 +535,26 @@ class NaviPlugin:
                     lambda message, r=role: self._on_string(r, message), 1)
         return bound, ""
 
-    def _sniff_string_topic(self, node, topic) -> str:
-        """Which of the three JSON inputs a `String` topic carries.
-
-        Decided from the topic's declared publishers where possible and from
-        the payload otherwise. Returns "" when it cannot tell, which the caller
-        reports rather than guessing — a depth summary mistaken for odometry
-        would produce a card that runs and steers by nothing.
-        """
-        name = topic.rsplit("/", 1)[-1]
-        # These suffixes are what the producing cards actually name their
-        # topics; used as a hint only, with the payload as the authority.
-        if name == "objects":
-            return "objects"
-        if name.endswith("visual_depth_summary") or name == "depth_summary":
-            return "depth_summary"
-        if name == "odom":
-            return "odom"
+    def _role_of(self, topic: str) -> str:
+        """角色，纯按话题名。认不出返回 ''。"""
+        for suffix, role in self._ROLE_SUFFIXES:
+            if topic.endswith(suffix):
+                return role
         return ""
+
+    def _role_from_graph(self, node, topic: str):
+        """兜底：名字认不出时问 ROS 图。返回 (role, hint)。
+
+        到这里才看发布者是合理的 —— 名字已经没能给出答案，图是仅剩的线索。
+        """
+        types = dict(node.get_topic_names_and_types()).get(topic) or []
+        if any(n.endswith(("CompressedImage", "Image")) for n in types):
+            return "depth_map", ""
+        if any(n.endswith("String") for n in types):
+            # String 上三种载荷都可能，名字又认不出，猜错的代价是拿摘要当里程
+            # 计、或者反过来 —— 那会让机器人按完全错误的数字行动。不猜。
+            return "", f"{topic}（String，但话题名不符合 perception 的命名约定，无法确定用途）"
+        return "", f"{topic}（{'/'.join(types) or '暂无发布者，且话题名不符合命名约定'}）"
 
     def _on_string(self, role, message):
         try:
@@ -484,6 +566,7 @@ class NaviPlugin:
             if role == "objects":
                 self._objects = payload
                 self._objects_ms = now
+                self._recent.append(payload)
             elif role == "depth_summary":
                 self._depth_bands = depth_mod.bands_from_summary(payload)
                 self._depth_ms = now

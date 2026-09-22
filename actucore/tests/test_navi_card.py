@@ -15,6 +15,20 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Minimal ROS message stubs. `_bind_inputs` imports these only to hand a type to
+# create_subscription, and the point of these tests is the role assignment that
+# happens before that — installing the two names is cheaper, and far less
+# fragile, than requiring a ROS install to test a dictionary lookup.
+import types as _types  # noqa: E402
+
+for _mod, _name in (("sensor_msgs.msg", "CompressedImage"),
+                    ("std_msgs.msg", "String")):
+    _pkg = _mod.split(".")[0]
+    sys.modules.setdefault(_pkg, _types.ModuleType(_pkg))
+    _m = sys.modules.setdefault(_mod, _types.ModuleType(_mod))
+    setattr(_m, _name, type(_name, (), {}))
+    setattr(sys.modules[_pkg], "msg", _m)
+
 from plugins.navi import NaviPlugin  # noqa: E402
 from plugins.navi import plugin as navi_plugin  # noqa: E402
 
@@ -197,3 +211,119 @@ def test_the_config_action_updates_a_live_card():
     card = _card()
     card.dispatch("navi", {"action": "config", "vx_max": 0.15})
     assert card._config.vx_max == 0.15
+
+
+# ── input binding ────────────────────────────────────────────────────────────
+#
+# These are the tests that would have caught the real-machine failure: on r1_sz
+# the canvas was wired correctly and navi still refused to start, because
+# visual_depth was still loading its TensorRT engine and its topic had no
+# publisher yet. The next log line was `visual_depth settled: running`.
+
+class _FakeNode:
+    """A node that knows nothing — which is the state during upstream loading."""
+
+    def __init__(self, graph=None):
+        self.graph = graph or {}
+        self.subscriptions = []
+
+    def get_topic_names_and_types(self):
+        return list(self.graph.items())
+
+    def create_subscription(self, msg_type, topic, cb, depth):
+        self.subscriptions.append(topic)
+
+
+def _bind(topics, graph=None):
+    card = _card()
+    return card._bind_inputs(_FakeNode(graph), topics)
+
+
+def test_roles_come_from_topic_names_not_from_live_publishers():
+    """The fix. An empty ROS graph must still bind correctly — perception
+    names its outputs deterministically, and loading is a normal transient."""
+    bound, problem = _bind(["/ubuntu/camera/main/objects",
+                            "/ubuntu/camera/main/visual_depth"])
+    assert problem == ""
+    assert bound["objects"] == "/ubuntu/camera/main/objects"
+    assert bound["depth_map"] == "/ubuntu/camera/main/visual_depth"
+
+
+def test_the_summary_suffix_is_not_swallowed_by_the_depth_map_suffix():
+    """`/visual_depth_summary` starts with `/visual_depth`; matched in the
+    wrong order the summary binds as a depth map and every distance is wrong."""
+    bound, problem = _bind(["/cam/objects", "/cam/visual_depth_summary"])
+    assert problem == ""
+    assert bound["depth_summary"] == "/cam/visual_depth_summary"
+    assert bound["depth_map"] == ""
+
+
+def test_odom_binds_by_name_too():
+    bound, _ = _bind(["/cam/objects", "/cam/visual_depth", "/ubuntu/state/odom"])
+    assert bound["odom"] == "/ubuntu/state/odom"
+
+
+def test_a_summary_only_wiring_is_accepted():
+    _, problem = _bind(["/cam/objects", "/cam/visual_depth_summary"])
+    assert problem == ""
+
+
+def test_missing_depth_is_still_refused():
+    """The check has to keep working — this is not a licence to bind nothing."""
+    _, problem = _bind(["/cam/objects"])
+    assert "深度" in problem
+
+
+def test_missing_detections_is_still_refused():
+    _, problem = _bind(["/cam/visual_depth"])
+    assert "vop" in problem
+
+
+def test_an_unrecognised_name_falls_back_to_the_graph():
+    bound, problem = _bind(
+        ["/cam/objects", "/weird/topic"],
+        graph={"/weird/topic": ["sensor_msgs/msg/CompressedImage"]})
+    assert problem == ""
+    assert bound["depth_map"] == "/weird/topic"
+
+
+def test_an_unrecognised_string_topic_is_not_guessed():
+    """Three different payloads ride on String. Mistaking a depth summary for
+    odometry makes the robot act on entirely the wrong numbers, so an
+    unrecognisable one is left unbound rather than assigned a role."""
+    bound, problem = _bind(["/cam/objects", "/cam/visual_depth", "/weird/topic"],
+                           graph={"/weird/topic": ["std_msgs/msg/String"]})
+    # Required inputs are all present, so this does not block the start...
+    assert problem == ""
+    assert "/weird/topic" not in bound.values()
+    # ...but an ignored wire must not be invisible: the operator drew it.
+    assert any("/weird/topic" in h for h in bound["unknown"])
+
+
+def test_an_ignored_wire_shows_up_in_the_degradations():
+    card = _card()
+    card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom",
+                     "unknown": ["/weird/topic（String，但话题名不符合…）"]}
+    assert any("没有被使用" in note for note in card._degradations())
+
+
+def test_an_unrecognised_name_is_refused_when_a_required_input_is_missing():
+    """Then it is the likely cause, and naming it is the whole point."""
+    _, problem = _bind(["/cam/objects", "/weird/topic"],
+                       graph={"/weird/topic": ["std_msgs/msg/String"]})
+    assert "深度" in problem and "/weird/topic" in problem
+
+
+def test_the_first_topic_of_a_role_wins():
+    bound, _ = _bind(["/a/objects", "/b/objects", "/cam/visual_depth"])
+    assert bound["objects"] == "/a/objects"
+
+
+def test_subscriptions_are_actually_created():
+    card = _card()
+    node = _FakeNode()
+    bound, problem = card._bind_inputs(
+        node, ["/cam/objects", "/cam/visual_depth", "/r1/state/odom"])
+    assert problem == ""
+    assert set(node.subscriptions) == {"/cam/objects", "/cam/visual_depth",
+                                       "/r1/state/odom"}

@@ -361,3 +361,105 @@ def test_an_empty_target_name_selects_nothing():
 def _solid_depth(metres):
     from plugins.navi import depth as D
     return np.full((D.HEIGHT, D.WIDTH), metres, dtype=np.float32)
+
+
+# ── stable object list ───────────────────────────────────────────────────────
+#
+# What `list_visible_objects` is built on. The point is the intersection: a
+# single frame is a bad thing to choose a navigation target from, because a
+# detection that appears once and vanishes sends the robot turning towards
+# something that was never there.
+
+def _frames(*per_frame):
+    return [_detections(*objs) for objs in per_frame]
+
+
+def test_an_object_in_every_frame_is_stable():
+    frames = _frames(*[[_obj(name="chair")] for _ in range(10)])
+    out = P.stable_objects(frames, min_frames=6)
+    assert [o["name"] for o in out] == ["chair"]
+    assert out[0]["seen_in_frames"] == 10
+
+
+def test_a_one_frame_flicker_is_dropped():
+    """The whole reason this function exists."""
+    frames = _frames(*[[_obj(name="chair")] for _ in range(9)])
+    frames.append(_detections(_obj(name="chair"), _obj(name="backpack")))
+    out = P.stable_objects(frames, min_frames=6)
+    assert [o["name"] for o in out] == ["chair"]
+
+
+def test_an_object_missing_a_couple_of_frames_still_counts():
+    """Occlusion and edge flicker drop a frame or two from something that is
+    really there; requiring every frame would empty the list."""
+    frames = _frames(*([[_obj(name="chair")]] * 7 + [[]] * 3))
+    assert [o["name"] for o in P.stable_objects(frames, min_frames=6)] == ["chair"]
+
+
+def test_results_are_ordered_most_reliable_first():
+    frames = _frames(*[[_obj(name="chair"), _obj(name="tv")] for _ in range(6)])
+    frames += _frames(*[[_obj(name="chair")] for _ in range(4)])
+    assert [o["name"] for o in P.stable_objects(frames, min_frames=5)][0] == "chair"
+
+
+def test_low_confidence_detections_never_become_stable():
+    frames = _frames(*[[_obj(name="chair", confidence=0.1)] for _ in range(10)])
+    assert P.stable_objects(frames, min_frames=6, config=_cfg()) == []
+
+
+# ── identity: colour is part of it ───────────────────────────────────────────
+
+def test_two_chairs_of_different_colours_are_two_entries():
+    """Without this the list has one "chair" and navigate_to("chair") picks
+    whichever one happens to win, which is not a choice the caller made."""
+    frames = _frames(*[[dict(_obj(name="chair", x=-0.5), color="dim muted azure"),
+                        dict(_obj(name="chair", x=0.5), color="bright vivid red")]
+                       for _ in range(10)])
+    keys = {o["key"] for o in P.stable_objects(frames, min_frames=6)}
+    assert keys == {"chair#azure", "chair#red"}
+
+
+def test_brightness_changes_do_not_split_one_object_in_two():
+    """Only the hue is part of the identity: brightness swings frame to frame
+    with the lighting, and including it would make one chair flicker between
+    two entries and neither would reach the stability threshold."""
+    frames = _frames(*[[dict(_obj(name="chair"),
+                             color=("dim muted azure" if i % 2 else
+                                    "bright muted azure"))]
+                       for i in range(10)])
+    out = P.stable_objects(frames, min_frames=6)
+    assert len(out) == 1 and out[0]["key"] == "chair#azure"
+
+
+def test_a_neutral_colour_does_not_enter_the_key():
+    """"neutral" says the hue is meaningless, so putting it in the key would be
+    inventing a distinction from the absence of one."""
+    frames = _frames(*[[dict(_obj(name="wall"), color="dim gray neutral")]
+                       for _ in range(10)])
+    assert P.stable_objects(frames, min_frames=6)[0]["key"] == "wall"
+
+
+def test_the_key_round_trips_through_select_target():
+    """`list_visible_objects` hands out keys and `navigate_to` takes them back;
+    if these two disagree the whole feature is decorative."""
+    red = dict(_obj(name="chair", x=0.5), color="bright vivid red")
+    blue = dict(_obj(name="chair", x=-0.5), color="dim muted azure")
+    chosen = P.select_target([red, blue], "chair#red", _cfg())
+    assert chosen is red
+
+
+def test_a_plain_name_still_works():
+    assert P.select_target([_obj(name="chair")], "chair", _cfg()) is not None
+
+
+def test_the_latest_frames_bearing_is_used():
+    """Both the robot and the object may be moving; an old bearing points at
+    where the target no longer is."""
+    frames = _frames(*[[_obj(name="chair", x=-0.5)] for _ in range(9)])
+    frames.append(_detections(_obj(name="chair", x=0.4)))
+    assert P.stable_objects(frames, min_frames=6)[0]["bearing"] == 0.4
+
+
+def test_describe_mentions_name_colour_and_side():
+    text = P.describe(dict(_obj(name="chair", x=0.5), color="dim muted azure"), 2.3)
+    assert "chair" in text and "azure" in text and "偏右" in text and "2.3m" in text

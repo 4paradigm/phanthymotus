@@ -129,9 +129,16 @@ def select_target(objects, name: str, config: Config):
 
     candidates = [o for o in (objects or [])
                   if float(o.get("confidence") or 0) >= config.min_confidence]
-    exact = [o for o in candidates if str(o.get("name", "")).lower() == wanted]
-    pool = exact or [o for o in candidates
-                     if wanted in str(o.get("name", "")).lower()]
+    # `list_visible_objects` 给出的 key（`chair#azure`）优先于名字。它是那份列表
+    # 里唯一能区分「两把不同颜色的椅子」的东西，而让 LLM 从列表里挑一个、再把
+    # 它退化成名字来匹配，等于把刚做出来的区分又丢掉。
+    keyed = [o for o in candidates if object_key(o).lower() == wanted]
+    if keyed:
+        pool = keyed
+    else:
+        exact = [o for o in candidates if str(o.get("name", "")).lower() == wanted]
+        pool = exact or [o for o in candidates
+                         if wanted in str(o.get("name", "")).lower()]
     if not pool:
         return None
     return max(pool, key=lambda o: (round(float(o.get("confidence") or 0), 2),
@@ -351,3 +358,83 @@ def _stuck(odom, state: State, commanded_vx: float, dt: float,
         return (f"指令 {commanded_vx:.2f} m/s 已 {state.moving_for_s:.1f}s，"
                 f"实测 {measured:.2f} m/s —— 判定被挡住，停止")
     return ""
+
+# ── 稳定物体列表 ──────────────────────────────────────────────────────────────
+#
+# 单帧检测是会闪的：一把椅子在连续十帧里可能只出现在七帧，而某一帧会凭空多出
+# 一个 0.4 置信度的「backpack」。把单帧结果直接交给 LLM 去挑目标，它会挑到一个
+# 下一帧就不存在的东西，然后导航卡片立刻进入搜索模式 —— 表现为机器人朝一个从
+# 来没有过的方向转圈。
+#
+# 所以对外暴露的是**最近若干帧的交集**：只有反复出现的才算数。
+
+# 目标身份的键。名字之外还要带颜色，否则「两把椅子」在列表里是一个条目，而
+# navigate_to("chair") 永远指向其中随机的一把。颜色来自 vop 的三元组，它在
+# `publish_color: name` 下就是一个可直接比较的字符串。
+def object_key(obj) -> str:
+    name = str(obj.get("name") or "?")
+    colour = str(obj.get("color") or "").strip()
+    # 只取色相那一段（三元组的最后一个词）：亮度会随光照在帧间跳动，把它算进
+    # 身份里会让同一把椅子在明暗之间变成两个条目。
+    hue = colour.split(" ")[-1] if colour else ""
+    return f"{name}#{hue}" if hue and hue != "neutral" else name
+
+
+def describe(obj, distance_m=None) -> str:
+    """一句人（和 LLM）能读、也能原样回填给 navigate_to 的描述。"""
+    parts = [str(obj.get("name") or "?")]
+    colour = str(obj.get("color") or "").strip()
+    if colour:
+        parts.append(colour)
+    bearing = _bearing(obj)
+    parts.append("正前方" if abs(bearing) <= 0.15
+                 else ("偏左" if bearing < 0 else "偏右")
+                 + ("很多" if abs(bearing) > 0.6 else ""))
+    if distance_m is not None:
+        parts.append(f"{distance_m:.1f}m")
+    return " · ".join(parts)
+
+
+def stable_objects(frames, *, min_frames: int = 6, config: Config = None) -> list:
+    """在最近这些帧里反复出现的物体。
+
+    `frames` 是最近 N 帧的 vop 载荷，最新的在最后。`min_frames` 是至少要出现在
+    几帧里 —— 不要求全部出现过，因为遮挡和边缘抖动会让一个确实在那里的东西漏掉
+    一两帧，而把阈值定成「全部」等于把列表清空。
+
+    返回按「出现帧数、置信度」排序，所以最可靠的排在最前 —— LLM 通常取第一个。
+    """
+    config = config or Config()
+    seen: dict = {}
+    for index, frame in enumerate(frames):
+        for obj in (frame or {}).get("objects") or []:
+            if float(obj.get("confidence") or 0) < config.min_confidence:
+                continue
+            key = object_key(obj)
+            entry = seen.setdefault(key, {"frames": set(), "last": obj,
+                                          "confidence": 0.0})
+            entry["frames"].add(index)
+            # 留最新的一帧作为方位来源：物体和机器人都可能在动，旧帧的方位会把
+            # 目标指到它已经不在的地方。
+            entry["last"] = obj
+            entry["confidence"] = max(entry["confidence"],
+                                      float(obj.get("confidence") or 0))
+
+    out = []
+    for key, entry in seen.items():
+        count = len(entry["frames"])
+        if count < min_frames:
+            continue
+        out.append({
+            "key": key,
+            "name": entry["last"].get("name"),
+            "color": entry["last"].get("color"),
+            "position": entry["last"].get("position"),
+            "bearing": _bearing(entry["last"]),
+            "confidence": round(entry["confidence"], 2),
+            "seen_in_frames": count,
+            "of_frames": len(frames),
+            "object": entry["last"],
+        })
+    out.sort(key=lambda o: (-o["seen_in_frames"], -o["confidence"]))
+    return out
