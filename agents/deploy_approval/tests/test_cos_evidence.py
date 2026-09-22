@@ -333,18 +333,22 @@ def test_production_compose_default_repos_are_main_and_driver():
 # ── service approval contract tests ────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_pr_author_cannot_approve_own_deploy():
-    """PR author must not be able to approve their own deployment."""
-    from ..service import DeployController, _is_self_approval
+async def test_pr_author_can_approve_own_deploy():
+    """PR author who is machine owner or has write/maintain/admin must be allowed to approve own deploy.
 
-    # Same numeric ID -> self-approval
-    assert _is_self_approval("12345", {"user": {"id": 12345}}) is True
-    # Different numeric ID -> not self-approval
-    assert _is_self_approval("12345", {"user": {"id": 67890}}) is False
-    # Missing user -> fail closed
-    assert _is_self_approval("12345", {}) is True
-    # Missing id -> fail closed
-    assert _is_self_approval("12345", {"user": {}}) is True
+    Regression: _is_self_approval gate removed from service.py.
+    Static assertion: no _is_self_approval definition or "PR author cannot approve" string remains.
+    """
+    from ..service import DeployController
+
+    # Static regression assertions
+    service_source = open(Path(__file__).parent.parent / "service.py").read()
+    assert "_is_self_approval" not in service_source, (
+        "_is_self_approval must be fully removed from service.py"
+    )
+    assert "PR author cannot approve their own deployment" not in service_source, (
+        '"PR author cannot approve their own deployment" must not exist in service.py'
+    )
 
 
 @pytest.mark.asyncio

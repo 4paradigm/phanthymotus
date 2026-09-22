@@ -776,3 +776,446 @@ class TestSourceMatrixFailedBuilds:
     def test_driver_repo_failed_build_is_not_deployable(self):
         build = FakeBuild(target="driver", driver_path="go2", success=False)
         assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False
+
+
+# ── Self-approval prohibition removal tests ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_approve_pr_author_machine_owner_allowed(controller, proxy, fake_github):
+    """A. PR author == actor, actor is machine owner => APPROVAL PASS, no self-approval denial.
+
+    collaborator_permission must NOT be called (owner path short-circuits).
+    Clean gate, fresh PR reread, and full deploy path must execute normally.
+    """
+    from ..service import DeployController
+
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb.append("write_hidden_state") or {})
+    proxy.project_status_label = AsyncMock()
+    events_tb: list[str] = []
+
+    # PR user id == actor_id (self-approval scenario)
+    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 10, "login": "owner1"}}
+    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 10, "login": "owner1"}}
+    get_pr_calls_tb = 0
+
+    async def _get_pr_tb(repo: str, pr_number: int) -> dict:
+        nonlocal get_pr_calls_tb
+        get_pr_calls_tb += 1
+        events_tb.append(f"get_pr_{get_pr_calls_tb}")
+        return first_pr if get_pr_calls_tb == 1 else second_pr
+
+    proxy.get_pr = AsyncMock(side_effect=_get_pr_tb)
+    proxy.comment_identity = AsyncMock(return_value=("10", "owner1"))
+    # Even though permission is read, owner path should short-circuit
+    proxy.collaborator_permission = AsyncMock(side_effect=Exception("should_not_be_called_for_owner"))
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(side_effect=lambda: events_tb.append("list_drivers") or [{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core.driver_status = AsyncMock(side_effect=lambda runtime_id: events_tb.append(f"driver_status:{runtime_id}") or {"status": "running", "running_image": ""})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=lambda *args, **kwargs: events_tb.append("deploy_post") or {})
+    controller._run_automated_case = AsyncMock(return_value={})
+
+    fake_github.comments[50] = {
+        "id": 50,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 10, "login": "owner1"},
+    }
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+
+    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "owner1", "10")
+
+    # Verify key sequence
+    assert "list_drivers" in events_tb
+    assert "get_pr_2" in events_tb
+    assert "write_hidden_state" in events_tb
+    assert "deploy_post" in events_tb
+    assert events_tb.index("list_drivers") < events_tb.index("get_pr_2")
+    assert events_tb.index("get_pr_2") < events_tb.index("write_hidden_state")
+    assert events_tb.index("write_hidden_state") < events_tb.index("deploy_post")
+    # No self-approval denial message
+    for call in proxy.write_hidden_state.call_args_list:
+        args = call.args
+        if len(args) >= 3:
+            markdown = args[2]
+            assert "PR author cannot approve their own deployment" not in markdown
+
+
+@pytest.mark.asyncio
+async def test_approve_pr_author_admin_allowed(controller, proxy, fake_github):
+    """B. PR author == approver, not owner, collaborator_permission=admin => ALLOW."""
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb2.append("write_hidden_state") or {})
+    proxy.project_status_label = AsyncMock()
+    events_tb2: list[str] = []
+
+    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 20, "login": "admin_user"}}
+    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 20, "login": "admin_user"}}
+    get_pr_calls_tb2 = 0
+
+    async def _get_pr_tb2(repo: str, pr_number: int) -> dict:
+        nonlocal get_pr_calls_tb2
+        get_pr_calls_tb2 += 1
+        events_tb2.append(f"get_pr_{get_pr_calls_tb2}")
+        return first_pr if get_pr_calls_tb2 == 1 else second_pr
+
+    proxy.get_pr = AsyncMock(side_effect=_get_pr_tb2)
+    proxy.comment_identity = AsyncMock(return_value=("20", "admin_user"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(side_effect=lambda: events_tb2.append("list_drivers") or [{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core.driver_status = AsyncMock(side_effect=lambda runtime_id: events_tb2.append(f"driver_status:{runtime_id}") or {"status": "running", "running_image": ""})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=lambda *args, **kwargs: events_tb2.append("deploy_post") or {})
+    controller._run_automated_case = AsyncMock(return_value={})
+
+    fake_github.comments[50] = {
+        "id": 50,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 20, "login": "admin_user"},
+    }
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+
+    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "admin_user", "20")
+
+    assert "deploy_post" in events_tb2
+    proxy.collaborator_permission.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approve_pr_author_write_allowed(controller, proxy, fake_github):
+    """C. PR author == approver, not owner, collaborator_permission=write => ALLOW."""
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb3.append("write_hidden_state") or {})
+    proxy.project_status_label = AsyncMock()
+    events_tb3: list[str] = []
+
+    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 30, "login": "write_user"}}
+    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 30, "login": "write_user"}}
+    get_pr_calls_tb3 = 0
+
+    async def _get_pr_tb3(repo: str, pr_number: int) -> dict:
+        nonlocal get_pr_calls_tb3
+        get_pr_calls_tb3 += 1
+        events_tb3.append(f"get_pr_{get_pr_calls_tb3}")
+        return first_pr if get_pr_calls_tb3 == 1 else second_pr
+
+    proxy.get_pr = AsyncMock(side_effect=_get_pr_tb3)
+    proxy.comment_identity = AsyncMock(return_value=("30", "write_user"))
+    proxy.collaborator_permission = AsyncMock(return_value="write")
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(side_effect=lambda: events_tb3.append("list_drivers") or [{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core.driver_status = AsyncMock(side_effect=lambda runtime_id: events_tb3.append(f"driver_status:{runtime_id}") or {"status": "running", "running_image": ""})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=lambda *args, **kwargs: events_tb3.append("deploy_post") or {})
+    controller._run_automated_case = AsyncMock(return_value={})
+
+    fake_github.comments[50] = {
+        "id": 50,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 30, "login": "write_user"},
+    }
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+
+    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "write_user", "30")
+
+    assert "deploy_post" in events_tb3
+
+
+@pytest.mark.asyncio
+async def test_approve_pr_author_maintain_allowed(controller, proxy, fake_github):
+    """D. PR author == approver, not owner, collaborator_permission=maintain => ALLOW."""
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb4.append("write_hidden_state") or {})
+    proxy.project_status_label = AsyncMock()
+    events_tb4: list[str] = []
+
+    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 40, "login": "maintain_user"}}
+    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 40, "login": "maintain_user"}}
+    get_pr_calls_tb4 = 0
+
+    async def _get_pr_tb4(repo: str, pr_number: int) -> dict:
+        nonlocal get_pr_calls_tb4
+        get_pr_calls_tb4 += 1
+        events_tb4.append(f"get_pr_{get_pr_calls_tb4}")
+        return first_pr if get_pr_calls_tb4 == 1 else second_pr
+
+    proxy.get_pr = AsyncMock(side_effect=_get_pr_tb4)
+    proxy.comment_identity = AsyncMock(return_value=("40", "maintain_user"))
+    proxy.collaborator_permission = AsyncMock(return_value="maintain")
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(side_effect=lambda: events_tb4.append("list_drivers") or [{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core.driver_status = AsyncMock(side_effect=lambda runtime_id: events_tb4.append(f"driver_status:{runtime_id}") or {"status": "running", "running_image": ""})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=lambda *args, **kwargs: events_tb4.append("deploy_post") or {})
+    controller._run_automated_case = AsyncMock(return_value={})
+
+    fake_github.comments[50] = {
+        "id": 50,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 40, "login": "maintain_user"},
+    }
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+
+    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "maintain_user", "40")
+
+    assert "deploy_post" in events_tb4
+
+
+@pytest.mark.asyncio
+async def test_approve_pr_author_read_non_owner_denied(controller, proxy, fake_github):
+    """E. PR author == approver, not owner, collaborator_permission=read => DENY (authorization insufficient, NOT self-approval)."""
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb5.append("write_hidden_state") or {})
+    proxy.project_status_label = AsyncMock()
+    events_tb5: list[str] = []
+
+    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 50, "login": "read_user"}}
+    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 50, "login": "read_user"}}
+    get_pr_calls_tb5 = 0
+
+    async def _get_pr_tb5(repo: str, pr_number: int) -> dict:
+        nonlocal get_pr_calls_tb5
+        get_pr_calls_tb5 += 1
+        events_tb5.append(f"get_pr_{get_pr_calls_tb5}")
+        return first_pr if get_pr_calls_tb5 == 1 else second_pr
+
+    proxy.get_pr = AsyncMock(side_effect=_get_pr_tb5)
+    proxy.comment_identity = AsyncMock(return_value=("50", "read_user"))
+    proxy.collaborator_permission = AsyncMock(return_value="read")
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(side_effect=lambda: events_tb5.append("list_drivers") or [{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core.driver_status = AsyncMock(side_effect=lambda runtime_id: events_tb5.append(f"driver_status:{runtime_id}") or {"status": "running", "running_image": ""})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=lambda *args, **kwargs: events_tb5.append("deploy_post") or {})
+    controller._run_automated_case = AsyncMock(return_value={})
+
+    fake_github.comments[50] = {
+        "id": 50,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 50, "login": "read_user"},
+    }
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+
+    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "read_user", "50")
+
+    # Must NOT reach deploy
+    assert "deploy_post" not in events_tb5
+    # Check denial is about authorization, not self-approval
+    for call in proxy.write_hidden_state.call_args_list:
+        args = call.args
+        if len(args) >= 3:
+            markdown = args[2]
+            assert "PR author cannot approve their own deployment" not in markdown
+            assert "not an owner" in markdown.lower() or "insufficient" in markdown.lower() or "collaborator permission" in markdown.lower()
+
+
+@pytest.mark.asyncio
+async def test_machine_owner_approval_skips_collaborator_lookup(controller, proxy, fake_github):
+    """I. Machine owner must not trigger GitHub collaborator_permission lookup."""
+    from ..service import DeployController
+
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb6.append("write_hidden_state") or {})
+    proxy.project_status_label = AsyncMock()
+    events_tb6: list[str] = []
+
+    first_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 60, "login": "owner1"}}
+    second_pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 60, "login": "owner1"}}
+    get_pr_calls_tb6 = 0
+
+    async def _get_pr_tb6(repo: str, pr_number: int) -> dict:
+        nonlocal get_pr_calls_tb6
+        get_pr_calls_tb6 += 1
+        events_tb6.append(f"get_pr_{get_pr_calls_tb6}")
+        return first_pr if get_pr_calls_tb6 == 1 else second_pr
+
+    proxy.get_pr = AsyncMock(side_effect=_get_pr_tb6)
+    proxy.comment_identity = AsyncMock(return_value=("60", "owner1"))
+    # Will raise if called — owner path must NOT call it
+    proxy.collaborator_permission = AsyncMock(side_effect=Exception("collaborator_permission_should_not_be_called"))
+
+    core = MagicMock()
+    core.list_drivers = AsyncMock(side_effect=lambda: events_tb6.append("list_drivers") or [{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core.driver_status = AsyncMock(side_effect=lambda runtime_id: events_tb6.append(f"driver_status:{runtime_id}") or {"status": "running", "running_image": ""})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=lambda *args, **kwargs: events_tb6.append("deploy_post") or {})
+    controller._run_automated_case = AsyncMock(return_value={})
+
+    fake_github.comments[50] = {
+        "id": 50,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 60, "login": "owner1"},
+    }
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent — Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
+
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+
+    # Should NOT raise — owner path bypasses collaborator lookup
+    await controller.handle_approve_deploy("4paradigm/phanthymotus", 1, 50, "test-machine", "owner1", "60")
+
+    assert "deploy_post" in events_tb6
+    proxy.collaborator_permission.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_has_no_pr_author_self_approval_prohibition():
+    """Static regression: service.py must not contain any self-approval prohibition."""
+    service_source = open(Path(__file__).parent.parent / "service.py").read()
+
+    assert "def _is_self_approval" not in service_source, (
+        "_is_self_approval helper must be removed from service.py"
+    )
+    assert "_is_self_approval(" not in service_source, (
+        "_is_self_approval must not be called from service.py"
+    )
+    assert "PR author cannot approve their own deployment" not in service_source, (
+        '"PR author cannot approve their own deployment" must not exist in service.py'
+    )
+    assert "A different Machine Owner or authorized collaborator must approve" not in service_source, (
+        '"A different Machine Owner or authorized collaborator must approve" must not exist in service.py'
+    )
+    assert "No-self-approval" not in service_source, (
+        '"No-self-approval" comments must not exist in service.py'
+    )

@@ -59,20 +59,6 @@ class DeployOutcomeUncertain(DeployControllerError):
 def _short(sha: str) -> str:
     return (sha or "")[:7]
 
-def _is_self_approval(actor_id: str, pr_data: dict) -> bool:
-    """Fail closed when identity cannot be verified."""
-    if not isinstance(actor_id, str) or not actor_id.isdigit():
-        return True
-    if not isinstance(pr_data, dict):
-        return True
-    user = pr_data.get("user")
-    if not isinstance(user, dict):
-        return True
-    uid = user.get("id")
-    if isinstance(uid, bool) or not isinstance(uid, int) or uid <= 0:
-        return True
-    return str(uid) == actor_id
-
 
 
 def _is_supported_target(target: str) -> bool:
@@ -884,24 +870,6 @@ class DeployController:
                 machine, actor, repo,
             )
 
-            # No-self-approval check (initial fresh PR)
-            if _is_self_approval(actor_id, pr_data):
-                state["status"] = "deploy-requested"
-                state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "approve_deploy",
-                    "phase": "completed",
-                    "args": {"machine": machine_alias, "actor": actor},
-                }
-                state["last_processed_comment_id"] = comment_id
-                markdown = (
-                    "PR author cannot approve their own deployment.\n"
-                    "A different Machine Owner or authorized collaborator must approve."
-                )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
-                return True
-
             # Determine which component_ids are assigned to this machine group
             components = state.get("components", [])
             existing_deployments = state.get("deployments", [])
@@ -1005,7 +973,7 @@ class DeployController:
                 await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
-            # Fresh PR re-read + no-self-approval re-check before unsafe POST
+            # Fresh PR re-read before unsafe POST
             fresh_pr = await self.proxy.get_pr(repo, pr_number)
             fresh_state = fresh_pr.get("state", "")
             fresh_merged = fresh_pr.get("merged", False)
@@ -1019,24 +987,6 @@ class DeployController:
                     comment_id,
                     "PR changed after clean gate.",
                 )
-                return True
-
-            # No-self-approval re-check (fresh PR)
-            if _is_self_approval(actor_id, fresh_pr):
-                state["status"] = "deploy-requested"
-                state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "approve_deploy",
-                    "phase": "completed",
-                    "args": {"machine": machine_alias, "actor": actor},
-                }
-                state["last_processed_comment_id"] = comment_id
-                markdown = (
-                    "PR author cannot approve their own deployment.\n"
-                    "A different Machine Owner or authorized collaborator must approve."
-                )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
             # Fresh exact approval comment re-validation
@@ -1093,24 +1043,6 @@ class DeployController:
                     comment_id,
                     "HEAD drifted after approval re-validation.",
                 )
-                return True
-
-            # No-self-approval re-check (FINAL fresh PR)
-            if _is_self_approval(actor_id, final_pr):
-                state["status"] = "deploy-requested"
-                state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "approve_deploy",
-                    "phase": "completed",
-                    "args": {"machine": machine_alias, "actor": actor},
-                }
-                state["last_processed_comment_id"] = comment_id
-                markdown = (
-                    "PR author cannot approve their own deployment.\n"
-                    "A different Machine Owner or authorized collaborator must approve."
-                )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
             # Capture frozen component + deployment snapshots before hidden state validation
