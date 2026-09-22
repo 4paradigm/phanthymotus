@@ -197,5 +197,3 @@ TOOLS = [
 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
 
 完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/vop.py` —— 它是最干净的范例。
-
-<!-- deploy-approval-e2e-trigger: actucore -->

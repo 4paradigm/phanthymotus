@@ -2470,5 +2470,3 @@ difference.
 
 Measured on jp6.1 (Python 3.10.12, pytest 8.3.3): 175 passed / 1 failed with
 autoload on, **176 passed** with it off.
-
-<!-- deploy-approval-e2e-trigger: perception -->
