@@ -14,8 +14,8 @@ android {
         applicationId = "com.phanthymotus.questcapture"
         minSdk = 29
         targetSdk = 35
-        versionCode = 20
-        versionName = "0.3.16-operator1-ikview2"
+        versionCode = 21
+        versionName = "0.3.17-operator1-ikview2"
 
         ndk {
             abiFilters += "arm64-v8a"

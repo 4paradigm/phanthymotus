@@ -7,9 +7,11 @@ import secrets
 import threading
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from .recording import PoseRecorder
-from .adapter import DriverLink, IntentAdapter
+from .adapter import DriverLink, IntentAdapter, validate_driver_endpoint
 from .capture import CaptureManager
 from .capture_server import CaptureWssServer, capture_certificate_base64
 from .protocol import TicketCodec, TicketVerifier
@@ -30,13 +32,32 @@ class TeleopPlugin:
         self.operator_commands=None
         self._operator_cancel=threading.Event()
         self.error=None;self._closing=False;self._instance=None;self._capture_status={};self._enrollment_status={}
+        # Retain accepted Canvas settings even when Core misses a short restart.
+        # Only configuration is restored: never a lease, session or start request.
+        state=self.cfg.get('capture',{}).get('state_file')
+        self._config_file=Path(state).with_suffix('.config.json') if state else None
+        self._config_base=hashlib.sha256(json.dumps(self.cfg,sort_keys=True).encode()).hexdigest()
+        self._config_error=None
+        try:
+            if self._config_file and self._config_file.exists():
+                saved=json.loads(self._config_file.read_text())
+                if saved.get('schema_version')!=1:raise ValueError('schema')
+                if saved.get('base_sha256')==self._config_base:
+                    self.cfg=self._validate_configuration(saved['values'])
+        except (OSError,ValueError,KeyError,TypeError,AttributeError):
+            self._config_error=self.error='saved_configuration_invalid'
+
+    def _actions(self):
+        unsupported={'finish','record_start','record_stop','record_status'} if self.cfg.get('robot_profile')=='g1_23' else set()
+        return [action for action in ACTIONS if action not in unsupported]
 
     def get_tools(self):
+        actions=self._actions()
         return [{'name':'teleop','type':'processor','multiInstance':False,'x-connection-panel':'teleop-v1',
             'description':'PICO 遥操：G1 双臂或天轶双臂与手开合。双握把使能；默认 Shadow；Driver 确认执行。',
-            'inputSchema':{'type':'object','properties':{'action':{'type':'string','enum':ACTIONS},
+            'inputSchema':{'type':'object','properties':{'action':{'type':'string','enum':actions},
                 'instance_id':{'type':'string'},'request_id':{'type':'string'},'fingerprint':{'type':'string'}},'required':['action'],'additionalProperties':False,
-                'x-action-params':{a:{'params':['request_id','fingerprint'] if a in ('approve_pairing','reject_pairing') else []} for a in ACTIONS},
+                'x-action-params':{a:{'params':['request_id','fingerprint'] if a in ('approve_pairing','reject_pairing') else []} for a in actions},
                 'x-resource':(['arm_l','arm_r'] if self.cfg.get('robot_profile')=='g1_23' else ['arm_l','arm_r','hand_l','hand_r'])},
             'configSchema':{'type':'object','properties':{
                 'robot_profile':{'type':'string','enum':['tianyi2','g1_23'],'default':'tianyi2','scope':'shared'},
@@ -56,6 +77,7 @@ class TeleopPlugin:
             future.cancel();raise
 
     def _ensure_host(self):
+        if self._config_error:raise ValueError(self._config_error)
         if self.runtime:return
         self._closing=False
         try:self._open_host()
@@ -139,11 +161,15 @@ class TeleopPlugin:
         self._status_future=asyncio.run_coroutine_threadsafe(publish_status(),self._loop)
 
     def info(self):
+        properties=self.get_tools()[0]['configSchema']['properties']
+        configuration={k:copy.deepcopy(self.cfg.get(k,v.get('default'))) for k,v in properties.items()
+                       if k in self.cfg or 'default' in v}
         if not self.runtime:
             return {'state':'fault' if self.error else 'idle','reason':self.error,
                     'mode':self.cfg.get('mode','shadow'),'output_active':False,
-                    'topic_out':self.get_tools()[0]['topic_out']}
+                    'topic_out':self.get_tools()[0]['topic_out'],'configuration':configuration}
         result=self.runtime.status()
+        result['configuration']=configuration
         result['session_state']=result['state']
         result['state']={'prepared_shadow':'ready','prepared_live':'ready',
                          'active_shadow':'active','active_live':'active','released':'idle','paused':'hold'}.get(result['state'],result['state'])
@@ -165,13 +191,48 @@ class TeleopPlugin:
             result['driver_feedback_error']=str(exc)
         return result
 
+    def _validate_configuration(self,values):
+        properties=self.get_tools()[0]['configSchema']['properties']
+        if not isinstance(values,dict) or set(values)-set(properties):raise ValueError('unknown_config')
+        updated={**self.cfg,**values}
+        for key,value in values.items():
+            definition=properties[key]
+            if definition['type']=='string' and not isinstance(value,str):raise ValueError('invalid_config:'+key)
+            if 'enum' in definition and value not in definition['enum']:raise ValueError('invalid_config:'+key)
+        if updated.get('mode','shadow') not in ('live','shadow'):raise ValueError('invalid_mode')
+        mapping=updated.get('mapping_version','relative_v1')
+        if mapping not in ('relative_v1','pr152_head_yaw_v1','pr152_clutch_relative_v1') or (updated.get('robot_profile')!='g1_23' and mapping!='relative_v1'):
+            raise ValueError('mapping_profile_mismatch')
+        scale=updated.get('position_scale',1 if mapping!='relative_v1' else .5)
+        if mapping!='relative_v1' and scale!=1:raise ValueError('g1_head_yaw_requires_unit_scale')
+        if type(scale) not in (int,float) or not .01<=scale<=1:raise ValueError('position_scale')
+        if updated.get('shadow_feedback_source')=='driver_joints' and (
+                updated.get('robot_profile')!='g1_23' or updated.get('mode','shadow')!='shadow'):
+            raise ValueError('joints_feedback_requires_g1_shadow')
+        validate_driver_endpoint(updated)
+        return updated
+
+    def _save_configuration(self,updated):
+        if not self._config_file:return
+        values={k:updated[k] for k in self.get_tools()[0]['configSchema']['properties'] if k in updated}
+        payload={'schema_version':1,'base_sha256':self._config_base,'values':values}
+        self._config_file.parent.mkdir(parents=True,exist_ok=True)
+        name=None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w',dir=self._config_file.parent,delete=False) as f:
+                name=f.name
+                json.dump(payload,f);f.flush();os.fsync(f.fileno())
+            os.replace(name,self._config_file)
+        finally:
+            if name and os.path.exists(name):os.unlink(name)
+
     def dispatch(self,name,args):
         action=args.get('action','info')
         if action=='stop':self._operator_cancel.set()
         try:
             with self._lock:
                 if name!='teleop':return None
-                if action not in ACTIONS:raise ValueError('unknown_action')
+                if action not in self._actions():raise ValueError('unsupported_action')
                 instance=args.get('instance_id')
                 if self._instance and instance and self._instance!=instance:raise ValueError('teleop_single_instance')
                 if instance:self._instance=instance
@@ -180,20 +241,12 @@ class TeleopPlugin:
                     return self.info()
                 if action=='config':
                     values={k:v for k,v in args.items() if k not in ('action','instance_id')}
-                    allowed=set(self.get_tools()[0]['configSchema']['properties'])
-                    if set(values)-allowed:raise ValueError('unknown_config')
-                    updated={**self.cfg,**values}
-                    if updated.get('mode','shadow') not in ('live','shadow'):raise ValueError('invalid_mode')
-                    mapping=updated.get('mapping_version','relative_v1')
-                    if mapping not in ('relative_v1','pr152_head_yaw_v1','pr152_clutch_relative_v1') or (updated.get('robot_profile')!='g1_23' and mapping!='relative_v1'):
-                        raise ValueError('mapping_profile_mismatch')
-                    scale=updated.get('position_scale',1 if mapping!='relative_v1' else .5)
-                    if mapping!='relative_v1' and scale!=1:raise ValueError('g1_head_yaw_requires_unit_scale')
-                    if type(scale) not in (int,float) or not 0<scale<=1:raise ValueError('position_scale')
-                    if updated==self.cfg:return self.info()
+                    updated=self._validate_configuration(values)
+                    if updated==self.cfg and not self._config_error:return self.info()
                     if self.runtime and (self.runtime.status()['authority_valid'] or self.link.lease):
                         raise ValueError('release_before_config')
-                    self.stop();self.cfg=updated;self.error=None;return self.info()
+                    self.stop();self._save_configuration(updated)
+                    self.cfg=updated;self.error=None;self._config_error=None;return self.info()
                 self._ensure_host()
                 if action=='finish':
                     connection=self.capture._connection

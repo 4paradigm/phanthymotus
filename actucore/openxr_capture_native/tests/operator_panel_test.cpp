@@ -12,6 +12,9 @@ int main(){
  sample.right_input.buttons[0]=0;sample.left_input.squeeze_pressed=true;
  panel.Sample(sample.head,aims,sample);sample.right_input.buttons[0]=1;
  panel.Sample(sample.head,aims,sample);assert(panel.pending.empty());
+ aims[1].position[0]=0;sample.right_input.buttons[0]=0;panel.Sample(sample.head,aims,sample);
+ sample.right_input.buttons[0]=1;panel.Sample(sample.head,aims,sample);assert(panel.pending=="finish");
+ panel.pending.clear();
  aims[1].position[0]=.29;sample.right_input.buttons[0]=0;panel.Sample(sample.head,aims,sample);
  sample.right_input.buttons[0]=1;panel.Sample(sample.head,aims,sample);assert(panel.pending=="stop");
  panel.pending.clear();sample.left_input.squeeze_pressed=false;sample.left_input.active=true;sample.left_input.buttons={0,0};

@@ -3,6 +3,8 @@ import json
 import time
 from typing import Optional
 
+import typing
+
 import aiohttp
 import fastapi
 from pydantic import BaseModel
@@ -15,6 +17,28 @@ from tool_config import (missing_required_config, plan_config_calls,
 router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
+
+
+def _teleop_management_headers(url, tool, arguments):
+    """Never forward the dedicated local capability to a registry-selected remote."""
+    if tool != 'teleop' or arguments.get('action', 'info') == 'info':
+        return {}
+    import os
+    from pathlib import Path
+    from urllib.parse import urlsplit
+    endpoint = urlsplit(url)
+    if (url != os.environ.get('TELEOP_MANAGEMENT_URL', '') or endpoint.scheme != 'http'
+        or endpoint.hostname not in ('localhost', '127.0.0.1', '::1')
+        or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment
+        or endpoint.path != '/mcp'):
+        raise fastapi.HTTPException(403, 'Teleop management endpoint is not configured')
+    try:
+        key = Path(os.environ['TELEOP_MANAGEMENT_KEY_FILE']).read_text().strip()
+    except (KeyError, OSError):
+        raise fastapi.HTTPException(503, 'Teleop management key is unavailable') from None
+    if len(key) < 32 or not key.isascii():
+        raise fastapi.HTTPException(503, 'Teleop management key is invalid')
+    return {'X-Teleop-Management': key}
 
 
 async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
@@ -122,7 +146,7 @@ async def _ping_mcp_http(url: str) -> dict:
             async with session.post(url, json=tools_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
                 tools = [
-                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
+                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in', 'x-connection-panel')}
                     for t in data.get('result', {}).get('tools', [])
                 ]
         except Exception as e:
@@ -287,6 +311,7 @@ def _guess_data_type(tools: list, resources: list, name: str) -> str:
         ('control/joint-torque', ('torque_control', 'joint_torque')),
         ('control/joint-velocity', ('joint_velocity',)),
         ('control/joint',    ('joint', 'joint_position', 'arm', 'servo', 'actuator')),
+        ('control/eef',      ('eef', 'end_effector_pose', 'servo_eef', 'cartesian')),
         ('control/attitude', ('attitude', 'roll', 'pitch', 'yaw', 'setpoint')),
         ('control/waypoint', ('waypoint', 'navigate_to', 'goto')),
         ('control/velocity', ('velocity', 'cmd_vel', 'wheel', 'drive', 'locomotion', 'motion', 'motor')),
@@ -521,7 +546,9 @@ async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
                     'method': 'tools/call',
                     'params': {'name': tool_name, 'arguments': {'action': 'config', **restore_cfg}},
                 }
-                await session.post(url, json=cfg_payload, headers=headers)
+                cfg_headers = {**headers, **_teleop_management_headers(url, tool_name, {'action':'config'})}
+                await session.post(url, json=cfg_payload, headers=cfg_headers,
+                                   allow_redirects=tool_name != 'teleop')
                 sent.append(tool_name)
     except Exception as e:
         print(f'[mcp/config-restore] {mcp_id} error: {e}')
@@ -1020,8 +1047,22 @@ async def _handle_agentcore_call(req: MCPCallRequest):
 
 
 @router.post('/{mcp_id}/call')
-async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
-    """Call a tool on an MCP server and return the result."""
+async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
+                        timeout_s: typing.Optional[float] = None):
+    """Call a tool on an MCP server and return the result.
+
+    `timeout_s` bounds the whole request. **默认仍然是不限时**，而那对 `start`
+    是对的：一张卡片的 `start` 合法地可能要几分钟（actucore 那张 VLA 卡片的
+    provider 构造会下载几个 GB）。
+
+    但对**轮询**类的调用（`info()`）它是错的：那些本该是毫秒级，而一个不回应的
+    MCP 服务器会让调用方永远等下去。真机实测 2026-09-21：perception 的 HTTP 线程
+    被同进程一个空转线程饿死（GIL），accept 队列堆满，于是
+    `_do_start_project_impl()` 挂在一次 `start` 上再不返回，`_start_project_lock`
+    永久为真，之后每次点启动都是 409 —— 除了重启进程没有出路。
+
+    所以超时是**调用方按用途给**的，不在这里定一个对两种用途都不对的默认值。
+    """
     # A paired peer's tool is reached over its signed link, not local HTTP, and this
     # handler builds JSON-RPC itself — so hand it to call_tool, which knows how to
     # route `transport: 'peer'` (peer/mcp_bridge.py). Without this the dashboard has
@@ -1195,7 +1236,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         raise fastapi.HTTPException(status_code=400, detail='MCP not reachable via HTTP')
 
     headers = {'Content-Type': 'application/json'}
-    timeout = aiohttp.ClientTimeout(total=None)
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Initialize first (required by MCP protocol)
@@ -1212,7 +1253,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
             _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
-            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
+            # Teleop lifecycle acts on its current session. Reapplying saved config
+            # before pause/finish/start can reset mode or reject an owned lease.
+            # Configuration is changed explicitly through the config action.
+            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG and req.tool != 'teleop':
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
 
@@ -1243,7 +1287,9 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                         'params': {'name': req.tool,
                                    'arguments': {'action': 'config', **cfg_body, **extra_args}},
                     }
-                    async with session.post(url, json=cfg_payload, headers=headers) as resp:
+                    cfg_headers = {**headers, **_teleop_management_headers(url, req.tool, {'action':'config'})}
+                    async with session.post(url, json=cfg_payload, headers=cfg_headers,
+                                            allow_redirects=req.tool != 'teleop') as resp:
                         cfg_data = await resp.json(content_type=None)
                         cfg_error = cfg_data.get('error')
                         if cfg_error:
@@ -1282,12 +1328,23 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 'method': 'tools/call',
                 'params': {'name': req.tool, 'arguments': final_args},
             }
-            async with session.post(url, json=call_payload, headers=headers) as resp:
+            headers.update(_teleop_management_headers(url, req.tool, final_args))
+            async with session.post(url, json=call_payload, headers=headers,
+                                    allow_redirects=req.tool != 'teleop') as resp:
                 data = await resp.json(content_type=None)
                 result = data.get('result', {})
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                if req.tool == 'teleop' and result.get('isError'):
+                    reason = '遥操请求被拒绝'
+                    for item in result.get('content') or []:
+                        try:
+                            detail = json.loads(item.get('text', ''))
+                            reason = str(detail.get('error') or detail.get('code') or reason)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    return {'code': 400, 'message': reason, 'data': result.get('content', result)}
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):

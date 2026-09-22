@@ -300,6 +300,7 @@ void CaptureTransport::SendOperatorCommand(const std::string& action) {
   SendWebSocket(nlohmann::json{{"type","operator_command"},{"connection_id",operator_connection_},
     {"request_id",id},{"action",action}}.dump());
   operator_state_="pending";operator_error_.clear();
+  Log("operator_request action="+action+" request_id="+id);
 }
 
 void CaptureTransport::HandleServerMessage(const std::string& payload) {
@@ -310,7 +311,10 @@ void CaptureTransport::HandleServerMessage(const std::string& payload) {
       wire.erase("operator_control");
     }
     if(wire.value("type",std::string{})=="operator_result"){
-      if(state_.authenticated){operator_state_=wire.value("state",std::string{});operator_error_=wire.value("error",std::string{});}
+      if(state_.authenticated){
+        operator_state_=wire.value("state",std::string{});operator_error_=wire.value("error",std::string{});
+        Log("operator_result state="+operator_state_+" error="+operator_error_);
+      }
       return;
     }
     if (wire.value("type", std::string{}) == "visualization") {
@@ -318,9 +322,14 @@ void CaptureTransport::HandleServerMessage(const std::string& payload) {
         try {
           const auto& visual=wire.at("visualization");
           if(visual.contains("operator")){
-            const auto& op=visual.at("operator");operator_state_=op.value("state",std::string{});
+            const auto& op=visual.at("operator");
             operator_mode_=op.value("mode",std::string{});
-            operator_error_=op.contains("error") && op["error"].is_string()?op["error"].get<std::string>():"";
+            // An early server rejection has no broker status. Keep its receipt
+            // visible until another explicit operation, not just the next frame.
+            if(operator_state_!="failed") {
+              operator_state_=op.value("state",std::string{});
+              operator_error_=op.contains("error") && op["error"].is_string()?op["error"].get<std::string>():"";
+            }
           }
           UpdateIkVisualization(visualization_, visual);
         }

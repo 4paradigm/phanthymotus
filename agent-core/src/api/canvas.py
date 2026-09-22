@@ -409,6 +409,19 @@ async def get_all_tool_configs():
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
+    if tool_name == 'teleop':
+        from api.mcp_manage import mcp_call_tool, MCPCallRequest
+        if not isinstance(body, dict) or 'action' in body or 'instance_id' in body:
+            raise fastapi.HTTPException(status_code=400, detail='配置必须是对象')
+        # Teleop rejects configuration while it owns an active session. Do not
+        # persist an unacknowledged config for replay on the next registration.
+        result = await mcp_call_tool(mcp_id, MCPCallRequest(
+            tool=tool_name, arguments={**body, 'action':'config'}))
+        if result.get('code') != 200:
+            return fastapi.responses.JSONResponse(status_code=400, content=result)
+        config.main[tool_config_key(mcp_id, tool_name)] = {
+            **(config.main.get(tool_config_key(mcp_id, tool_name), None) or {}), **body}
+        return {'code':200, 'data':result.get('data'), 'applied':True}
     config.main[tool_config_key(mcp_id, tool_name)] = body
     apply_tool_config(mcp_id, tool_name, body)
     return {'code': 200}

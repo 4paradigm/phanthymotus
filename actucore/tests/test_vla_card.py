@@ -21,6 +21,7 @@ Run: cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/tes
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 
@@ -30,6 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from plugins.vla import VLAPlugin  # noqa: E402
+from plugins.vla.plugin import FORMATS, Observation  # noqa: E402
 from plugins.vla import negotiate  # noqa: E402
 from plugins.vla.message import build as build_message  # noqa: E402
 from plugins.vla.providers import discover, REQUIRED  # noqa: E402
@@ -46,6 +48,7 @@ DESCRIPTOR = {
     "rate": {"max_hz": 100, "expected_hz": 30, "watchdog_ms": 200},
     "force_torque": None,
 }
+
 
 
 def make_card(**cfg):
@@ -114,7 +117,7 @@ def test_matching_capabilities_pass():
 
 def test_action_dim_mismatch_names_both_numbers():
     """"shape mismatch" sends somebody to read code; this sends them to a wire."""
-    problems = negotiate.check({"action_dim": 32}, DESCRIPTOR)
+    problems = negotiate.check(_caps(action_dim=32), DESCRIPTOR)
     assert problems
     assert "32" in problems[0] and "7" in problems[0]
 
@@ -126,13 +129,13 @@ def test_a_downstream_that_is_not_a_control_card_is_caught_first():
 
 
 def test_a_model_faster_than_the_hardware_is_refused():
-    problems = negotiate.check({"action_dim": 7, "control_hz": 500}, DESCRIPTOR)
+    problems = negotiate.check(_caps(control_hz=500), DESCRIPTOR)
     assert any("500" in p for p in problems)
 
 
 def test_every_problem_is_reported_at_once():
     """An operator fixing a canvas should see the whole disagreement."""
-    problems = negotiate.check({"action_dim": 32, "control_hz": 500}, DESCRIPTOR)
+    problems = negotiate.check(_caps(action_dim=32, control_hz=500), DESCRIPTOR)
     assert len(problems) == 2
 
 
@@ -204,7 +207,7 @@ def test_chunk_indices_walk_the_chunk_then_refill():
 
 def test_an_empty_chunk_raises_rather_than_publishing_nothing_silently():
     class Empty:
-        def capabilities(self): return {"action_dim": 7}
+        def capabilities(self): return _caps()
         def infer(self, obs=None, inference_delay=0): return []
         def health(self): return True
         def close(self): return None
@@ -744,6 +747,35 @@ def _stub_ros_messages():
     """
     import types as _types
 
+    # `_sensor_qos()` 要 rclpy.qos。真的装了就用真的 —— 那样这条断言在有 ROS 的
+    # 机器上比的是真枚举，而不是一个自己造的、怎么写都成立的替身。
+    try:
+        import rclpy.qos  # noqa: F401
+    except ImportError:
+        qos = _types.ModuleType("rclpy.qos")
+
+        class _Enum:
+            def __init__(self, name):
+                self.name = name
+
+            def __repr__(self):
+                return self.name
+
+        qos.ReliabilityPolicy = _types.SimpleNamespace(
+            BEST_EFFORT=_Enum("BEST_EFFORT"), RELIABLE=_Enum("RELIABLE"))
+        qos.HistoryPolicy = _types.SimpleNamespace(KEEP_LAST=_Enum("KEEP_LAST"))
+        qos.DurabilityPolicy = _types.SimpleNamespace(VOLATILE=_Enum("VOLATILE"))
+
+        class _Profile:
+            def __init__(self, **kw):
+                self.__dict__.update(kw)
+
+        qos.QoSProfile = _Profile
+        package = _types.ModuleType("rclpy")
+        package.qos = qos
+        sys.modules.setdefault("rclpy", package)
+        sys.modules["rclpy.qos"] = qos
+
     for name, members in (("sensor_msgs", ("CompressedImage", "Image")),
                           ("std_msgs", ("String",))):
         package = _types.ModuleType(name)
@@ -766,11 +798,25 @@ class _Graph:
         return list(self._topics.items())
 
     def create_subscription(self, message_type, topic, callback, qos):
-        self.subscribed.append((message_type.__name__, topic, callback))
+        # **qos 也要记下来。** 它此前被丢掉，而那正是订阅端 QoS 错了却没被任何
+        # 用例抓到的原因：这个假件把除了出问题的那一项之外的一切都记了下来。
+        self.subscribed.append((message_type.__name__, topic, callback, qos))
 
 
 def _caps(**over):
-    base = {"n_cameras": 0, "needs_state": False}
+    """一份能通过协商的 capabilities。
+
+    `control_mode` 在这里，是因为 `negotiate.check()` **缺它就拒** —— 维度相同不代表
+    动作空间相同（一个 23 维的末端位姿模型和一张 23 维的关节卡片，数字完全吻合），
+    而猜错的代价是机械臂走到错误的地方。不测动作空间的用例用这个构造器拿到一份合法
+    的，才不会被那条检查抢先触发。
+
+    **文件里曾经有两个同名的 `_caps`**，后定义的把前面那个遮蔽掉了，于是「补了字段
+    却还是失败」。只留这一个。
+    """
+    base = {"control_mode": "joint_position", "action_dim": 7,
+            "chunk_size": 10, "control_hz": 30,
+            "n_cameras": 0, "needs_state": False}
     base.update(over)
     return base
 
@@ -791,6 +837,91 @@ def test_roles_come_from_the_message_type_not_the_topic_name():
     assert problem == ""
     assert binding["state"] == "/st"
     assert list(binding["images"].values()) == ["/cam"]
+
+
+def test_observations_are_subscribed_best_effort():
+    """**这条是一次真机失败换来的。**
+
+    这个项目里每一个传感器发布者都是 BEST_EFFORT，而 rclpy 的默认 profile 是
+    RELIABLE —— 一个 RELIABLE 的订阅者收不到 BEST_EFFORT 的发布者，DDS 直接不
+    匹配。此前 `_bind_inputs` 传的是 `1`（展开成默认 profile），于是 vla_cloud 与
+    smolvla 在**任何一台真机上都拿不到观测**：卡片报 running、error 空、一条指令
+    都不发，而唯一的线索是 ROS stderr 里一行 "incompatible QoS"。
+
+    同一个文件里的 `_open_publisher` 一直是显式 BEST_EFFORT，还写了注释 —— 两边
+    不对称了很久没人发现，因为唯一能暴露它的地方（真 DDS 匹配）在用例里是假的。
+    """
+    from rclpy.qos import ReliabilityPolicy
+
+    _stub_ros_messages()
+    card = make_card()
+    node = _Graph({"/cam": ["sensor_msgs/msg/CompressedImage"],
+                   "/st": ["std_msgs/msg/String"]})
+
+    card._bind_inputs(node, ["/cam", "/st"], _caps(n_cameras=1, needs_state=True))
+
+    assert len(node.subscribed) == 2, "相机和状态都要订上"
+    for _type, topic, _cb, qos in node.subscribed:
+        assert qos.reliability == ReliabilityPolicy.BEST_EFFORT, topic
+        assert qos.depth == 1, f"{topic}：排队的观测就是过期的观测"
+
+
+def test_a_subscription_that_never_delivers_is_reported():
+    """订阅建立成功而一条消息都不来，是 DDS 里的常态，不是异常。
+
+    `_bind_inputs` 只能核对「话题连上了没」，核对不了「消息收到了没」。此前这三种
+    情况——QoS 不兼容、发布者没在发、域不同——表现完全一样：running / error 空 /
+    published 0。现在持续缺失会把**缺的是什么**写进 error。
+    """
+    card = make_card()
+    card._running = True
+    card._capabilities = _caps(n_cameras=2, needs_state=True)
+    card._publisher = object()
+
+    card._report_starvation(card._capabilities)
+    assert card._info()["error"] == "", "刚启动就报错会把所有正常启动也误伤"
+
+    card._starved_since -= card.STARVED_AFTER_S + 1
+    card._report_starvation(card._capabilities)
+
+    error = card._info()["error"]
+    assert "图像 0/2 路" in error and "本体状态" in error
+    assert "QoS" in error, "要说出最常见的那个原因，否则只是换个地方说「没收到」"
+
+
+def test_the_published_format_is_the_one_drivers_declare():
+    """**画布按严格字符串相等匹配端口。** 差一个字就连不上，而且是静默的。
+
+    真机上的表现：`vla` 的输出口怎么都拖不到 `servo_eef` 的输入口，没有提示、
+    没有日志。原因是这边发 `control/waypoint`、驱动收 `control/eef`。
+
+    `control/waypoint` 还不只是"另一个名字"——它在 agent-core 的格式表里是**导航**
+    语义（navigate_to / goto）。用它会让一张导航卡片和一张手臂卡片在画布上可以
+    互换着连。
+    """
+    assert FORMATS["eef_pose"] == "control/eef"
+    assert "waypoint" not in FORMATS.values(), "waypoint 是导航，不是末端位姿"
+
+
+def test_the_out_port_can_be_declared_before_anything_is_wired():
+    """**连线发生在 start 之前，而 descriptor 要 start 之后才有。**
+
+    不给这条路的话，末端位姿的驱动卡片永远连不上：要拿到 descriptor 得先连，要连
+    得先有 descriptor。而画布是严格字符串相等匹配，连不上时**静默** —— 拖放没反
+    应，没提示也没日志。真机上就卡在这里。
+    """
+    assert make_card()._format() == "control/joint", "默认必须是今天的行为"
+
+    eef = make_card(action_space="eef_pose")
+    assert eef._format() == "control/eef"
+    assert eef.get_tools()[0]["topic_out"][0]["format"] == "control/eef"
+
+
+def test_the_negotiated_descriptor_wins_over_the_configured_guess():
+    """配置只是连线时的占位。真值一到就该换掉它，否则填错会一直挂在那儿。"""
+    card = make_card(action_space="eef_pose")
+    card._descriptor = {"mode": "joint_position"}
+    assert card._format() == "control/joint"
 
 
 def test_a_model_that_needs_a_camera_refuses_to_start_without_one():
@@ -997,7 +1128,7 @@ def test_the_downstream_label_survives_a_sparse_descriptor():
 
 def test_a_descriptor_whose_groups_are_not_objects_is_refused_at_start():
     from plugins.vla import negotiate
-    caps = {"action_dim": 7, "chunk_size": 10, "control_hz": 30}
+    caps = _caps(chunk_size=10)
     problems = negotiate.check(caps, {**DESCRIPTOR, "groups": ["arm_l", "arm_r"]})
     assert problems and "groups" in problems[0]
     # names the offending indices, so a 26-dof descriptor does not have to be
@@ -1049,3 +1180,392 @@ def test_one_cards_broken_schema_does_not_empty_the_bundle():
     bundle = object.__new__(main.ActuCoreBundle)
     bundle._plugins = [Broken(), Fine()]
     assert [t["name"] for t in bundle.get_all_tools()] == ["fine"]
+
+
+# ── 动作空间：维度相同不代表空间相同 ─────────────────────────────────────────
+
+
+def test_a_model_in_a_different_action_space_is_refused():
+    """这条检查补上之前，这一组输入是**协商通过**的。
+
+    UnifoLM-VLA 的 G1 checkpoint 输出 23 维 EE_R6_G1（2 × [xyz(3) + R6(6) + 夹爪(1)]
+    + 腰 rpy(3)），而天轶那类机器人的命令卡片是 23 维 joint_position。两个 23 完全
+    吻合，`dof` 和 `control_hz` 都挑不出毛病，于是位姿被当成关节角发下去。
+    """
+    problems = negotiate.check(
+        _caps(control_mode="eef_r6_g1", action_dim=7),
+        DESCRIPTOR,                                   # mode=joint_position, dof=7
+    )
+    assert problems
+    assert any("eef_r6_g1" in p and "joint_position" in p for p in problems)
+
+
+def test_a_model_that_declares_nothing_is_refused():
+    """「不确定就拒绝，不要猜」—— 猜错的代价不是报错，是机械臂走到错误的地方。"""
+    caps = _caps()
+    caps.pop("control_mode")
+    problems = negotiate.check(caps, DESCRIPTOR)
+    assert problems
+    # 报错要说清楚去哪儿设，两侧各一处。
+    assert any("CONTROL_MODE" in p and "control_mode" in p for p in problems)
+
+
+def test_a_matching_action_space_passes():
+    assert negotiate.check(_caps(control_mode="joint_position"), DESCRIPTOR) == []
+
+
+# ── 混合向量：顶层一个 mode 说不清的那些 ─────────────────────────────────────
+
+# 规范化之后的 G1 动作空间：两个末端位姿、两个归一化夹爪、三个腰关节角。
+MIXED_GROUPS = [
+    {"name": "eef_l", "offset": 0, "count": 7, "mode": "eef_pose"},
+    {"name": "gripper_l", "offset": 7, "count": 1, "mode": "joint_position"},
+    {"name": "eef_r", "offset": 8, "count": 7, "mode": "eef_pose"},
+    {"name": "gripper_r", "offset": 15, "count": 1, "mode": "joint_position"},
+    {"name": "waist", "offset": 16, "count": 3, "mode": "joint_position"},
+]
+
+
+def _mixed_descriptor(groups=None):
+    return {
+        "control_interface": "motus.control/1",
+        "mode": "eef_pose",
+        "dof": 19,
+        "joint_names": [f"a{i}" for i in range(19)],
+        "units": {"length": "m", "angle": "rad"},
+        "limits": {"lower": [-2.0] * 19, "upper": [2.0] * 19},
+        "rate": {"max_hz": 100, "expected_hz": 30, "watchdog_ms": 200},
+        "force_torque": None,
+        "groups": [dict(g) for g in (groups or MIXED_GROUPS)],
+    }
+
+
+def test_a_mixed_vector_that_agrees_segment_by_segment_passes():
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _mixed_descriptor(),
+    )
+    assert problems == []
+
+
+def test_segments_that_line_up_differently_are_refused():
+    """总维度相同、顶层 mode 相同，而分段错位 —— 每一段都把邻段的数字当成自己的。
+
+    这是顶层那条检查看不见的分歧：两边都报 19 维的 `eef_pose`，一边第 7 维是夹爪、
+    另一边第 7 维还是位姿的一部分。发下去不报错。
+    """
+    shifted = [
+        {"name": "eef_l", "offset": 0, "count": 8, "mode": "eef_pose"},
+        {"name": "gripper_l", "offset": 8, "count": 1, "mode": "joint_position"},
+        {"name": "eef_r", "offset": 9, "count": 7, "mode": "eef_pose"},
+        {"name": "gripper_r", "offset": 16, "count": 1, "mode": "joint_position"},
+        {"name": "waist", "offset": 17, "count": 2, "mode": "joint_position"},
+    ]
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=shifted),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("位置对不上" in p for p in problems)
+
+
+def test_a_segment_in_the_wrong_space_is_refused():
+    """腰那三个是关节角。一个把它们也当成笛卡尔量的模型，维度全对。"""
+    wrong = [dict(g) for g in MIXED_GROUPS]
+    wrong[-1] = {**wrong[-1], "mode": "eef_pose"}
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=wrong),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("waist" in p for p in problems)
+
+
+def test_different_numbers_of_segments_are_refused_rather_than_zipped():
+    """段数不同就无从逐段核对。按最短的那个 zip 过去会静默漏掉尾巴。"""
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[{"name": "all", "offset": 0, "count": 19,
+                               "mode": "eef_pose"}]),
+        _mixed_descriptor(),
+    )
+    assert problems
+    assert any("分成" in p for p in problems)
+
+
+def test_a_driver_group_without_a_mode_inherits_the_top_level_one():
+    """和 `motus.control/1` 驱动侧同一条规矩 —— 不写就是「和整体一样」。
+
+    今天每一个已有的驱动都不写段 mode，所以这条不成立的话，它们全都会在协商时被
+    判成和模型分歧。
+    """
+    inheriting = [
+        {"name": "a", "offset": 0, "count": 10},         # 不写 → eef_pose
+        {"name": "b", "offset": 10, "count": 9, "mode": "eef_pose"},
+    ]
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[{"name": "a", "offset": 0, "count": 10,
+                               "mode": "eef_pose"},
+                              {"name": "b", "offset": 10, "count": 9,
+                               "mode": "eef_pose"}]),
+        _mixed_descriptor(inheriting),
+    )
+    assert problems == []
+
+
+# ── advisory vs optional：丢维要双方都同意过 ────────────────────────────────
+#
+# 由来是一次真机实测：G1 的 1 自由度腰上，`unifolm-vla-g1` 的 25 步动作块一步都
+# 没通过，全数停在 `waist_roll outside [-0.02, 0.02]` —— 那个限位没错（腰确实动不
+# 了），但它把整条指令拒掉了，连同两条本可以执行的手臂。
+#
+# 解法不是放宽限位（那会让 IK 按一个机器人到不了的躯干姿态解手臂，每拍差同样一点
+# 而没有一处报错），而是两侧各声明一半：驱动说「我收下但不执行」（advisory），
+# 模型说「任务不要求执行」（optional）。**这个函数是它们相遇的地方**，也是让
+# 「静默丢掉几维」在这套协议里不可能发生的那道门。
+
+
+def _advisory_waist_descriptor():
+    groups = [dict(g) for g in MIXED_GROUPS]
+    groups[-1]["advisory"] = True
+    return _mixed_descriptor(groups)
+
+
+def test_a_dropped_segment_the_model_requires_is_refused():
+    """驱动不执行，而模型认为必须执行 —— 这不是可以两边各让一步的事。"""
+    problems = negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _advisory_waist_descriptor(),
+    )
+    assert problems
+    assert any("advisory" in p and "optional" in p for p in problems)
+
+
+def test_a_dropped_segment_the_model_allows_is_accepted():
+    """许可到位就放行。这是 unifolm-vla-g1 在 1 自由度腰 G1 上真正走的那条路。"""
+    allowed = [dict(g) for g in MIXED_GROUPS]
+    allowed[-1]["optional"] = True
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=allowed),
+        _advisory_waist_descriptor(),
+    ) == []
+
+
+def test_permission_alone_changes_nothing():
+    """模型说可丢、驱动说会执行 —— 那就执行，没有分歧。
+
+    反过来理解这个字段（「模型说可丢，所以别执行了」）会让一台**真能弯腰**的
+    29dof G1 从此不再弯腰，而没有任何一处报错。
+    """
+    allowed = [dict(g) for g in MIXED_GROUPS]
+    allowed[-1]["optional"] = True
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19, control_groups=allowed),
+        _mixed_descriptor(),
+    ) == []
+
+
+def test_neither_side_declaring_anything_is_todays_every_model():
+    """两个字段都缺省 false，所以这条检查对今天每一对声明都是透明的。"""
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19,
+              control_groups=[dict(g) for g in MIXED_GROUPS]),
+        _mixed_descriptor(),
+    ) == []
+
+
+def test_a_single_space_model_is_not_forced_to_declare_segments():
+    """一边有段一边没有不算分歧 —— 今天每个模型都是单一空间，没有段是常态。"""
+    assert negotiate.check(
+        _caps(control_mode="eef_pose", action_dim=19),
+        _mixed_descriptor(),
+    ) == []
+    # 而顶层 mode 真的不同时，仍然由上面那条检查抓住 —— 不是因为没有段就放行。
+    assert negotiate.check(
+        _caps(control_mode="joint_position", action_dim=19),
+        _mixed_descriptor(),
+    )
+
+
+def test_the_action_space_check_does_not_mask_the_others():
+    """空间不对、维度也不对时，两条都要报出来。
+
+    `check()` 收集全部理由而不是撞上第一条就返回 —— 在画布上改接线的人应该一次看到
+    全部分歧，而不是修好一个再发现下一个。
+    """
+    problems = negotiate.check(
+        _caps(control_mode="joint_velocity", action_dim=32), DESCRIPTOR
+    )
+    assert len(problems) == 2
+    assert any("joint_velocity" in p for p in problems)
+    assert any("32" in p and "7" in p for p in problems)
+
+
+def test_the_local_providers_declare_their_action_space():
+    """mock 和 smolvla 都发绝对关节角。
+
+    不声明的话，它们自己会被上面那条检查拦下 —— 这个用例钉的是「新增 provider 时
+    别忘了这个字段」，而不是某个具体的值。
+    """
+    from plugins.vla.providers import mock as mock_provider
+
+    provider = mock_provider.PROVIDER(DESCRIPTOR, {})
+    assert provider.capabilities()["control_mode"] in ("joint_position",)
+
+
+# ── eef_state：增量模型的基准位姿 ────────────────────────────────────────────
+
+
+class _Message:
+    def __init__(self, data):
+        self.data = data
+
+
+def _state_message(values, eef=None, stamp_ms=7_000):
+    payload = {"schema": "motus.control/1", "kind": "joint_state",
+               "values": list(values), "stamp_ms": stamp_ms}
+    if eef is not None:
+        payload["eef"] = list(eef)
+    return _Message(json.dumps(payload))
+
+
+POSE = [0.3, 0.1, 0.2, 0.0, 0.0, 0.0, 1.0]
+
+
+def test_the_end_effector_pose_rides_in_the_state_payload_not_a_second_topic():
+    """`_bind_inputs` 按 **ROS 消息类型**分派角色，两路 `String` 它分不开。
+
+    单开一路末端位姿话题会变成一个按连线顺序赌运气的绑定 —— 有时对，有时把本体
+    状态当成位姿。所以发布方（driver 的 servo_eef）把 `eef` 放进同一条载荷。
+    """
+    card = make_card()
+    card._capabilities = _caps(n_cameras=0, needs_state=True, needs_eef_state=True)
+    card._on_state(_state_message([0.1] * 17, eef=POSE + [0.0] * 12))
+
+    observation = card.observation()
+    assert observation.state == [0.1] * 17
+    assert observation.eef_state[:7] == POSE
+
+
+def test_a_state_payload_without_the_field_leaves_it_none():
+    """今天绝大多数驱动的状态载荷里没有 `eef`。多出来的这个字段不能让它们变成
+    「报了一个空位姿」。"""
+    card = make_card()
+    card._capabilities = _caps(n_cameras=0, needs_state=True)
+    card._on_state(_state_message([0.1] * 17))
+    assert card.observation().eef_state is None
+
+
+def test_a_delta_model_publishes_nothing_when_the_base_pose_is_missing():
+    """和 `needs_state` 同样的处理。
+
+    凑一个单位位姿上去，手臂会飞到原点附近一个看起来挺合理的地方，而上游每一道
+    检查都满意 —— 不发这一拍，驱动的看门狗保持，那是正确的状态。
+    """
+    card = make_card()
+    card._capabilities = _caps(n_cameras=0, needs_state=False, needs_eef_state=True)
+    card._on_state(_state_message([0.1] * 17))          # 有 values，没有 eef
+    assert card.observation() is None
+
+    card._on_state(_state_message([0.1] * 17, eef=POSE))
+    assert card.observation() is not None
+
+
+def test_binding_refuses_to_start_a_delta_model_with_no_state_topic():
+    """缺什么在**启动时**说清楚。不然卡片会报 running、一条指令都不发，而原因
+    只藏在 info().error 里。"""
+    _stub_ros_messages()
+    card = make_card()
+    node = _Graph({"/cam": ["sensor_msgs/msg/CompressedImage"]})
+
+    _, problem = card._bind_inputs(
+        node, ["/cam"], _caps(n_cameras=1, needs_state=False, needs_eef_state=True))
+
+    assert "末端位姿" in problem
+
+
+def test_the_provider_omits_the_field_entirely_when_there_is_no_pose():
+    """服务端把 None 和 [] 分开看：后者是「机器人报了，但它是空的」，那是个错误。"""
+    from plugins.vla.providers import vla_cloud
+
+    provider = vla_cloud.VLACloudProvider({}, {"endpoint": "https://vla.test"})
+    sent = {}
+
+    def _post(path, payload):
+        sent.update(payload)
+        return {"seq": payload["seq"], "actions": [[0.0]]}
+
+    provider._post = _post
+    provider.infer(Observation(images={}, state=[0.0], eef_state=None))
+    assert "eef_state" not in sent
+
+    provider.infer(Observation(images={}, state=[0.0], eef_state=POSE))
+    assert sent["eef_state"] == POSE
+
+
+# ── mock 要能验**任何**动作空间的通路，那是它存在的理由 ─────────────────────
+
+EEF_DESC = {
+    "control_interface": "motus.control/1", "mode": "eef_pose", "dof": 17,
+    "joint_names": [f"a{i}" for i in range(17)],
+    "units": {"length": "m"},
+    "limits": {"lower": [-0.6] * 17, "upper": [0.9] * 17},
+    "rate": {"max_hz": 50, "expected_hz": 30, "watchdog_ms": 200},
+    "force_torque": None,
+    "groups": [
+        {"name": "eef_l", "offset": 0, "count": 7, "mode": "eef_pose"},
+        {"name": "eef_r", "offset": 7, "count": 7, "mode": "eef_pose"},
+        {"name": "waist", "offset": 14, "count": 3, "mode": "joint_position"},
+    ],
+}
+
+
+def _mock_on(descriptor):
+    from plugins.vla.providers.mock import MockProvider
+    return MockProvider(descriptor, amplitude=0.05, period_s=8.0, chunk_size=5)
+
+
+def test_mock_reports_the_downstream_action_space_not_a_fixed_one():
+    """写死 `joint_position` 让 mock **验不了任何非关节空间的卡片**。
+
+    真机实测 2026-09-21（G1）：接到 `servo_eef` 上协商当场拒——「模型输出
+    'joint_position' 空间的动作，下游接受 'eef_pose'」。拒得对，但那说明这条通路
+    根本没法用 mock 验，而"验证通路"是 mock 存在的全部理由。
+
+    这个信号本来就照着下游的 limits 生成 —— 它没有自己的动作空间，只有下游那个。
+    """
+    assert _mock_on(EEF_DESC).capabilities()["control_mode"] == "eef_pose"
+
+
+def test_mock_still_defaults_to_joint_position_without_a_mode():
+    """今天每一个 descriptor 都带 mode，但缺了也不能变成空串——那会被协商拒。"""
+    d = dict(EEF_DESC)
+    d.pop("mode")
+    assert _mock_on(d).capabilities()["control_mode"] == "joint_position"
+
+
+def test_mock_emits_unit_quaternions_for_eef_segments():
+    """**逐分量的正弦对四元数是错的。**
+
+    四个分量各自摆一条正弦，合起来不是单位长度，`ControlSink._check_contract`
+    会把每一条都拒掉 —— 通路依然验不成，只是失败挪后了一道。修 control_mode 而
+    不修这个，等于把门从协商挪到契约检查。
+    """
+    import math
+    provider = _mock_on(EEF_DESC)
+    worst = 0.0
+    for _ in range(20):
+        for step in provider.infer(None):
+            for offset in (3, 10):
+                norm = math.sqrt(sum(v * v for v in step[offset:offset + 4]))
+                worst = max(worst, abs(norm - 1.0))
+    assert worst < 1e-6, f"最大偏离 {worst}"
+
+
+def test_mock_leaves_non_eef_segments_alone():
+    """腰那三维是关节角，照旧走逐分量的正弦。"""
+    step = _mock_on(EEF_DESC).infer(None)[-1]
+    assert any(abs(v) > 1e-9 for v in step[14:17]), "腰应当在动"

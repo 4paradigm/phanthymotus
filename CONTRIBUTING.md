@@ -69,7 +69,7 @@ phanthymotus/
 │   └── plugins/       — ASR/TTS plugin implementations
 ├── actucore/          — Layer 2: ActuCore (execution models, MCP Server)
 │   ├── main.py        — MCP server entry point
-│   └── plugins/       — Execution model cards (including optional teleop)
+│   └── plugins/       — Execution model cards (VLA and optional teleop)
 ├── deploy/            — Build & deployment scripts
 └── docker-compose.yml — Full stack orchestration
 ```
@@ -86,7 +86,7 @@ See the [architecture diagram](README.md#architecture) for how these layers conn
 |-------|-----------|-------------|
 | Layer 1 — Hardware Drivers | MCP HTTP Servers | Physical device interfaces ([phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)). A single driver exposes both the sensor side (video, audio, lidar, joints, battery, status) and the actuator side (motion, hand, head, waist, speaker, LED) |
 | Layer 2 — Perception Stack | ASR/TTS/VLM plugins | Raw streams → semantics, with local inference support (Jetson) |
-| Layer 2 — ActuCore | Execution models | The mirror of perception on the action side: VLA, navigation, grasp policies, locomotion, whole-body control. Lives in `actucore/`, structurally identical to the perception stack — each model attaches as a `processor` card. Optional cards are enabled per robot; teleop defaults to Shadow |
+| Layer 2 — ActuCore | Execution models | The mirror of perception on the action side: VLA, navigation, grasp policies, locomotion, whole-body control. Lives in `actucore/`, structurally identical to the perception stack — each model attaches as a `processor` card. Hosts VLA and an optional PICO teleoperation card; see the ActuCore README for dependency and deployment requirements |
 | Layer 3 — Agent Core | FastAPI + LLM Loop | Event-driven agent with DDS bridge and web dashboard |
 
 ### Communication

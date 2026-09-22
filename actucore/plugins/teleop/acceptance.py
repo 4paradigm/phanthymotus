@@ -16,6 +16,9 @@ from .replay import analyze, digest, evaluate, evaluate_combined, execute, sched
 from .kinematics import TianyiIK, finite, MEASURED_LIMIT_TOLERANCE_RAD
 import numpy as np
 
+# Same MCP listener as every other ActuCore card. CLI reads the bundle config.
+ACTUCORE_MCP_PORT = 15730
+
 
 class _EvidenceWriter:
     """Ordered, bounded evidence I/O; never wait for disk in the input feeder."""
@@ -55,7 +58,7 @@ class _EvidenceWriter:
 
 def call(port, tool, action, **args):
     headers={'Content-Type':'application/json'}
-    if port==15740 and action!='info':
+    if tool=='teleop' and action!='info':
         key=Path(os.environ.get('TELEOP_MANAGEMENT_KEY_FILE','/run/teleop-management.key')).read_text().strip()
         if len(key)<32:raise ValueError('management_key_missing')
         headers['X-Teleop-Management']=key
@@ -69,7 +72,7 @@ def call(port, tool, action, **args):
 
 
 def idle():
-    d=call(15707,'teleop_executor','info');v=call(15740,'teleop','info')
+    d=call(15707,'teleop_executor','info');v=call(ACTUCORE_MCP_PORT,'teleop','info')
     if d['state']!='idle' or d['ownership_held'] or d['output_active']:raise ValueError('driver_not_released')
     if v['authority_valid'] or v.get('mode')!='shadow':raise ValueError('card_not_isolated_shadow')
     if d.get('foreign_publishers') or d.get('hands_enabled') is not False or d.get('calibration_error'):raise ValueError('driver_preflight')
@@ -79,18 +82,18 @@ def idle():
 def record(cfg):
     idle()
     # Recreate only the card session if needed, always retaining Shadow isolation.
-    call(15740,'teleop','calibrate')
-    status=call(15740,'teleop','record_start')
+    call(ACTUCORE_MCP_PORT,'teleop','calibrate')
+    status=call(ACTUCORE_MCP_PORT,'teleop','record_start')
     print('ARMED: waiting for both grips; then record 10 seconds. Hardware output disabled.',flush=True)
     try:
-        call(15740,'teleop','start')
+        call(ACTUCORE_MCP_PORT,'teleop','start')
         until=time.monotonic()+132
         while time.monotonic()<until:
-            time.sleep(.5);status=call(15740,'teleop','record_status')
+            time.sleep(.5);status=call(ACTUCORE_MCP_PORT,'teleop','record_status')
             if status['state'] not in ('armed','recording'):break
     finally:
-        status=call(15740,'teleop','record_stop')
-        call(15740,'teleop','stop')
+        status=call(ACTUCORE_MCP_PORT,'teleop','record_stop')
+        call(ACTUCORE_MCP_PORT,'teleop','stop')
     print(json.dumps(status),flush=True)
     if not status.get('complete'):raise ValueError('recording_incomplete')
     return status['recording_id']
@@ -116,7 +119,7 @@ def journal_link(link, path):
 
 
 def recover(cfg, recording):
-    v=call(15740,'teleop','info')
+    v=call(ACTUCORE_MCP_PORT,'teleop','info')
     if v.get('authority_valid') or v.get('mode')!='shadow':raise ValueError('card_not_isolated_shadow')
     paths=sorted(recording.glob('execution-*/.lease.json'))
     if not paths:raise ValueError('replay_recovery_journal_missing')
@@ -480,9 +483,11 @@ def combined(cfg,recording,directory):
 
 
 def main():
+    global ACTUCORE_MCP_PORT
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--config',required=True,type=Path)
     p.add_argument('action',choices=['record','analyze','check','run','paired','report','recover']);p.add_argument('--recording')
-    args=p.parse_args();cfg=yaml.safe_load(args.config.read_text())['plugins']['teleop']
+    args=p.parse_args();bundle=yaml.safe_load(args.config.read_text())
+    ACTUCORE_MCP_PORT=int(bundle.get('mcp_port',15730));cfg=bundle['plugins']['teleop']
     if cfg.get('robot_profile')!='tianyi2':raise ValueError('tianyi_only')
     root=Path(cfg['capture']['state_file']).parent/'recordings'
     if args.action=='record':record(cfg);return

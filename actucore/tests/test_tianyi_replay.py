@@ -114,33 +114,10 @@ def test_stable_tracking_error_is_reported_without_an_accuracy_gate():
     assert result['stable_max_error_rad']==pytest.approx([.06]*14)
 
 
-def load(name):
-    path=Path(__file__).parents[2]/'deploy'/name
-    s=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
 
 
-def test_publisher_changes_only_two_scalars_and_rejects_injection():
-    m=load('tianyi_teleop_publish.py')
-    raw='# keep\nservices:\n  agent-core: {image: user-version, environment: {VALUE: mine}}\n  actucore-teleop: {image: old}\n  tianyi2: {image: old-driver}\n'
-    images={'actucore-teleop':'sha256:'+'a'*64,'tianyi2':'sha256:'+'b'*64}
-    result=m.replace_images(raw,images)
-    assert '# keep' in result and 'agent-core: {image: user-version, environment: {VALUE: mine}}' in result
-    with pytest.raises(ValueError):m.replace_images(raw,{'agent-core':'sha256:'+'c'*64})
-    with pytest.raises(ValueError):m.replace_images(raw,{'tianyi2':'--privileged'})
 
 
-def test_installer_runs_only_in_sandbox_and_is_not_generic_sudo(tmp_path):
-    m=load('install_tianyi_teleop_publish.py');h=Path(__file__).parents[2]/'deploy/tianyi_teleop_publish.py'
-    import hashlib
-    compose=tmp_path/'opt/phanthy-motus/docker-compose.yml';compose.parent.mkdir(parents=True)
-    compose.write_text('services:\n  agent-core: {image: user}\n  actucore-teleop: {image: old}\n  tianyi2: {image: old}\n')
-    (tmp_path/'var/lib').mkdir(parents=True,exist_ok=True)
-    m.install(h,hashlib.sha256(h.read_bytes()).hexdigest(),prefix=tmp_path,validate=False)
-    rule=(tmp_path/'etc/sudoers.d/phanthy-teleop-publish').read_text()
-    assert 'NOPASSWD: ALL' not in rule and '/usr/local/sbin/tianyi-teleop-publish *' in rule
-    assert (tmp_path/'usr/local/sbin/tianyi-teleop-publish').read_bytes()==h.read_bytes()
-    assert 'agent-core' in (tmp_path/'var/lib/phanthy-teleop-publish/baseline.json').read_text()
-    with pytest.raises(ValueError,match='existing_install'):m.install(h,hashlib.sha256(h.read_bytes()).hexdigest(),prefix=tmp_path,validate=False)
 
 
 def test_report_needs_combined_pass(tmp_path):

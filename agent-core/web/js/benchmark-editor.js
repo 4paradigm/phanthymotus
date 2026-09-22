@@ -2,15 +2,24 @@
  * benchmark-editor.js — 改一个用例。
  *
  * 用例里能改的东西，绝大部分是**自然语言**：初始指令是用户会对机器人说的那句话，
- * 插话是他中途会插的那句话。只有触发条件（到达哪一站 / 第几秒）和几个数字是结构化
- * 的。所以这个编辑器长得像一张写字的表单，不像一个配置面板。
+ * 插话是他中途会插的那句话，要求是他对结果的期待。所以这个编辑器长得像一张写字的
+ * 表单，不像一个配置面板。
  *
- * ## 地图是一个声明，不是一个下拉框
+ * ## 要求是人话，挂在七条原则之一下面
  *
- * 这里**不**从仿真器的 `list_maps` 拉选项，站名也不从地图的 POI 里选。理由不只是
- * 解耦：判定层本来就设计成「同样形状的事件流，跑在真机器人上也一样能判」。一个必须
- * 先有仿真器、先有那张地图才能编辑的用例，把那条路堵死了。地图名和站名都是字符串，
- * 对不对得上由跑的时候说 —— 那时候本来就会按层报出来。
+ * 原先这里是一组结构化字段：期望站序、每站到达后必须讲解、被打断的那一段……那是
+ * 展区导览一个具体场景的词汇。现在写的是「到了再讲，不要没到就开讲」这样的句子，
+ * 由裁判去判 —— 而它判的时候手里拿着算好的指标，所以是有据可依的判断。
+ *
+ * ## 参考流程有自己的框，但走普通的计分
+ *
+ * 「先开地图，再导航」是一串步骤，而且**偏离不等于失败** —— 好的 agent 可能找到更优
+ * 的顺序。所以它有独立的输入框、裁判对它做逐步比对，但分数仍由一条要求的权重算。
+ *
+ * ## 地图不在这儿了
+ *
+ * 用例跑在**当前画布、当前世界**上。地图曾经是一个字段，现在不是了 —— 要换世界，
+ * 在画布上换。
  *
  * ## 为什么保存不拦
  *
@@ -20,9 +29,16 @@
 
 import { showToast } from './toast.js';
 
+// 七条原则。和 `benchmark_case.DIMENSIONS` 必须一致 —— 对不上的那条会被后端归到
+// 「回答效果」里，而用户看到的是自己选的那个原则下面空空如也。
 const DIMENSIONS = [
-  ['orchestration', '编排'], ['interruption', '打断'], ['long_horizon', '长程'],
-  ['safety', '安全'], ['latency', '时效'],
+  ['world_timing', '物理世界时序性'],
+  ['concurrency', '同步执行效率'],
+  ['llm_latency', 'LLM 延时'],
+  ['cache_hit', 'cache 命中'],
+  ['answer_quality', '回答效果'],
+  ['ux', '用户体验'],
+  ['physical_safety', '安全'],
 ];
 
 let _editing = null;     // { id, name, payload }
@@ -56,26 +72,7 @@ export function closeEditor() {
 
 // ── 纯函数：解析与提示（可单测，不碰 DOM） ───────────────────────────────────
 
-/**
- * 「P3, P4, P5」「每行一个」都接受。
- *
- * 站序是最常被手写的一项，而它跨行粘贴过来的机会和逗号分隔一样多。只认一种分隔符
- * 的话，另一种会安静地变成**一个**名字很长的站点 —— 跑起来一站都对不上，看着却像
- * 是 agent 走错了。
- */
-export function parseList(text) {
-  return String(text || '')
-    .split(/[,，\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
 
-/** 权重合计不是 100 时说一句。不阻止 —— 评分是按比例算的，105 也能跑。 */
-export function weightNote(weights) {
-  const total = DIMENSIONS.reduce((sum, [key]) => sum + (Number(weights[key]) || 0), 0);
-  if (!total) return '所有权重都是 0，总分算不出来';
-  return total === 100 ? '' : `合计 ${total}，不是 100（按比例折算，不影响跑）`;
-}
 
 /**
  * 一条插话只能有一个触发方式。
@@ -85,8 +82,12 @@ export function weightNote(weights) {
  */
 export function normalizeInjection(row) {
   const out = { text: String(row.text || ''), delay: Number(row.delay) || 0 };
-  if (row.mode === 'at') out.at = Number(row.at) || 0;
-  else out.after_arrival = String(row.after_arrival || '');
+  if (row.mode === 'at') out.after_action = undefined, out.at = Number(row.at) || 0;
+  else out.after_action = Math.max(1, Number(row.after_action) || 1);
+  // 两个触发条件**互斥**：两个都写进去，后端按 `after_action` 优先，而用户看到的是
+  // 自己填的秒数被无视了。只留选中的那一个。
+  if (out.at == null) delete out.at;
+  if (out.after_action == null) delete out.after_action;
   return out;
 }
 
@@ -99,10 +100,7 @@ function _render() {
   if (!body || !_editing) return;
   const test = _test();
   const run = test.run || {};
-  const world = run.world || {};
-  const expect = (test.evaluate || {}).expect || {};
-  const weights = (test.evaluate || {}).weights || {};
-  const leg = expect.interrupted_leg || {};
+  const reqs = (test.requirements || []).filter((r) => r.id !== '__procedure__');
 
   body.innerHTML = `
     <div class="bm-ed-row">
@@ -114,22 +112,26 @@ function _render() {
       <label class="bm-ed-label" for="bm-ed-prompt">初始指令</label>
       <textarea class="bm-ed-input bm-ed-prose" id="bm-ed-prompt" rows="2"
         placeholder="用户会对机器人说的那句话">${_esc(run.prompt || '')}</textarea>
-      <p class="bm-ed-hint">这句话会当作用户消息送进去，和真人说的走同一条路。</p>
+      <p class="bm-ed-hint">这句话会当作用户消息送进去，和真人说的走同一条路。
+        它跑在**当前画布**上 —— 运行不会改动画布。</p>
     </div>
 
     <div class="bm-ed-row">
-      <label class="bm-ed-label">世界</label>
-      <div class="bm-ed-inline">
-        <input class="bm-ed-input bm-ed-sm" id="bm-ed-map" placeholder="地图名"
-          value="${_esc(world.map || '')}">
-        <span class="bm-ed-unit">出生点</span>
-        ${['x', 'y', 'yaw'].map((axis) => `
-          <label class="bm-ed-weight">${axis}
-            <input class="bm-ed-input bm-ed-xs" id="bm-ed-${axis}"
-              value="${_esc((world.spawn || {})[axis] ?? '')}"></label>`).join('')}
-      </div>
-      <p class="bm-ed-hint">地图名交给仿真器解析。留空表示用它当前的世界 ——
-        用例跑在真机器人上时就留空。</p>
+      <label class="bm-ed-label" for="bm-ed-procedure">参考流程<span class="bm-ed-opt">可选</span></label>
+      <textarea class="bm-ed-input bm-ed-prose" id="bm-ed-procedure" rows="4"
+        placeholder="一行一步，例如：&#10;1. 打开地图&#10;2. 导航到第一站&#10;3. 到达后再讲解"
+        >${_esc(test.procedure || '')}</textarea>
+      <p class="bm-ed-hint">写了就多一条「按参考流程执行」的要求。裁判会**逐步比对**
+        并说明每一处偏离是否合理 —— 更优的顺序也是偏离，偏离不等于失败。</p>
+    </div>
+
+    <div class="bm-ed-row">
+      <label class="bm-ed-label">要求
+        <button class="bm-linkbtn" id="bm-ed-addreq">+ 添加一条</button>
+      </label>
+      <div id="bm-ed-reqs">${reqs.map(_requirementHtml).join('')}</div>
+      <p class="bm-ed-hint">用人话写你对结果的期待，挂到它属于的那条原则下面。
+        没写要求的原则照样按默认目标判 —— 那一半是算出来的，不经裁判。</p>
     </div>
 
     <div class="bm-ed-row">
@@ -137,81 +139,95 @@ function _render() {
         <button class="bm-linkbtn" id="bm-ed-add">+ 添加一条</button>
       </label>
       <div id="bm-ed-injections">${(run.injections || []).map(_injectionHtml).join('')}</div>
-      <p class="bm-ed-hint">按「到达某站」触发，而不是按绝对秒数：真机上 LLM 一轮
-        3-48 秒，写死的偏移会落到完全不同的一段路上。</p>
+      <p class="bm-ed-hint">按「第 N 个动作完成后」触发，而不是按绝对秒数：真机上 LLM
+        一轮 3-48 秒，写死的偏移会落到完全不同的一段过程上。</p>
     </div>
 
     <div class="bm-ed-row">
-      <label class="bm-ed-label" for="bm-ed-order">期望站序</label>
-      <textarea class="bm-ed-input bm-ed-prose" id="bm-ed-order" rows="2"
-        placeholder="P3, P4, P5……">${_esc((expect.waypoint_order || []).join(', '))}</textarea>
-    </div>
-
-    <div class="bm-ed-row bm-ed-checks">
-      <label><input type="checkbox" id="bm-ed-announce"
-        ${expect.announce_after_arrive === false ? '' : 'checked'}> 每站到达后必须讲解</label>
-      <label><input type="checkbox" id="bm-ed-occupied"
-        ${expect.never_occupied === false ? '' : 'checked'}> 从不进入占用格</label>
-    </div>
-
-    <div class="bm-ed-row">
-      <label class="bm-ed-label">被打断的那一段</label>
+      <label class="bm-ed-label">收尾</label>
       <div class="bm-ed-inline">
-        <label class="bm-ed-weight">去
-          <input class="bm-ed-input bm-ed-sm" id="bm-ed-leg" placeholder="哪一站"
-            value="${_esc(leg.target || '')}"></label>
-        <label class="bm-ed-weight">应报
-          <select class="bm-ed-input bm-ed-sm" id="bm-ed-legstatus">
-            ${['cancelled', 'completed', 'failed'].map((status) => `
-              <option value="${status}"${
-                (leg.acp_status || 'cancelled') === status ? ' selected' : ''
-              }>${status}</option>`).join('')}
-          </select></label>
-        <label class="bm-ed-weight">最小进度
-          <input class="bm-ed-input bm-ed-xs" id="bm-ed-legmin"
-            value="${_esc(leg.min_progress ?? '')}"></label>
-      </div>
-      <div class="bm-ed-inline">
-        <label class="bm-ed-weight">绕行后回到
-          <input class="bm-ed-input bm-ed-sm" id="bm-ed-resume" placeholder="哪一站"
-            value="${_esc(expect.resume_target || '')}"></label>
         <label class="bm-ed-weight">时间预算
           <input class="bm-ed-input bm-ed-xs" id="bm-ed-budget"
-            value="${_esc(expect.max_wall_seconds ?? '')}"></label>
+            value="${_esc(run.budget_seconds ?? 900)}"></label>
+        <span class="bm-ed-unit">秒</span>
+        <label class="bm-ed-weight">安静多久算结束
+          <input class="bm-ed-input bm-ed-xs" id="bm-ed-idle"
+            value="${_esc(run.idle_seconds ?? 60)}"></label>
         <span class="bm-ed-unit">秒</span>
       </div>
-    </div>
-
-    <div class="bm-ed-row">
-      <label class="bm-ed-label">权重 <span class="bm-ed-hint" id="bm-ed-weightnote"></span></label>
-      <div class="bm-ed-inline">
-        ${DIMENSIONS.map(([key, label]) => `
-          <label class="bm-ed-weight">${label}
-            <input class="bm-ed-input bm-ed-xs" data-weight="${key}"
-              value="${_esc(weights[key] ?? 0)}"></label>`).join('')}
-      </div>
+      <p class="bm-ed-hint">安静 = 没有新事实、而且没有还没完成的动作。
+        只看「没有新事实」会在机器人走在半路上时把运行判结束。</p>
     </div>`;
 
+  document.getElementById('bm-ed-addreq')?.addEventListener('click', _addRequirement);
+  _bindRequirementRows();
   document.getElementById('bm-ed-add')?.addEventListener('click', _addInjection);
   _bindInjectionRows();
-  body.querySelectorAll('[data-weight]').forEach((input) => {
-    input.addEventListener('input', _updateWeightNote);
-  });
-  _updateWeightNote();
   _showProblems([]);
 }
 
+function _requirementHtml(req, index) {
+  return `
+    <div class="bm-ed-req" data-idx="${index}">
+      <div class="bm-ed-inline">
+        <select class="bm-ed-input bm-ed-sm" data-rfield="dimension">
+          ${DIMENSIONS.map(([key, label]) => `
+            <option value="${key}"${
+              (req.dimension || 'answer_quality') === key ? ' selected' : ''
+            }>${label}</option>`).join('')}
+        </select>
+        <label class="bm-ed-weight">权重
+          <input class="bm-ed-input bm-ed-xs" data-rfield="weight"
+            value="${_esc(req.weight ?? 10)}"></label>
+        <button class="bm-linkbtn" data-rdrop="${index}">删除</button>
+      </div>
+      <textarea class="bm-ed-input bm-ed-prose" data-rfield="text" rows="2"
+        placeholder="例如：到了再讲，不要没到就开讲">${_esc(req.text || '')}</textarea>
+    </div>`;
+}
+
+
+function _bindRequirementRows() {
+  document.querySelectorAll('[data-rdrop]').forEach((button) => {
+    button.addEventListener('click', () => _dropRow(
+      (test) => (test.requirements ||= []), button.dataset.rdrop));
+  });
+}
+
+
+function _addRequirement() {
+  _collectInto();
+  const test = _test();
+  test.requirements = [...(test.requirements || []),
+                       { text: '', weight: 10, dimension: 'answer_quality' }];
+  _render();
+}
+
+
+function _readRequirements() {
+  return Array.from(document.querySelectorAll('.bm-ed-req')).map((row, index) => {
+    const field = (name) => row.querySelector(`[data-rfield="${name}"]`)?.value?.trim() ?? '';
+    return { id: `r${index}`, text: field('text'),
+             weight: Number(field('weight')) || 0,
+             dimension: field('dimension') || 'answer_quality' };
+  });
+}
+
+
 function _injectionHtml(injection, index) {
-  const byArrival = injection.at == null;
+  // 「第 N 个动作完成后」是 `after_arrival`（到达某一站）的通用化：到站是展区导览的
+  // 说法，而「第 N 个动作做完」在任何用例里都成立，判据也一样在事实流里。
+  const byAction = injection.at == null;
   return `
     <div class="bm-ed-injection" data-idx="${index}">
       <div class="bm-ed-inline">
-        <label><input type="radio" name="trig${index}" value="arrive"
-          ${byArrival ? 'checked' : ''}> 到达</label>
-        <input class="bm-ed-input bm-ed-sm" data-field="after_arrival" placeholder="站名"
-          value="${_esc(injection.after_arrival || '')}">
+        <label><input type="radio" name="trig${index}" value="action"
+          ${byAction ? 'checked' : ''}> 第</label>
+        <input class="bm-ed-input bm-ed-xs" data-field="after_action" placeholder="N"
+          value="${_esc(injection.after_action ?? '')}">
+        <span class="bm-ed-unit">个动作完成后</span>
         <label><input type="radio" name="trig${index}" value="at"
-          ${byArrival ? '' : 'checked'}> 第</label>
+          ${byAction ? '' : 'checked'}> 第</label>
         <input class="bm-ed-input bm-ed-xs" data-field="at" placeholder="秒"
           value="${_esc(injection.at ?? '')}">
         <label class="bm-ed-weight">延时
@@ -225,28 +241,33 @@ function _injectionHtml(injection, index) {
     </div>`;
 }
 
+/** 删掉列表里的第 index 条。
+ *
+ * **顺序是这个函数存在的理由：先把表单读回来，再删。** 反过来的话，`_collectInto()`
+ * 会从 DOM 重建整个列表 —— 而 DOM 里那一行还在，刚删掉的那条又被写了回去。表现就是
+ * 「点删除没反应」，而且控制台干干净净。插话那一段原先就是反的。
+ *
+ * 顺带：先 collect 也保住了用户在别的框里刚敲的字，那些还没进 payload。
+ */
+function _dropRow(pick, index) {
+  _collectInto();
+  const list = pick(_test());
+  list.splice(Number(index), 1);
+  _render();
+}
+
 function _bindInjectionRows() {
   document.querySelectorAll('[data-drop]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const run = _test().run || {};
-      run.injections = (run.injections || []).filter(
-        (_, i) => i !== Number(button.dataset.drop));
-      _collectInto(false);
-      _render();
-    });
+    button.addEventListener('click', () => _dropRow(
+      (test) => (test.run ||= {}).injections ||= [], button.dataset.drop));
   });
 }
 
 function _addInjection() {
-  _collectInto(false);
+  _collectInto();
   const run = _test().run || {};
-  run.injections = [...(run.injections || []), { after_arrival: '', delay: 0, text: '' }];
+  run.injections = [...(run.injections || []), { after_action: 1, delay: 0, text: '' }];
   _render();
-}
-
-function _updateWeightNote() {
-  const note = document.getElementById('bm-ed-weightnote');
-  if (note) note.textContent = weightNote(_readWeights());
 }
 
 // ── 读回表单 ─────────────────────────────────────────────────────────────────
@@ -257,59 +278,41 @@ function _number(id) {
   return raw === '' ? null : Number(raw);
 }
 
-function _readWeights() {
-  const weights = {};
-  document.querySelectorAll('[data-weight]').forEach((input) => {
-    weights[input.dataset.weight] = Number(input.value) || 0;
-  });
-  return weights;
-}
-
 function _readInjections() {
   return Array.from(document.querySelectorAll('.bm-ed-injection')).map((row) => {
     const field = (name) => row.querySelector(`[data-field="${name}"]`)?.value?.trim() ?? '';
-    const mode = row.querySelector('input[type="radio"]:checked')?.value || 'arrive';
+    const mode = row.querySelector('input[type="radio"]:checked')?.value || 'action';
     return normalizeInjection({
-      mode, after_arrival: field('after_arrival'), at: field('at'),
+      mode, after_action: field('after_action'), at: field('at'),
       delay: field('delay'), text: field('text'),
     });
   });
 }
 
-/** 把表单读回 `_editing.payload`。`spawn` 三个数都空就整块不写。 */
+/** 把表单读回 `_editing.payload`。 */
 function _collectInto() {
   const test = _test();
-  const spawn = { x: _number('bm-ed-x'), y: _number('bm-ed-y'), yaw: _number('bm-ed-yaw') };
-  const hasSpawn = Object.values(spawn).some((v) => v != null);
-
   _editing.name = _value('bm-ed-name') || _editing.name;
   test.name = _editing.name;
+  test.procedure = document.getElementById('bm-ed-procedure')?.value ?? '';
+  // 参考流程那条要求（`__procedure__`）不在渲染的行里 —— 它的文本由后端按 procedure
+  // 生成，只有权重和归属可能被改过。`_readRequirements()` 整个替换数组，不把它带上
+  // 的话，那份改动每保存一次就被抹掉一次，而且不报错。
+  //
+  // 放在**末尾**：上面那些行的下标就是渲染顺序，删除按下标走（见 `_dropRow`），
+  // 插在前面会让每一次删除都删错一条。
+  const procedure = (test.requirements || []).find((r) => r.id === '__procedure__');
+  test.requirements = [..._readRequirements(), ...(procedure ? [procedure] : [])];
   test.run = {
+    ...(test.run || {}),
     prompt: document.getElementById('bm-ed-prompt')?.value ?? '',
-    world: { ...(_value('bm-ed-map') ? { map: _value('bm-ed-map') } : {}),
-             ...(hasSpawn ? { spawn } : {}) },
     injections: _readInjections(),
+    budget_seconds: _number('bm-ed-budget') ?? 900,
+    idle_seconds: _number('bm-ed-idle') ?? 60,
   };
-
-  const expect = {
-    waypoint_order: parseList(document.getElementById('bm-ed-order')?.value),
-    announce_after_arrive: !!document.getElementById('bm-ed-announce')?.checked,
-    never_occupied: !!document.getElementById('bm-ed-occupied')?.checked,
-  };
-  if (_value('bm-ed-leg')) {
-    expect.interrupted_leg = {
-      target: _value('bm-ed-leg'),
-      acp_status: _value('bm-ed-legstatus') || 'cancelled',
-      ...(_number('bm-ed-legmin') == null ? {} : { min_progress: _number('bm-ed-legmin') }),
-    };
-  }
-  if (_value('bm-ed-resume')) expect.resume_target = _value('bm-ed-resume');
-  if (_number('bm-ed-budget') != null) expect.max_wall_seconds = _number('bm-ed-budget');
-  // 站序空着就别写一个空数组 —— validate 把空 expect 当作「没有断言」，
-  // 而一个 `waypoint_order: []` 会让它看起来像是断言过了。
-  if (!expect.waypoint_order.length) delete expect.waypoint_order;
-
-  test.evaluate = { expect, weights: _readWeights() };
+  // 地图和出生点不再是用例的字段 —— 用例跑在当前世界上。旧包体里带着的原样留着，
+  // 后端还认；这里只是不再产生新的。
+  delete test.evaluate;
   _editing.payload.test = test;
 }
 

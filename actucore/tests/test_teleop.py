@@ -304,7 +304,7 @@ def test_real_mcp_advertises_card_and_reports_operation_failure_without_ros(tmp_
     ns={'BaseHTTPRequestHandler':BaseHTTPRequestHandler,'json':json,'log':logging.getLogger('test'),
         '_brief':repr}
     exec(compile(ast.Module(body=nodes,type_ignores=[]),'main.py','exec'),ns)
-    bundle=ns['ActuCoreBundle']({'plugins':{'teleop':{'enabled':True,'mode':'shadow'}}},None)
+    bundle=ns['ActuCoreBundle']({'plugins':{'vla':{'enabled':True,'provider':'mock'},'teleop':{'enabled':True,'mode':'shadow'}}},None)
     ns['_bundle']=bundle
     server=ThreadingHTTPServer(('127.0.0.1',0),ns['make_handler']())
     thread=threading.Thread(target=server.serve_forever);thread.start()
@@ -321,12 +321,15 @@ def test_real_mcp_advertises_card_and_reports_operation_failure_without_ros(tmp_
         ns['_bundle']=dedicated
         assert rpc('initialize',{})['serverInfo']['name']=='ActuCore PICO Shadow'
         ns['_bundle']=bundle
-        tools=rpc('tools/list',{})['tools'];assert tools[0]['name']=='teleop' and tools[0]['type']=='processor'
+        tools={t['name']:t for t in rpc('tools/list',{})['tools']}
+        assert set(tools)=={'vla','teleop'} and tools['teleop']['type']=='processor'
+        ordinary=rpc('tools/call',{'name':'vla','arguments':{'action':'info'}},False)
+        assert json.loads(ordinary['content'][0]['text'])['state']=='idle'
         denied=rpc('tools/call',{'name':'teleop','arguments':{'action':'open_pairing'}},False)
         assert 'teleop_management_unauthorized' in denied['content'][0]['text']
         result=rpc('tools/call',{'name':'teleop','arguments':{'action':'config','mode':'invalid'}})
         assert result['isError'] is True
-        assert bundle._plugins[0].cfg['mode']=='shadow' and bundle._plugins[0].runtime is None
+        assert bundle._plugins[1].cfg['mode']=='shadow' and bundle._plugins[1].runtime is None
     finally:server.shutdown();thread.join(1);server.server_close()
 
 
@@ -437,3 +440,15 @@ def test_longer_stop_confirmation_does_not_extend_motion_deadline():
         assert state['state']=='fault'
         assert state['dispatch']['fault_code'] in ('adapter_io_stalled','adapter_apply_timeout','adapter_motion_deadline_missed','intent_expired')
     finally:r.close()
+
+
+def test_card_configuration_readback_and_rejection_preserves_values():
+    from teleop.plugin import TeleopPlugin
+    card=TeleopPlugin({'mode':'shadow','position_scale':.5,'capture':{'secret':'never-exposed'}},None)
+    assert card.info()['configuration']['position_scale']==.5
+    assert 'capture' not in card.info()['configuration']
+    for values in ({'position_scale':float('nan')},{'position_scale':.001},{'robot_profile':'other'},{'shadow_feedback_source':'other'}):
+        assert card.dispatch('teleop',{'action':'config',**values})['error']
+        assert card.cfg['position_scale']==.5
+    value=card.dispatch('teleop',{'action':'config','position_scale':.8})
+    assert value['configuration']['position_scale']==.8

@@ -70,6 +70,36 @@ def on_action_settled(fn) -> None:
     _settle_listeners.append(fn)
 
 
+_register_listeners: list = []
+
+
+def on_action_registered(fn) -> None:
+    """注册"一个异步动作开始了"的回调。签名 `fn(action_id, tool, args, resource)`。
+
+    和 `on_action_settled` 对称，存在的理由是**结算时已经查不到这些了**：
+    `_forget_pending` 必须先拆表再通知（见那里的注释），所以超时 / 取消路径上的订阅者
+    拿不到工具名和派发参数。订阅者想知道"这个动作是什么"，只能在它开始的时候记下来。
+
+    参数原样交出去，不做解释。基准测试要从里面认出一段路的目标是哪一站，而参数名
+    各家不同（天轶 `tag_name`、仿真器 `label`）—— 在这里挑一个名字出来，等于把某一家
+    驱动的 schema 焊进 ACP 层。
+    """
+    _register_listeners.append(fn)
+
+
+def _notify_registered(action_id: str, tool: str, args: dict, resource) -> None:
+    for fn in _register_listeners:
+        try:
+            fn(action_id, tool, args, resource)
+        except Exception as e:
+            print(f'[acp] register listener failed: {e}')
+
+
+def pending_result(action_id: str) -> dict | None:
+    """完成回调带回来的 payload。超时 / 取消路径上是 None —— 那条路查 `action_outcome`。"""
+    return _pending_results.get(action_id)
+
+
 def _notify_settled(action_id: str, resource=None) -> None:
     """`resource` 显式传入，因为 _forget_pending 是先拆表再通知的（见那里的注释），
     这时候已经查不到这个 action 占用过什么了。"""
@@ -958,6 +988,9 @@ async def call_tool(full_name: str, args: dict) -> str:
                 _res_txt = ','.join(sorted(_res)) if _res else 'undeclared/exclusive'
                 print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
                       f'timeout={dynamic_timeout:.0f}s, resource={_res_txt})')
+                # 通知订阅者。放在 try 里面、print 后面是有意的：这一段任何一步抛了，
+                # pending 就没建成，也就没有"动作开始了"这回事可通知。
+                _notify_registered(action_id, tool_name, args or {}, meta.get('resource'))
         except (json.JSONDecodeError, IndexError):
             pass
 

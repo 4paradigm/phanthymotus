@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import logging
 from collections import OrderedDict
 import numpy as np
 
@@ -47,6 +48,7 @@ class OperatorCommands:
         if action != 'stop':self.cancel = threading.Event()
         receipt = {'type':'operator_result','request_id':request_id,'action':action,'state':'accepted'}
         self.receipts[key] = receipt
+        logging.getLogger(__name__).info('operator action=%s accepted request=%s', action, request_id)
         async def run():
             try:
                 if previous and not previous.done():await previous
@@ -61,6 +63,7 @@ class OperatorCommands:
             except Exception as exc:
                 receipt.update(state='failed', error=str(exc))
                 self.status = {'state':'error','action':action,'error':str(exc)}
+            logging.getLogger(__name__).info('operator action=%s result=%s error=%s', action, receipt['state'], receipt.get('error'))
             if self.valid(connection):await connection.events.put(dict(receipt))
         self.task = asyncio.create_task(run())
         return dict(receipt)

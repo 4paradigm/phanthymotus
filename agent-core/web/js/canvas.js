@@ -12,6 +12,7 @@
  */
 
 import { showToast } from './toast.js';
+import { mountTeleopPanel } from './teleop-panel.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -1272,7 +1273,49 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
+  if (toolObj?.['x-connection-panel'] === 'teleop-v1') {
+    _mountTeleopConnectionPanel(el, mcpId, toolName);
+  }
   return el;
+}
+
+function _mountTeleopConnectionPanel(el, mcpId, toolName) {
+  const tool = (_allMcps.find(m => m.id === mcpId)?.tools || [])
+    .find(t => typeof t === 'object' && t.name === toolName);
+  const host = el.querySelector('.canvas-card-body-wrap');
+  if (!host) return;
+  // Dedicated controls replace the raw action/argument form for this card only.
+  host.querySelector('.canvas-card-body')?.remove();
+  host.querySelector('.canvas-exec-btn')?.remove();
+  host.querySelector('.canvas-footer-divider')?.remove();
+  mountTeleopPanel(host, {
+    actions: tool?.inputSchema?.properties?.action?.enum || ['info'],
+    configSchema: tool?.configSchema || {},
+    async loadConfig() {
+      const r=await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {signal:AbortSignal.timeout(4000)});
+      const body=await r.json();if(!r.ok || body.code!==200)throw new Error(body.message||'读取配置失败');
+      return body.data || {};
+    },
+    async saveConfig(values) {
+      if(_projectRunning)throw new Error('请先停止当前项目');
+      if(!(await _ensureEdit()))throw new Error('Canvas 正由其他人编辑');
+      const r=await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
+        method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values),signal:AbortSignal.timeout(10000)});
+      const body=await r.json();if(!r.ok || body.code!==200 || body.applied!==true)throw new Error(body.message||body.detail||'服务未确认应用配置');
+    },
+    async call(action, args = {}) {
+      const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tool: toolName, arguments: {action, ...args}}),
+        signal: AbortSignal.timeout(action === 'info' ? 4000 : 10000),
+      });
+      const body = await response.json();
+      const value = _parseMcpCallResult(body);
+      if (!response.ok || !value || value.error || value.isError)
+        throw new Error(value?.error || body.detail || body.message || '操作失败，未确认执行结果');
+      return value;
+    },
+  });
 }
 
 function _fmtColorClass(fmt) {
@@ -2009,21 +2052,53 @@ async function _startProject() {
   }
 }
 
-function _stopProject() {
+async function _stopProject() {
+  // **先请求，确认成功了再改状态** —— 和 _startProject 同一个形状。
+  //
+  // 此前是反过来的：先 _applyProjectState(false)，再做麦克风清理，最后
+  // `fetch(...).catch(() => {})`，然后**无条件**记一条「智能控制已停止」。
+  // 三处叠在一起，任何一种失败都长成"已经停了"：
+  //
+  //   * 清理那段抛异常 → fetch 那行根本执行不到，而状态已经翻了；
+  //   * `.catch()` 只接网络错误，**非 2xx 不会 reject** —— 后端返回 500 也算成功；
+  //   * 日志那行不看结果。
+  //
+  // 而状态一旦翻成 false，按钮就变回「开启智能控制」，再点走的是**启动**那一支
+  // —— 于是连重试的机会都没有。天轶实测 2026-09-21：后端 project_running 一直
+  // 是 true，20 分钟的访问日志里**一条 stop-project 都没有**，而界面显示已停止。
+  //
+  // 麦克风清理挪到请求之后，并且自己吞掉异常：它是收尾动作，不该挡住停止本身。
+  let ok = false;
+  try {
+    const res = await fetch('/api/config/stop-project', { method: 'POST' });
+    ok = res.ok;
+  } catch (err) {
+    ok = false;
+  }
+  if (!ok) {
+    // 不翻状态：按钮留在「停止智能控制」上，操作者能再点一次。谎报已停止是这个
+    // 函数此前唯一会做的事。
+    _logActivity('warn', '停止智能控制失败 —— 后端仍在运行，请重试');
+    return;
+  }
+
   _applyProjectState(false);
-  // Auto-stop mic stream
-  for (const card of _cards) {
-    if (card.toolName === 'remote_mic' && isMicActive()) {
-      toggleMicStream('', () => {}).catch(() => {});
-      const micBtn = card.el?.querySelector('.canvas-mic-btn');
-      if (micBtn) {
-        micBtn.textContent = '\uD83C\uDF99 开始录音';
-        micBtn.classList.remove('recording');
+  _logActivity('project', '智能控制已停止');
+
+  try {
+    for (const card of _cards) {
+      if (card.toolName === 'remote_mic' && isMicActive()) {
+        toggleMicStream('', () => {}).catch(() => {});
+        const micBtn = card.el?.querySelector('.canvas-mic-btn');
+        if (micBtn) {
+          micBtn.textContent = '\uD83C\uDF99 开始录音';
+          micBtn.classList.remove('recording');
+        }
       }
     }
+  } catch (err) {
+    _logActivity('warn', `麦克风收尾失败: ${err.message}`);
   }
-  fetch('/api/config/stop-project', { method: 'POST' }).catch(() => {});
-  _logActivity('project', '智能控制已停止');
 }
 
 function _syncProjectBtn() {

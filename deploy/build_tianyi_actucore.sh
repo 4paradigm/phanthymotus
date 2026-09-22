@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Build only. No push, image transfer, Compose changes or service startup.
+# Build an isolated CPU validation image only. Production teleop belongs inside
+# ordinary ActuCore (build_actucore.sh --jp-version 6.1 --with-teleop).
+# No push, image transfer, Compose changes or service startup.
 set -euo pipefail
 if [[ $# != 1 ]]; then
   echo 'Usage: build_tianyi_actucore.sh LOCAL_IMAGE_TAG' >&2

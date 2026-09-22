@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**`vla` 默认开启，新增 `teleop` 遥操候选默认关闭。** 遥操配置和验证边界见 [teleop 说明](plugins/teleop/README.md)。`enabled` 只决定卡片是否出现在工具列表里，不代表已取得硬件执行权。
+**`vla` 默认开启，`teleop` 遥操插件默认关闭。** 遥操配置和验证边界见 [teleop 说明](plugins/teleop/README.md)。`enabled` 只决定卡片是否出现在工具列表里，不代表已取得硬件执行权。
 
 ## `vla` 卡片
 
@@ -92,11 +92,11 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 | 注册类别 | `actucore` |
 | `serverInfo.name` | `actucore-bundle` |
 
-端口只有一个：ActuCore 没有 Perception 那种音频流场景，所以不开 WebSocket（15731 预留）。
+MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO WSS 配对、状态与信令，并通过协商的 WebRTC 数据通道接收输入；这些仍属于同一 ActuCore 进程。15731 不用于这条遥操链路。
 
 ## 构建与运行
 
-只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
+普通部署使用 `Dockerfile.jetson`；VLA 的本机模型能力取决于基础镜像。遥操的 IK 与通信可在 CPU 上运行，仓库也提供 `Dockerfile.cpu` 用于隔离验证。CPU 验证镜像不提供完整本机 SmolVLA 环境，不能作为保留既有 GPU/VLA 能力的直接替代。
 
 ```bash
 ./deploy/build_actucore.sh                    # JetPack 5.11（默认，与 build_perception.sh 一致）
@@ -104,7 +104,7 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
-**同一份 Dockerfile，两个 base**，应用层逐字节一样：
+**同一份 Jetson Dockerfile，两个 base**；卡片源码共用，基础环境和可选依赖不同：
 
 | | base | 可用 provider | 大小 |
 |---|---|---|---|
@@ -115,7 +115,13 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 
 jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）。加本机模型卡片时，如果它的依赖不在 base 里，放在它自己的 `RUN` 层，不要预装在共享基础层里。
 
-部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
+遥操构建有机型差异：
+
+- 天轶使用 Pinocchio + SciPy，`--jp-version 6.1 --with-teleop` 使用 `requirements.bundle.lock`，保留 VLA 兼容的 AV／NumPy 版本。JP5.11 构建入口拒绝 `--with-teleop`。
+- G1 使用 Pinocchio 的 CasADi 符号绑定。`g1_ik.py` 同时需要 `casadi` 和 `pinocchio.casadi`；只有 `import pinocchio` 成功不足以证明 G1 可求解。历史 ARM64 数值环境锁在 `plugins/teleop/requirements.numeric-linux-aarch64.lock`，包含 Pinocchio 3.1.0、CasADi 3.6.7、NumPy 1.26.4；当前天轶 bundle 锁是 Pin 3.7.0／NumPy 2.2.6，未安装 CasADi。两套锁不能直接叠装并声称与 VLA 兼容。
+- 当前 `Dockerfile.cpu` 也没有消费 G1 数值锁。因此北京 G1 的完整 IK 展示需要单独核验并构建可用的符号绑定环境；切换 `robot_profile` 不是依赖安装。该工作仍应保留一套 ActuCore，不能另起第二服务来掩盖依赖冲突。
+
+部署走 Dashboard 的服务部署页，Agent Core 从镜像的 `/deploy/service.yml` 读取服务片段（源码为 `actucore/deploy/service.yml`）。遥操的站点配置、TLS、配对状态与管理密钥挂载还需完整提供，不能仅凭普通 service 片段推定遥操可运行。构建脚本配置远端仓库后会推送；仅准备本地候选时不要把发布脚本当成无副作用的测试。
 
 ## 卡片契约
 
@@ -191,9 +197,21 @@ TOOLS = [
        self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
        log.info("XPlugin loaded")
    ```
-4. 该卡片需要的依赖加到 `Dockerfile`（以及 `Dockerfile.jetson`，如果要跑 GPU）
+4. 该卡片需要的依赖加到目标构建入口；普通部署为 `Dockerfile.jetson`，CPU 隔离验证为 `Dockerfile.cpu`
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
 
 完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/vop.py` —— 它是最干净的范例。
+
+## 遥操与 VLA 共用 ActuCore
+
+遥操是 `plugins.teleop` 卡片，与 VLA 共用 `ActuCoreBundle`、ROS executor 和 MCP 15730。不要另建 `actucore-teleop` 服务或第二个注册心跳。PICO 的 WSS/RTC 由该插件内部提供，15741 不属于第二套 ActuCore。
+
+JetPack 6.1 构建可使用 `deploy/build_actucore.sh --jp-version 6.1 --with-teleop`（此脚本在配置远端凭据时会推送，现场仅构建应直接调用 Dockerfile）。在同一 config.yaml 启用 `plugins.teleop`，保留已有 VLA 配置。共享依赖锁 `requirements.bundle.lock` 保留 VLA 的 AV 15.1 / NumPy 2.2.6；CPU 隔离回归仍可使用 Dockerfile.cpu，不是另开生产服务的部署方式。
+
+从历史独立服务迁移时，保留证书、配对状态、标定与管理密钥挂载；将 Core 的 `TELEOP_MANAGEMENT_URL` 指向 `http://localhost:15730/mcp`，保留原 MCP id 及所有卡片配置。先停止旧独立容器，再启用合并服务，验证通过后移除旧容器，避免配对端口和注册竞争。配置、开始、结束等日常操作继续在 Canvas/PICO 完成，无需后端脚本。
+
+镜像必须包含 `/deploy/dds-local.xml`，并与宿主只读挂载的 DDS profile 完全一致。不能只检查 `tools/list`：部署验收还需调用 teleop `info`，验证 ROS 节点及 WSS 真正初始化。
+
+Canvas 仍负责配置存储；teleop 将已接受的参数原子保存到配对状态文件旁的 `*.config.json`，用于 Core 未察觉短暂重启时恢复配置。此文件权限为 0600，只保存配置 schema 字段，不保存控制权、动作或会话；启动仍为空闲。部署配置改变后旧缓存不覆盖新配置；缓存损坏时拒绝初始化，可在卡片重新保存配置修复。迁移时保留整个状态目录。

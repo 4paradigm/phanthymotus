@@ -665,8 +665,15 @@
     <div class="modal-header">
       <span class="modal-title">基准测试</span>
       <div class="bm-header-meta" id="bm-env"></div>
+      <!-- 用例库和历史只在打开面板、以及跑动起止时重读。别处起的跑动、刚跑完的
+           那一条，不刷新就看不见 —— 而「关掉再打开」不该是刷新的办法。 -->
+      <button class="btn-icon" id="bm-refresh" title="刷新用例库与历史">&#8635;</button>
       <button class="btn-icon" id="benchmark-close">&#10005;</button>
     </div>
+
+    <!-- 画布上有真设备时的常驻提示。放在这里而不是只放在确认弹窗里：人该在挑用例
+         之前就知道这台机器会真的动，而不是按了「运行」才被拦一次。 -->
+    <div class="bm-hw-notice hidden" id="bm-hw-notice"></div>
 
     <div class="modal-body benchmark-body">
       <!-- 左栏：用例库。主体是「看现有的方案」——「打开文件」是导入路径，
@@ -687,7 +694,7 @@
         <div class="bm-launch">
           <label class="bm-repeats-row" for="bm-repeats">
             <span>重复</span>
-            <input type="number" id="bm-repeats" value="3" min="1" max="20">
+            <input type="number" id="bm-repeats" value="1" min="1" max="20">
             <span>次</span>
           </label>
           <p class="bm-note" id="bm-repeats-note"></p>
@@ -705,6 +712,9 @@
           <h4 class="bm-h">历史</h4>
           <!-- 分数画在共享的 0-100 轴上，样本量与被测配置贴着它 ——
                「动没动」靠形状回答，而不是让人在四个列之间心算。 -->
+          <!-- 最近两次之间的结论。不显著时这里写「测不出显著差异」而**不给方向** ——
+               两个均值不同不等于有差别，而形状看起来总像是动了。 -->
+          <div class="bm-compare hidden" id="bm-compare"></div>
           <div id="bm-runs"></div>
         </div>
       </section>
@@ -718,6 +728,9 @@
   <div class="modal bm-timeline-modal">
     <div class="modal-header">
       <span class="modal-title">运行详情</span>
+      <!-- 详情是打开时取一次的静态快照。跑动还在进行时打开，看到的就是那一刻的
+           样子，后面再没有更新。 -->
+      <button class="btn-icon" id="bm-timeline-refresh" title="重新读取这次运行">&#8635;</button>
       <button class="btn-icon" id="bm-timeline-close">&#10005;</button>
     </div>
     <div class="modal-body bm-timeline-body" id="bm-timeline-body"></div>

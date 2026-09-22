@@ -4,7 +4,10 @@
 
 * **被测的 agent 不能重置测量。** 跑动由 agent-core 驱动，不是 LLM 可调用的一张卡片。
 * **初始指令走用户消息那条路。** 用例问的就是「用户说了这句话之后会发生什么」。
-* **画布上有会动的真设备就拒绝跑。** 注入的文本和真实指令无法区分。
+* **画布上会动的真设备，开跑前必须经人确认。** 注入的文本和真实指令无法区分，
+  所以这些设备会真的动起来。从前这里是「一律拒绝」，那在真机上等于永远不能跑 ——
+  真机上每一张执行器卡都不属于仿真器。现在由现场的人决定，而**确认必须对得上服务端
+  此刻看到的那一组设备**。
 
 Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_benchmark_runner.py -q
 """
@@ -21,20 +24,22 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'runner-test.db'))
 
+import benchmark_facts  # noqa: E402
 import benchmark_runner  # noqa: E402
 import benchmark_store  # noqa: E402
 import config  # noqa: E402
 import event_bus  # noqa: E402
+import benchmark_judge  # noqa: E402
 import mcp_client  # noqa: E402
 
 CASE = {
     'name': 'bj-2f-tour',
     'requires': {'drivers': ['simulator-generic'], 'assets': ['bj-2f']},
     'run': {'prompt': '带我转一下展区并给我介绍下',
-            'world': {'map': 'bj-2f', 'spawn': {'x': 5.98, 'y': 8.77, 'yaw': 0.55}},
-            'injections': [{'after_arrival': 'P3', 'delay': 0.05, 'text': '先等一下'}]},
-    'evaluate': {'expect': {'waypoint_order': ['P3', 'P4'], 'max_wall_seconds': 30},
-                 'weights': {'orchestration': 100}},
+            'injections': [{'after_action': 1, 'delay': 0.05, 'text': '先等一下'}],
+            'budget_seconds': 30, 'idle_seconds': 0.01},
+    'requirements': [{'id': 'r0', 'text': '按顺序走完每一站', 'weight': 30,
+                      'dimension': 'world_timing'}],
 }
 
 
@@ -144,6 +149,150 @@ def test_an_undeclared_type_counts_as_acting(canvas, registry):
     assert len(benchmark_runner.unsafe_cards('mcp-sim')) == 1
 
 
+def test_a_split_sensor_is_not_listed_as_something_that_moves(canvas, registry,
+                                                              monkeypatch):
+    """带 action 枚举的工具会被按 action 拆开，`tool_meta` 里只有
+    `mcp__<id>__mic__start` 这样的键，`mcp__<id>__mic` 根本不存在。
+
+    画布卡片记的是**工具**名，所以拼出来的名字查不到申报 → `tool_type` 返回 '' →
+    「没申报就算会动」→ 麦克风进了「会动的设备」清单。方向上安全，但一份把麦克风算
+    进去的清单，人就不会认真读了 —— 而这份清单的全部作用就是让人认真读一遍。
+    """
+    monkeypatch.setitem(mcp_client.registry, 'mcp-real', {
+        'online': True, 'name': '天轶', 'server_name': 'x-humanoid-tianyi',
+        'category': 'driver',
+        'tool_meta': {'mcp__mcp-real__mic__start': {'type': 'sensor'},
+                      'mcp__mcp-real__mic__stop': {'type': 'sensor'},
+                      'mcp__mcp-real__loco__walk': {'type': 'actuator'}},
+    })
+    canvas(card('mcp-real', 'mic'), card('mcp-real', 'loco'))
+
+    assert [u['tool'] for u in benchmark_runner.unsafe_cards(None)] == ['loco']
+
+
+def test_a_tool_with_no_declaration_anywhere_still_counts_as_acting(canvas, registry,
+                                                                    monkeypatch):
+    """兜底不能松：查不到就是查不到，按会动处理。"""
+    monkeypatch.setitem(mcp_client.registry, 'mcp-real', {
+        'online': True, 'name': '天轶', 'category': 'driver', 'tool_meta': {}})
+    canvas(card('mcp-real', 'mystery'))
+
+    assert [u['tool'] for u in benchmark_runner.unsafe_cards(None)] == ['mystery']
+
+
+def test_without_a_simulator_every_actuator_needs_confirming(canvas, registry):
+    """真机上没有仿真器可以代劳，所以画布上会动的东西**全部**要进确认清单。
+
+    这也正是从前那条「非空就拒绝」在真机上的样子：清单永远非空，于是永远拒绝。
+    """
+    canvas(card('mcp-real', 'controlled_spatial'), card('mcp-real', 'whatever'),
+           card('mcp-real', 'camera_head'), card('agentcore', 'decision_core'))
+
+    moving = benchmark_runner.unsafe_cards(None)
+
+    assert sorted(u['tool'] for u in moving) == ['controlled_spatial', 'whatever']
+
+
+# ── 同一时刻只许一次跑动 ──────────────────────────────────────────────────────
+
+def test_claiming_is_atomic_so_two_requests_cannot_both_win():
+    """**检查与占位必须是同一步。**
+
+    `/case/run` 在检查之后、真正接管之前有一个 await（依赖检查，还可能走 MCP 网络）。
+    先查后占的话，两个并发请求会双双通过 —— 两次跑动同时往同一个 agent 注入用户消息、
+    同时重置世界，两份事实流交织在一起，而分数看起来只是「莫名其妙地低」。
+    """
+    assert benchmark_runner.claim() is True
+    assert benchmark_runner.claim() is False       # 第二个请求拿不到
+    assert benchmark_runner.is_busy() is True
+
+    benchmark_runner.release()
+
+    assert benchmark_runner.is_busy() is False
+    assert benchmark_runner.claim() is True
+    benchmark_runner.release()
+
+
+def test_a_failed_start_gives_the_slot_back():
+    """占上了却没跑成而不还，面板会一直说「已经有一次基准测试在跑」，
+    而实际上什么都没跑 —— 只能重启 agent-core 才能再跑。"""
+    import asyncio
+
+    from api import benchmark as bm_api
+
+    with pytest.raises(fastapi.HTTPException):
+        asyncio.run(bm_api.run_case(bm_api.CaseRunRequest(case_id='nope')))
+
+    assert benchmark_runner.is_busy() is False
+
+
+def test_handing_over_to_a_real_run_clears_the_claim():
+    benchmark_runner.claim()
+    run_id = benchmark_store.create_run('t')
+    run = benchmark_runner.CaseRun(CASE, 'mcp-sim', 1, 0, run_id, {}, case_id='c1')
+
+    benchmark_runner.set_current(run)
+
+    assert benchmark_runner.is_busy() is True      # 现在忙的是真正的跑动
+    assert benchmark_runner.current().snapshot()['case_id'] == 'c1'
+    benchmark_runner.set_current(None)
+
+
+# ── 开跑前的确认 ──────────────────────────────────────────────────────────────
+#
+# 这一组盯的是端点，不是分类。分类改对了而端点放行，等于一台真机器人在没人确认的
+# 情况下走起来。
+
+from api import benchmark as bm_api  # noqa: E402
+
+MOVING = [{'mcpId': 'mcp-real', 'tool': 'controlled_spatial', 'device': '天轶'}]
+
+
+def test_no_confirmation_means_no_run():
+    with pytest.raises(fastapi.HTTPException) as caught:
+        bm_api._check_confirmation(MOVING, None)
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail['needs_confirmation'] is True
+    assert caught.value.detail['moving_cards'] == MOVING
+
+
+def test_a_confirmation_that_matches_lets_the_run_start():
+    bm_api._check_confirmation(MOVING, ['mcp-real:controlled_spatial'])
+
+
+def test_a_confirmation_for_a_different_set_is_refused():
+    """画布在「弹窗弹出」和「点开始运行」之间是可以改的。
+
+    人看着仿真器的 tts 按了确认，另一个标签页把卡片换成真机底盘 —— 那个勾就为一组
+    他从没看见过的设备背了书。所以服务端重算，客户端送来的只用来核对。
+    """
+    with pytest.raises(fastapi.HTTPException) as caught:
+        bm_api._check_confirmation(MOVING, ['mcp-sim:tts'])
+
+    assert caught.value.status_code == 409
+    assert '变了' in caught.value.detail['error']
+
+
+def test_a_partial_confirmation_is_refused():
+    """确认了一台、实际会动两台 —— 这不是「确认过了」。"""
+    two = MOVING + [{'mcpId': 'mcp-real', 'tool': 'loco', 'device': '天轶'}]
+
+    with pytest.raises(fastapi.HTTPException):
+        bm_api._check_confirmation(two, ['mcp-real:controlled_spatial'])
+
+
+def test_an_empty_confirmation_list_does_not_authorise_real_devices():
+    """空列表是「我什么都没确认」，不是「确认了空集」。"""
+    with pytest.raises(fastapi.HTTPException):
+        bm_api._check_confirmation(MOVING, [])
+
+
+def test_nothing_moves_so_nothing_is_asked():
+    """仿真器在场时清单为空，不该弹窗 —— 行为和从前一字不差。"""
+    bm_api._check_confirmation([], None)
+
+
 # ── 触发时刻 ──────────────────────────────────────────────────────────────────
 
 def test_an_arrival_triggered_injection_waits_for_the_arrival():
@@ -168,14 +317,23 @@ def test_the_delay_is_counted_from_seeing_the_arrival_not_from_its_timestamp():
         {'after_arrival': 'P5', 'delay': 6.0}, sped_up, 30.0) == 36.0
 
 
-def test_a_run_is_finished_once_every_expected_waypoint_was_reached():
-    expect = {'waypoint_order': ['P3', 'P4']}
-    partial = {'events': [{'event': 'arrive', 'label': 'P3'}]}
-    complete = {'events': [{'event': 'arrive', 'label': 'P3'},
-                           {'event': 'arrive', 'label': 'P4'}]}
+def test_an_injection_can_fire_after_the_nth_action_whatever_that_action_was():
+    """`after_action` 是 `after_arrival` 的通用化 —— 「到达某一站」是展区导览的说法，
+    「第 N 个动作做完」在任何用例里都成立，判据也一样在事实流里。"""
+    two_done = [{'event': 'arrive', 't': 5.0}, {'event': 'speak_end', 't': 9.0}]
 
-    assert benchmark_runner._finished(partial, expect) is False
-    assert benchmark_runner._finished(complete, expect) is True
+    assert benchmark_runner._trigger_due({'after_action': 3, 'delay': 1.0},
+                                         two_done, 20.0) is None
+    assert benchmark_runner._trigger_due({'after_action': 2, 'delay': 1.0},
+                                         two_done, 20.0) == 21.0
+
+
+def test_the_old_after_arrival_trigger_still_works():
+    """旧用例还在用它。编辑器不再提供，但读到了要认。"""
+    arrived = [{'event': 'arrive', 'label': 'P5', 't': 300.0}]
+
+    assert benchmark_runner._trigger_due(
+        {'after_arrival': 'P5', 'delay': 6.0}, arrived, 30.0) == 36.0
 
 
 # ── 一次完整跑动 ──────────────────────────────────────────────────────────────
@@ -200,6 +358,27 @@ def simulator(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def judge(monkeypatch):
+    """裁判打桩。
+
+    `_one` 现在跑完会调 LLM 裁判 —— 不打桩的话，每一条跑动测试都会发真实请求，在没有
+    网络的机器上表现为「运行失败」，而失败原因和被测的东西毫无关系。
+
+    确定性那一半（默认目标对着指标判）照常真跑，本来就不该打桩 —— 那一半不花钱、
+    不联网，正是「模糊判定要少」换来的好处。
+    """
+    calls = []
+
+    async def fake(case, observations, facts, agent_track, model=None):
+        calls.append({'observations': observations, 'facts': facts,
+                      'agent_track': agent_track})
+        return {'items': [], 'model': 'fake-judge', 'error': ''}
+
+    monkeypatch.setattr(benchmark_judge, 'judge', fake)
+    return calls
+
+
 @pytest.fixture
 def said(monkeypatch):
     messages = []
@@ -216,7 +395,7 @@ def test_the_prompt_enters_as_a_user_message(simulator, said):
     会返回 200 然后只进后台批 —— 看起来像发了但没反应。"""
     run = run_once()
 
-    assert run.state == 'done'
+    assert run.state == 'done', run.error
     assert said[0]['source'] == 'message'
     assert said[0]['text'] == '带我转一下展区并给我介绍下'
 
@@ -255,15 +434,64 @@ def test_a_failed_note_does_not_stop_the_run(simulator, said, monkeypatch):
 
     run = run_once()
 
-    assert run.state == 'done'
+    assert run.state == 'done', run.error
 
 
-def test_the_world_is_reset_from_the_case_not_from_the_driver(simulator, said):
-    """地图和出生点来自用例。驱动里存一份、用例里存一份，迟早会对不上。"""
+def test_a_case_that_names_no_map_leaves_the_world_where_it_is(simulator, said):
+    """用例不再声明地图和出生点 —— **跑在当前世界上**，和「跑在当前画布上」是同一件事。
+
+    仿真器仍然被 reset（世界要回到一个干净的起点），但 `map` 是空的，也就是「保持你
+    现在这张图」。`world` 还写在包体里的旧用例照旧生效，只是编辑器不再提供这一项。
+    """
     run_once()
 
-    action, args = simulator[0][1]['action'], simulator[0][1]
-    assert action == 'reset'
+    args = simulator[0][1]
+    assert args['action'] == 'reset' and args['owner'] == benchmark_runner.OWNER
+    assert args['map'] == '' and args['spawn'] == {}
+
+
+def test_the_run_ends_when_the_world_goes_quiet(simulator, said):
+    """收尾条件换过一版：原先是「所有期望站点都到过了」—— 那要求用例先声明一串站名，
+    也就是把展区导览的词汇焊进了收尾逻辑。现在只剩预算耗尽和安静下来两条。"""
+    run = run_once()
+
+    assert run.state == 'done'
+    assert run.cases[0]['elapsed'] < 30       # 远没跑满预算
+
+
+def test_a_run_is_not_declared_over_while_an_action_is_still_pending(simulator, said,
+                                                                     monkeypatch):
+    """没有新事实常常只是因为机器人正走在半路上 —— 一段两分钟的导航期间事实流就是
+    不动的。光看「没有新事实」会在半路上把运行判结束，然后给一个「什么都没做完」的分。
+    """
+    monkeypatch.setattr(mcp_client, 'get_pending_actions', lambda: ['a1'])
+    monkeypatch.setitem(CASE['run'], 'budget_seconds', 0.3)
+
+    run = run_once()
+
+    monkeypatch.setitem(CASE['run'], 'budget_seconds', 30)
+    # 安静了，但有动作没完 —— 只能等到预算耗尽。
+    assert run.cases[0]['elapsed'] >= 0.3
+
+
+def test_the_run_records_when_the_user_spoke_and_when_it_interrupted(simulator, said):
+    """UX 那几个指标要知道这两个时刻，而事实流里没有 —— 它记的是机器人做了什么，
+    不是用户什么时候说的话。"""
+    run = run_once()
+
+    marks = run._marks
+    # 从「用户说完」起算，不从运行开始起算 —— 否则世界重置那几秒会被算进用户的等待。
+    assert marks['prompt_at'] >= marks['started']
+    assert len(marks['injections_at']) == 1
+    assert marks['injections_at'][0] >= marks['prompt_at']
+
+
+def test_a_legacy_case_that_still_carries_a_map_is_honoured(simulator, said):
+    legacy = {**CASE, 'run': {**CASE['run'], 'world': {'map': 'bj-2f',
+                                                       'spawn': {'x': 5.98}}}}
+    run_once(case=legacy)
+
+    args = simulator[0][1]
     assert args['map'] == 'bj-2f' and args['spawn']['x'] == 5.98
 
 
@@ -283,9 +511,9 @@ def test_repeats_each_get_their_own_seed(simulator, said):
         or len({c['score']['total'] for c in run.cases}) == 1
 
 
-def run_once(repeats=1, seed=0):
+def run_once(repeats=1, seed=0, case=None):
     run_id = benchmark_store.create_run('bj-2f-tour', n_repeats=repeats)
-    run = benchmark_runner.CaseRun(CASE, 'mcp-sim', repeats, seed, run_id, {})
+    run = benchmark_runner.CaseRun(case or CASE, 'mcp-sim', repeats, seed, run_id, {})
     benchmark_runner.set_current(run)
     asyncio.run(run._drive())
     return run
@@ -339,3 +567,142 @@ def test_the_gate_announces_itself(capsys):
     assert '智能控制未启动' in first and first.count('智能控制未启动') == 1  # 只说一次
     assert 'dds:/camera/objects' in first
     assert '丢弃 2 条' in second
+
+
+# ── 仿真器看不见非仿真的卡 ───────────────────────────────────────────────────
+
+def test_simulator_world_merges_what_the_simulator_cannot_see():
+    """**`sim_report` 只看得见仿真器自己那几张卡。**
+
+    画布上绑的若是 perception 的 `tts`（它合成真实音频、发到 `/perception/tts`），
+    仿真世界里不会留下任何痕迹 —— 运行日志左边 agent 明明在 `tts.speak`，右边
+    「世界真的做了什么」一句播报都没有，两边都没有报错。Orin6 上就是这么现形的。
+    """
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'nav_start', 't': 1.0, 'action_id': 'a1'},
+                    {'event': 'arrive', 't': 9.0, 'action_id': 'a1'}],
+         'acp_posts': [{'action_id': 'a1'}], 'trail_occupied': 0},
+        {'events': [{'event': 'speak_start', 't': 4.0, 'action_id': 's1'},
+                    {'event': 'speak_end', 't': 7.0, 'action_id': 's1'}],
+         'acp_posts': [{'action_id': 's1'}]})
+
+    assert [e['event'] for e in merged['events']] == [
+        'nav_start', 'speak_start', 'speak_end', 'arrive']
+    assert merged['trail_occupied'] == 0          # 只有仿真器算得出的量原样留着
+
+
+def test_an_action_both_sides_saw_is_not_counted_twice():
+    """仿真器的卡两边都会记：卡片返回给 agent-core 的 `action_id` 就是世界给这个动作
+    的 id。不去重的话导航会被数成两次，而时序和并行度全是按这些事件算的。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'nav_start', 't': 1.0, 'action_id': 'a1'}],
+         'acp_posts': []},
+        {'events': [{'event': 'nav_start', 't': 1.1, 'action_id': 'a1'}],
+         'acp_posts': []})
+
+    assert len(merged['events']) == 1
+
+
+def test_acp_posts_are_never_merged():
+    """`exactly_one_terminal_post` 数的就是「同一个动作上报了几次」。把两侧的 posts
+    按 action_id 去重，会把它要抓的那种真重复一起抹掉。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [], 'acp_posts': [{'action_id': 'a1'}, {'action_id': 'a1'}]},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': [{'action_id': 's1'}]})
+
+    assert merged['acp_posts'] == [{'action_id': 'a1'}, {'action_id': 'a1'}]
+
+
+def test_the_two_fact_clocks_are_put_on_one_base():
+    """**两边都用「相对秒数」，但相对的不是同一个起点。**
+
+    仿真器数的是本场景开始以来，记录器数的是本次录制开始以来，而场景通常在这次运行
+    之前就已经加载了。差十几秒就够了：合并后一排序，一条 `speak_start` 被顶到最前面，
+    而运行详情的右列拿最早那条事件当零点 —— 整列前移，看起来像机器人在被要求之前就
+    开了口。Orin6 上那次「开讲出现在 tts 调用之前」就是这个。
+    """
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'scenario_load', 't': 13.0, 'action_id': 'x'}],
+         'acp_posts': []},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': []},
+        t_offset=13.2)
+
+    assert [(e['event'], e['t']) for e in merged['events']] == [
+        ('scenario_load', 13.0), ('speak_start', 14.2)]
+
+
+def test_an_unalignable_world_shifts_nothing():
+    """对不齐就不搬。宁可两列差十几秒，也不要搬一个瞎猜的量 —— 搬错了，时序判定
+    （「到了再讲」）会拿错位的时间去比大小，而错位是看不出来的。"""
+    merged = benchmark_runner._merge_facts(
+        {'events': [{'event': 'scenario_load', 't': 5.0, 'action_id': 'x'}],
+         'acp_posts': []},
+        {'events': [{'event': 'speak_start', 't': 1.0, 'action_id': 's1'}],
+         'acp_posts': []})
+
+    assert [e['t'] for e in merged['events']] == [1.0, 5.0]
+
+
+def test_alignment_anchors_on_scenario_load_not_on_elapsed():
+    """**`elapsed` 和事件 `t` 在仿真器内部就不是一个基准。**
+
+    前者数的是本场景秒数，后者数的是仿真器的进程时钟 —— 一台跑了一个月的机器上是
+    三百多万秒。拿 `elapsed` 算出来的 offset 约等于 0，于是这一列照样错，只是错得
+    不那么显眼。锚点必须取仿真器自己在重置时记下的 `scenario_load`。
+    """
+    import asyncio
+
+    world = benchmark_runner.SimulatorWorld('mcp-x')
+    world._recorder = benchmark_facts.Recorder()
+    calls = []
+
+    async def _fake(tool, args):
+        calls.append(tool)
+        return {'elapsed': 4.2,          # 本场景秒数 —— 用它就错了
+                'events': [{'event': 'scenario_load', 't': 3377718.5},
+                           {'event': 'led', 't': 3377719.0}]}
+
+    world._call = _fake
+    asyncio.run(world._align())
+
+    assert world._t_offset == 3377718.5
+
+
+def test_a_run_started_before_any_conversation_backfills_its_session():
+    """**开跑那一刻 agent 可能还没有会话。**
+
+    agent-core 刚重启、这一轮之前没人说过话，`event.llm._session_id` 就是空的 ——
+    而会话恰恰是被这次运行的指令创建出来的。记成空之后再没人回头补，于是运行详情
+    左栏永远是「这次运行的对话记录已经没有了」，尽管右栏的世界事实一条不少，看起来
+    像 agent 什么都没做。Orin6 上就是这么现形的。
+    """
+    run_id = benchmark_store.create_run('没有会话就开跑')
+    run = benchmark_runner.CaseRun({}, None, 1, 0, run_id, {})
+    run.state = 'running'
+
+    import api.benchmark as api_benchmark
+    original, api_benchmark._current_session = api_benchmark._current_session, lambda: 'sess-1'
+    try:
+        assert run._session_id() == 'sess-1'
+        assert (benchmark_store.get_run(run_id) or {}).get('session_id') == 'sess-1'
+    finally:
+        api_benchmark._current_session = original
+        benchmark_store.delete_run(run_id)
+
+
+def test_a_finished_run_never_adopts_whatever_session_is_current():
+    """跑完的那条若补上「现在」的会话，等于把一段无关的对话安到一次历史运行上 ——
+    而它看起来完全正常：有轮次、有工具调用、时间也对得上窗口。"""
+    run_id = benchmark_store.create_run('跑完的')
+    run = benchmark_runner.CaseRun({}, None, 1, 0, run_id, {})
+    run.state = 'done'
+
+    import api.benchmark as api_benchmark
+    original, api_benchmark._current_session = api_benchmark._current_session, lambda: 'sess-9'
+    try:
+        assert run._session_id() == ''
+    finally:
+        api_benchmark._current_session = original
+        benchmark_store.delete_run(run_id)

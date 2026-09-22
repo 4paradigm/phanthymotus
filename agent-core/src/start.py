@@ -624,6 +624,11 @@ async def acp_complete(request: fastapi.Request):
     if not action_id:
         return {'ok': False, 'error': 'action_id required'}
 
+    # 基准测试的事实记录器要原样的这一份。顺序不重要 —— 记录器自己不依赖它，因为
+    # `mark_action_complete` 还有 SSE 那条调用路径根本不经过这个端点。
+    import benchmark_facts
+    benchmark_facts.note_acp_post(body)
+
     # 通道1: 解锁 sync() 等待
     mcp_client.mark_action_complete(action_id, body)
 

@@ -32,6 +32,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'benchmark-test.db'))
 
 import benchmark_store  # noqa: E402
+import config  # noqa: E402
 import mcp_client  # noqa: E402
 from api import benchmark  # noqa: E402
 
@@ -221,13 +222,77 @@ def test_an_offline_simulator_is_not_offered(monkeypatch):
     assert benchmark.find_simulator() is None
 
 
-def test_available_is_what_hides_the_panel_on_a_shipped_robot(monkeypatch):
+def test_a_running_run_serves_live_facts_instead_of_an_empty_world(monkeypatch):
+    """**跑动进行中，事实一条都还没落盘** —— 那是每次重复跑完才写的。
+
+    于是详情页的「世界真的做了什么」一直是空的，刷新也没用，看起来像世界什么都没做。
+    Orin6 上就是这么被问到的：agent 明明在 `navigate_to_tag`，右栏一片空白。
+    """
+    import asyncio
+
+    import benchmark_runner
+
+    run_id = benchmark_store.create_run('跑着的')
+
+    class _World:
+        async def facts(self):
+            return {'events': [{'event': 'nav_start', 't': 1.0, 'label': 'P3'},
+                               {'event': 'arrive', 't': 9.0, 'label': 'P3'}],
+                    'acp_posts': []}
+
+    class _Live:
+        state = 'running'
+        world = _World()
+
+        def __init__(self, rid):
+            self.run_id = rid
+
+    monkeypatch.setattr(benchmark_runner, 'current', lambda: _Live(run_id))
+    try:
+        result = asyncio.run(benchmark.run_timeline(run_id))
+    finally:
+        benchmark_store.delete_run(run_id)
+
+    assert [e['kind'] for e in result['world']] == ['nav_start', 'arrive']
+
+
+def test_a_finished_run_reads_what_was_stored_not_whatever_is_running_now(monkeypatch):
+    """跑完的那次读的必须是它自己的记录。拿当前跑动的事实去填一条历史，
+    等于把两次运行混成一条 —— 而分数还挂在旧的那条上。"""
+    import asyncio
+
+    import benchmark_runner
+
+    run_id = benchmark_store.create_run('跑完的')
+    benchmark_store.finish_run(run_id, status='done')
+
+    class _Live:
+        state = 'running'
+        run_id = 'another'
+
+    monkeypatch.setattr(benchmark_runner, 'current', lambda: _Live())
+    try:
+        result = asyncio.run(benchmark.run_timeline(run_id))
+    finally:
+        benchmark_store.delete_run(run_id)
+
+    assert result['world'] == []
+
+
+def test_the_panel_is_available_on_a_robot_with_no_simulator(monkeypatch):
+    """R1 上抓到的：装了最新 agent-core，设置里却没有基准测试这一项，而且没有任何
+    迹象说明为什么没有。
+
+    入口原先挂在「有没有仿真器」上。但基准测试测的是**解决方案** —— 裁判一直是纯函数，
+    事实流现在真机上也有（`benchmark_facts`），仿真器在不在场只决定世界能不能重置，
+    以及有没有轨迹占用这类只有它算得出的量。两件都不是「入口该不该存在」。
+    """
     monkeypatch.setattr(mcp_client, 'registry', {})
 
     result = asyncio.run(benchmark.available())
 
-    assert result['available'] is False
-    assert result['mcp_id'] is None
+    assert result['available'] is True
+    assert result['simulator'] is None      # 前端据此决定要不要走确认
 
 
 # ── 被测配置 ────────────────────────────────────────────────────────────────

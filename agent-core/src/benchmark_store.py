@@ -81,6 +81,11 @@ _SCHEMA = (
 # 不会自己长出来。重复执行会报 duplicate column，吞掉即可。
 _ADDITIONS = (
     'ALTER TABLE benchmark_case ADD COLUMN facts TEXT',
+    # 判定的**理由**和七条原则的**指标**。原先只存失败项的文本（`assertions`），
+    # 于是跑完之后「分数为什么是这个」答不了 —— 而那恰恰是打开这个面板的第一个问题。
+    # 裁判的逐步比对尤其：它是排查时最有用的那一份，却只活在内存里。
+    'ALTER TABLE benchmark_case ADD COLUMN results TEXT',
+    'ALTER TABLE benchmark_case ADD COLUMN observations TEXT',
     'ALTER TABLE benchmark_run ADD COLUMN session_id TEXT',
     'ALTER TABLE benchmark_run ADD COLUMN agent_track TEXT',
 )
@@ -99,9 +104,16 @@ def _get_conn():
 
 
 def _dumps(value) -> str:
+    """序列化，序列化不了就**说出来**。
+
+    原先这里是静默返回 `'{}'`。于是指标块里一个不可序列化的值，让整块数据消失得无声
+    无息 —— 读出来是「这次没有指标」，而实际是「存的时候出错了」。两者在界面上长得
+    一模一样，而修法完全不同。
+    """
     try:
         return json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        print(f'[benchmark] 存不下这段数据，已丢弃：{type(exc).__name__}: {exc}')
         return '{}'
 
 
@@ -132,20 +144,26 @@ def create_run(suite: str, *, tier: str = 'fidelity', n_repeats: int = 1,
 def add_case(run_id: str, *, scenario: str, repeat_idx: int = 0, seed: int = 0,
              ok: bool = False, outcome: str = '', score: float | None = None,
              elapsed_ms: int | None = None, assertions: list | None = None,
-             artifacts_ref: str = '', facts: dict | None = None) -> None:
+             artifacts_ref: str = '', facts: dict | None = None,
+             results: list | None = None, observations: dict | None = None) -> None:
     """记一次 repeat 的结果。
 
     `facts` 是驱动那一侧的完整事实（事件流、播报记录、ACP 上报）。存下来，是因为
     仿真器的世界**下一次运行一开始就被重置**了 —— 不在这里留一份，一次运行结束之后
     就再也没法回看它到底发生了什么，而「分数为什么是这个」恰恰只能从那里回答。
+
+    `results` 是每一项的判定与**理由**，`observations` 是七条原则的指标块。同样是
+    「不存就没了」：它们原先只活在内存里的 `CaseRun`，跑完那个对象就被下一次运行顶掉。
+    裁判对参考流程的逐步比对尤其 —— 那是排查时最有用的一份，而它一次都没落过盘。
     """
     conn = _get_conn()
     conn.execute(
         'INSERT INTO benchmark_case (run_id, scenario, repeat_idx, seed, ok, outcome, '
-        'score, elapsed_ms, assertions, artifacts_ref, facts) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        'score, elapsed_ms, assertions, artifacts_ref, facts, results, observations) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
         (run_id, scenario, int(repeat_idx), int(seed), 1 if ok else 0, outcome,
          score, elapsed_ms, _dumps(assertions or []), artifacts_ref,
-         _dumps(facts or {})))
+         _dumps(facts or {}), _dumps(results or []), _dumps(observations or {})))
     conn.commit()
 
 
@@ -165,6 +183,22 @@ def finish_run(run_id: str, *, status: str = 'done', score_total: float | None =
         'scores_by_dim=?, detail=?, agent_track=? WHERE id=?',
         (status, time.time(), score_total, score_stdev,
          _dumps(scores_by_dim or {}), detail, _dumps(agent_track or []), run_id))
+    conn.commit()
+
+
+def set_session(run_id: str, session_id: str) -> None:
+    """补记会话 id。
+
+    开跑那一刻 agent 可能还**没有**会话 —— agent-core 刚重启、这一轮之前没人说过话，
+    `event.llm._session_id` 就是空的，而会话正是被这次运行的指令创建出来的。记成空
+    之后再没人回头补，于是运行详情左栏永远是「这次运行的对话记录已经没有了」，尽管
+    右栏的世界事实一条不少。
+    """
+    if not session_id:
+        return
+    conn = _get_conn()
+    conn.execute('UPDATE benchmark_run SET session_id=? WHERE id=?',
+                 (session_id, run_id))
     conn.commit()
 
 
@@ -223,10 +257,12 @@ def get_run(run_id: str) -> dict | None:
         {'scenario': c[0], 'repeat_idx': c[1], 'seed': c[2], 'ok': bool(c[3]),
          'outcome': c[4], 'score': c[5], 'elapsed_ms': c[6],
          'assertions': _loads(c[7], []), 'artifacts_ref': c[8],
-         'facts': _loads(c[9], {})}
+         'facts': _loads(c[9], {}), 'results': _loads(c[10], []),
+         'observations': _loads(c[11], {})}
         for c in conn.execute(
             'SELECT scenario, repeat_idx, seed, ok, outcome, score, elapsed_ms, '
-            'assertions, artifacts_ref, facts FROM benchmark_case WHERE run_id=? ORDER BY id',
+            'assertions, artifacts_ref, facts, results, observations '
+            'FROM benchmark_case WHERE run_id=? ORDER BY id',
             (run_id,)).fetchall()
     ]
     return run
@@ -302,3 +338,61 @@ def delete_case(case_id: str) -> bool:
     cursor = conn.execute('DELETE FROM case_library WHERE id=?', (case_id,))
     conn.commit()
     return cursor.rowcount > 0
+
+
+# ── 两次运行之间，分数真的动了吗 ──────────────────────────────────────────────
+#
+# 原先这里只有 mean ± stdev，而面板照着它说「涨了」是没有依据的：LLM 是随机的，
+# 一次运行的分数是分布里的一个样本，两个样本均值不同不等于有差别。
+#
+# `tools/llm_bench` 已经把这件事做对过一次，它的 README 记着当初为什么必须这么做：
+# 「显著性用统计检验，不靠重复测量……任一条不过，报告就判『测不出显著差异』，
+# 不排名、不给推荐。」这里照搬，不重写。
+
+def _stats():
+    """`llm_bench.stats`，拿不到就返回 None。
+
+    它在 `tools/` 下，不是 `src/` 的一部分。**必须走包命名空间** —— 扁平的
+    `import config` 会被 `src/config.py` 顶掉（`tests/test_llm_bench.py` 开头记着
+    这个坑）。拿不到就老实说算不了，而不是退回自己手搓一个检验。
+    """
+    import pathlib
+    import sys
+    tools = str(pathlib.Path(__file__).resolve().parents[1] / 'tools')
+    if tools not in sys.path:
+        sys.path.append(tools)
+    try:
+        from llm_bench import stats
+        return stats
+    except Exception:
+        return None
+
+
+def compare_runs(baseline_id: str, current_id: str) -> dict:
+    """两次跑同一个用例，分数的差异站不站得住。
+
+    **按重复序号配对**，因为第 i 次重复两边用的是同一个 seed（`seed + index`）——
+    seed 存在的理由就是让两次运行之间有东西可以配对。样本不足（n<3）时返回
+    `available: False` 并说明原因，而不是给一个看起来很确定的结论。
+    """
+    stats = _stats()
+    if stats is None:
+        return {'available': False, 'reason': '取不到 llm_bench.stats，算不了显著性'}
+
+    def scores(run_id):
+        run = get_run(run_id) or {}
+        return {c.get('repeat_idx'): c.get('score') for c in (run.get('cases') or [])
+                if c.get('score') is not None}
+
+    before, after = scores(baseline_id), scores(current_id)
+    shared = sorted(set(before) & set(after))
+    deltas = [float(after[i]) - float(before[i]) for i in shared]
+    result = stats.significance(deltas)
+    result['paired'] = len(shared)
+    if not result.get('available'):
+        return result
+    # 「测不出显著差异」是一个结论，不是缺省值 —— 面板据此**不**给涨跌箭头。
+    result['verdict'] = ('更好' if result['significant'] and result['median_delta'] > 0
+                         else '更差' if result['significant']
+                         else '测不出显著差异')
+    return result

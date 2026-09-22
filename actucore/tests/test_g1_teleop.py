@@ -316,6 +316,7 @@ def test_driver_ack_waits_for_post_command_feedback(monkeypatch, action, fresh_w
     monkeypatch.setitem(sys.modules,'std_msgs.msg',SimpleNamespace(String=SimpleNamespace))
     link=object.__new__(DriverLink)
     link.lease={'session_id':'new','boot_id':'boot','secret':'00'*32};link.seq=0
+    link.release_requested_ns=0;link.management_request=None
     link.call=lambda *a:None
     old={'monotonic_ns':time.monotonic_ns()-10_000_000,'boot_id':'boot',
          'session_id':'old','state':'hold','hold_confirmed':True,'stop_confirmed':True,
@@ -341,7 +342,7 @@ def test_driver_ack_waits_for_post_command_feedback(monkeypatch, action, fresh_w
     else:
         invoke()
         if action=='stop':assert link.lease is None
-    assert link.condition.waits==1
+    assert link.condition.waits==(2 if action=='stop' and not fresh_wrong_session else 1)
     assert len(published)==(1 if action=='send' else 0)
 
 
@@ -499,9 +500,16 @@ def test_late_stop_feedback_reconciles_only_confirmed_requested_release(invalid)
     from teleop.adapter import DriverLink
     link=DriverLink.__new__(DriverLink);link.condition=threading.Condition()
     lease={'boot_id':'boot','session_id':'session','secret':'00'*32};link.lease=lease
+    link.release_requested_ns=0;link.management_request=None
+    link.latest={'monotonic_ns':time.monotonic_ns(),'boot_id':'boot',
+                 'ownership_held':True,'stop_confirmed':False}
     def timeout(*a):raise TimeoutError('response delayed')
     link.call=timeout
-    with pytest.raises(TimeoutError):link.stop(time.monotonic()+.1)
+    # A lost HTTP reply is no longer final: stop waits for independent DDS
+    # confirmation. An old sample cannot acknowledge that release request.
+    with pytest.raises(ValueError,match='^driver_feedback_ack_timeout$'):
+        link.stop(time.monotonic()+.01)
+    assert link.lease==lease
     requested=link.release_requested_ns
     state={'monotonic_ns':time.monotonic_ns(),'boot_id':'boot','ownership_held':False,'stop_confirmed':True}
     if invalid=='old':state['monotonic_ns']=requested-1

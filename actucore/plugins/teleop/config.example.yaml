@@ -1,5 +1,5 @@
-name: ActuCore PICO Shadow
-mcp_port: 15740
+# Merge plugins.teleop into the existing ActuCore config; preserve other cards.
+mcp_port: 15730
 plugins:
   teleop:
     enabled: true

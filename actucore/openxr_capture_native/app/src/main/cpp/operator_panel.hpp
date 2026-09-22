@@ -40,8 +40,9 @@ struct OperatorPanel {
       if(std::abs(h-y)>height/2)continue;
       for(int j=0;j<3;++j)if(std::abs(x-center(j))<width/2){
         hover=j;cursor={x,h,z};pointing=true;
-        // Start/return require released grips; stop is always clickable.
-        if(edge && (j==2 || (!frame.left_input.squeeze_pressed && !frame.right_input.squeeze_pressed)))
+        // Finish explicitly ends input in android_main before sending another
+        // frame. It must remain clickable while the operator holds a grip.
+        if(edge && (j!=0 || (!frame.left_input.squeeze_pressed && !frame.right_input.squeeze_pressed)))
           if(pending!="stop")pending=j==0?"start":j==1?"finish":"stop";
       }
     }

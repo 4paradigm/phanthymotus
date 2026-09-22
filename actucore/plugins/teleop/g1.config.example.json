@@ -1,6 +1,6 @@
 {
-  "name": "ActuCore PICO Teleop",
-  "mcp_port": 15740,
+  "name": "ActuCore",
+  "mcp_port": 15730,
   "plugins": {
     "teleop": {
       "enabled": true,

@@ -17,6 +17,21 @@ from .dispatch import AdapterAck
 from .kinematics import RelativeMapping, transform
 
 
+def validate_driver_endpoint(cfg):
+    """Validate editable connection fields before saving or allocating ROS nodes."""
+    if 'namespace' in cfg and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}',cfg['namespace']):
+        raise ValueError('invalid_namespace')
+    if 'driver_mcp_url' not in cfg:return
+    try:
+        url=urllib.parse.urlsplit(cfg['driver_mcp_url'])
+        valid=(url.scheme=='http' and not url.username and not url.password
+               and url.path=='/mcp' and not url.query and not url.fragment
+               and ipaddress.ip_address(url.hostname).is_loopback
+               and (url.port is None or 0<url.port<=65535))
+    except (ValueError,TypeError):valid=False
+    if not valid:raise ValueError('driver_mcp_must_be_loopback')
+
+
 class DriverLink:
     def __init__(self, cfg, executor):
         from rclpy.node import Node
@@ -27,9 +42,7 @@ class DriverLink:
         bundled=Path('/deploy/dds-local.xml')
         if not profile.is_file() or not bundled.is_file() or profile.read_bytes()!=bundled.read_bytes():
             raise ValueError('local_dds_profile_mismatch')
-        url=urllib.parse.urlsplit(cfg['driver_mcp_url'])
-        if url.scheme!='http' or url.username or url.password or url.path!='/mcp' or not ipaddress.ip_address(url.hostname).is_loopback:
-            raise ValueError('driver_mcp_must_be_loopback')
+        validate_driver_endpoint(cfg)
         self.url=cfg['driver_mcp_url'];self.executor=executor
         self.opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.condition=threading.Condition();self.latest=None
@@ -44,7 +57,6 @@ class DriverLink:
         self.node=Node('actucore_teleop',context=executor.context)
         executor.add_node(self.node)
         ns=cfg['namespace']
-        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,63}',ns):raise ValueError('invalid_namespace')
         self.topic=f'/{ns}/motion/teleop'
         self.qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT,
                            history=HistoryPolicy.KEEP_LAST,durability=DurabilityPolicy.VOLATILE)
