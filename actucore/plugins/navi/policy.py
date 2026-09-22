@@ -74,7 +74,22 @@ class Config:
     stop_distance_m: float = 1.2
     slow_distance_m: float = 1.8
     obstacle_stop_m: float = 0.8
-    align_tol: float = 0.08
+    # 全速前进所允许的横向偏差。**不是一道硬门** —— 超过它只按比例减速，到
+    # align_full_stop 才完全不前进，见 `_alignment_scale`。
+    align_tol: float = 0.15
+    # 偏到这个程度就只转不走：目标几乎在视野边缘，直着走过去是走向别处。
+    align_full_stop: float = 0.45
+    # 判定到达时的对正容差，比上面那个**松得多**，而且必须松。
+    #
+    # bearing 是归一化的横向偏移，不是角度：同样的侧移，5 米外几乎不动画面，
+    # 0.7 米处能把它甩出好几倍容差。用 align_tol 当到达条件，就是要求一个站在
+    # 面前的人一动不动 —— 真机上表现为距离早就进了 0.73 m，卡片却一直在「先转
+    # 正」，永远不判到达。而「转向算运动」又让 idle 超时救不了它：原地摆动是不
+    # 会停滞的。
+    arrive_align_tol: float = 0.30
+    # 已进入停止距离、却迟迟对不正时，多久之后接受「到了」。站在目标面前却因为
+    # 对不正而无限打转，比朝向差一点糟得多 —— 位置已经到了，朝向是锦上添花。
+    arrive_patience_s: float = 3.0
     k_yaw: float = 1.2
     k_fwd: float = 0.6
     vx_max: float = 0.4
@@ -112,6 +127,7 @@ class State:
     searched_rad: float = 0.0
     commanded_vx: float = 0.0
     moving_for_s: float = 0.0
+    close_for_s: float = 0.0
     idle_for_s: float = 0.0
     arrived: bool = False
     # Set once, read forever after: failure is terminal for one navigate_to.
@@ -267,28 +283,46 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # `wz` is positive counter-clockwise, so the sign is inverted here.
     wz = _clamp(-config.k_yaw * bearing, config.wz_max)
 
-    if distance is not None and distance <= config.stop_distance_m \
-            and abs(bearing) <= config.align_tol:
+    within = distance is not None and distance <= config.stop_distance_m
+    if within:
+        state.close_for_s += dt
+    else:
+        state.close_for_s = 0.0
+
+    # 到达：位置到了，且大致朝着它 —— 或者已经在原地转了够久。后半句是必须的，
+    # 见 `arrive_patience_s`。
+    if within and (abs(bearing) <= config.arrive_align_tol
+                   or state.close_for_s >= config.arrive_patience_s):
         state.arrived = True
         # One explicit zero before going quiet, so the chassis stops on a
         # command rather than on a watchdog timeout — arriving is a success and
         # should not look like a dropped link in the driver's log.
         return Decision(_twist(0.0, 0.0), ARRIVED,
-                        f"target at {distance:.2f} m, stop distance reached",
+                        f"target at {distance:.2f} m, stop distance reached"
+                        + ("" if abs(bearing) <= config.arrive_align_tol else
+                           f" (still {bearing:+.2f} off-centre after "
+                           f"{state.close_for_s:.1f}s in range; not waiting to "
+                           f"align — see arrive_patience_s)"),
                         distance_m=distance, bearing=bearing)
 
-    if abs(bearing) > config.align_tol:
-        # Turn in place first. Driving while badly misaligned traces an arc
-        # into whatever is beside the target.
+    # 对正程度连续地缩放前进速度，而不是一道开关。
+    #
+    # 硬门（偏差 > align_tol 就 vx=0）在近处必然死锁：bearing 是归一化横向偏移，
+    # 同样的侧移在 0.7 m 处远大于在 5 m 处，于是站在机器人面前的人只要轻微移动，
+    # 卡片就永远跨不过那道门 —— 真机上表现为「人就在前面，动的却一直是 wz」。
+    # 连续缩放保留了「偏得厉害就先转」的意图，而没有那个门槛。
+    align = _alignment_scale(bearing, config)
+    if align <= 0.0:
         state.commanded_vx = 0.0
         return Decision(_twist(0.0, wz), ALIGNING,
                         f"target off-centre by {bearing:+.2f} rad, turning in place first",
                         distance_m=distance, bearing=bearing)
 
-    vx = config.vx_max
+    vx = config.vx_max * align
     status, reason = APPROACHING, "approaching"
     if distance is not None:
-        vx = min(vx, max(0.0, config.k_fwd * (distance - config.stop_distance_m)))
+        vx = min(vx, max(0.0, config.k_fwd * (distance - config.stop_distance_m)
+                         * align))
         reason = f"target at {distance:.2f} m"
 
     vx, wz, status, reason = _avoid(vx, wz, bands, config, status, reason)
@@ -336,6 +370,21 @@ def _account_idle(decision: Decision, state: State, config: Config,
         f"(last state: {decision.status} — {decision.reason}); giving up")
     return Decision(None, FAILED, state.failed_reason,
                     distance_m=decision.distance_m, bearing=decision.bearing)
+
+
+def _alignment_scale(bearing: float, config: Config) -> float:
+    """前进速度乘的那个系数：对得越正走得越快，偏得厉害就只转不走。
+
+    1.0 直到 align_tol，之后线性降到 align_full_stop 处的 0。返回 0 表示原地转 ——
+    目标几乎在视野边缘，直着走过去是走向别处。
+    """
+    offset = abs(bearing)
+    if offset <= config.align_tol:
+        return 1.0
+    if offset >= config.align_full_stop:
+        return 0.0
+    span = max(1e-6, config.align_full_stop - config.align_tol)
+    return (config.align_full_stop - offset) / span
 
 
 def _avoid(vx, wz, bands, config: Config, status, reason):

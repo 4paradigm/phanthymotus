@@ -613,3 +613,75 @@ def test_both_colour_shapes_produce_the_same_key():
     """So a card keeps working across a change of `publish_color`."""
     assert (P.object_key({"name": "person", "color": _FULL_COLOUR})
             == P.object_key({"name": "person", "color": "dim muted green"}))
+
+
+# ── close range: the two deadlocks ───────────────────────────────────────────
+#
+# Both were reported from r1_sz with a person standing right in front of the
+# robot: it never declared arrival, and the only thing moving was wz. Both come
+# from the same property — `bearing` is a normalised lateral offset, not an
+# angle, so the same sideways step subtends far more of it at 0.7 m than at
+# 5 m. Any fixed threshold that works far away becomes unreachable up close.
+
+
+def test_a_target_straight_ahead_and_close_is_driven_towards_not_just_turned():
+    """"I am right in front of it and all it does is turn." A hard gate on
+    `align_tol` made vx zero for any wobble a standing person produces."""
+    state = _state()
+    decision = _step(detections=_detections(_obj(x=0.18)),
+                     depth=_depth(map_=_solid_depth(4.0)), state=state)
+    assert decision.status == P.APPROACHING
+    assert decision.values[0] > 0
+
+
+def test_forward_speed_scales_with_alignment_instead_of_switching():
+    aligned = _step(detections=_detections(_obj(x=0.0)),
+                    depth=_depth(map_=_solid_depth(4.0))).values[0]
+    off = _step(detections=_detections(_obj(x=0.30)),
+                depth=_depth(map_=_solid_depth(4.0))).values[0]
+    assert 0 < off < aligned
+
+
+def test_a_target_near_the_edge_is_still_turned_to_first():
+    """The intent of the old gate survives: driving at something almost out of
+    frame is driving somewhere else."""
+    decision = _step(detections=_detections(_obj(x=0.8)),
+                     depth=_depth(map_=_solid_depth(4.0)))
+    assert decision.status == P.ALIGNING and decision.values[0] == 0.0
+
+
+def test_arrival_does_not_require_the_precision_the_drive_gate_does():
+    """Arrival used to need |bearing| <= align_tol, which at 0.7 m asks a person
+    to hold still. The position is what arriving is about."""
+    state = _state()
+    decision = _step(detections=_detections(_obj(x=0.25)),
+                     depth=_depth(map_=_solid_depth(0.8)), state=state)
+    assert decision.status == P.ARRIVED
+
+
+def test_being_close_but_never_aligned_still_arrives_eventually():
+    """The deadlock in full: inside the stop distance, turning for ever.
+    `idle_timeout_s` cannot catch it either — turning counts as motion."""
+    config = _cfg(arrive_patience_s=0.5, arrive_align_tol=0.01)
+    state = _state()
+    for _ in range(12):
+        decision = _step(detections=_detections(_obj(x=0.30)),
+                         depth=_depth(map_=_solid_depth(0.8)),
+                         config=config, state=state, dt=0.1)
+        if decision.status == P.ARRIVED:
+            break          # the terminal reply is sticky; catch the moment
+    assert decision.status == P.ARRIVED
+    assert "not waiting to align" in decision.reason
+
+
+def test_leaving_the_stop_distance_resets_the_patience():
+    """Otherwise a moment spent close early on would count towards arriving
+    much later, somewhere else entirely."""
+    config = _cfg(arrive_patience_s=1.0, arrive_align_tol=0.01)
+    state = _state()
+    _step(detections=_detections(_obj(x=0.3)), depth=_depth(map_=_solid_depth(0.8)),
+          config=config, state=state, dt=0.5)
+    assert state.close_for_s == 0.5
+    _step(detections=_detections(_obj(x=0.3)), depth=_depth(map_=_solid_depth(5.0)),
+          config=config, state=state, dt=0.5)
+    assert state.close_for_s == 0.0
