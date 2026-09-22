@@ -21,13 +21,18 @@ def _local_url(service):
     try:
         p = urlsplit(url)
         good = (service.get('transport', 'http') == 'http' and p.scheme == 'http'
-                and ipaddress.ip_address(p.hostname).is_loopback and p.path == '/mcp'
-                and not (p.username or p.password or p.query or p.fragment)
+                and (p.hostname == 'localhost' or ipaddress.ip_address(p.hostname).is_loopback)
+                and p.path == '/mcp' and p.username is None and p.password is None
+                and not (p.query or p.fragment)
                 and (p.port is None or 0 < p.port < 65536))
     except (ValueError, TypeError):
         good = False
     if not good:
         raise TeleopProjectError('运动控制和执行卡必须来自已注册的同机 Driver')
+    if p.hostname == 'localhost':
+        # Driver registration uses localhost. Bind a literal loopback endpoint
+        # so the resulting control session never depends on name resolution.
+        return p._replace(netloc='127.0.0.1' + (f':{p.port}' if p.port is not None else '')).geturl()
     return url
 
 

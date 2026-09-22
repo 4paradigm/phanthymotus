@@ -59,6 +59,44 @@ def test_template_is_idempotent_registered_and_has_feedback_without_dag_cycle():
     assert feedback[0]['fromTopic'] == META['feedback_topic']
 
 
+@pytest.mark.parametrize('registered_url,bound_url', [
+    ('http://localhost:15707/mcp', 'http://127.0.0.1:15707/mcp'),
+    ('http://LOCALHOST:15707/mcp', 'http://127.0.0.1:15707/mcp'),
+    ('http://localhost/mcp', 'http://127.0.0.1/mcp'),
+    ('http://127.0.0.1:15707/mcp', 'http://127.0.0.1:15707/mcp'),
+    ('http://[::1]:15707/mcp', 'http://[::1]:15707/mcp'),
+])
+def test_registered_loopback_driver_builds_and_resolves_three_cards_without_dns(
+        registered_url, bound_url, monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda *a, **k: pytest.fail('unexpected DNS lookup'))
+    registry = copy.deepcopy(REGISTRY)
+    registry[1].update(url=registered_url, transport='http')
+    assert [target['mcp_id'] for target in motion_targets(registry)] == ['driver']
+    layout = build_motion_template(BARE, registry, 'vr', 'driver')
+    assert [card['toolName'] for card in layout['cards']] == ['teleop', 'motion_control', 'arm']
+    binding = resolve_bindings(layout, registry)['vr']
+    assert binding['url'] == binding['execution_binding']['url'] == bound_url
+    assert registry[1]['url'] == registered_url  # No registry mutation or re-registration.
+    assert len([edge for edge in layout['connections'] if edge.get('role') == 'feedback']) == 1
+
+
+@pytest.mark.parametrize('url', [
+    'http://localhost.example/mcp', 'http://robot.local/mcp', 'http://localhost./mcp',
+    'http://%6cocalhost/mcp', 'http://192.0.2.1/mcp', 'https://localhost/mcp',
+    'http://user@localhost/mcp', 'http://user:password@localhost/mcp',
+    'http://@localhost/mcp', 'http://localhost/mcp?redirect=1',
+    'http://localhost/mcp#fragment', 'http://localhost/other',
+    'http://localhost:0/mcp', 'http://localhost:65536/mcp',
+])
+def test_localhost_support_does_not_accept_remote_or_ambiguous_endpoints(url):
+    registry = copy.deepcopy(REGISTRY)
+    registry[1]['url'] = url
+    assert motion_targets(registry) == []
+    with pytest.raises(TeleopProjectError):
+        resolve_bindings(template(), registry)
+
+
 @pytest.mark.parametrize('mutate', [
     lambda l, r: l['connections'].pop(1),
     lambda l, r: l['connections'].append(copy.deepcopy(l['connections'][1])),
