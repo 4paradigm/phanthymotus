@@ -68,7 +68,9 @@ COPY actucore/plugins/teleop/requirements.bundle.lock /tmp/teleop-bundle.lock
 # Fetch the fixed, signed PICO APK as part of the ordinary image build.
 COPY actucore/openxr_capture_native/package-manifest.json /tmp/pico-package.json
 COPY actucore/openxr_capture_native/scripts/fetch_apk.py /tmp/fetch_pico_apk.py
-RUN python3 /tmp/fetch_pico_apk.py /tmp/pico-package.json /work/onboarding
+RUN if [ "$JP_VERSION" = "61" ]; then \
+        python3 /tmp/fetch_pico_apk.py /tmp/pico-package.json /work/onboarding; \
+    fi
 RUN if [ "$JP_VERSION" = "61" ]; then \
         python3 -m pip install --no-cache-dir --require-hashes -i ${PYPI_MIRROR} -r /tmp/teleop-bundle.lock && \
         python3 -c 'import pinocchio, scipy, aiortc, av'; \
@@ -78,7 +80,9 @@ RUN if [ "$JP_VERSION" = "61" ]; then \
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
-RUN python3 /work/plugins/teleop/onboarding.py /work/onboarding
+RUN if [ "$JP_VERSION" = "61" ]; then \
+        python3 /work/plugins/teleop/onboarding.py /work/onboarding; \
+    fi
 COPY deploy/fetch_g1_collision.py /tmp/fetch_g1_collision.py
 RUN if [ "$JP_VERSION" = "61" ]; then \
         python3 /tmp/fetch_g1_collision.py --manifest-dir /work/plugins/teleop/models/g1_collision; \

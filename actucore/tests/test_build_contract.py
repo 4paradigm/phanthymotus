@@ -165,6 +165,29 @@ def test_jetpack_arg_is_available_after_from_and_bare_build_stays_jp511():
     assert 'ARG JP_VERSION' in lines[start:]
 
 
+@pytest.mark.parametrize('dockerfile,jp,legacy_flag,enabled', [
+    ('Dockerfile.cpu', '61', '0', True),
+    ('Dockerfile.jetson', '61', '0', True),
+    ('Dockerfile.jetson', '61', '1', True),
+    ('Dockerfile.jetson', '511', '0', False),
+    ('Dockerfile.jetson', '511', '1', False),
+])
+def test_apk_fetch_and_prepare_follow_supported_image_version(build_env, dockerfile, jp, legacy_flag, enabled):
+    _, env, log = build_env
+    lines = instructions(ROOT / 'actucore' / dockerfile)
+    commands = [line[4:] for line in lines if line.startswith('RUN ') and
+                ('/tmp/fetch_pico_apk.py' in line or '/work/plugins/teleop/onboarding.py' in line)]
+    assert len(commands) == 2
+    for command in commands:
+        result = subprocess.run(['/bin/sh', '-c', command],
+            env={**env, 'JP_VERSION':jp, 'WITH_TELEOP':legacy_flag}, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    assert calls(log) == ([
+        ['python3', '/tmp/fetch_pico_apk.py', '/tmp/pico-package.json', '/work/onboarding'],
+        ['python3', '/work/plugins/teleop/onboarding.py', '/work/onboarding'],
+    ] if enabled else [])
+
+
 @pytest.mark.parametrize('dockerfile', ['Dockerfile.cpu', 'Dockerfile.jetson'])
 def test_site_readiness_module_and_vla_share_one_shipped_plugin_tree(dockerfile):
     copies = [shlex.split(line)[1:] for line in instructions(ROOT / 'actucore' / dockerfile)

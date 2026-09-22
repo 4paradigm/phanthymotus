@@ -438,9 +438,60 @@ async def get_all_tool_configs():
 
 
 
+_motion_config_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _save_motion_control_config(mcp_id: str, body: Any):
+    """Persist only a Driver-accepted configuration confirmed by a fresh info.
+
+    A lost receipt can leave runtime configuration uncertain. Keep the old saved
+    configuration and report failure rather than queueing an unconfirmed value
+    to be replayed on the next Driver registration.
+    """
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.config import payload_of
+    if not isinstance(body, dict) or 'action' in body or 'instance_id' in body:
+        raise fastapi.HTTPException(status_code=400, detail='配置必须是对象')
+    from tool_config import find_tool
+    properties = (find_tool(mcp_id, 'motion_control').get('configSchema') or {}).get('properties') or {}
+    if not properties:
+        raise fastapi.HTTPException(status_code=409, detail='运动控制卡未声明配置能力，请刷新服务')
+    if any(key not in properties for key in body):
+        # Do not let a permissive Driver apply known fields before ignoring an
+        # unknown one: validate the full request before any side effect.
+        raise fastapi.HTTPException(status_code=400, detail='包含运动控制卡未声明的配置字段，未下发')
+
+    async def call(action, **values):
+        try:
+            result = await mcp_call_tool(mcp_id, MCPCallRequest(
+                tool='motion_control', arguments={'action': action, **values}), timeout_s=10.)
+        except (TimeoutError, OSError) as error:
+            raise fastapi.HTTPException(status_code=503, detail='Driver 配置未确认：服务不可达或超时') from error
+        data = payload_of(result)
+        if (result.get('code') != 200 or not data or data.get('error')
+                or data.get('state') in ('error', 'fault')):
+            reason = str(data.get('error') or data.get('code') or result.get('message') or '无有效回执')[:240]
+            raise fastapi.HTTPException(status_code=409, detail='Driver 配置未确认：'+reason)
+        return data
+
+    async with _motion_config_locks.setdefault(mcp_id, asyncio.Lock()):
+        receipt = await call('config', **body)
+        accepted = receipt.get('config')
+        if (receipt.get('state') != 'configured' or not isinstance(accepted, dict)
+                or not accepted or any(key not in accepted or accepted[key] != value for key, value in body.items())):
+            raise fastapi.HTTPException(status_code=409, detail='Driver 配置回执与请求不一致，未保存')
+        current = (await call('info')).get('config')
+        if not isinstance(current, dict) or current != accepted:
+            raise fastapi.HTTPException(status_code=409, detail='Driver 配置读回不一致，未保存；请核对服务状态后重试')
+        config.main[tool_config_key(mcp_id, 'motion_control')] = dict(current)
+        return {'code': 200, 'data': dict(current), 'applied': True}
+
+
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
+    if tool_name == 'motion_control':
+        return await _save_motion_control_config(mcp_id, body)
     if tool_name == 'teleop':
         from api.mcp_manage import mcp_call_tool, MCPCallRequest
         if not isinstance(body, dict) or 'action' in body or 'instance_id' in body:
@@ -484,6 +535,8 @@ async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
     """Save config for a specific tool instance and apply it."""
+    if tool_name == 'motion_control':
+        raise fastapi.HTTPException(status_code=400, detail='运动控制卡仅支持共享配置，请使用卡片配置入口')
     config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
     apply_tool_config(mcp_id, tool_name, body, instance_id)
     return {'code': 200}

@@ -97,6 +97,8 @@ export ANDROID_SDK_ROOT=/path/to/android-sdk
 ./scripts/build_android.sh --platform pico
 ```
 
+NDK 的两份完整 NOTICE 由 Gradle 从固定版本 SDK 生成到 APK 资源，先校验版本和 SHA256；不在 Git 重复保存大文本。直接 Gradle 构建与脚本构建均执行这一步，许可证内容不裁剪。
+
 不传 `--platform` 默认构建两个 flavor；可用 `--platform meta` 单独构建 Meta。构建入口为 [build_android.sh](scripts/build_android.sh)，依赖定义位于 [Gradle 配置](app/build.gradle.kts)和 [CMake 配置](app/src/main/cpp/CMakeLists.txt)。构建不连接机器人。
 
 ```sh
@@ -114,7 +116,7 @@ python3 tests/verify_android_apks.py --platform pico --build-type release
 python3 scripts/stage_apk.py app/build/outputs/apk/pico/release/app-pico-release.apk
 ```
 
-`stage_apk.py` 读取 APK 真正的签名、包版本、debuggable 标记和对齐结果，生成本地制品与清单。维护者发布到不可变地址后更新 [package-manifest.json](package-manifest.json)；这是制品更新流程，不是使用者每次构建镜像的额外步骤。普通 CPU / Jetson ActuCore Docker 构建自动通过 [fetch_apk.py](scripts/fetch_apk.py) 下载清单指定的确定性 gzip 制品，验证外层大小及 SHA256，解压后再验证原始 release APK 大小及 SHA256，最后内置到 `/work/onboarding/pico.apk`。Canvas/Core 向用户提供原 APK，无需用户解压；无额外 teleop 构建开关。
+`stage_apk.py` 读取 APK 真正的签名、包版本、debuggable 标记和对齐结果，生成本地制品与清单。维护者发布到不可变地址后更新 [package-manifest.json](package-manifest.json)；这是制品更新流程，不是使用者每次构建镜像的额外步骤。普通 CPU 验证镜像及 JP6.1 ActuCore Docker 构建自动通过 [fetch_apk.py](scripts/fetch_apk.py) 下载清单指定的确定性 gzip 制品，验证外层大小及 SHA256，解压后再验证原始 release APK 大小及 SHA256，最后内置到 `/work/onboarding/pico.apk`。Canvas/Core 向用户提供原 APK，无需用户解压；无额外 teleop 构建开关。JP5.1.1 不声明遥操支持，不下载或准备该 APK。
 
 ActuCore 的既有 TLS 监听提供固定 `/onboarding/package` 和 `/onboarding/apk`；Canvas/Core 固定代理该已注册服务，浏览器无需直接接受配对服务的自签名证书。制品缺失或损坏不提供下载。配对服务证书和 APK 发布签名是不同身份，不能相互替代。
 
@@ -155,6 +157,18 @@ NLOHMANN_JSON_INCLUDE=/path/to/nlohmann/include ./tests/run_host_tests.sh
 ```
 
 [启动脚本测试](tests/launch_capture_test.sh)使用假 ADB；[宿主测试](tests/run_host_tests.sh)覆盖帧契约、配对、恢复、消息解析、按钮和可视化。完整协议与模型测试需要 C++20 编译器和 nlohmann/json 头文件；不设置 `NLOHMANN_JSON_INCLUDE` 会跳过相应检查。可另外设置 `MOTUS_IK_REPLAY=/path/to/visualizations.jsonl`，执行跨语言可视化回放。这些检查不需要头显和机器人，不代替 OpenXR 运行时或硬件执行验证。
+
+[邀请跨语言测试](tests/invitation_contract_test.py)在 JVM 执行生产 `ConnectionInvitation` 解析和 `ConnectionActivity.PairChannel` TLS 传输，连接 localhost 上真实 Python Enrollment，覆盖单次兑换、重放、过期、撤销、轮换及证书不匹配时不发送邀请。需要 JDK 17、Android 35 编译桩、Python aiohttp/cryptography，以及仅测试用的 [org.json 20240303](https://repo.maven.apache.org/maven2/org/json/json/20240303/)。测试不下载依赖，不将该 jar 加入 APK；仅适配 Android Base64，JSON 运行库与 Android 自带实现并不完全等同。
+
+```bash
+export JAVA_HOME=/path/to/jdk-17
+export MOTUS_ANDROID_JAR=/path/to/sdk/platforms/android-35/android.jar
+export MOTUS_JAVA_JSON_JAR=/path/to/json-20240303.jar
+export MOTUS_JAVA_JSON_SHA256=3cf6cd6892e32e2b4c1c39e0f52f5248a2f5b37646fdfbb79a66b46b618414ed
+python3 tests/invitation_contract_test.py
+```
+
+此测试不创建 Android Activity，不验证安装器、权限提示、浏览器唤起或 XR 运行时；这些仍需 PICO 实机验收。
 
 构建后检查 APK 的应用 ID、权限、元数据、ABI、ELF 依赖、对齐与签名：
 

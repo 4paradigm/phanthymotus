@@ -830,7 +830,10 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         body: JSON.stringify(values),
       });
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        if (toolName === 'motion_control') {
+          const failure = await resp.json().catch(() => ({}));
+          alert('配置保存失败：' + (failure.detail || failure.message || `HTTP ${resp.status}`));
+        } else alert(`配置保存失败 (HTTP ${resp.status})`);
         return;
       }
     } catch (err) {

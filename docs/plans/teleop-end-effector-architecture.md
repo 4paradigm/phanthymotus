@@ -1,13 +1,13 @@
 # PICO 遥操：通用输入、Driver 解算与执行卡片
 
-状态：2026-09-22 用户批准实施；仅本地开发与离线验证，尚未部署或真机验收。
+状态：2026-09-22 用户批准实施；已完成本地开发与离线验证。用户随后确认天轶空闲并授权机上排查，开始只读预检；新架构尚未部署或真机验收。
 
 ## 目标与边界
 
 完整交付 Canvas 配置 → PICO 安装配对 → 双臂遥操与显示 → 结束收臂。
 普通 ActuCore 内保留一张 `teleop`；天轶 Driver 内新增 `motion_control`，为已有 `arm` 增加连续目标输入。
 仅迁移天轶双臂，保留 G1、既有 VLA 和 motus.control/1；本轮不实现手腿控制，不增加独立服务。
-机器人承担接待期间不连接调试、不部署、不发送动作。Core 仅改所需配置、绑定和下载入口，保护用户其他修改。
+机器人承担接待期间不操作设备；用户确认空闲后，先核对实际占用、运行版本、ROS 状态和构建条件，再按授权准备目标机验证。机上排查不自动开启执行权或运动。Core 仅改所需配置、绑定和下载入口，保护用户其他修改。
 
 ## 三层与反馈
 
@@ -20,11 +20,11 @@
 
 ## 协议与运行契约
 
-- 新增 motus.control/2，保留 /1：沿用 mode/values/groups，补 boot/session/seq/source_seq/mapping_epoch、单调时钟期限和鉴权。
+- 新增 motus.control/2，保留 /1：沿用 mode/values 和 descriptor 中的 groups，补 boot/session/seq/source_seq/mapping_epoch、单调时钟期限和鉴权；groups 不重复放入命令。
 - 上游 eef_pose 是描述坐标系下 xyz 米与 xyzw 单位四元数；下游 joint_position 是描述关节顺序的 rad。
 - 同机 domain 42、版本化 JSON、最新目标；低频管理继续 MCP；秘密不发布到 topic。
 - Driver info 声明端口、末端、坐标系、模型/标定版本、单位、资源；不能仅凭维数推断语义。
-- 双臂使用一个原子命令，包含左右各 7 关节的 arm_l/arm_r group，共用同一执行租约；后续手开合是独立 normalized 组，不混入 7 维位姿。
+- 双臂使用一个原子命令，descriptor 声明左右各 7 关节的 arm_l/arm_r group，共用同一执行租约；后续手开合是独立 normalized 组，不混入 7 维位姿。
 - 每次重新使能用同一份新鲜 FK 快照建立映射，丢弃旧映射代次及过期求解。求解不能延长原输入寿命。
 - 执行循环 50 Hz，默认 1 rad/s；沿用已验证时效，不新增首次接管低速、累计行程或误差百分比门槛。
 - 只有一个共享执行门：原动作和流输入均检查资源，避免重复速度/恢复状态机。
@@ -72,7 +72,11 @@
 
 - 已实现三卡协议与端口绑定、Driver 解算/arm 流入口、自动反馈线、安装邀请、签名 APK 和配置表单。最终审查已补齐 Preview 身份释放和短暂丢反馈后保持握把的恢复握手；保留原映射，旧会话目标拒绝执行，真实故障不自动续动。新架构未部署。
 - 新 APK 0.3.18-onboarding1 已完成真实 release 构建、签名/许可检查；已发布固定构建制品，匿名读回、解压和 APK 哈希一致。未安装到实体 PICO。
-- Core 完整回归 1410 passed / 1 skipped，真实本地 Chrome 卡片操作通过。ActuCore 最终全套 665 passed / 46 skipped；跳过项分别为 G1 数值 ABI、私有录制和需显式运行的 ROS 集成入口，不能视为通过。
+- Core 配置审计补齐 Driver 接受并读回后才保存，失败不持久化候选；未知字段提前拒绝、实例入口不能绕过确认，页面显示拒绝原因。加入配置确认及统一管理鉴权后，完整 Core 回归 1451 passed / 1 skipped / 8 subtests passed。真实本地 Chrome 卡片操作及新增 Node 保存失败交互通过。ActuCore 全套 665 passed / 46 skipped；跳过项分别为 G1 数值 ABI、私有录制和需显式运行的 ROS 集成入口，不能视为通过。
+- Canvas 原管理鉴权保持，补齐 LLM 与 direct/hook 调用的同一精确本机 endpoint 限制、禁重定向及凭据校验；开始不自动重放配置。真实 localhost HTTP 守卫及失败路径测试通过。
+- JP6.1 与 CPU 验证镜像携带 APK；JP5.1.1 不下载、不准备遥操 APK。两份 NDK 大 NOTICE 改由固定 SDK 校验后生成；实际 Gradle 资源合并通过，生成内容与已发布 APK 字节一致，无需重发 APK。
+- JVM 中生产 Java 邀请解析和 TLS PairChannel 与 localhost Python Enrollment 实际互通，15 项检查通过；单次兑换及证书不匹配时不发送邀请均有验证。不运行 Android Activity，使用测试 JSON 库及 Base64 适配，不代替 PICO 安装/浏览器唤起实测。
 - 真实 ROS 集成已在本机 ARM64 禁网、只读容器单独运行：2 passed。使用真实 domain 42、Driver bus 子进程、EEF/joint/feedback topic、IK 与执行门；MCP HTTP 和本体反馈仍用有限速度模拟。Shadow 无 joint/厂商输出，Live 模拟执行及暂停确认通过；不是机器人验收。
-- 既有 bot 构建暴露的端口默认值与测试依赖范围已修复；Driver 新架构提交 4be9446 的普通镜像构建失败，正在依据实际日志修复；主仓新版本构建及复审待本次提交请求。100 ms IK 预算不放宽，实际目标架构的负载与性能继续单独报告。
+- 现有 10 秒录制 719 帧已做迁移数值对照：718 帧有效输入；旧 ActuCore 与新 Driver 均得到 523 个有效解、195 个不可达拒绝，分类分歧为 0；输出关节最大差 6.49e-13 rad。P95 求解耗时旧 10.68 ms、新 10.36 ms。使用双方同一已有本地标定、相同逐帧实测关节和独立初值，保留 100 ms 求解预算；未找到原录制精确匹配标定，因此仅证明该标定下逐帧迁移一致，不代表原现场动作、连续调度或物理验收。私有录制及逐帧结果不提交。
+- 主仓 5d0c104 的普通 Core 与 JetPack 6.1 ActuCore bot 镜像构建通过；镜像内 Core 1410、ActuCore 581 项通过。当前补丁会再次请求新 HEAD 复审，不沿用旧 HEAD 结果。Driver bot 的 rcutils 查库失败已定位到跨架构环境下 CMake 目录遍历错误码污染这一可复现机制；构建期修正的故障注入、完整本机 ARM64 构建和实际 bundle 隔离 smoke 通过，真实 EIO/缺库仍失败。Driver fc06778 已请求 bot 复验，尚未收到结果；未修改 bot 或放宽 100 ms IK 预算。
 - 操作手册和架构文档已同步本轮职责、配置、安装、兼容及验收边界。原物理动作记录只作旧链路基线，不用于宣布新版通过。

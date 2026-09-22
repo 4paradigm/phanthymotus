@@ -69,7 +69,9 @@ Canvas 提供安装二维码、15 分钟下载短地址、APK 版本，以及独
 
 签名 release APK 作为固定制品进入普通 ActuCore 镜像，无特殊 build flag 或新增 bot 服务。构建清单记录确定性 gzip 外层大小/SHA256，以及解压后原始 APK 大小/SHA256、版本和签名指纹；Docker 验证两层后仅保存原 APK。Core 从当前注册 ActuCore 的固定下载接口代理，并验证证书、文件大小与 SHA256；用户下载的是原 `.apk`，不需要解压。旧 debug 签名不能被新 release 签名覆盖，须由用户安排明确迁移和重新配对，代码不静默卸载。
 
-配置分属两张卡：teleop 提供模式、输入映射、位移比例和手柄变换；motion_control 提供已挂载 `calibration_path` 导入与 `joint_velocity_rad_s`。Driver 对候选模型/TCP/碰撞/速度完整验证后原子替换，并要求重新标定；已有 Live、Preview、准备会话、动作或收臂时拒绝修改。Core 保存配置并通过 `config` 应用、`info` 读回；卡片不是标定文件编辑器，也不改写 Driver 的 YAML/JSON 文件。
+配置分属两张卡：teleop 提供模式、输入映射、位移比例和手柄变换；motion_control 提供已挂载 `calibration_path` 导入与 `joint_velocity_rad_s`。Driver 对候选模型/TCP/碰撞/速度完整验证后原子替换，并要求重新标定；已有 Live、Preview、准备会话、动作或收臂时拒绝修改。Core 对 motion_control 先调用 `config`、再用 `info.config` 读回核对，最后持久化确认值；拒绝或未确认时保留原保存值并报告原因，不声称运行配置已回滚。未知字段下发前拒绝，实例配置入口不能绕过共享配置确认。卡片不是标定文件编辑器，也不改写 Driver 的 YAML/JSON 文件。
+
+Core 的 Canvas、LLM 与 direct/hook 管理调用共用 `teleop_management.py`：只有配置中精确匹配的本机 HTTP `/mcp` 地址可收到管理凭据，遥操请求不跟随重定向；密钥不写入卡片参数、topic 或日志。开始会话不隐式重放配置，普通工具保持既有调用语义。
 
 新路径缺少 Driver 控制模型时仍能安装、配对和配置，执行门禁继续拒绝运动；TLS、管理鉴权、状态目录等 ActuCore 自身站点资料缺失仍会返回 `required_site_config`。VLA 及其他插件不因单卡错误被关闭。
 

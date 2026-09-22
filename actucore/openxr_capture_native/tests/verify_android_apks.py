@@ -187,6 +187,12 @@ def verify_apk(
                              'plog-LICENSE', 'usrsctp-LICENSE', 'libjuice-LICENSE',
                              'Android-NDK-NOTICE', 'Android-NDK-NOTICE.toolchain'):
             require(len(archive.read('assets/licenses/'+license_name)) > 100, 'missing bundled license: '+license_name)
+        for name, expected_digest in {
+            'Android-NDK-NOTICE':'4d5224d1c0b54ffa88b0dc0088191638fdbb7227835095dfb98f7f66b416a323',
+            'Android-NDK-NOTICE.toolchain':'cbe3237be53c0a819f8df6aac5358fdee848eee3b6571b4e2ca20767ebd7465e',
+        }.items():
+            require(hashlib.sha256(archive.read('assets/licenses/'+name)).hexdigest() == expected_digest,
+                    'bundled NDK notice checksum mismatch: '+name)
     digest = hashlib.sha256(apk.read_bytes()).hexdigest()
     return {
         "bytes": apk.stat().st_size,

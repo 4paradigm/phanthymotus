@@ -108,7 +108,7 @@ MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO 
 
 CPU 专用验证镜像也直接安装遥操依赖，可用 `docker build -f actucore/Dockerfile.cpu -t local/actucore:teleop-cpu .` 或 `deploy/build_tianyi_actucore.sh LOCAL_IMAGE_TAG` 构建；无需修改现有脚本。CPU 镜像不作为普通 GPU/VLA 部署的替代。
 
-普通 Jetson 与 CPU 镜像构建都按固定清单获取签名 PICO release APK，无需新增构建开关。构建制品以确定性 gzip 发布，下载器先验证压缩包 SHA256，再解压并验证原 APK 的 SHA256 和大小；容器只向 Core 提供原 APK。Canvas 通过当前已注册的 teleop 服务代理下载，不让头显访问制品仓库。旧 debug APK 与 release 的签名不兼容，需操作者明确迁移；不会静默卸载或删除配对。安装过程和浏览器 deep link 仍需在实体 PICO 验收。
+普通 JP6.1 Jetson 与 CPU 验证镜像构建都按固定清单获取签名 PICO release APK，无需新增构建开关。构建制品以确定性 gzip 发布，下载器先验证压缩包 SHA256，再解压并验证原 APK 的 SHA256 和大小；容器只向 Core 提供原 APK。Canvas 通过当前已注册的 teleop 服务代理下载，不让头显访问制品仓库。旧 debug APK 与 release 的签名不兼容，需操作者明确迁移；不会静默卸载或删除配对。安装过程和浏览器 deep link 仍需在实体 PICO 验收。
 
 JP6.1 与 CPU 验证构建通过 `deploy/fetch_g1_collision.py` 从项目 COS 获取固定上游提交的 G1 碰撞网格并逐文件核对 SHA256；JP5.11 不下载这些模型。控制循环不联网下载，缺失或损坏资产时拒绝 G1 初始化。G1 求解器依赖仍需另外满足，包含网格不表示已支持完整 G1 IK。
 

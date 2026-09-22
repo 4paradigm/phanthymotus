@@ -20,25 +20,12 @@ _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race
 
 
 def _teleop_management_headers(url, tool, arguments):
-    """Never forward the dedicated local capability to a registry-selected remote."""
-    if tool != 'teleop' or arguments.get('action', 'info') == 'info':
-        return {}
-    import os
-    from pathlib import Path
-    from urllib.parse import urlsplit
-    endpoint = urlsplit(url)
-    if (url != os.environ.get('TELEOP_MANAGEMENT_URL', '') or endpoint.scheme != 'http'
-        or endpoint.hostname not in ('localhost', '127.0.0.1', '::1')
-        or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment
-        or endpoint.path != '/mcp'):
-        raise fastapi.HTTPException(403, 'Teleop management endpoint is not configured')
+    """Keep the API error contract while sharing the local-only HTTP capability."""
+    from teleop_management import TeleopManagementError, management_headers
     try:
-        key = Path(os.environ['TELEOP_MANAGEMENT_KEY_FILE']).read_text().strip()
-    except (KeyError, OSError):
-        raise fastapi.HTTPException(503, 'Teleop management key is unavailable') from None
-    if len(key) < 32 or not key.isascii():
-        raise fastapi.HTTPException(503, 'Teleop management key is invalid')
-    return {'X-Teleop-Management': key}
+        return management_headers(url, tool, arguments)
+    except TeleopManagementError as exc:
+        raise fastapi.HTTPException(exc.status_code, str(exc)) from None
 
 
 async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
