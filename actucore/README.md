@@ -96,6 +96,72 @@ MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO 
 
 MCP POST 要求单一、合法的 `Content-Length`，请求体上限 16 MiB、完整读取期限 10 秒；不支持 chunked 请求。非法长度、超限和超时分别返回 400/413/408，未提供长度返回 411。正常 JSON-RPC 与管理鉴权不变；该上限不用于 PICO RTC 姿态流。
 
+## `navi` 卡片
+
+看到目标就朝它走过去。接 `vop` 的检测结果和一路深度图，输出 `motus.control/1`
+的 **twist**（底盘速度）到一张驱动的底盘命令卡片。
+
+```
+camera ─┬─→ vop ────────────(data/json 检测+bbox)──→┐
+        │                                           ├─→ navi ─(control/velocity)─→ 驱动的底盘命令卡片
+        └─→ visual_depth ──(image/depth-zlib)──────→┤
+                                                    │
+           驱动的 loco_state ──(state/odom，可选)───→┘
+```
+
+`navigate_to(target="椅子")` 之后：转向目标 → 接近 → 按深度三段减速绕行 →
+到 `stop_distance_m` 停下并推 ACP 完成事件。
+
+**这是反应式视觉伺服，不是导航栈。** 没有地图、没有全局路径、绕不过 U 形障碍，
+也不会后退（深度图对身后一无所知）。要建图规划是另一条路线。
+
+### 启动门槛
+
+和 `vla` 一样，`enabled` 只决定它出不出现在侧边栏里。真正的门槛：
+
+1. 输出必须连到一张驱动的底盘命令卡片（`control/velocity` 端口），否则拿不到
+   下游 descriptor，直接拒绝启动；
+2. 输入必须有 vop 的检测结果，以及深度图或深度摘要中的**至少一路**；
+3. 协商不过就拒绝 —— 这张卡片只产生 `twist`，接到关节卡片上维度可能恰好也对，
+   靠 `mode` 拦下来；
+4. 每条指令还要过驱动侧 `ControlSink` 的检查链。
+
+### 两档降级，`info()` 里看得见
+
+少接一根线不会让卡片起不来，但会让它变笨，而**变笨和坏掉从下游看是一样的**。
+所以 `info().degraded` 会明说当前在哪一档：
+
+| 少了什么 | 后果 |
+|---|---|
+| 只有深度摘要，没有深度图 | 目标距离退化成「它所在的那三分之一画面里最近的东西」，那是最近的**障碍**而不是目标。精度明显变差，且障碍进入停止距离时会被当成「到达」 |
+| 没接 `state/odom` | 没有卡死检测。撞上东西不会自己停 —— 而单目深度贴近平面墙时恰恰最不可靠，这是它最需要兜底的场景 |
+| vop 没开 `publish_bbox` | 距离只能在目标中心取一小块，而不是整个目标区域取分位 |
+
+### 最重要的一条性质
+
+**说不清楚的时候什么都不发。** 观测过期、深度解不开、目标丢太久、判定卡死、
+已到达 —— 全都返回 `values=None`，卡片一条指令都不发，由驱动侧 watchdog 在
+`watchdog_ms` 内把底盘停住。
+
+刻意不发显式的零：零同样能停住机器人，但它会**继续喂饱 watchdog**，于是一个
+已经死掉的策略会留下一台「自以为正在被驱动」的机器人。沉默是坏掉的上游唯一
+伪造不了的信号。
+
+（唯一的例外是「到达」：那里会先发一帧显式的零再安静下来。到达是成功，应该停
+在一条指令上而不是停在超时上，否则驱动日志里看着像链路断了。）
+
+### 文件
+
+| 文件 | 内容 |
+|---|---|
+| `plugin.py` | 卡片：工具声明、生命周期、订阅、定时发布 |
+| `policy.py` | 控制律。纯函数，无 ROS —— 所有行为分支都在这里 |
+| `depth.py` | 深度解码与采样。纯函数，无 ROS |
+| `odom.py` | `motus.odom/1` 的读取侧。**故意不跨仓库 import** —— 协议是文档不是共享库，两边各自实现、各自跑契约测试 |
+
+`policy.py` 和 `depth.py` 不碰 ROS 是有意的：这样「目标被人挡住的同时左边还有
+个障碍会怎样」是一条测试，而不是一下午的真机调试。
+
 ## 构建与运行
 
 普通部署使用 `Dockerfile.jetson`；VLA 的本机模型能力取决于基础镜像。天轶新链路的 IK 位于 Driver，ActuCore 负责 PICO 通信与相对末端映射；两侧均可使用 CPU。仓库也提供 `Dockerfile.cpu` 用于隔离验证。CPU 验证镜像不提供完整本机 SmolVLA 环境，不能作为保留既有 GPU/VLA 能力的直接替代。
@@ -217,6 +283,27 @@ TOOLS = [
 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
 
 完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/vop.py` —— 它是最干净的范例。
+
+### 要发 `motus.control/1` 指令流的卡片
+
+别自己拼消息、也别自己写协商 —— 用 `plugins/control_stream/`：
+
+```python
+from ..control_stream import build as build_message
+from ..control_stream import negotiate
+
+problems = negotiate.check(self._capabilities(), descriptor, label="策略")
+if problems:
+    return self._error("与下游动作空间不匹配：" + "；".join(problems))
+rate = negotiate.effective_rate(capabilities, descriptor, self._cfg.get("rate_hz"))
+ttl  = negotiate.ttl_ms(rate, descriptor)
+```
+
+`label` 是报错里对上游的称呼，默认「模型」。导航策略不是模型，告诉它的操作者
+「模型输出 6 维」会把人送去找一个不存在的 checkpoint。
+
+这两个模块原本在 `plugins/vla/` 下，第二个消费者出现时提到了 `control_stream/`；
+`plugins/vla/` 留了两个 re-export shim，所以照旧从那里 import 的代码不用改。
 
 ## 遥操与 VLA 共用 ActuCore
 

@@ -139,6 +139,53 @@ def color_name(h_mean: float, s_mean: float, v_mean: float) -> str:
     return hue
 
 
+def _region(frame_bgr, bbox=None):
+    """The pixels a box selects, clamped to the frame. None if it selects none.
+
+    Shared by `color_stats` and `color_block` so the clamping exists once — the
+    box comes from a detector and routinely runs off the edge of the frame.
+    """
+    if bbox is None:
+        return frame_bgr
+    height, width = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = (int(round(float(v))) for v in bbox)
+    x1, x2 = max(0, min(x1, width - 1)), max(0, min(x2, width))
+    y1, y2 = max(0, min(y1, height - 1)), max(0, min(y2, height))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame_bgr[y1:y2, x1:x2]
+
+
+def color_triple(h_mean: float, s_mean: float, v_mean: float) -> str:
+    """The three labels as one space-joined string: "dim muted azure".
+
+    This is what the *stream* carries, and it is deliberately not `color_name`.
+
+    `color_name` is a **lossy projection** of the three, not a concatenation of
+    them: it never calls `dominant_saturation` at all (saturation reaches it only
+    as the `s < 25 -> neutral` threshold inside `dominant_hue`, so muted/vivid
+    vanishes), and it collapses six brightness levels into three prefixes.
+    Enumerated over the whole HSV space that is **150 distinct triples against 41
+    distinct color_names** — 73% of the distinctions gone. The other direction is
+    lossless: `color_name` is a pure function of `dominant_brightness` and
+    `dominant_hue`, both of which are here, so a consumer can recompute it
+    exactly (`test_color_name_recoverable_from_triple` pins that).
+
+    So the triple strictly dominates, and it costs one byte more.
+
+    Ordered brightness-saturation-hue because that reads as English. Splittable
+    on spaces because every word in all three vocabularies is a single token —
+    a property worth preserving if you ever add a name here.
+
+    Neutral colours always come out as "<brightness> gray neutral": `neutral` and
+    `gray` are triggered by the same `s < 25` test, so that pair is redundant by
+    construction. Emitted anyway rather than special-cased to two tokens — four
+    bytes buys every consumer a `split()` with no branch in it.
+    """
+    return (f"{dominant_brightness(v_mean)} {dominant_saturation(s_mean)} "
+            f"{dominant_hue(h_mean, s_mean, v_mean)}")
+
+
 def color_stats(frame_bgr, bbox=None) -> dict:
     """RGB/HSV mean and variance for a BGR frame or one box inside it.
 
@@ -150,15 +197,9 @@ def color_stats(frame_bgr, bbox=None) -> dict:
     """
     import cv2
 
-    region = frame_bgr
-    if bbox is not None:
-        height, width = frame_bgr.shape[:2]
-        x1, y1, x2, y2 = (int(round(float(v))) for v in bbox)
-        x1, x2 = max(0, min(x1, width - 1)), max(0, min(x2, width))
-        y1, y2 = max(0, min(y1, height - 1)), max(0, min(y2, height))
-        if x2 <= x1 or y2 <= y1:
-            return {}
-        region = frame_bgr[y1:y2, x1:x2]
+    region = _region(frame_bgr, bbox)
+    if region is None:
+        return {}
     rgb = region[:, :, ::-1].reshape(-1, 3).astype(np.float32)
     hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
     rgb_mean, rgb_var = rgb.mean(axis=0), rgb.var(axis=0)
@@ -174,6 +215,68 @@ def color_stats(frame_bgr, bbox=None) -> dict:
         "dominant_brightness": dominant_brightness(val),
         "color_name": color_name(h, sat, val),
     }
+
+
+COLOR_LEVELS = ("off", "name", "full")
+
+
+def _color_level(value) -> str:
+    """Normalise whatever `publish_color` was set to into one of COLOR_LEVELS.
+
+    Booleans are accepted because this reads as a switch and somebody will
+    eventually write `publish_color: true` in a yaml; mapping it to the default
+    level rather than refusing keeps that card running. An unrecognised string
+    falls back to the default too — a card that stops reporting colour because
+    of a typo would be diagnosed as a model problem, which is a long way from
+    the config line that caused it.
+    """
+    if value is None or value is True:
+        return "name"
+    if value is False:
+        return "off"
+    text = str(value).strip().lower()
+    return text if text in COLOR_LEVELS else "name"
+
+
+def color_block(frame_bgr, bbox, level: str) -> dict:
+    """The colour fields one streamed object carries, at the configured level.
+
+    Returns a dict to **merge into** the object, not to nest — so `off` is an
+    empty dict and the caller needs no branch.
+
+        off     nothing
+        name    {"color": "dim muted azure", "brightness": 120.9}
+        full    the twelve numbers and four labels of `color_stats`
+
+    `brightness` survives at the `name` level because it is the one *continuous*
+    colour value anything reads: the lights-on check wants `hsv_mean[2]` itself,
+    and six buckets cannot answer "is the room getting darker". Everything else
+    that level drops — `rgb_mean`, `rgb_var`, `hsv_var` — has, at the time of
+    writing, no reader anywhere in either repo, and answers "is this patch flat
+    or busy", which is a question asked of one photograph rather than five times
+    a second.
+
+    Why `name` is the default, and why the stream is worth trimming at all:
+    agent-core's topic subscriber puts a subscribed topic's **entire** message
+    into the event bus as an event's text (`agent-core/src/topic_subscriber.py`),
+    so every published byte is a byte of LLM context, per frame. Full colour is
+    239 of the 329 bytes an object used to cost — 73% of the payload, none of it
+    read by anything.
+    """
+    if level == "off":
+        return {}
+    if level == "full":
+        return {"color": color_stats(frame_bgr, bbox)}
+
+    import cv2
+
+    region = _region(frame_bgr, bbox)
+    if region is None:
+        return {}
+    h, s, v = (float(x) for x in
+               cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+                  .reshape(-1, 3).astype(np.float32).mean(axis=0))
+    return {"color": color_triple(h, s, v), "brightness": round(v, 1)}
 
 
 def output_topic_for(input_topic: Optional[str]) -> str:
@@ -255,6 +358,13 @@ TOOLS = [
             "properties": {
                 "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "instance"},
                 "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "instance"},
+                # Both govern the *streamed* payload only. The one-shot photo
+                # actions always answer in full: that reply is asked for once
+                # and read once, so nothing is gained by trimming it, and a
+                # caller who cannot see the frame has no other way to get the
+                # pixel box back.
+                "publish_bbox":  {"type": "boolean", "description": "在流式结果里带上像素框 [x1,y1,x2,y2]。关掉只剩中心点，下游想按目标区域采样另一张对齐的图（如深度图）就只能取一小块", "default": True, "scope": "instance"},
+                "publish_color": {"type": "string", "enum": list(COLOR_LEVELS), "description": "流式结果里的颜色详略：name=三元组+亮度（默认），full=全部 16 个字段，off=不发。每个对象每帧的差别是 27 B 与 239 B", "default": "name", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -269,7 +379,8 @@ class _VOPNode(Node):
     """Per-topic YOLO inference node."""
 
     def __init__(self, input_topic: Optional[str], model, confidence: float, fps: float,
-                 node_suffix: str, vocabulary: Optional[list] = None):
+                 node_suffix: str, vocabulary: Optional[list] = None,
+                 publish_bbox: bool = True, publish_color: str = "name"):
         super().__init__(f"vop_{node_suffix}" if node_suffix else "vop")
         # Topic-less is a supported mode, as in plugins/tts.py: a card driven
         # only by recognize_by_photo has no camera to subscribe to, but still
@@ -281,6 +392,8 @@ class _VOPNode(Node):
         self._vocabulary = list(vocabulary or [])
         self._confidence = confidence
         self._fps = fps
+        self._publish_bbox = bool(publish_bbox)
+        self._publish_color = publish_color if publish_color in COLOR_LEVELS else "name"
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
@@ -427,10 +540,17 @@ class _VOPNode(Node):
                 ],
                 "confidence": round(float(score), 2),
             }
+            if self._publish_bbox:
+                # The pixel box, which this loop has had all along and used to
+                # throw away after computing the colour from it. A consumer that
+                # wants to sample another aligned map (a depth frame, say) over
+                # the object can only do it properly with the box: a centre point
+                # gives it one small patch and no idea how big the thing is.
+                obj["bbox"] = [round(float(v), 1) for v in (x1, y1, x2, y2)]
             if pixels is not None:
                 # Colour of the box, so "the red ball" is answerable without
-                # the model ever seeing pixels.
-                obj["color"] = color_stats(pixels, (x1, y1, x2, y2))
+                # the model ever seeing pixels. Level-dependent — see color_block.
+                obj.update(color_block(pixels, (x1, y1, x2, y2), self._publish_color))
             objects.append(obj)
         return objects
 
@@ -474,6 +594,8 @@ class VideoObjectPerceptionPlugin:
         self._plugin_cfg = dict(plugin_cfg or {})
         self._confidence = float(plugin_cfg.get("confidence", 0.3))
         self._fps = int(plugin_cfg.get("fps", 5))
+        self._publish_bbox = bool(plugin_cfg.get("publish_bbox", True))
+        self._publish_color = _color_level(plugin_cfg.get("publish_color"))
         self._model_name = canonical_model_name(plugin_cfg.get("model", DEFAULT_MODEL))
         self._vocabulary: list[str] = []      # filled from the bundle's vocab.json
         self._model = None  # lazy load
@@ -792,10 +914,14 @@ class VideoObjectPerceptionPlugin:
             icfg = self._instance_configs.get(node_key, {})
             confidence = float(icfg.get("confidence", self._confidence))
             fps = int(icfg.get("fps", self._fps))
+            publish_bbox = bool(icfg.get("publish_bbox", self._publish_bbox))
+            publish_color = (_color_level(icfg["publish_color"])
+                             if "publish_color" in icfg else self._publish_color)
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
             input_for_node = input_topic or None
             node = _VOPNode(input_for_node, self._model, confidence, fps,
-                            node_suffix=suffix, vocabulary=self._vocabulary)
+                            node_suffix=suffix, vocabulary=self._vocabulary,
+                            publish_bbox=publish_bbox, publish_color=publish_color)
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
@@ -870,6 +996,8 @@ class VideoObjectPerceptionPlugin:
                     "output": node._output_topic,
                     "confidence": node._confidence,
                     "fps": node._fps,
+                    "publish_bbox": node._publish_bbox,
+                    "publish_color": node._publish_color,
                     "detect_count": node._detect_count,
                 }
             # Determine topic info: from running instance, args, or empty
@@ -1029,6 +1157,10 @@ class VideoObjectPerceptionPlugin:
                     self._confidence = float(cfg["confidence"])
                 if "fps" in cfg:
                     self._fps = int(cfg["fps"])
+                if "publish_bbox" in cfg:
+                    self._publish_bbox = bool(cfg["publish_bbox"])
+                if "publish_color" in cfg:
+                    self._publish_color = _color_level(cfg["publish_color"])
                 return {"status": "configured", "config": cfg}
 
         return None

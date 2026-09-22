@@ -223,7 +223,20 @@ def _resolve_msg_type(fmt: str):
         except ImportError:
             pass
         return None
-    if fmt in ('json', 'data/json') or fmt.startswith('sensor/') or fmt.startswith('data/'):
+    # `control/*` is the command stream an execution model sends to a driver
+    # (motus.control/1); `state/*` is what a driver reports about itself
+    # (motus.odom/1 and friends). Both are JSON inside a std_msgs/String, like
+    # the perception cards — spec in phanthymotus-driver/README_dev.md.
+    #
+    # Neither prefix used to be in this table, and the only consequence was one
+    # line on stderr: an unresolved format means the subscription is silently
+    # abandoned, so the topic stays registered in inspection, the producer keeps
+    # publishing at 10 Hz, and the canvas data-flow panel is empty for ever.
+    # That was navi on r1_sz — subscribing with rclpy received the commands
+    # while the panel showed nothing.
+    if (fmt in ('json', 'data/json') or fmt.startswith('sensor/')
+            or fmt.startswith('data/') or fmt.startswith('control/')
+            or fmt.startswith('state/')):
         try:
             from std_msgs.msg import String
             return String

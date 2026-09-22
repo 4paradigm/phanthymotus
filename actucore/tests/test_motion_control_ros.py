@@ -146,10 +146,18 @@ def test_real_dds_eef_joint_and_feedback(ros_chain, mode):
     chain = ros_chain
     adapter = EefIntentAdapter(chain.link, mode)
     assert adapter.calibrate()['calibrated']
-    # Calibration/claim replies are not feedback: await the real topic snapshot.
-    wait_for(lambda: chain.link.latest['eef_snapshot']['model_version'] == chain.c.versions['model_version'])
+    # A new DDS heartbeat can still carry an older FK snapshot. Wait for both
+    # the post-calibration topic and a fresh matching snapshot before the first
+    # input; production still enforces its unchanged 100 ms snapshot deadline.
     now = chain.link.last_feedback_received_ns
-    wait_for(lambda: chain.link.last_feedback_received_ns > now)
+    def fresh_snapshot():
+        snapshot = chain.link.latest.get('eef_snapshot', {})
+        return (chain.link.last_feedback_received_ns > now
+                and snapshot.get('model_version') == chain.c.versions['model_version']
+                and 0 <= time.monotonic_ns() - snapshot.get('monotonic_ns', 0) <= 50_000_000)
+    wait_for(fresh_snapshot, timeout=3.)
+    print('ROS_SNAPSHOT_READY', json.dumps({'mode': mode, 'age_ms':
+        (time.monotonic_ns() - chain.link.latest['eef_snapshot']['monotonic_ns']) / 1e6}))
     applied = apply(chain_for_apply(chain), adapter, 1)
     assert not chain.messages['eef'] and not chain.vendor_writes
     target = motion_frame(chain, adapter)

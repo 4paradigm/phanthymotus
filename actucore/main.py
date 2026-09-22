@@ -7,7 +7,7 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前提供 VLA 卡片及可选遥操卡片；遥操仅在站点配置检查通过后注册。
+当前提供 VLA、导航卡片及可选遥操卡片；遥操仅在站点配置检查通过后注册。
 新增卡片的完整步骤见 README.md。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
@@ -156,6 +156,11 @@ class ActuCoreBundle:
             except (ImportError, OSError, ValueError, RuntimeError):
                 self.required_site_config['teleop'] = [{'field': 'runtime', 'code': 'teleop_initialization_unavailable'}]
                 log.error("teleop unavailable; other cards retained")
+
+        if plugins_cfg.get("navi", {}).get("enabled", False):
+            from plugins.navi import NaviPlugin
+            self._plugins.append(NaviPlugin(plugins_cfg["navi"], executor))
+            log.info("NaviPlugin loaded")
 
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")

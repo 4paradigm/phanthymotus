@@ -229,3 +229,18 @@ def test_readiness_preserves_saved_pairing_state(tmp_path, monkeypatch):
     assert site.required_site_config(cfg) == []
     assert state.read_bytes() == before
     assert state.stat().st_mode & 0o777 == 0o600
+
+
+def test_bundle_keeps_vla_navigation_and_optional_teleop_independent(tmp_path, monkeypatch):
+    cfg = site_configuration(tmp_path, monkeypatch)
+    for complete_site in (True, False):
+        if not complete_site:
+            monkeypatch.delenv('TELEOP_MANAGEMENT_KEY_FILE')
+        bundle = bundle_type()({'plugins': {
+            'vla': {'enabled': True, 'provider': 'mock'},
+            'navi': {'enabled': True}, 'teleop': cfg}}, None)
+        tools = {tool['name'] for tool in bundle.get_all_tools()}
+        assert tools == ({'vla', 'navi', 'teleop'} if complete_site else {'vla', 'navi'})
+        assert bundle.dispatch('vla', {'action': 'info'})['state'] == 'idle'
+        assert bundle.dispatch('navi', {'action': 'info'})['state'] == 'idle'
+        assert all(getattr(p, '_node', None) is None for p in bundle._plugins)
