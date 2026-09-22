@@ -1,0 +1,114 @@
+{
+  "schema": "motus.tianyi-calibration.v1",
+  "version": "UNVERIFIED",
+  "urdf_path": "/calibration/tianyi2-official.urdf",
+  "urdf_sha256": "a7e742ad600c7f1e9eeecdd04046dea4cd5f81cccb6dde73f290968b345e4b20",
+  "arm_joint_names": [
+    "shoulder_pitch_l_joint",
+    "shoulder_roll_l_joint",
+    "shoulder_yaw_l_joint",
+    "elbow_pitch_l_joint",
+    "elbow_yaw_l_joint",
+    "wrist_pitch_l_joint",
+    "wrist_roll_l_joint",
+    "shoulder_pitch_r_joint",
+    "shoulder_roll_r_joint",
+    "shoulder_yaw_r_joint",
+    "elbow_pitch_r_joint",
+    "elbow_yaw_r_joint",
+    "wrist_pitch_r_joint",
+    "wrist_roll_r_joint"
+  ],
+  "torso_frame": "waist_yaw_link",
+  "locked_joints": {
+    "first_leg_pitch_joint": null,
+    "second_leg_pitch_joint": null,
+    "waist_pitch_joint": null,
+    "waist_yaw_joint": null,
+    "head_yaw_joint": null,
+    "head_pitch_joint": null,
+    "head_roll_joint": null,
+    "left_thumb_1_joint": null,
+    "left_thumb_2_joint": null,
+    "left_thumb_3_joint": null,
+    "left_thumb_4_joint": null,
+    "left_index_1_joint": null,
+    "left_index_2_joint": null,
+    "left_middle_1_joint": null,
+    "left_middle_2_joint": null,
+    "left_ring_1_joint": null,
+    "left_ring_2_joint": null,
+    "left_little_1_joint": null,
+    "left_little_2_joint": null,
+    "right_thumb_1_joint": null,
+    "right_thumb_2_joint": null,
+    "right_thumb_3_joint": null,
+    "right_thumb_4_joint": null,
+    "right_index_1_joint": null,
+    "right_index_2_joint": null,
+    "right_middle_1_joint": null,
+    "right_middle_2_joint": null,
+    "right_ring_1_joint": null,
+    "right_ring_2_joint": null,
+    "right_little_1_joint": null,
+    "right_little_2_joint": null
+  },
+  "fixed_motor_positions_rad": {
+    "1": null,
+    "2": null,
+    "3": null,
+    "31": null,
+    "32": null,
+    "51": null,
+    "52": null
+  },
+  "palm_frames": {
+    "left": {
+      "position": null,
+      "orientation": null
+    },
+    "right": {
+      "position": null,
+      "orientation": null
+    }
+  },
+  "hands": {
+    "left": {
+      "open": null,
+      "closed": null
+    },
+    "right": {
+      "open": null,
+      "closed": null
+    }
+  },
+  "workspace": {
+    "torso_box": null,
+    "left": null,
+    "right": null,
+    "capsules": []
+  },
+  "acceptance": {
+    "model_verified": false,
+    "workspace_verified": false,
+    "stop_verified": false,
+    "driver_crash_verified": false,
+    "pico_verified": false,
+    "external_control_excluded": false,
+    "power_feedback_verified": false,
+    "operator": "",
+    "date": "",
+    "evidence_sha256": ""
+  },
+  "controller_to_palm": {
+    "left": {
+      "position": null,
+      "orientation": null
+    },
+    "right": {
+      "position": null,
+      "orientation": null
+    }
+  },
+  "joint_velocity_rad_s": 0.2
+}

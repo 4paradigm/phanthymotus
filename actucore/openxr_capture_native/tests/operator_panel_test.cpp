@@ -1,0 +1,23 @@
+#include "../app/src/main/cpp/operator_panel.hpp"
+#include <cassert>
+using namespace motus::openxr_capture;
+int main(){
+ OperatorPanel panel;panel.enabled=true;
+ FrameSample sample;sample.head.valid=true;
+ sample.right_input.active=true;sample.right_input.buttons={0,0};
+ std::array<PoseSample,2> aims{};aims[1].valid=true;aims[1].position={-.29,.43,0};
+ panel.Sample(sample.head,aims,sample);assert(panel.hover==0 && panel.pending.empty());
+ sample.right_input.buttons[0]=1;panel.Sample(sample.head,aims,sample);assert(panel.pending=="start");
+ panel.pending.clear();panel.Sample(sample.head,aims,sample);assert(panel.pending.empty());
+ sample.right_input.buttons[0]=0;sample.left_input.squeeze_pressed=true;
+ panel.Sample(sample.head,aims,sample);sample.right_input.buttons[0]=1;
+ panel.Sample(sample.head,aims,sample);assert(panel.pending.empty());
+ aims[1].position[0]=.29;sample.right_input.buttons[0]=0;panel.Sample(sample.head,aims,sample);
+ sample.right_input.buttons[0]=1;panel.Sample(sample.head,aims,sample);assert(panel.pending=="stop");
+ panel.pending.clear();sample.left_input.squeeze_pressed=false;sample.left_input.active=true;sample.left_input.buttons={0,0};
+ aims[0].valid=true;aims[0].position={.29,.43,0};aims[1].position={-.29,.43,0};
+ sample.right_input.buttons[0]=0;panel.Sample(sample.head,aims,sample);
+ sample.left_input.buttons[0]=1;sample.right_input.buttons[0]=1;panel.Sample(sample.head,aims,sample);
+ assert(panel.pending=="stop");
+ panel.pending.clear();sample.head.valid=false;panel.Sample(sample.head,aims,sample);assert(panel.pending.empty() && panel.hover==-1);
+}

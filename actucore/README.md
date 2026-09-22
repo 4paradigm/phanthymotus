@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前有一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+**`vla` 默认开启，新增 `teleop` 遥操候选默认关闭。** 遥操配置和验证边界见 [teleop 说明](plugins/teleop/README.md)。`enabled` 只决定卡片是否出现在工具列表里，不代表已取得硬件执行权。
 
 ## `vla` 卡片
 
