@@ -2439,6 +2439,85 @@ other bundles in that file state.
 
 ---
 
+## Camera Parameters (`camera_info`)
+
+`vop` and `visual_depth` both sit in the middle of a chain that starts at a camera
+card and ends at something that has to act on metres. **Camera parameters travel
+along that chain**, and each stop rewrites the parts its own processing changed.
+
+The format is `motus.camera/1`, specified in
+`phanthymotus-driver/README_dev.md` § Camera Parameters. The implementation here
+is `plugins/camera_info.py` — deliberately a **separate implementation** of the
+same document rather than a shared import, as with `motus.control/1`.
+
+### Why these two cards have to care
+
+Neither of them uses the field of view itself. `vop` reports a **normalised**
+lateral offset (−1 … +1) and `visual_depth` reports metres per pixel; both are
+complete without any lens geometry. The consumer is what needs it:
+
+- navi's avoidance corridor is **metric** (half-width ≈ 0.33 m), so every tick it
+  converts that width back into a range of image columns — and that conversion is
+  the field of view.
+- `position` is only an angle once someone multiplies it by the half field of
+  view. Until then it is dimensionless.
+
+That number used to be typed into navi's own config by hand. On r1_sz it read
+0.55 rad against a lens measuring 0.888, the corridor came out **1.86 m wide —
+wider than any door**, every doorframe counted as dead ahead, and the robot turned
+away 0.6 m short of openings it fitted through. The depth map reported clear the
+whole time. The value had been measured on that robot the day before; it went into
+a report and not into a config file, and nothing noticed.
+
+### What each card changes, and what it must not
+
+| | `vop` | `visual_depth` |
+|---|---|---|
+| `id` | unchanged | unchanged — this is what lets navi check both its inputs are the same lens |
+| `half_fov_rad` | unchanged | **unchanged** — `cv2.resize` stretches rather than crops, so the same angular extent is still in the picture |
+| `width`/`height` | unchanged | rewritten to 640×480: the declaration describes the image **this port** publishes |
+| `K` | unchanged | **rescaled** — see below |
+| `D` | unchanged | unchanged (radial terms are dimensionless in normalised coords) |
+| `pipeline` | `+ perception/vop` | `+ perception/visual_depth` |
+| `source` | `inherited` | `inherited` |
+
+**The `K` trap.** `fx` is in pixels and a consumer derives the angle as
+`atan((width/2) / fx)`. Publish a resized image while passing `K` through
+untouched and both fields stay individually plausible while their ratio is wrong
+by exactly the resize factor — the same silent, confidently wrong geometry the
+format exists to prevent. `_rescale_K` scales the two axes independently, because
+1280×720 → 640×480 is not a uniform scale and `fx`/`fy` are separate entries
+precisely so that is expressible.
+
+If `visual_depth` ever **crops** instead of resizing, `half_fov_rad` stops being
+carried unchanged and has to be recomputed. That is why the reason is in the code
+rather than only here.
+
+### Nothing upstream means nothing downstream
+
+A card whose camera declared nothing emits **no** `camera_info` — not an entry
+full of nulls. The format requires a non-empty `id` and neither card can invent
+one; a camera's identity is not derivable from a topic name. A consumer that sees
+no entry falls back conservatively and says so, which is correct. A consumer that
+saw a made-up `id` would compare it against another made-up one and conclude two
+different lenses are the same.
+
+Instead both cards report `camera_info_note` in `info()`, naming the upstream as
+the thing to fix. "The camera declared nothing" and "this card dropped it" look
+identical from downstream, and only the first is somebody else's problem.
+
+A declaration is also dropped when its node is retired: a re-wired card answering
+`info()` with the optics of a camera it is no longer fed by is worse than
+answering with nothing.
+
+### Not yet done
+
+`visual_depth`'s **depth calibration** (`cal_a`/`cal_b`) is still selected by hand
+from the `calibration_preset` dropdown. It is a property of camera × depth model,
+not of the camera alone, so it cannot move to the camera card — but it can be
+**looked up** by `camera_info.id` instead of chosen, which is the obvious next
+step and is not implemented.
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |

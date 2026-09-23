@@ -206,3 +206,70 @@ def test_the_card_says_whose_problem_a_missing_declaration_is():
     out, note = plugin._camera_info(None, CAM_TOPIC, {}, "/d", "/s")
     assert out == []
     assert "上游相机没有声明" in note
+
+
+# ── vop: the other half of what navi needs ───────────────────────────────────
+
+def _vop():
+    from plugins import vop as vop_plugin
+    plugin = vop_plugin.VideoObjectPerceptionPlugin({}, "ubuntu", None)
+    plugin._vocabulary = ["person"]
+    return plugin, vop_plugin
+
+
+def test_vop_passes_the_optics_through_without_touching_the_geometry():
+    """vop reads the frame and publishes text — nothing about the picture's
+    geometry changes — so only `pipeline` grows. `width`/`height` and `K` must
+    come through exactly as they arrived, because recomputing what did not change
+    is where mistakes live.
+    """
+    plugin, mod = _vop()
+    K = [700.0, 0.0, 640.0, 0.0, 700.0, 360.0, 0.0, 0.0, 1.0]
+    plugin._upstream_camera[CAM_TOPIC] = _upstream(K=K)
+
+    info = plugin.dispatch("vop", {"action": "info", "input_topic": CAM_TOPIC})
+    entry = info["camera_info"][0]
+
+    assert entry["topic"] == mod.output_topic_for(CAM_TOPIC)
+    assert (entry["width"], entry["height"]) == (1280, 720)
+    assert entry["K"] == K
+    assert entry["half_fov_rad"] == 0.888
+    assert entry["pipeline"] == ["unitree/r1/camera_main", "perception/vop"]
+
+
+def test_vop_and_the_depth_map_carry_the_same_camera_identity():
+    """What makes navi's same-camera check possible at all.
+
+    vop reports a *normalised* lateral offset and the depth map is a grid of
+    distances; navi turns both into metres with one field of view, which is only
+    correct if both come from the same lens. Inputs are bound by what they carry
+    — deliberately — so camera A's vop paired with camera B's depth has always
+    been wirable, and would produce confidently wrong distances with nothing in
+    any log. Both sides declaring the same `id` is what turns that into a
+    comparison.
+    """
+    plugin, _ = _vop()
+    plugin._upstream_camera[CAM_TOPIC] = _upstream()
+    objects = plugin.dispatch("vop", {"action": "info",
+                                      "input_topic": CAM_TOPIC})["camera_info"][0]
+    assert camera_id(objects) == camera_id(_depth_entry())
+
+
+def test_vop_says_why_a_downstream_angle_will_be_missing():
+    """Without a field of view, `position` is a dimensionless number to everyone
+    downstream — and the avoidance corridor's width is computed from exactly that
+    angle. Saying so here is cheaper than diagnosing it at a doorway."""
+    plugin, _ = _vop()
+    info = plugin.dispatch("vop", {"action": "info", "input_topic": CAM_TOPIC})
+    assert "camera_info" not in info
+    assert "归一化" in info["camera_info_note"]
+
+
+def test_a_retired_node_takes_its_camera_with_it():
+    """A re-wired card answering with the optics of a camera it is no longer fed
+    by is worse than answering with nothing, because downstream cannot tell the
+    two apart."""
+    plugin, _ = _vop()
+    plugin._upstream_camera[CAM_TOPIC] = _upstream()
+    plugin._retire_node(CAM_TOPIC)
+    assert CAM_TOPIC not in plugin._upstream_camera
