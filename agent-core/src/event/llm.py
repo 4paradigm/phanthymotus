@@ -212,34 +212,118 @@ def _compact_turn(turn: list[dict]) -> list[dict]:
     return out
 
 
+_ELIDED = '…(略)'
+
+
+def _elide_arguments(args, value_chars: int = 40, max_chars: int = 400) -> str:
+    """把一条 tool_call 的 arguments 压短，且压完仍是**合法 JSON**。
+
+    `arguments` 按 OpenAI schema 是一个 JSON *字符串*，不是自由文本。所以
+    `args[:100] + '...'` 这种切法压出来的东西看着只是"短了点"，实际是
+    `{"text": "很长的一段话"}` 被切成 `{"text": "很长的一...` —— 引号和花括号
+    都没闭合。严格的服务端直接 400（`messages[N].tool_calls[M].function.arguments`），
+    而那类 400 在 `_classify_error` 里被判为不可重试，于是整个 turn 被丢掉；
+    宽松的服务端不报错，但模型读到的是一段坏掉的 JSON。
+
+    更糟的是这个损坏会**留下来**：`turn_messages` 就是 `self._current_turn`
+    （见 `_one_turn` 里的 alias），压缩是原地改的，改完随 turn 一起进内存历史和
+    SQLite，之后每一轮请求都把它再带回去一次。
+
+    这里改成按结构压：解析出来，逐个字段留键、截值，再 dump 回去。省下来的字数
+    和粗暴切片相当，但结果永远能被解析。解析不出来的（模型自己就写歪了）退回
+    `{}` —— 一个空对象是合法的，坏掉的半截不是。
+    """
+    if not isinstance(args, str):
+        return '{}'
+    if len(args) <= max_chars:
+        return args
+    try:
+        parsed = json.loads(args)
+    except (ValueError, TypeError):
+        return '{}'
+    if not isinstance(parsed, dict):
+        return '{}'
+
+    def _shrink(value):
+        if isinstance(value, str) and len(value) > value_chars:
+            return value[:value_chars] + _ELIDED
+        if isinstance(value, (list, dict)):
+            return _ELIDED
+        return value
+
+    out = {k: _shrink(v) for k, v in parsed.items()}
+    dumped = json.dumps(out, ensure_ascii=False)
+    if len(dumped) > max_chars:
+        # 字段太多，值再短也压不下来：只留键名。标量（数字、布尔）原样留着 ——
+        # 它们本来就短，而把 limit=5 写成 "…(略)" 等于顺手改了类型。
+        dumped = json.dumps(
+            {k: (v if isinstance(v, (int, float, bool)) or v is None else _ELIDED)
+             for k, v in out.items()},
+            ensure_ascii=False)
+    return dumped
+
+
 def _scrub(message_list: list[dict]) -> list[dict]:
-    """丢弃结构非法的 tool_call，以及随之失去归属的 tool 结果。
+    """丢弃结构非法的 tool_call、非法的 arguments，以及失去归属的 tool 结果。
 
     glm 偶发在正常 tool_call 后追加一条 id/name 均为空串的条目。它一旦落盘，
     历史续跑会把它一路带回去，之后每次请求都被服务端 400
     （messages[N].tool_calls[M].function missing required field "name"），
     直到那一轮从 tier1/tier2 里滚出去为止——表现就是「这台机器总是报错」。
+
+    另外两类损坏是**我们自己压缩出来的**，所以这里一并兜底 —— 不只是防御，
+    更是给已经中毒的历史一条修复路径：已部署机器的 `data.db` 里躺着的坏记录，
+    光改压缩函数是修不好的，得在读回来的路上洗掉。
+
+    - `arguments` 不是合法 JSON：修成 `'{}'` 而不是丢掉整个调用。调用一旦丢了，
+      跟它配对的 tool 结果就成了孤儿，等于把一个 400 换成另一个 400。
+    - 孤儿 tool 结果：`role: 'tool'` 的消息必须紧跟在声明了同一个 `tool_call_id`
+      的 assistant 之后，否则服务端拒绝整个请求。tier2 的 `_degrade_turn` 曾经
+      把 assistant 的 `tool_calls` 整个删掉却留着结果，Orin5 上 212 份留存请求里
+      有 25 份带着这种孤儿，最多一份里有 12 条。
     """
     from client.llm import _valid_tool_call
-    orphaned: set = set()
+    declared: set = set()
     out: list[dict] = []
     for msg in message_list:
+        # 内部字段不能进请求体。`_usage` 是我们自己挂在 assistant 消息上给历史 modal
+        # 看的，落盘后又随历史一路带回请求里 —— Orin5 留存的 212 份请求有 139 份的
+        # messages 里带着它。按 OpenAI 的 message schema 它是未知字段，宽松的服务端
+        # 忽略，严格的直接拒。存盘照存，出门之前摘掉。
+        if any(k.startswith('_') for k in msg):
+            msg = {k: v for k, v in msg.items() if not k.startswith('_')}
         if msg.get('role') == 'assistant' and msg.get('tool_calls'):
-            good = [tc for tc in msg['tool_calls'] if _valid_tool_call(tc)]
-            if len(good) != len(msg['tool_calls']):
-                orphaned.update(
-                    tc.get('id') for tc in msg['tool_calls']
-                    if isinstance(tc, dict) and not _valid_tool_call(tc)
-                )
+            good = []
+            for tc in msg['tool_calls']:
+                if not _valid_tool_call(tc):
+                    continue
+                fn = tc['function']
+                args = fn.get('arguments')
+                if args not in (None, '') and not _is_json_object(args):
+                    tc = {**tc, 'function': {**fn, 'arguments': '{}'}}
+                good.append(tc)
+            if good != msg['tool_calls']:
                 msg = {k: v for k, v in msg.items() if k != 'tool_calls'}
                 if good:
                     msg['tool_calls'] = good
                 elif not msg.get('content'):
                     continue  # 既无文本也无有效调用，整条丢掉
-        elif msg.get('role') == 'tool' and msg.get('tool_call_id') in orphaned:
+            declared.update(tc['id'] for tc in good)
+        elif msg.get('role') == 'tool' and msg.get('tool_call_id') not in declared:
             continue
         out.append(msg)
     return out
+
+
+def _is_json_object(args) -> bool:
+    """arguments 能不能被服务端当 JSON 解析出来。"""
+    if not isinstance(args, str):
+        return False
+    try:
+        json.loads(args)
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 def _sanitize(message_list: list[dict]) -> list[dict]:
@@ -1163,7 +1247,19 @@ def _waiting_facts() -> str:
 # ── Tiered Retention helpers ──────────────────────────────────────────────────
 
 def _degrade_turn(turn: list[dict]) -> list[dict]:
-    """降质 turn：tool results 截短，tool_calls 只留名称列表。用于 tier2 历史。"""
+    """降质 turn：tool results 截短，tool_calls 的 arguments 压短。用于 tier2 历史。
+
+    **tool_calls 必须留着。** 这里以前把它整个换成一行 `[调用: a, b]` 文本，但
+    后面那几条 `role: 'tool'` 结果原样留在列表里 —— 于是每个滚进 tier2 的 turn
+    都产出一批孤儿 tool 消息（`tool_call_id` 指向一个请求里根本不存在的调用）。
+    `_sanitize` 只管末尾未被回应的调用，`_scrub` 当时只管结构非法的调用，两个都
+    漏掉了这种。Orin5 留存的 212 份请求里 25 份带着这种孤儿，单份最多 12 条 ——
+    而留存目录里只有**成功**的请求，失败的那些根本不落盘，所以真实比例只会更高。
+    glm 容忍了它，严格按 OpenAI 语义校验的服务端会整个 400 掉。
+
+    省字数的目的靠压 arguments 达成，代价是每个调用多留几十个字符 —— 相比一条
+    tool 结果本身微不足道。
+    """
     degraded = []
     for msg in turn:
         if msg.get('role') == 'tool':
@@ -1173,16 +1269,25 @@ def _degrade_turn(turn: list[dict]) -> list[dict]:
             elif isinstance(content, list):
                 msg = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
-            names = [tc['function']['name'] for tc in msg['tool_calls']]
-            text = msg.get('content', '') or ''
-            msg = {'role': 'assistant', 'content': (text + '\n[调用: ' + ', '.join(names) + ']').strip()}
+            msg = {**msg, 'tool_calls': [
+                {**tc, 'function': {
+                    **tc['function'],
+                    'arguments': _elide_arguments(tc['function'].get('arguments', ''),
+                                                  value_chars=20, max_chars=80),
+                }}
+                for tc in msg['tool_calls']
+            ]}
         degraded.append(msg)
     return degraded
 
 
 def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> None:
     """Turn 内 compaction：保留最近 keep_recent 条完整，早期消息的 tool results 截短。
-    直接修改 turn_messages（in-place）。"""
+    直接修改 turn_messages（in-place）。
+
+    注意这个 in-place 不只影响这一次请求：`turn_messages` 就是 `self._current_turn`
+    （`_one_turn` 里的 alias），压完的内容会随 turn 进内存历史和 SQLite。所以这里
+    写坏一条 arguments，坏的就是之后每一次请求 —— 见 `_elide_arguments`。"""
     if len(turn_messages) <= keep_recent:
         return
     # 只压缩 [0 : -keep_recent] 范围内的消息
@@ -1196,12 +1301,14 @@ def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> 
             elif isinstance(content, list):
                 turn_messages[i] = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
-            # 保留 tool_calls 结构（API 需要），但截短 arguments
+            # 保留 tool_calls 结构（API 需要），但截短 arguments —— 按结构压，
+            # 不能直接切片，切出来的半截 JSON 服务端不收。
             new_calls = []
             for tc in msg['tool_calls']:
                 args = tc.get('function', {}).get('arguments', '')
-                if len(args) > 100:
-                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': args[:100] + '...'}}
+                elided = _elide_arguments(args, value_chars=30, max_chars=100)
+                if elided != args:
+                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': elided}}
                 else:
                     new_tc = tc
                 new_calls.append(new_tc)
@@ -2409,7 +2516,21 @@ class Event:
             async def _dispatch(call: dict) -> dict:
                 nonlocal _finish_deferred, _channel_replied
                 name   = call['function']['name']
-                args   = json.loads(call['function']['arguments'] or '{}')
+                # 模型写歪 arguments（被 max_tokens 截断、或者干脆不是 JSON）是随机
+                # 发生的。这里以前不设防，一次 JSONDecodeError 直接冒到 run_forever
+                # 的兜底 except，整个 turn 连同已经做完的活一起丢掉，日志里只留一行
+                # `[错误] JSONDecodeError`。改成把错误当工具结果还给模型 —— 它下一轮
+                # 自己就能改对，turn 不必因此报废。
+                try:
+                    args = json.loads(call['function']['arguments'] or '{}')
+                except (json.JSONDecodeError, TypeError) as _ae:
+                    raw = str(call['function'].get('arguments'))[:200]
+                    print(f'[decision] malformed arguments for {name}: {_ae}; raw={raw!r}')
+                    await push_event({'type': 'error', 'payload': {
+                        'message': f'malformed tool arguments for {name}: {_ae}'}})
+                    return {'id': call['id'], 'result':
+                            f'Error: arguments for {name} were not valid JSON ({_ae}). '
+                            f'Call the tool again with a well-formed JSON object.'}
                 # Set by either barrier branch below, when a barrier wait was cut short
                 # by reconsider_event rather than genuinely completing. Lets the caller
                 # tell "interrupted before it ever reached the device, still had made
