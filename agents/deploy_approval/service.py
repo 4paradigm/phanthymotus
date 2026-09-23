@@ -20,7 +20,9 @@ import re
 import os
 import inspect
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 from . import comments as comments_mod
@@ -922,8 +924,14 @@ class DeployController:
                 )
             )
 
-            if compatible_remaining_ids != required_remaining_ids:
-                # Zero deploy POST: partial coverage is not accepted.
+            # Multi-machine partial coverage: select only compatible, undeployed components.
+            selected_components = [
+                c for c in undeployed_components
+                if c.get("component_id", "") in compatible_remaining_ids
+            ]
+
+            if not selected_components:
+                # Selected machine covers zero remaining components.
                 state["status"] = "deploy-requested"
                 state["command"] = {
                     "comment_id": comment_id,
@@ -937,10 +945,9 @@ class DeployController:
                     undeployed_components,
                     self._get_machine_groups_for_components(undeployed_components),
                     gate_note=[
-                        "Selected machine does not cover all remaining components.",
+                        f"Machine `{machine_alias}` does not cover any remaining component.",
                         "ZERO deploy POST.",
-                        "Choose one machine that covers every remaining component.",
-                        "Send a NEW `/approve_deploy machine=<alias>`.",
+                        "Send a NEW `/approve_deploy machine=<alias>` for a compatible machine.",
                     ],
                 )
                 await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
@@ -951,10 +958,10 @@ class DeployController:
             node_id = machine.node_id
             core = await self._core_for_node(node_id)
 
-            # Clean gate: read running_image for every selected component before
-            # any deploy POST. Status fields are ignored.
-            preflight = await self._preflight_running_images(core, undeployed_components)
-            occupied = [item for item in preflight if item["running_image"]]
+            # Preflight: read running_image for every SELECTED component before
+            # any deploy POST. running_image is evidence, not a block — Agent Core
+            # handles old-container replacement via its own deploy contract.
+            preflight = await self._preflight_running_images(core, selected_components)
             for item in preflight:
                 item["component"]["runtime_id"] = item["runtime_id"]
             approve_attempt = {
@@ -972,31 +979,6 @@ class DeployController:
                 "outcome": "",
                 "health": [],
             }
-            if occupied:
-                state["status"] = "deploy-requested"
-                state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "approve_deploy",
-                    "phase": "completed",
-                    "args": {"machine": machine_alias, "actor": actor},
-                }
-                state["last_processed_comment_id"] = comment_id
-                markdown = comments_mod.approve_deploy_occupied_comment(
-                    repo,
-                    pr_number,
-                    pr_head,
-                    machine_alias,
-                    [item["component"] for item in occupied],
-                    {
-                        item["component"].get("component_id", ""): item["running_image"]
-                        for item in occupied
-                    },
-                )
-                approve_attempt["outcome"] = "blocked_occupied"
-                self._record_approve_attempt(state, approve_attempt)
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
-                return True
 
             # Fresh PR re-read before unsafe POST
             fresh_pr = await self.proxy.get_pr(repo, pr_number)
@@ -1116,8 +1098,9 @@ class DeployController:
             new_deployments = []
             deploy_error = None
             deploy_outcome_uncertain = False
-            # Sequential per-component deploy; definite POST success is recorded immediately.
-            for comp in undeployed_components:
+            # Sequential per-component deploy; POST success followed by
+            # post-deploy runtime verification before recording as deployed.
+            for comp in selected_components:
                 image_ref = comp["image_ref"]
                 runtime_id = str(comp.get("runtime_id") or "")
                 if not runtime_id:
@@ -1135,7 +1118,20 @@ class DeployController:
                     deploy_error = str(e)
                     break
 
-                # Deploy success: record deployment immediately
+                # Post-deploy verification: confirm target image is actually running
+                verified, health_evidence = await self._verify_deployed_runtime(
+                    core, node_id, comp.get("component_id", ""), runtime_id, image_ref,
+                )
+                approve_attempt["health"].append(health_evidence)
+                if not verified:
+                    deploy_outcome_uncertain = True
+                    deploy_error = (
+                        f"post-deploy verify timeout for {comp.get('target', '')!r}: "
+                        f"target image not observed running"
+                    )
+                    break
+
+                # Deploy success verified: record deployment
                 new_deployments.append({
                     "machine": machine_alias,
                     "component_ids": [comp["component_id"]],
@@ -1276,7 +1272,38 @@ class DeployController:
             approve_attempt["outcome"] = "deployed"
             self._record_approve_attempt(state, approve_attempt)
 
-            # Full coverage required: durable testing state FIRST
+            # Check full coverage: all components deployed -> testing; else -> stay deploy-requested
+            all_component_ids = {c.get("component_id", "") for c in components}
+            deployed_component_ids = set()
+            for dep in state["deployments"]:
+                if dep.get("phase") == "deployed":
+                    for cid in dep.get("component_ids", []):
+                        deployed_component_ids.add(cid)
+
+            if deployed_component_ids != all_component_ids:
+                # Partial coverage achieved; more machines needed.
+                state["status"] = "deploy-requested"
+                remaining = [
+                    c for c in components
+                    if c.get("component_id", "") not in deployed_component_ids
+                ]
+                markdown = comments_mod.deploy_requested(
+                    repo, pr_number, pr_head,
+                    remaining,
+                    self._get_machine_groups_for_components(remaining),
+                    gate_note=[
+                        "### Partial coverage completed",
+                        "",
+                        f"Machine `{machine_alias}` deployed its compatible components.",
+                        f"Remaining components need additional machine approval.",
+                        "Send a NEW `/approve_deploy machine=<alias>`.",
+                    ],
+                )
+                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
+
+            # All components deployed -> durable testing state FIRST
             state["status"] = "testing"
 
             # Build testing markdown WITHOUT advisory case result
@@ -1643,12 +1670,14 @@ class DeployController:
     def _get_machine_groups_for_components(
         self, components: list[dict],
     ) -> list[dict]:
-        """Determine FULL-COVERAGE machine groups from components.
+        """Determine compatible machine groups for the given components.
 
-        Returns ONLY machines whose compatible component_ids EQUAL the
-        complete set of all component_ids passed in.
+        Returns machines whose compatible component_ids are a non-empty
+        subset of the complete set of component_ids passed in.
 
-        Machines with partial coverage are excluded.
+        Machines with partial coverage ARE included — this supports
+        multi-machine deployment where no single machine covers all
+        remaining components.
         """
         machines = self.policy.get_machines()
         required_ids = {
@@ -1676,8 +1705,8 @@ class DeployController:
                     if not comp_driver_path or not m.driver_paths or comp_driver_path not in m.driver_paths:
                         continue
                 compatible.append(comp.get("component_id", ""))
-            # FULL COVERAGE ONLY: compatible must exactly match required
-            if set(compatible) == required_ids:
+            # PARTIAL COVERAGE OK: any machine with non-empty compatible set is shown
+            if compatible and set(compatible) <= required_ids:
                 groups.append({
                     "alias": m.alias,
                     "node_id": m.node_id,
@@ -1738,22 +1767,79 @@ class DeployController:
             })
         return preflight
 
-    def _occupied_gate_note(
-        self, machine_alias: str, component: dict, running_image: str
-    ) -> list[str]:
-        target = str(component.get("target", "") or "")
-        lines = [
-            "### Clean Gate",
-            "",
-            f"Component `{target}` on machine `{machine_alias}` is occupied.",
-            f"running_image: `{running_image}`",
-            "",
-            "running_image != \"\" -> ZERO deploy POST",
-            "status: deploy-requested",
-            "Machine Owner must clear the occupied runtime image manually.",
-            f"Then send `/approve_deploy machine={machine_alias}`.",
-        ]
-        return lines
+    async def _verify_deployed_runtime(
+        self,
+        core,
+        node_id: str,
+        component_id: str,
+        runtime_id: str,
+        target_image_ref: str,
+    ) -> tuple[bool, dict]:
+        """Verify that a deployed runtime is actually running the target image.
+
+        Bounded polling using self.config.total_timeout as the verification budget.
+        Success requires BOTH status=="running" AND running_image == target_image_ref
+        (exact string comparison).
+
+        Returns (True, health_evidence_dict) on success.
+        Returns (False, health_evidence_dict) on timeout/mismatch — caller must treat as uncertain.
+        """
+        deadline = time.monotonic() + self.config.total_timeout
+        poll_interval = 2  # seconds between polls
+        last_status = ""
+        last_running_image = ""
+        last_error: str | None = None
+
+        while True:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                status_data = await core.driver_status(runtime_id)
+            except AgentCoreError as e:
+                # Transient error — continue polling until deadline
+                last_error = str(e)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(poll_interval, remaining))
+                continue
+
+            status_val = status_data.get("status", "")
+            running_image = status_data.get("running_image", "")
+            last_status = status_val if isinstance(status_val, str) else ""
+            last_running_image = running_image if isinstance(running_image, str) else ""
+
+            if (isinstance(status_val, str) and status_val == "running"
+                    and isinstance(running_image, str)
+                    and running_image == target_image_ref):
+                # Success: exact target image observed and running
+                return True, {
+                    "component_id": component_id,
+                    "runtime_id": runtime_id,
+                    "status": "running",
+                    "running_image": target_image_ref,
+                    "target_image": target_image_ref,
+                    "verified": True,
+                }
+
+            # Still polling: status not yet running or image not yet converged
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
+
+        # Deadline reached — outcome is uncertain (POST already happened)
+        result: dict[str, Any] = {
+            "component_id": component_id,
+            "runtime_id": runtime_id,
+            "status": last_status,
+            "running_image": last_running_image,
+            "target_image": target_image_ref,
+            "verified": False,
+        }
+        if last_error:
+            result["error"] = last_error
+        return False, result
 
     async def _snapshot_terminal_runtime_logs(
         self, components: list[dict], deployments: list[dict],

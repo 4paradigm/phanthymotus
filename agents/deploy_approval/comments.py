@@ -264,7 +264,7 @@ def deploy_requested(
         "",
     ] + comp_lines + [
         "",
-        "### Full-coverage machines",
+        "### Compatible machines for remaining components",
         "",
     ]
     for mg in machine_groups:
@@ -397,48 +397,6 @@ def deploy_failed(
         cos_bundle_sha256=cos_bundle_sha256,
         cos_bundle_size=cos_bundle_size,
     )
-
-
-def approve_deploy_occupied_comment(
-    repo: str,
-    pr_number: int,
-    head_sha: str,
-    machine_alias: str,
-    occupied_components: list[dict],
-    running_image_by_component: dict[str, str],
-) -> str:
-    lines = [
-        BOT_MARKER,
-        lifecycle_marker(repo, pr_number),
-        "### Deploy Approval \u2014 Lifecycle",
-        "",
-        "**Status:** `deploy-requested`",
-        f"**Bound HEAD:** `{_short(head_sha)}`",
-        "",
-        "CLEAN GATE: occupied runtime image.",
-        "ZERO deployment was performed.",
-        "",
-    ]
-    for comp in occupied_components:
-        target = _escape(str(comp.get("target", "")))
-        runtime_id = _escape(str(comp.get("runtime_id", "")))
-        image_ref = running_image_by_component.get(str(comp.get("component_id", "")), "")
-        compact = _compact_running_image(image_ref)
-        if compact:
-            lines.append(f"- `{target}` runtime `{runtime_id}` -> `{compact}`")
-        else:
-            lines.append(f"- `{target}` runtime `{runtime_id}` -> `occupied`")
-    lines.extend([
-        "",
-        f"Clear `{_escape(machine_alias)}` manually, then send:",
-        f"`/approve_deploy machine={machine_alias}`",
-        "",
-        "Re-read `running_image` on the next NEW approve.",
-        "Controller does not perform stop/remove/cleanup.",
-        "",
-        last_checked_line(),
-    ])
-    return "\n".join(lines)
 
 
 def approve_deploy_revoked_comment(

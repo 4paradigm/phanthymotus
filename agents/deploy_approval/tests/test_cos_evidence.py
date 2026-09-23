@@ -392,8 +392,11 @@ async def test_approve_rejects_machine_without_full_coverage():
     )
 
     groups = controller._get_machine_groups_for_components(components)
-    # No machine covers both components, so groups should be empty
-    assert groups == []
+    # Partial coverage is allowed: machine supports perception but not planning,
+    # so it should be listed with only the compatible component.
+    assert len(groups) == 1
+    assert groups[0]["alias"] == "alpha"
+    assert groups[0]["component_ids"] == ["comp-a"]
 
 
 @pytest.mark.asyncio

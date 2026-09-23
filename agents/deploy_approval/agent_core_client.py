@@ -393,10 +393,21 @@ class AgentCoreClient:
                 f"agent-core deploy error: status={inner.get('status')!r}, error={error_msg!r}"
             )
         if skipped is True:
-            # skipped=True is NOT a known-success deployment
-            raise AgentCoreError(
-                "agent-core deploy skipped=true; not a confirmed success"
-            )
+            # skipped classification — must check status for proper outcome
+            if isinstance(status, str) and status == "running":
+                # skipped=true + status=running => known success, idempotent deploy
+                # Still requires post-deploy verification of exact target image
+                pass  # fall through to normal success path
+            elif isinstance(status, str) and status == "deploying":
+                # skipped=true + status=deploying => another deploy in progress, outcome unknown
+                raise AgentCoreDeployOutcomeUncertain(
+                    "agent-core deploy skipped=true, status=deploying"
+                )
+            else:
+                # skipped=true + unknown status => fail closed
+                raise AgentCoreDeployOutcomeUncertain(
+                    f"agent-core deploy skipped=true, unknown status={status!r}"
+                )
         # Known-success: must have a non-empty status string and no error/skipped
         if not isinstance(status, str) or not status:
             raise AgentCoreDeployOutcomeUncertain(
@@ -423,13 +434,28 @@ class AgentCoreClient:
                     "agent-core driver_status running_image must be a string"
                 )
             result: dict[str, Any] = {"running_image": running}
+            # Preserve status field — critical for post-deploy verification.
+            # If status is present it MUST be a non-empty string; fail closed otherwise.
+            if "status" in inner:
+                status_val = inner["status"]
+                if not isinstance(status_val, str) or not status_val:
+                    raise AgentCoreError(
+                        "agent-core driver_status status must be a non-empty string when present"
+                    )
+                result["status"] = status_val
             logs = inner.get("logs")
             if isinstance(logs, str) and logs:
                 result["logs"] = logs
             return result
         logs = inner.get("logs")
         if "status" in inner and isinstance(logs, str):
-            return {"running_image": ""}
+            result: dict[str, Any] = {"running_image": ""}
+            if not isinstance(inner["status"], str) or not inner["status"]:
+                raise AgentCoreError(
+                    "agent-core driver_status status must be a non-empty string when present"
+                )
+            result["status"] = inner["status"]
+            return result
         raise AgentCoreError(
             "agent-core driver_status missing running_image for no-container shape"
         )

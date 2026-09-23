@@ -536,7 +536,7 @@ def test_real_agent_core_list_envelopes_accept_list_data():
             ({"code": 200, "data": []}, "list_drivers", []),
             ({"code": 200, "data": []}, "list_mcp", []),
             ({"code": 200, "data": {"status": "stopped", "running_image": ""}},
-             "driver_status", {"running_image": ""}),
+             "driver_status", {"running_image": "", "status": "stopped"}),
             ({"code": 200, "data": {"online": True, "tools": [{"name": "x"}]}},
              "mcp_ping", {"online": True, "tools": [{"name": "x"}]}),
         ]
@@ -878,10 +878,8 @@ class TestValidateApiPathSegment:
                 }, request=request)
 
         c = self._make_client(Transport())
-        with pytest.raises(AgentCoreError, match="skipped") as excinfo:
+        with pytest.raises(AgentCoreDeployOutcomeUncertain, match="skipped"):
             asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
-        assert isinstance(excinfo.value, AgentCoreError)
-        assert not isinstance(excinfo.value, AgentCoreDeployOutcomeUncertain)
 
     def test_deploy_post_transport_timeout_is_uncertain(self):
         # Scenario 1: httpx.ReadTimeout (transport-layer error)
@@ -940,3 +938,54 @@ def test_github_self_created_client_disables_proxy_env(monkeypatch):
         assert client.http.trust_env is False
     finally:
         asyncio.run(client.http.aclose())
+
+
+    def test_deploy_driver_skipped_running_is_known_success(self):
+        """skipped=true + status=running => no exception (caller still verifies)."""
+        from httpx import Response
+        class Transport(httpx.BaseTransport):
+            def handle_request(self, request):
+                return Response(
+                    200,
+                    json={"code": 200, "data": {
+                        "status": "running", "skipped": True,
+                        "message": "already running with same image",
+                    }},
+                )
+        c = self._make_client(Transport())
+        result = asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
+        assert result is not None
+
+    def test_deploy_driver_skipped_deploying_is_uncertain(self):
+        """skipped=true + status=deploying => AgentCoreDeployOutcomeUncertain."""
+        from httpx import Response
+        class Transport(httpx.BaseTransport):
+            def handle_request(self, request):
+                return Response(
+                    200,
+                    json={"code": 200, "data": {
+                        "status": "deploying", "skipped": True,
+                        "message": "another deploy in progress",
+                    }},
+                )
+        c = self._make_client(Transport())
+        with pytest.raises(AgentCoreDeployOutcomeUncertain, match="skipped"):
+            asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
+
+    def test_driver_status_preserves_status_with_running_image_strict(self):
+        """status field preserved when running_image present; invalid status fails closed."""
+        from httpx import Response
+        class Transport(httpx.BaseTransport):
+            def handle_request(self, request):
+                if "valid" in str(request.url):
+                    return Response(200, json={"code": 200, "data": {
+                        "status": "running", "running_image": "registry/repo:tag",
+                    }})
+                return Response(200, json={"code": 200, "data": {
+                    "status": 123, "running_image": "registry/repo:tag",
+                }})
+        c = self._make_client(Transport())
+        result = asyncio.run(c.driver_status("valid-driver"))
+        assert result == {"status": "running", "running_image": "registry/repo:tag"}
+        with pytest.raises(AgentCoreError, match="status must be a non-empty string"):
+            asyncio.run(c.driver_status("invalid-driver"))

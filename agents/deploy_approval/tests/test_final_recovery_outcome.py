@@ -189,11 +189,12 @@ async def test_driver_status_current_no_container_shape_normalizes_to_empty_runn
 
     client = _driver_client(Transport())
     result = await client.driver_status("driver")
-    assert result == {"running_image": ""}
+    assert result == {"running_image": "", "status": "stopped"}
 
 
 @pytest.mark.asyncio
-async def test_driver_status_existing_container_ignores_status_value():
+async def test_driver_status_invalid_status_type_fails_closed():
+    """status field present but not a non-empty string -> AgentCoreError (fail closed)."""
     class Transport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request):
             return httpx.Response(
@@ -209,8 +210,8 @@ async def test_driver_status_existing_container_ignores_status_value():
             )
 
     client = _driver_client(Transport())
-    result = await client.driver_status("driver")
-    assert result == {"running_image": "registry.example/repo@sha256:" + "a" * 64}
+    with pytest.raises(AgentCoreError, match="status must be a non-empty string"):
+        await client.driver_status("driver")
 
 
 @pytest.mark.asyncio
@@ -716,6 +717,7 @@ async def test_new_approve_from_uncertain_refreshes_before_clean_gate():
     core.driver_status = AsyncMock(side_effect=_driver_status)
     core.deploy_driver = AsyncMock(return_value={"code": 0})
     controller._core_for_node = AsyncMock(return_value=core)
+    controller._verify_deployed_runtime = AsyncMock(return_value=(True, {"component_id": "comp-001", "runtime_id": "test", "running_image": "x", "passed": False}))
     controller._run_automated_case = AsyncMock(return_value={})
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
@@ -1016,6 +1018,7 @@ async def test_uncertain_post_stops_later_components():
         return {"result": {"code": 0}}
 
     controller._deploy_component = AsyncMock(side_effect=_deploy_component)
+    controller._verify_deployed_runtime = AsyncMock(return_value=(True, {"component_id": "comp-001", "runtime_id": "test", "running_image": "x", "passed": False}))
     controller._run_automated_case = AsyncMock(return_value={})
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
     proxy.get_issue_comments = AsyncMock(return_value=[])
@@ -1390,6 +1393,7 @@ async def test_new_approve_deploys_only_remaining_components():
         {"id": "actucore", "target": "actucore", "image": "registry.example/repo:v1"},
     ])
     controller._core_for_node = AsyncMock(return_value=core)
+    controller._verify_deployed_runtime = AsyncMock(return_value=(True, {"component_id": "comp-001", "runtime_id": "test", "running_image": "x", "passed": False}))
     controller._run_automated_case = AsyncMock(return_value={})
 
     await controller.handle_approve_deploy(REPO, 1, 99, "test-machine", "owner1", actor_id)

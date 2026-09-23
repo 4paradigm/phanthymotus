@@ -292,16 +292,51 @@ def _validate_hidden_state(data: dict) -> dict:
         for h in health:
             if not isinstance(h, dict):
                 raise MalformedHiddenStateError("approve_attempt health entries must be dicts")
-            if set(h.keys()) != {"component_id", "runtime_id", "running_image", "passed"}:
-                raise MalformedHiddenStateError("approve_attempt health keys must match the canonical schema")
+            # Legacy schema (deprecated but still allowed for backward compat)
+            legacy_keys = {"component_id", "runtime_id", "running_image", "passed"}
+            # New schema — post-deploy verification (verified == True/False)
+            new_schema_keys = {"component_id", "runtime_id", "status", "running_image", "target_image", "verified"}
+            # New schema with optional error (uncertain post-deploy)
+            new_schema_with_error_keys = new_schema_keys | {"error"}
+            h_keys = set(h.keys())
+            if h_keys != legacy_keys and h_keys not in (new_schema_keys, new_schema_with_error_keys):
+                raise MalformedHiddenStateError(
+                    f"approve_attempt health keys must match canonical schema, got {h_keys}"
+                )
             if not isinstance(h.get("component_id", ""), str):
                 raise MalformedHiddenStateError("approve_attempt health component_id must be a string")
             if not isinstance(h.get("runtime_id", ""), str):
                 raise MalformedHiddenStateError("approve_attempt health runtime_id must be a string")
             if not isinstance(h.get("running_image", ""), str):
                 raise MalformedHiddenStateError("approve_attempt health running_image must be a string")
-            if not isinstance(h.get("passed"), bool):
+            if "passed" in h and not isinstance(h.get("passed"), bool):
                 raise MalformedHiddenStateError("approve_attempt health passed must be a bool")
+            if "verified" in h and not isinstance(h.get("verified"), bool):
+                raise MalformedHiddenStateError("approve_attempt health verified must be a bool")
+            # Semantic validation for new schema
+            if h_keys in (new_schema_keys, new_schema_with_error_keys):
+                if h.get("verified") is True:
+                    if h.get("status") != "running":
+                        raise MalformedHiddenStateError(
+                            "health verified=true requires status==running"
+                        )
+                    if h.get("running_image") != h.get("target_image"):
+                        raise MalformedHiddenStateError(
+                            "health verified=true requires running_image==target_image"
+                        )
+                    if not h.get("target_image"):
+                        raise MalformedHiddenStateError(
+                            "health verified=true requires non-empty target_image"
+                        )
+                if "error" in h:
+                    if not isinstance(h["error"], str) or not h["error"]:
+                        raise MalformedHiddenStateError(
+                            "health error must be a non-empty string when present"
+                        )
+                    if h.get("verified") is not False:
+                        raise MalformedHiddenStateError(
+                            "health error implies verified=false"
+                        )
     approve_attempts_total = data.get("approve_attempts_total", len(approve_attempts))
     if isinstance(approve_attempts_total, bool) or not isinstance(approve_attempts_total, int):
         raise MalformedHiddenStateError("approve_attempts_total must be a non-negative int")

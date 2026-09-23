@@ -727,7 +727,7 @@ async def test_clean_gate_ignores_runtime_status_when_image_empty(controller, pr
 
 
 @pytest.mark.asyncio
-async def test_clean_gate_blocks_occupied_image_even_if_status_looks_clean(controller, proxy, mock_github):
+async def test_existing_running_image_allows_normal_agent_core_upgrade(controller, proxy, mock_github):
     state = _deploy_requested_state()
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
@@ -740,19 +740,25 @@ async def test_clean_gate_blocks_occupied_image_even_if_status_looks_clean(contr
     })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
-    core.driver_status = AsyncMock(return_value={"status": "stopped", "running_image": "old@sha256:" + "b" * 64})
-    core.deploy_driver = AsyncMock()
+    core.driver_status = AsyncMock(side_effect=[
+        {"status": "stopped", "running_image": "old@sha256:" + "b" * 64},  # preflight sees old
+        {"status": "running", "running_image": "old@sha256:" + "b" * 64},   # verify poll 1: still old
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},  # verify poll 2: target observed
+    ])
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
     controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
 
     await controller.handle_approve_deploy("repo", 1, 202, "test-machine", "owner1", "1")
 
-    core.deploy_driver.assert_not_called()
+    # NEW: deploy MUST be called despite occupied running_image
+    core.deploy_driver.assert_called_once()
     written_state = proxy.write_hidden_state.call_args.args[3]
-    assert written_state["status"] == "deploy-requested"
+    assert written_state["status"] == "testing"
     assert written_state["command"]["phase"] == "completed"
     assert written_state["last_processed_comment_id"] == 202
-    assert "running_image" in proxy.write_hidden_state.call_args.args[2]
-
 
 @pytest.mark.asyncio
 async def test_clean_gate_preflights_all_components_before_any_deploy(controller, proxy, mock_github):
@@ -792,7 +798,7 @@ async def test_clean_gate_preflights_all_components_before_any_deploy(controller
 
     await controller.handle_approve_deploy("repo", 1, 203, "test-machine", "owner1", "1")
 
-    # Both components should be deployed
+    # Preflight runs on selected compatible components only; both are deployed
     assert core.deploy_driver.call_count == 2
 
 
@@ -800,7 +806,7 @@ async def test_clean_gate_preflights_all_components_before_any_deploy(controller
 async def test_new_approve_rechecks_running_image_until_empty(controller, proxy, mock_github):
     state1 = _deploy_requested_state()
     state2 = _deploy_requested_state()
-    proxy.read_hidden_state = AsyncMock(side_effect=[state1, state2, state2])
+    proxy.read_hidden_state = AsyncMock(side_effect=[state1, state2, state2, state2])
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
@@ -812,10 +818,13 @@ async def test_new_approve_rechecks_running_image_until_empty(controller, proxy,
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
     core.driver_status = AsyncMock(side_effect=[
-        {"status": "busy", "running_image": "occupied@sha256:" + "b" * 64},
-        {"status": "busy", "running_image": ""},
+        {"status": "busy", "running_image": "occupied@sha256:" + "b" * 64},  # first preflight
+        {"status": "running", "running_image": "occupied@sha256:" + "b" * 64},  # first verify poll 1: old
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},  # first verify poll 2: target
+        {"status": "busy", "running_image": "occupied@sha256:" + "b" * 64},  # second preflight
+        {"status": "running", "running_image": "occupied@sha256:" + "b" * 64},  # second verify poll 1: old
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},  # second verify poll 2: target
     ])
-    core.deploy_driver = AsyncMock()
     controller._core_for_node = AsyncMock(return_value=core)
     controller._run_automated_case = AsyncMock(return_value={})
     controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
@@ -824,8 +833,8 @@ async def test_new_approve_rechecks_running_image_until_empty(controller, proxy,
     await controller.handle_approve_deploy("repo", 1, 204, "test-machine", "owner1", "1")
     await controller.handle_approve_deploy("repo", 1, 205, "test-machine", "owner1", "1")
 
-    core.deploy_driver.assert_called_once()
-
+    # With the new clean gate, running_image is evidence not a block -> both calls deploy
+    assert core.deploy_driver.call_count == 2
 
 @pytest.mark.asyncio
 async def test_clean_gate_writes_executing_before_first_deploy_post(controller, proxy, mock_github):
@@ -840,7 +849,12 @@ async def test_clean_gate_writes_executing_before_first_deploy_post(controller, 
     })
     core = AsyncMock()
     core.list_drivers = AsyncMock(return_value=[{"id": "perception", "target": "perception", "image": "registry/repo@sha256:" + "a" * 64, "variant": "5.11"}])
-    core.driver_status = AsyncMock(side_effect=[{"status": "busy", "running_image": ""}, {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64}])
+    core.driver_status = AsyncMock(side_effect=[
+        {"status": "busy", "running_image": ""},  # preflight
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},  # verify: exact target image_ref
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},  # snapshot terminal logs
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},  # automated case runtime logs
+    ])
     events: list[str] = []
 
     async def _write_hidden_state(*args, **kwargs):
@@ -1025,28 +1039,51 @@ async def test_record_test_fail_uses_failed(controller, proxy, mock_github):
 
 
 @pytest.mark.asyncio
-async def test_partial_machine_approval_stays_deploy_requested(controller, proxy, mock_github):
-    # Both components must successfully deploy. Use same image digest for health mock simplicity.
+async def test_partial_machine_approval_deploys_compatible_subset_and_stays_requested(controller, proxy, mock_github):
+    # Two components for different platforms:
+    # perception 5.11 (JP5) and actucore 6.1 (JP6)
     components = [
-        _component(component_id="comp-perception", target="perception", variant="5.11", image_ref="registry/repo@sha256:" + "c" * 64),
-        _component(component_id="comp-driver", target="driver", variant="", driver_path="custom/driver", image_ref="registry/repo@sha256:" + "c" * 64, resolved_platform="linux/arm64"),
+        _component(component_id="comp-perception", target="perception", variant="5.11", runtime_id="perception", image_ref="registry/repo@sha256:" + "c" * 64),
+        _component(component_id="comp-actucore", target="actucore", variant="6.1", runtime_id="actucore", image_ref="registry/repo@sha256:" + "d" * 64),
     ]
-    state = _deploy_requested_state(components=components)
+    state = _deploy_requested_state(components=components, deployments=[])
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 401,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
     core = AsyncMock()
+    # Machine only supports perception 5.11 — actucore 6.1 is NOT in list_drivers
     core.list_drivers = AsyncMock(return_value=[
-        {"id": "perception", "target": "perception", "variant": "5.11"},
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
     ])
-    core.driver_status = AsyncMock(side_effect=[{"status": "busy", "running_image": ""}, {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64}])
-    core.deploy_driver = AsyncMock()
+    core.driver_status = AsyncMock(side_effect=[
+        {"status": "busy", "running_image": ""},  # preflight perception
+        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},  # health pass perception
+    ])
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
     controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
 
     await controller.handle_approve_deploy("repo", 1, 401, "test-machine", "owner1", "1")
 
-    assert proxy.write_hidden_state.call_args.args[3]["status"] == "deploy-requested"
+    # Only perception deployed, actucore NOT deployed
+    assert core.deploy_driver.call_count == 1
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "deploy-requested"
+    assert written_state["command"]["phase"] == "completed"
+    # Only perception in deployments
+    dep_components = []
+    for dep in written_state["deployments"]:
+        dep_components.extend(dep.get("component_ids", []))
+    assert "comp-perception" in dep_components
+    assert "comp-actucore" not in dep_components
 
 
 @pytest.mark.asyncio
@@ -1086,6 +1123,268 @@ async def test_all_machine_groups_deployed_enters_testing(controller, proxy, moc
     await controller.handle_approve_deploy("repo", 1, 402, "driver-machine", "driver-owner", "2")
 
     assert proxy.write_hidden_state.call_args.args[3]["status"] == "testing"
+
+
+@pytest.mark.asyncio
+async def test_two_machine_approval_sequence_enters_testing_only_after_full_coverage(controller, proxy, mock_github):
+    """Two machines sequentially deploy their compatible subsets.
+    After both machines have deployed, status transitions to testing."""
+    # Four components: perception 5.11, actucore 5.11, perception 6.1, actucore 6.1
+    # Add jp5-machine to policy fixture for this test
+    controller.policy.machines["jp5-machine"] = MachineInfo(
+        alias="jp5-machine", node_id="node-1", owners=["owner1"],
+        node_host="127.0.0.1", targets=["perception", "actucore"],
+        platforms=["linux/arm64"], variants=["5.11"],
+    )
+
+    # Add jp6-machine to policy fixture for this test
+    controller.policy.machines["jp6-machine"] = MachineInfo(
+        alias="jp6-machine", node_id="node-2", owners=["owner1"],
+        node_host="127.0.0.2", targets=["perception", "actucore"],
+        platforms=["linux/arm64"], variants=["6.1"],
+    )
+
+    components = [
+        _component(component_id="comp-perc511", target="perception", variant="5.11", runtime_id="perception", image_ref="registry/repo@sha256:" + "a" * 64),
+        _component(component_id="comp-actucore511", target="actucore", variant="5.11", runtime_id="actucore", image_ref="registry/repo@sha256:" + "b" * 64),
+        _component(component_id="comp-perc61", target="perception", variant="6.1", runtime_id="perception-v2", image_ref="registry/repo@sha256:" + "c" * 64),
+        _component(component_id="comp-actucore61", target="actucore", variant="6.1", runtime_id="actucore-v2", image_ref="registry/repo@sha256:" + "d" * 64),
+    ]
+
+    # -- First approve: jp5-machine deploys 5.11 components --
+    state = _deploy_requested_state(components=components, deployments=[])
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 501,
+        "body": "/approve_deploy machine=jp5-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core = AsyncMock()
+    # jp5-machine supports only 5.11 variants
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
+        {"id": "actucore", "target": "actucore", "image": "registry/repo", "variant": "5.11"},
+    ])
+    core.driver_status = AsyncMock(side_effect=[
+        {"status": "busy", "running_image": ""},   # preflight perception 5.11
+        {"status": "busy", "running_image": ""},   # preflight actucore 5.11
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},  # health perc511
+        {"status": "running", "running_image": "registry/repo@sha256:" + "b" * 64},  # health actucore511
+    ])
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+
+    await controller.handle_approve_deploy("repo", 1, 501, "jp5-machine", "owner1", "1")
+
+    # First machine: 2 deploy POST (5.11 only)
+    assert core.deploy_driver.call_count == 2
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "deploy-requested"  # not full coverage
+    # Only 5.11 components deployed
+    dep_components = []
+    for dep in written_state["deployments"]:
+        dep_components.extend(dep.get("component_ids", []))
+    assert "comp-perc511" in dep_components
+    assert "comp-actucore511" in dep_components
+    assert "comp-perc61" not in dep_components
+    assert "comp-actucore61" not in dep_components
+    assert controller._run_automated_case.call_count == 0  # automated case NOT run yet
+
+    # -- Second approve: jp6-machine reads durable state, deploys 6.1 components --
+    proxy.read_hidden_state = AsyncMock(return_value=written_state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 502,
+        "body": "/approve_deploy machine=jp6-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core2 = AsyncMock()
+    # jp6-machine supports only 6.1 variants
+    core2.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "6.1"},
+        {"id": "actucore", "target": "actucore", "image": "registry/repo", "variant": "6.1"},
+    ])
+    core2.driver_status = AsyncMock(side_effect=[
+        {"status": "busy", "running_image": ""},   # preflight perception 6.1
+        {"status": "busy", "running_image": ""},   # preflight actucore 6.1
+        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},  # health perc61
+        {"status": "running", "running_image": "registry/repo@sha256:" + "d" * 64},  # health actucore61
+    ])
+    core2.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core2)
+    controller._run_automated_case = AsyncMock(return_value={"comp-perc61": "pass", "comp-actucore61": "pass"})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=written_state)
+
+    await controller.handle_approve_deploy("repo", 1, 502, "jp6-machine", "owner1", "1")
+
+    # Second machine: 2 more deploy POST (6.1 only)
+    assert core2.deploy_driver.call_count == 2
+    final_state = proxy.write_hidden_state.call_args.args[3]
+    assert final_state["status"] == "testing"  # FULL coverage -> testing
+    # All 4 components now deployed
+    final_dep_components = []
+    for dep in final_state["deployments"]:
+        final_dep_components.extend(dep.get("component_ids", []))
+    assert "comp-perc511" in final_dep_components
+    assert "comp-actucore511" in final_dep_components
+    assert "comp-perc61" in final_dep_components
+    assert "comp-actucore61" in final_dep_components
+    # Automated case runs ONCE after full coverage
+    assert controller._run_automated_case.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_machine_with_zero_remaining_coverage_posts_zero_deploy(controller, proxy, mock_github):
+    # jp5-machine supports perception + actucore at 5.11 only
+    controller.policy.machines["jp5-machine"] = MachineInfo(
+        alias="jp5-machine", node_id="node-1", owners=["owner1"],
+        node_host="127.0.0.1", targets=["perception", "actucore"],
+        platforms=["linux/arm64"], variants=["5.11"],
+    )
+    """Selected machine is incompatible with remaining components -> ZERO deploy, status stays deploy-requested."""
+    components = [
+        _component(component_id="comp-perc61", target="perception", variant="6.1", runtime_id="perception-v2", image_ref="registry/repo@sha256:" + "c" * 64),
+    ]
+    state = _deploy_requested_state(components=components, deployments=[])
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    core = AsyncMock()
+    # Machine supports only perception 5.11, NOT 6.1
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
+    ])
+    core.deploy_driver = AsyncMock()
+    controller._core_for_node = AsyncMock(return_value=core)
+
+    await controller.handle_approve_deploy("repo", 1, 601, "jp5-machine", "owner1", "1")
+
+    # ZERO deploy POST
+    core.deploy_driver.assert_not_called()
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "deploy-requested"
+    assert written_state["command"]["phase"] == "completed"
+    # Existing deployments unchanged (still empty)
+    assert written_state["deployments"] == []
+
+
+@pytest.mark.asyncio
+async def test_multi_machine_partial_coverage_is_variant_and_platform_generic(controller, proxy, mock_github):
+    """Prove multi-machine partial coverage is variant/platform generic, not hardcoded."""
+    controller.policy.machines["machine-alpha"] = MachineInfo(
+        alias="machine-alpha", node_id="node-alpha", owners=["owner1"],
+        node_host="127.0.0.1", targets=["perception", "actucore"],
+        platforms=["linux/example-arch"], variants=["alpha"],
+    )
+    controller.policy.machines["machine-beta"] = MachineInfo(
+        alias="machine-beta", node_id="node-beta", owners=["owner1"],
+        node_host="127.0.0.2", targets=["perception", "actucore"],
+        platforms=["linux/example-arch"], variants=["beta"],
+    )
+
+    components = [
+        _component(component_id="comp-perc-alpha", target="perception", variant="alpha", runtime_id="perception",
+                    image_ref="registry/repo@sha256:" + "a" * 64, resolved_platform="linux/example-arch"),
+        _component(component_id="comp-actucore-alpha", target="actucore", variant="alpha", runtime_id="actucore",
+                    image_ref="registry/repo@sha256:" + "b" * 64, resolved_platform="linux/example-arch"),
+        _component(component_id="comp-perc-beta", target="perception", variant="beta", runtime_id="perception-v2",
+                    image_ref="registry/repo@sha256:" + "c" * 64, resolved_platform="linux/example-arch"),
+        _component(component_id="comp-actucore-beta", target="actucore", variant="beta", runtime_id="actucore-v2",
+                    image_ref="registry/repo@sha256:" + "d" * 64, resolved_platform="linux/example-arch"),
+    ]
+
+    # -- First approve: machine-alpha deploys alpha subset --
+    state = _deploy_requested_state(components=components, deployments=[])
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 2, "login": "pr_author"}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 701,
+        "body": "/approve_deploy machine=machine-alpha",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core = AsyncMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "alpha"},
+        {"id": "actucore", "target": "actucore", "image": "registry/repo", "variant": "alpha"},
+    ])
+    core.driver_status = AsyncMock(side_effect=[
+        {"status": "busy", "running_image": ""},
+        {"status": "busy", "running_image": ""},
+        {"status": "running", "running_image": "registry/repo@sha256:" + "a" * 64},
+        {"status": "running", "running_image": "registry/repo@sha256:" + "b" * 64},
+    ])
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+
+    await controller.handle_approve_deploy("repo", 1, 701, "machine-alpha", "owner1", "1")
+
+    # Exactly 2 deploy POST (alpha only)
+    assert core.deploy_driver.call_count == 2
+    written_state = proxy.write_hidden_state.call_args.args[3]
+    assert written_state["status"] == "deploy-requested"  # partial coverage
+    dep_components = []
+    for dep in written_state["deployments"]:
+        dep_components.extend(dep.get("component_ids", []))
+    assert "comp-perc-alpha" in dep_components
+    assert "comp-actucore-alpha" in dep_components
+    assert "comp-perc-beta" not in dep_components
+    assert "comp-actucore-beta" not in dep_components
+    assert controller._run_automated_case.call_count == 0
+
+    # -- Second approve: machine-beta deploys beta subset --
+    proxy.read_hidden_state = AsyncMock(return_value=written_state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 702,
+        "body": "/approve_deploy machine=machine-beta",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core2 = AsyncMock()
+    core2.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "beta"},
+        {"id": "actucore", "target": "actucore", "image": "registry/repo", "variant": "beta"},
+    ])
+    core2.driver_status = AsyncMock(side_effect=[
+        {"status": "busy", "running_image": ""},
+        {"status": "busy", "running_image": ""},
+        {"status": "running", "running_image": "registry/repo@sha256:" + "c" * 64},
+        {"status": "running", "running_image": "registry/repo@sha256:" + "d" * 64},
+    ])
+    core2.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core2)
+    controller._run_automated_case = AsyncMock(return_value={"comp-perc-beta": "pass", "comp-actucore-beta": "pass"})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=written_state)
+
+    await controller.handle_approve_deploy("repo", 1, 702, "machine-beta", "owner1", "1")
+
+    # 2 more deploy POST (beta only)
+    assert core2.deploy_driver.call_count == 2
+    final_state = proxy.write_hidden_state.call_args.args[3]
+    assert final_state["status"] == "testing"  # FULL coverage
+    final_dep_components = []
+    for dep in final_state["deployments"]:
+        final_dep_components.extend(dep.get("component_ids", []))
+    assert "comp-perc-alpha" in final_dep_components
+    assert "comp-actucore-alpha" in final_dep_components
+    assert "comp-perc-beta" in final_dep_components
+    assert "comp-actucore-beta" in final_dep_components
+    assert controller._run_automated_case.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -1226,3 +1525,255 @@ async def test_same_pr_number_different_repos_have_separate_evidence(controller)
 # ══════════════════════════════════════════════════════════════════════════════
 # MIGRATED from test_v10_contract.py
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# REGRESSION tests — post-deploy verification and uncertain contracts
+# ═══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_existing_running_image_allows_upgrade_only_after_target_image_observed(
+    controller, proxy, mock_github, monkeypatch
+):
+    """PRE old image -> deploy POST -> verify first poll old -> verify subsequent target+running -> success."""
+    fake_now = [0.0]
+    def fake_monotonic():
+        fake_now[0] += 0.5
+        return fake_now[0]
+    monkeypatch.setattr("agents.deploy_approval.service.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("agents.deploy_approval.service.asyncio.sleep", AsyncMock())
+
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 901, "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core = AsyncMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
+    ])
+    old_image = "registry/repo@sha256:" + "b" * 64
+    target_image = "registry/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(side_effect=[
+        {"status": "stopped", "running_image": old_image},
+        {"status": "stopped", "running_image": old_image},
+        {"status": "running", "running_image": target_image},
+    ])
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+
+    await controller.handle_approve_deploy("repo", 1, 901, "test-machine", "owner1", "1")
+
+    core.deploy_driver.assert_called_once()
+    written = proxy.write_hidden_state.call_args.args[3]
+    assert written["status"] == "testing"
+    health = written.get("approve_attempts", [{}])[-1].get("health", [])
+    assert len(health) == 1
+    assert health[0]["running_image"] == target_image
+    assert health[0]["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_post_deploy_old_image_never_becomes_target_is_uncertain_and_not_deployed(
+    controller, proxy, mock_github, monkeypatch
+):
+    """POST success -> verify always old image -> timeout -> uncertain, component NOT deployed."""
+    fake_now = [0.0]
+    def fake_monotonic():
+        fake_now[0] += 0.5
+        return fake_now[0]
+    monkeypatch.setattr("agents.deploy_approval.service.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("agents.deploy_approval.service.asyncio.sleep", AsyncMock())
+    controller.config.total_timeout = 1
+
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 911, "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core = AsyncMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
+    ])
+    old_image = "registry/repo@sha256:" + "b" * 64
+    target_image = "registry/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(return_value={"status": "running", "running_image": old_image})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+
+    await controller.handle_approve_deploy("repo", 1, 911, "test-machine", "owner1", "1")
+
+    core.deploy_driver.assert_called_once()
+    written = proxy.write_hidden_state.call_args.args[3]
+    assert written["status"] == "deploy-requested"
+    assert written["command"]["phase"] == "uncertain"
+    health = written.get("approve_attempts", [{}])[-1].get("health", [])
+    assert len(health) == 1
+    assert health[0]["verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_post_deploy_target_image_but_not_running_is_not_deployed(
+    controller, proxy, mock_github, monkeypatch
+):
+    """status=stopped + running_image=TARGET is NOT success."""
+    fake_now = [0.0]
+    def fake_monotonic():
+        fake_now[0] += 0.5
+        return fake_now[0]
+    monkeypatch.setattr("agents.deploy_approval.service.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("agents.deploy_approval.service.asyncio.sleep", AsyncMock())
+    controller.config.total_timeout = 1
+
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 921, "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core = AsyncMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
+    ])
+    target_image = "registry/repo@sha256:" + "a" * 64
+    core.driver_status = AsyncMock(return_value={"status": "stopped", "running_image": target_image})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+
+    await controller.handle_approve_deploy("repo", 1, 921, "test-machine", "owner1", "1")
+
+    core.deploy_driver.assert_called_once()
+    written = proxy.write_hidden_state.call_args.args[3]
+    assert written["status"] == "deploy-requested"
+    assert written["command"]["phase"] == "uncertain"
+
+
+@pytest.mark.asyncio
+async def test_same_image_agent_core_skip_is_verified_and_accepted(
+    controller, proxy, mock_github, monkeypatch
+):
+    """PRE running=target image -> deploy skipped=true/status=running -> verify passes -> deployed."""
+    fake_now = [0.0]
+    def fake_monotonic():
+        fake_now[0] += 0.5
+        return fake_now[0]
+    monkeypatch.setattr("agents.deploy_approval.service.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("agents.deploy_approval.service.asyncio.sleep", AsyncMock())
+
+    target_image = "registry/repo@sha256:" + "a" * 64
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 931, "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core = AsyncMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
+    ])
+    core.driver_status = AsyncMock(side_effect=[
+        {"status": "running", "running_image": target_image},
+        {"status": "running", "running_image": target_image},
+    ])
+    core.deploy_driver = AsyncMock(return_value={
+        "code": 200, "data": {"status": "running", "skipped": True, "message": "already running"},
+    })
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+
+    await controller.handle_approve_deploy("repo", 1, 931, "test-machine", "owner1", "1")
+
+    core.deploy_driver.assert_called_once()
+    written = proxy.write_hidden_state.call_args.args[3]
+    assert written["status"] == "testing"
+    health = written.get("approve_attempts", [{}])[-1].get("health", [])
+    assert len(health) == 1
+    assert health[0]["verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_partial_deploy_uncertain_preserves_verified_and_stops_later(
+    controller, proxy, mock_github, monkeypatch
+):
+    """Component A already deployed -> Component B uncertain -> A durable, B not deployed."""
+    from ..policy import MachineInfo
+    # Add a machine that supports both perception and actucore at 5.11
+    controller.policy.machines["full-machine"] = MachineInfo(
+        alias="full-machine", node_id="node-3", owners=["owner1"],
+        node_host="127.0.0.3", targets=["perception", "actucore"],
+        platforms=["linux/arm64"], variants=["5.11"],
+    )
+    fake_now = [0.0]
+    def fake_monotonic():
+        fake_now[0] += 0.5
+        return fake_now[0]
+    monkeypatch.setattr("agents.deploy_approval.service.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("agents.deploy_approval.service.asyncio.sleep", AsyncMock())
+    controller.config.total_timeout = 1
+
+    components = [
+        _component(component_id="comp-a", target="perception", variant="5.11", runtime_id="perception",
+                    image_ref="registry/repo@sha256:" + "a" * 64),
+        _component(component_id="comp-b", target="actucore", variant="5.11", runtime_id="actucore",
+                    image_ref="registry/repo@sha256:" + "b" * 64),
+    ]
+    state = _deploy_requested_state(
+        components=components,
+        deployments=[{"machine": "prev-machine", "component_ids": ["comp-a"], "phase": "deployed"}],
+    )
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
+    mock_github.get_comment = AsyncMock(return_value={
+        "id": 941, "body": "/approve_deploy machine=full-machine",
+        "user": {"id": 1, "login": "owner1"},
+    })
+    core = AsyncMock()
+    core.list_drivers = AsyncMock(return_value=[
+        {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
+        {"id": "actucore", "target": "actucore", "image": "registry/repo", "variant": "5.11"},
+    ])
+    core.driver_status = AsyncMock(return_value={"status": "starting", "running_image": "old"})
+    core.deploy_driver = AsyncMock(return_value={"ok": True})
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+
+    await controller.handle_approve_deploy("repo", 1, 941, "full-machine", "owner1", "1")
+
+    assert core.deploy_driver.call_count == 1
+    written = proxy.write_hidden_state.call_args.args[3]
+    assert written["status"] == "deploy-requested"
+    assert written["command"]["phase"] == "uncertain"
+    dep_ids = []
+    for d in written["deployments"]:
+        dep_ids.extend(d.get("component_ids", []))
+    assert "comp-a" in dep_ids
+    assert "comp-b" not in dep_ids
