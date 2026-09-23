@@ -642,6 +642,15 @@ class NaviPlugin:
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
                        "且目标被遮挡时只能按**指令**（而非实测）推算它去了哪，"
                        "dry_run、姿态被拒、死区归零都会让两者对不上")
+        # The chassis is wired but swallowing everything. Without this the card
+        # reports a healthy stream of commands, the driver reports APPLIED, and
+        # the robot stands still — which is exactly how it presented on r1_sz
+        # right after a deploy reset the driver's config to its image defaults.
+        if self._descriptor.get("dry_run"):
+            out.append("下游底盘是 dry_run —— 指令会被完整接收、检查、计数，"
+                       "然后**丢掉**，机器人不会动")
+        if self._descriptor.get("rotate_only"):
+            out.append("下游底盘是 rotate_only —— vx/vy 会被清零，只执行转向")
         if self._running and not self._descriptor:
             out.append("没有接驱动的底盘命令卡片 —— 指令只发到话题上，"
                        "不会驱动任何硬件（想看它算什么的话，这是对的）")

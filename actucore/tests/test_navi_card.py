@@ -663,3 +663,15 @@ def test_every_schema_default_matches_the_file_default():
             assert navi_cfg[key] == spec["default"], (
                 f"{key}: config.yaml 是 {navi_cfg[key]}，schema 默认是 "
                 f"{spec['default']} —— 画布会用后者覆盖前者")
+
+
+def test_a_chassis_that_swallows_commands_is_reported_as_degraded():
+    """A policy whose commands are being dropped looks exactly like one that is
+    working: same verdicts, same counters, same silence. On r1_sz a deploy reset
+    the driver to its image defaults (`dry_run: true`) and the robot stood still
+    while every layer reported success."""
+    card = _card()
+    card._running = True
+    card._binding = {"objects": "o", "depth_map": "d", "odom": "s"}
+    card._descriptor = {"mode": "twist", "dry_run": True}
+    assert any("dry_run" in note for note in card._degradations())

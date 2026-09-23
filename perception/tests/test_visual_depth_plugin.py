@@ -791,18 +791,47 @@ def test_a_preset_supplies_a_fit_when_nothing_was_typed():
     assert (a, b) == (1.0, depth_plugin.CALIBRATION_PRESETS["Unitree R1"]["cal_b"])
 
 
-def test_a_typed_in_fit_beats_the_preset():
-    """The canvas sends every field on every config call, defaults included, so
-    "typed 1.0/0.0" and "left alone" arrive identical — presence cannot tell
-    them apart. Non-identity can, and 1.0/0.0 *is* "no correction", so reading
-    it as "no opinion" costs nothing."""
+def test_the_selector_decides_when_there_is_one():
+    """The dropdown says what is in effect instead of leaving it to be
+    inferred. A preset selected while numbers sit in the fields means the
+    preset."""
     cfg = {"calibration_preset": "Unitree R1", "cal_a": 1.0, "cal_b": -0.5}
+    assert depth_plugin._calibration_from_cfg(cfg)[1] != -0.5
+    cfg["calibration_preset"] = depth_plugin.CAL_MANUAL
     assert depth_plugin._calibration_from_cfg(cfg) == (1.0, -0.5)
+
+
+def test_a_file_config_without_a_selector_still_applies_its_numbers():
+    """`perception/config.yaml` has no dropdown, and writing `cal_b: -0.9`
+    there has always meant "apply this". Requiring the selector would silently
+    stop that working — which is how a file config becomes decoration."""
+    assert depth_plugin._calibration_from_cfg({"cal_a": 1.0, "cal_b": -0.9}) == (1.0, -0.9)
+    assert depth_plugin.calibration_origin({"cal_b": -0.9}) == "manual"
+
+
+def test_numbers_the_selector_is_ignoring_are_said_out_loud():
+    """Dropping them quietly is the failure this card keeps running into."""
+    assert depth_plugin.calibration_conflict(
+        {"calibration_preset": depth_plugin.CAL_NONE, "cal_b": -0.9})
+    assert not depth_plugin.calibration_conflict(
+        {"calibration_preset": depth_plugin.CAL_MANUAL, "cal_b": -0.9})
+    assert not depth_plugin.calibration_conflict({"cal_b": -0.9})
 
 
 def test_an_untouched_pair_does_not_shadow_the_preset():
     cfg = {"calibration_preset": "Unitree R1", "cal_a": 1.0, "cal_b": 0.0}
     assert depth_plugin._calibration_from_cfg(cfg)[1] != 0.0
+
+
+def test_the_dropdown_has_no_blank_row():
+    """An option you cannot see is an option you cannot choose deliberately —
+    the same shape as every other silent default this card has been bitten by.
+    "" is still accepted from an existing config, but it is not offered."""
+    enum = depth_plugin.TOOLS[0]["configSchema"]["properties"]["calibration_preset"]["enum"]
+    assert "" not in enum
+    assert enum[0] == depth_plugin.CAL_NONE
+    assert depth_plugin.CAL_MANUAL in enum
+    assert depth_plugin._calibration_from_cfg({"calibration_preset": ""}) == (1.0, 0.0)
 
 
 def test_an_unknown_preset_falls_back_rather_than_guessing():
@@ -822,7 +851,8 @@ def test_the_origin_is_reported_and_distinguishes_the_four_cases():
     assert depth_plugin.calibration_origin({}) == "model-default"
     assert depth_plugin.calibration_origin(
         {"calibration_preset": "Unitree R1"}) == "preset:Unitree R1"
-    assert depth_plugin.calibration_origin({"cal_b": -0.9}) == "manual"
+    assert depth_plugin.calibration_origin(
+        {"calibration_preset": depth_plugin.CAL_MANUAL, "cal_b": -0.9}) == "manual"
     assert depth_plugin.calibration_origin({"depth_scale": 0.4}) == "legacy-depth_scale"
 
 
@@ -842,7 +872,30 @@ def test_the_default_is_no_preset_and_no_correction():
     before presets existed, because a preset applied to the wrong camera is the
     failure this whole mechanism exists to make visible."""
     schema = depth_plugin.TOOLS[0]["configSchema"]["properties"]
-    assert schema["calibration_preset"]["default"] == ""
+    assert schema["calibration_preset"]["default"] == depth_plugin.CAL_NONE
     assert schema["cal_a"]["default"] == 1.0 and schema["cal_b"]["default"] == 0.0
     assert depth_plugin._calibration_from_cfg({}) == (1.0, 0.0)
     assert depth_plugin.calibration_origin({}) == "model-default"
+
+
+def test_every_schema_default_matches_the_file_default():
+    """**agent-core sends every schema field on every config call, defaults
+    included**, so a key here silently overrides the same key in
+    perception/config.yaml. The navi card was bitten by exactly this: the file
+    said 0.6, the card reported 0.4, and the only trace was a note that read
+    like the file had never been edited.
+
+    A field may live in the schema or in the file; if it lives in both, the two
+    defaults have to agree or the file is decoration."""
+    import os
+    import yaml
+
+    root = os.path.join(os.path.dirname(__file__), "..")
+    with open(os.path.join(root, "config.yaml")) as handle:
+        cfg = yaml.safe_load(handle)["plugins"].get("visual_depth") or {}
+
+    for key, spec in depth_plugin.TOOLS[0]["configSchema"]["properties"].items():
+        if key in cfg and "default" in spec:
+            assert cfg[key] == spec["default"], (
+                f"{key}: config.yaml 是 {cfg[key]}，schema 默认是 "
+                f"{spec['default']} —— 画布会用后者覆盖前者")

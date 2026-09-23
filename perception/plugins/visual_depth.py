@@ -177,6 +177,16 @@ CALIBRATION_PROCEDURE = (
 # camera it is actually a property of is recorded in `camera` below. Two robots
 # of the same model share a preset only because they share a lens, so a variant
 # that ships a different camera needs its own entry rather than this one.
+# The two non-preset choices in the same dropdown, so the field says what is in
+# effect instead of leaving it to be inferred.
+#
+# An empty option rendered as a blank row in the dialog — a value you cannot
+# see is a value you cannot choose deliberately, which is the same shape as
+# every other silent default this card has been bitten by. "" is still accepted
+# so an existing config keeps working, but it is not offered.
+CAL_NONE = "no calibrate"
+CAL_MANUAL = "manual set"
+
 CALIBRATION_PRESETS = {
     "Unitree R1": {
         "cal_a": 1.0,
@@ -270,15 +280,19 @@ TOOLS = [
                 # non-identity value there wins — see _calibration_from_cfg.
                 "calibration_preset": {
                     "type": "string",
-                    "enum": [""] + sorted(CALIBRATION_PRESETS),
-                    "description": "按相机选一组量好的标定；留空则用 engine 自带的。"
-                                   "上面手填的 cal_a/cal_b 只要不是 1.0/0.0 就优先于它。"
-                                   "**预设是按相机而不是按机器人分的** —— 换镜头必须重标，"
-                                   "选错相机和不标定一样危险，只是更不容易发现。",
-                    "default": "",
+                    "enum": [CAL_NONE, CAL_MANUAL] + sorted(CALIBRATION_PRESETS),
+                    "description": "深度标定从哪来。"
+                                   f"{CAL_NONE!r} = 用 engine 自带的通用标定（默认）；"
+                                   f"{CAL_MANUAL!r} = 用上面填的 cal_a / cal_b；"
+                                   "其余是按机器人量好的预设。"
+                                   "**标定是相机的属性** —— 同型号换了镜头必须重标，"
+                                   "选错和不标定一样危险，只是更不容易发现。",
+                    "default": CAL_NONE,
                     "scope": "instance",
                 },
-                "max_depth_m":  {"type": "number",  "description": "Values above this are published as invalid (0)", "default": 20.0, "scope": "instance"},
+                # max_depth_m 不在这里：见 perception/config.yaml。它是发布层的
+                # 截断阈值，操作员没有判断依据，而每多一个 schema 字段就多一处
+                # 静默覆盖 config.yaml 的机会。
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -396,6 +410,24 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) 
     """
     cal_a = float(cfg.get("cal_a", default[0]))
     cal_b = float(cfg.get("cal_b", default[1]))
+    # **The dropdown decides — when there is one.**
+    #
+    # The canvas sends `calibration_preset` on every config call, so its
+    # presence means a selector is driving. Its *absence* means this config came
+    # from `perception/config.yaml`, which has no dropdown and where writing
+    # `cal_b: -0.9` has always meant "apply this". Making the selector
+    # mandatory would silently stop that working, which is how a file config
+    # becomes decoration — the exact failure the navi card had with its own
+    # schema defaults.
+    choice = cfg.get("calibration_preset")
+    if choice is not None:
+        choice = str(choice or CAL_NONE)
+        if choice == CAL_MANUAL:
+            return cal_a, cal_b
+        if choice in CALIBRATION_PRESETS:
+            preset = CALIBRATION_PRESETS[choice]
+            return float(preset["cal_a"]), float(preset["cal_b"])
+        return 1.0, 0.0
     if (cal_a, cal_b) != (1.0, 0.0):
         return cal_a, cal_b
 
@@ -410,10 +442,7 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) 
         if legacy > 0:
             return cal_a, float(np.log(legacy))
 
-    preset = CALIBRATION_PRESETS.get(str(cfg.get("calibration_preset") or ""))
-    if preset:
-        return float(preset["cal_a"]), float(preset["cal_b"])
-    return cal_a, cal_b
+    return 1.0, 0.0
 
 
 def calibration_origin(cfg: dict) -> str:
@@ -423,16 +452,39 @@ def calibration_origin(cfg: dict) -> str:
     from outside; this is the one field that separates them, so it says which
     kind of number is in play rather than only whether one was applied.
     """
-    cal_a = float(cfg.get("cal_a", 1.0))
-    cal_b = float(cfg.get("cal_b", 0.0))
-    if (cal_a, cal_b) != (1.0, 0.0):
+    choice = cfg.get("calibration_preset")
+    if choice is not None:
+        choice = str(choice or CAL_NONE)
+        if choice == CAL_MANUAL:
+            return "manual"
+        if choice in CALIBRATION_PRESETS:
+            return f"preset:{choice}"
+        return "model-default"
+    if (float(cfg.get("cal_a", 1.0)), float(cfg.get("cal_b", 0.0))) != (1.0, 0.0):
         return "manual"
     if cfg.get("depth_scale") not in (None, "") and "cal_b" not in cfg:
         return "legacy-depth_scale"
-    name = str(cfg.get("calibration_preset") or "")
-    if name in CALIBRATION_PRESETS:
-        return f"preset:{name}"
     return "model-default"
+
+
+def calibration_conflict(cfg: dict) -> str:
+    """A typed-in fit that the dropdown is ignoring, or "".
+
+    Someone who fills in cal_a/cal_b and forgets to switch the selector gets
+    their numbers dropped. Applying them instead would be a guess; dropping
+    them *quietly* would be the failure this card keeps running into. So they
+    are dropped, and said out loud.
+    """
+    choice = cfg.get("calibration_preset")
+    if choice is None or str(choice or CAL_NONE) == CAL_MANUAL:
+        return ""
+    choice = str(choice or CAL_NONE)
+    pair = (float(cfg.get("cal_a", 1.0)), float(cfg.get("cal_b", 0.0)))
+    if pair == (1.0, 0.0):
+        return ""
+    return (f"配置里填了 cal_a={pair[0]:g} / cal_b={pair[1]:g}，但标定来源选的是 "
+            f"{choice!r} —— 这两个数**没有生效**。要用它们请把来源改成 "
+            f"{CAL_MANUAL!r}。")
 
 
 def sample_region(depth_m: np.ndarray, region: str = "center") -> dict:
@@ -1207,7 +1259,9 @@ class VideoDepthPerceptionPlugin:
                 # before anyone measured, which with an untouched card is the
                 # engine's own fit.
                 if self._cal_cfg_backup is not None:
-                    for key, value in zip(("cal_a", "cal_b"), self._cal_cfg_backup):
+                    for key, value in zip(
+                            ("cal_a", "cal_b", "calibration_preset"),
+                            self._cal_cfg_backup):
                         if value is _ABSENT:
                             self._plugin_cfg.pop(key, None)
                         else:
@@ -1273,10 +1327,16 @@ class VideoDepthPerceptionPlugin:
             # perception/config.yaml) a restart loses the fit — and it has,
             # twice, on r1_sz, each time silently restoring a 3.2x error.
             if self._cal_cfg_backup is None:
-                self._cal_cfg_backup = (self._plugin_cfg.get("cal_a", _ABSENT),
-                                        self._plugin_cfg.get("cal_b", _ABSENT))
+                self._cal_cfg_backup = (
+                    self._plugin_cfg.get("cal_a", _ABSENT),
+                    self._plugin_cfg.get("cal_b", _ABSENT),
+                    self._plugin_cfg.get("calibration_preset", _ABSENT))
             self._plugin_cfg["cal_a"] = 1.0
             self._plugin_cfg["cal_b"] = round(cal_b, 6)
+            # ...and switch the selector, or the rule above would ignore the fit
+            # that was just measured — writing two numbers nothing reads is
+            # worse than not writing them.
+            self._plugin_cfg["calibration_preset"] = CAL_MANUAL
             log.info(f"[visual_depth] calibrated: {len(self._cal_samples)} sample(s) "
                      f"→ cal_a=1.0 cal_b={cal_b:.4f}")
 
@@ -1286,7 +1346,8 @@ class VideoDepthPerceptionPlugin:
                 # as a field rather than left in prose because it is the one
                 # thing that has to survive a restart, and prose does not get
                 # copied accurately.
-                "save_to_config": {"cal_a": 1.0, "cal_b": round(cal_b, 6)},
+                "save_to_config": {"calibration_preset": CAL_MANUAL,
+                                   "cal_a": 1.0, "cal_b": round(cal_b, 6)},
                 "message": _calibration_message(self._cal_samples),
             }
             warnings = []
