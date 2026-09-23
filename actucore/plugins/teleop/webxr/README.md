@@ -33,7 +33,7 @@
 ## 验证
 
 ```sh
-node --test actucore/tests/webxr.test.mjs
+node --test actucore/tests/webxr.test.mjs actucore/tests/webxr-lifecycle.test.mjs
 python -m pytest actucore/tests/test_webxr.py actucore/tests/test_teleop_transport.py -q
 RUN_WEBXR_BROWSER=1 CHROME_PATH=/path/to/chrome python -m pytest actucore/tests/test_webxr.py -q
 python -m pytest agent-core/tests/test_teleop_install.py agent-core/tests/test_teleop_install_contract.py -q
@@ -41,6 +41,10 @@ node agent-core/tests/teleop-panel.browser.cjs
 ```
 
 Node 使用可控时钟检查输入门控、失焦、帧中断、积压、任务失效及迟到 SDP；Python 检查实际 HTTPS/WSS、同源限制和跨客户端凭据隔离。可选 Chromium 检查使用真实页面、浏览器加密配对、WebSocket、WebRTC 和 RecordingAdapter；设备能力探测、位姿/握把及输入时钟是测试输入，避免把桌面定时器调度当作头显帧率证据。TLS 忽略只存在于临时 localhost 测试上下文，生产客户端没有该选项。HUD 使用真实 WebGL 编译和绘制，但 XR framebuffer/视图为夹具。
+
+2026-09-23，PICO 4 Ultra（OS 5.15.7、浏览器 4.0.38）通过 USB localhost 诊断页，以本版 `frame.mjs` 和 `view.mjs` 完成两轮 30 秒真实输入测试：2,142 / 2,154 帧，约 71.4 / 71.8 FPS，头显和左右手柄每帧有效，没有超过 250 ms 的帧间隔；记录到双握使能和松握解除。第二轮确认左右手柄均能射线点击“开始”按钮，其余按钮与多轮重握仍待补测。诊断页不连接机器人，也未运行完整配对 / WSS / RTC 链路，USB localhost 不构成生产 HTTPS 部署证据。
+
+该设备进入透视时实际产生短暂 `hidden → visible-blurred → visible` 事件，随后开始有效跟踪。客户端在首次有效帧前等待这段切换，首次采集后任何失焦仍关闭输入。生命周期回归直接加载 `app.mjs`，覆盖初始化异步等待、未聚焦帧、首次跟踪和后续失焦；旧实现会在初始化阶段提前断开。
 
 提交前需明确区分上述证据与真机验收：PICO 4 与 4 Ultra 的实际透视、控制器映射、HUD 射线操作、15 分钟帧率/延迟、至少 10 轮失焦/断网/重定位恢复、TLS 部署、应用库入口及机器人动作仍需现场验证。首次现场验证先使用 Shadow，随后按现有机器人验收流程验证 Live。
 

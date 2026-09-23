@@ -92,7 +92,9 @@ $('enter').onclick=async()=>{
     session=current;
     current.addEventListener('end',()=>{if(session===current)client.fail('已退出透视，输入已停止');});
     current.addEventListener('inputsourceschange',()=>{if(session===current&&client.focused)client.fail('手柄输入源已变化，请重新进入并开始');});
-    current.addEventListener('visibilitychange',()=>{if(session===current&&current.visibilityState!=='visible')client.focus(false);});
+    // PICO can emit hidden / visible-blurred while entering immersive mode.
+    // No input is enabled until the first visible, fully tracked frame.
+    current.addEventListener('visibilitychange',()=>{if(session===current&&client.focused&&current.visibilityState!=='visible')client.focus(false);});
     panel=new XrPanel($('xr'));await panel.gl.makeXRCompatible();
     if(session!==current)return;
     current.updateRenderState({baseLayer:new XRWebGLLayer(current,panel.gl,{alpha:true})});
@@ -111,7 +113,11 @@ $('enter').onclick=async()=>{
     const loop=(time,frame)=>{
       if(session!==current)return;
       try {
-        if(current.visibilityState!=='visible'){client.focus(false);return;}
+        if(current.visibilityState!=='visible'){
+          if(client.focused)client.focus(false);
+          else current.requestAnimationFrame(loop);
+          return;
+        }
         const sample=frameSample(frame,space,current);lastHead=frame.getViewerPose(space);
         if(!client.focused&&sample.head&&sample.left&&sample.right)client.focus(true);
         if(client.focused)client.submit(sample);
