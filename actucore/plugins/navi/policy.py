@@ -154,7 +154,9 @@ class Config:
     # quantity that needs a real angle, to be split between vx and vy, and this
     # is the camera's horizontal half-FOV (~63° full). Being 20% out only makes
     # the arc slightly wide; the yaw loop closes it either way.
-    half_fov_rad: float = 0.55
+    # 见 config.yaml 里同名项下那段 —— 填错会静默地放宽或收窄米制走廊，而症状
+    # 会表现成「过不了门」。换相机必须用 tools/measure_fov.py 重新量。
+    half_fov_rad: float = 0.888
     # Sidestep while approaching, and to get out from in front of an obstacle.
     # Turn it off for a base with no lateral degree of freedom — the descriptor
     # pinning vy to zero does that on its own, but this says so in one place.

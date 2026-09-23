@@ -20,6 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from plugins.navi import depth as D  # noqa: E402
 from plugins.navi import policy as P  # noqa: E402
 
 
@@ -1334,3 +1335,64 @@ def test_a_corridor_that_clears_resets_the_blocked_clock():
         decision = P.step(detections=_detections(_obj(x=0.0)), depth=depth,
                           odom=None, config=config, state=state, dt=0.1)
         assert decision.status != P.FAILED
+
+
+# ── half_fov_rad: 一个数填错，走廊就比门宽 ───────────────────────────────────
+
+def _doorway(open_w_m, wall_m, *, half_fov_rad, far_m=6.0):
+    """一面 `wall_m` 远的墙，中间开一个 `open_w_m` 宽的洞，洞后面是 `far_m`。
+
+    深度值按**真实**视场角摆放，配置里的值才是被考问的那个 —— 这正是真机上出错
+    的方式：图是相机给的，反算用的是配置。
+    """
+    m = np.full((480, 640), far_m, dtype=float)
+    u = (np.arange(640) + 0.5) / 640 * 2 - 1
+    m[:, np.abs(np.tan(u * half_fov_rad) * wall_m) > open_w_m / 2] = wall_m
+    return m
+
+
+def test_a_standard_doorway_reads_as_passable():
+    """r1_sz 上过不了门的原因，量化。
+
+    走廊是米制的，所以代码要把半宽反算成画面上的像素列，而那一步用的就是
+    `half_fov_rad`。填小了，切片就偏宽：配 0.55 而实测 0.888 时，1 m 处「半宽
+    0.5 m 的走廊」采样了画面半宽的 84%，真实对应 ±0.93 m —— 走廊有 1.86 m 宽，
+    比任何一扇门都宽。于是门框永远算在正前方，clearance 读到门平面而不是门洞。
+    """
+    true_fov = 0.888
+    config = _cfg(half_fov_rad=true_fov)
+    # 必须用机器人自己声明的 footprint。Config 的兜底半宽 0.35 加上余量要求
+    # **1.0 m 净宽**，而标准门只有 0.8~0.9 m —— 也就是说没有 footprint 声明的底盘
+    # 本来就过不了门，而且过不去的理由跟视场角无关。R1 声明的是 0.179。
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    keep = config.half_width_m + config.clearance_margin_m
+    assert 2 * keep < 0.90, "0.9 m 的门本来就该放得下这台机器人"
+
+    for wall in (1.2, 1.0, 0.8, 0.7, 0.6):
+        depth = _doorway(0.90, wall, half_fov_rad=true_fov)
+        clearance, coverage = D.corridor(
+            depth, half_width_m=keep, half_fov_rad=config.half_fov_rad,
+            reference_m=config.obstacle_stop_m)
+        assert clearance > config.obstacle_stop_m, (
+            f"离门 {wall} m 时走廊被门框挡住了：clearance={clearance}")
+        assert coverage >= config.coverage_min
+
+    # 反过来钉住这条测试确实有效：把视场角填成出厂的 0.55，同一张图就会在 0.6 m
+    # 处判定挡住 —— 也就是真机上看到的行为。
+    depth = _doorway(0.90, 0.6, half_fov_rad=true_fov)
+    wrong, _ = D.corridor(depth, half_width_m=keep, half_fov_rad=0.55,
+                          reference_m=config.obstacle_stop_m)
+    assert wrong <= config.obstacle_stop_m
+
+
+def test_something_genuinely_too_narrow_still_stops_the_robot():
+    """放宽视场角不是把避障关掉 —— 过不去的洞还是要挡住。"""
+    true_fov = 0.888
+    config = _cfg(half_fov_rad=true_fov)
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    keep = config.half_width_m + config.clearance_margin_m
+    depth = _doorway(2 * keep - 0.2, 0.5, half_fov_rad=true_fov)
+    clearance, _ = D.corridor(depth, half_width_m=keep,
+                              half_fov_rad=config.half_fov_rad,
+                              reference_m=config.obstacle_stop_m)
+    assert clearance is not None and clearance <= config.obstacle_stop_m
