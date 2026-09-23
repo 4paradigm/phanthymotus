@@ -20,7 +20,7 @@ from ..case_runner import CaseRunner
 from ..config import Config
 from ..models import MachineInfo
 from ..policy import Policy
-from ..registry_client import RegistryClient, RegistryError, ResolvedImage
+# registry_client removed: Deploy Approval no longer accesses Registry
 from ..service import DeployController
 from ..github_state_proxy import GitHubStateProxy
 from .conftest import make_config
@@ -124,9 +124,6 @@ def test_runtime_env_names_are_upstream_existing_only():
         "POLL_INTERVAL_SECONDS",
         "WEBHOOK_ENABLED",
         "GITHUB_WEBHOOK_SECRET",
-        "REGISTRY",
-        "REGISTRY_USER",
-        "REGISTRY_PASSWORD",
     ):
         assert name in all_text
 
@@ -212,8 +209,8 @@ def test_source_of_truth_contract_is_explicit():
     )
     assert "GitHub hidden lifecycle JSON" in docs
     assert "GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence" in docs
-    assert "Registry only verifies/resolves that exact Review Agent image tag" in docs
-    assert "Agent Core only supplies runtime identity, current `running_image`, and MCP evidence" in docs
+    assert "Deploy Approval performs zero Registry HTTP" in docs
+    assert "Agent Core receives the exact tag" in docs
 
 
 def test_single_replica_restart_safe_contract_is_documented():
@@ -450,12 +447,6 @@ async def test_phanthymotus_core_plus_perception_deploys_only_perception(control
         "last_processed_comment_id": 0,
     })
     with patch('agents.deploy_approval.service.extract_review_evidence', return_value=mock_evidence):
-        controller.registry.resolve = AsyncMock(
-            return_value=SimpleNamespace(
-                image_ref="registry.example/perception@sha256:" + "b" * 64,
-                platform="linux/arm64",
-            )
-        )
         proxy.write_hidden_state = AsyncMock()
         proxy.project_status_label = AsyncMock()
         mock_github.resolve_commit_sha.return_value = "a" * 40
@@ -538,9 +529,7 @@ def policy(config):
 
 @pytest.fixture
 def controller(config, proxy, policy, mock_github):
-    registry = MagicMock()
-    registry.resolve = AsyncMock()
-    return DeployController(config, proxy, policy, mock_github, registry)
+    return DeployController(config, proxy, policy, mock_github)
 
 
 def _component(**overrides):
@@ -737,3 +726,32 @@ class TestCaseContract:
         assert captured["_driver_id"] == "perception"
         # list_drivers may have been called but the result was not used for resolution
         # (the pinned runtime_id from deploy takes precedence)
+
+
+def test_no_registry_legacy_terms_in_production_files():
+    """Regression: production files must not contain registry-era legacy terms."""
+    files = {
+        "config.py": _text("agents/deploy_approval/config.py"),
+        "agent_md": _text("DEPLOY_APPROVAL_AGENT.md"),
+        "arch_md": _text("docs/deploy-approval-github-driven-architecture.md"),
+    }
+    all_text = "\n".join(files.values())
+
+    forbidden = [
+        "GitHub/poll/webhook/registry keys",
+        "Review Agent / Registry / Agent Core",
+        "fresh GitHub PR comments + Registry resolution",
+        "Registry remains an internal fresh-fact implementation detail",
+        "resolved to an immutable `repository@sha256:digest`",
+        "| `REGISTRY` |",
+        "| `REGISTRY_USER` |",
+        "| `REGISTRY_PASSWORD` |",
+        "GitHub State Proxy 和 Registry 作为独立 Actor",
+    ]
+    for term in forbidden:
+        assert term not in all_text, f"Found forbidden term: {term!r}"
+
+    # Must contain the correct zero-registry claims
+    assert "Deploy Approval performs zero Registry HTTP" in all_text
+    assert "Agent Core receives the exact tag" in all_text
+    assert "owns all Registry authentication, pull, and deploy" in all_text

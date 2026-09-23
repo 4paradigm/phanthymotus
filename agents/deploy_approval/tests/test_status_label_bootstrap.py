@@ -558,7 +558,6 @@ async def test_project_status_label_uses_canonical_space_after_colon():
     from ..config import Config
     cfg = Config(
         github_repos=list(DEFAULT_GITHUB_REPOS),
-        registry="ccr.ccs.tencentyun.com",
         agent_core_tokens={"test-machine": "token"},
         poll_enabled=True,
         github_webhook_secret="secret",

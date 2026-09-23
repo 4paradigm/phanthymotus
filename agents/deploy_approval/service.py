@@ -43,7 +43,7 @@ from .review_comment_parser import (
     _parse_build_table,
     _parse_build_images,
 )
-from .registry_client import RegistryClient, parse_reference
+from .image_ref import validate_image_ref, get_deploy_platform
 
 logger = logging.getLogger(__name__)
 
@@ -180,14 +180,12 @@ class DeployController:
         proxy: GitHubStateProxy,
         policy: Policy,
         github: GitHubClient,
-        registry: object = None,
         agent_core_factory: object = None,
     ):
         self.config = config
         self.proxy = proxy
         self.policy = policy
         self.github = github
-        self.registry = registry
         self._agent_core_factory = agent_core_factory
         self._core_clients: dict[str, AgentCoreClient] = {}
         self.cos = CosClient(config)
@@ -437,6 +435,19 @@ class DeployController:
             rebuilt.append(item)
         return rebuilt
 
+    @staticmethod
+    def _component_semantic_key(component: dict) -> tuple:
+        """Stable semantic key for migration compatibility.
+
+        Based ONLY on identity fields, NOT on image_ref/digest/runtime_id.
+        """
+        return (
+            component.get("target", ""),
+            component.get("driver_path", ""),
+            component.get("variant", ""),
+            component.get("review_image_tag", ""),
+        )
+
     async def _build_component_snapshot(
         self,
         repo: str,
@@ -444,31 +455,45 @@ class DeployController:
         head_sha: str,
         builds: list[BuildInfo],
     ) -> list[dict] | None:
+        """Build component snapshot from trusted Review Agent build evidence.
+
+        No Registry access.  Image references come directly from the trusted
+        GitHub comment.  Platform is policy-derived (linux/arm64).
+        """
         snapshot: list[dict] = []
+        seen_semantic_keys: set[tuple] = set()
         for build in builds or []:
             if not build.success or not build.deployable:
                 continue
-            resolved = await self._resolve_image_ref(
-                repo,
-                pr_number,
-                head_sha,
-                build,
-            )
-            if resolved is None:
+            review_image_tag = str(build.image_tag or "")
+            if not review_image_tag:
                 return None
-            image_ref, resolved_platform = resolved
+            try:
+                validated_tag = validate_image_ref(review_image_tag)
+            except ValueError:
+                return None
+            resolved_platform = get_deploy_platform()
             if not resolved_platform:
                 return None
             component_id = hashlib.sha256(
-                f"{build.target}|{build.driver_path}|{build.variant}|{image_ref}".encode()
+                f"{build.target}|{build.driver_path}|{build.variant}|{validated_tag}".encode()
             ).hexdigest()[:16]
+            skey = (
+                build.target,
+                build.driver_path,
+                build.variant,
+                validated_tag,
+            )
+            if skey in seen_semantic_keys:
+                return None
+            seen_semantic_keys.add(skey)
             snapshot.append({
                 "component_id": component_id,
                 "target": build.target,
                 "driver_path": build.driver_path,
                 "variant": build.variant,
-                "review_image_tag": build.image_tag,
-                "image_ref": image_ref,
+                "review_image_tag": validated_tag,
+                "image_ref": validated_tag,
                 "resolved_platform": resolved_platform,
             })
         return snapshot
@@ -1580,37 +1605,6 @@ class DeployController:
     # ── Build helpers ──
 
 
-    async def _resolve_image_ref(
-        self, repo: str, pr_number: int, head_sha: str,
-        build: BuildInfo,
-    ) -> tuple[str, str] | None:
-        """Resolve the exact Review Agent image fact to immutable digest + platform.
-
-        Returns (image_ref, platform) or None.
-        """
-        try:
-            review_image_tag = str(build.image_tag or "")
-            if not review_image_tag:
-                return None
-            family, _tag = parse_reference(review_image_tag)
-            resolved = await self.registry.resolve(
-                review_image_tag,
-                platform="linux/arm64",
-                allowed_prefixes=[family],
-            )
-            if resolved is None:
-                return None
-            image_ref = resolved.image_ref or ""
-            resolved_platform = resolved.platform or ""
-            if resolved_platform != "linux/arm64":
-                return None
-            return (image_ref, resolved_platform)
-        except Exception as e:
-            logger.warning(
-                "resolve_image_ref %s#%s: %s", repo, pr_number, e,
-            )
-            return None
-
     def _get_component_ids_for_machine(
         self, machine_alias: str, components: list[dict],
     ) -> list[str]:
@@ -2387,7 +2381,7 @@ class DeployController:
         """Refresh an uncertain command without replaying the old comment.
 
         Returns:
-        - "deploy-requested" when a fresh immutable snapshot was rebuilt.
+        - "deploy-requested" when a fresh validation snapshot was rebuilt.
         - "review-required" when the head drifted or no exact review job exists.
         - "uncertain" when the rebuild could not complete but must stay pending.
         - "noop" when the PR is no longer open/active.
@@ -2550,27 +2544,48 @@ class DeployController:
             return "uncertain"
 
         old_review_evidence = state.get("review_evidence", {})
-        old_components = self._canonical_component_snapshot(state.get("components", []))
-        fresh_canonical = self._canonical_component_snapshot(fresh_components)
-        same_snapshot = (
-            old_review_evidence == review_evidence_data and old_components == fresh_canonical
+        old_components = state.get("components", [])
+
+        # Build semantic-key maps for migration compatibility.
+        # A semantic key change (target/driver_path/variant/image_tag) means
+        # a genuinely different build — reset everything.
+        old_semantic_key_list = [
+            self._component_semantic_key(oc)
+            for oc in old_components
+            if isinstance(oc, dict)
+        ]
+        old_semantic_duplicate = (
+            len(old_semantic_key_list) != len(set(old_semantic_key_list))
         )
-        updated_state = dict(state)
-        updated_state["review_evidence"] = review_evidence_data
-        updated_state["status"] = "deploy-requested"
-        updated_state["command"] = {
-            "comment_id": comment_id,
-            "kind": "approve_deploy",
-            "phase": "completed",
-            "args": dict(cmd.get("args", {}) or {}),
+        old_semantic_keys = set(old_semantic_key_list)
+        fresh_semantic_keys = {
+            self._component_semantic_key(fc)
+            for fc in fresh_components
+            if isinstance(fc, dict)
         }
-        updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
-        if not same_snapshot:
+
+        # A true evidence/tag change resets everything.
+        evidence_changed = old_review_evidence != review_evidence_data
+        # Symmetric set comparison: detects added, removed, and changed components.
+        semantic_changed = old_semantic_duplicate or old_semantic_keys != fresh_semantic_keys
+
+        if evidence_changed or semantic_changed:
+            # Genuinely different build/evidence — reset to fresh snapshot.
             fresh_reset_components: list[dict] = []
             for component in fresh_components:
                 item = dict(component)
                 item.pop("runtime_id", None)
                 fresh_reset_components.append(item)
+            updated_state = dict(state)
+            updated_state["review_evidence"] = review_evidence_data
+            updated_state["status"] = "deploy-requested"
+            updated_state["command"] = {
+                "comment_id": comment_id,
+                "kind": "approve_deploy",
+                "phase": "completed",
+                "args": dict(cmd.get("args", {}) or {}),
+            }
+            updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
             updated_state["components"] = fresh_reset_components
             updated_state["deployments"] = []
             updated_state["approve_attempts"] = []
@@ -2580,37 +2595,105 @@ class DeployController:
             updated_state["test_result"] = ""
             updated_state["cos"] = {"object_key": "", "sha256": "", "size": 0}
         else:
-            preserved_components = self._components_with_preserved_runtime_bindings(
-                fresh_components,
-                state.get("components", []),
-                state.get("deployments", []),
-            )
-            if preserved_components is None:
-                logger.warning(
-                    "uncertain recovery runtime binding unavailable %s#%s head=%s",
-                    repo, pr_number, current_head,
-                )
-                state["command"] = {
+            # Same evidence AND same semantic keys — apply migration rules.
+            deployed_component_ids: set[str] = set()
+            for dep in state.get("deployments", []):
+                if isinstance(dep, dict) and dep.get("phase") == "deployed":
+                    for cid in dep.get("component_ids", []):
+                        if isinstance(cid, str) and cid:
+                            deployed_component_ids.add(cid)
+
+            # Fail-closed: deployed components must have non-empty runtime_id.
+            # If a deployed component is missing runtime_id, fall through to the
+            # reset branch instead of proceeding with migration.
+            _migration_ok = True
+            for old_comp in old_components:
+                if not isinstance(old_comp, dict):
+                    continue
+                old_cid = old_comp.get("component_id", "")
+                if old_cid in deployed_component_ids:
+                    runtime_id = old_comp.get("runtime_id", "")
+                    if not isinstance(runtime_id, str) or not runtime_id:
+                        # Missing runtime_id for deployed component — reset to fresh.
+                        _migration_ok = False
+                        break
+
+            if not _migration_ok:
+                # Fall through to the reset branch below.
+                fresh_reset_components: list[dict] = []
+                for component in fresh_components:
+                    item = dict(component)
+                    item.pop("runtime_id", None)
+                    fresh_reset_components.append(item)
+                updated_state = dict(state)
+                updated_state["review_evidence"] = review_evidence_data
+                updated_state["status"] = "deploy-requested"
+                updated_state["command"] = {
                     "comment_id": comment_id,
                     "kind": "approve_deploy",
-                    "phase": "uncertain",
+                    "phase": "completed",
                     "args": dict(cmd.get("args", {}) or {}),
                 }
-                state["last_processed_comment_id"] = max(old_cursor, comment_id)
-                markdown = comments_mod.uncertain_comment(
-                    repo, pr_number, current_head,
-                )
-                if machine_alias:
-                    markdown += "\n\n" + "\n".join([
-                        "### Restart Recovery",
-                        "",
-                        "Validation facts are temporarily unavailable.",
-                        f"Try a new `/approve_deploy machine={machine_alias}` later.",
-                    ])
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                return "uncertain"
-            updated_state["components"] = preserved_components
-            updated_state["deployments"] = list(state.get("deployments", []))
+                updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
+                updated_state["components"] = fresh_reset_components
+                updated_state["deployments"] = []
+                updated_state["approve_attempts"] = []
+                updated_state["approve_attempts_total"] = 0
+                updated_state["approve_attempts_truncated"] = False
+                updated_state["case_results"] = {}
+                updated_state["test_result"] = ""
+                updated_state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+            else:
+                semantic_map: dict[tuple, dict] = {}
+                for fc in fresh_components:
+                    if isinstance(fc, dict):
+                        semantic_map[self._component_semantic_key(fc)] = fc
+
+                migrated: list[dict] = []
+                for old_comp in old_components:
+                    if not isinstance(old_comp, dict):
+                        continue
+                    skey = self._component_semantic_key(old_comp)
+                    fresh = semantic_map.get(skey)
+                    if not fresh:
+                        continue
+                    old_cid = old_comp.get("component_id", "")
+                    is_deployed = old_cid in deployed_component_ids
+                    if is_deployed:
+                        # Rule B: preserve historical artifact
+                        migrated.append({
+                            "component_id": old_cid,
+                            "target": fresh["target"],
+                            "driver_path": fresh["driver_path"],
+                            "variant": fresh["variant"],
+                            "review_image_tag": fresh["review_image_tag"],
+                            "image_ref": old_comp.get("image_ref", ""),
+                            "resolved_platform": fresh["resolved_platform"],
+                            "runtime_id": old_comp.get("runtime_id", ""),
+                        })
+                    else:
+                        # Rule A: migrate to tag, reuse old component_id
+                        migrated.append({
+                            "component_id": old_cid,
+                            "target": fresh["target"],
+                            "driver_path": fresh["driver_path"],
+                            "variant": fresh["variant"],
+                            "review_image_tag": fresh["review_image_tag"],
+                            "image_ref": fresh["image_ref"],
+                            "resolved_platform": fresh["resolved_platform"],
+                        })
+
+                updated_state = dict(state)
+                updated_state["review_evidence"] = review_evidence_data
+                updated_state["status"] = "deploy-requested"
+                updated_state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": dict(cmd.get("args", {}) or {}),
+                }
+                updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
+                updated_state["components"] = migrated
 
         state.clear()
         state.update(updated_state)
@@ -2620,10 +2703,6 @@ class DeployController:
             "",
             "Validation facts were refreshed from the current HEAD.",
         ]
-        if same_snapshot:
-            gate_note.append("Previously confirmed deployments were preserved.")
-        else:
-            gate_note.append("Old validation snapshot was replaced.")
         if machine_alias:
             gate_note.append(
                 f"Send a NEW `/approve_deploy machine={machine_alias}`."

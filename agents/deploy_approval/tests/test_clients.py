@@ -94,7 +94,6 @@ def test_validate_config_requires_exact_runtime_repo_set(github_repos, should_pa
         github_repos=github_repos,
         poll_enabled=True,
         github_webhook_secret="secret",
-        registry="ccr.ccs.tencentyun.com",
         review_comment_author_id="7950763",
         agent_core_tokens={"test-machine": "test-token"},
     )
@@ -227,7 +226,6 @@ def _controller_for_core_tests(core_factory=None) -> DeployController:
         config,
         MagicMock(),
         policy,
-        MagicMock(),
         MagicMock(),
         agent_core_factory=core_factory,
     )
@@ -565,158 +563,6 @@ def test_real_agent_core_list_envelopes_accept_list_data():
     ]
 
 
-def test_real_agent_core_registry_catalog_facets_contract():
-    """/api/registry/catalog must be parsed into data/facets/filter with
-    non-empty cpu_arch/acc_arch, and a real /api/drivers entry without a
-    platform field must still parse as a list of driver dicts."""
-    cfg = _client()
-
-    async def _scenario():
-        catalog_tr = _Transport({
-            "code": 200,
-            "data": {"repos": []},
-            "cached": False,
-            "facets": {
-                "cpu_arch": "arm64",
-                "acc_arch": "jetson-jp5",
-            },
-            "filter": {
-                "applied": True,
-            },
-        })
-        drivers_tr = _Transport({
-            "code": 200,
-            "data": [
-                {
-                    "id": "perception",
-                    "name": "perception",
-                    "image": "registry.example/repo/perception:rel-n5.11",
-                    "port": "80",
-                    "description": "",
-                    "category": "perception",
-                    "mcp_url": "",
-                    "running_image": "",
-                },
-            ],
-        })
-        c = AgentCoreClient(
-            cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1", http=httpx.AsyncClient(
-                transport=_TransportFromScenarios({
-                    "/api/registry/catalog": catalog_tr,
-                    "/api/drivers": drivers_tr,
-                })
-            ),
-        )
-        catalog = await c.registry_catalog()
-        assert catalog["data"] == {"repos": []}
-        assert catalog["facets"] == {
-            "cpu_arch": "arm64", "acc_arch": "jetson-jp5",
-        }
-        assert catalog["filter"] == {"applied": True}
-        drivers = await c.list_drivers()
-        assert len(drivers) == 1
-        # The REAL schema has no platform/required_platform field and that is
-        # fine: the adapter must not require one to parse the entry.
-        assert "platform" not in drivers[0]
-        assert "required_platform" not in drivers[0]
-        assert drivers[0]["id"] == "perception"
-
-    asyncio.run(_scenario())
-
-
-def test_registry_catalog_rejects_legacy_nested_facets_shape():
-    """The legacy nested mock shape (facets/filter under data) is NOT the real
-    /api/registry/catalog envelope and must fail closed, never be guessed."""
-    cfg = _client()
-    tr = _Transport({
-        "code": 200,
-        "data": {
-            "facets": {
-                "cpu_arch": "arm64",
-                "acc_arch": "jetson-jp5",
-            },
-            "filter": {},
-            "data": {},
-        },
-    })
-    c = AgentCoreClient(
-        cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
-    )
-    with pytest.raises(AgentCoreError):
-        asyncio.run(c.registry_catalog())
-
-
-def test_registry_catalog_rejects_missing_top_level_facets():
-    """A top-level envelope without facets cannot prove host architecture and
-    must fail closed (missing filter also fails closed)."""
-    cfg = _client()
-    tr = _Transport({
-        "code": 200,
-        "data": {"repos": []},
-        "filter": {"applied": True},
-    })
-    c = AgentCoreClient(
-        cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
-    )
-    with pytest.raises(AgentCoreError):
-        asyncio.run(c.registry_catalog())
-
-
-def test_registry_catalog_rejects_non_dict_top_level_filter():
-    """filter is top-level in the real envelope; a malformed filter must fail
-    closed instead of being silently replaced."""
-    cfg = _client()
-    tr = _Transport({
-        "code": 200,
-        "data": {"repos": []},
-        "facets": {"cpu_arch": "arm64", "acc_arch": "jetson-jp5"},
-        "filter": "applied",
-    })
-    c = AgentCoreClient(
-        cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
-    )
-    with pytest.raises(AgentCoreError):
-        asyncio.run(c.registry_catalog())
-
-
-def test_registry_catalog_rejects_missing_filter_fail_closed():
-    """The real API always supplies filter; a drift that drops it must fail
-    closed, not be normalized to {}."""
-    cfg = _client()
-    tr = _Transport({
-        "code": 200,
-        "data": {"repos": []},
-        "facets": {"cpu_arch": "arm64", "acc_arch": "jetson-jp5"},
-    })
-    c = AgentCoreClient(
-        cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
-    )
-    with pytest.raises(AgentCoreError):
-        asyncio.run(c.registry_catalog())
-
-
-def test_registry_catalog_rejects_empty_cpu_or_acc_arch():
-    """Empty cpu_arch/acc_arch cannot prove host architecture; fail closed."""
-    cfg = _client()
-    for cpu, acc in (("", "jetson-jp5"), ("arm64", " ")):
-        tr = _Transport({
-            "code": 200,
-            "data": {"repos": []},
-            "facets": {"cpu_arch": cpu, "acc_arch": acc},
-            "filter": {"applied": True},
-        })
-        c = AgentCoreClient(
-            cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
-        )
-        with pytest.raises(AgentCoreError):
-            asyncio.run(c.registry_catalog())
-
 
 def test_list_drivers_rejects_object_data_fail_closed():
     """If a node wrongly wraps /api/drivers as an object the adapter fails
@@ -731,21 +577,11 @@ def test_list_drivers_rejects_object_data_fail_closed():
         asyncio.run(c.list_drivers())
 
 
-def test_deploy_driver_requires_immutable_digest_form():
-    """The deploy POST adapter refuses a mutable tag: only
-    repo@sha256:<64hex> may ever be sent to /deploy."""
+def test_deploy_driver_exact_tag_passthrough():
+    """Exact full image tag passed verbatim to Agent Core deploy POST."""
+    import json
     cfg = _client()
-    for bad in ("registry.example/repo/perception:latest",
-                "registry.example/repo/perception",
-                "registry.example/repo/perception@sha256:abc",
-                "registry.example/repo/perception@sha256:" + "z" * 64):
-        tr = _Transport({"code": 200, "data": {"status": "starting"}})
-        c = AgentCoreClient(
-            cfg, base_url="https://192.0.2.1:15678",
-        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
-        )
-        with pytest.raises(AgentCoreError):
-            asyncio.run(c.deploy_driver("drv", bad))
+    tag = "bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp5.11"
 
     class Capture(httpx.AsyncBaseTransport):
         def __init__(self):
@@ -761,9 +597,47 @@ def test_deploy_driver_requires_immutable_digest_form():
         cfg, base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
     )
-    good = "registry.example/repo/perception@sha256:" + "a" * 64
-    asyncio.run(c.deploy_driver("drv", good))
-    assert b"@sha256:" in tr.body
+    asyncio.run(c.deploy_driver("perception", tag))
+    assert json.loads(tr.body) == {"image": tag}
+
+
+def test_deploy_driver_legacy_digest_accepted():
+    """Legacy repo@sha256:<64hex> still accepted for hidden-state compatibility."""
+    import json
+    cfg = _client()
+    digest_ref = "registry.example/repo@sha256:" + "a" * 64
+
+    class Capture(httpx.AsyncBaseTransport):
+        def __init__(self):
+            self.body = None
+
+        async def handle_async_request(self, request):
+            self.body = request.content
+            return httpx.Response(200, json={"code": 200, "data": {"status": "starting"}},
+                                  request=request)
+
+    tr = Capture()
+    c = AgentCoreClient(
+        cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
+    )
+    asyncio.run(c.deploy_driver("drv", digest_ref))
+    assert json.loads(tr.body) == {"image": digest_ref}
+
+
+def test_deploy_driver_malformed_image_rejected():
+    """Malformed image references must be rejected before any HTTP call."""
+    cfg = _client()
+    for bad in ("", "registry/repo", "https://registry/repo:tag",
+                "registry/repo:tag\nbad",
+                "registry/repo:tag?x=1", "registry/repo:tag#fragment"):
+        tr = _Transport({"code": 200, "data": {"status": "starting"}})
+        c = AgentCoreClient(
+            cfg, base_url="https://192.0.2.1:15678",
+        node_host="192.0.2.1", http=httpx.AsyncClient(transport=tr),
+        )
+        with pytest.raises(AgentCoreError):
+            asyncio.run(c.deploy_driver("drv", bad))
 
 
 # ── MCP strict schema: NO coercion of non-object tools ────────────────────
@@ -1062,23 +936,6 @@ def test_github_self_created_client_disables_proxy_env(monkeypatch):
     from ..config import Config
     cfg = Config(github_repos=["org/repo"], poll_enabled=True)
     client = GitHubClient(cfg)
-    try:
-        assert client.http.trust_env is False
-    finally:
-        asyncio.run(client.http.aclose())
-
-
-# ── FIX 3: Registry self-created client trust_env regression ────────────────
-
-def test_registry_self_created_client_disables_proxy_env(monkeypatch):
-    """RegistryClient self-created AsyncClient must not inherit proxy env."""
-    monkeypatch.setenv("HTTP_PROXY", "http://evil-proxy:8080")
-    monkeypatch.setenv("HTTPS_PROXY", "http://evil-proxy:8080")
-    monkeypatch.setenv("ALL_PROXY", "http://evil-proxy:8080")
-    from ..registry_client import RegistryClient
-    from ..config import Config
-    cfg = Config(github_repos=["org/repo"], poll_enabled=True, registry="localhost:5000")
-    client = RegistryClient(cfg)
     try:
         assert client.http.trust_env is False
     finally:

@@ -44,19 +44,38 @@ def _short(sha: str) -> str:
 
 
 def _short_digest(image_ref: str) -> str:
-    if "@sha256:" not in (image_ref or ""):
-        return ""
-    digest = image_ref.split("@sha256:", 1)[1].strip()
-    if len(digest) < 12:
-        return ""
-    return digest[:12]
+    """Return a compact display for an image ref: short digest or truncated tag."""
+    if "@sha256:" in (image_ref or ""):
+        digest = image_ref.split("@sha256:", 1)[1].strip()
+        if len(digest) < 12:
+            return ""
+        return f"@sha256:{digest[:12]}"
+    # Tag form — show the tag portion (after last :)
+    if image_ref and ":" in image_ref:
+        tag = image_ref.rsplit(":", 1)[-1]
+        if len(tag) > 40:
+            return tag[:40] + "…"
+        return tag
+    return ""
+
+
+def _compact_image_ref(image_ref: str) -> str:
+    """Display an image_ref: full tag for tag form, short digest for legacy digest form."""
+    if "@sha256:" in (image_ref or ""):
+        digest = image_ref.split("@sha256:", 1)[1].strip()
+        if len(digest) < 12:
+            return ""
+        return f"@sha256:{digest[:12]}"
+    # Tag form — show the FULL image_ref (safe, no credentials)
+    return image_ref if image_ref else ""
 
 
 def _compact_running_image(image_ref: str) -> str:
-    digest = _short_digest(image_ref)
-    if digest:
-        return f"@sha256:{digest}"
-    return ""
+    """Compact display for running_image evidence."""
+    result = _short_digest(image_ref)
+    if result:
+        return result
+    return "occupied"
 
 
 def _escape(text: str) -> str:
@@ -230,8 +249,8 @@ def deploy_requested(
             label = f"{target} {variant}"
         elif driver_path:
             label = f"{target} {driver_path}"
-        digest = _short_digest(image_ref)
-        extra = f" · `@sha256:{digest}`" if digest else ""
+        display = _compact_image_ref(image_ref)
+        extra = f" · `{display}`" if display else ""
         comp_lines.append(f"- {_escape(label)}{extra}")
     lines = [
         BOT_MARKER,
@@ -493,7 +512,7 @@ def uncertain_comment(
         "",
         "Only a NEW `/approve_deploy` starts recovery validation:",
         "- re-check the current full HEAD",
-        "- refresh the validation / immutable image snapshot",
+        "- refresh the validation / frozen Review Agent image snapshot",
         "- then run the running_image-only CLEAN GATE",
         "",
         last_checked_line(),

@@ -23,9 +23,6 @@ services:
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
       WEBHOOK_ENABLED: "${WEBHOOK_ENABLED:-false}"
       GITHUB_WEBHOOK_SECRET: "${GITHUB_WEBHOOK_SECRET:-}"
-      REGISTRY: "${REGISTRY:-}"
-      REGISTRY_USER: "${REGISTRY_USER:-}"
-      REGISTRY_PASSWORD: "${REGISTRY_PASSWORD:-}"
     volumes:
       - ./machines.yaml:/run/deploy-approval/machines.yaml:ro
       - ./secrets.yaml:/run/deploy-approval/secrets.yaml:ro

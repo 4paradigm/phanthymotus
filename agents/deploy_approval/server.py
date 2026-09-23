@@ -19,7 +19,6 @@ from agents import github_app_auth
 from .github_state_proxy import GitHubStateProxy
 from .github_command_watcher import GitHubCommandWatcher
 from .policy import Policy
-from .registry_client import RegistryClient
 from .router_webhook import router as webhook_router
 from .service import DeployController
 
@@ -228,7 +227,7 @@ async def _resolve_active_repos(
 
 
 
-async def _lifespan_cleanup(watcher, controller, github, registry, github_auth):
+async def _lifespan_cleanup(watcher, controller, github, github_auth):
     """Best-effort cleanup for every lifespan exit path.
 
     Each step is independently try/except so that a cleanup failure
@@ -246,14 +245,13 @@ async def _lifespan_cleanup(watcher, controller, github, registry, github_auth):
     except Exception as exc:
         logger.warning("lifespan cleanup controller.aclose failed: %s", type(exc).__name__)
 
-    for name, client in (("github", github), ("registry", registry)):
-        try:
-            http = getattr(client, "http", None)
-            aclose = getattr(http, "aclose", None)
-            if aclose is not None:
-                await aclose()
-        except Exception as exc:
-            logger.warning("lifespan cleanup %s http close failed: %s", name, type(exc).__name__)
+    try:
+        http = getattr(github, "http", None)
+        aclose = getattr(http, "aclose", None)
+        if aclose is not None:
+            await aclose()
+    except Exception as exc:
+        logger.warning("lifespan cleanup github http close failed: %s", type(exc).__name__)
 
     try:
         await github_auth.close()
@@ -282,7 +280,6 @@ def create_app(config: Config | None = None):
         config,
         token_provider=github_auth.get_installation_token,
     )
-    registry = RegistryClient(config)
 
     # GitHubStateProxy receives github_app_id for lazy provenance check
     proxy = GitHubStateProxy(
@@ -290,7 +287,7 @@ def create_app(config: Config | None = None):
     )
 
     controller = DeployController(
-        config, proxy, policy, github, registry,
+        config, proxy, policy, github,
         agent_core_factory=None,
     )
 
@@ -322,7 +319,6 @@ def create_app(config: Config | None = None):
                 watcher,
                 controller,
                 github,
-                registry,
                 github_auth,
             )
 
@@ -330,7 +326,6 @@ def create_app(config: Config | None = None):
     app.state.config = config
     app.state.policy = policy
     app.state.github = github
-    app.state.registry = registry
     app.state.controller = controller
     app.state.proxy = proxy
     app.state.watcher = watcher

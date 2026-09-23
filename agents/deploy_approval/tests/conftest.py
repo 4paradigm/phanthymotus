@@ -19,7 +19,6 @@ def make_config(**overrides):
         github_repos=["4paradigm/phanthymotus"],
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry="ccr.ccs.tencentyun.com",
         review_comment_author_id="7950763",
         review_comment_author_login="review-agent-bot",
         agent_core_tokens={"test-machine": "test-token"},

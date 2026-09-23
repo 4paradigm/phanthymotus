@@ -30,6 +30,7 @@ import re
 from typing import Any
 
 from .config import Config
+from .image_ref import validate_image_ref
 from .github_client import GitHubClient, GitHubError
 
 logger = logging.getLogger(__name__)
@@ -82,10 +83,20 @@ def _is_valid_full_sha(value: Any) -> bool:
     return bool(re.match(r"^[0-9a-f]{40}$", value))
 
 
-def _is_valid_digest_ref(value: Any) -> bool:
+def _is_valid_image_ref(value: Any) -> bool:
+    """Validate image_ref using the canonical validator.
+
+    Accepts legacy digest or new tag form.
+    Returns True if valid, False otherwise.
+    """
     if not isinstance(value, str):
         return False
-    return bool(re.match(r"^[A-Za-z0-9._-]+(?::[0-9]+)?/[a-z0-9]+(?:(?:[._]|__+|[-]+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__+|[-]+)[a-z0-9]+)*)*@sha256:[0-9a-f]{64}$", value))
+    try:
+        validate_image_ref(value)
+        return True
+    except ValueError:
+        return False
+
 
 
 def _validate_review_evidence(data: dict) -> dict:
@@ -219,7 +230,7 @@ def _validate_hidden_state(data: dict) -> dict:
         if not isinstance(comp.get("variant"), str):
             raise MalformedHiddenStateError("variant must be a string")
         image_ref = comp.get("image_ref", "")
-        if not _is_valid_digest_ref(image_ref):
+        if not _is_valid_image_ref(image_ref):
             raise MalformedHiddenStateError(f"invalid image_ref: {image_ref!r}")
         resolved_platform = comp.get("resolved_platform", "")
         if not isinstance(resolved_platform, str) or not resolved_platform:

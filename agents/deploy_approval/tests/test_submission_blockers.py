@@ -175,9 +175,7 @@ def policy(config):
 
 @pytest.fixture
 def controller(config, proxy, policy, fake_github):
-    registry = MagicMock()
-    registry.resolve = AsyncMock()
-    return DeployController(config, proxy, policy, fake_github, registry)
+    return DeployController(config, proxy, policy, fake_github)
 
 
 @pytest.mark.asyncio
@@ -203,12 +201,9 @@ async def test_request_deploy_requires_deploy_ready(controller, proxy, fake_gith
     proxy.write_hidden_state = AsyncMock()
     proxy.comment_identity = AsyncMock(return_value=("1", "alice"))
     fake_github.pr = {"state": "open", "merged": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
-    controller.registry.resolve = AsyncMock()
-
     await controller.handle_request_deploy("repo", 1, 11)
 
     proxy.write_hidden_state.assert_not_called()
-    controller.registry.resolve.assert_not_called()
 
 
 def test_parsed_command_has_no_legacy_build_index_field():
@@ -237,18 +232,6 @@ def test_deploy_script_has_no_agent_core_self_registration_contract():
     assert "self-registers via POST /api/nodes/register" not in deploy
     assert "registered Agent Cores" not in deploy
 
-
-def test_registry_digest_verifier_has_no_rollback_contract_semantics():
-    root = Path(__file__).resolve().parents[3]
-    registry = (root / "agents/deploy_approval/registry_client.py").read_text(encoding="utf-8")
-    forbidden = (
-        "historical rollback baseline",
-        "rollback baseline",
-        "deploy/rollback",
-        "previous running_image",
-    )
-    for phrase in forbidden:
-        assert phrase not in registry
 
 
 def test_hidden_state_rejects_empty_command_phase():

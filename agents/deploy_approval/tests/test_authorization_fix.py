@@ -27,7 +27,6 @@ def _make_config(**overrides) -> Config:
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry="registry.example",
         review_comment_author_id="7950763",
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
@@ -280,7 +279,6 @@ def test_webhook_driver_blocked_when_inactive():
         webhook_enabled=True,
         github_webhook_secret="secret",
         poll_enabled=True,
-        registry="registry.example",
         review_comment_author_id="7950763",
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
@@ -301,7 +299,7 @@ def test_webhook_driver_blocked_when_inactive():
 
     response = client.post(
         "/webhook",
-        data=payload,
+        content=payload,
         headers={
             "X-GitHub-Event": "issue_comment",
             "X-Hub-Signature-256": "sha256=94b5df81103e3a1a6c2e6f7a9d0a429131d732bfca34d2e3d5b63d56cff457da",
@@ -323,7 +321,6 @@ def test_webhook_driver_allowed_when_active():
         webhook_enabled=True,
         github_webhook_secret="secret",
         poll_enabled=True,
-        registry="registry.example",
         review_comment_author_id="7950763",
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
@@ -352,7 +349,7 @@ def test_webhook_driver_allowed_when_active():
 
     response = client.post(
         "/webhook",
-        data=payload,
+        content=payload,
         headers={
             "X-GitHub-Event": "issue_comment",
             "X-Hub-Signature-256": "sha256=94b5df81103e3a1a6c2e6f7a9d0a429131d732bfca34d2e3d5b63d56cff457da",
@@ -601,7 +598,6 @@ async def test_startup_main_only_active_repos():
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry="registry.example",
         review_comment_author_id="7950763",
         machine_owners_file=machine_yaml_path,
         secrets_file="/dev/null",
@@ -690,7 +686,6 @@ async def test_startup_missing_main_watcher_not_started():
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry="registry.example",
         review_comment_author_id="7950763",
         machine_owners_file=machine_yaml_path,
         secrets_file="/dev/null",
@@ -1133,7 +1128,6 @@ async def test_startup_authorization_failure_closes_resources():
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry="registry.example",
         review_comment_author_id="7950763",
         machine_owners_file=machine_yaml_path,
         secrets_file="/dev/null",
@@ -1185,7 +1179,6 @@ async def test_startup_authorization_failure_closes_resources():
     from .. import server as server_mod
     orig_auth = server_mod.github_app_auth.create_github_app_auth
     orig_ghc = server_mod.GitHubClient
-    orig_reg = server_mod.RegistryClient
     orig_watcher = server_mod.GitHubCommandWatcher
 
     class _FakeAppAuth:
@@ -1197,7 +1190,6 @@ async def test_startup_authorization_failure_closes_resources():
 
     server_mod.github_app_auth.create_github_app_auth = lambda: _FakeAppAuth()
     server_mod.GitHubClient = lambda cfg_, token_provider=None: FakeGitHub()
-    server_mod.RegistryClient = lambda cfg_: FakeRegistry()
     server_mod.GitHubCommandWatcher = FakeWatcher
 
     try:
@@ -1208,13 +1200,11 @@ async def test_startup_authorization_failure_closes_resources():
     finally:
         server_mod.github_app_auth.create_github_app_auth = orig_auth
         server_mod.GitHubClient = orig_ghc
-        server_mod.RegistryClient = orig_reg
         server_mod.GitHubCommandWatcher = orig_watcher
 
     assert watcher_started == []
     assert auth_closed == [True]
     assert github_closed == [True]
-    assert registry_closed == [True]
 
 
 # ------------------------------------------------------------------
@@ -1256,14 +1246,13 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
         github_api_url="https://api.github.com",
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry="registry.example",
         review_comment_author_id="7950763",
         machine_owners_file=machine_yaml_path,
         secrets_file="/dev/null",
         webhook_enabled=False,
     )
 
-    cleanup_attempts = {"stop": 0, "aclose": 0, "gh_close": 0, "reg_close": 0, "auth_close": 0}
+    cleanup_attempts = {"stop": 0, "aclose": 0, "gh_close": 0, "auth_close": 0}
 
     class FakeGitHub:
         async def get_current_user(self):
@@ -1286,15 +1275,6 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
                     raise RuntimeError("github close failed")
             return FakeHTTP()
 
-    class FakeRegistry:
-        @property
-        def http(self):
-            class FakeHTTP:
-                async def aclose(self):
-                    cleanup_attempts["reg_close"] += 1
-                    raise RuntimeError("registry close failed")
-            return FakeHTTP()
-
     watcher_started = []
 
     class FakeWatcher:
@@ -1309,7 +1289,6 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
     from .. import server as server_mod
     orig_auth = server_mod.github_app_auth.create_github_app_auth
     orig_ghc = server_mod.GitHubClient
-    orig_reg = server_mod.RegistryClient
     orig_watcher = server_mod.GitHubCommandWatcher
     orig_controller = server_mod.DeployController
 
@@ -1328,7 +1307,6 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
 
     server_mod.github_app_auth.create_github_app_auth = lambda: _FakeAppAuth()
     server_mod.GitHubClient = lambda cfg_, token_provider=None: FakeGitHub()
-    server_mod.RegistryClient = lambda cfg_: FakeRegistry()
     server_mod.GitHubCommandWatcher = FakeWatcher
     server_mod.DeployController = lambda *a, **k: FakeController()
 
@@ -1340,7 +1318,6 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
     finally:
         server_mod.github_app_auth.create_github_app_auth = orig_auth
         server_mod.GitHubClient = orig_ghc
-        server_mod.RegistryClient = orig_reg
         server_mod.GitHubCommandWatcher = orig_watcher
         server_mod.DeployController = orig_controller
 
@@ -1351,7 +1328,6 @@ async def test_startup_cleanup_failure_does_not_mask_authorization_error():
     assert cleanup_attempts["stop"] == 1
     assert cleanup_attempts["aclose"] == 1
     assert cleanup_attempts["gh_close"] == 1
-    assert cleanup_attempts["reg_close"] == 1
     assert cleanup_attempts["auth_close"] == 1
 
 
@@ -1376,7 +1352,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
 
     orig_auth = server_mod.github_app_auth.create_github_app_auth
     orig_ghc = server_mod.GitHubClient
-    orig_reg = server_mod.RegistryClient
     orig_watcher = server_mod.GitHubCommandWatcher
     orig_controller = server_mod.DeployController
 
@@ -1392,9 +1367,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
         async def aclose(self):
             cleanup_counts['gh_close'] += 1
 
-    class FakeRegistryHTTP:
-        async def aclose(self):
-            cleanup_counts['reg_close'] += 1
 
     class FakeWatcherCounting:
         def __init__(self, *args, **kwargs):
@@ -1422,9 +1394,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
             cleanup_counts['gh_close'] += 1
             raise RuntimeError('github close failed')
 
-    class FakeRegistryCounting:
-        def __init__(self, *a):
-            self.http = FakeRegistryHTTP()
 
         async def aclose(self):
             cleanup_counts['reg_close'] += 1
@@ -1442,7 +1411,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
 
     server_mod.github_app_auth.create_github_app_auth = lambda: FakeAppAuthCounting()
     server_mod.GitHubClient = lambda cfg_, token_provider=None: FakeGitHubCounting()
-    server_mod.RegistryClient = lambda cfg_: FakeRegistryCounting()
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as mf:
         mf.write("version: 1\n")
@@ -1463,7 +1431,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
         github_api_url='https://api.github.com',
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry='registry.example',
         review_comment_author_id='7950763',
         machine_owners_file=machine_yaml_path,
         secrets_file='/dev/null',
@@ -1481,14 +1448,12 @@ async def test_lifespan_body_exception_cleanup_runs_once():
     finally:
         server_mod.github_app_auth.create_github_app_auth = orig_auth
         server_mod.GitHubClient = orig_ghc
-        server_mod.RegistryClient = orig_reg
         server_mod.GitHubCommandWatcher = orig_watcher
         server_mod.DeployController = orig_controller
 
     assert cleanup_counts['stop'] == 1, f"stop called {cleanup_counts['stop']} times"
     assert cleanup_counts['aclose'] == 1, f"aclose called {cleanup_counts['aclose']} times"
     assert cleanup_counts['gh_close'] == 1, f"gh_close called {cleanup_counts['gh_close']} times"
-    assert cleanup_counts['reg_close'] == 1, f"reg_close called {cleanup_counts['reg_close']} times"
     assert cleanup_counts['auth_close'] == 1, f"auth_close called {cleanup_counts['auth_close']} times"
 
 
@@ -1504,7 +1469,6 @@ async def test_normal_shutdown_cleanup_exactly_once():
 
     orig_auth = server_mod.github_app_auth.create_github_app_auth
     orig_ghc = server_mod.GitHubClient
-    orig_reg = server_mod.RegistryClient
     orig_watcher = server_mod.GitHubCommandWatcher
     orig_controller = server_mod.DeployController
 
@@ -1520,9 +1484,6 @@ async def test_normal_shutdown_cleanup_exactly_once():
         async def aclose(self):
             cleanup_counts['gh_close'] += 1
 
-    class FakeRegistryHTTP:
-        async def aclose(self):
-            cleanup_counts['reg_close'] += 1
 
     class FakeWatcherNormal:
         def __init__(self, *args, **kwargs):
@@ -1547,9 +1508,6 @@ async def test_normal_shutdown_cleanup_exactly_once():
         async def aclose(self):
             cleanup_counts['gh_close'] += 1
 
-    class FakeRegistryNormal:
-        def __init__(self, *a):
-            self.http = FakeRegistryHTTP()
 
         async def aclose(self):
             cleanup_counts['reg_close'] += 1
@@ -1565,7 +1523,6 @@ async def test_normal_shutdown_cleanup_exactly_once():
 
     server_mod.github_app_auth.create_github_app_auth = lambda: FakeAppAuthNormal()
     server_mod.GitHubClient = lambda cfg_, token_provider=None: FakeGitHubNormal()
-    server_mod.RegistryClient = lambda cfg_: FakeRegistryNormal()
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as mf:
         mf.write("version: 1\n")
@@ -1586,7 +1543,6 @@ async def test_normal_shutdown_cleanup_exactly_once():
         github_api_url='https://api.github.com',
         poll_enabled=True,
         poll_interval_seconds=30,
-        registry='registry.example',
         review_comment_author_id='7950763',
         machine_owners_file=machine_yaml_path,
         secrets_file='/dev/null',
@@ -1603,12 +1559,10 @@ async def test_normal_shutdown_cleanup_exactly_once():
     finally:
         server_mod.github_app_auth.create_github_app_auth = orig_auth
         server_mod.GitHubClient = orig_ghc
-        server_mod.RegistryClient = orig_reg
         server_mod.GitHubCommandWatcher = orig_watcher
         server_mod.DeployController = orig_controller
 
     assert cleanup_counts['stop'] == 1, f"stop called {cleanup_counts['stop']} times"
     assert cleanup_counts['aclose'] == 1, f"aclose called {cleanup_counts['aclose']} times"
     assert cleanup_counts['gh_close'] == 1, f"gh_close called {cleanup_counts['gh_close']} times"
-    assert cleanup_counts['reg_close'] == 1, f"reg_close called {cleanup_counts['reg_close']} times"
     assert cleanup_counts['auth_close'] == 1, f"auth_close called {cleanup_counts['auth_close']} times"

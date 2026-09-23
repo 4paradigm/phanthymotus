@@ -120,13 +120,13 @@ merge 后正式 release / production deployment 属于 main/release workflow，�
 Source matrix:
 
 - GitHub PR comments: Review Agent output (build / test / code review evidence)
-- Registry: only immutable verification / resolution of the exact `review_image_tag` from comments
+- Registry: Deploy Approval performs zero Registry HTTP. Image references are frozen from trusted Review Agent GitHub comments; tag-to-digest resolution is not performed by Deploy Approval.
 - Agent Core: runtime identity / current `running_image` / MCP evidence
 - GitHub hidden JSON: restart-safe persistence snapshot
 
-`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过本地管理员维护的 `machines.yaml` 中配置的 literal IPv4 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Agent Core endpoint 固定为 `https://<node_host>:15678`，HTTP redirect 禁用。每台机器通过 Agent Core 的 `node_host` 直连 `https://<node_host>:15678`，不做 TLS peer certificate pin，允许 `verify=False`。Deploy Approval 不做 TOFU，不允许 PR/comment 指定目标 IP 或证书路径。Registry 只作为 `/request_deploy` 内部的 exact Review Agent image 解析与 immutable verification 实现细节，不作为独立 actor 或独立控制面。
+`phanthymotus` 只部署 `perception` / `actucore`，`CORE` 不作为可部署组件；`phanthymotus-driver` 以 `driver_path` 作为机器策略身份，但 runtime id 必须通过 Agent Core 的精确 image repository 匹配得到，不能直接从 `driver_path` 拼接或模糊推导。Deploy Controller 通过本地管理员维护的 `machines.yaml` 中配置的 literal IPv4 `node_host` 连接到已存在的 Agent Core API，不做 Agent Core registration。Agent Core endpoint 固定为 `https://<node_host>:15678`，HTTP redirect 禁用。每台机器通过 Agent Core 的 `node_host` 直连 `https://<node_host>:15678`，不做 TLS peer certificate pin，允许 `verify=False`。Deploy Approval 不做 TOFU，不允许 PR/comment 指定目标 IP 或证书路径。Deploy Approval freezes the exact image:tag from the trusted Review Agent GitHub comment and passes it verbatim to Agent Core. Agent Core owns all Registry authentication, pull, and deploy. Deploy Approval performs zero Registry HTTP. Legacy repo@sha256 hidden-state values remain readable only for migration and historical compatibility.
 
-fresh Review Agent build_results + fresh Registry immutable resolution
+fresh Review Agent build_results + exact image:tag from trusted comment
 ↓
 fresh static component snapshot
 ↓
@@ -196,8 +196,7 @@ Review Agent 证据仅来自可信的 GitHub PR 对话评论。Deploy Approval �
 * Review Agent 服务器
 * Review Agent `GITHUB_TOKEN`
 
-Registry 仍为内部新鲜事实实现细节：Review Agent Build Result 评论中的精确
-`image:tag` 被解析为不可变的 `repository@sha256:digest`。Registry 不在时序图中作为独立 actor 展示。
+Deploy Approval freezes the exact image:tag from the trusted Review Agent Build Result comment. Deploy Approval performs zero Registry HTTP and does not resolve tags to digests. Agent Core receives the exact tag and owns Registry auth/pull/deploy. Legacy repo@sha256 hidden-state values remain readable only for migration and historical compatibility.
 
 
 
@@ -216,7 +215,8 @@ Registry 仍为内部新鲜事实实现细节：Review Agent Build Result 评论
 6. Agent Core
 7. COS
 
-不显示 GitHub State Proxy 和 Registry 作为独立 Actor。它们只能作为内部实现细节，不能成为第二个 Deploy Controller。
+GitHub State Proxy 是 Deploy Controller 的内部 GitHub 状态边界，不作为独立 Actor。
+Registry 已从 Deploy Approval 架构中移除；Deploy Approval 不访问 Registry HTTP，也不执行 tag-to-digest resolution。
 
 ## 顶层状态
 
@@ -318,7 +318,7 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 - 只取该 Job 中所有 successful deployable components
 - CORE 排除
 - `review_image_tag` 必须直接来自 Review Agent Build Result 评论的 Images section
-- mutable image tag 只允许通过现有 Registry client 一次性解析成 immutable `repository@sha256:...`
+- mutable image tag is frozen from the trusted Review Agent comment and passed verbatim to Agent Core; Deploy Approval does not resolve tags to digests
 - 保存 `resolved_platform`
 - hidden JSON 持久化 validation snapshot
 - `status: deploy-requested`

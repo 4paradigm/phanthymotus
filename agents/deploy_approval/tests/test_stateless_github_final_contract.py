@@ -126,9 +126,7 @@ def policy(config):
 
 @pytest.fixture
 def controller(config, proxy, policy, mock_github):
-    registry = MagicMock()
-    registry.resolve = AsyncMock()
-    return DeployController(config, proxy, policy, mock_github, registry)
+    return DeployController(config, proxy, policy, mock_github)
 
 
 def _component(**overrides):

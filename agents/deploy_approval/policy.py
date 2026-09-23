@@ -284,9 +284,6 @@ class Policy:
     def can_request(self, requester: str) -> None:
         return None
 
-    def build_pinned_ref(self, family: str, digest: str) -> str:
-        return f"{family}@{digest}"
-
     def get_machines(self) -> list:
         """Return all machines as a list."""
         return list(self.machines.values())

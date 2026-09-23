@@ -269,7 +269,7 @@ build_env_file() {
     chmod 600 "$tmp"
     {        printf 'DEPLOY_APPROVAL_RUNTIME_UID=%s\n' "$RUNTIME_UID"
         printf 'DEPLOY_APPROVAL_RUNTIME_GID=%s\n' "$RUNTIME_GID"
-        for key in GITHUB_REPOS POLL_ENABLED POLL_INTERVAL_SECONDS WEBHOOK_ENABLED GITHUB_WEBHOOK_SECRET REGISTRY REGISTRY_USER REGISTRY_PASSWORD; do
+        for key in GITHUB_REPOS POLL_ENABLED POLL_INTERVAL_SECONDS WEBHOOK_ENABLED GITHUB_WEBHOOK_SECRET; do
             value="${!key:-}"
             if [ -n "$value" ]; then
                 printf '%s=%s\n' "$key" "$value"

@@ -48,7 +48,8 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 ## Key Contracts
 
 - **Stateless:** No SQLite, no DB_PATH, no DeploymentStore. All state is in the GitHub lifecycle comment hidden state.
-- **GitHub hidden lifecycle JSON is the ONLY authoritative persistent Deploy Approval business-state store.** Fresh facts come from Review Agent / Registry / Agent Core and are copied into hidden state to make the snapshot restart-safe.
+- **GitHub hidden lifecycle JSON is the ONLY authoritative persistent Deploy Approval business-state store.** Fresh facts come from trusted Review Agent GitHub comments and Agent Core
+and are copied into hidden state to make the snapshot restart-safe.
 - **Restart-safe, single-replica / single-writer:** Deploy Approval is intentionally restart-safe stateless, but only one `GitHubCommandWatcher` serially processes mutating commands. Multiple concurrent Deploy Controller replicas are unsupported because the current hidden-state protocol has no CAS/distributed lock, and replicas >1 would violate the at-most-once unsafe-side-effect model.
 - **Polling:** PR comments are polled using `POLL_INTERVAL_SECONDS` from the upstream environment. Default: 30 seconds. No webhook required.
 - **Open-PR watcher enumeration:** `GitHubCommandWatcher` enumerates all open PRs in configured `GITHUB_REPOS`. Enumeration uses `state=open`, `sort=updated`, `direction=desc`, `per_page=100` and continues paging until the batch is empty or shorter than 100. There is no age/lookback cutoff, no 500-PR truncation, and page overlap is deduplicated by PR number. Closed/merged PRs are not enumerated by Deploy Approval.
@@ -59,9 +60,9 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **Status labels:** `status:*` labels are best-effort UI projection only. Label bootstrap/list/create failures are logged as warnings and never block startup or business operations. Label failure does not affect any gate or lifecycle transition.
 - **Review Agent authentication:** Review Agent uses a user-provided `GITHUB_TOKEN`, not the GitHub App. This is strictly separate from Deploy Approval's GitHub App credentials.
 - **Supported repos (DESIRED_REPOS):** `4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver` are permanently declared as desired/supported repositories in source code.  Runtime `GITHUB_REPOS` is resolved at startup by a single fresh `GET /installation/repositories` call: `ACTIVE_REPOS = DESIRED_REPOS ∩ AUTHORIZED_REPOS`.  Missing, duplicate, unknown, or third-party repository entries fail closed.
-- **Evidence source:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation. Trusted Review Agent GitHub comments provide Build Result, Test Results, and Code Review. Build/Test commit short SHA resolves via GitHub to full SHA for exact equality with fresh PR HEAD. Image tag comes from the selected Build Result comment Images section (full mutable ref, not basename). Registry resolves to immutable digest. No Review Agent HTTP API.
+- **Evidence source:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation. Trusted Review Agent GitHub comments provide Build Result, Test Results, and Code Review. Build/Test commit short SHA resolves via GitHub to full SHA for exact equality with fresh PR HEAD. Image tag comes from the selected Build Result comment Images section (full mutable ref, not basename). Deploy Approval freezes the exact image:tag from the trusted Review Agent GitHub comment. Deploy Approval performs zero Registry HTTP. Agent Core receives the exact tag and owns all Registry authentication, pull, and deploy. No Review Agent HTTP API.
 - **Full-coverage machine list:** `deploy_requested` lifecycle comment shows only machines that can cover ALL REMAINING components. If no machine can cover all remaining components, status stays deploy-requested and the operator must update machine policy.
-- **Source matrix:** GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence and image:tag candidate facts; Registry only verifies/resolves that exact Review Agent image tag; Agent Core only supplies runtime identity, current `running_image`, and MCP evidence; GitHub persists the deployment snapshot.
+- **Source matrix:** GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence and image:tag candidate facts; Deploy Approval freezes the exact image:tag from the trusted Review Agent comment without contacting the Registry; Agent Core receives the exact tag and owns all Registry authentication, pull, and deploy; GitHub persists the deployment snapshot. Legacy repo@sha256 hidden-state values remain readable only for migration and historical compatibility.
 - **Deployability:** `phanthymotus` deploys `perception` and `actucore`, not `CORE`; `phanthymotus-driver` deploys exact driver paths.
 - **Variant contract:** perception variants are canonical `5.11` and `6.1`. Legacy `jetson-jp5.11` / `jetson-jp6.1` are normalized only at config load.
 - **Full-coverage gate:** `/approve_deploy` first checks that the selected machine covers ALL REMAINING components. If coverage is partial, zero deploy POST is performed; the comment lists only full-coverage machines.
@@ -69,7 +70,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 - **Agent Core no-container response:** the current compatibility shape normalizes to `running_image=""` only when `running_image` and `error` are absent, `status` key exists, and `logs` is a string. The `status` VALUE has zero CLEAN/health/case business influence. Error or malformed shapes fail closed.
 - status VALUE has zero CLEAN/health/case business influence.
 - error/malformed shapes fail closed.
-- **unsafe deploy POST:** if the POST outcome is unknown after the unsafe attempt begins, the command becomes `command.phase=uncertain`, `status=deploy-requested`, `approve_attempt.outcome=uncertain`, and there is ZERO later POST. Only a NEW `/approve_deploy` can resume, which re-checks fresh HEAD, fresh hidden state, fresh actor, fresh GitHub PR comments + Registry resolution, and fresh running_image-only CLEAN gate.
+- **unsafe deploy POST:** if the POST outcome is unknown after the unsafe attempt begins, the command becomes `command.phase=uncertain`, `status=deploy-requested`, `approve_attempt.outcome=uncertain`, and there is ZERO later POST. Only a NEW `/approve_deploy` can resume, which re-checks fresh HEAD, fresh hidden state, fresh actor, fresh GitHub PR comments, and fresh running_image-only CLEAN gate.
 - **Final unsafe order:** Full-Coverage -> running_image-only CLEAN -> fresh exact approval comment -> final fresh PR/full HEAD -> persist command.phase=executing to GitHub FIRST -> Agent Core deploy POST.
 - **approval_revoked:** final fresh approval comment revalidation checks: comment object valid, comment id exact, actor id exact, body parses as approve_deploy, machine alias exact. If any check fails (comment deleted, changed, malformed, actor mismatch, machine alias mismatch, or cannot be revalidated): `approve_attempt.outcome=approval_revoked`, `status=deploy-requested`, `command.phase=completed`, cursor advances to current comment, ZERO deploy POST. Machine Owner must send a NEW `/approve_deploy`. `approval_revoked` is not a top-level status and does not introduce a new lifecycle state.
 - **Success goes directly to testing:** Full-coverage approval + clean pass + successful deploy = status: testing directly. No intermediate machine-group progress check.
@@ -250,15 +251,13 @@ conversation comments.  Deploy Approval does **not** access:
 * Review Agent server
 * Review Agent `GITHUB_TOKEN`
 
-Registry remains an internal fresh-fact implementation detail: the exact
-`image:tag` from a Review Agent Build Result comment is resolved to an
-immutable `repository@sha256:digest`.  Registry is not exposed as a top-level
-actor in diagrams.
+**Registry has been removed:** Deploy Approval performs zero Registry HTTP.
+Trusted Review Agent exact image:tag is frozen into hidden state and passed
+unchanged to Agent Core.  Agent Core owns all Registry authentication, pull,
+and deployment.
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
 Deploy Approval does not define a new runtime env namespace.
 
 It reuses the upstream existing keys below and fixed read-only files:
@@ -273,9 +272,6 @@ It reuses the upstream existing keys below and fixed read-only files:
 | `POLL_INTERVAL_SECONDS` | upstream existing env |
 | `WEBHOOK_ENABLED` | upstream existing env |
 | `GITHUB_WEBHOOK_SECRET` | upstream existing env |
-| `REGISTRY` | upstream existing env |
-| `REGISTRY_USER` | upstream existing env |
-| `REGISTRY_PASSWORD` | upstream existing env |
 
 | `machines.yaml` | fixed read-only machine policy file |
 | `secrets.yaml` | fixed read-only COS secrets file |

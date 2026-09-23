@@ -117,9 +117,6 @@ def _controller():
     github = MagicMock()
     github.get_current_user = AsyncMock(return_value={"id": 123, "login": "bot"})
     github.get_issue_comments = AsyncMock(return_value=[])
-    registry = MagicMock()
-    registry.resolve = AsyncMock()
-
     async def _get_comment(repo, cid):
         if isinstance(cid, int) and not isinstance(cid, bool) and cid > 0:
             return {
@@ -131,8 +128,8 @@ def _controller():
 
     proxy.get_comment = AsyncMock(side_effect=_get_comment)
 
-    controller = DeployController(config, proxy, policy, github, registry)
-    return controller, proxy, policy, github, registry, config
+    controller = DeployController(config, proxy, policy, github)
+    return controller, proxy, policy, github, config
 
 
 def _request_payload(comment_body: str) -> dict:
@@ -249,7 +246,7 @@ async def test_driver_status_malformed_missing_running_image_fails_closed():
 @pytest.mark.asyncio
 async def test_request_deploy_uses_canonical_component_snapshot_helper():
     from ..review_comment_parser import ReviewCommentEvidence, ReviewBuild
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     evidence = ReviewCommentEvidence(
         head_sha="a" * 40,
         commit_prefix="abcdef1",
@@ -331,14 +328,13 @@ async def test_request_deploy_uses_canonical_component_snapshot_helper():
     controller._build_component_snapshot.assert_awaited_once_with(
         "4paradigm/phanthymotus", 1, "a" * 40, builds
     )
-    registry.resolve.assert_not_called()
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert written_state["components"][0]["component_id"] == "comp-123"
 
 
 @pytest.mark.asyncio
 async def test_uncertain_recovery_rebuilds_fresh_component_snapshot():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state(
         review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component(component_id="comp-old", image_ref="registry.example/repo@sha256:" + "c" * 64)],
@@ -394,7 +390,7 @@ async def test_uncertain_recovery_rebuilds_fresh_component_snapshot():
 
 @pytest.mark.asyncio
 async def test_uncertain_recovery_new_job_never_keeps_old_components():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state(
         review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component(component_id="comp-old")],
@@ -446,7 +442,7 @@ async def test_uncertain_recovery_new_job_never_keeps_old_components():
 
 @pytest.mark.asyncio
 async def test_uncertain_recovery_snapshot_change_resets_deployments():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state(
         review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component(component_id="comp-old")],
@@ -512,7 +508,7 @@ async def test_uncertain_recovery_snapshot_change_resets_deployments():
 
 @pytest.mark.asyncio
 async def test_uncertain_recovery_same_snapshot_preserves_known_successful_deployments():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state(
         review_evidence={"build_comment_id": 1001, "build_comment_updated_at": "2026-09-18T03:55:54Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 1002, "code_review_comment_id": 1003, "review_author_id": "7950763"},
         components=[
@@ -576,7 +572,7 @@ async def test_uncertain_recovery_same_snapshot_preserves_known_successful_deplo
 
 @pytest.mark.asyncio
 async def test_uncertain_recovery_clears_runtime_id_for_ambiguous_component():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state(
         review_evidence={"build_comment_id": 1001, "build_comment_updated_at": "2026-09-18T03:55:54Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 1002, "code_review_comment_id": 1003, "review_author_id": "7950763"},
         components=[
@@ -637,8 +633,8 @@ async def test_uncertain_recovery_clears_runtime_id_for_ambiguous_component():
 
 
 @pytest.mark.asyncio
-async def test_uncertain_recovery_registry_failure_stays_uncertain():
-    controller, proxy, policy, github, registry, config = _controller()
+async def test_uncertain_recovery_snapshot_rebuild_failure_stays_uncertain():
+    controller, proxy, policy, github, config = _controller()
     state = _state(
         review_evidence={"build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "test_comment_updated_at": "2026-09-18T00:00:00Z", "code_review_comment_id": 3, "code_review_comment_updated_at": "2026-09-18T00:00:00Z", "review_author_id": "7950763"},
         components=[_component()],
@@ -692,7 +688,7 @@ async def test_uncertain_recovery_registry_failure_stays_uncertain():
 
 @pytest.mark.asyncio
 async def test_new_approve_from_uncertain_refreshes_before_clean_gate():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state()
     refreshed_state = _state(
         review_evidence={"build_comment_id": 99, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
@@ -734,7 +730,7 @@ async def test_new_approve_from_uncertain_refreshes_before_clean_gate():
 
 @pytest.mark.asyncio
 async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state()
     state["command"]["phase"] = "uncertain"
     state["last_processed_comment_id"] = 17
@@ -761,7 +757,6 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
         ]
     )
     proxy.is_bot_comment = MagicMock(return_value=False)
-    controller.registry.resolve = AsyncMock(side_effect=AssertionError("unexpected registry refresh"))
     controller._core_for_node = AsyncMock(side_effect=AssertionError("unexpected Agent Core lookup"))
     controller._deploy_component = AsyncMock(side_effect=AssertionError("unexpected deploy"))
     controller._run_automated_case = AsyncMock(side_effect=AssertionError("unexpected case run"))
@@ -773,7 +768,6 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
 
     assert state["command"]["phase"] == "uncertain"
     assert controller.on_command.await_count == 0
-    assert controller.registry.resolve.await_count == 0
     assert controller._core_for_node.await_count == 0
     assert controller._deploy_component.await_count == 0
     assert proxy.write_hidden_state.await_count == 0
@@ -782,7 +776,7 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
 @pytest.mark.asyncio
 async def test_watcher_uncertain_new_approve_refreshes_review_before_clean_gate():
     from ..review_comment_parser import ReviewCommentEvidence, ReviewBuild
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state()
     state["command"]["phase"] = "uncertain"
     state["last_processed_comment_id"] = 17
@@ -846,12 +840,6 @@ async def test_watcher_uncertain_new_approve_refreshes_review_before_clean_gate(
             },
         ]
 
-    async def _resolve(*args, **kwargs):
-        events.append("registry.resolve")
-        return SimpleNamespace(
-            image_ref="ccr.ccs.tencentyun.com/repo@sha256:" + "b" * 64,
-            platform="linux/arm64",
-        )
 
     async def _list_drivers():
         events.append("list_drivers")
@@ -892,7 +880,6 @@ async def test_watcher_uncertain_new_approve_refreshes_review_before_clean_gate(
     proxy.is_bot_comment = MagicMock(return_value=False)
     proxy.comment_identity = AsyncMock(return_value=("111", "owner1"))
     proxy.persist_cursor = AsyncMock()
-    controller.registry.resolve = AsyncMock(side_effect=_resolve)
     core = AsyncMock()
     core.list_drivers = AsyncMock(side_effect=_list_drivers)
     core.driver_status = AsyncMock(side_effect=_driver_status)
@@ -958,7 +945,7 @@ async def test_deploy_post_prevalidation_error_is_not_outcome_uncertain():
 
     client = _driver_client(Transport())
     with pytest.raises(AgentCoreError) as excinfo:
-        await client.deploy_driver("driver", "registry.example/repo:latest")
+        await client.deploy_driver("driver", "https://registry.example/repo:latest")
     assert not isinstance(excinfo.value, AgentCoreDeployOutcomeUncertain)
 
 
@@ -983,13 +970,7 @@ async def test_uncertain_post_stops_later_components():
     11. no automatic replay
     12. no rollback behavior
     """
-    controller, proxy, policy, github, registry, config = _controller()
-    controller._resolve_image_ref = AsyncMock(
-        return_value=(
-            "registry.example/repo@sha256:" + "a" * 64,
-            "linux/arm64",
-        )
-    )
+    controller, proxy, policy, github, config = _controller()
     real_comps = await controller._build_component_snapshot(
         "4paradigm/phanthymotus", 1, "a" * 40,
         [_build(), _build(target="actucore"), _build(target="driver", driver_path="custom/driver")],
@@ -1073,7 +1054,7 @@ async def test_uncertain_post_stops_later_components():
 
 @pytest.mark.asyncio
 async def test_uncertain_post_does_not_upload_failed_cos():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     state = _state(
         components=[_component(component_id="comp-1"), _component(component_id="comp-2", target="actucore", runtime_id="actucore")],
         deployments=[],
@@ -1108,8 +1089,6 @@ async def test_uncertain_post_does_not_upload_failed_cos():
 
 
 
-@pytest.mark.asyncio
-
 def test_poll_disabled_webhook_enabled_fails_config():
     with pytest.raises(ValueError, match="requires polling"):
         validate_config(
@@ -1126,7 +1105,7 @@ def test_poll_disabled_webhook_enabled_fails_config():
 
 @pytest.mark.asyncio
 async def test_webhook_remains_supplementary_zero_dispatch():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     config.webhook_enabled = True
     payload = {
         "action": "created",
@@ -1228,10 +1207,7 @@ def test_uncertain_post_state_passes_real_hidden_state_validator():
 
 @pytest.mark.asyncio
 async def test_build_component_snapshot_never_contains_runtime_id():
-    controller, proxy, policy, github, registry, config = _controller()
-    controller._resolve_image_ref = AsyncMock(
-        return_value=("registry.example/repo@sha256:" + "b" * 64, "linux/arm64")
-    )
+    controller, proxy, policy, github, config = _controller()
     result = await controller._build_component_snapshot(
         "repo",
         1,
@@ -1244,7 +1220,7 @@ async def test_build_component_snapshot_never_contains_runtime_id():
 
 
 def test_uncertain_same_snapshot_preserves_runtime_id_from_old_deployed_component():
-    controller, proxy, policy, github, registry, config = _controller()
+    controller, proxy, policy, github, config = _controller()
     fresh = [
         _fresh_component(component_id="comp-1"),
         _fresh_component(component_id="comp-2", target="actucore"),
@@ -1273,8 +1249,7 @@ async def test_new_approve_deploys_only_remaining_components():
     import copy
     import hashlib
 
-    controller, proxy, policy, github, registry, config = _controller()
-    config.registry = "registry.example"
+    controller, proxy, policy, github, config = _controller()
     REPO = "4paradigm/phanthymotus"
     events: list[str] = []
     write_log: list[tuple[str, dict]] = []
@@ -1440,3 +1415,815 @@ async def test_new_approve_deploys_only_remaining_components():
     assert final_state["status"] == "testing"
     assert final_state["command"]["phase"] == "completed"
     _validate_hidden_state(final_state)
+
+
+LEGACY_DIGEST = "registry.example/repo@sha256:" + "a" * 64
+TAG_A = "bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp5.11"
+TAG_B = "bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260923.4707deb-jetson-jp5.11"
+
+
+def _fake_config():
+    from ..config import REVIEW_AGENT_GITHUB_LOGIN, REVIEW_AGENT_GITHUB_USER_ID
+    from ..tests.conftest import make_config
+    return make_config(
+        review_comment_author_id=REVIEW_AGENT_GITHUB_USER_ID,
+        review_comment_author_login=REVIEW_AGENT_GITHUB_LOGIN,
+        agent_core_tokens={"m1": "test-token"},
+    )
+
+
+def _make_policy():
+    from ..policy import Policy
+    policy = MagicMock()
+    policy.get_machines.return_value = [
+        MagicMock(
+            alias="m1", node_host="127.0.0.1", node_id="n1",
+            owners=["alice"],
+            targets=["perception", "actucore"],
+            variants=["5.11"],
+            platforms=["linux/arm64"],
+            driver_paths=[],
+            node_host_public=False,
+            is_production=True,
+        )
+    ]
+    policy.get_machine_by_node_id.return_value = policy.get_machines.return_value[0]
+    policy.check_machine_targets_component.return_value = None
+    policy.check_variant_compatible.return_value = None
+    policy.check_driver_path_compatible.return_value = None
+    policy.check_full_coverage.return_value = None
+    policy.get_machine_groups_for_components.return_value = []
+    return policy
+
+
+def _make_controller(fake_proxy, policy, fake_github):
+    from ..config import REVIEW_AGENT_GITHUB_LOGIN, REVIEW_AGENT_GITHUB_USER_ID
+    from ..service import DeployController
+    config = _fake_config()
+    config.review_comment_author_id = REVIEW_AGENT_GITHUB_USER_ID
+    config.review_comment_author_login = REVIEW_AGENT_GITHUB_LOGIN
+    config.agent_core_tokens = {"m1": "test-token"}
+    controller = DeployController(config, fake_proxy, policy, fake_github)
+    return controller
+
+
+# ── Legacy digest migration regression tests (no Registry) ──────────
+
+
+@pytest.mark.asyncio
+async def test_legacy_digest_undeployed_component_migrates_to_tag_preserving_component_id(config, monkeypatch):
+    """TEST 1: Old component with digest image_ref, no deployment, same semantic key
+    -> migrate to tag, keep component_id. ZERO Registry calls."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from ..github_state_proxy import HIDDEN_STATE_MARKER
+    from ..review_comment_parser import ReviewCommentEvidence
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    # Old state: undeployed, legacy digest, uncertain
+    old_cid = "legacy-cid"
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [{
+            "component_id": old_cid, "target": "perception", "driver_path": "",
+            "variant": "5.11", "review_image_tag": TAG_A,
+            "image_ref": LEGACY_DIGEST, "resolved_platform": "linux/arm64",
+        }],
+        "deployments": [],
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False, "case_results": {}, "test_result": "",
+        "cos": {"object_key": "", "sha256": "", "size": 0},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    # Set up comment with hidden state
+    # Patch extract_review_evidence at the service module level to return valid evidence
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[MagicMock(target="perception", success=True, deployable=True,
+                          image_tag=TAG_A, driver_path="", variant="5.11")],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence))
+
+    # Directly call _refresh_uncertain_state
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    from ..github_state_proxy import _validate_hidden_state as _validate_hidden_state_fn
+    _validate_hidden_state_fn(state_copy)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    assert result == "deploy-requested"
+
+    # Verify written state
+    write_call = fake_proxy.write_hidden_state.call_args
+    assert write_call is not None, "write_hidden_state must have been called"
+    written_state = write_call[0][3] if len(write_call[0]) > 3 else write_call[1].get("state")
+    assert written_state is not None
+
+    # component_id is on each component, not on state
+    comp = written_state["components"][0]
+    assert comp["component_id"] == old_cid, f"component_id should be {old_cid}, got {comp['component_id']}"
+    assert comp["review_image_tag"] == TAG_A
+    assert comp["image_ref"] == TAG_A
+    assert comp["resolved_platform"] == "linux/arm64"
+    assert "runtime_id" not in comp, "runtime_id must not be present for undeployed component"
+    assert written_state["deployments"] == []
+
+    # Verify ZERO registry calls (no registry mock was set up, so any call would fail)
+    # If the code tried to call registry.resolve, it would raise AttributeError
+
+
+
+@pytest.mark.asyncio
+async def test_legacy_digest_deployed_component_preserves_deployment_and_historical_digest(config, monkeypatch):
+    """TEST 2: Old deployed component with legacy digest preserves deployment and historical data."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from ..github_state_proxy import HIDDEN_STATE_MARKER
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    old_cid = "legacy-deployed-cid"
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [{
+            "component_id": old_cid, "target": "perception", "driver_path": "",
+            "variant": "5.11", "review_image_tag": TAG_A,
+            "image_ref": LEGACY_DIGEST, "resolved_platform": "linux/arm64",
+            "runtime_id": "perception",
+        }],
+        "deployments": [{
+            "machine": "m1", "component_ids": [old_cid], "phase": "deployed"
+        }],
+        "approve_attempts": [{"comment_id": 10, "actor": "alice", "machine": "m1",
+                              "preflight": [], "outcome": "uncertain", "health": []}],
+        "approve_attempts_total": 1,
+        "approve_attempts_truncated": False,
+        "case_results": {"legacy-deployed-cid": "pass"},
+        "test_result": "pass",
+        "cos": {"object_key": "evidence/key", "sha256": "b" * 64, "size": 1024},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    # Patch extract_review_evidence at the service module level to return valid evidence
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[MagicMock(target="perception", success=True, deployable=True,
+                          image_tag=TAG_A, driver_path="", variant="5.11")],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    from ..github_state_proxy import _validate_hidden_state as _validate_hidden_state_fn
+    _validate_hidden_state_fn(state_copy)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    assert result == "deploy-requested"
+
+    write_call = fake_proxy.write_hidden_state.call_args
+    written_state = write_call[0][3] if len(write_call[0]) > 3 else write_call[1].get("state")
+
+    comp = written_state["components"][0]
+    assert comp["component_id"] == old_cid
+    assert comp["review_image_tag"] == TAG_A
+    assert comp["image_ref"] == LEGACY_DIGEST  # Historical digest preserved for deployed
+    assert comp["runtime_id"] == "perception"
+
+    assert written_state["deployments"] == [{"machine": "m1", "component_ids": [old_cid], "phase": "deployed"}]
+    assert written_state["approve_attempts"] == old_state["approve_attempts"]
+    assert written_state["approve_attempts_total"] == 1
+
+    assert written_state["case_results"] == {"legacy-deployed-cid": "pass"}
+    assert written_state["test_result"] == "pass"
+    assert written_state["cos"] == {"object_key": "evidence/key", "sha256": "b" * 64, "size": 1024}
+
+
+@pytest.mark.asyncio
+async def test_legacy_deployed_component_missing_runtime_id_fails_closed(config, monkeypatch):
+    """TEST: Deployed component without runtime_id must fail closed — not continue as migration."""
+    import json
+    from unittest.mock import AsyncMock
+    from ..github_state_proxy import HIDDEN_STATE_MARKER
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    old_cid = "legacy-deployed-no-runtime"
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [{
+            "component_id": old_cid, "target": "perception", "driver_path": "",
+            "variant": "5.11", "review_image_tag": TAG_A,
+            "image_ref": LEGACY_DIGEST, "resolved_platform": "linux/arm64",
+            "runtime_id": "",  # Missing runtime_id for deployed component!
+        }],
+        "deployments": [{
+            "machine": "m1", "component_ids": [old_cid], "phase": "deployed"
+        }],
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False, "case_results": {}, "test_result": "",
+        "cos": {"object_key": "", "sha256": "", "size": 0},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    # Patch extract_review_evidence
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence_rt = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[MagicMock(target="perception", success=True, deployable=True,
+                          image_tag=TAG_A, driver_path="", variant="5.11")],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence_rt))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    # Should reset to fresh snapshot (semantic_changed=True, evidence_changed=True)
+    assert result == "deploy-requested"
+
+    write_call = fake_proxy.write_hidden_state.call_args
+    written_state = write_call[0][3] if len(write_call[0]) > 3 else write_call[1].get("state")
+
+    # Because runtime_id was missing for deployed component, it triggers reset to fresh
+    # Fresh components have a NEW component_id (from TAG_A), deployments should be cleared
+    assert written_state["deployments"] == []
+    # gate_note must NOT say "Previously confirmed deployments were preserved."
+    write_call = fake_proxy.write_hidden_state.call_args
+    markdown_arg = write_call[0][2] if len(write_call[0]) > 2 else ""
+    assert "Previously confirmed deployments were preserved." not in markdown_arg
+    # The component should have a fresh component_id (from TAG_A), not the old one
+    comp = written_state["components"][0]
+    # Fresh component_id comes from sha256(target|driver_path|variant|tag)
+    import hashlib
+    expected_cid = hashlib.sha256(f"perception||5.11|{TAG_A}".encode()).hexdigest()[:16]
+    assert comp["component_id"] == expected_cid
+    assert "runtime_id" not in comp, "runtime_id must not be present in fresh snapshot"
+
+
+
+@pytest.mark.asyncio
+async def test_real_review_tag_change_resets_snapshot(config, monkeypatch):
+    """TEST 3: Real tag change -> semantic_changed=True, reset everything."""
+    import json
+    from unittest.mock import AsyncMock
+    from ..github_state_proxy import HIDDEN_STATE_MARKER
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    old_cid_a = "component-tag-a"
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [{
+            "component_id": old_cid_a, "target": "perception", "driver_path": "",
+            "variant": "5.11", "review_image_tag": TAG_A,
+            "image_ref": TAG_A, "resolved_platform": "linux/arm64",
+            "runtime_id": "perception",
+        }],
+        "deployments": [{"machine": "m1", "component_ids": [old_cid_a], "phase": "deployed"}],
+        "approve_attempts": [{"comment_id": 10, "actor": "alice", "machine": "m1",
+                              "preflight": [], "outcome": "uncertain", "health": []}],
+        "approve_attempts_total": 1,
+        "approve_attempts_truncated": False,
+        "case_results": {"component-tag-a": "pass"},
+        "test_result": "pass",
+        "cos": {"object_key": "key", "sha256": "b" * 64, "size": 100},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    # Patch extract_review_evidence with TAG_B (different from old TAG_A)
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence_b = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[MagicMock(target="perception", success=True, deployable=True,
+                          image_tag=TAG_B, driver_path="", variant="5.11")],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence_b))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    assert result == "deploy-requested"
+
+    write_call = fake_proxy.write_hidden_state.call_args
+    written_state = write_call[0][3] if len(write_call[0]) > 3 else write_call[1].get("state")
+
+    # semantic_changed=True because TAG_B != TAG_A
+    assert written_state["deployments"] == []
+    assert written_state["approve_attempts"] == []
+    assert written_state["case_results"] == {}
+    assert written_state["test_result"] == ""
+    assert written_state["cos"] == {"object_key": "", "sha256": "", "size": 0}
+
+    # New component_id from TAG_B
+    import hashlib
+    expected_cid = hashlib.sha256(f"perception||5.11|{TAG_B}".encode()).hexdigest()[:16]
+    assert written_state["components"][0]["component_id"] == expected_cid
+    assert written_state["components"][0]["review_image_tag"] == TAG_B
+    assert written_state["components"][0]["image_ref"] == TAG_B
+
+
+
+@pytest.mark.asyncio
+async def test_removed_component_resets_snapshot(config, monkeypatch):
+    """TEST 4: Removed component -> semantic_changed=True, reset everything."""
+    import json
+    from unittest.mock import AsyncMock
+    from ..github_state_proxy import HIDDEN_STATE_MARKER
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    import hashlib
+    cid_a = hashlib.sha256(f"perception||5.11|{TAG_A}".encode()).hexdigest()[:16]
+    cid_b = hashlib.sha256(f"actucore||5.11|{TAG_A}".encode()).hexdigest()[:16]
+
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [
+            {"component_id": cid_a, "target": "perception", "driver_path": "",
+             "variant": "5.11", "review_image_tag": TAG_A, "image_ref": TAG_A,
+             "resolved_platform": "linux/arm64", "runtime_id": "perception"},
+            {"component_id": cid_b, "target": "actucore", "driver_path": "",
+             "variant": "5.11", "review_image_tag": TAG_A, "image_ref": TAG_A,
+             "resolved_platform": "linux/arm64", "runtime_id": "actucore"},
+        ],
+        "deployments": [
+            {"machine": "m1", "component_ids": [cid_a], "phase": "deployed"},
+            {"machine": "m1", "component_ids": [cid_b], "phase": "deployed"},
+        ],
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False, "case_results": {}, "test_result": "",
+        "cos": {"object_key": "", "sha256": "", "size": 0},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    # Patch extract_review_evidence with only perception (B removed)
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence_a = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[MagicMock(target="perception", success=True, deployable=True,
+                          image_tag=TAG_A, driver_path="", variant="5.11")],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence_a))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    assert result == "deploy-requested"
+
+    write_call = fake_proxy.write_hidden_state.call_args
+    written_state = write_call[0][3] if len(write_call[0]) > 3 else write_call[1].get("state")
+
+    # semantic_changed=True because B was removed
+    assert written_state["deployments"] == []
+    assert written_state["approve_attempts"] == []
+    assert written_state["case_results"] == {}
+    assert written_state["test_result"] == ""
+    assert written_state["cos"] == {"object_key": "", "sha256": "", "size": 0}
+    # Only component A remains (fresh)
+    assert len(written_state["components"]) == 1
+    assert written_state["components"][0]["target"] == "perception"
+    assert written_state["components"][0]["component_id"] == cid_a
+
+
+
+@pytest.mark.asyncio
+async def test_added_component_resets_snapshot(config, monkeypatch):
+    """TEST 5: Added component -> semantic_changed=True, reset everything."""
+    import json
+    from unittest.mock import AsyncMock
+    from ..github_state_proxy import HIDDEN_STATE_MARKER
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    import hashlib
+    cid_a = hashlib.sha256(f"perception||5.11|{TAG_A}".encode()).hexdigest()[:16]
+    cid_b = hashlib.sha256(f"actucore||5.11|{TAG_A}".encode()).hexdigest()[:16]
+
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [
+            {"component_id": cid_a, "target": "perception", "driver_path": "",
+             "variant": "5.11", "review_image_tag": TAG_A, "image_ref": TAG_A,
+             "resolved_platform": "linux/arm64", "runtime_id": "perception"},
+        ],
+        "deployments": [
+            {"machine": "m1", "component_ids": [cid_a], "phase": "deployed"},
+        ],
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False, "case_results": {}, "test_result": "",
+        "cos": {"object_key": "", "sha256": "", "size": 0},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    # Patch extract_review_evidence with both perception and actucore (B added)
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence_ab = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[
+            MagicMock(target="perception", success=True, deployable=True,
+                      image_tag=TAG_A, driver_path="", variant="5.11"),
+            MagicMock(target="actucore", success=True, deployable=True,
+                      image_tag=TAG_A, driver_path="", variant="5.11"),
+        ],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence_ab))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    assert result == "deploy-requested"
+
+    write_call = fake_proxy.write_hidden_state.call_args
+    written_state = write_call[0][3] if len(write_call[0]) > 3 else write_call[1].get("state")
+
+    # semantic_changed=True because B was added
+    assert written_state["deployments"] == []
+    assert written_state["approve_attempts"] == []
+    assert written_state["case_results"] == {}
+    assert written_state["test_result"] == ""
+    assert written_state["cos"] == {"object_key": "", "sha256": "", "size": 0}
+    # Both A and B are fresh
+    assert len(written_state["components"]) == 2
+
+
+
+@pytest.mark.asyncio
+async def test_duplicate_old_semantic_component_resets_snapshot(config, monkeypatch):
+    """TEST: Old state with duplicate semantic components -> semantic_changed=True, reset."""
+    import hashlib
+    from unittest.mock import AsyncMock, MagicMock
+    from ..review_comment_parser import ReviewCommentEvidence
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    cid_a = hashlib.sha256(f"perception||5.11|{TAG_A}".encode()).hexdigest()[:16]
+
+    # Old state has TWO components with same semantic key (perception, TAG_A)
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [
+            {"component_id": cid_a, "target": "perception", "driver_path": "",
+             "variant": "5.11", "review_image_tag": TAG_A, "image_ref": TAG_A,
+             "resolved_platform": "linux/arm64"},
+            {"component_id": cid_a + "-dup", "target": "perception", "driver_path": "",
+             "variant": "5.11", "review_image_tag": TAG_A, "image_ref": TAG_A,
+             "resolved_platform": "linux/arm64"},
+        ],
+        "deployments": [{"machine": "m1", "component_ids": [cid_a], "phase": "deployed"}],
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False, "case_results": {}, "test_result": "",
+        "cos": {"object_key": "", "sha256": "", "size": 0},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    import agents.deploy_approval.service as svc_mod
+    fake_evidence_a = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[MagicMock(target="perception", success=True, deployable=True,
+                          image_tag=TAG_A, driver_path="", variant="5.11")],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence_a))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    assert result == "deploy-requested"
+
+    write_call = fake_proxy.write_hidden_state.call_args
+    written_state = write_call[0][3] if len(write_call[0]) > 3 else write_call[1].get("state")
+
+    # duplicate old semantic keys -> semantic_changed=True -> full reset
+    assert written_state["deployments"] == []
+    assert written_state["approve_attempts"] == []
+    assert written_state["case_results"] == {}
+    assert written_state["test_result"] == ""
+    assert written_state["cos"] == {"object_key": "", "sha256": "", "size": 0}
+    assert len(written_state["components"]) == 1
+    assert written_state["components"][0]["target"] == "perception"
+
+@pytest.mark.asyncio
+async def test_duplicate_fresh_semantic_component_fails_closed(config, monkeypatch):
+    """TEST 6: Fresh evidence with duplicate semantic components -> snapshot returns None."""
+    import hashlib
+    from unittest.mock import AsyncMock, MagicMock
+    from ..review_comment_parser import ReviewBuild
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    # Call the REAL _build_component_snapshot with two identical BuildInfo (Mock with deployable)
+    build1 = MagicMock(target="perception", driver_path="", variant="5.11",
+                       success=True, deployable=True, image_tag=TAG_A, version="v1")
+    build2 = MagicMock(target="perception", driver_path="", variant="5.11",
+                       success=True, deployable=True, image_tag=TAG_A, version="v1")
+
+    snapshot = await controller._build_component_snapshot(
+        "4paradigm/phanthymotus", 1, "a" * 40, [build1, build2]
+    )
+    assert snapshot is None, "duplicate semantic key must produce None snapshot"
+
+    # Now also exercise via _refresh_uncertain_state with duplicate evidence builds
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [], "deployments": [],
+        "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False, "case_results": {}, "test_result": "",
+        "cos": {"object_key": "", "sha256": "", "size": 0},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence_dup = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[
+            MagicMock(target="perception", success=True, deployable=True,
+                      image_tag=TAG_A, driver_path="", variant="5.11"),
+            MagicMock(target="perception", success=True, deployable=True,
+                      image_tag=TAG_A, driver_path="", variant="5.11"),
+        ],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence_dup))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    # duplicate semantic key -> _build_component_snapshot returns None -> uncertain
+    assert result == "uncertain"
+    assert old_state["deployments"] == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_migration_zero_registry_http(config, monkeypatch):
+    """TEST 7: Legacy migration makes ZERO Registry HTTP calls.
+
+    Proves: legacy digest state -> recovery -> exact Review Agent tag ->
+    ZERO Registry dependency.
+    """
+    import json
+    import hashlib
+    from unittest.mock import AsyncMock
+    from ..github_state_proxy import HIDDEN_STATE_MARKER
+
+    fake_proxy = AsyncMock()
+    fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
+    fake_proxy.comment_identity = AsyncMock(return_value=("test_author", "test_author"))
+    fake_proxy.read_hidden_state = AsyncMock(return_value=None)
+
+    fake_github = AsyncMock()
+    fake_github.get_issue_comments = AsyncMock(return_value=[])
+    fake_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
+
+    policy = _make_policy()
+    controller = _make_controller(fake_proxy, policy, fake_github)
+
+    # CRITICAL: Controller must NOT have a registry attribute at all.
+    assert not hasattr(controller, "registry")
+
+    old_cid = "legacy-migration-cid"
+    old_state = {
+        "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
+        "review_evidence": {
+            "build_comment_id": 1, "build_comment_updated_at": "2025-01-01T00:00:00Z",
+            "commit_prefix": "a" * 7, "resolved_head_sha": "a" * 40,
+            "test_comment_id": 2, "test_comment_updated_at": "2025-01-01T00:00:01Z",
+            "code_review_comment_id": 3, "code_review_comment_updated_at": "2025-01-01T00:00:02Z",
+            "review_author_id": "7950763",
+        },
+        "components": [{
+            "component_id": old_cid, "target": "perception", "driver_path": "",
+            "variant": "5.11", "review_image_tag": TAG_A,
+            "image_ref": LEGACY_DIGEST, "resolved_platform": "linux/arm64",
+        }],
+        "deployments": [], "approve_attempts": [], "approve_attempts_total": 0,
+        "approve_attempts_truncated": False, "case_results": {}, "test_result": "",
+        "cos": {"object_key": "", "sha256": "", "size": 0},
+        "command": {"comment_id": 17, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "m1"}},
+        "last_processed_comment_id": 17,
+    }
+
+    # Patch extract_review_evidence
+    import agents.deploy_approval.service as svc_mod
+    from ..review_comment_parser import ReviewCommentEvidence
+    fake_evidence_zr = ReviewCommentEvidence(
+        head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
+        build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
+        test_comment_id=2, test_comment_updated_at="2025-01-01T00:00:01Z",
+        code_review_comment_id=3, code_review_comment_updated_at="2025-01-01T00:00:02Z",
+        builds=[MagicMock(target="perception", success=True, deployable=True,
+                          image_tag=TAG_A, driver_path="", variant="5.11")],
+    )
+    monkeypatch.setattr(svc_mod, "extract_review_evidence", MagicMock(return_value=fake_evidence_zr))
+
+    import copy
+    state_copy = copy.deepcopy(old_state)
+    result = await controller._refresh_uncertain_state("4paradigm/phanthymotus", 1, state_copy)
+
+    assert result == "deploy-requested"
+
+    # Verify write_hidden_state was actually called
+    fake_proxy.write_hidden_state.assert_awaited()
+
+    # Parse the written state from the call
+    written_state = fake_proxy.write_hidden_state.call_args.args[3]
+
+    # Verify the migrated component preserves old component_id and gets exact Review Agent tag
+    assert written_state["components"][0]["component_id"] == old_cid
+    assert written_state["components"][0]["review_image_tag"] == TAG_A
+    assert written_state["components"][0]["image_ref"] == TAG_A
+    assert written_state["components"][0]["resolved_platform"] == "linux/arm64"
+
+    # Verify all deployment/tracking state was reset
+    assert written_state["deployments"] == []

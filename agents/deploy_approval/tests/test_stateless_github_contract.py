@@ -21,7 +21,6 @@ def config():
         github_repos=["4paradigm/phanthymotus"],
         machine_owners_file="/dev/null",
         poll_interval_seconds=30,
-        registry="registry.example",
     )
 
 
@@ -79,9 +78,7 @@ def policy(config):
 
 @pytest.fixture
 def controller(config, proxy, policy, mock_github):
-    registry = MagicMock()
-    registry.resolve = AsyncMock()
-    return DeployController(config, proxy, policy, mock_github, registry)
+    return DeployController(config, proxy, policy, mock_github)
 
 
 def _component(**overrides):
@@ -128,7 +125,6 @@ async def test_request_deploy_re_reads_command_identity_from_github(controller, 
         "head": {"sha": "a" * 40},
         "user": {"id": 111, "login": "alice"},
     }
-    controller.registry.resolve.return_value = SimpleNamespace(image_ref="registry/repo@sha256:" + "b" * 64, platform="linux/arm64")
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
 
@@ -191,7 +187,6 @@ async def test_request_deploy_rejects_non_pr_author_id(controller, proxy, mock_g
 
     await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
 
-    controller.registry.resolve.assert_not_called()
     proxy.write_hidden_state.assert_not_called()
     proxy.post_issue_comment.assert_called_once()
 
@@ -210,7 +205,6 @@ async def test_request_deploy_missing_comment_identity_fails_closed(controller, 
 
     await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
 
-    controller.registry.resolve.assert_not_called()
     proxy.write_hidden_state.assert_not_called()
     proxy.post_issue_comment.assert_called_once()
 
@@ -229,7 +223,6 @@ async def test_request_deploy_unauthorized_has_zero_registry_and_deploy_side_eff
 
     await controller.handle_request_deploy("4paradigm/phanthymotus", 1, 101)
 
-    controller.registry.resolve.assert_not_called()
     proxy.write_hidden_state.assert_not_called()
 
 
@@ -302,9 +295,10 @@ def test_hidden_state_rejects_empty_platform_for_deploy_requested():
         _validate_hidden_state(_state(components=[_component(resolved_platform="")]))
 
 
-def test_hidden_state_rejects_mutable_image_ref():
+def test_hidden_state_rejects_malformed_image_ref():
+    """Image refs without tag or digest are rejected even though repo:tag is now valid."""
     with pytest.raises(MalformedHiddenStateError, match="image_ref"):
-        _validate_hidden_state(_state(components=[_component(image_ref="registry/repo:latest")]))
+        _validate_hidden_state(_state(components=[_component(image_ref="registry/repo")]))
 
 def test_hidden_state_accepts_real_driver_registry_depth():
     ref = (
@@ -452,88 +446,10 @@ def test_unrelated_machine_hidden(controller, policy):
 
 
 @pytest.mark.asyncio
-async def test_resolve_image_ref_passes_linux_arm64_for_perception(controller, proxy, policy):
-    """A. perception target must call registry.resolve with platform="linux/arm64"."""
-    from dataclasses import replace
-    build = replace(
-        BuildInfo(
-            idx=0, target="perception", driver_path="", variant="5.11",
-            success=True, image_tag="registry.example/4paradigm/phanthymotus:release.v1-jetson-jp5.11",
-            deployable=True,
-        ),
-    )
-    result = await controller._resolve_image_ref(
-        "4paradigm/phanthymotus", 260, "a" * 40, build,
-    )
-    controller.registry.resolve.assert_awaited_once()
-    call_kwargs = controller.registry.resolve.await_args
-    assert call_kwargs.kwargs.get("platform") == "linux/arm64"
+async def test_request_deploy_zero_registry_dependency(controller, proxy, mock_github):
+    """A. /request_deploy uses exact Review Agent tag, ZERO registry calls.
 
-
-@pytest.mark.asyncio
-async def test_resolve_image_ref_passes_linux_arm64_for_actucore(controller, proxy, policy):
-    """B. actucore target must call registry.resolve with platform="linux/arm64"."""
-    from dataclasses import replace
-    build = replace(
-        BuildInfo(
-            idx=1, target="actucore", driver_path="", variant="6.1",
-            success=True, image_tag="registry.example/4paradigm/phanthymotus:release.v2-jetson-jp6.1",
-            deployable=True,
-        ),
-    )
-    result = await controller._resolve_image_ref(
-        "4paradigm/phanthymotus", 260, "a" * 40, build,
-    )
-    controller.registry.resolve.assert_awaited_once()
-    call_kwargs = controller.registry.resolve.await_args
-    assert call_kwargs.kwargs.get("platform") == "linux/arm64"
-
-
-@pytest.mark.asyncio
-async def test_resolve_image_ref_passes_linux_arm64_for_driver(controller, proxy, policy):
-    """C. driver target must call registry.resolve with platform="linux/arm64"."""
-    from dataclasses import replace
-    build = replace(
-        BuildInfo(
-            idx=2, target="driver", driver_path="unitree/g1", variant="",
-            success=True, image_tag="registry.example/4paradigm/phanthymotus-driver:v1-jetson-jp5.11",
-            deployable=True,
-        ),
-    )
-    result = await controller._resolve_image_ref(
-        "4paradigm/phanthymotus-driver", 260, "a" * 40, build,
-    )
-    controller.registry.resolve.assert_awaited_once()
-    call_kwargs = controller.registry.resolve.await_args
-    assert call_kwargs.kwargs.get("platform") == "linux/arm64"
-
-
-@pytest.mark.asyncio
-async def test_resolve_image_ref_rejects_wrong_platform(controller, proxy, policy):
-    """D. registry returns linux/amd64 -> _resolve_image_ref returns None."""
-    from dataclasses import replace
-    from types import SimpleNamespace
-    controller.registry.resolve.return_value = SimpleNamespace(
-        image_ref="registry/repo@sha256:" + "c" * 64, platform="linux/amd64",
-    )
-    build = replace(
-        BuildInfo(
-            idx=0, target="perception", driver_path="", variant="5.11",
-            success=True, image_tag="registry.example/4paradigm/phanthymotus:release.v1-jetson-jp5.11",
-            deployable=True,
-        ),
-    )
-    result = await controller._resolve_image_ref(
-        "4paradigm/phanthymotus", 260, "a" * 40, build,
-    )
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_request_deploy_component_snapshot_regression(controller, proxy, mock_github):
-    """E+F. Simulate real scenario: perception 5.11, perception 6.1, actucore 5.11, actucore 6.1.
-
-    registry returns digest-pinned refs with platform=linux/arm64.
+    Simulate real scenario: perception 5.11, perception 6.1, actucore 5.11, actucore 6.1.
     /request_deploy succeeds, status=deploy-requested, 4 components.
     """
     from dataclasses import replace
@@ -547,15 +463,6 @@ async def test_request_deploy_component_snapshot_regression(controller, proxy, m
         "head": {"sha": "a" * 40},
         "user": {"id": 111, "login": "alice"},
     }
-
-    def fake_resolve(tag, platform="", allowed_prefixes=None):
-        from types import SimpleNamespace
-        return SimpleNamespace(
-            image_ref="registry.example/repo@sha256:" + "d" * 64,
-            platform="linux/arm64",
-        )
-
-    controller.registry.resolve = AsyncMock(side_effect=fake_resolve)
     proxy.read_hidden_state = AsyncMock(return_value=_state(status="deploy-ready", review_evidence={
         "build_comment_id": 1, "build_comment_updated_at": "2026-09-18T00:00:00Z",
         "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40,
@@ -568,10 +475,10 @@ async def test_request_deploy_component_snapshot_regression(controller, proxy, m
     mock_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
 
     builds = [
-        replace(BuildInfo(idx=0, target="perception", driver_path="", variant="5.11", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp5.11", deployable=True)),
-        replace(BuildInfo(idx=1, target="perception", driver_path="", variant="6.1", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp6.1", deployable=True)),
-        replace(BuildInfo(idx=2, target="actucore", driver_path="", variant="5.11", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp5.11", deployable=True)),
-        replace(BuildInfo(idx=3, target="actucore", driver_path="", variant="6.1", success=True, image_tag="registry.example/4paradigm/phanthymotus:release.260922.4707deb-jetson-jp6.1", deployable=True)),
+        replace(BuildInfo(idx=0, target="perception", driver_path="", variant="5.11", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp5.11", deployable=True)),
+        replace(BuildInfo(idx=1, target="perception", driver_path="", variant="6.1", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp6.1", deployable=True)),
+        replace(BuildInfo(idx=2, target="actucore", driver_path="", variant="5.11", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore:release.260922.4707deb-jetson-jp5.11", deployable=True)),
+        replace(BuildInfo(idx=3, target="actucore", driver_path="", variant="6.1", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore:release.260922.4707deb-jetson-jp6.1", deployable=True)),
     ]
 
     fake_evidence = ReviewCommentEvidence(
@@ -598,7 +505,8 @@ async def test_request_deploy_component_snapshot_regression(controller, proxy, m
     assert len(components) == 4
     for c in components:
         assert c.get("resolved_platform") == "linux/arm64"
-        assert c.get("image_ref", "").startswith("registry.example/repo@sha256:")
+        assert "@sha256:" not in c.get("image_ref", "")
+        assert "bj-warehouse.tencentcloudcr.com/phanthy-motus/" in c.get("image_ref", "")
 
     # Verify status label was set
     proxy.project_status_label.assert_called()

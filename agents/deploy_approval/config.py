@@ -1,8 +1,8 @@
 """Configuration for the Deploy Approval Agent (pre-merge validation only).
 
 Deploy Approval does not define a new runtime env namespace. It reuses the
-existing upstream GitHub/poll/webhook/registry keys and fixed read-only files
-for machine ownership and COS secrets.
+existing upstream GitHub/poll/webhook keys and fixed read-only files for
+machine ownership, Review Agent trust, Agent Core tokens, and COS secrets.
 
 Review Agent HTTP API is NOT a Deploy Approval dependency.
 Deploy Approval reads Review Agent output from GitHub PR comments.
@@ -83,10 +83,7 @@ class Config:
     cos_secret_id: str = ""
     cos_secret_key: str = ""
 
-    # Registry trust anchor — the ONLY allowed registry host for image resolution.
-    registry: str = ""
 
-    registry_auth_host_allowlist: list[str] = field(default_factory=list)
 
     # Agent Core access tokens keyed by machine alias
     agent_core_tokens: dict[str, str] = field(
@@ -263,8 +260,6 @@ def load_config() -> Config:
         cos_bucket=cos.get("bucket", ""),
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
-        registry=os.getenv("REGISTRY", "").strip(),
-        registry_auth_host_allowlist=[],
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
     )
     validate_config(cfg)
@@ -331,52 +326,6 @@ def validate_config(cfg: Config) -> None:
         val = getattr(cfg, name)
         if not isinstance(val, str):
             raise ValueError(f"{name} must be a string")
-    if not isinstance(cfg.registry_auth_host_allowlist, list):
-        raise ValueError("REGISTRY_AUTH_HOST_ALLOWLIST must be a list")
-    # Registry trust anchor validation
-    registry = cfg.registry
-    if not registry:
-        raise ValueError("REGISTRY is required — production Deploy Approval must configure REGISTRY")
-    # Must not contain scheme
-    if registry.startswith("https://") or registry.startswith("http://"):
-        raise ValueError(f"REGISTRY must not include scheme, got {registry!r}")
-    # Must not contain whitespace
-    if any(c.isspace() for c in registry):
-        raise ValueError(f"REGISTRY must not contain whitespace, got {registry!r}")
-    # Must not contain userinfo
-    if "@" in registry:
-        raise ValueError(f"REGISTRY must not contain userinfo, got {registry!r}")
-    # Must not contain path
-    if "/" in registry:
-        raise ValueError(f"REGISTRY must not contain path, got {registry!r}")
-    # Must not contain query or fragment
-    if "?" in registry or "#" in registry:
-        raise ValueError(f"REGISTRY must not contain query/fragment, got {registry!r}")
-    # Must have a valid host part (before any port)
-    host_part = registry.split(":")[0]
-    if not host_part:
-        raise ValueError(f"REGISTRY host must not be empty, got {registry!r}")
-    # Review comment trust: strict canonical identity check.
-    # The authoritative production Review Agent identity is defined by
-    # REVIEW_AGENT_GITHUB_USER_ID / REVIEW_AGENT_GITHUB_LOGIN.
-    # Secrets.yaml review_comment_trust MUST match exactly.
-    # This prevents deploying with a wrong trust configuration (e.g. Haohao-end).
-    if cfg.review_comment_author_id != REVIEW_AGENT_GITHUB_USER_ID:
-        raise ValueError(
-            f"secrets.yaml review_comment_trust.author_id must be "
-            f"{REVIEW_AGENT_GITHUB_USER_ID!r} (authoritative production "
-            f"Review Agent GitHub user ID), got {cfg.review_comment_author_id!r}. "
-            "Deploy Approval refuses to trust a Review Agent comment author "
-            "that does not match the canonical identity."
-        )
-    if cfg.review_comment_author_login != REVIEW_AGENT_GITHUB_LOGIN:
-        raise ValueError(
-            f"secrets.yaml review_comment_trust.author_login must be "
-            f"{REVIEW_AGENT_GITHUB_LOGIN!r} (authoritative production "
-            f"Review Agent GitHub login), got {cfg.review_comment_author_login!r}. "
-            "Deploy Approval refuses to trust a Review Agent comment author "
-            "that does not match the canonical identity."
-        )
     # Validate agent_core_tokens
     act = cfg.agent_core_tokens
     if not isinstance(act, Mapping):
@@ -388,3 +337,14 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("agent_core_tokens keys must be non-empty strings")
         if not isinstance(v, str) or not v.strip():
             raise ValueError("agent_core_tokens values must be non-empty strings")
+    # Fail closed: review_comment_trust must match authoritative Review Agent identity.
+    if cfg.review_comment_author_id != REVIEW_AGENT_GITHUB_USER_ID:
+        raise ValueError(
+            "review_comment_trust.author_id does not match authoritative Review Agent "
+            f"(expected {REVIEW_AGENT_GITHUB_USER_ID!r}, got {cfg.review_comment_author_id!r})"
+        )
+    if cfg.review_comment_author_login != REVIEW_AGENT_GITHUB_LOGIN:
+        raise ValueError(
+            "review_comment_trust.author_login does not match authoritative Review Agent "
+            f"(expected {REVIEW_AGENT_GITHUB_LOGIN!r}, got {cfg.review_comment_author_login!r})"
+        )

@@ -29,7 +29,6 @@ def test_validate_config_no_longer_requires_github_token():
     validate_config(
         Config(
             github_repos=list(DEFAULT_GITHUB_REPOS),
-            registry="ccr.ccs.tencentyun.com",
             review_comment_author_id="7950763",
             agent_core_tokens={"test": "token"},
         )
@@ -43,7 +42,7 @@ def test_validate_config_default_repos():
     assert "4paradigm/phanthymotus-driver" in c.github_repos
     # Explicit empty overrides defaults — must fail closed
     with pytest.raises(ValueError, match="GITHUB_REPOS is required"):
-        validate_config(Config(github_repos=[], registry="ccr.ccs.tencentyun.com", agent_core_tokens={"test": "token"}))
+        validate_config(Config(github_repos=[], agent_core_tokens={"test": "token"}))
 
 
 @pytest.mark.parametrize(
@@ -63,7 +62,6 @@ def test_validate_config_default_repos():
 def test_github_repos_requires_exact_runtime_repo_set(repos, should_pass):
     cfg = Config(
         github_repos=repos,
-        registry="ccr.ccs.tencentyun.com",
         agent_core_tokens={"test": "token"},
         review_comment_author_id="7950763",
     )
@@ -133,7 +131,6 @@ def test_config_env_override(monkeypatch, tmp_path):
     """Explicit GITHUB_REPOS overrides the default."""
     monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus,4paradigm/phanthymotus-driver")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
-    monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
     secrets = tmp_path / "secrets.yaml"
     secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "kentcyq"\nagent_core_tokens:\n  test-machine: test-token\n')
     import agents.deploy_approval.config as config_mod
@@ -150,7 +147,6 @@ def test_config_env_empty_fails_closed(monkeypatch):
     """Explicit empty GITHUB_REPOS must fail closed."""
     monkeypatch.setenv("GITHUB_REPOS", "")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
-    monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
     with pytest.raises(ValueError, match="GITHUB_REPOS is required"):
         load_config()
 
@@ -158,7 +154,6 @@ def test_config_env_empty_fails_closed(monkeypatch):
 def test_config_env_unset_uses_default(monkeypatch, tmp_path):
     """GITHUB_REPOS unset uses DEFAULT_GITHUB_REPOS."""
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
-    monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
     monkeypatch.delenv("GITHUB_REPOS", raising=False)
     secrets = tmp_path / "secrets.yaml"
     secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "kentcyq"\nagent_core_tokens:\n  test-machine: test-token\n')
@@ -346,7 +341,6 @@ def test_validate_config_accepts_canonical_identity():
     validate_config(
         Config(
             github_repos=list(DEFAULT_GITHUB_REPOS),
-            registry="ccr.ccs.tencentyun.com",
             review_comment_author_id=REVIEW_AGENT_GITHUB_USER_ID,
             review_comment_author_login=REVIEW_AGENT_GITHUB_LOGIN,
             agent_core_tokens={"test": "token"},
@@ -356,11 +350,10 @@ def test_validate_config_accepts_canonical_identity():
 
 def test_validate_config_rejects_haohao_end_as_review_agent():
     """B. author_id=184792454, author_login=Haohao-end => fail closed."""
-    with pytest.raises(ValueError, match="author_id must be"):
+    with pytest.raises(ValueError, match="does not match authoritative Review Agent"):
         validate_config(
             Config(
                 github_repos=list(DEFAULT_GITHUB_REPOS),
-                registry="ccr.ccs.tencentyun.com",
                 review_comment_author_id="184792454",
                 review_comment_author_login="Haohao-end",
                 agent_core_tokens={"test": "token"},
@@ -370,11 +363,10 @@ def test_validate_config_rejects_haohao_end_as_review_agent():
 
 def test_validate_config_rejects_correct_id_wrong_login():
     """C. author_id correct but login wrong => fail closed."""
-    with pytest.raises(ValueError, match="author_login must be"):
+    with pytest.raises(ValueError, match="does not match authoritative Review Agent"):
         validate_config(
             Config(
                 github_repos=list(DEFAULT_GITHUB_REPOS),
-                registry="ccr.ccs.tencentyun.com",
                 review_comment_author_id="7950763",
                 review_comment_author_login="wrong-login",
                 agent_core_tokens={"test": "token"},
@@ -384,11 +376,10 @@ def test_validate_config_rejects_correct_id_wrong_login():
 
 def test_validate_config_rejects_wrong_id_correct_login():
     """D. author_id wrong but login correct => fail closed."""
-    with pytest.raises(ValueError, match="author_id must be"):
+    with pytest.raises(ValueError, match="does not match authoritative Review Agent"):
         validate_config(
             Config(
                 github_repos=list(DEFAULT_GITHUB_REPOS),
-                registry="ccr.ccs.tencentyun.com",
                 review_comment_author_id="12345",
                 review_comment_author_login="kentcyq",
                 agent_core_tokens={"test": "token"},
@@ -401,7 +392,6 @@ def test_load_config_reads_canonical_secrets(tmp_path, monkeypatch):
     import agents.deploy_approval.config as config_mod
     orig = config_mod._load_secrets_config
 
-    monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
 
     secrets = tmp_path / "secrets.yaml"
     secrets.write_text(
@@ -532,3 +522,110 @@ def test_docs_have_no_self_approval_forbidden():
     arch_md = ROOT / "docs" / "deploy-approval-github-driven-architecture.md"
     arch_text = arch_md.read_text(encoding="utf-8")
     assert "Self-approval is FORBIDDEN" not in arch_text
+
+
+# ── agent_core_tokens fail-closed validation ────────────────────────
+
+def test_agent_core_tokens_empty_mapping_fails():
+    """agent_core_tokens={} -> ValueError."""
+    with pytest.raises(ValueError, match="agent_core_tokens must be non-empty"):
+        validate_config(
+            Config(
+                github_repos=list(DEFAULT_GITHUB_REPOS),
+                review_comment_author_id="7950763",
+                agent_core_tokens={},
+            )
+        )
+
+
+def test_agent_core_tokens_non_mapping_fails():
+    """agent_core_tokens='not-a-mapping' -> ValueError."""
+    with pytest.raises(ValueError, match="agent_core_tokens must be a mapping"):
+        validate_config(
+            Config(
+                github_repos=list(DEFAULT_GITHUB_REPOS),
+                review_comment_author_id="7950763",
+                agent_core_tokens="not-a-mapping",
+            )
+        )
+
+
+def test_agent_core_tokens_empty_key_fails():
+    """agent_core_tokens={"": "token"} -> ValueError."""
+    with pytest.raises(ValueError, match="agent_core_tokens keys must be non-empty strings"):
+        validate_config(
+            Config(
+                github_repos=list(DEFAULT_GITHUB_REPOS),
+                review_comment_author_id="7950763",
+                agent_core_tokens={"": "token"},
+            )
+        )
+
+
+def test_agent_core_tokens_empty_value_fails():
+    """agent_core_tokens={"machine": ""} -> ValueError."""
+    with pytest.raises(ValueError, match="agent_core_tokens values must be non-empty strings"):
+        validate_config(
+            Config(
+                github_repos=list(DEFAULT_GITHUB_REPOS),
+                review_comment_author_id="7950763",
+                agent_core_tokens={"machine": ""},
+            )
+        )
+
+
+def test_agent_core_tokens_valid_mapping_passes():
+    """Valid mapping -> PASS."""
+    validate_config(
+        Config(
+            github_repos=list(DEFAULT_GITHUB_REPOS),
+            review_comment_author_id="7950763",
+            agent_core_tokens={"machine1": "token1", "machine2": "token2"},
+        )
+    )
+
+
+def test_load_config_ignores_legacy_registry_environment(tmp_path, monkeypatch):
+    """Prove legacy REGISTRY env vars are inert at runtime."""
+    import agents.deploy_approval.config as config_mod
+    orig = config_mod._load_secrets_config
+
+    # Set all legacy registry env vars
+    monkeypatch.setenv("REGISTRY", "ccr.ccs.tencentyun.com")
+    monkeypatch.setenv("REGISTRY_USER", "some-user")
+    monkeypatch.setenv("REGISTRY_PASSWORD", "some-password")
+
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text(
+        'version: 1\n'
+        'cos:\n'
+        '  region: test\n'
+        '  bucket: test\n'
+        '  secret_id: test\n'
+        '  secret_key: test\n'
+        'review_comment_trust:\n'
+        '  author_id: "7950763"\n'
+        '  author_login: "kentcyq"\n'
+        'agent_core_tokens:\n'
+        '  test-machine: test-token\n'
+    )
+
+    def patched(path):
+        return orig(str(secrets))
+
+    config_mod._load_secrets_config = patched
+    try:
+        cfg = config_mod.load_config()
+    finally:
+        config_mod._load_secrets_config = orig
+
+    # Config must not have any registry attribute
+    assert not hasattr(cfg, "registry"), "Config must not have registry attribute"
+    assert not hasattr(cfg, "registry_auth_host_allowlist"), "Config must not have registry_auth_host_allowlist"
+
+    # Normal canonical config must load successfully
+    assert cfg.cos_region == "test"
+    assert cfg.cos_bucket == "test"
+    assert cfg.review_comment_author_id == "7950763"
+    assert cfg.review_comment_author_login == "kentcyq"
+    assert "test-machine" in cfg.agent_core_tokens

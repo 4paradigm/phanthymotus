@@ -133,18 +133,28 @@ def _sanitize_for_evidence(value: str) -> str:
 
 
 def _short_digest(ref: str) -> str:
+    """Return a compact display for an image ref: short digest or truncated tag."""
     value = str(ref or "").strip()
-    if "@sha256:" not in value:
-        return ""
-    digest = value.rsplit("@sha256:", 1)[-1]
-    if len(digest) < 12:
-        return ""
-    return digest[:12]
+    if "@sha256:" in value:
+        digest = value.rsplit("@sha256:", 1)[-1]
+        if len(digest) < 12:
+            return ""
+        return f"@sha256:{digest[:12]}"
+    # Tag form
+    if ":" in value:
+        tag = value.rsplit(":", 1)[-1]
+        if len(tag) > 40:
+            return tag[:40] + "…"
+        return tag
+    return ""
 
 
 def _compact_running_image(ref: str) -> str:
-    digest = _short_digest(ref)
-    return f"@sha256:{digest}" if digest else "occupied"
+    """Compact display for running_image evidence."""
+    result = _short_digest(ref)
+    if result:
+        return result
+    return "occupied"
 
 
 EVIDENCE_MAX_ARCHIVE_BYTES = 10 * 1024 * 1024

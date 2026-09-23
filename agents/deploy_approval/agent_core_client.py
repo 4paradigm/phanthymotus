@@ -25,6 +25,7 @@ from .clients_common import (
     stream_request,
 )
 from .config import Config
+from .image_ref import validate_image_ref
 
 logger = logging.getLogger(__name__)
 
@@ -297,60 +298,6 @@ class AgentCoreClient:
             raise AgentCoreError("agent-core list_drivers data must be a list")
         return drivers
 
-    async def registry_catalog(self) -> dict:
-        """Return the selected Agent Core's host-arch registry catalog facets.
-
-        Calls the read-only ``GET /api/registry/catalog`` and returns a dict
-        containing at least ``data``, ``facets`` and ``filter``:
-
-        {
-          "data": <dict>,
-          "facets": {"cpu_arch": "arm64", "acc_arch": "jetson-jp5"},
-          "filter": <dict-or-empty>,
-        }
-
-        ``facets.cpu_arch`` and ``facets.acc_arch`` are the Agent Core's own
-        host-architecture detection (never PR text). Malformed envelopes fail
-        closed with ``AgentCoreError`` so a node whose host platform cannot be
-        proven is never approved.
-        """
-        response = await self.request("GET", "/api/registry/catalog")
-        catalog_data = response.get("data")
-        if not isinstance(catalog_data, dict):
-            raise AgentCoreError(
-                "agent-core registry_catalog data must be an object"
-            )
-        facets = response.get("facets")
-        if not isinstance(facets, dict):
-            raise AgentCoreError(
-                "agent-core registry_catalog facets must be an object"
-            )
-        cpu = facets.get("cpu_arch")
-        acc = facets.get("acc_arch")
-        if not isinstance(cpu, str) or not cpu.strip():
-            raise AgentCoreError(
-                "agent-core registry_catalog facets.cpu_arch must be a "
-                "non-empty string"
-            )
-        if not isinstance(acc, str) or not acc.strip():
-            raise AgentCoreError(
-                "agent-core registry_catalog facets.acc_arch must be a "
-                "non-empty string"
-            )
-        filt = response.get("filter")
-        if not isinstance(filt, dict):
-            raise AgentCoreError(
-                "agent-core registry_catalog filter must be an object"
-            )
-        return {
-            "data": catalog_data,
-            "facets": {
-                "cpu_arch": cpu.strip(),
-                "acc_arch": acc.strip(),
-            },
-            "filter": filt,
-        }
-
     async def list_mcp(self) -> list:
         data = await self.request("GET", "/api/mcp")
         mcps = data.get("data")
@@ -359,11 +306,12 @@ class AgentCoreClient:
         return mcps
 
     async def deploy_driver(self, driver_id: str, image: str) -> dict:
-        """POST the immutable target image to the selected Agent Core driver.
+        """POST the target image to the selected Agent Core driver.
 
-        ``image`` must already be in the exact immutable form
-        ``<repo>@sha256:<64hex>``; a mutable tag or any other shape is a hard
-        client error so a deploy POST can never carry a user-supplied tag."""
+        Accepts exact image:tag or legacy repo@sha256:<64hex>.
+        The image string is validated but NOT modified — passed verbatim
+        as {"image": image} to Agent Core.
+        """
         if not isinstance(driver_id, str):
             raise AgentCoreError("deploy_driver requires a non-empty driver id")
         if not driver_id:
@@ -374,23 +322,11 @@ class AgentCoreClient:
         if " " in driver_id or "\t" in driver_id:
             raise AgentCoreError("deploy_driver driver_id must not contain whitespace")
         driver_id = _validate_api_path_segment(driver_id, "deploy_driver driver_id")
-        if not isinstance(image, str) or not image:
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
-        if "@" not in image:
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
-        _family, _, _digest = image.rpartition("@")
-        if not (_digest.startswith("sha256:") and len(_digest) == 71):
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
-        if not all(c in "0123456789abcdefABCDEF" for c in _digest[7:]):
-            raise AgentCoreError(
-                "deploy image must be the immutable repo@sha256:<64hex> form"
-            )
+        try:
+            validated_image = validate_image_ref(image)
+        except ValueError as exc:
+            raise AgentCoreError(str(exc)) from exc
+        # validated_image == image — passed verbatim as {"image": image}
         path = f"/api/drivers/{driver_id}/deploy"
         url = self.base_url + path
         try:
