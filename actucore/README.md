@@ -253,6 +253,47 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 （唯一的例外是「到达」：那里会先发一帧显式的零再安静下来。到达是成功，应该停
 在一条指令上而不是停在超时上，否则驱动日志里看着像链路断了。）
 
+### 标定工具（`tools/`）
+
+走廊的几何建立在两个从来没在这台机器人上量过的量上，两个脚本各管一个。**两个都
+只读传感器，不发任何指令**，所以在站着、躺着、或者正在干别的的机器人上跑都安全
+（机器人由人来开）。它们随镜像发布，不用 `docker cp` —— 热拷进去的文件会一直和镜
+像发散，而一次出处不明的测量值不了多少钱。
+
+```bash
+docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_fov.py wall
+docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_fov.py object --width 0.60 --target box
+docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_odom_drift.py static --seconds 60
+docker exec -it phanthy-motus-actucore-1 python3 /work/tools/measure_odom_drift.py landmark --target chair --seconds 120
+```
+
+**`measure_fov.py`** 回答两个问题，不只一个。`half_fov_rad` 是个配置值不是读数，
+而整条走廊的横向换算都按它的 `tan` 缩放；同时 `corridor` 算的是
+`lateral = tan(θ) × depth`，这在深度是**到成像平面的垂直距离**（z-depth）时才对，
+如果深度是**沿射线的距离**（range）就该用 `sin(θ)` —— 31° 处差 17%，正好落在肩膀
+所在的角度上。
+
+`wall` 方法两个问题一起回答，而且不需要卷尺：正对一面平墙，z-depth 读出来是平的，
+range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 range，曲线的陡峭程度直接
+给出 `half_fov`。**两种都拟合不上**也是一个结论 —— 那说明这个深度源不满足针孔几何，
+换多少 `half_fov_rad` 都救不回来。
+
+`object` 方法需要一把卷尺和一个已知宽度的矩形目标，用两条边（不是半宽）算，所以目
+标不必摆在画面正中。建议在两个距离各测一次：结果差超过几个百分点，出问题的就不是
+视场角而是镜头畸变或深度标定。
+
+**`measure_odom_drift.py`** 量的不是抽象的位姿漂移，而是**跟踪器真正消费的那个量**：
+滑行 T 秒之后，一个静止参照物的预测方位和实测方位差多少。而且是**和「什么都不做」
+对比着量** —— 如果用里程计补偿并不比假设世界没动更准，那补偿就没有挣到它的复杂度，
+局部记忆栅格（`docs/visual-navigation.md` 取舍八）也就不用考虑了。这个比值是结论，
+不是原始误差。
+
+推算那一步直接调 `track.Tracker._predict`，不另写一份：要量的是**跑在机器人上的那
+个变换**，第二份拷贝可能是对的而线上那份是错的。
+
+`static` 模式最便宜：机器人站着不动，凡是累积出来的都是偏置。足式速度估计的偏置通
+常是主导项，而且它会稳定地朝一个方向攒。
+
 ### 文件
 
 | 文件 | 内容 |
@@ -260,7 +301,9 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 | `plugin.py` | 卡片：工具声明、生命周期、订阅、定时发布 |
 | `policy.py` | 控制律。纯函数，无 ROS —— 所有行为分支都在这里 |
 | `depth.py` | 深度解码与采样。纯函数，无 ROS |
+| `track.py` | 单目标跟踪：生命周期、自运动补偿、遮挡外推。纯函数，无 ROS |
 | `odom.py` | `motus.odom/1` 的读取侧。**故意不跨仓库 import** —— 协议是文档不是共享库，两边各自实现、各自跑契约测试 |
+| `../tools/` | 标定脚本，见上。只读传感器 |
 
 `policy.py` 和 `depth.py` 不碰 ROS 是有意的：这样「目标被人挡住的同时左边还有
 个障碍会怎样」是一条测试，而不是一下午的真机调试。
