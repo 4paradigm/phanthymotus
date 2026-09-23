@@ -2510,13 +2510,34 @@ A declaration is also dropped when its node is retired: a re-wired card answerin
 `info()` with the optics of a camera it is no longer fed by is worse than
 answering with nothing.
 
-### Not yet done
+### The depth calibration is looked up by camera identity, not chosen
 
-`visual_depth`'s **depth calibration** (`cal_a`/`cal_b`) is still selected by hand
-from the `calibration_preset` dropdown. It is a property of camera × depth model,
-not of the camera alone, so it cannot move to the camera card — but it can be
-**looked up** by `camera_info.id` instead of chosen, which is the obvious next
-step and is not implemented.
+`cal_a`/`cal_b` are a property of **camera x depth model**, so they cannot move to
+the camera card — the camera has no idea which model is downstream of it. What is
+automated is the **lookup**: the camera declares who it is, that identity survives
+every hop, and `visual_depth` picks its own row out of its own table.
+
+| `calibration_preset` | what it does |
+|---|---|
+| `auto (by camera)` | **default.** Match `camera_info.id` against `CALIBRATION_PRESETS[*].camera_ids`; no match falls back to the engine's generic fit |
+| `no calibrate` | no correction at all, whatever the camera says |
+| `manual set` | the typed `cal_a`/`cal_b` |
+| a preset name | that row, regardless of which camera is attached |
+
+Three rules that follow, each with a reason:
+
+- **The match is exact, never by prefix.** A fit is measured on one lens.
+  Matching `unitree/...` would silently apply r1's numbers to a camera that
+  merely shares a vendor — the wrong-camera failure wearing a convenience.
+- **`no calibrate` was not repurposed.** Cards already deployed hold that value
+  explicitly, and on r1_sz the difference between it and the preset is a factor
+  of **2.65 in every distance**. Redefining what a stored value means is not
+  something to do to a running robot, so `auto (by camera)` was added alongside.
+  Existing cards therefore keep their behaviour and have to be switched by hand.
+- **`info().calibration` distinguishes the outcomes**: `auto:<preset>`,
+  `auto:no-match(<id>)`, `auto:no-camera`, `preset:<name>`, `manual`,
+  `model-default`. A card whose depth is 2.65x out and one whose depth is right
+  look identical from outside; this field is what separates them.
 
 ## Topic Naming
 

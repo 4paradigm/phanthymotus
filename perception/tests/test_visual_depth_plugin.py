@@ -829,8 +829,8 @@ def test_the_dropdown_has_no_blank_row():
     "" is still accepted from an existing config, but it is not offered."""
     enum = depth_plugin.TOOLS[0]["configSchema"]["properties"]["calibration_preset"]["enum"]
     assert "" not in enum
-    assert enum[0] == depth_plugin.CAL_NONE
-    assert depth_plugin.CAL_MANUAL in enum
+    assert enum[0] == depth_plugin.CAL_AUTO
+    assert depth_plugin.CAL_NONE in enum and depth_plugin.CAL_MANUAL in enum
     assert depth_plugin._calibration_from_cfg({"calibration_preset": ""}) == (1.0, 0.0)
 
 
@@ -867,15 +867,20 @@ def test_a_preset_names_the_camera_even_though_it_is_labelled_by_robot():
             f"{name} 的 camera 字段太短，说不清它到底标的是哪个镜头")
 
 
-def test_the_default_is_no_preset_and_no_correction():
-    """Nothing preselected: an unconfigured card must behave exactly as it did
-    before presets existed, because a preset applied to the wrong camera is the
-    failure this whole mechanism exists to make visible."""
+def test_the_default_asks_the_camera_and_corrects_nothing_without_one():
+    """The default is now automatic, but automatic with **no camera** must be
+    identical to no correction — a preset applied to the wrong camera is the
+    failure this whole mechanism exists to make visible, and "I could not tell
+    which camera this is" is precisely the wrong-camera case."""
     schema = depth_plugin.TOOLS[0]["configSchema"]["properties"]
-    assert schema["calibration_preset"]["default"] == depth_plugin.CAL_NONE
+    assert schema["calibration_preset"]["default"] == depth_plugin.CAL_AUTO
     assert schema["cal_a"]["default"] == 1.0 and schema["cal_b"]["default"] == 0.0
     assert depth_plugin._calibration_from_cfg({}) == (1.0, 0.0)
     assert depth_plugin.calibration_origin({}) == "model-default"
+
+    auto = {"calibration_preset": depth_plugin.CAL_AUTO}
+    assert depth_plugin._calibration_from_cfg(auto) == (1.0, 0.0)
+    assert depth_plugin.calibration_origin(auto) == "auto:no-camera"
 
 
 def test_every_schema_default_matches_the_file_default():
@@ -899,3 +904,77 @@ def test_every_schema_default_matches_the_file_default():
             assert cfg[key] == spec["default"], (
                 f"{key}: config.yaml 是 {cfg[key]}，schema 默认是 "
                 f"{spec['default']} —— 画布会用后者覆盖前者")
+
+
+# ── 标定按相机身份自动查表 ────────────────────────────────────────────────────
+
+_R1_CAM = "unitree/r1/camera_main"
+
+
+def test_a_known_camera_selects_its_own_fit_with_nobody_choosing():
+    """The point of the whole chain, arriving at the last stage that uses it.
+
+    The camera declares who it is; that identity survives every hop; and the
+    depth card picks its own row out of its own table. Nobody has to know that
+    r1_sz needs `cal_b: -0.9753`, and nobody can forget.
+    """
+    cfg = {"calibration_preset": depth_plugin.CAL_AUTO}
+    preset = depth_plugin.CALIBRATION_PRESETS["Unitree R1"]
+    assert depth_plugin._calibration_from_cfg(cfg, camera_id=_R1_CAM) == (
+        preset["cal_a"], preset["cal_b"])
+    assert depth_plugin.calibration_origin(cfg, _R1_CAM) == "auto:Unitree R1"
+
+
+def test_an_unknown_camera_falls_back_to_the_engine_and_says_which_one():
+    """Not a failure — a camera nobody has measured. But "matched nothing" and
+    "was not asked" are different facts, and a card whose depth is 2.65x out
+    looks exactly like one whose depth is right."""
+    cfg = {"calibration_preset": depth_plugin.CAL_AUTO}
+    assert depth_plugin._calibration_from_cfg(cfg, camera_id="acme/cam/1") == (1.0, 0.0)
+    assert depth_plugin.calibration_origin(cfg, "acme/cam/1") == "auto:no-match(acme/cam/1)"
+
+
+def test_the_lookup_is_exact_rather_than_by_prefix():
+    """A fit is measured on one lens. Matching `unitree/...` by prefix would
+    silently apply r1's numbers to a camera that merely shares a vendor — which
+    is the wrong-camera failure wearing a convenience."""
+    cfg = {"calibration_preset": depth_plugin.CAL_AUTO}
+    for other in ("unitree/r1/camera_left", "unitree/g1/camera_main", "unitree"):
+        assert depth_plugin._calibration_from_cfg(cfg, camera_id=other) == (1.0, 0.0)
+
+
+def test_an_explicit_choice_still_overrides_the_automatic_one():
+    """Automatic is the default, not a lock. The camera can be wrong — on this
+    very robot the field of view was wrong for a day — so the operator keeps a
+    way to say otherwise, and `info()` keeps saying which one is in play."""
+    manual = {"calibration_preset": "Unitree R1"}
+    assert depth_plugin._calibration_from_cfg(manual, camera_id="acme/cam/1") == (
+        depth_plugin.CALIBRATION_PRESETS["Unitree R1"]["cal_a"],
+        depth_plugin.CALIBRATION_PRESETS["Unitree R1"]["cal_b"])
+    assert depth_plugin.calibration_origin(manual, "acme/cam/1") == "preset:Unitree R1"
+
+    typed = {"calibration_preset": depth_plugin.CAL_MANUAL, "cal_a": 1.0, "cal_b": -0.5}
+    assert depth_plugin._calibration_from_cfg(typed, camera_id=_R1_CAM) == (1.0, -0.5)
+
+
+def test_no_calibrate_keeps_meaning_no_correction_even_with_a_known_camera():
+    """Cards already deployed hold `CAL_NONE` explicitly. On r1_sz the
+    difference between that and the preset is a factor of 2.65 in every distance
+    — redefining what a stored value means is not something to do to a running
+    robot, so `CAL_AUTO` was added rather than `CAL_NONE` being repurposed."""
+    cfg = {"calibration_preset": depth_plugin.CAL_NONE}
+    assert depth_plugin._calibration_from_cfg(cfg, camera_id=_R1_CAM) == (1.0, 0.0)
+
+
+def test_a_file_config_is_unaffected_by_any_of_this():
+    """No dropdown means the config came from perception/config.yaml, where
+    writing `cal_b: -0.9` has always meant "apply this"."""
+    assert depth_plugin._calibration_from_cfg({"cal_b": -0.9}, camera_id=_R1_CAM) == (
+        1.0, -0.9)
+
+
+def test_every_preset_declares_the_cameras_it_was_measured_on():
+    """A preset with no camera ids can never be selected automatically, which
+    makes it a row that silently only works if somebody picks it by hand."""
+    for name, preset in depth_plugin.CALIBRATION_PRESETS.items():
+        assert preset.get("camera_ids"), f"{name} 没有声明 camera_ids"

@@ -186,9 +186,28 @@ CALIBRATION_PROCEDURE = (
 # so an existing config keeps working, but it is not offered.
 CAL_NONE = "no calibrate"
 CAL_MANUAL = "manual set"
+# **The default, and the only option that requires nothing of the operator.**
+#
+# The camera declares its identity (`motus.camera/1`, see
+# `phanthymotus-driver/README_dev.md`), and that identity is enough to pick the
+# right row out of the table below — so the calibration stops being a thing
+# somebody has to know to select. It stays *here* rather than moving to the
+# camera card, because a depth fit is a property of camera × depth model and the
+# camera has no idea which model is downstream of it. What is automated is the
+# **lookup**, not the ownership.
+#
+# `CAL_NONE` keeps its old meaning ("no correction at all") rather than being
+# redefined as this. Cards already deployed hold `CAL_NONE` explicitly, and on
+# r1_sz the difference is a factor of 2.65 in every distance — silently changing
+# what a stored value means is not something to do to a running robot.
+CAL_AUTO = "auto (by camera)"
 
 CALIBRATION_PRESETS = {
     "Unitree R1": {
+        # Matched against `camera_info.id` for the automatic lookup. A list,
+        # because one robot's cameras can share a fit and because a fit measured
+        # on one model often applies to a whole family.
+        "camera_ids": ["unitree/r1/camera_main"],
         "cal_a": 1.0,
         "cal_b": -0.9753,
         "camera": "Unitree R1 主相机 1280x720（超广角，实测约 102° 全视场）",
@@ -280,14 +299,17 @@ TOOLS = [
                 # non-identity value there wins — see _calibration_from_cfg.
                 "calibration_preset": {
                     "type": "string",
-                    "enum": [CAL_NONE, CAL_MANUAL] + sorted(CALIBRATION_PRESETS),
+                    "enum": [CAL_AUTO, CAL_NONE, CAL_MANUAL]
+                            + sorted(CALIBRATION_PRESETS),
                     "description": "深度标定从哪来。"
-                                   f"{CAL_NONE!r} = 用 engine 自带的通用标定（默认）；"
+                                   f"{CAL_AUTO!r} = 按上游相机声明的身份自动查表"
+                                   "（默认，查不到就退回 engine 自带的标定）；"
+                                   f"{CAL_NONE!r} = 一律不额外修正；"
                                    f"{CAL_MANUAL!r} = 用上面填的 cal_a / cal_b；"
-                                   "其余是按机器人量好的预设。"
+                                   "其余是手动指定某台机器人的预设。"
                                    "**标定是相机的属性** —— 同型号换了镜头必须重标，"
                                    "选错和不标定一样危险，只是更不容易发现。",
-                    "default": CAL_NONE,
+                    "default": CAL_AUTO,
                     "scope": "instance",
                 },
                 # max_depth_m 不在这里：见 perception/config.yaml。它是发布层的
@@ -394,7 +416,24 @@ def _calibration_message(samples: list) -> str:
     )
 
 
-def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) -> tuple[float, float]:
+def _preset_for_camera(camera_id: str):
+    """The preset row a camera identity selects, or `(None, None)`.
+
+    The join that makes the calibration stop being a thing somebody has to know
+    to pick. Exact match only — a fit is measured on one lens, and guessing by
+    prefix would silently apply r1's numbers to a camera that merely shares a
+    vendor.
+    """
+    if not camera_id:
+        return None, None
+    for name, preset in CALIBRATION_PRESETS.items():
+        if camera_id in (preset.get("camera_ids") or ()):
+            return name, preset
+    return None, None
+
+
+def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
+                          camera_id: str = "") -> tuple[float, float]:
     """Resolve (cal_a, cal_b): typed-in value, then preset, then legacy, then engine.
 
     **Non-identity wins over a preset, and that test is deliberate.** The canvas
@@ -427,6 +466,13 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) 
         if choice in CALIBRATION_PRESETS:
             preset = CALIBRATION_PRESETS[choice]
             return float(preset["cal_a"]), float(preset["cal_b"])
+        if choice == CAL_AUTO:
+            # The camera said who it is; that is enough to pick the row. No
+            # match is not a failure — it is a camera nobody has measured, and
+            # the honest answer is the engine's own generic fit.
+            _, preset = _preset_for_camera(camera_id)
+            if preset:
+                return float(preset["cal_a"]), float(preset["cal_b"])
         return 1.0, 0.0
     if (cal_a, cal_b) != (1.0, 0.0):
         return cal_a, cal_b
@@ -445,7 +491,7 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) 
     return 1.0, 0.0
 
 
-def calibration_origin(cfg: dict) -> str:
+def calibration_origin(cfg: dict, camera_id: str = "") -> str:
     """Which of the four sources is in effect, for `info()`.
 
     A card whose depth is 3.2x out and a card whose depth is right look the same
@@ -459,6 +505,14 @@ def calibration_origin(cfg: dict) -> str:
             return "manual"
         if choice in CALIBRATION_PRESETS:
             return f"preset:{choice}"
+        if choice == CAL_AUTO:
+            name, _ = _preset_for_camera(camera_id)
+            # Which of the two "automatic" outcomes happened has to be
+            # distinguishable: a card whose depth is 2.65x out and one whose
+            # depth is right look identical from outside, and this is the field
+            # that separates them.
+            return f"auto:{name}" if name else (
+                f"auto:no-match({camera_id})" if camera_id else "auto:no-camera")
         return "model-default"
     if (float(cfg.get("cal_a", 1.0)), float(cfg.get("cal_b", 0.0))) != (1.0, 0.0):
         return "manual"
@@ -888,6 +942,18 @@ class VideoDepthPerceptionPlugin:
             self._model = VisionEngineSession(engine)
             log.info(f"[visual_depth] engine loaded, input={self._model.input_size}")
 
+    def _camera_id_for(self, node_key: str) -> str:
+        """The identity of the camera feeding this instance, or "".
+
+        The join key for the calibration lookup. It arrives with the upstream
+        declaration on `start` and survives every stage of the chain, which is
+        the property that makes it usable this far downstream.
+        """
+        from plugins.camera_info import camera_id
+
+        with self._nodes_lock:
+            return camera_id(self._upstream_camera.get(node_key) or {})
+
     def _camera_info(self, instance_id, input_topic, nodes,
                      depth_topic: str, summary_topic: str) -> tuple:
         """`(declarations, note)` for this card's two output ports.
@@ -931,7 +997,9 @@ class VideoDepthPerceptionPlugin:
                 input_topic or None, self._model,
                 fps=int(icfg.get("fps", self._fps)),
                 **dict(zip(("cal_a", "cal_b"),
-                           _calibration_from_cfg(icfg, (self._cal_a, self._cal_b)))),
+                           _calibration_from_cfg(
+                               icfg, (self._cal_a, self._cal_b),
+                               camera_id=self._camera_id_for(node_key)))),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
             )
@@ -1041,7 +1109,7 @@ class VideoDepthPerceptionPlugin:
             report.update(extra)
         return report
 
-    def _calibration_label(self) -> str:
+    def _calibration_label(self, camera_id: str = "") -> str:
         """Which fit produced these metres, and **where that fit came from**.
 
         "site" was not enough. A refit typed in by hand, one chosen from a
@@ -1055,7 +1123,7 @@ class VideoDepthPerceptionPlugin:
             return f"site:calibrate({len(self._cal_samples)} 样本)"
         if self._cal_a == 1.0 and self._cal_b == 0.0:
             return "model-default"
-        return f"site:{calibration_origin(self._plugin_cfg)}"
+        return f"site:{calibration_origin(self._plugin_cfg, camera_id)}"
 
     def _require_engine(self):
         """Return a loaded engine, loading it on demand.
@@ -1224,7 +1292,11 @@ class VideoDepthPerceptionPlugin:
                 "desc": "Monocular depth estimation (YOLO26-depth, TensorRT)",
             }
             info["unit"] = "m"
-            info["calibration"] = self._calibration_label()
+            cam_key = instance_id if instance_id in nodes else (
+                next(iter(nodes), None) if nodes
+                else (instance_id or input_topic or _DEFAULT_INSTANCE))
+            info["calibration"] = self._calibration_label(
+                self._camera_id_for(cam_key))
             if camera_out:
                 info["camera_info"] = camera_out
             if camera_note:
