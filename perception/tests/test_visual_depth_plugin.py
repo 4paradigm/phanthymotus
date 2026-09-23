@@ -786,9 +786,9 @@ def test_no_usable_frame_is_an_error_not_a_zero():
 # ── presets: a number that looks like a fact needs a provenance ──────────────
 
 def test_a_preset_supplies_a_fit_when_nothing_was_typed():
-    cfg = {"calibration_preset": "unitree-r1-main"}
+    cfg = {"calibration_preset": "Unitree R1"}
     a, b = depth_plugin._calibration_from_cfg(cfg)
-    assert (a, b) == (1.0, depth_plugin.CALIBRATION_PRESETS["unitree-r1-main"]["cal_b"])
+    assert (a, b) == (1.0, depth_plugin.CALIBRATION_PRESETS["Unitree R1"]["cal_b"])
 
 
 def test_a_typed_in_fit_beats_the_preset():
@@ -796,12 +796,12 @@ def test_a_typed_in_fit_beats_the_preset():
     "typed 1.0/0.0" and "left alone" arrive identical — presence cannot tell
     them apart. Non-identity can, and 1.0/0.0 *is* "no correction", so reading
     it as "no opinion" costs nothing."""
-    cfg = {"calibration_preset": "unitree-r1-main", "cal_a": 1.0, "cal_b": -0.5}
+    cfg = {"calibration_preset": "Unitree R1", "cal_a": 1.0, "cal_b": -0.5}
     assert depth_plugin._calibration_from_cfg(cfg) == (1.0, -0.5)
 
 
 def test_an_untouched_pair_does_not_shadow_the_preset():
-    cfg = {"calibration_preset": "unitree-r1-main", "cal_a": 1.0, "cal_b": 0.0}
+    cfg = {"calibration_preset": "Unitree R1", "cal_a": 1.0, "cal_b": 0.0}
     assert depth_plugin._calibration_from_cfg(cfg)[1] != 0.0
 
 
@@ -821,16 +821,28 @@ def test_every_preset_records_where_it_came_from():
 def test_the_origin_is_reported_and_distinguishes_the_four_cases():
     assert depth_plugin.calibration_origin({}) == "model-default"
     assert depth_plugin.calibration_origin(
-        {"calibration_preset": "unitree-r1-main"}) == "preset:unitree-r1-main"
+        {"calibration_preset": "Unitree R1"}) == "preset:Unitree R1"
     assert depth_plugin.calibration_origin({"cal_b": -0.9}) == "manual"
     assert depth_plugin.calibration_origin({"depth_scale": 0.4}) == "legacy-depth_scale"
 
 
-def test_the_preset_is_keyed_by_camera_not_by_robot():
-    """It is a property of the lens and the image pipeline. Two robots of the
-    same model share it only because they share the camera — and r1_sz's lens
-    is ~102 degrees across, which is why the engine's general-purpose fit was
-    out by 3.2x in the first place."""
-    for name in depth_plugin.CALIBRATION_PRESETS:
-        assert "main" in name or "camera" in name or "cam" in name, (
-            f"{name} 看起来是按机器人命名的，预设必须按相机")
+def test_a_preset_names_the_camera_even_though_it_is_labelled_by_robot():
+    """Named for the robot because that is what the person choosing one knows,
+    but it is a property of the lens — and a variant shipping a different
+    camera must not quietly inherit this entry. The `camera` field is where
+    that check can be made; r1_sz's lens is ~102 degrees across, which is why
+    the engine's general-purpose fit was out by 3.2x to begin with."""
+    for name, preset in depth_plugin.CALIBRATION_PRESETS.items():
+        assert len(str(preset["camera"])) > 8, (
+            f"{name} 的 camera 字段太短，说不清它到底标的是哪个镜头")
+
+
+def test_the_default_is_no_preset_and_no_correction():
+    """Nothing preselected: an unconfigured card must behave exactly as it did
+    before presets existed, because a preset applied to the wrong camera is the
+    failure this whole mechanism exists to make visible."""
+    schema = depth_plugin.TOOLS[0]["configSchema"]["properties"]
+    assert schema["calibration_preset"]["default"] == ""
+    assert schema["cal_a"]["default"] == 1.0 and schema["cal_b"]["default"] == 0.0
+    assert depth_plugin._calibration_from_cfg({}) == (1.0, 0.0)
+    assert depth_plugin.calibration_origin({}) == "model-default"

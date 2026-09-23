@@ -150,6 +150,10 @@ CALIBRATION_FRAMES = 15
 # temptation to add one is real.
 _SCATTER_LIMIT = 0.20
 
+# Distinguishes "the config had no cal_a" from "the config had cal_a = None",
+# so a reset can put the dict back exactly as it found it.
+_ABSENT = object()
+
 CALIBRATION_PROCEDURE = (
     "把机器人开到一面平整的墙（或任何平面）正前方，让墙尽量正对、填满画面中央，"
     "用卷尺量出镜头到墙的真实距离，调用 calibrate 填进 distance_m。"
@@ -169,11 +173,12 @@ CALIBRATION_PROCEDURE = (
 # from obstacles while believing it had stopped at 0.8. A preset chosen for the
 # wrong camera fails the same way and just as quietly.
 #
-# Keyed by **camera**, not by robot: this is a property of the lens and the
-# image pipeline, and two robots of the same model share it only because they
-# share the camera.
+# Named for the robot, because that is what the person choosing one knows; the
+# camera it is actually a property of is recorded in `camera` below. Two robots
+# of the same model share a preset only because they share a lens, so a variant
+# that ships a different camera needs its own entry rather than this one.
 CALIBRATION_PRESETS = {
-    "unitree-r1-main": {
+    "Unitree R1": {
         "cal_a": 1.0,
         "cal_b": -0.9753,
         "camera": "Unitree R1 主相机 1280x720（超广角，实测约 102° 全视场）",
@@ -784,6 +789,9 @@ class VideoDepthPerceptionPlugin:
         # Kept whole: image_input reads max_image_bytes and the path-confinement
         # settings straight from it (see plugins/image_input.py).
         self._plugin_cfg = dict(plugin_cfg or {})
+        # What cal_a/cal_b were before `calibrate` overwrote them, so
+        # `reset_calibration` can put the dict back exactly as it found it.
+        self._cal_cfg_backup = None
         self._fps = int(plugin_cfg.get("fps", 2))
         self._cal_a, self._cal_b = _calibration_from_cfg(plugin_cfg)
         # (measured_m, predicted_m) reference readings from the `calibrate`
@@ -1194,6 +1202,17 @@ class VideoDepthPerceptionPlugin:
         elif action in ("calibrate", "reset_calibration"):
             if action == "reset_calibration" or args.get("reset"):
                 self._cal_samples = []
+                # Undo what `calibrate` wrote into the config, so reset means
+                # what it has always meant: back to whatever was configured
+                # before anyone measured, which with an untouched card is the
+                # engine's own fit.
+                if self._cal_cfg_backup is not None:
+                    for key, value in zip(("cal_a", "cal_b"), self._cal_cfg_backup):
+                        if value is _ABSENT:
+                            self._plugin_cfg.pop(key, None)
+                        else:
+                            self._plugin_cfg[key] = value
+                    self._cal_cfg_backup = None
                 self._apply_calibration(*_calibration_from_cfg(self._plugin_cfg))
                 return self._calibration_report({"message": "标定已清空，恢复成 engine 自带的标定"})
 
@@ -1235,11 +1254,39 @@ class VideoDepthPerceptionPlugin:
             cal_b = fit_cal_b([s["predicted_m"] for s in self._cal_samples],
                               [s["measured_m"] for s in self._cal_samples])
             self._apply_calibration(1.0, cal_b)
+            # Write the fit into the card's own config as the manual pair.
+            #
+            # It makes the card internally consistent: `info()` then reports
+            # `manual` rather than claiming a preset or the engine default is in
+            # play, which is what the reader of a distance needs to know.
+            #
+            # The pre-calibration pair is snapshotted first, because
+            # `reset_calibration` promises a return to *the engine's own fit* —
+            # writing here without that would quietly redefine reset as "go back
+            # to the last thing I measured", and there are two tests on the
+            # original meaning.
+            #
+            # **It is not persistence.** The canvas owns this config and pushes
+            # its own copy on every `config` call, including on project start,
+            # which will overwrite these two numbers with whatever the dialog
+            # holds. Until they are typed in there (or into
+            # perception/config.yaml) a restart loses the fit — and it has,
+            # twice, on r1_sz, each time silently restoring a 3.2x error.
+            if self._cal_cfg_backup is None:
+                self._cal_cfg_backup = (self._plugin_cfg.get("cal_a", _ABSENT),
+                                        self._plugin_cfg.get("cal_b", _ABSENT))
+            self._plugin_cfg["cal_a"] = 1.0
+            self._plugin_cfg["cal_b"] = round(cal_b, 6)
             log.info(f"[visual_depth] calibrated: {len(self._cal_samples)} sample(s) "
                      f"→ cal_a=1.0 cal_b={cal_b:.4f}")
 
             extra = {
                 "sample": self._cal_samples[-1],
+                # The exact pair to put in the card's config dialog. Spelled out
+                # as a field rather than left in prose because it is the one
+                # thing that has to survive a restart, and prose does not get
+                # copied accurately.
+                "save_to_config": {"cal_a": 1.0, "cal_b": round(cal_b, 6)},
                 "message": _calibration_message(self._cal_samples),
             }
             warnings = []
