@@ -109,7 +109,7 @@ class Config:
     # Lateral offset that still allows full speed. **Not a gate** — past it the
     # speed is scaled down, reaching zero at align_full_stop. See
     # `_alignment_scale`.
-    align_tol: float = 0.08
+    align_tol: float = 0.15
     # Turn only, no travel, past this: the target is near the edge of frame,
     # and driving straight at it is driving somewhere else.
     align_full_stop: float = 0.45
