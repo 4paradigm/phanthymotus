@@ -200,6 +200,20 @@ plugins:
   # 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。
 
   navi:
+    # **这个文件是这张卡片绝大多数参数唯一的家。**
+    #
+    # 卡片的 configSchema 只暴露三个：rate_hz、stop_distance_m、obstacle_stop_m
+    # —— 操作员能判断的那三个。其余全在这里，因为它们需要的是一段解释而不是一个
+    # 输入框；要调的人仍然可以用 config 动作改。
+    #
+    # 还有一条更要紧的理由：**agent-core 每次 config 调用都会把 schema 里的字段
+    # 连同默认值一起下发**，所以出现在 schema 里的键会静默覆盖这里的同名键。
+    # r1_sz 上这里写着 vx_max: 0.6 而卡片报的是 0.4，就是 schema 默认值赢了 ——
+    # 唯一的痕迹是一条读起来像「这个文件从没被改过」的 degraded 提示。
+    #
+    # 所以往 schema 里加字段之前先想清楚：加进去就等于把这里的对应项变成装饰。
+    # test_navi_card.py 有一条测试盯着两边的默认值必须一致。
+    #
     # 视觉导航。enabled 只决定这张卡片出不出现在工具列表和侧边栏里，不决定它动
     # 不动 —— 和 vla 一样，真正的门槛都在别处：
     #   1. 必须在画布上把输出连到一张驱动的底盘命令卡片（control/velocity 端口），

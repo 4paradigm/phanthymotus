@@ -219,53 +219,38 @@ class NaviPlugin:
                 "x-is-dangerous": True,
                 "x-resource": ["base"],
             },
+            # **Three knobs, not twenty-two.**
+            #
+            # Everything else lives in `actucore/config.yaml`, where it has the
+            # paragraph of explanation it needs, and stays reachable through the
+            # `config` action for anyone tuning. What it must not be is a form
+            # field: an operator asked to pick `release_frac` or
+            # `bearingless_std_factor` has no way to judge the answer, and the
+            # dialog's length hides the three that actually matter.
+            #
+            # There is a second, sharper reason. **agent-core sends every field
+            # in this schema on every config call, defaults included** — so a
+            # key here silently overrides the same key in config.yaml. On r1_sz
+            # the file said `vx_max: 0.6` and the card reported 0.4, because the
+            # schema default won. Every field removed from here is one fewer
+            # place for the file to be quietly ignored; every field kept has to
+            # carry the same default the file does, which `test_navi_card.py`
+            # now checks.
             "configSchema": {
                 "type": "object",
                 "properties": {
-                    "topic": {"type": "string", "default": DEFAULT_TOPIC,
-                              "scope": "instance"},
                     "rate_hz": {"type": "number", "default": 10,
+                                "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
-                    "priority": {"type": "integer", "default": 50,
-                                 "scope": "instance"},
                     "stop_distance_m": {"type": "number", "default": 1.2,
-                                        "scope": "instance"},
-                    "slow_distance_m": {"type": "number", "default": 1.8,
+                                        "description": "走到目标前多远算到达（米）",
                                         "scope": "instance"},
                     "obstacle_stop_m": {"type": "number", "default": 0.8,
+                                        "description": "正前方障碍近于这个距离就完全"
+                                                       "不前进（米）。必须小于 "
+                                                       "stop_distance_m，否则机器人会"
+                                                       "被它正要走向的目标挡停",
                                         "scope": "instance"},
-                    "vx_max": {"type": "number", "default": 0.4,
-                               "scope": "instance"},
-                    "vy_max": {"type": "number", "default": 0.4,
-                               "scope": "instance"},
-                    "wz_max": {"type": "number", "default": 0.8,
-                               "scope": "instance"},
-                    "use_lateral": {"type": "boolean", "default": True,
-                                    "scope": "instance"},
-                    "lateral_scale": {"type": "number", "default": 1.0,
-                                      "scope": "instance"},
-                    "align_min_scale": {"type": "number", "default": 0.45,
-                                        "scope": "instance"},
-                    "half_fov_rad": {"type": "number", "default": 0.55,
-                                     "scope": "instance"},
-                    "align_tol": {"type": "number", "default": 0.08,
-                                  "scope": "instance"},
-                    "min_confidence": {"type": "number", "default": 0.35,
-                                       "scope": "instance"},
-                    "clearance_margin_m": {"type": "number", "default": 0.15,
-                                           "scope": "instance"},
-                    "coverage_min": {"type": "number", "default": 0.25,
-                                     "scope": "instance"},
-                    "sustain_confidence": {"type": "number", "default": 0.15,
-                                           "scope": "instance"},
-                    "confirm_hits": {"type": "integer", "default": 3,
-                                     "scope": "instance"},
-                    "confirm_window": {"type": "integer", "default": 5,
-                                       "scope": "instance"},
-                    "max_coast_s": {"type": "number", "default": 1.2,
-                                    "scope": "instance"},
-                    "max_obs_age_ms": {"type": "number", "default": 500,
-                                       "scope": "instance"},
                 },
                 "required": [],
             },

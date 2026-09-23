@@ -628,3 +628,38 @@ def test_a_lost_target_tells_the_caller_to_look_before_retrying():
     text = _tool()["inputSchema"]["x-action-params"]["navigate_to"]["description"]
     assert "list_visible_objects" in text
     assert "类别并不稳定" in text
+
+
+# ── the config dialog is three knobs, and its defaults are load-bearing ──────
+
+def test_the_dialog_offers_only_what_an_operator_can_judge():
+    """Twenty-two fields, most of them things like `release_frac` and
+    `bearingless_std_factor`, gave an operator no way to judge an answer and
+    buried the three that matter. The rest live in config.yaml with the
+    paragraph of explanation they need, and stay reachable via the `config`
+    action."""
+    keys = set(_tool()["configSchema"]["properties"])
+    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m"}
+
+
+def test_every_schema_default_matches_the_file_default():
+    """**agent-core sends every schema field on every config call, defaults
+    included**, so a key here silently overrides the same key in config.yaml.
+    On r1_sz the file said `vx_max: 0.6` and the card reported 0.4 — the schema
+    default won, and the only trace was a degraded note that read like the file
+    had never been edited.
+
+    A field may live in the schema or in the file; if it lives in both, the two
+    defaults have to agree or the file is decoration."""
+    import os
+    import yaml
+
+    root = os.path.join(os.path.dirname(__file__), "..")
+    with open(os.path.join(root, "config.yaml")) as handle:
+        navi_cfg = yaml.safe_load(handle)["plugins"]["navi"]
+
+    for key, spec in _tool()["configSchema"]["properties"].items():
+        if key in navi_cfg:
+            assert navi_cfg[key] == spec["default"], (
+                f"{key}: config.yaml 是 {navi_cfg[key]}，schema 默认是 "
+                f"{spec['default']} —— 画布会用后者覆盖前者")
