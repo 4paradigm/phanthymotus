@@ -841,3 +841,67 @@ def test_without_a_declaration_no_box_is_invented():
     out = card._normalise_boxes({"objects": [{"name": "person",
                                               "bbox": [100, 50, 300, 450]}]})
     assert "bbox_norm" not in out["objects"][0]
+
+
+# ── 渲染不许占用喂底盘的那条线程 ─────────────────────────────────────────────
+
+def test_the_tick_hands_the_frame_off_instead_of_rendering_it():
+    """Rendering a frame costs **27 ms measured on Orin 5** — a quarter of a
+    10 Hz command period. Doing it inline stalls the stream that feeds the
+    chassis every time the overlay ticks.
+
+    The module said a picture for a human must not be able to stop a robot;
+    that was written about exceptions, and only exceptions were guarded.
+    Latency is the same promise.
+    """
+    import queue as _queue
+
+    card = _card()
+    card._running = True
+    card._view_queue = _queue.Queue(maxsize=1)
+    card._view_publisher = object()
+    card._state.target = "person"
+
+    card._publish_view()
+    assert card._view_queue.qsize() == 1, "tick 没有把帧交出去"
+    snapshot = card._view_queue.get_nowait()
+    # Everything the worker needs, and nothing that has to be recomputed on the
+    # tick to get it.
+    assert set(snapshot) >= {"depth_m", "objects", "jpeg", "decision", "track",
+                             "bearing", "target", "clearance", "coverage"}
+
+
+def test_a_backed_up_queue_keeps_the_newest_frame():
+    """One slot, newest wins. An overlay frame from two seconds ago is worse
+    than a dropped one — the same rule the camera frames upstream follow."""
+    import queue as _queue
+
+    card = _card()
+    card._running = True
+    card._view_queue = _queue.Queue(maxsize=1)
+    card._view_publisher = object()
+    card._view_queue.put_nowait({"stale": True})
+
+    card._view_next_at = 0.0
+    card._publish_view()
+    assert "stale" not in card._view_queue.get_nowait()
+
+
+def test_the_tick_does_nothing_when_the_overlay_is_off():
+    card = _card(view_hz=0)
+    card._running = True
+    assert card._publish_view() is None
+
+
+def test_the_bearing_is_snapshotted_as_a_number_not_as_the_track():
+    """The Track is mutated in place by the tick; handing the object to another
+    thread would let the renderer read it mid-update. A float cannot tear."""
+    import queue as _queue
+
+    card = _card()
+    card._running = True
+    card._view_queue = _queue.Queue(maxsize=1)
+    card._view_publisher = object()
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["bearing"] is None or isinstance(snapshot["bearing"], float)
