@@ -133,6 +133,27 @@ _FLATNESS_LIMIT = 0.15
 # Most often a typo (2 for 20) or a reading taken facing something else.
 _OUTLIER_PCT = 25.0
 
+# How many recent frames one calibration sample is drawn from. At the card's
+# default 2 fps this is about seven seconds of standing still, which is what
+# the operator is doing anyway while holding a tape measure.
+#
+# Measured on r1_sz, robot stationary, same wall: fourteen consecutive frames
+# spanned 1.68-2.09 m — 22% peak to peak, 6% standard deviation. One frame is
+# a draw from that; the median of fourteen is worth about three times less
+# scatter, which is the difference between a calibration and a coin toss.
+CALIBRATION_FRAMES = 15
+
+# Frame-to-frame spread, as a fraction of the median, past which the sample is
+# reported as too noisy to build a calibration on. It does not refuse — the
+# number is still the best estimate available — but it says so, because a fit
+# whose inputs move by this much cannot support a two-parameter model and the
+# temptation to add one is real.
+_SCATTER_LIMIT = 0.20
+
+# Distinguishes "the config had no cal_a" from "the config had cal_a = None",
+# so a reset can put the dict back exactly as it found it.
+_ABSENT = object()
+
 CALIBRATION_PROCEDURE = (
     "把机器人开到一面平整的墙（或任何平面）正前方，让墙尽量正对、填满画面中央，"
     "用卷尺量出镜头到墙的真实距离，调用 calibrate 填进 distance_m。"
@@ -140,6 +161,65 @@ CALIBRATION_PROCEDURE = (
     "量错了用 reset_calibration 清空重来。"
 )
 
+
+
+# Fits measured on a real camera, so that a robot of a known kind does not
+# have to start from the engine's general-purpose one.
+#
+# **Every entry carries where it came from, and that is not decoration.** A
+# preset is a number that looks like a fact, which is exactly what the engine's
+# own `model-default` is — and applying that one to r1_sz's ultra-wide lens made
+# it report 1.0 m as 3.2 m, which in turn made the navigation card stop 0.2 m
+# from obstacles while believing it had stopped at 0.8. A preset chosen for the
+# wrong camera fails the same way and just as quietly.
+#
+# Named for the robot, because that is what the person choosing one knows; the
+# camera it is actually a property of is recorded in `camera` below. Two robots
+# of the same model share a preset only because they share a lens, so a variant
+# that ships a different camera needs its own entry rather than this one.
+# The two non-preset choices in the same dropdown, so the field says what is in
+# effect instead of leaving it to be inferred.
+#
+# An empty option rendered as a blank row in the dialog — a value you cannot
+# see is a value you cannot choose deliberately, which is the same shape as
+# every other silent default this card has been bitten by. "" is still accepted
+# so an existing config keeps working, but it is not offered.
+CAL_NONE = "no calibrate"
+CAL_MANUAL = "manual set"
+# **The default, and the only option that requires nothing of the operator.**
+#
+# The camera declares its identity (`motus.camera/1`, see
+# `phanthymotus-driver/README_dev.md`), and that identity is enough to pick the
+# right row out of the table below — so the calibration stops being a thing
+# somebody has to know to select. It stays *here* rather than moving to the
+# camera card, because a depth fit is a property of camera × depth model and the
+# camera has no idea which model is downstream of it. What is automated is the
+# **lookup**, not the ownership.
+#
+# `CAL_NONE` keeps its old meaning ("no correction at all") rather than being
+# redefined as this. Cards already deployed hold `CAL_NONE` explicitly, and on
+# r1_sz the difference is a factor of 2.65 in every distance — silently changing
+# what a stored value means is not something to do to a running robot.
+CAL_AUTO = "auto (by camera)"
+
+CALIBRATION_PRESETS = {
+    "Unitree R1": {
+        # Matched against `camera_info.id` for the automatic lookup. A list,
+        # because one robot's cameras can share a fit and because a fit measured
+        # on one model often applies to a whole family.
+        "camera_ids": ["unitree/r1/camera_main"],
+        "cal_a": 1.0,
+        "cal_b": -0.9753,
+        "camera": "Unitree R1 主相机 1280x720（超广角，实测约 102° 全视场）",
+        "measured_on": "r1_sz, 2026-09-23",
+        "samples": 5,
+        "range_m": "1.0–2.8",
+        "residual_pct": 20,
+        "note": "单帧取样拟合的 —— 多帧平均是这次之后才加的，同一距离先后两次"
+                "测量曾差 31%。整体比例可信（5 个样本在 log 空间取均值），"
+                "逐点残差约 ±20%。想要更准就用现在的 calibrate 重量两三个点。",
+    },
+}
 
 
 TOOLS = [
@@ -214,7 +294,27 @@ TOOLS = [
                 # identity — i.e. trust the engine.
                 "cal_a": {"type": "number", "description": "站点标定指数 a（d^a）。默认 1.0 = 不额外修正，直接用 engine 自带的标定", "default": 1.0, "scope": "instance"},
                 "cal_b": {"type": "number", "description": "站点标定偏移 b（乘 e^b）。默认 0.0 = 不额外修正。与 ultralytics model.calibrate() 的 cal_b 同一参数", "default": 0.0, "scope": "instance"},
-                "max_depth_m":  {"type": "number",  "description": "Values above this are published as invalid (0)", "default": 20.0, "scope": "instance"},
+                # Presets are for the common case (a known robot, a known
+                # camera); cal_a/cal_b above stay for anything else, and a
+                # non-identity value there wins — see _calibration_from_cfg.
+                "calibration_preset": {
+                    "type": "string",
+                    "enum": [CAL_AUTO, CAL_NONE, CAL_MANUAL]
+                            + sorted(CALIBRATION_PRESETS),
+                    "description": "深度标定从哪来。"
+                                   f"{CAL_AUTO!r} = 按上游相机声明的身份自动查表"
+                                   "（默认，查不到就退回 engine 自带的标定）；"
+                                   f"{CAL_NONE!r} = 一律不额外修正；"
+                                   f"{CAL_MANUAL!r} = 用上面填的 cal_a / cal_b；"
+                                   "其余是手动指定某台机器人的预设。"
+                                   "**标定是相机的属性** —— 同型号换了镜头必须重标，"
+                                   "选错和不标定一样危险，只是更不容易发现。",
+                    "default": CAL_AUTO,
+                    "scope": "instance",
+                },
+                # max_depth_m 不在这里：见 perception/config.yaml。它是发布层的
+                # 截断阈值，操作员没有判断依据，而每多一个 schema 字段就多一处
+                # 静默覆盖 config.yaml 的机会。
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -316,21 +416,129 @@ def _calibration_message(samples: list) -> str:
     )
 
 
-def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) -> tuple[float, float]:
-    """Read (cal_a, cal_b) from a config, honouring the legacy `depth_scale`.
+def _preset_for_camera(camera_id: str):
+    """The preset row a camera identity selects, or `(None, None)`.
 
-    `depth_scale` was a linear multiplier, which is exactly cal_b = log(scale)
-    at cal_a = 1 — so an existing card keeps the behaviour it was configured
-    for rather than silently reverting to identity.
+    The join that makes the calibration stop being a thing somebody has to know
+    to pick. Exact match only — a fit is measured on one lens, and guessing by
+    prefix would silently apply r1's numbers to a camera that merely shares a
+    vendor.
+    """
+    if not camera_id:
+        return None, None
+    for name, preset in CALIBRATION_PRESETS.items():
+        if camera_id in (preset.get("camera_ids") or ()):
+            return name, preset
+    return None, None
+
+
+def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
+                          camera_id: str = "") -> tuple[float, float]:
+    """Resolve (cal_a, cal_b): typed-in value, then preset, then legacy, then engine.
+
+    **Non-identity wins over a preset, and that test is deliberate.** The canvas
+    sends every field in the schema on every config call, defaults included, so
+    "the operator typed 1.0/0.0" and "the operator left it alone" arrive
+    identical — presence cannot distinguish them. Being non-identity can: 1.0/0.0
+    *is* "no correction", so treating it as "no opinion" costs nothing, while
+    any other value is something somebody put there on purpose.
+
+    `depth_scale` was a linear multiplier, which is exactly cal_b = log(scale) at
+    cal_a = 1 — so an existing card keeps the behaviour it was configured for
+    rather than silently reverting to identity.
     """
     cal_a = float(cfg.get("cal_a", default[0]))
     cal_b = float(cfg.get("cal_b", default[1]))
+    # **The dropdown decides — when there is one.**
+    #
+    # The canvas sends `calibration_preset` on every config call, so its
+    # presence means a selector is driving. Its *absence* means this config came
+    # from `perception/config.yaml`, which has no dropdown and where writing
+    # `cal_b: -0.9` has always meant "apply this". Making the selector
+    # mandatory would silently stop that working, which is how a file config
+    # becomes decoration — the exact failure the navi card had with its own
+    # schema defaults.
+    choice = cfg.get("calibration_preset")
+    if choice is not None:
+        choice = str(choice or CAL_NONE)
+        if choice == CAL_MANUAL:
+            return cal_a, cal_b
+        if choice in CALIBRATION_PRESETS:
+            preset = CALIBRATION_PRESETS[choice]
+            return float(preset["cal_a"]), float(preset["cal_b"])
+        if choice == CAL_AUTO:
+            # The camera said who it is; that is enough to pick the row. No
+            # match is not a failure — it is a camera nobody has measured, and
+            # the honest answer is the engine's own generic fit.
+            _, preset = _preset_for_camera(camera_id)
+            if preset:
+                return float(preset["cal_a"]), float(preset["cal_b"])
+        return 1.0, 0.0
+    if (cal_a, cal_b) != (1.0, 0.0):
+        return cal_a, cal_b
+
+    # Legacy keeps its original rule — **presence**, not value. Writing
+    # `cal_b: 0.0` next to a `depth_scale` is how you turn the old multiplier
+    # off, and there is an existing test for exactly that. The non-identity
+    # rule above is only about presets, where the canvas's habit of sending
+    # every default makes presence useless.
     legacy = cfg.get("depth_scale")
     if legacy not in (None, "") and "cal_b" not in cfg:
         legacy = float(legacy)
         if legacy > 0:
-            cal_b = float(np.log(legacy))
-    return cal_a, cal_b
+            return cal_a, float(np.log(legacy))
+
+    return 1.0, 0.0
+
+
+def calibration_origin(cfg: dict, camera_id: str = "") -> str:
+    """Which of the four sources is in effect, for `info()`.
+
+    A card whose depth is 3.2x out and a card whose depth is right look the same
+    from outside; this is the one field that separates them, so it says which
+    kind of number is in play rather than only whether one was applied.
+    """
+    choice = cfg.get("calibration_preset")
+    if choice is not None:
+        choice = str(choice or CAL_NONE)
+        if choice == CAL_MANUAL:
+            return "manual"
+        if choice in CALIBRATION_PRESETS:
+            return f"preset:{choice}"
+        if choice == CAL_AUTO:
+            name, _ = _preset_for_camera(camera_id)
+            # Which of the two "automatic" outcomes happened has to be
+            # distinguishable: a card whose depth is 2.65x out and one whose
+            # depth is right look identical from outside, and this is the field
+            # that separates them.
+            return f"auto:{name}" if name else (
+                f"auto:no-match({camera_id})" if camera_id else "auto:no-camera")
+        return "model-default"
+    if (float(cfg.get("cal_a", 1.0)), float(cfg.get("cal_b", 0.0))) != (1.0, 0.0):
+        return "manual"
+    if cfg.get("depth_scale") not in (None, "") and "cal_b" not in cfg:
+        return "legacy-depth_scale"
+    return "model-default"
+
+
+def calibration_conflict(cfg: dict) -> str:
+    """A typed-in fit that the dropdown is ignoring, or "".
+
+    Someone who fills in cal_a/cal_b and forgets to switch the selector gets
+    their numbers dropped. Applying them instead would be a guess; dropping
+    them *quietly* would be the failure this card keeps running into. So they
+    are dropped, and said out loud.
+    """
+    choice = cfg.get("calibration_preset")
+    if choice is None or str(choice or CAL_NONE) == CAL_MANUAL:
+        return ""
+    choice = str(choice or CAL_NONE)
+    pair = (float(cfg.get("cal_a", 1.0)), float(cfg.get("cal_b", 0.0)))
+    if pair == (1.0, 0.0):
+        return ""
+    return (f"配置里填了 cal_a={pair[0]:g} / cal_b={pair[1]:g}，但标定来源选的是 "
+            f"{choice!r} —— 这两个数**没有生效**。要用它们请把来源改成 "
+            f"{CAL_MANUAL!r}。")
 
 
 def sample_region(depth_m: np.ndarray, region: str = "center") -> dict:
@@ -396,6 +604,42 @@ def encode_depth(depth_m: np.ndarray, max_depth_m: float) -> bytes:
     ceiling = min(65535.0, max(1.0, max_depth_m) * 1000.0)
     mm[(mm < 1) | (mm > ceiling)] = 0
     return zlib.compress(mm.astype("<u2").tobytes(), 1)
+
+
+def sample_region_over_frames(frames, region: str = "center") -> dict:
+    """`sample_region` over several frames, plus how much they disagreed.
+
+    The median of the per-frame medians, not the median of everything pooled:
+    one bad frame should move the answer by nothing, and pooling lets it move
+    the answer by its share of the pixels.
+
+    `scatter` is the peak-to-peak spread of the per-frame readings as a
+    fraction of the median — the quantity that, left unmeasured on r1_sz, let a
+    22% frame-to-frame wobble be mistaken for a 12% improvement from a second
+    fit parameter.
+    """
+    readings = []
+    flatness = []
+    for frame in frames:
+        try:
+            one = sample_region(frame, region)
+        except Exception:                                      # noqa: BLE001
+            continue
+        if one.get("distance_m") and one["distance_m"] > 0:
+            readings.append(float(one["distance_m"]))
+            flatness.append(float(one.get("flatness") or 0.0))
+    if not readings:
+        raise ValueError("no usable depth in that region")
+
+    values = np.asarray(readings, dtype=np.float64)
+    median = float(np.median(values))
+    spread = float(values.max() - values.min()) / max(median, 1e-6)
+    return {
+        "distance_m": median,
+        "flatness": float(np.median(flatness)) if flatness else 0.0,
+        "frames": len(readings),
+        "scatter": round(spread, 3),
+    }
 
 
 def summarize_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) -> dict:
@@ -465,13 +709,79 @@ def measure_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) ->
     return stats
 
 
+def lens_barrel_mask(frame, *, threshold: int, max_fraction: float):
+    """Where the picture is the camera's own housing rather than the scene.
+
+    **Measured on r1_sz, 2026-09-23.** The main camera looks out through a round
+    barrel, so a wide black ring fills the corners of every frame. The depth
+    model does not know that and happily invents a distance for it: the four
+    corners read **0.64–0.83 m** while the centre read 1.76 m, i.e. "something
+    right in front of me", everywhere around the edge. And the map's valid-pixel
+    fraction was **100%** — so `coverage`, the whole "unknown is not free"
+    protection downstream, never fired. This is not a missing reading. It is a
+    confident wrong one, which is strictly worse.
+
+    Consequences before this existed: the angular thirds navi used to pick an
+    escape direction were reading the barrel rather than the room (left 0.906,
+    right 0.993, centre 1.368 on a corridor that was clear), and the metric
+    corridor could be tripped to a stop by the robot's own lens at close range.
+
+    ── Why detect rather than declare ──────────────────────────────────────────
+
+    A declared region (a circle in `camera_info`) would be deterministic, but it
+    has to be measured per camera and it goes stale the moment a mount changes.
+    The barrel has a signature no scene has: **near-black *and* connected to the
+    frame edge.** Border-connectivity is what keeps a black object in the middle
+    of the room from being masked — it is surrounded by scene, so it is its own
+    component.
+
+    The remaining false positive — a genuinely dark region touching the edge —
+    fails safe: masked pixels become "no reading", `coverage` drops, and navi
+    refuses to drive into what it cannot see. That is the designed behaviour for
+    unknown, and it is the right answer for a camera staring into a dark corner.
+
+    `max_fraction` is the backstop for the one case where that is useless: a
+    dark enough room makes one border-connected blob out of everything, and a
+    fully masked map is a blind robot. Past that fraction nothing is masked and
+    the caller is told, because "the room is dark" and "my lens is blocked" want
+    different responses from a person.
+
+    Returns a boolean mask at the frame's resolution, or `None` if nothing
+    should be masked.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    dark = (gray <= threshold).astype(np.uint8)
+    if not dark.any():
+        return None
+
+    count, labels = cv2.connectedComponents(dark, connectivity=4)
+    if count < 2:
+        return None
+    edge = np.concatenate([labels[0, :], labels[-1, :],
+                           labels[:, 0], labels[:, -1]])
+    touching = np.unique(edge)
+    touching = touching[touching != 0]
+    if not touching.size:
+        return None
+
+    mask = np.isin(labels, touching)
+    fraction = float(mask.mean())
+    if fraction > max_fraction:
+        return None
+    return mask
+
+
 # ── ROS2 Node (one per instance/topic) ───────────────────────────────────────
 
 class _DepthNode(Node):
     """Per-topic depth inference node."""
 
     def __init__(self, input_topic: Optional[str], model, fps: float, cal_a: float,
-                 cal_b: float, max_depth_m: float, node_suffix: str):
+                 cal_b: float, max_depth_m: float, node_suffix: str,
+                 cal_origin: str = "", mask_barrel: bool = True,
+                 barrel_threshold: int = 24, barrel_max_fraction: float = 0.6):
         super().__init__(f"visual_depth_{node_suffix}" if node_suffix else "visual_depth")
         # Topic-less is a supported mode, as in plugins/vop.py and plugins/tts.py:
         # a card driven only by recognize_by_photo has no camera to subscribe
@@ -483,8 +793,24 @@ class _DepthNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
         self._cal_a = cal_a
         self._cal_b = cal_b
+        # Where *this instance's* fit came from. **Not the card's.**
+        #
+        # The card-level `_cal_a`/`_cal_b` come from `perception/config.yaml`;
+        # a canvas instance gets its own from the instance config, and they can
+        # differ by a lot. On r1_sz the card reported `model-default` while this
+        # node was applying `cal_b: -0.9753` — a factor of 2.65 on every
+        # distance. That field exists to say which fit produced these metres,
+        # so reporting a scope that is not producing them defeats it exactly.
+        self._cal_origin = cal_origin or "model-default"
         self._scale_label = "metric"
         self._max_depth_m = max_depth_m
+        self._mask_barrel = mask_barrel
+        self._barrel_threshold = barrel_threshold
+        self._barrel_max_fraction = barrel_max_fraction
+        # What share of the last frame was housing. Reported in `info()` because
+        # "42% of my picture is lens barrel" is a thing an operator should be
+        # able to see without reading a depth map by eye.
+        self._barrel_fraction = 0.0
 
         self._depth_pub = self.create_publisher(CompressedImage, self._depth_topic, _PUB_QOS)
         self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
@@ -495,9 +821,22 @@ class _DepthNode(Node):
         self._last_inference_time = 0.0
         self._frame_count = 0
         self._running = False
-        # Most recent decoded depth, BEFORE site calibration — the frame the
-        # `calibrate` action fits against. One array, replaced per frame.
-        self._last_raw_depth: Optional[np.ndarray] = None
+        # Recent decoded depth, BEFORE site calibration — what the `calibrate`
+        # action fits against.
+        #
+        # **A deque, not one frame.** It was one frame, and on r1_sz that made
+        # the whole calibration a lottery: with the robot stationary and the
+        # scene unchanged, fourteen consecutive frames of the same wall gave
+        # 1.68–2.09 m, a 22% peak-to-peak spread; two `calibrate` calls at the
+        # same 1.6 m gave 3.82 and 5.00, 31% apart. Four such samples were then
+        # fitted with two parameters and the residuals argued convincingly for
+        # a log-slope that was entirely noise.
+        #
+        # A reading whose reproducibility is ±30% cannot support an argument
+        # about a 6% model improvement. Averaging is not polish here; it is the
+        # difference between calibrating and guessing.
+        from collections import deque as _deque
+        self._raw_depth_history = _deque(maxlen=CALIBRATION_FRAMES)
         # See perception/README.md § "Plugin Concurrency" — every dispatch runs
         # on its own ThreadingHTTPServer thread and the canvas issues
         # config→start→stop→start within seconds.
@@ -506,6 +845,13 @@ class _DepthNode(Node):
     def request_stop(self) -> None:
         """Signal cancellation without taking the lock, so stop can abort a start."""
         self._stop_event.set()
+
+    @property
+    def calibration_label(self) -> str:
+        """Which fit produced **this node's** metres."""
+        if self._cal_a == 1.0 and self._cal_b == 0.0:
+            return "model-default"
+        return f"site:{self._cal_origin}"
 
     def start(self) -> dict:
         with self._lifecycle_lock:
@@ -548,6 +894,7 @@ class _DepthNode(Node):
             "depth_topic": self._depth_topic,
             "summary_topic": self._summary_topic,
             "scale": self._scale_label,
+            "calibration": self.calibration_label,
             "mode": "stream" if self._input_topic else "on_demand",
         }
 
@@ -589,16 +936,44 @@ class _DepthNode(Node):
                 # frame repeatedly without compounding its own correction —
                 # fitting against already-corrected depth converges on
                 # whatever the first guess was.
-                self._last_raw_depth = raw
+                self._raw_depth_history.append(raw)
                 depth_m = apply_site_calibration(raw, self._cal_a, self._cal_b)
                 # Resampled here, not by the model: the renderer's canvas is
                 # fixed at 640x480 and a mismatch is dropped silently.
                 if depth_m.shape != (DEPTH_HEIGHT, DEPTH_WIDTH):
                     depth_m = cv2.resize(depth_m, (DEPTH_WIDTH, DEPTH_HEIGHT),
                                          interpolation=cv2.INTER_NEAREST)
+                depth_m = self._mask_lens_barrel(frame, depth_m)
                 self._publish(depth_m)
             except Exception as e:
                 log.error(f"[visual_depth] inference error: {e}", exc_info=True)
+
+    def _mask_lens_barrel(self, frame, depth_m: np.ndarray) -> np.ndarray:
+        """Blank the depth where the picture is the camera's own housing.
+
+        NaN rather than a large number, because `encode_depth` already maps NaN
+        to the 0 that means "no reading" — so this arrives downstream as an
+        honest gap, and `coverage` treats it the way it treats every other gap.
+        Writing a far value instead would say "clear", which is the mistake in
+        the opposite direction.
+        """
+        if not self._mask_barrel:
+            return depth_m
+        import cv2
+
+        mask = lens_barrel_mask(frame, threshold=self._barrel_threshold,
+                                max_fraction=self._barrel_max_fraction)
+        if mask is None:
+            self._barrel_fraction = 0.0
+            return depth_m
+        if mask.shape != depth_m.shape:
+            mask = cv2.resize(mask.astype(np.uint8),
+                              (depth_m.shape[1], depth_m.shape[0]),
+                              interpolation=cv2.INTER_NEAREST).astype(bool)
+        self._barrel_fraction = float(mask.mean())
+        out = depth_m.astype(np.float32, copy=True)
+        out[mask] = np.nan
+        return out
 
     def _publish(self, depth_m: np.ndarray, summary: Optional[dict] = None):
         """Publish one depth map and its summary.
@@ -638,7 +1013,18 @@ class VideoDepthPerceptionPlugin:
         # Kept whole: image_input reads max_image_bytes and the path-confinement
         # settings straight from it (see plugins/image_input.py).
         self._plugin_cfg = dict(plugin_cfg or {})
+        # What cal_a/cal_b were before `calibrate` overwrote them, so
+        # `reset_calibration` can put the dict back exactly as it found it.
+        self._cal_cfg_backup = None
         self._fps = int(plugin_cfg.get("fps", 2))
+        # Lens-barrel masking. In the file rather than the schema: an operator
+        # has no way to judge a luma threshold, and every schema field is one
+        # more chance to silently override this file (see actucore's navi card
+        # for what that cost). See `lens_barrel_mask` for why it exists.
+        self._mask_barrel = bool(plugin_cfg.get("mask_lens_barrel", True))
+        self._barrel_threshold = int(plugin_cfg.get("lens_barrel_threshold", 24))
+        self._barrel_max_fraction = float(
+            plugin_cfg.get("lens_barrel_max_fraction", 0.6))
         self._cal_a, self._cal_b = _calibration_from_cfg(plugin_cfg)
         # (measured_m, predicted_m) reference readings from the `calibrate`
         # action, in call order. Refit from scratch on every addition, so a
@@ -653,6 +1039,12 @@ class VideoDepthPerceptionPlugin:
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _DepthNode] = {}
         self._instance_configs: dict[str, dict] = {}
+        # What the camera feeding each instance said about its optics
+        # (`motus.camera/1`, arrives as `camera_info` on `start`). Kept so
+        # `info()` can pass it on, rewritten for the image this card publishes —
+        # see `plugins/camera_info.py`. Guarded by `_nodes_lock` like the dict
+        # above it, per the plugin concurrency rules in the README.
+        self._upstream_camera: dict[str, dict] = {}
         # Guards _nodes / _instance_configs; never held across a node start,
         # stop, or a model load.
         self._nodes_lock = threading.RLock()
@@ -676,6 +1068,51 @@ class VideoDepthPerceptionPlugin:
             self._model = VisionEngineSession(engine)
             log.info(f"[visual_depth] engine loaded, input={self._model.input_size}")
 
+    def _camera_id_for(self, node_key: str) -> str:
+        """The identity of the camera feeding this instance, or "".
+
+        The join key for the calibration lookup. It arrives with the upstream
+        declaration on `start` and survives every stage of the chain, which is
+        the property that makes it usable this far downstream.
+        """
+        from plugins.camera_info import camera_id
+
+        with self._nodes_lock:
+            return camera_id(self._upstream_camera.get(node_key) or {})
+
+    def _camera_info(self, instance_id, input_topic, nodes,
+                     depth_topic: str, summary_topic: str) -> tuple:
+        """`(declarations, note)` for this card's two output ports.
+
+        The note exists because "the upstream camera declared nothing" and "this
+        card dropped it on the floor" look identical from downstream, and only
+        the first is somebody else's business to fix. Downstream already degrades
+        correctly on a missing declaration — this is so the operator reading
+        *this* card can see whose problem it is.
+        """
+        from plugins.camera_info import inherit
+
+        key = instance_id if instance_id in (nodes or {}) else None
+        if key is None:
+            key = next(iter(nodes), None) if nodes else (input_topic or _DEFAULT_INSTANCE)
+        with self._nodes_lock:
+            upstream = self._upstream_camera.get(key) or {}
+        if not upstream:
+            return [], ("上游相机没有声明 camera_info —— 下游拿不到视场角，避障走廊"
+                        "只能按保守兜底值算。相机卡片补上声明即可，见 "
+                        "phanthymotus-driver/README_dev.md 的 Camera Parameters")
+
+        out = inherit(upstream, topic=depth_topic, fmt="image/depth-zlib",
+                      stage="perception/visual_depth",
+                      width=DEPTH_WIDTH, height=DEPTH_HEIGHT)
+        # The summary carries the same optics — it is the same picture reduced to
+        # three numbers — so it is declared too, rather than left for a consumer
+        # wired to the summary alone to guess at.
+        out += inherit(upstream, topic=summary_topic, fmt="data/json",
+                       stage="perception/visual_depth",
+                       width=DEPTH_WIDTH, height=DEPTH_HEIGHT)
+        return out, ""
+
     def _start_node(self, node_key: str, input_topic: Optional[str]):
         """Register before starting, so a concurrent stop can always cancel it."""
         with self._nodes_lock:
@@ -686,9 +1123,18 @@ class VideoDepthPerceptionPlugin:
                 input_topic or None, self._model,
                 fps=int(icfg.get("fps", self._fps)),
                 **dict(zip(("cal_a", "cal_b"),
-                           _calibration_from_cfg(icfg, (self._cal_a, self._cal_b)))),
+                           _calibration_from_cfg(
+                               icfg, (self._cal_a, self._cal_b),
+                               camera_id=self._camera_id_for(node_key)))),
+                cal_origin=calibration_origin(icfg, self._camera_id_for(node_key)),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
+                mask_barrel=bool(icfg.get("mask_lens_barrel",
+                                          self._mask_barrel)),
+                barrel_threshold=int(icfg.get("lens_barrel_threshold",
+                                              self._barrel_threshold)),
+                barrel_max_fraction=float(icfg.get("lens_barrel_max_fraction",
+                                                   self._barrel_max_fraction)),
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -701,6 +1147,11 @@ class VideoDepthPerceptionPlugin:
             node = self._nodes.pop(node_key, None)
         if node is None:
             return None
+        with self._nodes_lock:
+            # Goes with the node. Leaving it behind would let a re-wired card
+            # answer `info()` with the optics of a camera it is no longer fed by,
+            # which is a worse answer than no answer.
+            self._upstream_camera.pop(node_key, None)
         node.request_stop()
         result = node.stop()
         # remove-then-destroy: the node must leave the executor before its
@@ -714,12 +1165,13 @@ class VideoDepthPerceptionPlugin:
     # ── site calibration from known distances ────────────────────────────────
 
     def _raw_depth_for_calibration(self, args: dict, instance_id: str):
-        """An uncalibrated depth map to fit against, plus where it came from.
+        """Uncalibrated depth to fit against, as a **list of frames**.
 
         Prefers an explicitly supplied photo, because "here is a picture of a
         target at 2.0 m" is reproducible; otherwise takes the running
-        instance's most recent frame, which is what someone standing in front
-        of the robot actually has.
+        instance's recent frames — plural, see `_raw_depth_history`. A photo is
+        one frame by nature and is returned as a list of one, so the caller has
+        a single shape to handle and the scatter simply comes out zero.
         """
         if args.get("image_path") or args.get("url") or args.get("image_url"):
             cfg = dict(self._plugin_cfg)
@@ -730,7 +1182,7 @@ class VideoDepthPerceptionPlugin:
                 raise BadInput("could not decode that file as an image", source)
             from plugins.vision_runtime import decode_depth
             outputs, meta = self._require_engine().infer(frame)
-            return decode_depth(outputs, meta), source
+            return [decode_depth(outputs, meta)], source
 
         with self._nodes_lock:
             node = self._nodes.get(instance_id) if instance_id else None
@@ -743,12 +1195,12 @@ class VideoDepthPerceptionPlugin:
                 "nothing to calibrate against — start this card on a camera "
                 "first, or pass image_path / url"
             )
-        raw = node._last_raw_depth
-        if raw is None:
+        frames = list(node._raw_depth_history)
+        if not frames:
             raise ValueError(
                 f"{node._input_topic or 'this card'} has not produced a frame yet"
             )
-        return raw, node._input_topic or "(on-demand)"
+        return frames, node._input_topic or "(on-demand)"
 
     def _apply_calibration(self, cal_a: float, cal_b: float) -> None:
         """Set the fit here and on every running node, without a restart."""
@@ -790,9 +1242,21 @@ class VideoDepthPerceptionPlugin:
             report.update(extra)
         return report
 
-    def _calibration_label(self) -> str:
-        """Which fit produced these metres — the engine's, or a site refit."""
-        return "model-default" if (self._cal_a == 1.0 and self._cal_b == 0.0) else "site"
+    def _calibration_label(self, camera_id: str = "") -> str:
+        """Which fit produced these metres, and **where that fit came from**.
+
+        "site" was not enough. A refit typed in by hand, one chosen from a
+        preset table, and one fitted live against a tape measure are three very
+        different levels of evidence, and only the last was ever measured on
+        *this* camera. A reader deciding whether to trust a distance needs to
+        know which of the three is in play — `model-default` on r1_sz's
+        ultra-wide lens reported 1.0 m as 3.2 m, and nothing said so.
+        """
+        if self._cal_samples:
+            return f"site:calibrate({len(self._cal_samples)} 样本)"
+        if self._cal_a == 1.0 and self._cal_b == 0.0:
+            return "model-default"
+        return f"site:{calibration_origin(self._plugin_cfg, camera_id)}"
 
     def _require_engine(self):
         """Return a loaded engine, loading it on demand.
@@ -917,6 +1381,10 @@ class VideoDepthPerceptionPlugin:
                     "summary_topic": node._summary_topic,
                     "fps": node._fps,
                     "scale": node._scale_label,
+                    # Per instance, because that is the scope that has one. Two
+                    # cards on one camera may legitimately run different fits.
+                    "calibration": node.calibration_label,
+                    "lens_barrel_pct": round(node._barrel_fraction * 100, 1),
                     "frame_count": node._frame_count,
                 }
                 for key, node in nodes.items()
@@ -942,6 +1410,13 @@ class VideoDepthPerceptionPlugin:
                 {"topic": summary_topic, "format": "data/json"},
             ] if (input_topic or nodes) else [])
 
+            # Pass the camera's optics on, rewritten for what this card actually
+            # publishes: the map is resampled to 640x480, which changes the
+            # declared size and rescales `K` while leaving `half_fov_rad` alone
+            # (a stretch, not a crop). See `plugins/camera_info.py`.
+            camera_out, camera_note = self._camera_info(
+                instance_id, input_topic, nodes, depth_topic, summary_topic)
+
             scale = "metric"
             info = {
                 "name": "VideoDepthPerception", "manufacture": "Embodied",
@@ -954,11 +1429,28 @@ class VideoDepthPerceptionPlugin:
                 "desc": "Monocular depth estimation (YOLO26-depth, TensorRT)",
             }
             info["unit"] = "m"
-            info["calibration"] = self._calibration_label()
+            cam_key = instance_id if instance_id in nodes else (
+                next(iter(nodes), None) if nodes
+                else (instance_id or input_topic or _DEFAULT_INSTANCE))
+            # **The running instance's fit, not the card's.** They come from
+            # different configs and can differ by a lot: on r1_sz the card said
+            # `model-default` from perception/config.yaml while the canvas
+            # instance was applying `cal_b: -0.9753`, a factor of 2.65 on every
+            # distance. This field's whole job is to say which fit produced the
+            # metres being published.
+            live = (nodes or {}).get(cam_key)
+            info["calibration"] = (live.calibration_label if live is not None
+                                   else self._calibration_label(
+                                       self._camera_id_for(cam_key)))
+            if camera_out:
+                info["camera_info"] = camera_out
+            if camera_note:
+                info["camera_info_note"] = camera_note
             return info
 
         elif action == "start":
             input_topic = args.get("input_topic")
+            upstream_camera = args.get("camera_info")
             if not input_topic:
                 topics_list = args.get("input_topics") or []
                 if topics_list:
@@ -968,6 +1460,17 @@ class VideoDepthPerceptionPlugin:
             # owns its publishers, and answers recognize_by_photo /
             # recognize_by_url. It just has nothing to subscribe to.
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+
+            # Recorded before the node starts, so `info()` can answer with it
+            # even while the engine is still loading — and recorded even when it
+            # is empty, so a restart that no longer carries a declaration
+            # replaces the old one rather than leaving a stale entry claiming a
+            # lens that is no longer wired.
+            if input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
+                with self._nodes_lock:
+                    self._upstream_camera[node_key] = _camera_for_topic(
+                        upstream_camera, input_topic)
 
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
@@ -1035,6 +1538,19 @@ class VideoDepthPerceptionPlugin:
         elif action in ("calibrate", "reset_calibration"):
             if action == "reset_calibration" or args.get("reset"):
                 self._cal_samples = []
+                # Undo what `calibrate` wrote into the config, so reset means
+                # what it has always meant: back to whatever was configured
+                # before anyone measured, which with an untouched card is the
+                # engine's own fit.
+                if self._cal_cfg_backup is not None:
+                    for key, value in zip(
+                            ("cal_a", "cal_b", "calibration_preset"),
+                            self._cal_cfg_backup):
+                        if value is _ABSENT:
+                            self._plugin_cfg.pop(key, None)
+                        else:
+                            self._plugin_cfg[key] = value
+                    self._cal_cfg_backup = None
                 self._apply_calibration(*_calibration_from_cfg(self._plugin_cfg))
                 return self._calibration_report({"message": "标定已清空，恢复成 engine 自带的标定"})
 
@@ -1049,8 +1565,8 @@ class VideoDepthPerceptionPlugin:
 
             region = args.get("region") or "center"
             try:
-                raw, source = self._raw_depth_for_calibration(args, instance_id)
-                reading = sample_region(raw, region)
+                frames, source = self._raw_depth_for_calibration(args, instance_id)
+                reading = sample_region_over_frames(frames, region)
             except BadInput as error:
                 return error.as_result()
             except Exception as error:  # noqa: BLE001 — surfaced to the caller
@@ -1061,6 +1577,13 @@ class VideoDepthPerceptionPlugin:
                 "predicted_m": round(reading["distance_m"], 3),
                 "region": region,
                 "flatness": reading["flatness"],
+                # How much this reading moved while nothing did. Recorded per
+                # sample because it is the honest error bar on the fit, and
+                # because without it the next person will do what was done
+                # here: read structure into the residuals and add a parameter
+                # to explain it.
+                "frames": reading["frames"],
+                "scatter": reading["scatter"],
                 "source": source,
             })
             # Refit over every sample, not incrementally: `a` is pinned at 1.0
@@ -1069,14 +1592,56 @@ class VideoDepthPerceptionPlugin:
             cal_b = fit_cal_b([s["predicted_m"] for s in self._cal_samples],
                               [s["measured_m"] for s in self._cal_samples])
             self._apply_calibration(1.0, cal_b)
+            # Write the fit into the card's own config as the manual pair.
+            #
+            # It makes the card internally consistent: `info()` then reports
+            # `manual` rather than claiming a preset or the engine default is in
+            # play, which is what the reader of a distance needs to know.
+            #
+            # The pre-calibration pair is snapshotted first, because
+            # `reset_calibration` promises a return to *the engine's own fit* —
+            # writing here without that would quietly redefine reset as "go back
+            # to the last thing I measured", and there are two tests on the
+            # original meaning.
+            #
+            # **It is not persistence.** The canvas owns this config and pushes
+            # its own copy on every `config` call, including on project start,
+            # which will overwrite these two numbers with whatever the dialog
+            # holds. Until they are typed in there (or into
+            # perception/config.yaml) a restart loses the fit — and it has,
+            # twice, on r1_sz, each time silently restoring a 3.2x error.
+            if self._cal_cfg_backup is None:
+                self._cal_cfg_backup = (
+                    self._plugin_cfg.get("cal_a", _ABSENT),
+                    self._plugin_cfg.get("cal_b", _ABSENT),
+                    self._plugin_cfg.get("calibration_preset", _ABSENT))
+            self._plugin_cfg["cal_a"] = 1.0
+            self._plugin_cfg["cal_b"] = round(cal_b, 6)
+            # ...and switch the selector, or the rule above would ignore the fit
+            # that was just measured — writing two numbers nothing reads is
+            # worse than not writing them.
+            self._plugin_cfg["calibration_preset"] = CAL_MANUAL
             log.info(f"[visual_depth] calibrated: {len(self._cal_samples)} sample(s) "
                      f"→ cal_a=1.0 cal_b={cal_b:.4f}")
 
             extra = {
                 "sample": self._cal_samples[-1],
+                # The exact pair to put in the card's config dialog. Spelled out
+                # as a field rather than left in prose because it is the one
+                # thing that has to survive a restart, and prose does not get
+                # copied accurately.
+                "save_to_config": {"calibration_preset": CAL_MANUAL,
+                                   "cal_a": 1.0, "cal_b": round(cal_b, 6)},
                 "message": _calibration_message(self._cal_samples),
             }
             warnings = []
+            if reading["scatter"] > _SCATTER_LIMIT:
+                warnings.append(
+                    f"这个样本的帧间抖动是中位数的 {reading['scatter'] * 100:.0f}%"
+                    f"（{reading['frames']} 帧，阈值 {_SCATTER_LIMIT * 100:.0f}%）。"
+                    "读数本身就这么不稳，那么标定残差里的任何「规律」都可能只是"
+                    "抓到了哪一帧 —— 先让画面稳下来（别动、别让人走过），"
+                    "再判断误差是不是随距离变化。")
             if reading["flatness"] > _FLATNESS_LIMIT:
                 warnings.append(
                     f"取样区域看起来不是一个平面：区域内深度的四分位跨度是中位数的 "

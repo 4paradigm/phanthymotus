@@ -100,6 +100,11 @@ class NaviPlugin:
         self._executor = executor
         self._namespace = (namespace or "").strip("/")
         self._topic = self._cfg.get("topic") or DEFAULT_TOPIC
+        # A second, human-only port. Derived from the command topic so a card
+        # given a custom one keeps the pair together.
+        self._view_topic = str(self._cfg.get("view_topic") or
+                               (self._topic.rsplit("/", 1)[0] + "/view"))
+        self._view_hz = float(self._cfg.get("view_hz", 5.0))
 
         # Guards bookkeeping only — never a node start/stop, or a stop would
         # queue behind the start it is meant to cancel. Same rule as every
@@ -130,6 +135,13 @@ class NaviPlugin:
         # a publish behind the decode of a depth frame.
         self._obs_lock = threading.RLock()
         self._objects = None
+        self._view_publisher = None
+        self._view_next_at = 0.0
+        self._view_failed = False
+        # (width, height) of the frame vop's boxes are in, from its camera
+        # declaration. (0, 0) until one arrives — and then no box is converted,
+        # which is the honest answer rather than a guessed resolution.
+        self._objects_frame = (0, 0)
         self._objects_ms = 0
         # The last N detection payloads, for `list_visible_objects` to intersect.
         # A deque rather than a list: this is written every frame on the hot
@@ -144,6 +156,11 @@ class NaviPlugin:
         self._odom_ms = 0
         self._binding = {}
         self._acp_action_id = ""
+        self._limit_notes: list = []
+        # What `_adopt_camera` had to change or assume. Separate from
+        # `_limit_notes` only because they are populated at different points in
+        # `_start`; both end up in `degraded`.
+        self._camera_notes: list = []
 
     # ── tool ─────────────────────────────────────────────────────────────────
 
@@ -196,6 +213,12 @@ class NaviPlugin:
                             "即为换目标（旧目标立即作废）。异步：立即返回 "
                             "action_id，到达或失败时回调通知，失败的回调里带着原因"
                             "（没找到 / 被挡住 / 长时间没有进展）。"
+                            "**如果失败原因是「没找到」，先调 list_visible_objects "
+                            "看一眼机器人现在到底认出了什么**，再把看到的东西报给"
+                            "用户让他确认 —— 检测模型给同一个物体的类别并不稳定"
+                            "（同一个灭火器可能这一分钟叫 fire extinguisher、"
+                            "下一分钟叫 bottle），所以「没找到」往往是名字对不上，"
+                            "而不是东西不在。"
                             "**任务目的明确时直接调这个就行**（「去沙发那边」"
                             "「跟着那个人」），用普通名字即可，不必先 "
                             "list_visible_objects —— 那一步在这里只是多一次往返。",
@@ -212,31 +235,38 @@ class NaviPlugin:
                 "x-is-dangerous": True,
                 "x-resource": ["base"],
             },
+            # **Three knobs, not twenty-two.**
+            #
+            # Everything else lives in `actucore/config.yaml`, where it has the
+            # paragraph of explanation it needs, and stays reachable through the
+            # `config` action for anyone tuning. What it must not be is a form
+            # field: an operator asked to pick `release_frac` or
+            # `bearingless_std_factor` has no way to judge the answer, and the
+            # dialog's length hides the three that actually matter.
+            #
+            # There is a second, sharper reason. **agent-core sends every field
+            # in this schema on every config call, defaults included** — so a
+            # key here silently overrides the same key in config.yaml. On r1_sz
+            # the file said `vx_max: 0.6` and the card reported 0.4, because the
+            # schema default won. Every field removed from here is one fewer
+            # place for the file to be quietly ignored; every field kept has to
+            # carry the same default the file does, which `test_navi_card.py`
+            # now checks.
             "configSchema": {
                 "type": "object",
                 "properties": {
-                    "topic": {"type": "string", "default": DEFAULT_TOPIC,
-                              "scope": "instance"},
                     "rate_hz": {"type": "number", "default": 10,
+                                "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
-                    "priority": {"type": "integer", "default": 50,
-                                 "scope": "instance"},
-                    "stop_distance_m": {"type": "number", "default": 1.2,
+                    "stop_distance_m": {"type": "number", "default": 0.8,
+                                        "description": "走到目标前多远算到达（米）",
                                         "scope": "instance"},
-                    "slow_distance_m": {"type": "number", "default": 1.8,
+                    "obstacle_stop_m": {"type": "number", "default": 0.6,
+                                        "description": "正前方障碍近于这个距离就完全"
+                                                       "不前进（米）。必须小于 "
+                                                       "stop_distance_m，否则机器人会"
+                                                       "被它正要走向的目标挡停",
                                         "scope": "instance"},
-                    "obstacle_stop_m": {"type": "number", "default": 0.8,
-                                        "scope": "instance"},
-                    "vx_max": {"type": "number", "default": 0.4,
-                               "scope": "instance"},
-                    "wz_max": {"type": "number", "default": 0.8,
-                               "scope": "instance"},
-                    "align_tol": {"type": "number", "default": 0.08,
-                                  "scope": "instance"},
-                    "min_confidence": {"type": "number", "default": 0.35,
-                                       "scope": "instance"},
-                    "max_obs_age_ms": {"type": "number", "default": 500,
-                                       "scope": "instance"},
                 },
                 "required": [],
             },
@@ -245,7 +275,10 @@ class NaviPlugin:
             # the moment this one fails to start, which reads like a wiring
             # problem on a canvas that is wired correctly.
             "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT,
-                           "desc": "motus.control/1 twist 指令流"}],
+                           "desc": "motus.control/1 twist 指令流"},
+                          {"topic": self._view_topic, "format": "image/jpeg",
+                           "desc": "这张卡片看到的与决定的：深度图、走廊、目标框与"
+                                   "距离、三个轴的指令。只给人看"}],
             "topic_in": [
                 {"format": "data/json",
                  "desc": "vop 的检测结果（必需）"},
@@ -318,6 +351,15 @@ class NaviPlugin:
                     f"下游 mode 是 {mode!r}，这张卡片只会产生 {CONTROL_MODE!r} —— "
                     "它输出的是底盘速度，不是关节角")
 
+        # Fit the policy's ceilings to the robot before the first tick.
+        #
+        # Without this the card happily runs a configuration the chassis cannot
+        # execute — a `wz_max` under the robot's own deadband means every turn
+        # command snaps to all-or-nothing, and nothing anywhere says so. The
+        # notes go into `degraded` so the adjustment is visible rather than
+        # merely correct.
+        self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
+
         rate = negotiate.effective_rate(capabilities, descriptor,
                                         self._cfg.get("rate_hz"))
 
@@ -353,12 +395,59 @@ class NaviPlugin:
             # shows a card that looks perfectly healthy.
             return self._error(problem)
 
+        # Camera geometry, now that the inputs are bound and we know which
+        # topic carries the depth. This has to come after `_bind_inputs` and
+        # after `adopt_limits` — the corridor's half-width is read from the
+        # chassis footprint and its *angular* extent from the camera, and both
+        # have to be settled before the first tick converts one into the other.
+        camera_problem = self._adopt_camera(args.get("camera_info"), binding)
+        if camera_problem:
+            self._unwind()
+            return self._error(camera_problem)
+
         self._binding = binding
         log.info("navi started: topic=%s %.1f Hz ttl=%d ms inputs=%s",
                  self._topic, rate, self._ttl_ms, binding)
         return {"state": "running", "topic": self._topic, "rate_hz": rate,
                 "ttl_ms": self._ttl_ms, "inputs": binding,
                 "degraded": self._degradations()}
+
+    def _adopt_camera(self, declarations, binding: dict) -> str:
+        """Adopt the depth camera's geometry; return a reason to refuse, or "".
+
+        Two jobs, and only the second can refuse a start.
+
+        **Adopt.** The half field of view belongs to the camera and used to be
+        typed into this card's config by hand. On r1_sz it read 0.55 rad against
+        a lens measuring 0.888, which made the metric corridor 1.86 m wide —
+        wider than any door — so every doorframe counted as dead ahead and the
+        robot turned away from openings it fitted through. Missing declarations
+        are not fatal: the conservative fallback stands and `degraded` says so.
+
+        **Check both eyes are the same eye.** vop reports a *normalised* lateral
+        offset and the depth map is a grid of distances; this card turns both
+        into metres with one field of view, which is only correct if both come
+        from the same lens. Nothing has ever enforced that — inputs are bound by
+        what they carry, deliberately, so wiring camera A's vop to camera B's
+        depth has always been available and would produce confidently wrong
+        distances. Now that both sides declare an `id`, it is a comparison.
+        """
+        from .camera import camera_id, for_topic
+
+        depth_topic = binding.get("depth_map") or binding.get("depth_summary")
+        depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
+        self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
+
+        objects_decl = for_topic(declarations, binding.get("objects"))
+        self._objects_frame = (objects_decl.get("width") or 0,
+                               objects_decl.get("height") or 0)
+        depth_id, objects_id = camera_id(depth_decl), camera_id(objects_decl)
+        if depth_id and objects_id and depth_id != objects_id:
+            return (f"两路输入来自不同的相机：检测结果来自 {objects_id}，深度图来自 "
+                    f"{depth_id}。这张卡片用同一个视场角把两者都换算成米，"
+                    f"两颗镜头就会算出看起来合理但错的距离 —— 请把 vop 和 "
+                    f"visual_depth 接到同一颗相机上")
+        return ""
 
     def _capabilities(self) -> dict:
         return {"control_mode": CONTROL_MODE,
@@ -400,7 +489,12 @@ class NaviPlugin:
                     "message": f"已订阅 {self._binding['objects']}，但还没收到任何"
                                f"检测结果 —— 确认 vop 卡片在运行且相机有画面"}
 
-        need = max(1, int(round(len(frames) * 0.6)))
+        # Same bar as the tracker's: something that would be *chased* after
+        # `confirm_hits` of `confirm_window` frames should be *listed* on the
+        # same evidence. The two used to disagree by an order of magnitude —
+        # ten frames to appear in this list, one frame to start driving a
+        # chassis — and the list was the strict one.
+        need = self._stability_bar(len(frames))
         items = policy_mod.stable_objects(frames, min_frames=need,
                                           config=self._config)
         out = []
@@ -478,14 +572,19 @@ class NaviPlugin:
             out["visible_now"] = visible
         return out
 
+    def _stability_bar(self, frames: int) -> int:
+        """How many of `frames` an object must appear in to count as really there."""
+        ratio = self._config.confirm_hits / max(1, self._config.confirm_window)
+        return max(1, min(frames, int(round(frames * ratio))))
+
     def _visible_keys(self) -> list:
         with self._obs_lock:
             frames = list(self._recent)
         if not frames:
             return []
-        need = max(1, int(round(len(frames) * 0.6)))
         return [o["key"] for o in policy_mod.stable_objects(
-            frames, min_frames=need, config=self._config)]
+            frames, min_frames=self._stability_bar(len(frames)),
+            config=self._config)]
 
     @staticmethod
     def _matches_anything(target: str, keys) -> bool:
@@ -540,9 +639,16 @@ class NaviPlugin:
     def _config_action(self, args: dict):
         changed = {}
         for key, value in (args or {}).items():
-            if key in policy_mod.Config.__dataclass_fields__ and value is not None:
-                setattr(self._config, key, float(value))
-                changed[key] = float(value)
+            field = policy_mod.Config.__dataclass_fields__.get(key)
+            if field is None or value is None:
+                continue
+            # Coerce to the field's own type. Blanket `float()` turned
+            # `use_lateral` into 1.0 — truthy, so it worked, which is exactly
+            # how a field ends up holding the wrong type for a year.
+            cast = (bool if field.type in ("bool", bool)
+                    else int if field.type in ("int", int) else float)
+            setattr(self._config, key, cast(value))
+            changed[key] = getattr(self._config, key)
         return {"status": "configured", "config": changed}
 
     def _info(self):
@@ -562,10 +668,24 @@ class NaviPlugin:
                 # ever — which is exactly how it presented on r1_sz: subscribing
                 # to /actucore/navi/cmd with rclpy received commands at 10 Hz
                 # while the canvas showed nothing.
-                "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT}],
+                # Both ports. agent-core registers the bus topics off this
+                # reply, so a port missing here is a card that publishes into a
+                # topic the dashboard never subscribes to — healthy everywhere,
+                # invisible in the panel.
+                "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT},
+                              {"topic": self._view_topic,
+                               "format": "image/jpeg"}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
                 "published": self._published,
+                # (width, height) of the frame vop's boxes are in. (0, 0) means
+                # no declaration arrived and boxes cannot be used — see
+                # `_degradations`.
+                "objects_frame": list(self._objects_frame),
+                # Why the overlay has a box or has not, without guessing: how
+                # many detections arrived, how many carry a usable box, and how
+                # many of those are the thing being chased.
+                "boxes": self._box_stats(),
                 "inputs": dict(self._binding),
                 # Which precision the card is actually operating at. A card
                 # falling back to the summary and a card working properly look
@@ -575,6 +695,10 @@ class NaviPlugin:
                           "distance_m": decision.distance_m,
                           "bearing": decision.bearing}
                          if decision else None),
+                # **Coasting has to be visible here.** A robot walking towards a
+                # prediction and a robot walking towards something it can see
+                # produce identical commands, and only this says which is which.
+                "track": self._state.tracker.describe(),
                 "error": self._last_error,
             }
 
@@ -589,12 +713,40 @@ class NaviPlugin:
         out = []
         if not self._binding.get("depth_map"):
             out.append("只接了深度摘要，没有深度图 —— 距离按目标所在的三分之一"
-                       "画面估计，精度明显变差")
+                       "画面估计，精度明显变差；避障也退回按画面三等分判断，"
+                       "那是一个**角度**扇区，近处比机器人还窄（0.8 m 处只覆盖"
+                       "±0.16 m），肩膀会擦到判据之外的东西。摘要还无法表达"
+                       "「这一段有多少像素是有效的」，所以满是空洞的一段会被"
+                       "当成空旷")
         if not self._binding.get("odom"):
-            out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停")
+            out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
+                       "且目标被遮挡时只能按**指令**（而非实测）推算它去了哪，"
+                       "dry_run、姿态被拒、死区归零都会让两者对不上")
+        # The chassis is wired but swallowing everything. Without this the card
+        # reports a healthy stream of commands, the driver reports APPLIED, and
+        # the robot stands still — which is exactly how it presented on r1_sz
+        # right after a deploy reset the driver's config to its image defaults.
+        if self._descriptor.get("dry_run"):
+            out.append("下游底盘是 dry_run —— 指令会被完整接收、检查、计数，"
+                       "然后**丢掉**，机器人不会动")
+        if self._descriptor.get("rotate_only"):
+            out.append("下游底盘是 rotate_only —— vx/vy 会被清零，只执行转向")
         if self._running and not self._descriptor:
             out.append("没有接驱动的底盘命令卡片 —— 指令只发到话题上，"
                        "不会驱动任何硬件（想看它算什么的话，这是对的）")
+        out.extend(self._limit_notes)
+        out.extend(self._camera_notes)
+        if not all(self._objects_frame):
+            # **Not a cosmetic loss.** Without the frame size vop's pixel boxes
+            # cannot be normalised, and `target_distance` silently drops from
+            # "percentile over the whole target" to "one small patch at its
+            # centre" — the degradation this card documents as the cost of vop
+            # running without `publish_bbox`, reached by a different route and
+            # previously reported by nothing. The overlay's missing box is the
+            # same fact, seen.
+            out.append("vop 没有声明 camera_info 的分辨率 —— 它的像素框无法归一化，"
+                       "目标距离退化成中心一小块取样（而不是整框取分位），叠加图上"
+                       "也不会有目标框")
         for hint in (self._binding.get("unknown") or []):
             out.append(f"有一路输入没有被使用：{hint}")
         return out
@@ -711,6 +863,41 @@ class NaviPlugin:
             return "", f"{topic}（String，但话题名不符合 perception 的命名约定，无法确定用途）"
         return "", f"{topic}（{'/'.join(types) or '暂无发布者，且话题名不符合命名约定'}）"
 
+    def _normalise_boxes(self, payload: dict) -> dict:
+        """Give every detection a `bbox_norm`, from the pixel box vop publishes.
+
+        **These two sides never agreed on a key.** vop publishes `bbox` in *its
+        camera's* pixels; `policy.target_distance` asks for `bbox_norm` in 0..1.
+        Nobody publishes that name, so the box path has never once run: every
+        target's distance has come from the centre-patch fallback, and
+        `_degradations()` did not catch it because it checks the config switch
+        rather than whether a box ever arrived.
+
+        `sample_box`'s own docstring says why the normalised form is the one
+        that crosses the boundary: vop's pixels are in its camera's resolution
+        and the depth map has been resampled to 640x480, so passing pixels
+        across "produces plausible numbers for the wrong part of the image".
+        The contract was right; the key name was never wired.
+
+        The frame size comes from the camera declaration on the objects topic
+        (`motus.camera/1`). **No declaration, no conversion** — inferring the
+        resolution from a box that happens to be large would be exactly the kind
+        of plausible guess this card keeps being bitten by.
+        """
+        objects = (payload or {}).get("objects")
+        if not isinstance(objects, list):
+            return payload
+        width, height = self._objects_frame
+        for obj in objects:
+            if not isinstance(obj, dict) or obj.get("bbox_norm"):
+                continue
+            box = obj.get("bbox")
+            if not box or len(box) != 4 or not (width and height):
+                continue
+            x1, y1, x2, y2 = (float(v) for v in box)
+            obj["bbox_norm"] = [x1 / width, y1 / height, x2 / width, y2 / height]
+        return payload
+
     def _on_string(self, role, message):
         try:
             payload = json.loads(message.data)
@@ -719,16 +906,26 @@ class NaviPlugin:
         now = int(time.time() * 1000)
         with self._obs_lock:
             if role == "objects":
-                self._objects = payload
+                self._objects = self._normalise_boxes(payload)
                 self._objects_ms = now
                 self._recent.append(payload)
             elif role == "depth_summary":
                 self._depth_bands = depth_mod.bands_from_summary(payload)
                 self._depth_ms = now
             elif role == "odom":
+                # All three axes the policy uses, not just `vx`. The stuck
+                # detector only ever wanted forward speed, but the tracker
+                # compensates its prediction for the robot's whole twist —
+                # yaw most of all, since on a legged chassis turning is what
+                # moves a target across the frame fastest.
+                #
                 # `axis_of` returns None for an unmeasured axis rather than
-                # 0.0 — the stuck detector depends on the difference.
-                self._odom = {"vx": odom_mod.axis_of(payload, "vx")}
+                # 0.0, and both consumers depend on the difference: a robot
+                # that cannot answer "am I moving" must not look stopped, and
+                # one that cannot answer "am I turning" must not have its own
+                # rotation assumed to be zero.
+                self._odom = {axis: odom_mod.axis_of(payload, axis)
+                              for axis in ("vx", "vy", "wz")}
                 self._odom_ms = now
 
     def _on_depth_map(self, message):
@@ -748,10 +945,14 @@ class NaviPlugin:
 
     def _open_publisher(self):
         from rclpy.node import Node
+        from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
         node = Node(f"navi_{abs(hash(self._topic)) % 100000}")
         self._publisher = node.create_publisher(String, self._topic, 10)
+        if self._view_hz > 0:
+            self._view_publisher = node.create_publisher(
+                CompressedImage, self._view_topic, 2)
         self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick)
         self._executor.add_node(node)
         with self._lock:
@@ -797,10 +998,16 @@ class NaviPlugin:
         # Lift the command out of the robot's deadband, or drop it to zero. The
         # threshold comes from the downstream descriptor — it is a property of
         # the robot, and this policy should not know any robot's numbers.
-        values = policy_mod.apply_deadband(
-            decision.values,
-            ((self._descriptor.get("limits") or {}).get("min_magnitude")
-             if self._descriptor else None))
+        #
+        # **Which threshold depends on what the command itself asks for.** On a
+        # legged chassis the yaw deadband is a property of the gait, not of the
+        # axis: R1 needs 1.0 rad/s to start turning from a standstill and 0.05
+        # once it is already walking. Applying the standing figure to a command
+        # that also translates inflates a small correction twenty-fold — and
+        # this line would have done exactly that to every command the policy
+        # had just been careful not to quantise.
+        values = policy_mod.apply_deadband(decision.values,
+                                           self._deadband_for(decision.values))
 
         self._seq += 1
         obs_ms = self._objects_ms or int(now * 1000)
@@ -846,6 +1053,20 @@ class NaviPlugin:
             }
         return message
 
+    def _deadband_for(self, values) -> list:
+        """The floors that apply to *this* command.
+
+        `min_magnitude_moving` is optional, so a chassis that does not declare
+        one keeps the standing floors everywhere — the old behaviour, which errs
+        towards commanding too much rather than too little.
+        """
+        limits = (self._descriptor.get("limits") or {}) if self._descriptor else {}
+        standing = limits.get("min_magnitude")
+        moving = limits.get("min_magnitude_moving")
+        if not moving or not (values[0] or values[1]):
+            return standing
+        return list(moving)
+
     def _tick(self):
         publisher = self._publisher
         if publisher is None or not self._running or self._paused:
@@ -860,6 +1081,13 @@ class NaviPlugin:
                 self._last_error = f"{type(error).__name__}: {error}"
             log.warning("navi tick failed: %s", error)
             return
+        # **Before the early return, not after it.** The tick publishes nothing
+        # when the decision is to publish nothing — blind, searching, arrived,
+        # refused — and those are exactly the moments somebody wants the picture
+        # for. Drawing only while commands flow would make the overlay go dark
+        # precisely when the robot stops explaining itself.
+        self._publish_view()
+
         if message is None:
             self._maybe_complete()
             return
@@ -872,6 +1100,112 @@ class NaviPlugin:
         with self._lock:
             self._published += 1
         self._maybe_complete()
+
+    def _publish_view(self):
+        """Draw the decision, if it is time and if drawing works.
+
+        **Wrapped whole, and rate-limited separately from the command stream.**
+        A picture for a human must never be able to stop a robot: an exception
+        in a colour map, a missing codec, an image this card has no business
+        failing on — none of that may reach the tick that feeds the chassis. So
+        a failure here is counted and logged once, and the commands carry on.
+        """
+        publisher = self._view_publisher
+        if publisher is None or self._view_hz <= 0:
+            return
+        now = time.monotonic()
+        if now < self._view_next_at:
+            return
+        self._view_next_at = now + 1.0 / self._view_hz
+        try:
+            from sensor_msgs.msg import CompressedImage
+
+            from . import view as view_mod
+
+            box, measured = self._target_box()
+            frame = view_mod.render(
+                depth_m=self._depth_map,
+                decision=self._last_decision,
+                track=self._state.tracker.describe(),
+                box=box, measured=measured,
+                clearance=self._state.last_clearance,
+                coverage=self._state.last_coverage,
+                config=self._config)
+            message = CompressedImage()
+            message.format = "jpeg"
+            message.data = view_mod.encode(frame)
+            publisher.publish(message)
+        except Exception as error:                            # noqa: BLE001
+            if not self._view_failed:
+                self._view_failed = True
+                log.warning("navi view render failed, disabling it: %s", error,
+                            exc_info=True)
+            self._view_publisher = None
+
+    def _box_stats(self) -> dict:
+        payload = self._objects or {}
+        objects = payload.get("objects") or []
+        target = (self._state.target or "").strip().lower()
+        named = [o for o in objects
+                 if target and (target in str(o.get("name") or "").lower()
+                                or str(o.get("name") or "").lower() in target)]
+        return {
+            "detections": len(objects),
+            "with_bbox": sum(1 for o in objects if o.get("bbox")),
+            "with_bbox_norm": sum(1 for o in objects if o.get("bbox_norm")),
+            "matching_target": len(named),
+            "target_has_box": sum(1 for o in named if o.get("bbox_norm")),
+        }
+
+    def _target_box(self):
+        """`(box, measured_distance)` for the thing being chased, or `(None, None)`.
+
+        The measured distance is drawn **next to the tracker's**, and that
+        comparison is the point. The two are different quantities: one is what
+        the depth map says right now, the other is a filtered estimate that has
+        been ego-motion compensated every tick since the last observation. When
+        there is no odometry the compensation runs on the *commanded* twist, so
+        a robot told to walk at 1 m/s that does not quite manage it has its
+        target dragged 0.1 m closer per tick with nothing to pull it back but a
+        4 Hz detector — which shows up as a tracked range **below the nearest
+        thing in the whole picture**, an impossible reading that nothing was
+        reporting.
+
+        Associated here rather than carried through the tracker on purpose: the
+        tracker works in metres and bearings and has no use for a rectangle, and
+        threading one through it to draw a picture would put display concerns
+        into the estimator. The cost is that this is a *display-time* guess —
+        the nearest detection by bearing, of the right name — and when the
+        detector is not seeing the target at all there is simply no box, which
+        is itself the thing worth showing.
+        """
+        payload = self._objects or {}
+        target = (self._state.target or "").strip().lower()
+        track = self._state.tracker.track
+        if not target or track is None:
+            return None, None
+        best, best_gap, best_obj = None, 1e9, None
+        for obj in payload.get("objects") or []:
+            name = str(obj.get("name") or "").lower()
+            if target not in name and name not in target:
+                continue
+            box = obj.get("bbox_norm")
+            if not box:
+                continue
+            position = obj.get("position") or [0.0, 0.0]
+            bearing = float(position[0]) * self._config.half_fov_rad
+            gap = abs(bearing - track.bearing_rad)
+            if gap < best_gap:
+                best, best_gap, best_obj = box, gap, obj
+        if best_obj is None:
+            return None, None
+        source = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
+                  if self._depth_map is not None or self._depth_bands else None)
+        try:
+            measured = policy_mod.target_distance(best_obj, source, self._config)
+        except Exception:                                     # noqa: BLE001
+            measured = None
+        return best, measured
 
     def _maybe_complete(self):
         """Report the outcome once, on arrival **or** failure.

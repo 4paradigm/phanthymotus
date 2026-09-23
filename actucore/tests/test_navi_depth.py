@@ -173,3 +173,102 @@ def test_a_summary_missing_a_region_yields_none_for_it():
     assert D.bands_from_summary({"nearest_by_region": {}})["center"] is None
     assert D.bands_from_summary({})["left"] is None
     assert D.bands_from_summary(None)["left"] is None
+
+
+# ── the corridor ─────────────────────────────────────────────────────────────
+#
+# A band is a slice of the *image*; a collision is metric. That mismatch is the
+# reason this section exists, and the first test is the whole argument.
+
+_HALF_FOV = 0.55          # ~63 degrees, navi's default
+
+
+def _columns():
+    return ((np.arange(D.WIDTH) - (D.WIDTH - 1) / 2.0)
+            * (2.0 * np.tan(_HALF_FOV) / D.WIDTH))
+
+
+def _with_patch(background, lateral_m, distance_m, width_m, rows=(290, 400)):
+    """A depth map holding one patch at a metric position, right-positive."""
+    out = np.full((D.HEIGHT, D.WIDTH), float(background), dtype=np.float32)
+    columns = np.abs(_columns() * distance_m - lateral_m) <= width_m / 2.0
+    out[rows[0]:rows[1], columns] = distance_m
+    return out
+
+
+def _corridor(depth_map, **over):
+    args = {"half_width_m": 0.33, "half_fov_rad": _HALF_FOV, "reference_m": 0.8}
+    args.update(over)
+    return D.corridor(depth_map, **args)
+
+
+def test_an_obstacle_the_bands_call_left_can_be_inside_the_robots_width():
+    """The failure this whole mechanism exists for.
+
+    At 0.7 m the centre third of a 63° lens spans ±0.14 m — **narrower than a
+    humanoid's shoulders**. So a doorframe 0.25 m off the axis is filed under
+    "left", the left band has never stopped forward motion, and the shoulder
+    goes into it while the depth map reports the way ahead as clear.
+    """
+    depth_map = _with_patch(5.0, lateral_m=-0.25, distance_m=0.7, width_m=0.1)
+
+    assert D.nearest_by_band(depth_map)["center"] == pytest.approx(5.0), \
+        "the centre band sees nothing — which is the bug"
+    assert D.nearest_by_band(depth_map)["left"] == pytest.approx(0.7)
+
+    clearance, coverage = _corridor(depth_map)
+    assert clearance == pytest.approx(0.7), "the corridor sees it"
+    assert coverage > 0.9
+
+
+def test_the_corridor_still_ignores_what_the_robot_will_miss():
+    """It has to cut both ways, or it is just a wider band: a thing well outside
+    the robot's width must not stop it."""
+    depth_map = _with_patch(5.0, lateral_m=-1.2, distance_m=2.0, width_m=0.3)
+    clearance, _ = _corridor(depth_map)
+    assert clearance == pytest.approx(5.0)
+
+
+def test_a_corridor_full_of_holes_does_not_read_as_an_empty_one():
+    """`clearance` alone cannot express this: every invalid pixel drops silently
+    out of the minimum, so a corridor nobody could measure and a corridor with
+    nothing in it produce the same number. The things that make holes — chair
+    legs, glass, dark edges — are the things that catch a shoulder."""
+    depth_map = np.full((D.HEIGHT, D.WIDTH), np.nan, dtype=np.float32)
+    clearance, coverage = _corridor(depth_map)
+    assert clearance is None
+    assert coverage == 0.0
+
+
+def test_coverage_is_graduated_rather_than_a_flag():
+    solid = _corridor(np.full((D.HEIGHT, D.WIDTH), 5.0, dtype=np.float32))[1]
+    patchy = np.full((D.HEIGHT, D.WIDTH), 5.0, dtype=np.float32)
+    patchy[::2, :] = np.nan
+    assert solid == pytest.approx(1.0, abs=0.02)
+    assert 0.3 < _corridor(patchy)[1] < 0.7
+
+
+def test_a_corridor_wider_than_the_lens_cannot_be_fully_covered():
+    """Close in, the robot is wider than the field of view — at half a metre a
+    ±0.33 m corridor spans about 67° and a 63° lens does not reach its edges.
+    Counting only the visible columns would report a fully-measured corridor
+    while a third of the robot's width was never in frame."""
+    solid = np.full((D.HEIGHT, D.WIDTH), 5.0, dtype=np.float32)
+    assert _corridor(solid, reference_m=0.5)[1] < 0.95
+    assert _corridor(solid, reference_m=1.5)[1] == pytest.approx(1.0, abs=0.02)
+
+
+def test_a_corridor_entirely_outside_the_lens_reports_no_coverage():
+    """Not an error and not a division by zero. Zero is the truth: asked about
+    a place the camera cannot see, the honest answer is "I cannot see there"."""
+    solid = np.full((D.HEIGHT, D.WIDTH), 5.0, dtype=np.float32)
+    clearance, coverage = _corridor(solid, lateral_offset_m=6.0, reference_m=0.8)
+    assert coverage == 0.0
+
+
+def test_the_offset_corridor_is_the_space_a_sidestep_moves_into():
+    """Which is a different question from "is the right of the picture empty",
+    and the one that decides whether a shoulder clears."""
+    depth_map = _with_patch(5.0, lateral_m=0.35, distance_m=1.0, width_m=0.2)
+    assert _corridor(depth_map, lateral_offset_m=0.33)[0] == pytest.approx(1.0)
+    assert _corridor(depth_map, lateral_offset_m=-0.33)[0] == pytest.approx(5.0)

@@ -213,8 +213,66 @@ def _install_fake_cv2():
         cols = (_np.arange(width) * src.shape[1] // width).clip(0, src.shape[1] - 1)
         return src[rows][:, cols]
 
+    def cvtColor(src, code):
+        if code != cv2.COLOR_BGR2GRAY:
+            raise NotImplementedError(f"fake cv2: cvtColor code {code}")
+        return src.mean(axis=2).astype(_np.uint8)
+
+    def connectedComponents(image, connectivity=8):
+        """Two-pass labelling with union-find. 4-connectivity only.
+
+        Small and slow, which is fine: the frames in these tests are tens of
+        pixels across. It exists so `lens_barrel_mask` runs for real here —
+        stubbing it out to "no mask" would make every test of the masking path
+        pass by not testing it.
+        """
+        rows, cols = image.shape
+        labels = _np.zeros((rows, cols), dtype=_np.int32)
+        parent = [0]
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        for r in range(rows):
+            for c in range(cols):
+                if not image[r, c]:
+                    continue
+                up = labels[r - 1, c] if r else 0
+                left = labels[r, c - 1] if c else 0
+                if up and left:
+                    labels[r, c] = min(up, left)
+                    union(up, left)
+                elif up or left:
+                    labels[r, c] = up or left
+                else:
+                    parent.append(len(parent))
+                    labels[r, c] = len(parent) - 1
+
+        remap, nxt = {0: 0}, 1
+        for r in range(rows):
+            for c in range(cols):
+                if not labels[r, c]:
+                    continue
+                root = find(labels[r, c])
+                if root not in remap:
+                    remap[root] = nxt
+                    nxt += 1
+                labels[r, c] = remap[root]
+        return nxt, labels
+
+    cv2.COLOR_BGR2GRAY = 6
     cv2.imdecode = imdecode
     cv2.resize = resize
+    cv2.cvtColor = cvtColor
+    cv2.connectedComponents = connectedComponents
     sys.modules["cv2"] = cv2
 
 

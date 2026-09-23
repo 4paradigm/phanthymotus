@@ -210,7 +210,11 @@ def test_info_reports_metres_and_says_whose_calibration():
 def test_info_reports_a_site_calibration_once_one_is_set():
     plugin, _ = _plugin(cfg={"cal_a": 0.97, "cal_b": 0.12})
     info = plugin.dispatch("visual_depth", {"action": "info"})
-    assert info["calibration"] == "site"
+    # The label gained a suffix: a fit typed in by hand, one taken from a preset
+    # table and one fitted live against a tape measure are three different
+    # levels of evidence, and only the last was measured on *this* camera.
+    assert info["calibration"].startswith("site")
+    assert info["calibration"] == "site:manual"
     assert "note" not in info
 
 
@@ -525,7 +529,7 @@ def test_calibrate_from_a_photo_fits_and_applies_immediately(tmp_path):
     assert result["samples"] == 1
     assert result["sample"]["predicted_m"] == pytest.approx(4.0)
     assert result["residuals"][0]["corrected_m"] == pytest.approx(2.0, abs=0.01)
-    assert result["calibration"] == "site"
+    assert result["calibration"].startswith("site:calibrate")
     # In-memory only — saying so is the difference between a calibration that
     # survives a restart and one that quietly does not.
     assert "cal_a / cal_b" in result["persist"]
@@ -726,3 +730,345 @@ def test_a_one_shot_answer_carries_no_boilerplate(tmp_path):
     # What does survive: the measurements, and one token of provenance.
     assert result["calibration"] == "model-default"
     assert result["nearest"] and result["farthest"] and result["average"]
+
+
+
+
+# ── one sample is one frame, and that was the whole problem ──────────────────
+
+def test_a_sample_is_the_median_of_many_frames_not_one():
+    """Measured on r1_sz: robot stationary, same wall, fourteen consecutive
+    frames spanned 1.68-2.09 m — 22% peak to peak. Two `calibrate` calls at the
+    same 1.6 m gave 3.82 and 5.00, 31% apart. Four such single-frame samples
+    were then fitted with two parameters, and the residuals argued convincingly
+    for a log-slope that was entirely noise."""
+    frames = [np.full((48, 64), value, dtype=np.float32)
+              for value in (1.68, 1.81, 1.83, 1.92, 2.09)]
+    out = depth_plugin.sample_region_over_frames(frames, "center")
+    assert out["distance_m"] == pytest.approx(1.83, abs=0.01), "median of the per-frame medians"
+    assert out["frames"] == 5
+
+
+def test_one_bad_frame_does_not_move_the_answer():
+    """The median of the per-frame medians, not the median of everything
+    pooled: pooling lets one frame move the answer by its share of the pixels."""
+    frames = [np.full((48, 64), 2.0, dtype=np.float32) for _ in range(6)]
+    frames.append(np.full((48, 64), 40.0, dtype=np.float32))
+    assert depth_plugin.sample_region_over_frames(frames, "center")["distance_m"] == pytest.approx(2.0)
+
+
+def test_the_scatter_is_reported_because_it_is_the_error_bar():
+    """Without it the next person reads structure into the residuals and adds a
+    parameter to explain it — which is exactly what happened."""
+    steady = [np.full((48, 64), 2.0, dtype=np.float32) for _ in range(5)]
+    assert depth_plugin.sample_region_over_frames(steady, "center")["scatter"] == pytest.approx(0.0)
+
+    wobbly = [np.full((48, 64), v, dtype=np.float32) for v in (1.7, 1.8, 2.1)]
+    out = depth_plugin.sample_region_over_frames(wobbly, "center")
+    assert out["scatter"] == pytest.approx((2.1 - 1.7) / 1.8, abs=0.01)
+    assert out["scatter"] > depth_plugin._SCATTER_LIMIT, "22% on r1_sz has to trip the warning"
+
+
+def test_a_frame_with_nothing_valid_is_skipped_rather_than_fatal():
+    frames = [np.full((48, 64), np.nan, dtype=np.float32),
+              np.full((48, 64), 2.0, dtype=np.float32)]
+    out = depth_plugin.sample_region_over_frames(frames, "center")
+    assert out["frames"] == 1 and out["distance_m"] == pytest.approx(2.0)
+
+
+def test_no_usable_frame_is_an_error_not_a_zero():
+    """Zero metres is the most alarming thing a depth consumer can be told."""
+    with pytest.raises(ValueError):
+        depth_plugin.sample_region_over_frames(
+            [np.full((48, 64), np.nan, dtype=np.float32)], "center")
+
+
+# ── presets: a number that looks like a fact needs a provenance ──────────────
+
+def test_a_preset_supplies_a_fit_when_nothing_was_typed():
+    cfg = {"calibration_preset": "Unitree R1"}
+    a, b = depth_plugin._calibration_from_cfg(cfg)
+    assert (a, b) == (1.0, depth_plugin.CALIBRATION_PRESETS["Unitree R1"]["cal_b"])
+
+
+def test_the_selector_decides_when_there_is_one():
+    """The dropdown says what is in effect instead of leaving it to be
+    inferred. A preset selected while numbers sit in the fields means the
+    preset."""
+    cfg = {"calibration_preset": "Unitree R1", "cal_a": 1.0, "cal_b": -0.5}
+    assert depth_plugin._calibration_from_cfg(cfg)[1] != -0.5
+    cfg["calibration_preset"] = depth_plugin.CAL_MANUAL
+    assert depth_plugin._calibration_from_cfg(cfg) == (1.0, -0.5)
+
+
+def test_a_file_config_without_a_selector_still_applies_its_numbers():
+    """`perception/config.yaml` has no dropdown, and writing `cal_b: -0.9`
+    there has always meant "apply this". Requiring the selector would silently
+    stop that working — which is how a file config becomes decoration."""
+    assert depth_plugin._calibration_from_cfg({"cal_a": 1.0, "cal_b": -0.9}) == (1.0, -0.9)
+    assert depth_plugin.calibration_origin({"cal_b": -0.9}) == "manual"
+
+
+def test_numbers_the_selector_is_ignoring_are_said_out_loud():
+    """Dropping them quietly is the failure this card keeps running into."""
+    assert depth_plugin.calibration_conflict(
+        {"calibration_preset": depth_plugin.CAL_NONE, "cal_b": -0.9})
+    assert not depth_plugin.calibration_conflict(
+        {"calibration_preset": depth_plugin.CAL_MANUAL, "cal_b": -0.9})
+    assert not depth_plugin.calibration_conflict({"cal_b": -0.9})
+
+
+def test_an_untouched_pair_does_not_shadow_the_preset():
+    cfg = {"calibration_preset": "Unitree R1", "cal_a": 1.0, "cal_b": 0.0}
+    assert depth_plugin._calibration_from_cfg(cfg)[1] != 0.0
+
+
+def test_the_dropdown_has_no_blank_row():
+    """An option you cannot see is an option you cannot choose deliberately —
+    the same shape as every other silent default this card has been bitten by.
+    "" is still accepted from an existing config, but it is not offered."""
+    enum = depth_plugin.TOOLS[0]["configSchema"]["properties"]["calibration_preset"]["enum"]
+    assert "" not in enum
+    assert enum[0] == depth_plugin.CAL_AUTO
+    assert depth_plugin.CAL_NONE in enum and depth_plugin.CAL_MANUAL in enum
+    assert depth_plugin._calibration_from_cfg({"calibration_preset": ""}) == (1.0, 0.0)
+
+
+def test_an_unknown_preset_falls_back_rather_than_guessing():
+    assert depth_plugin._calibration_from_cfg({"calibration_preset": "nope"}) == (1.0, 0.0)
+
+
+def test_every_preset_records_where_it_came_from():
+    """A preset chosen for the wrong camera fails exactly the way the engine's
+    own default failed on r1_sz — silently, by a factor of three. Whoever picks
+    one has to be able to see what it was measured on."""
+    for name, preset in depth_plugin.CALIBRATION_PRESETS.items():
+        for field in ("camera", "measured_on", "samples", "range_m", "note"):
+            assert preset.get(field), f"{name} 缺少出处字段 {field}"
+
+
+def test_the_origin_is_reported_and_distinguishes_the_four_cases():
+    assert depth_plugin.calibration_origin({}) == "model-default"
+    assert depth_plugin.calibration_origin(
+        {"calibration_preset": "Unitree R1"}) == "preset:Unitree R1"
+    assert depth_plugin.calibration_origin(
+        {"calibration_preset": depth_plugin.CAL_MANUAL, "cal_b": -0.9}) == "manual"
+    assert depth_plugin.calibration_origin({"depth_scale": 0.4}) == "legacy-depth_scale"
+
+
+def test_a_preset_names_the_camera_even_though_it_is_labelled_by_robot():
+    """Named for the robot because that is what the person choosing one knows,
+    but it is a property of the lens — and a variant shipping a different
+    camera must not quietly inherit this entry. The `camera` field is where
+    that check can be made; r1_sz's lens is ~102 degrees across, which is why
+    the engine's general-purpose fit was out by 3.2x to begin with."""
+    for name, preset in depth_plugin.CALIBRATION_PRESETS.items():
+        assert len(str(preset["camera"])) > 8, (
+            f"{name} 的 camera 字段太短，说不清它到底标的是哪个镜头")
+
+
+def test_the_default_asks_the_camera_and_corrects_nothing_without_one():
+    """The default is now automatic, but automatic with **no camera** must be
+    identical to no correction — a preset applied to the wrong camera is the
+    failure this whole mechanism exists to make visible, and "I could not tell
+    which camera this is" is precisely the wrong-camera case."""
+    schema = depth_plugin.TOOLS[0]["configSchema"]["properties"]
+    assert schema["calibration_preset"]["default"] == depth_plugin.CAL_AUTO
+    assert schema["cal_a"]["default"] == 1.0 and schema["cal_b"]["default"] == 0.0
+    assert depth_plugin._calibration_from_cfg({}) == (1.0, 0.0)
+    assert depth_plugin.calibration_origin({}) == "model-default"
+
+    auto = {"calibration_preset": depth_plugin.CAL_AUTO}
+    assert depth_plugin._calibration_from_cfg(auto) == (1.0, 0.0)
+    assert depth_plugin.calibration_origin(auto) == "auto:no-camera"
+
+
+def test_every_schema_default_matches_the_file_default():
+    """**agent-core sends every schema field on every config call, defaults
+    included**, so a key here silently overrides the same key in
+    perception/config.yaml. The navi card was bitten by exactly this: the file
+    said 0.6, the card reported 0.4, and the only trace was a note that read
+    like the file had never been edited.
+
+    A field may live in the schema or in the file; if it lives in both, the two
+    defaults have to agree or the file is decoration."""
+    import os
+    import yaml
+
+    root = os.path.join(os.path.dirname(__file__), "..")
+    with open(os.path.join(root, "config.yaml")) as handle:
+        cfg = yaml.safe_load(handle)["plugins"].get("visual_depth") or {}
+
+    for key, spec in depth_plugin.TOOLS[0]["configSchema"]["properties"].items():
+        if key in cfg and "default" in spec:
+            assert cfg[key] == spec["default"], (
+                f"{key}: config.yaml 是 {cfg[key]}，schema 默认是 "
+                f"{spec['default']} —— 画布会用后者覆盖前者")
+
+
+# ── 标定按相机身份自动查表 ────────────────────────────────────────────────────
+
+_R1_CAM = "unitree/r1/camera_main"
+
+
+def test_a_known_camera_selects_its_own_fit_with_nobody_choosing():
+    """The point of the whole chain, arriving at the last stage that uses it.
+
+    The camera declares who it is; that identity survives every hop; and the
+    depth card picks its own row out of its own table. Nobody has to know that
+    r1_sz needs `cal_b: -0.9753`, and nobody can forget.
+    """
+    cfg = {"calibration_preset": depth_plugin.CAL_AUTO}
+    preset = depth_plugin.CALIBRATION_PRESETS["Unitree R1"]
+    assert depth_plugin._calibration_from_cfg(cfg, camera_id=_R1_CAM) == (
+        preset["cal_a"], preset["cal_b"])
+    assert depth_plugin.calibration_origin(cfg, _R1_CAM) == "auto:Unitree R1"
+
+
+def test_an_unknown_camera_falls_back_to_the_engine_and_says_which_one():
+    """Not a failure — a camera nobody has measured. But "matched nothing" and
+    "was not asked" are different facts, and a card whose depth is 2.65x out
+    looks exactly like one whose depth is right."""
+    cfg = {"calibration_preset": depth_plugin.CAL_AUTO}
+    assert depth_plugin._calibration_from_cfg(cfg, camera_id="acme/cam/1") == (1.0, 0.0)
+    assert depth_plugin.calibration_origin(cfg, "acme/cam/1") == "auto:no-match(acme/cam/1)"
+
+
+def test_the_lookup_is_exact_rather_than_by_prefix():
+    """A fit is measured on one lens. Matching `unitree/...` by prefix would
+    silently apply r1's numbers to a camera that merely shares a vendor — which
+    is the wrong-camera failure wearing a convenience."""
+    cfg = {"calibration_preset": depth_plugin.CAL_AUTO}
+    for other in ("unitree/r1/camera_left", "unitree/g1/camera_main", "unitree"):
+        assert depth_plugin._calibration_from_cfg(cfg, camera_id=other) == (1.0, 0.0)
+
+
+def test_an_explicit_choice_still_overrides_the_automatic_one():
+    """Automatic is the default, not a lock. The camera can be wrong — on this
+    very robot the field of view was wrong for a day — so the operator keeps a
+    way to say otherwise, and `info()` keeps saying which one is in play."""
+    manual = {"calibration_preset": "Unitree R1"}
+    assert depth_plugin._calibration_from_cfg(manual, camera_id="acme/cam/1") == (
+        depth_plugin.CALIBRATION_PRESETS["Unitree R1"]["cal_a"],
+        depth_plugin.CALIBRATION_PRESETS["Unitree R1"]["cal_b"])
+    assert depth_plugin.calibration_origin(manual, "acme/cam/1") == "preset:Unitree R1"
+
+    typed = {"calibration_preset": depth_plugin.CAL_MANUAL, "cal_a": 1.0, "cal_b": -0.5}
+    assert depth_plugin._calibration_from_cfg(typed, camera_id=_R1_CAM) == (1.0, -0.5)
+
+
+def test_no_calibrate_keeps_meaning_no_correction_even_with_a_known_camera():
+    """Cards already deployed hold `CAL_NONE` explicitly. On r1_sz the
+    difference between that and the preset is a factor of 2.65 in every distance
+    — redefining what a stored value means is not something to do to a running
+    robot, so `CAL_AUTO` was added rather than `CAL_NONE` being repurposed."""
+    cfg = {"calibration_preset": depth_plugin.CAL_NONE}
+    assert depth_plugin._calibration_from_cfg(cfg, camera_id=_R1_CAM) == (1.0, 0.0)
+
+
+def test_a_file_config_is_unaffected_by_any_of_this():
+    """No dropdown means the config came from perception/config.yaml, where
+    writing `cal_b: -0.9` has always meant "apply this"."""
+    assert depth_plugin._calibration_from_cfg({"cal_b": -0.9}, camera_id=_R1_CAM) == (
+        1.0, -0.9)
+
+
+def test_every_preset_declares_the_cameras_it_was_measured_on():
+    """A preset with no camera ids can never be selected automatically, which
+    makes it a row that silently only works if somebody picks it by hand."""
+    for name, preset in depth_plugin.CALIBRATION_PRESETS.items():
+        assert preset.get("camera_ids"), f"{name} 没有声明 camera_ids"
+
+
+def test_info_reports_the_fit_the_running_instance_is_actually_applying():
+    """The provenance field describing a scope that is not producing the metres.
+
+    The card-level `cal_a`/`cal_b` come from `perception/config.yaml`; a canvas
+    instance gets its own from the instance config, and they can differ by a lot.
+    On r1_sz the card reported `model-default` while the node was applying
+    `cal_b: -0.9753` — a factor of **2.65 on every distance**. That field exists
+    to say which fit produced these metres, so reporting the wrong scope defeats
+    it exactly, and does so in the direction that reads as "nothing to see here".
+    """
+    plugin, _ = _plugin(model=_FakeModel())
+    plugin.dispatch("visual_depth", {
+        "action": "config", "instance_id": "card-1",
+        "calibration_preset": "Unitree R1"})
+    plugin.dispatch("visual_depth", {
+        "action": "start", "instance_id": "card-1", "input_topic": "/cam"})
+
+    info = plugin.dispatch("visual_depth", {"action": "info",
+                                            "instance_id": "card-1"})
+    assert info["calibration"] == "site:preset:Unitree R1"
+    assert info["instances"]["card-1"]["calibration"] == "site:preset:Unitree R1"
+    # And the card's own file-level config really is identity, so this could
+    # only have come from the instance.
+    assert (plugin._cal_a, plugin._cal_b) == (1.0, 0.0)
+
+
+# ── 镜筒渐晕：不是缺失，是自信地错 ───────────────────────────────────────────
+
+def _framed(width=64, height=48, border=8, inner=200):
+    """A frame with a black border, the way a lens barrel actually appears."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[border:height - border, border:width - border] = inner
+    return frame
+
+
+def test_the_lens_barrel_is_found_by_being_black_and_touching_the_edge():
+    """Measured on r1_sz: the four corners of every frame are the camera's own
+    housing, and the depth model invents 0.64–0.83 m for them — "something right
+    in front of me", all the way round the edge — while the map's valid-pixel
+    fraction stays 100%. So `coverage`, the whole "unknown is not free"
+    protection downstream, never fires."""
+    mask = depth_plugin.lens_barrel_mask(_framed(), threshold=24, max_fraction=0.9)
+    assert mask is not None
+    assert mask[0, 0] and mask[-1, -1], "四角是镜筒"
+    assert not mask[24, 32], "画面中间不是"
+
+
+def test_a_dark_object_in_the_middle_of_the_room_is_not_masked():
+    """Border-connectivity is the whole discriminator. A black chair is
+    surrounded by scene, so it is its own component — masking it would throw
+    away a real obstacle, which is the opposite of the intended error."""
+    frame = _framed()
+    frame[20:28, 28:36] = 0          # a black object, floating in the picture
+    mask = depth_plugin.lens_barrel_mask(frame, threshold=24, max_fraction=0.9)
+    assert not mask[24, 32], "画面中间的黑色物体被当成镜筒了"
+
+
+def test_a_frame_that_is_mostly_dark_is_not_masked_at_all():
+    """The backstop. A dark enough room makes one border-connected blob out of
+    everything, and a fully masked map is a blind robot. "The room is dark" and
+    "my lens is blocked" want different responses from a person, so past the
+    threshold nothing is masked."""
+    assert depth_plugin.lens_barrel_mask(_framed(border=20), threshold=24,
+                                         max_fraction=0.6) is None
+
+
+def test_the_masked_depth_becomes_no_reading_rather_than_far_away():
+    """NaN, because `encode_depth` already maps it to the 0 that means "no
+    reading" — so it arrives downstream as an honest gap and `coverage` treats
+    it like every other gap. A far value would say "clear", which is the same
+    mistake pointing the other way."""
+    node = depth_plugin._DepthNode(None, None, fps=2, cal_a=1.0, cal_b=0.0,
+                                   max_depth_m=20.0, node_suffix="t")
+    depth = np.full((48, 64), 5.0, dtype=np.float32)
+    out = node._mask_lens_barrel(_framed(), depth)
+
+    assert np.isnan(out[0, 0]), "镜筒处应当是「没有读数」"
+    assert out[24, 32] == 5.0, "场景部分不受影响"
+    assert node._barrel_fraction > 0
+    # And the encoder turns that into the 0 the renderer contract reserves.
+    assert depth_plugin.encode_depth(
+        np.full((depth_plugin.DEPTH_HEIGHT, depth_plugin.DEPTH_WIDTH), np.nan),
+        20.0) == depth_plugin.encode_depth(
+        np.zeros((depth_plugin.DEPTH_HEIGHT, depth_plugin.DEPTH_WIDTH)), 20.0)
+
+
+def test_masking_can_be_turned_off_from_the_file():
+    node = depth_plugin._DepthNode(None, None, fps=2, cal_a=1.0, cal_b=0.0,
+                                   max_depth_m=20.0, node_suffix="t",
+                                   mask_barrel=False)
+    depth = np.full((48, 64), 5.0, dtype=np.float32)
+    assert not np.isnan(node._mask_lens_barrel(_framed(), depth)).any()

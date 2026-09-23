@@ -157,3 +157,96 @@ def bands_from_summary(summary: dict) -> dict:
     """
     regions = (summary or {}).get("nearest_by_region") or {}
     return {name: regions.get(name) for name in BANDS}
+
+
+# ── the corridor: what the robot will actually drive through ─────────────────
+
+
+def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
+             reference_m: float, lateral_offset_m: float = 0.0):
+    """Nearest obstacle inside a metric corridor, and how much of it was measured.
+
+    Returns `(clearance_m | None, coverage)`. `clearance_m` is None when nothing
+    valid falls inside the corridor; `coverage` is the fraction of the frame
+    region the corridor occupies at `reference_m` that carries a real reading.
+
+    ── why this exists, and why `nearest_by_band` is not enough ─────────────
+
+    A band is a fixed slice of the *image*, so it covers a different width of
+    the *world* at every distance. With a 63° lens the centre third spans
+    `0.204 × distance` either side of the axis:
+
+        at 0.8 m   ±0.16 m      at 1.1 m   ±0.22 m      at 2.0 m   ±0.41 m
+
+    A humanoid is about ±0.18 m wide at the shoulders before any margin. So the
+    band is **narrower than the robot below about a metre** — which is to say
+    below the distance at which anything is decided — and wider than it beyond,
+    where it only causes needless slowing. The near case is how a shoulder
+    clips a doorframe while the depth map reports the way ahead as clear: the
+    obstacle was in the frame, in the left third, and the left third has never
+    stopped forward motion.
+
+    So the test is metric: convert each pixel's column to a lateral offset at
+    its own measured depth, and keep what lies inside the robot's width.
+
+    ── unknown is not free ──────────────────────────────────────────────────
+
+    `coverage` is the other half, and the more important one. A depth map has
+    holes — dark, shiny, thin, or too close — and the objects that produce them
+    are exactly the ones that catch a shoulder: chair legs, table edges, glass.
+    Returning only a clearance lets a corridor full of holes read as an empty
+    one, because every invalid pixel silently drops out of the minimum.
+
+    The denominator is the image region the corridor would occupy at
+    `reference_m` (pass the distance you care about — the stop distance).
+    Reporting it separately rather than folding it into the clearance keeps the
+    two questions apart: "how far is the nearest thing I can see" and "how much
+    of what I need to see can I see at all".
+
+    `lateral_offset_m` shifts the corridor sideways, **right-positive** to match
+    `position[0]` from vop. That is how a sidestep is checked: the question is
+    not whether the way ahead is clear but whether the way the robot is about to
+    move into is.
+    """
+    top = int(HEIGHT * OBSTACLE_ROW_SPAN[0])
+    bottom = int(HEIGHT * OBSTACLE_ROW_SPAN[1])
+    rows = depth_m[top:bottom, :]
+
+    # Tangent of the horizontal angle for each column, right-positive. Derived
+    # from the half-FOV rather than from intrinsics because **nothing in this
+    # project publishes intrinsics** — see the card's degradations. It is the
+    # one number here that is a configuration rather than a measurement.
+    tangent = ((np.arange(WIDTH) - (WIDTH - 1) / 2.0)
+               * (2.0 * np.tan(half_fov_rad) / WIDTH))
+
+    lateral = tangent[None, :] * rows
+    inside = np.abs(lateral - lateral_offset_m) <= half_width_m
+    valid = inside & np.isfinite(rows)
+    samples = rows[valid]
+    clearance = (round(float(np.percentile(samples, OBSTACLE_PERCENTILE)), 3)
+                 if samples.size else None)
+
+    # Coverage denominator: the columns the corridor projects onto at
+    # `reference_m` — **including the part that falls outside the lens**.
+    #
+    # That last clause matters more than it looks. Close in, the robot is wider
+    # than the field of view: at half a metre a ±0.33 m corridor spans about 67°
+    # and a 63° lens does not reach the edges of it. Counting only the visible
+    # columns would report a fully-measured corridor while a third of the
+    # robot's width was never in frame — the same "unknown reads as clear"
+    # failure this function exists to close, one level up.
+    reference = max(1e-6, reference_m)
+    low = (lateral_offset_m - half_width_m) / reference
+    high = (lateral_offset_m + half_width_m) / reference
+    step = 2.0 * np.tan(half_fov_rad) / WIDTH
+    wanted = max(1e-9, (high - low) / step)
+
+    window = (tangent >= low) & (tangent <= high)
+    visible = int(window.sum())
+    if not visible:
+        # The corridor is entirely outside the lens. Zero, not a division by
+        # zero — and zero is the truth: the camera cannot see there at all.
+        return clearance, 0.0
+    region = rows[:, window]
+    measured = float(np.isfinite(region).mean()) if region.size else 0.0
+    return clearance, round(measured * min(1.0, visible / wanted), 3)
