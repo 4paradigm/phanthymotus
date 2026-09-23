@@ -231,6 +231,52 @@ def _draw_profile(observed, centre_depth: float, buckets: int = 24) -> None:
     print("  一面正对的平墙是平滑对称的；房间是坑洼且不对称的。")
 
 
+def _fit_plane(observed, normalised, valid, kind: str):
+    """Least-squares fit of a flat plane seen from a camera, allowing a tilt.
+
+    A wall square-on is hard to achieve by eye, and the first two runs on r1_sz
+    both failed on it — the second was a clean monotonic ramp from 4.41 m on the
+    left to 3.65 m on the right, which is a flat wall at an angle and fitted
+    neither of the square-on hypotheses. Squaring the robot better is the wrong
+    answer: the geometry is solvable with the tilt in it.
+
+    Camera at the origin looking along +x, a pixel at normalised `u` sitting on
+    the ray `(1, t)` with `t = u * m`, `m = tan(half_fov)`. For a plane
+    `n·P = p`::
+
+        z-depth   d(u) = p / (1 + g*u)              g = m * n_y/n_x
+        range     d(u) = p * sqrt(1 + (m*u)^2) / (1 + g*u)
+
+    **Only the second one carries the field of view.** In the z-depth model `m`
+    and the wall's tilt appear solely as the product `g`, so they cannot be
+    separated — which is the same statement as "a flat wall read as flat tells
+    you nothing about the lens", just generalised to an oblique one. In the
+    range model `m` also appears inside the square root, and that curvature is
+    what makes it recoverable.
+
+    Returns `(residual, parameters)`; `parameters` carries `m` only for `range`.
+    """
+    best = None
+    tilts = np.arange(-0.60, 0.601, 0.005)
+    moduli = ([0.0] if kind == "z" else np.arange(0.20, 1.40, 0.01))
+    for m in moduli:
+        numerator = (np.sqrt(1.0 + (m * normalised) ** 2) if kind == "range"
+                     else np.ones_like(normalised))
+        for g in tilts:
+            denominator = 1.0 + g * normalised
+            if np.any(np.abs(denominator) < 0.2):
+                continue                       # the plane would pass behind us
+            shape = numerator / denominator
+            scale = (np.sum(observed[valid] * shape[valid])
+                     / max(1e-9, np.sum(shape[valid] ** 2)))
+            residual = _nrmse(observed, scale * shape,
+                              float(np.nanmedian(observed)))
+            if best is None or (np.isfinite(residual) and residual < best[0]):
+                best = (float(residual), {"m": float(m), "g": float(g),
+                                          "p": float(scale)})
+    return best
+
+
 def measure_wall(args) -> None:
     maps, _ = _collect(want_depth=True, want_objects=False, frames=args.frames,
                        depth_topic=args.depth_topic, objects_topic="",
@@ -246,71 +292,66 @@ def measure_wall(args) -> None:
         raise SystemExit("墙面上有效深度太少，换一面纹理稍多的墙，或靠近一些")
 
     centre_px = (depth_mod.WIDTH - 1) / 2.0
-    normalised = (columns - centre_px) / centre_px      # -1..1 across the span
+    normalised = (columns - centre_px) / centre_px
     middle = len(observed) // 2
     centre_depth = float(np.nanmedian(observed[middle - 20:middle + 20]))
     edge_depth = float(np.nanmedian(
         np.concatenate([observed[:40], observed[-40:]])))
-    ratio = edge_depth / max(1e-9, centre_depth)
 
     print()
     print(f"样本 {len(maps)} 帧，列 {low}..{high}，有效 {valid.sum()}/{len(columns)}")
-    _draw_profile(observed, centre_depth=float(np.nanmedian(observed)))
-    print(f"中心深度 {centre_depth:.3f} m   边缘深度 {edge_depth:.3f} m   "
-          f"边缘/中心 = {ratio:.3f}")
+    _draw_profile(observed, centre_depth=centre_depth)
+    print(f"中心深度 {centre_depth:.3f} m   边缘深度 {edge_depth:.3f} m")
     print()
 
-    # ── hypothesis 1: z-depth. A flat wall reads flat. ──────────────────────
-    flat = np.full_like(observed, centre_depth)
-    error_flat = _nrmse(observed, flat, centre_depth)
+    error_z, params_z = _fit_plane(observed, normalised, valid, "z")
+    error_r, params_r = _fit_plane(observed, normalised, valid, "range")
+    half_fov = math.atan(params_r["m"])
 
-    # ── hypothesis 2: ray range, d(u) = d0 / cos(theta). Fit half_fov. ──────
-    best = None
-    for half_fov in np.arange(0.20, 1.10, 0.002):
-        angle = np.arctan(normalised * math.tan(half_fov))
-        shape = 1.0 / np.cos(angle)
-        mask = valid
-        d0 = (np.sum(observed[mask] * shape[mask])
-              / max(1e-9, np.sum(shape[mask] ** 2)))
-        error = _nrmse(observed, d0 * shape, centre_depth)
-        if best is None or (np.isfinite(error) and error < best[1]):
-            best = (float(half_fov), float(error), float(d0))
-    half_fov, error_range, d0 = best
-
-    # The physically meaningful discriminator, stated as a number the operator
-    # can sanity-check against the picture rather than as a fit statistic.
-    span_edge = FIT_SPAN[1] * 2 - 1
-    predicted_ratio = 1.0 / math.cos(math.atan(span_edge * math.tan(half_fov)))
-
-    print("两种假设（残差是深度本身的百分比，越小越好）")
-    print(f"  z-depth（墙读出来是平的）   残差 {error_flat * 100:5.2f}%   "
-          f"预期 边缘/中心 = 1.000")
-    print(f"  ray range（d0/cos θ）       残差 {error_range * 100:5.2f}%   "
-          f"预期 边缘/中心 = {predicted_ratio:.3f}"
+    print("两种假设（都允许墙是斜的；残差是深度本身的百分比，越小越好）")
+    print(f"  z-depth（到成像平面的垂直距离） 残差 {error_z * 100:5.2f}%   "
+          f"倾斜 g={params_z['g']:+.3f}")
+    print(f"  ray range（沿射线的距离）       残差 {error_r * 100:5.2f}%   "
+          f"倾斜 g={params_r['g']:+.3f}"
           f"   → half_fov {half_fov:.3f} rad（{math.degrees(half_fov) * 2:.1f}° 全视场）")
     print()
 
+    # **The range model contains the z-depth model.** As `m` goes to zero the
+    # sqrt term goes to 1 and the two become the same curve, so a range fit that
+    # lands on an implausibly narrow lens has not found a range camera — it has
+    # collapsed into the z-depth limit, using its extra parameter to imitate the
+    # simpler model. Comparing residuals alone would call that a tie.
+    #
+    # No robot camera here is anywhere near this narrow; the configured value is
+    # 63° full field and the cheapest webcam is wider than 40°.
+    degenerate = math.degrees(half_fov) * 2 < 35.0
+
     configured = policy_mod.Config().half_fov_rad
-    if error_flat < error_range * 0.7:
+    if min(error_z, error_r) > 0.05:
+        print(f"结论：**两种都拟合不上**（最好的也有 {min(error_z, error_r) * 100:.1f}% 残差）。")
+        print("      看上面的剖面：平墙（正对或斜的）应该是一条光滑单调的曲线。")
+        print("      如果剖面是坑洼的，那是房间不是墙，换个位置重来。")
+        print("      如果剖面光滑却仍拟合不上，那说明这个深度源不满足针孔几何 ——")
+        print("      corridor 的整套换算就没有可信基础，换多少 half_fov_rad 都救不回来。")
+    elif error_z <= error_r or degenerate:
         print("结论：深度通道是 **z-depth**（到成像平面的垂直距离）。")
+        if degenerate and error_r < error_z:
+            print(f"      （range 模型的残差略低，但它只是**退化**成了 z-depth：")
+            print(f"      m→0 时 sqrt(1+t²)→1，两条曲线就重合了。它拟合出的视场角是")
+            print(f"      {math.degrees(half_fov) * 2:.1f}°，没有哪台机器人相机这么窄。）")
         print("      corridor 里的 `lateral = tan(θ) * depth` 是对的，不用改。")
-        print("      但这个方法**量不出 half_fov** —— 平的曲线不含角度信息。")
-        print(f"      请再跑一次 object 方法。当前配置 {configured} rad。")
-    elif error_range < error_flat * 0.7:
+        print("      但 z-depth **量不出 half_fov** —— 在这个模型里视场角和墙的倾角")
+        print("      只以乘积出现，分不开。请改用 object 方法。")
+        print(f"      当前配置 {configured} rad。")
+    elif error_r < error_z * 0.8 and not degenerate:
         print("结论：深度通道是**沿射线的距离（range）**，不是 z-depth。")
         print("      **corridor 目前算错了**：它用的是 `lateral = tan(θ) * depth`，")
         print("      range 下应该是 `lateral = sin(θ) * depth`。31° 处差 17%。")
         print(f"      顺带量出 half_fov = {half_fov:.3f} rad（配置为 {configured}）。")
     else:
-        print("结论：**两种假设都不像**。")
-        print("      如果残差都很大，说明这个深度源不满足针孔几何 —— 那 corridor")
-        print("      的整套换算就没有可信基础，换多少 half_fov_rad 都救不回来，")
-        print("      得先搞清楚 visual_depth 输出的到底是什么量。")
-        print("      如果只是区分不开，多半是墙没填满画面或没摆正，重试一次。")
-    if not (0.5 < ratio < 2.0):
-        print()
-        print(f"[warn] 边缘/中心 = {ratio:.3f}，不像是一面正对着的平墙。")
-        print("       摆正、贴近到墙填满画面，再测一次。")
+        print("结论：两者拟合得一样好，**区分不开**。")
+        print("      多半是墙离得太远、张角太小 —— 两种模型在小角度下本来就趋同。")
+        print("      走近到 1~1.5 m 让墙填满画面再测一次。")
 
 
 # ── method: object ───────────────────────────────────────────────────────────
