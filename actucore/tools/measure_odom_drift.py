@@ -264,27 +264,33 @@ def _integrated_yaw(odom, start_s: float, end_s: float) -> float:
 
 
 def _integrated_translation(odom, start_s: float, end_s: float) -> float:
-    """How far the robot says it travelled over the window, in metres.
+    """**Path length** travelled over the window, in metres.
 
-    Needed to spot the one confound that made a 120-second recording
-    unanswerable: **rotation and translation cancel in bearing when the robot
-    arcs around the landmark**, which is precisely what an operator does
-    naturally — turning away and then walking to bring the target back into
-    view. The apparent rotation then comes out a fraction of the odometry's,
-    and the odometry is fine. Without this number there is nothing to
-    distinguish that from a yaw scale error, and the first analysis very nearly
-    reported one.
+    Path rather than net displacement, and the difference is not pedantic: the
+    twist is in the body frame, so summing `(vx, vy)` vectors across a window
+    in which the robot also rotated adds numbers expressed in different frames
+    and yields neither path nor displacement. The first version did exactly
+    that and produced a confident "the robot moved 10.7 m" for a robot that had
+    moved a couple of metres. Path length is a sum of magnitudes, so it is
+    invariant to the rotation and needs no heading integration — and "did it
+    walk at all during this window" is exactly a question about magnitude.
+
+    It exists to spot the confound that made three recordings unanswerable:
+    **rotation and translation cancel in bearing when the robot arcs around the
+    landmark**, which is what an operator does naturally — turning away and
+    then walking to bring the target back into view. The apparent rotation then
+    comes out a fraction of the odometry's, with the odometry perfectly fine.
     """
     import bisect
 
     stamps = [entry[0] for entry in odom]
-    total, previous = np.zeros(2), start_s
+    total, previous = 0.0, start_s
     for index in range(bisect.bisect_right(stamps, start_s),
                        bisect.bisect_right(stamps, end_s)):
         stamp, twist = odom[index]
-        total = total + np.array([twist[0], twist[1]]) * (stamp - previous)
+        total += math.hypot(twist[0], twist[1]) * (stamp - previous)
         previous = stamp
-    return float(np.linalg.norm(total))
+    return total
 
 
 def _propagate(point, odom, start_s: float, end_s: float, config,
