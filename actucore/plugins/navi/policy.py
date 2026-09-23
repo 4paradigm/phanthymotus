@@ -363,6 +363,12 @@ class State:
     # `_approach`. It did not have one, and that is why every run began with a
     # sidestep nobody asked for.
     vy_gate: Gate = field(default_factory=Gate)
+    # What the corridor read on the last tick. Kept so the debug overlay can
+    # draw the number the decision was made from, rather than measuring the
+    # depth map a second time and risking a picture that disagrees with the
+    # behaviour it is supposed to explain.
+    last_clearance: float = None
+    last_coverage: float = 1.0
     tracker: Tracker = field(default_factory=Tracker)
     # What we last asked the chassis to do. Stands in for odometry when none is
     # wired: with a deadband the robot either does roughly the commanded speed
@@ -896,7 +902,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config,
                        state, dt)
     vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
-                                            status, reason)
+                                            status, reason, state)
 
     # **Blocked is an outcome, not a mood.** Trying to get round something is
     # the right first response, and it is what `_avoid` just did — but a robot
@@ -1144,7 +1150,7 @@ def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
         dt=dt, min_dwell_s=config.min_dwell_s)
 
 
-def _avoid(vx, vy, wz, depth, config: Config, status, reason):
+def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
     """Slow for what is ahead, and move out from in front of it if it is close.
 
     Backing away is not available — the depth map covers what the camera sees
@@ -1158,6 +1164,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason):
     """
     bands = (depth or {}).get("bands") or {}
     ahead, coverage = _clearance(depth, config)
+    if state is not None:
+        state.last_clearance, state.last_coverage = ahead, coverage
 
     # Too little of the corridor measured to say anything about it. Not the same
     # as "clear", and it used to be treated as such — an invalid pixel simply

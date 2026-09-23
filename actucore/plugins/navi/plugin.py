@@ -100,6 +100,11 @@ class NaviPlugin:
         self._executor = executor
         self._namespace = (namespace or "").strip("/")
         self._topic = self._cfg.get("topic") or DEFAULT_TOPIC
+        # A second, human-only port. Derived from the command topic so a card
+        # given a custom one keeps the pair together.
+        self._view_topic = str(self._cfg.get("view_topic") or
+                               (self._topic.rsplit("/", 1)[0] + "/view"))
+        self._view_hz = float(self._cfg.get("view_hz", 5.0))
 
         # Guards bookkeeping only — never a node start/stop, or a stop would
         # queue behind the start it is meant to cancel. Same rule as every
@@ -130,6 +135,9 @@ class NaviPlugin:
         # a publish behind the decode of a depth frame.
         self._obs_lock = threading.RLock()
         self._objects = None
+        self._view_publisher = None
+        self._view_next_at = 0.0
+        self._view_failed = False
         self._objects_ms = 0
         # The last N detection payloads, for `list_visible_objects` to intersect.
         # A deque rather than a list: this is written every frame on the hot
@@ -263,7 +271,10 @@ class NaviPlugin:
             # the moment this one fails to start, which reads like a wiring
             # problem on a canvas that is wired correctly.
             "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT,
-                           "desc": "motus.control/1 twist 指令流"}],
+                           "desc": "motus.control/1 twist 指令流"},
+                          {"topic": self._view_topic, "format": "image/jpeg",
+                           "desc": "这张卡片看到的与决定的：深度图、走廊、目标框与"
+                                   "距离、三个轴的指令。只给人看"}],
             "topic_in": [
                 {"format": "data/json",
                  "desc": "vop 的检测结果（必需）"},
@@ -868,10 +879,14 @@ class NaviPlugin:
 
     def _open_publisher(self):
         from rclpy.node import Node
+        from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
         node = Node(f"navi_{abs(hash(self._topic)) % 100000}")
         self._publisher = node.create_publisher(String, self._topic, 10)
+        if self._view_hz > 0:
+            self._view_publisher = node.create_publisher(
+                CompressedImage, self._view_topic, 2)
         self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick)
         self._executor.add_node(node)
         with self._lock:
@@ -1011,7 +1026,79 @@ class NaviPlugin:
         publisher.publish(payload)
         with self._lock:
             self._published += 1
+        self._publish_view()
         self._maybe_complete()
+
+    def _publish_view(self):
+        """Draw the decision, if it is time and if drawing works.
+
+        **Wrapped whole, and rate-limited separately from the command stream.**
+        A picture for a human must never be able to stop a robot: an exception
+        in a colour map, a missing codec, an image this card has no business
+        failing on — none of that may reach the tick that feeds the chassis. So
+        a failure here is counted and logged once, and the commands carry on.
+        """
+        publisher = self._view_publisher
+        if publisher is None or self._view_hz <= 0:
+            return
+        now = time.monotonic()
+        if now < self._view_next_at:
+            return
+        self._view_next_at = now + 1.0 / self._view_hz
+        try:
+            from sensor_msgs.msg import CompressedImage
+
+            from . import view as view_mod
+
+            frame = view_mod.render(
+                depth_m=self._depth_map,
+                decision=self._last_decision,
+                track=self._state.tracker.describe(),
+                box=self._target_box(),
+                clearance=self._state.last_clearance,
+                coverage=self._state.last_coverage,
+                config=self._config)
+            message = CompressedImage()
+            message.format = "jpeg"
+            message.data = view_mod.encode(frame)
+            publisher.publish(message)
+        except Exception as error:                            # noqa: BLE001
+            if not self._view_failed:
+                self._view_failed = True
+                log.warning("navi view render failed, disabling it: %s", error,
+                            exc_info=True)
+            self._view_publisher = None
+
+    def _target_box(self):
+        """The current detection's box for the thing being chased, or None.
+
+        Associated here rather than carried through the tracker on purpose: the
+        tracker works in metres and bearings and has no use for a rectangle, and
+        threading one through it to draw a picture would put display concerns
+        into the estimator. The cost is that this is a *display-time* guess —
+        the nearest detection by bearing, of the right name — and when the
+        detector is not seeing the target at all there is simply no box, which
+        is itself the thing worth showing.
+        """
+        payload = self._objects or {}
+        target = (self._state.target or "").strip().lower()
+        track = self._state.tracker.track
+        if not target or track is None:
+            return None
+        best, best_gap = None, 1e9
+        for obj in payload.get("objects") or []:
+            name = str(obj.get("name") or "").lower()
+            if target not in name and name not in target:
+                continue
+            box = obj.get("bbox_norm")
+            if not box:
+                continue
+            position = obj.get("position") or [0.0, 0.0]
+            bearing = float(position[0]) * self._config.half_fov_rad
+            gap = abs(bearing - track.bearing_rad)
+            if gap < best_gap:
+                best, best_gap = box, gap
+        return best
 
     def _maybe_complete(self):
         """Report the outcome once, on arrival **or** failure.
