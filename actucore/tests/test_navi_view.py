@@ -333,26 +333,38 @@ def _jpeg(width=1280, height=720, value=200):
 
 
 @needs_cv2
-def test_the_camera_frame_shows_through_the_depth_colour():
-    """The point of the second input: one picture that says both what the robot
-    can see and what it is reacting to."""
-    bright = _jpeg(value=240)
-    with_rgb = _render(rgb_jpeg=bright, depth_m=_depth(1.0), blend=0.5)
-    without = _render(depth_m=_depth(1.0))
-    assert not np.array_equal(with_rgb, without)
-    # Halfway between the camera's grey and the ramp's colour for 1 m.
-    lone = V._LUT[V._index_of(np.array([[1.0]]))][0, 0].astype(int)
-    mid = with_rgb[240, 320].astype(int)
-    assert all(min(240, c) - 12 <= m <= max(240, c) + 12
-               for m, c in zip(mid, lone))
+def test_the_camera_gives_structure_and_the_depth_gives_colour():
+    """Not an average of the two.
+
+    `addWeighted` on two bright images is a brighter image with less contrast in
+    both — on r1_sz that read as "the depth is barely there", because the office
+    and the far half of the ramp are both pale and averaging destroyed what
+    little distinguished them. Multiplying keeps the channels separate: a dark
+    part of the room stays dark, and the hue is the depth's whatever the scene.
+    """
+    dark = _render(rgb_jpeg=_jpeg(value=40), depth_m=_depth(1.0))
+    lit = _render(rgb_jpeg=_jpeg(value=220), depth_m=_depth(1.0))
+
+    assert dark[240, 320].astype(int).sum() < lit[240, 320].astype(int).sum(), (
+        "相机的明暗没有传过来")
+    # Same distance, so the same hue — only the brightness differs.
+    ratio = lambda p: p.astype(float) / max(p.astype(float).sum(), 1)
+    assert np.allclose(ratio(dark[240, 320]), ratio(lit[240, 320]), atol=0.06)
 
 
 @needs_cv2
-def test_the_blend_weight_moves_the_result_between_the_two_sources():
-    depth_only = _render(rgb_jpeg=_jpeg(value=240), depth_m=_depth(1.0), blend=1.0)
-    camera_only = _render(rgb_jpeg=_jpeg(value=240), depth_m=_depth(1.0), blend=0.0)
-    assert camera_only[240, 320].min() > 200, "权重 0 应当基本只剩相机画面"
-    assert not np.array_equal(depth_only, camera_only)
+def test_the_hue_follows_the_depth_and_not_the_scene():
+    near = _render(rgb_jpeg=_jpeg(value=160), depth_m=_depth(0.4))
+    far = _render(rgb_jpeg=_jpeg(value=160), depth_m=_depth(4.0))
+    assert not np.array_equal(near[240, 320], far[240, 320])
+
+
+@needs_cv2
+def test_the_blend_weight_pulls_back_towards_the_plain_camera():
+    full = _render(rgb_jpeg=_jpeg(value=240), depth_m=_depth(1.0), blend=1.0)
+    none_ = _render(rgb_jpeg=_jpeg(value=240), depth_m=_depth(1.0), blend=0.0)
+    assert none_[240, 320].min() > 200, "权重 0 应当基本只剩相机画面"
+    assert not np.array_equal(full, none_)
 
 
 @needs_cv2

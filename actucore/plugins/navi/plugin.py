@@ -107,7 +107,7 @@ class NaviPlugin:
         self._view_hz = float(self._cfg.get("view_hz", 5.0))
         # How much of the depth colour is mixed over the camera frame, 0..1.
         self._view_blend = max(0.0, min(1.0, float(
-            self._cfg.get("view_blend", 0.5))))
+            self._cfg.get("view_blend", 1.0))))
 
         # Guards bookkeeping only — never a node start/stop, or a stop would
         # queue behind the start it is meant to cancel. Same rule as every

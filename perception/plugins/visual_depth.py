@@ -1080,6 +1080,21 @@ class VideoDepthPerceptionPlugin:
         with self._nodes_lock:
             return camera_id(self._upstream_camera.get(node_key) or {})
 
+    def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
+        """`{"camera_info": [...]}` for an `info()` answered while loading.
+
+        See the same helper in plugins/vop.py for why the early return had to
+        stop dropping it.
+        """
+        topic = args.get("input_topic") or ""
+        if not topic:
+            topics = args.get("input_topics") or []
+            topic = topics[0] if topics else ""
+        depth_topic, summary_topic = output_topics_for(topic)
+        declared, _ = self._camera_info(instance_id, topic, {},
+                                        depth_topic, summary_topic)
+        return {"camera_info": declared} if declared else {}
+
     def _camera_info(self, instance_id, input_topic, nodes,
                      depth_topic: str, summary_topic: str) -> tuple:
         """`(declarations, note)` for this card's two output ports.
@@ -1364,9 +1379,12 @@ class VideoDepthPerceptionPlugin:
 
         if action == "info":
             if self._model_loading:
+                # The declaration does not wait for the engine — see the same
+                # spot in plugins/vop.py for what dropping it cost.
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
                         "model": "yolo26n-depth", "state": "loading",
-                        "desc": "Loading depth engine..."}
+                        "desc": "Loading depth engine...",
+                        **self._loading_camera_info(args, instance_id)}
             if self._model_load_error:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
                         "model": "yolo26n-depth", "state": "error",

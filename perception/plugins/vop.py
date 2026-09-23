@@ -933,6 +933,26 @@ class VideoObjectPerceptionPlugin:
         node.start()
         log.info(f"[vop] node started (background): {input_topic}")
 
+    def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
+        """`{"camera_info": [...]}` for an `info()` answered while loading.
+
+        Recorded at `start`, which happens before the engine begins loading, so
+        it is available here — the only reason it was ever missing is that this
+        reply returned early.
+        """
+        from plugins.camera_info import inherit
+
+        topic = args.get("input_topic") or ""
+        if not topic:
+            topics = args.get("input_topics") or []
+            topic = topics[0] if topics else ""
+        key = instance_id or topic or _DEFAULT_INSTANCE
+        with self._nodes_lock:
+            upstream = self._upstream_camera.get(key) or {}
+        declared = inherit(upstream, topic=output_topic_for(topic),
+                           fmt="data/json", stage="perception/vop")
+        return {"camera_info": declared} if declared else {}
+
     def _retire_node(self, node_key: str) -> Optional[dict]:
         """Stop, unregister and destroy one node. Returns its stop() result."""
         with self._nodes_lock:
@@ -990,6 +1010,17 @@ class VideoObjectPerceptionPlugin:
                     "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
                     "state": "loading",
                     "desc": "Loading YOLO model...",
+                    # **The declaration does not wait for the engine.**
+                    #
+                    # This reply used to drop it, and agent-core records
+                    # whatever `info()` returns — so a consumer that started
+                    # while this card was still loading got no camera
+                    # declaration at all, and nothing said so. On r1_sz that
+                    # cost navi its box path and the corridor's real geometry,
+                    # and it only ever reproduced on a *cold* container, because
+                    # a warm one starts immediately and never passes through
+                    # here.
+                    **self._loading_camera_info(args, instance_id),
                 }
             if self._model_load_error:
                 return {

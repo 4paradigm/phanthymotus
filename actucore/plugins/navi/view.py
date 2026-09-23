@@ -120,17 +120,23 @@ def _colormap(depth_m: np.ndarray, far_m: float):
 
 def _composite(rgb, depth_m: np.ndarray, config, width: int, height: int,
                blend: float):
-    """Depth colour blended over the camera image at a fixed weight.
+    """The camera's structure, the depth's colour.
 
-    One `addWeighted` rather than a per-pixel alpha: this runs on the publish
-    tick next to a 10 Hz command stream, and a fused OpenCV op on 307k pixels is
-    a few tenths of a millisecond where a numpy expression with a broadcast mask
-    is several. The JPEG decode dominates either way, which is why the frame is
-    kept compressed until something actually draws it.
+    **Not an average of the two.** `addWeighted` on two bright images is a
+    brighter image with less contrast in both — on r1_sz it read as "the depth
+    is barely there", because the office and the far half of the depth ramp are
+    both pale and averaging them destroyed the little that distinguished them.
 
-    `INTER_LINEAR` for the same reason — `INTER_AREA` is visibly better for big
-    downscales and measurably slower, and nobody is reading this image for its
-    resampling.
+    Multiplying instead keeps the two channels of information separate and
+    intact: **every pixel's brightness comes from the camera, every pixel's hue
+    from the depth.** You can still see what a thing is, and its colour says how
+    far away it is. `blend` then pulls back towards the plain camera image for
+    anyone who wants less of it.
+
+    Two fused OpenCV ops on 307k pixels, which is what this can afford next to a
+    10 Hz command stream. `INTER_LINEAR` for the same reason — `INTER_AREA` is
+    visibly better for big downscales and measurably slower, and nobody reads
+    this image for its resampling.
     """
     import cv2
 
@@ -141,7 +147,15 @@ def _composite(rgb, depth_m: np.ndarray, config, width: int, height: int,
     if colour.shape[:2] != (height, width):
         colour = cv2.resize(colour, (width, height),
                             interpolation=cv2.INTER_NEAREST)
-    return cv2.addWeighted(base, 1.0 - blend, colour, blend, 0.0)
+    luma = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    # 1/160 rather than 1/255: multiplying two images darkens, and the depth
+    # ramp's own mid-tones are what carry the reading. The gain puts a mid-grey
+    # scene back at roughly the ramp's own brightness instead of half of it.
+    tinted = cv2.multiply(colour, cv2.cvtColor(luma, cv2.COLOR_GRAY2BGR),
+                          scale=1.0 / 160.0)
+    if blend >= 1.0:
+        return tinted
+    return cv2.addWeighted(tinted, blend, base, 1.0 - blend, 0.0)
 
 
 def _column_of(bearing_rad: float, half_fov_rad: float, width: int) -> int:
