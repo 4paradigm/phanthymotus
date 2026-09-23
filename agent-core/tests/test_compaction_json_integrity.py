@@ -177,6 +177,22 @@ def test_scrub_repairs_broken_arguments_without_orphaning_result():
     _assert_payload_valid(out)
 
 
+def test_scrub_strips_internal_fields_from_outbound_messages():
+    """`_usage` 是给历史 modal 看的，不该出现在请求体里。
+
+    Orin5 留存的 212 份请求里 139 份的 messages 带着它 —— 落盘时挂上去，
+    读回来就一路跟进请求。按 OpenAI 的 message schema 它是未知字段。
+    """
+    history = [
+        {'role': 'assistant', 'content': 'ok', '_usage': {'total_tokens': 12},
+         'tool_calls': [_call('c1', 'tts', '{}')]},
+        {'role': 'tool', 'tool_call_id': 'c1', 'content': 'ok'},
+    ]
+    out = _scrub(history)
+    assert all(not k.startswith('_') for m in out for k in m)
+    assert out[0]['content'] == 'ok' and out[0]['tool_calls'][0]['id'] == 'c1'
+
+
 def test_scrub_leaves_valid_history_untouched():
     history = [
         {'role': 'assistant', 'content': '', 'tool_calls': [_call('c1', 'tts', '{"text": "hi"}')]},

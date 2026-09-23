@@ -282,6 +282,12 @@ def _scrub(message_list: list[dict]) -> list[dict]:
     declared: set = set()
     out: list[dict] = []
     for msg in message_list:
+        # 内部字段不能进请求体。`_usage` 是我们自己挂在 assistant 消息上给历史 modal
+        # 看的，落盘后又随历史一路带回请求里 —— Orin5 留存的 212 份请求有 139 份的
+        # messages 里带着它。按 OpenAI 的 message schema 它是未知字段，宽松的服务端
+        # 忽略，严格的直接拒。存盘照存，出门之前摘掉。
+        if any(k.startswith('_') for k in msg):
+            msg = {k: v for k, v in msg.items() if not k.startswith('_')}
         if msg.get('role') == 'assistant' and msg.get('tool_calls'):
             good = []
             for tc in msg['tool_calls']:
