@@ -71,6 +71,7 @@ def _conn(src, dst, topic):
 def rig(monkeypatch):
     """Cards that answer `info` the way a camera and a depth processor do."""
     starts = {}
+    infos = []
 
     topic_outs = {
         CAM:   [{'topic': CAM_TOPIC, 'format': 'image/jpeg'}],
@@ -90,6 +91,7 @@ def rig(monkeypatch):
             starts[card_id] = args
             return {'code': 200, 'data': {'state': 'running'}}
         if action == 'info':
+            infos.append(card_id)
             data = {'state': 'idle', 'topic_out': topic_outs.get(card_id, [])}
             if card_id in declarations:
                 data['camera_info'] = declarations[card_id]
@@ -128,7 +130,7 @@ def rig(monkeypatch):
                       ('api.inspection', inspection), ('channel.manager', chan)):
         monkeypatch.setitem(sys.modules, name, mod)
 
-    return types.SimpleNamespace(starts=starts, events=events,
+    return types.SimpleNamespace(starts=starts, events=events, infos=infos,
                                  declarations=declarations)
 
 
@@ -256,28 +258,23 @@ def test_a_card_with_no_inbound_connection_gets_no_argument(rig):
 def test_no_extra_round_trip_is_taken_for_it(rig):
     """The whole reason this direction is cheap. `_resolve_and_register` already
     calls `info()` on every card right after it starts; this reuses that answer.
+
     A second call would also be *wrong* here — it would run after the source is
-    live, so a card that reports different optics once streaming would be able to
-    contradict what the consumer already adopted."""
-    calls = []
+    live, so a card reporting different optics once streaming could contradict
+    what the consumer already adopted.
+
+    Counted in the fixture's own `_call` rather than by wrapping `mcp_call_tool`
+    a second time. That wrapper depended on which module object
+    `api.mcp_manage` resolved to, and the other start-project test files replace
+    it too — so it passed when run alone and silently counted **nothing** in a
+    full run, which is the failure mode a test must not have.
+    """
     rig.declarations[CAM] = [_decl(CAM_TOPIC)]
+    layout = {
+        'cards': [_card(CAM, 'camera_main'), _card(DEPTH, 'visual_depth')],
+        'connections': [_conn(CAM, DEPTH, CAM_TOPIC)],
+    }
+    _run(layout)
 
-    import api.mcp_manage as mcp
-    original = mcp.mcp_call_tool
-
-    async def _counting(mcp_id, req, timeout_s=None):
-        if dict(req.arguments).get('action') == 'info':
-            calls.append(dict(req.arguments).get('instance_id'))
-        return await original(mcp_id, req, timeout_s=timeout_s)
-
-    mcp.mcp_call_tool = _counting
-    try:
-        layout = {
-            'cards': [_card(CAM, 'camera_main'), _card(DEPTH, 'visual_depth')],
-            'connections': [_conn(CAM, DEPTH, CAM_TOPIC)],
-        }
-        _run(layout)
-    finally:
-        mcp.mcp_call_tool = original
-
-    assert calls.count(CAM) == 1, f'camera 被 info() 了 {calls.count(CAM)} 次'
+    assert rig.infos, 'info() 一次都没被调用 —— 这条测试在空转'
+    assert rig.infos.count(CAM) == 1, f'camera 被 info() 了 {rig.infos.count(CAM)} 次'
