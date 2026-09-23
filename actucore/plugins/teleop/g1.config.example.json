@@ -1,0 +1,25 @@
+{
+  "name": "ActuCore",
+  "mcp_port": 15730,
+  "plugins": {
+    "teleop": {
+      "enabled": true,
+      "robot_profile": "g1_23",
+      "mode": "shadow",
+      "mapping_version": "pr152_head_yaw_v1",
+      "position_scale": 1.0,
+      "namespace": "g1",
+      "driver_mcp_url": "http://127.0.0.1:15701/mcp",
+      "calibration_path": "/calibration/g1.json",
+      "capture": {
+        "discovery_enabled": true,
+        "bind_host": "0.0.0.0",
+        "port": 15741,
+        "public_wss_url": "wss://robot.example:15741/ws/teleop-capture",
+        "state_file": "/var/lib/motus-teleop/capture.json",
+        "tls_cert_file": "/etc/motus-teleop-capture-tls/cert.pem",
+        "tls_key_file": "/etc/motus-teleop-capture-tls/key.pem"
+      }
+    }
+  }
+}

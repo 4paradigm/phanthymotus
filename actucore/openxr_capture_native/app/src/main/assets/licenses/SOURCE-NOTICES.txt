@@ -1,0 +1,13 @@
+PhanthyMotus native OpenXR Capture; source and bundled third-party notices.
+Source migration: https://github.com/4paradigm/phanthymotus-driver/tree/a97bbfb56a97f1a4959120a470393a96e40fdbb8/generic/openxr_capture_native (Apache-2.0).
+This client adds enrollment, PICO passthrough, operator UI and Tianyi visualization in ActuCore.
+OpenXR loader 1.1.60: https://github.com/KhronosGroup/OpenXR-SDK/tree/release-1.1.60 (Apache-2.0).
+Android NDK 27.0.12077973: supplied NOTICE and NOTICE.toolchain retained.
+Mbed TLS is used under Apache-2.0; the upstream dual-license file is retained without alteration.
+Unmodified dependency source for the distributed native libraries is available at:
+https://github.com/Mbed-TLS/mbedtls/tree/068ff080b369adfac81509f9b57b2afabaf82dc5
+https://github.com/paullouisageneau/libdatachannel/tree/c6696d157b5612df2a741d9a03b192b47ab6cefb
+https://github.com/nlohmann/json/tree/55f93686c01528224f448c19128836e7df245f72
+https://github.com/SergiusTheBest/plog/tree/94899e0b926ac1b0f4750bfbd495167b4a6ae9ef
+https://github.com/sctplab/usrsctp/tree/fec583d54493f879d2ae44a743423bf8a04371ab
+https://github.com/paullouisageneau/libjuice/tree/22145ec3473c73d811417ac9a6aee0de530aaa3f

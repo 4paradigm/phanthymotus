@@ -12,8 +12,18 @@ Installed via conftest so every module in the suite sees them, regardless of
 collection order — putting them in one test file made the others depend on
 being collected second, which is not something a test file should rely on.
 """
+import os
 import sys
 import types
+
+# Explicit DDS integration runs must use the installed ROS implementation.
+# Import before setdefault so these laptop stubs cannot shadow real packages.
+# Missing ROS dependencies intentionally fail an explicitly requested run.
+if os.environ.get("RUN_MOTION_CONTROL_ROS") == "1":
+    import rclpy
+    import rclpy.qos
+    import sensor_msgs.msg
+    import std_msgs.msg
 
 _STUBS = {
     "sensor_msgs.msg": ("CompressedImage", "Image"),

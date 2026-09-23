@@ -8,6 +8,8 @@ from pydantic import BaseModel
 import config
 import aiohttp
 import openai as openai_lib
+from teleop_project import (TeleopProjectError, resolve_bindings, validate_profile,
+                            validate_target, has_project_lifecycle, shutdown_complete, teleop_cards)
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
 
@@ -114,7 +116,8 @@ async def config_status():
 @router.get('/project-running')
 async def get_project_running():
     core = config.main.get('core', {})
-    return {'running': bool(core.get('project_running', False))}
+    return {'running': bool(core.get('project_running', False)),
+            'phase': core.get('project_phase', ''), 'error': core.get('project_stop_error', '')}
 
 
 # ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
@@ -149,6 +152,8 @@ def order_cards_by_dependency(cards, connections):
     # card behind them, turning stale layout data into a total failure to start.
     deps = {}
     for conn in connections or []:
+        if conn.get('role') == 'feedback':
+            continue
         src, dst = conn.get('fromCardId'), conn.get('toCardId')
         if src in ids and dst in ids and src != dst:
             deps.setdefault(dst, set()).add(src)
@@ -168,6 +173,7 @@ def order_cards_by_dependency(cards, connections):
 
 # 正在进行中的那次启动。**是任务句柄，不是布尔标志** —— 见 `_do_start_project`。
 _start_project_task = None
+_stop_project_task = None
 
 # 整次启动的兜底上限。不是"预期耗时"，是"再久就一定有问题"：`_settle_loading_item`
 # 是 create_task 发出去的，不占这条流程，所以正常情况下这里是秒级；留到 15 分钟是
@@ -224,6 +230,7 @@ async def _do_start_project():
     except _aio.TimeoutError:
         print(f'[start-project] timed out after {START_PROJECT_TIMEOUT_S}s — '
               '有 MCP 服务器不回应；已取消本次启动')
+        await _do_stop_project()
         return False
     except _aio.CancelledError:
         # 被 `_cancel_start_project()` 取消。这是操作者的动作，不是失败。
@@ -321,6 +328,7 @@ def _control_topics(topic_list: list) -> set:
     return {
         t.get('topic') for t in (topic_list or [])
         if t.get('topic') and str(t.get('format') or '').startswith('control/')
+        and t.get('format') != 'control/teleop'
     }
 
 
@@ -336,6 +344,12 @@ def _descriptor_conflict(descriptors: list) -> bool:
     if len(descriptors) < 2:
         return False
     first = descriptors[0]
+    if any(d.get('control_interface', d.get('schema')) == 'motus.control/2' for d in descriptors):
+        import json
+        fields = ('control_interface', 'schema', 'mode', 'dof', 'joint_names', 'units',
+                  'frame', 'groups', 'model_version', 'calibration_version')
+        canonical = lambda d: json.dumps({k: d.get(k) for k in fields}, sort_keys=True)
+        return any(canonical(d) != canonical(first) for d in descriptors[1:])
     key = (first.get('mode'), first.get('dof'), tuple(first.get('joint_names') or []))
     return any(
         (d.get('mode'), d.get('dof'), tuple(d.get('joint_names') or [])) != key
@@ -415,12 +429,24 @@ async def _do_start_project_impl():
         the dashboard would then subscribe to — no waveform, while audio flows on
         the real one.
         """
+        arguments = ({'action': 'info'} if tool_name == 'teleop_executor' else
+                     {'action': 'info', 'instance_id': card_id, **info_args})
         info = await mcp_call_tool(mcp_id, MCPCallRequest(
-            tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
-                                       **info_args},
+            tool=tool_name, arguments=arguments,
         ), timeout_s=INFO_TIMEOUT_S)
         data = payload_of(info)
         topic_out = data.get('topic_out') or []
+        if tool_name == 'teleop' and card_id in bindings:
+            # Resolve the saved command edge before arming. The plugin may still
+            # report its previous namespace until project_start applies binding.
+            registry = (config.main.get('services', {}) or {}).get('mcp', []) or []
+            source = next(t for m in registry if m.get('id') == mcp_id
+                          for t in m.get('tools', []) if t.get('name') == tool_name)
+            topic_out = [dict(p) for p in (topic_out or source.get('topic_out', []))]
+            for port in topic_out:
+                if port.get('format') == ('control/eef' if bindings[card_id].get('protocol_version') == 2 else 'control/teleop'):
+                    port['topic'] = bindings[card_id]['command_topic']
+            data = {**data, 'topic_out': topic_out}
         if topic_out:
             resolved_topics[card_id] = topic_out
             from api.inspection import register_topic_internal
@@ -430,7 +456,7 @@ async def _do_start_project_impl():
         return data
 
     async def _settle_loading_item(mcp_id: str, tool_name: str, card_id: str,
-                                  info_args: dict) -> None:
+                                  info_args: dict) -> bool:
         """Poll a card that started into `loading` and report its real outcome.
 
         Runs detached: a 60 MB model download must not hold up the other cards,
@@ -475,7 +501,7 @@ async def _do_start_project_impl():
                     'tool': tool_name, 'mcp_id': mcp_id, 'status': 'cancelled',
                     'message': '启动已取消',
                 }})
-                return
+                return False
             status = 'error' if state == 'error' else 'ready'
             print(f'[start-project] {tool_name} ({mcp_id}) settled: {state}')
             if status == 'ready':
@@ -487,18 +513,53 @@ async def _do_start_project_impl():
                 'tool': tool_name, 'mcp_id': mcp_id, 'status': status,
                 'message': message if status == 'error' else '',
             }})
-            return
+            return status == 'ready'
         await push_event({'type': 'project_start_item', 'payload': {
             'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
             'message': f'模型加载超过 {LOADING_TIMEOUT_S // 60} 分钟仍未就绪',
         }})
+        return False
 
-    layout = config.main.get('canvas_layout', {})
+    from motion_project import with_feedback_edges, validate_execution_target
+    layout = with_feedback_edges(config.main.get('canvas_layout', {}),
+                                 (config.main.get('services', {}) or {}).get('mcp', []) or [])
     cards = layout.get('cards', [])
     connections = layout.get('connections', [])
 
     if not cards:
         return
+
+    # The graph determines the robot. Never silently fall back to a manually
+    # configured endpoint when a command edge is absent or ambiguous.
+    try:
+        bindings = resolve_bindings(layout, (config.main.get('services', {}) or {}).get('mcp', []) or [])
+        for card in teleop_cards(layout):
+            response = await mcp_call_tool(card['mcpId'], MCPCallRequest(
+                tool='teleop', arguments={'action': 'info', 'instance_id': card['id']}),
+                timeout_s=INFO_TIMEOUT_S)
+            if response.get('code') != 200:
+                raise TeleopProjectError(response.get('message') or '遥操服务未应答')
+            validate_profile(bindings[card['id']], payload_of(response))
+            binding = bindings[card['id']]
+            target = await mcp_call_tool(binding['mcp_id'], MCPCallRequest(
+                tool=binding['tool'], arguments={'action': 'info'}), timeout_s=INFO_TIMEOUT_S)
+            if target.get('code') != 200:
+                raise TeleopProjectError(target.get('message') or '遥操 Driver 未应答')
+            validate_target(binding, payload_of(target))
+            if binding.get('protocol_version') == 2:
+                execution = binding['execution_binding']
+                response = await mcp_call_tool(execution['mcp_id'], MCPCallRequest(
+                    tool=execution['tool'], arguments={'action': 'info'}), timeout_s=INFO_TIMEOUT_S)
+                if response.get('code') != 200:
+                    raise TeleopProjectError(response.get('message') or '执行卡未应答')
+                validate_execution_target(execution, payload_of(response))
+    except Exception as error:
+        core = config.main.get('core', {})
+        core['project_start_error'] = str(error)
+        config.main['core'] = core
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True, 'errors': [str(error)]}})
+        return False
 
     ordered, cyclic = order_cards_by_dependency(cards, connections)
     if cyclic:
@@ -519,6 +580,7 @@ async def _do_start_project_impl():
     errors = []
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
+    negotiated_ports: dict[str, dict] = {}
 
     def _topic_clash(card_id: str, info: dict):
         """Another card already publishing a topic this one just claimed.
@@ -559,7 +621,11 @@ async def _do_start_project_impl():
             # Both sides have to say so. One card declaring `control/*` while
             # the other declares `data/json` is not a negotiated hand-over, it
             # is the original bug wearing a format string.
-            if shared <= control and shared <= _control_topics(out):
+            session_topics = {b[k] for b in bindings.values() if b.get('protocol_version') == 2
+                              for k in ('command_topic',)}
+            session_topics.update(b['execution_binding']['command_topic'] for b in bindings.values()
+                                  if b.get('protocol_version') == 2)
+            if shared <= control and shared <= _control_topics(out) and not shared & session_topics:
                 print(f'[start-project] {sorted(shared)} has multiple control '
                       f'sources ({card_id}, {other_id}) — arbitrated by priority')
                 continue
@@ -576,7 +642,7 @@ async def _do_start_project_impl():
             return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
-                                 control_interface: dict = None):
+                                 control_interface: dict = None, control_interfaces: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -587,6 +653,17 @@ async def _do_start_project_impl():
         await push_event({'type': 'project_start_item', 'payload': {
             'tool': tool_name, 'mcp_id': mcp_id, 'status': 'starting',
         }})
+
+        if tool_name == 'teleop':
+            # PICO must not be able to start a session while other project cards
+            # are still starting or about to fail. Only resolve its output here.
+            try:
+                await _resolve_and_register(mcp_id, tool_name, card_id, {})
+            except Exception as error:
+                errors.append(tool_name)
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': str(error)}})
+            return
 
         args = {'action': 'start', 'instance_id': card_id}
         info_args: dict = {}
@@ -621,7 +698,18 @@ async def _do_start_project_impl():
             # producer can reconcile against it and refuse — not on `info`,
             # which must stay answerable by a card that has not been given one.
             args['control_interface'] = control_interface
+        if control_interfaces:
+            args['control_interfaces'] = control_interfaces
+        for binding in bindings.values():
+            if (binding.get('protocol_version') == 2 and binding['mcp_id'] == mcp_id
+                    and binding['tool'] == tool_name):
+                args['execution_binding'] = binding['execution_binding']
 
+        if tool_name == 'teleop_executor':
+            # Its fixed DDS endpoint is declared by x-teleop-target; the edge
+            # binds the producer, not an arbitrary Driver input_topic.
+            args = {'action': 'start'}
+            info_args, wanted = {}, []
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
             result = await mcp_call_tool(mcp_id, req)
@@ -657,9 +745,15 @@ async def _do_start_project_impl():
                         'tool': tool_name, 'mcp_id': mcp_id, 'status': 'loading',
                         'message': message,
                     }})
-                    _asyncio.create_task(
-                        _settle_loading_item(mcp_id, tool_name, card_id, info_args)
-                    )
+                    if bindings:
+                        # A robot operator must not be armed until all cards in
+                        # its project actually settle, including cold models.
+                        if not await _settle_loading_item(mcp_id, tool_name, card_id, info_args):
+                            errors.append(tool_name)
+                    else:
+                        _asyncio.create_task(
+                            _settle_loading_item(mcp_id, tool_name, card_id, info_args)
+                        )
                     # Resolve topic_out for the downstream cards and register it
                     # on the bus. Non-fatal: a card that cannot answer info()
                     # still runs.
@@ -816,7 +910,7 @@ async def _do_start_project_impl():
         driver differ between runs of an unchanged canvas.
         """
         topics, unresolved = [], []
-        for conn in [c for c in connections if c.get('toCardId') == card_id]:
+        for conn in [c for c in connections if c.get('toCardId') == card_id and c.get('role') != 'feedback']:
             topic = _topic_of_connection(conn)
             if not topic:
                 unresolved.append(conn)
@@ -851,10 +945,18 @@ async def _do_start_project_impl():
         without one.
         """
         descriptors, sources, unreachable = [], [], []
+        per_port = {}
+        registry = (config.main.get('services', {}) or {}).get('mcp', []) or []
+        producer = next((c for c in cards if c.get('id') == card_id), {})
+        producer_tool = next((t for m in registry if m.get('id') == producer.get('mcpId')
+                              for t in m.get('tools', []) if isinstance(t, dict)
+                              and t.get('name') == producer.get('toolName')), {})
+        producer_ports = producer_tool.get('topic_out', [])
         for conn in connections:
             if conn.get('fromCardId') != card_id:
                 continue
-            if not str(conn.get('format') or '').startswith('control/'):
+            if (conn.get('role') == 'feedback' or not str(conn.get('format') or '').startswith('control/')
+                    or conn.get('format') == 'control/teleop'):
                 continue
             target = next((c for c in cards if c.get('id') == conn.get('toCardId')), None)
             if not target:
@@ -872,13 +974,29 @@ async def _do_start_project_impl():
                 # have never heard of motus.control/1, and a control link to
                 # one of those must not fail a start.
                 reachable = (info or {}).get('code') == 200
-                descriptor = (payload_of(info) or {}).get('control_interface')
+                data = payload_of(info) or {}
+                consumer_ports = data.get('topic_in', [])
+                try:
+                    consumer_port = consumer_ports[int(conn.get('toPortIdx', 0))]
+                except (IndexError, ValueError, TypeError):
+                    consumer_port = {}
+                consumer_key = consumer_port.get('port_id') or consumer_port.get('id') or str(conn.get('toPortIdx', 0))
+                descriptor = (data.get('control_interfaces') or {}).get(consumer_key)
+                if descriptor is None:
+                    descriptor = data.get('control_interface')
             except Exception as error:
                 print(f'[start-project] {tool_name} descriptor info() failed: {error}')
                 reachable, descriptor = False, None
             if isinstance(descriptor, dict) and descriptor:
                 descriptors.append(descriptor)
                 sources.append(tool_name)
+                index = str(conn.get('fromPortIdx', 0))
+                try:
+                    output = producer_ports[int(index)]
+                except (IndexError, ValueError, TypeError):
+                    output = {}
+                key = output.get('port_id') or output.get('id') or index
+                per_port.setdefault(key, []).append(descriptor)
             elif not reachable:
                 unreachable.append(tool_name)
 
@@ -894,11 +1012,18 @@ async def _do_start_project_impl():
                             f'动作空间。连线是对的 —— 请检查该卡片所在的设备是否'
                             f'在线、是否刚重启。')
             return {}, ''
-        if _descriptor_conflict(descriptors):
+        supports_ports = 'control_interfaces' in producer_tool.get('inputSchema', {}).get('properties', {})
+        if unreachable and (supports_ports or producer_tool.get('x-motion-control')):
+            return {}, f'下游卡片 {", ".join(unreachable)} 没有应答，不能完成端口协商'
+        if any(_descriptor_conflict(values) for values in per_port.values()):
             return {}, (f'{card_id} 的控制输出接到了动作空间不一致的卡片：'
                         f'{", ".join(sources)}。一路指令流无法同时满足两种动作空间，'
                         f'请分开连线')
-        return descriptors[0], ''
+        if len(per_port) > 1 and not supports_ports:
+            return {}, '生产者未声明多输出端口协商能力，不能把不同端口合并为一路控制'
+        if supports_ports:
+            negotiated_ports[card_id] = {key: values[0] for key, values in per_port.items()}
+        return (descriptors[0] if len(per_port) == 1 else {}), ''
 
     def _unresolved_message(card: dict, unresolved: list) -> str:
         """Name the upstream cards whose topic could not be found."""
@@ -954,7 +1079,27 @@ async def _do_start_project_impl():
             continue
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
-                                 control_interface=descriptor)
+                                 control_interface=descriptor,
+                                 control_interfaces=negotiated_ports.get(card.get('id', '')))
+
+    if not errors:
+        for card in teleop_cards(layout):
+            try:
+                result = await mcp_call_tool(card['mcpId'], MCPCallRequest(
+                    tool='teleop', arguments={'action': 'project_start', 'instance_id': card['id'],
+                                             'driver_binding': bindings[card['id']]}),
+                    timeout_s=INFO_TIMEOUT_S)
+                state, reason = tool_state_of(result)
+                if (result.get('code') != 200 or state in ('error', 'fault')
+                        or payload_of(result).get('armed') is not True):
+                    raise TeleopProjectError(reason or result.get('message') or '遥操未确认等待头显开始')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': 'teleop', 'mcp_id': card['mcpId'], 'status': 'ready',
+                    'message': '等待 PICO 开始遥操'}})
+            except Exception as error:
+                errors.append('teleop')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': 'teleop', 'mcp_id': card['mcpId'], 'status': 'error', 'message': str(error)}})
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
@@ -965,7 +1110,7 @@ async def _do_start_project_impl():
 
     # 全部成功 → 标记 running
     core = config.main.get('core', {})
-    core['project_running'] = True
+    core.update(project_running=True, project_phase='running', project_stop_error='', project_start_error='')
     config.main['core'] = core
 
     # 广播启动完成
@@ -975,28 +1120,51 @@ async def _do_start_project_impl():
     return True
 
 
-async def _stop_cards(cards) -> int:
-    """Send `stop` to each card's instance. Returns how many calls were made.
+async def _stop_cards(cards, *, strict=False) -> int:
+    """Return all teleop arms before any downstream Driver can be stopped.
 
-    `stop` is idempotent — a plugin that is already idle returns
-    `{"state": "idle"}` — so this is safe to call on cards that were never
-    started.
+    Failed return keeps the old graph reachable and leaves Driver feedback and
+    execution transport alive for diagnosis and an explicit retry.
     """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
 
     stopped = 0
+    managed = set()
+    registry = (config.main.get('services', {}) or {}).get('mcp', []) or []
+    for card in teleop_cards({'cards': cards}):
+        if not has_project_lifecycle(registry, card):
+            continue  # Legacy G1 standalone Shadow uses stop, without a return promise.
+        managed.add(card['id'])
+        try:
+            result = await mcp_call_tool(card['mcpId'], MCPCallRequest(
+                tool='teleop', arguments={'action': 'project_stop', 'instance_id': card['id']}),
+                timeout_s=55.)
+            payload = payload_of(result)
+            if result.get('code') != 200 or not shutdown_complete(payload):
+                reason = payload.get('error') or result.get('message') or '收臂或控制权释放尚未确认'
+                raise TeleopProjectError(str(reason))
+        except Exception as error:
+            raise TeleopProjectError(f"{card.get('toolName', 'teleop')}: {error}") from error
+        stopped += 1
+
+    errors = []
     for card in cards:
-        mcp_id = card.get('mcpId', '')
-        tool_name = card.get('toolName', '')
-        card_id = card.get('id', '')
-        if not mcp_id or not tool_name:
+        mcp_id, tool_name, card_id = card.get('mcpId', ''), card.get('toolName', ''), card.get('id', '')
+        if not mcp_id or not tool_name or card_id in managed:
             continue
         try:
-            req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
-            await mcp_call_tool(mcp_id, req)
+            arguments = {'action': 'stop'} if tool_name == 'teleop_executor' else {'action': 'stop', 'instance_id': card_id}
+            req = MCPCallRequest(tool=tool_name, arguments=arguments)
+            result = await mcp_call_tool(mcp_id, req, timeout_s=5.) if strict else await mcp_call_tool(mcp_id, req)
+            state, message = tool_state_of(result)
+            if strict and (result.get('code') != 200 or state in ('error', 'fault')):
+                raise TeleopProjectError(message or '停止未确认')
             stopped += 1
-        except Exception:
-            pass
+        except Exception as error:
+            if strict:
+                errors.append(f'{tool_name}: {error}')
+    if errors:
+        raise TeleopProjectError('; '.join(errors))
     return stopped
 
 
@@ -1027,21 +1195,48 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
 
 
 async def _do_stop_project():
-    """停止所有 canvas cards。"""
+    """Join concurrent stop requests; disconnecting a browser cannot cancel return."""
+    import asyncio
+    global _stop_project_task
+    if _stop_project_task is None or _stop_project_task.done():
+        _stop_project_task = asyncio.create_task(_do_stop_project_impl())
+    return await asyncio.shield(_stop_project_task)
+
+
+async def _do_stop_project_impl():
     from api.motus_stream import push_event
 
     layout = config.main.get('canvas_layout', {})
-    await _stop_cards(layout.get('cards', []))
+    core = config.main.get('core', {})
+    core.update(project_phase='stopping', project_stop_error='')
+    config.main['core'] = core
+    await push_event({'type': 'project_state', 'payload': {
+        'running': True, 'phase': 'stopping', 'error': ''}})
+    try:
+        await _stop_cards(layout.get('cards', []), strict=True)
+    except Exception as error:
+        core = config.main.get('core', {})
+        core.update(project_running=True, project_phase='stop_failed', project_stop_error=str(error))
+        config.main['core'] = core
+        await push_event({'type': 'project_state', 'payload': {
+            'running': True, 'phase': 'stop_failed', 'error': str(error)}})
+        return False
 
     core = config.main.get('core', {})
-    core['project_running'] = False
+    core.update(project_running=False, project_phase='idle', project_stop_error='')
     config.main['core'] = core
-    await push_event({'type': 'project_state', 'payload': {'running': False}})
-    print('[stop-project] done')
+    await push_event({'type': 'project_state', 'payload': {'running': False, 'phase': 'idle', 'error': ''}})
+    return True
 
 
 @router.post('/start-project')
 async def api_start_project():
+    core = config.main.get('core', {})
+    if core.get('project_phase') in ('stopping', 'stop_failed'):
+        return fastapi.responses.JSONResponse(status_code=409, content={
+            'ok': False, 'detail': core.get('project_stop_error') or '正在收臂，请等待停止完成'})
+    if core.get('project_running'):
+        return {'ok': True, 'already_running': True}
     task = _start_project_task
     if task is not None and not task.done():
         return fastapi.responses.JSONResponse(
@@ -1052,7 +1247,8 @@ async def api_start_project():
     if success is False:
         return fastapi.responses.JSONResponse(
             status_code=500,
-            content={'ok': False, 'detail': '部分设备启动失败，已回滚'}
+            content={'ok': False, 'detail': (config.main.get('core', {}).get('project_stop_error')
+                     or config.main.get('core', {}).get('project_start_error') or '部分设备启动失败，已回滚')}
         )
     return {'ok': True}
 
@@ -1062,7 +1258,10 @@ async def api_stop_project():
     # **先取消在飞的那次启动，再停卡片。** 顺序是有意的：反过来的话被停掉的卡片
     # 会被那次仍在继续的启动重新拉起来，而操作者看到的是"停了又自己起来了"。
     cancelled = _cancel_start_project()
-    await _do_stop_project()
+    if not await _do_stop_project():
+        return fastapi.responses.JSONResponse(status_code=409, content={
+            'ok': False, 'detail': config.main.get('core', {}).get('project_stop_error') or '停止尚未确认',
+            'phase': 'stop_failed', 'cancelled_start': cancelled})
     return {'ok': True, 'cancelled_start': cancelled}
 
 
@@ -1073,10 +1272,8 @@ class ProjectRunningRequest(BaseModel):
 
 @router.put('/project-running')
 async def set_project_running(req: ProjectRunningRequest):
-    core = config.main.get('core', {})
-    core['project_running'] = req.running
-    config.main['core'] = core
-    return {'ok': True}
+    # Compatibility endpoint must not bypass graph arming or arm return.
+    return await api_start_project() if req.running else await api_stop_project()
 
 
 @router.get('/auto-start')
@@ -1609,5 +1806,3 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
-

@@ -1,0 +1,2 @@
+# Preserve upstream license bytes, including original indentation and line ends.
+app/src/main/assets/licenses/* whitespace=-blank-at-eol,-space-before-tab

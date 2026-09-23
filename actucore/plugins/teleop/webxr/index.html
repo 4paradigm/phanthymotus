@@ -1,0 +1,26 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="manifest" href="/webxr/manifest.webmanifest"><link rel="icon" href="/webxr/icon.svg">
+<title>PhanthyMotus 浏览器遥操</title>
+<style>
+body{font:20px/1.6 system-ui,sans-serif;background:#eef3fa;color:#15243a;margin:0}main{max-width:720px;margin:24px auto;padding:28px;background:white;border-radius:20px}h1{font-size:32px}button{font:600 21px system-ui;padding:18px;margin:8px 0;border:0;border-radius:12px;background:#245bcb;color:white;cursor:pointer;width:100%}button:disabled{opacity:.45;cursor:default}#disconnect{background:#a52c35}#fingerprint{font:24px monospace;overflow-wrap:anywhere}#status{min-height:64px}details{margin-top:24px}canvas[hidden],[hidden]{display:none!important}
+</style><main>
+<h1>打开网页，连接你的机器人</h1>
+<p>使用 PICO 自带浏览器，并与机器人连接同一局域网。可将本页添加到应用库，方便下次打开。</p>
+<p id="support" role="status">正在检查浏览器能力…</p>
+<p id="status" role="status">正在读取连接信息…</p>
+<button id="pair" disabled>首次使用：申请配对</button>
+<p id="fingerprint" hidden></p><button id="confirm" hidden>两端配对码一致，确认</button>
+<button id="reconnect" hidden>连接已配对机器人</button>
+<button id="enter" disabled>进入透视遥操</button>
+<button id="disconnect" disabled>断开连接 / 停止输入</button>
+<p>进入透视后，拿起双手柄，用扳机选择“开始遥操”。松开扳机后握紧双握把跟随；松开任一握把暂停。</p>
+<details><summary>连接帮助与更换机器人</summary>
+<p>首次配对：先在电脑端遥操卡片打开“允许新设备配对”，然后点击上方申请配对，核对两端配对码。</p>
+<p>首次进入透视时需确认浏览器权限。网页切换、跟踪丢失或网络中断都会停止输入，恢复后需重新连接并确认开始。</p>
+<p>浏览器需要可信的 HTTPS 证书。若页面或连接出现证书错误，请维护者配置站点证书。请勿通过忽略证书错误继续。</p>
+<p>更换机器人或配对已撤销时，先在电脑端撤销旧配对，再忘记本机记录。清除浏览器数据也会清除配对。</p>
+<button id="forget">忘记本机配对记录</button>
+</details>
+</main><canvas id="xr" hidden></canvas>
+<script type="module" src="/webxr/app.mjs"></script></html>

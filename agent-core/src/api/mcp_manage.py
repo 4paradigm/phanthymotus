@@ -19,6 +19,15 @@ router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
 
 
+def _teleop_management_headers(url, tool, arguments):
+    """Keep the API error contract while sharing the local-only HTTP capability."""
+    from teleop_management import TeleopManagementError, management_headers
+    try:
+        return management_headers(url, tool, arguments)
+    except TeleopManagementError as exc:
+        raise fastapi.HTTPException(exc.status_code, str(exc)) from None
+
+
 async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
     """Register topics with the embedded inspection module (process-internal call).
 
@@ -124,7 +133,7 @@ async def _ping_mcp_http(url: str) -> dict:
             async with session.post(url, json=tools_payload, headers=headers) as resp:
                 data = await resp.json(content_type=None)
                 tools = [
-                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in')}
+                    {k: v for k, v in t.items() if k in ('name', 'description', 'type', 'multiInstance', 'inputSchema', 'configSchema', 'topic_out', 'topic_in', 'x-connection-panel', 'x-teleop-target', 'x-motion-control', 'x-control-target')}
                     for t in data.get('result', {}).get('tools', [])
                 ]
         except Exception as e:
@@ -524,7 +533,9 @@ async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
                     'method': 'tools/call',
                     'params': {'name': tool_name, 'arguments': {'action': 'config', **restore_cfg}},
                 }
-                await session.post(url, json=cfg_payload, headers=headers)
+                cfg_headers = {**headers, **_teleop_management_headers(url, tool_name, {'action':'config'})}
+                await session.post(url, json=cfg_payload, headers=cfg_headers,
+                                   allow_redirects=tool_name != 'teleop')
                 sent.append(tool_name)
     except Exception as e:
         print(f'[mcp/config-restore] {mcp_id} error: {e}')
@@ -1229,7 +1240,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             # Also send config for non-system actions (set_*/get_*) so driver can resolve device_path after restart
             action = req.arguments.get('action')
             _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
-            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
+            # Teleop lifecycle acts on its current session. Reapplying saved config
+            # before pause/finish/start can reset mode or reject an owned lease.
+            # Configuration is changed explicitly through the config action.
+            if action and action not in _SYSTEM_ACTIONS_NO_CONFIG and req.tool != 'teleop':
                 tools = target.get('tools') or []
                 tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
 
@@ -1260,7 +1274,9 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                         'params': {'name': req.tool,
                                    'arguments': {'action': 'config', **cfg_body, **extra_args}},
                     }
-                    async with session.post(url, json=cfg_payload, headers=headers) as resp:
+                    cfg_headers = {**headers, **_teleop_management_headers(url, req.tool, {'action':'config'})}
+                    async with session.post(url, json=cfg_payload, headers=cfg_headers,
+                                            allow_redirects=req.tool != 'teleop') as resp:
                         cfg_data = await resp.json(content_type=None)
                         cfg_error = cfg_data.get('error')
                         if cfg_error:
@@ -1299,12 +1315,23 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 'method': 'tools/call',
                 'params': {'name': req.tool, 'arguments': final_args},
             }
-            async with session.post(url, json=call_payload, headers=headers) as resp:
+            headers.update(_teleop_management_headers(url, req.tool, final_args))
+            async with session.post(url, json=call_payload, headers=headers,
+                                    allow_redirects=req.tool != 'teleop') as resp:
                 data = await resp.json(content_type=None)
                 result = data.get('result', {})
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                if req.tool == 'teleop' and result.get('isError'):
+                    reason = '遥操请求被拒绝'
+                    for item in result.get('content') or []:
+                        try:
+                            detail = json.loads(item.get('text', ''))
+                            reason = str(detail.get('error') or detail.get('code') or reason)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    return {'code': 400, 'message': reason, 'data': result.get('content', result)}
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):
