@@ -73,6 +73,16 @@ OBJECTS_SUFFIX = "/objects"
 # proposed memory grid would need.
 HORIZONS = (0.5, 1.0, 1.2, 2.0, 5.0)
 
+# Only pairs where the robot actually turned this much say anything about the
+# compensation. Below it the prediction is nearly the identity, so compensated,
+# naive and flipped all agree — true, and useless. It dominated the median in
+# both recordings on r1_sz: 120 seconds of driving each, and the median window
+# still contained 0.003 rad of rotation, because most windows fall in the
+# pauses between manoeuvres rather than in them. Conditioning on motion uses
+# the samples that carry the signal instead of asking the operator to turn
+# without ever stopping.
+MOVING_YAW_RAD = 0.10
+
 
 def _discover(node, suffix: str, explicit: str = "", settle_s: float = 6.0) -> str:
     """A topic by name suffix, waiting for the ROS graph to fill in.
@@ -213,7 +223,27 @@ def _record(args, *, want_landmark: bool):
     return odom, observations
 
 
-def _propagate(point, odom, start_s: float, end_s: float, config):
+def _integrated_yaw(odom, start_s: float, end_s: float) -> float:
+    """How far the robot says it turned over the window, in radians.
+
+    Without this there is no way to tell a compensation that is wrong from a
+    robot that did not move: both leave the compensated error close to (or
+    worse than) the naive one, and only one of them is a bug in our code.
+    """
+    import bisect
+
+    stamps = [entry[0] for entry in odom]
+    total, previous = 0.0, start_s
+    for index in range(bisect.bisect_right(stamps, start_s),
+                       bisect.bisect_right(stamps, end_s)):
+        stamp, twist = odom[index]
+        total += twist[2] * (stamp - previous)
+        previous = stamp
+    return total
+
+
+def _propagate(point, odom, start_s: float, end_s: float, config,
+               sign: float = 1.0):
     """Where a stationary point should be now, given what we did in between.
 
     Calls the tracker's own `_predict`, on a track whose target velocity is
@@ -232,7 +262,7 @@ def _propagate(point, odom, start_s: float, end_s: float, config):
     twist = odom[max(0, first - 1)][1] if odom else (0.0, 0.0, 0.0)
     for index in range(first, last):
         stamp, twist = odom[index]
-        tracker._predict(twist, stamp - previous, config, True)
+        tracker._predict([v * sign for v in twist], stamp - previous, config, True)
         previous = stamp
     # The tail. Odometry arrives at 10 Hz and `end_s` is an observation's
     # timestamp, so there is almost always a fraction of a tick left over —
@@ -240,7 +270,7 @@ def _propagate(point, odom, start_s: float, end_s: float, config):
     # R1's minimum turn rate is 0.1 rad of phantom error on a **perfect**
     # odometry. That would have been read as drift.
     if end_s > previous:
-        tracker._predict(twist, end_s - previous, config, True)
+        tracker._predict([v * sign for v in twist], end_s - previous, config, True)
     return tracker.track.position
 
 
@@ -310,8 +340,34 @@ def run_static(args) -> None:
 
 # ── mode: landmark ───────────────────────────────────────────────────────────
 
+def _save_recording(path: str, odom, observations) -> None:
+    import json as _json
+
+    with open(path, "w") as handle:
+        _json.dump({"odom": [[t, list(v)] for t, v in odom],
+                    "observations": [[t, [float(p[0]), float(p[1])]]
+                                     for t, p in observations]}, handle)
+    print(f"[info] 原始记录已存到 {path}", flush=True)
+
+
+def _load_recording(path: str):
+    import json as _json
+
+    with open(path) as handle:
+        raw = _json.load(handle)
+    return ([(t, tuple(v)) for t, v in raw["odom"]],
+            [(t, np.array(p)) for t, p in raw["observations"]])
+
+
 def run_landmark(args) -> None:
-    odom, observations = _record(args, want_landmark=True)
+    if args.load:
+        odom, observations = _load_recording(args.load)
+        print(f"[info] 读入 {args.load}：里程计 {len(odom)} 条，观测 "
+              f"{len(observations)} 条")
+    else:
+        odom, observations = _record(args, want_landmark=True)
+        if args.save:
+            _save_recording(args.save, odom, observations)
     if len(observations) < 20:
         raise SystemExit(
             f"只取到 {len(observations)} 条 {args.target!r} 的观测 —— 目标要一直"
@@ -320,7 +376,17 @@ def run_landmark(args) -> None:
     config = policy_mod.Config()
     import bisect
 
-    results = {h: {"compensated": [], "naive": [], "range": []} for h in HORIZONS}
+    # `flipped` runs the same propagation with the ego twist negated, and
+    # `turned` records how far the robot says it turned over the window.
+    #
+    # Both exist because the first real run came back with compensation three
+    # times *worse* than doing nothing, at every horizon. Noise does not do
+    # that — noisy odometry makes compensation no better than naive, not
+    # reliably worse. A constant factor points at a sign or a scale, and the
+    # cheapest way to tell a sign error from "the robot barely moved" is to
+    # measure both rather than argue about which is more likely.
+    results = {h: {"compensated": [], "naive": [], "flipped": [], "turned": [],
+                   "range": []} for h in HORIZONS}
     stamps = [stamp for stamp, _ in observations]
     for now_s, observed in observations:
         for horizon in HORIZONS:
@@ -340,15 +406,21 @@ def run_landmark(args) -> None:
             if abs(past[0] - target_s) > 0.12:
                 continue
             predicted = _propagate(past[1], odom, past[0], now_s, config)
+            flipped = _propagate(past[1], odom, past[0], now_s, config, sign=-1.0)
 
             observed_range, observed_bearing = track_mod.polar_of(observed)
             predicted_range, predicted_bearing = track_mod.polar_of(predicted)
             _, naive_bearing = track_mod.polar_of(past[1])
+            _, flipped_bearing = track_mod.polar_of(flipped)
 
             results[horizon]["compensated"].append(
                 _wrapped(predicted_bearing - observed_bearing))
             results[horizon]["naive"].append(
                 _wrapped(naive_bearing - observed_bearing))
+            results[horizon]["flipped"].append(
+                _wrapped(flipped_bearing - observed_bearing))
+            results[horizon]["turned"].append(
+                _integrated_yaw(odom, past[0], now_s))
             results[horizon]["range"].append(predicted_range - observed_range)
 
     print()
@@ -369,6 +441,8 @@ def run_landmark(args) -> None:
         print(_percentiles(bucket["compensated"], "  归一化", "",
                            scale=1.0 / config.half_fov_rad))
         print(_percentiles(bucket["naive"], "方位(不补偿)", " rad"))
+        print(_percentiles(bucket["flipped"], "方位(反符号)", " rad"))
+        print(_percentiles(bucket["turned"], "里程计说转了", " rad"))
         print(_percentiles(bucket["range"], "距离", " m"))
         print()
 
@@ -380,23 +454,53 @@ def run_landmark(args) -> None:
         print("      并且确保过程中真的转了几次身。")
         return
 
-    compensated = statistics.median(abs(v) for v in bucket["compensated"])
-    naive = statistics.median(abs(v) for v in bucket["naive"])
+    # **Only the windows the robot actually turned in say anything.** A median
+    # over every window is a median over the pauses, and on r1_sz that buried
+    # two full recordings.
+    moving = [index for index, turned in enumerate(bucket["turned"])
+              if abs(turned) >= MOVING_YAW_RAD]
+    print("=" * 66)
+    print(f"在 max_coast_s = {config.max_coast_s}s 处，"
+          f"**只看确实转了的窗口**（|转角| ≥ {MOVING_YAW_RAD} rad）：")
+    print(f"  这样的窗口 {len(moving)}/{len(bucket['turned'])} 个")
+    print()
+    if len(moving) < 15:
+        print("结论：**有效样本太少，下不了结论。** 整段记录里几乎没有转身动作，")
+        print("      而不转的时候补偿本来就等于不补偿。重跑一次，明确地左转 90°、")
+        print("      转回来、右转 90°、转回来，反复几轮。")
+        print("      下次记得加 --save /tmp/drive.json —— 之后可以 --load 重新分析，")
+        print("      不必再开一遍机器人。")
+        return
+
+    def _median(key):
+        return statistics.median(abs(bucket[key][i]) for i in moving)
+
+    compensated = _median("compensated")
+    naive = _median("naive")
+    flipped = _median("flipped")
+    turned = _median("turned")
     normalised = compensated / config.half_fov_rad
 
-    print("=" * 66)
-    print(f"在 max_coast_s = {config.max_coast_s}s 处：")
     print(f"  补偿后方位误差 {compensated:.3f} rad = {normalised:.3f}（归一化）")
     print(f"  不补偿         {naive:.3f} rad")
+    print(f"  反符号补偿     {flipped:.3f} rad")
+    print(f"  里程计说转了   {turned:.3f} rad")
     print(f"  align_tol      {config.align_tol}（归一化），"
           f"arrive_align_tol {config.arrive_align_tol}")
     print()
+
     gain = naive / max(1e-4, compensated)
-    if naive <= compensated * 1.2:
-        print("结论：**补偿没有带来好处。** 里程计在这个时间尺度上已经不比")
-        print("      「假设世界没动」更准，那么自运动补偿在这台机器人上是白")
-        print("      做的，而局部记忆栅格（取舍八里那条）不用考虑了。")
-        print("      先查里程计本身：跑一次 static 模式看有没有偏置。")
+    if flipped < compensated * 0.6:
+        print("结论：**自运动补偿的符号是反的。** 把 ego twist 取负之后误差从")
+        print(f"      {compensated:.3f} rad 降到 {flipped:.3f} rad。")
+        print("      这不是精度问题，是约定问题：motus.odom/1 规定 wz 正方向是逆")
+        print("      时针，而驱动是直接把厂商的 yaw_speed 放进 twist[5] 的。先去")
+        print("      核对驱动那一侧的符号 —— 卡死检测和跟踪器都建立在这个量上。")
+    elif naive <= compensated * 1.2:
+        print("结论：**补偿没有带来好处**，而且机器人确实转了，符号也不像反的。")
+        print("      那么里程计在这个时间尺度上已经不比「假设世界没动」更准，")
+        print("      自运动补偿在这台机器人上是白做的，局部记忆栅格也不用考虑。")
+        print("      先跑 static 模式看有没有偏置。")
     elif normalised > config.align_tol:
         print(f"结论：补偿有效（比不补偿好 {min(gain, 999):.0f} 倍），")
         print(f"      但滑行到 {config.max_coast_s}s 时误差已经超过 align_tol，")
@@ -420,6 +524,15 @@ def main() -> None:
     parser.add_argument("--seconds", type=float, default=60.0)
     parser.add_argument("--target", default="chair",
                         help="landmark 模式：一个**不动的**参照物，vop 认得的名字")
+    # Recording is the expensive part — somebody has to drive a robot for two
+    # minutes — and the analysis is the part that keeps getting revised. Keeping
+    # them separable means a better question can be asked of a drive that
+    # already happened, instead of asking for the drive again. Two were burned
+    # before this existed.
+    parser.add_argument("--save", default="",
+                        help="把原始记录存成 json，之后可以用 --load 重新分析")
+    parser.add_argument("--load", default="",
+                        help="分析一份存下来的记录，完全不碰机器人")
     parser.add_argument("--odom-topic", default="")
     parser.add_argument("--depth-topic", default="")
     parser.add_argument("--objects-topic", default="")
