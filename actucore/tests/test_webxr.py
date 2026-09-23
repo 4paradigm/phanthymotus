@@ -180,7 +180,7 @@ def test_chromium_pair_real_rtc_frames_and_focus_loss(tmp_path,monkeypatch):
                   const config=await (await fetch('/webxr/config')).json();
                   window.fixtureGrip=0;window.fixtureLoss=false;window.fixtureTime=100;
                   const pose={emulatedPosition:false,transform:{position:{x:0,y:1,z:0},orientation:{x:0,y:0,z:0,w:1}}};
-                  const controller=hand=>controllerOf({handedness:hand,targetRayMode:'tracked-pointer',gripSpace:{},gamepad:{mapping:'xr-standard',connected:true,axes:[0,0,0,0],buttons:[{value:0,pressed:false},{value:fixtureGrip,pressed:fixtureGrip===1}]}},pose,hand);
+                  const controller=hand=>controllerOf({handedness:hand,targetRayMode:'tracked-pointer',gripSpace:{},gamepad:{mapping:'xr-standard',connected:true,axes:[0,0,0,0],buttons:[{value:0,pressed:false},{value:fixtureGrip,pressed:fixtureGrip===1},...Array.from({length:4},()=>({value:0,pressed:false}))]}},pose,hand);
                   window.transport=new CaptureClient({url:config.wss_url,now:()=>fixtureTime,onLoss:()=>{fixtureLoss=true;}});
                   transport.connect(JSON.parse(localStorage.getItem('motus.webxr.capture.v1')).credentials);
                   window.pump=setInterval(()=>{fixtureTime+=20;transport.submit({head:poseOf(pose),left:controller('left'),right:controller('right')});},20);

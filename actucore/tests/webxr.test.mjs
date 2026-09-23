@@ -53,6 +53,16 @@ test('assignment accepts current EEF producer and refuses mobile/unknown modes',
   }
 });
 
+test('PICO six-button xr-standard input matches the native trigger/squeeze contract',()=>{
+  const source=input('left',1,.2);
+  source.gamepad.axes=[0,0,.1,-.2];
+  source.gamepad.buttons.push(...Array.from({length:4},()=>({value:1,pressed:true})));
+  const normalized=controllerOf(source,pose,'left');
+  assert.deepEqual(normalized.wire,{axes:[0,0,.1,-.2],buttons:[.2,1]});
+  assert.equal(normalized.squeeze,'pressed');
+  assert.equal(source.gamepad.buttons.length,6);
+});
+
 class Socket {
   readyState=1;bufferedAmount=0;messages=[];
   send(raw){this.messages.push(JSON.parse(raw));}

@@ -22,7 +22,9 @@ export function controllerOf(source, pose, hand) {
   const pressed=gamepad.buttons[1].pressed===true;
   // A changing/inconsistent squeeze is neither a confirmed release nor a press.
   const squeeze=pressed && buttons[1]>=.75 ? 'pressed' : !pressed && buttons[1]<.75 ? 'released' : 'transition';
-  return {pose:normalized,wire:{axes,buttons},squeeze};
+  // RTC Frame v1's native producer sends trigger and squeeze only. PICO also
+  // exposes thumbstick and face buttons through xr-standard; omit those extras.
+  return {pose:normalized,wire:{axes,buttons:buttons.slice(0,2)},squeeze};
 }
 
 export function frameSample(frame, space, session) {
