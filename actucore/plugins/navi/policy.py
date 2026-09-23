@@ -1013,6 +1013,17 @@ def _keepout_m(config: Config) -> float:
     return config.half_width_m + config.clearance_margin_m
 
 
+def _side_label(room, coverage, config: Config) -> str:
+    """One side's verdict, for a reason string an operator has to act on."""
+    if coverage < config.coverage_min:
+        return f"只有 {coverage * 100:.0f}% 深度有效"
+    if room is None:
+        return "无读数"
+    if room <= config.slow_distance_m:
+        return f"{room:.2f} m 处有东西"
+    return f"{room:.2f} m"
+
+
 def _clearance(depth, config: Config, lateral_offset_m: float = 0.0):
     """`(nearest obstacle in the corridor, how much of it was measured)`.
 
@@ -1124,22 +1135,77 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason):
                 wz, status, reason
 
     if ahead <= config.obstacle_stop_m:
-        left, right = bands.get("left"), bands.get("right")
-        # Turn towards whichever side reports more room. If neither reports
-        # anything, keep the bearing-derived wz — it is at least aimed at the
-        # target, and turning arbitrarily is not an improvement on that.
-        if left is not None and right is not None:
-            towards_right = right > left
-            wz = config.wz_max * (-1.0 if towards_right else 1.0)
-            vy = (_lift(-config.vy_max * config.lateral_scale if towards_right
-                        else config.vy_max * config.lateral_scale,
-                        config.floor_vy, config.vy_max)
-                  if _may_strafe(towards_right, depth, config) else 0.0)
-        else:
-            vy = 0.0
+        # **Which way out, decided on metric corridors — not on the angular
+        # thirds.**
+        #
+        # This branch was the other half of the bug the metric corridor was
+        # introduced to fix. "Is the way ahead blocked" became metric; "which way
+        # do I go" stayed on `bands`, which describe what is ahead-and-to-the-side
+        # at a couple of metres rather than what is beside the shoulder. A
+        # **doorway** beside the path is the worst case for that: you can see
+        # through it, so it reads as the *emptiest* band, and the robot steers
+        # into the one thing in reach.
+        #
+        # That is what happened on r1_sz. The robot could have walked straight
+        # through a 1.1 m door; instead it reached the doorway, deliberately
+        # turned towards it, and put a shoulder into the frame — at
+        # `wz_max` = 1.5 rad/s and `vy_max` = 1.0 m/s, because the escape was
+        # full-scale and unconditional.
+        #
+        # So both sides are now judged by the corridor the robot would actually
+        # move into, which is the same question `_may_strafe` asks, and the turn
+        # is refused outright when neither side is measured and clear.
+        keep = _keepout_m(config)
+        left_room, left_cov = _clearance(depth, config, lateral_offset_m=-keep)
+        right_room, right_cov = _clearance(depth, config, lateral_offset_m=keep)
+
+        def _room(room, coverage):
+            """How much room a side offers, or None if the answer is not usable.
+
+            Unmeasured is not free. Sideways is the direction a forward-facing
+            camera knows least about, and this is the one place the policy moves
+            into space it cannot see.
+            """
+            if coverage < config.coverage_min:
+                return None
+            if room is None:
+                return float("inf")
+            return room if room > config.slow_distance_m else None
+
+        options = {-1.0: _room(left_room, left_cov),
+                   1.0: _room(right_room, right_cov)}
+        usable = {sign: room for sign, room in options.items() if room is not None}
+
+        if not usable:
+            # Nowhere to go that we can see. Keep the target-derived yaw — it at
+            # least points at the target — and do not spin towards a band: a
+            # walking humanoid rotating at wz_max sweeps its shoulders through
+            # space no corridor checked, which is exactly how one found a
+            # doorframe.
+            return (0.0, 0.0, wz, AVOIDING,
+                    f"走廊内 {ahead:.2f} m 处有障碍，两侧也都不可用"
+                    f"（左 {_side_label(left_room, left_cov, config)}，"
+                    f"右 {_side_label(right_room, right_cov, config)}）；停下")
+
+        sign = max(usable, key=lambda k: usable[k])
+        # Turn towards the gap rather than at full scale. The gap sits at
+        # `atan(keep / ahead)` off the nose, so this is the same proportional law
+        # the main loop uses applied to the angle that actually has to be closed
+        # — bounded, derived, and about a third of what wz_max was commanding.
+        gap_angle = math.atan2(keep, max(ahead, 0.1))
+        wz = _clamp(-sign * config.k_yaw * gap_angle, config.wz_max)
+        # `sign` indexes the **offset corridor** (+1 = the one displaced to the
+        # right), while the body frame has y pointing **left** — so the sidestep
+        # takes the opposite sign. Getting this wrong steps into the obstacle it
+        # just decided to avoid, at full speed, and every other signal in the
+        # decision still looks right.
+        vy = (_lift(-sign * config.vy_max * config.lateral_scale,
+                    config.floor_vy, config.vy_max)
+              if _may_strafe(sign > 0, depth, config) else 0.0)
+        side = "右" if sign > 0 else "左"
         return (0.0, vy, wz, AVOIDING,
-                f"走廊内 {ahead:.2f} m 处有障碍；停止前进"
-                + ("并向旁边让开" if vy else "并转向"))
+                f"走廊内 {ahead:.2f} m 处有障碍；停止前进，朝{side}侧"
+                + ("让开并转向" if vy else "转向"))
 
     if ahead < config.slow_distance_m:
         span = max(1e-6, config.slow_distance_m - config.obstacle_stop_m)

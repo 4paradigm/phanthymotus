@@ -337,19 +337,80 @@ def test_an_obstacle_inside_the_stop_distance_halts_forward_motion():
     assert decision.status == P.AVOIDING
 
 
-def test_it_turns_towards_the_freer_side():
-    # The obstacle goes in the map (that is what the corridor reads) and the
-    # asymmetry in the bands (that is what picks the side). Setting them
-    # independently is what isolates the choice from the detection.
-    blocked = _obstacle_map(5.0, [(0.0, 0.6, 0.3)])
-    left_free = _step(detections=_detections(_obj(x=0.0)),
-                      depth=_depth({"left": 5.0, "center": 0.6, "right": 1.0},
-                                   map_=blocked))
-    right_free = _step(detections=_detections(_obj(x=0.0)),
-                       depth=_depth({"left": 1.0, "center": 0.6, "right": 5.0},
-                                    map_=blocked))
-    assert left_free.values[5] > 0      # counter-clockwise, towards the left
-    assert right_free.values[5] < 0
+def test_it_turns_towards_the_side_the_map_says_is_free():
+    """The way out is chosen by the corridor the robot would move **into**.
+
+    It used to be chosen by the angular thirds, which describe what is
+    ahead-and-to-the-side at a couple of metres rather than what is beside the
+    shoulder — the other half of the bug the metric corridor was introduced to
+    fix, left behind when "is it blocked" was converted and "which way out" was
+    not. See the doorway test below for what that cost.
+    """
+    # The obstacle sits off-axis, so exactly one offset corridor clears it.
+    to_the_right = _step(detections=_detections(_obj(x=0.0)),
+                         depth=_depth(map_=_obstacle_map(5.0, [(0.25, 0.6, 0.3)])))
+    to_the_left = _step(detections=_detections(_obj(x=0.0)),
+                        depth=_depth(map_=_obstacle_map(5.0, [(-0.25, 0.6, 0.3)])))
+
+    assert to_the_right.values[5] > 0, "障碍在右，应当朝左转（逆时针为正）"
+    assert to_the_left.values[5] < 0
+    # y is left-positive, so the sidestep goes the other way from the obstacle.
+    assert to_the_right.values[1] > 0 and to_the_left.values[1] < 0
+
+
+def test_a_doorway_beside_the_path_is_not_mistaken_for_the_way_out():
+    """r1_sz, 2026-09-23: the robot could have walked straight through a 1.1 m
+    door. Instead it reached the doorway, deliberately turned towards it, and put
+    a shoulder into the frame.
+
+    A doorway is the worst case for choosing by the angular bands, because you
+    can **see through it** — so it reads as the emptiest band while being the one
+    thing in reach. Here the bands say the right side is wide open and the map
+    says the right side is a wall at 0.5 m; the map has to win.
+    """
+    decision = _step(
+        detections=_detections(_obj(x=0.0)),
+        depth=_depth({"left": 2.0, "center": 0.5, "right": 9.0},
+                     map_=_obstacle_map(5.0, [(0.0, 0.5, 0.25), (0.6, 0.5, 0.5)])))
+
+    assert decision.status == P.AVOIDING
+    assert decision.values[0] == 0.0
+    assert decision.values[1] >= 0.0, "朝右让开就是撞门框那一下"
+    assert decision.values[5] >= 0.0, "更不该朝右转"
+
+
+def test_the_escape_turn_is_aimed_at_the_gap_rather_than_slammed_to_the_limit():
+    """It used to command `wz_max` outright — 1.5 rad/s on r1_sz, unrelated to
+    how blocked it was or where the target was. That is a lunge, not an evasion,
+    and a walking humanoid rotating that fast sweeps its shoulders through space
+    no corridor checked.
+
+    The gap sits at `atan(keep / ahead)` off the nose, so the turn closes that
+    angle with the same proportional law the main loop uses.
+    """
+    config = _cfg()
+    decision = _step(detections=_detections(_obj(x=0.0)), config=config,
+                     depth=_depth(map_=_obstacle_map(5.0, [(0.25, 0.6, 0.3)])))
+    expected = config.k_yaw * math.atan2(P._keepout_m(config), 0.6)
+    assert abs(decision.values[5]) == pytest.approx(min(expected, config.wz_max),
+                                                    abs=1e-6)
+    assert abs(decision.values[5]) < config.wz_max
+
+
+def test_with_no_usable_side_it_stops_instead_of_spinning_towards_a_band():
+    """Nowhere to go that it can see. Keeping the target-derived yaw is right;
+    spinning towards whichever third looks emptier is how the shoulder found the
+    doorframe."""
+    # `stop_distance_m` pinned under the wall's range, or the target — whose
+    # distance is read from that same wall — counts as reached and arrival
+    # pre-empts the whole branch.
+    config = _cfg(stop_distance_m=0.3)
+    decision = _step(detections=_detections(_obj(x=0.0)), config=config,
+                     depth=_depth({"left": 9.0, "center": 0.5, "right": 9.0},
+                                  map_=_obstacle_map(0.5, [])))
+    assert decision.status == P.AVOIDING
+    assert decision.values[0] == 0.0 and decision.values[1] == 0.0
+    assert "两侧也都不可用" in decision.reason
 
 
 def test_the_summary_only_path_cannot_separate_target_from_obstacle():
