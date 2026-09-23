@@ -1021,6 +1021,13 @@ class NaviPlugin:
                 self._last_error = f"{type(error).__name__}: {error}"
             log.warning("navi tick failed: %s", error)
             return
+        # **Before the early return, not after it.** The tick publishes nothing
+        # when the decision is to publish nothing — blind, searching, arrived,
+        # refused — and those are exactly the moments somebody wants the picture
+        # for. Drawing only while commands flow would make the overlay go dark
+        # precisely when the robot stops explaining itself.
+        self._publish_view()
+
         if message is None:
             self._maybe_complete()
             return
@@ -1032,7 +1039,6 @@ class NaviPlugin:
         publisher.publish(payload)
         with self._lock:
             self._published += 1
-        self._publish_view()
         self._maybe_complete()
 
     def _publish_view(self):
