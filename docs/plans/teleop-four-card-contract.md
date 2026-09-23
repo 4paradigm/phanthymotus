@@ -1,5 +1,7 @@
 # 双臂遥操四卡实现与验收契约
 
+关联 PR：[ext_vr #329](https://github.com/4paradigm/phanthymotus-driver/pull/329) · [teleop #259](https://github.com/4paradigm/phanthymotus/pull/259) · [天轶执行 #321](https://github.com/4paradigm/phanthymotus-driver/pull/321) · [G1 执行 #330](https://github.com/4paradigm/phanthymotus-driver/pull/330)。
+
 将设备接入、通用遥操映射、机器人运动学和硬件执行分开，让用户从 Canvas 齿轮页完成 PICO 安装与连接，再通过头显完成双臂遥操。主仓 [#259](https://github.com/4paradigm/phanthymotus/pull/259) 负责通用 teleop 和必要的 Core 宿主适配；天轶执行沿用 [#321](https://github.com/4paradigm/phanthymotus-driver/pull/321)，ext_vr 和北京 G1 执行分别使用独立 Driver PR。
 
 **状态：Draft / 实施与验收契约，2026-09-23。本次提交仅更新文档和 PR 说明，不包含四卡运行时实现、部署或新的硬件验收。已有三卡代码及历史结果继续保留，不能勾选本方案的验收项。** PR 正文与本文件同步维护，作为工程实现及用户、雨强验收的依据；范围变化必须同步验收条目，不以聊天记录隐式改变要求。
@@ -7,7 +9,7 @@
 ## 确定的架构
 
 ```mermaid
-flowchart LR
+flowchart TD
     P[PICO App] <-->|设备输入、显示及管理回执| E[Driver ext_vr]
     E -->|标准双手柄输入| T[普通 ActuCore teleop]
     T -->|双末端目标| M[Driver motion_control]
@@ -81,16 +83,16 @@ Canvas 显示三条正向连接及 motion 到 teleop/ext_vr 的两条反馈连�
 
 | PR / Agent | 实施范围 |
 |---|---|
-| ext_vr 新 Driver PR / A | App、设备协议、安装/配对鉴权、输入、显示、G1/天轶 bundle 的最小设备接入；设备功能契约及其验收 |
-| 主仓 #259 / 主 Agent | teleop、端口和反馈绑定、生命周期；另列 ext_vr 的 Core 宿主适配提交（齿轮页托管、固定下载代理、认证调用与配置确认），不把设备业务留在 teleop |
-| G1 执行新 Driver PR / B | 北京 G1_23 motion_control/arm、模型、连续执行、补偿、SDK 交还及已有 release |
-| 天轶 #321 / C | 天轶 motion_control/arm、模型、连续执行、恢复和 finish/stop |
+| [ext_vr #329](https://github.com/4paradigm/phanthymotus-driver/pull/329) / A | App、设备协议、安装/配对鉴权、输入、显示、G1/天轶 bundle 的最小设备接入；设备功能契约及其验收 |
+| 主仓 [#259](https://github.com/4paradigm/phanthymotus/pull/259) / 主 Agent | teleop、端口和反馈绑定、生命周期；另列 ext_vr 的 Core 宿主适配提交（齿轮页托管、固定下载代理、认证调用与配置确认），不把设备业务留在 teleop |
+| [G1 执行 #330](https://github.com/4paradigm/phanthymotus-driver/pull/330) / B | 北京 G1_23 motion_control/arm、模型、连续执行、补偿、SDK 交还及已有 release |
+| 天轶 [#321](https://github.com/4paradigm/phanthymotus-driver/pull/321) / C | 天轶 motion_control/arm、模型、连续执行、恢复和 finish/stop |
 
 四个 Agent 在独立 worktree 并行推进，公共协议和 bundle 注册由指定写入者整合固定提交，不并发写同一段。天轶和北京 G1 哪个空闲先测哪个，分别验收；不以其中一台结果替代另一台。普通 Core 的其他修改和原画布保留，部署前审查实际增量及占用，不用旧整份 Compose 一致性阻塞回放。
 
 ## 本 PR 交付与验证状态
 
-### #259 验收条目
+### [#259](https://github.com/4paradigm/phanthymotus/pull/259) 验收条目
 
 每条均为待验收要求。证据必须覆盖用户可观察结果，不能仅用 HTTP 200、publish 返回或测试替身记为物理通过。
 
@@ -130,4 +132,4 @@ Canvas 显示三条正向连接及 motion 到 teleop/ext_vr 的两条反馈连�
 
 移除输入频率造成的额外限幅是本次预期行为变化，不要求逐帧关节解与冻结版一致。先验证执行链，再比较完整链路的动作进度、延迟与中断；允许滞后，不能把卡死隐藏成通过。
 
-远端 #259 在本次文档提交前为 `d7e0c16d29a2e56d978e92fd28e0acb80e730727`。其旧正文与版本化历史结果保存在 [PR #259 历史说明](../validation/teleop-pr259-history-20260923.md)，不当作本四卡方案的完成证据。现有三卡实现见 [历史架构说明](../design/teleop-architecture.md) 和 [历史操作手册](../../actucore/plugins/teleop/README.md)；两者开头标明适用版本，本文件和 PR 最新正文规定后续目标。
+远端 [#259](https://github.com/4paradigm/phanthymotus/pull/259) 在本次文档提交前为 `d7e0c16d29a2e56d978e92fd28e0acb80e730727`。其旧正文与版本化历史结果保存在 [PR 259 历史说明](../validation/teleop-pr259-history-20260923.md)，不当作本四卡方案的完成证据。现有三卡实现见 [历史架构说明](../design/teleop-architecture.md) 和 [历史操作手册](../../actucore/plugins/teleop/README.md)；两者开头标明适用版本，本文件和 PR 最新正文规定后续目标。
