@@ -176,6 +176,11 @@ class Config:
     # Past this offset, turn rather than strafe: the bearing estimate is worst at
     # the frame edge, and so is the depth band that would have to clear it.
     lateral_max_bearing: float = 0.7
+    # Strafe only when the honest lateral speed is at least this share of the
+    # robot's lateral floor — i.e. when `_lift` amplifies by no more than 1/this.
+    # See `_worth_strafing`: without it, a target a few percent off centre
+    # produced a full-speed sidestep.
+    lateral_lift_ratio: float = 0.5
     # Hysteresis. An axis engages at its threshold and releases at this fraction
     # of it — without the gap, an error hovering at the threshold toggles the
     # axis at tick rate, and on a deadbanded robot that toggle is full speed to
@@ -354,6 +359,10 @@ class State:
     target: str = ""
     yaw_gate: Gate = field(default_factory=Gate)
     fwd_gate: Gate = field(default_factory=Gate)
+    # The lateral axis needs one for the same reason the other two do — see
+    # `_approach`. It did not have one, and that is why every run began with a
+    # sidestep nobody asked for.
+    vy_gate: Gate = field(default_factory=Gate)
     tracker: Tracker = field(default_factory=Tracker)
     # What we last asked the chassis to do. Stands in for odometry when none is
     # wired: with a deadband the robot either does roughly the commanded speed
@@ -884,7 +893,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         remaining, engage=0.05, release=0.0,
         dt=dt, min_dwell_s=config.min_dwell_s)
 
-    vx, vy = _approach(speed if driving else 0.0, bearing, depth, config)
+    vx, vy = _approach(speed if driving else 0.0, bearing, depth, config,
+                       state, dt)
     vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
                                             status, reason)
 
@@ -1071,7 +1081,8 @@ def _may_strafe(towards_right: bool, depth, config: Config) -> bool:
     return room is None or room > config.slow_distance_m
 
 
-def _approach(speed: float, bearing: float, depth, config: Config):
+def _approach(speed: float, bearing: float, depth, config: Config,
+              state: "State" = None, dt: float = 0.0):
     """Split the approach speed between forward and sideways.
 
     The target sits at roughly `bearing * half_fov_rad` off the nose, so
@@ -1096,7 +1107,41 @@ def _approach(speed: float, bearing: float, depth, config: Config):
     lateral = -speed * math.sin(angle) * config.lateral_scale
     if lateral == 0.0 or not _may_strafe(lateral < 0, depth, config):
         return forward, 0.0
+    if not _worth_strafing(lateral, config, state, dt):
+        return forward, 0.0
     return forward, _lift(lateral, config.floor_vy, config.vy_max)
+
+
+def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
+    """Whether this lateral component is big enough to be worth a real sidestep.
+
+    **`_lift` is not free on a deadbanded axis.** It raises whatever it is given
+    to the floor, so a target 0.05 off centre asks for 0.04 m/s and receives
+    R1's minimum 0.4 — a **ninefold** amplification, and a visible sideways lurch
+    at the start of every run before the robot settles into walking forward.
+    That is what an operator sees as "it always does a sidestep it does not
+    need, and then comes towards me".
+
+    The yaw axis already had this covered (`_finalise_yaw` + its gate); the
+    lateral one did not, which is the whole bug.
+
+    The threshold is derived rather than tuned: strafe only when the honest
+    lateral is at least half the floor, i.e. when `_lift` is amplifying by no
+    more than 2x. Below that the yaw loop closes the same error, more slowly and
+    without the lurch — and it is already turning anyway.
+
+    Hysteresis and dwell for the same reason every other gate here has them: an
+    error sitting on the threshold would otherwise switch the axis on and off at
+    tick rate, which is the juddering this card was written to remove.
+    """
+    if config.floor_vy <= 1e-6:
+        return True                      # no deadband, no amplification, no gate
+    engage = config.floor_vy * config.lateral_lift_ratio
+    if state is None:
+        return abs(lateral) >= engage
+    return state.vy_gate.update(
+        abs(lateral), engage=engage, release=engage * config.release_frac,
+        dt=dt, min_dwell_s=config.min_dwell_s)
 
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason):

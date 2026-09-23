@@ -1564,3 +1564,71 @@ def test_the_doorway_only_reads_as_passable_because_the_camera_said_so():
                                   reference_m=config.obstacle_stop_m)
         assert clearance > config.obstacle_stop_m, (
             f"离门 {wall} m 时走廊被门框挡住了：clearance={clearance}")
+
+
+# ── 起步时那个没必要的侧移 ───────────────────────────────────────────────────
+
+def test_a_target_a_few_percent_off_centre_does_not_trigger_a_sidestep():
+    """What an operator saw as "every run starts with a sidestep it does not
+    need, then it comes towards me".
+
+    `_lift` raises whatever it is given to the axis floor, so a bearing of 0.05
+    asks for ~0.04 m/s of lateral and receives R1's minimum 0.4 — a **ninefold**
+    amplification, and a visible sideways lurch. The yaw axis had a gate for
+    exactly this; the lateral axis did not.
+    """
+    config = _cfg()
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    assert config.floor_vy > 0, "前提：这台机器人有横移死区"
+
+    state = seed(_state(), _detections(_obj(x=0.05)), _depth(), config)
+    decision = P.step(detections=_detections(_obj(x=0.05)), depth=_depth(),
+                      odom=None, config=config, state=state, dt=0.1)
+
+    assert decision.values[1] == 0.0, "微小的方位差不该换来一次全速横移"
+    assert decision.values[0] > 0.0, "但还是要往前走"
+
+
+def test_a_target_well_off_to_one_side_still_gets_a_real_sidestep():
+    """The gate must not turn the feature off. Walking a straight line to
+    something off to one side is the whole reason vy exists.
+
+    **On R1 that band is narrow, and honestly so.** The lateral floor is
+    0.4 m/s, so *any* sidestep this robot makes is a 0.4 m/s one — at an
+    approach speed near 1 m/s that is a 22-degree crab, a large manoeuvre. The
+    honest lateral demand only reaches half the floor when the target is well
+    off axis, so on this chassis strafing is rare by construction rather than by
+    tuning. A base that can creep sideways is unaffected (see below).
+    """
+    config = _cfg()
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    state = seed(_state(), _detections(_obj(x=0.65)), _depth(), config)
+    decision = P.step(detections=_detections(_obj(x=0.65)), depth=_depth(),
+                      odom=None, config=config, state=state, dt=0.1)
+    assert abs(decision.values[1]) >= config.floor_vy
+
+
+def test_where_the_sidestep_starts_on_r1_is_pinned_rather_than_incidental():
+    """Which bearings strafe is a consequence of the robot's floor and the
+    alignment ramp, not of a number somebody chose. Pinned so that a change to
+    either shows up here instead of on a robot."""
+    config = _cfg()
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    strafing = []
+    for bearing in [b / 100 for b in range(0, 71, 5)]:
+        state = seed(_state(), _detections(_obj(x=bearing)), _depth(), config)
+        values = P.step(detections=_detections(_obj(x=bearing)), depth=_depth(),
+                        odom=None, config=config, state=state, dt=0.1).values
+        strafing.append(values is not None and abs(values[1]) > 0)
+    first = next((i for i, on in enumerate(strafing) if on), None)
+    assert first is not None, "完全不横移就是把功能关掉了"
+    assert 0.40 <= first * 0.05 <= 0.70, f"起始方位 {first * 0.05}"
+
+
+def test_a_base_with_no_lateral_deadband_is_not_gated_at_all():
+    """A wheeled base can creep sideways, so `_lift` is not amplifying anything
+    and there is nothing to protect against."""
+    config = _cfg()
+    P.adopt_limits(config, {"limits": {"lower": [-1.0] * 6, "upper": [1.0] * 6}})
+    assert config.floor_vy == 0.0
+    assert P._worth_strafing(0.01, config, None, 0.1) is True
