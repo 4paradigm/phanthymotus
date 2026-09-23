@@ -678,6 +678,14 @@ class NaviPlugin:
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
                 "published": self._published,
+                # (width, height) of the frame vop's boxes are in. (0, 0) means
+                # no declaration arrived and boxes cannot be used — see
+                # `_degradations`.
+                "objects_frame": list(self._objects_frame),
+                # Why the overlay has a box or has not, without guessing: how
+                # many detections arrived, how many carry a usable box, and how
+                # many of those are the thing being chased.
+                "boxes": self._box_stats(),
                 "inputs": dict(self._binding),
                 # Which precision the card is actually operating at. A card
                 # falling back to the summary and a card working properly look
@@ -728,6 +736,17 @@ class NaviPlugin:
                        "不会驱动任何硬件（想看它算什么的话，这是对的）")
         out.extend(self._limit_notes)
         out.extend(self._camera_notes)
+        if not all(self._objects_frame):
+            # **Not a cosmetic loss.** Without the frame size vop's pixel boxes
+            # cannot be normalised, and `target_distance` silently drops from
+            # "percentile over the whole target" to "one small patch at its
+            # centre" — the degradation this card documents as the cost of vop
+            # running without `publish_bbox`, reached by a different route and
+            # previously reported by nothing. The overlay's missing box is the
+            # same fact, seen.
+            out.append("vop 没有声明 camera_info 的分辨率 —— 它的像素框无法归一化，"
+                       "目标距离退化成中心一小块取样（而不是整框取分位），叠加图上"
+                       "也不会有目标框")
         for hint in (self._binding.get("unknown") or []):
             out.append(f"有一路输入没有被使用：{hint}")
         return out
@@ -1122,6 +1141,21 @@ class NaviPlugin:
                 log.warning("navi view render failed, disabling it: %s", error,
                             exc_info=True)
             self._view_publisher = None
+
+    def _box_stats(self) -> dict:
+        payload = self._objects or {}
+        objects = payload.get("objects") or []
+        target = (self._state.target or "").strip().lower()
+        named = [o for o in objects
+                 if target and (target in str(o.get("name") or "").lower()
+                                or str(o.get("name") or "").lower() in target)]
+        return {
+            "detections": len(objects),
+            "with_bbox": sum(1 for o in objects if o.get("bbox")),
+            "with_bbox_norm": sum(1 for o in objects if o.get("bbox_norm")),
+            "matching_target": len(named),
+            "target_has_box": sum(1 for o in named if o.get("bbox_norm")),
+        }
 
     def _target_box(self):
         """`(box, measured_distance)` for the thing being chased, or `(None, None)`.

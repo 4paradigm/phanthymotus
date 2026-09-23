@@ -175,6 +175,10 @@ def test_a_fully_wired_card_reports_no_degradation():
     card._descriptor = _descriptor()          # a chassis is wired downstream
     card._binding = {"objects": "/cam/objects", "depth_map": "/cam/visual_depth",
                      "odom": "/r1/state/odom"}
+    # Fully wired includes the camera having said what resolution its boxes are
+    # in: without it vop's pixel boxes cannot be normalised and the target's
+    # distance silently drops to a centre patch.
+    card._objects_frame = (1280, 720)
     assert card._degradations() == []
 
 
@@ -183,6 +187,7 @@ def test_info_carries_the_degradations_and_the_target():
     card._running = True
     card._descriptor = _descriptor()
     card._binding = {"objects": "/o", "depth_map": "", "odom": ""}
+    card._objects_frame = (1280, 720)
     info = card.dispatch("navi", {"action": "info"})
     assert info["state"] == "running"
     assert len(info["degraded"]) == 2
@@ -450,6 +455,7 @@ def test_a_connected_card_does_not_claim_to_be_unbound():
     card._running = True
     card._descriptor = _descriptor()
     card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom"}
+    card._objects_frame = (1280, 720)
     assert card._degradations() == []
 
 
@@ -773,3 +779,49 @@ def test_the_same_camera_on_both_inputs_is_accepted():
         _DEPTH_TOPIC: _decl(_DEPTH_TOPIC),
         _OBJECTS_TOPIC: _decl(_OBJECTS_TOPIC),
     }, _binding()) == ""
+
+
+def test_a_camera_that_never_said_its_resolution_is_reported():
+    """Not a cosmetic loss. Without the frame size vop's pixel boxes cannot be
+    normalised, and `target_distance` silently drops from "percentile over the
+    whole target" to "one patch at its centre" — the degradation this card
+    documents as the cost of running vop without `publish_bbox`, reached by a
+    different route and, until now, reported by nothing."""
+    card = _card()
+    card._running = True
+    card._descriptor = _descriptor()
+    card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom"}
+    assert any("像素框无法归一化" in n for n in card._degradations())
+
+
+def test_the_box_counters_localise_a_missing_overlay_box():
+    """Four things have to line up for the overlay to draw a box, and "no box"
+    used to be one symptom for all four. These counters say which."""
+    card = _card()
+    card._objects_frame = (1000, 500)
+    card._state.target = "person"
+    card._objects = card._normalise_boxes({"objects": [
+        {"name": "person", "bbox": [100, 50, 300, 450], "position": [0.0, 0.0]},
+        {"name": "chair", "bbox": [0, 0, 10, 10], "position": [0.5, 0.0]},
+        {"name": "person", "position": [0.2, 0.0]},        # detector gave no box
+    ]})
+    stats = card._box_stats()
+    assert stats == {"detections": 3, "with_bbox": 2, "with_bbox_norm": 2,
+                     "matching_target": 2, "target_has_box": 1}
+
+
+def test_a_pixel_box_becomes_a_normalised_one():
+    card = _card()
+    card._objects_frame = (1000, 500)
+    out = card._normalise_boxes({"objects": [{"name": "person",
+                                              "bbox": [100, 50, 300, 450]}]})
+    assert out["objects"][0]["bbox_norm"] == [0.1, 0.1, 0.3, 0.9]
+
+
+def test_without_a_declaration_no_box_is_invented():
+    """Inferring the resolution from a box that happens to be large is exactly
+    the plausible guess this card keeps being bitten by."""
+    card = _card()
+    out = card._normalise_boxes({"objects": [{"name": "person",
+                                              "bbox": [100, 50, 300, 450]}]})
+    assert "bbox_norm" not in out["objects"][0]
