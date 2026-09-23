@@ -1082,7 +1082,10 @@ def test_the_yaw_axis_does_not_chatter_around_its_threshold():
 
 def test_a_turn_ends_once_the_target_is_well_centred():
     """Hysteresis must not become a latch: the release threshold is real."""
-    config = _cfg()
+    # The gate only exists for commands under the robot's floor, so a config
+    # with no deadband never engages it — adopt R1's so there is one.
+    config = _cfg(align_min_scale=0.0, use_lateral=False)
+    P.adopt_limits(config, _R1_DESC)
     state = seed(_state(), _detections(_obj(x=0.5)), _depth(), config)
     P.step(detections=_detections(_obj(x=0.5)), depth=_depth(), odom=None,
            config=config, state=state, dt=0.1)
@@ -1200,3 +1203,63 @@ def test_the_summary_only_path_cannot_detect_a_corridor_full_of_holes():
     config = _cfg()
     depth = {"map": None, "bands": {"left": None, "center": None, "right": None}}
     assert P._clearance(depth, config) == (None, 1.0)
+
+
+# ── the deadband is a property of the gait, not of the axis ──────────────────
+
+_R1_COUPLED = {"limits": dict(_R1_DESC["limits"],
+                              min_magnitude_moving=[0.4, 0.4, 0.0, 0.0, 0.0, 0.05])}
+
+
+def test_yaw_is_proportional_while_the_robot_is_walking():
+    """The bug this whole section is about.
+
+    R1 needs 1.0 rad/s to start turning from a standstill and 0.05 once it is
+    already walking — twenty times smaller. Lifting every yaw command to the
+    standing floor mid-approach turns a 0.05 correction into a 1.0 one, then
+    reverses, then overshoots again. On the robot that looked like weaving left
+    and right on the way to a target it was already facing.
+    """
+    config = _cfg()
+    P.adopt_limits(config, _R1_COUPLED)
+    assert config.floor_wz_moving == 0.05
+
+    depth = _depth(map_=_solid_depth(3.0))
+    detections = _detections(_obj(x=0.12))          # slightly off centre
+    decision = _step(detections=detections, depth=depth, config=config)
+
+    assert decision.values[0] > 0, "it is walking"
+    wz = decision.values[5]
+    assert 0 < abs(wz) < 0.5, (
+        f"wz={wz:+.2f} — a small bearing error while walking must produce a "
+        "small turn, not the standing floor")
+
+
+def test_turning_in_place_still_uses_the_standing_floor():
+    """Which is the whole reason the gate and the lift exist: from a standstill
+    the robot genuinely cannot turn slowly."""
+    config = _cfg(align_min_scale=0.0, use_lateral=False)
+    P.adopt_limits(config, _R1_COUPLED)
+    decision = _step(detections=_detections(_obj(x=0.9)), depth=_depth(),
+                     config=config)
+    assert decision.values[0] == 0.0, "not translating"
+    assert abs(decision.values[5]) >= config.floor_wz
+
+
+def test_a_chassis_that_declares_no_moving_floor_keeps_the_standing_one():
+    """Optional field: absent means the old behaviour, which errs towards
+    commanding too much rather than too little."""
+    config = _cfg()
+    P.adopt_limits(config, _R1_DESC)
+    assert config.floor_wz_moving == config.floor_wz
+
+
+def test_the_card_picks_the_floor_from_the_command_it_is_about_to_send():
+    """`apply_deadband` runs after the policy and would otherwise re-inflate
+    exactly the commands the policy was careful not to quantise."""
+    from plugins.navi import plugin as navi_plugin
+
+    card = navi_plugin.NaviPlugin({}, executor=None)
+    card._descriptor = _R1_COUPLED
+    assert card._deadband_for([0.4, 0.0, 0, 0, 0, 0.05])[5] == 0.05, "walking"
+    assert card._deadband_for([0.0, 0.0, 0, 0, 0, 0.05])[5] == 1.0, "standing"

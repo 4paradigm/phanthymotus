@@ -287,6 +287,17 @@ class Config:
     floor_vx: float = 0.0
     floor_vy: float = 0.0
     floor_wz: float = 0.0
+    # **The yaw floor while the robot is already translating**, which on a
+    # legged robot is a different number entirely: a gait cycle that is running
+    # can be steered a little per step, one that has to be started cannot.
+    # Measured on r1_sz — standing, nothing under 1.0 rad/s moves it at all;
+    # walking, a commanded 0.05 rad/s is visible. Twenty times smaller.
+    #
+    # Lifting every yaw command to the standing floor mid-approach overshoots a
+    # small correction twenty-fold, reverses, and overshoots again. That is what
+    # "the robot weaves left and right on its way to a target it is already
+    # facing" turned out to be.
+    floor_wz_moving: float = 0.0
 
 
 @dataclass
@@ -507,6 +518,16 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             (5, "wz", "wz_max", "floor_wz")):
         floor = at(floors, index) or 0.0
         setattr(config, floor_attr, floor)
+        if index == 5:
+            # The moving floor is optional: a chassis that does not declare one
+            # keeps the standing floor everywhere, which is the old behaviour
+            # and errs towards commanding too much rather than too little.
+            moving = at(list(limits.get("min_magnitude_moving") or []), 5)
+            config.floor_wz_moving = floor if moving is None else moving
+            if moving is not None and moving < floor:
+                notes.append(
+                    f"行进中偏航下限 {moving:g} 远低于站立时的 {floor:g}，"
+                    f"走动时按前者做比例控制")
 
         # An axis the robot does not have. Pinned lower == upper == 0 is how a
         # descriptor says so, and the policy has to stop asking for it — not
@@ -705,17 +726,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # act on the placeholder the tracker needed in order to exist.
     distance = track.range_m if track.range_known else None
 
-    # Turn towards it. Positive bearing means the target is right of centre, and
-    # `wz` is positive counter-clockwise, so the sign is inverted here.
+    # Turn towards it, proportionally. Positive bearing means the target is
+    # right of centre, and `wz` is positive counter-clockwise, so the sign is
+    # inverted here.
     #
-    # Gated rather than continuous: see `Gate`. The gain still sets the *rate*
-    # once engaged, so a target far off to the side is chased faster.
-    turning = state.yaw_gate.update(
-        abs(bearing), engage=config.align_tol,
-        release=config.align_tol * config.release_frac,
-        dt=dt, min_dwell_s=config.min_dwell_s)
-    wz = (_lift(-config.k_yaw * bearing, config.floor_wz, config.wz_max)
-          if turning else 0.0)
+    # **Left unquantised for now.** Whether this has to be lifted to a deadband
+    # depends on something not known yet at this point — whether the robot ends
+    # up translating — so the decision is deferred to `_finalise_yaw` once vx is
+    # settled. See `floor_wz_moving`.
+    raw_wz = _clamp(-config.k_yaw * bearing, config.wz_max)
 
     within = distance is not None and distance <= config.stop_distance_m
     if within:
@@ -751,6 +770,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
     align = _alignment_scale(bearing, config)
     if align <= 0.0:
         state.commanded_vx = 0.0
+        # Turning in place: the standing floor applies, so this is the one path
+        # that still needs the gate and the lift.
+        wz = _finalise_yaw(raw_wz, False, bearing, config, state, dt)
         return Decision(_twist(0.0, 0.0, wz), ALIGNING,
                         f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
                         distance_m=distance, bearing=bearing)
@@ -775,7 +797,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
         dt=dt, min_dwell_s=config.min_dwell_s)
 
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config)
-    vx, vy, wz, status, reason = _avoid(vx, vy, wz, depth, config, status, reason)
+    vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
+                                            status, reason)
+    # Now vx is settled, so which deadband the yaw axis is subject to is known.
+    wz = _finalise_yaw(raw_wz, bool(vx or vy), bearing, config, state, dt)
 
     stuck = _stuck(odom, state, vx, dt, config)
     if stuck:
@@ -820,6 +845,42 @@ def _account_idle(decision: Decision, state: State, config: Config,
         f"(last state: {decision.status} — {decision.reason}); giving up")
     return Decision(None, FAILED, state.failed_reason,
                     distance_m=decision.distance_m, bearing=decision.bearing)
+
+
+def _finalise_yaw(raw: float, translating: bool, bearing: float,
+                  config: Config, state: State, dt: float) -> float:
+    """Quantise the yaw command onto what the robot can execute *right now*.
+
+    The floor is not a constant of the axis — it is a constant of the *gait*.
+    Standing, R1 does nothing below 1.0 rad/s. Walking, 0.05 rad/s is visible.
+    So the same 0.05 command is unexecutable in one state and fine in the other,
+    and which state applies is only known after `_avoid` has had its say about
+    vx.
+
+    The gate and the lift apply to **one band only**: commands the robot cannot
+    execute, i.e. below the floor. Above it, proportional control works and the
+    machinery is not merely unnecessary but harmful — both exist *because* a
+    deadbanded axis cannot correct slowly, and applying them where it can turns
+    a 0.05 rad/s correction into a 1.0 rad/s one: a twenty-fold overshoot, a
+    reversal, and another overshoot.
+
+    Conditioning on the command rather than on the state is what makes this one
+    rule instead of two: standing, almost every useful yaw lands under the 1.0
+    floor and is gated; walking, almost nothing does.
+    """
+    floor = config.floor_wz_moving if translating else config.floor_wz
+    if floor <= 1e-6 or abs(raw) >= floor:
+        # Keep the gate's state coherent, so a later transition back to turning
+        # in place does not inherit a stale "already engaged".
+        state.yaw_gate.on = False
+        state.yaw_gate.held_s = 0.0
+        return raw
+
+    turning = state.yaw_gate.update(
+        abs(bearing), engage=config.align_tol,
+        release=config.align_tol * config.release_frac,
+        dt=dt, min_dwell_s=config.min_dwell_s)
+    return _lift(raw, floor, config.wz_max) if turning else 0.0
 
 
 def _alignment_scale(bearing: float, config: Config) -> float:

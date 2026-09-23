@@ -873,10 +873,16 @@ class NaviPlugin:
         # Lift the command out of the robot's deadband, or drop it to zero. The
         # threshold comes from the downstream descriptor — it is a property of
         # the robot, and this policy should not know any robot's numbers.
-        values = policy_mod.apply_deadband(
-            decision.values,
-            ((self._descriptor.get("limits") or {}).get("min_magnitude")
-             if self._descriptor else None))
+        #
+        # **Which threshold depends on what the command itself asks for.** On a
+        # legged chassis the yaw deadband is a property of the gait, not of the
+        # axis: R1 needs 1.0 rad/s to start turning from a standstill and 0.05
+        # once it is already walking. Applying the standing figure to a command
+        # that also translates inflates a small correction twenty-fold — and
+        # this line would have done exactly that to every command the policy
+        # had just been careful not to quantise.
+        values = policy_mod.apply_deadband(decision.values,
+                                           self._deadband_for(decision.values))
 
         self._seq += 1
         obs_ms = self._objects_ms or int(now * 1000)
@@ -921,6 +927,20 @@ class NaviPlugin:
                 "joint_names": list(TWIST_AXES),
             }
         return message
+
+    def _deadband_for(self, values) -> list:
+        """The floors that apply to *this* command.
+
+        `min_magnitude_moving` is optional, so a chassis that does not declare
+        one keeps the standing floors everywhere — the old behaviour, which errs
+        towards commanding too much rather than too little.
+        """
+        limits = (self._descriptor.get("limits") or {}) if self._descriptor else {}
+        standing = limits.get("min_magnitude")
+        moving = limits.get("min_magnitude_moving")
+        if not moving or not (values[0] or values[1]):
+            return standing
+        return list(moving)
 
     def _tick(self):
         publisher = self._publisher
