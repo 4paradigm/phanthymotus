@@ -675,3 +675,97 @@ def test_a_chassis_that_swallows_commands_is_reported_as_degraded():
     card._binding = {"objects": "o", "depth_map": "d", "odom": "s"}
     card._descriptor = {"mode": "twist", "dry_run": True}
     assert any("dry_run" in note for note in card._degradations())
+
+
+# ── 相机几何沿连线传下来（motus.camera/1）──────────────────────────────────────
+
+_DEPTH_TOPIC = "/ubuntu/camera/main/visual_depth"
+_OBJECTS_TOPIC = "/ubuntu/camera/main/objects"
+
+
+def _decl(topic, **over):
+    out = {"schema": "motus.camera/1", "topic": topic,
+           "id": "unitree/r1/camera_main", "width": 640, "height": 480,
+           "half_fov_rad": 0.888, "source": "inherited"}
+    out.update(over)
+    return out
+
+
+def _binding(**over):
+    out = {"objects": _OBJECTS_TOPIC, "depth_map": _DEPTH_TOPIC,
+           "depth_summary": "", "odom": ""}
+    out.update(over)
+    return out
+
+
+def test_the_card_adopts_the_geometry_of_whichever_topic_carries_the_depth():
+    """Joined on the topic this card bound, not on list position and not on the
+    upstream card's name — inputs are dispatched by what they carry, on purpose,
+    so a different depth source has to keep working."""
+    card = _card(half_fov_rad=0.55)
+    assert card._adopt_camera({_DEPTH_TOPIC: _decl(_DEPTH_TOPIC)}, _binding()) == ""
+    assert card._config.half_fov_rad == 0.888
+    assert any("0.888" in note for note in card._camera_notes)
+
+
+def test_a_declaration_for_some_other_topic_is_not_used_for_the_depth():
+    """The failure this keying prevents: one lens's geometry silently applied to
+    another lens's picture."""
+    card = _card(half_fov_rad=0.55)
+    card._adopt_camera({"/somewhere/else": _decl("/somewhere/else")}, _binding())
+    assert card._config.half_fov_rad == 0.55
+    assert card._camera_notes, "用了兜底值就得说出来"
+
+
+def test_the_note_reaches_degraded_where_an_operator_will_see_it():
+    card = _card(half_fov_rad=0.55)
+    card._running = True
+    card._adopt_camera(None, _binding())
+    card._binding = _binding()
+    assert any("camera_info" in note for note in card._degradations())
+
+
+def test_only_a_summary_is_enough_to_carry_the_geometry():
+    """Depth-summary-only is an existing degraded tier. It is still a camera, so
+    it still has a field of view."""
+    card = _card(half_fov_rad=0.55)
+    summary = "/ubuntu/camera/main/visual_depth/summary"
+    card._adopt_camera({summary: _decl(summary)},
+                       _binding(depth_map="", depth_summary=summary))
+    assert card._config.half_fov_rad == 0.888
+
+
+def test_two_different_cameras_refuse_to_start():
+    """vop reports a normalised offset, the depth map is a grid of distances, and
+    this card turns both into metres with **one** field of view — which is only
+    correct if they are the same lens.
+
+    Nothing has ever enforced it: inputs bind by what they carry, so camera A's
+    vop plus camera B's depth has always been wirable and would produce
+    confidently wrong distances with nothing in any log. The original navi plan
+    promised this check and never implemented it; both sides declaring an `id`
+    makes it a comparison.
+    """
+    card = _card()
+    problem = card._adopt_camera({
+        _DEPTH_TOPIC: _decl(_DEPTH_TOPIC, id="unitree/r1/camera_main"),
+        _OBJECTS_TOPIC: _decl(_OBJECTS_TOPIC, id="unitree/r1/camera_left"),
+    }, _binding())
+    assert "不同的相机" in problem
+    assert "camera_left" in problem and "camera_main" in problem
+
+
+def test_one_side_declaring_nothing_is_not_treated_as_a_mismatch():
+    """Half the cards in the repo declare nothing. Refusing on a missing
+    declaration would fail every canvas that has not been updated yet."""
+    card = _card()
+    assert card._adopt_camera({_DEPTH_TOPIC: _decl(_DEPTH_TOPIC)}, _binding()) == ""
+    assert card._adopt_camera({}, _binding()) == ""
+
+
+def test_the_same_camera_on_both_inputs_is_accepted():
+    card = _card()
+    assert card._adopt_camera({
+        _DEPTH_TOPIC: _decl(_DEPTH_TOPIC),
+        _OBJECTS_TOPIC: _decl(_OBJECTS_TOPIC),
+    }, _binding()) == ""

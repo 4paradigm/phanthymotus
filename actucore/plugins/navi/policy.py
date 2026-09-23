@@ -67,6 +67,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+from .camera import half_fov as _resolve_half_fov
 from .track import Tracker
 
 # Status values. `arrived` and `stuck` are terminal for one `navigate_to`;
@@ -150,12 +151,19 @@ class Config:
     #
     # `position[0]` from vop is a fraction of the image half-width, **not** a
     # heading — which is why `align_tol` and friends are all in those same
-    # normalised units and must stay that way. The approach velocity is the only
-    # quantity that needs a real angle, to be split between vx and vy, and this
-    # is the camera's horizontal half-FOV (~63° full). Being 20% out only makes
-    # the arc slightly wide; the yaw loop closes it either way.
-    # 见 config.yaml 里同名项下那段 —— 填错会静默地放宽或收窄米制走廊，而症状
-    # 会表现成「过不了门」。换相机必须用 tools/measure_fov.py 重新量。
+    # normalised units and must stay that way.
+    #
+    # **A fallback, not the answer.** The camera declares this now
+    # (`motus.camera/1`, see `_adopt_camera`); this value is what gets used when
+    # nothing upstream says. It is deliberately on the *small* side, because the
+    # two failure directions are not symmetric — see `_adopt_camera`.
+    #
+    # Two consumers, and the second is the one that bites. Splitting the approach
+    # velocity between vx and vy needs a real angle, and being 20% out there only
+    # makes the arc slightly wide because the yaw loop closes it anyway. But the
+    # avoidance corridor is metric, so every tick it converts a half-width back
+    # into a column range using this — and being 1.6x out there made the corridor
+    # wider than any door.
     half_fov_rad: float = 0.888
     # Sidestep while approaching, and to get out from in front of an obstacle.
     # Turn it off for a base with no lateral degree of freedom — the descriptor
@@ -486,6 +494,53 @@ def _adopt_footprint(config: Config, descriptor: dict) -> list[str]:
         return [f"底盘的 footprint 标注为 estimate（±{declared:g} m），"
                 "不是量出来的，避障余量按此理解"]
     return []
+
+
+def _adopt_camera(config: Config, declaration: dict) -> list[str]:
+    """Take the horizontal field of view from the camera that produced the depth.
+
+    Same move as `_adopt_footprint` and `min_magnitude`: the thing that knows
+    declares it, the policy adopts it at start, and anything it had to change or
+    assume goes into `info().degraded`. Camera parameters were the last quantity
+    here that a human had to copy by hand, and copying it wrong is what made the
+    robot refuse doorways.
+
+    **Unlike the footprint, this number's failure modes are not symmetric, and
+    neither is safe.** Understate the field of view and the corridor comes out
+    too wide, so the robot refuses gaps it fits through — stuck, but nothing is
+    hit. Overstate it and the corridor comes out too narrow, so an obstacle
+    beside the path is filed as being outside it and a shoulder goes into a
+    doorframe. Stuck is recoverable and a collision is not, so a missing
+    declaration keeps the conservative fallback rather than guessing wide — and
+    says so, because on r1_sz "the robot keeps turning away at the door" was
+    diagnosed as a tracking problem first, twice.
+    """
+    notes: list[str] = []
+    if not isinstance(declaration, dict) or not declaration:
+        return [f"没拿到相机的 camera_info —— 避障走廊按 half_fov_rad="
+                f"{config.half_fov_rad:g} 的保守值算。如果机器人在门口反复转向或"
+                f"绕开明明走得过的缝，先检查相机卡片有没有声明 camera_info"]
+
+    angle, source = _resolve_half_fov(declaration)
+    if angle is None:
+        return [f"相机的 camera_info 里读不到可用的视场角（{source}）—— 走廊按保守的"
+                f" half_fov_rad={config.half_fov_rad:g} 算。用 tools/measure_fov.py"
+                f" 量一次，填到**那颗镜头的驱动声明**里，不要填到这张卡片上"]
+
+    previous = config.half_fov_rad
+    config.half_fov_rad = angle
+    # Report the adoption whenever it moved the number enough to change a
+    # decision. Silence would repeat the original mistake from the other side:
+    # an operator who set this by hand is owed the news that the camera
+    # overruled them, rather than a card that quietly ignores the setting.
+    if abs(angle - previous) > 0.02:
+        notes.append(
+            f"相机声明的水平半视场角是 {angle:.3f} rad（{source}），已采纳 —— "
+            f"卡片配置里的 {previous:.3f} 不再生效。走廊宽度按这个数算，"
+            f"两者相差 {abs(angle - previous) / max(previous, 1e-6) * 100:.0f}%")
+    if source in ("unknown", "unspecified"):
+        notes.append("相机没说这个视场角是量出来的还是猜的（source 缺失）")
+    return notes
 
 
 def adopt_limits(config: Config, descriptor: dict) -> list[str]:

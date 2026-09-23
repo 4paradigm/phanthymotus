@@ -145,6 +145,10 @@ class NaviPlugin:
         self._binding = {}
         self._acp_action_id = ""
         self._limit_notes: list = []
+        # What `_adopt_camera` had to change or assume. Separate from
+        # `_limit_notes` only because they are populated at different points in
+        # `_start`; both end up in `degraded`.
+        self._camera_notes: list = []
 
     # ── tool ─────────────────────────────────────────────────────────────────
 
@@ -376,12 +380,57 @@ class NaviPlugin:
             # shows a card that looks perfectly healthy.
             return self._error(problem)
 
+        # Camera geometry, now that the inputs are bound and we know which
+        # topic carries the depth. This has to come after `_bind_inputs` and
+        # after `adopt_limits` — the corridor's half-width is read from the
+        # chassis footprint and its *angular* extent from the camera, and both
+        # have to be settled before the first tick converts one into the other.
+        camera_problem = self._adopt_camera(args.get("camera_info"), binding)
+        if camera_problem:
+            self._unwind()
+            return self._error(camera_problem)
+
         self._binding = binding
         log.info("navi started: topic=%s %.1f Hz ttl=%d ms inputs=%s",
                  self._topic, rate, self._ttl_ms, binding)
         return {"state": "running", "topic": self._topic, "rate_hz": rate,
                 "ttl_ms": self._ttl_ms, "inputs": binding,
                 "degraded": self._degradations()}
+
+    def _adopt_camera(self, declarations, binding: dict) -> str:
+        """Adopt the depth camera's geometry; return a reason to refuse, or "".
+
+        Two jobs, and only the second can refuse a start.
+
+        **Adopt.** The half field of view belongs to the camera and used to be
+        typed into this card's config by hand. On r1_sz it read 0.55 rad against
+        a lens measuring 0.888, which made the metric corridor 1.86 m wide —
+        wider than any door — so every doorframe counted as dead ahead and the
+        robot turned away from openings it fitted through. Missing declarations
+        are not fatal: the conservative fallback stands and `degraded` says so.
+
+        **Check both eyes are the same eye.** vop reports a *normalised* lateral
+        offset and the depth map is a grid of distances; this card turns both
+        into metres with one field of view, which is only correct if both come
+        from the same lens. Nothing has ever enforced that — inputs are bound by
+        what they carry, deliberately, so wiring camera A's vop to camera B's
+        depth has always been available and would produce confidently wrong
+        distances. Now that both sides declare an `id`, it is a comparison.
+        """
+        from .camera import camera_id, for_topic
+
+        depth_topic = binding.get("depth_map") or binding.get("depth_summary")
+        depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
+        self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
+
+        objects_decl = for_topic(declarations, binding.get("objects"))
+        depth_id, objects_id = camera_id(depth_decl), camera_id(objects_decl)
+        if depth_id and objects_id and depth_id != objects_id:
+            return (f"两路输入来自不同的相机：检测结果来自 {objects_id}，深度图来自 "
+                    f"{depth_id}。这张卡片用同一个视场角把两者都换算成米，"
+                    f"两颗镜头就会算出看起来合理但错的距离 —— 请把 vop 和 "
+                    f"visual_depth 接到同一颗相机上")
+        return ""
 
     def _capabilities(self) -> dict:
         return {"control_mode": CONTROL_MODE,
@@ -655,6 +704,7 @@ class NaviPlugin:
             out.append("没有接驱动的底盘命令卡片 —— 指令只发到话题上，"
                        "不会驱动任何硬件（想看它算什么的话，这是对的）")
         out.extend(self._limit_notes)
+        out.extend(self._camera_notes)
         for hint in (self._binding.get("unknown") or []):
             out.append(f"有一路输入没有被使用：{hint}")
         return out

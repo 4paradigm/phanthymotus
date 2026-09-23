@@ -12,6 +12,7 @@ a robot that believes it is being driven.
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -1396,3 +1397,109 @@ def test_something_genuinely_too_narrow_still_stops_the_robot():
                               half_fov_rad=config.half_fov_rad,
                               reference_m=config.obstacle_stop_m)
     assert clearance is not None and clearance <= config.obstacle_stop_m
+
+
+# ── 相机几何由相机声明，这张卡片采纳（motus.camera/1）──────────────────────────
+
+def _declaration(**over):
+    out = {"schema": "motus.camera/1", "topic": "/ubuntu/camera/main/visual_depth",
+           "id": "unitree/r1/camera_main", "width": 640, "height": 480,
+           "distortion_model": "unknown", "D": None, "K": None,
+           "half_fov_rad": 0.888, "half_fov_v_rad": None,
+           "source": "inherited", "pipeline": ["unitree/r1/camera_main"]}
+    out.update(over)
+    return out
+
+
+def test_the_camera_supplies_the_field_of_view():
+    """The quantity this card used to make a human copy by hand, and the last
+    one here that a human still did."""
+    config = _cfg(half_fov_rad=0.55)
+    notes = P._adopt_camera(config, _declaration(half_fov_rad=0.888,
+                                                 source="measured"))
+    assert config.half_fov_rad == pytest.approx(0.888)
+    # The adoption is reported, because an operator who typed 0.55 is owed the
+    # news that the camera overruled them — the same rule adopt_limits follows.
+    assert any("0.888" in n and "0.550" in n for n in notes), notes
+
+
+def test_an_adoption_that_changes_nothing_says_nothing():
+    """`degraded` is read by people. A note per start that reports the status quo
+    trains them to ignore the list."""
+    config = _cfg(half_fov_rad=0.888)
+    assert P._adopt_camera(config, _declaration()) == []
+
+
+def test_no_declaration_keeps_the_conservative_value_and_names_the_symptom():
+    """The failure directions are not symmetric and neither is safe: too small a
+    field of view widens the corridor and the robot refuses gaps it fits through;
+    too large narrows it and a shoulder goes into a doorframe. Stuck is
+    recoverable, a collision is not — so the fallback stays conservative.
+
+    And it names the symptom, because "the robot keeps turning away at the door"
+    was diagnosed as a tracking problem first, twice.
+    """
+    config = _cfg(half_fov_rad=0.55)
+    notes = P._adopt_camera(config, {})
+    assert config.half_fov_rad == 0.55
+    assert len(notes) == 1 and "门口" in notes[0] and "camera_info" in notes[0]
+
+
+def test_a_camera_that_declares_no_angle_is_not_a_camera_that_declares_zero():
+    """Rule 1 of the format, from the consumer's side. Substituting a plausible
+    number here would recreate the bug the format was written to prevent."""
+    config = _cfg(half_fov_rad=0.55)
+    notes = P._adopt_camera(config, _declaration(half_fov_rad=None,
+                                                 source="unknown"))
+    assert config.half_fov_rad == 0.55
+    assert "measure_fov" in notes[0], "得告诉人怎么把这个数量出来"
+
+
+def test_a_full_angle_in_the_half_angle_field_is_refused_not_halved():
+    """The likeliest way a declaration is wrong. Quietly halving it would be a
+    guess about somebody else's bug; the fallback plus a note is not."""
+    config = _cfg(half_fov_rad=0.55)
+    notes = P._adopt_camera(config, _declaration(half_fov_rad=1.776,
+                                                 source="measured"))
+    assert config.half_fov_rad == 0.55
+    assert "半" in notes[0] and "1.776" in notes[0]
+
+
+def test_a_foreign_schema_is_not_silently_read_as_ours():
+    config = _cfg(half_fov_rad=0.55)
+    notes = P._adopt_camera(config, _declaration(schema="motus.camera/2"))
+    assert config.half_fov_rad == 0.55
+    assert "schema" in notes[0]
+
+
+def test_a_solved_calibration_beats_the_declared_angle():
+    """`K` comes out of many observations; the angle beside it is usually a tape
+    measure. Preferring the coarser number would be backwards."""
+    config = _cfg(half_fov_rad=0.55)
+    fx = 400.0
+    P._adopt_camera(config, _declaration(width=1280, K=[fx, 0, 640, 0, fx, 360, 0, 0, 1],
+                                         half_fov_rad=0.2, source="manual"))
+    assert config.half_fov_rad == pytest.approx(math.atan(640.0 / fx))
+
+
+def test_the_doorway_only_reads_as_passable_because_the_camera_said_so():
+    """Ties the corridor geometry to the declaration chain.
+
+    The same scenario as `test_a_standard_doorway_reads_as_passable`, except the
+    field of view arrives the way it does on a robot. So if the chain ever breaks
+    — a camera card that stops declaring, a plumbing change in agent-core — this
+    test goes red here instead of the robot finding out at a door.
+    """
+    true_fov = 0.888
+    config = _cfg(half_fov_rad=0.55)          # the value that caused the bug
+    P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
+    P._adopt_camera(config, _declaration(half_fov_rad=true_fov, source="measured"))
+
+    keep = config.half_width_m + config.clearance_margin_m
+    for wall in (1.2, 1.0, 0.8, 0.7, 0.6):
+        depth = _doorway(0.90, wall, half_fov_rad=true_fov)
+        clearance, _ = D.corridor(depth, half_width_m=keep,
+                                  half_fov_rad=config.half_fov_rad,
+                                  reference_m=config.obstacle_stop_m)
+        assert clearance > config.obstacle_stop_m, (
+            f"离门 {wall} m 时走廊被门框挡住了：clearance={clearance}")
