@@ -212,11 +212,31 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
         left, right = edges
         blocked = clearance <= config.obstacle_stop_m
         colour = _WARN if blocked else _CORRIDOR
+
+        # **Drawn as a dimension, not as two lines.**
+        #
+        # Two bare verticals were asked about twice: they read as unrelated
+        # marks, and nothing connected them to the `+-0.33m` in the corner. A
+        # cross-bar with arrow ends is the drawing convention for "this is a
+        # width", and putting the number on the bar rather than in a corner is
+        # what makes it answer its own question.
+        bar = int(height * 0.30)
         for x in (left, right):
-            _line(frame, (x, int(height * 0.25)), (x, height), colour)
+            _line(frame, (x, bar), (x, height), colour)
+        cv2.arrowedLine(frame, (left, bar), (right, bar), _CASING, 6,
+                        tipLength=0.04)
+        cv2.arrowedLine(frame, (right, bar), (left, bar), _CASING, 6,
+                        tipLength=0.04)
+        cv2.arrowedLine(frame, (left, bar), (right, bar), colour, 2,
+                        tipLength=0.04)
+        cv2.arrowedLine(frame, (right, bar), (left, bar), colour, 2,
+                        tipLength=0.04)
+        span = f"path {keep * 2:.2f}m wide"
+        (tw, _), _ = cv2.getTextSize(span, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        _text(frame, span, ((left + right - tw) // 2, bar - 8), colour, 0.5)
         _text(frame,
-              f"corridor {clearance:.2f}m  cov {coverage * 100:.0f}%  "
-              f"+-{keep:.2f}m", (8, 24), colour, 0.55)
+              f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
+              (8, 24), colour, 0.55)
 
     # ── the target ───────────────────────────────────────────────────────────
     if box:

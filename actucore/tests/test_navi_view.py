@@ -306,3 +306,20 @@ def test_both_numbers_are_drawn_when_a_measurement_exists():
     both = _render(box=(0.3, 0.3, 0.6, 0.8), measured=1.20,
                    track={"state": "confirmed", "range_m": 1.23})
     assert not np.array_equal(plain, both)
+
+
+@needs_cv2
+def test_the_corridor_reads_as_a_width_not_as_two_stray_lines():
+    """Asked about twice, which is the design feedback.
+
+    Two bare verticals read as unrelated marks, and nothing connected them to
+    the half-width printed in a corner. A cross-bar with arrow ends is the
+    drawing convention for "this is a width", and the number belongs on the bar.
+    """
+    frame = _render(clearance=1.0)
+    left, right = V.corridor_edges(1.0, P.Config(), 640)
+    bar = int(480 * 0.30)
+
+    between = frame[bar, left + 8:right - 8]
+    lit = (between == np.array(V._CORRIDOR)).all(axis=1).sum()
+    assert lit > (right - left) * 0.5, "两条竖线之间没有横杆把它们连起来"
