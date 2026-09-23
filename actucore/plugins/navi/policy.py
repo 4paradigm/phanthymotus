@@ -1040,12 +1040,22 @@ def _search(config: Config, state: State, dt: float) -> Decision:
     # eventually noticed. "I turned all the way round and it is not here" is a
     # result, and the caller is owed it.
     if state.searched_rad >= config.search_sweep_rad:
-        state.failed_reason = (f"swept {state.searched_rad:.1f} rad without seeing "
-                               f"{state.target!r}: target lost")
+        # The suggestion is part of the answer, not politeness. A detector's
+        # class for one object is not stable — the same fire extinguisher on
+        # r1_sz was reported 373 times as `fire extinguisher` in one recording
+        # and as `bottle` twenty minutes later — so "not found" far more often
+        # means the name does not match than that the thing is absent. A caller
+        # told only "lost" retries the same wrong name or gives up.
+        state.failed_reason = (
+            f"swept {state.searched_rad:.1f} rad without seeing "
+            f"{state.target!r}: target lost. "
+            f"检测模型对同一物体的类别并不稳定，「没找到」多半是名字对不上 —— "
+            f"用 list_visible_objects 看一眼现在认出了什么，再和用户确认")
         return Decision(None, FAILED, state.failed_reason)
     if state.searching_for_s >= config.search_timeout_s:
-        state.failed_reason = (f"searched {state.searching_for_s:.0f}s without finding "
-                               f"{state.target!r}")
+        state.failed_reason = (
+            f"searched {state.searching_for_s:.0f}s without finding "
+            f"{state.target!r}。用 list_visible_objects 看一眼现在认出了什么")
         return Decision(None, FAILED, state.failed_reason)
 
     return Decision(_twist(0.0, 0.0, wz), SEARCHING,

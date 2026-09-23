@@ -617,3 +617,14 @@ def test_the_listing_bar_and_the_chasing_bar_agree():
     ratio = card._config.confirm_hits / card._config.confirm_window
     assert card._stability_bar(10) == round(10 * ratio)
     assert card._stability_bar(1) == 1, "never ask for more frames than exist"
+
+
+def test_a_lost_target_tells_the_caller_to_look_before_retrying():
+    """A detector's class for one object is not stable: the same fire
+    extinguisher on r1_sz was reported 373 times as `fire extinguisher` in one
+    recording and as `bottle` twenty minutes later. So "not found" far more
+    often means the name does not match than that the thing is absent, and a
+    caller told only "lost" retries the same wrong name or gives up."""
+    text = _tool()["inputSchema"]["x-action-params"]["navigate_to"]["description"]
+    assert "list_visible_objects" in text
+    assert "类别并不稳定" in text
