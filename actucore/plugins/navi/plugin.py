@@ -662,7 +662,13 @@ class NaviPlugin:
                 # ever — which is exactly how it presented on r1_sz: subscribing
                 # to /actucore/navi/cmd with rclpy received commands at 10 Hz
                 # while the canvas showed nothing.
-                "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT}],
+                # Both ports. agent-core registers the bus topics off this
+                # reply, so a port missing here is a card that publishes into a
+                # topic the dashboard never subscribes to — healthy everywhere,
+                # invisible in the panel.
+                "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT},
+                              {"topic": self._view_topic,
+                               "format": "image/jpeg"}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
                 "published": self._published,

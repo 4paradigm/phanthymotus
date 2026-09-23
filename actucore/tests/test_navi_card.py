@@ -469,7 +469,11 @@ def test_info_returns_topic_out_so_the_dashboard_can_subscribe():
     producing nothing."""
     out = _card().dispatch("navi", {"action": "info"})["topic_out"]
     assert out == [{"topic": navi_plugin.DEFAULT_TOPIC,
-                    "format": "control/velocity"}]
+                    "format": "control/velocity"},
+                   # The human-only overlay is a port like any other: a card
+                   # that publishes it without declaring it is invisible in the
+                   # panel while being perfectly healthy everywhere else.
+                   {"topic": "/actucore/navi/view", "format": "image/jpeg"}]
 
 
 def test_info_and_the_schema_agree_about_the_output_topic():
