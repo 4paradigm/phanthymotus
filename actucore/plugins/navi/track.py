@@ -76,9 +76,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-TENTATIVE = "tentative"   # seen, not yet trusted enough to move a robot
+TENTATIVE = "tentative"    # seen, not yet trusted enough to move a robot
 CONFIRMED = "confirmed"
-COASTING = "coasting"     # not seen this tick; position is predicted
+COASTING = "coasting"      # not seen this tick; position is predicted
+REACQUIRING = "reacquiring"  # something matched after a coast, not yet believed
 LOST = "lost"
 
 # Body frame throughout: x forward, y **left**, metres. Same convention as
@@ -132,10 +133,24 @@ class Track:
     # "assumed 3 m" must not be allowed to decide when the robot has arrived.
     range_known: bool = False
 
+    # Matches accumulated since the track started coasting. Resurrecting a
+    # track decides what the robot chases, exactly as creating one does, so it
+    # is held to the same evidence — see `_hit`.
+    reacquire_hits: int = 0
+
     @property
     def drivable(self) -> bool:
         """Whether this track may move the robot. Tentative ones may not."""
-        return self.state in (CONFIRMED, COASTING)
+        return self.state in (CONFIRMED, COASTING, REACQUIRING)
+
+    @property
+    def observed(self) -> bool:
+        """A live, believed fix — not a prediction and not a fresh guess.
+
+        What "arrived" is allowed to rest on. A coasted position is a good
+        enough reason to keep walking and a bad one to declare the journey over.
+        """
+        return self.state == CONFIRMED and self.coast_s == 0.0
 
     @property
     def position(self) -> np.ndarray:
@@ -396,6 +411,23 @@ class Tracker:
             return None
         if cost > config.gate_chi2:
             return None
+
+        # **The gate widens while coasting, and that had no ceiling.** Growing
+        # it is right — the longer the target has been hidden, the further from
+        # the prediction it may legitimately reappear — but after 1.2 s the
+        # covariance alone opened it to about 3.7 m, and the detector's class is
+        # not stable enough to survive an opening that size. On r1_sz a track on
+        # a person four metres away was resurrected onto a traffic cone at 0.7 m
+        # that vop had labelled `person` for one frame, and the card then
+        # reported arrival.
+        #
+        # So it is also capped by what the target could physically have done:
+        # nothing moves faster than `max_target_speed`, and the ego motion is
+        # already in the prediction, so this residual is the target's own travel.
+        reach = (config.max_target_speed * max(track.since_obs_s, 1e-3)
+                 + 3.0 * std)
+        if float(np.hypot(*residual)) > reach:
+            return None
         # Colour is a tie-break, never a gate. `object_key` already excludes
         # brightness because it swings with the lighting; hue is steadier but
         # still flickers, and rejecting on it would drop a track for a cloud
@@ -415,7 +447,29 @@ class Tracker:
             return
 
         track = self.track
-        was_coasting = track.state == COASTING
+        was_coasting = track.state in (COASTING, REACQUIRING)
+
+        if was_coasting:
+            # **One frame resurrects a track; three create one.** That asymmetry
+            # is the same bug that made a single false positive start a chase,
+            # moved to the other end of the lifecycle — and it is worse here,
+            # because the gate is at its widest exactly when the evidence is at
+            # its thinnest. Until the count is met the track keeps coasting on
+            # its prediction: still drivable, still not jumped.
+            track.reacquire_hits += 1
+            track.history.append(True)
+            # `coast_s` deliberately keeps its value: until the match is
+            # accepted the position being published is still a prediction, and
+            # `describe()` should say so. It also bounds this state — at most
+            # `confirm_hits` ticks can pass before the track is either accepted
+            # or dropped by the coast budget.
+            if track.reacquire_hits < config.confirm_hits:
+                track.state = REACQUIRING
+                self.last_reason = (
+                    f"疑似重新看到目标（{track.reacquire_hits}/{config.confirm_hits}）"
+                    "，先按预测继续，确认了才接受它的位置")
+                return
+            track.reacquire_hits = 0
 
         if was_coasting and track.last_obs is not None and track.since_obs_s > 1e-6:
             # OC-SORT's observation-centric re-update, in the form this state
@@ -508,6 +562,7 @@ class Tracker:
             return
 
         track.state = COASTING
+        track.reacquire_hits = 0
         track.coast_s += dt
         if track.coast_s > config.max_coast_s:
             self.track = None
@@ -531,6 +586,7 @@ class Tracker:
             "hits": track.hits,
             "coast_s": round(track.coast_s, 2),
             "age_s": round(track.age_s, 1),
+            "observed": track.observed,
             "range_m": round(track.range_m, 2) if track.range_known else None,
             "position_std_m": round(track.position_std_m, 2),
             "reason": self.last_reason,

@@ -103,13 +103,13 @@ class Config:
     Still unvalidated on hardware — see docs/visual-navigation.md.
     """
 
-    stop_distance_m: float = 1.2
-    slow_distance_m: float = 1.8
-    obstacle_stop_m: float = 0.8
+    stop_distance_m: float = 0.8
+    slow_distance_m: float = 1.5
+    obstacle_stop_m: float = 0.6
     # Lateral offset that still allows full speed. **Not a gate** — past it the
     # speed is scaled down, reaching zero at align_full_stop. See
     # `_alignment_scale`.
-    align_tol: float = 0.15
+    align_tol: float = 0.08
     # Turn only, no travel, past this: the target is near the edge of frame,
     # and driving straight at it is driving somewhere else.
     align_full_stop: float = 0.45
@@ -129,6 +129,12 @@ class Config:
     # far worse outcome than facing it a little off: the position is what
     # arriving means, the heading is a courtesy.
     arrive_patience_s: float = 3.0
+    # How long the corridor may stay blocked before the task gives up **naming
+    # the obstacle**. Without it a blocked robot sidesteps and turns for ever:
+    # it is commanding motion, so the idle timeout never fires, and the caller
+    # is told nothing. Generous, because stepping out from in front of something
+    # legitimately takes a few seconds.
+    blocked_timeout_s: float = 12.0
     # Speed retained when the target is at `align_full_stop` or further off.
     # 0.0 restores the original behaviour — stop dead and turn in place — and is
     # the right setting for a base that cannot translate sideways. Anything
@@ -137,9 +143,9 @@ class Config:
     align_min_scale: float = 0.45
     k_yaw: float = 1.2
     k_fwd: float = 0.6
-    vx_max: float = 0.4
-    vy_max: float = 0.4
-    wz_max: float = 0.8
+    vx_max: float = 1.0
+    vy_max: float = 1.0
+    wz_max: float = 1.5
     # The one place a normalised bearing becomes an angle.
     #
     # `position[0]` from vop is a fraction of the image half-width, **not** a
@@ -353,6 +359,7 @@ class State:
     close_for_s: float = 0.0
     idle_for_s: float = 0.0
     arrived: bool = False
+    blocked_for_s: float = 0.0
     # Set once, read forever after: failure is terminal for one navigate_to.
     failed_reason: str = ""
     notes: list = field(default_factory=list)
@@ -744,8 +751,22 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     # Arrived: in position and roughly facing it — or turning in place for long
     # enough. The second clause is not optional; see `arrive_patience_s`.
-    if within and (abs(bearing) <= config.arrive_align_tol
-                   or state.close_for_s >= config.arrive_patience_s):
+    # **Arriving is a claim, and a coasted position cannot support it.**
+    #
+    # "I have reached the target" and "something is in the way" are different
+    # conclusions, and until now the first could impersonate the second: the
+    # arrival test runs before `_avoid`, so a track sitting on an obstacle
+    # reported success while the real target was metres away. On r1_sz that
+    # happened twice in a row — the track had been resurrected onto a traffic
+    # cone and the card declared it had arrived.
+    #
+    # A prediction is a good enough reason to keep walking and a bad one to
+    # declare the journey over, so arrival needs a live fix. Without one the
+    # code below falls through to the obstacle logic, which will stop for the
+    # thing that is actually there and say so.
+    live = track.observed
+    if within and live and (abs(bearing) <= config.arrive_align_tol
+                            or state.close_for_s >= config.arrive_patience_s):
         state.arrived = True
         # One explicit zero before going quiet, so the chassis stops on a
         # command rather than on a watchdog timeout — arriving is a success and
@@ -784,6 +805,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                * (distance - config.stop_distance_m) * align))
         reason = f"target at {distance:.2f} m"
 
+    if within and not live:
+        # Inside the stop distance by the tracker's reckoning, but the position
+        # is a prediction. Do not walk into whatever is actually there, and do
+        # not call it an arrival either — hold still and let `_avoid` below
+        # name the thing in the corridor, if there is one.
+        speed = 0.0
+        status = SEARCHING
+        reason = ("目标看起来已经在 {:.2f} m 内，但当前并没有真正看到它"
+                  "（轨迹处于预测状态），不按到达处理").format(distance)
+
     # Keep walking until the stop distance is genuinely reached.
     #
     # `speed` falls below the robot's floor well before then — at R1's numbers,
@@ -799,6 +830,22 @@ def _decide(detections, depth, odom, config: Config, state: State,
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config)
     vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
                                             status, reason)
+
+    # **Blocked is an outcome, not a mood.** Trying to get round something is
+    # the right first response, and it is what `_avoid` just did — but a robot
+    # that has been shuffling sideways for twelve seconds is not making
+    # progress, and the caller deserves the real reason rather than a timeout
+    # or, worse, a report that it arrived.
+    if status == AVOIDING and not vx:
+        state.blocked_for_s += dt
+        if state.blocked_for_s >= config.blocked_timeout_s:
+            blocked = (f"前方被挡住了 {state.blocked_for_s:.0f} 秒，绕不过去："
+                       f"{reason}")
+            state.failed_reason = blocked
+            return Decision(None, FAILED, blocked,
+                            distance_m=distance, bearing=bearing)
+    else:
+        state.blocked_for_s = 0.0
     # Now vx is settled, so which deadband the yaw axis is subject to is known.
     wz = _finalise_yaw(raw_wz, bool(vx or vy), bearing, config, state, dt)
 

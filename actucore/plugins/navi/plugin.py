@@ -242,10 +242,10 @@ class NaviPlugin:
                     "rate_hz": {"type": "number", "default": 10,
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
-                    "stop_distance_m": {"type": "number", "default": 1.2,
+                    "stop_distance_m": {"type": "number", "default": 0.8,
                                         "description": "走到目标前多远算到达（米）",
                                         "scope": "instance"},
-                    "obstacle_stop_m": {"type": "number", "default": 0.8,
+                    "obstacle_stop_m": {"type": "number", "default": 0.6,
                                         "description": "正前方障碍近于这个距离就完全"
                                                        "不前进（米）。必须小于 "
                                                        "stop_distance_m，否则机器人会"

@@ -871,7 +871,7 @@ def test_being_close_but_never_aligned_still_arrives_eventually():
     state = _state()
     for _ in range(12):
         decision = _step(detections=_detections(_obj(x=0.30)),
-                         depth=_depth(map_=_solid_depth(0.8)),
+                         depth=_depth(map_=_solid_depth(0.5)),
                          config=config, state=state, dt=0.1)
         if decision.status == P.ARRIVED:
             break          # the terminal reply is sticky; catch the moment
@@ -978,7 +978,9 @@ def test_a_ceiling_below_the_floor_is_raised_off_it():
     the robot turned in a 10 Hz square wave. Nothing reported it — the SDK
     accepted all of it.
     """
-    config = _cfg()
+    # Pinned, not inherited: the shipped `wz_max` has since been raised past
+    # R1's floor, and this test is about what happens when it is not.
+    config = _cfg(wz_max=0.8)
     assert config.wz_max < _R1_DESC["limits"]["min_magnitude"][5]
     notes = P.adopt_limits(config, _R1_DESC)
 
@@ -1013,11 +1015,14 @@ def test_an_axis_the_chassis_does_not_have_is_switched_off():
 def test_a_robot_with_no_deadband_keeps_plain_proportional_control():
     """The floors are read from the descriptor, so a wheeled base — which can
     creep — is unaffected by any of this."""
-    config = _cfg()
+    config = _cfg(vx_max=0.4)
     P.adopt_limits(config, {"limits": {"lower": [-1.0] * 6, "upper": [1.0] * 6}})
     assert (config.floor_vx, config.floor_vy, config.floor_wz) == (0.0, 0.0, 0.0)
+    # 0.1 m short of the stop distance, so the proportional term is small on
+    # its own — no floor, no lift, nothing rounding it up.
     values = _step(detections=_detections(_obj(x=0.02)),
-                   depth=_depth(map_=_solid_depth(1.3)), config=config).values
+                   depth=_depth(map_=_solid_depth(config.stop_distance_m + 0.1)),
+                   config=config).values
     assert 0 < values[0] < 0.1, "a small residual distance, commanded small"
 
 
@@ -1165,7 +1170,9 @@ def test_an_obstacle_the_bands_call_left_now_stops_the_robot():
     A doorframe 0.25 m off the axis at 0.7 m is inside a humanoid's width and
     outside the centre third of the picture. The bands file it under "left",
     and the left band has never stopped forward motion."""
-    config = _cfg()
+    # `obstacle_stop_m` pinned to what this scenario was measured at; the
+    # shipped default has since been tuned down on r1_sz.
+    config = _cfg(obstacle_stop_m=0.8)
     P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
     depth = {"map": _obstacle_map(5.0, [(-0.25, 0.7, 0.1)], config=config),
              "bands": {"left": 0.7, "center": 5.0, "right": 5.0}}
@@ -1263,3 +1270,67 @@ def test_the_card_picks_the_floor_from_the_command_it_is_about_to_send():
     card._descriptor = _R1_COUPLED
     assert card._deadband_for([0.4, 0.0, 0, 0, 0, 0.05])[5] == 0.05, "walking"
     assert card._deadband_for([0.0, 0.0, 0, 0, 0, 0.05])[5] == 1.0, "standing"
+
+
+# ── "arrived" and "blocked" must stop impersonating each other ───────────────
+
+def test_a_coasted_position_cannot_be_called_an_arrival():
+    """What ended two navigations on r1_sz in a row.
+
+    The arrival test ran before the obstacle logic, so a track whose position
+    was a prediction — and which had in fact been re-acquired onto a traffic
+    cone — reported success while the person it was following was metres away.
+    Walking on a prediction is fine; declaring the journey over on one is not.
+    """
+    config = _cfg()
+    depth = _depth(map_=_solid_depth(0.5))
+    state = seed(_state(), _detections(_obj(x=0.0)), depth, config)
+
+    # The target goes out of view. The track survives on its prediction, which
+    # still says "right in front of us".
+    decision = P.step(detections={"objects": []}, depth=depth, odom=None,
+                      config=config, state=state, dt=0.1)
+    assert decision.status != P.ARRIVED
+    assert not state.arrived
+    # And the reason names what is actually there, rather than claiming
+    # success — which is the whole point of the reordering.
+    assert "障碍" in decision.reason
+
+    # It comes back, and now the claim is supported.
+    for _ in range(config.confirm_hits + 1):
+        decision = P.step(detections=_detections(_obj(x=0.0)), depth=depth,
+                          odom=None, config=config, state=state, dt=0.1)
+    assert decision.status == P.ARRIVED
+
+
+def test_a_corridor_that_stays_blocked_fails_saying_so():
+    """Trying to get round it is the right first move, and `_avoid` makes it.
+    But a robot that has been shuffling sideways for twelve seconds is not
+    making progress, and the caller is owed the real reason — "blocked", not a
+    generic idle timeout, and certainly not "arrived"."""
+    config = _cfg(blocked_timeout_s=1.0, stop_distance_m=0.3)
+    depth = _depth(map_=_solid_depth(0.4))       # inside obstacle_stop_m
+    state = seed(_state(), _detections(_obj(x=0.0)), depth, config)
+
+    for _ in range(20):
+        decision = P.step(detections=_detections(_obj(x=0.0)), depth=depth,
+                          odom=None, config=config, state=state, dt=0.1)
+        if decision.status == P.FAILED:
+            break
+    assert decision.status == P.FAILED
+    assert "挡住" in decision.reason and "障碍" in decision.reason
+    assert decision.values is None, "a failure publishes nothing"
+
+
+def test_a_corridor_that_clears_resets_the_blocked_clock():
+    """A person stepping across the path is not a blockage."""
+    config = _cfg(blocked_timeout_s=1.0, stop_distance_m=0.3)
+    blocked = _depth(map_=_solid_depth(0.4))
+    clear = _depth(map_=_solid_depth(5.0))
+    state = seed(_state(), _detections(_obj(x=0.0)), blocked, config)
+
+    for _ in range(30):
+        depth = blocked if _ % 10 < 8 else clear
+        decision = P.step(detections=_detections(_obj(x=0.0)), depth=depth,
+                          odom=None, config=config, state=state, dt=0.1)
+        assert decision.status != P.FAILED

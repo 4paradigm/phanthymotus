@@ -194,7 +194,9 @@ def test_re_acquisition_rebuilds_velocity_from_the_two_observations():
     before = tracker.track.mean[2:].copy()
 
     _feed(tracker, _detections(), config=config, ticks=4)
-    _feed(tracker, _detections(_obj(bearing=0.3)), config=config)
+    # Re-acquisition costs the same evidence as creation — see the test below.
+    _feed(tracker, _detections(_obj(bearing=0.3)), config=config,
+          ticks=config.confirm_hits)
 
     after = tracker.track.mean[2:]
     assert not np.allclose(before, after), "the coast's velocity was kept"
@@ -398,3 +400,59 @@ def test_a_payload_with_no_stamp_is_counted_every_time():
     for _ in range(config.confirm_hits):
         drivable = _feed(tracker, _detections(_obj()), config=config)
     assert drivable is not None
+
+
+# ── re-acquisition: reviving a track has the same consequences as starting one ──
+
+def test_a_single_frame_cannot_revive_a_coasted_track():
+    """The asymmetry that stopped a navigation on the wrong object.
+
+    Creating a track took `confirm_hits` frames; resurrecting one took a single
+    frame — and it did so exactly when the gate was at its widest, because the
+    covariance had been growing for the whole coast. On r1_sz a track on a
+    person was re-acquired onto a traffic cone that vop had labelled `person`
+    for one frame, and the card reported that it had arrived.
+    """
+    config = _cfg()
+    tracker = T.Tracker()
+    _feed(tracker, _detections(_obj(bearing=0.0)), config=config,
+          ticks=config.confirm_hits)
+    _feed(tracker, _detections(), config=config, ticks=3)
+
+    track = _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
+    assert track is not None and track.state == T.REACQUIRING
+    assert track.drivable, "the prediction is still good enough to keep walking"
+    assert not track.observed, "but not good enough to call it an arrival"
+
+    for _ in range(config.confirm_hits - 1):
+        track = _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
+    assert track.state == T.CONFIRMED and track.observed
+
+
+def test_one_missed_frame_restarts_the_re_acquisition_count():
+    """A flicker is not evidence. Only a run of consecutive matches is."""
+    config = _cfg()
+    tracker = T.Tracker()
+    _feed(tracker, _detections(_obj(bearing=0.0)), config=config,
+          ticks=config.confirm_hits)
+    _feed(tracker, _detections(), config=config, ticks=2)
+    _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
+    _feed(tracker, _detections(), config=config)
+    track = _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
+    assert track.state == T.REACQUIRING and track.reacquire_hits == 1
+
+
+def test_the_gate_cannot_open_wider_than_the_target_could_walk():
+    """Covariance growth alone let the gate reach several metres. A target that
+    was four metres away is not suddenly at arm's length; it did not walk there,
+    so whatever is at arm's length is something else."""
+    config = _cfg(max_target_speed=1.0)
+    tracker = T.Tracker()
+    _feed(tracker, _detections(_obj(bearing=0.0)), config=config,
+          depth=_depth(4.0), ticks=config.confirm_hits)
+    _feed(tracker, _detections(), config=config, depth=_depth(4.0), ticks=3)
+
+    for _ in range(config.confirm_hits):
+        track = _feed(tracker, _detections(_obj(bearing=0.0)), config=config,
+                      depth=_depth(0.7))
+    assert track.state != T.CONFIRMED, "a 3.3 m jump was accepted as the target"
