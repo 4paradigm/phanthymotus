@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import time
 import uuid
@@ -141,6 +142,9 @@ class NaviPlugin:
         self._view_publisher = None
         self._view_next_at = 0.0
         self._view_failed = False
+        self._view_queue = None
+        self._view_thread = None
+        self._view_stop = threading.Event()
         # (width, height) of the frame vop's boxes are in, from its camera
         # declaration. (0, 0) until one arrives — and then no box is converted,
         # which is the honest answer rather than a guessed resolution.
@@ -645,7 +649,15 @@ class NaviPlugin:
     def _unwind(self):
         with self._lock:
             self._running = False
+        self._stop_view_thread()
         self._stop()
+
+    def _stop_view_thread(self):
+        self._view_stop.set()
+        thread, self._view_thread = self._view_thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._view_queue = None
 
     def _config_action(self, args: dict):
         changed = {}
@@ -986,6 +998,11 @@ class NaviPlugin:
         if self._view_hz > 0:
             self._view_publisher = node.create_publisher(
                 CompressedImage, self._view_topic, 2)
+            self._view_queue = queue.Queue(maxsize=1)
+            self._view_stop = threading.Event()
+            self._view_thread = threading.Thread(
+                target=self._view_worker, daemon=True, name="navi_view")
+            self._view_thread.start()
         self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick)
         self._executor.add_node(node)
         with self._lock:
@@ -1135,50 +1152,105 @@ class NaviPlugin:
         self._maybe_complete()
 
     def _publish_view(self):
-        """Draw the decision, if it is time and if drawing works.
+        """Hand the current decision to the render thread. **Never render here.**
 
-        **Wrapped whole, and rate-limited separately from the command stream.**
-        A picture for a human must never be able to stop a robot: an exception
-        in a colour map, a missing codec, an image this card has no business
-        failing on — none of that may reach the tick that feeds the chassis. So
-        a failure here is counted and logged once, and the commands carry on.
+        This runs on the timer that feeds the chassis at `rate_hz`. Rendering a
+        frame costs **27 ms measured on Orin 5** — a quarter of a 10 Hz command
+        period — so doing it inline stalls the command stream every time the
+        overlay ticks. The module docstring already said a picture for a human
+        must not be able to stop a robot; that was written about exceptions, and
+        only exceptions were guarded. Latency is the same promise.
+
+        So the tick does the cheap part — a snapshot of references, microseconds
+        — and a worker does the rest at its own pace. One slot, newest wins: an
+        overlay frame from two seconds ago is worse than a dropped one, exactly
+        as with the camera frames upstream.
         """
-        publisher = self._view_publisher
-        if publisher is None or self._view_hz <= 0:
+        if self._view_queue is None or self._view_hz <= 0:
             return
         now = time.monotonic()
         if now < self._view_next_at:
             return
         self._view_next_at = now + 1.0 / self._view_hz
+
+        track = self._state.tracker.track
+        with self._obs_lock:
+            jpeg = self._image_jpeg
+        snapshot = {
+            # Arrays and payloads are *replaced* by their callbacks, never
+            # mutated in place, so holding a reference is a safe snapshot.
+            "depth_m": self._depth_map,
+            "objects": self._objects,
+            "jpeg": jpeg,
+            "decision": self._last_decision,
+            "track": self._state.tracker.describe(),
+            # The scalar, not the Track: that object is mutated in place by the
+            # tick and reading it from another thread would tear.
+            "bearing": track.bearing_rad if track is not None else None,
+            "target": (self._state.target or "").strip().lower(),
+            "clearance": self._state.last_clearance,
+            "coverage": self._state.last_coverage,
+        }
         try:
-            from sensor_msgs.msg import CompressedImage
+            self._view_queue.put_nowait(snapshot)
+        except queue.Full:
+            try:
+                self._view_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._view_queue.put_nowait(snapshot)
+            except queue.Full:
+                pass
 
-            from . import view as view_mod
+    def _view_worker(self):
+        """Render and publish, off the command tick.
 
-            box, measured = self._target_box()
-            with self._obs_lock:
-                jpeg = self._image_jpeg
-            frame = view_mod.render(
-                depth_m=self._depth_map,
-                decision=self._last_decision,
-                track=self._state.tracker.describe(),
-                box=box, measured=measured,
-                clearance=self._state.last_clearance,
-                coverage=self._state.last_coverage,
-                rgb_jpeg=jpeg, blend=self._view_blend,
-                config=self._config)
-            message = CompressedImage()
-            message.format = "jpeg"
-            message.data = view_mod.encode(frame)
-            publisher.publish(message)
-        except Exception as error:                            # noqa: BLE001
-            if not self._view_failed:
-                self._view_failed = True
-                log.warning("navi view render failed, disabling it: %s", error,
-                            exc_info=True)
-            self._view_publisher = None
+        A failure disables the port and is logged once: the command stream must
+        carry on, and a log line per frame from a broken codec would bury it.
+        """
+        while not self._view_stop.is_set():
+            try:
+                snapshot = self._view_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            publisher = self._view_publisher
+            if publisher is None:
+                continue
+            try:
+                from sensor_msgs.msg import CompressedImage
+
+                from . import view as view_mod
+
+                box, measured = self._box_for(snapshot)
+                frame = view_mod.render(
+                    depth_m=snapshot["depth_m"],
+                    decision=snapshot["decision"],
+                    track=snapshot["track"],
+                    box=box, measured=measured,
+                    clearance=snapshot["clearance"],
+                    coverage=snapshot["coverage"],
+                    rgb_jpeg=snapshot["jpeg"], blend=self._view_blend,
+                    config=self._config)
+                message = CompressedImage()
+                message.format = "jpeg"
+                message.data = view_mod.encode(frame)
+                publisher.publish(message)
+            except Exception as error:                        # noqa: BLE001
+                if not self._view_failed:
+                    self._view_failed = True
+                    log.warning("navi view render failed, disabling it: %s",
+                                error, exc_info=True)
+                self._view_publisher = None
 
     def _box_stats(self) -> dict:
+        """Why the overlay has a box or has not, without guessing.
+
+        Four things have to line up — a detection arrived, vop attached a pixel
+        box, the camera declared a resolution to normalise it with, and the name
+        matches what is being chased — and all four failures look identical on
+        the picture. These say which.
+        """
         payload = self._objects or {}
         objects = payload.get("objects") or []
         target = (self._state.target or "").strip().lower()
@@ -1193,7 +1265,7 @@ class NaviPlugin:
             "target_has_box": sum(1 for o in named if o.get("bbox_norm")),
         }
 
-    def _target_box(self):
+    def _box_for(self, snapshot: dict):
         """`(box, measured_distance)` for the thing being chased, or `(None, None)`.
 
         The measured distance is drawn **next to the tracker's**, and that
@@ -1215,10 +1287,10 @@ class NaviPlugin:
         detector is not seeing the target at all there is simply no box, which
         is itself the thing worth showing.
         """
-        payload = self._objects or {}
-        target = (self._state.target or "").strip().lower()
-        track = self._state.tracker.track
-        if not target or track is None:
+        payload = snapshot["objects"] or {}
+        target = snapshot["target"]
+        bearing = snapshot["bearing"]
+        if not target or bearing is None:
             return None, None
         best, best_gap, best_obj = None, 1e9, None
         for obj in payload.get("objects") or []:
@@ -1229,14 +1301,15 @@ class NaviPlugin:
             if not box:
                 continue
             position = obj.get("position") or [0.0, 0.0]
-            bearing = float(position[0]) * self._config.half_fov_rad
-            gap = abs(bearing - track.bearing_rad)
+            obj_bearing = float(position[0]) * self._config.half_fov_rad
+            gap = abs(obj_bearing - bearing)
             if gap < best_gap:
                 best, best_gap, best_obj = box, gap, obj
         if best_obj is None:
             return None, None
-        source = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
-                  if self._depth_map is not None or self._depth_bands else None)
+        depth_m = snapshot["depth_m"]
+        source = ({"map": depth_m, "bands": dict(self._depth_bands)}
+                  if depth_m is not None or self._depth_bands else None)
         try:
             measured = policy_mod.target_distance(best_obj, source, self._config)
         except Exception:                                     # noqa: BLE001
