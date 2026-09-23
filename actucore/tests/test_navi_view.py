@@ -323,3 +323,48 @@ def test_the_corridor_reads_as_a_width_not_as_two_stray_lines():
     between = frame[bar, left + 8:right - 8]
     lit = (between == np.array(V._CORRIDOR)).all(axis=1).sum()
     assert lit > (right - left) * 0.5, "两条竖线之间没有横杆把它们连起来"
+
+
+@needs_cv2
+def _jpeg(width=1280, height=720, value=200):
+    import cv2
+    frame = np.full((height, width, 3), value, dtype=np.uint8)
+    return cv2.imencode(".jpg", frame)[1].tobytes()
+
+
+@needs_cv2
+def test_the_camera_frame_shows_through_the_depth_colour():
+    """The point of the second input: one picture that says both what the robot
+    can see and what it is reacting to."""
+    bright = _jpeg(value=240)
+    with_rgb = _render(rgb_jpeg=bright, depth_m=_depth(1.0), blend=0.5)
+    without = _render(depth_m=_depth(1.0))
+    assert not np.array_equal(with_rgb, without)
+    # Halfway between the camera's grey and the ramp's colour for 1 m.
+    lone = V._LUT[V._index_of(np.array([[1.0]]))][0, 0].astype(int)
+    mid = with_rgb[240, 320].astype(int)
+    assert all(min(240, c) - 12 <= m <= max(240, c) + 12
+               for m, c in zip(mid, lone))
+
+
+@needs_cv2
+def test_the_blend_weight_moves_the_result_between_the_two_sources():
+    depth_only = _render(rgb_jpeg=_jpeg(value=240), depth_m=_depth(1.0), blend=1.0)
+    camera_only = _render(rgb_jpeg=_jpeg(value=240), depth_m=_depth(1.0), blend=0.0)
+    assert camera_only[240, 320].min() > 200, "权重 0 应当基本只剩相机画面"
+    assert not np.array_equal(depth_only, camera_only)
+
+
+@needs_cv2
+def test_a_camera_frame_without_depth_still_draws():
+    frame = _render(rgb_jpeg=_jpeg(value=180), depth_m=None)
+    assert frame.shape == (480, 640, 3)
+    assert frame[240, 320].min() > 150
+
+
+@needs_cv2
+def test_a_corrupt_jpeg_falls_back_to_the_depth_map():
+    """A picture for a human must not be able to stop a robot — including when
+    the frame it was handed is garbage."""
+    frame = _render(rgb_jpeg=b"not a jpeg", depth_m=_depth(1.0))
+    assert frame.shape == (480, 640, 3)

@@ -118,6 +118,32 @@ def _colormap(depth_m: np.ndarray, far_m: float):
     return frame
 
 
+def _composite(rgb, depth_m: np.ndarray, config, width: int, height: int,
+               blend: float):
+    """Depth colour blended over the camera image at a fixed weight.
+
+    One `addWeighted` rather than a per-pixel alpha: this runs on the publish
+    tick next to a 10 Hz command stream, and a fused OpenCV op on 307k pixels is
+    a few tenths of a millisecond where a numpy expression with a broadcast mask
+    is several. The JPEG decode dominates either way, which is why the frame is
+    kept compressed until something actually draws it.
+
+    `INTER_LINEAR` for the same reason — `INTER_AREA` is visibly better for big
+    downscales and measurably slower, and nobody is reading this image for its
+    resampling.
+    """
+    import cv2
+
+    base = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+    if depth_m is None:
+        return base
+    colour = _colormap(depth_m, 0.0)
+    if colour.shape[:2] != (height, width):
+        colour = cv2.resize(colour, (width, height),
+                            interpolation=cv2.INTER_NEAREST)
+    return cv2.addWeighted(base, 1.0 - blend, colour, blend, 0.0)
+
+
 def _column_of(bearing_rad: float, half_fov_rad: float, width: int) -> int:
     """Image column for an angle off the nose. Right of centre is positive."""
     u = bearing_rad / max(half_fov_rad, 1e-6)
@@ -183,16 +209,31 @@ def _arrow(frame, origin, dx, dy, colour, label: str):
 
 
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
-           measured=None, width: int = 640, height: int = 480):
-    """One frame. `depth_m` may be None — the overlay still draws.
+           measured=None, rgb_jpeg=None, blend: float = 0.5,
+           width: int = 640, height: int = 480):
+    """One frame. Every input may be absent — the overlay still draws.
 
     `box` is the target's `bbox_norm` (x1, y1, x2, y2 in 0..1) or None;
-    `clearance`/`coverage` are what the corridor read this tick.
+    `clearance`/`coverage` are what the corridor read this tick; `rgb_jpeg` is
+    the raw camera frame, which turns the depth into a translucent mask over the
+    real picture instead of a picture of its own.
     """
     import cv2
 
     far = max(config.slow_distance_m * 1.5, 2.0)
-    if depth_m is None:
+    rgb = None
+    if rgb_jpeg:
+        try:
+            rgb = cv2.imdecode(np.frombuffer(rgb_jpeg, np.uint8),
+                               cv2.IMREAD_COLOR)
+        except Exception:                                     # noqa: BLE001
+            rgb = None
+
+    if rgb is not None:
+        # The camera and the depth map cover the same field of view — perception
+        # resizes rather than crops — so a plain resize puts them in register.
+        frame = _composite(rgb, depth_m, config, width, height, blend)
+    elif depth_m is None:
         frame = np.full((height, width, 3), 30, dtype=np.uint8)
     else:
         frame = _colormap(depth_m, far)

@@ -144,9 +144,11 @@ def test_the_prefix_has_no_underscore():
     assert "_" not in NaviPlugin.PREFIX
 
 
-def test_it_declares_all_three_input_formats():
+def test_it_declares_every_input_format_it_accepts():
     formats = {entry["format"] for entry in _tool()["topic_in"]}
-    assert formats == {"data/json", "image/depth-zlib", "state/odom"}
+    assert formats == {"data/json", "image/depth-zlib", "state/odom",
+                       # The raw camera, optional and only for the overlay.
+                       "image/jpeg"}
 
 
 # ── degradation has to be visible ────────────────────────────────────────────
@@ -280,12 +282,26 @@ def test_missing_detections_is_still_refused():
     assert "vop" in problem
 
 
-def test_an_unrecognised_name_falls_back_to_the_graph():
+def test_an_image_topic_with_no_known_suffix_is_the_camera_not_the_depth_map():
+    """perception derives its depth topic from the camera's
+    (`<camera>/visual_depth`), so a CompressedImage whose name does not end in
+    that suffix cannot be the depth map — `_role_of` would already have caught
+    it. Binding it as depth instead would compute distances from JPEG bytes;
+    getting it wrong this way costs only the loud "depth is not connected"
+    refusal at start.
+    """
     bound, problem = _bind(
-        ["/cam/objects", "/weird/topic"],
-        graph={"/weird/topic": ["sensor_msgs/msg/CompressedImage"]})
+        ["/cam/objects", "/cam/visual_depth", "/ubuntu/camera/main"],
+        graph={"/ubuntu/camera/main": ["sensor_msgs/msg/CompressedImage"]})
     assert problem == ""
-    assert bound["depth_map"] == "/weird/topic"
+    assert bound["image"] == "/ubuntu/camera/main"
+    assert bound["depth_map"] == "/cam/visual_depth"
+
+
+def test_the_camera_is_optional():
+    """Every canvas drawn before this input existed must keep working."""
+    bound, problem = _bind(["/cam/objects", "/cam/visual_depth"])
+    assert problem == "" and bound["image"] == ""
 
 
 def test_an_unrecognised_string_topic_is_not_guessed():
