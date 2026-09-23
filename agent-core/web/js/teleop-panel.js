@@ -29,7 +29,7 @@ export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfi
 <div class="tp-actions"></div><div class="tp-error" role="alert"></div><div class="tp-notice" role="status"></div>
 <dl><dt>连接 Driver</dt><dd data-field="driver"></dd><dt>智能控制</dt><dd data-field="armed"></dd><dt>PICO 连接</dt><dd data-field="connected"></dd><dt>跟踪</dt><dd data-field="tracking"></dd><dt>输入时效</dt><dd data-field="age"></dd><dt>标定</dt><dd data-field="calibration"></dd></dl>
 <details class="tp-topology" hidden><summary>连接机器人卡片</summary><p>遥操 → 运动控制 → 双臂执行；虚线自动返回求解与执行反馈。</p><select aria-label="目标机器人"></select><button type="button">建立三段连线</button><p class="tp-topology-result" role="status"></p></details>
-<details class="tp-install" hidden><summary>安装 PICO 与一键连接</summary><p>在 PICO 浏览器打开短地址下载应用；生成连接邀请后，资料会自动预填。</p><button type="button" class="tp-download">生成安装链接</button> <button type="button" class="tp-invite" disabled>生成一次性连接邀请</button> <button type="button" class="tp-revoke-invite" hidden>撤销邀请</button><p class="tp-package"></p><a class="tp-install-link" target="_blank" rel="noreferrer" style="overflow-wrap:anywhere"></a><img class="tp-install-qr" alt="PICO 安装与连接二维码" hidden width="220" height="220" style="display:block;background:white;margin:8px auto"><p class="tp-install-result" role="status"></p></details>
+<details class="tp-install" hidden><summary>安装 PICO 与一键连接</summary><p>在 PICO 浏览器打开安装入口、输入安装码。安装后直接打开应用，选择机器人，再在电脑端确认配对。</p><button type="button" class="tp-download">生成安装链接</button> <button type="button" class="tp-invite" disabled>生成一次性连接邀请</button> <button type="button" class="tp-revoke-invite" hidden>撤销邀请</button><p class="tp-entry"></p><p class="tp-install-code" style="font-size:20px;letter-spacing:2px"></p><p class="tp-package"></p><a class="tp-install-link" target="_blank" rel="noreferrer" style="overflow-wrap:anywhere"></a><img class="tp-install-qr" alt="PICO 安装与连接二维码" hidden width="220" height="220" style="display:block;background:white;margin:8px auto"><p class="tp-install-result" role="status"></p></details>
 <details class="tp-pair"><summary>连接与配对</summary><p data-field="pairing"></p><div class="tp-fingerprint"></div><div class="tp-pair-buttons"></div></details>
 <details class="tp-config"><summary>服务配置</summary><p>结束会话后保存并应用。保存不启动机器人；重新开始前需标定。</p><form><div class="tp-config-fields"></div><button type="submit">保存并应用配置</button><p class="tp-config-result" role="status"></p></form></details>
 <details><summary>诊断与维护</summary><div class="tp-maintenance tp-pair-buttons"></div><pre></pre></details>`;
@@ -56,10 +56,12 @@ export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfi
     if(url.origin!==location.origin || !url.pathname.startsWith('/pico/'))throw Error('安装链接来源不匹配');
     const link=install.querySelector('a');link.href=url.href;link.textContent=url.origin+url.pathname;
     const image=install.querySelector('img');image.src='data:image/svg+xml;base64,'+btoa(value.qr_svg);image.hidden=false;
-    install.querySelector('.tp-install-result').textContent=value.deep_link?'邀请仅可使用一次，15 分钟内有效；连接不会开始运动。':'安装链接 15 分钟有效；仅提供安装包下载。';
+    install.querySelector('.tp-install-result').textContent=value.deep_link?'邀请仅可使用一次，15 分钟内有效；连接不会开始运动。':'安装码 15 分钟有效。安装后点打开；在下方连接与配对中允许新设备配对，再在头显选择机器人。';
   }
   install.querySelector('.tp-download').onclick=async()=>{const b=install.querySelector('.tp-download');b.disabled=true;
     try{installation=await prepareInstallation();showInstallation(installation);
+      install.querySelector('.tp-entry').textContent=installation.entry_url ? '头显安装入口：'+installation.entry_url : '';
+      install.querySelector('.tp-install-code').textContent=installation.install_code ? '安装码：'+installation.install_code : '';
       const p=installation.package;install.querySelector('.tp-package').textContent=`版本 ${p.version} · ${Math.round(p.size_bytes/1024/1024)} MB · SHA256 ${p.sha256}`;
       install.querySelector('.tp-invite').disabled=!createInvitation || !has('create_invitation');}
     catch(e){install.querySelector('.tp-install-result').textContent=e.message;}

@@ -30,6 +30,9 @@ public final class ConnectionActivity extends Activity {
     private boolean resolving;
     private final java.util.ArrayDeque<NsdServiceInfo> resolveQueue = new java.util.ArrayDeque<>();
     private TextView status;
+    private TextView discoveryStatus;
+    private Button invitationConnect;
+    private Button reconnect;
     private EditText address;
     private LinearLayout devices;
     private Button confirm;
@@ -51,20 +54,31 @@ public final class ConnectionActivity extends Activity {
         LinearLayout layout = new LinearLayout(this); layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(32, 24, 32, 24); scroll.addView(layout); setContentView(scroll);
         TextView title = new TextView(this); title.setText("PhanthyMotus · 连接机器人"); title.setTextSize(24); layout.addView(title);
-        TextView legend = new TextView(this);
-        legend.setText("透视调试视图：绿=实测手臂，橙=期望手臂姿态（IK），粉=手柄映射目标。\n模型显示在眼前，不与现实机器人重合；Shadow不驱动机器人；天轶暂停时暗橙线保留最后有效姿态，过期实测线隐藏。");
-        legend.setTextSize(16); layout.addView(legend);
-        status = new TextView(this); status.setTextSize(18); layout.addView(status);
+        TextView help = new TextView(this);
+        help.setText("首次连接：\n1. 头显和机器人连接同一局域网。\n2. 在电脑端遥操卡片点击“允许新设备配对”。\n3. 在下方选择机器人，核对两端配对码并确认。\n连接资料会自动保存，下次打开无需重新配置。");
+        help.setTextSize(20); layout.addView(help);
+        discoveryStatus = new TextView(this); discoveryStatus.setTextSize(20); layout.addView(discoveryStatus);
         devices = new LinearLayout(this); devices.setOrientation(LinearLayout.VERTICAL); layout.addView(devices);
-        button(layout, "刷新局域网机器人", this::discover);
-        address = new EditText(this); address.setSingleLine(true); address.setHint("备用地址，例如 robot.local:15741"); layout.addView(address);
-        button(layout, "连接当前机器人", () -> { if (invitation != null) redeemInvitation(); else begin(address.getText().toString().trim()); });
-        confirm = button(layout, "指纹一致，在头显确认", () -> { confirmed = true; confirm.setEnabled(false); });
-        confirm.setEnabled(false);
-        button(layout, "连接已配对机器人", () -> launch(null));
-        button(layout, "取消 / 断开", () -> { cancelled = true; confirmed = false; confirm.setEnabled(false); message("已取消连接；运动不会自动恢复"); });
-        button(layout, "忘记设备", () -> new AlertDialog.Builder(this).setMessage("忘记本机凭据？机器人卡片内也需撤销旧配对，才能重新申请。")
-            .setPositiveButton("忘记", (d,w) -> { cancelled = true; credentials().edit().clear().commit(); message("已忘记设备"); })
+        button(layout, "重新查找机器人", this::discover);
+        status = new TextView(this); status.setTextSize(22); layout.addView(status);
+        invitationConnect = button(layout, "连接邀请中的机器人", this::redeemInvitation);
+        invitationConnect.setVisibility(android.view.View.GONE);
+        confirm = button(layout, "两端配对码一致，确认连接", () -> { confirmed = true; confirm.setEnabled(false); message("已确认，等待电脑端批准连接…"); });
+        confirm.setEnabled(false); confirm.setVisibility(android.view.View.GONE);
+        reconnect = button(layout, "重新连接已配对机器人", () -> launch(null));
+        reconnect.setVisibility(credentials().getString("capture_credential", "").isEmpty() ? android.view.View.GONE : android.view.View.VISIBLE);
+        button(layout, "取消连接", () -> { cancelled = true; confirmed = false; confirm.setEnabled(false); message("已取消；需要连接时请重新选择机器人。"); });
+        LinearLayout advanced = new LinearLayout(this); advanced.setOrientation(LinearLayout.VERTICAL);
+        advanced.setVisibility(android.view.View.GONE);
+        button(layout, "连接帮助 / 更换机器人", () -> advanced.setVisibility(advanced.getVisibility()==android.view.View.VISIBLE ? android.view.View.GONE : android.view.View.VISIBLE));
+        layout.addView(advanced);
+        TextView networkHelp = new TextView(this); networkHelp.setTextSize(18);
+        networkHelp.setText("没有发现机器人：检查访客 Wi-Fi 或网络隔离。请维护者提供备用地址，或从安装页打开连接邀请。更换机器人时，请先在电脑端撤销旧配对，再忘记本机记录。");
+        advanced.addView(networkHelp);
+        address = new EditText(this); address.setSingleLine(true); address.setHint("维护者提供的备用地址"); advanced.addView(address);
+        button(advanced, "通过备用地址连接", () -> begin(address.getText().toString().trim()));
+        button(advanced, "忘记已配对机器人", () -> new AlertDialog.Builder(this).setMessage("忘记本机凭据？机器人卡片内也需撤销旧配对，才能重新申请。")
+            .setPositiveButton("忘记", (d,w) -> { cancelled = true; credentials().edit().clear().commit(); reconnect.setVisibility(android.view.View.GONE); message("已忘记设备，请重新选择机器人。"); })
             .setNegativeButton("取消", null).show());
         discover();
         // Cold launch reconnects only to the persisted, certificate-pinned identity.
@@ -111,17 +125,22 @@ public final class ConnectionActivity extends Activity {
 
     private void discover() {
         stopDiscovery(); devices.removeAllViews();
-        message("正在发现机器人；未发现时检查同一局域网，或输入备用地址。先在卡片内打开允许配对。");
+        discoveryStatus.setText("正在查找同一局域网的机器人…");
+        final int searchEpoch = discoveryEpoch;
+        discoveryStatus.postDelayed(() -> {
+            if (searchEpoch == discoveryEpoch && devices.getChildCount() == 0)
+                discoveryStatus.setText("还没有找到机器人。请检查同一 Wi-Fi，点击重新查找；仍未找到可展开连接帮助。");
+        }, 8000);
         nsd = (NsdManager)getSystemService(NSD_SERVICE);
         WifiManager wifi = (WifiManager)getApplicationContext().getSystemService(WIFI_SERVICE);
         multicast = wifi.createMulticastLock("motus-discovery"); multicast.setReferenceCounted(false); multicast.acquire();
         discovery = new NsdManager.DiscoveryListener() {
             public void onDiscoveryStarted(String type) { }
             public void onDiscoveryStopped(String type) { }
-            public void onStartDiscoveryFailed(String type, int error) { message("自动发现不可用，请刷新或输入地址（"+error+"）"); }
+            public void onStartDiscoveryFailed(String type, int error) { runOnUiThread(() -> { if (discovery == this) discoveryStatus.setText("暂时无法查找机器人，请点击重新查找或展开连接帮助。"); }); }
             public void onStopDiscoveryFailed(String type, int error) { }
             public void onServiceLost(NsdServiceInfo service) {
-                runOnUiThread(() -> { for (int i=devices.getChildCount()-1;i>=0;i--) if (service.getServiceName().equals(devices.getChildAt(i).getTag())) devices.removeViewAt(i); });
+                runOnUiThread(() -> { if (discovery != this) return; for (int i=devices.getChildCount()-1;i>=0;i--) if (service.getServiceName().equals(devices.getChildAt(i).getTag())) devices.removeViewAt(i); });
             }
             public void onServiceFound(NsdServiceInfo service) {
                 runOnUiThread(() -> {
@@ -151,7 +170,9 @@ public final class ConnectionActivity extends Activity {
                         byte[] name=item.getAttributes().get("name");
                         String label=name==null?item.getServiceName():new String(name,StandardCharsets.UTF_8);
                         for(int i=devices.getChildCount()-1;i>=0;i--) if(item.getServiceName().equals(devices.getChildAt(i).getTag())) devices.removeViewAt(i);
-                        Button b=button(devices,label+" · "+endpoint,()->{address.setText(endpoint);begin(endpoint);});
+                        Button b=button(devices,"连接 · "+label,()->{address.setText(endpoint);begin(endpoint);});
+                        b.setTextSize(22); b.setContentDescription("连接机器人 "+label+"，地址 "+endpoint);
+                        discoveryStatus.setText("请选择要连接的机器人；请先在电脑端允许新设备配对。");
                         b.setTag(item.getServiceName());
                     }
                     resolveNext();
@@ -238,11 +259,13 @@ public final class ConnectionActivity extends Activity {
     private void importInvitation(Intent intent) {
         if (pairing) { message("配对申请进行中，请先取消后重新打开邀请"); return; }
         invitation = null;
+        invitationConnect.setVisibility(android.view.View.GONE);
         try {
             invitation = ConnectionInvitation.parse(intent.getDataString());
             address.setText(invitation.getString("endpoint"));
+            invitationConnect.setVisibility(android.view.View.VISIBLE);
             message("已导入机器人 " + invitation.getString("device_id").substring(0,12)
-                + " 的一次性邀请。点击连接当前机器人；连接不会使能运动。");
+                + " 的一次性邀请。点击连接邀请中的机器人；连接不会使能运动。");
         } catch (Exception e) { message("连接邀请无效，请从当前机器人 Canvas 重新打开"); }
         // Never retain the bearer token in the Activity's reusable launch Intent.
         intent.setData(null);
@@ -283,7 +306,8 @@ public final class ConnectionActivity extends Activity {
     private void begin(String endpoint) {
         if (pairing) { message("已有配对申请，请先完成或取消后重试"); return; }
         if (!credentials().getString("capture_credential", "").isEmpty()) { message("已有配对，请先忘记设备并在卡片内撤销旧配对"); return; }
-        cancelled=false; confirmed=false; pairing=true; confirm.setEnabled(false);
+        cancelled=false; confirmed=false; pairing=true; confirm.setEnabled(false); confirm.setVisibility(android.view.View.GONE);
+        message("正在申请连接，请在电脑端保持配对窗口打开…");
         worker.execute(() -> {
             try {
                 PairChannel channel = new PairChannel(endpoint);
@@ -301,8 +325,8 @@ public final class ConnectionActivity extends Activity {
                 transcript.write(serverNonce);
                 String fingerprint=hex(digest(transcript.toByteArray())).substring(0,32);
                 if (!fingerprint.equals(pending.getString("fingerprint"))) throw new IOException("服务器身份校验失败");
-                message("请与 Canvas 卡片逐组核对指纹：\n"+fingerprint.replaceAll("(.{8})(?!$)","$1 ")+"\n两端确认后才能配对；不一致请取消。");
-                runOnUiThread(() -> confirm.setEnabled(!cancelled));
+                message("请核对电脑端显示的配对码：\n"+fingerprint.replaceAll("(.{8})(?!$)","$1 ")+"\n两端确认后才能配对；不一致请取消。");
+                runOnUiThread(() -> { confirm.setVisibility(android.view.View.VISIBLE); confirm.setEnabled(!cancelled); });
                 long deadline=android.os.SystemClock.elapsedRealtime()+120000;
                 while (!cancelled && android.os.SystemClock.elapsedRealtime()<deadline) {
                     JSONObject poll=new JSONObject().put("request_id",pending.getString("request_id"))
@@ -318,7 +342,7 @@ public final class ConnectionActivity extends Activity {
                     Thread.sleep(1000);
                 }
                 message(cancelled ? "已取消配对" : "配对已过期，请重新打开卡片配对窗口");
-            } catch (Exception e) { message("连接失败："+e.getMessage()); }
+            } catch (Exception e) { message("pairing_window_closed".equals(e.getMessage()) ? "电脑端尚未允许配对或窗口已过期。请点击遥操卡片的“允许新设备配对”，再选择机器人。" : "连接失败，请检查网络和电脑端配对状态后重试。详情："+e.getMessage()); }
             finally { pairing=false; runOnUiThread(() -> confirm.setEnabled(false)); }
         });
     }
@@ -338,7 +362,7 @@ public final class ConnectionActivity extends Activity {
     }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request,result,data);
-        if(request==42) message("采集连接已结束。若连接失败，请检查网络；身份变化或配对被撤销时需重新配对。可点击连接重试。");
+        if(request==42) { reconnect.setVisibility(credentials().getString("capture_credential", "").isEmpty() ? android.view.View.GONE : android.view.View.VISIBLE); message("采集连接已结束。若连接失败，请检查网络；身份变化或配对被撤销时需重新配对。可点击连接重试。"); }
     }
     @Override public void onPause() { cancelled=true; stopDiscovery(); super.onPause(); }
     @Override public void onDestroy() { cancelled=true; stopDiscovery(); worker.shutdownNow(); super.onDestroy(); }

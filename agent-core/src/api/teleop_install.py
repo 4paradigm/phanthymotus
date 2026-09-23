@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from pathlib import Path
 import re
 import secrets
 import sqlite3
@@ -18,7 +19,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 import config
@@ -31,6 +32,8 @@ _MAX_DOWNLOADS = 3
 _DOWNLOAD_INTERVAL = 2
 _DOWNLOAD_LEASE = 240
 _MAX_APK = 512 * 1024 * 1024
+_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+_INSTALL_PAGE = Path(__file__).resolve().parents[2] / 'web/pico-install.html'
 _HEADERS = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
             'X-Content-Type-Options': 'nosniff'}
 
@@ -132,13 +135,15 @@ def _ticket_db():
 
 
 def _ticket_digest(token):
-    if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16}', token):
+    if not isinstance(token, str) or not re.fullmatch(r'(?:[A-HJ-NP-Z2-9]{12}|[A-Za-z0-9_-]{16})', token):
         raise HTTPException(410, '安装链接已过期或撤销，请在遥操卡片重新生成')
     return hashlib.sha256(token.encode()).hexdigest()
 
 
 def _create_ticket(mcp_id, info, package):
-    token, now = secrets.token_urlsafe(12), _ticket_time()
+    # Download-only capability: 12 unambiguous symbols (~59 bits), 15 minutes,
+    # at most three downloads. Pairing retains its independent 256-bit invitation.
+    token, now = ''.join(secrets.choice(_CODE_ALPHABET) for _ in range(12)), _ticket_time()
     public_info = {k: info[k] for k in ('capture_origin', 'certificate_sha256', 'package_path', 'apk_path')}
     with _ticket_db() as db:
         db.execute('DELETE FROM teleop_install_tickets WHERE expires <= ? OR created > ?', (now, now))
@@ -188,6 +193,8 @@ async def prepare_installation(mcp_id: str, request: Request):
     token = _create_ticket(mcp_id, info, package)
     url = str(request.base_url).rstrip('/') + '/pico/' + token
     return {'code': 200, 'data': {'ticket': token, 'url': url, 'expires_in_seconds': _TTL,
+                                 'entry_url': str(request.base_url).rstrip('/') + '/pico',
+                                 'install_code': '-'.join(token[i:i+4] for i in range(0, len(token), 4)),
                                  'package': package, 'qr_svg': qr_svg(url)}}
 
 
@@ -215,22 +222,37 @@ async def prepare_invitation(mcp_id: str, token: str, request: Request):
     return {'code': 200, 'data': {**invitation, 'url': url, 'qr_svg': qr_svg(url)}}
 
 
+def _installation_page(status=200):
+    return HTMLResponse(_INSTALL_PAGE.read_text(encoding='utf-8'), status_code=status,
+                        headers={**_HEADERS, 'Content-Security-Policy':
+                                 "default-src 'none'; script-src 'self'; connect-src 'self'; "
+                                 "style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"})
+
+
+@public_router.get('', response_class=HTMLResponse)
+@public_router.get('/', response_class=HTMLResponse)
+async def installation_entry():
+    """Bookmarkable entry; a download code never enrolls a headset."""
+    return _installation_page()
+
+
 @public_router.get('/{token}', response_class=HTMLResponse)
 async def installation_page(token: str):
-    _ticket(token)
-    # No template interpolation with server/peer text; hashes stay client-only.
-    return HTMLResponse('''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>PICO 遥操安装</title>
-<body style="font:18px/1.7 system-ui;max-width:640px;margin:40px auto;padding:20px">
-<h1>连接机器人</h1><p>在 PICO 浏览器下载并安装应用，然后返回本页连接。</p>
-<p>下载链接十五分钟有效，最多下载三次（含重试）；在卡片重新生成会撤销旧链接。下载不会配对或开始运动。</p>
-<p><a id="apk">下载 PICO 安装包</a></p><p><a id="connect" hidden>打开应用并连接此机器人</a></p>
-<p id="hint">已有应用时，请在 Canvas 生成一次性连接邀请。安装不会启动机器人。</p>
-<script>const p=location.pathname.replace(/\\/$/,'');document.querySelector('#apk').href=p+'/apk';
-const payload=location.hash.slice(1);if(/^[A-Za-z0-9_-]{1,8192}$/.test(payload)){
-const a=document.querySelector('#connect');a.href='motus-teleop://connect#'+payload;a.hidden=false;
-document.querySelector('#hint').textContent='点击连接会预填机器人资料并使用一次性邀请；不会开始运动。';}
-</script></body></html>''', headers={**_HEADERS, 'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"})
+    try:
+        _ticket(token)
+    except HTTPException as exc:
+        if exc.status_code != 410:
+            raise
+        # Render recovery instructions instead of a raw JSON error in the headset.
+        return _installation_page(410)
+    return _installation_page()
+
+
+@public_router.get('/{token}/package')
+async def installation_package(token: str):
+    entry = _ticket(token)
+    package = entry['package']
+    return JSONResponse({k: package[k] for k in ('version', 'size_bytes', 'sha256')}, headers=_HEADERS)
 
 
 @public_router.get('/{token}/apk')

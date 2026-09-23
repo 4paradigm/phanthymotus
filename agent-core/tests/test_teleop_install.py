@@ -111,7 +111,7 @@ def test_pinned_proxy_download_and_fragment_invitation(tmp_path, monkeypatch):
             path = '/pico/' + data['ticket']
             c.headers.clear()
             page = await c.get(path)
-            assert page.status_code == 200 and 'location.hash' in page.text
+            assert page.status_code == 200 and '/js/pico-install.js' in page.text
             assert 'one-use-fixture' not in page.text
             download = await c.get(path+'/apk')
             assert download.status_code == 200 and download.content == APK
@@ -286,3 +286,29 @@ def test_crashed_download_lease_recovers_without_extending_ticket(monkeypatch):
     with pytest.raises(api.HTTPException) as caught:
         api._ticket(token,download_id=first['download_id'])
     assert caught.value.status_code == 410
+
+
+def test_fixed_entry_and_readable_download_code_do_not_pair(tmp_path, monkeypatch):
+    async def run():
+        async with capture(tmp_path) as (info, seen), client(monkeypatch, info) as c:
+            data = (await c.post('/api/teleop-install/registered-ac')).json()['data']
+            assert data['entry_url'] == 'https://core.example/pico'
+            assert len(data['ticket']) == 12
+            assert data['install_code'].replace('-', '') == data['ticket']
+            assert set(data['ticket']) <= set(api._CODE_ALPHABET)
+            c.headers.clear()
+            for path in ('/pico', '/pico/'):
+                response = await c.get(path)
+                assert response.status_code == 200 and 'code-form' in response.text
+            metadata = await c.get('/pico/'+data['ticket']+'/package')
+            assert metadata.status_code == 200
+            assert set(metadata.json()) == {'version', 'size_bytes', 'sha256'}
+            # No endpoint, CA, invitation, MCP call or download is exposed by the entry.
+            assert seen == ['/onboarding/package']
+            assert api._ticket(data['ticket'])['download_id'] is None
+            assert (await c.post('/api/teleop-install/registered-ac/invitation/'+data['ticket'])).status_code == 401
+            monkeypatch.setattr(api, '_ticket_time', lambda: time.time()+901)
+            expired = await c.get('/pico/'+data['ticket'])
+            assert expired.status_code == 410 and '重新输入安装码' in expired.text
+            assert (await c.get('/pico/'+data['ticket']+'/package')).status_code == 410
+    asyncio.run(run())

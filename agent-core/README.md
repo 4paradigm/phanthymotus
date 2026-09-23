@@ -56,3 +56,9 @@ NODE_PATH=/path/to/playwright/node_modules node tests/teleop-panel.browser.cjs
 ```
 
 浏览器测试可通过 `CHROME_PATH` 指定已有 Chrome。二维码解码检查使用测试环境的 CairoSVG、Pillow 和 zxing-cpp；这些不是生产依赖。测试使用本地 TLS 服务和受控 MCP 替身，验证连线、协议、安装校验及状态流程，不代表部署或真机验收。
+
+### PICO 安装入口
+
+在遥操卡片生成安装链接后，头显可使用固定 `<Core 地址>/pico` 入口加分组安装码下载。页面提供版本、下载、直接打开 App 后配对的步骤，以及安装码过期恢复入口。新安装码 12 位、只授权下载 APK，15 分钟有效且最多三次下载；旧 16 字符链接仍兼容。配对确认与安装码独立；无需向浏览器提供管理令牌。固定地址属于当前部署，不会自动配置公共域名或 HTTPS 证书。
+
+验证：`python -m pytest agent-core/tests/test_teleop_install.py agent-core/tests/test_teleop_install_contract.py -q`；浏览器沿用 `teleop-panel.browser.cjs` 的 host Playwright/Chrome 环境运行 `agent-core/tests/pico-install.browser.cjs`。这些检查不代替 PICO 系统安装器和升级验收。
