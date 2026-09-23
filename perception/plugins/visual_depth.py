@@ -715,7 +715,8 @@ class _DepthNode(Node):
     """Per-topic depth inference node."""
 
     def __init__(self, input_topic: Optional[str], model, fps: float, cal_a: float,
-                 cal_b: float, max_depth_m: float, node_suffix: str):
+                 cal_b: float, max_depth_m: float, node_suffix: str,
+                 cal_origin: str = ""):
         super().__init__(f"visual_depth_{node_suffix}" if node_suffix else "visual_depth")
         # Topic-less is a supported mode, as in plugins/vop.py and plugins/tts.py:
         # a card driven only by recognize_by_photo has no camera to subscribe
@@ -727,6 +728,15 @@ class _DepthNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
         self._cal_a = cal_a
         self._cal_b = cal_b
+        # Where *this instance's* fit came from. **Not the card's.**
+        #
+        # The card-level `_cal_a`/`_cal_b` come from `perception/config.yaml`;
+        # a canvas instance gets its own from the instance config, and they can
+        # differ by a lot. On r1_sz the card reported `model-default` while this
+        # node was applying `cal_b: -0.9753` — a factor of 2.65 on every
+        # distance. That field exists to say which fit produced these metres,
+        # so reporting a scope that is not producing them defeats it exactly.
+        self._cal_origin = cal_origin or "model-default"
         self._scale_label = "metric"
         self._max_depth_m = max_depth_m
 
@@ -763,6 +773,13 @@ class _DepthNode(Node):
     def request_stop(self) -> None:
         """Signal cancellation without taking the lock, so stop can abort a start."""
         self._stop_event.set()
+
+    @property
+    def calibration_label(self) -> str:
+        """Which fit produced **this node's** metres."""
+        if self._cal_a == 1.0 and self._cal_b == 0.0:
+            return "model-default"
+        return f"site:{self._cal_origin}"
 
     def start(self) -> dict:
         with self._lifecycle_lock:
@@ -805,6 +822,7 @@ class _DepthNode(Node):
             "depth_topic": self._depth_topic,
             "summary_topic": self._summary_topic,
             "scale": self._scale_label,
+            "calibration": self.calibration_label,
             "mode": "stream" if self._input_topic else "on_demand",
         }
 
@@ -1000,6 +1018,7 @@ class VideoDepthPerceptionPlugin:
                            _calibration_from_cfg(
                                icfg, (self._cal_a, self._cal_b),
                                camera_id=self._camera_id_for(node_key)))),
+                cal_origin=calibration_origin(icfg, self._camera_id_for(node_key)),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
             )
@@ -1248,6 +1267,9 @@ class VideoDepthPerceptionPlugin:
                     "summary_topic": node._summary_topic,
                     "fps": node._fps,
                     "scale": node._scale_label,
+                    # Per instance, because that is the scope that has one. Two
+                    # cards on one camera may legitimately run different fits.
+                    "calibration": node.calibration_label,
                     "frame_count": node._frame_count,
                 }
                 for key, node in nodes.items()
@@ -1295,8 +1317,16 @@ class VideoDepthPerceptionPlugin:
             cam_key = instance_id if instance_id in nodes else (
                 next(iter(nodes), None) if nodes
                 else (instance_id or input_topic or _DEFAULT_INSTANCE))
-            info["calibration"] = self._calibration_label(
-                self._camera_id_for(cam_key))
+            # **The running instance's fit, not the card's.** They come from
+            # different configs and can differ by a lot: on r1_sz the card said
+            # `model-default` from perception/config.yaml while the canvas
+            # instance was applying `cal_b: -0.9753`, a factor of 2.65 on every
+            # distance. This field's whole job is to say which fit produced the
+            # metres being published.
+            live = (nodes or {}).get(cam_key)
+            info["calibration"] = (live.calibration_label if live is not None
+                                   else self._calibration_label(
+                                       self._camera_id_for(cam_key)))
             if camera_out:
                 info["camera_info"] = camera_out
             if camera_note:

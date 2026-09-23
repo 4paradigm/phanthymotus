@@ -978,3 +978,29 @@ def test_every_preset_declares_the_cameras_it_was_measured_on():
     makes it a row that silently only works if somebody picks it by hand."""
     for name, preset in depth_plugin.CALIBRATION_PRESETS.items():
         assert preset.get("camera_ids"), f"{name} 没有声明 camera_ids"
+
+
+def test_info_reports_the_fit_the_running_instance_is_actually_applying():
+    """The provenance field describing a scope that is not producing the metres.
+
+    The card-level `cal_a`/`cal_b` come from `perception/config.yaml`; a canvas
+    instance gets its own from the instance config, and they can differ by a lot.
+    On r1_sz the card reported `model-default` while the node was applying
+    `cal_b: -0.9753` — a factor of **2.65 on every distance**. That field exists
+    to say which fit produced these metres, so reporting the wrong scope defeats
+    it exactly, and does so in the direction that reads as "nothing to see here".
+    """
+    plugin, _ = _plugin(model=_FakeModel())
+    plugin.dispatch("visual_depth", {
+        "action": "config", "instance_id": "card-1",
+        "calibration_preset": "Unitree R1"})
+    plugin.dispatch("visual_depth", {
+        "action": "start", "instance_id": "card-1", "input_topic": "/cam"})
+
+    info = plugin.dispatch("visual_depth", {"action": "info",
+                                            "instance_id": "card-1"})
+    assert info["calibration"] == "site:preset:Unitree R1"
+    assert info["instances"]["card-1"]["calibration"] == "site:preset:Unitree R1"
+    # And the card's own file-level config really is identity, so this could
+    # only have come from the instance.
+    assert (plugin._cal_a, plugin._cal_b) == (1.0, 0.0)
