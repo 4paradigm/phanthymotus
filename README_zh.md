@@ -32,6 +32,10 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 
 参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解如何从源码构建和运行。
 
+### 双臂遥操开发契约（Draft）
+
+[`ext_vr → teleop → motion_control → arm` 四卡方案](docs/plans/teleop-four-card-contract.md) 定义了 PICO 齿轮页安装配对、通用双臂输入、天轶/北京 G1 执行与编号验收项。目前是实施与验收依据，不表示四卡功能已发布；交付进度以关联 PR 的版本化证据为准。
+
 ## 特性
 
 - **可视化编排** — 拖拽式 Web Dashboard，在画布上连接设备、传感器和 AI 模型
