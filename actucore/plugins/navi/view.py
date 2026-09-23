@@ -143,18 +143,47 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
             _column_of(edge, config.half_fov_rad, width))
 
 
+# Everything drawn on top gets a dark casing first.
+#
+# **The ramp this overlay now shares washes the far field out to near-white**
+# (0xE6E4DD), which is the right thing for depth — the eye should pass over
+# distances nobody acts on — and fatal for white text and white lines drawn on
+# top of it. The first version was legible only because viridis happens to be
+# dark; against the real ramp the distances disappeared into the background.
+#
+# Casing rather than a translucent box behind each label: it costs one extra
+# draw, works on any background including the flat grey of "no reading", and
+# does not hide the depth it is sitting on.
+_CASING = (20, 20, 20)
+
+
+def _text(frame, text: str, org, colour, scale: float = 0.5):
+    import cv2
+
+    for thickness, shade in ((3, _CASING), (1, colour)):
+        cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, shade,
+                    thickness, cv2.LINE_AA)
+
+
+def _line(frame, start, end, colour, thickness: int = 2):
+    import cv2
+
+    cv2.line(frame, start, end, _CASING, thickness + 3, cv2.LINE_AA)
+    cv2.line(frame, start, end, colour, thickness, cv2.LINE_AA)
+
+
 def _arrow(frame, origin, dx, dy, colour, label: str):
     import cv2
 
     end = (int(origin[0] + dx), int(origin[1] + dy))
+    cv2.arrowedLine(frame, origin, end, _CASING, 6, tipLength=0.3)
     cv2.arrowedLine(frame, origin, end, colour, 3, tipLength=0.3)
     if label:
-        cv2.putText(frame, label, (end[0] + 6, end[1] + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, colour, 1, cv2.LINE_AA)
+        _text(frame, label, (end[0] + 6, end[1] + 4), colour, 0.45)
 
 
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
-           width: int = 640, height: int = 480):
+           measured=None, width: int = 640, height: int = 480):
     """One frame. `depth_m` may be None — the overlay still draws.
 
     `box` is the target's `bbox_norm` (x1, y1, x2, y2 in 0..1) or None;
@@ -184,33 +213,46 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
         blocked = clearance <= config.obstacle_stop_m
         colour = _WARN if blocked else _CORRIDOR
         for x in (left, right):
-            cv2.line(frame, (x, int(height * 0.25)), (x, height), colour, 2)
-        cv2.putText(frame,
-                    f"corridor {clearance:.2f}m  cov {coverage * 100:.0f}%  "
-                    f"+-{keep:.2f}m",
-                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
+            _line(frame, (x, int(height * 0.25)), (x, height), colour)
+        _text(frame,
+              f"corridor {clearance:.2f}m  cov {coverage * 100:.0f}%  "
+              f"+-{keep:.2f}m", (8, 24), colour, 0.55)
 
     # ── the target ───────────────────────────────────────────────────────────
     if box:
         x1, y1, x2, y2 = (int(box[0] * width), int(box[1] * height),
                           int(box[2] * width), int(box[3] * height))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), _CASING, 5)
         cv2.rectangle(frame, (x1, y1), (x2, y2), _TARGET, 2)
         state = (track or {}).get("state", "")
         rng = (track or {}).get("range_m")
         label = f"{state}" + (f"  {rng:.2f}m" if rng is not None else "  ?m")
-        cv2.putText(frame, label, (x1, max(y1 - 6, 14)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, _TARGET, 1, cv2.LINE_AA)
+        colour = _TARGET
+        if measured is not None:
+            # **Both numbers, because the gap between them is a real failure
+            # mode.** The tracked range is a filtered estimate that has been
+            # ego-motion compensated every tick since the last observation, and
+            # without odometry that compensation runs on the *commanded* twist
+            # — so a robot told to walk faster than it does drags its target
+            # closer with nothing but a 4 Hz detector pulling back. The symptom
+            # is a tracked range below the nearest thing in the whole picture,
+            # which nothing was reporting.
+            label += f"  (meas {measured:.2f}m)"
+            if rng is not None and abs(rng - measured) > max(0.3, measured * 0.3):
+                colour = _WARN
+        _text(frame, label, (x1, max(y1 - 8, 18)), colour, 0.6)
     elif track and track.get("state") in ("coasting", "reacquiring"):
         # No box means the detector is not seeing it; the track is a prediction.
         # Saying so is the point — a robot walking towards a guess looks exactly
         # like one walking towards something it can see.
-        cv2.putText(frame, f"{track['state']} (predicted)", (8, height - 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, _WARN, 1, cv2.LINE_AA)
+        _text(frame, f"{track['state']} (predicted)", (8, height - 62), _WARN,
+              0.55)
 
     # ── the command ──────────────────────────────────────────────────────────
     values = (decision.values if decision is not None else None) or [0.0] * 6
     vx, vy, wz = values[0], values[1], values[5]
-    base = (width // 2, height - 24)
+    base = (width // 2, height - 30)
+    cv2.circle(frame, base, 6, _CASING, -1)
     cv2.circle(frame, base, 4, _ARROW, -1)
     if abs(vx) > 1e-6:
         _arrow(frame, base, 0, -vx * 90, _ARROW, f"vx {vx:+.2f}")
@@ -222,15 +264,16 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
         # origin, leaning the way the robot is turning.
         span = int(np.clip(wz / max(config.wz_max, 1e-6), -1, 1) * 70)
         cv2.arrowedLine(frame, (base[0], base[1] - 40),
+                        (base[0] - span, base[1] - 40), _CASING, 6, tipLength=0.3)
+        cv2.arrowedLine(frame, (base[0], base[1] - 40),
                         (base[0] - span, base[1] - 40), _ARROW, 3, tipLength=0.3)
-        cv2.putText(frame, f"wz {wz:+.2f}", (base[0] - span - 20, base[1] - 48),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, _ARROW, 1, cv2.LINE_AA)
+        _text(frame, f"wz {wz:+.2f}", (base[0] - span - 20, base[1] - 48),
+              _ARROW, 0.45)
 
     status = (decision.status if decision is not None else "idle") or "idle"
     distance = decision.distance_m if decision is not None else None
     line = status + (f"  target {distance:.2f}m" if distance is not None else "")
-    cv2.putText(frame, line, (8, height - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    _text(frame, line, (8, height - 10), (255, 255, 255), 0.65)
     return frame
 
 

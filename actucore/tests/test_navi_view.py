@@ -99,6 +99,31 @@ def _render(**over):
 # ── the frame ────────────────────────────────────────────────────────────────
 
 @needs_cv2
+def test_everything_drawn_on_top_is_legible_against_a_washed_out_far_field():
+    """The defect that came with adopting the dashboard's ramp.
+
+    That ramp washes the far field out to near-white, which is right for depth —
+    the eye should pass over distances nobody acts on — and fatal for white text
+    and white lines drawn on top of it. The first version was legible only
+    because viridis happens to be dark; against the real ramp the distances
+    vanished into the background.
+
+    Asserted as "there are casing-dark pixels next to the bright ones", which is
+    what survives any background including the flat grey of "no reading".
+    """
+    frame = _render(depth_m=_depth(5.0),          # far: the washed-out extreme
+                    decision=_decision(vx=0.5, status="approaching",
+                                       distance=1.2),
+                    box=(0.3, 0.3, 0.6, 0.8),
+                    track={"state": "confirmed", "range_m": 1.23})
+    dark = (frame.astype(int).sum(axis=2) < 120)
+    assert dark.sum() > 400, "前景没有深色描边，白底上读不出来"
+
+    plain = _render(depth_m=_depth(5.0), clearance=None)
+    assert (plain.astype(int).sum(axis=2) < 120).sum() < dark.sum()
+
+
+@needs_cv2
 def test_it_produces_a_frame_of_the_declared_size():
     frame = _render()
     assert frame.shape == (480, 640, 3) and frame.dtype == np.uint8
@@ -252,3 +277,32 @@ def test_a_nonsense_decision_does_not_raise():
         V.render(depth_m=_depth(), decision=bad, track={"state": "lost"},
                  box=(0.0, 0.0, 1.0, 1.0), clearance=float("nan"),
                  coverage=0.0, config=P.Config())
+
+
+@needs_cv2
+def test_a_tracked_range_that_disagrees_with_the_measurement_is_flagged():
+    """The reading that should be impossible, made visible.
+
+    The tracked range is a filtered estimate, ego-motion compensated every tick
+    since the last observation — and with no odometry that compensation runs on
+    the **commanded** twist. A robot told to walk at 1 m/s that does not quite
+    manage it drags its target 0.1 m closer per tick, with nothing but a 4 Hz
+    detector pulling back. What that looks like from outside is a tracked range
+    *below the nearest thing in the whole picture*, and nothing was reporting it.
+    """
+    agreeing = _render(box=(0.3, 0.3, 0.6, 0.8), measured=1.20,
+                       track={"state": "confirmed", "range_m": 1.23})
+    drifted = _render(box=(0.3, 0.3, 0.6, 0.8), measured=2.22,
+                      track={"state": "confirmed", "range_m": 0.55})
+
+    warn = lambda f: (f == np.array(V._WARN)).all(axis=2).sum()
+    assert warn(drifted) > warn(agreeing), "两个数差一倍也没有任何提示"
+
+
+@needs_cv2
+def test_both_numbers_are_drawn_when_a_measurement_exists():
+    plain = _render(box=(0.3, 0.3, 0.6, 0.8),
+                    track={"state": "confirmed", "range_m": 1.23})
+    both = _render(box=(0.3, 0.3, 0.6, 0.8), measured=1.20,
+                   track={"state": "confirmed", "range_m": 1.23})
+    assert not np.array_equal(plain, both)

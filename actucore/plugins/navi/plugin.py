@@ -1103,11 +1103,12 @@ class NaviPlugin:
 
             from . import view as view_mod
 
+            box, measured = self._target_box()
             frame = view_mod.render(
                 depth_m=self._depth_map,
                 decision=self._last_decision,
                 track=self._state.tracker.describe(),
-                box=self._target_box(),
+                box=box, measured=measured,
                 clearance=self._state.last_clearance,
                 coverage=self._state.last_coverage,
                 config=self._config)
@@ -1123,7 +1124,18 @@ class NaviPlugin:
             self._view_publisher = None
 
     def _target_box(self):
-        """The current detection's box for the thing being chased, or None.
+        """`(box, measured_distance)` for the thing being chased, or `(None, None)`.
+
+        The measured distance is drawn **next to the tracker's**, and that
+        comparison is the point. The two are different quantities: one is what
+        the depth map says right now, the other is a filtered estimate that has
+        been ego-motion compensated every tick since the last observation. When
+        there is no odometry the compensation runs on the *commanded* twist, so
+        a robot told to walk at 1 m/s that does not quite manage it has its
+        target dragged 0.1 m closer per tick with nothing to pull it back but a
+        4 Hz detector — which shows up as a tracked range **below the nearest
+        thing in the whole picture**, an impossible reading that nothing was
+        reporting.
 
         Associated here rather than carried through the tracker on purpose: the
         tracker works in metres and bearings and has no use for a rectangle, and
@@ -1137,8 +1149,8 @@ class NaviPlugin:
         target = (self._state.target or "").strip().lower()
         track = self._state.tracker.track
         if not target or track is None:
-            return None
-        best, best_gap = None, 1e9
+            return None, None
+        best, best_gap, best_obj = None, 1e9, None
         for obj in payload.get("objects") or []:
             name = str(obj.get("name") or "").lower()
             if target not in name and name not in target:
@@ -1150,8 +1162,16 @@ class NaviPlugin:
             bearing = float(position[0]) * self._config.half_fov_rad
             gap = abs(bearing - track.bearing_rad)
             if gap < best_gap:
-                best, best_gap = box, gap
-        return best
+                best, best_gap, best_obj = box, gap, obj
+        if best_obj is None:
+            return None, None
+        source = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
+                  if self._depth_map is not None or self._depth_bands else None)
+        try:
+            measured = policy_mod.target_distance(best_obj, source, self._config)
+        except Exception:                                     # noqa: BLE001
+            measured = None
+        return best, measured
 
     def _maybe_complete(self):
         """Report the outcome once, on arrival **or** failure.
