@@ -116,13 +116,42 @@ def test_no_reading_is_not_a_colour_on_the_depth_ramp():
     assert not np.array_equal(corner, frame[240, 320]), "和有读数的地方一样了"
 
 
-@needs_cv2
-def test_near_reads_brighter_than_far():
-    """Read at a glance by someone standing next to a moving robot: the near
-    field is what it is about to walk into and should be the loudest thing."""
-    near = _render(depth_m=_depth(0.5))[240, 320].astype(int).sum()
-    far = _render(depth_m=_depth(5.0))[240, 320].astype(int).sum()
-    assert near > far
+def test_near_is_loud_and_far_washes_out():
+    """Red belongs to what you are about to hit. The ramp's own rule, and the
+    reason it is not a rainbow — inherited with the table rather than invented
+    here."""
+    lut = V.depth_lut()
+    near, far = lut[0].astype(int), lut[-1].astype(int)
+    assert near[2] > near[0], "近处应当偏红（BGR）"
+    assert far.min() > 150, "远处应当洗白，让眼睛掠过去"
+
+
+def test_lightness_rises_with_distance_so_it_survives_greyscale():
+    """The property that makes it safe for all three common colour-vision
+    deficiencies: the reading never depends on telling two hues apart."""
+    lut = V.depth_lut().astype(int)
+    luma = lut @ [0.114, 0.587, 0.299]          # BGR weights
+    drops = np.diff(luma) < -6
+    assert not drops.any(), f"亮度曲线有 {drops.sum()} 处明显下陷"
+
+
+def test_the_table_still_matches_the_dashboards():
+    """Two copies, one in Python and one in JavaScript, because a container and
+    a browser cannot share a module. Pinned so a change to one shows up here
+    rather than as two panels that quietly disagree."""
+    import pathlib
+    import re
+
+    js = (pathlib.Path(__file__).resolve().parents[2] / "agent-core" / "web"
+          / "js" / "renderers" / "camera.js").read_text()
+    stops = re.findall(r"\[(\d+\.\d+), 0x([0-9A-F]{2}), 0x([0-9A-F]{2}), "
+                       r"0x([0-9A-F]{2})\]", js)
+    assert stops, "没能从 camera.js 里解析出色带"
+    parsed = [(float(d), int(r, 16), int(g, 16), int(b, 16))
+              for d, r, g, b in stops]
+    assert parsed == V._DEPTH_STOPS
+    assert f"DEPTH_NEAR_SHARE = {V._DEPTH_NEAR_SHARE}" in js
+    assert f"DEPTH_NEAR_M = {V._DEPTH_NEAR_M}" in js
 
 
 @needs_cv2

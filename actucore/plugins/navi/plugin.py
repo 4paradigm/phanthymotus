@@ -138,6 +138,10 @@ class NaviPlugin:
         self._view_publisher = None
         self._view_next_at = 0.0
         self._view_failed = False
+        # (width, height) of the frame vop's boxes are in, from its camera
+        # declaration. (0, 0) until one arrives — and then no box is converted,
+        # which is the honest answer rather than a guessed resolution.
+        self._objects_frame = (0, 0)
         self._objects_ms = 0
         # The last N detection payloads, for `list_visible_objects` to intersect.
         # A deque rather than a list: this is written every frame on the hot
@@ -435,6 +439,8 @@ class NaviPlugin:
         self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
 
         objects_decl = for_topic(declarations, binding.get("objects"))
+        self._objects_frame = (objects_decl.get("width") or 0,
+                               objects_decl.get("height") or 0)
         depth_id, objects_id = camera_id(depth_decl), camera_id(objects_decl)
         if depth_id and objects_id and depth_id != objects_id:
             return (f"两路输入来自不同的相机：检测结果来自 {objects_id}，深度图来自 "
@@ -838,6 +844,41 @@ class NaviPlugin:
             return "", f"{topic}（String，但话题名不符合 perception 的命名约定，无法确定用途）"
         return "", f"{topic}（{'/'.join(types) or '暂无发布者，且话题名不符合命名约定'}）"
 
+    def _normalise_boxes(self, payload: dict) -> dict:
+        """Give every detection a `bbox_norm`, from the pixel box vop publishes.
+
+        **These two sides never agreed on a key.** vop publishes `bbox` in *its
+        camera's* pixels; `policy.target_distance` asks for `bbox_norm` in 0..1.
+        Nobody publishes that name, so the box path has never once run: every
+        target's distance has come from the centre-patch fallback, and
+        `_degradations()` did not catch it because it checks the config switch
+        rather than whether a box ever arrived.
+
+        `sample_box`'s own docstring says why the normalised form is the one
+        that crosses the boundary: vop's pixels are in its camera's resolution
+        and the depth map has been resampled to 640x480, so passing pixels
+        across "produces plausible numbers for the wrong part of the image".
+        The contract was right; the key name was never wired.
+
+        The frame size comes from the camera declaration on the objects topic
+        (`motus.camera/1`). **No declaration, no conversion** — inferring the
+        resolution from a box that happens to be large would be exactly the kind
+        of plausible guess this card keeps being bitten by.
+        """
+        objects = (payload or {}).get("objects")
+        if not isinstance(objects, list):
+            return payload
+        width, height = self._objects_frame
+        for obj in objects:
+            if not isinstance(obj, dict) or obj.get("bbox_norm"):
+                continue
+            box = obj.get("bbox")
+            if not box or len(box) != 4 or not (width and height):
+                continue
+            x1, y1, x2, y2 = (float(v) for v in box)
+            obj["bbox_norm"] = [x1 / width, y1 / height, x2 / width, y2 / height]
+        return payload
+
     def _on_string(self, role, message):
         try:
             payload = json.loads(message.data)
@@ -846,7 +887,7 @@ class NaviPlugin:
         now = int(time.time() * 1000)
         with self._obs_lock:
             if role == "objects":
-                self._objects = payload
+                self._objects = self._normalise_boxes(payload)
                 self._objects_ms = now
                 self._recent.append(payload)
             elif role == "depth_summary":

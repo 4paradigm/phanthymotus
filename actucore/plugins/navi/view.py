@@ -34,10 +34,35 @@ import math
 
 import numpy as np
 
-# Near is bright, far is dark. Viridis rather than the jet/rainbow ramp: it is
-# perceptually uniform and survives colour blindness, and this image exists to
-# be read quickly by someone standing next to a moving robot.
-_NEAR_M = 0.3
+# **The dashboard's own depth ramp, not a second one.**
+#
+# The first version used viridis, and the result was two panels side by side
+# showing the same depth map in different colours — which makes an operator
+# translate between them before they can compare, at exactly the moment they are
+# trying to work out why a robot did something. Whichever ramp is better, two is
+# worse than one.
+#
+# Ported from `agent-core/web/js/renderers/camera.js`, which is the source of
+# truth and carries the reasoning: near is loud and far washes out (red belongs
+# to what you are about to hit); the stops sit at the distances the robot acts
+# on rather than spread evenly, so most of the contrast lands where a decision
+# changes; lightness rises monotonically with distance, so the reading survives
+# greyscale and all three common colour-vision deficiencies.
+#
+# Duplicated rather than shared for the same reason `motus.control/1` is a
+# document and not a package — this is Python in a container, that is JavaScript
+# in a browser. Change one, change both; a test pins the two tables together.
+_DEPTH_STOPS = [
+    (0.00, 0x5E, 0x14, 0x10), (0.30, 0xA8, 0x21, 0x0F),
+    (0.60, 0xDC, 0x5A, 0x14), (0.80, 0xE8, 0x74, 0x1E),
+    (1.10, 0xF0, 0x9C, 0x2E), (1.45, 0xF3, 0xC4, 0x52),
+    (1.80, 0xC9, 0xCC, 0x8E), (2.10, 0xB4, 0xD2, 0xCC),
+    (3.20, 0xC6, 0xD6, 0xD6), (5.00, 0xE6, 0xE4, 0xDD),
+]
+_DEPTH_MAX_M = 5.0
+_DEPTH_NEAR_M = 2.0
+_DEPTH_NEAR_SHARE = 0.72
+
 _NO_READING = (70, 70, 70)
 _CORRIDOR = (255, 255, 255)
 _TARGET = (80, 220, 255)
@@ -45,16 +70,50 @@ _ARROW = (120, 255, 120)
 _WARN = (80, 120, 255)
 
 
-def _colormap(depth_m: np.ndarray, far_m: float):
-    import cv2
+def depth_lut() -> np.ndarray:
+    """256x3 BGR lookup, the same one the dashboard builds.
 
+    A table rather than per-pixel interpolation for the reason it is one there:
+    307k pixels a frame for a result with only 256 distinct values.
+    """
+    table = np.zeros((256, 3), dtype=np.uint8)
+    for i in range(256):
+        f = i / 255.0
+        if f <= _DEPTH_NEAR_SHARE:
+            metres = (f / _DEPTH_NEAR_SHARE) * _DEPTH_NEAR_M
+        else:
+            metres = _DEPTH_NEAR_M + ((f - _DEPTH_NEAR_SHARE)
+                                      / (1 - _DEPTH_NEAR_SHARE)) * (
+                _DEPTH_MAX_M - _DEPTH_NEAR_M)
+        k = 0
+        while k < len(_DEPTH_STOPS) - 2 and metres > _DEPTH_STOPS[k + 1][0]:
+            k += 1
+        d0, r0, g0, b0 = _DEPTH_STOPS[k]
+        d1, r1, g1, b1 = _DEPTH_STOPS[k + 1]
+        t = min(1.0, max(0.0, (metres - d0) / (d1 - d0)))
+        # BGR: what cv2 writes out.
+        table[i] = (b0 + (b1 - b0) * t, g0 + (g1 - g0) * t, r0 + (r1 - r0) * t)
+    return table
+
+
+_LUT = depth_lut()
+
+
+def _index_of(depth_m: np.ndarray) -> np.ndarray:
+    """Metres to LUT index, near band stretched — the same warp as the panel."""
+    metres = np.clip(np.nan_to_num(depth_m, nan=_DEPTH_MAX_M), 0.0, _DEPTH_MAX_M)
+    near = metres <= _DEPTH_NEAR_M
+    out = np.empty(metres.shape, dtype=np.float64)
+    out[near] = metres[near] / _DEPTH_NEAR_M * _DEPTH_NEAR_SHARE
+    out[~near] = _DEPTH_NEAR_SHARE + (
+        (metres[~near] - _DEPTH_NEAR_M) / (_DEPTH_MAX_M - _DEPTH_NEAR_M)
+    ) * (1 - _DEPTH_NEAR_SHARE)
+    return np.clip(out * 255, 0, 255).astype(np.uint8)
+
+
+def _colormap(depth_m: np.ndarray, far_m: float):
     valid = np.isfinite(depth_m) & (depth_m > 0)
-    span = max(far_m - _NEAR_M, 0.1)
-    t = np.clip((np.nan_to_num(depth_m, nan=far_m) - _NEAR_M) / span, 0.0, 1.0)
-    # Inverted so near reads bright: the near field is what the robot is about
-    # to walk into, and it should be the loudest thing in the picture.
-    frame = cv2.applyColorMap(((1.0 - t) * 255).astype(np.uint8),
-                              cv2.COLORMAP_VIRIDIS)
+    frame = _LUT[_index_of(depth_m)]
     frame[~valid] = _NO_READING
     return frame
 
