@@ -96,19 +96,34 @@ FIT_ROWS = (0.35, 0.65)
 
 # ── ROS plumbing ─────────────────────────────────────────────────────────────
 
-def _discover(node, suffix: str, explicit: str = "") -> str:
+def _discover(node, suffix: str, explicit: str = "", settle_s: float = 6.0) -> str:
+    """A topic by name suffix, waiting for the ROS graph to fill in.
+
+    **Polls rather than asking once.** `get_topic_names_and_types()` right after
+    `Node()` returns whatever discovery has managed so far, which on a busy
+    domain is often nothing — the first run of this tool reported "no topic
+    ending in /state/odom" while that topic was publishing at 10 Hz and a probe
+    with a two-second sleep in front of it listed the topic fine.
+    """
+    import rclpy
+
     if explicit:
         return explicit
-    matches = [name for name, _ in node.get_topic_names_and_types()
-               if name.endswith(suffix)]
+    deadline = time.monotonic() + settle_s
+    matches: list = []
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.2)
+        matches = [name for name, _ in node.get_topic_names_and_types()
+                   if name.endswith(suffix)]
+        if matches:
+            break
     if not matches:
         raise SystemExit(
-            f"没有找到以 {suffix} 结尾的话题。确认 perception 的卡片在运行，"
+            f"{settle_s:.0f}s 内没有找到以 {suffix} 结尾的话题。确认对应的卡片在运行，"
             f"并且这个进程和它在同一个 ROS_DOMAIN_ID / DDS profile 下。")
     if len(matches) > 1:
         print(f"[warn] {suffix} 匹配到多个话题，用第一个：{matches}", flush=True)
     return matches[0]
-
 
 def _collect(*, want_depth: bool, want_objects: bool, frames: int,
              depth_topic: str, objects_topic: str, timeout_s: float):
@@ -453,12 +468,130 @@ def measure_object(args) -> None:
         print("       出问题的就不是视场角，而是镜头畸变或深度标定。")
 
 
+# ── method: step ─────────────────────────────────────────────────────────────
+#
+# The `object` method needs `bbox_norm`, which vop only publishes when
+# `publish_bbox` is on — and the perception image deployed on r1_sz predates
+# that switch. This one reads the same geometry straight out of the depth map
+# and needs no detector at all, which also removes the detector's box from the
+# error budget: a box drawn around a chair includes whatever the model thinks
+# the chair is, while a depth step is where the object physically ends.
+
+# How much nearer than its surroundings a patch has to be to count as the
+# object rather than as texture on the wall behind it.
+STEP_MARGIN_M = 0.25
+# ...and how wide, so a sliver of noise cannot be mistaken for a box.
+STEP_MIN_COLUMNS = 30
+# Rows to look in. Wider than the wall fit: a box on the floor sits low.
+STEP_ROWS = (0.25, 0.90)
+
+
+def _near_profile(maps) -> np.ndarray:
+    """Per column, the nearest thing in the row band — the box if there is one."""
+    top = int(depth_mod.HEIGHT * STEP_ROWS[0])
+    bottom = int(depth_mod.HEIGHT * STEP_ROWS[1])
+    stack = np.stack([m[top:bottom, :] for m in maps]).reshape(-1, depth_mod.WIDTH)
+    out = np.full(depth_mod.WIDTH, np.nan)
+    for column in range(depth_mod.WIDTH):
+        valid = stack[:, column]
+        valid = valid[np.isfinite(valid)]
+        if valid.size:
+            out[column] = np.percentile(valid, 10)
+    return out
+
+
+def _widest_step(profile):
+    """The widest run of columns standing clearly in front of the background.
+
+    Returns `(first, last, depth)` or None. The background is the profile's own
+    upper half, so nothing has to be measured about the room.
+    """
+    finite = profile[np.isfinite(profile)]
+    if finite.size < 100:
+        return None
+    background = float(np.percentile(finite, 75))
+    near = np.isfinite(profile) & (profile < background - STEP_MARGIN_M)
+
+    best = None
+    start = None
+    for column in range(len(profile) + 1):
+        inside = column < len(profile) and near[column]
+        if inside and start is None:
+            start = column
+        elif not inside and start is not None:
+            if best is None or (column - start) > (best[1] - best[0] + 1):
+                best = (start, column - 1)
+            start = None
+    if best is None or (best[1] - best[0] + 1) < STEP_MIN_COLUMNS:
+        return None
+    depth = float(np.nanmedian(profile[best[0]:best[1] + 1]))
+    return best[0], best[1], depth
+
+
+def measure_step(args) -> None:
+    """half_fov from a known-width object found as a step in the depth map."""
+    if not args.width:
+        raise SystemExit("step 方法需要 --width：物体的真实宽度，米")
+
+    maps, _ = _collect(want_depth=True, want_objects=False, frames=args.frames,
+                       depth_topic=args.depth_topic, objects_topic="",
+                       timeout_s=args.timeout)
+    profile = _near_profile(maps)
+    _draw_profile(profile, centre_depth=float(np.nanmedian(profile)))
+
+    found = _widest_step(profile)
+    if found is None:
+        raise SystemExit(
+            "\n深度图里找不到清晰的台阶。把物体放在墙前 1~2 m、让它整个进画面，"
+            f"并且比背景近至少 {STEP_MARGIN_M} m（现在的剖面见上）。")
+    first, last, distance = found
+    if args.distance is not None:
+        distance = args.distance
+
+    centre = (depth_mod.WIDTH - 1) / 2.0
+    left = (first - centre) / centre
+    right = (last - centre) / centre
+    span = right - left
+
+    # Both edges rather than a half-width about the image centre, so the object
+    # does not have to be centred — tan is not linear, and an off-centre object
+    # of a given width subtends a smaller span than a centred one.
+    #
+    #   W = D * tan(half_fov) * (u_right - u_left)
+    half_fov = math.atan(args.width / (distance * span))
+    configured = policy_mod.Config().half_fov_rad
+
+    print()
+    print(f"台阶：列 {first}..{last}（共 {last - first + 1} 列，归一化 "
+          f"{left:+.3f}..{right:+.3f}）")
+    print(f"      距离 {distance:.3f} m"
+          + ("（来自深度图）" if args.distance is None else "（由 --distance 给定）")
+          + f"   真实宽度 {args.width} m")
+    print()
+    print(f"half_fov_rad = {half_fov:.4f} rad  "
+          f"（{math.degrees(half_fov) * 2:.1f}° 全视场）")
+    print(f"当前配置     = {configured} rad")
+    delta = (half_fov - configured) / configured * 100
+    print(f"差 {delta:+.1f}%")
+    print()
+    if first <= 2 or last >= depth_mod.WIDTH - 3:
+        print("[warn] 台阶顶到画面边缘了 —— 物体没有整个进画面，测出来的宽度偏小、")
+        print("       视场角偏大。往后退一点再测。")
+    if abs(delta) < 5:
+        print("结论：配置值够用，走廊宽度的误差在 5% 以内。")
+    else:
+        print(f"结论：把 actucore/config.yaml 的 navi.half_fov_rad 改成 {half_fov:.3f}。")
+        print(f"      走廊的横向换算与这个值的 tan 成正比。")
+    print("      在两个不同距离各测一次；差超过几个百分点，问题就不在视场角，")
+    print("      而在镜头畸变或深度标定。")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="量 navi 走廊依赖的相机几何。只读传感器，不发任何指令。")
-    parser.add_argument("method", choices=("wall", "object"))
+    parser.add_argument("method", choices=("wall", "object", "step"))
     parser.add_argument("--width", type=float,
-                        help="object 方法：目标的真实宽度，米")
+                        help="object / step 方法：目标的真实宽度，米")
     parser.add_argument("--target", default="box",
                         help="object 方法：vop 认得的目标名，默认 box")
     parser.add_argument("--distance", type=float,
@@ -472,6 +605,8 @@ def main() -> None:
 
     if args.method == "wall":
         measure_wall(args)
+    elif args.method == "step":
+        measure_step(args)
     else:
         measure_object(args)
 

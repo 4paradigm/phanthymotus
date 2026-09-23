@@ -74,17 +74,34 @@ OBJECTS_SUFFIX = "/objects"
 HORIZONS = (0.5, 1.0, 1.2, 2.0, 5.0)
 
 
-def _discover(node, suffix: str, explicit: str = "") -> str:
+def _discover(node, suffix: str, explicit: str = "", settle_s: float = 6.0) -> str:
+    """A topic by name suffix, waiting for the ROS graph to fill in.
+
+    **Polls rather than asking once.** `get_topic_names_and_types()` right after
+    `Node()` returns whatever discovery has managed so far, which on a busy
+    domain is often nothing — the first run of this tool reported "no topic
+    ending in /state/odom" while that topic was publishing at 10 Hz and a probe
+    with a two-second sleep in front of it listed the topic fine.
+    """
+    import rclpy
+
     if explicit:
         return explicit
-    matches = [name for name, _ in node.get_topic_names_and_types()
-               if name.endswith(suffix)]
+    deadline = time.monotonic() + settle_s
+    matches: list = []
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.2)
+        matches = [name for name, _ in node.get_topic_names_and_types()
+                   if name.endswith(suffix)]
+        if matches:
+            break
     if not matches:
-        raise SystemExit(f"没有找到以 {suffix} 结尾的话题。")
+        raise SystemExit(
+            f"{settle_s:.0f}s 内没有找到以 {suffix} 结尾的话题。确认对应的卡片在运行，"
+            f"并且这个进程和它在同一个 ROS_DOMAIN_ID / DDS profile 下。")
     if len(matches) > 1:
-        print(f"[warn] {suffix} 匹配到多个，用第一个：{matches}", flush=True)
+        print(f"[warn] {suffix} 匹配到多个话题，用第一个：{matches}", flush=True)
     return matches[0]
-
 
 def _record(args, *, want_landmark: bool):
     """Spin for `--seconds`, returning (odom samples, landmark observations).
