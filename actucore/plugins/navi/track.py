@@ -192,6 +192,8 @@ class Tracker:
 
     def __init__(self):
         self.track: Track | None = None
+        # The payload stamp the lifecycle last counted. See `step`.
+        self._last_stamp = None
         # Why the last tick did what it did — surfaced in info(), because a
         # tracker that quietly refuses to confirm anything looks identical from
         # outside to a camera with nothing in front of it.
@@ -213,6 +215,24 @@ class Tracker:
             self._predict(ego, dt, config, ego_measured)
             self.track.age_s += dt
             self.track.since_obs_s += dt
+
+        # **One payload is one piece of evidence, however many times it is read.**
+        #
+        # The policy ticks at `rate_hz` and the detector publishes at whatever
+        # rate it manages; on r1_sz those are 10 Hz and 3.6 Hz, so the card sees
+        # the same payload on roughly three consecutive ticks. Counting a hit
+        # each time turns "three of the last five frames" into "one frame, read
+        # three times" — which confirms a track off a single false positive,
+        # the exact failure this lifecycle exists to prevent. It would also fold
+        # the same measurement into the filter three times and shrink the
+        # covariance as if three cameras had agreed.
+        #
+        # Prediction still runs above: our own motion continues whether or not
+        # a new picture arrived. Only the *evidence* is skipped.
+        stamp = (detections or {}).get("timestamp")
+        if detections is not None and stamp is not None and stamp == self._last_stamp:
+            return self.track if (self.track and self.track.drivable) else None
+        self._last_stamp = stamp
 
         candidates = self._candidates(detections, depth, target, config)
         matched = self._associate(candidates, config)
@@ -510,6 +530,7 @@ class Tracker:
             "state": track.state,
             "hits": track.hits,
             "coast_s": round(track.coast_s, 2),
+            "age_s": round(track.age_s, 1),
             "range_m": round(track.range_m, 2) if track.range_known else None,
             "position_std_m": round(track.position_std_m, 2),
             "reason": self.last_reason,

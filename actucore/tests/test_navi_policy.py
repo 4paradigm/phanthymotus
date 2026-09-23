@@ -34,8 +34,25 @@ def _obj(name="chair", x=0.0, y=0.0, confidence=0.9, bbox=None):
     return out
 
 
+# Detection payloads carry a stamp and the tracker counts one payload as one
+# piece of evidence however many times it is read — so a test that means "the
+# next frame" has to produce a new stamp. A constant here made every tick a
+# re-read of the same frame, and nothing was ever confirmed.
+_FRAME = [0.0]
+
+
 def _detections(*objects):
-    return {"timestamp": 1.0, "count": len(objects), "objects": list(objects)}
+    _FRAME[0] += 0.1
+    return {"timestamp": round(_FRAME[0], 4), "count": len(objects),
+            "objects": list(objects)}
+
+
+def _next_frame(payload):
+    """The same picture, taken again. A new stamp, same contents."""
+    if payload is None:
+        return None
+    _FRAME[0] += 0.1
+    return dict(payload, timestamp=round(_FRAME[0], 4))
 
 
 def _depth(bands=None, map_=None):
@@ -144,7 +161,7 @@ def seed(state, detections, depth=None, config=None, frames=None, dt=0.1):
     """
     config = config or _cfg()
     for _ in range(config.confirm_hits if frames is None else frames):
-        state.tracker.step(detections=detections, depth=depth,
+        state.tracker.step(detections=_next_frame(detections), depth=depth,
                            target=state.target, config=config,
                            ego=(0.0, 0.0, 0.0), dt=dt)
     return state

@@ -198,6 +198,39 @@ def _nrmse(observed, predicted, scale: float) -> float:
     return float(residual / max(1e-9, scale))
 
 
+def _draw_profile(observed, centre_depth: float, buckets: int = 24) -> None:
+    """The depth across the frame, as a picture.
+
+    Added after the first run on a robot: the fit said "neither hypothesis
+    fits" and stopped there, which is true but not actionable — the operator
+    cannot tell a depth source that violates pinhole geometry from a robot that
+    is simply not pointed at a wall. The shape separates them at a glance. A
+    wall is a smooth, symmetric curve; a room is lumpy and asymmetric.
+    """
+    edges = np.linspace(0, len(observed), buckets + 1).astype(int)
+    values = []
+    for index in range(buckets):
+        chunk = observed[edges[index]:edges[index + 1]]
+        chunk = chunk[np.isfinite(chunk)]
+        values.append(float(np.median(chunk)) if chunk.size else float("nan"))
+
+    finite = [v for v in values if np.isfinite(v)]
+    if not finite:
+        return
+    low, high = min(finite), max(finite)
+    span = max(1e-6, high - low)
+    print()
+    print(f"  横向剖面（左→右，{low:.2f}..{high:.2f} m）")
+    for row in range(8, 0, -1):
+        threshold = low + span * (row - 0.5) / 8
+        line = "".join("█" if np.isfinite(v) and v >= threshold else " "
+                       for v in values)
+        print(f"  {low + span * row / 8:5.2f} |{line}")
+    print(f"        +{'-' * buckets}")
+    print(f"         左{' ' * (buckets - 4)}右")
+    print("  一面正对的平墙是平滑对称的；房间是坑洼且不对称的。")
+
+
 def measure_wall(args) -> None:
     maps, _ = _collect(want_depth=True, want_objects=False, frames=args.frames,
                        depth_topic=args.depth_topic, objects_topic="",
@@ -222,6 +255,7 @@ def measure_wall(args) -> None:
 
     print()
     print(f"样本 {len(maps)} 帧，列 {low}..{high}，有效 {valid.sum()}/{len(columns)}")
+    _draw_profile(observed, centre_depth=float(np.nanmedian(observed)))
     print(f"中心深度 {centre_depth:.3f} m   边缘深度 {edge_depth:.3f} m   "
           f"边缘/中心 = {ratio:.3f}")
     print()

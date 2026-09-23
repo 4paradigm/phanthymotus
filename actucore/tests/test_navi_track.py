@@ -339,3 +339,62 @@ def test_bearing_is_right_positive_and_y_is_left():
     assert point[0] > 0 and point[1] < 0, "a bearing to the right is -y"
     range_m, bearing = T.polar_of(point)
     assert range_m == pytest.approx(2.0) and bearing == pytest.approx(0.5)
+
+
+# ── one payload is one piece of evidence ─────────────────────────────────────
+
+def _stamped(stamp, *objects):
+    return {"timestamp": stamp, "objects": list(objects)}
+
+
+def test_re_reading_one_payload_does_not_confirm_a_track():
+    """Measured on r1_sz: the policy ticks at 10 Hz and vop publishes at 3.6 Hz,
+    so the same payload is read on about three consecutive ticks.
+
+    Counting a hit each time turns "three of the last five frames" into "one
+    frame, read three times" — which confirms a track off a single false
+    positive, the exact failure this lifecycle exists to prevent.
+    """
+    config = _cfg()
+    tracker = T.Tracker()
+    payload = _stamped(100.0, _obj())
+    for _ in range(6):
+        assert _feed(tracker, payload, config=config) is None, \
+            "one detection frame confirmed a track by being read repeatedly"
+    assert tracker.track.state == T.TENTATIVE
+    assert tracker.track.hits == 1
+
+
+def test_three_distinct_payloads_confirm():
+    config = _cfg()
+    tracker = T.Tracker()
+    for index in range(config.confirm_hits):
+        drivable = _feed(tracker, _stamped(100.0 + index, _obj()), config=config)
+    assert drivable is not None
+
+
+def test_a_repeated_payload_still_advances_the_prediction():
+    """Only the evidence is skipped. Our own motion continues whether or not a
+    new picture arrived, so the estimate must keep moving with it."""
+    config = _cfg()
+    tracker = T.Tracker()
+    for index in range(config.confirm_hits):
+        _feed(tracker, _stamped(100.0 + index, _obj(bearing=0.0)), config=config)
+    before = tracker.track.bearing_rad
+
+    repeat = _stamped(200.0, _obj(bearing=0.0))
+    _feed(tracker, repeat, config=config)              # new stamp: counted
+    _feed(tracker, repeat, config=config, ticks=4, ego=(0.0, 0.0, 1.0))
+    assert tracker.track.bearing_rad > before + 0.2, \
+        "the robot turned while re-reading one frame and the estimate did not move"
+
+
+def test_a_payload_with_no_stamp_is_counted_every_time():
+    """A detector that does not stamp its output cannot be de-duplicated, and
+    the safe fallback is to treat each read as evidence — over-counting is the
+    behaviour that existed before, not a new hazard."""
+    config = _cfg()
+    tracker = T.Tracker()
+    for _ in range(config.confirm_hits):
+        drivable = _feed(tracker, _detections(_obj()), config=config)
+    assert drivable is not None
