@@ -31,6 +31,31 @@ import prompt as prompt_mod
 from api.motus_stream import push_event
 
 
+# 活动面板里一条触发事件能有多长。
+#
+# **原先是 200 字，而且只留开头。** 对一句人说的话够用，对 ACP 的完成事件正好切在
+# 最有用的地方 —— `{"type": "action_complete", "action_id": …, "status": "failed",
+# "result": {"status": "failed", "reason": …}}` 的样板部分就占掉一百八十几个字符，
+# `reason` 在最后面，于是面板上永远停在 `"reaso`。而 `reason` 恰恰是唯一不能从别处
+# 推出来的东西（「目标丢失」和「被挡住十几秒动不了」该做的下一步完全相反）。
+#
+# 这和 `collector._slim_acp_result` 修过的是同一类错，只是那次修的是送进 LLM 的那
+# 一份，面板这一份被漏掉了。所以这里不只是把数字调大：超长时**两头都留**，并写明
+# 中间省了多少 —— 不写明的话，半句话看起来就是全部。
+_ACTIVITY_TEXT_CHARS = 2000
+_ACTIVITY_TEXT_TAIL = 600
+
+
+def _activity_text(text) -> str:
+    text = str(text or '')
+    if len(text) <= _ACTIVITY_TEXT_CHARS:
+        return text
+    head = _ACTIVITY_TEXT_CHARS - _ACTIVITY_TEXT_TAIL
+    dropped = len(text) - _ACTIVITY_TEXT_CHARS
+    return (f'{text[:head]}\n…（中间省略 {dropped} 字）…\n'
+            f'{text[-_ACTIVITY_TEXT_TAIL:]}')
+
+
 def _decoded_json(value):
     """Unwrap a JSON string into the value it encodes, or return it unchanged.
 
@@ -2127,7 +2152,7 @@ class Event:
         await push_event({
             'type':    'trigger',
             'mcp_id':  trigger_event.get('source', ''),
-            'payload': {'text': trigger_event.get('text', '')[:200]},
+            'payload': {'text': _activity_text(trigger_event.get('text', ''))},
         })
 
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
