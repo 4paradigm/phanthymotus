@@ -82,6 +82,8 @@ HORIZONS = (0.5, 1.0, 1.2, 2.0, 5.0)
 # the samples that carry the signal instead of asking the operator to turn
 # without ever stopping.
 MOVING_YAW_RAD = 0.10
+# ...and travelled less than this, for the windows that isolate the yaw term.
+PURE_TURN_TRAVEL_M = 0.05
 
 
 def _discover(node, suffix: str, explicit: str = "", settle_s: float = 6.0) -> str:
@@ -119,9 +121,17 @@ def _record(args, *, want_landmark: bool):
     Each odom sample is `(monotonic_s, (vx, vy, wz))`; each observation is
     `(monotonic_s, body-frame point)`.
 
-    Receipt time rather than the message stamp: at 10 Hz over horizons of
-    seconds the arrival jitter is far below what is being measured, and using
-    one clock removes any question of skew between the two publishers.
+    **Stamped at the source, not on receipt.** vop's payload carries its own
+    `latency_ms`, so a detection published at T describes the world at
+    T − latency; measured on r1_sz that is 84 ms, against 1 ms of transport.
+    Small, but it is a *skew* between two streams rather than noise, and it
+    biases only `compensated` — which integrates the twist over an interval
+    shifted against the one the observations actually span. `naive` never looks
+    at odometry and is unaffected, so the skew shows up as compensation being
+    worse than doing nothing.
+
+    Both publishers stamp with `time.time()` on the same host, so the stamps
+    are directly comparable.
     """
     import rclpy
     from rclpy.node import Node
@@ -143,6 +153,7 @@ def _record(args, *, want_landmark: bool):
 
     odom: list = []
     observations: list = []
+    latencies: list = []
     latest_depth = [None]
     unmeasured = [0]
 
@@ -159,8 +170,10 @@ def _record(args, *, want_landmark: bool):
         # An unmeasured axis becomes 0 here **only** after the all-null check
         # above: a robot that reports nothing is a different case from one that
         # reports zero, and the warning at the end depends on the difference.
-        odom.append((time.monotonic(),
-                     tuple(0.0 if v is None else float(v) for v in twist)))
+        stamp = sample.get("stamp_ms")
+        when = (float(stamp) / 1000.0 if isinstance(stamp, (int, float))
+                else time.time())
+        odom.append((when, tuple(0.0 if v is None else float(v) for v in twist)))
 
     def on_depth(message):
         try:
@@ -188,8 +201,12 @@ def _record(args, *, want_landmark: bool):
         if range_m is None:
             return
         bearing = policy_mod._bearing(match) * config.half_fov_rad
-        observations.append((time.monotonic(),
-                             track_mod.point_of(range_m, bearing)))
+        published = payload.get("timestamp")
+        latency_s = float(payload.get("latency_ms") or 0.0) / 1000.0
+        when = (float(published) - latency_s
+                if isinstance(published, (int, float)) else time.time())
+        observations.append((when, track_mod.point_of(range_m, bearing)))
+        latencies.append(latency_s)
 
     node.create_subscription(String, odom_topic, on_odom, qos)
     if want_landmark:
@@ -215,6 +232,10 @@ def _record(args, *, want_landmark: bool):
     node.destroy_node()
     rclpy.shutdown()
 
+    if latencies:
+        ordered = sorted(latencies)
+        print(f"[info] 检测延迟中位 {ordered[len(ordered) // 2] * 1000:.0f} ms"
+              f" —— 观测时刻已按它往回校正", flush=True)
     if unmeasured[0]:
         print(f"[warn] {unmeasured[0]} 条 odom 六个轴全是 null —— 这台机器人"
               f"根本不报速度，补偿无从谈起", flush=True)
@@ -240,6 +261,30 @@ def _integrated_yaw(odom, start_s: float, end_s: float) -> float:
         total += twist[2] * (stamp - previous)
         previous = stamp
     return total
+
+
+def _integrated_translation(odom, start_s: float, end_s: float) -> float:
+    """How far the robot says it travelled over the window, in metres.
+
+    Needed to spot the one confound that made a 120-second recording
+    unanswerable: **rotation and translation cancel in bearing when the robot
+    arcs around the landmark**, which is precisely what an operator does
+    naturally — turning away and then walking to bring the target back into
+    view. The apparent rotation then comes out a fraction of the odometry's,
+    and the odometry is fine. Without this number there is nothing to
+    distinguish that from a yaw scale error, and the first analysis very nearly
+    reported one.
+    """
+    import bisect
+
+    stamps = [entry[0] for entry in odom]
+    total, previous = np.zeros(2), start_s
+    for index in range(bisect.bisect_right(stamps, start_s),
+                       bisect.bisect_right(stamps, end_s)):
+        stamp, twist = odom[index]
+        total = total + np.array([twist[0], twist[1]]) * (stamp - previous)
+        previous = stamp
+    return float(np.linalg.norm(total))
 
 
 def _propagate(point, odom, start_s: float, end_s: float, config,
@@ -386,7 +431,7 @@ def run_landmark(args) -> None:
     # cheapest way to tell a sign error from "the robot barely moved" is to
     # measure both rather than argue about which is more likely.
     results = {h: {"compensated": [], "naive": [], "flipped": [], "turned": [],
-                   "range": []} for h in HORIZONS}
+                   "moved": [], "range": []} for h in HORIZONS}
     stamps = [stamp for stamp, _ in observations]
     for now_s, observed in observations:
         for horizon in HORIZONS:
@@ -421,6 +466,8 @@ def run_landmark(args) -> None:
                 _wrapped(flipped_bearing - observed_bearing))
             results[horizon]["turned"].append(
                 _integrated_yaw(odom, past[0], now_s))
+            results[horizon]["moved"].append(
+                _integrated_translation(odom, past[0], now_s))
             results[horizon]["range"].append(predicted_range - observed_range)
 
     print()
@@ -459,10 +506,18 @@ def run_landmark(args) -> None:
     # two full recordings.
     moving = [index for index, turned in enumerate(bucket["turned"])
               if abs(turned) >= MOVING_YAW_RAD]
+    # Windows where the robot turned and did **not** also walk. Only these say
+    # anything about the yaw term on its own: with translation in the window,
+    # a robot arcing around the landmark produces a bearing change far smaller
+    # than its rotation, and no amount of statistics separates that from
+    # odometry over-reporting yaw.
+    turning_only = [index for index in moving
+                    if bucket["moved"][index] < PURE_TURN_TRAVEL_M]
     print("=" * 66)
     print(f"在 max_coast_s = {config.max_coast_s}s 处，"
           f"**只看确实转了的窗口**（|转角| ≥ {MOVING_YAW_RAD} rad）：")
-    print(f"  这样的窗口 {len(moving)}/{len(bucket['turned'])} 个")
+    print(f"  这样的窗口 {len(moving)}/{len(bucket['turned'])} 个，"
+          f"其中**转了但没走**的 {len(turning_only)} 个")
     print()
     if len(moving) < 15:
         print("结论：**有效样本太少，下不了结论。** 整段记录里几乎没有转身动作，")
@@ -490,7 +545,15 @@ def run_landmark(args) -> None:
     print()
 
     gain = naive / max(1e-4, compensated)
-    if flipped < compensated * 0.6:
+    if len(turning_only) < 8 and compensated > naive:
+        print("结论：**这份记录答不了「偏航准不准」。** 转身的窗口里机器人同时在走")
+        print(f"      （转了没走的窗口只有 {len(turning_only)} 个），而绕着地标走弧线时")
+        print("      旋转和平移在方位角上互相抵消 —— 表观转角会远小于里程计转角，")
+        print("      **而里程计可能一点毛病都没有**。这两种情况这份数据分不开。")
+        print()
+        print("      重录一段**纯原地转身**：站定不动，慢慢左转 30°、停、转回来，")
+        print("      反复几轮，全程不要走动，让地标始终在视野里。60 秒就够。")
+    elif flipped < compensated * 0.6:
         print("结论：**自运动补偿的符号是反的。** 把 ego twist 取负之后误差从")
         print(f"      {compensated:.3f} rad 降到 {flipped:.3f} rad。")
         print("      这不是精度问题，是约定问题：motus.odom/1 规定 wz 正方向是逆")
