@@ -726,3 +726,54 @@ def test_a_one_shot_answer_carries_no_boilerplate(tmp_path):
     # What does survive: the measurements, and one token of provenance.
     assert result["calibration"] == "model-default"
     assert result["nearest"] and result["farthest"] and result["average"]
+
+
+
+
+# ── one sample is one frame, and that was the whole problem ──────────────────
+
+def test_a_sample_is_the_median_of_many_frames_not_one():
+    """Measured on r1_sz: robot stationary, same wall, fourteen consecutive
+    frames spanned 1.68-2.09 m — 22% peak to peak. Two `calibrate` calls at the
+    same 1.6 m gave 3.82 and 5.00, 31% apart. Four such single-frame samples
+    were then fitted with two parameters, and the residuals argued convincingly
+    for a log-slope that was entirely noise."""
+    frames = [np.full((48, 64), value, dtype=np.float32)
+              for value in (1.68, 1.81, 1.83, 1.92, 2.09)]
+    out = depth_plugin.sample_region_over_frames(frames, "center")
+    assert out["distance_m"] == pytest.approx(1.83, abs=0.01), "median of the per-frame medians"
+    assert out["frames"] == 5
+
+
+def test_one_bad_frame_does_not_move_the_answer():
+    """The median of the per-frame medians, not the median of everything
+    pooled: pooling lets one frame move the answer by its share of the pixels."""
+    frames = [np.full((48, 64), 2.0, dtype=np.float32) for _ in range(6)]
+    frames.append(np.full((48, 64), 40.0, dtype=np.float32))
+    assert depth_plugin.sample_region_over_frames(frames, "center")["distance_m"] == pytest.approx(2.0)
+
+
+def test_the_scatter_is_reported_because_it_is_the_error_bar():
+    """Without it the next person reads structure into the residuals and adds a
+    parameter to explain it — which is exactly what happened."""
+    steady = [np.full((48, 64), 2.0, dtype=np.float32) for _ in range(5)]
+    assert depth_plugin.sample_region_over_frames(steady, "center")["scatter"] == pytest.approx(0.0)
+
+    wobbly = [np.full((48, 64), v, dtype=np.float32) for v in (1.7, 1.8, 2.1)]
+    out = depth_plugin.sample_region_over_frames(wobbly, "center")
+    assert out["scatter"] == pytest.approx((2.1 - 1.7) / 1.8, abs=0.01)
+    assert out["scatter"] > depth_plugin._SCATTER_LIMIT, "22% on r1_sz has to trip the warning"
+
+
+def test_a_frame_with_nothing_valid_is_skipped_rather_than_fatal():
+    frames = [np.full((48, 64), np.nan, dtype=np.float32),
+              np.full((48, 64), 2.0, dtype=np.float32)]
+    out = depth_plugin.sample_region_over_frames(frames, "center")
+    assert out["frames"] == 1 and out["distance_m"] == pytest.approx(2.0)
+
+
+def test_no_usable_frame_is_an_error_not_a_zero():
+    """Zero metres is the most alarming thing a depth consumer can be told."""
+    with pytest.raises(ValueError):
+        depth_plugin.sample_region_over_frames(
+            [np.full((48, 64), np.nan, dtype=np.float32)], "center")

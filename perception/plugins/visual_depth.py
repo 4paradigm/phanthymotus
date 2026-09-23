@@ -133,6 +133,23 @@ _FLATNESS_LIMIT = 0.15
 # Most often a typo (2 for 20) or a reading taken facing something else.
 _OUTLIER_PCT = 25.0
 
+# How many recent frames one calibration sample is drawn from. At the card's
+# default 2 fps this is about seven seconds of standing still, which is what
+# the operator is doing anyway while holding a tape measure.
+#
+# Measured on r1_sz, robot stationary, same wall: fourteen consecutive frames
+# spanned 1.68-2.09 m — 22% peak to peak, 6% standard deviation. One frame is
+# a draw from that; the median of fourteen is worth about three times less
+# scatter, which is the difference between a calibration and a coin toss.
+CALIBRATION_FRAMES = 15
+
+# Frame-to-frame spread, as a fraction of the median, past which the sample is
+# reported as too noisy to build a calibration on. It does not refuse — the
+# number is still the best estimate available — but it says so, because a fit
+# whose inputs move by this much cannot support a two-parameter model and the
+# temptation to add one is real.
+_SCATTER_LIMIT = 0.20
+
 CALIBRATION_PROCEDURE = (
     "把机器人开到一面平整的墙（或任何平面）正前方，让墙尽量正对、填满画面中央，"
     "用卷尺量出镜头到墙的真实距离，调用 calibrate 填进 distance_m。"
@@ -398,6 +415,42 @@ def encode_depth(depth_m: np.ndarray, max_depth_m: float) -> bytes:
     return zlib.compress(mm.astype("<u2").tobytes(), 1)
 
 
+def sample_region_over_frames(frames, region: str = "center") -> dict:
+    """`sample_region` over several frames, plus how much they disagreed.
+
+    The median of the per-frame medians, not the median of everything pooled:
+    one bad frame should move the answer by nothing, and pooling lets it move
+    the answer by its share of the pixels.
+
+    `scatter` is the peak-to-peak spread of the per-frame readings as a
+    fraction of the median — the quantity that, left unmeasured on r1_sz, let a
+    22% frame-to-frame wobble be mistaken for a 12% improvement from a second
+    fit parameter.
+    """
+    readings = []
+    flatness = []
+    for frame in frames:
+        try:
+            one = sample_region(frame, region)
+        except Exception:                                      # noqa: BLE001
+            continue
+        if one.get("distance_m") and one["distance_m"] > 0:
+            readings.append(float(one["distance_m"]))
+            flatness.append(float(one.get("flatness") or 0.0))
+    if not readings:
+        raise ValueError("no usable depth in that region")
+
+    values = np.asarray(readings, dtype=np.float64)
+    median = float(np.median(values))
+    spread = float(values.max() - values.min()) / max(median, 1e-6)
+    return {
+        "distance_m": median,
+        "flatness": float(np.median(flatness)) if flatness else 0.0,
+        "frames": len(readings),
+        "scatter": round(spread, 3),
+    }
+
+
 def summarize_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) -> dict:
     """Nearest valid reading per vertical band, plus the overall range.
 
@@ -495,9 +548,22 @@ class _DepthNode(Node):
         self._last_inference_time = 0.0
         self._frame_count = 0
         self._running = False
-        # Most recent decoded depth, BEFORE site calibration — the frame the
-        # `calibrate` action fits against. One array, replaced per frame.
-        self._last_raw_depth: Optional[np.ndarray] = None
+        # Recent decoded depth, BEFORE site calibration — what the `calibrate`
+        # action fits against.
+        #
+        # **A deque, not one frame.** It was one frame, and on r1_sz that made
+        # the whole calibration a lottery: with the robot stationary and the
+        # scene unchanged, fourteen consecutive frames of the same wall gave
+        # 1.68–2.09 m, a 22% peak-to-peak spread; two `calibrate` calls at the
+        # same 1.6 m gave 3.82 and 5.00, 31% apart. Four such samples were then
+        # fitted with two parameters and the residuals argued convincingly for
+        # a log-slope that was entirely noise.
+        #
+        # A reading whose reproducibility is ±30% cannot support an argument
+        # about a 6% model improvement. Averaging is not polish here; it is the
+        # difference between calibrating and guessing.
+        from collections import deque as _deque
+        self._raw_depth_history = _deque(maxlen=CALIBRATION_FRAMES)
         # See perception/README.md § "Plugin Concurrency" — every dispatch runs
         # on its own ThreadingHTTPServer thread and the canvas issues
         # config→start→stop→start within seconds.
@@ -589,7 +655,7 @@ class _DepthNode(Node):
                 # frame repeatedly without compounding its own correction —
                 # fitting against already-corrected depth converges on
                 # whatever the first guess was.
-                self._last_raw_depth = raw
+                self._raw_depth_history.append(raw)
                 depth_m = apply_site_calibration(raw, self._cal_a, self._cal_b)
                 # Resampled here, not by the model: the renderer's canvas is
                 # fixed at 640x480 and a mismatch is dropped silently.
@@ -714,12 +780,13 @@ class VideoDepthPerceptionPlugin:
     # ── site calibration from known distances ────────────────────────────────
 
     def _raw_depth_for_calibration(self, args: dict, instance_id: str):
-        """An uncalibrated depth map to fit against, plus where it came from.
+        """Uncalibrated depth to fit against, as a **list of frames**.
 
         Prefers an explicitly supplied photo, because "here is a picture of a
         target at 2.0 m" is reproducible; otherwise takes the running
-        instance's most recent frame, which is what someone standing in front
-        of the robot actually has.
+        instance's recent frames — plural, see `_raw_depth_history`. A photo is
+        one frame by nature and is returned as a list of one, so the caller has
+        a single shape to handle and the scatter simply comes out zero.
         """
         if args.get("image_path") or args.get("url") or args.get("image_url"):
             cfg = dict(self._plugin_cfg)
@@ -730,7 +797,7 @@ class VideoDepthPerceptionPlugin:
                 raise BadInput("could not decode that file as an image", source)
             from plugins.vision_runtime import decode_depth
             outputs, meta = self._require_engine().infer(frame)
-            return decode_depth(outputs, meta), source
+            return [decode_depth(outputs, meta)], source
 
         with self._nodes_lock:
             node = self._nodes.get(instance_id) if instance_id else None
@@ -743,12 +810,12 @@ class VideoDepthPerceptionPlugin:
                 "nothing to calibrate against — start this card on a camera "
                 "first, or pass image_path / url"
             )
-        raw = node._last_raw_depth
-        if raw is None:
+        frames = list(node._raw_depth_history)
+        if not frames:
             raise ValueError(
                 f"{node._input_topic or 'this card'} has not produced a frame yet"
             )
-        return raw, node._input_topic or "(on-demand)"
+        return frames, node._input_topic or "(on-demand)"
 
     def _apply_calibration(self, cal_a: float, cal_b: float) -> None:
         """Set the fit here and on every running node, without a restart."""
@@ -1049,8 +1116,8 @@ class VideoDepthPerceptionPlugin:
 
             region = args.get("region") or "center"
             try:
-                raw, source = self._raw_depth_for_calibration(args, instance_id)
-                reading = sample_region(raw, region)
+                frames, source = self._raw_depth_for_calibration(args, instance_id)
+                reading = sample_region_over_frames(frames, region)
             except BadInput as error:
                 return error.as_result()
             except Exception as error:  # noqa: BLE001 — surfaced to the caller
@@ -1061,6 +1128,13 @@ class VideoDepthPerceptionPlugin:
                 "predicted_m": round(reading["distance_m"], 3),
                 "region": region,
                 "flatness": reading["flatness"],
+                # How much this reading moved while nothing did. Recorded per
+                # sample because it is the honest error bar on the fit, and
+                # because without it the next person will do what was done
+                # here: read structure into the residuals and add a parameter
+                # to explain it.
+                "frames": reading["frames"],
+                "scatter": reading["scatter"],
                 "source": source,
             })
             # Refit over every sample, not incrementally: `a` is pinned at 1.0
@@ -1077,6 +1151,13 @@ class VideoDepthPerceptionPlugin:
                 "message": _calibration_message(self._cal_samples),
             }
             warnings = []
+            if reading["scatter"] > _SCATTER_LIMIT:
+                warnings.append(
+                    f"这个样本的帧间抖动是中位数的 {reading['scatter'] * 100:.0f}%"
+                    f"（{reading['frames']} 帧，阈值 {_SCATTER_LIMIT * 100:.0f}%）。"
+                    "读数本身就这么不稳，那么标定残差里的任何「规律」都可能只是"
+                    "抓到了哪一帧 —— 先让画面稳下来（别动、别让人走过），"
+                    "再判断误差是不是随距离变化。")
             if reading["flatness"] > _FLATNESS_LIMIT:
                 warnings.append(
                     f"取样区域看起来不是一个平面：区域内深度的四分位跨度是中位数的 "
