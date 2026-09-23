@@ -2493,6 +2493,50 @@ If `visual_depth` ever **crops** instead of resizing, `half_fov_rad` stops being
 carried unchanged and has to be recomputed. That is why the reason is in the code
 rather than only here.
 
+### The lens barrel is masked, because "unknown" could not catch it
+
+r1_sz's main camera looks out through a round barrel, so a wide black ring fills
+the corners of every frame. The depth model does not know that and invents a
+distance for it. Measured 2026-09-23:
+
+| | median depth |
+|---|---|
+| four corners (solid black housing in the RGB) | **0.64 – 0.83 m** |
+| centre of frame | 1.76 m |
+| **valid-pixel fraction of the whole map** | **100%** |
+
+So every edge of the picture reported "something right in front of me", and
+`coverage` — the entire "unknown is not free" protection downstream — never
+fired, because **this is not a missing reading. It is a confident wrong one**,
+which is strictly worse.
+
+What it cost, before this existed: the angular thirds navi used to choose an
+escape direction were reading the barrel rather than the room (left 0.906, right
+0.993, centre 1.368, on a corridor that was clear), and at close range the metric
+corridor could be tripped to a stop by the robot's own lens.
+
+**The discriminator is "near-black **and** connected to the frame edge."** No
+scene has that signature; a black object in the middle of the room is surrounded
+by scene and is its own component, so it is not masked — masking it would throw
+away a real obstacle, which is the opposite of the intended error.
+
+Detected per frame rather than declared as a region in `camera_info`: a declared
+circle has to be measured per camera and goes stale the moment a mount changes,
+while the signature does not. The remaining false positive — a genuinely dark
+region touching the edge — **fails safe**: masked pixels become "no reading",
+coverage drops, and navi refuses to drive into what it cannot see.
+
+`lens_barrel_max_fraction` (0.6) is the backstop for the one case where that is
+useless: a dark enough room makes one border-connected blob out of everything,
+and a fully masked map is a blind robot. Past that fraction nothing is masked —
+"the room is dark" and "my lens is blocked" want different responses from a
+person, so the card does not guess. `info().instances[*].lens_barrel_pct` says
+how much of the last frame was housing.
+
+Masked pixels become `NaN`, which `encode_depth` already maps to the 0 that the
+renderer contract reserves for "no reading". Writing a far value instead would
+say *clear*, which is the same mistake pointing the other way.
+
 ### Nothing upstream means nothing downstream
 
 A card whose camera declared nothing emits **no** `camera_info` — not an entry

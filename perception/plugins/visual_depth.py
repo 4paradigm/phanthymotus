@@ -709,6 +709,70 @@ def measure_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) ->
     return stats
 
 
+def lens_barrel_mask(frame, *, threshold: int, max_fraction: float):
+    """Where the picture is the camera's own housing rather than the scene.
+
+    **Measured on r1_sz, 2026-09-23.** The main camera looks out through a round
+    barrel, so a wide black ring fills the corners of every frame. The depth
+    model does not know that and happily invents a distance for it: the four
+    corners read **0.64–0.83 m** while the centre read 1.76 m, i.e. "something
+    right in front of me", everywhere around the edge. And the map's valid-pixel
+    fraction was **100%** — so `coverage`, the whole "unknown is not free"
+    protection downstream, never fired. This is not a missing reading. It is a
+    confident wrong one, which is strictly worse.
+
+    Consequences before this existed: the angular thirds navi used to pick an
+    escape direction were reading the barrel rather than the room (left 0.906,
+    right 0.993, centre 1.368 on a corridor that was clear), and the metric
+    corridor could be tripped to a stop by the robot's own lens at close range.
+
+    ── Why detect rather than declare ──────────────────────────────────────────
+
+    A declared region (a circle in `camera_info`) would be deterministic, but it
+    has to be measured per camera and it goes stale the moment a mount changes.
+    The barrel has a signature no scene has: **near-black *and* connected to the
+    frame edge.** Border-connectivity is what keeps a black object in the middle
+    of the room from being masked — it is surrounded by scene, so it is its own
+    component.
+
+    The remaining false positive — a genuinely dark region touching the edge —
+    fails safe: masked pixels become "no reading", `coverage` drops, and navi
+    refuses to drive into what it cannot see. That is the designed behaviour for
+    unknown, and it is the right answer for a camera staring into a dark corner.
+
+    `max_fraction` is the backstop for the one case where that is useless: a
+    dark enough room makes one border-connected blob out of everything, and a
+    fully masked map is a blind robot. Past that fraction nothing is masked and
+    the caller is told, because "the room is dark" and "my lens is blocked" want
+    different responses from a person.
+
+    Returns a boolean mask at the frame's resolution, or `None` if nothing
+    should be masked.
+    """
+    import cv2
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    dark = (gray <= threshold).astype(np.uint8)
+    if not dark.any():
+        return None
+
+    count, labels = cv2.connectedComponents(dark, connectivity=4)
+    if count < 2:
+        return None
+    edge = np.concatenate([labels[0, :], labels[-1, :],
+                           labels[:, 0], labels[:, -1]])
+    touching = np.unique(edge)
+    touching = touching[touching != 0]
+    if not touching.size:
+        return None
+
+    mask = np.isin(labels, touching)
+    fraction = float(mask.mean())
+    if fraction > max_fraction:
+        return None
+    return mask
+
+
 # ── ROS2 Node (one per instance/topic) ───────────────────────────────────────
 
 class _DepthNode(Node):
@@ -716,7 +780,8 @@ class _DepthNode(Node):
 
     def __init__(self, input_topic: Optional[str], model, fps: float, cal_a: float,
                  cal_b: float, max_depth_m: float, node_suffix: str,
-                 cal_origin: str = ""):
+                 cal_origin: str = "", mask_barrel: bool = True,
+                 barrel_threshold: int = 24, barrel_max_fraction: float = 0.6):
         super().__init__(f"visual_depth_{node_suffix}" if node_suffix else "visual_depth")
         # Topic-less is a supported mode, as in plugins/vop.py and plugins/tts.py:
         # a card driven only by recognize_by_photo has no camera to subscribe
@@ -739,6 +804,13 @@ class _DepthNode(Node):
         self._cal_origin = cal_origin or "model-default"
         self._scale_label = "metric"
         self._max_depth_m = max_depth_m
+        self._mask_barrel = mask_barrel
+        self._barrel_threshold = barrel_threshold
+        self._barrel_max_fraction = barrel_max_fraction
+        # What share of the last frame was housing. Reported in `info()` because
+        # "42% of my picture is lens barrel" is a thing an operator should be
+        # able to see without reading a depth map by eye.
+        self._barrel_fraction = 0.0
 
         self._depth_pub = self.create_publisher(CompressedImage, self._depth_topic, _PUB_QOS)
         self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
@@ -871,9 +943,37 @@ class _DepthNode(Node):
                 if depth_m.shape != (DEPTH_HEIGHT, DEPTH_WIDTH):
                     depth_m = cv2.resize(depth_m, (DEPTH_WIDTH, DEPTH_HEIGHT),
                                          interpolation=cv2.INTER_NEAREST)
+                depth_m = self._mask_lens_barrel(frame, depth_m)
                 self._publish(depth_m)
             except Exception as e:
                 log.error(f"[visual_depth] inference error: {e}", exc_info=True)
+
+    def _mask_lens_barrel(self, frame, depth_m: np.ndarray) -> np.ndarray:
+        """Blank the depth where the picture is the camera's own housing.
+
+        NaN rather than a large number, because `encode_depth` already maps NaN
+        to the 0 that means "no reading" — so this arrives downstream as an
+        honest gap, and `coverage` treats it the way it treats every other gap.
+        Writing a far value instead would say "clear", which is the mistake in
+        the opposite direction.
+        """
+        if not self._mask_barrel:
+            return depth_m
+        import cv2
+
+        mask = lens_barrel_mask(frame, threshold=self._barrel_threshold,
+                                max_fraction=self._barrel_max_fraction)
+        if mask is None:
+            self._barrel_fraction = 0.0
+            return depth_m
+        if mask.shape != depth_m.shape:
+            mask = cv2.resize(mask.astype(np.uint8),
+                              (depth_m.shape[1], depth_m.shape[0]),
+                              interpolation=cv2.INTER_NEAREST).astype(bool)
+        self._barrel_fraction = float(mask.mean())
+        out = depth_m.astype(np.float32, copy=True)
+        out[mask] = np.nan
+        return out
 
     def _publish(self, depth_m: np.ndarray, summary: Optional[dict] = None):
         """Publish one depth map and its summary.
@@ -917,6 +1017,14 @@ class VideoDepthPerceptionPlugin:
         # `reset_calibration` can put the dict back exactly as it found it.
         self._cal_cfg_backup = None
         self._fps = int(plugin_cfg.get("fps", 2))
+        # Lens-barrel masking. In the file rather than the schema: an operator
+        # has no way to judge a luma threshold, and every schema field is one
+        # more chance to silently override this file (see actucore's navi card
+        # for what that cost). See `lens_barrel_mask` for why it exists.
+        self._mask_barrel = bool(plugin_cfg.get("mask_lens_barrel", True))
+        self._barrel_threshold = int(plugin_cfg.get("lens_barrel_threshold", 24))
+        self._barrel_max_fraction = float(
+            plugin_cfg.get("lens_barrel_max_fraction", 0.6))
         self._cal_a, self._cal_b = _calibration_from_cfg(plugin_cfg)
         # (measured_m, predicted_m) reference readings from the `calibrate`
         # action, in call order. Refit from scratch on every addition, so a
@@ -1021,6 +1129,12 @@ class VideoDepthPerceptionPlugin:
                 cal_origin=calibration_origin(icfg, self._camera_id_for(node_key)),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
+                mask_barrel=bool(icfg.get("mask_lens_barrel",
+                                          self._mask_barrel)),
+                barrel_threshold=int(icfg.get("lens_barrel_threshold",
+                                              self._barrel_threshold)),
+                barrel_max_fraction=float(icfg.get("lens_barrel_max_fraction",
+                                                   self._barrel_max_fraction)),
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -1270,6 +1384,7 @@ class VideoDepthPerceptionPlugin:
                     # Per instance, because that is the scope that has one. Two
                     # cards on one camera may legitimately run different fits.
                     "calibration": node.calibration_label,
+                    "lens_barrel_pct": round(node._barrel_fraction * 100, 1),
                     "frame_count": node._frame_count,
                 }
                 for key, node in nodes.items()

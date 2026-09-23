@@ -1004,3 +1004,71 @@ def test_info_reports_the_fit_the_running_instance_is_actually_applying():
     # And the card's own file-level config really is identity, so this could
     # only have come from the instance.
     assert (plugin._cal_a, plugin._cal_b) == (1.0, 0.0)
+
+
+# ── 镜筒渐晕：不是缺失，是自信地错 ───────────────────────────────────────────
+
+def _framed(width=64, height=48, border=8, inner=200):
+    """A frame with a black border, the way a lens barrel actually appears."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[border:height - border, border:width - border] = inner
+    return frame
+
+
+def test_the_lens_barrel_is_found_by_being_black_and_touching_the_edge():
+    """Measured on r1_sz: the four corners of every frame are the camera's own
+    housing, and the depth model invents 0.64–0.83 m for them — "something right
+    in front of me", all the way round the edge — while the map's valid-pixel
+    fraction stays 100%. So `coverage`, the whole "unknown is not free"
+    protection downstream, never fires."""
+    mask = depth_plugin.lens_barrel_mask(_framed(), threshold=24, max_fraction=0.9)
+    assert mask is not None
+    assert mask[0, 0] and mask[-1, -1], "四角是镜筒"
+    assert not mask[24, 32], "画面中间不是"
+
+
+def test_a_dark_object_in_the_middle_of_the_room_is_not_masked():
+    """Border-connectivity is the whole discriminator. A black chair is
+    surrounded by scene, so it is its own component — masking it would throw
+    away a real obstacle, which is the opposite of the intended error."""
+    frame = _framed()
+    frame[20:28, 28:36] = 0          # a black object, floating in the picture
+    mask = depth_plugin.lens_barrel_mask(frame, threshold=24, max_fraction=0.9)
+    assert not mask[24, 32], "画面中间的黑色物体被当成镜筒了"
+
+
+def test_a_frame_that_is_mostly_dark_is_not_masked_at_all():
+    """The backstop. A dark enough room makes one border-connected blob out of
+    everything, and a fully masked map is a blind robot. "The room is dark" and
+    "my lens is blocked" want different responses from a person, so past the
+    threshold nothing is masked."""
+    assert depth_plugin.lens_barrel_mask(_framed(border=20), threshold=24,
+                                         max_fraction=0.6) is None
+
+
+def test_the_masked_depth_becomes_no_reading_rather_than_far_away():
+    """NaN, because `encode_depth` already maps it to the 0 that means "no
+    reading" — so it arrives downstream as an honest gap and `coverage` treats
+    it like every other gap. A far value would say "clear", which is the same
+    mistake pointing the other way."""
+    node = depth_plugin._DepthNode(None, None, fps=2, cal_a=1.0, cal_b=0.0,
+                                   max_depth_m=20.0, node_suffix="t")
+    depth = np.full((48, 64), 5.0, dtype=np.float32)
+    out = node._mask_lens_barrel(_framed(), depth)
+
+    assert np.isnan(out[0, 0]), "镜筒处应当是「没有读数」"
+    assert out[24, 32] == 5.0, "场景部分不受影响"
+    assert node._barrel_fraction > 0
+    # And the encoder turns that into the 0 the renderer contract reserves.
+    assert depth_plugin.encode_depth(
+        np.full((depth_plugin.DEPTH_HEIGHT, depth_plugin.DEPTH_WIDTH), np.nan),
+        20.0) == depth_plugin.encode_depth(
+        np.zeros((depth_plugin.DEPTH_HEIGHT, depth_plugin.DEPTH_WIDTH)), 20.0)
+
+
+def test_masking_can_be_turned_off_from_the_file():
+    node = depth_plugin._DepthNode(None, None, fps=2, cal_a=1.0, cal_b=0.0,
+                                   max_depth_m=20.0, node_suffix="t",
+                                   mask_barrel=False)
+    depth = np.full((48, 64), 5.0, dtype=np.float32)
+    assert not np.isnan(node._mask_lens_barrel(_framed(), depth)).any()
