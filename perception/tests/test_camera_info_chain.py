@@ -273,3 +273,49 @@ def test_a_retired_node_takes_its_camera_with_it():
     plugin._upstream_camera[CAM_TOPIC] = _upstream()
     plugin._retire_node(CAM_TOPIC)
     assert CAM_TOPIC not in plugin._upstream_camera
+
+
+# ── 加载中也要答得出声明 ─────────────────────────────────────────────────────
+
+def test_vop_declares_while_its_engine_is_still_loading():
+    """The bug this was found by, on a *cold* r1_sz.
+
+    perception's vision cards answer `start` with `loading` while a TensorRT
+    engine comes up in the background, and agent-core carries on and records
+    whatever `info()` returns. That reply used to be a bare stub — no
+    `topic_out`, no `camera_info` — so a consumer that started in that window
+    got no camera declaration at all, and nothing said so. navi lost both its
+    box path and the corridor's real geometry.
+
+    It only ever reproduced on a cold container: a warm one starts immediately
+    and never passes through the loading reply at all.
+
+    The declaration is recorded at `start`, before loading begins, so it was
+    always available — the early return simply dropped it.
+    """
+    plugin, _ = _vop()
+    plugin._upstream_camera[CAM_TOPIC] = _upstream()
+    plugin._model_loading = True
+
+    info = plugin.dispatch("vop", {"action": "info", "input_topic": CAM_TOPIC})
+    assert info["state"] == "loading"
+    assert camera_id(info["camera_info"][0]) == "unitree/r1/camera_main"
+
+
+def test_visual_depth_declares_while_its_engine_is_still_loading():
+    plugin = _plugin()
+    plugin._upstream_camera[CAM_TOPIC] = _upstream()
+    plugin._model_loading = True
+
+    info = plugin.dispatch("visual_depth", {"action": "info",
+                                            "input_topic": CAM_TOPIC})
+    assert info["state"] == "loading"
+    assert [e["topic"] for e in info["camera_info"]] == [
+        f"{CAM_TOPIC}/visual_depth", f"{CAM_TOPIC}/visual_depth_summary"]
+
+
+def test_a_loading_card_with_no_upstream_declares_nothing_rather_than_a_stub():
+    plugin, _ = _vop()
+    plugin._model_loading = True
+    info = plugin.dispatch("vop", {"action": "info", "input_topic": CAM_TOPIC})
+    assert "camera_info" not in info

@@ -105,6 +105,9 @@ class NaviPlugin:
         self._view_topic = str(self._cfg.get("view_topic") or
                                (self._topic.rsplit("/", 1)[0] + "/view"))
         self._view_hz = float(self._cfg.get("view_hz", 5.0))
+        # How much of the depth colour is mixed over the camera frame, 0..1.
+        self._view_blend = max(0.0, min(1.0, float(
+            self._cfg.get("view_blend", 1.0))))
 
         # Guards bookkeeping only — never a node start/stop, or a stop would
         # queue behind the start it is meant to cancel. Same rule as every
@@ -142,6 +145,10 @@ class NaviPlugin:
         # declaration. (0, 0) until one arrives — and then no box is converted,
         # which is the honest answer rather than a guessed resolution.
         self._objects_frame = (0, 0)
+        # Latest camera frame, still compressed. Optional input: without it the
+        # overlay draws the depth map alone, exactly as before.
+        self._image_jpeg = None
+        self._image_ms = 0
         self._objects_ms = 0
         # The last N detection payloads, for `list_visible_objects` to intersect.
         # A deque rather than a list: this is written every frame on the hot
@@ -282,6 +289,10 @@ class NaviPlugin:
             "topic_in": [
                 {"format": "data/json",
                  "desc": "vop 的检测结果（必需）"},
+                {"format": "image/jpeg",
+                 "desc": "原始相机画面（可选）—— 只用于 view 叠加图：深度按"
+                         "「机器人是否在对这里做反应」做透明度，压在真实画面上，"
+                         "于是一眼能同时看到它看见了什么和它在反应什么"},
                 {"format": "image/depth-zlib",
                  "desc": "深度图 640x480 uint16 mm（与深度摘要二选一）"},
                 {"format": "state/odom",
@@ -682,6 +693,8 @@ class NaviPlugin:
                 # no declaration arrived and boxes cannot be used — see
                 # `_degradations`.
                 "objects_frame": list(self._objects_frame),
+                "image_age_ms": (int(time.time() * 1000) - self._image_ms
+                                 if self._image_ms else None),
                 # Why the overlay has a box or has not, without guessing: how
                 # many detections arrived, how many carry a usable box, and how
                 # many of those are the thing being chased.
@@ -791,7 +804,8 @@ class NaviPlugin:
         还没有数据不是错误：`observation()` 的过期检查已经覆盖它，而那条路径的
         结论是「什么都不发，让下游 watchdog 停住底盘」，正是此时该做的事。
         """
-        bound = {"objects": "", "depth_map": "", "depth_summary": "", "odom": ""}
+        bound = {"objects": "", "depth_map": "", "depth_summary": "", "odom": "",
+                 "image": ""}
         unknown = []
 
         for topic in topics:
@@ -833,6 +847,12 @@ class NaviPlugin:
         if bound["depth_map"]:
             node.create_subscription(CompressedImage, bound["depth_map"],
                                      self._on_depth_map, qos)
+        if bound["image"]:
+            # Kept as bytes and decoded only when a frame is drawn: the camera
+            # runs at 15 fps and the overlay at 5, so decoding on arrival would
+            # spend two thirds of the work on frames nobody looks at.
+            node.create_subscription(CompressedImage, bound["image"],
+                                     self._on_image, qos)
         for role in ("objects", "depth_summary", "odom"):
             if bound[role]:
                 node.create_subscription(
@@ -854,7 +874,14 @@ class NaviPlugin:
         """
         types = dict(node.get_topic_names_and_types()).get(topic) or []
         if any(n.endswith(("CompressedImage", "Image")) for n in types):
-            return "depth_map", ""
+            # **The camera, not the depth map.** perception derives its depth
+            # topic from the camera's (`<camera>/visual_depth`), so a
+            # CompressedImage whose name does not end in that suffix cannot be
+            # the depth map — `_role_of` would already have caught it. Guessing
+            # `depth_map` here instead would bind the raw camera as depth and
+            # produce distances from JPEG bytes; guessing wrong this way costs
+            # only the loud "depth is not connected" refusal at start.
+            return "image", ""
         if any(n.endswith("String") for n in types):
             # Three different payloads ride on String and the name says
             # nothing, so a wrong guess means reading a depth summary as
@@ -927,6 +954,12 @@ class NaviPlugin:
                 self._odom = {axis: odom_mod.axis_of(payload, axis)
                               for axis in ("vx", "vy", "wz")}
                 self._odom_ms = now
+
+    def _on_image(self, message):
+        """The raw camera frame, kept compressed until something draws it."""
+        with self._obs_lock:
+            self._image_jpeg = bytes(message.data)
+            self._image_ms = int(time.time() * 1000)
 
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")
@@ -1123,6 +1156,8 @@ class NaviPlugin:
             from . import view as view_mod
 
             box, measured = self._target_box()
+            with self._obs_lock:
+                jpeg = self._image_jpeg
             frame = view_mod.render(
                 depth_m=self._depth_map,
                 decision=self._last_decision,
@@ -1130,6 +1165,7 @@ class NaviPlugin:
                 box=box, measured=measured,
                 clearance=self._state.last_clearance,
                 coverage=self._state.last_coverage,
+                rgb_jpeg=jpeg, blend=self._view_blend,
                 config=self._config)
             message = CompressedImage()
             message.format = "jpeg"
