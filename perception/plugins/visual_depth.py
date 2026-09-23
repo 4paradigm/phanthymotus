@@ -859,6 +859,12 @@ class VideoDepthPerceptionPlugin:
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _DepthNode] = {}
         self._instance_configs: dict[str, dict] = {}
+        # What the camera feeding each instance said about its optics
+        # (`motus.camera/1`, arrives as `camera_info` on `start`). Kept so
+        # `info()` can pass it on, rewritten for the image this card publishes —
+        # see `plugins/camera_info.py`. Guarded by `_nodes_lock` like the dict
+        # above it, per the plugin concurrency rules in the README.
+        self._upstream_camera: dict[str, dict] = {}
         # Guards _nodes / _instance_configs; never held across a node start,
         # stop, or a model load.
         self._nodes_lock = threading.RLock()
@@ -881,6 +887,39 @@ class VideoDepthPerceptionPlugin:
             log.info(f"[visual_depth] loading engine: {engine}")
             self._model = VisionEngineSession(engine)
             log.info(f"[visual_depth] engine loaded, input={self._model.input_size}")
+
+    def _camera_info(self, instance_id, input_topic, nodes,
+                     depth_topic: str, summary_topic: str) -> tuple:
+        """`(declarations, note)` for this card's two output ports.
+
+        The note exists because "the upstream camera declared nothing" and "this
+        card dropped it on the floor" look identical from downstream, and only
+        the first is somebody else's business to fix. Downstream already degrades
+        correctly on a missing declaration — this is so the operator reading
+        *this* card can see whose problem it is.
+        """
+        from plugins.camera_info import inherit
+
+        key = instance_id if instance_id in (nodes or {}) else None
+        if key is None:
+            key = next(iter(nodes), None) if nodes else (input_topic or _DEFAULT_INSTANCE)
+        with self._nodes_lock:
+            upstream = self._upstream_camera.get(key) or {}
+        if not upstream:
+            return [], ("上游相机没有声明 camera_info —— 下游拿不到视场角，避障走廊"
+                        "只能按保守兜底值算。相机卡片补上声明即可，见 "
+                        "phanthymotus-driver/README_dev.md 的 Camera Parameters")
+
+        out = inherit(upstream, topic=depth_topic, fmt="image/depth-zlib",
+                      stage="perception/visual_depth",
+                      width=DEPTH_WIDTH, height=DEPTH_HEIGHT)
+        # The summary carries the same optics — it is the same picture reduced to
+        # three numbers — so it is declared too, rather than left for a consumer
+        # wired to the summary alone to guess at.
+        out += inherit(upstream, topic=summary_topic, fmt="data/json",
+                       stage="perception/visual_depth",
+                       width=DEPTH_WIDTH, height=DEPTH_HEIGHT)
+        return out, ""
 
     def _start_node(self, node_key: str, input_topic: Optional[str]):
         """Register before starting, so a concurrent stop can always cancel it."""
@@ -907,6 +946,11 @@ class VideoDepthPerceptionPlugin:
             node = self._nodes.pop(node_key, None)
         if node is None:
             return None
+        with self._nodes_lock:
+            # Goes with the node. Leaving it behind would let a re-wired card
+            # answer `info()` with the optics of a camera it is no longer fed by,
+            # which is a worse answer than no answer.
+            self._upstream_camera.pop(node_key, None)
         node.request_stop()
         result = node.stop()
         # remove-then-destroy: the node must leave the executor before its
@@ -1161,6 +1205,13 @@ class VideoDepthPerceptionPlugin:
                 {"topic": summary_topic, "format": "data/json"},
             ] if (input_topic or nodes) else [])
 
+            # Pass the camera's optics on, rewritten for what this card actually
+            # publishes: the map is resampled to 640x480, which changes the
+            # declared size and rescales `K` while leaving `half_fov_rad` alone
+            # (a stretch, not a crop). See `plugins/camera_info.py`.
+            camera_out, camera_note = self._camera_info(
+                instance_id, input_topic, nodes, depth_topic, summary_topic)
+
             scale = "metric"
             info = {
                 "name": "VideoDepthPerception", "manufacture": "Embodied",
@@ -1174,10 +1225,15 @@ class VideoDepthPerceptionPlugin:
             }
             info["unit"] = "m"
             info["calibration"] = self._calibration_label()
+            if camera_out:
+                info["camera_info"] = camera_out
+            if camera_note:
+                info["camera_info_note"] = camera_note
             return info
 
         elif action == "start":
             input_topic = args.get("input_topic")
+            upstream_camera = args.get("camera_info")
             if not input_topic:
                 topics_list = args.get("input_topics") or []
                 if topics_list:
@@ -1187,6 +1243,17 @@ class VideoDepthPerceptionPlugin:
             # owns its publishers, and answers recognize_by_photo /
             # recognize_by_url. It just has nothing to subscribe to.
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+
+            # Recorded before the node starts, so `info()` can answer with it
+            # even while the engine is still loading — and recorded even when it
+            # is empty, so a restart that no longer carries a declaration
+            # replaces the old one rather than leaving a stale entry claiming a
+            # lens that is no longer wired.
+            if input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
+                with self._nodes_lock:
+                    self._upstream_camera[node_key] = _camera_for_topic(
+                        upstream_camera, input_topic)
 
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
