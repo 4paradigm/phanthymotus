@@ -1021,7 +1021,10 @@ def test_the_lens_barrel_is_found_by_being_black_and_touching_the_edge():
     in front of me", all the way round the edge — while the map's valid-pixel
     fraction stays 100%. So `coverage`, the whole "unknown is not free"
     protection downstream, never fires."""
-    mask = depth_plugin.lens_barrel_mask(_framed(), threshold=24, max_fraction=0.9)
+    # `scale=1` so the assertions can be in frame coordinates; the rule being
+    # tested is about darkness and connectivity, not about resolution.
+    mask = depth_plugin.lens_barrel_mask(_framed(), threshold=24,
+                                         max_fraction=0.9, scale=1)
     assert mask is not None
     assert mask[0, 0] and mask[-1, -1], "四角是镜筒"
     assert not mask[24, 32], "画面中间不是"
@@ -1033,7 +1036,8 @@ def test_a_dark_object_in_the_middle_of_the_room_is_not_masked():
     away a real obstacle, which is the opposite of the intended error."""
     frame = _framed()
     frame[20:28, 28:36] = 0          # a black object, floating in the picture
-    mask = depth_plugin.lens_barrel_mask(frame, threshold=24, max_fraction=0.9)
+    mask = depth_plugin.lens_barrel_mask(frame, threshold=24, max_fraction=0.9,
+                                         scale=1)
     assert not mask[24, 32], "画面中间的黑色物体被当成镜筒了"
 
 
@@ -1072,3 +1076,42 @@ def test_masking_can_be_turned_off_from_the_file():
                                    mask_barrel=False)
     depth = np.full((48, 64), 5.0, dtype=np.float32)
     assert not np.isnan(node._mask_lens_barrel(_framed(), depth)).any()
+
+
+def test_the_barrel_is_found_at_a_quarter_resolution():
+    """The barrel is a large smooth region with a hard edge — nothing about
+    finding it needs every pixel, and the connected-components pass is
+    superlinear enough that full resolution cost **6.5 ms of a 46 ms frame** on
+    Orin 5 against 0.6 ms at a quarter. The caller resizes the mask to the depth
+    map anyway, so the only thing lost is a pixel or two at an edge that is
+    already soft.
+    """
+    frame = _framed(width=256, height=192, border=32)
+    small = depth_plugin.lens_barrel_mask(frame, threshold=24, max_fraction=0.9)
+    assert small.shape == (192 // 4, 256 // 4)
+    assert small[0, 0] and not small[24, 32]
+
+    full = depth_plugin.lens_barrel_mask(frame, threshold=24, max_fraction=0.9,
+                                         scale=1)
+    # Same answer, to within the resampling.
+    assert abs(float(small.mean()) - float(full.mean())) < 0.05
+
+
+def test_a_calibration_with_a_equal_to_one_is_a_multiply_not_a_power():
+    """`fit_cal_b` pins `a` at 1.0 following ultralytics and nothing here ever
+    fits it otherwise, so the only exponent that occurs in practice is the one
+    that does nothing — while `np.power(d, 1.0)` still walks every pixel through
+    the pow kernel. Measured on Orin 5: **6.3 ms of a 46 ms frame**, 13%, to
+    raise each pixel to the first power.
+
+    `d**1.0` is `d`, so the fast path has to be bit-identical, not merely close.
+    """
+    depth = np.linspace(0.1, 8.0, 64 * 48).reshape(48, 64).astype(np.float32)
+    fast = depth_plugin.apply_site_calibration(depth, 1.0, -0.9753)
+    slow = np.nan_to_num(np.power(np.maximum(depth, 0.0), 1.0)
+                         * float(np.exp(-0.9753)))
+    assert np.array_equal(fast, slow)
+
+    # And a real exponent still goes the long way.
+    curved = depth_plugin.apply_site_calibration(depth, 1.2, -0.5)
+    assert not np.allclose(curved, depth * float(np.exp(-0.5)))
