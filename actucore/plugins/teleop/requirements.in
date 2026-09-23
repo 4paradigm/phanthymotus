@@ -1,0 +1,11 @@
+# ROS 2 Humble / Python 3.10+, CPU-only. cmeel ABI versions must move together.
+numpy==2.2.6
+scipy==1.15.3
+pin==3.7.0
+cmeel-urdfdom==4.0.1
+cmeel-tinyxml2==10.0.0
+aiohttp==3.12.15
+aiortc==1.14.0
+av==16.0.1
+PyYAML==6.0.3
+zeroconf==0.151.3

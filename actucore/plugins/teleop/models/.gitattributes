@@ -1,0 +1,2 @@
+# Preserve the upstream license verbatim, including its trailing spaces.
+LICENSE -whitespace

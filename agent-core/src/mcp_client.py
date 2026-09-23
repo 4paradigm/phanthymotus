@@ -351,7 +351,20 @@ async def _jrpc(session: aiohttp.ClientSession, url: str, method: str, params: d
     bad call, because nothing in the transcript said anything had failed.
     """
     payload = {'jsonrpc': '2.0', 'id': req_id, 'method': method, 'params': params}
-    async with session.post(url, json=payload) as resp:
+    request_options = {}
+    if method == 'tools/call' and params.get('name') == 'teleop':
+        from teleop_management import TeleopManagementError, management_headers
+        try:
+            request_options = {
+                'headers': management_headers(url, 'teleop', params.get('arguments') or {}),
+                'allow_redirects': False,
+            }
+        except TeleopManagementError as exc:
+            return {JRPC_ERROR_KEY: {'code': -32001, 'message': str(exc)}}
+    async with session.post(url, json=payload, **request_options) as resp:
+        if request_options and not 200 <= resp.status < 300:
+            return {JRPC_ERROR_KEY: {'code': -32001,
+                    'message': f'Teleop management HTTP request failed ({resp.status})'}}
         data = await resp.json(content_type=None)
     if isinstance(data, dict) and data.get('error') is not None and 'result' not in data:
         return {JRPC_ERROR_KEY: data['error']}
@@ -857,9 +870,10 @@ async def call_tool(full_name: str, args: dict) -> str:
             print(f'[mcp] {full_name} validation error: {msg}')
             return msg
 
-    # Auto-config: start 前自动 apply 已保存的 config
+    # Teleop owns a live session: only explicit config/reconnect may reapply it.
+    # Other tools retain their existing start-time automatic configuration.
     action = args.get('action')
-    if action == 'start':
+    if action == 'start' and tool_name != 'teleop':
         meta = info.get('tool_meta', {}).get(full_name, {})
         if meta.get('has_config_schema'):
             saved_cfg = _get_tool_config(mcp_id, tool_name)
@@ -1390,8 +1404,18 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
         "params": {"name": tool_name, "arguments": args},
     }
     try:
+        request_options = {}
+        if tool_name == 'teleop':
+            from teleop_management import management_headers
+            request_options = {
+                'headers': management_headers(url, tool_name, args),
+                'allow_redirects': False,
+            }
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5),
+                                    **request_options) as resp:
+                if tool_name == 'teleop' and not 200 <= resp.status < 300:
+                    return {'error': f'Teleop management HTTP request failed ({resp.status})'}
                 data = await resp.json()
                 if "error" in data:
                     return {"error": data["error"]}

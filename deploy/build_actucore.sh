@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # build_actucore.sh — 构建 actucore（执行模型层）镜像并推送
 #
-# 只有 Jetson GPU 版：执行模型（VLA / 抓取策略 / locomotion）都要 GPU，
-# 没有 CPU 变体。
+# 本入口构建普通 Jetson bundle；CPU 隔离验证使用 build_tianyi_actucore.sh。
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认，与 build_perception.sh 一致）
@@ -60,7 +59,7 @@ fi
 DATE="$(date +%y%m%d)"
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 
-# ── Jetson-only：执行模型都要 GPU，没有 CPU 变体 ──────────────────────
+# ── 普通 Jetson bundle ───────────────────────────────────────────────
 DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
 BUILD_CONTEXT="${REPO_ROOT}"
 TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"

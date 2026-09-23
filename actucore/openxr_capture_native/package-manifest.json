@@ -1,0 +1,14 @@
+{
+  "filename": "pico.apk",
+  "application_id": "com.phanthymotus.picocapture",
+  "version_code": 23,
+  "version": "0.3.19-operator1-ikview2",
+  "build_type": "release",
+  "size_bytes": 2428338,
+  "sha256": "49ec4d31988585254e3c36dca90f50b0396061284841bed208bbf9cf51e46b4f",
+  "signing_certificate_sha256": "12b025ef35194425aa994c025e87f3733ff02d30637fdcd9e78e89a488c38b5f",
+  "source_url": "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/teleop/pico/0.3.19-operator1-ikview2/e1283240dbfd2dad9c799431ea403afec3a552ab1a131610a755506f68f45aac/container-apk.gz",
+  "source_encoding": "gzip",
+  "source_sha256": "e1283240dbfd2dad9c799431ea403afec3a552ab1a131610a755506f68f45aac",
+  "source_size_bytes": 2378685
+}

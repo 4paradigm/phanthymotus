@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>安装 PhanthyMotus 遥操</title>
+<style>
+:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#f3f6fb;color:#182536;font:20px/1.7 system-ui,sans-serif}main{max-width:720px;margin:32px auto;padding:32px;background:white;border-radius:24px}h1{font-size:32px;line-height:1.3}h2{font-size:24px}p{margin:12px 0}.muted{color:#556577}button,.primary{display:block;border:0;border-radius:12px;padding:18px 24px;background:#245bcb;color:white;font:600 22px system-ui;text-align:center;text-decoration:none;cursor:pointer;width:100%}input{font:24px monospace;padding:16px;border:2px solid #9aabc0;border-radius:12px;width:100%;margin:12px 0;text-transform:uppercase;letter-spacing:2px}li{padding:8px 0}details{border-top:1px solid #dce3ed;margin-top:24px;padding-top:16px}a{color:#245bcb}code{overflow-wrap:anywhere}#error{color:#a02020}#entry-link{display:block;padding:12px 0}[hidden]{display:none!important}@media(max-width:600px){main{margin:0;padding:24px;border-radius:0}}
+</style>
+<main>
+<p class="muted">PhanthyMotus · PICO 遥操作</p>
+<h1>安装一次，以后点开就能连接</h1>
+<p>请在 <strong>PICO 头显自带浏览器</strong>打开本页。手机扫码可查看说明，安装需要在头显内完成。</p>
+<form id="code-form" hidden>
+<label for="code">输入电脑端遥操卡片显示的安装码</label>
+<input id="code" name="code" autocomplete="off" spellcheck="false" maxlength="24" placeholder="ABCD-EFGH-JKLM" required>
+<button type="submit">继续安装</button>
+<p class="muted">电脑端：遥操卡片 → 安装 PICO → 生成安装链接。安装码 15 分钟有效。</p>
+</form>
+<section id="installation" hidden>
+<p id="package" class="muted" role="status">正在检查安装包…</p>
+<a id="apk" class="primary" hidden>安装遥操</a>
+<ol>
+<li>点击上方按钮下载；下载完成后，打开安装包并按系统提示确认安装。</li>
+<li>安装完成，直接点击<strong>打开</strong>。</li>
+<li>电脑端打开遥操卡片的<strong>允许新设备配对</strong>，在 App 中选择发现的机器人。核对两端配对码、确认后，连接资料会自动保存。</li>
+</ol>
+<p>头显和机器人需要连接同一局域网。下次打开 App 会连接已配对机器人；开始遥操需要另行确认。</p>
+<details><summary>已有 App，使用连接邀请</summary>
+<p id="invite-hint">也可以在电脑端生成一次性连接邀请，在头显浏览器打开邀请链接。</p>
+<a id="connect" class="primary" hidden>打开 App 并导入邀请</a>
+</details>
+<details><summary>安装或连接遇到问题</summary>
+<ul><li>安装入口在哪里：在浏览器下载列表中打开刚下载的安装包。</li><li>提示安装来源权限：按系统提示允许当前浏览器安装，然后继续。</li><li>没有发现机器人：检查同一 Wi-Fi、访客网络隔离，点击 App 的“重新查找”；仍找不到可展开“连接帮助”。</li><li>配对窗口过期：在电脑端重新点击“允许新设备配对”，再选择机器人。</li><li>旧测试版提示签名冲突：联系维护者安排迁移，避免直接卸载丢失配对。</li></ul>
+<p>版本与校验信息：<code id="digest"></code></p>
+</details>
+</section>
+<p id="error" role="alert"></p>
+<a id="entry-link" href="/pico" hidden>重新输入安装码</a>
+</main>
+<script src="/js/pico-install.js" defer></script>
+</html>

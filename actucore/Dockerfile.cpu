@@ -1,0 +1,30 @@
+# Build from the Core repository root. CPU-only ROS Humble/aarch64 runtime.
+ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base@sha256:82d45949e7c3fd85e6baf4a2b24b384a3ec020a5e237c5f801bc2f2269ca649f
+FROM ${ROS_BASE_IMAGE}
+ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
+# This image is the dedicated CPU teleop validation environment. Dependencies
+# remain in this application image, not in the shared ROS base.
+COPY actucore/plugins/teleop/requirements.lock /tmp/teleop-requirements.lock
+# Fetch the fixed, signed PICO APK as part of the ordinary image build.
+COPY actucore/openxr_capture_native/package-manifest.json /tmp/pico-package.json
+COPY actucore/openxr_capture_native/scripts/fetch_apk.py /tmp/fetch_pico_apk.py
+RUN python3 /tmp/fetch_pico_apk.py /tmp/pico-package.json /work/onboarding
+RUN python3 -m pip install --no-cache-dir --require-hashes -i ${PYPI_MIRROR} -r /tmp/teleop-requirements.lock && \
+    python3 -c 'import pinocchio, scipy, aiortc, yaml'
+WORKDIR /work
+COPY actucore/main.py actucore/config.yaml /work/
+COPY actucore/plugins/ /work/plugins/
+RUN python3 /work/plugins/teleop/onboarding.py /work/onboarding
+COPY deploy/fetch_g1_collision.py /tmp/fetch_g1_collision.py
+RUN python3 /tmp/fetch_g1_collision.py --manifest-dir /work/plugins/teleop/models/g1_collision
+COPY perception/utils/logsafe.py /work/logsafe.py
+COPY perception/utils/model_downloader.py /work/model_downloader.py
+COPY perception/utils/model_progress.py /work/model_progress.py
+COPY actucore/deploy/service.cpu.yml /deploy/service.yml
+COPY agent-core/deploy/dds-local.xml /deploy/dds-local.xml
+COPY agent-core/deploy/dds-local.xml /opt/phanthy-motus/dds-local.xml
+ENV ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+EXPOSE 15730 15741
+CMD ["bash", "-c", "source /opt/ros/humble/setup.bash && exec python3 /work/main.py"]

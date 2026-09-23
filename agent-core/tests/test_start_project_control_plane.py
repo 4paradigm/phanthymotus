@@ -247,9 +247,13 @@ def test_two_agreeing_action_spaces_are_fine(driver):
 # ── several publishers on one control topic ──────────────────────────────────
 
 def test_two_control_sources_on_one_topic_are_allowed(driver):
-    """A teleop pendant taking over from a policy is the intended shape."""
+    """A generic priority-controlled pendant shares the motus.control/1 sink.
+
+    The dedicated teleop tool now uses control/teleop and exclusive binding;
+    it is intentionally not this arbitrated generic control source.
+    """
     layout = {
-        'cards': [_card(VLA, 'vla'), _card(TELEOP, 'teleop'), _card(ARM, 'servo')],
+        'cards': [_card(VLA, 'vla'), _card(TELEOP, 'manual_pendant'), _card(ARM, 'servo')],
         'connections': [_conn(VLA, ARM), _conn(TELEOP, ARM)],
     }
     _run(layout)
@@ -343,6 +347,31 @@ def test_an_unreachable_consumer_does_not_hide_a_reachable_one(driver):
     _run(layout)
 
     assert driver.starts[VLA]['control_interface'] == ARM_DESCRIPTOR
+
+
+def test_distinct_control_output_ports_negotiate_independently(driver):
+    old_services = config.main.get('services', {})
+    config.main['services'] = {'mcp': [{'id': 'mcp-vla', 'tools': [{
+        'name': 'vla', 'topic_out': [{'port_id': 'left'}, {'port_id': 'right'}],
+        'inputSchema': {'properties': {'control_interfaces': {'type': 'object'}}},
+    }]}]}
+    second = {**_conn(VLA, ARM2), 'fromPortIdx': '1'}
+    layout = {'cards': [_card(VLA, 'vla'), _card(ARM, 'servo'), _card(ARM2, 'servo2')],
+              'connections': [_conn(VLA, ARM), second]}
+    try:
+        _run(layout)
+        assert driver.starts[VLA]['control_interfaces'] == {'left': ARM_DESCRIPTOR, 'right': ARM2_DESCRIPTOR}
+        assert 'control_interface' not in driver.starts[VLA]
+    finally:
+        config.main['services'] = old_services
+
+
+def test_v2_frames_and_groups_cannot_be_silently_broadcast():
+    first = {**ARM_DESCRIPTOR, 'control_interface': 'motus.control/2', 'frame': 'chest',
+             'groups': [{'name': 'arm_l', 'mode': 'joint_position', 'count': 7}]}
+    assert config_api._descriptor_conflict([first, {**first, 'frame': 'world'}])
+    assert config_api._descriptor_conflict([first, {**first, 'groups': []}])
+    assert not config_api._descriptor_conflict([first, dict(first)])
 
 
 # ── 一次挂住的启动不能永久锁死"启动"这个动作 ─────────────────────────────────

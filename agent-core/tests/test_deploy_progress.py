@@ -12,6 +12,7 @@ import asyncio
 import json
 import sys
 import os
+from unittest import mock
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -90,42 +91,50 @@ def test_preflight_checks():
     print()
 
 
-async def test_progress_stream():
-    """Test progress streaming (mock)."""
+def test_progress_stream():
+    """Run the async stream contract without an optional pytest plugin."""
+    asyncio.run(_exercise_progress_stream())
+
+
+async def _exercise_progress_stream():
+    """Exercise actual event emission and replay buffering; no deployment."""
     print("\n=== Testing Progress Stream (Mock) ===\n")
 
-    from api.deploy_stream import DeployProgress
+    from api import deploy_stream
 
     driver_id = 'test-driver'
+    queue = asyncio.Queue()
+    # Isolate the in-memory subscribers and history; keep emit() itself real.
+    with mock.patch.dict(deploy_stream._runs, clear=True), \
+            mock.patch.dict(deploy_stream._streams, {driver_id: {queue}}, clear=True):
+        async with deploy_stream.DeployProgress(driver_id) as progress:
+            for check_id, message in [('disk', '检查磁盘空间…'),
+                                      ('network', '检查网络连接…'),
+                                      ('registry', '检查仓库认证…')]:
+                await progress.check(check_id, message, status='pass')
 
-    async with DeployProgress(driver_id) as progress:
-        # Simulate deployment steps
-        await progress.check('disk', '检查磁盘空间…', status='pass')
-        await asyncio.sleep(0.5)
+            for percent in [0, 25, 50, 75, 100]:
+                await progress.update('pull', '拉取镜像层…', percent=percent,
+                                      speed=f'{2.5 - (percent / 100)}MB/s')
+            await progress.update('compose', '合并配置…')
+            await progress.update('start', '启动容器…')
+            await progress.done('部署完成')
 
-        await progress.check('network', '检查网络连接…', status='pass')
-        await asyncio.sleep(0.5)
-
-        await progress.check('registry', '检查仓库认证…', status='pass')
-        await asyncio.sleep(0.5)
-
-        # Simulate pull progress
-        for percent in [0, 25, 50, 75, 100]:
-            await progress.update(
-                'pull',
-                f'拉取镜像层…',
-                percent=percent,
-                speed=f'{2.5 - (percent / 100)}MB/s'
-            )
-            await asyncio.sleep(0.5)
-
-        await progress.update('com配置…')
-        await asyncio.sleep(0.5)
-
-        await progress.update('start', '启动容器…')
-        await asyncio.sleep(0.5)
-
-        await progress.done('部署完成')
+        run = deploy_stream._runs[driver_id]
+        events = [json.loads(message) for message in run['events']]
+        live = [queue.get_nowait() for _ in range(queue.qsize())]
+        assert [json.loads(message) for _, message in live] == events
+        assert all(run_id == run['run_id'] for run_id, _ in live)
+        assert all(event['run_id'] == run['run_id'] for event in events)
+        assert [event['type'] for event in events] == (
+            ['start'] + ['check'] * 3 + ['progress'] * 7 + ['done'])
+        assert [event['check_id'] for event in events if event['type'] == 'check'] == [
+            'disk', 'network', 'registry']
+        updates = [event for event in events if event['type'] == 'progress']
+        assert [event['stage'] for event in updates] == ['pull'] * 5 + ['compose', 'start']
+        assert [event['percent'] for event in updates[:5]] == [0, 25, 50, 75, 100]
+        assert events[-1]['message'] == '部署完成'
+        assert run['active'] is False
 
     print("Progress stream mock completed successfully")
 
@@ -162,7 +171,7 @@ async def main():
         test_preflight_checks()
 
         # Test 2: Progress streaming
-        await test_progress_stream()
+        await _exercise_progress_stream()
 
         # Test 3: Error messages
         test_error_messages()

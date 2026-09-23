@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前有一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+**`vla` 默认开启，`teleop` 遥操插件默认关闭。** 遥操配置和验证边界见 [teleop 说明](plugins/teleop/README.md)。遥操需要 `enabled` 且站点配置检查通过才出现在工具列表里；注册卡片不代表已取得硬件执行权。
 
 ## `vla` 卡片
 
@@ -92,7 +92,9 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 | 注册类别 | `actucore` |
 | `serverInfo.name` | `actucore-bundle` |
 
-端口只有一个：ActuCore 没有 Perception 那种音频流场景，所以不开 WebSocket（15731 预留）。
+MCP 与 SSE 共用 15730。启用 `teleop` 时，插件另在 15741 提供 PICO WSS 配对、状态与信令，并通过协商的 WebRTC 数据通道接收输入；这些仍属于同一 ActuCore 进程。15731 不用于这条遥操链路。
+
+MCP POST 要求单一、合法的 `Content-Length`，请求体上限 16 MiB、完整读取期限 10 秒；不支持 chunked 请求。非法长度、超限和超时分别返回 400/413/408，未提供长度返回 411。正常 JSON-RPC 与管理鉴权不变；该上限不用于 PICO RTC 姿态流。
 
 ## `navi` 卡片
 
@@ -162,15 +164,25 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 
 ## 构建与运行
 
-只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
+普通部署使用 `Dockerfile.jetson`；VLA 的本机模型能力取决于基础镜像。天轶新链路的 IK 位于 Driver，ActuCore 负责 PICO 通信与相对末端映射；两侧均可使用 CPU。仓库也提供 `Dockerfile.cpu` 用于隔离验证。CPU 验证镜像不提供完整本机 SmolVLA 环境，不能作为保留既有 GPU/VLA 能力的直接替代。
 
 ```bash
 ./deploy/build_actucore.sh                    # JetPack 5.11（默认，与 build_perception.sh 一致）
-./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1，带本机推理
+./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1，本机推理 + 遥操依赖
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
-**同一份 Dockerfile，两个 base**，应用层逐字节一样：
+标准 JP6.1 ActuCore 镜像直接包含 Pinocchio、SciPy、RTC 等遥操依赖，无需额外构建选项。Dockerfile 按既有 `JP_VERSION=61` 参数选择依赖，已移除不再生效的 `--with-teleop` / `WITH_TELEOP` 及独立标签变体。JP5.11 保持原 Python 环境，不安装遥操依赖；裸 Dockerfile 构建仍默认 JP5.11。依赖只安装到 ActuCore 应用镜像，不修改共享基础镜像。运行时 `plugins.teleop.enabled` 仍默认关闭。
+
+CPU 专用验证镜像也直接安装遥操依赖，可用 `docker build -f actucore/Dockerfile.cpu -t local/actucore:teleop-cpu .` 或 `deploy/build_tianyi_actucore.sh LOCAL_IMAGE_TAG` 构建；无需修改现有脚本。CPU 镜像不作为普通 GPU/VLA 部署的替代。
+
+普通 JP6.1 Jetson 与 CPU 验证镜像构建都按固定清单获取签名 PICO release APK，无需新增构建开关。构建制品以确定性 gzip 发布，下载器先验证压缩包 SHA256，再解压并验证原 APK 的 SHA256 和大小；容器只向 Core 提供原 APK。Canvas 通过当前已注册的 teleop 服务代理下载，不让头显访问制品仓库。旧 debug APK 与 release 的签名不兼容，需操作者明确迁移；不会静默卸载或删除配对。安装过程和浏览器 deep link 仍需在实体 PICO 验收。
+
+JP6.1 与 CPU 验证构建通过 `deploy/fetch_g1_collision.py` 从项目 COS 获取固定上游提交的 G1 碰撞网格并逐文件核对 SHA256；JP5.11 不下载这些模型。控制循环不联网下载，缺失或损坏资产时拒绝 G1 初始化。G1 求解器依赖仍需另外满足，包含网格不表示已支持完整 G1 IK。
+
+体积记录（2026-09-22 registry ARM64 manifest）：`release.260922.3e993b5-jetson-jp6.1` 压缩层合计 9,217,592,312 B，前 29 层与当次 `jp61-torch` 基础镜像一致，基础层合计 9,124,251,313 B；全部应用层共 93,340,999 B，不全部归因于遥操。遥操依赖层 85,810,339 B、APK 层 2,381,531 B、G1 网格层 4,438,722 B，均为压缩口径，不与下表未压缩体积混用。普通镜像随包携带能力满足无需另选镜像即可在卡片启用的要求；保留 G1 legacy 数值依赖是本轮不迁移 G1 的兼容成本。CPU 镜像使用固定 ROS base 做隔离验收，不复制 Jetson CUDA/VLA 基础层，不作为新增生产服务；未用旧 CPU 镜像体积冒充本次构建结果。
+
+**同一份 Jetson Dockerfile，两个 base**；卡片源码共用，基础环境和可选依赖不同：
 
 | | base | 可用 provider | 大小 |
 |---|---|---|---|
@@ -181,7 +193,15 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 
 jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）。加本机模型卡片时，如果它的依赖不在 base 里，放在它自己的 `RUN` 层，不要预装在共享基础层里。
 
-部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
+遥操构建有机型差异：
+
+- 天轶新链路由 Driver 使用 Pinocchio + SciPy 完成 IK。ActuCore 保留旧遥操路径的数值依赖；普通 JP6.1 构建使用 `requirements.bundle.lock`，保留 VLA 兼容的 AV／NumPy 版本。
+- G1 使用 Pinocchio 的 CasADi 符号绑定。`g1_ik.py` 同时需要 `casadi` 和 `pinocchio.casadi`；只有 `import pinocchio` 成功不足以证明 G1 可求解。历史 ARM64 数值环境锁在 `plugins/teleop/requirements.numeric-linux-aarch64.lock`，包含 Pinocchio 3.1.0、CasADi 3.6.7、NumPy 1.26.4；当前天轶 bundle 锁是 Pin 3.7.0／NumPy 2.2.6，未安装 CasADi。两套锁不能直接叠装并声称与 VLA 兼容。
+- 当前 `Dockerfile.cpu` 也没有消费 G1 数值锁。因此北京 G1 的完整 IK 展示需要单独核验并构建可用的符号绑定环境；切换 `robot_profile` 不是依赖安装。该工作仍应保留一套 ActuCore，不能另起第二服务来掩盖依赖冲突。
+
+部署走 Dashboard 的服务部署页，Agent Core 从镜像的 `/deploy/service.yml` 读取服务片段。Jetson 的源码为 `actucore/deploy/service.yml`；CPU 为 `actucore/deploy/service.cpu.yml`，服务身份相同，但不要求 NVIDIA runtime。两种镜像均声明 MCP 15730 与可选 PICO WSS 15741；声明端口不自动启动遥操。遥操的站点配置、TLS、配对状态与管理密钥挂载还需完整提供，不能仅凭普通 service 片段推定遥操可运行。构建脚本配置远端仓库后会推送；仅准备本地候选时不要把发布脚本当成无副作用的测试。
+
+PR bot 使用现有命令 `/request_bot_review core actucore jp61`，候选 Dockerfile 会自动构建包含天轶遥操依赖的统一 ActuCore；不需要修改在线 bot、任务模型或构建脚本。同一 HEAD 已审查时再加 `force`。构建成功与测试通过分别记录；本地脚本检查不能代替目标架构镜像构建。
 
 ## 卡片契约
 
@@ -257,7 +277,7 @@ TOOLS = [
        self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
        log.info("XPlugin loaded")
    ```
-4. 该卡片需要的依赖加到 `Dockerfile`（以及 `Dockerfile.jetson`，如果要跑 GPU）
+4. 该卡片需要的依赖加到目标构建入口；普通部署为 `Dockerfile.jetson`，CPU 隔离验证为 `Dockerfile.cpu`
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
@@ -284,3 +304,23 @@ ttl  = negotiate.ttl_ms(rate, descriptor)
 
 这两个模块原本在 `plugins/vla/` 下，第二个消费者出现时提到了 `control_stream/`；
 `plugins/vla/` 留了两个 re-export shim，所以照旧从那里 import 的代码不用改。
+
+## 遥操与 VLA 共用 ActuCore
+
+遥操是 `plugins.teleop` 卡片，与 VLA 共用 `ActuCoreBundle`、ROS executor 和 MCP 15730。不要另建 `actucore-teleop` 服务或第二个注册心跳。PICO 的 WSS/RTC 由该插件内部提供，15741 不属于第二套 ActuCore。
+
+天轶推荐连接三张卡：`teleop → motion_control → arm`。teleop 负责配对、输入映射与使能；Driver 的 motion_control 负责模型、标定、IK、碰撞、速度与正常结束收臂；arm 通过共享执行权和安全门完成厂商位置下发。Canvas 自动展示反馈虚线，反馈不进入执行 DAG。仓库新配置选择 `control_backend: motion_control`，遥操仍默认关闭；旧配置与 G1 的 legacy 路径继续保留，不自动改绑。新链路首轮仅接双臂，不把旧手部能力扩展为新接口验收。
+
+日常操作在 Canvas 完成：建立三段连线，保存各卡配置，从 teleop 生成安装链接及 15 分钟一次性邀请；PICO 浏览器下载安装后点击 deep link 导入，确认并一键配对。已配对设备冷启动自动连接，仍需重新使能才能运动。Driver 的 `calibration_path` 是标定文件导入路径，`joint_velocity_rad_s` 默认 1.0、最大 1.5 且受 URDF 限制；卡片配置在空闲时经完整验证原子应用，不编辑 JSON 文件，变更后需重新标定。
+
+JetPack 6.1 构建使用 `deploy/build_actucore.sh --jp-version 6.1`（此脚本在配置远端凭据时会推送，现场仅构建应直接调用 Dockerfile 并传入对应 `JP_VERSION=61` 和基础镜像）。在同一 config.yaml 启用 `plugins.teleop`，保留已有 VLA 配置。共享依赖锁 `requirements.bundle.lock` 保留 VLA 的 AV 15.1 / NumPy 2.2.6；CPU 隔离回归仍可使用 Dockerfile.cpu，不是另开生产服务的部署方式。
+
+从历史独立服务迁移时，保留证书、配对状态、标定与管理密钥挂载；将 Core 的 `TELEOP_MANAGEMENT_URL` 指向 `http://localhost:15730/mcp`，保留原 MCP id 及所有卡片配置。先停止旧独立容器，再启用合并服务，验证通过后移除旧容器，避免配对端口和注册竞争。配置、开始、结束等日常操作继续在 Canvas/PICO 完成，无需后端脚本。
+
+镜像必须包含 `/deploy/dds-local.xml`，并与宿主只读挂载的 DDS profile 完全一致。不能只检查 `tools/list`：部署验收还需调用 teleop `info`，验证 ROS 节点及 WSS 真正初始化。
+
+启用配置不绕过站点检查。启动时如果管理密钥、TLS、状态目录或依赖缺失，Bundle 不注册遥操工具，但保留其他卡片。legacy 路径还检查本地模型与标定；新 motion_control 路径由 Driver 检查模型及标定，缺失时禁止运动，不阻止 teleop 展示配对和安装入口。可从 `tools/list._meta.required_site_config` 或直接 `teleop info` 读取字段级诊断；不公开密钥和站点路径。补齐文件/挂载后重启 ActuCore 重新注册。配置要求与日常 Canvas 操作见 [遥操说明](plugins/teleop/README.md#部署与接口)。
+
+Canvas 仍负责配置存储；teleop 将已接受的参数原子保存到配对状态文件旁的 `*.config.json`，用于 Core 未察觉短暂重启时恢复配置。此文件权限为 0600，只保存配置 schema 字段，不保存控制权、动作或会话；启动仍为空闲。部署配置改变后旧缓存不覆盖新配置；缓存损坏时拒绝初始化，可在卡片重新保存配置修复。迁移时保留整个状态目录。
+
+本轮新链路已在天轶以 Shadow、Driver Live 门关闭的配置部署，真实关节反馈、EEF 求解与 ActuCore 显示数据回传及 Canvas 三卡连线已核对；实体 PICO 安装、渲染与新版物理动作尚未验收。代码与离线回归、签名 APK 构建、目标架构镜像构建、设备部署与真机验收分别记录；任一前置结果不能代替低速跟随、暂停、故障停止和恢复的真实反馈证据。架构与协议见 [遥操架构](../docs/design/teleop-architecture.md)。

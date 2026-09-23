@@ -1,7 +1,6 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
 # One Dockerfile for both JetPack lines; the base comes in as BASE_IMAGE (see
-# below). The application layers are byte-identical on both — what differs is
-# only what the base already carries.
+# below). The card sources are shared; JP6.1 also installs the teleop bundle.
 #
 # Build context: repo root (phanthymotus/) so we can access both
 # actucore/ and deploy/ros-base/audio_msgs/
@@ -18,9 +17,8 @@ ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 # `docker build`, and having them disagree with the script would mean the same
 # command producing a different image depending on how it was invoked.
 ARG JP_VERSION=511
-# One Dockerfile, two bases. Everything above and below this line is identical
-# on both JetPack lines — only what the base carries differs, and the card sorts
-# itself out at runtime:
+# One Dockerfile, two bases. JP6.1 includes the teleop dependencies alongside
+# VLA; JP5.11 preserves its older Python/numeric environment:
 #
 #   jp5.11  jetson-base            remote providers only. Thin. (default)
 #   jp6.1   jetson-base-actucore   CUDA torch 2.9 + lerobot → local *and* remote
@@ -34,6 +32,7 @@ ARG JP_VERSION=511
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
+ARG JP_VERSION
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -61,10 +60,31 @@ RUN cd /ros_ws && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests
 
+# Teleop is included on JP6.1 in this same process, using VLA-compatible pins.
+# JP_VERSION selects dependencies; no separate teleop build variant is needed.
+COPY actucore/plugins/teleop/requirements.bundle.lock /tmp/teleop-bundle.lock
+# Fetch the fixed, signed PICO APK as part of the ordinary image build.
+COPY actucore/openxr_capture_native/package-manifest.json /tmp/pico-package.json
+COPY actucore/openxr_capture_native/scripts/fetch_apk.py /tmp/fetch_pico_apk.py
+RUN if [ "$JP_VERSION" = "61" ]; then \
+        python3 /tmp/fetch_pico_apk.py /tmp/pico-package.json /work/onboarding; \
+    fi
+RUN if [ "$JP_VERSION" = "61" ]; then \
+        python3 -m pip install --no-cache-dir --require-hashes -i ${PYPI_MIRROR} -r /tmp/teleop-bundle.lock && \
+        python3 -c 'import pinocchio, scipy, aiortc, av'; \
+    fi
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
+RUN if [ "$JP_VERSION" = "61" ]; then \
+        python3 /work/plugins/teleop/onboarding.py /work/onboarding; \
+    fi
+COPY deploy/fetch_g1_collision.py /tmp/fetch_g1_collision.py
+RUN if [ "$JP_VERSION" = "61" ]; then \
+        python3 /tmp/fetch_g1_collision.py --manifest-dir /work/plugins/teleop/models/g1_collision; \
+    fi
 COPY actucore/config.yaml /work/config.yaml
 # Atomic-write stdout guard. The build context is the repo root, so this reuses
 # perception's copy instead of adding a fourth one to keep in sync — see the
@@ -85,8 +105,10 @@ COPY perception/utils/model_progress.py /work/model_progress.py
 # Agent Core reads /deploy/service.yml out of the image to merge the compose
 # fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/
+# Teleop checks the host DDS profile against this bundled reference.
+COPY agent-core/deploy/dds-local.xml /deploy/dds-local.xml
 
-EXPOSE 15730
+EXPOSE 15730 15741
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
 RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \

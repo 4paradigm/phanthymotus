@@ -12,6 +12,7 @@
  */
 
 import { showToast } from './toast.js';
+import { mountTeleopPanel } from './teleop-panel.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -113,6 +114,8 @@ let _mcpsPendingRefresh = false;
 // `_projectStateKnown` closes it by separating "stopped" from "not yet known"
 // and refusing edits for both.
 let _projectRunning = false;
+let _projectPhase = 'idle';
+let _projectError = '';
 let _projectStateKnown = false;
 
 export function isProjectRunning() { return _projectRunning; }
@@ -155,7 +158,7 @@ function _editsLocked() { return _editLockReason() !== ''; }
 function _syncProjectState(delay = 500) {
   return fetch('/api/config/project-running')
     .then(r => r.json())
-    .then(d => { _applyProjectState(d.running); return true; })
+    .then(d => { _applyProjectState(d.running, d.phase, d.error); return true; })
     .catch(() => {
       if (!_projectStateKnown) {
         setTimeout(() => _syncProjectState(Math.min(delay * 2, 5000)), delay);
@@ -165,12 +168,14 @@ function _syncProjectState(delay = 500) {
 }
 
 /** Record what the backend says about the run state, and unblock editing. */
-function _applyProjectState(running) {
+function _applyProjectState(running, phase = running ? 'running' : 'idle', error = '') {
   _projectRunning = !!running;
+  _projectPhase = phase || (running ? 'running' : 'idle');
+  _projectError = error || '';
   _projectStateKnown = true;
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-    btn.classList.toggle('locked', !_projectRunning);
+    btn.classList.toggle('locked', !_projectRunning || ['stopping','stop_failed'].includes(_projectPhase));
   });
 }
 export function redrawCanvas() { _scheduleRedraw(); }
@@ -357,7 +362,7 @@ export async function initCanvas(initialMcps) {
       // Applied even when it matches what we hold: this is also the first
       // authoritative answer some page loads get, and it is what marks the
       // state known.
-      if (running !== _projectRunning || !_projectStateKnown) _applyProjectState(running);
+      _applyProjectState(running, event.payload?.phase, event.payload?.error);
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
     } else if (event.type === 'canvas_layout') {
@@ -787,7 +792,9 @@ async function _removeCard(id) {
   // leave it, so its ROS node, subscription and any CUDA context would live
   // until perception exits — publishing to a topic no card accounts for.
   // `stop` is idempotent, so doing this to a card that was never started is fine.
-  _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
+  // Teleop removal is confirmed by the backend's project_stop before the
+  // persisted graph is removed; a raw stop here would cancel its arm return.
+  if (removed.toolName !== 'teleop') _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
   removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
@@ -1272,7 +1279,69 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
+  if (toolObj?.['x-connection-panel'] === 'teleop-v1') {
+    _mountTeleopConnectionPanel(el, mcpId, toolName);
+  }
   return el;
+}
+
+function _mountTeleopConnectionPanel(el, mcpId, toolName) {
+  const tool = (_allMcps.find(m => m.id === mcpId)?.tools || [])
+    .find(t => typeof t === 'object' && t.name === toolName);
+  const host = el.querySelector('.canvas-card-body-wrap');
+  if (!host) return;
+  // Dedicated controls replace the raw action/argument form for this card only.
+  host.querySelector('.canvas-card-body')?.remove();
+  host.querySelector('.canvas-exec-btn')?.remove();
+  host.querySelector('.canvas-footer-divider')?.remove();
+  mountTeleopPanel(host, {
+    actions: tool?.inputSchema?.properties?.action?.enum || ['info'],
+    configSchema: tool?.configSchema || {},
+    loadTargets: tool?.topic_out?.some(p=>p.format==='control/eef') ? async()=>{
+      const r=await fetch('/api/canvas/teleop-targets');const body=await r.json();if(!r.ok)throw Error(body.detail||'读取机器人失败');return body.data||[];
+    } : undefined,
+    async buildTemplate(driverMcpId) {
+      if(_projectRunning)throw Error('请先关闭智能控制并等待收臂完成');
+      if(!(await _ensureEdit()) || await _saveLayout()===false)throw Error('请先保存当前画布');
+      const r=await fetch('/api/canvas/teleop-template',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({teleop_card_id:el.dataset.cardId,driver_mcp_id:driverMcpId})});
+      const body=await r.json();if(!r.ok)throw Error(body.detail||'无法建立三段模板');
+      const save=await fetch('/api/canvas/layout',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body.data,session_id:_sessionId})});
+      if(!save.ok){const failure=await save.json();throw Error(failure.detail||'画布未保存');}
+      await _reloadLayout();
+    },
+    async prepareInstallation(){
+      const r=await fetch(`/api/teleop-install/${encodeURIComponent(mcpId)}`,{method:'POST',signal:AbortSignal.timeout(20000)});
+      const body=await r.json();if(!r.ok)throw Error(body.detail||'安装包尚未就绪');return body.data;
+    },
+    async createInvitation(ticket){
+      const r=await fetch(`/api/teleop-install/${encodeURIComponent(mcpId)}/invitation/${encodeURIComponent(ticket)}`,{method:'POST',signal:AbortSignal.timeout(15000)});
+      const body=await r.json();if(!r.ok)throw Error(body.detail||'邀请未生成');return body.data;
+    },
+    async loadConfig() {
+      const r=await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {signal:AbortSignal.timeout(4000)});
+      const body=await r.json();if(!r.ok || body.code!==200)throw new Error(body.message||'读取配置失败');
+      return body.data || {};
+    },
+    async saveConfig(values) {
+      if(_projectRunning)throw new Error('请先停止当前项目');
+      if(!(await _ensureEdit()))throw new Error('Canvas 正由其他人编辑');
+      const r=await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
+        method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values),signal:AbortSignal.timeout(10000)});
+      const body=await r.json();if(!r.ok || body.code!==200 || body.applied!==true)throw new Error(body.message||body.detail||'服务未确认应用配置');
+    },
+    async call(action, args = {}) {
+      const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tool: toolName, arguments: {action, ...args}}),
+        signal: AbortSignal.timeout(action === 'info' ? 4000 : 10000),
+      });
+      const body = await response.json();
+      const value = _parseMcpCallResult(body);
+      if (!response.ok || !value || value.error || value.isError)
+        throw new Error(value?.error || body.detail || body.message || '操作失败，未确认执行结果');
+      return value;
+    },
+  });
 }
 
 function _fmtColorClass(fmt) {
@@ -1704,7 +1773,7 @@ function _dropConnector(id) {
 
 function _removeTopicConnection(connId) {
   const conn = _connections.find(c => c.id === connId);
-  if (!conn) return;
+  if (!conn || conn.role === 'feedback') return;
   _connections = _connections.filter(c => c.id !== connId);
   _resolveAllTopics();
   _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
@@ -1751,6 +1820,9 @@ function _redrawConnections() {
     line.setAttribute('d', d);
     const fmtCls = _fmtColorClass(conn.format);
     line.setAttribute('class', `connector-line ${fmtCls}`);
+    line.style.strokeDasharray = conn.role === 'feedback' ? '5 5' : '';
+    btn.hidden = conn.role === 'feedback';
+    line.setAttribute('aria-label', conn.role === 'feedback' ? '自动反馈：求解结果与执行状态' : conn.format);
     line.setAttribute('marker-end', `url(#${_ARROW_BY_FMT[fmtCls] || 'conn-arrow'})`);
     btn.style.left = (x1 + x2) / 2 + 'px';
     btn.style.top  = (y1 + y2) / 2 + 'px';
@@ -1846,8 +1918,17 @@ function _resolveAllTopics() {
     inDegree[card.id] = 0;
   }
   for (const conn of _connections) {
+    if (conn.role === 'feedback') continue;
     if (outgoing[conn.fromCardId]) outgoing[conn.fromCardId].push(conn);
     inDegree[conn.toCardId] = (inDegree[conn.toCardId] || 0) + 1;
+  }
+
+  // Feedback is subscribed from the registered controller descriptor, not a
+  // startup dependency. Show its topic without feeding it through the DAG.
+  for (const conn of _connections.filter(c => c.role === 'feedback')) {
+    const card = _cards.find(c => c.id === conn.toCardId);
+    const port = card?.el.querySelector(`.canvas-port.in[data-idx="${conn.toPortIdx}"]`);
+    if (port) port.dataset.topic = conn.fromTopic || '';
   }
 
   // 3. BFS from sources (inDegree === 0)
@@ -1904,7 +1985,7 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
 
 async function _startProject() {
   // Save canvas layout first (so backend reads latest topology)
-  await _saveLayout();
+  if (await _saveLayout() === false) return;
 
   // Import motus for event subscription
   const { onMotusEvent, offMotusEvent, whenMotusConnected } = await import('./motus-stream.js');
@@ -2010,32 +2091,23 @@ async function _startProject() {
 }
 
 async function _stopProject() {
-  // **先请求，确认成功了再改状态** —— 和 _startProject 同一个形状。
-  //
-  // 此前是反过来的：先 _applyProjectState(false)，再做麦克风清理，最后
-  // `fetch(...).catch(() => {})`，然后**无条件**记一条「智能控制已停止」。
-  // 三处叠在一起，任何一种失败都长成"已经停了"：
-  //
-  //   * 清理那段抛异常 → fetch 那行根本执行不到，而状态已经翻了；
-  //   * `.catch()` 只接网络错误，**非 2xx 不会 reject** —— 后端返回 500 也算成功；
-  //   * 日志那行不看结果。
-  //
-  // 而状态一旦翻成 false，按钮就变回「开启智能控制」，再点走的是**启动**那一支
-  // —— 于是连重试的机会都没有。天轶实测 2026-09-21：后端 project_running 一直
-  // 是 true，20 分钟的访问日志里**一条 stop-project 都没有**，而界面显示已停止。
-  //
-  // 麦克风清理挪到请求之后，并且自己吞掉异常：它是收尾动作，不该挡住停止本身。
-  let ok = false;
+  if (_projectPhase === 'stopping') return;
+  _applyProjectState(true, 'stopping');
+  _logActivity('project', '正在结束遥操并等待收臂，完成后停止其余卡片');
+  let failure = '';
   try {
-    const res = await fetch('/api/config/stop-project', { method: 'POST' });
-    ok = res.ok;
+    const res = await fetch('/api/config/stop-project', {
+      method: 'POST', signal: AbortSignal.timeout(65000),
+    });
+    const body = await res.json();
+    if (!res.ok || body.ok !== true) failure = body.detail || body.message || `HTTP ${res.status}`;
   } catch (err) {
-    ok = false;
+    failure = err.message || '无法确认停止结果';
   }
-  if (!ok) {
-    // 不翻状态：按钮留在「停止智能控制」上，操作者能再点一次。谎报已停止是这个
-    // 函数此前唯一会做的事。
-    _logActivity('warn', '停止智能控制失败 —— 后端仍在运行，请重试');
+  if (failure) {
+    _applyProjectState(true, 'stop_failed', failure);
+    _logActivity('error', `停止未完成：${failure}。Driver 保持可用，请排查后重试停止。`);
+    _showToast(`停止未完成：${failure}`);
     return;
   }
 
@@ -2061,8 +2133,10 @@ async function _stopProject() {
 function _syncProjectBtn() {
   const btn = document.getElementById('canvas-project-toggle');
   if (!btn) return;
-  btn.textContent = _projectRunning ? '停止智能控制' : '开启智能控制';
-  btn.title = _projectRunning ? '停止智能控制' : '开启智能控制';
+  btn.textContent = _projectPhase === 'stopping' ? '正在收臂并停止…' :
+    _projectPhase === 'stop_failed' ? '重试停止智能控制' : _projectRunning ? '停止智能控制' : '开启智能控制';
+  btn.title = _projectError || btn.textContent;
+  btn.disabled = _projectPhase === 'stopping';
   btn.classList.toggle('running', _projectRunning);
 }
 
@@ -2364,7 +2438,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
  */
 function _inputTopicsFor(card) {
   const topics = [];
-  for (const conn of _connections.filter(c => c.toCardId === card.id)) {
+  for (const conn of _connections.filter(c => c.toCardId === card.id && c.role !== 'feedback')) {
     const src = _cards.find(c => c.id === conn.fromCardId);
     const outPort = src?.el?.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
     const topic = outPort?.dataset.topic || '';
@@ -2734,13 +2808,28 @@ async function _saveLayout() {
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
     });
-    if (resp.status === 403) {
-      // Lost edit permission — reload layout from server
-      _isEditor = false;
-      _updateEditorUI();
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      if (resp.status === 403) { _isEditor = false; _updateEditorUI(); }
+      _showToast(body.detail || body.message || '画布未保存');
       await _reloadLayout();
+      return false;
     }
-  } catch { /* silent */ }
+    const saved = await resp.json();
+    if (saved.data?.connections) {
+      _connections = saved.data.connections;
+      for (const value of saved.data.cards || []) {
+        const card = _cards.find(c => c.id === value.id);
+        if (card && value.toolName === 'teleop') {
+          card.topicOut = value.topicOut || card.topicOut;
+          card.topicIn = value.topicIn || card.topicIn;
+        }
+      }
+      _resolveAllTopics();
+      _scheduleRedraw();
+    }
+    return true;
+  } catch (error) { _showToast(`画布未保存：${error.message}`); return false; }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

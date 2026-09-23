@@ -6,6 +6,13 @@
 mcp_port: 15730
 
 plugins:
+  # One ActuCore / one MCP endpoint. Normal JP6.1 builds include teleop.
+  # Site identity/pairing stays here; the robot model belongs to its Driver.
+  teleop:
+    enabled: false
+    control_backend: motion_control
+    mode: shadow
+
   vla:
     # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。
     # 关掉的话 actucore 又变回一个空的 MCP host，画布上无从连起。

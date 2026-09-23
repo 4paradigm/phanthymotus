@@ -7,7 +7,7 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前版本不带任何卡片 —— 这是骨架 + 全链路（注册、探活、部署）打通。
+当前提供 VLA、导航卡片及可选遥操卡片；遥操仅在站点配置检查通过后注册。
 新增卡片的完整步骤见 README.md。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
@@ -110,7 +110,9 @@ def _load_config() -> dict:
 
 class ActuCoreBundle:
     def __init__(self, cfg: dict, executor):
+        self.server_name = cfg.get("name", "actucore-bundle")
         self._plugins: list = []
+        self.required_site_config: dict = {}
         plugins_cfg = cfg.get("plugins") or {}
 
         # ── 卡片注册区 ────────────────────────────────────────────────────
@@ -136,6 +138,24 @@ class ActuCoreBundle:
             from plugins.vla import VLAPlugin
             self._plugins.append(VLAPlugin(plugins_cfg["vla"], executor))
             log.info("VLAPlugin loaded")
+
+        if plugins_cfg.get("teleop", {}).get("enabled", False):
+            from plugins.teleop.site import required_site_config
+            try:
+                from plugins.teleop import TeleopPlugin
+                plugin = TeleopPlugin(plugins_cfg["teleop"], executor)
+                # Validate the accepted restored configuration, not an obsolete
+                # calibration path from the original deployment file.
+                issues = required_site_config(plugin.cfg)
+                if issues:
+                    self.required_site_config['teleop'] = issues
+                    log.error("teleop not advertised: required_site_config=%s", issues)
+                else:
+                    self._plugins.append(plugin)
+                    log.info("TeleopPlugin loaded")
+            except (ImportError, OSError, ValueError, RuntimeError):
+                self.required_site_config['teleop'] = [{'field': 'runtime', 'code': 'teleop_initialization_unavailable'}]
+                log.error("teleop unavailable; other cards retained")
 
         if plugins_cfg.get("navi", {}).get("enabled", False):
             from plugins.navi import NaviPlugin
@@ -175,6 +195,10 @@ class ActuCoreBundle:
     def dispatch(self, full_name: str, args: dict) -> dict | None:
         prefix, sep, tool_name = full_name.partition("_")
         name = tool_name if sep else prefix
+        if prefix in self.required_site_config:
+            return {'state': 'unavailable', 'error': 'required_site_config',
+                    'required_site_config': self.required_site_config[prefix],
+                    'output_active': False}
         for p in self._plugins:
             if p.PREFIX == prefix:
                 return p.dispatch(name, args)
@@ -188,6 +212,10 @@ _bundle: ActuCoreBundle | None = None
 
 def make_handler():
     class Handler(BaseHTTPRequestHandler):
+        # Card configs may be large, but HTTP bodies are never unbounded.
+        max_request_bytes = 16 * 1024 * 1024
+        request_body_timeout_s = 10.0
+
         def log_message(self, fmt, *args):
             if args and "/sse" in str(args[0]):
                 return
@@ -245,8 +273,54 @@ def make_handler():
             self.end_headers()
 
         def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(length)
+            def framing_error(status, message):
+                self.close_connection = True
+                self._send(status, json.dumps({"error": message}))
+
+            lengths = self.headers.get_all("Content-Length", [])
+            if self.headers.get("Transfer-Encoding") is not None:
+                framing_error(400, "Transfer-Encoding is not supported")
+                return
+            if not lengths:
+                framing_error(411, "Content-Length is required")
+                return
+            if (len(lengths) != 1 or not lengths[0].isascii()
+                    or not lengths[0].isdecimal()):
+                framing_error(400, "Invalid Content-Length")
+                return
+            digits = lengths[0].lstrip('0') or '0'
+            if len(digits) > len(str(self.max_request_bytes)):
+                framing_error(413, "Request body too large")
+                return
+            length = int(digits)
+            if length > self.max_request_bytes:
+                framing_error(413, "Request body too large")
+                return
+            previous_timeout = self.connection.gettimeout()
+            try:
+                import time
+                deadline = time.monotonic() + self.request_body_timeout_s
+                raw = bytearray()
+                while len(raw) < length:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(65536, length - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+            except TimeoutError:
+                framing_error(408, "Request body timed out")
+                return
+            except OSError:
+                self.close_connection = True
+                return
+            finally:
+                self.connection.settimeout(previous_timeout)
+            if len(raw) != length:
+                framing_error(400, "Incomplete request body")
+                return
 
             try:
                 rpc = json.loads(raw)
@@ -255,6 +329,10 @@ def make_handler():
                                             "error": {"code": -32700, "message": f"Parse error: {e}"}}))
                 return
 
+            if not isinstance(rpc, dict):
+                self._send(200, json.dumps({"jsonrpc": "2.0", "id": None,
+                                            "error": {"code": -32600, "message": "Invalid Request"}}))
+                return
             rid    = rpc.get("id")
             method = rpc.get("method", "")
             params = rpc.get("params") or {}
@@ -272,23 +350,41 @@ def make_handler():
                 if method == "initialize":
                     log.debug(f"[mcp] initialize request from client")
                     ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "actucore-bundle", "version": "1.0.0"}})
+                        "serverInfo": {"name": _bundle.server_name, "version": "1.0.0"}})
                 elif method == "tools/list":
-                    ok({"tools": _bundle.get_all_tools()})
+                    ok({"tools": _bundle.get_all_tools(),
+                        "_meta": {"required_site_config": _bundle.required_site_config}})
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
+                    if name.partition('_')[0] == 'teleop' and args.get('action', 'info') != 'info':
+                        import hmac
+                        import os
+                        from pathlib import Path
+                        try:
+                            key = Path(os.environ['TELEOP_MANAGEMENT_KEY_FILE']).read_text().strip()
+                        except (KeyError, OSError):
+                            key = ''
+                        if (len(key) < 32 or self.client_address[0] not in ('127.0.0.1', '::1')
+                            or self.headers.get('Origin')
+                            or not hmac.compare_digest(self.headers.get('X-Teleop-Management', ''), key)):
+                            ok({'isError': True, 'content': [{'type': 'text', 'text': json.dumps(
+                                {'state': 'error', 'error': 'teleop_management_unauthorized'})}]})
+                            return
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
-                    if not is_info:
+                    if not is_info and name != 'teleop':
                         log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        if not is_info:
+                        if not is_info and name != 'teleop':
                             log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                        reply = {"content": [{"type": "text", "text": json.dumps(result)}]}
+                        if name == 'teleop' and isinstance(result, dict) and (result.get('error') or result.get('state') == 'error'):
+                            reply['isError'] = True
+                        ok(reply)
                 else:
                     err(-32601, f"Method not found: {method}")
             except BrokenPipeError:
