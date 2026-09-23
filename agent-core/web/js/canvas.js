@@ -1309,6 +1309,10 @@ function _mountTeleopConnectionPanel(el, mcpId, toolName) {
       if(!save.ok){const failure=await save.json();throw Error(failure.detail||'画布未保存');}
       await _reloadLayout();
     },
+    async prepareWebxr(){
+      const r=await fetch(`/api/teleop-install/${encodeURIComponent(mcpId)}/webxr`,{signal:AbortSignal.timeout(15000)});
+      const body=await r.json();if(!r.ok)throw Error(body.detail||'浏览器入口暂不可用');return body.data;
+    },
     async prepareInstallation(){
       const r=await fetch(`/api/teleop-install/${encodeURIComponent(mcpId)}`,{method:'POST',signal:AbortSignal.timeout(20000)});
       const body=await r.json();if(!r.ok)throw Error(body.detail||'安装包尚未就绪');return body.data;

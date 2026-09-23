@@ -230,6 +230,22 @@ def test_repeat_downloads_are_bounded_rotation_and_revocation_are_authorized(tmp
     asyncio.run(run())
 
 
+def test_webxr_entry_requires_dashboard_auth_and_declared_capture_origin(tmp_path, monkeypatch):
+    async def run():
+        async with capture(tmp_path) as (info, seen), client(monkeypatch, info) as c:
+            path='/api/teleop-install/registered-ac/webxr'
+            assert (await c.get(path)).status_code==409
+            info['webxr_url']=info['capture_origin']+'/webxr/'
+            result=await c.get(path)
+            assert result.status_code==200 and result.json()['data']['url']==info['webxr_url']
+            assert seen==[]  # Browser entry does not depend on or download the APK.
+            info['webxr_url']='https://arbitrary.example/webxr/'
+            assert (await c.get(path)).status_code==409
+            c.headers.clear()
+            assert (await c.get(path)).status_code==401
+    asyncio.run(run())
+
+
 def test_ticket_capacity_expiry_and_backward_clock_are_bounded(monkeypatch):
     clock = [1000.]
     monkeypatch.setattr(api, '_ticket_time', lambda: clock[0])

@@ -154,7 +154,7 @@ class CaptureManager:
             raise ValueError("Capture state credential digest is invalid")
         client_kind = record["client_kind"]
         app_version = record["app_version"]
-        if client_kind != "native_openxr":
+        if client_kind not in {"native_openxr", "webxr"}:
             raise ValueError("Capture state client kind is invalid")
         if not isinstance(app_version, str) or not _APP_VERSION_RE.fullmatch(app_version):
             raise ValueError("Capture state app version is invalid")
@@ -250,7 +250,7 @@ class CaptureManager:
         if message["frame_protocol"] != RTC_FRAME_PROTOCOL:
             raise CaptureError("frame_protocol_unsupported")
         client_kind = message["client_kind"]
-        if client_kind != "native_openxr":
+        if client_kind not in {"native_openxr", "webxr"}:
             raise CaptureError("capture_client_unsupported")
         app_version = message["app_version"]
         if not isinstance(app_version, str) or not _APP_VERSION_RE.fullmatch(app_version):

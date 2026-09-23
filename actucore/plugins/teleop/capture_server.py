@@ -15,6 +15,7 @@ from aiohttp import web
 from cryptography import x509
 
 from .enrollment import Enrollment
+from .webxr import browser_origin_allowed, register_webxr
 from .onboarding import APK_DIRECTORY, APK_FILENAME, MIME_TYPE, package_metadata
 
 from .capture import (
@@ -244,6 +245,9 @@ async def visualization_stream(websocket, provider):
 
 
 async def capture_websocket_handler(request: web.Request) -> web.StreamResponse:
+    enrollment = request.app.get(ENROLLMENT_KEY)
+    if request.headers.get("Origin") is not None and (enrollment is None or not browser_origin_allowed(request, enrollment)):
+        raise web.HTTPForbidden()
     manager = request.app[CAPTURE_KEY]
     websocket = web.WebSocketResponse(max_msg_size=MAX_CAPTURE_MESSAGE_BYTES)
     await websocket.prepare(request)
@@ -361,8 +365,10 @@ async def enrollment_handler(request):
     try:
         if request.query_string or request.content_length is None or request.content_length > 4096:
             raise CaptureError('pairing_request_invalid')
-        data = capture_json(await request.text())
         enrollment = request.app[ENROLLMENT_KEY]
+        if not browser_origin_allowed(request, enrollment):
+            raise CaptureError('pairing_origin_invalid', status=403)
+        data = capture_json(await request.text())
         operation = request.match_info['operation']
         method = {'request': enrollment.request, 'poll': enrollment.poll, 'invite': enrollment.redeem_invitation}[operation]
         result = await method(data)
@@ -391,6 +397,7 @@ def create_capture_app(manager: CaptureManager, enrollment=None) -> web.Applicat
     app.router.add_get('/onboarding/apk', package_handler)
     if enrollment is not None:
         app[ENROLLMENT_KEY] = enrollment
+        register_webxr(app, enrollment)
         app.router.add_post('/pairing/{operation:request|poll|invite}', enrollment_handler)
     app.router.add_get("/ws/teleop-capture", capture_websocket_handler)
     return app
@@ -413,7 +420,7 @@ class CaptureWssServer:
         return {'capture_origin': 'https://'+parsed.netloc,
             'certificate_sha256': self.enrollment.device_id,
             'package_path': '/onboarding/package', 'apk_path': '/onboarding/apk',
-            'package': package_metadata()}
+            'package': package_metadata(), 'webxr_url': 'https://'+parsed.netloc+'/webxr/'}
 
     async def start(self) -> None:
         if self._runner is not None:

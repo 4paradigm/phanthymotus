@@ -28,6 +28,8 @@
 
 ## 安装入口与权限
 
+支持 WebXR 的 PICO 浏览器可使用卡片内的“浏览器遥操 · 试验版”，通过 `GET /api/teleop-install/{mcp_id}/webxr` 取得同源 HTTPS 入口，无需 APK。此接口沿用 Dashboard 鉴权，打开入口后仍须两端确认配对。部署要求浏览器可信的 Capture HTTPS 证书；完整流程、能力范围及真机待验项见 [WebXR 说明](../actucore/plugins/teleop/webxr/README.md)。
+
 安装服务仍在现有 Core 与 ActuCore 内，不增加独立部署服务：
 
 | 接口 | 用途与权限 |

@@ -181,6 +181,16 @@ def _release_download(token, download_id):
                    (_ticket_digest(token), download_id))
 
 
+@router.get('/{mcp_id}/webxr')
+async def webxr_entry(mcp_id: str):
+    info = await _call(mcp_id, 'installation_info')
+    origin, _ = _endpoint(info)
+    # No APK download or pairing invitation needed just to open the browser app.
+    if info.get('webxr_url') != origin + '/webxr/':
+        raise HTTPException(409, '当前遥操服务尚未提供浏览器入口')
+    return {'code': 200, 'data': {'url': info['webxr_url'], 'qr_svg': qr_svg(info['webxr_url'])}}
+
+
 @router.post('/{mcp_id}')
 async def prepare_installation(mcp_id: str, request: Request):
     info = await _call(mcp_id, 'installation_info')

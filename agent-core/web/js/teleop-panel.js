@@ -15,7 +15,7 @@ export function viewState(info, fresh=true, projectManaged=false) {
     reason:!fresh?'状态读取失败，不能确认机器人是否停止':REASONS[reason] || reason || (projectManaged?(armed?'请在 PICO 点击开始遥操':'连好 Driver 并开启智能控制，之后在 PICO 点击开始'):'独立卡片模式：未支持项目托管收臂；先松开双握把再开始'),
     busy:project.stopping===true || ['starting','returning','stopping'].includes(op.state)};
 }
-export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfig,saveConfig,loadTargets,buildTemplate,prepareInstallation,createInvitation}) {
+export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfig,saveConfig,loadTargets,buildTemplate,prepareInstallation,createInvitation,prepareWebxr}) {
   const supported=new Set(actions), buttons=new Map();
   let info=null, fresh=false, pending=null, busy=false, timer=null, disposed=false, error='', readError='', notice='', request=0, operationPending=null;
   const panel=document.createElement('section');panel.className='teleop-panel';panel.setAttribute('aria-label','遥操控制');
@@ -37,6 +37,21 @@ export function mountTeleopPanel(host,{call,actions=[],configSchema={},loadConfi
   const field=(key,value)=>{panel.querySelector(`[data-field="${key}"]`).textContent=value;};
   const has=a=>supported.has(a);
   const projectManaged=has('project_start') && has('project_stop');
+  panel.querySelector('.tp-pair').insertAdjacentHTML('beforebegin',`<details class="tp-webxr" hidden><summary>浏览器遥操 · 试验版</summary><p>在 PICO 浏览器打开入口，无需 APK。需要可信 HTTPS 证书；进入后在下方允许新设备配对。</p><button type="button">显示浏览器入口</button><a target="_blank" rel="noreferrer" style="display:block;overflow-wrap:anywhere"></a><img alt="浏览器遥操入口二维码" hidden width="220" height="220"><p role="status"></p></details>`);
+  const browserEntry=panel.querySelector('.tp-webxr');
+  if(prepareWebxr && has('installation_info')){
+    browserEntry.hidden=false;
+    browserEntry.querySelector('button').onclick=async()=>{
+      const button=browserEntry.querySelector('button');button.disabled=true;
+      try{const value=await prepareWebxr(),url=new URL(value.url);
+        if(url.protocol!=='https:'||url.username||url.password||url.pathname!=='/webxr/'||url.search||url.hash)throw Error('浏览器入口地址无效');
+        const link=browserEntry.querySelector('a');link.href=url.href;link.textContent=url.href;
+        const image=browserEntry.querySelector('img');image.src='data:image/svg+xml;base64,'+btoa(value.qr_svg);image.hidden=false;
+        browserEntry.querySelector('p[role=status]').textContent='在头显浏览器打开；此链接不授予配对或运动权限。';
+      }catch(e){browserEntry.querySelector('p[role=status]').textContent=e.message;}
+      finally{if(!disposed)button.disabled=false;}
+    };
+  }
   let installation=null;
   const install=panel.querySelector('.tp-install'),template=panel.querySelector('.tp-topology');
   if(prepareInstallation && has('installation_info'))install.hidden=false;

@@ -125,6 +125,7 @@ const server=http.createServer((req,res)=>{
    sample={mode:'shadow',state:'idle',capture:{connected:false},project:{armed:false,driver_binding:{protocol_version:2,robot_profile:'tianyi2',tool:'motion_control',mcp_id:'driver',execution_binding:{tool:'arm'}}}};
    ui=mountTeleopPanel(host,{actions:['info','project_start','project_stop','installation_info','create_invitation','revoke_invitation'],
     loadTargets:async()=>[{mcp_id:'driver',label:'展示机器人',robot_profile:'tianyi2'}],buildTemplate:async(id)=>templates.push(id),
+    prepareWebxr:async()=>({url:'https://robot.example:15741/webxr/',qr_svg:qr}),
     prepareInstallation:async()=>{installations++;return {ticket:'download-only',url:location.origin+'/pico/download-only',qr_svg:qr,package:{version:'fixture',size_bytes:100,sha256:'f'.repeat(64)}};},
     createInvitation:async(ticket)=>{invitations.push(ticket);return {url:location.origin+'/pico/download-only#c2VjcmV0',deep_link:'motus-teleop://connect#c2VjcmV0',qr_svg:qr};},
     call:async(a)=>{calls.push({a});return structuredClone(sample);}});await ui.refresh();
@@ -133,6 +134,9 @@ const server=http.createServer((req,res)=>{
   assert.equal(await three.locator('[data-field=driver]').innerText(),'tianyi2 · motion_control → arm');
   await three.locator('.tp-topology summary').click();await three.locator('.tp-topology button').click();
   assert.deepEqual(await page.evaluate(()=>templates),['driver']);
+  await three.locator('.tp-webxr summary').click();await three.locator('.tp-webxr button').click();
+  await page.waitForFunction(()=>document.querySelector('#three-stage .tp-webxr a').href==='https://robot.example:15741/webxr/');
+  assert.equal(await page.evaluate(()=>installations),0);
   await three.locator('.tp-install summary').click();await three.locator('.tp-download').click();
   await page.waitForFunction(()=>document.querySelector('#three-stage .tp-invite').disabled===false);
   assert.match(await three.locator('.tp-install-qr').getAttribute('src'),/^data:image\/svg\+xml;base64,/);
