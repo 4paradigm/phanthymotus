@@ -12,8 +12,55 @@ Installed via conftest so every module in the suite sees them, regardless of
 collection order — putting them in one test file made the others depend on
 being collected second, which is not something a test file should rely on.
 """
+import os
 import sys
 import types
+
+import pytest
+
+
+def _assert_plugins_is_ours() -> None:
+    """`plugins` must resolve to actucore/plugins, not perception/plugins.
+
+    Both directories hold a top-level package called `plugins`, and each suite
+    puts its own root on sys.path when its first test module is imported. So
+    the two suites cannot share one interpreter: whichever is collected first
+    binds `plugins` in sys.modules, and every test module in the other then
+    dies with `No module named 'plugins.navi'` — nine ImportErrors that name a
+    module which is sitting right there on disk.
+
+    Each suite is run on its own (see CLAUDE.md, and the PR review agent, which
+    gives every component its own `docker run`), so this is a foot-gun rather
+    than a supported mode. Failing here with the reason beats failing nine
+    times with the symptom.
+    """
+    plugins = sys.modules.get("plugins")
+    if plugins is None:
+        return
+    ours = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "plugins"))
+    paths = sorted({os.path.realpath(p) for p in getattr(plugins, "__path__", [])})
+    if ours in paths:
+        return
+    # pytest.exit rather than raise: an exception from a hook is reported as
+    # INTERNALERROR with a traceback, which reads like the test tooling broke.
+    pytest.exit(
+        f"`plugins` is bound to {', '.join(paths) or plugins!r}, not {ours}. "
+        f"perception/tests and actucore/tests both define a top-level "
+        f"`plugins` package, so they cannot share one pytest process. Run "
+        f"them as two separate commands.",
+        returncode=pytest.ExitCode.USAGE_ERROR,
+    )
+
+
+def pytest_collectstart(collector):
+    # Not at conftest import time: pytest loads every conftest in the tree
+    # before importing any test module, so at that point `plugins` is still
+    # unbound and the guard sees nothing. This hook runs immediately before
+    # each module in this directory is imported, which is exactly when the
+    # binding matters.
+    if isinstance(collector, pytest.Module):
+        _assert_plugins_is_ours()
+
 
 _STUBS = {
     "sensor_msgs.msg": ("CompressedImage", "Image"),

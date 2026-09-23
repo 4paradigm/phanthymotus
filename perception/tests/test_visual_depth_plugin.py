@@ -25,6 +25,7 @@ from vision_stubs import (  # noqa: F401
     _FakeExecutor,
     _FakeNode,
     _wait_until,
+    frame_bytes,
 )
 
 import plugins.visual_depth as depth_plugin  # noqa: E402
@@ -144,7 +145,7 @@ def test_valid_fraction_reflects_partial_coverage():
 
 # ── pipeline ─────────────────────────────────────────────────────────────────
 
-def _feed(node, marker=b"640x480"):
+def _feed(node, marker=frame_bytes(640, 480)):
     node._image_cb(_FakeCompressedImage(marker))
 
 
@@ -276,7 +277,7 @@ def test_a_frame_that_fails_to_decode_is_skipped_not_fatal():
     node = executor.nodes[0]
     _feed(node, b"not-a-frame")
     time.sleep(0.01)          # clear the 1 ms rate-limit window between frames
-    _feed(node, b"640x480")
+    _feed(node, frame_bytes(640, 480))
 
     depth_pub = next(p for p in node.publishers if p.topic.endswith("/visual_depth"))
     assert _wait_until(lambda: bool(depth_pub.messages))
@@ -322,7 +323,7 @@ def _photo_plugin(tmp_path, depth=None, **cfg):
     return _plugin(cfg=base, model=_FakeModel(depth=depth if depth is not None else _graded_depth()))
 
 
-def _write_frame(tmp_path, name="scene.jpg", marker=b"200x100"):
+def _write_frame(tmp_path, name="scene.jpg", marker=frame_bytes(200, 100)):
     path = tmp_path / name
     path.write_bytes(marker)
     return str(path)
@@ -375,7 +376,7 @@ def test_recognize_by_photo_on_an_undecodable_file(tmp_path):
 
 def test_recognize_by_url_shares_the_photo_path(tmp_path, monkeypatch):
     import plugins.image_input as image_input
-    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: b"200x100")
+    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: frame_bytes(200, 100))
     plugin, _ = _photo_plugin(tmp_path)
     result = plugin.dispatch("visual_depth", {
         "action": "recognize_by_url", "url": "https://example.com/scene.jpg"})
