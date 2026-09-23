@@ -159,6 +159,35 @@ CALIBRATION_PROCEDURE = (
 
 
 
+# Fits measured on a real camera, so that a robot of a known kind does not
+# have to start from the engine's general-purpose one.
+#
+# **Every entry carries where it came from, and that is not decoration.** A
+# preset is a number that looks like a fact, which is exactly what the engine's
+# own `model-default` is — and applying that one to r1_sz's ultra-wide lens made
+# it report 1.0 m as 3.2 m, which in turn made the navigation card stop 0.2 m
+# from obstacles while believing it had stopped at 0.8. A preset chosen for the
+# wrong camera fails the same way and just as quietly.
+#
+# Keyed by **camera**, not by robot: this is a property of the lens and the
+# image pipeline, and two robots of the same model share it only because they
+# share the camera.
+CALIBRATION_PRESETS = {
+    "unitree-r1-main": {
+        "cal_a": 1.0,
+        "cal_b": -0.9753,
+        "camera": "Unitree R1 主相机 1280x720（超广角，实测约 102° 全视场）",
+        "measured_on": "r1_sz, 2026-09-23",
+        "samples": 5,
+        "range_m": "1.0–2.8",
+        "residual_pct": 20,
+        "note": "单帧取样拟合的 —— 多帧平均是这次之后才加的，同一距离先后两次"
+                "测量曾差 31%。整体比例可信（5 个样本在 log 空间取均值），"
+                "逐点残差约 ±20%。想要更准就用现在的 calibrate 重量两三个点。",
+    },
+}
+
+
 TOOLS = [
     {
         "name": "visual_depth",
@@ -231,6 +260,19 @@ TOOLS = [
                 # identity — i.e. trust the engine.
                 "cal_a": {"type": "number", "description": "站点标定指数 a（d^a）。默认 1.0 = 不额外修正，直接用 engine 自带的标定", "default": 1.0, "scope": "instance"},
                 "cal_b": {"type": "number", "description": "站点标定偏移 b（乘 e^b）。默认 0.0 = 不额外修正。与 ultralytics model.calibrate() 的 cal_b 同一参数", "default": 0.0, "scope": "instance"},
+                # Presets are for the common case (a known robot, a known
+                # camera); cal_a/cal_b above stay for anything else, and a
+                # non-identity value there wins — see _calibration_from_cfg.
+                "calibration_preset": {
+                    "type": "string",
+                    "enum": [""] + sorted(CALIBRATION_PRESETS),
+                    "description": "按相机选一组量好的标定；留空则用 engine 自带的。"
+                                   "上面手填的 cal_a/cal_b 只要不是 1.0/0.0 就优先于它。"
+                                   "**预设是按相机而不是按机器人分的** —— 换镜头必须重标，"
+                                   "选错相机和不标定一样危险，只是更不容易发现。",
+                    "default": "",
+                    "scope": "instance",
+                },
                 "max_depth_m":  {"type": "number",  "description": "Values above this are published as invalid (0)", "default": 20.0, "scope": "instance"},
             },
         },
@@ -334,20 +376,58 @@ def _calibration_message(samples: list) -> str:
 
 
 def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) -> tuple[float, float]:
-    """Read (cal_a, cal_b) from a config, honouring the legacy `depth_scale`.
+    """Resolve (cal_a, cal_b): typed-in value, then preset, then legacy, then engine.
 
-    `depth_scale` was a linear multiplier, which is exactly cal_b = log(scale)
-    at cal_a = 1 — so an existing card keeps the behaviour it was configured
-    for rather than silently reverting to identity.
+    **Non-identity wins over a preset, and that test is deliberate.** The canvas
+    sends every field in the schema on every config call, defaults included, so
+    "the operator typed 1.0/0.0" and "the operator left it alone" arrive
+    identical — presence cannot distinguish them. Being non-identity can: 1.0/0.0
+    *is* "no correction", so treating it as "no opinion" costs nothing, while
+    any other value is something somebody put there on purpose.
+
+    `depth_scale` was a linear multiplier, which is exactly cal_b = log(scale) at
+    cal_a = 1 — so an existing card keeps the behaviour it was configured for
+    rather than silently reverting to identity.
     """
     cal_a = float(cfg.get("cal_a", default[0]))
     cal_b = float(cfg.get("cal_b", default[1]))
+    if (cal_a, cal_b) != (1.0, 0.0):
+        return cal_a, cal_b
+
+    # Legacy keeps its original rule — **presence**, not value. Writing
+    # `cal_b: 0.0` next to a `depth_scale` is how you turn the old multiplier
+    # off, and there is an existing test for exactly that. The non-identity
+    # rule above is only about presets, where the canvas's habit of sending
+    # every default makes presence useless.
     legacy = cfg.get("depth_scale")
     if legacy not in (None, "") and "cal_b" not in cfg:
         legacy = float(legacy)
         if legacy > 0:
-            cal_b = float(np.log(legacy))
+            return cal_a, float(np.log(legacy))
+
+    preset = CALIBRATION_PRESETS.get(str(cfg.get("calibration_preset") or ""))
+    if preset:
+        return float(preset["cal_a"]), float(preset["cal_b"])
     return cal_a, cal_b
+
+
+def calibration_origin(cfg: dict) -> str:
+    """Which of the four sources is in effect, for `info()`.
+
+    A card whose depth is 3.2x out and a card whose depth is right look the same
+    from outside; this is the one field that separates them, so it says which
+    kind of number is in play rather than only whether one was applied.
+    """
+    cal_a = float(cfg.get("cal_a", 1.0))
+    cal_b = float(cfg.get("cal_b", 0.0))
+    if (cal_a, cal_b) != (1.0, 0.0):
+        return "manual"
+    if cfg.get("depth_scale") not in (None, "") and "cal_b" not in cfg:
+        return "legacy-depth_scale"
+    name = str(cfg.get("calibration_preset") or "")
+    if name in CALIBRATION_PRESETS:
+        return f"preset:{name}"
+    return "model-default"
 
 
 def sample_region(depth_m: np.ndarray, region: str = "center") -> dict:
@@ -858,8 +938,20 @@ class VideoDepthPerceptionPlugin:
         return report
 
     def _calibration_label(self) -> str:
-        """Which fit produced these metres — the engine's, or a site refit."""
-        return "model-default" if (self._cal_a == 1.0 and self._cal_b == 0.0) else "site"
+        """Which fit produced these metres, and **where that fit came from**.
+
+        "site" was not enough. A refit typed in by hand, one chosen from a
+        preset table, and one fitted live against a tape measure are three very
+        different levels of evidence, and only the last was ever measured on
+        *this* camera. A reader deciding whether to trust a distance needs to
+        know which of the three is in play — `model-default` on r1_sz's
+        ultra-wide lens reported 1.0 m as 3.2 m, and nothing said so.
+        """
+        if self._cal_samples:
+            return f"site:calibrate({len(self._cal_samples)} 样本)"
+        if self._cal_a == 1.0 and self._cal_b == 0.0:
+            return "model-default"
+        return f"site:{calibration_origin(self._plugin_cfg)}"
 
     def _require_engine(self):
         """Return a loaded engine, loading it on demand.

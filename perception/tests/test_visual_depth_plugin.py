@@ -210,7 +210,11 @@ def test_info_reports_metres_and_says_whose_calibration():
 def test_info_reports_a_site_calibration_once_one_is_set():
     plugin, _ = _plugin(cfg={"cal_a": 0.97, "cal_b": 0.12})
     info = plugin.dispatch("visual_depth", {"action": "info"})
-    assert info["calibration"] == "site"
+    # The label gained a suffix: a fit typed in by hand, one taken from a preset
+    # table and one fitted live against a tape measure are three different
+    # levels of evidence, and only the last was measured on *this* camera.
+    assert info["calibration"].startswith("site")
+    assert info["calibration"] == "site:manual"
     assert "note" not in info
 
 
@@ -525,7 +529,7 @@ def test_calibrate_from_a_photo_fits_and_applies_immediately(tmp_path):
     assert result["samples"] == 1
     assert result["sample"]["predicted_m"] == pytest.approx(4.0)
     assert result["residuals"][0]["corrected_m"] == pytest.approx(2.0, abs=0.01)
-    assert result["calibration"] == "site"
+    assert result["calibration"].startswith("site:calibrate")
     # In-memory only — saying so is the difference between a calibration that
     # survives a restart and one that quietly does not.
     assert "cal_a / cal_b" in result["persist"]
@@ -777,3 +781,56 @@ def test_no_usable_frame_is_an_error_not_a_zero():
     with pytest.raises(ValueError):
         depth_plugin.sample_region_over_frames(
             [np.full((48, 64), np.nan, dtype=np.float32)], "center")
+
+
+# ── presets: a number that looks like a fact needs a provenance ──────────────
+
+def test_a_preset_supplies_a_fit_when_nothing_was_typed():
+    cfg = {"calibration_preset": "unitree-r1-main"}
+    a, b = depth_plugin._calibration_from_cfg(cfg)
+    assert (a, b) == (1.0, depth_plugin.CALIBRATION_PRESETS["unitree-r1-main"]["cal_b"])
+
+
+def test_a_typed_in_fit_beats_the_preset():
+    """The canvas sends every field on every config call, defaults included, so
+    "typed 1.0/0.0" and "left alone" arrive identical — presence cannot tell
+    them apart. Non-identity can, and 1.0/0.0 *is* "no correction", so reading
+    it as "no opinion" costs nothing."""
+    cfg = {"calibration_preset": "unitree-r1-main", "cal_a": 1.0, "cal_b": -0.5}
+    assert depth_plugin._calibration_from_cfg(cfg) == (1.0, -0.5)
+
+
+def test_an_untouched_pair_does_not_shadow_the_preset():
+    cfg = {"calibration_preset": "unitree-r1-main", "cal_a": 1.0, "cal_b": 0.0}
+    assert depth_plugin._calibration_from_cfg(cfg)[1] != 0.0
+
+
+def test_an_unknown_preset_falls_back_rather_than_guessing():
+    assert depth_plugin._calibration_from_cfg({"calibration_preset": "nope"}) == (1.0, 0.0)
+
+
+def test_every_preset_records_where_it_came_from():
+    """A preset chosen for the wrong camera fails exactly the way the engine's
+    own default failed on r1_sz — silently, by a factor of three. Whoever picks
+    one has to be able to see what it was measured on."""
+    for name, preset in depth_plugin.CALIBRATION_PRESETS.items():
+        for field in ("camera", "measured_on", "samples", "range_m", "note"):
+            assert preset.get(field), f"{name} 缺少出处字段 {field}"
+
+
+def test_the_origin_is_reported_and_distinguishes_the_four_cases():
+    assert depth_plugin.calibration_origin({}) == "model-default"
+    assert depth_plugin.calibration_origin(
+        {"calibration_preset": "unitree-r1-main"}) == "preset:unitree-r1-main"
+    assert depth_plugin.calibration_origin({"cal_b": -0.9}) == "manual"
+    assert depth_plugin.calibration_origin({"depth_scale": 0.4}) == "legacy-depth_scale"
+
+
+def test_the_preset_is_keyed_by_camera_not_by_robot():
+    """It is a property of the lens and the image pipeline. Two robots of the
+    same model share it only because they share the camera — and r1_sz's lens
+    is ~102 degrees across, which is why the engine's general-purpose fit was
+    out by 3.2x in the first place."""
+    for name in depth_plugin.CALIBRATION_PRESETS:
+        assert "main" in name or "camera" in name or "cam" in name, (
+            f"{name} 看起来是按机器人命名的，预设必须按相机")
