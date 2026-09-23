@@ -78,6 +78,13 @@ def test_elide_many_fields_falls_back_to_keys_only():
     assert len(json.loads(out)) == 20        # 仍然合法，且键名都在
 
 
+def test_elide_keys_only_fallback_preserves_scalars():
+    """把 limit=5 压成 "…(略)" 等于顺手改了类型，而标量本来就不占地方。"""
+    args = json.dumps({f'text{i}': 'v' * 50 for i in range(8)} | {'limit': 5, 'deep': True})
+    out = json.loads(_elide_arguments(args, value_chars=10, max_chars=80))
+    assert out['limit'] == 5 and out['deep'] is True
+
+
 def test_elide_nested_structures_are_replaced_not_cut():
     out = _elide_arguments(json.dumps({'items': list(range(500))}), max_chars=50)
     json.loads(out)

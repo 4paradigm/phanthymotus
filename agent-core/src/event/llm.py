@@ -254,8 +254,12 @@ def _elide_arguments(args, value_chars: int = 40, max_chars: int = 400) -> str:
     out = {k: _shrink(v) for k, v in parsed.items()}
     dumped = json.dumps(out, ensure_ascii=False)
     if len(dumped) > max_chars:
-        # 字段太多，值再短也压不下来：只留键名。仍然是合法 JSON。
-        dumped = json.dumps({k: _ELIDED for k in out}, ensure_ascii=False)
+        # 字段太多，值再短也压不下来：只留键名。标量（数字、布尔）原样留着 ——
+        # 它们本来就短，而把 limit=5 写成 "…(略)" 等于顺手改了类型。
+        dumped = json.dumps(
+            {k: (v if isinstance(v, (int, float, bool)) or v is None else _ELIDED)
+             for k, v in out.items()},
+            ensure_ascii=False)
     return dumped
 
 
