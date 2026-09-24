@@ -1303,8 +1303,35 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     a chassis that refuses the command, a gait that has not started yet, a robot
     held or blocked mid-turn. All of those "complete" a full circle on schedule
     and report `target lost` for something that was behind the robot the whole
-    time. `wz` on R1 was verified against two commanded full turns and came back
-    within 3%, so the measurement is worth using.
+    time.
+
+    **Measured on r1_sz, 2026-09-24**, which settled both the direction of the
+    error and its size. Neither was guessable beforehand, and they point
+    opposite ways:
+
+      - `wz` itself is sound — two full turns in place integrated to 362.9 deg
+        and 349.1 deg against a true 360.
+      - Under this card's own search command the chassis turns **slower** than
+        commanded: about 0.93 rad/s against a commanded 1.0. So the old
+        accumulator *over*counted and the sweep ended short — 6.4 rad of
+        commanded rotation is about 5.95 rad of real rotation, giving up some
+        **30 deg before closing the circle**. A target in that last sector was
+        reported `target lost` without ever being looked at, and that sector is
+        the far side from `last_seen_side`, which is where a target that went
+        missing tends to be.
+      - The run that produced those numbers swept 6.5 rad, and a human watching
+        it described "a bit more than one turn". 6.5 rad is 372 deg. That
+        agreement is the evidence that this counter now means what it says.
+
+    The 30 deg is estimated from second-resolution logs; the honest range is
+    10-55 deg. Tightening it needs `searched_rad` sampled at 100 ms through a
+    sweep, which costs another spin of the robot and changes no decision here.
+
+    Had the error gone the other way — a chassis turning *faster* than
+    commanded — the same fix would instead stop the robot over-rotating, which
+    on this robot is not merely slow: `_avoid` never restricts rotation, so
+    every extra second of spin sweeps the shoulders through space no corridor
+    has checked.
     """
     state.missing_frames += 1
     if state.missing_frames < config.lost_frames:
