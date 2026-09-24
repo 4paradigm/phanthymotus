@@ -395,8 +395,10 @@ def test_stereo_start_without_calibration_runs_capture_only():
     assert _cloud_pub(node).messages == []
 
     # calibrate 不再报 "no stereo instance"，而是走到棋盘检测。
-    # fake cv2 没实现棋盘 API → cv2_unavailable；真 cv2 下则是
-    # no_checkerboard（黑帧）。两者都说明已越过"没有实例"这一步。
+    # fake cv2 没实现棋盘 API → cv2_unavailable；真 cv2 下 8×6 帧放不下
+    # 9×6 棋盘，尺寸预检 → no_checkerboard（此前直接 cv2.error 炸掉
+    # 整个请求 —— review 指出、镜像里复现的崩溃）。两者都说明已越过
+    # "没有实例"这一步。
     reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "first"})
     assert reply["ok"] is False
     assert reply["reason"] in ("no_checkerboard", "cv2_unavailable")
@@ -611,6 +613,112 @@ def test_calibrate_without_stereo_instance_says_so():
     plugin, executor = _plugin()
     reply = plugin.dispatch("pointcloud", {"action": "calibrate"})
     assert reply["ok"] is False
+
+
+def test_calibrate_rejects_frame_too_small_for_board():
+    """review 指出、镜像里复现的崩溃：8×6 帧配 9×6 棋盘时
+    findChessboardCorners 的 adaptiveThreshold 断言失败抛 cv2.error，
+    dispatch 只接 ValueError → MCP 请求直接异常。尺寸预检 + cv2.error
+    捕获后都按 no_checkerboard 契约回复。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    small = np.zeros((6, 8, 3), dtype=np.uint8)  # 8 列 < board_w=9
+    node._last_stereo_pair = (small, small.copy())
+    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "t"})
+    if reply["reason"] == "cv2_unavailable":
+        pytest.skip("fake cv2 has no chessboard API — size precheck untested here")
+    assert reply["ok"] is False
+    assert reply["reason"] == "no_checkerboard"
+
+
+def test_calibrate_rejects_cv2_error_as_no_checkerboard(monkeypatch):
+    """真 cv2 下图能容纳棋盘仍可能断言失败（纯色/过小）—— cv2.error
+    必须落回 no_checkerboard 契约，不能让请求抛异常。用假检测触发。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    big = np.zeros((60, 80, 3), dtype=np.uint8)  # 放得下 9×6，过尺寸预检
+    node._last_stereo_pair = (big, big.copy())
+
+    import cv2
+
+    class _Cv2Error(Exception):
+        pass
+
+    def _boom(gray, pattern, flags):
+        raise _Cv2Error("adaptiveThreshold assertion failed")
+
+    monkeypatch.setattr(cv2, "findChessboardCorners", _boom, raising=False)
+    # fake cv2 没有 cv2.error 名字 —— 插件里 except cv2.error 需要它存在
+    monkeypatch.setattr(cv2, "error", _Cv2Error, raising=False)
+    # flags 常量同样缺（在 try 之外取值，缺了会先撞 AttributeError）
+    monkeypatch.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
+    monkeypatch.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
+    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "t"})
+    assert reply["ok"] is False
+    assert reply["reason"] == "no_checkerboard"
+
+
+def test_calibrate_same_pair_is_not_a_new_pose():
+    """review 指出的重复采样：连打 15 次 calibrate 不挪棋盘，会采到 15 份
+    相同观测，stereoCalibrate 拟合出貌似成功的退化标定。同一对帧（seq
+    未变）必须被拒（same_pose），新帧才算新姿态。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    # 假棋盘检测：图够大就"找到"角点，坐标随灰度图尺寸变（模拟不同姿态）。
+    import cv2
+
+    def _fake_find(gray, pattern, flags):
+        pts = np.array([[[(i % gray.shape[1]), (j % gray.shape[0])]]
+                        for i in range(pattern[0]) for j in range(pattern[1])],
+                       dtype=np.float32)
+        return True, pts
+
+    def _fake_subpix(gray, corners, win, zone, crit):
+        return corners
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cv2, "findChessboardCorners", _fake_find, raising=False)
+    monkey.setattr(cv2, "cornerSubPix", _fake_subpix, raising=False)
+    # fake cv2 缺棋盘检测用的常量与 cv2.error —— 一并补上
+    monkey.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
+    monkey.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
+    monkey.setattr(cv2, "error", Exception, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_EPS", 1, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_MAX_ITER", 2, raising=False)
+    try:
+        node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
+        node._stereo_pair_seq = 1
+        first = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 3, "name": "t"})
+        # 采集未满 3 对会停在 collecting（不碰 stereoCalibrate）。
+        assert first["ok"] is True
+        assert first["state"] == "collecting"
+        assert first["pairs_used"] == 1
+
+        # 同一对帧（seq 没变）：拒绝，不计数
+        again = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 3, "name": "t"})
+        assert again["ok"] is False
+        assert again["reason"] == "same_pose"
+        assert again["pairs_used"] == 1
+
+        # 新帧（seq 变了）：重新计数，pairs_used 前进
+        node._stereo_pair_seq = 2
+        fresh = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 3, "name": "t"})
+        assert fresh["ok"] is True
+        assert fresh["pairs_used"] == 2
+    finally:
+        monkey.undo()
 
 
 # ── info / config / 生命周期 ─────────────────────────────────────────────────

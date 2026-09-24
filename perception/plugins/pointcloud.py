@@ -20,8 +20,9 @@ plugins/pointcloud.py — PointCloudPerceptionPlugin: 3D 点云，三种输入�
 
 标定：A/B 只需 {fx, fy, cx, cy} 或 hfov（缺省 90°，零配置可用）；
 C 需 {fx, cx, cy, Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动
-rectify）。`calibrate` action 面向 C：现场棋盘格采样 → stereoCalibrate →
-按角点 Δy 自动分档 → 落盘 /models/stereo_calib/ 并返回可粘贴回配置的 blob。
+rectify）。`calibrate` action 面向 C：现场棋盘格采样（同一对帧不算新姿态）
+→ stereoCalibrate → 按 rectify 后角点 Δy 自动分档 → 落盘 /models/stereo_calib/
+并返回可粘贴回配置的 blob。
 
 纯数学在 plugins/pointcloud_math.py（不依赖 cv2 / rclpy，本地可测）。
 """
@@ -143,7 +144,8 @@ TOOLS = [
                     "params": ["board_w", "board_h", "square_m", "pairs", "name"],
                     "description": (
                         "双目标定：把棋盘格举到双目前，保持左右同帧可见，"
-                        "每换一个姿态调用一次直到采满 pairs（默认 15）对。"
+                        "每换一个姿态调用一次直到采满 pairs（默认 15）对"
+                        "（还是同一对帧会被拒，挪动棋盘出新帧再调）。"
                         "完成后返回 rms / 角点数 / Δy 分档 / 标定 blob（可直接粘贴进卡片配置），"
                         "并落盘到 /models/stereo_calib/。需要卡片以双目模式 start 过"
                         "（无标定也可以 start，只采集不出云）"
@@ -257,8 +259,10 @@ class _PointCloudNode(Node):
         self._frame_count = 0
         self._running = False
         # calibrate 用：最近一对左右帧（解好色的 BGR），棋盘格检测在
-        # calibrate 线程里做，不在回调里做。
+        # calibrate 线程里做，不在回调里做。_stereo_pair_seq 随每对新帧
+        # 自增 —— calibrate 靠它识别"还是同一帧"（review 指出的重复采样）。
         self._last_stereo_pair: Optional[tuple] = None
+        self._stereo_pair_seq = 0
         self._lifecycle_lock = threading.RLock()
 
     # ── 生命周期（同 visual_depth：request_stop 不拿锁；stop 只收 worker）──
@@ -414,6 +418,7 @@ class _PointCloudNode(Node):
                 if self._mode == "stereo":
                     left, right = self._stereo_queue.get(timeout=1.0)
                     self._last_stereo_pair = (left, right)
+                    self._stereo_pair_seq += 1
                     self._emit_stereo(left, right)
                 else:
                     kind, payload = self._frame_queue.get(timeout=1.0)
@@ -737,6 +742,8 @@ class PointCloudPerceptionPlugin:
     # ── calibrate（stereo）────────────────────────────────────────────────
 
     def _stereo_pair_for_calibration(self, instance_id: str) -> tuple:
+        """取标定用的 (pair, seq)。seq 随每对新帧自增，calibrate 靠它
+        区分"新姿态"与"同一帧重复调用"（review 指出的重复采样）。"""
         with self._nodes_lock:
             node = self._nodes.get(instance_id) if instance_id else None
             if node is None:
@@ -750,7 +757,7 @@ class PointCloudPerceptionPlugin:
         pair = node._last_stereo_pair
         if pair is None:
             raise ValueError("no stereo frame received yet — check both cameras are publishing")
-        return pair
+        return pair, node._stereo_pair_seq
 
     def _calibrate(self, args: dict, instance_id: str) -> dict:
         import cv2
@@ -766,13 +773,25 @@ class PointCloudPerceptionPlugin:
             # 穿越），拒绝整个请求而不是换个名字替它落盘。
             return {"ok": False, "reason": "bad_name", "detail": name_error}
 
-        left, right = self._stereo_pair_for_calibration(instance_id)
+        # 图比棋盘还小时 findChessboardCorners 内部 adaptiveThreshold 断言
+        # 失败直接抛 cv2.error（镜像里 8×6 帧 + 9×6 棋盘就是这么炸的），
+        # 提前按尺寸拒绝并给出能看懂的回复。
+        (left, right), pair_seq = self._stereo_pair_for_calibration(instance_id)
+        if left.shape[0] < board_h or left.shape[1] < board_w:
+            return {"ok": False, "reason": "no_checkerboard",
+                    "detail": f"帧只有 {left.shape[1]}x{left.shape[0]}，"
+                              f"放不下 {board_w}x{board_h} 的棋盘格"}
         gray_l = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
         gray_r = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
         pattern_size = (board_w, board_h)
         flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-        found_l, corners_l = cv2.findChessboardCorners(gray_l, pattern_size, flags)
-        found_r, corners_r = cv2.findChessboardCorners(gray_r, pattern_size, flags)
+        try:
+            found_l, corners_l = cv2.findChessboardCorners(gray_l, pattern_size, flags)
+            found_r, corners_r = cv2.findChessboardCorners(gray_r, pattern_size, flags)
+        except cv2.error as error:
+            # 图能容纳棋盘但检测仍可能断言失败（过小/纯色帧）—— 按文档
+            # 契约回 no_checkerboard，而不是让 MCP 请求抛异常。
+            return {"ok": False, "reason": "no_checkerboard", "detail": str(error)}
         if not (found_l and found_r):
             return {"ok": False, "reason": "no_checkerboard",
                     "detail": f"两张图里没找到 {board_w}x{board_h} 的棋盘格。"
@@ -785,6 +804,18 @@ class PointCloudPerceptionPlugin:
             session = self._cal_sessions.setdefault(
                 instance_id or _DEFAULT_INSTANCE, {"pairs": [], "target": target})
             session["target"] = target
+            # 同一对帧（seq 未变）不允许计为新姿态：连打 15 次 calibrate
+            # 不挪棋盘会采到 15 份相同观测，stereoCalibrate 拟合出貌似
+            # 成功的退化标定。等下一对帧（seq 变了）才继续收。
+            last_seq = session.get("pair_seq")
+            if last_seq is not None and last_seq == pair_seq:
+                return {
+                    "ok": False, "reason": "same_pose",
+                    "pairs_used": len(session["pairs"]), "pairs_target": target,
+                    "message": "还是同一对帧（没检测到新画面）。挪动棋盘格换个姿态，"
+                               "确认左右相机出新帧后再调用一次",
+                }
+            session["pair_seq"] = pair_seq
             session["pairs"].append((corners_l, corners_r, gray_l.shape[::-1]))
             pairs = list(session["pairs"])
         if len(pairs) < target:
@@ -813,10 +844,24 @@ class PointCloudPerceptionPlugin:
             obj_points, img_points_l, img_points_r,
             K1, D1, K2, D2, size,
             criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5))
-        # Δy：把左角点投到极线，看右对应点差多少 —— 已校正的双目 Δy≈0
+        # 分档依据是“这对相机还需不需要运行时 rectify”，所以 Δy 必须在
+        # stereoRectify 之后量（review 指出：未校正的角点坐标算出的 Δy
+        # 会把畸变/近平行误判成已校正，之后 _rectify_pair 就跳过去畸变）。
+        # stereoRectify 输出的 R1/R2 把两图都旋转到共线行：用它映射第一对
+        # 角点，同行残差才是真正的极线误差。
+        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+            K1, D1, K2, D2, size, np.eye(3, dtype=np.float64), T.reshape(3, 1),
+            flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
+
+        def _rectified_y(pts, K, D, R, P):
+            homogeneous = cv2.undistortPoints(pts.reshape(-1, 1, 2), K, D, R=R, P=P)
+            return homogeneous.reshape(-1, 2)[:, 1]
+
         left_pts = img_points_l[0].reshape(-1, 2)
         right_pts = img_points_r[0].reshape(-1, 2)
-        dy = float(np.median(np.abs(left_pts[:, 1] - right_pts[:, 1])))
+        y_l = _rectified_y(left_pts, K1, D1, R1, P1)
+        y_r = _rectified_y(right_pts, K2, D2, R2, P2)
+        dy = float(np.median(np.abs(y_l - y_r)))
 
         blob = {
             "K1": K1.tolist(), "D1": D1.tolist(),

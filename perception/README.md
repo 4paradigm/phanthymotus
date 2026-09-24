@@ -1698,8 +1698,10 @@ a full `stereoCalibrate` blob (`K1/K2/D1/D2/R/T`, rectified at runtime).
 subscribes, pairs frames within a 50 ms sync window, and stores the latest pair
 for the `calibrate` action, but publishes no cloud. Hold a checkerboard
 (default 9×6 inner corners, 0.025 m squares) in front of both cameras and call
-`calibrate` once per pose until `pairs` (default 15) are collected; the result
-is an RMS-graded blob auto-tiered by epipolar Δy (< 1.5 px → rectified), saved
+`calibrate` once per pose until `pairs` (default 15) are collected — a repeated
+call on the same pair of frames is rejected (`same_pose`), so each sample needs
+fresh frames with the board moved. The result is an RMS-graded blob auto-tiered
+by the epipolar Δy measured *after* rectification (< 1.5 px → rectified), saved
 under `/models/stereo_calib/` and returned in the reply for pasting back into
 the card's `calibration` config. Restart the card to publish.
 
