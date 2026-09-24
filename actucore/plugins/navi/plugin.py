@@ -745,7 +745,8 @@ class NaviPlugin:
                        "当成空旷")
         if not self._binding.get("odom"):
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
-                       "且目标被遮挡时只能按**指令**（而非实测）推算它去了哪，"
+                       "目标被遮挡时只能按**指令**（而非实测）推算它去了哪；"
+                       "搜索的「转满一圈」也按指令算，机器人没真转也会报 target lost。"
                        "dry_run、姿态被拒、死区归零都会让两者对不上")
         # The chassis is wired but swallowing everything. Without this the card
         # reports a healthy stream of commands, the driver reports APPLIED, and
