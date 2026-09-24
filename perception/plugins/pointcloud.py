@@ -45,8 +45,8 @@ from std_msgs.msg import String, UInt8MultiArray
 from plugins.pointcloud_math import (
     MAX_POINTS, RECTIFIED_DY_PX, CALIB_DIR,
     backproject_depth, calibration_tier, decimate_cloud, decimation_stride,
-    encode_packet, filter_cloud, load_calibration_blob,
-    pinhole_of, Q_from_baseline, summarize_cloud,
+    default_calib_name, encode_packet, filter_cloud, load_calibration_blob,
+    pinhole_of, Q_from_baseline, sanitize_calib_name, summarize_cloud,
 )
 from utils.ros_lifecycle import dispose_node
 
@@ -118,7 +118,7 @@ TOOLS = [
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "depth", "mono", "stereo"],
-                    "description": "输入模式。auto（默认）按话题数自动判定：1 路 image/depth-* → depth；1 路 image/jpeg → mono；2 路 image/jpeg → stereo",
+                    "description": "输入模式。auto（默认）：2 路输入 → 双目 stereo；1 路输入同时订阅 Image/CompressedImage 并按首帧消息类型自动选 depth（z16/zlib 深度图）或 mono（jpeg）",
                 },
                 "calibration": {
                     "type": "string",
@@ -128,13 +128,13 @@ TOOLS = [
                 "board_h": {"type": "integer", "description": "calibrate 用：棋盘格内角点行数（默认 6）"},
                 "square_m": {"type": "number", "description": "calibrate 用：棋盘格格距（米，默认 0.025）"},
                 "pairs": {"type": "integer", "description": "calibrate 用：要采集的棋盘格姿态数（默认 15）"},
-                "name": {"type": "string", "description": "calibrate 用：标定结果文件名（默认按时间戳），落在 /models/stereo_calib/ 下"},
+                "name": {"type": "string", "description": "calibrate 用：标定结果文件名（默认按时间戳），落在 /models/stereo_calib/ 下。只能含字母/数字/点/下划线/连字符"},
             },
             "required": ["action"],
             "x-action-params": {
                 "start": {
                     "params": ["input_topic", "input_topics", "mode", "calibration"],
-                    "description": "启动。给 input_topic（单输入）或 input_topics（双目左右两路）。mode 留空则按输入自动判定",
+                    "description": "启动。给 input_topic（单输入）或 input_topics（双目左右两路）。mode 留空则按输入与消息类型自动判定",
                 },
                 "stop": {"params": [], "description": "停止点云输出"},
                 "info": {"params": [], "description": "查看状态、模式与输出话题"},
@@ -284,6 +284,15 @@ class _PointCloudNode(Node):
                         Image, self._input_topic, self._depth_image_cb, _LOW_LAT_QOS))
                     self._subs.append(self.create_subscription(
                         CompressedImage, self._input_topic, self._depth_comp_cb, _LOW_LAT_QOS))
+                elif self._mode == "auto":
+                    # 话题名不说明载的是什么（"/camera/image_raw" 也可能是
+                    # z16 深度）：Image + CompressedImage 都订上，回调按消息
+                    # 真实类型分派 —— Image→depth-z16；CompressedImage.format
+                    # 含 depth→depth-zlib，否则当 jpeg 走 mono。
+                    self._subs.append(self.create_subscription(
+                        Image, self._input_topic, self._auto_image_cb, _LOW_LAT_QOS))
+                    self._subs.append(self.create_subscription(
+                        CompressedImage, self._input_topic, self._auto_comp_cb, _LOW_LAT_QOS))
                 else:  # mono
                     self._subs.append(self.create_subscription(
                         CompressedImage, self._input_topic, self._jpeg_cb, _LOW_LAT_QOS))
@@ -357,6 +366,24 @@ class _PointCloudNode(Node):
             return
         self._drop_stale(self._frame_queue, ("depth_z16", msg))
 
+    def _auto_image_cb(self, msg: Image):
+        # Image 消息只会是深度（z16）；RGB 走 CompressedImage。
+        if self._throttled():
+            return
+        self._mode = "depth"
+        self._drop_stale(self._frame_queue, ("depth_z16", msg))
+
+    def _auto_comp_cb(self, msg: CompressedImage):
+        if self._throttled():
+            return
+        fmt = str(getattr(msg, "format", "") or "")
+        if "depth" in fmt:
+            self._mode = "depth"
+            self._drop_stale(self._frame_queue, ("depth_zlib", msg))
+        else:
+            self._mode = "mono"
+            self._drop_stale(self._frame_queue, ("jpeg", bytes(msg.data)))
+
     def _left_cb(self, msg: CompressedImage):
         frame = _decode_jpeg(bytes(msg.data))
         if frame is None:
@@ -390,8 +417,14 @@ class _PointCloudNode(Node):
                 else:
                     kind, payload = self._frame_queue.get(timeout=1.0)
                     if kind == "jpeg":
+                        if self._mode == "auto":
+                            # auto 首帧定成 mono：引擎若未就绪，在 worker 里加载
+                            self._mode = "mono"
+                            self._maybe_load_mono_model()
                         self._emit_mono(payload)
                     else:
+                        if self._mode == "auto":
+                            self._mode = "depth"
                         self._emit_depth(payload)
             except queue.Empty:
                 continue
@@ -435,8 +468,22 @@ class _PointCloudNode(Node):
         self._publish(xyz)
 
     def _model_for_mono(self):
-        # 由插件在 start 时注入，见 PointCloudPerceptionPlugin._start_node。
-        return getattr(self, "_mono_model", None)
+        # 由插件在 start 时注入，见 PointCloudPerceptionPlugin._start_node；
+        # auto 模式引擎后台加载时 _mono_model 还是 None，插件留了取回钩子。
+        model = getattr(self, "_mono_model", None)
+        if model is None:
+            getter = getattr(self, "_plugin_model", None)
+            if callable(getter):
+                model = getter()
+        return model
+
+    def _maybe_load_mono_model(self):
+        """auto→mono 首帧：引擎未就绪时触发后台加载（深度输入则永不来这里）。"""
+        if self._model_for_mono() is not None:
+            return
+        loader = getattr(self, "_ensure_mono_model", None)
+        if callable(loader):
+            loader()
 
     # C: 双目 → 视差 → Q 反投影
     def _emit_stereo(self, left: np.ndarray, right: np.ndarray):
@@ -522,8 +569,11 @@ def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict):
     L = cv2.remap(cv2.cvtColor(left, cv2.COLOR_BGR2GRAY), map1, map2, cv2.INTER_LINEAR)
     R = cv2.remap(cv2.cvtColor(right, cv2.COLOR_BGR2GRAY), map3, map4, cv2.INTER_LINEAR)
     fx = float(P1[0, 0]); cx = float(P1[0, 2]); cy = float(P1[1, 2])
-    Tx = float(P1[0, 3] / -P1[0, 0])  # P1[0,3] = -fx·Tx（标准双目为负）
-    # Q_from_baseline 会再取一次绝对值归一，这里保持 OpenCV 原始符号也可。
+    # 基线取外参 T[0]，不是 P1[0,3]：stereoRectify 以左目为参考系，平移
+    # 放在 P2[0,3]，P1[0,3] 正常为 0 —— 从它推导基线恒得 0，Q 反投影
+    # 除零（review 指出的 raw 档无法发布的根因）。Q_from_baseline 只取
+    # 长度，统一归一到负号。
+    Tx = float(T[0]) if np.any(T) else float(P2[0, 3] / -P2[0, 0])
     return fx, cx, cy, -abs(Tx), L, R, map1
 
 
@@ -576,22 +626,30 @@ class PointCloudPerceptionPlugin:
             self._model = VisionEngineSession(engine)
             log.info(f"[pointcloud] mono depth engine loaded, input={self._model.input_size}")
 
+    def _ensure_model_bg(self):
+        """auto 节点用：worker 线程里同步加载引擎（首帧定成 jpeg 时调用）。"""
+        with self._model_lock:
+            if self._model is not None:
+                return
+        self._ensure_model()
+
     # ── node 生命周期 ──────────────────────────────────────────────────────
 
     def _resolve_mode(self, args: dict) -> tuple[str, Optional[str], Optional[str], Optional[dict]]:
-        """→ (mode, left_topic, right_topic, calibration)。auto 按输入判定。"""
+        """→ (mode, left_topic, right_topic, calibration)。auto 按输入判定。
+
+        单话题 auto 不猜话题名（"/camera/image_raw" 也可能载着 z16 深度）：
+        按 explicit "depth" 之外一律走 "auto" 节点 —— start 时同时订阅
+        Image + CompressedImage，回调按消息真实类型分派（见 _auto_*_cb），
+        首帧确定 depth / mono。
+        """
         topics_list = list(args.get("input_topics") or [])
         input_topic = args.get("input_topic") or (topics_list[0] if topics_list else "")
         right_topic = topics_list[1] if len(topics_list) > 1 else None
         mode = args.get("mode") or "auto"
         calibration = load_calibration_blob(args.get("calibration")) or self._calibration
         if mode == "auto":
-            if right_topic:
-                mode = "stereo"
-            elif input_topic and "depth" in input_topic:
-                mode = "depth"
-            else:
-                mode = "mono" if input_topic else "mono"
+            mode = "stereo" if right_topic else "auto"
         return mode, input_topic or None, right_topic, calibration
 
     def _start_node(self, node_key: str, mode: str, input_topic: Optional[str],
@@ -614,6 +672,12 @@ class PointCloudPerceptionPlugin:
             )
             if mode == "mono":
                 node._mono_model = self._model
+            elif mode == "auto":
+                # auto 可能落到 mono：引擎已就绪就注入，否则首帧判定为 jpeg 后
+                # 由 _ensure_mono_model 后台加载（深度输入则永不加载）。
+                node._mono_model = self._model
+                node._plugin_model = lambda: self._model
+                node._ensure_mono_model = self._ensure_model_bg
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
@@ -657,7 +721,12 @@ class PointCloudPerceptionPlugin:
         board_h = int(args.get("board_h", 6))
         square = float(args.get("square_m", 0.025))
         target = int(args.get("pairs", _CALIB_PAIRS_TARGET))
-        name = args.get("name") or time.strftime("stereo_%Y%m%d_%H%M%S")
+        name = args.get("name") or default_calib_name()
+        name, name_error = sanitize_calib_name(name)
+        if name is None:
+            # 文件名带路径分隔符会写出 CALIB_DIR 之外（review 指出的路径
+            # 穿越），拒绝整个请求而不是换个名字替它落盘。
+            return {"ok": False, "reason": "bad_name", "detail": name_error}
 
         left, right = self._stereo_pair_for_calibration(instance_id)
         gray_l = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
@@ -819,10 +888,16 @@ class PointCloudPerceptionPlugin:
                     return {"state": "error",
                             "message": "stereo 模式需要先标定：把双目 start 后用 calibrate action "
                                        "现场采棋盘格，或把标定 blob / 文件路径填进 calibration"}
+            elif mode == "auto" and not input_topic:
+                return {"state": "error",
+                        "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
             if running is None:
+                # mono 一定需要引擎：后台加载完再起节点。auto 首帧才定
+                # depth/mono，立即起节点、首帧是 jpeg 时再懒加载（纯深度
+                # 相机永远不碰 TRT）。
                 needs_model = (mode == "mono" and self._model is None)
                 if needs_model:
                     if self._model_loading:

@@ -11,7 +11,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import struct
+import time
 from typing import Optional
 
 import numpy as np
@@ -194,3 +196,29 @@ def pinhole_of(blob: dict, w: int, h: int) -> tuple:
     if fx == 0.0:
         fx, _, _, _ = intrinsics_from_hfov(w, h, 90.0)
     return fx, fy or fx, float(blob.get("cx", w / 2.0)), float(blob.get("cy", h / 2.0))
+
+
+# calibrate 落盘文件名的合法字符（路径穿越/注入一律拒绝）
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def sanitize_calib_name(name) -> tuple:
+    """校验标定文件名 → (安全名, 错误信息)。仅限 basename 白名单字符。
+
+    name 参与 `os.path.join(CALIB_DIR, f"{name}.json")`：`../../x` 这类
+    带路径分隔符的值会写出 /models/stereo_calib 之外（review 指出的
+    路径穿越）。返回 (None, 错误) 表示调用方应报错而不是落盘。
+    """
+    text = str(name or "").strip()
+    if not text:
+        return None, "name 不能为空"
+    if not _SAFE_NAME_RE.match(text):
+        return None, "name 只能包含字母、数字、点、下划线和连字符（不含路径）"
+    if text in (".", ".."):
+        return None, "name 不能是 . 或 .."
+    return text, None
+
+
+def default_calib_name() -> str:
+    """按时间戳生成默认标定名（sanitize_calib_name 保证合法）。"""
+    return time.strftime("stereo_%Y%m%d_%H%M%S")
