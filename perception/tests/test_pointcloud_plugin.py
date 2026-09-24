@@ -28,6 +28,7 @@ from vision_stubs import (
     _FakeImage,
     _FakeNode,
     _wait_until,
+    frame_bytes,
 )
 
 import plugins.pointcloud as pc  # noqa: E402
@@ -62,6 +63,16 @@ def _decode_cloud(raw: bytes) -> np.ndarray:
     return np.frombuffer(raw[8:], dtype="<f4").reshape(n, 3)
 
 
+def _wait_cloud_and_summary(node):
+    """等一对输出。_publish 先发云再发摘要，只等云就断言摘要会撞上
+    中间态（review 指出的竞态），两个都等到才算一帧完整落地。"""
+    cloud_pub = _cloud_pub(node)
+    summary_pub = _summary_pub(node)
+    assert _wait_until(
+        lambda: bool(cloud_pub.messages) and bool(summary_pub.messages))
+    return cloud_pub.messages[0], json.loads(summary_pub.messages[0])
+
+
 # ── review issue 2：auto 按消息类型分派，不嗅探话题名 ─────────────────────────
 
 def test_auto_mode_subscribes_to_both_image_and_compressed():
@@ -93,9 +104,7 @@ def test_auto_mode_depth_image_on_rgb_named_topic_publishes():
                     if s.callback.__name__ == "_auto_image_cb")
     image_cb(msg)
 
-    pub = _cloud_pub(node)
-    assert _wait_until(lambda: bool(pub.messages))
-    summary = json.loads(_summary_pub(node).messages[0])
+    _, summary = _wait_cloud_and_summary(node)
     assert summary["mode"] == "depth"
     assert summary["nearest"] == pytest.approx(1.5, abs=1e-3)
 
@@ -111,9 +120,7 @@ def test_auto_mode_depth_zlib_compressed_image_publishes():
                    if s.callback.__name__ == "_auto_comp_cb")
     comp_cb(msg)
 
-    pub = _cloud_pub(node)
-    assert _wait_until(lambda: bool(pub.messages))
-    summary = json.loads(_summary_pub(node).messages[0])
+    _, summary = _wait_cloud_and_summary(node)
     assert summary["mode"] == "depth"
     assert summary["nearest"] == pytest.approx(2.5, abs=1e-3)
 
@@ -137,16 +144,124 @@ def test_auto_mode_jpeg_frame_routes_to_mono():
     plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     model = _FakeModel()
-    plugin._model = model  # start 已过，直接注入引擎实例
+    plugin._model = model  # start 已过，经 _plugin_model 钩子被 worker 取到
 
     comp_cb = next(s.callback for s in node.subscriptions
                    if s.callback.__name__ == "_auto_comp_cb")
-    comp_cb(_FakeCompressedImage(b"8x8", fmt="jpeg"))
+    comp_cb(_FakeCompressedImage(frame_bytes(8, 8), fmt="jpeg"))
 
     pub = _cloud_pub(node)
     assert _wait_until(lambda: bool(pub.messages) and model.calls >= 1)
     summary = json.loads(_summary_pub(node).messages[0])
     assert summary["mode"] == "mono"
+
+
+def test_auto_mode_cold_start_jpeg_triggers_lazy_load_and_publishes():
+    """review issue 1 的回归：auto 节点冷启动、引擎未就绪时，首帧 jpeg
+    必须触发 worker 里的懒加载并在加载完成后出云 —— 旧实现回调先改
+    _mode，worker 的懒加载分支永远轮不到，帧被静默丢。"""
+    class _FakeModel:
+        @property
+        def input_size(self):
+            return (4, 4)
+
+        def infer(self, frame):
+            from plugins.vision_runtime import LetterboxMeta
+            return [np.full(frame.shape[:2], 2.0, dtype=np.float32)], \
+                LetterboxMeta(1.0, 0, 0, frame.shape[1], frame.shape[0])
+
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+
+    load_started = threading.Event()
+    release_load = threading.Event()
+
+    def _blocking_loader():
+        load_started.set()
+        release_load.wait(timeout=5.0)
+        plugin._model = _FakeModel()   # 加载"完成"：引擎就位
+
+    node._ensure_mono_model = _blocking_loader
+
+    comp_cb = next(s.callback for s in node.subscriptions
+                   if s.callback.__name__ == "_auto_comp_cb")
+    comp_cb(_FakeCompressedImage(frame_bytes(8, 8), fmt="jpeg"))
+
+    assert load_started.wait(timeout=3.0), "worker never triggered lazy load"
+    # 加载期间 info 报 loading（review issue 2）—— 但这里的加载没走
+    # _load_model_sync，状态位由下面的显式 mono 测试覆盖。
+    assert _cloud_pub(node).messages == []  # 引擎没就绪，不该有云
+    release_load.set()
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["mode"] == "mono"
+
+
+def test_info_reports_loading_while_explicit_mono_engine_loads():
+    """review issue 2 的回归：显式 mono 后台加载期间 info 必须报 loading
+    （带下载进度），而不是 idle。用假 _ensure_model 卡住加载窗口。"""
+    plugin, executor = _plugin()
+
+    load_started = threading.Event()
+    release_load = threading.Event()
+
+    def _fake_ensure_model():
+        load_started.set()
+        release_load.wait(timeout=5.0)
+        plugin._model = object()
+
+    plugin._ensure_model = _fake_ensure_model
+    reply = plugin.dispatch("pointcloud",
+                            {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+    assert reply["state"] == "loading"
+
+    assert load_started.wait(timeout=3.0)
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert info["state"] == "loading"
+
+    release_load.set()
+    assert _wait_until(
+        lambda: plugin.dispatch("pointcloud", {"action": "info"})["state"] == "running")
+    # 节点在引擎就绪后才创建
+    assert len(executor.nodes) == 1
+
+
+def test_info_reports_error_when_engine_load_fails():
+    plugin, _ = _plugin()
+
+    def _failing_ensure_model():
+        raise RuntimeError("download failed: no route to host")
+
+    plugin._ensure_model = _failing_ensure_model
+    reply = plugin.dispatch("pointcloud",
+                            {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+    assert reply["state"] == "loading"
+
+    assert _wait_until(
+        lambda: plugin.dispatch("pointcloud", {"action": "info"})["state"] == "error")
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert "download failed" in info["desc"]
+    # 失败后再次 start 直接报错，而不是再挂一次加载
+    reply = plugin.dispatch("pointcloud",
+                            {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+    assert reply["state"] == "error"
+
+
+def test_rectify_pair_rejects_zero_baseline():
+    """坏标定（基线 0）在 _rectify_pair 就报 ValueError，而不是 worker
+    每帧撞 Q 除零（review 建议）。"""
+    fake = _install_fake_stereo_rectify()
+    try:
+        blob = json.loads(json.dumps(RAW_BLOB))
+        blob["T"] = [[0.0], [0], [0]]
+        blob["Tx"] = 0.0
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        with pytest.raises(ValueError, match="基线"):
+            pc._rectify_pair(left, right, blob)
+    finally:
+        fake.restore()
 
 
 def test_explicit_depth_mode_still_subscribes_image_and_compressed():
@@ -181,11 +296,9 @@ def test_depth_z16_image_publishes_cloud():
                      width=4, height=4, step=8)
     node._depth_image_cb(msg)
 
-    pub = _cloud_pub(node)
-    assert _wait_until(lambda: bool(pub.messages))
-    cloud = _decode_cloud(pub.messages[0])
+    raw_cloud, summary = _wait_cloud_and_summary(node)
+    cloud = _decode_cloud(raw_cloud)
     assert cloud.shape[0] > 0
-    summary = json.loads(_summary_pub(node).messages[0])
     assert summary["nearest"] == pytest.approx(2.0, abs=1e-3)
 
 
@@ -198,9 +311,7 @@ def test_depth_zlib_compressed_publishes_cloud():
     raw = np.full((480, 640), 3000, dtype="<u2").tobytes()
     node._depth_comp_cb(_FakeCompressedImage(zlib.compress(raw), fmt="depth-zlib"))
 
-    pub = _cloud_pub(node)
-    assert _wait_until(lambda: bool(pub.messages))
-    summary = json.loads(_summary_pub(node).messages[0])
+    _, summary = _wait_cloud_and_summary(node)
     assert summary["nearest"] == pytest.approx(3.0, abs=1e-3)
 
 
@@ -241,9 +352,7 @@ def test_depth_respects_min_max_range():
                      width=3, height=1, step=6)
     node._depth_image_cb(msg)
 
-    pub = _cloud_pub(node)
-    assert _wait_until(lambda: bool(pub.messages))
-    summary = json.loads(_summary_pub(node).messages[0])
+    _, summary = _wait_cloud_and_summary(node)
     assert summary["nearest"] == pytest.approx(2.0, abs=1e-3)
     # 1x3 图 stride=1，只有中间那点落在 [1, 3] m
     assert summary["points"] == 1
@@ -260,9 +369,7 @@ def test_max_points_cap_is_honoured():
                      width=60, height=60, step=120)
     node._depth_image_cb(msg)
 
-    pub = _cloud_pub(node)
-    assert _wait_until(lambda: bool(pub.messages))
-    summary = json.loads(_summary_pub(node).messages[0])
+    _, summary = _wait_cloud_and_summary(node)
     # ceil(sqrt(3600/100)) = 6 → (60/6)^2 = 100 点
     assert summary["points"] == 100
 
@@ -302,12 +409,10 @@ def test_stereo_frame_pairing_requires_sync_window():
         "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
     node = executor.nodes[0]
 
-    node._left_cb(_FakeCompressedImage(b"8x6", fmt="jpeg"))
-    # 旧左帧过期后右帧到来 → 不配对（_STEREO_SYNC_S = 0.05s）
-    import time as _t
+    node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
     with node._left_lock:
         node._left_latest = (0.0, np.zeros((6, 8, 3), dtype=np.uint8))
-    node._right_cb(_FakeCompressedImage(b"8x6", fmt="jpeg"))
+    node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
     _wait_until(lambda: False, timeout=0.2)
     assert node._stereo_queue.empty()
 
@@ -331,8 +436,8 @@ def test_stereo_pairing_publishes_with_rectified_blob():
     original = type(node)._emit_stereo
     type(node)._emit_stereo = _fake_emit_stereo
     try:
-        node._left_cb(_FakeCompressedImage(b"8x6", fmt="jpeg"))
-        node._right_cb(_FakeCompressedImage(b"8x6", fmt="jpeg"))
+        node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+        node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
         pub = _cloud_pub(node)
         assert _wait_until(lambda: bool(pub.messages))
         cloud = _decode_cloud(pub.messages[0])

@@ -367,10 +367,12 @@ class _PointCloudNode(Node):
         self._drop_stale(self._frame_queue, ("depth_z16", msg))
 
     def _auto_image_cb(self, msg: Image):
-        # Image 消息只会是深度（z16）；RGB 走 CompressedImage。
+        # Image 消息只会是深度（z16）；RGB 走 CompressedImage。这里不改
+        # _mode：mode 的定形只发生在 worker 里（按队列里的 kind），否则
+        # worker 的懒加载分支永远轮不到（review issue：冷启动 jpeg 帧
+        # 全部静默丢）。
         if self._throttled():
             return
-        self._mode = "depth"
         self._drop_stale(self._frame_queue, ("depth_z16", msg))
 
     def _auto_comp_cb(self, msg: CompressedImage):
@@ -378,10 +380,8 @@ class _PointCloudNode(Node):
             return
         fmt = str(getattr(msg, "format", "") or "")
         if "depth" in fmt:
-            self._mode = "depth"
             self._drop_stale(self._frame_queue, ("depth_zlib", msg))
         else:
-            self._mode = "mono"
             self._drop_stale(self._frame_queue, ("jpeg", bytes(msg.data)))
 
     def _left_cb(self, msg: CompressedImage):
@@ -416,15 +416,14 @@ class _PointCloudNode(Node):
                     self._emit_stereo(left, right)
                 else:
                     kind, payload = self._frame_queue.get(timeout=1.0)
+                    if self._mode == "auto":
+                        # mode 只在这里定形（回调不动 _mode），保证懒加载
+                        # 分支一定轮得到
+                        self._mode = "mono" if kind == "jpeg" else "depth"
                     if kind == "jpeg":
-                        if self._mode == "auto":
-                            # auto 首帧定成 mono：引擎若未就绪，在 worker 里加载
-                            self._mode = "mono"
-                            self._maybe_load_mono_model()
+                        self._maybe_load_mono_model()
                         self._emit_mono(payload)
                     else:
-                        if self._mode == "auto":
-                            self._mode = "depth"
                         self._emit_depth(payload)
             except queue.Empty:
                 continue
@@ -478,7 +477,11 @@ class _PointCloudNode(Node):
         return model
 
     def _maybe_load_mono_model(self):
-        """auto→mono 首帧：引擎未就绪时触发后台加载（深度输入则永不来这里）。"""
+        """worker：本帧是 jpeg（mono 链路）而引擎未就绪 → 加载再出云。
+
+        加载可能要下载模型（分钟级），阻塞 worker 是有意的：期间 _model_loading
+        置位让 info 报 loading，新帧被 _drop_stale 挤掉（maxsize=1），不堆积。
+        深度输入永不走这里。"""
         if self._model_for_mono() is not None:
             return
         loader = getattr(self, "_ensure_mono_model", None)
@@ -574,6 +577,11 @@ def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict):
     # 除零（review 指出的 raw 档无法发布的根因）。Q_from_baseline 只取
     # 长度，统一归一到负号。
     Tx = float(T[0]) if np.any(T) else float(P2[0, 3] / -P2[0, 0])
+    if not np.isfinite(Tx) or abs(Tx) < 1e-6:
+        # review 建议：坏标定在 start 时报清楚，而不是 worker 每帧一个
+        # 千篇一律的 ZeroDivisionError。基线为 0/非有限意味着 blob 里既没
+        # 有可用的 T 也没有 Tx，Q 反投影必然除零。
+        raise ValueError(f"stereo 标定基线异常（Tx={Tx}）：需要 blob 的 T[0]/Tx，且不能为 0")
     return fx, cx, cy, -abs(Tx), L, R, map1
 
 
@@ -627,11 +635,39 @@ class PointCloudPerceptionPlugin:
             log.info(f"[pointcloud] mono depth engine loaded, input={self._model.input_size}")
 
     def _ensure_model_bg(self):
-        """auto 节点用：worker 线程里同步加载引擎（首帧定成 jpeg 时调用）。"""
+        """auto 节点用：worker 线程里同步加载引擎（首帧定成 jpeg 时调用）。
+
+        阻塞 worker 是有意的：加载可能要下载模型（分钟级），期间新帧被
+        _drop_stale 挤掉（maxsize=1）不堆积。深度输入永不走这里。"""
+        with self._model_lock:
+            if self._model is not None or self._model_loading:
+                return
+        self._load_model_sync()
+
+    def _load_model_sync(self) -> bool:
+        """置位加载状态 → 同步加载 → 失败时留 error。返回是否由本线程执行。
+
+        显式 mono 的 _bg_start 与 auto 的 _ensure_model_bg 共用这一份，
+        _model_loading/_model_load_error 在两条路径上都可见（review 指出
+        原先 auto 加载不置位，info 把下载中的卡片报成 idle）。"""
         with self._model_lock:
             if self._model is not None:
-                return
-        self._ensure_model()
+                return False  # 已就绪，不必加载
+            if self._model_loading:
+                return False  # 已有加载在跑
+            self._model_loading = True
+            self._model_load_error = None
+            self._model_load_status = None
+        try:
+            self._ensure_model()
+        except Exception as error:  # noqa: BLE001 — 记下来给 info/dispatch 报
+            self._model_load_error = str(error)
+            log.error(f"[pointcloud] engine load failed: {error}", exc_info=True)
+            return False
+        finally:
+            self._model_loading = False
+            self._model_load_status = None
+        return True
 
     # ── node 生命周期 ──────────────────────────────────────────────────────
 
@@ -833,6 +869,19 @@ class PointCloudPerceptionPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            # 下载契约（同 visual_depth 的 info）：加载中报 loading + 进度，
+            # 失败报 error —— 否则 mono 加载期间卡片显示 idle，运维看不到
+            # 一次可能长达数分钟的模型下载。
+            if self._model_loading:
+                return {"name": "PointCloudPerception", "manufacture": "Embodied",
+                        "model": "depth|stereo", "state": "loading",
+                        "desc": self._model_load_status or "Loading depth engine...",
+                        "instances": {}, "topic_in": [], "topic_out": []}
+            if self._model_load_error:
+                return {"name": "PointCloudPerception", "manufacture": "Embodied",
+                        "model": "depth|stereo", "state": "error",
+                        "desc": f"Engine load failed: {self._model_load_error}",
+                        "instances": {}, "topic_in": [], "topic_out": []}
             with self._nodes_lock:
                 nodes = dict(self._nodes)
             instances = {
@@ -907,18 +956,10 @@ class PointCloudPerceptionPlugin:
                         return {"state": "error", "message": f"Engine failed to load: {self._model_load_error}"}
 
                     def _bg_start():
-                        self._model_loading = True
-                        self._model_load_error = None
-                        self._model_load_status = None
-                        try:
-                            self._ensure_model()
-                            self._model_loading = False
-                            self._model_load_status = None
+                        if not self._load_model_sync():
+                            return  # 已有加载在跑或已失败，等它 / 由它报
+                        if self._model_load_error is None:
                             self._start_node(node_key, mode, input_topic, right_topic, calibration)
-                        except Exception as error:  # noqa: BLE001
-                            self._model_loading = False
-                            self._model_load_error = str(error)
-                            log.error(f"[pointcloud] engine load failed: {error}", exc_info=True)
 
                     threading.Thread(target=_bg_start, daemon=True, name="pointcloud_model_load").start()
                     return {"state": "loading", "mode": mode, "input": input_topic,
