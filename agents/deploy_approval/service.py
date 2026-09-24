@@ -36,7 +36,25 @@ from .config import Config
 from .cos_client import CosClient
 from .evidence_builder import EvidenceBuilder, _case_id_for_target
 from .github_client import GitHubClient, GitHubError
-from .github_state_proxy import GitHubStateProxy, _validate_hidden_state
+from .github_state_proxy import (
+    GitHubStateProxy,
+    GitHubStateProxyError,
+    _validate_hidden_state,
+    _extract_hidden_state,
+    _build_hidden_state_body,
+    _insert_history_into_visible,
+    _count_visible_bytes,
+    _truncate_events_to_fit,
+    _MAX_VISIBLE_LIFECYCLE_BYTES,
+    _MAX_COMMENT_BODY_BYTES,
+    HISTORY_ARCHIVE_MARKER_PREFIX,
+    _next_history_archive_page,
+    _build_archive_body,
+    _parse_visible_history,
+    VISIBLE_HISTORY_START_MARKER,
+    VISIBLE_HISTORY_END_MARKER,
+    HIDDEN_STATE_MARKER,
+)
 from .models import BuildInfo, new_id, utc_now
 from .policy import Policy, PolicyError
 from .review_comment_parser import (
@@ -653,10 +671,20 @@ class DeployController:
                     "No deploy approval lifecycle found. Wait for review lifecycle reconciliation first.",
                 )
                 return True
-            if state.get("status") != "deploy-ready":
-                await self._post_error(
-                    repo, pr_number,
-                    f"Current status is `{state.get('status')}`. Expected `deploy-ready`.",
+            _current_status = state.get("status", "")
+            if _current_status == "deploy-ready":
+                pass  # normal path continues below
+            elif _current_status in ("deploy-requested", "testing", "succeeded", "failed"):
+                logger.warning(
+                    "STALE_COMMAND_IGNORED kind=request_deploy comment_id=%s current_status=%s",
+                    comment_id, _current_status,
+                )
+                await self.proxy.persist_cursor(repo, pr_number, comment_id)
+                return True
+            else:
+                await self._post_command_not_ready(
+                    repo, pr_number, _current_status,
+                    "Wait for the PR to reach `deploy-ready` status before requesting deployment.",
                 )
                 return True
             if pr_head != state.get("head_sha", ""):
@@ -683,7 +711,14 @@ class DeployController:
                 markdown = comments_mod.superseded_comment(
                     repo, pr_number, old_head, pr_head,
                 )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                event = {
+                    "event": "HEAD drift detected",
+                    "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown, event=event,
+                )
                 await self.proxy.project_status_label(repo, pr_number, "review-required")
                 return True
             pr_user = pr_data.get("user", {})
@@ -819,7 +854,14 @@ class DeployController:
             markdown = comments_mod.deploy_requested(
                 repo, pr_number, pr_head, components, machine_groups,
             )
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            event = {
+                "event": "Deployment requested",
+                "lifecycle": "`deploy-ready` \u2192 `deploy-requested`",
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, markdown, event=event,
+            )
             await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
             return True
 
@@ -842,11 +884,20 @@ class DeployController:
                 )
                 return True
 
-            if state.get("status") != "deploy-requested":
-                await self._post_error(
-                    repo, pr_number,
-                    f"Current status is `{state.get('status')}`. "
-                    "Expected `deploy-requested`.",
+            _current_status = state.get("status", "")
+            if _current_status == "deploy-requested":
+                pass  # normal path continues below
+            elif _current_status in ("testing", "succeeded", "failed"):
+                logger.warning(
+                    "STALE_COMMAND_IGNORED kind=approve_deploy comment_id=%s current_status=%s",
+                    comment_id, _current_status,
+                )
+                await self.proxy.persist_cursor(repo, pr_number, comment_id)
+                return True
+            else:
+                await self._post_command_not_ready(
+                    repo, pr_number, _current_status,
+                    "Deploy Approval is not yet in `deploy-requested` state. Wait for Review Agent to complete and Developer to run `/request_deploy`.",
                 )
                 return True
 
@@ -882,15 +933,15 @@ class DeployController:
                 else:
                     return True
 
-            # Get machine info
-            machine = self.policy.get_machine(machine_alias)
-            if machine is None:
-                await self._post_error(
-                    repo, pr_number,
-                    f"Unknown machine alias `{machine_alias}`. "
-                    "Check machine owners configuration.",
-                )
+            # Resolve machine selector (alias or IPv4) to canonical MachineInfo
+            try:
+                machine = Policy.resolve_machine_selector(machine_alias, self.policy.machines)
+            except PolicyError as e:
+                await self._post_error(repo, pr_number, str(e))
                 return True
+
+            # Use canonical alias for all state persistence
+            machine_alias = machine.alias
 
             # Check permissions async
             await self._check_approval_permissions(
@@ -937,7 +988,7 @@ class DeployController:
                     "comment_id": comment_id,
                     "kind": "approve_deploy",
                     "phase": "completed",
-                    "args": {"machine": machine_alias, "actor": actor},
+            # machine_alias added conditionally below
                 }
                 state["last_processed_comment_id"] = comment_id
                 markdown = comments_mod.deploy_requested(
@@ -949,8 +1000,16 @@ class DeployController:
                         "ZERO deploy POST.",
                         "Send a NEW `/approve_deploy machine=<alias>` for a compatible machine.",
                     ],
+                    deployments=[],
                 )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                event = {
+                    "event": f"Machine `{machine_alias}` selected",
+                    "machine": machine_alias,
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown, event=event,
+                )
                 await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
@@ -1015,8 +1074,14 @@ class DeployController:
                     "Approval comment was deleted, edited, or changed.\n"
                     "A NEW approval comment is required."
                 )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                event = {
+                    "event": "Approval revoked",
+                    "machine": machine_alias,
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown, event=event,
+                )
                 return True
 
             # Fresh actor permission re-check
@@ -1098,6 +1163,27 @@ class DeployController:
             new_deployments = []
             deploy_error = None
             deploy_outcome_uncertain = False
+            # Pre-flight visible history capacity before unsafe deploy POST
+            prospective = comments_mod.deploy_requested(
+                repo, pr_number, pr_head,
+                state.get("components", []),
+                self._get_machine_groups_for_components(state.get("components", [])),
+                deployments=state.get("deployments", []),
+                last_lifecycle_event=comments_mod.beijing_now_str(),
+            )
+            # Pass a conservative deployment event reservation so preflight
+            # measures: base renderer + existing history + this event
+            deploy_reservation = {
+                "event": "Machine `<alias>` deployed",
+                "machine": "<alias>",
+                "ip": "<ip>",
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._preflight_archive_for_event(
+                repo, pr_number, prospective,
+                reserved_event=deploy_reservation,
+            )
+
             # Sequential per-component deploy; POST success followed by
             # post-deploy runtime verification before recording as deployed.
             for comp in selected_components:
@@ -1164,7 +1250,15 @@ class DeployController:
                         "No further deploy POSTs are allowed in this cycle.",
                     ],
                 )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                event = {
+                    "event": "Deploy outcome uncertain",
+                    "result": "uncertain",
+                    "machine": machine_alias,
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown, event=event,
+                )
                 await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
@@ -1185,8 +1279,14 @@ class DeployController:
                 )
                 approve_attempt["outcome"] = "failed"
                 self._record_approve_attempt(state, approve_attempt)
-                await self.proxy.write_hidden_state(
-                    repo, pr_number, markdown, state
+                event = {
+                    "event": "Deploy failed",
+                    "result": "failed",
+                    "machine": machine_alias,
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown, event=event,
                 )
                 await self.proxy.project_status_label(repo, pr_number, "failed")
 
@@ -1299,7 +1399,16 @@ class DeployController:
                         "Send a NEW `/approve_deploy machine=<alias>`.",
                     ],
                 )
-                await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                machine_info = self.policy.get_machine(machine_alias)
+                deploy_event = {
+                    "event": f"Machine `{machine_alias}` deployed",
+                    "machine": machine_alias,
+                    "ip": machine_info.node_host if machine_info else "",
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown, event=deploy_event,
+                )
                 await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
@@ -1310,8 +1419,14 @@ class DeployController:
             testing_markdown = comments_mod.testing(
                 repo, pr_number, pr_head, case_result="",
             )
-            # Persist testing lifecycle state FIRST
-            await self.proxy.write_hidden_state(repo, pr_number, testing_markdown, state)
+            event = {
+                "event": "All components deployed",
+                "lifecycle": "`deploy-requested` \u2192 `testing`",
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, testing_markdown, event=event,
+            )
             # Project status label "testing" SECOND
             await self.proxy.project_status_label(repo, pr_number, "testing")
 
@@ -1385,11 +1500,20 @@ class DeployController:
                 )
                 return True
 
-            if state.get("status") != "testing":
-                await self._post_error(
-                    repo, pr_number,
-                    f"Current status is `{state.get('status')}`. "
-                    "Expected `testing`.",
+            _current_status = state.get("status", "")
+            if _current_status == "testing":
+                pass  # normal path continues below
+            elif _current_status in ("succeeded", "failed"):
+                logger.warning(
+                    "STALE_COMMAND_IGNORED kind=record_test comment_id=%s current_status=%s",
+                    comment_id, _current_status,
+                )
+                await self.proxy.persist_cursor(repo, pr_number, comment_id)
+                return True
+            else:
+                await self._post_command_not_ready(
+                    repo, pr_number, _current_status,
+                    "Deployment has not yet reached `testing` state. Complete all required component deployments first.",
                 )
                 return True
 
@@ -1451,15 +1575,32 @@ class DeployController:
 
             # Write a REAL terminal visible lifecycle comment immediately
             if result == "pass":
+                enriched = self._enrich_deployments_for_render(
+                    state.get("deployments", []),
+                )
                 terminal_markdown = comments_mod.succeeded_comment(
                     repo, pr_number, pr_head,
+                    deployments=enriched,
+                    components=state.get("components", []),
                 )
+                event = {
+                    "event": "Test recorded",
+                    "lifecycle": "`testing` \u2192 `succeeded`",
+                    "result": "pass",
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
             else:
                 terminal_markdown = comments_mod.failed_comment(repo, pr_number, pr_head)
+                event = {
+                    "event": "Test recorded",
+                    "lifecycle": "`testing` \u2192 `failed`",
+                    "result": "fail",
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
 
             # Terminal state is written to GitHub before COS upload
-            await self.proxy.write_hidden_state(
-                repo, pr_number, terminal_markdown, state,
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, terminal_markdown, event=event,
             )
             await self.proxy.project_status_label(repo, pr_number, state["status"])
 
@@ -1710,9 +1851,36 @@ class DeployController:
                 groups.append({
                     "alias": m.alias,
                     "node_id": m.node_id,
+                    "ip": m.node_host,
                     "component_ids": compatible,
                 })
         return groups
+
+    def _enrich_deployments_for_render(self, deployments: list[dict]) -> list[dict]:
+        """Enrich deployment rows with machine IP for render-only display.
+
+        Resolves each deployment's canonical machine alias against the
+        configured policy to obtain node_host. This works even when the
+        machine is no longer among the remaining-compatible machine groups.
+
+        Hidden-state authoritative identity remains the alias only.
+        """
+        enriched: list[dict] = []
+        for dep in deployments:
+            if not isinstance(dep, dict):
+                enriched.append(dep)
+                continue
+            machine_alias = dep.get("machine", "")
+            ip = ""
+            if machine_alias:
+                machine_info = self.policy.get_machine(machine_alias)
+                if machine_info is not None:
+                    ip = machine_info.node_host or ""
+            enriched.append({
+                **dep,
+                "ip": ip,
+            })
+        return enriched
 
     async def _preflight_running_images(
         self,
@@ -2132,12 +2300,326 @@ class DeployController:
             )
             return {"object_key": "", "sha256": "", "size": 0}
 
+    async def _preflight_archive_for_event(
+        self,
+        repo: str,
+        pr_number: int,
+        prospective_visible: str,
+        reserved_event: dict | None = None,
+    ) -> None:
+        """Pre-flight visible lifecycle capacity and create archive if needed.
+
+        Computes the REAL prospective visible body:
+          prospective_renderer_output
+          + existing generated history events
+          + reserved/new event (if any)
+          + archive links
+        and measures its UTF-8 bytes.
+
+        Must be called BEFORE any unsafe side effect (Agent Core deploy POST).
+        If archive creation fails, raise to prevent the unsafe action.
+        If prospective body exceeds 48 KiB and there is no archivables history,
+        raise explicitly (fail closed).
+        """
+        from .github_state_proxy import (
+            _parse_visible_history,
+            _build_history_block,
+            _insert_history_into_visible,
+            VISIBLE_HISTORY_START_MARKER,
+            VISIBLE_HISTORY_END_MARKER,
+        )
+
+        # 1. Fresh-read current lifecycle comment
+        comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+        if comment is None:
+            # No existing lifecycle comment: compute prospective body size.
+            # Build real prospective visible: base + reserved_event
+            from .github_state_proxy import (
+                _build_history_block,
+                _insert_history_into_visible,
+            )
+            if reserved_event is not None:
+                prospective_with_history = _insert_history_into_visible(
+                    prospective_visible, reserved_event,
+                )
+            else:
+                prospective_with_history = prospective_visible
+            body_bytes = _count_visible_bytes(prospective_with_history)
+            if body_bytes <= _MAX_VISIBLE_LIFECYCLE_BYTES:
+                # Under budget: no archive needed, caller will create lifecycle comment
+                return
+            else:
+                # Over budget with no existing comment to archive into: fail closed
+                raise GitHubStateProxyError(
+                    "preflight archive: visible lifecycle exceeds 48 KiB "
+                    "soft limit and no trusted lifecycle comment exists to host archives"
+                )
+
+        current_body = comment.get("body", "")
+        if not isinstance(current_body, str):
+            raise GitHubStateProxyError(
+                "preflight archive: comment body is not a string"
+            )
+
+        # 2. Parse existing visible history events
+        existing_visible, existing_events = _parse_visible_history(current_body)
+
+        # 3. Build the real prospective visible body
+        #    base renderer + existing history + new event
+        if reserved_event is not None:
+            # Merge existing events into prospective base, then prepend new event
+            if existing_events:
+                existing_block = _build_history_block(existing_events)
+                temp_base = prospective_visible.rstrip() + "\n\n" + existing_block + "\n"
+            else:
+                temp_base = prospective_visible
+            prospective_with_history = _insert_history_into_visible(temp_base, reserved_event)
+        else:
+            prospective_with_history = prospective_visible
+
+        # 4. Count real prospective visible bytes
+        body_bytes = _count_visible_bytes(prospective_with_history)
+        if body_bytes <= _MAX_VISIBLE_LIFECYCLE_BYTES:
+            return
+
+        # 5. Need to archive oldest events
+        if not existing_events:
+            raise GitHubStateProxyError(
+                "preflight archive: visible lifecycle exceeds 48 KiB "
+                "soft limit and no history events available to archive"
+            )
+
+        # 6. Truncate oldest events to fit
+        kept, archived = _truncate_events_to_fit(
+            existing_events,
+            _MAX_VISIBLE_LIFECYCLE_BYTES - 2048,  # 2 KiB headroom
+        )
+
+        if not archived:
+            raise GitHubStateProxyError(
+                "preflight archive: unable to fit visible lifecycle even "
+                "after attempting to archive oldest events"
+            )
+
+        # 7. Create archive comment
+        existing_comments = await self.proxy.get_issue_comments(repo, pr_number)
+        page_num = _next_history_archive_page(existing_comments, repo, pr_number)
+
+        archive_body = _build_archive_body(
+            repo, pr_number, page_num, archived,
+            extra_text="Archived oldest history events to preserve main lifecycle capacity.",
+        )
+
+        await self.proxy.post_issue_comment(repo, pr_number, archive_body)
+
+        # 8. Rewrite the SAME lifecycle comment to remove archived events
+        from .github_state_proxy import HIDDEN_STATE_MARKER
+        hidden_idx = current_body.find(HIDDEN_STATE_MARKER)
+        if hidden_idx < 0:
+            raise GitHubStateProxyError("preflight archive: cannot find hidden state marker")
+
+        existing_visible_part = current_body[:hidden_idx].rstrip()
+
+        final_events = kept if kept else []
+
+        # Build the new history block with kept events only
+        new_history_block = _build_history_block(final_events)
+
+        # Reconstruct visible with shrunk history
+        h_start = existing_visible_part.find(VISIBLE_HISTORY_START_MARKER)
+        h_end = existing_visible_part.find(VISIBLE_HISTORY_END_MARKER)
+        if h_start >= 0 and h_end >= 0:
+            before_hist = existing_visible_part[:h_start]
+            after_hist = existing_visible_part[h_end + len(VISIBLE_HISTORY_END_MARKER):]
+            new_visible = before_hist + new_history_block + after_hist
+        else:
+            new_visible = existing_visible_part.rstrip() + "\n\n" + new_history_block + "\n"
+
+        # 9. Verify the shrunk visible fits
+        shrunk_bytes = _count_visible_bytes(new_visible)
+        if shrunk_bytes > _MAX_VISIBLE_LIFECYCLE_BYTES:
+            # Should not happen if truncation logic is correct, but guard anyway
+            raise GitHubStateProxyError(
+                "preflight archive: shrunk visible lifecycle still exceeds 48 KiB soft limit"
+            )
+
+        # 10. Parse fresh hidden state and write back
+        fresh_state = _extract_hidden_state(current_body)
+        if fresh_state is None:
+            raise GitHubStateProxyError("preflight archive: cannot extract hidden state")
+        fresh_state = _validate_hidden_state(fresh_state)
+
+        final_body = _build_hidden_state_body(new_visible, fresh_state)
+        comment_id = comment.get("id")
+        if isinstance(comment_id, int):
+            await self.proxy.update_comment(repo, comment_id, final_body)
+
+    async def _write_lifecycle_with_history(
+        self,
+        repo: str,
+        pr_number: int,
+        state: dict,
+        new_visible_markdown: str,
+        event: dict | None = None,
+    ) -> None:
+        """Write lifecycle comment with automatic history management.
+
+        If event is provided, it is appended to the visible History section.
+        Legacy v1 migration is handled automatically on first meaningful event.
+        Preserves existing History events across lifecycle rewrites.
+        """
+        comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+        if comment is None:
+            if event is not None:
+                final_visible = _insert_history_into_visible(new_visible_markdown, event)
+            else:
+                final_visible = new_visible_markdown
+            await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
+            return
+
+        existing_body = comment.get("body", "")
+        if not isinstance(existing_body, str):
+            if event is not None:
+                final_visible = _insert_history_into_visible(new_visible_markdown, event)
+            else:
+                final_visible = new_visible_markdown
+            await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
+            return
+
+        from .github_state_proxy import HIDDEN_STATE_MARKER
+        idx = existing_body.find(HIDDEN_STATE_MARKER)
+        if idx < 0:
+            if event is not None:
+                final_visible = _insert_history_into_visible(new_visible_markdown, event)
+            else:
+                final_visible = new_visible_markdown
+            await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
+            return
+
+        existing_visible = existing_body[:idx].rstrip()
+
+        # Check if this is a legacy comment (missing new-format markers)
+        is_legacy = (
+            VISIBLE_HISTORY_START_MARKER not in existing_visible
+            and "### Workflow" not in existing_visible
+        )
+
+        if is_legacy and event is not None:
+            # First meaningful event on a legacy comment
+            # 1. Preserve legacy visible markdown in an archive
+            legacy_snapshot = existing_visible
+
+            existing_comments = await self.proxy.get_issue_comments(repo, pr_number)
+            page_num = _next_history_archive_page(existing_comments, repo, pr_number)
+
+            archive_body = _build_archive_body(
+                repo, pr_number, page_num, [],
+                extra_text=(
+                    "Legacy lifecycle snapshot preserved before history-enabled renderer migration.\n\n"
+                    + legacy_snapshot
+                ),
+            )
+            await self.proxy.post_issue_comment(repo, pr_number, archive_body)
+
+        # 2. Collect existing history events from the current lifecycle comment
+        existing_events: list[dict] = []
+        if not is_legacy:
+            _, existing_events = _parse_visible_history(existing_visible)
+
+        # 3. Build the prospective new visible markdown with event + existing events
+        if event is not None:
+            # _insert_history_into_visible reads existing events from visible markdown.
+            # new_visible_markdown is a fresh renderer output with no history section.
+            # So we inject existing events first via a temporary placeholder,
+            # then let _insert_history_into_visible prepend the new event on top.
+            if existing_events:
+                existing_history_block = _build_history_block(existing_events)
+                temp_visible = new_visible_markdown.rstrip() + "\n\n" + existing_history_block + "\n"
+            else:
+                temp_visible = new_visible_markdown
+            final_visible = _insert_history_into_visible(temp_visible, event)
+        else:
+            final_visible = new_visible_markdown
+
+        # 3.5. Discover trusted archive comments and add archive links if any
+        try:
+            existing_comments = await self.proxy.get_issue_comments(repo, pr_number)
+            archive_links = self._discover_trusted_archive_links(
+                existing_comments, repo, pr_number,
+            )
+            if archive_links:
+                archives_block = comments_mod._archives_link_block(archive_links)
+                # Insert archive links before the History section
+                h_start = final_visible.find("### History")
+                if h_start >= 0:
+                    final_visible = (
+                        final_visible[:h_start]
+                        + archives_block
+                        + final_visible[h_start:]
+                    )
+                else:
+                    # No History section yet; append before hidden state marker
+                    final_visible = final_visible.rstrip() + "\n\n" + archives_block
+        except Exception:
+            # Archive link discovery is best-effort
+            pass
+
+        # 4. Write the final state
+        await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
+
+    def _discover_trusted_archive_links(
+        self, comments: list[dict], repo: str, pr_number: int,
+    ) -> list[dict]:
+        """Discover trusted History Archive comments from GitHub.
+
+        Only accepts comments with both BOT_MARKER, the archive marker,
+        AND GitHub App provenance via self.proxy.is_bot_comment().
+        Never stores archive list in hidden state.
+        Returns dicts with page and url for the archive link block.
+        """
+        from .comments import BOT_MARKER
+        links: list[dict] = []
+        seen_pages: set[int] = set()
+        for c in comments:
+            if not isinstance(c, dict):
+                continue
+            cbody = c.get("body", "")
+            if not isinstance(cbody, str):
+                continue
+            # Must contain bot marker
+            if BOT_MARKER not in cbody:
+                continue
+            # Must be authored by the configured GitHub App
+            if not self.proxy.is_bot_comment(c):
+                continue
+            marker_prefix = f"{HISTORY_ARCHIVE_MARKER_PREFIX}{repo}:{pr_number}:"
+            if marker_prefix not in cbody:
+                continue
+            # Extract page number
+            try:
+                after_prefix = cbody.split(marker_prefix, 1)[1]
+                page_str = after_prefix.split(" -->", 1)[0].strip()
+                page_num = int(page_str)
+                if page_num <= 0 or page_num in seen_pages:
+                    continue
+                seen_pages.add(page_num)
+            except (ValueError, IndexError):
+                continue
+            links.append({
+                "page": page_num,
+                "url": c.get("html_url", ""),
+            })
+        # Sort by page ascending
+        links.sort(key=lambda x: x["page"])
+        return links
+
     async def _supersede_head_drift(
         self, repo: str, pr_number: int, state: dict,
         new_head: str, comment_id: int,
     ) -> None:
         """Handle HEAD drift by superseding the current deployment."""
         old_head = state.get("head_sha", "")
+        old_status = state.get("status", "review-required")
         state["status"] = "review-required"
         state["head_sha"] = new_head
         state["review_evidence"] = {}
@@ -2160,7 +2642,14 @@ class DeployController:
         markdown = comments_mod.superseded_comment(
             repo, pr_number, old_head, new_head,
         )
-        await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+        event = {
+            "event": "HEAD drift detected",
+            "lifecycle": f"`{old_status}` \u2192 `review-required`",
+            "timestamp": comments_mod.beijing_now_str(),
+        }
+        await self._write_lifecycle_with_history(
+            repo, pr_number, state, markdown, event=event,
+        )
         await self.proxy.project_status_label(repo, pr_number, "review-required")
 
     async def _invalidate_review_required(
@@ -2192,8 +2681,34 @@ class DeployController:
         state["last_processed_comment_id"] = comment_id
 
         markdown = comments_mod.review_required(repo, pr_number, head_sha)
-        await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+        event = {
+            "event": reason,
+            "lifecycle": "`deploy-requested` \u2192 `review-required`",
+            "timestamp": comments_mod.beijing_now_str(),
+        }
+        await self._write_lifecycle_with_history(
+            repo, pr_number, state, markdown, event=event,
+        )
         await self.proxy.project_status_label(repo, pr_number, "review-required")
+
+    async def _post_command_not_ready(
+        self, repo: str, pr_number: int, current_status: str, next_action_text: str,
+    ) -> None:
+        """Post a non-error 'command not ready' reply comment."""
+        body = "\n".join([
+            comments_mod.BOT_MARKER,
+            "### Deploy Approval — Command not ready",
+            "",
+            f"Current lifecycle: `{current_status}`",
+            "",
+            "### Next action",
+            "",
+            next_action_text,
+        ])
+        try:
+            await self.proxy.post_issue_comment(repo, pr_number, body)
+        except GitHubError as e:
+            logger.warning("post command not ready comment %s#%s: %s", repo, pr_number, e)
 
     async def _post_error(
         self, repo: str, pr_number: int, message: str,
@@ -2255,7 +2770,14 @@ class DeployController:
                 }
                 try:
                     markdown = comments_mod.review_required(repo, pr_number, current_head)
-                    await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+                    event = {
+                        "event": "HEAD drift detected",
+                        "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                        "timestamp": comments_mod.beijing_now_str(),
+                    }
+                    await self._write_lifecycle_with_history(
+                        repo, pr_number, state, markdown, event=event,
+                    )
                     await self.proxy.project_status_label(repo, pr_number, "review-required")
                 except Exception as e:
                     logger.warning(
@@ -2383,6 +2905,7 @@ class DeployController:
             review_evidence_data: dict = {}
             build_infos = []
 
+        state_was_none = state is None
         if state is None:
             state = self._init_hidden_state(
                 head_sha=current_head,
@@ -2399,6 +2922,9 @@ class DeployController:
             }
             state["last_processed_comment_id"] = 0
         else:
+            prev_status = state.get("status", "review-required")
+            prev_head = state.get("head_sha", "")
+            prev_evidence = state.get("review_evidence", {})
             state["head_sha"] = current_head
             state["status"] = desired_status
             state["review_evidence"] = review_evidence_data
@@ -2417,19 +2943,53 @@ class DeployController:
                 "args": {},
             }
 
-        try:
-            if desired_status == "reviewing":
-                markdown = comments_mod.reviewing(repo, pr_number, current_head)
-            elif desired_status == "review-required":
-                markdown = comments_mod.review_required(repo, pr_number, current_head)
-            else:
-                markdown = comments_mod.deploy_ready(repo, pr_number, current_head, build_infos)
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
-            await self.proxy.project_status_label(repo, pr_number, desired_status)
-        except Exception as e:
-            logger.warning(
-                "reconcile lifecycle %s#%s: %s", repo, pr_number, e,
+        # No-churn: only write lifecycle/history if there is a real change
+        # (prev_status/prev_head/prev_evidence captured BEFORE state mutation above)
+        if state_was_none:
+            meaningful_change = True
+        else:
+            meaningful_change = (
+                prev_status != desired_status
+                or prev_head != current_head
+                or prev_evidence != review_evidence_data
             )
+
+        if not meaningful_change:
+            # Same state, no meaningful change — only project status label
+            try:
+                await self.proxy.project_status_label(repo, pr_number, desired_status)
+            except Exception as e:
+                logger.warning(
+                    "reconcile label projection %s#%s: %s", repo, pr_number, e,
+                )
+        else:
+            try:
+                if desired_status == "reviewing":
+                    markdown = comments_mod.reviewing(repo, pr_number, current_head)
+                elif desired_status == "review-required":
+                    markdown = comments_mod.review_required(repo, pr_number, current_head)
+                else:
+                    markdown = comments_mod.deploy_ready(repo, pr_number, current_head, build_infos)
+                if state_was_none:
+                    event = {
+                        "event": "Lifecycle initialized",
+                        "lifecycle": f"`none` \u2192 `{desired_status}`",
+                        "timestamp": comments_mod.beijing_now_str(),
+                    }
+                else:
+                    event = {
+                        "event": "Review lifecycle transitioned",
+                        "lifecycle": f"`{prev_status}` \u2192 `{desired_status}`",
+                        "timestamp": comments_mod.beijing_now_str(),
+                    }
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown, event=event,
+                )
+                await self.proxy.project_status_label(repo, pr_number, desired_status)
+            except Exception as e:
+                logger.warning(
+                    "reconcile lifecycle %s#%s: %s", repo, pr_number, e,
+                )
 
     async def _handle_uncertain_if_needed(
         self, repo: str, pr_number: int, state: dict,
@@ -2452,11 +3012,28 @@ class DeployController:
         old_cursor = int(state.get("last_processed_comment_id", 0) or 0)
         if comment_id > old_cursor:
             state["last_processed_comment_id"] = comment_id
+        # Extract canonical machine alias from command args (safe read)
+        cmd_args = cmd.get("args", {})
+        machine_alias = ""
+        if isinstance(cmd_args, dict):
+            raw_machine = cmd_args.get("machine", "")
+            if isinstance(raw_machine, str):
+                machine_alias = raw_machine
+
 
         markdown = comments_mod.uncertain_comment(
             repo, pr_number, state.get("head_sha", ""),
         )
-        await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+        event = {
+            "event": "Deploy outcome uncertain",
+            "result": "uncertain",
+            "timestamp": comments_mod.beijing_now_str(),
+        }
+        if machine_alias:
+            event["machine"] = machine_alias
+        await self._write_lifecycle_with_history(
+            repo, pr_number, state, markdown, event=event,
+        )
         await self.proxy.project_status_label(
             repo, pr_number, state.get("status", "review-required"),
         )
@@ -2506,7 +3083,14 @@ class DeployController:
             markdown = comments_mod.review_required(
                 repo, pr_number, current_head or state.get("head_sha", ""),
             )
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            event = {
+                "event": "HEAD drift detected",
+                "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, markdown, event=event,
+            )
             await self.proxy.project_status_label(repo, pr_number, "review-required")
             return "review-required"
 
@@ -2548,7 +3132,14 @@ class DeployController:
             markdown = comments_mod.review_required(
                 repo, pr_number, current_head,
             )
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            event = {
+                "event": "Review evidence unavailable",
+                "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, markdown, event=event,
+            )
             await self.proxy.project_status_label(repo, pr_number, "review-required")
             return "review-required"
 
@@ -2577,7 +3168,14 @@ class DeployController:
             markdown = comments_mod.review_required(
                 repo, pr_number, current_head,
             )
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            event = {
+                "event": "Review evidence unresolved",
+                "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, markdown, event=event,
+            )
             await self.proxy.project_status_label(repo, pr_number, "review-required")
             return "review-required"
         for eb in evidence.builds:
@@ -2626,7 +3224,15 @@ class DeployController:
                     "Validation facts are temporarily unavailable.",
                     f"Try a new `/approve_deploy machine={machine_alias}` later.",
                 ])
-            await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+            event = {
+                "event": "Restart recovery snapshot unavailable",
+                "result": "uncertain",
+                "machine": machine_alias,
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._write_lifecycle_with_history(
+                repo, pr_number, state, markdown, event=event,
+            )
             return "uncertain"
 
         old_review_evidence = state.get("review_evidence", {})
@@ -2799,8 +3405,15 @@ class DeployController:
             state.get("components", []),
             self._get_machine_groups_for_components(state.get("components", [])),
             gate_note=gate_note,
+            deployments=state.get("deployments", []),
         )
-        await self.proxy.write_hidden_state(repo, pr_number, markdown, state)
+        event = {
+            "event": "Restart recovery: evidence refreshed",
+            "timestamp": comments_mod.beijing_now_str(),
+        }
+        await self._write_lifecycle_with_history(
+            repo, pr_number, state, markdown, event=event,
+        )
         await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
         return "deploy-requested"
 

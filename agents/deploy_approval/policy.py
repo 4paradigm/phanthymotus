@@ -288,6 +288,56 @@ class Policy:
         """Return all machines as a list."""
         return list(self.machines.values())
 
+    @staticmethod
+    def resolve_machine_selector(selector: str, machines: dict[str, "MachineInfo"]) -> "MachineInfo":
+        """Resolve a machine selector (alias or literal IPv4) to a canonical MachineInfo.
+
+        1. Exact alias match first.
+        2. If not found, validate selector as literal IPv4.
+        3. Find machines with node_host == selector.
+        4. Exactly 1 match -> return it.
+        5. 0 matches -> raise PolicyError.
+        6. Multiple matches -> raise PolicyError listing sorted aliases.
+        7. If selector is not a valid IPv4 and not an alias -> raise PolicyError.
+        """
+        # 1. Exact alias match
+        if selector in machines:
+            return machines[selector]
+
+        # 2. Validate as literal IPv4
+        try:
+            parsed = ipaddress.ip_address(selector)
+        except ValueError:
+            raise PolicyError(
+                f"invalid machine selector {selector!r}: "
+                "not a known alias or valid IPv4 address"
+            )
+        if parsed.version != 4:
+            raise PolicyError(
+                f"invalid machine selector {selector!r}: only IPv4 addresses are supported"
+            )
+
+        canonical_ipv4 = str(parsed)
+
+        # 3. Find machines with matching node_host
+        matches: list[MachineInfo] = []
+        for m in machines.values():
+            if m.node_host == canonical_ipv4:
+                matches.append(m)
+
+        # 4-6. Resolve based on match count
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) == 0:
+            raise PolicyError(f"no machine found with IP {canonical_ipv4!r}")
+        # Multiple matches -> ambiguous
+        sorted_aliases = sorted(m.alias for m in matches)
+        raise PolicyError(
+            f"ambiguous IP {canonical_ipv4!r}: matches machines "
+            f"{', '.join(f'`{a}`' for a in sorted_aliases)}. "
+            "Please use a machine alias instead."
+        )
+
     def machine_supports_target(self, alias: str, target: str) -> bool:
         """Check if a machine supports a given target based on static config.
 

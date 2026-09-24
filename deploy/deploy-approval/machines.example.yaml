@@ -4,7 +4,7 @@
 # machines:
 #   <alias>:          # unique, non-empty, used in /approve_deploy machine=<alias>
 #     node_id: <id>   # unique, non-empty machine-policy identifier
-#     node_host: <ipv4>  # fake literal IPv4 used to reach Agent Core at https://<node_host>:15678
+#     node_host: <ipv4>  # literal IPv4 used to reach Agent Core at https://<node_host>:15678
 #     owners:         # non-empty list of GitHub logins (case-insensitive, deduped)
 #       - <github-login>
 #     targets:        # list of targets this machine can host
@@ -20,6 +20,26 @@
 #       - unitree/g1
 #
 # Missing/invalid file -> startup fail closed.
+#
+# ── approve_deploy machine= selector ──────────────────────────────────────
+#
+# The /approve_deploy command accepts either:
+#   1. A machine alias (e.g. machine=sh-g1-01)
+#   2. A literal IPv4 address (e.g. machine=192.0.2.101)
+#
+# Resolution order:
+#   1. Exact alias match → selected
+#   2. Literal IPv4 → matched against node_host of all machines
+#      - 0 matches → fail closed
+#      - 1 match   → selected
+#      - >1 match  → fail closed (error lists all aliases, instruct to use alias)
+#
+# If multiple aliases share the same node_host, the IP selector
+# MUST NOT be used — always use the explicit alias.
+#
+# Internal authoritative machine identity is always the alias.
+# State, history, and deployments store the canonical alias.
+# The IP is only displayed in comments and UI tables.
 
 version: 1
 

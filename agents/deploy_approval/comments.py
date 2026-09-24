@@ -16,23 +16,26 @@ from .models import BuildInfo
 BOT_MARKER = "<!-- deploy-approval-agent -->"
 _BEIJING = ZoneInfo("Asia/Shanghai")
 
+_MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024  # 48 KiB soft budget
+
 
 def beijing_now_str() -> str:
     now = _dt.datetime.now(_BEIJING)
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def last_checked_line(checked_at: float | None = None) -> str:
-    if isinstance(checked_at, (int, float)) and checked_at > 0:
-        try:
-            moment = _dt.datetime.fromtimestamp(checked_at, tz=_BEIJING).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        except (OverflowError, OSError, ValueError):
-            moment = beijing_now_str()
-    else:
-        moment = beijing_now_str()
-    return f"Last checked: {moment} (UTC+08:00, Asia/Shanghai)"
+def last_lifecycle_event_line(timestamp: str = "") -> str:
+    """Last lifecycle event line. Only updated on meaningful business events.
+
+    Args:
+        timestamp: Timestamp string in "YYYY-MM-DD HH:MM:SS" format (Asia/Shanghai)
+    Returns:
+        "Last lifecycle event: YYYY-MM-DD HH:MM:SS (UTC+08:00, Asia/Shanghai)"
+        If timestamp is empty, uses beijing_now_str().
+    """
+    if not timestamp:
+        timestamp = beijing_now_str()
+    return f"Last lifecycle event: {timestamp} (UTC+08:00, Asia/Shanghai)"
 
 
 def lifecycle_marker(repo: str, pr_number: int) -> str:
@@ -54,7 +57,7 @@ def _short_digest(image_ref: str) -> str:
     if image_ref and ":" in image_ref:
         tag = image_ref.rsplit(":", 1)[-1]
         if len(tag) > 40:
-            return tag[:40] + "…"
+            return tag[:40] + "\u2026"
         return tag
     return ""
 
@@ -111,7 +114,6 @@ def _safe_download_url(url: str) -> str:
     return url
 
 
-
 def _build_table(builds: list[BuildInfo]) -> str:
     """Render the build results table for deploy-ready comment."""
     lines = [
@@ -121,7 +123,7 @@ def _build_table(builds: list[BuildInfo]) -> str:
     for b in builds:
         variant = _escape(b.variant or b.driver_path or chr(0x2014))
         build_status = "success" if b.success else "failed"
-        eligibility = "deployable" if b.deployable else "unsupported"
+        eligibility = "deployable" if b.success and b.deployable else "unsupported"
         if not b.success:
             eligibility = "not deployable"
         lines.append(
@@ -146,9 +148,9 @@ def _cos_evidence_block(
             lines.append(f"[Download COS evidence]({safe_url})")
     text = f"COS: `{_escape(object_key)}`"
     if sha256:
-        text += f" · `@sha256:{_escape(sha256[:12])}`"
+        text += f" \u00b7 `@sha256:{_escape(sha256[:12])}`"
     if size:
-        text += f" · `{_human_size(size)}`"
+        text += f" \u00b7 `{_human_size(size)}`"
     lines.append(text)
     return lines
 
@@ -162,11 +164,124 @@ def _human_size(size: int) -> str:
         return f"{size / (1024 * 1024):.1f} MB"
 
 
-# Lifecycle comment builders
+# ── Workflow helper ──────────────────────────────────────────────
 
 
-def review_required(repo: str, pr_number: int, head_sha: str) -> str:
-    """status: review-required"""
+def _workflow_lines(status: str) -> str:
+    """Return the fixed 8-step workflow as markdown.
+
+    Always forward order. [x] for complete, [ ] for pending.
+    First unchecked step marked with \u2190 **Next**.
+    If all checked, last step is marked done.
+    """
+    step_defs = [
+        ("1. Request Review", 0),
+        ("2. Review Agent completed", 1),
+        ("3. Request deployment", 2),
+        ("4. Machine Owner approval(s)", 3),
+        ("5. All required components deployed", 4),
+        ("6. Automated Cases", 4),
+        ("7. Record validation result", 5),
+        ("8. Deployment accepted", 6),
+    ]
+
+    status_levels = {
+        "review-required": 0,
+        "reviewing": 1,
+        "deploy-ready": 2,
+        "deploy-requested": 3,
+        "testing": 5,
+        "succeeded": 7,
+        "failed": 5,
+    }
+    current_level = status_levels.get(status, 0)
+
+    lines = []
+    next_marked = False
+    for label, required_level in step_defs:
+        checked = current_level > required_level
+        mark = "[x]" if checked else "[ ]"
+        line = f"- {mark} {label}"
+        if not checked and not next_marked:
+            line += " \u2190 **Next**"
+            next_marked = True
+        lines.append(line)
+
+    # If all steps are checked, no Next marker needed
+    if not next_marked:
+        return "\n".join(lines)
+
+    return "\n".join(lines)
+
+
+# ── History helpers ──────────────────────────────────────────────
+
+
+def _history_events_block(events: list[dict]) -> str:
+    """Render history events, newest first."""
+    if not events:
+        return "No history events yet."
+
+    lines = []
+    for evt in events:
+        ts = evt.get("timestamp", beijing_now_str())
+        title = evt.get("event", "Event")
+        lines.append(f"#### {ts} \u2014 {title}")
+        lines.append("")
+
+        lifecycle = evt.get("lifecycle", "")
+        if lifecycle:
+            lines.append(f"**Lifecycle:** {lifecycle}")
+            lines.append("")
+
+        machine = evt.get("machine", "")
+        ip = evt.get("ip", "")
+        if machine or ip:
+            if machine and ip:
+                lines.append(f"**Machine:** `{_escape(machine)}` \u00b7 **IP:** `{ip}`")
+            elif machine:
+                lines.append(f"**Machine:** `{_escape(machine)}`")
+            else:
+                lines.append(f"**IP:** `{ip}`")
+            lines.append("")
+
+        components = evt.get("components", "")
+        if components:
+            lines.append(f"**Components:** {components}")
+            lines.append("")
+
+        result = evt.get("result", "")
+        if result:
+            lines.append(f"**Result:** {result}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _archives_link_block(archives: list[dict]) -> str:
+    """Render archived history links."""
+    if not archives:
+        return ""
+
+    lines = ["### Archived history", ""]
+    for arch in archives:
+        page = arch.get("page", 1)
+        url = arch.get("url", "")
+        if url:
+            lines.append(f"- [History Archive #{page}]({url})")
+        else:
+            lines.append(f"- History Archive #{page}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ── Lifecycle comment builders ───────────────────────────────────
+
+
+def review_required(
+    repo: str, pr_number: int, head_sha: str, last_lifecycle_event: str = "",
+) -> str:
+    """status: review-required \u2014 initial comment with full 8-step workflow."""
     return "\n".join([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -174,19 +289,29 @@ def review_required(repo: str, pr_number: int, head_sha: str) -> str:
         "",
         "**Status:** `review-required`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
         "",
-        "**Next action \u2014 Developer**",
+        "### Workflow",
+        "",
+        _workflow_lines("review-required"),
+        "",
+        "### Next action",
+        "",
+        "**Developer**",
         "",
         "`/request_bot_review`",
         "",
-        "After the Review Agent completes its review of this exact HEAD, "
-        "Deploy Approval will update this comment with the build list.",
+        "### Current Deployment",
         "",
-        last_checked_line(),
+        "No deployment has been requested yet.",
+        "",
+        last_lifecycle_event_line(last_lifecycle_event),
     ])
 
 
-def reviewing(repo: str, pr_number: int, head_sha: str) -> str:
+def reviewing(
+    repo: str, pr_number: int, head_sha: str, last_lifecycle_event: str = "",
+) -> str:
     return "\n".join([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -194,16 +319,26 @@ def reviewing(repo: str, pr_number: int, head_sha: str) -> str:
         "",
         "**Status:** `reviewing`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
         "",
-        "Review Agent is reviewing/building this exact HEAD.",
-        "No action required yet.",
+        "### Workflow",
         "",
-        last_checked_line(),
+        _workflow_lines("reviewing"),
+        "",
+        "### Next action",
+        "",
+        "**Waiting for Review Agent**",
+        "",
+        "No action required.",
+        "",
+        last_lifecycle_event_line(last_lifecycle_event),
     ])
 
 
-def deploy_ready(repo: str, pr_number: int, head_sha: str,
-                 builds: list[BuildInfo]) -> str:
+def deploy_ready(
+    repo: str, pr_number: int, head_sha: str,
+    builds: list[BuildInfo], last_lifecycle_event: str = "",
+) -> str:
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -211,21 +346,24 @@ def deploy_ready(repo: str, pr_number: int, head_sha: str,
         "",
         "**Status:** `deploy-ready`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
         "",
-        f"Builds for reviewed HEAD `{_short(head_sha)}`",
+        "### Workflow",
+        "",
+        _workflow_lines("deploy-ready"),
+        "",
+        "### Next action",
+        "",
+        "**Developer**",
+        "",
+        "`/request_deploy`",
+        "",
+        "### Components",
         "",
         _build_table(builds),
         "",
+        last_lifecycle_event_line(last_lifecycle_event),
     ]
-    deployable = [b for b in builds if b.success and b.deployable]
-    if deployable:
-        lines.append("**Next action \u2014 Developer**")
-        lines.append("")
-        lines.append("`/request_deploy`")
-    else:
-        lines.append("No deployable builds. Review Agent must fix build errors.")
-    lines.append("")
-    lines.append(last_checked_line())
     return "\n".join(lines)
 
 
@@ -234,24 +372,65 @@ def deploy_requested(
     components: list[dict],
     machine_groups: list[dict],
     gate_note: list[str] | None = None,
+    deployments: list[dict] | None = None,
+    last_lifecycle_event: str = "",
 ) -> str:
-    """status: deploy-requested — shows components and compatible machines."""
+    """status: deploy-requested with IP table, workflow, deployment, history."""
+    # Build component labels
     comp_lines = []
     for c in components:
-        target = c.get("target", "")
-        variant = c.get("variant", "") or ""
-        driver_path = c.get("driver_path", "") or ""
-        image_ref = c.get("image_ref", "") or ""
-        label = target
-        if target == "driver" and driver_path:
-            label = f"driver {driver_path}"
-        elif variant:
-            label = f"{target} {variant}"
-        elif driver_path:
-            label = f"{target} {driver_path}"
-        display = _compact_image_ref(image_ref)
-        extra = f" · `{display}`" if display else ""
-        comp_lines.append(f"- {_escape(label)}{extra}")
+        if isinstance(c, dict):
+            target = c.get("target", "")
+            variant = c.get("variant", "") or ""
+            driver_path = c.get("driver_path", "") or ""
+            image_ref = c.get("image_ref", "") or ""
+            label = target
+            if target == "driver" and driver_path:
+                label = f"driver {driver_path}"
+            elif variant:
+                label = f"{target} {variant}"
+            elif driver_path:
+                label = f"{target} {driver_path}"
+            display = _compact_image_ref(image_ref)
+            extra = f" \u2014 `{display}`" if display else ""
+            comp_lines.append(f"- {_escape(label)}{extra}")
+
+    # Build machine table with IP
+    table_lines = [
+        "| Machine | IP | Components |",
+        "|---|---|---|",
+    ]
+    for mg in machine_groups:
+        if not isinstance(mg, dict):
+            continue
+        alias = mg.get("alias", "?")
+        ip = mg.get("ip", "")
+        cids = mg.get("component_ids", [])
+        comp_labels = []
+        for cid in cids:
+            for c in components if isinstance(components, list) else []:
+                if isinstance(c, dict) and c.get("component_id") == cid:
+                    target = c.get("target", "")
+                    variant = c.get("variant", "") or ""
+                    driver_path = c.get("driver_path", "") or ""
+                    lbl = target
+                    if target == "driver" and driver_path:
+                        lbl = f"driver {driver_path}"
+                    elif variant:
+                        lbl = f"{target} {variant}"
+                    comp_labels.append(lbl)
+                    break
+            if not any(
+                isinstance(c, dict) and c.get("component_id") == cid
+                for c in (components or [])
+            ):
+                comp_labels.append(cid)
+        ip_str = f"`{ip}`" if ip else "`\u2014`"
+        comps_str = (
+            ", ".join(f"`{_escape(l)}`" for l in comp_labels) if comp_labels else "`none`"
+        )
+        table_lines.append(f"| `{_escape(alias)}` | {ip_str} | {comps_str} |")
+
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -259,66 +438,89 @@ def deploy_requested(
         "",
         "**Status:** `deploy-requested`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
+    ]
+    if last_lifecycle_event:
+        lines.append(f"**Last lifecycle event:** {last_lifecycle_event} (UTC+08:00, Asia/Shanghai)")
+    lines.extend([
         "",
-        "### Components to deploy",
+        "### Workflow",
         "",
-    ] + comp_lines + [
+        _workflow_lines("deploy-requested"),
+        "",
+        "### Next action",
+        "",
+        "**Machine Owner**",
+        "",
+        "`/approve_deploy machine=<alias-or-ip>`",
+        "",
+        "Machine Owner may use either the machine alias or the listed IP address.",
         "",
         "### Compatible machines for remaining components",
         "",
-    ]
-    for mg in machine_groups:
-        alias = mg.get("alias", "?")
-        cids = mg.get("component_ids", [])
-        cid_str = ", ".join(cids) if cids else "none"
-        lines.append(f"- `{_escape(alias)}`: {cid_str}")
+    ])
+
+    if table_lines:
+        lines.extend(table_lines)
+    else:
+        lines.extend(["No compatible machines found.", ""])
+
     if gate_note:
-        lines += [
-            "",
-            *gate_note,
+        lines.extend(["", *gate_note])
+
+    # Current Deployment section
+    lines.extend(["", "### Current Deployment", ""])
+    if deployments:
+        dep_lines = [
+            "| Machine | IP | Component | Variant/Path | Image | Result |",
+            "|---|---|---|---|---|---|",
         ]
-    lines += [
-        "",
-        "**Next action \u2014 Machine Owner**",
-        "",
-        "`/approve_deploy machine=<alias>`",
-        "",
-        last_checked_line(),
-    ]
-    return "\n".join(lines)
+        for dep in deployments:
+            if not isinstance(dep, dict):
+                continue
+            machine = dep.get("machine", "?")
+            # Prefer enriched IP from deployment row (resolved from policy),
+            # fallback to remaining machine_groups lookup.
+            dep_ip = dep.get("ip", "")
+            if not dep_ip:
+                for mg in machine_groups:
+                    if isinstance(mg, dict) and mg.get("alias") == machine:
+                        dep_ip = mg.get("ip", "")
+                        break
+            for cid in dep.get("component_ids", []):
+                comp_target = cid
+                comp_variant = ""
+                comp_driver = ""
+                comp_image = ""
+                for c in components if isinstance(components, list) else []:
+                    if isinstance(c, dict) and c.get("component_id") == cid:
+                        comp_target = c.get("target", cid)
+                        comp_variant = c.get("variant", "") or ""
+                        comp_driver = c.get("driver_path", "") or ""
+                        comp_image = c.get("image_ref", "") or ""
+                        break
+                vpath = comp_variant if comp_variant else (comp_driver if comp_driver else "\u2014")
+                img_display = _compact_image_ref(comp_image) if comp_image else "\u2014"
+                dep_lines.append(
+                    f"| `{_escape(machine)}` | `{dep_ip}` | `{_escape(comp_target)}` "
+                    f"| `{_escape(vpath)}` | `{img_display}` | `deployed` |"
+                )
+        lines.extend(dep_lines)
+    else:
+        lines.append("No deployment has been performed yet.")
 
-
-def failed_comment(
-    repo: str, pr_number: int, head_sha: str,
-    error: str = "",
-    cos_object_key: str = "",
-    cos_bundle_sha256: str = "",
-    cos_bundle_size: int = 0,
-    cos_download_url: str = "",
-
-) -> str:
-    lines = [
-        BOT_MARKER,
-        lifecycle_marker(repo, pr_number),
-        "### Deploy Approval \u2014 Lifecycle",
+    lines.extend([
         "",
-        "**Status:** `failed`",
-        f"**Bound HEAD:** `{_short(head_sha)}`",
-        "",
-        "Deployment or validation failed. The deployment is not accepted.",
-    ]
-    if error:
-        lines.append(f"**Error:** {_escape(error)}")
-    lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
-    lines.append(last_checked_line())
+        last_lifecycle_event_line(last_lifecycle_event),
+    ])
+
     return "\n".join(lines)
 
 
 def testing(
     repo: str, pr_number: int, head_sha: str,
-    deployment_id: str = "",
-
-    case_result: str = "",
+    deployment_id: str = "", case_result: str = "",
+    last_lifecycle_event: str = "",
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -327,83 +529,149 @@ def testing(
         "",
         "**Status:** `testing`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
+        "",
+        "### Workflow",
+        "",
+        _workflow_lines("testing"),
+        "",
+        "### Next action",
+        "",
+        "**Machine Owner**",
+        "",
+        '`/record_test result=pass|fail [summary="..."]`',
+        "",
+        "### Current Deployment",
         "",
         "All required components have been deployed.",
-        "Fixed Case results are advisory only.",
     ]
     if case_result:
-        lines.append(f"**Automated case results:** {case_result}")
-        lines.append("Fixed Case results are advisory only.")
-    lines.append("")
-    lines.append("**Next action \u2014 Machine Owner**")
-    lines.append("")
-    lines.append("`/record_test result=pass|fail [summary=\"...\"]`")
-    lines.append("")
-    lines.append(last_checked_line())
+        lines.extend([
+            "",
+            f"**Automated case results:** {case_result}",
+            "Fixed Case results are advisory only.",
+        ])
+    lines.extend([
+        "",
+        last_lifecycle_event_line(last_lifecycle_event),
+    ])
     return "\n".join(lines)
 
 
 def succeeded_comment(
     repo: str, pr_number: int, head_sha: str,
-    cos_object_key: str = "",
-    cos_bundle_sha256: str = "",
-    cos_bundle_size: int = 0,
-    cos_download_url: str = "",
-
+    cos_object_key: str = "", cos_bundle_sha256: str = "",
+    cos_bundle_size: int = 0, cos_download_url: str = "",
+    deployments: list[dict] | None = None,
+    components: list[dict] | None = None,
+    machine_groups: list[dict] | None = None,
+    last_lifecycle_event: str = "",
 ) -> str:
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
         "",
-        "**Status:** `succeeded`",
+        "**Status:** \u2705 `succeeded`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
         "",
-        "Testing passed. The deployment is accepted.",
+        "### Workflow",
+        "",
+        _workflow_lines("succeeded"),
+        "",
+        "### Next action",
+        "",
+        "**None. Deployment lifecycle is complete.**",
+        "",
+        "### Current Deployment",
+        "",
     ]
+    if deployments and components:
+        dep_lines = [
+            "| Machine | IP | Component | Variant/Path | Image | Result |",
+            "|---|---|---|---|---|---|",
+        ]
+        for dep in deployments:
+            if not isinstance(dep, dict):
+                continue
+            machine = dep.get("machine", "?")
+            # Prefer enriched IP from deployment row (resolved from policy),
+            # fallback to machine_groups lookup if not enriched.
+            dep_ip = dep.get("ip", "")
+            if not dep_ip and machine_groups:
+                for mg in machine_groups:
+                    if isinstance(mg, dict) and mg.get("alias") == machine:
+                        dep_ip = mg.get("ip", "")
+                        break
+            for cid in dep.get("component_ids", []):
+                comp_target = cid
+                comp_variant = ""
+                comp_driver = ""
+                comp_image = ""
+                for c in components:
+                    if isinstance(c, dict) and c.get("component_id") == cid:
+                        comp_target = c.get("target", cid)
+                        comp_variant = c.get("variant", "") or ""
+                        comp_driver = c.get("driver_path", "") or ""
+                        comp_image = c.get("image_ref", "") or ""
+                        break
+                vpath = comp_variant if comp_variant else (comp_driver if comp_driver else "\u2014")
+                img_display = _compact_image_ref(comp_image) if comp_image else "\u2014"
+                dep_lines.append(
+                    f"| `{_escape(machine)}` | `{dep_ip}` | `{_escape(comp_target)}` "
+                    f"| `{_escape(vpath)}` | `{img_display}` | `deployed` |"
+                )
+        lines.extend(dep_lines)
+    else:
+        lines.append("Deployment completed.")
+
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
-    lines.append(last_checked_line())
+    lines.extend([
+        "",
+        last_lifecycle_event_line(last_lifecycle_event),
+    ])
     return "\n".join(lines)
 
 
-def build_test_failed_comment(
+def failed_comment(
     repo: str, pr_number: int, head_sha: str,
-    cos_object_key: str = "",
-    cos_bundle_sha256: str = "",
-    cos_bundle_size: int = 0,
-
+    error: str = "", cos_object_key: str = "", cos_bundle_sha256: str = "",
+    cos_bundle_size: int = 0, cos_download_url: str = "",
+    last_lifecycle_event: str = "",
 ) -> str:
-    return failed_comment(
-        repo, pr_number, head_sha,
-        error="Testing failed. The deployment is not accepted.",
-        cos_object_key=cos_object_key,
-        cos_bundle_sha256=cos_bundle_sha256,
-        cos_bundle_size=cos_bundle_size,
-    )
-
-
-def deploy_failed(
-    repo: str, pr_number: int, head_sha: str,
-    error: str = "",
-    cos_object_key: str = "",
-    cos_bundle_sha256: str = "",
-    cos_bundle_size: int = 0,
-
-) -> str:
-    return failed_comment(
-        repo, pr_number, head_sha,
-        error=error or "Deployment execution failed.",
-        cos_object_key=cos_object_key,
-        cos_bundle_sha256=cos_bundle_sha256,
-        cos_bundle_size=cos_bundle_size,
-    )
+    lines = [
+        BOT_MARKER,
+        lifecycle_marker(repo, pr_number),
+        "### Deploy Approval \u2014 Lifecycle",
+        "",
+        "**Status:** \u274c `failed`",
+        f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
+        "",
+        "### Workflow",
+        "",
+        _workflow_lines("failed"),
+        "",
+        "### Next action",
+        "",
+        "**None. Deployment lifecycle has failed.**",
+        "",
+        "The deployment is not accepted.",
+    ]
+    if error:
+        lines.append(f"**Error:** {_escape(error)}")
+    lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
+    lines.extend([
+        "",
+        last_lifecycle_event_line(last_lifecycle_event),
+    ])
+    return "\n".join(lines)
 
 
 def approve_deploy_revoked_comment(
-    repo: str,
-    pr_number: int,
-    head_sha: str,
-    machine_alias: str,
+    repo: str, pr_number: int, head_sha: str, machine_alias: str,
+    last_lifecycle_event: str = "",
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -412,44 +680,61 @@ def approve_deploy_revoked_comment(
         "",
         "**Status:** `deploy-requested`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
+        "",
+        "### Workflow",
+        "",
+        _workflow_lines("deploy-requested"),
         "",
         "The approval command changed, was removed, or could not be revalidated "
         "before deployment.",
         "ZERO deployment was performed.",
         "",
-        "Machine Owner must send a NEW:",
+        "### Next action",
+        "",
+        "**Machine Owner**",
         "",
         f"`/approve_deploy machine={machine_alias}`",
         "",
-        last_checked_line(),
+        last_lifecycle_event_line(last_lifecycle_event),
     ]
     return "\n".join(lines)
 
 
-def superseded_comment(repo: str, pr_number: int, old_head: str,
-                       new_head: str) -> str:
+def superseded_comment(
+    repo: str, pr_number: int, old_head: str, new_head: str,
+    last_lifecycle_event: str = "",
+) -> str:
     return "\n".join([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
         "",
         "**Status:** `review-required`",
+        f"**Bound HEAD:** `{_short(new_head)}`",
+        f"**Repository:** `{repo}`",
+        "",
+        "### Workflow",
+        "",
+        _workflow_lines("review-required"),
         "",
         f"PR HEAD has changed: `{_short(old_head)}` \u2192 `{_short(new_head)}`",
         "The old deployment is no longer valid.",
         "",
-        "**Next action \u2014 Developer**",
+        "### Next action",
+        "",
+        "**Developer**",
         "",
         "`/request_bot_review`",
         "",
-        last_checked_line(),
+        last_lifecycle_event_line(last_lifecycle_event),
     ])
 
 
 def uncertain_comment(
     repo: str, pr_number: int, head_sha: str,
+    last_lifecycle_event: str = "",
 ) -> str:
-    """deploy-requested lifecycle with command.phase=uncertain."""
     return "\n".join([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
@@ -458,22 +743,40 @@ def uncertain_comment(
         "**Status:** `deploy-requested`",
         "**Command phase:** `uncertain`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
         "",
-        "Background polling keeps this command `uncertain`.",
-        "- ZERO automatic replay",
-        "- ZERO deployment",
-        "- The old `/approve_deploy` comment will not be replayed.",
+        "### Workflow",
         "",
-        "**Next action \u2014 Machine Owner**",
+        _workflow_lines("deploy-requested"),
         "",
-        "`/approve_deploy machine=<alias>`",
+        "### Next action",
         "",
-        "Only a NEW `/approve_deploy` starts recovery validation:",
-        "- re-check the current full HEAD",
-        "- refresh the validation / frozen Review Agent image snapshot",
-        "- then run the running_image-only CLEAN GATE",
+        "**Machine Owner**",
         "",
-        last_checked_line(),
+        "`/approve_deploy machine=<alias-or-ip>`",
+        "",
+        "Only a NEW `/approve_deploy` starts recovery validation.",
+        "",
+        last_lifecycle_event_line(last_lifecycle_event),
+    ])
+
+
+def command_not_ready(
+    repo: str, pr_number: int, head_sha: str,
+    current_status: str, next_action_text: str,
+) -> str:
+    """Non-error comment for commands that are not yet ready."""
+    return "\n".join([
+        BOT_MARKER,
+        "### Deploy Approval \u2014 Command not ready",
+        "",
+        f"Current lifecycle: `{current_status}`",
+        "",
+        "### Next action",
+        "",
+        next_action_text,
+        "",
+        last_lifecycle_event_line(),
     ])
 
 
@@ -481,11 +784,9 @@ def deploy_status_comment(
     status: str, head_sha: str, repo: str, pr_number: int,
     components: list | None = None,
     deployments: list | None = None,
-    cos_object_key: str = "",
-    cos_bundle_sha256: str = "",
-    cos_bundle_size: int = 0,
-    cos_download_url: str = "",
-
+    cos_object_key: str = "", cos_bundle_sha256: str = "",
+    cos_bundle_size: int = 0, cos_download_url: str = "",
+    last_lifecycle_event: str = "",
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -494,6 +795,11 @@ def deploy_status_comment(
         "",
         f"**Status:** `{status}`",
         f"**Bound HEAD:** `{_short(head_sha)}`",
+        f"**Repository:** `{repo}`",
+        "",
+        "### Workflow",
+        "",
+        _workflow_lines(status),
         "",
     ]
     if components:
@@ -513,7 +819,10 @@ def deploy_status_comment(
     lines.extend(_cos_evidence_block(
         cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url,
     ))
-    lines.append(last_checked_line())
+    lines.extend([
+        "",
+        last_lifecycle_event_line(last_lifecycle_event),
+    ])
     return "\n".join(lines)
 
 
@@ -529,7 +838,7 @@ def deploy_help_text(topic: str = "") -> str:
             "`/request_deploy`",
             "",
             "**Parameters:** None.",
-            "Binds the current PR HEAD's latest complete current-HEAD trusted Review Agent GitHub comment evidence and all deployable components.",
+            "Binds the current PR HEAD\'s latest complete current-HEAD trusted Review Agent GitHub comment evidence and all deployable components.",
             "",
             "**Who can run:** PR Author only.",
             "**When:** PR must be open and not merged.",
@@ -542,16 +851,16 @@ def deploy_help_text(topic: str = "") -> str:
             "Approve a deployment and bind it to a machine.",
             "",
             "**Syntax:**",
-            "`/approve_deploy machine=<machine-alias>`",
+            "`/approve_deploy machine=<alias-or-ip>`",
             "",
             "**Parameters:**",
-            "- `machine=<alias>` \u2014 Machine alias, not IP/URL.",
+            "- `machine=<alias-or-ip>` \u2014 Machine alias or unique IPv4 address.",
             "",
             "**Who can run:** Machine Owner (machine owners[] or write/maintain/admin collaborator).",
-            "**Note:** Clean gate reads `running_image` for every selected component "
-            "before any deploy POST. If a runtime is occupied, zero deployment is "
-            "performed and the owner must clean it manually, then send a NEW "
-            "`/approve_deploy machine=<alias>`.",
+            "**Note:** Deploy Approval reads `running_image` as evidence only before "
+            "each deploy POST. Agent Core handles container replacement. "
+            "If a runtime is already running, Agent Core will perform an in-place "
+            "upgrade or idempotent no-op as appropriate.",
         ])
     if topic == "record_test":
         return "\n".join([
@@ -579,7 +888,7 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/request_deploy` \u2014 Request deployment for current HEAD",
         "",
         "**Machine Owner commands:**",
-        "- `/approve_deploy machine=<alias>` \u2014 Approve and bind machine",
+        "- `/approve_deploy machine=<alias-or-ip>` \u2014 Approve and bind machine",
         "- `/record_test result=pass|fail [summary=\"...\"]` \u2014 Record overall test result",
         "",
         "**Read-only commands:**",

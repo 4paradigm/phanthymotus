@@ -22,6 +22,11 @@ Deploy Controller → COS
 - **GitHubStateProxy** reads/writes hidden state JSON in the lifecycle comment.
 - **DeployController** is stateless between commands — it reads state from the lifecycle comment, validates, and writes back.
 
+## Backward Compatibility
+
+Deploy Approval maintains **full backward compatibility with v1 hidden state**. Existing lifecycle comments with the `<!-- deploy-approval-state:v1
+... -->` marker are read and written without requiring any new fields. Legacy visible markdown is preserved until the first meaningful lifecycle event, at which point it is archived to an immutable History Archive before the new renderer takes over. Deployments and restarts do NOT automatically rewrite legacy comments.
+
 ## State Machine (hidden state only)
 
 ```
@@ -31,7 +36,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 
 **Removed states:** `waiting-approval`, `waiting-machine-clean`, `deploying`, `deploy-failed`, `test-failed`, `rejected`, `cancelled`, `expired`, `rolling_back`, `rolled_back`, `rollback_failed`, `waiting_cleanup`.
 
-**Removed partial deployment:** `/approve_deploy` initially binds ALL deployable components, but operates on ALL REMAINING components only. A previously durably successful component for the exact same snapshot remains successful. Selected machine must cover ALL REMAINING components. No partial machine-group deployment, no waiting for additional machine approvals. Selected machine must pass the full-coverage gate before the CLEAN gate.
+**Multi-machine partial coverage:** `/approve_deploy` operates only on the compatible subset of REMAINING (undeployed) components for the selected machine. Multiple machines can independently approve and deploy their respective compatible subsets across multiple `/approve_deploy` calls. Once ALL components are deployed the lifecycle advances to `testing`. If any machine experiences post-deploy uncertainty the lifecycle stays `deploy-requested` with `command.phase=uncertain`. Previously durably successful components are never re-deployed.
 
 ## Commands
 
@@ -44,6 +49,12 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 | `/deploy_help [topic]` | Anyone | Help for commands. |
 
 **Legacy commands that are now `unknown`:** `/reject_deploy`, `/rollback_deploy`, `/cancel_deploy`, `/resume_deploy`.
+
+## Stale Command Handling
+
+Stale commands (e.g. duplicate `/approve_deploy` after lifecycle has advanced to `testing`, or duplicate `/record_test` after `succeeded`) are **silent NO-OPs**: the cursor advances, zero GitHub error comment is created, zero lifecycle mutation occurs, zero History is appended, zero labels are mutated, and zero deploy POST is executed. The watcher logs `STALE_COMMAND_IGNORED`.
+
+Commands that are "not ready" (e.g. `/approve_deploy` while status is `reviewing`) produce a `### Deploy Approval — Command not ready` informational comment; this is NOT a deployment error.
 
 ## Key Contracts
 
@@ -61,12 +72,10 @@ and are copied into hidden state to make the snapshot restart-safe.
 - **Review Agent authentication:** Review Agent uses a user-provided `GITHUB_TOKEN`, not the GitHub App. This is strictly separate from Deploy Approval's GitHub App credentials.
 - **Supported repos (DESIRED_REPOS):** `4paradigm/phanthymotus` and `4paradigm/phanthymotus-driver` are permanently declared as desired/supported repositories in source code.  Runtime `GITHUB_REPOS` is resolved at startup by a single fresh `GET /installation/repositories` call: `ACTIVE_REPOS = DESIRED_REPOS ∩ AUTHORIZED_REPOS`.  Missing, duplicate, unknown, or third-party repository entries fail closed.
 - **Evidence source:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation. Trusted Review Agent GitHub comments provide Build Result, Test Results, and Code Review. Build/Test commit short SHA resolves via GitHub to full SHA for exact equality with fresh PR HEAD. Image tag comes from the selected Build Result comment Images section (full mutable ref, not basename). Deploy Approval freezes the exact image:tag from the trusted Review Agent GitHub comment. Deploy Approval performs zero Registry HTTP. Agent Core receives the exact tag and owns all Registry authentication, pull, and deploy. No Review Agent HTTP API.
-- **Full-coverage machine list:** `deploy_requested` lifecycle comment shows only machines that can cover ALL REMAINING components. If no machine can cover all remaining components, status stays deploy-requested and the operator must update machine policy.
 - **Source matrix:** GitHub PR comments are the source of Review Agent Build/Test/Code Review evidence and image:tag candidate facts; Deploy Approval freezes the exact image:tag from the trusted Review Agent comment without contacting the Registry; Agent Core receives the exact tag and owns all Registry authentication, pull, and deploy; GitHub persists the deployment snapshot. Legacy repo@sha256 hidden-state values remain readable only for migration and historical compatibility.
 - **Deployability:** `phanthymotus` deploys `perception` and `actucore`, not `CORE`; `phanthymotus-driver` deploys exact driver paths.
 - **Variant contract:** perception variants are canonical `5.11` and `6.1`. Legacy `jetson-jp5.11` / `jetson-jp6.1` are normalized only at config load.
-- **Full-coverage gate:** `/approve_deploy` first checks that the selected machine covers ALL REMAINING components. If coverage is partial, zero deploy POST is performed; the comment lists only full-coverage machines.
-- **CLEAN gate:** `/approve_deploy` reads `running_image` for ALL REMAINING components before any deploy POST. If any `running_image` is non-empty, zero deployment is performed, cursor advances, and the owner must clear the occupied runtime image manually, then send a NEW `/approve_deploy`. Controller does not perform stop/remove/cleanup.
+- **CLEAN gate:** `/approve_deploy` reads `running_image` for the selected machine's compatible components. Non-empty `running_image` is recorded as preflight evidence but does NOT block deployment; Agent Core is responsible for replacing old containers. Controller does not perform stop/remove/cleanup.
 - **Agent Core no-container response:** the current compatibility shape normalizes to `running_image=""` only when `running_image` and `error` are absent, `status` key exists, and `logs` is a string. The `status` VALUE has zero CLEAN/health/case business influence. Error or malformed shapes fail closed.
 - status VALUE has zero CLEAN/health/case business influence.
 - error/malformed shapes fail closed.
@@ -256,7 +265,43 @@ Trusted Review Agent exact image:tag is frozen into hidden state and passed
 unchanged to Agent Core.  Agent Core owns all Registry authentication, pull,
 and deployment.
 
-## Environment Variables
+## Lifecycle Workflow
+
+The lifecycle comment displays a fixed 8-step workflow:
+
+1. Request Review
+2. Review Agent completed
+3. Request deployment
+4. Machine Owner approval(s)
+5. All required components deployed
+6. Automated Cases
+7. Record validation result
+8. Deployment accepted
+
+Steps are marked `[x]` (complete) or `[ ]` (pending) with `← Next` on the first pending step.
+
+## History & Archives
+
+History is persisted in the visible lifecycle markdown, newest-first. When the visible body approaches 48 KiB, oldest events are moved to immutable **History Archive** comments (marked `<!-- deploy-approval-history:<repo>:<pr>:<page -->`). The main lifecycle comment links to archives. History is NEVER silently dropped. Hidden state JSON never contains unbounded history arrays.
+
+## Fixed COS Layout
+
+COS evidence uses a fixed root path `phanthymotus_pr/` (no runtime override). Layout:
+
+```
+phanthymotus_pr/
+  phanthymotus/
+    YYYY-MM/
+      YYYY-MM-DD/
+        pr-N/
+          evidence-<sha>.log.gz
+```
+
+Same pattern for `phanthymotus-driver/`.
+
+## Zero Registry Dependency
+
+Deploy Approval performs **zero Registry HTTP**. It does not read, parse, or push to any container registry. Registry credentials, digests, and authentication are entirely owned by Agent Core. Deploy Approval freezes the exact image tag from the trusted Review Agent GitHub comment and passes it unchanged.
 
 Deploy Approval does not define a new runtime env namespace.
 

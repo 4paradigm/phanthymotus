@@ -32,6 +32,7 @@ from typing import Any
 from .config import Config
 from .image_ref import validate_image_ref
 from .github_client import GitHubClient, GitHubError
+from .comments import beijing_now_str
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,52 @@ _MAX_HIDDEN_STATE_BYTES = 8192
 
 # Maximum lifecycle comment body size (64 KB)
 _MAX_COMMENT_BODY_BYTES = 65536
+
+# Maximum visible lifecycle markdown soft budget (48 KiB)
+_MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024
+
+# Visible history section markers
+VISIBLE_HISTORY_START_MARKER = "<!-- deploy-approval-visible-history:start -->"
+VISIBLE_HISTORY_END_MARKER = "<!-- deploy-approval-visible-history:end -->"
+
+# History archive marker prefix
+HISTORY_ARCHIVE_MARKER_PREFIX = "<!-- deploy-approval-history:"
+
+# History event delimiter marker
+HISTORY_EVENT_DELIMITER = "<!-- deploy-approval-history-event -->"
+
+
+def _history_archive_marker(repo: str, pr_number: int, page: int) -> str:
+    """Return the exact archive marker string for a given page."""
+    return f"{HISTORY_ARCHIVE_MARKER_PREFIX}{repo}:{pr_number}:{page} -->"
+
+
+def _next_history_archive_page(comments: list[dict], repo: str, pr_number: int) -> int:
+    """Discover the next archive page number from existing comments.
+
+    Parses markers of the form:
+        <!-- deploy-approval-history:<repo>:<pr>:<page> -->
+    Returns the smallest positive integer greater than any existing page.
+    """
+    page_num = 1
+    prefix = f"{HISTORY_ARCHIVE_MARKER_PREFIX}{repo}:{pr_number}:"
+    for c in comments:
+        cbody = c.get("body", "")
+        if not isinstance(cbody, str):
+            continue
+        if prefix not in cbody:
+            continue
+        # Extract page number after the prefix
+        try:
+            after_prefix = cbody.split(prefix, 1)[1]
+            page_str = after_prefix.split(" -->", 1)[0].strip()
+            p = int(page_str)
+            if p >= page_num:
+                page_num = p + 1
+        except (ValueError, IndexError):
+            pass
+    return page_num
+
 
 
 class GitHubStateProxyError(Exception):
@@ -179,6 +226,19 @@ def _validate_hidden_state(data: dict) -> dict:
     if extra_keys:
         raise MalformedHiddenStateError(
             f"extra keys not allowed: {', '.join(sorted(extra_keys))}"
+        )
+
+    # Explicitly reject unbounded history fields — history must persist
+    # in visible markdown only, never in hidden JSON state.
+    if "history" in data:
+        raise MalformedHiddenStateError(
+            "hidden state must not contain 'history' field; "
+            "history persists in visible lifecycle markdown only"
+        )
+    if "history_events" in data:
+        raise MalformedHiddenStateError(
+            "hidden state must not contain 'history_events' field; "
+            "history persists in visible lifecycle markdown only"
         )
 
     if data.get("version") != 1:
@@ -457,6 +517,221 @@ def _build_hidden_state_body(visible_markdown: str, state: dict) -> str:
         return visible_markdown.rstrip() + "\n\n" + hidden_block
     return hidden_block
 
+
+
+# ── Visible history helpers ──────────────────────────────────────────────────
+
+
+def _parse_visible_history(body: str) -> tuple[str, list[dict]]:
+    """Parse visible lifecycle body into (body_without_history, events).
+
+    Returns the body text stripped of the generated history section,
+    plus a list of event dicts (newest first).
+    """
+    start = body.find(VISIBLE_HISTORY_START_MARKER)
+    end = body.find(VISIBLE_HISTORY_END_MARKER)
+    if start < 0 or end < 0 or end <= start:
+        # No generated history section — whole body is visible
+        return body.rstrip(), []
+    # Strip history section from body
+    before = body[:start].rstrip()
+    after = body[end + len(VISIBLE_HISTORY_END_MARKER):].lstrip()
+    clean_body = (before + "\n" + after).strip() + "\n"
+
+    # Parse events from the history section
+    history_section = body[start + len(VISIBLE_HISTORY_START_MARKER):end]
+    events: list[dict] = []
+    # Split by optional delimiter
+    blocks = re.split(r"<!-- deploy-approval-history-event -->", history_section)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        evt: dict[str, Any] = {}
+        for line in block.splitlines():
+            line = line.strip()
+            # Extract timestamp from header #### 2026-09-24 10:00:00 \u2014 Title
+            ts_match = re.match(r"^####\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\u2014\s+(.*)$", line)
+            if ts_match:
+                evt["timestamp"] = ts_match.group(1)
+                evt["event"] = ts_match.group(2)
+                continue
+            if line.startswith("**Lifecycle:**"):
+                evt["lifecycle"] = line.replace("**Lifecycle:**", "").strip()
+            elif line.startswith("**Machine:**"):
+                m = re.search(r"`([^`]*)`", line)
+                if m:
+                    evt["machine"] = m.group(1)
+                ip_m = re.search(r"\u00b7\s+\**IP:**\s+`([^`]*)`", line)
+                if ip_m:
+                    evt["ip"] = ip_m.group(1)
+            elif line.startswith("**Components:**"):
+                evt["components"] = line.replace("**Components:**", "").strip()
+            elif line.startswith("**Result:**"):
+                evt["result"] = line.replace("**Result:**", "").strip()
+        if evt:
+            events.append(evt)
+    return clean_body, events
+
+
+def _build_history_block(events: list[dict]) -> str:
+    """Build the generated visible history section string."""
+    lines = [VISIBLE_HISTORY_START_MARKER]
+    for evt in events:
+        ts = evt.get("timestamp", beijing_now_str())
+        title = evt.get("event", "Event")
+        lines.append(f"#### {ts} \u2014 {title}")
+        lines.append("")
+        lifecycle = evt.get("lifecycle", "")
+        if lifecycle:
+            lines.append(f"**Lifecycle:** {lifecycle}")
+            lines.append("")
+        machine = evt.get("machine", "")
+        ip = evt.get("ip", "")
+        if machine or ip:
+            if machine and ip:
+                lines.append(f"**Machine:** `{machine}` \u00b7 **IP:** `{ip}`")
+            elif machine:
+                lines.append(f"**Machine:** `{machine}`")
+            else:
+                lines.append(f"**IP:** `{ip}`")
+            lines.append("")
+        components = evt.get("components", "")
+        if components:
+            lines.append(f"**Components:** {components}")
+            lines.append("")
+        result = evt.get("result", "")
+        if result:
+            lines.append(f"**Result:** {result}")
+            lines.append("")
+        lines.append(HISTORY_EVENT_DELIMITER)
+        lines.append("")
+    lines.append(VISIBLE_HISTORY_END_MARKER)
+    return "\n".join(lines)
+
+
+def _insert_history_into_visible(visible: str, event: dict) -> str:
+    """Insert a new history event into the visible lifecycle markdown.
+
+    Preserves existing generated history section; prepends new event.
+    Ensures exactly one "### History" heading exists.
+    """
+    start = visible.find(VISIBLE_HISTORY_START_MARKER)
+    end = visible.find(VISIBLE_HISTORY_END_MARKER)
+    if start >= 0 and end >= 0 and end > start:
+        # Parse existing events, prepend new event
+        _, existing_events = _parse_visible_history(visible)
+        new_events = [event] + existing_events
+        new_history = _build_history_block(new_events)
+        # Replace existing history section
+        before_history = visible[:start]
+        after_history = visible[end + len(VISIBLE_HISTORY_END_MARKER):]
+        return before_history + new_history + after_history
+    else:
+        # No existing history section — append one with "### History" heading
+        existing_events: list[dict] = []
+        new_events = [event] + existing_events
+        new_history = _build_history_block(new_events)
+        return visible.rstrip() + "\n\n### History\n\n" + new_history + "\n"
+
+
+
+
+def _render_history_event(evt: dict) -> str:
+    """Render a single history event dict into markdown lines.
+
+    Used by both _build_history_block (main) and archive creation,
+    ensuring archived events are semantically identical to main history.
+    """
+    lines = []
+    ts = evt.get("timestamp", beijing_now_str())
+    title = evt.get("event", "Event")
+    lines.append(f"#### {ts} — {title}")
+    lines.append("")
+    lifecycle = evt.get("lifecycle", "")
+    if lifecycle:
+        lines.append(f"**Lifecycle:** {lifecycle}")
+        lines.append("")
+    machine = evt.get("machine", "")
+    ip = evt.get("ip", "")
+    if machine or ip:
+        from .comments import _escape
+        if machine and ip:
+            lines.append(f"**Machine:** `{_escape(machine)}` · **IP:** `{ip}`")
+        elif machine:
+            lines.append(f"**Machine:** `{_escape(machine)}`")
+        else:
+            lines.append(f"**IP:** `{ip}`")
+        lines.append("")
+    components = evt.get("components", "")
+    if components:
+        lines.append(f"**Components:** {components}")
+        lines.append("")
+    result = evt.get("result", "")
+    if result:
+        lines.append(f"**Result:** {result}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _count_visible_bytes(visible: str) -> int:
+    """Count UTF-8 encoded bytes of visible lifecycle markdown."""
+    return len(visible.encode("utf-8"))
+
+
+def _truncate_events_to_fit(
+    events: list[dict], target_bytes: int,
+) -> tuple[list[dict], list[dict]]:
+    """Truncate oldest events until total history block fits target_bytes.
+
+    Returns (kept_events, archived_events).
+    Never silently drops events — archived events must be moved to an archive.
+    Every popped event goes into archived; kept + archived == original (no dup, no loss).
+    """
+    # Try keeping all events
+    candidate = _build_history_block(events)
+    if _count_visible_bytes(candidate) <= target_bytes:
+        return events, []
+    # Remove oldest events one by one until it fits
+    kept = list(events)
+    archived: list[dict] = []
+    while kept:
+        removed = kept.pop()  # remove oldest (last in newest-first list)
+        archived.insert(0, removed)
+        candidate = _build_history_block(kept)
+        if _count_visible_bytes(candidate) <= target_bytes:
+            break
+    return kept, archived
+
+
+def _build_archive_body(
+    repo: str,
+    pr_number: int,
+    page_num: int,
+    events: list[dict],
+    extra_text: str = "",
+) -> str:
+    """Build an immutable history archive comment body.
+
+    Always starts with BOT_MARKER + archive marker.
+    """
+    from .comments import BOT_MARKER
+    archive_marker = _history_archive_marker(repo, pr_number, page_num)
+    archive_lines = [
+        BOT_MARKER,
+        archive_marker,
+        f"### Deploy Approval — History Archive #{page_num}",
+        "",
+    ]
+    if extra_text:
+        archive_lines.append(extra_text)
+        archive_lines.append("")
+    for evt in events:
+        event_text = _render_history_event(evt)
+        archive_lines.append(event_text)
+        archive_lines.append(HISTORY_EVENT_DELIMITER)
+        archive_lines.append("")
+    return "\n".join(archive_lines)
 
 class GitHubStateProxy:
     """GitHub-only state proxy for Deploy Approval.
@@ -776,8 +1051,15 @@ class GitHubStateProxy:
     ) -> None:
         """Project hidden status onto exactly one status:* label.
 
-        Runtime self-heal: fresh read → create desired if missing → fresh
-        verify → add → remove other canonical status:* labels.
+        Idempotent runtime self-heal:
+        1. Fresh GET current labels
+        2. If desired already present → skip create/add entirely
+        3. Delete ONLY canonical status:* labels that actually exist on PR
+        4. Add desired label only if not present
+        5. Preserve every non-status label
+
+        If current labels are already exactly the desired state:
+        ZERO label create, ZERO add, ZERO delete.
 
         Any create/add/remove failure is warning-only; hidden lifecycle state
         is never rolled back and business flow is never blocked.
@@ -800,40 +1082,11 @@ class GitHubStateProxy:
                     repo, issue_number, read_exc,
                 )
 
-            # 2. Desired canonical status label missing → best-effort create
-            desired_applied = desired_label in current_labels
-            if not desired_applied:
-                try:
-                    await self._ensure_label_exists(repo, desired_label)
-                except Exception as create_exc:
-                    logger.warning(
-                        "label ensure/create failed for %s#%s %s: %s (continuing)",
-                        repo, issue_number, desired_label, create_exc,
-                    )
-
-            if not desired_applied:
-                # Fresh verify after create attempt.
-                verify_labels: list[str] = []
-                try:
-                    verify_labels = await self.get_issue_labels(repo, issue_number)
-                except Exception:
-                    pass
-                desired_applied = desired_label in verify_labels
-
-            # Add desired label only if fresh verification did not confirm it.
-            if not desired_applied:
-                try:
-                    await self.add_issue_label(repo, issue_number, desired_label)
-                    desired_applied = True
-                except Exception as add_exc:
-                    logger.warning(
-                        "label add failed for %s#%s %s: %s (continuing)",
-                        repo, issue_number, desired_label, add_exc,
-                    )
-
-            if desired_applied:
+            # 2. If desired already exists → skip create/add
+            if desired_label in current_labels:
+                # 3. Remove only OTHER canonical status:* labels that actually exist
                 for label in _ALLOWED_STATUS_LABELS:
-                    if label != desired_label:
+                    if label != desired_label and label in current_labels:
                         try:
                             await self.remove_issue_label(repo, issue_number, label)
                         except Exception as rem_exc:
@@ -841,11 +1094,35 @@ class GitHubStateProxy:
                                 "label remove failed for %s#%s %s: %s (best-effort, next reconcile will heal)",
                                 repo, issue_number, label, rem_exc,
                             )
-            else:
+                return
+
+            # 4. Desired missing → best-effort ensure + add
+            try:
+                await self._ensure_label_exists(repo, desired_label)
+            except Exception as create_exc:
                 logger.warning(
-                    "desired label was not applied for %s#%s; preserving existing status labels",
-                    repo, issue_number,
+                    "label ensure/create failed for %s#%s %s: %s (continuing)",
+                    repo, issue_number, desired_label, create_exc,
                 )
+
+            try:
+                await self.add_issue_label(repo, issue_number, desired_label)
+            except Exception as add_exc:
+                logger.warning(
+                    "label add failed for %s#%s %s: %s (continuing)",
+                    repo, issue_number, desired_label, add_exc,
+                )
+
+            # 5. Remove only OTHER canonical status:* labels that actually exist
+            for label in _ALLOWED_STATUS_LABELS:
+                if label != desired_label and label in current_labels:
+                    try:
+                        await self.remove_issue_label(repo, issue_number, label)
+                    except Exception as rem_exc:
+                        logger.warning(
+                            "label remove failed for %s#%s %s: %s (best-effort, next reconcile will heal)",
+                            repo, issue_number, label, rem_exc,
+                        )
         except Exception as e:
             logger.warning(
                 "label projection failed for %s#%s: %s",

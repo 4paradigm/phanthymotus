@@ -91,6 +91,7 @@ def _controller():
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
     proxy.comment_identity = AsyncMock(return_value=("111", "alice"))
+    proxy.find_trusted_lifecycle_comment = AsyncMock(return_value={"id": 42, "body": ""})
     proxy.get_pr = AsyncMock(
         return_value={
             "state": "open",

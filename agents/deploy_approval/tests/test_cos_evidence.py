@@ -353,7 +353,7 @@ async def test_pr_author_can_approve_own_deploy():
 
 @pytest.mark.asyncio
 async def test_approve_rejects_machine_without_full_coverage():
-    """A machine that does not cover all remaining components must be rejected."""
+    """A machine with partial coverage must keep only its compatible remaining components."""
     from ..service import DeployController
     from types import SimpleNamespace
 
@@ -361,6 +361,7 @@ async def test_approve_rejects_machine_without_full_coverage():
         SimpleNamespace(
             alias="alpha",
             node_id="node-1",
+            node_host="192.0.2.10",
             platforms=["linux/arm64"],
             variants=[],
             driver_paths=[],
