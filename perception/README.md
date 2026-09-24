@@ -2439,6 +2439,150 @@ other bundles in that file state.
 
 ---
 
+## Camera Parameters (`camera_info`)
+
+`vop` and `visual_depth` both sit in the middle of a chain that starts at a camera
+card and ends at something that has to act on metres. **Camera parameters travel
+along that chain**, and each stop rewrites the parts its own processing changed.
+
+The format is `motus.camera/1`, specified in
+`phanthymotus-driver/README_dev.md` § Camera Parameters. The implementation here
+is `plugins/camera_info.py` — deliberately a **separate implementation** of the
+same document rather than a shared import, as with `motus.control/1`.
+
+### Why these two cards have to care
+
+Neither of them uses the field of view itself. `vop` reports a **normalised**
+lateral offset (−1 … +1) and `visual_depth` reports metres per pixel; both are
+complete without any lens geometry. The consumer is what needs it:
+
+- navi's avoidance corridor is **metric** (half-width ≈ 0.33 m), so every tick it
+  converts that width back into a range of image columns — and that conversion is
+  the field of view.
+- `position` is only an angle once someone multiplies it by the half field of
+  view. Until then it is dimensionless.
+
+That number used to be typed into navi's own config by hand. On r1_sz it read
+0.55 rad against a lens measuring 0.888, the corridor came out **1.86 m wide —
+wider than any door**, every doorframe counted as dead ahead, and the robot turned
+away 0.6 m short of openings it fitted through. The depth map reported clear the
+whole time. The value had been measured on that robot the day before; it went into
+a report and not into a config file, and nothing noticed.
+
+### What each card changes, and what it must not
+
+| | `vop` | `visual_depth` |
+|---|---|---|
+| `id` | unchanged | unchanged — this is what lets navi check both its inputs are the same lens |
+| `half_fov_rad` | unchanged | **unchanged** — `cv2.resize` stretches rather than crops, so the same angular extent is still in the picture |
+| `width`/`height` | unchanged | rewritten to 640×480: the declaration describes the image **this port** publishes |
+| `K` | unchanged | **rescaled** — see below |
+| `D` | unchanged | unchanged (radial terms are dimensionless in normalised coords) |
+| `pipeline` | `+ perception/vop` | `+ perception/visual_depth` |
+| `source` | `inherited` | `inherited` |
+
+**The `K` trap.** `fx` is in pixels and a consumer derives the angle as
+`atan((width/2) / fx)`. Publish a resized image while passing `K` through
+untouched and both fields stay individually plausible while their ratio is wrong
+by exactly the resize factor — the same silent, confidently wrong geometry the
+format exists to prevent. `_rescale_K` scales the two axes independently, because
+1280×720 → 640×480 is not a uniform scale and `fx`/`fy` are separate entries
+precisely so that is expressible.
+
+If `visual_depth` ever **crops** instead of resizing, `half_fov_rad` stops being
+carried unchanged and has to be recomputed. That is why the reason is in the code
+rather than only here.
+
+### The lens barrel is masked, because "unknown" could not catch it
+
+r1_sz's main camera looks out through a round barrel, so a wide black ring fills
+the corners of every frame. The depth model does not know that and invents a
+distance for it. Measured 2026-09-23:
+
+| | median depth |
+|---|---|
+| four corners (solid black housing in the RGB) | **0.64 – 0.83 m** |
+| centre of frame | 1.76 m |
+| **valid-pixel fraction of the whole map** | **100%** |
+
+So every edge of the picture reported "something right in front of me", and
+`coverage` — the entire "unknown is not free" protection downstream — never
+fired, because **this is not a missing reading. It is a confident wrong one**,
+which is strictly worse.
+
+What it cost, before this existed: the angular thirds navi used to choose an
+escape direction were reading the barrel rather than the room (left 0.906, right
+0.993, centre 1.368, on a corridor that was clear), and at close range the metric
+corridor could be tripped to a stop by the robot's own lens.
+
+**The discriminator is "near-black **and** connected to the frame edge."** No
+scene has that signature; a black object in the middle of the room is surrounded
+by scene and is its own component, so it is not masked — masking it would throw
+away a real obstacle, which is the opposite of the intended error.
+
+Detected per frame rather than declared as a region in `camera_info`: a declared
+circle has to be measured per camera and goes stale the moment a mount changes,
+while the signature does not. The remaining false positive — a genuinely dark
+region touching the edge — **fails safe**: masked pixels become "no reading",
+coverage drops, and navi refuses to drive into what it cannot see.
+
+`lens_barrel_max_fraction` (0.6) is the backstop for the one case where that is
+useless: a dark enough room makes one border-connected blob out of everything,
+and a fully masked map is a blind robot. Past that fraction nothing is masked —
+"the room is dark" and "my lens is blocked" want different responses from a
+person, so the card does not guess. `info().instances[*].lens_barrel_pct` says
+how much of the last frame was housing.
+
+Masked pixels become `NaN`, which `encode_depth` already maps to the 0 that the
+renderer contract reserves for "no reading". Writing a far value instead would
+say *clear*, which is the same mistake pointing the other way.
+
+### Nothing upstream means nothing downstream
+
+A card whose camera declared nothing emits **no** `camera_info` — not an entry
+full of nulls. The format requires a non-empty `id` and neither card can invent
+one; a camera's identity is not derivable from a topic name. A consumer that sees
+no entry falls back conservatively and says so, which is correct. A consumer that
+saw a made-up `id` would compare it against another made-up one and conclude two
+different lenses are the same.
+
+Instead both cards report `camera_info_note` in `info()`, naming the upstream as
+the thing to fix. "The camera declared nothing" and "this card dropped it" look
+identical from downstream, and only the first is somebody else's problem.
+
+A declaration is also dropped when its node is retired: a re-wired card answering
+`info()` with the optics of a camera it is no longer fed by is worse than
+answering with nothing.
+
+### The depth calibration is looked up by camera identity, not chosen
+
+`cal_a`/`cal_b` are a property of **camera x depth model**, so they cannot move to
+the camera card — the camera has no idea which model is downstream of it. What is
+automated is the **lookup**: the camera declares who it is, that identity survives
+every hop, and `visual_depth` picks its own row out of its own table.
+
+| `calibration_preset` | what it does |
+|---|---|
+| `auto (by camera)` | **default.** Match `camera_info.id` against `CALIBRATION_PRESETS[*].camera_ids`; no match falls back to the engine's generic fit |
+| `no calibrate` | no correction at all, whatever the camera says |
+| `manual set` | the typed `cal_a`/`cal_b` |
+| a preset name | that row, regardless of which camera is attached |
+
+Three rules that follow, each with a reason:
+
+- **The match is exact, never by prefix.** A fit is measured on one lens.
+  Matching `unitree/...` would silently apply r1's numbers to a camera that
+  merely shares a vendor — the wrong-camera failure wearing a convenience.
+- **`no calibrate` was not repurposed.** Cards already deployed hold that value
+  explicitly, and on r1_sz the difference between it and the preset is a factor
+  of **2.65 in every distance**. Redefining what a stored value means is not
+  something to do to a running robot, so `auto (by camera)` was added alongside.
+  Existing cards therefore keep their behaviour and have to be switched by hand.
+- **`info().calibration` distinguishes the outcomes**: `auto:<preset>`,
+  `auto:no-match(<id>)`, `auto:no-camera`, `preset:<name>`, `manual`,
+  `model-default`. A card whose depth is 2.65x out and one whose depth is right
+  look identical from outside; this field is what separates them.
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |

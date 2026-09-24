@@ -420,6 +420,13 @@ async def _do_start_project_impl():
                                        **info_args},
         ), timeout_s=INFO_TIMEOUT_S)
         data = payload_of(info)
+        # Kept whole, not just `topic_out`. A card's `info()` is the only place
+        # it describes itself, and a consumer downstream may need more of that
+        # description than its output topics — `camera_info` is the first such
+        # case. Retaining the payload costs nothing here because the call has
+        # already been made; going back for it later would mean a second round
+        # trip, out of dependency order.
+        resolved_info[card_id] = data
         topic_out = data.get('topic_out') or []
         if topic_out:
             resolved_topics[card_id] = topic_out
@@ -519,6 +526,9 @@ async def _do_start_project_impl():
     errors = []
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
+    # The whole info() payload per card, same population point. See
+    # `_upstream_camera_info`.
+    resolved_info: dict[str, dict] = {}
 
     def _topic_clash(card_id: str, info: dict):
         """Another card already publishing a topic this one just claimed.
@@ -576,7 +586,8 @@ async def _do_start_project_impl():
             return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
-                                 control_interface: dict = None):
+                                 control_interface: dict = None,
+                                 camera_info: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -621,6 +632,13 @@ async def _do_start_project_impl():
             # producer can reconcile against it and refuse — not on `info`,
             # which must stay answerable by a card that has not been given one.
             args['control_interface'] = control_interface
+
+        if camera_info:
+            # The optics behind each input, keyed by topic. Sent on `start` for
+            # the same reason: a consumer adopts it once, before the first
+            # frame, and reports in `info().degraded` what it had to assume when
+            # a source declared nothing.
+            args['camera_info'] = camera_info
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -828,6 +846,46 @@ async def _do_start_project_impl():
             return topics[0], [], unresolved
         return '', [], unresolved
 
+    def _upstream_camera_info(card_id: str) -> dict:
+        """What this card's sources say about the optics behind each input.
+
+        `{topic: declaration}` — see `phanthymotus-driver/README_dev.md`
+        § Camera Parameters for the format and why it exists.
+
+        **The mirror image of `_downstream_descriptor`, and cheaper.** That one
+        runs against the start order and has to call `info()` itself, because a
+        command producer needs to know about a consumer that has not started.
+        This one runs *with* the order: a card's sources are always started
+        first, so their `info()` answers are already in `resolved_info` and this
+        is a dictionary lookup.
+
+        Keyed by the topic each declaration names, not by position and not by
+        the source card's name. A card may publish several ports and a consumer
+        may have several inputs, so list position means nothing to either side;
+        and naming the upstream card would undo the reason consumers dispatch
+        inputs by what they carry rather than by where they came from.
+
+        A source that declares nothing simply has no entry. That is not a fault
+        — almost no card has heard of this format — and it must never fail a
+        start; the consumer degrades and says so.
+        """
+        out: dict = {}
+        for conn in [c for c in connections if c.get('toCardId') == card_id]:
+            declarations = (resolved_info.get(conn.get('fromCardId')) or {}).get('camera_info')
+            if not isinstance(declarations, list):
+                continue
+            for entry in declarations:
+                if not isinstance(entry, dict):
+                    continue
+                topic = entry.get('topic')
+                # First declaration for a topic wins. Two sources publishing the
+                # same topic is already reported as a clash by `_topic_clash`;
+                # silently taking whichever card started last would make the
+                # optics disagree with the clash message.
+                if topic and topic not in out:
+                    out[topic] = entry
+        return out
+
     async def _downstream_descriptor(card_id: str) -> tuple[dict, str]:
         """The action space of whatever this card's `control/*` output feeds.
 
@@ -954,7 +1012,8 @@ async def _do_start_project_impl():
             continue
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
-                                 control_interface=descriptor)
+                                 control_interface=descriptor,
+                                 camera_info=_upstream_camera_info(card.get('id', '')))
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:

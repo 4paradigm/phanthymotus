@@ -608,6 +608,12 @@ class VideoObjectPerceptionPlugin:
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _VOPNode] = {}
         self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
+        # What the camera feeding each instance said about its optics
+        # (`motus.camera/1`, arrives as `camera_info` on `start`). vop's
+        # `position` is a **normalised** lateral offset, so without a field of
+        # view it is a dimensionless number to everyone downstream; passing the
+        # declaration on is what makes it an angle. Guarded by `_nodes_lock`.
+        self._upstream_camera: dict[str, dict] = {}
         # Guards _nodes and _instance_configs. Every dispatch() runs on its own
         # ThreadingHTTPServer thread, so an unguarded read-modify-write of
         # _nodes can leave a started node unreachable — see
@@ -927,10 +933,34 @@ class VideoObjectPerceptionPlugin:
         node.start()
         log.info(f"[vop] node started (background): {input_topic}")
 
+    def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
+        """`{"camera_info": [...]}` for an `info()` answered while loading.
+
+        Recorded at `start`, which happens before the engine begins loading, so
+        it is available here — the only reason it was ever missing is that this
+        reply returned early.
+        """
+        from plugins.camera_info import inherit
+
+        topic = args.get("input_topic") or ""
+        if not topic:
+            topics = args.get("input_topics") or []
+            topic = topics[0] if topics else ""
+        key = instance_id or topic or _DEFAULT_INSTANCE
+        with self._nodes_lock:
+            upstream = self._upstream_camera.get(key) or {}
+        declared = inherit(upstream, topic=output_topic_for(topic),
+                           fmt="data/json", stage="perception/vop")
+        return {"camera_info": declared} if declared else {}
+
     def _retire_node(self, node_key: str) -> Optional[dict]:
         """Stop, unregister and destroy one node. Returns its stop() result."""
         with self._nodes_lock:
             node = self._nodes.pop(node_key, None)
+            # Goes with the node: a re-wired card answering info() with the
+            # optics of a camera it is no longer fed by is worse than answering
+            # with nothing, because downstream cannot tell the difference.
+            self._upstream_camera.pop(node_key, None)
         if node is None:
             return None
         node.request_stop()
@@ -980,6 +1010,17 @@ class VideoObjectPerceptionPlugin:
                     "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
                     "state": "loading",
                     "desc": "Loading YOLO model...",
+                    # **The declaration does not wait for the engine.**
+                    #
+                    # This reply used to drop it, and agent-core records
+                    # whatever `info()` returns — so a consumer that started
+                    # while this card was still loading got no camera
+                    # declaration at all, and nothing said so. On r1_sz that
+                    # cost navi its box path and the corridor's real geometry,
+                    # and it only ever reproduced on a *cold* container, because
+                    # a warm one starts immediately and never passes through
+                    # here.
+                    **self._loading_camera_info(args, instance_id),
                 }
             if self._model_load_error:
                 return {
@@ -1038,6 +1079,36 @@ class VideoObjectPerceptionPlugin:
             if self._rejected_classes:
                 info["ignored_config_classes"] = self._rejected_classes
                 info["warning"] = self._frozen_vocab_error(self._rejected_classes)
+
+            # Pass the camera's optics on. Nothing about the picture's geometry
+            # changes here — vop reads the frame and publishes text — so the
+            # declaration goes through with only `pipeline` extended, and in
+            # particular `width`/`height` and `K` are left exactly as they came.
+            #
+            # It matters twice downstream. navi needs a field of view to turn
+            # `position` into an angle at all; and it compares the `id` on this
+            # port against the one on its depth input, which is the only thing
+            # that catches camera A's detections being paired with camera B's
+            # distances — wirable today, and wrong in a way nothing logs.
+            if topics_out:
+                from plugins.camera_info import inherit
+                # Same key derivation `start` uses, so info() looks up the entry
+                # that start recorded.
+                key = instance_id if instance_id in nodes else (
+                    next(iter(nodes), None) if nodes
+                    else (instance_id or input_topic or _DEFAULT_INSTANCE))
+                with self._nodes_lock:
+                    upstream = self._upstream_camera.get(key) or {}
+                declared = inherit(upstream, topic=topics_out[0]["topic"],
+                                   fmt="data/json", stage="perception/vop")
+                if declared:
+                    info["camera_info"] = declared
+                elif input_topic:
+                    info["camera_info_note"] = (
+                        "上游相机没有声明 camera_info —— 本卡片报的 position 是归一化"
+                        "横向偏移，下游拿不到视场角就没法换算成角度，而导航的避障走廊"
+                        "宽度正是按这个角度算的。相机卡片补上声明即可，见 "
+                        "phanthymotus-driver/README_dev.md 的 Camera Parameters")
             return info
 
         elif action == "start":
@@ -1051,6 +1122,14 @@ class VideoObjectPerceptionPlugin:
             # recognize_by_photo / recognize_by_url. It just has nothing to
             # subscribe to, so it consumes no frames.
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+            # Recorded before the node starts, and recorded even when empty, so a
+            # restart that no longer carries a declaration replaces the old entry
+            # rather than leaving one that claims a camera no longer wired.
+            if input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
+                with self._nodes_lock:
+                    self._upstream_camera[node_key] = _camera_for_topic(
+                        args.get("camera_info"), input_topic)
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
             if running is None:

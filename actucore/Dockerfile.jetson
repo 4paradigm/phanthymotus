@@ -82,6 +82,11 @@ COPY perception/utils/model_downloader.py /work/model_downloader.py
 # downloader: smolvla imports both, so shipping one without the other fails at
 # card start, on a robot, with an ImportError nothing here would have caught.
 COPY perception/utils/model_progress.py /work/model_progress.py
+# Calibration tools. In the image rather than `docker cp`-ed in when needed:
+# a hot-copied file keeps diverging from its image until the next real deploy,
+# and a measurement whose tool is of unknown provenance is worth very little.
+# They are text and they run on demand; nothing imports them at start.
+COPY actucore/tools/      /work/tools/
 # Agent Core reads /deploy/service.yml out of the image to merge the compose
 # fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/

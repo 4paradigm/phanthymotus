@@ -234,13 +234,131 @@ def _install_fake_cv2():
         cols = (_np.arange(width) * src.shape[1] // width).clip(0, src.shape[1] - 1)
         return src[rows][:, cols]
 
+    def _bgr2hsv(src):
+        """OpenCV's 8-bit HSV ranges, not the textbook ones.
+
+        H is halved to 0..179 so it fits a byte, S and V are 0..255. A stub
+        that returned H in 0..359 would look right and put every hue in the
+        wrong bin, which is the sort of green nobody would question.
+        """
+        bgr = src.astype(_np.float32)
+        blue, green, red = bgr[..., 0], bgr[..., 1], bgr[..., 2]
+        value = bgr.max(axis=-1)
+        chroma = value - bgr.min(axis=-1)
+        # Grey pixels have no hue and no saturation; the divisions below are
+        # masked rather than guarded so a whole flat frame stays vectorised.
+        safe_chroma = _np.where(chroma == 0, 1.0, chroma)
+        hue = _np.select(
+            [value == red, value == green],
+            [60.0 * (green - blue) / safe_chroma,
+             120.0 + 60.0 * (blue - red) / safe_chroma],
+            default=240.0 + 60.0 * (red - green) / safe_chroma,
+        )
+        hue = _np.where(chroma == 0, 0.0, hue) % 360.0
+        saturation = _np.where(value == 0, 0.0, chroma / _np.where(value == 0, 1.0, value) * 255.0)
+        return _np.stack([
+            _np.round(hue / 2.0), _np.round(saturation), _np.round(value),
+        ], axis=-1).astype(_np.uint8)
+
+    def cvtColor(src, code):
+        if code == cv2.COLOR_BGR2GRAY:
+            return src.mean(axis=2).astype(_np.uint8)
+        if code == cv2.COLOR_BGR2HSV:
+            return _bgr2hsv(src)
+        raise NotImplementedError(f"fake cv2: cvtColor code {code}")
+
+    def connectedComponents(image, connectivity=8):
+        """Two-pass labelling with union-find. 4-connectivity only.
+
+        Small and slow, which is fine: the frames in these tests are tens of
+        pixels across. It exists so `lens_barrel_mask` runs for real here —
+        stubbing it out to "no mask" would make every test of the masking path
+        pass by not testing it.
+        """
+        rows, cols = image.shape
+        labels = _np.zeros((rows, cols), dtype=_np.int32)
+        parent = [0]
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        for r in range(rows):
+            for c in range(cols):
+                if not image[r, c]:
+                    continue
+                up = labels[r - 1, c] if r else 0
+                left = labels[r, c - 1] if c else 0
+                if up and left:
+                    labels[r, c] = min(up, left)
+                    union(up, left)
+                elif up or left:
+                    labels[r, c] = up or left
+                else:
+                    parent.append(len(parent))
+                    labels[r, c] = len(parent) - 1
+
+        remap, nxt = {0: 0}, 1
+        for r in range(rows):
+            for c in range(cols):
+                if not labels[r, c]:
+                    continue
+                root = find(labels[r, c])
+                if root not in remap:
+                    remap[root] = nxt
+                    nxt += 1
+                labels[r, c] = remap[root]
+        return nxt, labels
+
+    cv2.COLOR_BGR2GRAY = 6
+    cv2.COLOR_BGR2HSV = 40
     cv2.imdecode = imdecode
     cv2.resize = resize
+    cv2.cvtColor = cvtColor
+    cv2.connectedComponents = connectedComponents
+    cv2.__motus_fake__ = True
     sys.modules["cv2"] = cv2
 
 
 _install_fake_ros()
 _install_fake_cv2()
+
+
+def frame_bytes(width: int = 200, height: int = 100, fill: int = 0) -> bytes:
+    """A payload the *active* cv2 decodes into a height×width×3 BGR frame.
+
+    The fake cv2's `imdecode` reads a `b"WxH"` marker, which is cheap and needs
+    no encoder on a host that has no OpenCV. But those markers were written as
+    literals throughout the plugin tests, so on a machine that *does* have
+    OpenCV — every perception image, and therefore every PR-review-bot run —
+    real `imdecode` returned None, the worker skipped the frame, and 29 tests
+    across vop and visual_depth failed on "nothing was published". The suite
+    was green exactly where the code does not run and red exactly where it
+    does, which is the worst way round.
+
+    Going through this helper means one payload format per host: a marker when
+    the frame will be decoded by the stub, a genuine JPEG when it will be
+    decoded by OpenCV. A uniform fill survives JPEG quantisation exactly, so
+    colour and brightness assertions hold either way.
+    """
+    import cv2
+
+    if getattr(cv2, "__motus_fake__", False):
+        return f"{width}x{height}".encode()
+
+    import numpy as np
+
+    ok, buffer = cv2.imencode(".jpg", np.full((height, width, 3), fill, dtype=np.uint8))
+    if not ok:
+        raise RuntimeError("cv2.imencode failed to build a test frame")
+    return buffer.tobytes()
 
 
 def _wait_until(predicate, timeout=3.0):

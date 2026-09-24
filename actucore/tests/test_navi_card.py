@@ -8,6 +8,7 @@ opens a publisher, which is exactly the set of paths where a mistake produces
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -143,9 +144,11 @@ def test_the_prefix_has_no_underscore():
     assert "_" not in NaviPlugin.PREFIX
 
 
-def test_it_declares_all_three_input_formats():
+def test_it_declares_every_input_format_it_accepts():
     formats = {entry["format"] for entry in _tool()["topic_in"]}
-    assert formats == {"data/json", "image/depth-zlib", "state/odom"}
+    assert formats == {"data/json", "image/depth-zlib", "state/odom",
+                       # The raw camera, optional and only for the overlay.
+                       "image/jpeg"}
 
 
 # ── degradation has to be visible ────────────────────────────────────────────
@@ -174,6 +177,10 @@ def test_a_fully_wired_card_reports_no_degradation():
     card._descriptor = _descriptor()          # a chassis is wired downstream
     card._binding = {"objects": "/cam/objects", "depth_map": "/cam/visual_depth",
                      "odom": "/r1/state/odom"}
+    # Fully wired includes the camera having said what resolution its boxes are
+    # in: without it vop's pixel boxes cannot be normalised and the target's
+    # distance silently drops to a centre patch.
+    card._objects_frame = (1280, 720)
     assert card._degradations() == []
 
 
@@ -182,6 +189,7 @@ def test_info_carries_the_degradations_and_the_target():
     card._running = True
     card._descriptor = _descriptor()
     card._binding = {"objects": "/o", "depth_map": "", "odom": ""}
+    card._objects_frame = (1280, 720)
     info = card.dispatch("navi", {"action": "info"})
     assert info["state"] == "running"
     assert len(info["degraded"]) == 2
@@ -274,12 +282,26 @@ def test_missing_detections_is_still_refused():
     assert "vop" in problem
 
 
-def test_an_unrecognised_name_falls_back_to_the_graph():
+def test_an_image_topic_with_no_known_suffix_is_the_camera_not_the_depth_map():
+    """perception derives its depth topic from the camera's
+    (`<camera>/visual_depth`), so a CompressedImage whose name does not end in
+    that suffix cannot be the depth map — `_role_of` would already have caught
+    it. Binding it as depth instead would compute distances from JPEG bytes;
+    getting it wrong this way costs only the loud "depth is not connected"
+    refusal at start.
+    """
     bound, problem = _bind(
-        ["/cam/objects", "/weird/topic"],
-        graph={"/weird/topic": ["sensor_msgs/msg/CompressedImage"]})
+        ["/cam/objects", "/cam/visual_depth", "/ubuntu/camera/main"],
+        graph={"/ubuntu/camera/main": ["sensor_msgs/msg/CompressedImage"]})
     assert problem == ""
-    assert bound["depth_map"] == "/weird/topic"
+    assert bound["image"] == "/ubuntu/camera/main"
+    assert bound["depth_map"] == "/cam/visual_depth"
+
+
+def test_the_camera_is_optional():
+    """Every canvas drawn before this input existed must keep working."""
+    bound, problem = _bind(["/cam/objects", "/cam/visual_depth"])
+    assert problem == "" and bound["image"] == ""
 
 
 def test_an_unrecognised_string_topic_is_not_guessed():
@@ -449,6 +471,7 @@ def test_a_connected_card_does_not_claim_to_be_unbound():
     card._running = True
     card._descriptor = _descriptor()
     card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom"}
+    card._objects_frame = (1280, 720)
     assert card._degradations() == []
 
 
@@ -468,7 +491,11 @@ def test_info_returns_topic_out_so_the_dashboard_can_subscribe():
     producing nothing."""
     out = _card().dispatch("navi", {"action": "info"})["topic_out"]
     assert out == [{"topic": navi_plugin.DEFAULT_TOPIC,
-                    "format": "control/velocity"}]
+                    "format": "control/velocity"},
+                   # The human-only overlay is a port like any other: a card
+                   # that publishes it without declaring it is invisible in the
+                   # panel while being perfectly healthy everywhere else.
+                   {"topic": "/actucore/navi/view", "format": "image/jpeg"}]
 
 
 def test_info_and_the_schema_agree_about_the_output_topic():
@@ -512,6 +539,13 @@ def _first_command(card):
     card._depth_bands = {"left": 5.0, "center": 5.0, "right": 5.0}
     card._depth_ms = 10 ** 13
     card._config.max_obs_age_ms = 10 ** 13
+    # The policy will not command anything from a track it has not confirmed,
+    # so the card has to tick a few times before there is a first command at
+    # all. Dropping the unconfirmed ticks keeps this about the descriptor echo.
+    for _ in range(card._config.confirm_hits):
+        message = card.next_command()
+        if message is not None:
+            return message
     return card.next_command()
 
 
@@ -538,6 +572,7 @@ def test_the_descriptor_is_not_echoed_on_every_command():
     card = _card()
     first = _first_command(card)
     assert "control_interface" in first
+    assert first["seq"] == 1, "the echo is keyed on the sequence number"
     assert "control_interface" not in card.next_command()
 
 
@@ -565,3 +600,308 @@ def test_a_clear_goal_does_not_have_to_list_first():
     params = _tool()["inputSchema"]["x-action-params"]
     assert "不必先" in params["navigate_to"]["description"]
     assert "甄别" in params["list_visible_objects"]["description"]
+
+
+# ── the tracker needs the whole twist, not just forward speed ────────────────
+
+def test_odometry_is_read_on_all_three_axes_the_policy_uses():
+    """`vx` alone was enough for the stuck detector, which is all there used to
+    be. The tracker compensates its prediction for the robot's whole twist, and
+    **yaw matters most**: on a legged chassis turning is what moves a target
+    across the frame fastest, and a yaw rate read as zero puts the prediction
+    the full rotation out within a few ticks."""
+    card = _card()
+
+    class _Message:
+        data = json.dumps({"schema": "motus.odom/1", "frame": "body",
+                           "stamp_ms": 1, "twist": [0.4, None, None, None, None, 1.0]})
+
+    card._on_string("odom", _Message())
+    assert card._odom == {"vx": 0.4, "vy": None, "wz": 1.0}
+
+
+def test_an_unmeasured_axis_stays_none_rather_than_zero():
+    """The whole reason motus.odom/1 forbids reporting 0.0 for an axis nobody
+    measured. A robot that cannot answer "am I turning" must not have its own
+    rotation assumed away — the tracker would then predict a stationary world
+    while the chassis spins."""
+    card = _card()
+
+    class _Message:
+        data = json.dumps({"schema": "motus.odom/1", "frame": "body",
+                           "stamp_ms": 1, "twist": [None] * 6})
+
+    card._on_string("odom", _Message())
+    assert card._odom == {"vx": None, "vy": None, "wz": None}
+
+
+def test_the_listing_bar_and_the_chasing_bar_agree():
+    """These used to disagree by an order of magnitude — ten frames to appear in
+    `list_visible_objects`, one frame to start driving a chassis — and the
+    *listing* was the strict one."""
+    card = _card()
+    ratio = card._config.confirm_hits / card._config.confirm_window
+    assert card._stability_bar(10) == round(10 * ratio)
+    assert card._stability_bar(1) == 1, "never ask for more frames than exist"
+
+
+def test_a_lost_target_tells_the_caller_to_look_before_retrying():
+    """A detector's class for one object is not stable: the same fire
+    extinguisher on r1_sz was reported 373 times as `fire extinguisher` in one
+    recording and as `bottle` twenty minutes later. So "not found" far more
+    often means the name does not match than that the thing is absent, and a
+    caller told only "lost" retries the same wrong name or gives up."""
+    text = _tool()["inputSchema"]["x-action-params"]["navigate_to"]["description"]
+    assert "list_visible_objects" in text
+    assert "类别并不稳定" in text
+
+
+# ── the config dialog is three knobs, and its defaults are load-bearing ──────
+
+def test_the_dialog_offers_only_what_an_operator_can_judge():
+    """Twenty-two fields, most of them things like `release_frac` and
+    `bearingless_std_factor`, gave an operator no way to judge an answer and
+    buried the three that matter. The rest live in config.yaml with the
+    paragraph of explanation they need, and stay reachable via the `config`
+    action."""
+    keys = set(_tool()["configSchema"]["properties"])
+    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m"}
+
+
+def test_every_schema_default_matches_the_file_default():
+    """**agent-core sends every schema field on every config call, defaults
+    included**, so a key here silently overrides the same key in config.yaml.
+    On r1_sz the file said `vx_max: 0.6` and the card reported 0.4 — the schema
+    default won, and the only trace was a degraded note that read like the file
+    had never been edited.
+
+    A field may live in the schema or in the file; if it lives in both, the two
+    defaults have to agree or the file is decoration."""
+    import os
+    import yaml
+
+    root = os.path.join(os.path.dirname(__file__), "..")
+    with open(os.path.join(root, "config.yaml")) as handle:
+        navi_cfg = yaml.safe_load(handle)["plugins"]["navi"]
+
+    for key, spec in _tool()["configSchema"]["properties"].items():
+        if key in navi_cfg:
+            assert navi_cfg[key] == spec["default"], (
+                f"{key}: config.yaml 是 {navi_cfg[key]}，schema 默认是 "
+                f"{spec['default']} —— 画布会用后者覆盖前者")
+
+
+def test_a_chassis_that_swallows_commands_is_reported_as_degraded():
+    """A policy whose commands are being dropped looks exactly like one that is
+    working: same verdicts, same counters, same silence. On r1_sz a deploy reset
+    the driver to its image defaults (`dry_run: true`) and the robot stood still
+    while every layer reported success."""
+    card = _card()
+    card._running = True
+    card._binding = {"objects": "o", "depth_map": "d", "odom": "s"}
+    card._descriptor = {"mode": "twist", "dry_run": True}
+    assert any("dry_run" in note for note in card._degradations())
+
+
+# ── 相机几何沿连线传下来（motus.camera/1）──────────────────────────────────────
+
+_DEPTH_TOPIC = "/ubuntu/camera/main/visual_depth"
+_OBJECTS_TOPIC = "/ubuntu/camera/main/objects"
+
+
+def _decl(topic, **over):
+    out = {"schema": "motus.camera/1", "topic": topic,
+           "id": "unitree/r1/camera_main", "width": 640, "height": 480,
+           "half_fov_rad": 0.888, "source": "inherited"}
+    out.update(over)
+    return out
+
+
+def _binding(**over):
+    out = {"objects": _OBJECTS_TOPIC, "depth_map": _DEPTH_TOPIC,
+           "depth_summary": "", "odom": ""}
+    out.update(over)
+    return out
+
+
+def test_the_card_adopts_the_geometry_of_whichever_topic_carries_the_depth():
+    """Joined on the topic this card bound, not on list position and not on the
+    upstream card's name — inputs are dispatched by what they carry, on purpose,
+    so a different depth source has to keep working."""
+    card = _card(half_fov_rad=0.55)
+    assert card._adopt_camera({_DEPTH_TOPIC: _decl(_DEPTH_TOPIC)}, _binding()) == ""
+    assert card._config.half_fov_rad == 0.888
+    assert any("0.888" in note for note in card._camera_notes)
+
+
+def test_a_declaration_for_some_other_topic_is_not_used_for_the_depth():
+    """The failure this keying prevents: one lens's geometry silently applied to
+    another lens's picture."""
+    card = _card(half_fov_rad=0.55)
+    card._adopt_camera({"/somewhere/else": _decl("/somewhere/else")}, _binding())
+    assert card._config.half_fov_rad == 0.55
+    assert card._camera_notes, "用了兜底值就得说出来"
+
+
+def test_the_note_reaches_degraded_where_an_operator_will_see_it():
+    card = _card(half_fov_rad=0.55)
+    card._running = True
+    card._adopt_camera(None, _binding())
+    card._binding = _binding()
+    assert any("camera_info" in note for note in card._degradations())
+
+
+def test_only_a_summary_is_enough_to_carry_the_geometry():
+    """Depth-summary-only is an existing degraded tier. It is still a camera, so
+    it still has a field of view."""
+    card = _card(half_fov_rad=0.55)
+    summary = "/ubuntu/camera/main/visual_depth/summary"
+    card._adopt_camera({summary: _decl(summary)},
+                       _binding(depth_map="", depth_summary=summary))
+    assert card._config.half_fov_rad == 0.888
+
+
+def test_two_different_cameras_refuse_to_start():
+    """vop reports a normalised offset, the depth map is a grid of distances, and
+    this card turns both into metres with **one** field of view — which is only
+    correct if they are the same lens.
+
+    Nothing has ever enforced it: inputs bind by what they carry, so camera A's
+    vop plus camera B's depth has always been wirable and would produce
+    confidently wrong distances with nothing in any log. The original navi plan
+    promised this check and never implemented it; both sides declaring an `id`
+    makes it a comparison.
+    """
+    card = _card()
+    problem = card._adopt_camera({
+        _DEPTH_TOPIC: _decl(_DEPTH_TOPIC, id="unitree/r1/camera_main"),
+        _OBJECTS_TOPIC: _decl(_OBJECTS_TOPIC, id="unitree/r1/camera_left"),
+    }, _binding())
+    assert "不同的相机" in problem
+    assert "camera_left" in problem and "camera_main" in problem
+
+
+def test_one_side_declaring_nothing_is_not_treated_as_a_mismatch():
+    """Half the cards in the repo declare nothing. Refusing on a missing
+    declaration would fail every canvas that has not been updated yet."""
+    card = _card()
+    assert card._adopt_camera({_DEPTH_TOPIC: _decl(_DEPTH_TOPIC)}, _binding()) == ""
+    assert card._adopt_camera({}, _binding()) == ""
+
+
+def test_the_same_camera_on_both_inputs_is_accepted():
+    card = _card()
+    assert card._adopt_camera({
+        _DEPTH_TOPIC: _decl(_DEPTH_TOPIC),
+        _OBJECTS_TOPIC: _decl(_OBJECTS_TOPIC),
+    }, _binding()) == ""
+
+
+def test_a_camera_that_never_said_its_resolution_is_reported():
+    """Not a cosmetic loss. Without the frame size vop's pixel boxes cannot be
+    normalised, and `target_distance` silently drops from "percentile over the
+    whole target" to "one patch at its centre" — the degradation this card
+    documents as the cost of running vop without `publish_bbox`, reached by a
+    different route and, until now, reported by nothing."""
+    card = _card()
+    card._running = True
+    card._descriptor = _descriptor()
+    card._binding = {"objects": "/o", "depth_map": "/d", "odom": "/r1/state/odom"}
+    assert any("像素框无法归一化" in n for n in card._degradations())
+
+
+def test_the_box_counters_localise_a_missing_overlay_box():
+    """Four things have to line up for the overlay to draw a box, and "no box"
+    used to be one symptom for all four. These counters say which."""
+    card = _card()
+    card._objects_frame = (1000, 500)
+    card._state.target = "person"
+    card._objects = card._normalise_boxes({"objects": [
+        {"name": "person", "bbox": [100, 50, 300, 450], "position": [0.0, 0.0]},
+        {"name": "chair", "bbox": [0, 0, 10, 10], "position": [0.5, 0.0]},
+        {"name": "person", "position": [0.2, 0.0]},        # detector gave no box
+    ]})
+    stats = card._box_stats()
+    assert stats == {"detections": 3, "with_bbox": 2, "with_bbox_norm": 2,
+                     "matching_target": 2, "target_has_box": 1}
+
+
+def test_a_pixel_box_becomes_a_normalised_one():
+    card = _card()
+    card._objects_frame = (1000, 500)
+    out = card._normalise_boxes({"objects": [{"name": "person",
+                                              "bbox": [100, 50, 300, 450]}]})
+    assert out["objects"][0]["bbox_norm"] == [0.1, 0.1, 0.3, 0.9]
+
+
+def test_without_a_declaration_no_box_is_invented():
+    """Inferring the resolution from a box that happens to be large is exactly
+    the plausible guess this card keeps being bitten by."""
+    card = _card()
+    out = card._normalise_boxes({"objects": [{"name": "person",
+                                              "bbox": [100, 50, 300, 450]}]})
+    assert "bbox_norm" not in out["objects"][0]
+
+
+# ── 渲染不许占用喂底盘的那条线程 ─────────────────────────────────────────────
+
+def test_the_tick_hands_the_frame_off_instead_of_rendering_it():
+    """Rendering a frame costs **27 ms measured on Orin 5** — a quarter of a
+    10 Hz command period. Doing it inline stalls the stream that feeds the
+    chassis every time the overlay ticks.
+
+    The module said a picture for a human must not be able to stop a robot;
+    that was written about exceptions, and only exceptions were guarded.
+    Latency is the same promise.
+    """
+    import queue as _queue
+
+    card = _card()
+    card._running = True
+    card._view_queue = _queue.Queue(maxsize=1)
+    card._view_publisher = object()
+    card._state.target = "person"
+
+    card._publish_view()
+    assert card._view_queue.qsize() == 1, "tick 没有把帧交出去"
+    snapshot = card._view_queue.get_nowait()
+    # Everything the worker needs, and nothing that has to be recomputed on the
+    # tick to get it.
+    assert set(snapshot) >= {"depth_m", "objects", "jpeg", "decision", "track",
+                             "bearing", "target", "clearance", "coverage"}
+
+
+def test_a_backed_up_queue_keeps_the_newest_frame():
+    """One slot, newest wins. An overlay frame from two seconds ago is worse
+    than a dropped one — the same rule the camera frames upstream follow."""
+    import queue as _queue
+
+    card = _card()
+    card._running = True
+    card._view_queue = _queue.Queue(maxsize=1)
+    card._view_publisher = object()
+    card._view_queue.put_nowait({"stale": True})
+
+    card._view_next_at = 0.0
+    card._publish_view()
+    assert "stale" not in card._view_queue.get_nowait()
+
+
+def test_the_tick_does_nothing_when_the_overlay_is_off():
+    card = _card(view_hz=0)
+    card._running = True
+    assert card._publish_view() is None
+
+
+def test_the_bearing_is_snapshotted_as_a_number_not_as_the_track():
+    """The Track is mutated in place by the tick; handing the object to another
+    thread would let the renderer read it mid-update. A float cannot tear."""
+    import queue as _queue
+
+    card = _card()
+    card._running = True
+    card._view_queue = _queue.Queue(maxsize=1)
+    card._view_publisher = object()
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["bearing"] is None or isinstance(snapshot["bearing"], float)
