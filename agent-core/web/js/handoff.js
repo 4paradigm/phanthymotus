@@ -94,7 +94,9 @@ export function handoffMarkup() {
     <div class="account-section-label">手机接入</div>
     <div class="account-card handoff-card">
       <div class="handoff-stub">
-        <div class="handoff-qr ${revealed ? '' : 'is-covered'}" id="handoff-qr">
+        <!-- 不要给这里任何 id：account.js 把同一份 HTML 同时写进桌面 modal 和
+             移动端面板两个容器，id 会在文档里出现两份。 -->
+        <div class="handoff-qr ${revealed ? '' : 'is-covered'}">
           ${url ? qrTile(url) : ''}
           ${revealed ? '' : `
             <button class="handoff-reveal" data-handoff="reveal">
