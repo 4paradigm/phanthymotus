@@ -440,8 +440,11 @@ def _deploy_help(built: list[BuildResult]) -> str:
 ./deploy/run-pr-image.sh {r.image_tag}
 ```
 
-Then `--logs`, `--shell`, `--down`. Starts container `{r.container_name}`, and
-`--down` removes it and the generated compose file completely.
+Then `--logs {r.container_name}`, `--shell`, `--down`. Starts container
+`{r.container_name}`, and `--down` removes it and the generated compose file
+completely. Several images can be under test at once — each gets its own
+compose project, so starting one leaves the others alone; name the container
+to say which one a command applies to, or omit it while only one is running.
 """
 
     # Targets with no service fragment — in practice just core, which is the
