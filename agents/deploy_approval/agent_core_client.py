@@ -552,9 +552,18 @@ class AgentCoreClient:
         Requires *exact* ``image`` (already validated by ``validate_image_ref``).
         HTTP 200 => UPDATE_ACCEPTED, NOT deployed.
 
-        Transport-level uncertainty (timeout, connection reset, etc.) raises
-        ``AgentCoreDeployOutcomeUncertain``.  Non-2xx and malformed responses
-        raise ``AgentCoreError``.
+        Classification:
+        * Validation / security errors BEFORE request is sent:
+          confirmed ``AgentCoreError``
+        * POST transport uncertainty (timeout, connection reset, etc.):
+          ``AgentCoreDeployOutcomeUncertain``
+        * Response received but cannot safely prove update did NOT start:
+         保守按 ``AgentCoreDeployOutcomeUncertain``
+        * Explicit application error (non-2xx, malformed envelope,
+          code!=0/200, data.status=="error"):
+          ``AgentCoreError``
+
+        Never classify a possibly-executed self-update as "absolutely not run".
         """
         try:
             validated_image = validate_image_ref(image)

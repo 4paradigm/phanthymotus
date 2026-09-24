@@ -1221,8 +1221,13 @@ class DeployController:
                 # Route core through self-update path; non-core via existing path
                 if comp_target == "core":
                     # Core has no automated case; runtime_id is always "core"
+                    # Use unified idempotent entry point
                     try:
-                        await self._deploy_core_component(core, node_id, image_ref)
+                        verified, health_evidence, post_performed = (
+                            await self._deploy_or_adopt_core_component(
+                                core, node_id, component_id, image_ref,
+                            )
+                        )
                     except DeployOutcomeUncertain as e:
                         deploy_outcome_uncertain = True
                         deploy_error = str(e)
@@ -1231,10 +1236,6 @@ class DeployController:
                         deploy_error = str(e)
                         break
 
-                    # Verify core update: poll until current_tag == target_tag
-                    verified, health_evidence = await self._verify_core_update(
-                        core, component_id, image_ref,
-                    )
                     approve_attempt["health"].append(health_evidence)
                     if not verified:
                         deploy_outcome_uncertain = True
@@ -1244,7 +1245,7 @@ class DeployController:
                         )
                         break
 
-                    # Deploy success verified: record deployment
+                    # Deploy success verified (or adopted as already deployed): record deployment
                     new_deployments.append({
                         "machine": machine_alias,
                         "component_ids": [component_id],
@@ -1992,12 +1993,16 @@ class DeployController:
                         f"— refusing to deploy the same runtime twice"
                     )
                 seen_runtime_ids[runtime_id] = component.get("component_id", "")
+                already_target = bool(
+                    current_tag and current_tag == target_tag,
+                )
                 preflight.append({
                     "component": component,
                     "runtime_id": runtime_id,
                     "running_image": current_tag,
                     "current_tag": current_tag,
                     "target_tag": target_tag,
+                    "already_target": already_target,
                     "runtime_repo": "",
                 })
                 continue
@@ -2138,6 +2143,12 @@ class DeployController:
                 comp_target = comp.get("target", "")
                 # Core has no driver_status; use sentinel log
                 if comp_target == "core":
+                    runtime_id = "core"
+                    seen_key = (machine_alias, runtime_id)
+                    if seen_key in seen:
+                        continue
+                    seen.add(seen_key)
+                    source_key = f"{machine_alias}/{runtime_id}"
                     result[source_key] = "[CORE_RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
                     continue
                 if not runtime_id:
@@ -2371,6 +2382,57 @@ class DeployController:
         core_comp = [c for c in components if c.get("target") == "core"]
         return non_core + core_comp
 
+
+    async def _deploy_or_adopt_core_component(
+        self,
+        core: AgentCoreClient,
+        node_id: str,
+        component_id: str,
+        image_ref: str,
+    ) -> tuple[bool, dict, bool]:
+        """Deploy core via self-update, or adopt if already at target.
+
+        Returns (verified, health_evidence, post_performed).
+
+        This is the single entry point for core deployment in
+        handle_approve_deploy — it implements the idempotent
+        "already-target → zero POST" protection.
+        """
+        target_tag = _target_tag_from_image_ref(image_ref)
+        if not target_tag:
+            raise DeployControllerError(
+                "core image has no verifiable tag — refusing unsafe POST"
+            )
+
+        # Step 1: fresh already-target check
+        try:
+            update_info = await core.core_update_check()
+        except AgentCoreError as e:
+            raise DeployControllerError(
+                f"core already-target check failed: {e}"
+            ) from e
+
+        current_tag = str(update_info.get("current_tag", "") or "")
+
+        # Step 2: if already at target, adopt without POST
+        if current_tag and current_tag == target_tag:
+            return True, {
+                "component_id": component_id,
+                "runtime_id": "core",
+                "current_tag": current_tag,
+                "target_tag": target_tag,
+                "verified": True,
+                "already_target": True,
+            }, False
+
+        # Step 3: perform the unsafe POST then verify
+        await self._deploy_core_component(core, node_id, image_ref)
+        verified, health_evidence = await self._verify_core_update(
+            core, component_id, image_ref,
+        )
+        if verified:
+            health_evidence["already_target"] = False
+        return verified, health_evidence, True
     async def _run_automated_case(
         self, repo: str, pr_number: int, head_sha: str,
         components: list[dict],

@@ -316,7 +316,7 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 - 选择 latest unambiguous 同 HEAD review evidence
 - 绑定 `review_evidence`（build_comment_id、test_comment_id、code_review_comment_id）
 - 只取该 Job 中所有 successful deployable components
-- CORE 排除
+- Core、perception 和 actucore 均为可部署组件；core variant=""，runtime_id="core"，使用 Agent Core self-update contract
 - `review_image_tag` 必须直接来自 Review Agent Build Result 评论的 Images section
 - mutable image tag is frozen from the trusted Review Agent comment and passed verbatim to Agent Core; Deploy Approval does not resolve tags to digests
 - 保存 `resolved_platform`
