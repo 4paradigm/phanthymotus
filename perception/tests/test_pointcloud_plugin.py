@@ -376,11 +376,30 @@ def test_max_points_cap_is_honoured():
 
 # ── stereo 生命周期与 info 契约 ───────────────────────────────────────────────
 
-def test_stereo_start_requires_calibration():
-    plugin, executor = _plugin()
+def test_stereo_start_without_calibration_runs_capture_only():
+    """review 指出的死锁回归：calibrate 要运行中的 stereo 节点，stereo 又
+    要求先有标定 → 新卡片永远进不了第一次标定。无标定 stereo 现在以
+    capture-only 启动（订阅/配对/存帧，不出云），calibrate 可用。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
     reply = plugin.dispatch("pointcloud", {
         "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
-    assert reply["state"] == "error"
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._mode == "stereo"
+
+    # 左右帧照常配对存帧（calibrate 的输入），但 unknown 档不出云
+    node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    assert _wait_until(lambda: node._last_stereo_pair is not None)
+    _wait_until(lambda: False, timeout=0.2)
+    assert _cloud_pub(node).messages == []
+
+    # calibrate 不再报 "no stereo instance"，而是走到棋盘检测。
+    # fake cv2 没实现棋盘 API → cv2_unavailable；真 cv2 下则是
+    # no_checkerboard（黑帧）。两者都说明已越过"没有实例"这一步。
+    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "first"})
+    assert reply["ok"] is False
+    assert reply["reason"] in ("no_checkerboard", "cv2_unavailable")
 
 
 def test_stereo_start_requires_both_topics():

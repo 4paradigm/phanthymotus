@@ -1670,6 +1670,52 @@ instance_id ever showed up in the log.
 
 ---
 
+## Point Cloud (`pointcloud`)
+
+`plugins/pointcloud.py` — a `processor` card named **`pointcloud`**. Turns camera
+input into a 3D point cloud on `{input_topic}/pointcloud` (`sensor/pointcloud`)
+plus a JSON summary on `{input_topic}/pointcloud_summary`. Three input forms,
+auto-detected by message type when `mode` is left at `auto`:
+
+| Input | Subscription | Path |
+|-------|-------------|------|
+| Depth map (z16 `Image` / zlib `CompressedImage`) | `input_topic` | pinhole back-projection |
+| Mono RGB (`image/jpeg`) | `input_topic` | `yolo26n-depth` TRT engine (shared with `visual_depth`) → back-projection |
+| Stereo pair (left + right `image/jpeg`) | `input_topics[0]`, `input_topics[1]` | SGBM disparity + Q reprojection |
+
+Pure math lives in `plugins/pointcloud_math.py` (no cv2/rclpy; unit-tested on the
+host). The packet format is `struct.pack("<II", 12, N) + N × float32 LE`, the
+renderer caps it at 40000 points, and the plugin decimates to `max_points`
+(default 20000) before publishing.
+
+### Calibration
+
+Depth/mono only need intrinsics — `{fx, fy, cx, cy}` or `{hfov}` (default 90°,
+zero-config). Stereo needs either `{fx, cx, cy, Tx}` (already-rectified pair) or
+a full `stereoCalibrate` blob (`K1/K2/D1/D2/R/T`, rectified at runtime).
+
+**Stereo bootstrap:** a stereo card can be started *without* calibration — it
+subscribes, pairs frames within a 50 ms sync window, and stores the latest pair
+for the `calibrate` action, but publishes no cloud. Hold a checkerboard
+(default 9×6 inner corners, 0.025 m squares) in front of both cameras and call
+`calibrate` once per pose until `pairs` (default 15) are collected; the result
+is an RMS-graded blob auto-tiered by epipolar Δy (< 1.5 px → rectified), saved
+under `/models/stereo_calib/` and returned in the reply for pasting back into
+the card's `calibration` config. Restart the card to publish.
+
+The reverse ordering is a deadlock we shipped once: `calibrate` requires a
+running stereo node, and stereo `start` used to require a calibration first —
+a new card could never collect the frames it needed to produce one.
+
+### Mono engine loading
+
+The mono path reuses `visual_depth`'s TensorRT engine downloader, including the
+info contract: while the engine downloads (minutes on first run), `info` reports
+`loading` with progress, and `error` with the reason if the download fails. An
+`auto` node whose first frame is a depth map never touches the engine at all.
+
+---
+
 ## Face Recognition
 
 `plugins/face.py` — a `processor` card named **`face_recognition`**. Subscribes to an
@@ -2592,6 +2638,8 @@ Three rules that follow, each with a reason:
 | Output (vop) | `{input_topic}/objects` | `data/json` |
 | Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
 | Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |
+| Output (pointcloud) | `{input_topic}/pointcloud` | `sensor/pointcloud` |
+| Output (pointcloud summary) | `{input_topic}/pointcloud_summary` | `data/json` |
 
 The depth map is **640x480 uint16 millimetres, zlib level 1**, published as a
 `CompressedImage` with `format="16UC1; compressedDepth zlib"`. The size is not

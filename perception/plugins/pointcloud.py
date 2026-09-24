@@ -122,7 +122,7 @@ TOOLS = [
                 },
                 "calibration": {
                     "type": "string",
-                    "description": "标定：JSON 对象或 /models 下的标定文件路径。深度图/单目要 {fx,fy,cx,cy} 或 {hfov}（缺省 90°）；双目要 {fx,cx,cy,Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动 rectify）。双目建议先用 calibrate action 现场标定",
+                    "description": "标定：JSON 对象或 /models 下的标定文件路径。深度图/单目要 {fx,fy,cx,cy} 或 {hfov}（缺省 90°）；双目要 {fx,cx,cy,Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动 rectify）。双目没标定也可以先 start（只采集不出云），再用 calibrate 现场标定后把 blob 填回来重启",
                 },
                 "board_w": {"type": "integer", "description": "calibrate 用：棋盘格内角点列数（默认 9）"},
                 "board_h": {"type": "integer", "description": "calibrate 用：棋盘格内角点行数（默认 6）"},
@@ -146,6 +146,7 @@ TOOLS = [
                         "每换一个姿态调用一次直到采满 pairs（默认 15）对。"
                         "完成后返回 rms / 角点数 / Δy 分档 / 标定 blob（可直接粘贴进卡片配置），"
                         "并落盘到 /models/stereo_calib/。需要卡片以双目模式 start 过"
+                        "（无标定也可以 start，只采集不出云）"
                     ),
                 },
             },
@@ -494,10 +495,11 @@ class _PointCloudNode(Node):
 
         blob = self._calibration
         tier = calibration_tier(blob)
-        if tier in ("raw", "rectified"):
-            fx, cx, cy, Tx, left_u, right_u, map1 = _rectify_pair(left, right, blob)
-        else:
-            return  # stereo 模式必须先标定；_publish 由 start 时的校验兜住
+        if tier not in ("raw", "rectified"):
+            # 无标定 stereo 是合法的"标定采集"状态（start 允许，见 dispatch）：
+            # 只配对存帧供 calibrate 用，不出云。
+            return
+        fx, cx, cy, Tx, left_u, right_u, map1 = _rectify_pair(left, right, blob)
         h, w = left_u.shape[:2]
         # SGBM 参数照 Go1 经验取：块匹配对小基线更稳，但 SGBM 质量更好。
         block = 5
@@ -934,9 +936,11 @@ class PointCloudPerceptionPlugin:
                     return {"state": "error",
                             "message": "stereo 模式需要左右两路输入（input_topics[0]=左, [1]=右）"}
                 if not calibration or calibration_tier(calibration) not in ("raw", "rectified"):
-                    return {"state": "error",
-                            "message": "stereo 模式需要先标定：把双目 start 后用 calibrate action "
-                                       "现场采棋盘格，或把标定 blob / 文件路径填进 calibration"}
+                    # review 指出的死锁：calibrate 需要运行中的 stereo 节点，
+                    # 而 stereo 又要求先有标定 —— 新卡片永远走不进第一次标定。
+                    # 放行无标定启动：节点照常订阅配对存帧（_emit_stereo 的
+                    # unknown 档不出云），calibrate 采完把 blob 填回配置重启。
+                    log.info("[pointcloud] stereo start without calibration: capture-only")
             elif mode == "auto" and not input_topic:
                 return {"state": "error",
                         "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
@@ -1010,5 +1014,8 @@ class PointCloudPerceptionPlugin:
                 return self._calibrate(args, instance_id)
             except ValueError as error:
                 return {"ok": False, "reason": "bad_input", "detail": str(error)}
+            except AttributeError as error:
+                # fake cv2（host 测试）没实现棋盘 API；真环境不会走到
+                return {"ok": False, "reason": "cv2_unavailable", "detail": str(error)}
 
         return None
