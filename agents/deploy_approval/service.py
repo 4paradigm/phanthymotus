@@ -82,7 +82,7 @@ def _short(sha: str) -> str:
 
 
 def _is_supported_target(target: str) -> bool:
-    return target in ("perception", "actucore", "driver")
+    return target in ("core", "perception", "actucore", "driver")
 
 
 def _image_repository(ref: str) -> str:
@@ -96,6 +96,24 @@ def _image_repository(ref: str) -> str:
     if colon > slash:
         return ref[:colon]
     return ref
+
+
+def _target_tag_from_image_ref(ref: str) -> str:
+    """Extract the tag portion from an image reference.
+
+    Returns empty string if no tag can be resolved (e.g. repo@sha256:...).
+    For image:tag returns *tag*.  For repo@sha256: returns "".
+    """
+    ref = str(ref or "").strip()
+    if not ref:
+        return ""
+    if "@sha256:" in ref:
+        return ""
+    slash = ref.rfind("/")
+    colon = ref.rfind(":")
+    if colon > slash:
+        return ref[colon + 1:]
+    return ""
 
 
 _CANONICAL_VARIANTS = {"5.11", "6.1"}
@@ -137,8 +155,10 @@ def _is_deployable_build(repo: str, build) -> bool:
             return False
         return True
     if repo_lower in ("4paradigm/phanthymotus", "haohao-end/phanthymotus"):
-        # Core family: perception and actucore are deployable; driver is NOT
-        if target != "driver":
+        # Core family: core, perception, and actucore are deployable; driver is NOT
+        if target == "driver":
+            return False
+        if target in ("core", "perception", "actucore"):
             return True
         return False
     # Unknown repository: nothing is deployable
@@ -1184,45 +1204,84 @@ class DeployController:
                 reserved_event=deploy_reservation,
             )
 
+            # Order components: non-core first, core last (core restarts agent-core)
+            ordered_components = self._order_components_for_deploy(selected_components)
+
             # Sequential per-component deploy; POST success followed by
             # post-deploy runtime verification before recording as deployed.
-            for comp in selected_components:
+            for comp in ordered_components:
                 image_ref = comp["image_ref"]
                 runtime_id = str(comp.get("runtime_id") or "")
+                component_id = comp.get("component_id", "")
+                comp_target = comp.get("target", "")
                 if not runtime_id:
-                    deploy_error = f"missing runtime id for {comp.get('target', '')}"
-                    break
-                try:
-                    await self._deploy_component(
-                        core, node_id, image_ref, runtime_id,
-                    )
-                except DeployOutcomeUncertain as e:
-                    deploy_outcome_uncertain = True
-                    deploy_error = str(e)
-                    break
-                except DeployControllerError as e:
-                    deploy_error = str(e)
+                    deploy_error = f"missing runtime id for {comp_target}"
                     break
 
-                # Post-deploy verification: confirm target image is actually running
-                verified, health_evidence = await self._verify_deployed_runtime(
-                    core, node_id, comp.get("component_id", ""), runtime_id, image_ref,
-                )
-                approve_attempt["health"].append(health_evidence)
-                if not verified:
-                    deploy_outcome_uncertain = True
-                    deploy_error = (
-                        f"post-deploy verify timeout for {comp.get('target', '')!r}: "
-                        f"target image not observed running"
-                    )
-                    break
+                # Route core through self-update path; non-core via existing path
+                if comp_target == "core":
+                    # Core has no automated case; runtime_id is always "core"
+                    try:
+                        await self._deploy_core_component(core, node_id, image_ref)
+                    except DeployOutcomeUncertain as e:
+                        deploy_outcome_uncertain = True
+                        deploy_error = str(e)
+                        break
+                    except DeployControllerError as e:
+                        deploy_error = str(e)
+                        break
 
-                # Deploy success verified: record deployment
-                new_deployments.append({
-                    "machine": machine_alias,
-                    "component_ids": [comp["component_id"]],
-                    "phase": "deployed",
-                })
+                    # Verify core update: poll until current_tag == target_tag
+                    verified, health_evidence = await self._verify_core_update(
+                        core, component_id, image_ref,
+                    )
+                    approve_attempt["health"].append(health_evidence)
+                    if not verified:
+                        deploy_outcome_uncertain = True
+                        deploy_error = (
+                            f"post-deploy verify timeout for core: "
+                            f"target image not observed running"
+                        )
+                        break
+
+                    # Deploy success verified: record deployment
+                    new_deployments.append({
+                        "machine": machine_alias,
+                        "component_ids": [component_id],
+                        "phase": "deployed",
+                    })
+                else:
+                    try:
+                        await self._deploy_component(
+                            core, node_id, image_ref, runtime_id,
+                        )
+                    except DeployOutcomeUncertain as e:
+                        deploy_outcome_uncertain = True
+                        deploy_error = str(e)
+                        break
+                    except DeployControllerError as e:
+                        deploy_error = str(e)
+                        break
+
+                    # Post-deploy verification: confirm target image is actually running
+                    verified, health_evidence = await self._verify_deployed_runtime(
+                        core, node_id, component_id, runtime_id, image_ref,
+                    )
+                    approve_attempt["health"].append(health_evidence)
+                    if not verified:
+                        deploy_outcome_uncertain = True
+                        deploy_error = (
+                            f"post-deploy verify timeout for {comp_target!r}: "
+                            f"target image not observed running"
+                        )
+                        break
+
+                    # Deploy success verified: record deployment
+                    new_deployments.append({
+                        "machine": machine_alias,
+                        "component_ids": [component_id],
+                        "phase": "deployed",
+                    })
 
             if deploy_outcome_uncertain:
                 state["deployments"] = list(existing_deployments) + list(new_deployments)
@@ -1798,7 +1857,7 @@ class DeployController:
             if not comp_platform or not machine.platforms or comp_platform not in machine.platforms:
                 continue
             comp_variant = comp.get("variant", "")
-            if comp.get("target") != "driver" and machine.variants:
+            if comp.get("target") not in ("core", "driver") and machine.variants:
                 if not comp_variant or comp_variant not in machine.variants:
                     continue
             if comp.get("target") == "driver":
@@ -1838,7 +1897,7 @@ class DeployController:
                 if not comp_platform or not m.platforms or comp_platform not in m.platforms:
                     continue
                 comp_variant = comp.get("variant", "")
-                if comp.get("target") != "driver" and m.variants:
+                if comp.get("target") not in ("core", "driver") and m.variants:
                     if not comp_variant or comp_variant not in m.variants:
                         continue
                 if comp.get("target") == "driver":
@@ -1891,15 +1950,58 @@ class DeployController:
 
         Also validates that no two selected components resolve to the same
         runtime_id — duplicates would cause double-deploy of the same runtime.
+
+        Core components use /api/system/update-check instead of driver Status.
+        list_drivers() is only called when there are non-core components.
         """
-        drivers = await core.list_drivers()
-        if not isinstance(drivers, list):
-            raise DeployControllerError("Agent Core list_drivers returned an invalid payload")
+        has_non_core = any(c.get("target") != "core" for c in components)
+        if has_non_core:
+            drivers = await core.list_drivers()
+            if not isinstance(drivers, list):
+                raise DeployControllerError("Agent Core list_drivers returned an invalid payload")
+        else:
+            drivers = []
 
         cached_statuses: dict[str, dict] = {}
         preflight: list[dict] = []
         seen_runtime_ids: dict[str, str] = {}  # runtime_id -> component_id
         for component in components:
+            comp_target = component.get("target", "")
+            if comp_target == "core":
+                # Core preflight: use update-check instead of driver status
+                try:
+                    update_info = await core.core_update_check()
+                except AgentCoreError as e:
+                    raise DeployControllerError(
+                        f"core preflight update-check failed: {e}"
+                    ) from e
+                current_tag = str(update_info.get("current_tag", "") or "")
+                target_tag = _target_tag_from_image_ref(
+                    str(component.get("image_ref", "") or ""),
+                )
+                if not target_tag:
+                    raise DeployControllerError(
+                        "core image has no verifiable tag — refusing unsafe POST"
+                    )
+                runtime_id = "core"
+                if runtime_id in seen_runtime_ids:
+                    raise DeployControllerError(
+                        f"duplicate runtime_id {runtime_id!r} for components "
+                        f"{seen_runtime_ids[runtime_id]!r} and "
+                        f"{component.get('component_id', '')!r} "
+                        f"— refusing to deploy the same runtime twice"
+                    )
+                seen_runtime_ids[runtime_id] = component.get("component_id", "")
+                preflight.append({
+                    "component": component,
+                    "runtime_id": runtime_id,
+                    "running_image": current_tag,
+                    "current_tag": current_tag,
+                    "target_tag": target_tag,
+                    "runtime_repo": "",
+                })
+                continue
+
             resolved = self._resolve_component_runtime(drivers, component)
             if resolved is None:
                 target = component.get("target", "")
@@ -2033,6 +2135,11 @@ class DeployController:
                 if comp is None:
                     continue
                 runtime_id = str(comp.get("runtime_id") or "")
+                comp_target = comp.get("target", "")
+                # Core has no driver_status; use sentinel log
+                if comp_target == "core":
+                    result[source_key] = "[CORE_RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
+                    continue
                 if not runtime_id:
                     continue
                 seen_key = (machine_alias, runtime_id)
@@ -2146,6 +2253,123 @@ class DeployController:
             raise DeployControllerError(
                 f"Deploy failed for {runtime_id} on node {node_id}: {e}"
             )
+
+    async def _deploy_core_component(
+        self,
+        core: AgentCoreClient,
+        node_id: str,
+        image_ref: str,
+    ) -> dict:
+        """Deploy core via Agent Core self-update POST /api/system/update.
+
+        Must be called AFTER all non-core components have been deployed,
+        because core update restarts Agent Core and would interrupt further
+        API calls.
+
+        Returns {"result": data_dict} on UPDATE_ACCEPTED.
+        Raises DeployOutcomeUncertain on transport uncertainty.
+        Raises DeployControllerError on confirmed failure.
+        """
+        try:
+            result = await core.update_core(image_ref)
+            return {"result": result}
+        except AgentCoreDeployOutcomeUncertain as e:
+            raise DeployOutcomeUncertain(
+                f"Core deploy outcome uncertain for node {node_id}: {e}"
+            ) from e
+        except AgentCoreError as e:
+            raise DeployControllerError(
+                f"Core deploy failed for node {node_id}: {e}"
+            )
+
+    async def _verify_core_update(
+        self,
+        core: AgentCoreClient,
+        component_id: str,
+        target_image_ref: str,
+    ) -> tuple[bool, dict]:
+        """Poll /api/system/update-check until current_tag matches target_tag.
+
+        Success condition: current_tag is a non-empty string AND equals target_tag.
+        up_to_date==True alone is NOT sufficient (Agent Core may return it
+        incorrectly on error paths).
+
+        Connection failures during restart are treated as transient — the
+        bounded polling budget continues until deadline.
+
+        Returns (True, evidence) on verified success.
+        Returns (False, evidence) on timeout/uncertainty.
+        """
+        target_tag = _target_tag_from_image_ref(target_image_ref)
+        if not target_tag:
+            # No verifiable tag — cannot confirm deployment
+            return False, {
+                "component_id": component_id,
+                "runtime_id": "core",
+                "current_tag": "",
+                "target_tag": target_tag,
+                "verified": False,
+                "error": "core image has no verifiable tag",
+            }
+
+        deadline = time.monotonic() + self.config.total_timeout
+        poll_interval = 2  # seconds between polls
+        last_current_tag = ""
+        last_error: str | None = None
+
+        while True:
+            if time.monotonic() >= deadline:
+                break
+            try:
+                update_info = await core.core_update_check()
+            except AgentCoreError as e:
+                # Transient (restart in progress) — continue polling
+                last_error = str(e)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(poll_interval, remaining))
+                continue
+
+            current_tag = str(update_info.get("current_tag", "") or "")
+            last_current_tag = current_tag
+
+            if current_tag and current_tag == target_tag:
+                # Exact match — deployment confirmed
+                return True, {
+                    "component_id": component_id,
+                    "runtime_id": "core",
+                    "current_tag": current_tag,
+                    "target_tag": target_tag,
+                    "verified": True,
+                }
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(poll_interval, remaining))
+
+        # Deadline reached — outcome uncertain (POST already happened)
+        result: dict[str, Any] = {
+            "component_id": component_id,
+            "runtime_id": "core",
+            "current_tag": last_current_tag,
+            "target_tag": target_tag,
+            "verified": False,
+        }
+        if last_error:
+            result["error"] = last_error
+        return False, result
+
+    @staticmethod
+    def _order_components_for_deploy(components: list[dict]) -> list[dict]:
+        """Order components so non-core deploy first, core last.
+
+        Preserves relative order within each group.
+        """
+        non_core = [c for c in components if c.get("target") != "core"]
+        core_comp = [c for c in components if c.get("target") == "core"]
+        return non_core + core_comp
 
     async def _run_automated_case(
         self, repo: str, pr_number: int, head_sha: str,

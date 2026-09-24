@@ -96,7 +96,7 @@ class BuildInfo:
     variant: str
     success: bool
     image_tag: str
-    deployable: bool  # computed by Controller: target=perception|actucore|driver
+    deployable: bool  # computed by Controller: target=core|perception|actucore|driver
     component_id: str = ""
 
 

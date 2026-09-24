@@ -491,3 +491,117 @@ class AgentCoreClient:
                 "agent-core mcp_ping tools must be a list or null"
             )
         return inner
+
+    async def core_update_check(self) -> dict:
+        """GET /api/system/update-check — poll core self-update status.
+
+        Returns the parsed ``{code, data, message}`` envelope where
+        ``data`` is a dict containing at least:
+        - current_tag : str  (may be empty during pull/restart)
+        - latest_tag  : str
+        - latest_image: str
+        - up_to_date  : bool
+        """
+        url = self.base_url + "/api/system/update-check"
+        require_http_policy(
+            url, self.config, allow_private=self.config.allow_private_http,
+            agent_core_node=self.node_host,
+        )
+        try:
+            resp = await stream_request(
+                self.http, "GET", url, self.config.max_response_bytes,
+                headers=self._headers(), timeout=self.config.total_timeout)
+        except httpx.HTTPError as e:
+            raise AgentCoreError(f"agent-core update-check request failed: {e}")
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
+        try:
+            require_2xx(resp.status_code, "agent-core GET /api/system/update-check")
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
+        resp = await enforce_body_size(resp, self.config.max_response_bytes)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise AgentCoreError("agent-core update-check returned non-JSON")
+        if not isinstance(data, dict):
+            raise AgentCoreError("agent-core update-check unexpected payload")
+        self._check_code(data, "GET", "/api/system/update-check")
+        inner = data.get("data")
+        if not isinstance(inner, dict):
+            raise AgentCoreError(
+                "agent-core update-check: data is not an object"
+            )
+        # Ensure typed fields — strings may be empty during pull/restart
+        for key in ("current_tag", "latest_tag", "latest_image"):
+            val = inner.get(key)
+            if val is not None and not isinstance(val, str):
+                raise AgentCoreError(
+                    f"agent-core update-check {key} must be str or null, got {val!r}"
+                )
+        up_to_date = inner.get("up_to_date")
+        if up_to_date is not None and not isinstance(up_to_date, bool):
+            raise AgentCoreError(
+                f"agent-core update-check up_to_date must be bool or null, got {up_to_date!r}"
+            )
+        return inner
+
+    async def update_core(self, image: str) -> dict:
+        """POST /api/system/update — trigger Agent Core self-update.
+
+        Requires *exact* ``image`` (already validated by ``validate_image_ref``).
+        HTTP 200 => UPDATE_ACCEPTED, NOT deployed.
+
+        Transport-level uncertainty (timeout, connection reset, etc.) raises
+        ``AgentCoreDeployOutcomeUncertain``.  Non-2xx and malformed responses
+        raise ``AgentCoreError``.
+        """
+        try:
+            validated_image = validate_image_ref(image)
+        except ValueError as exc:
+            raise AgentCoreError(str(exc)) from exc
+        url = self.base_url + "/api/system/update"
+        try:
+            require_http_policy(
+                url, self.config, allow_private=self.config.allow_private_http,
+                agent_core_node=self.node_host,
+            )
+        except SecurityError as e:
+            raise AgentCoreError(str(e)) from e
+        try:
+            resp = await stream_request(
+                self.http, "POST", url, self.config.max_response_bytes,
+                headers=self._headers(), json={"image": validated_image},
+                timeout=self.config.total_timeout)
+        except httpx.HTTPError as e:
+            raise AgentCoreDeployOutcomeUncertain(
+                f"agent-core update outcome uncertain: {e}"
+            ) from e
+        except SecurityError as e:
+            raise AgentCoreDeployOutcomeUncertain(str(e)) from e
+        try:
+            require_2xx(resp.status_code, "agent-core POST /api/system/update")
+        except SecurityError as e:
+            raise AgentCoreDeployOutcomeUncertain(str(e)) from e
+        resp = await enforce_body_size(resp, self.config.max_response_bytes)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core update returned non-JSON"
+            )
+        if not isinstance(data, dict):
+            raise AgentCoreDeployOutcomeUncertain(
+                "agent-core update returned unexpected payload"
+            )
+        code = data.get("code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            raise AgentCoreDeployOutcomeUncertain(
+                f"agent-core update malformed code {code!r}"
+            )
+        if code not in (0, 200):
+            raise AgentCoreError(
+                f"agent-core update failed: code={code!r}, "
+                f"message={data.get('message')!r}"
+            )
+        return data

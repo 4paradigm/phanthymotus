@@ -53,6 +53,7 @@ machines:
     targets:
       - perception
       - actucore
+      - core
     platforms:
       - linux/arm64
     variants:
