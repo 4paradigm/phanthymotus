@@ -208,6 +208,28 @@ plugins:
     # 让机器人失明。「房间黑」和「镜头被挡」需要人做不同的处置，所以不猜。
     lens_barrel_max_fraction: 0.6
 
+  # Unified point cloud. One tool, three inputs:
+  #   A. depth map   (image/depth-z16 Image | image/depth-zlib CompressedImage)
+  #   B. mono RGB    (image/jpeg) — reuses visual_depth's TensorRT engine
+  #   C. stereo pair (image/jpeg × 2)   — SGBM + reprojectImageTo3D
+  # A/B are zero-config (hfov defaults to 90°); C wants calibration, which the
+  # card's calibrate action produces on the spot and persists under
+  # /models/stereo_calib/. Engine load (B only) is lazy on first start, like
+  # visual_depth.
+  pointcloud:
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    fps: 2
+    # Rendering ceiling is 40000 per frame (pointcloud.js MAX_POINTS); keep the
+    # default well under it so the browser stays responsive.
+    max_points: 20000
+    min_depth_m: 0.1
+    max_depth_m: 10.0
+    # Mono-mode site refit, same parameterisation as visual_depth:
+    # metres_out = metres_in**cal_a * exp(cal_b). 1.0 / 0.0 = trust the engine.
+    cal_a: 1.0
+    cal_b: 0.0
+
   ocr:
     enabled: true
     provider: rapidocr
