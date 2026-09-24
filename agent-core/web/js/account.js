@@ -10,6 +10,8 @@
  * 表单埋在「设置 → 技能 → 我的技能」里，用户根本找不到。
  */
 
+import { handoffMarkup, mountHandoff, handleHandoffClick, loadHandoffAddresses } from './handoff.js';
+
 const TOKEN_KEY = 'rc_token';
 const ROLE_KEY  = 'rc_role';
 const USER_KEY  = 'rc_user_id';
@@ -119,6 +121,8 @@ export function hideAccount() {
 /** 重新拉身份与两个市场的摘要，然后重绘。 */
 export async function refreshAccount() {
   _render();                       // 先用现有状态画一次，避免闪空白
+  // 和下面的身份请求并发：两件事互不相干，串起来只是让页面多空一会儿
+  const addresses = loadHandoffAddresses();
   if (getRcToken()) {
     try {
       const res = await fetch('/api/account/session', { headers: rcHeaders() });
@@ -141,6 +145,7 @@ export async function refreshAccount() {
   } else {
     _user = null;
   }
+  await addresses;
   _syncBadges();
   _render();
   _loadEntrySummaries();
@@ -159,6 +164,7 @@ function _render() {
   const html = `
     ${_notice ? `<div class="account-notice">${_esc(_notice)}</div>` : ''}
     ${_user ? _renderIdentity() : _renderAuthForm()}
+    ${handoffMarkup()}
     ${_renderTokenSection()}
     <div class="account-section-label">内容</div>
     <div class="settings-list account-entry-list">
@@ -185,6 +191,8 @@ function _render() {
     const el = document.getElementById(id);
     if (el) el.innerHTML = html;
   });
+  // 二维码那段的倒计时活在 handoff.js 的模块状态里，DOM 一换就要接回去
+  mountHandoff(_render);
 }
 
 function _renderIdentity() {
@@ -296,6 +304,8 @@ function _syncBadges() {
 // ── 交互 ────────────────────────────────────────────────────────────────────
 
 function _onClick(e) {
+  if (handleHandoffClick(e, _render)) return;
+
   const entry = e.target.closest('[data-entry]');
   if (entry) {
     // 两个市场都不需要登录就能浏览，直接点隐藏的原按钮，沿用它们自己的初始化

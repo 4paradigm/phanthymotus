@@ -8341,6 +8341,215 @@ html, body {
 /* 「我的」tab 上的圆点表示"已登录"，不是未读/告警，所以不用 .tabbar-badge 的红色 */
 #account-tab-badge { background: var(--accent); }
 
+/* ── 手机接入（扫码把控制台交到手上）──────────────────────────────────────
+   卡片做成一张可撕的票根：左边是二维码，中间一条打孔线，右边是地址。
+   那条打孔线不是装饰 —— 它说的正是这个功能在做的事：左半边跟着人走。
+   除此之外一概从简，没有渐变、没有额外投影、没有 hover 动效。 */
+
+.handoff-card {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* 票根的左半：二维码所在的白底方块。白底是给扫码器的，不是审美选择 ——
+   暖米色背景会压低对比度，边缘的机器扫起来会吃力。 */
+.handoff-stub {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 14px;
+  display: flex;
+  align-items: center;
+}
+
+/* 撕口：一条虚线就够了。先前还在两端各开了一个半圆缺口，位置要靠
+   百分比去凑，换个尺寸就错位 —— 而那条虚线本身已经把意思说完了。 */
+.handoff-stub::after {
+  content: '';
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: 0;
+  border-right: 1px dashed var(--border-med);
+}
+
+/* 顶上留 4px 给倒计时条自己一条带 —— 压在码面上会吃掉静区，而静区不够
+   扫码器就找不到定位图案。码本身的静区由 qrSvg 的 margin 给足 4 格。 */
+.handoff-qr {
+  position: relative;
+  box-sizing: border-box;
+  width: 152px;
+  height: 156px;
+  padding-top: 4px;
+  border-radius: var(--radius-sm);
+  background: #fff;
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.handoff-qr svg { display: block; width: 100%; height: 100%; }
+
+/* 盖住时把二维码糊掉而不是移除：保持同样的尺寸，点开不会让整页跳一下 */
+.handoff-qr.is-covered svg { filter: blur(7px); opacity: .5; }
+
+.handoff-reveal {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: none;
+  /* 盖板要压得住底下那层糊掉的二维码，不然按钮文字读不清 */
+  background: rgba(253, 250, 245, .90);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.handoff-reveal svg { width: 20px; height: 20px; color: var(--accent); }
+.handoff-reveal:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* 自动收起的倒计时。唯一一处非交互触发的动效，它在回答一个用户会问的问题：
+   还剩多久。 */
+.handoff-countdown {
+  position: absolute;
+  left: 0;
+  /* 压在方块顶边而不是底边：底边挨着卡片描边，2px 的线在那儿读起来
+     就是描边的一部分，等于没画 */
+  top: 0;
+  height: 3px;
+  width: 100%;
+  background: var(--accent);
+  transform-origin: left center;
+  animation: handoff-countdown linear forwards;
+}
+@keyframes handoff-countdown {
+  from { transform: scaleX(1); }
+  to   { transform: scaleX(0); }
+}
+
+.handoff-qr-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 票根的右半 */
+.handoff-detail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  padding: 14px 16px 14px 18px;
+}
+.handoff-url {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.handoff-where {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.handoff-addrs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.handoff-addr {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+.handoff-addr.is-active {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+
+.handoff-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 4px;
+}
+.handoff-hide { color: var(--text-muted); }
+
+.handoff-card-empty { padding: 16px; }
+.handoff-empty-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+@media (max-width: 768px) {
+  /* 手机扫不了自己的屏幕，所以这一页在手机上换个主次：先给地址和「复制链接」，
+     二维码转到下面，用来把控制台递给旁边的另一台手机。 */
+  .handoff-card { flex-direction: column-reverse; }
+  .handoff-detail { padding: 16px 16px 14px; }
+  .handoff-stub {
+    padding: 14px 16px 16px;
+    justify-content: center;
+  }
+  /* 竖排之后打孔线要转 90 度 */
+  .handoff-stub::after {
+    top: 0;
+    bottom: auto;
+    left: 12px;
+    right: 12px;
+    border-right: none;
+    border-top: 1px dashed var(--border-med);
+  }
+  /* 高度要比宽度多出顶上那条倒计时带，否则它又压回静区里去了 */
+  .handoff-qr { width: 208px; height: 212px; }
+  .handoff-url { font-size: 15px; }
+  .handoff-where { font-size: 12px; }
+}
+
+/* 触摸目标按指针精度分，不按宽度 —— 平板匹配这一块但不匹配上面那个 768px
+   的布局块，而手指在平板上和在手机上一样粗。 */
+@media (pointer: coarse) {
+  .handoff-addr { padding: 8px 14px; font-size: 12px; }
+  .handoff-actions { gap: 22px; min-height: 44px; }
+  .handoff-actions .account-copy-btn,
+  .handoff-actions .account-link {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+  /* 盖板本身就是按钮，整块 152x156 都能点，不必再加下限 */
+  .handoff-reveal { font-size: 13px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 时间到了照样收起 —— 计时器在 JS 里；这里只是不再扫那条线 */
+  .handoff-countdown { animation: none; }
+}
+
 /* ── Peer collaboration panel ───────────────────────────────────────────────
    Reuses .user-row / .user-role-select / .user-role-dot from the channel user
    list; only peer-specific pieces live here. */
