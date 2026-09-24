@@ -21,6 +21,7 @@
  */
 
 import { getToken } from './auth.js';
+import { loadLocalAddresses } from './local-address.js';
 import { qrSvg } from './qrcode.js';
 import { showToast } from './toast.js';
 
@@ -34,25 +35,14 @@ let _timer = null;
 
 // ── 数据 ────────────────────────────────────────────────────────────────────
 
-/** 拉本机可达地址。只在第一次渲染时问一次，网卡不会在看这一页的时候变。 */
+/**
+ * 拉本机可达地址。列表由 local-address.js 缓存，和插件配置页里的二维码字段
+ * 共用；选中项（`_selected`）留在这里各自持有。
+ */
 export async function loadHandoffAddresses() {
   if (_addresses) return;
-  try {
-    const json = await (await fetch('/api/network/reachable')).json();
-    _addresses = json.data?.addresses || [];
-  } catch {
-    _addresses = [];
-  }
-  // 服务端一个地址都给不出时，退回当前这个 —— 至少在「电脑和手机连同一个
-  // 网、用 IP 打开的控制台」这种最常见的情形下是对的。
-  if (!_addresses.length && location.hostname && !_isLoopback(location.hostname)) {
-    _addresses = [{ device: '', ip: location.hostname, kind: 'other', primary: true }];
-  }
+  _addresses = await loadLocalAddresses();
   if (!_selected) _selected = _addresses[0]?.ip || '';
-}
-
-function _isLoopback(host) {
-  return host === 'localhost' || host === '::1' || host.startsWith('127.');
 }
 
 /** 扫码打开的完整地址。端口与协议沿用当前这一个，只换主机名。 */

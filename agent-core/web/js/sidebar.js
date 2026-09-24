@@ -6,6 +6,7 @@
 
 import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
+import { makeQrField, isDisplayOnly } from './qr-field.js';
 
 /**
  * 分区图标。
@@ -323,7 +324,12 @@ function _buildChip(mcp, tool) {
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
   const configKey = `${mcp.id}:${tool.name}`;
-  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
+  // 「已配置」只看会产生输入的字段。纯展示字段（二维码）永远不保存任何值，
+  // 把它算进来的话，一个只声明了二维码的工具会永久挂着未配置的警告三角。
+  // 齿轮按钮照旧按 hasSharedFields 出现 —— 正因为要点开它才看得到二维码。
+  const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
+    .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
+  const configured = needsInput ? !!_toolConfigs[configKey] : true;
 
   const configBtnHtml = hasSharedFields
     ? `<button class="chip-config-btn" title="配置"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
@@ -428,7 +434,10 @@ function _buildToolCard(mcp, tool) {
   const configKey = `${mcp.id}:${tool.name}`;
   // Only tools with shared (non-instance-scope) fields need sidebar-level configuration
   const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
-  const configured = hasSharedFields ? !!_toolConfigs[configKey] : true;
+  // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
+  const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
+    .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
+  const configured = needsInput ? !!_toolConfigs[configKey] : true;
 
   // Badge
   const badgeHtml = toolType
@@ -743,6 +752,9 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (isDisplayOnly(def)) {
+      // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
+      input = makeQrField(key, def);
     } else if (_isStructuredField(def)) {
       input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
@@ -1087,6 +1099,9 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         errOpt.textContent = 'Failed to load channels';
         input.appendChild(errOpt);
       });
+    } else if (isDisplayOnly(def)) {
+      // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
+      input = makeQrField(key, def);
     } else if (_isStructuredField(def)) {
       input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
