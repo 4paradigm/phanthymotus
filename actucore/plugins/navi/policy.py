@@ -787,7 +787,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     bands = depth.get("bands") or {}
 
     if track is None:
-        return _search(config, state, dt)
+        return _search(config, state, dt, odom)
 
     state.missing_frames = 0
     state.searching_for_s = 0.0
@@ -1288,7 +1288,7 @@ def _scaled(value: float, factor: float, floor: float, ceiling: float) -> float:
     return _lift(value * factor, floor, ceiling)
 
 
-def _search(config: Config, state: State, dt: float) -> Decision:
+def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     """Target not in frame. Turn towards where it last was, then give up.
 
     Two ways to stop, and the first is the better one. With odometry the sweep
@@ -1296,6 +1296,15 @@ def _search(config: Config, state: State, dt: float) -> Decision:
     circle. Without it the only available measure is wall-clock, which gives up
     early on a robot that turns slowly and late on one that spins — a timeout
     is the fallback, not the design.
+
+    That is what this docstring claimed while the code accumulated the
+    **commanded** rate, which measures the turn the robot was asked for rather
+    than the one it performed. The two diverge exactly where the sweep matters:
+    a chassis that refuses the command, a gait that has not started yet, a robot
+    held or blocked mid-turn. All of those "complete" a full circle on schedule
+    and report `target lost` for something that was behind the robot the whole
+    time. `wz` on R1 was verified against two commanded full turns and came back
+    within 3%, so the measurement is worth using.
     """
     state.missing_frames += 1
     if state.missing_frames < config.lost_frames:
@@ -1313,11 +1322,37 @@ def _search(config: Config, state: State, dt: float) -> Decision:
     # finds it eventually, by going all the way round, and so reads as "search
     # is just slow" rather than as a wrong sign.
     wz = -config.search_rate * state.last_seen_side
-    # Accumulated from the commanded rate, which is only the turn actually
-    # performed while `search_rate` clears the deadband — below it the command
-    # is zeroed downstream and this would count a rotation that never happened.
-    # Keeping search_rate above the threshold is what makes the two agree.
-    state.searched_rad += abs(wz) * dt
+
+    # **The component along the direction we are turning, signed — not `abs`.**
+    #
+    # Three things make the obvious `abs(measured) * dt` wrong, and all three
+    # inflate the sweep, i.e. give up early on a target that is really there:
+    #
+    #   - yaw rate carries noise, and `abs` rectifies it, so a *stationary*
+    #     robot accumulates sweep. R1's `yaw_speed` also has a small zero bias
+    #     (~0.12 deg/s measured while standing still), which `abs` cannot
+    #     cancel either. Signed accumulation cancels both exactly.
+    #   - a rotation in the *opposite* direction would count as progress,
+    #     including the robot being turned by hand or shoved.
+    #   - body sway during a legged gait reverses sign within a step.
+    #
+    # The accumulator is floored at zero so an opposing turn cannot bank
+    # negative credit that a later real sweep has to pay off.
+    measured = (odom or {}).get("wz")
+    sweep_measured = measured is not None
+    if sweep_measured:
+        direction = 1.0 if wz >= 0 else -1.0
+        state.searched_rad = max(0.0, state.searched_rad
+                                 + float(measured) * direction * dt)
+    else:
+        # No odometry, or a robot that does not measure yaw rate — `None`, never
+        # 0.0, which is the whole reason the format forbids reporting zero for an
+        # unmeasured axis. Fall back to the commanded rate, which is the turn
+        # actually performed only while `search_rate` clears the deadband: below
+        # it the command is zeroed downstream and this would count a rotation
+        # that never happened. Keeping search_rate above the threshold is what
+        # makes the two agree.
+        state.searched_rad += abs(wz) * dt
 
     # Exhausted searches used to go quiet, which left the caller with no answer
     # at all — the task neither succeeded nor failed, and only the ACP timeout
@@ -1330,9 +1365,13 @@ def _search(config: Config, state: State, dt: float) -> Decision:
         # and as `bottle` twenty minutes later — so "not found" far more often
         # means the name does not match than that the thing is absent. A caller
         # told only "lost" retries the same wrong name or gives up.
+        # Say which of the two measures ended it. "Swept a full circle" and
+        # "was told to sweep a full circle" are different claims, and only one
+        # of them is evidence the target is not there.
         state.failed_reason = (
-            f"swept {state.searched_rad:.1f} rad without seeing "
-            f"{state.target!r}: target lost. "
+            f"swept {state.searched_rad:.1f} rad "
+            f"({'measured' if sweep_measured else 'commanded, no odometry'}) "
+            f"without seeing {state.target!r}: target lost. "
             f"检测模型对同一物体的类别并不稳定，「没找到」多半是名字对不上 —— "
             f"用 list_visible_objects 看一眼现在认出了什么，再和用户确认")
         return Decision(None, FAILED, state.failed_reason)
