@@ -149,12 +149,15 @@ def _is_valid_image_ref(value: Any) -> bool:
 def _validate_review_evidence(data: dict) -> dict:
     """Strictly validate review_evidence dict. Returns validated data or raises.
 
-    Exact 9 fields:
+    Required provenance fields:
       build_comment_id, build_comment_updated_at,
       commit_prefix, resolved_head_sha,
       test_comment_id, test_comment_updated_at,
       code_review_comment_id, code_review_comment_updated_at,
       review_author_id
+
+    New snapshots may also carry the parsed test totals.  They are optional
+    so existing lifecycle comments remain readable during migration.
     """
     if not isinstance(data, dict):
         raise MalformedHiddenStateError("review_evidence is not a dict")
@@ -165,7 +168,8 @@ def _validate_review_evidence(data: dict) -> dict:
         "code_review_comment_id", "code_review_comment_updated_at",
         "review_author_id",
     }
-    extra = set(data.keys()) - required
+    optional = {"test_passed", "test_failed", "test_skipped"}
+    extra = set(data.keys()) - required - optional
     if extra:
         raise MalformedHiddenStateError(f"extra review_evidence keys: {', '.join(sorted(extra))}")
     for k in required:
@@ -208,6 +212,18 @@ def _validate_review_evidence(data: dict) -> dict:
     rai = data["review_author_id"]
     if not isinstance(rai, str) or not rai or not rai.isdigit():
         raise MalformedHiddenStateError("review_evidence.review_author_id must be a non-empty numeric string")
+    test_passed = data.get("test_passed", 0)
+    test_failed = data.get("test_failed", 0)
+    test_skipped = data.get("test_skipped", False)
+    for key, value in (("test_passed", test_passed), ("test_failed", test_failed)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise MalformedHiddenStateError(
+                f"review_evidence.{key} must be a non-negative int"
+            )
+    if not isinstance(test_skipped, bool):
+        raise MalformedHiddenStateError(
+            "review_evidence.test_skipped must be a bool"
+        )
     return data
 
 
@@ -283,7 +299,8 @@ def _validate_hidden_state(data: dict) -> dict:
         review_image_tag = comp.get("review_image_tag", "")
         if not isinstance(review_image_tag, str) or not review_image_tag:
             raise MalformedHiddenStateError("review_image_tag missing")
-        if comp.get("target") not in {"perception", "actucore", "driver"}:
+        target = comp.get("target")
+        if target not in {"perception", "actucore", "driver", "core"}:
             raise MalformedHiddenStateError(f"invalid component target: {comp.get('target')!r}")
         if not isinstance(comp.get("driver_path"), str):
             raise MalformedHiddenStateError("driver_path must be a string")
@@ -298,6 +315,20 @@ def _validate_hidden_state(data: dict) -> dict:
         runtime_id = comp.get("runtime_id", "")
         if runtime_id != "" and (not isinstance(runtime_id, str) or not runtime_id):
             raise MalformedHiddenStateError("runtime_id must be an empty or non-empty string")
+        if target == "core":
+            if comp_keys != {
+                "component_id", "target", "driver_path", "variant",
+                "review_image_tag", "image_ref", "resolved_platform", "runtime_id",
+            }:
+                raise MalformedHiddenStateError(
+                    "core component must use the canonical runtime-bound schema"
+                )
+            if comp.get("driver_path") != "":
+                raise MalformedHiddenStateError("core driver_path must be empty")
+            if comp.get("variant") != "":
+                raise MalformedHiddenStateError("core variant must be empty")
+            if runtime_id != "core":
+                raise MalformedHiddenStateError("core runtime_id must be 'core'")
 
     deployments = data.get("deployments", [])
     if not isinstance(deployments, list):
@@ -358,10 +389,81 @@ def _validate_hidden_state(data: dict) -> dict:
             new_schema_keys = {"component_id", "runtime_id", "status", "running_image", "target_image", "verified"}
             # New schema with optional error (uncertain post-deploy)
             new_schema_with_error_keys = new_schema_keys | {"error"}
+            # Core self-update verification schema.  Core has no running_image
+            # or driver status; it is verified through update-check current_tag.
+            core_schema_keys = {
+                "component_id", "runtime_id", "current_tag", "target_tag", "verified",
+            }
+            core_schema_optional = {"already_target", "error"}
             h_keys = set(h.keys())
-            if h_keys != legacy_keys and h_keys not in (new_schema_keys, new_schema_with_error_keys):
+            is_core_schema = (
+                core_schema_keys <= h_keys
+                and h_keys - core_schema_keys <= core_schema_optional
+            )
+            if (
+                h_keys != legacy_keys
+                and h_keys not in (new_schema_keys, new_schema_with_error_keys)
+                and not is_core_schema
+            ):
                 raise MalformedHiddenStateError(
                     f"approve_attempt health keys must match canonical schema, got {h_keys}"
+                )
+            if is_core_schema:
+                component_id = h.get("component_id")
+                if not isinstance(component_id, str) or not component_id:
+                    raise MalformedHiddenStateError(
+                        "core health component_id must be a non-empty string"
+                    )
+                if h.get("runtime_id") != "core":
+                    raise MalformedHiddenStateError(
+                        "core health runtime_id must be 'core'"
+                    )
+                if not isinstance(h.get("current_tag"), str):
+                    raise MalformedHiddenStateError(
+                        "core health current_tag must be a string"
+                    )
+                if not isinstance(h.get("target_tag"), str) or not h.get("target_tag"):
+                    raise MalformedHiddenStateError(
+                        "core health target_tag must be a non-empty string"
+                    )
+                if not isinstance(h.get("verified"), bool):
+                    raise MalformedHiddenStateError(
+                        "core health verified must be a bool"
+                    )
+                if h.get("verified") is True:
+                    if not h.get("current_tag"):
+                        raise MalformedHiddenStateError(
+                            "core health verified=true requires non-empty current_tag"
+                        )
+                    if h.get("current_tag") != h.get("target_tag"):
+                        raise MalformedHiddenStateError(
+                            "core health verified=true requires current_tag==target_tag"
+                        )
+                if "already_target" in h:
+                    if not isinstance(h["already_target"], bool):
+                        raise MalformedHiddenStateError(
+                            "core health already_target must be a bool"
+                        )
+                    if h["already_target"] is True and (
+                        h.get("verified") is not True
+                        or h.get("current_tag") != h.get("target_tag")
+                    ):
+                        raise MalformedHiddenStateError(
+                            "core health already_target=true requires verified target"
+                        )
+                if "error" in h:
+                    if not isinstance(h["error"], str) or not h["error"]:
+                        raise MalformedHiddenStateError(
+                            "core health error must be a non-empty string when present"
+                        )
+                    if h.get("verified") is not False:
+                        raise MalformedHiddenStateError(
+                            "core health error implies verified=false"
+                        )
+                continue
+            if h.get("runtime_id") == "core":
+                raise MalformedHiddenStateError(
+                    "core health must use the canonical update-check schema"
                 )
             if not isinstance(h.get("component_id", ""), str):
                 raise MalformedHiddenStateError("approve_attempt health component_id must be a string")

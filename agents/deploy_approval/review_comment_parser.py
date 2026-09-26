@@ -544,10 +544,13 @@ def parse_test_results(
     """Parse Test Results comment.
 
     Returns (passed, failed, skipped).
-    Returns (0, 0, True) if no test suite ran.
 
-    Test table has 5 columns: Suite | Result | Passed | Failed | Took
-    Passed and failed counts are accumulated across all suites.
+    A real Test Results table takes precedence over any informational
+    ``skip-tests`` text in the comment footer.
+
+    Passed and failed counts are accumulated independently across every
+    concrete suite row because a failed suite can still contain many
+    passing tests.
     """
     if not _has_marker(body) or TEST_HEADING not in body:
         return (0, 0, False)
@@ -556,51 +559,53 @@ def parse_test_results(
     if section is None:
         return (0, 0, False)
 
-    # Check for skip-tests
-    if "skip-tests" in section.lower() or "skipped" in section.lower():
-        # Check if there are actual results
-        passed = 0
-        failed = 0
-        for line in section.splitlines():
-            if "passed" in line.lower() and ":" in line:
-                try:
-                    val = line.split(":")[-1].strip()
-                    passed = int(val)
-                except (ValueError, IndexError):
-                    pass
-            if "failed" in line.lower() and ":" in line:
-                try:
-                    val = line.split(":")[-1].strip()
-                    failed = int(val)
-                except (ValueError, IndexError):
-                    pass
-        if passed == 0 and failed == 0:
-            return (0, 0, True)
-        return (passed, failed, False)
-
-    # Parse table rows — 5-column regex: Suite | Result | Passed | Failed | Took
     passed = 0
     failed = 0
+    saw_result_row = False
+
     for line in section.splitlines():
         m = _TEST_TABLE_ROW_RE.match(line.strip())
-        if m:
-            # Skip table header/separator rows
-            target = m.group(1).strip()
-            if not target or re.fullmatch(r"[- :\t]+", target) and len(target) > 2:
-                continue
-            result = m.group(2).strip().lower()
-            if ":white_check_mark:" in result or result == "pass":
-                try:
-                    passed += int(m.group(3).strip())
-                except (ValueError, IndexError):
-                    passed += 1
-            elif ":x:" in result or result in ("fail", "failure"):
-                try:
-                    failed += int(m.group(4).strip())
-                except (ValueError, IndexError):
-                    failed += 1
+        if not m:
+            continue
 
-    return (passed, failed, False)
+        suite = m.group(1).strip()
+
+        if not suite:
+            continue
+
+        if suite.lower() == "suite":
+            continue
+
+        if re.fullmatch(r"[- :\t]+", suite) and len(suite) > 2:
+            continue
+
+        try:
+            row_passed = int(m.group(3).strip())
+            row_failed = int(m.group(4).strip())
+        except (ValueError, IndexError):
+            continue
+
+        saw_result_row = True
+        passed += row_passed
+        failed += row_failed
+
+    if saw_result_row:
+        return (passed, failed, False)
+
+    # Review Agent normally emits no Test Results comment at all when
+    # nothing ran. Preserve compatibility for an explicit skipped-only
+    # Test Results body, but never let the standard footer override a
+    # real table above.
+    lowered = section.lower()
+    if (
+        "tests skipped" in lowered
+        or "test skipped" in lowered
+        or "not run" in lowered
+        or "skip-tests" in lowered
+    ):
+        return (0, 0, True)
+
+    return (0, 0, False)
 
 
 # ------------------------------------------------------------------

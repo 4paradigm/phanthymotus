@@ -51,6 +51,7 @@ from .github_state_proxy import (
     _next_history_archive_page,
     _build_archive_body,
     _parse_visible_history,
+    _build_history_block,
     VISIBLE_HISTORY_START_MARKER,
     VISIBLE_HISTORY_END_MARKER,
     HIDDEN_STATE_MARKER,
@@ -123,6 +124,18 @@ _LEGACY_VARIANTS = {
 }
 
 MAX_RECENT_APPROVE_ATTEMPTS = 4
+
+_REVIEW_EVIDENCE_IDENTITY_FIELDS = frozenset({
+    "build_comment_id",
+    "build_comment_updated_at",
+    "commit_prefix",
+    "resolved_head_sha",
+    "test_comment_id",
+    "test_comment_updated_at",
+    "code_review_comment_id",
+    "code_review_comment_updated_at",
+    "review_author_id",
+})
 
 
 def _normalize_variant(value: str) -> str:
@@ -301,7 +314,7 @@ class DeployController:
         evidence: "ReviewCommentEvidence",
         resolved_head: str,
     ) -> dict:
-        """Return the canonical 9-field review_evidence snapshot."""
+        """Return the canonical review evidence snapshot."""
         return {
             "build_comment_id": evidence.build_comment_id,
             "build_comment_updated_at": evidence.build_comment_updated_at,
@@ -312,6 +325,22 @@ class DeployController:
             "code_review_comment_id": evidence.code_review_comment_id,
             "code_review_comment_updated_at": evidence.code_review_comment_updated_at,
             "review_author_id": evidence.review_author_id,
+            "test_passed": evidence.test_passed,
+            "test_failed": evidence.test_failed,
+            "test_skipped": evidence.test_skipped,
+        }
+
+    @staticmethod
+    def _review_evidence_identity(snapshot: dict) -> dict:
+        """Return provenance fields used to identify the reviewed run.
+
+        Test totals are evidence metadata, not a new review run.  Ignoring
+        them here keeps old nine-field lifecycle snapshots migration-safe.
+        """
+        return {
+            key: snapshot.get(key)
+            for key in _REVIEW_EVIDENCE_IDENTITY_FIELDS
+            if key in snapshot
         }
 
     async def _resolve_commit_prefix_for_head(
@@ -426,6 +455,21 @@ class DeployController:
         return canonical
 
     @staticmethod
+    def _fresh_component_runtime_binding(component: dict) -> dict:
+        """Normalize runtime identity for a fresh component snapshot.
+
+        Core is its own runtime and therefore carries a static binding from
+        the review snapshot onward.  Other targets are dynamically resolved
+        during preflight; a fresh snapshot must not retain an old binding.
+        """
+        item = dict(component)
+        if item.get("target") == "core":
+            item["runtime_id"] = "core"
+        else:
+            item.pop("runtime_id", None)
+        return item
+
+    @staticmethod
     def _components_with_preserved_runtime_bindings(
         fresh_components: list[dict],
         old_components: list[dict],
@@ -453,7 +497,7 @@ class DeployController:
             if not isinstance(component_id, str) or not component_id:
                 return None
             runtime_id = component.get("runtime_id")
-            if component_id in deployed_component_ids:
+            if component_id in deployed_component_ids and component.get("target") != "core":
                 if not isinstance(runtime_id, str) or not runtime_id:
                     return None
                 old_runtime_bindings[component_id] = runtime_id
@@ -466,8 +510,8 @@ class DeployController:
             component_id = item.get("component_id", "")
             if not isinstance(component_id, str) or not component_id:
                 return None
-            item.pop("runtime_id", None)
-            if component_id in deployed_component_ids:
+            item = DeployController._fresh_component_runtime_binding(item)
+            if component_id in deployed_component_ids and item.get("target") != "core":
                 runtime_id = old_runtime_bindings.get(component_id)
                 if not isinstance(runtime_id, str) or not runtime_id:
                     return None
@@ -527,7 +571,7 @@ class DeployController:
             if skey in seen_semantic_keys:
                 return None
             seen_semantic_keys.add(skey)
-            snapshot.append({
+            component = {
                 "component_id": component_id,
                 "target": build.target,
                 "driver_path": build.driver_path,
@@ -535,7 +579,12 @@ class DeployController:
                 "review_image_tag": validated_tag,
                 "image_ref": validated_tag,
                 "resolved_platform": resolved_platform,
-            })
+            }
+            if build.target == "core":
+                component["driver_path"] = ""
+                component["variant"] = ""
+                component["runtime_id"] = "core"
+            snapshot.append(component)
         return snapshot
 
     async def _rebind_terminal_cos_if_current(
@@ -837,18 +886,10 @@ class DeployController:
                 )
                 return True
 
-            # Build review_evidence snapshot with all 9 canonical fields
-            review_evidence_data = {
-                "build_comment_id": evidence.build_comment_id,
-                "build_comment_updated_at": evidence.build_comment_updated_at,
-                "commit_prefix": evidence.commit_prefix,
-                "resolved_head_sha": resolved_head,
-                "test_comment_id": evidence.test_comment_id,
-                "test_comment_updated_at": evidence.test_comment_updated_at,
-                "code_review_comment_id": evidence.code_review_comment_id,
-                "code_review_comment_updated_at": evidence.code_review_comment_updated_at,
-                "review_author_id": evidence.review_author_id,
-            }
+            # Use the same canonical snapshot as reconcile and recovery.
+            review_evidence_data = self._review_evidence_snapshot(
+                evidence, resolved_head,
+            )
 
             # Determine compatible machine groups
             machine_groups = self._get_machine_groups_for_components(components)
@@ -3543,7 +3584,10 @@ class DeployController:
         }
 
         # A true evidence/tag change resets everything.
-        evidence_changed = old_review_evidence != review_evidence_data
+        evidence_changed = (
+            self._review_evidence_identity(old_review_evidence)
+            != self._review_evidence_identity(review_evidence_data)
+        )
         # Symmetric set comparison: detects added, removed, and changed components.
         semantic_changed = old_semantic_duplicate or old_semantic_keys != fresh_semantic_keys
 
@@ -3551,9 +3595,9 @@ class DeployController:
             # Genuinely different build/evidence — reset to fresh snapshot.
             fresh_reset_components: list[dict] = []
             for component in fresh_components:
-                item = dict(component)
-                item.pop("runtime_id", None)
-                fresh_reset_components.append(item)
+                fresh_reset_components.append(
+                    self._fresh_component_runtime_binding(component)
+                )
             updated_state = dict(state)
             updated_state["review_evidence"] = review_evidence_data
             updated_state["status"] = "deploy-requested"
@@ -3589,7 +3633,13 @@ class DeployController:
                 if not isinstance(old_comp, dict):
                     continue
                 old_cid = old_comp.get("component_id", "")
-                if old_cid in deployed_component_ids:
+                if (
+                    old_cid in deployed_component_ids
+                    and old_comp.get("target") != "core"
+                ):
+                    # Non-core runtime ids are dynamic and must be present
+                    # before preserving a deployed binding.  Core is static
+                    # and is normalized to "core" below.
                     runtime_id = old_comp.get("runtime_id", "")
                     if not isinstance(runtime_id, str) or not runtime_id:
                         # Missing runtime_id for deployed component — reset to fresh.
@@ -3600,9 +3650,9 @@ class DeployController:
                 # Fall through to the reset branch below.
                 fresh_reset_components: list[dict] = []
                 for component in fresh_components:
-                    item = dict(component)
-                    item.pop("runtime_id", None)
-                    fresh_reset_components.append(item)
+                    fresh_reset_components.append(
+                        self._fresh_component_runtime_binding(component)
+                    )
                 updated_state = dict(state)
                 updated_state["review_evidence"] = review_evidence_data
                 updated_state["status"] = "deploy-requested"
@@ -3639,7 +3689,7 @@ class DeployController:
                     is_deployed = old_cid in deployed_component_ids
                     if is_deployed:
                         # Rule B: preserve historical artifact
-                        migrated.append({
+                        migrated_component = {
                             "component_id": old_cid,
                             "target": fresh["target"],
                             "driver_path": fresh["driver_path"],
@@ -3647,11 +3697,18 @@ class DeployController:
                             "review_image_tag": fresh["review_image_tag"],
                             "image_ref": old_comp.get("image_ref", ""),
                             "resolved_platform": fresh["resolved_platform"],
-                            "runtime_id": old_comp.get("runtime_id", ""),
-                        })
+                        }
+                        migrated_component = self._fresh_component_runtime_binding(
+                            migrated_component
+                        )
+                        if fresh["target"] != "core":
+                            migrated_component["runtime_id"] = old_comp.get(
+                                "runtime_id", ""
+                            )
+                        migrated.append(migrated_component)
                     else:
                         # Rule A: migrate to tag, reuse old component_id
-                        migrated.append({
+                        migrated.append(self._fresh_component_runtime_binding({
                             "component_id": old_cid,
                             "target": fresh["target"],
                             "driver_path": fresh["driver_path"],
@@ -3659,7 +3716,7 @@ class DeployController:
                             "review_image_tag": fresh["review_image_tag"],
                             "image_ref": fresh["image_ref"],
                             "resolved_platform": fresh["resolved_platform"],
-                        })
+                        }))
 
                 updated_state = dict(state)
                 updated_state["review_evidence"] = review_evidence_data
@@ -3834,7 +3891,10 @@ class DeployController:
         if resolved_head != fresh_head:
             return False
         fresh_snapshot = self._review_evidence_snapshot(evidence, resolved_head)
-        return fresh_snapshot == persisted_review_evidence
+        return (
+            self._review_evidence_identity(fresh_snapshot)
+            == self._review_evidence_identity(persisted_review_evidence)
+        )
 
 
     def _validate_hidden_state(self, state: dict) -> None:
