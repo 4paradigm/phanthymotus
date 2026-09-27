@@ -139,7 +139,7 @@ replace static snapshot
 clear deployment/case/COS validation state
 NO rollback
 
-Agent Core no-container response 只在 `running_image` / `error` 均缺失、`status` key 存在且 `logs` 为字符串时归一化为 `running_image=""`。`status` VALUE 不参与 CLEAN / health / case 决策；`error` 或 malformed shape 继续 fail closed。
+Agent Core 的 no-container response 只在 `running_image` / `error` 均缺失、`status` key 存在且 `logs` 为字符串时归一化为 `running_image=""`。非 core preflight 记录 `running_image` 作为 evidence；非空不自动阻断部署，旧容器替换由 Agent Core 负责。普通 `status` 值本身不能作为 deployment lifecycle 成功条件；部署后验证必须同时观察 `status="running"` 与精确 target image。`error` 或 malformed shape 继续 fail closed。
 
 unsafe deploy POST 进入未知结果时：
 command.phase=uncertain
@@ -147,24 +147,78 @@ status=deploy-requested
 ZERO later POST
 NEW approve only
 
-## Full-Coverage Machine Gate
+## Multi-Machine Partial Coverage
 
-/approve_deploy 必须首先通过 full-coverage gate：
+`/approve_deploy machine=<alias>` 是 variant/platform generic 的单机审批，
+但每次只处理该 machine 当前能够兼容的 undeployed components。流程首先分别计算：
 
-1. 计算 ALL REMAINING component_ids
-2. 计算 selected machine 实际能覆盖的 component_ids
-3. 只有 machine_compatible_component_ids >= all_remaining_component_ids 才允许继续
-4. 如果 coverage 不足：ZERO deploy POST，status 保持 deploy-requested，comment 列出 full-coverage machines
+1. 所有 undeployed components；
+2. selected machine 对这些 remaining components 的 compatible subset。
 
-full-coverage gate 确保不再存在 partial machine-group 部署、不再跨机器轮询、不再等待剩余 component。
+因此，当前合同明确支持 **partial compatible component deployment**：
 
-full-coverage gate 必须在 CLEAN gate 之前执行。
+- coverage 为 0：ZERO deploy POST；`status` 保持 `deploy-requested`；当前 approve command
+  以 completed 结束；提示 Machine Owner 选择 compatible machine，并必须发 NEW
+  `/approve_deploy`。
+- coverage 为部分：只部署这一部分；成功结果写入 hidden state `deployments`；同一
+  snapshot 中已经 durable deployed 的 component 后续不得重复部署；`status` 继续为
+  `deploy-requested`；visible lifecycle 展示 remaining components；remaining components
+  require NEW `/approve_deploy`，可以由另一台 compatible machine 继续。
+- 只有 `deployed_component_ids == all_component_ids` 时，才 durable 写入
+  `status=testing`。
 
-CLEAN 通过后：FULL-COVERAGE -> running_image-only CLEAN -> fresh exact approval comment -> final fresh PR/full HEAD -> persist command.phase=executing to GitHub FIRST -> deploy ALL REMAINING components -> durable status: testing -> fixed Case (advisory only) -> Machine Owner /record_test -> succeeded | failed.
+机器名不构成架构合同；兼容性由当前 component snapshot 的 platform、variant、
+driver path 与机器策略共同决定。当前实现允许先完成一个 compatible subset，再由另一台
+machine 完成剩余 subset。
 
-不再检查 "所有 machine group 是否全部部署完毕"，因为 selected machine 已要求覆盖全部 REMAINING components。已 durably 成功的相同 snapshot 组件不会重新部署。
+## Preflight、部署顺序与 runtime verification
 
-**无 post-deploy health gate：** 每次 Agent Core deploy POST 返回正常即视为该组件部署成功，不额外调用 `driver_status` 轮询 `running_image` 来判定生命周期成功。终态证据上传前，对已部署 runtime 做一次性的 `driver_status` 日志快照；失败只写固定 marker，不改变已写入 GitHub 的终态。
+在任何 unsafe deploy POST 前，selected components 必须全部完成 preflight：
+
+- non-core 通过 Agent Core 获取唯一 runtime binding，并读取 `driver_status` 的
+  `running_image`；该值写入 approve_attempt preflight evidence。非空只表示当前 runtime
+  evidence，不是阻断条件；Deploy Approval 不执行 stop/remove/cleanup，旧容器替换由
+  Agent Core 负责。
+- core 使用 GET `/api/system/update-check`，runtime_id 固定为 `core`，并解析可验证的
+  target tag。
+- API response malformed、runtime 无法唯一解析、Agent Core 不可达或其他 preflight
+  失败都必须 fail closed，不能进入 unsafe POST。
+- 不能把 Agent Core 普通 `status` 值单独当作 deployment lifecycle 成功条件；它只能在
+  具体验证合同中与 target image 一起使用。
+
+部署顺序固定为 **non-core first / core last**，因为 core self-update 会重启 Agent Core。
+
+NON-CORE 的 **post-deploy runtime verification**：
+
+1. POST Agent Core deploy；
+2. bounded polling 重新观察实际 runtime；
+3. 必须同时真实观察到 `status="running"` 和精确的 target image（non-core target image
+   verification）；
+4. verification 成功后，才把 component 写入 hidden state `deployments`。
+
+如果 verify timeout、target image 未观察到，或 outcome unknown：
+
+- `status=deploy-requested`；
+- `command.phase=uncertain`；
+- `approve_attempt.outcome=uncertain`；
+- 本轮 ZERO further deploy POST；
+- 只能通过 NEW `/approve_deploy` 重新验证并继续。
+
+CORE 的 **core self-update exact current_tag == target_tag verification**：
+
+1. 先 GET `/api/system/update-check`；
+2. 若 `current_tag` 非空且精确等于 target tag，则 adopt existing target，ZERO POST
+   `/api/system/update`，并记录为已验证 deployed；
+3. 否则 POST `/api/system/update`；
+4. POST 后继续轮询 GET `/api/system/update-check`；
+5. 只有 `current_tag != ""` 且 `current_tag == target_tag` 才算成功；
+6. `up_to_date=true` 单独不能判定成功；restart 期间连接失败属于 bounded polling 内的
+   transient condition；
+7. timeout 或未观察到 target tag 按 uncertain 处理。
+
+core 必须在本 machine 的所有 non-core 后执行。只有本次 selected subset 的部署和验证
+完成后，才将其结果 durable 写入 hidden state；仍有未部署 component 时保持
+`deploy-requested`，并让剩余 component 通过 NEW approve 继续。
 
 ## Agent Authentication
 
@@ -332,14 +386,17 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 - `test-plan=`
 - `test-case=`
 
-## /approve_deploy：running_image-only CLEAN GATE
+## /approve_deploy：selected subset preflight 与 unsafe execution
 
 `/approve_deploy machine=<alias>` 每一条 NEW command 都必须重新读取：
 
 - PR state
 - full HEAD
 - hidden lifecycle state
-- command comment actor
+- exact command comment actor and machine selector
+- fresh actor authorization
+- fresh Review Agent evidence and component snapshot
+- selected components 的 runtime bindings / preflight
 
 若 HEAD drift：
 
@@ -349,112 +406,111 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 - `status: review-required`
 - 下一步给 Developer：`/request_bot_review`
 
-### Full-Coverage Machine Gate
+### Multi-Machine Partial Coverage
 
-一条 `/approve_deploy` 命令只选择一台 machine。这台 machine 必须覆盖 ALL REMAINING components。
+每条 command 只选择一台 machine，但 selected machine 只处理其能够兼容的
+remaining undeployed components。先计算 all undeployed components，再计算
+compatible components for selected machine；机器 selector、platform、variant 和
+driver path 均按当前 policy 精确匹配，不写死具体机器名。
 
-- coverage 不完整 → ZERO deploy POST，status 保持 `deploy-requested`，提示用户选择 full-coverage machine
-- 不存在跨 machine partial success
-- 不存在"先部署一部分，再换另一台机器继续部署"的流程
-- 成功覆盖并部署全部 REMAINING components 后直接进入 `testing`
+- selected machine coverage 为 0：ZERO deploy POST；`status` 保持 `deploy-requested`；
+  当前 command completed；visible comment 提示选择新的 compatible machine，并要求
+  NEW `/approve_deploy`。
+- selected machine 只覆盖 remaining 的一部分：允许部署这一部分，成功结果 durable
+  写入 hidden state `deployments`；已 deployed component 不得重复部署；`status` 继续为
+  `deploy-requested`；visible lifecycle 展示 remaining components；remaining components
+  require NEW `/approve_deploy`，可由另一台 compatible machine 继续。
+- 仅当 `deployed_component_ids == all_component_ids` 时才进入 `testing`。
 
-### CLEAN GATE
+### Preflight evidence
 
-CLEAN GATE 只读取 `running_image`，不判断机器状态。禁止把下面这些值用于 pre-deploy gate：
+selected components 在 ANY unsafe deploy POST 前必须全部完成 preflight：
+
+- non-core：通过 Agent Core 获取唯一 runtime binding，并读取 `running_image`；
+  `running_image` 写入 approve_attempt preflight evidence，但非空不自动阻断部署。
+- core：使用 GET `/api/system/update-check`，runtime_id 固定为 `core`，并解析 target tag。
+- preflight/API response malformed、runtime 无法唯一解析、Agent Core 不可达等情况
+  必须 fail closed，ZERO unsafe POST。
+- Agent Core 自己负责旧容器替换；Deploy Approval 不执行 stop/remove/cleanup。
+- 不得把 Agent Core 普通 `status` 值单独作为 deployment lifecycle 成功条件。
+
+禁止把下面这些值当作独立的 deployment lifecycle gate：
 
 - `READY`
 - `BUSY`
 - `OFFLINE`
 - `stopped`
 - `running`
-- 任何基于 `status` 字段与 `stopped` / `running` 组合出的 clean 条件
+- 任何只基于普通 `status` 字段的成功条件
 - node availability state
 - machine readiness state
 
-如果 selected machine 上的 ALL REMAINING components 都满足：
+`running_image` 是 evidence，不是“必须为空”的阻断条件；Agent Core 的 deploy contract
+负责替换旧 container。预检仍必须覆盖本次 selected subset 的每个 component，不能因为
+某个组件预检通过就跳过其他组件。
+
+### Unsafe POST 前的最终顺序
 
 ```text
-running_image == ""
-```
-
-才允许继续。
-
-如果任一 component 满足：
-
-```text
-running_image != ""
-```
-
-则：
-
-- ZERO deploy POST
-- `status` 继续为 `deploy-requested`
-- 该 NEW approve command 自身完成
-- cursor 推进到当前 comment id
-- visible comment 明确提示：
-  - 哪个 runtime/component 被占用
-  - 当前 `running_image`
-  - ZERO deployment was performed
-  - Machine Owner 必须手工清空
-  - 清空后再发一条 NEW `/approve_deploy machine=<alias>`
-
-### 同一 machine 的多组件预检
-
-本次 approval 的 ALL REMAINING components 必须在 ANY deploy POST 前全部 preflight：
-
-```text
-ALL REMAINING components preflight
+all undeployed components
+    ↓
+compatible subset for selected machine
+    ↓
+selected subset preflight / runtime binding
 BEFORE
 ANY deploy POST
+    ↓
+fresh exact approval comment + exact actor + exact machine selector
+    ↓
+fresh actor authorization
+    ↓
+final fresh PR/full HEAD
+    ↓
+fresh hidden state + Review Agent evidence + component snapshot
+    ↓
+persist command.phase=executing to GitHub FIRST
+    ↓
+non-core deploy + post-deploy runtime verification
+    ↓
+core self-update + exact current_tag == target_tag verification
 ```
 
-只要其中一个占用，必须 ZERO deploy POST，不能先部署一部分再发现另一个占用。
-
-### CLEAN PASS 的严格顺序
-
-只有全部 `running_image == ""` 时，才执行：
-
-1. fresh exact approval comment revalidation
-2. final fresh PR/full HEAD
-3. persist `command.phase = executing` to GitHub FIRST
-4. 然后才允许第一个 Agent Core deploy POST
-
-严格顺序：
-
-```text
-CLEAN GATE PASS
-    ↓
-fresh exact approval comment revalidation (comment valid, id exact, actor exact, body parses, alias exact)
-    ↓
-any failure -> approve_attempt.outcome=approval_revoked, status=deploy-requested, command.phase=completed, ZERO POST
-    ↓
-final fresh PR/full HEAD (drift -> review-required, ZERO POST)
-    ↓
-GitHub hidden state command.phase=executing persisted
-    ↓
-POST existing Agent Core deploy
-```
-
-### fresh exact approval comment revalidation
-
-任何检查失败：
-
-- comment object valid
-- comment id exact
-- actor id exact
-- body parses as approve_deploy
-- machine alias exact
-
-则：
+任何最终 fresh gate 失败都必须在 unsafe POST 前 fail closed；审批 comment 被删除、编辑、
+actor 不匹配、body 不再解析为 approve_deploy 或 machine selector 不精确时：
 
 - `approve_attempt.outcome=approval_revoked`
 - `status=deploy-requested`
 - `command.phase=completed`
-- cursor advances to current comment
+- cursor 推进到当前 comment
 - ZERO deploy POST
-- Machine Owner must send a NEW `/approve_deploy`
+- Machine Owner 必须发送 NEW `/approve_deploy`
 
-`approval_revoked` 不是 top-level status，不增加新的 lifecycle state。
+### Post-deploy runtime verification 与 partial completion
+
+部署按 **non-core first / core last** 顺序逐组件执行：
+
+- non-core：Agent Core deploy POST 后，bounded polling `driver_status`，必须真实观察
+  `status="running"` 且 `running_image` 精确等于 target image，验证成功后才记录
+  component 为 deployed。
+- core：先 GET `/api/system/update-check`；若 `current_tag` 已精确等于 target tag，
+  adopt existing target 并 ZERO POST `/api/system/update`；否则 POST update，再轮询
+  update-check，只有非空且精确相等的 `current_tag == target_tag` 才算成功。
+- core 的 `up_to_date=true` 单独不够；restart 期间连接失败可在 bounded polling 内
+  作为 transient condition；timeout 或未观察到 target tag 是 uncertain。
+
+如果 deploy POST 后 verify timeout、target image 未观察到，或 POST outcome unknown：
+
+- `approve_attempt.outcome=uncertain`
+- `status=deploy-requested`
+- `command.phase=uncertain`
+- 本轮 ZERO further deploy POST
+- 只能由 NEW `/approve_deploy` 继续。
+
+本轮已经验证成功的 selected subset 会先 durable 写入 hidden `deployments`。若仍有
+remaining components，visible lifecycle 展示它们，保持 `deploy-requested`，并要求
+remaining components require NEW approve；已 durable deployed 的相同 snapshot component
+不得重复部署。只有全部 component deployed 后，才 durable 写入 `status=testing`，随后
+再投影 testing label，并运行 advisory Automated Case。
 
 ## Case：advisory only
 
@@ -469,7 +525,7 @@ POST existing Agent Core deploy
 - Case exception/timeout/unavailable 不得回退 `testing` 状态
 - Case 必须使用实际 Agent Core binding / actual runtime id
 - 不允许 placeholder PASS
-- 不允许 shell / subprocess / SSH / user-supplied executable
+- 不允许 shell / subprocess / SSH / docker.sock / user-supplied executable
 - advisory case_results 持久化前必须 fresh-read hidden state 并校验 same HEAD + status=testing + same command
 
 ### 需要存在的真实行为测试
@@ -585,6 +641,8 @@ fetch/filter comments
 2. fresh current full HEAD
 3. fresh PR comments → `extract_review_evidence()`
 4. Controller 本地 exact 过滤：可信作者 + commit prefix resolve + HEAD 绑定
+5. fresh component snapshot 与已 durable `deployments` 对比
+6. fresh runtime bindings / preflight（包括 non-core `running_image` 与 core update-check）
 
 如果：
 
@@ -602,7 +660,9 @@ fetch/filter comments
 
 - refresh validation snapshot
 - `status: deploy-requested`
-- 然后才继续 running_image-only CLEAN GATE
+- 然后才继续 selected subset compatibility、fresh runtime binding/preflight、
+  exact approval revalidation 与 `command.phase=executing` durable write；旧 snapshot
+  中已 durable deployed 的 component 不得重复部署。
 
 ## 最终命令流
 
@@ -648,7 +708,10 @@ Deploy Approval 的最终收口原则是：
 - Deploy Controller 无状态
 - Review Agent 不改接口
 - Agent Core 不改 deploy contract
-- CLEAN GATE 只看 `running_image`
+- Multi-Machine Partial Coverage：每次只部署 selected machine 的 compatible subset
+- partial compatible component deployment 后，remaining components require NEW approve
+- post-deploy runtime verification：non-core target image 必须被真实观察到运行
+- core self-update 使用 exact current_tag == target_tag verification，且 non-core first / core last
 - uncertain 后不自动 replay
 - Case 只做 advisory
 
