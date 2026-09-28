@@ -131,6 +131,10 @@ def _register_core_mcp(silent=False):
                         'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
                         'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
                         'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
+                        'music_type': {'type': 'string', 'description': '音乐曲库', 'enum': ['none', 'mock', 'motus_music'], 'default': 'none'},
+                        'music_endpoint': {'type': 'string', 'description': '音乐曲库 HTTPS endpoint', 'x-sensitive': True, 'x-show-when': {'music_type': 'motus_music'}},
+                        'music_api_key': {'type': 'string', 'description': '音乐曲库 API Key', 'format': 'password', 'x-show-when': {'music_type': 'motus_music'}},
+                        'music_timeout_ms': {'type': 'integer', 'description': '曲库请求总时限（含重试，毫秒）', 'default': 3000, 'minimum': 100, 'maximum': 30000, 'x-show-when': {'music_type': 'motus_music'}},
                     },
                     'required': ['llm_url', 'llm_key']
                 },
@@ -259,7 +263,7 @@ def _register_core_mcp(silent=False):
                     'what this particular person/chat actually said; other people\'s chats may appear '
                     'elsewhere in your shared history and must not be attributed to this one. '
                     'If the triggering user_role is "viewer" (read-only), you will only be offered '
-                    'sensor/resource tools, read-only tools (WebSearch, search_history, memory_recall, '
+                    'sensor/resource tools, read-only tools (WebSearch, MusicSearch, search_history, memory_recall, '
                     'raw_input_info) plus this one — actuator/processor/delegated tools are rejected; '
                     'reply with what you can read or look up, and say so if the request needs an action '
                     'you cannot take.'

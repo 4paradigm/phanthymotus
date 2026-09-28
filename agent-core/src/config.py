@@ -121,6 +121,12 @@ _DB_DEFAULTS = {
             'base_url': '',
             'api_key': '',
         },
+        'music': {
+            'type': 'none',
+            'endpoint': '',
+            'api_key': '',
+            'timeout_ms': 3000,
+        },
     },
     'llm_logger': {
         'enabled': True,

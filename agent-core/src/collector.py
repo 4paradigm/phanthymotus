@@ -619,7 +619,7 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
             ),
             priority=P_LOW,
             model=bg_config.get('bg_model'),
-            tool_deny=['mcp__*', 'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'PythonExec'],
+            tool_deny=['mcp__*', 'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'MusicSearch', 'PythonExec'],
             max_rounds=10,
             timeout_s=3600,
             context_seed=message,

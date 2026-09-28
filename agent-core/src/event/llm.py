@@ -532,7 +532,7 @@ _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 # 查询）都算读，不算 mutate。Bot 门禁维持只给 finish，因为群里任何人都能顶一个
 # Bot 身份，是更弱的信任边界。
 _VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
-    'WebSearch', 'search_history', 'memory_recall', 'raw_input_info',
+    'WebSearch', 'MusicSearch', 'search_history', 'memory_recall', 'raw_input_info',
 })
 
 
@@ -1604,7 +1604,12 @@ class Event:
             ('Grep', self._desktop_tools.Grep),
             ('WebFetch', self._desktop_tools.WebFetch),
             ('WebSearch', self._desktop_tools.WebSearch),
+            ('MusicSearch', self._desktop_tools.MusicSearch),
         ])
+        # Capabilities are prepared once at startup, off the system prompt.
+        # Refreshes appear in tool results; they do not churn the prompt prefix.
+        from music.service import service as music_service
+        self._sys_tools['MusicSearch']['schema']['description'] += await music_service.tool_hint()
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
         # 恢复持久化的活跃任务及其定时检查

@@ -1017,6 +1017,12 @@ async def _handle_agentcore_call(req: MCPCallRequest):
                 search_cfg['api_key'] = search_key
             dt['search'] = search_cfg
             config.main['desktop_tools'] = dt
+        if 'music_type' in req.arguments:
+            from music.settings import save_settings
+            try:
+                await asyncio.to_thread(save_settings, req.arguments)
+            except ValueError as exc:
+                return {'code': 400, 'data': {'error': str(exc)}}
         return {'code': 200, 'data': 'config saved'}
 
     return {'code': 200, 'data': None}

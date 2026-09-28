@@ -229,7 +229,7 @@ class Subagent:
         # counter that run() publishes would have no caller able to read it,
         # and chains could only ever be one hop long.
         _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
-                          'WebFetch', 'WebSearch', 'memory_recall',
+                          'WebFetch', 'WebSearch', 'MusicSearch', 'memory_recall',
                           'peer_list', 'peer_state', 'peer_tools', 'peer_call',
                           'peer_delegate'}
         # `peer_call` is withheld from a delegated subagent, for the same reason the

@@ -769,6 +769,35 @@ class DesktopTools:
             desc += f' ({content_type})'
         return desc
 
+    @log.function_(call=True)
+    async def MusicSearch(self,
+        query: typing.Annotated[str, '情绪、场景、歌名或歌词片段，最长 200 字'] = '',
+        genre: typing.Annotated[str, '曲风代码，逗号分隔，如 pop,folk,rnb,rock,jazz；不确定留空'] = '',
+        language: typing.Annotated[str, '语种代码，逗号分隔：zh,en,ja,ko,th,pt,fr'] = '',
+        vocal: typing.Annotated[str, '人声：male/female/mixed/instrumental；不确定留空'] = '',
+        tags: typing.Annotated[str, '情绪/场景/主题/音色标签，逗号分隔；未知标签作为自由文本匹配'] = '',
+        artist: typing.Annotated[str, '歌手名或歌手 ID'] = '',
+        top_k: typing.Annotated[int, '返回数量，默认 3，最多 10，以 provider 能力为准'] = 3,
+        exclude_ids: typing.Annotated[str, '换一首时保留上次条件，并排除已播放 ID；逗号分隔，最多 50 个'] = '',
+        duration_min_s: typing.Annotated[int, '最短秒数，0 表示不限'] = 0,
+        duration_max_s: typing.Annotated[int, '最长秒数，0 表示不限'] = 0,
+        track_id: typing.Annotated[str, '非空时只查询该歌曲详情/刷新过期地址，不执行检索'] = '',
+    ) -> str:
+        """检索音乐曲库或按 track_id 刷新歌曲地址。空结果/错误不能编造歌曲。
+
+        返回 relaxed 时必须说明放宽了哪些条件。机器人播放可调用已连接的 music.play，
+        传 url=audio.url、audio_format=audio.format、expires_at=audio.expires_at、track_id 和 usage。
+        personal_playback 只允许当次播放，不得 WebFetch 保存、上传聊天附件或二次分发。
+        mock 只有虚构元数据，没有可播放音频。检索本身不会开始播放。
+        """
+        import json
+        from music.service import service
+        result = await service.execute(query=query, genre=genre, language=language, vocal=vocal,
+                                       tags=tags, artist=artist, top_k=top_k, exclude_ids=exclude_ids,
+                                       duration_min_s=duration_min_s, duration_max_s=duration_max_s,
+                                       track_id=track_id)
+        return json.dumps(result, ensure_ascii=False)
+
     # ── 9. WebSearch ─────────────────────────────────────────────────────────
 
     @log.function_(call=True)
