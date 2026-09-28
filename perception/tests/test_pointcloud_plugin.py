@@ -479,7 +479,7 @@ def test_rectify_pair_raw_tier_takes_baseline_from_T():
     try:
         left = np.zeros((6, 8, 3), dtype=np.uint8)
         right = np.zeros((6, 8, 3), dtype=np.uint8)
-        fx, cx, cy, Tx, L, R, map1 = pc._rectify_pair(left, right, RAW_BLOB)
+        fx, cx, cy, Tx, L, R = pc._rectify_pair(left, right, RAW_BLOB)
         # 基线长度 = |T[0]| = 0.05，符号归一到负
         assert Tx == pytest.approx(-0.05)
         assert fx == pytest.approx(300.0)
@@ -491,14 +491,55 @@ def test_rectify_pair_raw_tier_takes_baseline_from_T():
         fake.restore()
 
 
+def test_rectify_pair_raw_tier_maps_cached_per_size():
+    """review 指出：docstring 说缓存 rectify 映射、代码却每帧重算
+    stereoRectify + initUndistortRectifyMap。缓存以帧尺寸为键：同尺寸
+    第二帧不再碰 stereoRectify，换尺寸重算一次。"""
+    fake = _install_fake_stereo_rectify()
+    calls = {"rectify": 0}
+
+    real_rectify = fake._cv2().stereoRectify
+
+    def counting_rectify(*args, **kwargs):
+        calls["rectify"] += 1
+        return real_rectify(*args, **kwargs)
+
+    fake._cv2().stereoRectify = counting_rectify
+    try:
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        cache = {}
+        pc._rectify_pair(left, right, RAW_BLOB, cache)
+        pc._rectify_pair(left, right, RAW_BLOB, cache)
+        assert calls["rectify"] == 1  # 同尺寸：命中缓存
+        bigger = np.zeros((12, 16, 3), dtype=np.uint8)
+        pc._rectify_pair(bigger, bigger.copy(), RAW_BLOB, cache)
+        assert calls["rectify"] == 2  # 换尺寸：重算
+    finally:
+        fake.restore()
+
+
 def test_rectify_pair_rectified_tier_uses_blob_tx():
     fake = _install_fake_stereo_rectify()
     try:
         left = np.zeros((6, 8, 3), dtype=np.uint8)
         right = np.zeros((6, 8, 3), dtype=np.uint8)
-        fx, cx, cy, Tx, L, R, map1 = pc._rectify_pair(left, right, RECTIFIED_BLOB)
+        fx, cx, cy, Tx, L, R = pc._rectify_pair(left, right, RECTIFIED_BLOB)
         assert Tx == pytest.approx(-0.05)  # abs → 负号归一
-        assert map1 is None
+    finally:
+        fake.restore()
+
+
+def test_rectify_pair_rectified_tier_rejects_zero_tx():
+    """review 指出：rectified 档 Tx=0 以前直接 -abs(0) 放行，
+    Q_from_baseline 的 -1/Tx 每帧除零。worker 侧必须拦下。"""
+    fake = _install_fake_stereo_rectify()
+    try:
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        blob = {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0}
+        with pytest.raises(ValueError, match="Tx"):
+            pc._rectify_pair(left, right, blob)
     finally:
         fake.restore()
 
@@ -719,6 +760,262 @@ def test_calibrate_same_pair_is_not_a_new_pose():
         assert fresh["pairs_used"] == 2
     finally:
         monkey.undo()
+
+
+def _calib_monkeypatch():
+    """calibrate 走通全程需要的假 cv2 棋盘 API：能"找到"角点（坐标随
+    灰度图尺寸变，模拟不同姿态）+ 假 stereoCalibrate 返回 9 元组。"""
+    import cv2
+
+    def _fake_find(gray, pattern, flags):
+        pts = np.array([[(i % gray.shape[1]), (j % gray.shape[0])]
+                        for i in range(pattern[0]) for j in range(pattern[1])],
+                       dtype=np.float32).reshape(-1, 1, 2)
+        return True, pts
+
+    def _fake_subpix(gray, corners, win, zone, crit):
+        return corners
+
+    def _fake_stereo_calibrate(obj, l, r, K1, D1, K2, D2, size, criteria=None):
+        # 与真 stereoCalibrate 同构的 9 元组返回；K/D 就用初值。
+        return (0.5,
+                np.asarray(K1, dtype=np.float64).copy(),
+                np.asarray(D1, dtype=np.float64).copy(),
+                np.asarray(K2, dtype=np.float64).copy(),
+                np.asarray(D2, dtype=np.float64).copy(),
+                np.eye(3, dtype=np.float64),
+                np.array([[-0.05], [0.0], [0.0]], dtype=np.float64),
+                np.eye(3, dtype=np.float64),
+                np.eye(3, dtype=np.float64))
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cv2, "findChessboardCorners", _fake_find, raising=False)
+    monkey.setattr(cv2, "cornerSubPix", _fake_subpix, raising=False)
+    monkey.setattr(cv2, "stereoCalibrate", _fake_stereo_calibrate, raising=False)
+    monkey.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
+    monkey.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
+    monkey.setattr(cv2, "error", Exception, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_EPS", 1, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_MAX_ITER", 2, raising=False)
+    return monkey
+
+
+def _collect_calib_pairs(plugin, node, target):
+    """推进采集到 target 对（每对前自增 seq 模拟新帧）。"""
+    reply = None
+    for seq in range(1, target + 1):
+        node._stereo_pair_seq = seq
+        reply = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": target, "name": "t"})
+    return reply
+
+
+def test_calibrate_done_keeps_raw_blob_by_default():
+    """review High：旧的"rectify 后量 Δy 分档"是同义反复 —— stereoRectify
+    本来就把两图行对齐，任何标定 rectify 后 Δy ≈ 0，必然落 rectified 档、
+    把刚算出的 raw K1/K2/D1/D2/R/T 丢掉 → 运行时跳过去畸变，SGBM 吃
+    畸变图。默认必须保留 raw blob。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+    node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
+
+    monkey = _calib_monkeypatch()
+    try:
+        reply = _collect_calib_pairs(plugin, node, 3)
+        assert reply["ok"] is True
+        assert reply["state"] == "done"
+        assert reply["tier"] == "raw"
+        blob = reply["calibration"]
+        for key in ("K1", "D1", "K2", "D2", "R", "T"):
+            assert key in blob, key
+        assert "epipolar_dy_px" not in reply
+        assert "epipolar_dy_px" not in blob
+    finally:
+        monkey.undo()
+
+
+def test_calibrate_pre_rectified_flag_lands_rectified_shortcut():
+    """只有调用方显式 pre_rectified=true（上游保证两路已立体校正）才落
+    rectified 快捷档 —— blob 只剩 Q 反投影四要素。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+    node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
+
+    monkey = _calib_monkeypatch()
+    try:
+        node._stereo_pair_seq = 1
+        reply = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 1, "name": "t",
+            "pre_rectified": True})
+        assert reply["ok"] is True
+        assert reply["tier"] == "rectified"
+        assert set(reply["calibration"]) == {"fx", "cx", "cy", "Tx",
+                                             "rms", "pairs_used"}
+        assert reply["calibration"]["Tx"] == pytest.approx(0.05)
+    finally:
+        monkey.undo()
+
+
+# ── review issue 2：rectified 档 Tx=0 启动即拒 ────────────────────────────────
+
+def test_start_rejects_rectified_calibration_with_zero_tx():
+    """review Medium：Tx=0 的 rectified 标定以前 start 照收，worker 里
+    Q_from_baseline 的 -1/Tx 每帧除零。必须在 start 就报配置错误。"""
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(
+        {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0})})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "Tx" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_rectified_calibration_with_nonfinite_tx():
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(
+        {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": "abc"})})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "Tx" in reply["message"]
+
+
+# ── review 建议：mode / input_topics 数量校验 ─────────────────────────────────
+
+def test_start_rejects_unknown_mode():
+    """mode 拼错（如 detph）以前静默当 mono 处理 —— z16 帧永远收不到。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "detph"})
+    assert reply["state"] == "error"
+    assert "mode" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_more_than_two_input_topics():
+    """第三路以前被静默忽略 —— 双目只认前两路，宁拒不错。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/a", "/b", "/c"]})
+    assert reply["state"] == "error"
+    assert "input_topics" in reply["message"]
+    assert executor.nodes == []
+
+
+# ── review issue 3：camera_info 声明沿链路传递 ────────────────────────────────
+
+_UPSTREAM_DECL = {
+    "schema": "motus.camera/1", "topic": "/cam/rgb", "format": "image/jpeg",
+    "id": "unitree/r1/camera_main", "width": 1280, "height": 720,
+    "distortion_model": "unknown", "D": None,
+    "K": [700.0, 0.0, 640.0, 0.0, 700.0, 360.0, 0.0, 0.0, 1.0],
+    "half_fov_rad": 0.888, "half_fov_v_rad": None, "source": "measured",
+    "measured_on": "r1_sz", "pipeline": ["unitree/r1/camera_main"], "vendor": {},
+}
+
+
+def test_start_records_upstream_declaration_and_info_carries_it():
+    """review Medium：以前 start 不收 camera_info、info() 也不传 ——
+    上游声明了真实内参，反投影却按 90° hfov 硬算，下游拿不到任何
+    motus.camera/1 声明。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    entries = info["camera_info"]
+    assert [e["topic"] for e in entries] == [
+        "/cam/rgb/pointcloud", "/cam/rgb/pointcloud_summary"]
+    assert all(e["schema"] == "motus.camera/1" for e in entries)
+    assert all(e["pipeline"][-1] == "perception/pointcloud" for e in entries)
+    # 点云不裁剪不缩放（抽稀只丢点不丢视场）：K 与 half_fov_rad 原样继承
+    assert all(e["K"] == _UPSTREAM_DECL["K"] for e in entries)
+    assert all(e["half_fov_rad"] == 0.888 for e in entries)
+    assert all(e["width"] == 1280 and e["height"] == 720 for e in entries)
+    assert "camera_info_note" not in info
+
+
+def test_info_without_upstream_declaration_says_whose_problem_it_is():
+    """"上游没声明"和"本卡弄丢了"在下游看来一样，只有前者该找相机卡片
+    的人 —— note 必须区分。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    assert "camera_info" not in info
+    assert "上游相机没有声明" in info["camera_info_note"]
+
+
+def test_retire_node_drops_the_upstream_declaration():
+    """重新接线的卡片拿着已不喂它的相机的光学参数回答 info()，比不答
+    还糟 —— 声明随节点走。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    assert "/cam/rgb" in plugin._upstream_camera
+    plugin.dispatch("pointcloud", {"action": "stop"})
+    assert "/cam/rgb" not in plugin._upstream_camera
+
+
+def test_restart_without_declaration_replaces_the_stale_one():
+    """重启不再带声明时必须替换旧值，而不是留着过期镜头。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    plugin.dispatch("pointcloud", {"action": "stop"})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    assert "camera_info" not in info
+    assert "上游相机没有声明" in info["camera_info_note"]
+
+
+def test_loading_info_still_carries_the_declaration():
+    """loading 早退分支不能把声明丢在地上（visual_depth/vop 的教训）。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    plugin._model_loading = True  # 模拟 mono 引擎加载窗口
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    assert info["state"] == "loading"
+    assert [e["topic"] for e in info["camera_info"]] == [
+        "/cam/rgb/pointcloud", "/cam/rgb/pointcloud_summary"]
+
+
+def test_pinhole_for_uses_upstream_k_rescaled_across_resolutions():
+    """A/B 模式反投影：上游声明了 K 就用它（按分辨率缩放），而不是按
+    90° hfov 硬算横向坐标。无上游无标定时才落 90° 兜底。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    node = executor.nodes[0]
+    # 同分辨率：原样 K
+    fx, fy, cx, cy = node._pinhole_for(1280, 720)
+    assert fx == pytest.approx(700.0) and fy == pytest.approx(700.0)
+    assert cx == pytest.approx(640.0) and cy == pytest.approx(360.0)
+    # 半分辨率：K 按像素缩一半
+    fx, fy, cx, cy = node._pinhole_for(640, 360)
+    assert fx == pytest.approx(350.0) and fy == pytest.approx(350.0)
+    assert cx == pytest.approx(320.0) and cy == pytest.approx(180.0)
+
+
+def test_pinhole_for_falls_back_to_90deg_without_anything():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    fx, fy, cx, cy = node._pinhole_for(640, 360)
+    assert fx == pytest.approx(320.0)  # 90° hfov → w/2
+    assert cx == pytest.approx(320.0) and cy == pytest.approx(180.0)
 
 
 # ── info / config / 生命周期 ─────────────────────────────────────────────────

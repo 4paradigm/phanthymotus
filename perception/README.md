@@ -1700,10 +1700,16 @@ for the `calibrate` action, but publishes no cloud. Hold a checkerboard
 (default 9×6 inner corners, 0.025 m squares) in front of both cameras and call
 `calibrate` once per pose until `pairs` (default 15) are collected — a repeated
 call on the same pair of frames is rejected (`same_pose`), so each sample needs
-fresh frames with the board moved. The result is an RMS-graded blob auto-tiered
-by the epipolar Δy measured *after* rectification (< 1.5 px → rectified), saved
-under `/models/stereo_calib/` and returned in the reply for pasting back into
-the card's `calibration` config. Restart the card to publish.
+fresh frames with the board moved. The result is an RMS-graded blob saved under
+`/models/stereo_calib/` and returned in the reply for pasting back into the
+card's `calibration` config. Restart the card to publish. Tiering is explicit,
+not inferred: by default the full `K1/K2/D1/D2/R/T` blob is kept and the card
+rectifies at runtime; pass `pre_rectified: true` only when the upstream
+guarantees the two streams are already stereo-rectified — that shortcut keeps
+just `{fx, cx, cy, Tx}` and skips per-frame rectification. (Measuring the
+epipolar Δy *after* `stereoRectify` cannot discriminate: rectification
+row-aligns both views by construction, so the residual is ≈ 0 for any
+calibration.)
 
 The reverse ordering is a deadlock we shipped once: `calibrate` requires a
 running stereo node, and stereo `start` used to require a calibration first —

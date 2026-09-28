@@ -18,11 +18,13 @@ plugins/pointcloud.py — PointCloudPerceptionPlugin: 3D 点云，三种输入�
     {input}/pointcloud          sensor/pointcloud  UInt8MultiArray 二进制包
     {input}/pointcloud_summary  data/json           点数/范围/最近障碍摘要
 
-标定：A/B 只需 {fx, fy, cx, cy} 或 hfov（缺省 90°，零配置可用）；
-C 需 {fx, cx, cy, Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动
-rectify）。`calibrate` action 面向 C：现场棋盘格采样（同一对帧不算新姿态）
-→ stereoCalibrate → 按 rectify 后角点 Δy 自动分档 → 落盘 /models/stereo_calib/
-并返回可粘贴回配置的 blob。
+标定：A/B 只需 {fx, fy, cx, cy} 或 hfov（缺省 90°；上游 camera_info 声明
+了 K 时优先用 K，见 _pinhole_for）；C 需 {fx, cx, cy, Tx}（已校正）或完整
+stereoCalibrate blob（未校正，自动 rectify）。`calibrate` action 面向 C：
+现场棋盘格采样（同一对帧不算新姿态）→ stereoCalibrate → 默认保留完整
+raw blob（运行时 rectify；只有明确 pre_rectified=true 才落快捷档 ——
+rectify 后的 Δy 对任何标定都 ≈ 0，不能拿来分档）→ 落盘
+/models/stereo_calib/ 并返回可粘贴回配置的 blob。
 
 纯数学在 plugins/pointcloud_math.py（不依赖 cv2 / rclpy，本地可测）。
 """
@@ -44,10 +46,11 @@ from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String, UInt8MultiArray
 
 from plugins.pointcloud_math import (
-    MAX_POINTS, RECTIFIED_DY_PX, CALIB_DIR,
+    MAX_POINTS, CALIB_DIR,
     backproject_depth, calibration_tier, decimate_cloud, decimation_stride,
-    default_calib_name, encode_packet, filter_cloud, load_calibration_blob,
-    pinhole_of, Q_from_baseline, sanitize_calib_name, summarize_cloud,
+    default_calib_name, encode_packet, filter_cloud, intrinsics_from_hfov,
+    load_calibration_blob, pinhole_of, Q_from_baseline, sanitize_calib_name,
+    summarize_cloud,
 )
 from utils.ros_lifecycle import dispose_node
 
@@ -130,6 +133,14 @@ TOOLS = [
                 "square_m": {"type": "number", "description": "calibrate 用：棋盘格格距（米，默认 0.025）"},
                 "pairs": {"type": "integer", "description": "calibrate 用：要采集的棋盘格姿态数（默认 15）"},
                 "name": {"type": "string", "description": "calibrate 用：标定结果文件名（默认按时间戳），落在 /models/stereo_calib/ 下。只能含字母/数字/点/下划线/连字符"},
+                "pre_rectified": {
+                    "type": "boolean",
+                    "description": (
+                        "calibrate 用：默认 false。只有当上游保证左右两路已经过立体校正"
+                        "（行对齐、无畸变）才设 true —— 此时只保留 Q 反投影四要素（运行时跳过 rectify）。"
+                        "默认保留完整标定 blob，运行时逐帧 rectify"
+                    ),
+                },
             },
             "required": ["action"],
             "x-action-params": {
@@ -141,14 +152,15 @@ TOOLS = [
                 "info": {"params": [], "description": "查看状态、模式与输出话题"},
                 "config": {"params": ["calibration"], "description": "更新实例配置（calibration / fps / max_points 等），需重启实例生效"},
                 "calibrate": {
-                    "params": ["board_w", "board_h", "square_m", "pairs", "name"],
+                    "params": ["board_w", "board_h", "square_m", "pairs", "name", "pre_rectified"],
                     "description": (
                         "双目标定：把棋盘格举到双目前，保持左右同帧可见，"
                         "每换一个姿态调用一次直到采满 pairs（默认 15）对"
                         "（还是同一对帧会被拒，挪动棋盘出新帧再调）。"
-                        "完成后返回 rms / 角点数 / Δy 分档 / 标定 blob（可直接粘贴进卡片配置），"
-                        "并落盘到 /models/stereo_calib/。需要卡片以双目模式 start 过"
-                        "（无标定也可以 start，只采集不出云）"
+                        "完成后返回 rms / 角点数 / 标定 blob（可直接粘贴进卡片配置），"
+                        "并落盘到 /models/stereo_calib/。默认保留完整 blob（运行时 rectify）；"
+                        "只有上游明确保证已 pre-rectified 才用快捷档。"
+                        "需要卡片以双目模式 start 过（无标定也可以 start，只采集不出云）"
                     ),
                 },
             },
@@ -243,6 +255,10 @@ class _PointCloudNode(Node):
         self._cal_a = cal_a
         self._cal_b = cal_b
         self._cloud_topic, self._summary_topic = output_topics_for(input_topic)
+        # raw 档 rectify 映射缓存（_rectify_pair）：blob 固定，映射只随
+        # 分辨率变 —— 每帧重算 stereoRectify/initUndistortRectifyMap 是
+        # review 指出的白烧 CPU。worker 线程独占，无需加锁。
+        self._rectify_cache: dict = {}
 
         self._cloud_pub = self.create_publisher(UInt8MultiArray, self._cloud_topic, _PUB_QOS)
         self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
@@ -442,7 +458,7 @@ class _PointCloudNode(Node):
         if depth_m is None:
             return
         h, w = depth_m.shape[:2]
-        fx, fy, cx, cy = pinhole_of(self._calibration, w, h)
+        fx, fy, cx, cy = self._pinhole_for(w, h)
         stride = decimation_stride(w, h, self._max_points)
         xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride,
                                  self._min_depth_m, self._max_depth_m)
@@ -466,11 +482,31 @@ class _PointCloudNode(Node):
                 np.power(np.maximum(depth_m, 0.0), self._cal_a) * float(np.exp(self._cal_b)),
                 nan=0.0, posinf=0.0, neginf=0.0)
         h, w = depth_m.shape[:2]
-        fx, fy, cx, cy = pinhole_of(self._calibration, w, h)
+        fx, fy, cx, cy = self._pinhole_for(w, h)
         stride = decimation_stride(w, h, self._max_points)
         xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride,
                                 self._min_depth_m, self._max_depth_m)
         self._publish(xyz)
+
+    def _pinhole_for(self, w: int, h: int) -> tuple:
+        """(fx, fy, cx, cy)：实例标定 → 上游 camera_info 的 K（跨分辨率
+        按 camera_info._rescale_K 缩放）→ hfov 90° 兜底。
+
+        review 指出：上游明明声明了真实内参，反投影却按 90° hfov 硬算，
+        横向坐标系统性偏差。K 是像素单位、分辨率变了必须缩放。
+        """
+        if self._calibration:
+            return pinhole_of(self._calibration, w, h)
+        upstream = getattr(self, "_upstream_intrinsics", None)
+        if upstream:
+            K, src_w, src_h = upstream
+            from plugins.camera_info import _rescale_K
+
+            scaled = _rescale_K(K, (src_w, src_h), (w, h)) if (w, h) != (src_w, src_h) else list(K)
+            if scaled:
+                return (float(scaled[0]), float(scaled[4]),
+                        float(scaled[2]), float(scaled[5]))
+        return intrinsics_from_hfov(w, h, 90.0)
 
     def _model_for_mono(self):
         # 由插件在 start 时注入，见 PointCloudPerceptionPlugin._start_node；
@@ -504,7 +540,8 @@ class _PointCloudNode(Node):
             # 无标定 stereo 是合法的"标定采集"状态（start 允许，见 dispatch）：
             # 只配对存帧供 calibrate 用，不出云。
             return
-        fx, cx, cy, Tx, left_u, right_u, map1 = _rectify_pair(left, right, blob)
+        fx, cx, cy, Tx, left_u, right_u = _rectify_pair(
+            left, right, blob, getattr(self, "_rectify_cache", None))
         h, w = left_u.shape[:2]
         # SGBM 参数照 Go1 经验取：块匹配对小基线更稳，但 SGBM 质量更好。
         block = 5
@@ -547,49 +584,67 @@ class _PointCloudNode(Node):
         self._summary_pub.publish(smsg)
 
 
-def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict):
-    """按标定分档把左右帧变校正灰度图。返回 (fx, cx, cy, Tx, L, R, map1)。
+def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict,
+                  cache: Optional[dict] = None):
+    """按标定分档把左右帧变校正灰度图。返回 (fx, cx, cy, Tx, L, R)。
 
     * rectified 档：帧本来就共线，直接灰度化。
-    * raw 档：用 blob 里的 K1/K2/D1/D2/T 调 cv2.stereoRectify 生成映射，
-      只缓存一次（blob 不变，映射随分辨率变）。
+    * raw 档：用 blob 里的 K1/K2/D1/D2/T 调 cv2.stereoRectify 生成映射。
+      blob 在节点生命周期内不变、映射只随分辨率变：传 cache dict 时按
+      帧尺寸复用上次的映射与投影参数（review 指出 docstring 声称缓存、
+      代码却每帧重算 stereoRectify + initUndistortRectifyMap）。
     """
     import cv2
 
     tier = calibration_tier(blob)
     if tier == "rectified":
+        try:
+            tx = float(blob["Tx"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"stereo 标定基线异常（Tx={blob.get('Tx')!r}）：{error}")
+        if not np.isfinite(tx) or abs(tx) < 1e-6:
+            # 与 raw 档同一契约：Q_from_baseline 里 -1/Tx，Tx=0 每帧除零
+            # （review 指出 start 只查档位不查数值）。start 会提前拒绝，
+            # 这里是 worker 侧的兜底。
+            raise ValueError(f"stereo 标定基线异常（Tx={tx}）：rectified 档的 Tx 必须非零")
         L = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
         R = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
         return float(blob["fx"]), float(blob.get("cx", blob["fx"])), \
-            float(blob.get("cy", blob["fx"])), -abs(float(blob["Tx"])), L, R, None
+            float(blob.get("cy", blob["fx"])), -abs(tx), L, R
 
-    K1 = np.asarray(blob.get("K1") or blob.get("K_left"), dtype=np.float64).reshape(3, 3)
-    D1 = np.asarray(blob.get("D1") or blob.get("D_left") or [0, 0, 0, 0], dtype=np.float64).ravel()
-    K2 = np.asarray(blob.get("K2") or blob.get("K_right"), dtype=np.float64).reshape(3, 3)
-    D2 = np.asarray(blob.get("D2") or blob.get("D_right") or [0, 0, 0, 0], dtype=np.float64).ravel()
-    T = np.asarray(blob.get("T") or [-blob.get("Tx", 0.02443), 0, 0], dtype=np.float64).ravel()
-    size = (left.shape[1], left.shape[0])
     if left.shape[:2] != right.shape[:2]:
         right = cv2.resize(right, (left.shape[1], left.shape[0]))
-    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
-        K1, D1, K2, D2, size, np.eye(3, dtype=np.float64), T.reshape(3, 1),
-        flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
-    map1, map2 = cv2.initUndistortRectifyMap(K1, D1, R1, P1, size, cv2.CV_32FC1)
-    map3, map4 = cv2.initUndistortRectifyMap(K2, D2, R2, P2, size, cv2.CV_32FC1)
+    size = (left.shape[1], left.shape[0])
+    entry = cache.get("maps") if (cache is not None and cache.get("size") == size) else None
+    if entry is None:
+        K1 = np.asarray(blob.get("K1") or blob.get("K_left"), dtype=np.float64).reshape(3, 3)
+        D1 = np.asarray(blob.get("D1") or blob.get("D_left") or [0, 0, 0, 0], dtype=np.float64).ravel()
+        K2 = np.asarray(blob.get("K2") or blob.get("K_right"), dtype=np.float64).reshape(3, 3)
+        D2 = np.asarray(blob.get("D2") or blob.get("D_right") or [0, 0, 0, 0], dtype=np.float64).ravel()
+        T = np.asarray(blob.get("T") or [-blob.get("Tx", 0.02443), 0, 0], dtype=np.float64).ravel()
+        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+            K1, D1, K2, D2, size, np.eye(3, dtype=np.float64), T.reshape(3, 1),
+            flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
+        map1, map2 = cv2.initUndistortRectifyMap(K1, D1, R1, P1, size, cv2.CV_32FC1)
+        map3, map4 = cv2.initUndistortRectifyMap(K2, D2, R2, P2, size, cv2.CV_32FC1)
+        fx = float(P1[0, 0]); cx = float(P1[0, 2]); cy = float(P1[1, 2])
+        # 基线取外参 T[0]，不是 P1[0,3]：stereoRectify 以左目为参考系，平移
+        # 放在 P2[0,3]，P1[0,3] 正常为 0 —— 从它推导基线恒得 0，Q 反投影
+        # 除零（review 指出的 raw 档无法发布的根因）。Q_from_baseline 只取
+        # 长度，统一归一到负号。
+        Tx = float(T[0]) if np.any(T) else float(P2[0, 3] / -P2[0, 0])
+        if not np.isfinite(Tx) or abs(Tx) < 1e-6:
+            # review 建议：坏标定在 start 时报清楚，而不是 worker 每帧一个
+            # 千篇一律的 ZeroDivisionError。基线为 0/非有限意味着 blob 里既没
+            # 有可用的 T 也没有 Tx，Q 反投影必然除零。
+            raise ValueError(f"stereo 标定基线异常（Tx={Tx}）：需要 blob 的 T[0]/Tx，且不能为 0")
+        entry = (map1, map2, map3, map4, fx, cx, cy, -abs(Tx))
+        if cache is not None:
+            cache["size"], cache["maps"] = size, entry
+    map1, map2, map3, map4, fx, cx, cy, Tx = entry
     L = cv2.remap(cv2.cvtColor(left, cv2.COLOR_BGR2GRAY), map1, map2, cv2.INTER_LINEAR)
     R = cv2.remap(cv2.cvtColor(right, cv2.COLOR_BGR2GRAY), map3, map4, cv2.INTER_LINEAR)
-    fx = float(P1[0, 0]); cx = float(P1[0, 2]); cy = float(P1[1, 2])
-    # 基线取外参 T[0]，不是 P1[0,3]：stereoRectify 以左目为参考系，平移
-    # 放在 P2[0,3]，P1[0,3] 正常为 0 —— 从它推导基线恒得 0，Q 反投影
-    # 除零（review 指出的 raw 档无法发布的根因）。Q_from_baseline 只取
-    # 长度，统一归一到负号。
-    Tx = float(T[0]) if np.any(T) else float(P2[0, 3] / -P2[0, 0])
-    if not np.isfinite(Tx) or abs(Tx) < 1e-6:
-        # review 建议：坏标定在 start 时报清楚，而不是 worker 每帧一个
-        # 千篇一律的 ZeroDivisionError。基线为 0/非有限意味着 blob 里既没
-        # 有可用的 T 也没有 Tx，Q 反投影必然除零。
-        raise ValueError(f"stereo 标定基线异常（Tx={Tx}）：需要 blob 的 T[0]/Tx，且不能为 0")
-    return fx, cx, cy, -abs(Tx), L, R, map1
+    return fx, cx, cy, Tx, L, R
 
 
 class PointCloudPerceptionPlugin:
@@ -616,6 +671,10 @@ class PointCloudPerceptionPlugin:
         self._nodes: dict[str, _PointCloudNode] = {}
         self._instance_configs: dict[str, dict] = {}
         self._nodes_lock = threading.RLock()
+        # 上游相机的 motus.camera/1 声明（start 时经 for_topic 按输入话题
+        # 挑出）：A/B 模式的内参兜底（_pinhole_for）与 info() 的向下继承
+        # 都用它。空声明也记录 —— 重启不带声明时替换旧值，不留过期的镜头。
+        self._upstream_camera: dict[str, dict] = {}
         # calibrate 的采集状态：{(instance_id): {"pairs": [...], "target": N}}
         self._cal_sessions: dict[str, dict] = {}
         self._cal_lock = threading.Lock()
@@ -690,10 +749,56 @@ class PointCloudPerceptionPlugin:
         input_topic = args.get("input_topic") or (topics_list[0] if topics_list else "")
         right_topic = topics_list[1] if len(topics_list) > 1 else None
         mode = args.get("mode") or "auto"
+        # review 建议：不认识的 mode 以前会静默当成 mono 订阅（start 的
+        # else 分支只订 CompressedImage），depth 拼错成 detph 就永远收不到
+        # z16 帧。这里报清楚而不是猜。input_topics 超过 2 路同理 ——
+        # 第三路会被静默忽略，双目只认前两路。
+        if mode not in ("auto", "depth", "mono", "stereo"):
+            raise ValueError(f"不支持的 mode：{mode!r}（可选 auto / depth / mono / stereo）")
+        if len(topics_list) > 2:
+            raise ValueError(f"input_topics 最多 2 路（左、右），收到 {len(topics_list)} 路")
         calibration = load_calibration_blob(args.get("calibration")) or self._calibration
         if mode == "auto":
             mode = "stereo" if right_topic else "auto"
         return mode, input_topic or None, right_topic, calibration
+
+    def _camera_info(self, instance_id, input_topic, nodes,
+                     cloud_topic: str, summary_topic: str) -> tuple:
+        """`(declarations, note)`：本卡两个输出端口的 motus.camera/1 声明。
+
+        同 visual_depth：点云不裁剪不缩放（抽稀只丢点不丢视场），width/
+        height 原样继承，K 与 half_fov_rad 都不变。note 区分"上游没声明"
+        与"本卡弄丢了"——只有前者该找相机卡片的人。
+        """
+        from plugins.camera_info import inherit
+
+        key = instance_id if instance_id in (nodes or {}) else None
+        if key is None:
+            key = next(iter(nodes), None) if nodes else (input_topic or _DEFAULT_INSTANCE)
+        with self._nodes_lock:
+            upstream = self._upstream_camera.get(key) or {}
+        if not upstream:
+            return [], ("上游相机没有声明 camera_info —— 下游拿不到视场角，"
+                        "横向坐标只能按 90° 兜底反投影。相机卡片补上声明即可，见 "
+                        "phanthymotus-driver/README_dev.md 的 Camera Parameters")
+        # 点云端口：视场与上游一致，只是格式变了；摘要描述的是同一片点云。
+        out = inherit(upstream, topic=cloud_topic, fmt="sensor/pointcloud",
+                      stage="perception/pointcloud")
+        out += inherit(upstream, topic=summary_topic, fmt="data/json",
+                       stage="perception/pointcloud")
+        return out, ""
+
+    def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
+        """`{"camera_info": [...]}`：loading 期间 info() 也要带声明（同
+        visual_depth / vop 的教训：早退分支不能把声明丢在地上）。"""
+        topic = args.get("input_topic") or ""
+        if not topic:
+            topics = args.get("input_topics") or []
+            topic = topics[0] if topics else ""
+        cloud_topic, summary_topic = output_topics_for(topic)
+        declared, _ = self._camera_info(instance_id, topic, {},
+                                        cloud_topic, summary_topic)
+        return {"camera_info": declared} if declared else {}
 
     def _start_node(self, node_key: str, mode: str, input_topic: Optional[str],
                     right_topic: Optional[str], calibration):
@@ -721,6 +826,16 @@ class PointCloudPerceptionPlugin:
                 node._mono_model = self._model
                 node._plugin_model = lambda: self._model
                 node._ensure_mono_model = self._ensure_model_bg
+            with self._nodes_lock:
+                upstream = self._upstream_camera.get(node_key) or {}
+            # A/B 模式的反投影内参兜底用上游 K（见 _pinhole_for）；
+            # stereo 的 K 是双目标定的，不掺上游单目声明。
+            if mode in ("depth", "mono", "auto"):
+                K = upstream.get("K")
+                if isinstance(K, (list, tuple)) and len(K) == 9:
+                    node._upstream_intrinsics = (
+                        [float(v) for v in K],
+                        upstream.get("width"), upstream.get("height"))
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
@@ -732,6 +847,10 @@ class PointCloudPerceptionPlugin:
             node = self._nodes.pop(node_key, None)
         if node is None:
             return None
+        with self._nodes_lock:
+            # 声明随节点走：留着会让重新接线的卡片拿一个已经不喂它的相机
+            # 的光学参数回答 info()（同 visual_depth 的注释）。
+            self._upstream_camera.pop(node_key, None)
         node.request_stop()
         result = node.stop()
         dispose_node(self._executor, node, label=f"pointcloud/{node_key}")
@@ -844,42 +963,29 @@ class PointCloudPerceptionPlugin:
             obj_points, img_points_l, img_points_r,
             K1, D1, K2, D2, size,
             criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5))
-        # 分档依据是“这对相机还需不需要运行时 rectify”，所以 Δy 必须在
-        # stereoRectify 之后量（review 指出：未校正的角点坐标算出的 Δy
-        # 会把畸变/近平行误判成已校正，之后 _rectify_pair 就跳过去畸变）。
-        # stereoRectify 输出的 R1/R2 把两图都旋转到共线行：用它映射第一对
-        # 角点，同行残差才是真正的极线误差。
-        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
-            K1, D1, K2, D2, size, np.eye(3, dtype=np.float64), T.reshape(3, 1),
-            flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
-
-        def _rectified_y(pts, K, D, R, P):
-            homogeneous = cv2.undistortPoints(pts.reshape(-1, 1, 2), K, D, R=R, P=P)
-            return homogeneous.reshape(-1, 2)[:, 1]
-
-        left_pts = img_points_l[0].reshape(-1, 2)
-        right_pts = img_points_r[0].reshape(-1, 2)
-        y_l = _rectified_y(left_pts, K1, D1, R1, P1)
-        y_r = _rectified_y(right_pts, K2, D2, R2, P2)
-        dy = float(np.median(np.abs(y_l - y_r)))
-
-        blob = {
-            "K1": K1.tolist(), "D1": D1.tolist(),
-            "K2": K2.tolist(), "D2": D2.tolist(),
-            "R": R.tolist(), "T": T.tolist(),
-            "board": {"w": board_w, "h": board_h, "square_m": square},
-            "rms": round(float(rms), 4),
-            "pairs_used": len(pairs),
-            "epipolar_dy_px": round(dy, 2),
-        }
-        if dy < RECTIFIED_DY_PX:
+        # 分档只认显式声明：stereoRectify 本来就把两图都旋转到共线行，
+        # rectify 之后量的 Δy 对任何标定都 ≈ 0，拿它分档必然永远落
+        # rectified 档、把刚算出来的 raw blob 丢掉（review 指出的回归：
+        # 运行时会跳过去畸变，SGBM 吃的是畸变图）。默认保留完整 raw
+        # blob（运行时 rectify）；只有调用方明确 pre_rectified=true
+        # （上游保证两路已做立体校正）才落快捷档。
+        if args.get("pre_rectified"):
             # 已校正：只需要 Q 矩阵的四要素。objp 以米建，T 即米，无需 mm 换算。
-            fx = float(K1[0, 0]); cx = float(K1[0, 2]); cy = float(K1[1, 2])
-            blob = {"fx": fx, "cx": cx, "cy": cy, "Tx": abs(float(T[0])),
-                    "rms": blob["rms"], "pairs_used": len(pairs),
-                    "epipolar_dy_px": blob["epipolar_dy_px"]}
+            # T 是 (3,1)：float(T[0]) 撞 numpy 弃用警告，用 ravel()[0]。
+            blob = {"fx": float(K1[0, 0]), "cx": float(K1[0, 2]),
+                    "cy": float(K1[1, 2]),
+                    "Tx": abs(float(np.asarray(T).ravel()[0])),
+                    "rms": round(float(rms), 4), "pairs_used": len(pairs)}
             tier = "rectified"
         else:
+            blob = {
+                "K1": K1.tolist(), "D1": D1.tolist(),
+                "K2": K2.tolist(), "D2": D2.tolist(),
+                "R": R.tolist(), "T": T.tolist(),
+                "board": {"w": board_w, "h": board_h, "square_m": square},
+                "rms": round(float(rms), 4),
+                "pairs_used": len(pairs),
+            }
             tier = "raw"
 
         try:
@@ -897,7 +1003,6 @@ class PointCloudPerceptionPlugin:
         return {
             "ok": True, "state": "done", "tier": tier,
             "rms": round(float(rms), 4), "pairs_used": len(pairs),
-            "epipolar_dy_px": round(dy, 2),
             "calibration": blob,
             "saved_to": saved_to,
             "message": (
@@ -923,7 +1028,8 @@ class PointCloudPerceptionPlugin:
                 return {"name": "PointCloudPerception", "manufacture": "Embodied",
                         "model": "depth|stereo", "state": "loading",
                         "desc": self._model_load_status or "Loading depth engine...",
-                        "instances": {}, "topic_in": [], "topic_out": []}
+                        "instances": {}, "topic_in": [], "topic_out": [],
+                        **self._loading_camera_info(args, instance_id)}
             if self._model_load_error:
                 return {"name": "PointCloudPerception", "manufacture": "Embodied",
                         "model": "depth|stereo", "state": "error",
@@ -964,7 +1070,7 @@ class PointCloudPerceptionPlugin:
                 {"topic": cloud_topic, "format": "sensor/pointcloud"},
                 {"topic": summary_topic, "format": "data/json"},
             ] if topics_in or nodes else [])
-            return {
+            info = {
                 "name": "PointCloudPerception", "manufacture": "Embodied",
                 "model": "depth|stereo",
                 "state": "running" if instances else "idle",
@@ -973,9 +1079,23 @@ class PointCloudPerceptionPlugin:
                 "topic_out": topics_out,
                 "desc": "3D point cloud from depth map / mono RGB / stereo pair",
             }
+            # 光学参数往下传（同 visual_depth 的契约）：声明了才带
+            # camera_info，没声明就带 note 说明是谁的问题。
+            camera_out, camera_note = self._camera_info(
+                instance_id, (args.get("input_topic") or
+                              (args.get("input_topics") or [""])[0] or ""),
+                nodes, cloud_topic, summary_topic)
+            if camera_out:
+                info["camera_info"] = camera_out
+            if camera_note:
+                info["camera_info_note"] = camera_note
+            return info
 
         elif action == "start":
-            mode, input_topic, right_topic, calibration = self._resolve_mode(args)
+            try:
+                mode, input_topic, right_topic, calibration = self._resolve_mode(args)
+            except ValueError as error:
+                return {"state": "error", "message": str(error)}
             if mode == "stereo":
                 if not (input_topic and right_topic):
                     return {"state": "error",
@@ -986,10 +1106,30 @@ class PointCloudPerceptionPlugin:
                     # 放行无标定启动：节点照常订阅配对存帧（_emit_stereo 的
                     # unknown 档不出云），calibrate 采完把 blob 填回配置重启。
                     log.info("[pointcloud] stereo start without calibration: capture-only")
+                elif calibration_tier(calibration) == "rectified":
+                    # review 指出：rectified 档 Tx=0 以前 start 照收，worker
+                    # 里 Q_from_baseline 的 -1/Tx 每帧除零。启动时就拒绝。
+                    tx = calibration.get("Tx")
+                    try:
+                        tx = float(tx)
+                    except (TypeError, ValueError):
+                        tx = None
+                    if tx is None or not np.isfinite(tx) or abs(tx) < 1e-6:
+                        return {"state": "error",
+                                "message": f"rectified 标定的基线 Tx 无效（Tx={calibration.get('Tx')!r}）："
+                                           "需要非零有限值（米），否则 Q 反投影每帧除零"}
             elif mode == "auto" and not input_topic:
                 return {"state": "error",
                         "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+            # 先记录再起节点（同 visual_depth）：loading 期间 info() 也能回答；
+            # 空声明同样记录 —— 重启不再带声明时要替换旧值而不是留过期镜头。
+            if input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
+
+                with self._nodes_lock:
+                    self._upstream_camera[node_key] = _camera_for_topic(
+                        args.get("camera_info"), input_topic)
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
             if running is None:

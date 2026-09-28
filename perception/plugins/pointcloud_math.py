@@ -26,9 +26,6 @@ MAX_POINTS = 40000
 # 标定文件落盘位置（/models 是容器唯一可持久化挂载）
 CALIB_DIR = "/models/stereo_calib"
 
-# 已校正双目的判定阈值：对应角点 Δy 中位数小于此值视为已 rectify
-RECTIFIED_DY_PX = 1.5
-
 
 def decimation_stride(w: int, h: int, max_points: int) -> int:
     """q5 参照：stride = ceil(sqrt(w*h/max_points))，至少 1。"""
