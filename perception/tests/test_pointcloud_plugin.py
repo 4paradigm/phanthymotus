@@ -264,6 +264,95 @@ def test_rectify_pair_rejects_zero_baseline():
         fake.restore()
 
 
+def test_real_path_mono_load_does_not_deadlock(monkeypatch, caplog):
+    """review 第 6 轮指控：_load_model_sync 持非重入锁调 _ensure_model
+    → 重入死锁，真冷启动永远 loading。缩进上其实没有（state-guard 的
+    with 块在调 _ensure_model 前已退出），但旧测试全用假 _ensure_model
+    绕过了真实路径 —— 重构一旦真把调用挪进锁里，只有这条能抓住：
+    它会卡在 loading 直到 _wait_until 超时。下载器与会话都换成桩，
+    锁路径保持原样。"""
+    import logging as _logging
+
+    import utils.model_downloader as downloader
+    import plugins.vision_runtime as runtime
+
+    class _FakeSession:
+        def __init__(self, engine_path, **kw):
+            self.path = engine_path
+
+        @property
+        def input_size(self):
+            return (4, 4)
+
+    monkeypatch.setattr(downloader, "ensure_depth_model",
+                        lambda dir_, **kw: {"yolo26n-depth.engine": "/models/depth/fake.engine"})
+    monkeypatch.setattr(runtime, "VisionEngineSession", _FakeSession)
+
+    plugin, executor = _plugin()
+    with caplog.at_level(_logging.WARNING, logger="plugins.pointcloud"):
+        reply = plugin.dispatch("pointcloud",
+                                {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+        assert reply["state"] == "loading"
+        assert _wait_until(
+            lambda: plugin.dispatch("pointcloud", {"action": "info"})["state"] == "running")
+        assert len(executor.nodes) == 1
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert info["instances"]["/cam/rgb"]["mode"] == "mono"
+    assert isinstance(plugin._model, _FakeSession)
+
+
+def test_raw_blob_forwards_calibrated_R_to_stereoRectify():
+    """review 第 6 轮 issue 2：raw 档 stereoRectify 以前恒传 np.eye(3)，
+    标定出的 R（相机间相对旋转）被丢掉 —— 有转角的双目校正映射错，
+    SGBM 极线不水平，视差全是噪声。blob 带 R 时必须原样转发。"""
+    fake = _install_fake_stereo_rectify()
+    seen = {}
+    real_rectify = fake._cv2().stereoRectify
+
+    def capturing_rectify(K1, D1, K2, D2, size, R, T, flags=0, alpha=0.0):
+        seen["R"] = np.asarray(R)
+        return real_rectify(K1, D1, K2, D2, size, R, T, flags=flags, alpha=alpha)
+
+    fake._cv2().stereoRectify = capturing_rectify
+    try:
+        blob = json.loads(json.dumps(RAW_BLOB))
+        theta = np.deg2rad(30.0)
+        blob["R"] = [[np.cos(theta), -np.sin(theta), 0.0],
+                     [np.sin(theta), np.cos(theta), 0.0],
+                     [0.0, 0.0, 1.0]]
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        pc._rectify_pair(left, right, blob)
+        assert "R" in seen, "stereoRectify 没被调用"
+        np.testing.assert_allclose(seen["R"], np.asarray(blob["R"]), atol=1e-12)
+    finally:
+        fake.restore()
+
+
+def test_legacy_raw_blob_without_R_falls_back_to_identity():
+    """老 blob 没有 R 字段：退单位阵（= 旧行为，两相机按共线假设），
+    不拒收。"""
+    fake = _install_fake_stereo_rectify()
+    seen = {}
+    real_rectify = fake._cv2().stereoRectify
+
+    def capturing_rectify(K1, D1, K2, D2, size, R, T, flags=0, alpha=0.0):
+        seen["R"] = np.asarray(R)
+        return real_rectify(K1, D1, K2, D2, size, R, T, flags=flags, alpha=alpha)
+
+    fake._cv2().stereoRectify = capturing_rectify
+    try:
+        blob = json.loads(json.dumps(RAW_BLOB))
+        assert "R" not in blob
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        fx, cx, cy, Tx, _L, _R = pc._rectify_pair(left, right, blob)
+        assert Tx == pytest.approx(-0.05)
+        np.testing.assert_allclose(seen["R"], np.eye(3), atol=1e-12)
+    finally:
+        fake.restore()
+
+
 def test_explicit_depth_mode_still_subscribes_image_and_compressed():
     plugin, executor = _plugin()
     plugin.dispatch("pointcloud",
@@ -903,6 +992,139 @@ def test_start_rejects_more_than_two_input_topics():
     assert reply["state"] == "error"
     assert "input_topics" in reply["message"]
     assert executor.nodes == []
+
+
+# ── review 第 6 轮：start 预检 raw blob，坏配置当场报错 ─────────────────────
+
+def test_start_rejects_raw_blob_with_missing_K2():
+    """K2 缺了以前 start 照收（只查档位），首帧才在 worker 里炸 ——
+    卡片显示 running 却一云不出。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    del blob["K2"]
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "raw" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_raw_blob_with_malformed_K1():
+    """K1 不是 9 元素（3x3 reshape 失败）同理当场报错。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob["K1"] = [300, 0, 160, 0, 300, 120]  # 6 元素：reshape(3,3) 必炸
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "K1/K2" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_raw_blob_with_zero_baseline():
+    """T 全零且没有 Tx：Q 反投影必然除零，start 拒收（与 rectified 档
+    的 Tx 校验同一契约）。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob["T"] = [[0.0], [0], [0]]
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "基线" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_accepts_a_good_raw_blob():
+    """预检不误伤：合法 raw blob（含 R）照常启动 —— R 本身有 30° 转角
+    也照样收，因为转角正是要交给 stereoRectify 处理的东西。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    theta = np.deg2rad(30.0)
+    blob["R"] = [[np.cos(theta), -np.sin(theta), 0.0],
+                 [np.sin(theta), np.cos(theta), 0.0],
+                 [0.0, 0.0, 1.0]]
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob),
+                                    "fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    assert len(executor.nodes) == 1
+
+
+# ── review 第 6 轮：每帧日志节流，坏流不淹容器日志 ───────────────────────────
+
+def test_zlib_decode_failure_logs_once_then_samples(caplog):
+    """畸形 depth-zlib 帧以前每回调一条 warning —— 2 fps 的坏流一天
+    十几万行。现在第 1 条记录、之后每第 100 条采样，好帧复位计数。"""
+    import logging as _logging
+
+    pc._zlib_fail_count = 0
+    bad = _FakeCompressedImage(b"not-zlib-at-all", fmt="depth-zlib")
+    good = _FakeCompressedImage(
+        zlib.compress(np.full((480, 640), 1500, dtype="<u2").tobytes()),
+        fmt="depth-zlib")
+
+    with caplog.at_level(_logging.WARNING, logger="plugins.pointcloud"):
+        for _ in range(199):
+            depth, _ = pc._decode_depth_message(bad)
+            assert depth is None
+        # 第 1 条与第 100 条；2..99、101..199 静默
+        warns = [r for r in caplog.records if "depth-zlib" in r.message]
+        assert len(warns) == 2
+        assert "第 1 帧" in warns[0].message
+        assert "第 100 帧" in warns[1].message
+        # 好帧复位：之后的第一条坏帧是新一轮的第 1 条
+        depth, _ = pc._decode_depth_message(good)
+        assert depth is not None
+        depth, _ = pc._decode_depth_message(bad)
+        warns = [r for r in caplog.records if "depth-zlib" in r.message]
+        assert len(warns) == 3
+        assert "第 1 帧" in warns[2].message
+    pc._zlib_fail_count = 0
+
+
+def test_worker_error_logs_full_trace_once_then_samples(caplog):
+    """worker 异常以前每帧一条完整 traceback。现在首条带 traceback、
+    之后每第 100 条采样且有界，处理成功即复位。"""
+    import logging as _logging
+
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    def _boom(self_inner, msg):
+        raise RuntimeError("kaboom " + "x" * 500)
+
+    original = pc._PointCloudNode._emit_depth
+    pc._PointCloudNode._emit_depth = _boom
+    try:
+        with caplog.at_level(_logging.ERROR, logger="plugins.pointcloud"):
+            for _ in range(150):
+                node._frame_queue.put(("depth_z16", "fake"))
+                assert _wait_until(lambda: node._frame_queue.empty(), timeout=2.0)
+            errors = [r for r in caplog.records if "worker error" in r.message]
+            assert len(errors) == 2
+            assert errors[0].exc_info is not None  # 首条带 traceback
+            assert "worker error" in errors[0].message  # 首条无计数标记，是状态转换
+            assert len(errors[0].message) > 300  # 首条带完整错误详情
+            assert "第 100 帧" in errors[1].message
+            assert len(errors[1].message) < 300  # 采样条只有有界摘要
+            # 好帧复位：之后第一条 worker 错误是新一轮的第 1 条（带 traceback）
+            pc._PointCloudNode._emit_depth = original
+            good = _FakeImage(data=np.full((4, 4), 2000, dtype="<u2").tobytes(),
+                              encoding="16UC1", width=4, height=4, step=8)
+            node._frame_queue.put(("depth_z16", good))
+            assert _wait_until(lambda: bool(_cloud_pub(node).messages), timeout=2.0)
+            assert node._worker_error_count == 0
+            pc._PointCloudNode._emit_depth = _boom
+            node._frame_queue.put(("depth_z16", "fake"))
+            assert _wait_until(lambda: node._worker_error_count == 1, timeout=2.0)
+            errors = [r for r in caplog.records
+                      if "worker error" in r.message and r.exc_info is not None]
+            assert len(errors) == 2  # 新一轮首条又是完整 traceback
+    finally:
+        pc._PointCloudNode._emit_depth = original
+        node.request_stop()
 
 
 # ── review issue 3：camera_info 声明沿链路传递 ────────────────────────────────

@@ -190,6 +190,12 @@ TOOLS = [
 ]
 
 
+# review 第 6 轮：畸形 depth-zlib 帧以前每回调刷一条 warning，2 fps 的坏流
+# 一天十几万行。第 1 条与之后每第 100 条采样记录，解出一帧好数据即复位
+# —— 连续失败是状态，散落的失败是噪声。模块级计数：日志洪峰按进程算。
+_zlib_fail_count = 0
+
+
 def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
     """z16 Image 或 depth-zlib CompressedImage → (深度图[米], 编码名)。
 
@@ -197,6 +203,8 @@ def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
     —— 与 visual_depth 的发布格式一致，解码端共用同一约定。
     """
     import cv2
+
+    global _zlib_fail_count
 
     if isinstance(msg, Image):
         if msg.encoding not in ("16UC1", "mono16"):
@@ -214,10 +222,14 @@ def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
     try:
         raw = zlib_decompress(data)
     except Exception as error:
-        log.warning(f"[pointcloud] depth-zlib decompress failed: {error}")
+        _zlib_fail_count += 1
+        if _zlib_fail_count == 1 or _zlib_fail_count % 100 == 0:
+            log.warning(f"[pointcloud] depth-zlib decompress failed"
+                        f"（第 {_zlib_fail_count} 帧）: {str(error)[:200]}")
         return None, getattr(msg, "format", "depth-zlib")
     if len(raw) < 640 * 480 * 2:
         return None, "depth-zlib"
+    _zlib_fail_count = 0
     depth = np.frombuffer(raw[:640 * 480 * 2], dtype="<u2").reshape(480, 640).astype(np.float32) * 0.001
     return depth, "depth-zlib"
 
@@ -271,6 +283,7 @@ class _PointCloudNode(Node):
         self._left_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        self._worker_error_count = 0
         self._last_emit_time = 0.0
         self._frame_count = 0
         self._running = False
@@ -450,7 +463,20 @@ class _PointCloudNode(Node):
             except queue.Empty:
                 continue
             except Exception as error:  # noqa: BLE001 — keep the worker alive
-                log.error(f"[pointcloud] worker error: {error}", exc_info=True)
+                # review 第 6 轮：以前每帧一条完整 traceback —— 坏标定/坏帧
+                # 把容器日志淹掉。第 1 条带 traceback，之后每第 100 条采样
+                # 且只记有界摘要；一帧处理成功即复位。
+                self._worker_error_count += 1
+                if self._worker_error_count == 1:
+                    log.error(f"[pointcloud] worker error: {error}", exc_info=True)
+                elif self._worker_error_count % 100 == 0:
+                    log.error(f"[pointcloud] worker error"
+                              f"（第 {self._worker_error_count} 帧，连续失败）: "
+                              f"{str(error)[:200]}")
+            else:
+                if self._worker_error_count:
+                    self._worker_error_count = 0
+                    log.info("[pointcloud] worker recovered; error stream cleared")
 
     # A: 深度图 → 反投影
     def _emit_depth(self, msg):
@@ -584,12 +610,37 @@ class _PointCloudNode(Node):
         self._summary_pub.publish(smsg)
 
 
+def _raw_stereo_params(blob: dict) -> tuple:
+    """解析 raw 档 blob → (K1, D1, K2, D2, R, T)。解析不了就 ValueError。
+
+    start 的预检与 _rectify_pair 的缓存 miss 共用这一份 —— 两处各写一遍
+    必然漂移（review 第 6 轮：start 只查档位不查数值，坏 blob 拖到首帧
+    才在 worker 里炸，卡片显示 running 却一云不出）。"""
+    try:
+        K1 = np.asarray(blob.get("K1") or blob.get("K_left"), dtype=np.float64).reshape(3, 3)
+        K2 = np.asarray(blob.get("K2") or blob.get("K_right"), dtype=np.float64).reshape(3, 3)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"raw 标定的 K1/K2 不是 9 元素的 3x3 矩阵：{error}")
+    D1 = np.asarray(blob.get("D1") or blob.get("D_left") or [0, 0, 0, 0], dtype=np.float64).ravel()
+    D2 = np.asarray(blob.get("D2") or blob.get("D_right") or [0, 0, 0, 0], dtype=np.float64).ravel()
+    T = np.asarray(blob.get("T") or [-blob.get("Tx", 0.02443), 0, 0], dtype=np.float64).ravel()
+    # blob 里带标定出来的 R（stereoCalibrate 的第 6 个返回值）。老 blob 没有
+    # R 字段时退单位阵 —— R=I 是"两相机已共线"的假设，比拒收宽容，且与
+    # 旧行为兼容（此前恒传 I，等价于所有老 blob 都当共线用）。
+    R = np.asarray(blob.get("R") if blob.get("R") is not None else np.eye(3),
+                   dtype=np.float64)
+    if R.size != 9:
+        raise ValueError(f"raw 标定的 R 不是 3x3（{R.size} 个元素）")
+    R = R.reshape(3, 3)
+    return K1, D1, K2, D2, R, T
+
+
 def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict,
                   cache: Optional[dict] = None):
     """按标定分档把左右帧变校正灰度图。返回 (fx, cx, cy, Tx, L, R)。
 
     * rectified 档：帧本来就共线，直接灰度化。
-    * raw 档：用 blob 里的 K1/K2/D1/D2/T 调 cv2.stereoRectify 生成映射。
+    * raw 档：用 blob 里的 K1/K2/D1/D2/R/T 调 cv2.stereoRectify 生成映射。
       blob 在节点生命周期内不变、映射只随分辨率变：传 cache dict 时按
       帧尺寸复用上次的映射与投影参数（review 指出 docstring 声称缓存、
       代码却每帧重算 stereoRectify + initUndistortRectifyMap）。
@@ -617,13 +668,9 @@ def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict,
     size = (left.shape[1], left.shape[0])
     entry = cache.get("maps") if (cache is not None and cache.get("size") == size) else None
     if entry is None:
-        K1 = np.asarray(blob.get("K1") or blob.get("K_left"), dtype=np.float64).reshape(3, 3)
-        D1 = np.asarray(blob.get("D1") or blob.get("D_left") or [0, 0, 0, 0], dtype=np.float64).ravel()
-        K2 = np.asarray(blob.get("K2") or blob.get("K_right"), dtype=np.float64).reshape(3, 3)
-        D2 = np.asarray(blob.get("D2") or blob.get("D_right") or [0, 0, 0, 0], dtype=np.float64).ravel()
-        T = np.asarray(blob.get("T") or [-blob.get("Tx", 0.02443), 0, 0], dtype=np.float64).ravel()
+        K1, D1, K2, D2, R, T = _raw_stereo_params(blob)
         R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
-            K1, D1, K2, D2, size, np.eye(3, dtype=np.float64), T.reshape(3, 1),
+            K1, D1, K2, D2, size, R, T.reshape(3, 1),
             flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
         map1, map2 = cv2.initUndistortRectifyMap(K1, D1, R1, P1, size, cv2.CV_32FC1)
         map3, map4 = cv2.initUndistortRectifyMap(K2, D2, R2, P2, size, cv2.CV_32FC1)
@@ -1118,6 +1165,22 @@ class PointCloudPerceptionPlugin:
                         return {"state": "error",
                                 "message": f"rectified 标定的基线 Tx 无效（Tx={calibration.get('Tx')!r}）："
                                            "需要非零有限值（米），否则 Q 反投影每帧除零"}
+                else:
+                    # review 第 6 轮：raw 档以前 start 只查档位不查内容，
+                    # K 缺失/畸形拖到首帧才在 worker 里炸 —— 卡片显示
+                    # running 却一云不出。启动时用与 _rectify_pair 同一份
+                    # 解析器预检（含基线非零有限），坏配置当场报清楚。
+                    try:
+                        K1, _D1, K2, _D2, _R, T = _raw_stereo_params(calibration)
+                        tx = float(T[0]) if T.size else 0.0
+                        if not np.isfinite(tx) or abs(tx) < 1e-6:
+                            raise ValueError(
+                                f"基线异常（Tx={tx}）：T/Tx 缺失或为 0，Q 反投影必然除零")
+                        if not (np.all(np.isfinite(K1)) and np.all(np.isfinite(K2))):
+                            raise ValueError("K1/K2 含非有限值（NaN/inf）")
+                    except ValueError as error:
+                        return {"state": "error",
+                                "message": f"raw 标定无法使用：{error}"}
             elif mode == "auto" and not input_topic:
                 return {"state": "error",
                         "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
