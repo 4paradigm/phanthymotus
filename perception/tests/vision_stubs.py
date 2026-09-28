@@ -108,6 +108,13 @@ class _FakeString:
         self.data = ""
 
 
+class _FakeUInt8MultiArray:
+    """Stands in for std_msgs.msg.UInt8MultiArray (pointcloud binary packets)."""
+
+    def __init__(self):
+        self.data = b""
+
+
 class _FakeCompressedImage:
     # Defaults so a plugin that *publishes* one can construct it the way ROS
     # does — `CompressedImage()` then assign — as well as tests that build an
@@ -115,6 +122,18 @@ class _FakeCompressedImage:
     def __init__(self, data: bytes = b"", fmt="jpeg"):
         self.data = data
         self.format = fmt
+
+
+class _FakeImage:
+    """Stands in for sensor_msgs.msg.Image (raw, e.g. 16UC1 depth)."""
+
+    def __init__(self, data=b"", encoding="", width=0, height=0, step=0, is_bigendian=0):
+        self.data = data
+        self.encoding = encoding
+        self.width = width
+        self.height = height
+        self.step = step
+        self.is_bigendian = is_bigendian
 
 
 class _FakeAudioChunk:
@@ -156,9 +175,11 @@ def _install_fake_ros():
     sensor_msgs = types.ModuleType("sensor_msgs")
     sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
     sensor_msgs_msg.CompressedImage = _FakeCompressedImage
+    sensor_msgs_msg.Image = _FakeImage
     std_msgs = types.ModuleType("std_msgs")
     std_msgs_msg = types.ModuleType("std_msgs.msg")
     std_msgs_msg.String = _FakeString
+    std_msgs_msg.UInt8MultiArray = _FakeUInt8MultiArray
     audio_msgs = types.ModuleType("audio_msgs")
     audio_msgs_msg = types.ModuleType("audio_msgs.msg")
     audio_msgs_msg.AudioChunk = _FakeAudioChunk

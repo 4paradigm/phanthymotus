@@ -8,6 +8,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   tts              语音合成（VITS2 / Matcha / Kokoro，本地 TensorRT 或 ONNX）
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
+  pointcloud       点云（深度图反投影 / 单目深度估计 / 双目立体匹配）
   ocr              文字识别（RapidOCR + TensorRT）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 
@@ -161,6 +162,25 @@ class PerceptionBundle:
                 log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
             except Exception:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
+
+        pcl_cfg = plugins_cfg.get("pointcloud") or {}
+        if pcl_cfg.get("enabled", False):
+            import re, socket
+            namespace = pcl_cfg.get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.pointcloud import PointCloudPerceptionPlugin
+            # Guarded like visual_depth: the stereo/mono path pulls in cv2 and
+            # the mono engine only lazily, but a bad config must still not take
+            # the rest of the stack down. The card simply does not appear.
+            try:
+                self._plugins.append(
+                    PointCloudPerceptionPlugin(pcl_cfg, namespace, executor)
+                )
+                log.info("PointCloudPerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("PointCloudPerceptionPlugin failed to load; continuing without pointcloud",
                           exc_info=True)
 
         if plugins_cfg.get("ocr", {}).get("enabled", False):
