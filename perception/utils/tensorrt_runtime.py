@@ -296,7 +296,8 @@ class CudaRuntime:
 class TensorRTEngine:
     """One deserialized engine + execution context + reusable CUDA buffers.
 
-    Supports exactly one input tensor (any number of outputs). Static and
+    Supports one primary input and explicitly opted-in static auxiliary inputs.
+    Any number of outputs are supported. Static and
     dynamic-shape engines are handled the same way: `infer()` selects the
     optimization profile covering the input shape, sets it, resolves output
     shapes, grows device buffers on demand and runs H2D → execute → D2H →
@@ -304,7 +305,8 @@ class TensorRTEngine:
     instance may be shared between threads.
     """
 
-    def __init__(self, path: str | Path, *, device_id: int = 0):
+    def __init__(self, path: str | Path, *, device_id: int = 0,
+                 primary_input: str | None = None):
         import tensorrt as trt
 
         self.path = str(path)
@@ -353,11 +355,23 @@ class TensorRTEngine:
                 name for name in names
                 if self._engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
             ]
-            if len(inputs) != 1:
+            if primary_input is None and len(inputs) != 1:
                 raise TensorRTError(
                     f"TensorRT engine must have exactly one input; got {inputs} ({self.path})"
                 )
-            self.input_name: str = inputs[0]
+            if primary_input is not None and primary_input not in inputs:
+                raise TensorRTError(f"unknown primary input {primary_input!r}; got {inputs}")
+            self.input_name: str = primary_input or inputs[0]
+            self.auxiliary_shapes = {}
+            self.auxiliary_dtypes = {}
+            for name in inputs:
+                if name == self.input_name:
+                    continue
+                shape = tuple(int(v) for v in self._engine.get_tensor_shape(name))
+                if not shape or any(v <= 0 for v in shape):
+                    raise TensorRTShapeError(f"auxiliary input {name} must have a static shape; got {shape}")
+                self.auxiliary_shapes[name] = shape
+                self.auxiliary_dtypes[name] = trt_dtype_to_numpy(trt, self._engine.get_tensor_dtype(name))
             self.output_names: list[str] = [name for name in names if name not in inputs]
             if not self.output_names:
                 raise TensorRTError(f"TensorRT engine has no outputs ({self.path})")
@@ -427,10 +441,23 @@ class TensorRTEngine:
 
     # ── execution ────────────────────────────────────────────────────────
 
-    def infer(self, array: np.ndarray) -> list[np.ndarray]:
-        """Run the engine on one input array; returns outputs in output_names order."""
+    def infer(self, array: np.ndarray, *, auxiliary_inputs=None) -> list[np.ndarray]:
+        """Run the primary array and all declared auxiliary tensors."""
         array = np.ascontiguousarray(array, dtype=self.input_dtype)
         shape = tuple(int(v) for v in array.shape)
+        auxiliary_inputs = auxiliary_inputs or {}
+        if set(auxiliary_inputs) != set(self.auxiliary_shapes):
+            raise TensorRTShapeError(
+                f"expected auxiliary inputs {sorted(self.auxiliary_shapes)}, got {sorted(auxiliary_inputs)}"
+            )
+        auxiliary = {}
+        for name, value in auxiliary_inputs.items():
+            value = np.ascontiguousarray(value, dtype=self.auxiliary_dtypes[name])
+            if value.shape != self.auxiliary_shapes[name]:
+                raise TensorRTShapeError(
+                    f"auxiliary input {name} shape {value.shape} must be {self.auxiliary_shapes[name]}"
+                )
+            auxiliary[name] = value
         with self._lock:
             if self._context is None or self._cuda is None:
                 raise TensorRTError(f"TensorRT engine is closed ({self.path})")
@@ -444,6 +471,9 @@ class TensorRTEngine:
                     self._active_profile = profile
                 if not context.set_input_shape(self.input_name, shape):
                     raise TensorRTError(f"TensorRT rejected input shape {shape} ({self.path})")
+                for name, value in auxiliary.items():
+                    if not context.set_input_shape(name, value.shape):
+                        raise TensorRTShapeError(f"TensorRT rejected auxiliary shape {name}: {value.shape}")
                 self._active_shape = shape
 
             outputs: list[np.ndarray] = []
@@ -461,6 +491,10 @@ class TensorRTEngine:
                 context.set_tensor_address(name, self._ensure_capacity(name, output.nbytes))
 
             cuda.copy_host_to_device(input_pointer, array)
+            for name, value in auxiliary.items():
+                pointer = self._ensure_capacity(name, value.nbytes)
+                context.set_tensor_address(name, pointer)
+                cuda.copy_host_to_device(pointer, value)
             if not context.execute_async_v3(cuda.stream_handle):
                 raise TensorRTError(f"TensorRT execute_async_v3 failed ({self.path})")
             for name, output in zip(self.output_names, outputs):

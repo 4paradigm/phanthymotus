@@ -243,6 +243,16 @@ class PerceptionBundle:
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
 
+    def shutdown(self) -> None:
+        """Let resource-owning plugins finish before ROS and Python shut down."""
+        for plugin in self._plugins:
+            shutdown = getattr(plugin, "shutdown", None)
+            if shutdown is not None:
+                try:
+                    shutdown()
+                except Exception:
+                    log.exception("plugin shutdown failed: %s", plugin.PREFIX)
+
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
@@ -675,6 +685,7 @@ def main():
     try:
         server.serve_forever()
     finally:
+        _bundle.shutdown()
         executor.shutdown()
         rclpy.shutdown()
 
