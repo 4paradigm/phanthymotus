@@ -130,8 +130,8 @@ def test_device_schema_default_is_cpu():
 def test_asr_models_supporting():
     assert "sensevoice-small" in asr.asr_models_supporting("gpu")
     assert "parakeet-en" in asr.asr_models_supporting("gpu")
-    # Measured 0.80x on CUDA — deliberately absent.
-    assert "x-asr-zh-en" not in asr.asr_models_supporting("gpu")
+    # CUDA selects a separate non-quantised bundle, never the CPU int8 files.
+    assert "x-asr-zh-en" in asr.asr_models_supporting("gpu")
     assert asr.asr_models_supporting("cpu") == sorted(asr.ASR_MODELS)
 
 
@@ -282,6 +282,7 @@ def test_config_degrades_a_carried_over_device_instead_of_rejecting(monkeypatch)
     weights now, so the cpu-only model under test here is x-asr-zh-en — the
     only one left after the paraformers and zipformer-en were dropped.)
     """
+    monkeypatch.delitem(asr.ASR_MODELS["x-asr-zh-en"]["devices"], "gpu")
     plugin, loads = _plugin_with(monkeypatch, "sensevoice-small", "gpu")
 
     result = plugin.dispatch("asr", {"action": "config",
@@ -299,6 +300,7 @@ def test_config_still_rejects_an_explicit_unsupported_device(monkeypatch):
     Degrading this one silently is how a "GPU is not faster" bug report gets
     written against a model that never ran on the GPU at all.
     """
+    monkeypatch.delitem(asr.ASR_MODELS["x-asr-zh-en"]["devices"], "gpu")
     plugin, loads = _plugin_with(monkeypatch, "x-asr-zh-en", "cpu")
 
     result = plugin.dispatch("asr", {"action": "config",

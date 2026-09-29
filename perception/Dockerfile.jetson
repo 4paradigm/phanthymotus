@@ -232,17 +232,19 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pillow>=7.1.2" && \
 # parse the version out of the filename.
 RUN . /etc/jetpack.env; \
     if [ -n "${SHERPA_GPU_WHEEL}" ]; then \
-        FILE="$(basename "${SHERPA_GPU_WHEEL}")" && \
+        FILE="$(python3 -c 'import os, sys, urllib.parse; key=sys.argv[1]; u=urllib.parse.urlsplit(key); print(os.path.basename(urllib.parse.unquote(u.path)) if u.scheme in ("http", "https") else os.path.basename(key))' "${SHERPA_GPU_WHEEL}")" && \
         echo "[build] sherpa-onnx: GPU wheel for jp${JP_VERSION} — ${SHERPA_GPU_WHEEL}" && \
         python3 -c "import urllib.request, urllib.parse, sys; \
 key, dest = sys.argv[1], sys.argv[2]; \
-urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(key), dest)" \
+url = key if urllib.parse.urlsplit(key).scheme in ('http', 'https') else 'https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(key); \
+urllib.request.urlretrieve(url, dest)" \
             "${SHERPA_GPU_WHEEL}" "/tmp/${FILE}" && \
         pip3 install --no-cache-dir "/tmp/${FILE}" && \
         rm -f "/tmp/${FILE}" && \
         python3 -c "import sherpa_onnx, pathlib; \
 lib = pathlib.Path(sherpa_onnx.__file__).parent / 'lib' / 'libonnxruntime_providers_cuda.so'; \
 assert lib.is_file(), 'CUDA provider missing from the installed wheel'; \
+assert hasattr(sherpa_onnx, 'OfflineTtsConfig'), 'ASR-only wheel cannot replace the full perception runtime'; \
 print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
     else \
         echo "[build] sherpa-onnx: no GPU wheel for jp${JP_VERSION} — CPU wheel from PyPI" && \

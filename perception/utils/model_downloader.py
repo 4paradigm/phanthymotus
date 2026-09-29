@@ -70,6 +70,11 @@ def _progress_hook(name: str, progress_cb=None):
     return hook
 
 MODELS = {
+    "asr_x_asr_prefix_lm": {
+        "base_url": "https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/084684b9523dadc2105165bfa70efbf4bf133851",
+        "files": {"model.onnx": {"size": 14474728, "sha256": "198ba6ad5cd74d33761e433b9838a4f4b3fdb708f5e1d877ae803b63e1aadd75"}},
+        "check_file": "model.onnx",
+    },
     "asr_sensevoice": {
         "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
         "check_file": "tokens.txt",
@@ -79,7 +84,17 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "asr_x_asr": {
-        "url": f"{COS_BASE}/x-asr-zh-en-punct-int8-robot.zip",
+        "base_url": "https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-zh-en-int8/resolve/a26e671d6656d3a124b19354ed7b0ab92c4e872c",
+        "files": {
+            "encoder-epoch-99-avg-1.int8.onnx": {"size": 160093173, "sha256": "e7764438ee197500f1f7fbe45db26e26e9da7ada73f4ae5bff00607b1dae6e46"},
+            "decoder-epoch-99-avg-1.onnx": {"size": 11309084, "sha256": "d27b3b869b826c88429507c8104f99cccb2eb8cb0627b0f7f353a42332630026"},
+            "joiner-epoch-99-avg-1.int8.onnx": {"size": 2581422, "sha256": "3561f4412c6a12d23e35f6951abedc39eaca576cfd7bc215bbf82fad8ed309e3"},
+            "tokens.txt": {"size": 58806, "sha256": "b818a60878b9aae978cbb8ad594acbd403d76d1af2e31ef4197c84e2dbdba27c"},
+            "bpe.model": {"size": 119265, "sha256": "f87a38025a5fdd1e4e9591f6a44bb81295097ce0b80df6f4ab9f44e52c64ca5f"},
+            "bpe.vocab": {"size": 69594, "sha256": "28fc94d67aae53d8c58010fcfb16fc8c2f8dd263e03f3490c98210e354e8f914"},
+            "hotwords.txt": {"size": 3539, "sha256": "578ed36b6fbe46a3cae352450a600f691091cc00fa05fae684fc256adcd77abd"},
+            "hotwords.bpe.txt": {"size": 5988, "sha256": "aa3ef8cd7def298eafad69e4d1c1f49b9b3337a74f853bbd162ce9d98419838b"},
+        },
         "check_file": "tokens.txt",
     },
     "tts": {
@@ -119,6 +134,10 @@ def ensure_model(name: str, model_dir: str, progress_cb=None,
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
+
+    if info.get("files"):
+        ensure_verified_bundle(name, model_dir, info["base_url"], info["files"], progress_cb=progress_cb)
+        return
 
     check_path = os.path.join(model_dir, info["check_file"])
     if os.path.exists(check_path):
@@ -708,6 +727,18 @@ SHERPA_GPU_BUNDLES = {
                 "sha256": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
             },
         },
+    },
+}
+
+
+SHERPA_GPU_BUNDLES["asr_x_asr_gpu"] = {
+    "base_url": "https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-zh-en-fp32/resolve/d2e48f5e15b9ce62b4f2110ab1e052fc28aafc04",
+    "files": {
+        "encoder-epoch-99-avg-1.onnx": {"size": 597233354, "sha256": "2b54fc9564b5343edea63cc414b0f06804b22595a50b795c0959d618be2251a0"},
+        "decoder-epoch-99-avg-1.onnx": MODELS["asr_x_asr"]["files"]["decoder-epoch-99-avg-1.onnx"],
+        "joiner-epoch-99-avg-1.onnx": {"size": 10260467, "sha256": "f93b6701062bf26e300305fa6f1173bcf6927c33bbcc9260f1eddf4a0daf0e49"},
+        **{name: MODELS["asr_x_asr"]["files"][name] for name in
+           ("tokens.txt", "bpe.model", "bpe.vocab", "hotwords.txt", "hotwords.bpe.txt")},
     },
 }
 
