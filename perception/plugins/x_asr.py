@@ -173,6 +173,8 @@ class XASRAdapter:
                 raise ValueError(f'Entity per-token scores must exceed {HOTWORDS_SCORE + 0.1}')
             encoded_hotwords = _boost_hotwords(encoded_hotwords, entity_boost)
             os.environ['SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE'] = f'{early_min:g}'
+        else:
+            os.environ.pop('SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE', None)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=str(encoder),
             decoder=str(decoder),

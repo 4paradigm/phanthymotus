@@ -47,14 +47,16 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 # image was built for, which is otherwise guesswork from the tag alone.
 ARG SHERPA_GPU_WHEEL_511=https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/a3cec5c20554fcfc7aa2bde23ad893590abd33d9/sherpa_onnx-1.13.6%2Bcuda.prefixfullentity1-cp38-cp38-linux_aarch64.whl
 ARG SHERPA_GPU_WHEEL_61=https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/a3cec5c20554fcfc7aa2bde23ad893590abd33d9/sherpa_onnx-1.13.6%2Bcuda.prefixfullentity1-cp310-cp310-linux_aarch64.whl
+ARG SHERPA_GPU_WHEEL_SHA256_511=2c341da1d09e8001e3db16683c65fe094a22a6207104c430599cb7f9fd620ac4
+ARG SHERPA_GPU_WHEEL_SHA256_61=a278c8ae2b5fd7decd9e04e8482de410b4a12ffdee1568f878bb5f187ec84139
 ARG DLA_COMPILER_SO_61=jp61/libnvdla_compiler.so
 RUN case "${JP_VERSION}" in \
-        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; DLA= ;; \
-        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; DLA="${DLA_COMPILER_SO_61}" ;; \
-        *)   NUMPY=1.24.4; WHEEL=; DLA= ;; \
+        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; WHEEL_SHA="${SHERPA_GPU_WHEEL_SHA256_511}"; DLA= ;; \
+        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; WHEEL_SHA="${SHERPA_GPU_WHEEL_SHA256_61}"; DLA="${DLA_COMPILER_SO_61}" ;; \
+        *)   NUMPY=1.24.4; WHEEL=; WHEEL_SHA=; DLA= ;; \
     esac; \
-    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\n' \
-        "${NUMPY}" "${WHEEL}" \
+    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nSHERPA_GPU_WHEEL_SHA256=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\n' \
+        "${NUMPY}" "${WHEEL}" "${WHEEL_SHA}" \
         "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" \
         "${DLA}" \
         > /etc/jetpack.env && \
@@ -235,12 +237,12 @@ RUN . /etc/jetpack.env; \
         FILE="$(python3 -c 'import os, sys, urllib.parse; key=sys.argv[1]; u=urllib.parse.urlsplit(key); print(os.path.basename(urllib.parse.unquote(u.path)) if u.scheme in ("http", "https") else os.path.basename(key))' "${SHERPA_GPU_WHEEL}")" && \
         echo "[build] sherpa-onnx: GPU wheel for jp${JP_VERSION} — ${SHERPA_GPU_WHEEL}" && \
         python3 -c "import urllib.request, urllib.parse, sys, hashlib, pathlib; \
-key, dest = sys.argv[1], sys.argv[2]; \
+key, dest, expected = sys.argv[1:]; \
+assert expected, 'SHA256 is required for the selected runtime wheel'; \
 url = key if urllib.parse.urlsplit(key).scheme in ('http', 'https') else 'https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(key); \
-pinned = {'sherpa_onnx-1.13.6+cuda.prefixfullentity1-cp310-cp310-linux_aarch64.whl': 'a278c8ae2b5fd7decd9e04e8482de410b4a12ffdee1568f878bb5f187ec84139', 'sherpa_onnx-1.13.6+cuda.prefixfullentity1-cp38-cp38-linux_aarch64.whl': '2c341da1d09e8001e3db16683c65fe094a22a6207104c430599cb7f9fd620ac4'}; \
-urllib.request.urlretrieve(url, dest); expected = pinned.get(pathlib.Path(dest).name); \
-assert expected is None or hashlib.sha256(pathlib.Path(dest).read_bytes()).hexdigest() == expected, 'Runtime wheel checksum mismatch'" \
-            "${SHERPA_GPU_WHEEL}" "/tmp/${FILE}" && \
+urllib.request.urlretrieve(url, dest); \
+assert hashlib.sha256(pathlib.Path(dest).read_bytes()).hexdigest() == expected, 'Runtime wheel checksum mismatch'" \
+            "${SHERPA_GPU_WHEEL}" "/tmp/${FILE}" "${SHERPA_GPU_WHEEL_SHA256}" && \
         pip3 install --no-cache-dir "/tmp/${FILE}" && \
         rm -f "/tmp/${FILE}" && \
         python3 -c "import sherpa_onnx, pathlib; \

@@ -1011,8 +1011,21 @@ just a different provider string.
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
 | `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
-| `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
+| `x-asr-zh-en` | int8 encoder/joiner + fp32 decoder | fp32 encoder/decoder/joiner | Measure on the target device and decoding configuration |
 | `parakeet-en` | int8, 104 MB | **fp32, 437 MB** | **4.9x** long / **2.0x** short |
+
+X-ASR GPU loads the separately published FP32 bundle; it does not run the mixed
+INT8 CPU bundle on CUDA. The earlier INT8-on-CUDA slowdown is not a measurement
+of this FP32 path. CPU remains the global default. GPU uses additional runtime
+and inference memory; weight-file size is not the process or unified-memory
+footprint, and multiple-instance headroom must be checked on the target.
+
+X-ASR exposes optional `asr_beam_paths`, `asr_tail_pad_ms`,
+`asr_prefix_lm_scale` and `asr_entity_boost` settings. Prefix LM and early entity
+ranking require the corresponding full-runtime capabilities; entity boosts are
+per-token scores for packaged CJK phrases and require prefix LM. With entity
+boosting disabled, the original hotword table and ordinary ranking are restored.
+The main default model remains SenseVoice on CPU.
 
 ### Removed models
 
@@ -1321,11 +1334,16 @@ are converted from those with `tools/convert_onnx_fp16.py`.
 
 ### The CUDA wheels
 
-PyPI ships CPU-only `sherpa-onnx`, so `Dockerfile.jetson` downloads a wheel built
-in-house from COS under `public/sherpa-onnx/<jp>/`, one per JetPack line, and falls
-back to the PyPI CPU wheel for any `JP_VERSION` without one:
+PyPI ships CPU-only `sherpa-onnx`. `Dockerfile.jetson` defaults to fixed public
+ModelScope full CUDA prefix/entity wheels, one per JetPack line. The full build
+retains TTS, VAD and speaker-diarization APIs. A public URL or legacy COS key can
+still be supplied through `SHERPA_GPU_WHEEL_511` or `SHERPA_GPU_WHEEL_61`; provide
+its matching `SHERPA_GPU_WHEEL_SHA256_511` or `SHERPA_GPU_WHEEL_SHA256_61` when
+overriding it. Every selected wheel must pass that checksum, irrespective of its
+filename. An unsupported `JP_VERSION` without a GPU wheel keeps the PyPI CPU
+fallback. The underlying runtime/ABI pairings are:
 
-| | onnxruntime-gpu | CUDA / cuDNN | COS key |
+| | onnxruntime-gpu | CUDA / cuDNN | Legacy COS override key |
 |---|---|---|---|
 | jp5.11 (focal, L4T R35) | 1.16.0 | 11.4 / 8 | `jp511/sherpa_onnx-<ver>+cuda-cp38-cp38-linux_aarch64.whl` |
 | jp6.1 (jammy, L4T R36) | 1.18.1 | 12.6 / 9 | `jp61/sherpa_onnx-<ver>+cuda-cp310-cp310-linux_aarch64.whl` |
@@ -1335,7 +1353,7 @@ there are two wheels rather than one. `cmake/onnxruntime-linux-aarch64-gpu.cmake
 in sherpa-onnx pins the URL and SHA256 per version and names the target board for
 each; 1.18.1 is the one it lists for L4T R36 + CUDA 12.6.
 
-**The directory carries the JetPack, because the filename cannot.** Upstream's
+**For legacy COS keys, the directory carries the JetPack.** Upstream's
 `setup.py` tags the wheel `<ver>+cuda-cp<abi>`, so in a flat directory the only
 thing separating the two builds is `cp38` vs `cp310` — a *Python* discriminator,
 not a CUDA one. It selects correctly today, since each image ships exactly one
