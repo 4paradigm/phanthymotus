@@ -140,6 +140,10 @@ def search_result(data, request, *, mock=False):
         seen.add(track['id'])
         if not isinstance(track.get('artist'), dict):
             raise MusicError('invalid_response', '曲库歌曲缺少有效 artist。')
+        # A catalogue may not have labelled the voice yet. Unknown is not
+        # instrumental (or any other voice), and must not satisfy a filter.
+        if 'vocal' not in track or (track['vocal'] is not None and track['vocal'] not in VOCALS):
+            raise MusicError('invalid_response', '曲库 vocal 必须为已知人声类型或 null（未知）。')
         if not mock:
             audio = track.get('audio')
             if not isinstance(audio, dict):

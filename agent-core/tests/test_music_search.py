@@ -101,6 +101,25 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(MusicError):
             search_result({'schema': SCHEMA, 'tracks': [track(audio={'url': 'http://audio.example/a'})]}, search_request())
 
+    def test_unknown_vocal_is_preserved_but_does_not_satisfy_a_filter(self):
+        data = {'schema': SCHEMA, 'tracks': [track(vocal=None)], 'relaxed': []}
+        self.assertIsNone(search_result(data, search_request())['tracks'][0]['vocal'])
+        for voice in ('female', 'male', 'mixed', 'instrumental'):
+            with self.subTest(voice=voice), self.assertRaises(MusicError):
+                search_result(data, search_request(vocal=voice))
+        relaxed = {**data, 'relaxed': ['vocal']}
+        self.assertIsNone(search_result(relaxed, search_request(vocal='female'))['tracks'][0]['vocal'])
+
+    def test_unknown_vocal_does_not_expand_request_values_or_hide_malformed_data(self):
+        for voice in (None, 'unknown', 'null'):
+            with self.subTest(voice=voice), self.assertRaises(MusicError):
+                search_request(vocal=voice)
+        missing = track()
+        del missing['vocal']
+        for invalid in (track(vocal='unknown'), track(vocal=[]), missing):
+            with self.assertRaises(MusicError):
+                search_result({'schema': SCHEMA, 'tracks': [invalid]}, search_request())
+
     def test_malformed_containers_return_contract_errors(self):
         for field in ('artist', 'audio'):
             with self.subTest(field=field), self.assertRaises(MusicError):
@@ -257,6 +276,13 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(provider, 'track', return_value={'schema': SCHEMA, 'track': []}):
             result = await self.service.execute(track_id='bad')
         self.assertEqual(result['error']['code'], 'invalid_response')
+
+    async def test_unknown_voice_detail_keeps_metadata_and_explains_it(self):
+        provider, _ = await self.service.prepare()
+        with patch.object(provider, 'track', return_value={'schema': SCHEMA, 'track': track(vocal=None)}):
+            result = await self.service.execute(track_id='fictional-1')
+        self.assertIsNone(result['track']['vocal'])
+        self.assertIn('人声未知', result['reply_notice'])
 
     async def test_settings_save_preserves_mask_and_supports_clear(self):
         await asyncio.to_thread(save_settings, {'music_type': 'motus_music',

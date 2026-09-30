@@ -67,7 +67,8 @@ class MusicService:
                 data = search_result(await provider.search(request), request,
                                      mock=mock)
             return {**data, 'usage_notice': 'personal_playback 仅限当次播放；不得下载保存、上传聊天附件或二次分发。',
-                    'reply_notice': '如 relaxed 非空，必须如实说明放宽条件；空结果不能编造歌曲。',
+                    'reply_notice': '如 relaxed 非空，必须如实说明放宽条件；空结果不能编造歌曲。'
+                                    'vocal 为 null 表示人声未知，不得推断为男声、女声或纯音乐。',
                     'available_tags': caps['filters'].get('tags', {})}
         except MusicError as exc:
             return exc.result()

@@ -160,7 +160,11 @@ components:
             voice: {type: string}
         genre: {type: string}
         language: {type: string}
-        vocal: {type: string}
+        vocal:
+          type: string
+          nullable: true
+          enum: [male, female, mixed, instrumental, null]
+          description: Null means unlabelled/unknown, never instrumental; it cannot satisfy an unrelaxed vocal filter.
         tags: {type: array, items: {type: string}}
         duration_s: {type: number, minimum: 0}
         cover_url: {type: string, format: uri}

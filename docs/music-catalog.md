@@ -76,6 +76,14 @@ tags were never hard constraints. Explain relaxation to the user, for example
 criteria still hold. The client rejects excluded/duplicate songs, wrong language
 and violations of unrelaxed structured criteria. Empty results stay empty.
 
+`track.vocal` may be `null` when voice metadata has not been labelled. The client
+preserves it as **unknown**, never inferring a voice from the artist name or
+treating it as instrumental. Response compatibility includes this real-service
+case; request `filters.vocal` still accepts only the four declared voice codes.
+A null voice cannot satisfy an explicit vocal constraint unless the server lists
+`vocal` in `relaxed`, which must be explained to the user. A missing vocal field
+or an unrecognised non-null code is an invalid response.
+
 ## Usage boundary
 
 `usage.scope: personal_playback` permits the current playback only. It does not
