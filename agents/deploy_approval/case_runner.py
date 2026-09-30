@@ -10,17 +10,12 @@ only dictionary keys.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from typing import Any
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
-
-
-class CaseRunnerError(Exception):
-    pass
 
 
 # Fixed case registry: Controller-owned, never user-supplied.
@@ -80,10 +75,6 @@ class CaseRunner:
         self._registry = list(_FIXED_CASES)
         self._core = core
         self._driver_id = driver_id
-
-    def list_cases(self) -> list[dict[str, Any]]:
-        """Return the list of all available fixed cases."""
-        return list(self._registry)
 
     def select_case(self, target: str, variant: str,
                     node_id: str) -> str | None:

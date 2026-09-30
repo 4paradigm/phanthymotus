@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 import httpx
 
 from ..agent_core_client import AgentCoreClient, AgentCoreDeployOutcomeUncertain, AgentCoreError
-from ..config import Config, DEFAULT_GITHUB_REPOS, validate_config
+from ..config import Config, validate_config
 from ..models import MachineInfo
 from ..policy import Policy
 from ..service import DeployController, DeployControllerError
@@ -279,7 +279,6 @@ def test_controller_aclose_logs_and_continues():
 
 
 def test_agent_core_accepts_code_200():
-    cfg = _client()
     tr = _Transport({"code": 200, "data": {"running_image": "registry/repo@sha256:" + "a" * 64}})
     c = _agent_core_client(tr)
     out = asyncio.run(c.driver_status("driver"))
@@ -700,7 +699,7 @@ def test_resolve_commit_sha_rejects_non_40hex():
         cfg = make_config()
         client = GitHubClient(cfg, token_provider=_token, http=httpx.AsyncClient(transport=Tr()))
         try:
-            result = asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
+            asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
             assert False, f"should have failed for sha={bad}"
         except Exception:
             pass
@@ -723,7 +722,7 @@ def test_resolve_commit_sha_rejects_missing_sha_key():
     cfg = make_config()
     client = GitHubClient(cfg, token_provider=_token, http=httpx.AsyncClient(transport=Tr()))
     try:
-        result = asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
+        asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
         assert False, "should have failed"
     except Exception:
         pass
@@ -744,7 +743,7 @@ def test_resolve_commit_sha_rejects_non_2xx():
     cfg = make_config()
     client = GitHubClient(cfg, token_provider=_token, http=httpx.AsyncClient(transport=Tr()))
     try:
-        result = asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
+        asyncio.run(client.resolve_commit_sha("org/repo", "abc1234"))
         assert False, "should have failed"
     except Exception:
         pass

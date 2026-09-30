@@ -14,7 +14,6 @@ import pytest
 
 from ..config import DEFAULT_GITHUB_REPOS
 from ..github_client import GitHubClient, GitHubError
-from ..github_state_proxy import GitHubStateProxy
 from ..server import _STATUS_LABEL_SPECS, _bootstrap_status_labels, create_app
 from .conftest import make_config
 

@@ -14,7 +14,7 @@ from ..commands import ParsedCommand, parse_command
 from .. import service as service_mod
 from ..github_command_watcher import GitHubCommandWatcher
 from ..github_state_proxy import GitHubStateProxy, MalformedHiddenStateError, _validate_hidden_state
-from ..models import HiddenState, MachineInfo
+from ..models import MachineInfo
 from ..policy import Policy
 from ..service import DeployController
 from .conftest import make_config
@@ -242,6 +242,11 @@ def test_hidden_state_rejects_empty_command_phase():
         _validate_hidden_state(state)
 
 
+def test_hidden_state_validator_rejects_non_canonical_status():
+    with pytest.raises(MalformedHiddenStateError):
+        _validate_hidden_state({**_review_state(), "status": "not-a-status"})
+
+
 def test_init_hidden_state_defaults_to_completed_phase():
     controller = object.__new__(DeployController)
 
@@ -252,12 +257,6 @@ def test_init_hidden_state_defaults_to_completed_phase():
     )
 
     assert state["command"]["phase"] == "completed"
-
-
-def test_hidden_state_model_defaults_to_completed_phase():
-    state = HiddenState()
-
-    assert state.command["phase"] == "completed"
 
 
 
@@ -343,7 +342,7 @@ def test_deploy_ready_hidden_state_allows_empty_components_with_review_job():
 
 
 @pytest.mark.asyncio
-async def test_approve_rechecks_pr_after_clean_gate_before_executing(controller, proxy, fake_github):
+async def test_approve_rechecks_pr_after_preflight_before_executing(controller, proxy, fake_github):
     state = _deploy_requested_state()
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events.append("write_hidden_state") or {})
@@ -410,7 +409,7 @@ async def test_approve_rechecks_pr_after_clean_gate_before_executing(controller,
 
 
 @pytest.mark.asyncio
-async def test_approve_head_changes_after_clean_gate_zero_deploy_post(controller, proxy, fake_github):
+async def test_approve_head_changes_after_preflight_zero_deploy_post(controller, proxy, fake_github):
     proxy.read_hidden_state = AsyncMock(return_value=_deploy_requested_state())
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
@@ -440,7 +439,7 @@ async def test_approve_head_changes_after_clean_gate_zero_deploy_post(controller
 
 
 @pytest.mark.asyncio
-async def test_approve_pr_closes_after_clean_gate_zero_deploy_post(controller, proxy, fake_github):
+async def test_approve_pr_closes_after_preflight_zero_deploy_post(controller, proxy, fake_github):
     proxy.read_hidden_state = AsyncMock(return_value=_deploy_requested_state())
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
@@ -768,10 +767,8 @@ async def test_approve_pr_author_machine_owner_allowed(controller, proxy, fake_g
     """A. PR author == actor, actor is machine owner => APPROVAL PASS, no self-approval denial.
 
     collaborator_permission must NOT be called (owner path short-circuits).
-    Clean gate, fresh PR reread, and full deploy path must execute normally.
+    Runtime preflight, fresh PR reread, and full deploy path must execute normally.
     """
-    from ..service import DeployController
-
     state = _deploy_requested_state()
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb.append("write_hidden_state") or {})
@@ -1116,8 +1113,6 @@ async def test_approve_pr_author_read_non_owner_denied(controller, proxy, fake_g
 @pytest.mark.asyncio
 async def test_machine_owner_approval_skips_collaborator_lookup(controller, proxy, fake_github):
     """I. Machine owner must not trigger GitHub collaborator_permission lookup."""
-    from ..service import DeployController
-
     state = _deploy_requested_state()
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock(side_effect=lambda *args, **kwargs: events_tb6.append("write_hidden_state") or {})
@@ -1202,3 +1197,110 @@ async def test_service_has_no_pr_author_self_approval_prohibition():
     assert "No-self-approval" not in service_source, (
         '"No-self-approval" comments must not exist in service.py'
     )
+
+@pytest.mark.asyncio
+async def test_request_deploy_blocks_draft_pr(controller, proxy, fake_github):
+    proxy.read_hidden_state = AsyncMock(return_value=_review_state(status="deploy-ready"))
+    proxy.comment_identity = AsyncMock(return_value=("1", "alice"))
+    proxy.post_issue_comment = AsyncMock()
+    fake_github.pr = {"state": "open", "merged": False, "draft": True,
+                      "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}}
+    await controller.handle_request_deploy("repo", 1, 11)
+    proxy.post_issue_comment.assert_awaited_once()
+    assert "ready-for-review" in proxy.post_issue_comment.call_args.args[2]
+
+
+@pytest.mark.asyncio
+async def test_approve_blocked_if_pr_becomes_draft_after_request(controller, proxy, fake_github):
+    """Approve gate: PR turning draft between /request_deploy and /approve_deploy blocks the unsafe POST."""
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("1", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    # First fresh PR read at approve entry: PR already became draft
+    proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "draft": True,
+                                           "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}})
+    core = MagicMock()
+    core.list_drivers = AsyncMock()
+    core.driver_status = AsyncMock()
+    core.deploy_driver = AsyncMock(side_effect=AssertionError("zero Agent Core unsafe POST"))
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=AssertionError("zero deploy POST"))
+    controller._run_automated_case = AsyncMock(side_effect=AssertionError("unexpected case run"))
+    fake_github.comments[60] = {
+        "id": 60,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    }
+
+    await controller.handle_approve_deploy("repo", 1, 60, "test-machine", "owner1", "1")
+
+    # Zero unsafe POST, lifecycle must not enter testing
+    controller._deploy_component.assert_not_called()
+    core.deploy_driver.assert_not_called()
+    posted_bodies = [c["body"] for c in fake_github.posted]
+    assert any("ready-for-review" in body for body in posted_bodies)
+
+
+@pytest.mark.asyncio
+async def test_final_fresh_draft_blocks_unsafe_post(controller, proxy, fake_github):
+    """Final unsafe gate: last authoritative fresh PR read returns draft=true after all other gates pass."""
+    state = _deploy_requested_state()
+    proxy.read_hidden_state = AsyncMock(return_value=state)
+    proxy.write_hidden_state = AsyncMock()
+    proxy.project_status_label = AsyncMock()
+    proxy.comment_identity = AsyncMock(return_value=("1", "alice"))
+    proxy.collaborator_permission = AsyncMock(return_value="admin")
+    # Entry PR read: non-draft. Final authoritative fresh read: draft=True.
+    proxy.get_pr = AsyncMock(side_effect=[
+        {"state": "open", "merged": False, "draft": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}},
+        {"state": "open", "merged": False, "draft": False, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}},
+        {"state": "open", "merged": False, "draft": True, "head": {"sha": "a" * 40}, "user": {"id": 1, "login": "alice"}},
+    ])
+    core = MagicMock()
+    core.list_drivers = AsyncMock(return_value=[{"id": "perception", "category": "driver", "image": "registry/repo:latest"}])
+    core.driver_status = AsyncMock(return_value={"status": "running", "running_image": ""})
+    core.deploy_driver = AsyncMock(side_effect=AssertionError("zero Agent Core deploy/update POST"))
+    controller._core_for_node = AsyncMock(return_value=core)
+    controller._deploy_component = AsyncMock(side_effect=AssertionError("zero deploy POST"))
+    controller._run_automated_case = AsyncMock(return_value={})
+    controller._fresh_review_evidence_matches_state = AsyncMock(return_value=True)
+    controller._revalidate_hidden_state = AsyncMock(return_value=state)
+    fake_github.comments[61] = {
+        "id": 61,
+        "body": "/approve_deploy machine=test-machine",
+        "user": {"id": 1, "login": "owner1"},
+    }
+    fake_github.comments[1001] = {
+        "id": 1001,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent \u2014 Build Result\n\nCommit: `abc1234`\n\n| Target | Status | Version | Took |\n| perception | :white_check_mark: Success | `registry/repo:v1` | 10s |\n",
+        "created_at": "2026-09-18T00:00:00Z",
+        "updated_at": "2026-09-18T00:01:00Z",
+    }
+    fake_github.comments[1002] = {
+        "id": 1002,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent \u2014 Test Results\n\nCommit: `abc1234`\n\n| Suite | Result | Passed | Failed | Took |\n| perception | :white_check_mark: Passed | 10 | 0 | 5s |\n",
+        "created_at": "2026-09-18T00:02:00Z",
+        "updated_at": "2026-09-18T00:03:00Z",
+    }
+    fake_github.comments[1003] = {
+        "id": 1003,
+        "user": {"id": 7950763, "login": "review-agent-bot"},
+        "body": "<!-- pr-review-agent -->\n## PR Review Agent \u2014 Code Review\n\nAll checks passed.",
+        "created_at": "2026-09-18T00:04:00Z",
+        "updated_at": "2026-09-18T00:05:00Z",
+    }
+
+    await controller.handle_approve_deploy("repo", 1, 61, "test-machine", "owner1", "1")
+
+    # The final gate fired BEFORE any unsafe successful path
+    controller._deploy_component.assert_not_called()
+    core.deploy_driver.assert_not_called()
+    for call in proxy.write_hidden_state.call_args_list:
+        assert call.args[3].get("status") != "testing"
+    posted_bodies = [c["body"] for c in fake_github.posted]
+    assert any("ready-for-review" in body for body in posted_bodies)

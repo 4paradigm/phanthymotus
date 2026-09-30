@@ -271,65 +271,6 @@ class GitHubClient:
         except SecurityError as e:
             raise GitHubError(str(e)) from e
 
-    async def get_pr_file_at_exact_head(
-        self, repo: str, pr_number: int, head_sha: str, path: str
-    ) -> bytes:
-        """Read a file from the exact PR HEAD via the GitHub Contents API.
-
-        Args:
-            repo: Full repo name (e.g., "4paradigm/phanthymotus").
-            pr_number: The PR number used for error messages.
-            head_sha: The exact commit SHA to read from.
-            path: Repo-relative file path (must be validated by caller).
-
-        Returns:
-            The raw file bytes.
-
-        Raises:
-            GitHubError: If the file cannot be read, or the HEAD does not match.
-        """
-        # First, verify the PR still has the expected head_sha
-        pr = await self.get_pr(repo, pr_number)
-        current_head = (pr.get("head") or {}).get("sha", "")
-        if current_head != head_sha:
-            raise GitHubError(
-                f"PR head has changed: expected {head_sha[:7]}, got {current_head[:7]}"
-            )
-        # Get the head repo full_name (supports fork PRs)
-        head_repo = (pr.get("head") or {}).get("repo") or {}
-        head_full_name = head_repo.get("full_name", "") or repo
-        # Read file from the exact head SHA
-        file_path = "/repos/%s/contents/%s?ref=%s" % (
-            head_full_name, path.lstrip("/"), head_sha
-        )
-        url = self.api(file_path)
-        require_http_policy(
-            url, self.config, allow_private=self.config.allow_private_http
-        )
-        resp = await self._request("GET", file_path, timeout=self.config.total_timeout)
-        try:
-            require_2xx(resp.status_code, "github get file contents")
-        except SecurityError as e:
-            raise GitHubError(str(e)) from e
-        data = await self._read_json(resp)
-        content_type = data.get("type", "")
-        if content_type != "file":
-            raise GitHubError(
-                f"Path {path!r} is a {content_type}, not a file"
-            )
-        encoded = data.get("content", "")
-        encoding = data.get("encoding", "")
-        import base64
-        if encoding == "base64":
-            try:
-                return base64.b64decode(encoded)
-            except Exception as e:
-                raise GitHubError(f"File content decode failed: {e}")
-        elif encoding == "none" or encoding == "":
-            return encoded.encode("utf-8")
-        else:
-            raise GitHubError(f"Unsupported file encoding: {encoding}")
-
     async def get_issue_labels(self, repo: str, issue_number: int) -> list[str]:
         """Get the current labels for an issue/PR."""
         url = self.api(f"/repos/{repo}/issues/{issue_number}/labels")
@@ -375,11 +316,6 @@ class GitHubClient:
         pr = await self.get_pr(repo, pr_number)
         merged = pr.get("merged") is True  # strict: only JSON true counts
         return merged, str(pr.get("merged_at") or ""), str(pr.get("merge_commit_sha") or "")
-
-    async def pr_head_sha(self, repo: str, pr_number: int) -> str:
-        pr = await self.get_pr(repo, pr_number)
-        return str((pr.get("head") or {}).get("sha") or "")
-
 
     async def resolve_commit_sha(self, repo: str, ref: str) -> str:
         """GET /repos/{repo}/commits/{ref} -> return full 40-hex SHA.
@@ -457,11 +393,6 @@ class GitHubClient:
             )
         return sorted(repos)
 
-    async def _get_token(self) -> str:
-        """Get current installation token from the token provider."""
-        if self._token_provider is not None:
-            return await self._token_provider()
-        raise GitHubError("No token provider configured for GitHubClient")
     async def pr_state(self, repo: str, pr_number: int) -> PrSnapshot | None:
         """Strict, fail-closed snapshot of a PR for candidate creation.
 
@@ -549,51 +480,6 @@ class GitHubClient:
         if not isinstance(perm, str) or not perm:
             return ""
         return perm
-
-    async def user_in_team(self, team: str, username: str) -> bool:
-        """Live GitHub team membership check (always authoritative, fail-closed).
-
-        ``team`` is ``org/slug``. The endpoint is
-        ``GET /orgs/{org}/teams/{slug}/memberships/{username}``; only an
-        explicit 200 with ``state == "active"`` passes. Any API error, 404,
-        non-2xx, malformed payload or unknown/absent team returns False.
-        """
-        team = (team or "").strip().strip("/")
-        username = (username or "").strip()
-        if "/" not in team or not username:
-            return False
-        org, _, slug = team.partition("/")
-        if not org or not slug:
-            return False
-        path = f"/orgs/{org}/teams/{slug}/memberships/{username}"
-        try:
-            resp = await self._request("GET", path, timeout=self.config.total_timeout,
-            )
-        except (httpx.HTTPError, SecurityError) as e:
-            logger.warning("team membership check failed for %s: %s", team, e)
-            return False
-        if resp.status_code in (401, 403, 404):
-            return False
-        try:
-            require_2xx(resp.status_code, "github team membership")
-        except SecurityError as e:
-            logger.warning("team membership HTTP %s: %s", resp.status_code, e)
-            return False
-        data = await self._read_json(resp)
-        return data.get("state") == "active"
-
-    async def get_current_user(self) -> dict:
-        """Fetch the authenticated user's GitHub identity.
-
-        GET /user. Returns a dict with ``id`` (int) and ``login`` (str).
-        Raises GitHubError on failure.
-        """
-        resp = await self._request("GET", "/user", timeout=self.config.total_timeout,)
-        try:
-            require_2xx(resp.status_code, "github current user")
-        except SecurityError as e:
-            raise GitHubError(str(e)) from e
-        return await self._read_json(resp)
 
     async def list_repository_labels(self, repo: str) -> list[dict]:
         """List all labels in a repository with bounded pagination."""

@@ -19,8 +19,6 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -207,15 +205,6 @@ class ReviewCommentEvidence:
 # Helpers
 # ------------------------------------------------------------------
 
-def _parse_image_ref(text: str) -> tuple[str, str]:
-    """Parse image reference into (repo, tag)."""
-    text = text.strip()
-    if ":" in text:
-        parts = text.rsplit(":", 1)
-        return parts[0], parts[1]
-    return text, ""
-
-
 def _normalize_variant(variant: str) -> str:
     """Normalize legacy variant names to canonical forms."""
     v = variant.strip().lower()
@@ -360,94 +349,6 @@ def _parse_build_images(text: str) -> dict[str, str]:
                 return {}
             images[target] = image_ref
     return images
-
-
-def parse_build_result(
-    body: str,
-) -> ReviewBuild | None:
-    """Parse a single Build Result section and return merged ReviewBuild.
-
-    Returns None on any malformed input.
-    """
-    if not _has_marker(body):
-        return None
-    if BUILD_HEADING not in body:
-        return None
-
-    section = _find_section(body, BUILD_HEADING)
-    if section is None:
-        return None
-
-    # Extract commit prefix
-    commit_prefix = _extract_commit_prefix(section)
-    if not commit_prefix:
-        return None
-
-    # Parse table
-    table_rows = _parse_build_table(section)
-    if not table_rows:
-        return None
-
-    # Parse images section
-    images = _parse_build_images(section)
-
-    # Merge all rows into a single ReviewBuild per target
-    # We collect per-target info and return list of ReviewBuild
-    builds: list[ReviewBuild] = []
-    seen_keys: set[tuple[str, str, str]] = set()
-
-    for row in table_rows:
-        raw_label = row["target"]
-        normalized = _normalize_build_label(raw_label)
-        if normalized is None:
-            return None  # unknown/malformed => fail closed
-
-        target = normalized["target"]
-        driver_path = normalized["driver_path"]
-        variant = normalized["variant"]
-
-        dup_key = (target, driver_path, variant)
-        if dup_key in seen_keys:
-            return None  # duplicate => fail
-        seen_keys.add(dup_key)
-
-        status_raw = row["status"]
-        # Success indicators
-        is_success = (
-            ":white_check_mark:" in status_raw
-            or status_raw.lower() == "success"
-        )
-        is_failed = (
-            ":x:" in status_raw
-            or status_raw.lower() in ("failed", "failure")
-        )
-        is_killed = (
-            status_raw.lower() in ("killed",)
-        )
-
-        version_raw = row["version"].strip("`")
-        version = row["version"]
-
-        # Use raw display label for image section lookup
-        image_ref = images.get(raw_label, "")
-        if not image_ref and is_success:
-            return None  # success without image => fail
-
-        image_tag = image_ref  # full mutable ref: registry.example/path/image:tag
-
-        build = ReviewBuild(
-            target=target,
-            driver_path=driver_path,
-            variant=variant,
-            success=is_success and not is_failed and not is_killed,
-            version=version,
-            image_tag=image_tag,
-            image_ref=image_ref,
-            took=row.get("took", ""),
-        )
-        builds.append(build)
-
-    return builds[0] if len(builds) == 1 else None
 
 
 def parse_all_build_results(

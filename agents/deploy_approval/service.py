@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import os
 import inspect
 
 import asyncio
@@ -34,7 +33,7 @@ from .agent_core_client import (
 from .case_runner import CaseRunner
 from .config import Config
 from .cos_client import CosClient
-from .evidence_builder import EvidenceBuilder, _case_id_for_target
+from .evidence_builder import EvidenceBuilder
 from .github_client import GitHubClient, GitHubError
 from .github_state_proxy import (
     GitHubStateProxy,
@@ -46,23 +45,18 @@ from .github_state_proxy import (
     _count_visible_bytes,
     _truncate_events_to_fit,
     _MAX_VISIBLE_LIFECYCLE_BYTES,
-    _MAX_COMMENT_BODY_BYTES,
     HISTORY_ARCHIVE_MARKER_PREFIX,
     _next_history_archive_page,
     _build_archive_body,
     _parse_visible_history,
     _build_history_block,
     VISIBLE_HISTORY_START_MARKER,
-    VISIBLE_HISTORY_END_MARKER,
-    HIDDEN_STATE_MARKER,
 )
-from .models import BuildInfo, new_id, utc_now
+from .models import BuildInfo
 from .policy import Policy, PolicyError
 from .review_comment_parser import (
     extract_review_evidence,
     ReviewCommentEvidence,
-    _parse_build_table,
-    _parse_build_images,
 )
 from .image_ref import validate_image_ref, get_deploy_platform
 
@@ -177,23 +171,6 @@ def _is_deployable_build(repo: str, build) -> bool:
     # Unknown repository: nothing is deployable
     return False
 
-def _trim_approve_attempts(
-    state: dict,
-    attempt: dict,
-) -> tuple[list[dict], int, bool]:
-    attempts = list(state.get("approve_attempts", []))
-    total = state.get("approve_attempts_total")
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-        total = len(attempts)
-    total += 1
-    truncated = False
-    attempts.append(attempt)
-    if len(attempts) > MAX_RECENT_APPROVE_ATTEMPTS:
-        truncated = True
-        attempts = attempts[-MAX_RECENT_APPROVE_ATTEMPTS:]
-    return attempts, total, truncated
-
-
 def _component_id_set(deployments: list[dict]) -> set[str]:
     deployed: set[str] = set()
     for dep in deployments:
@@ -300,14 +277,6 @@ class DeployController:
     @staticmethod
     def _empty_cos() -> dict[str, Any]:
         return {"object_key": "", "sha256": "", "size": 0}
-
-    @staticmethod
-    def _empty_approve_attempts() -> dict[str, Any]:
-        return {
-            "approve_attempts": [],
-            "approve_attempts_total": 0,
-            "approve_attempts_truncated": False,
-        }
 
     @staticmethod
     def _review_evidence_snapshot(
@@ -635,17 +604,6 @@ class DeployController:
             await self.proxy.write_hidden_state(repo, pr_number, markdown, fresh_state)
         return True
 
-    @staticmethod
-    def _deployment_component_ids(state: dict) -> set[str]:
-        deployed_component_ids: set[str] = set()
-        for dep in state.get("deployments", []):
-            if dep.get("phase") != "deployed":
-                continue
-            for cid in dep.get("component_ids", []):
-                if isinstance(cid, str) and cid:
-                    deployed_component_ids.add(cid)
-        return deployed_component_ids
-
     def _resolve_component_runtime(
         self,
         drivers: list[dict],
@@ -811,6 +769,12 @@ class DeployController:
                     "PR is not open. Deploy only when PR is open and unmerged.",
                 )
                 return True
+            if pr_data.get("draft") is True:
+                await self._post_error(
+                    repo, pr_number,
+                    "Deployment requires PR ready-for-review / non-draft.",
+                )
+                return True
 
             # Get build evidence from PR comments
             try:
@@ -841,7 +805,6 @@ class DeployController:
             builds = []
             for eb in evidence.builds:
                 bi = BuildInfo(
-                    idx=0,
                     target=eb.target,
                     driver_path=eb.driver_path,
                     variant=eb.variant,
@@ -975,6 +938,13 @@ class DeployController:
                 )
                 return True
 
+            if pr_data.get("draft") is True:
+                await self._post_error(
+                    repo, pr_number,
+                    "Deployment requires PR ready-for-review / non-draft.",
+                )
+                return True
+
             # Check HEAD drift
             if pr_head and pr_head != state.get("head_sha", ""):
                 await self._supersede_head_drift(
@@ -1027,9 +997,6 @@ class DeployController:
                 return True
 
 
-            required_remaining_ids = {
-                c.get("component_id", "") for c in undeployed_components
-            }
             compatible_remaining_ids = set(
                 self._get_component_ids_for_machine(
                     machine_alias, undeployed_components,
@@ -1059,7 +1026,7 @@ class DeployController:
                     gate_note=[
                         f"Machine `{machine_alias}` does not cover any remaining component.",
                         "ZERO deploy POST.",
-                        "Send a NEW `/approve_deploy machine=<alias>` for a compatible machine.",
+                        "Send a NEW `/approve_deploy machine=<alias-or-ip>` for a compatible machine.",
                     ],
                     deployments=[],
                 )
@@ -1105,14 +1072,19 @@ class DeployController:
             fresh_state = fresh_pr.get("state", "")
             fresh_merged = fresh_pr.get("merged", False)
             fresh_head = fresh_pr.get("head", {}).get("sha", "")
-            if fresh_state != "open" or fresh_merged or fresh_head != state.get("head_sha", ""):
+            if fresh_state != "open" or fresh_merged or fresh_pr.get("draft") is True or fresh_head != state.get("head_sha", ""):
+                if fresh_pr.get("draft") is True:
+                    await self._post_error(
+                        repo, pr_number,
+                        "Deployment requires PR ready-for-review / non-draft.",
+                    )
                 await self._invalidate_review_required(
                     repo,
                     pr_number,
                     state,
                     fresh_head or state.get("head_sha", ""),
                     comment_id,
-                    "PR changed after clean gate.",
+                    "PR changed after runtime preflight.",
                 )
                 return True
 
@@ -1156,7 +1128,12 @@ class DeployController:
             final_merged = final_pr.get("merged", False)
             final_head = final_pr.get("head", {}).get("sha", "")
 
-            if final_state != "open" or final_merged:
+            if final_state != "open" or final_merged or final_pr.get("draft") is True:
+                if final_pr.get("draft") is True:
+                    await self._post_error(
+                        repo, pr_number,
+                        "Deployment requires PR ready-for-review / non-draft.",
+                    )
                 await self._invalidate_review_required(
                     repo,
                     pr_number,
@@ -1194,7 +1171,7 @@ class DeployController:
             if validated_state is None:
                 await self._invalidate_review_required(
                     repo, pr_number, state, final_head, comment_id,
-                    "Hidden state changed after clean gate.",
+                    "Hidden state changed after final pre-deploy validation.",
                 )
                 return True
 
@@ -1473,7 +1450,7 @@ class DeployController:
             approve_attempt["outcome"] = "deployed"
             self._record_approve_attempt(state, approve_attempt)
 
-            # Check full coverage: all components deployed -> testing; else -> stay deploy-requested
+            # Check completion: all required components durably deployed -> testing; else -> stay deploy-requested
             all_component_ids = {c.get("component_id", "") for c in components}
             deployed_component_ids = set()
             for dep in state["deployments"]:
@@ -1497,7 +1474,7 @@ class DeployController:
                         "",
                         f"Machine `{machine_alias}` deployed its compatible components.",
                         f"Remaining components need additional machine approval.",
-                        "Send a NEW `/approve_deploy machine=<alias>`.",
+                        "Send a NEW `/approve_deploy machine=<alias-or-ip>`.",
                     ],
                 )
                 machine_info = self.policy.get_machine(machine_alias)
@@ -2826,9 +2803,14 @@ class DeployController:
         existing_visible = existing_body[:idx].rstrip()
 
         # Check if this is a legacy comment (missing new-format markers)
+        # Only migrate a recognizable old Deploy Approval lifecycle. Transient
+        # statuses such as "Deploying..." are not lifecycle documents.
         is_legacy = (
             VISIBLE_HISTORY_START_MARKER not in existing_visible
             and "### Workflow" not in existing_visible
+            and "<!-- deploy-approval-agent -->" in existing_visible
+            and "Deploy Approval" in existing_visible
+            and ("**Status:**" in existing_visible or "### Deploy Approval" in existing_visible)
         )
 
         if is_legacy and event is not None:
@@ -3202,7 +3184,6 @@ class DeployController:
                             build_infos = []
                             for eb in evidence.builds:
                                 bi = BuildInfo(
-                                    idx=0,
                                     target=eb.target,
                                     driver_path=eb.driver_path,
                                     variant=eb.variant,
@@ -3296,7 +3277,7 @@ class DeployController:
                 elif desired_status == "review-required":
                     markdown = comments_mod.review_required(repo, pr_number, current_head)
                 else:
-                    markdown = comments_mod.deploy_ready(repo, pr_number, current_head, build_infos)
+                    markdown = comments_mod.deploy_ready(repo, pr_number, current_head, build_infos, review_evidence=review_evidence_data)
                 if state_was_none:
                     event = {
                         "event": "Lifecycle initialized",
@@ -3507,7 +3488,6 @@ class DeployController:
             return "review-required"
         for eb in evidence.builds:
             bi = BuildInfo(
-                idx=0,
                 target=eb.target,
                 driver_path=eb.driver_path,
                 variant=eb.variant,
@@ -3742,7 +3722,7 @@ class DeployController:
             gate_note.append(
                 f"Send a NEW `/approve_deploy machine={machine_alias}`."
             )
-        gate_note.append("fresh HEAD + actor -> CLEAN GATE")
+        gate_note.append("fresh HEAD + actor -> FINAL PRE-DEPLOY VALIDATION")
         markdown = comments_mod.deploy_requested(
             repo, pr_number, current_head,
             state.get("components", []),
@@ -3934,7 +3914,7 @@ class DeployController:
             if not machine_alias:
                 await self._post_error(
                     repo, pr_number,
-                    "`/approve_deploy` requires `machine=<alias>`.",
+                    "`/approve_deploy` requires `machine=<alias-or-ip>`.",
                 )
                 return True
             return await self.handle_approve_deploy(
@@ -3969,15 +3949,6 @@ class DeployController:
 
         logger.warning("on_command: unknown kind %s", cmd.kind)
         return True
-
-
-def _extract_visible_markdown(body: str) -> str:
-    """Extract visible markdown before the hidden state marker."""
-    from .github_state_proxy import HIDDEN_STATE_MARKER
-    idx = body.find(HIDDEN_STATE_MARKER)
-    if idx < 0:
-        return body
-    return body[:idx].rstrip()
 
 
 # Backward-compatible aliases

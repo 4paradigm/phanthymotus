@@ -339,8 +339,6 @@ async def test_pr_author_can_approve_own_deploy():
     Regression: _is_self_approval gate removed from service.py.
     Static assertion: no _is_self_approval definition or "PR author cannot approve" string remains.
     """
-    from ..service import DeployController
-
     # Static regression assertions
     service_source = open(Path(__file__).parent.parent / "service.py").read()
     assert "_is_self_approval" not in service_source, (
@@ -352,7 +350,7 @@ async def test_pr_author_can_approve_own_deploy():
 
 
 @pytest.mark.asyncio
-async def test_approve_rejects_machine_without_full_coverage():
+async def test_machine_partial_coverage_includes_only_compatible_components():
     """A machine with partial coverage must keep only its compatible remaining components."""
     from ..service import DeployController
     from types import SimpleNamespace

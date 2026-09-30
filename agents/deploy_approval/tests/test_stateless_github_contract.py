@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -454,7 +452,7 @@ async def test_request_deploy_zero_registry_dependency(controller, proxy, mock_g
     """
     from dataclasses import replace
     from unittest.mock import patch
-    from ..review_comment_parser import ReviewCommentEvidence, ReviewBuild
+    from ..review_comment_parser import ReviewCommentEvidence
 
     mock_github.get_comment.return_value = {"id": 101, "user": {"id": 111, "login": "alice"}, "body": "/request_deploy"}
     mock_github.get_pr.return_value = {
@@ -475,10 +473,10 @@ async def test_request_deploy_zero_registry_dependency(controller, proxy, mock_g
     mock_github.resolve_commit_sha = AsyncMock(return_value="a" * 40)
 
     builds = [
-        replace(BuildInfo(idx=0, target="perception", driver_path="", variant="5.11", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp5.11", deployable=True)),
-        replace(BuildInfo(idx=1, target="perception", driver_path="", variant="6.1", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp6.1", deployable=True)),
-        replace(BuildInfo(idx=2, target="actucore", driver_path="", variant="5.11", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore:release.260922.4707deb-jetson-jp5.11", deployable=True)),
-        replace(BuildInfo(idx=3, target="actucore", driver_path="", variant="6.1", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore:release.260922.4707deb-jetson-jp6.1", deployable=True)),
+        replace(BuildInfo(target="perception", driver_path="", variant="5.11", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp5.11", deployable=True)),
+        replace(BuildInfo(target="perception", driver_path="", variant="6.1", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260922.4707deb-jetson-jp6.1", deployable=True)),
+        replace(BuildInfo(target="actucore", driver_path="", variant="5.11", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore:release.260922.4707deb-jetson-jp5.11", deployable=True)),
+        replace(BuildInfo(target="actucore", driver_path="", variant="6.1", success=True, image_tag="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore:release.260922.4707deb-jetson-jp6.1", deployable=True)),
     ]
 
     fake_evidence = ReviewCommentEvidence(

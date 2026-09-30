@@ -127,10 +127,10 @@
   <!-- SECTION 03: APPROVE / CLEAN / DEPLOY                         -->
   <!-- ============================================================ -->
   <g id="section-03-approve-deploy">
-    <text x="40" y="822" class="mono small">03 · MACHINE-OWNER APPROVAL · MACHINE SUPPORT · EMPTY-RUNTIME CHECK · DEPLOY</text>
+    <text x="40" y="822" class="mono small">03 · APPROVAL · PARTIAL COVERAGE · RUNTIME EVIDENCE · DEPLOY</text>
 
     <path d="M920 858 L307 858" class="orange"/>
-    <text x="614" y="849" text-anchor="middle" class="mono msg">/approve_deploy machine=&lt;alias&gt;</text>
+    <text x="614" y="849" text-anchor="middle" class="mono msg">/approve_deploy machine=&lt;alias-or-ip&gt; → canonical alias</text>
 
     <path d="M307 898 L712 898" class="orange"/>
     <text x="510" y="889" text-anchor="middle" class="mono msg">fresh PR HEAD (commit SHA) + fresh approver + fresh saved state</text>
@@ -138,39 +138,39 @@
     <!-- Decision box is visually isolated: branch arrows start below it. -->
     <rect x="557" y="936" width="310" height="58" class="gate"/>
     <text x="712" y="958" text-anchor="middle" class="mono statusText" fill="#9A6A32">MACHINE SUPPORT CHECK</text>
-    <text x="712" y="979" text-anchor="middle" class="mono small">selected machine supports every REMAINING deploy target</text>
+    <text x="712" y="979" text-anchor="middle" class="mono small">select compatible undeployed subset on this machine</text>
 
     <path d="M712 1018 L307 1018" class="red"/>
     <text x="510" y="1009" text-anchor="middle" class="mono small">NOT SUPPORTED</text>
     <rect x="228" y="1040" width="158" height="24" class="statusWait"/>
     <text x="307" y="1056" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
-    <text x="307" y="1084" text-anchor="middle" class="mono small">choose a machine that supports the whole deployment</text>
+    <text x="307" y="1084" text-anchor="middle" class="mono small">zero coverage: zero POST; send a NEW compatible approval</text>
 
     <text x="728" y="1098" class="mono msgStrong">SUPPORTED ↓</text>
 
     <path d="M712 1124 L1115 1124" class="blue"/>
-    <text x="914" y="1107" text-anchor="middle" class="mono msg">check every REMAINING deploy target on the selected machine</text>
+    <text x="914" y="1107" text-anchor="middle" class="mono msg">check the compatible undeployed subset on the selected machine</text>
     <text x="914" y="1120" text-anchor="middle" class="mono msg">+ read its current running image</text>
 
     <path d="M1115 1170 L712 1170" class="green"/>
-    <text x="914" y="1161" text-anchor="middle" class="mono msg">current running images for all REMAINING deploy targets</text>
+    <text x="914" y="1161" text-anchor="middle" class="mono msg">current running images as preflight evidence</text>
 
     <rect x="582" y="1202" width="260" height="60" class="gate"/>
-    <text x="712" y="1224" text-anchor="middle" class="mono statusText" fill="#9A6A32">EMPTY-RUNTIME CHECK</text>
-    <text x="712" y="1247" text-anchor="middle" class="mono small">no deploy target is currently running</text>
+    <text x="712" y="1224" text-anchor="middle" class="mono statusText" fill="#9A6A32">RUNTIME PREFLIGHT EVIDENCE</text>
+    <text x="712" y="1247" text-anchor="middle" class="mono small">non-empty is allowed; Agent Core replaces existing runtime</text>
 
-    <!-- NOT EMPTY branch: zero deploy POST; owner must clear manually and send a NEW approval. -->
+    <!-- Existing runtime is evidence and does not block the unsafe operation. -->
     <path d="M712 1296 L307 1296" class="red"/>
-    <text x="510" y="1287" text-anchor="middle" class="mono msgStrong">a deploy target is already running → ZERO deploy POST</text>
+    <text x="510" y="1287" text-anchor="middle" class="mono msgStrong">persist executing before unsafe POST; unknown outcome → uncertain</text>
 
     <rect x="228" y="1318" width="158" height="24" class="statusWait"/>
     <text x="307" y="1334" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
 
     <path d="M307 1368 L920 1368" class="blue"/>
-    <text x="614" y="1359" text-anchor="middle" class="mono msg">comment: clear the existing running image manually</text>
+    <text x="614" y="1359" text-anchor="middle" class="mono msg">partial success persists subset; all durable components → testing</text>
 
     <path d="M920 1410 L307 1410" class="orange"/>
-    <text x="614" y="1401" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias&gt;</text>
+    <text x="614" y="1401" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
     <text x="510" y="1437" text-anchor="middle" class="mono small">new approval restarts Section 03 from fresh state</text>
 
     <text x="728" y="1480" class="mono msgStrong">EMPTY ↓</text>
@@ -292,10 +292,10 @@
     <text x="307" y="3010" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
 
     <path d="M920 3054 L307 3054" class="orange"/>
-    <text x="614" y="3045" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias&gt;</text>
+    <text x="614" y="3045" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
 
     <path d="M307 3094 L712 3094" class="green"/>
-    <text x="510" y="3085" text-anchor="middle" class="mono msg">continue Section 03 · repeat machine support + empty-runtime checks</text>
+    <text x="510" y="3085" text-anchor="middle" class="mono msg">continue Section 03 · select next compatible subset + runtime evidence</text>
 
     <path d="M712 3142 L307 3142" class="red"/>
     <text x="510" y="3133" text-anchor="middle" class="mono msgStrong">PR HEAD CHANGED</text>
@@ -324,7 +324,7 @@
     <text x="307" y="3452" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
 
     <path d="M920 3498 L307 3498" class="orange"/>
-    <text x="614" y="3489" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias&gt;</text>
+    <text x="614" y="3489" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
 
     <path d="M307 3538 L712 3538" class="green"/>
     <text x="510" y="3529" text-anchor="middle" class="mono msg">continue Section 03</text>

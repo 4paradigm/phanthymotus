@@ -1,15 +1,13 @@
 """Authority, machine owners, and image policy checks (pre-merge validation).
 
 Pre-merge validation: one approver suffices (collaborator OR machine owner).
-PR author MUST NOT approve their own deployment.
+Self-approval is allowed when the actor satisfies machine-owner or collaborator authorization.
 Every decision is fail-closed: an unknown target, user, machine or image is a
 hard error, never a pass.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import ipaddress
 from typing import Any
@@ -232,7 +230,6 @@ def load_machines(path: str) -> dict[str, MachineInfo]:
 class Policy:
     def __init__(self, config: Config):
         self.config = config
-        self.policy_version = self._fingerprint(config)
         self.machines: dict[str, MachineInfo] = {}
 
     def load_machines(self) -> None:
@@ -253,36 +250,6 @@ class Policy:
     @staticmethod
     def collaborator_can_approve(permission: str) -> bool:
         return isinstance(permission, str) and permission in Policy.COLLABORATOR_WRITE
-
-    @staticmethod
-    def _fingerprint(config: Config) -> str:
-        payload = {"v": 7}
-        blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        return "deploy-approval-" + hashlib.sha256(blob).hexdigest()[:16]
-
-    def can_approve(
-        self,
-        actor: str,
-        *,
-        actor_id: str = "",
-        machine_alias: str = "",
-    ) -> None:
-        """Raise PolicyError unless ``actor`` may approve for the machine.
-
-        Gates:
-        1. actor must be an owner of the selected machine
-        """
-        machine = self.get_machine(machine_alias)
-        if machine is None:
-            raise PolicyError(f"machine {machine_alias!r} not found in machine owners")
-        actor_lower = actor.strip().lower() if actor else ""
-        if actor_lower not in machine.owners:
-            raise PolicyError(
-                f"actor {actor!r} is not an owner of machine {machine_alias!r}"
-            )
-
-    def can_request(self, requester: str) -> None:
-        return None
 
     def get_machines(self) -> list:
         """Return all machines as a list."""

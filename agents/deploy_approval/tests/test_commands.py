@@ -1,7 +1,6 @@
 """Tests for Deploy Approval command parsing."""
 from __future__ import annotations
 
-import pytest
 from ..commands import parse_command, command_starts_line_any
 
 

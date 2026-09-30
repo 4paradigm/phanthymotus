@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
-import re
 import os
 import ipaddress
 from dataclasses import dataclass, field
@@ -111,19 +110,6 @@ def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int | None =
     if min_val is not None and val < min_val:
         raise ValueError(f"{name} must be >= {min_val}, got {val!r}")
     return val
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        f = float(raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be a real number, got {raw!r}")
-    if f <= 0 or f != f or f in (float("inf"), float("-inf")):
-        raise ValueError(f"{name} must be a positive finite number, got {raw!r}")
-    return f
 
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}

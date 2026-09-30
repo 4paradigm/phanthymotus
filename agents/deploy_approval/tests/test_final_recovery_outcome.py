@@ -2,31 +2,26 @@
 
 from __future__ import annotations
 
-import inspect
-import asyncio
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 
-from .. import agent_core_client as agent_core_client_module
 from .. import comments as comments_mod
 from ..agent_core_client import (
     AgentCoreClient,
     AgentCoreDeployOutcomeUncertain,
     AgentCoreError,
 )
-from ..clients_common import SecurityError
 from ..config import Config, validate_config
-from ..github_state_proxy import GitHubStateProxy, _validate_hidden_state
+from ..github_state_proxy import _validate_hidden_state
 from ..models import BuildInfo, MachineInfo
 from ..policy import Policy
 from ..github_command_watcher import GitHubCommandWatcher
 from ..router_webhook import webhook
-from ..service import DeployController, DeployControllerError, DeployOutcomeUncertain
+from ..service import DeployController, DeployOutcomeUncertain
 from .conftest import make_config
 
 
@@ -74,7 +69,6 @@ def _state(**overrides) -> dict:
 def _build(*, target: str = "perception", driver_path: str = "", variant: str = "5.11",
            success: bool = True, image_tag: str = "registry.example/repo:v1") -> BuildInfo:
     return BuildInfo(
-        idx=0,
         target=target,
         driver_path=driver_path,
         variant=variant,
@@ -247,21 +241,8 @@ async def test_driver_status_malformed_missing_running_image_fails_closed():
 
 @pytest.mark.asyncio
 async def test_request_deploy_uses_canonical_component_snapshot_helper():
-    from ..review_comment_parser import ReviewCommentEvidence, ReviewBuild
     controller, proxy, policy, github, config = _controller()
-    evidence = ReviewCommentEvidence(
-        head_sha="a" * 40,
-        commit_prefix="abcdef1",
-        build_comment_id=5001,
-        build_comment_updated_at="2026-09-03T10:00:00Z",
-        test_comment_id=5002,
-        test_comment_updated_at="2026-09-03T10:01:00Z",
-        code_review_comment_id=5003,
-        code_review_comment_updated_at="2026-09-03T10:02:00Z",
-        builds=[ReviewBuild(target="perception", driver_path="", variant="5.11", success=True, version="release.260918.abcdef1", image_tag="ccr.ccs.tencentyun.com/repo:v1")],
-        review_author_id="7950763",
-    )
-    builds = [BuildInfo(0, "perception", "", "5.11", True, "registry.example/repo:v1", True)]
+    builds = [BuildInfo("perception", "", "5.11", True, "registry.example/repo:v1", True)]
     emdash = "\u2014"
     github.get_issue_comments = AsyncMock(return_value=[
         {
@@ -689,15 +670,8 @@ async def test_uncertain_recovery_snapshot_rebuild_failure_stays_uncertain():
 
 
 @pytest.mark.asyncio
-async def test_new_approve_from_uncertain_refreshes_before_clean_gate():
+async def test_new_approve_from_uncertain_refreshes_before_final_pre_deploy_validation():
     controller, proxy, policy, github, config = _controller()
-    state = _state()
-    refreshed_state = _state(
-        review_evidence={"build_comment_id": 99, "build_comment_updated_at": "2026-09-18T00:00:00Z", "commit_prefix": "abc1234", "resolved_head_sha": "a" * 40, "test_comment_id": 2, "code_review_comment_id": 3, "review_author_id": "7950763"},
-        components=[_component()],
-        deployments=[],
-        command={"comment_id": 17, "kind": "approve_deploy", "phase": "completed", "args": {"machine": "test-machine"}},
-    )
     events: list[str] = []
 
     async def _refresh(*args, **kwargs):
@@ -777,25 +751,11 @@ async def test_watcher_uncertain_without_new_approve_does_not_refresh_review():
 
 
 @pytest.mark.asyncio
-async def test_watcher_uncertain_new_approve_refreshes_review_before_clean_gate():
-    from ..review_comment_parser import ReviewCommentEvidence, ReviewBuild
+async def test_watcher_uncertain_new_approve_refreshes_review_before_final_pre_deploy_validation():
     controller, proxy, policy, github, config = _controller()
     state = _state()
     state["command"]["phase"] = "uncertain"
     state["last_processed_comment_id"] = 17
-
-    evidence = ReviewCommentEvidence(
-        head_sha="a" * 40,
-        commit_prefix="abcdef1",
-        build_comment_id=5001,
-        build_comment_updated_at="2026-09-03T10:00:00Z",
-        test_comment_id=5002,
-        test_comment_updated_at="2026-09-03T10:01:00Z",
-        code_review_comment_id=5003,
-        code_review_comment_updated_at="2026-09-03T10:02:00Z",
-        builds=[ReviewBuild(target="perception", driver_path="", variant="5.11", success=True, version="release.260918.abcdef1", image_tag="ccr.ccs.tencentyun.com/repo:v1")],
-        review_author_id="7950763",
-    )
 
     events: list[str] = []
 
@@ -1438,7 +1398,6 @@ def _fake_config():
 
 
 def _make_policy():
-    from ..policy import Policy
     policy = MagicMock()
     policy.get_machines.return_value = [
         MagicMock(
@@ -1456,7 +1415,6 @@ def _make_policy():
     policy.check_machine_targets_component.return_value = None
     policy.check_variant_compatible.return_value = None
     policy.check_driver_path_compatible.return_value = None
-    policy.check_full_coverage.return_value = None
     policy.get_machine_groups_for_components.return_value = []
     return policy
 
@@ -1468,6 +1426,12 @@ def _make_controller(fake_proxy, policy, fake_github):
     config.review_comment_author_id = REVIEW_AGENT_GITHUB_USER_ID
     config.review_comment_author_login = REVIEW_AGENT_GITHUB_LOGIN
     config.agent_core_tokens = {"m1": "test-token"}
+    # AsyncMock proxies return coroutines for every attribute; production
+    # find_trusted_lifecycle_comment must resolve to None so the controller
+    # falls through to its normal history scan, and is_bot_comment is a SYNC
+    # method that must stay MagicMock-shaped to avoid un-awaited coroutines.
+    fake_proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
+    fake_proxy.is_bot_comment = MagicMock(return_value=False)
     controller = DeployController(config, fake_proxy, policy, fake_github)
     return controller
 
@@ -1479,9 +1443,7 @@ def _make_controller(fake_proxy, policy, fake_github):
 async def test_legacy_digest_undeployed_component_migrates_to_tag_preserving_component_id(config, monkeypatch):
     """TEST 1: Old component with digest image_ref, no deployment, same semantic key
     -> migrate to tag, keep component_id. ZERO Registry calls."""
-    import json
     from unittest.mock import AsyncMock, MagicMock
-    from ..github_state_proxy import HIDDEN_STATE_MARKER
     from ..review_comment_parser import ReviewCommentEvidence
 
     fake_proxy = AsyncMock()
@@ -1525,7 +1487,6 @@ async def test_legacy_digest_undeployed_component_migrates_to_tag_preserving_com
     # Set up comment with hidden state
     # Patch extract_review_evidence at the service module level to return valid evidence
     import agents.deploy_approval.service as svc_mod
-    from ..review_comment_parser import ReviewCommentEvidence
     fake_evidence = ReviewCommentEvidence(
         head_sha="a" * 40, commit_prefix="a" * 7, review_author_id="7950763",
         build_comment_id=1, build_comment_updated_at="2025-01-01T00:00:00Z",
@@ -1568,9 +1529,7 @@ async def test_legacy_digest_undeployed_component_migrates_to_tag_preserving_com
 @pytest.mark.asyncio
 async def test_legacy_digest_deployed_component_preserves_deployment_and_historical_digest(config, monkeypatch):
     """TEST 2: Old deployed component with legacy digest preserves deployment and historical data."""
-    import json
     from unittest.mock import AsyncMock, MagicMock
-    from ..github_state_proxy import HIDDEN_STATE_MARKER
 
     fake_proxy = AsyncMock()
     fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
@@ -1657,9 +1616,7 @@ async def test_legacy_digest_deployed_component_preserves_deployment_and_histori
 @pytest.mark.asyncio
 async def test_legacy_deployed_component_missing_runtime_id_fails_closed(config, monkeypatch):
     """TEST: Deployed component without runtime_id must fail closed — not continue as migration."""
-    import json
     from unittest.mock import AsyncMock
-    from ..github_state_proxy import HIDDEN_STATE_MARKER
 
     fake_proxy = AsyncMock()
     fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
@@ -1743,9 +1700,7 @@ async def test_legacy_deployed_component_missing_runtime_id_fails_closed(config,
 @pytest.mark.asyncio
 async def test_real_review_tag_change_resets_snapshot(config, monkeypatch):
     """TEST 3: Real tag change -> semantic_changed=True, reset everything."""
-    import json
     from unittest.mock import AsyncMock
-    from ..github_state_proxy import HIDDEN_STATE_MARKER
 
     fake_proxy = AsyncMock()
     fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
@@ -1829,9 +1784,7 @@ async def test_real_review_tag_change_resets_snapshot(config, monkeypatch):
 @pytest.mark.asyncio
 async def test_removed_component_resets_snapshot(config, monkeypatch):
     """TEST 4: Removed component -> semantic_changed=True, reset everything."""
-    import json
     from unittest.mock import AsyncMock
-    from ..github_state_proxy import HIDDEN_STATE_MARKER
 
     fake_proxy = AsyncMock()
     fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
@@ -1916,9 +1869,7 @@ async def test_removed_component_resets_snapshot(config, monkeypatch):
 @pytest.mark.asyncio
 async def test_added_component_resets_snapshot(config, monkeypatch):
     """TEST 5: Added component -> semantic_changed=True, reset everything."""
-    import json
     from unittest.mock import AsyncMock
-    from ..github_state_proxy import HIDDEN_STATE_MARKER
 
     fake_proxy = AsyncMock()
     fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
@@ -1934,7 +1885,6 @@ async def test_added_component_resets_snapshot(config, monkeypatch):
 
     import hashlib
     cid_a = hashlib.sha256(f"perception||5.11|{TAG_A}".encode()).hexdigest()[:16]
-    cid_b = hashlib.sha256(f"actucore||5.11|{TAG_A}".encode()).hexdigest()[:16]
 
     old_state = {
         "version": 1, "head_sha": "a" * 40, "status": "deploy-requested",
@@ -2078,9 +2028,7 @@ async def test_duplicate_old_semantic_component_resets_snapshot(config, monkeypa
 @pytest.mark.asyncio
 async def test_duplicate_fresh_semantic_component_fails_closed(config, monkeypatch):
     """TEST 6: Fresh evidence with duplicate semantic components -> snapshot returns None."""
-    import hashlib
     from unittest.mock import AsyncMock, MagicMock
-    from ..review_comment_parser import ReviewBuild
 
     fake_proxy = AsyncMock()
     fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
@@ -2156,10 +2104,7 @@ async def test_legacy_migration_zero_registry_http(config, monkeypatch):
     Proves: legacy digest state -> recovery -> exact Review Agent tag ->
     ZERO Registry dependency.
     """
-    import json
-    import hashlib
     from unittest.mock import AsyncMock
-    from ..github_state_proxy import HIDDEN_STATE_MARKER
 
     fake_proxy = AsyncMock()
     fake_proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False, "head": {"sha": "a" * 40}})
@@ -2232,3 +2177,192 @@ async def test_legacy_migration_zero_registry_http(config, monkeypatch):
 
     # Verify all deployment/tracking state was reset
     assert written_state["deployments"] == []
+
+
+# ── History archive regression tests ────────────────────────────────────────
+
+
+def _lifecycle_visible(repo: str, pr_number: int, status: str = "deploy-requested") -> str:
+    """Build a minimal NEW-format trusted lifecycle visible markdown."""
+    from ..comments import BOT_MARKER, lifecycle_marker
+    return "\n".join([
+        BOT_MARKER,
+        lifecycle_marker(repo, pr_number),
+        "### Deploy Approval \u2014 Lifecycle",
+        "",
+        f"**Status:** `{status}`",
+        "",
+        "### Workflow",
+        "",
+        "- [x] review",
+        "",
+    ])
+
+
+def _lifecycle_body(repo: str, pr_number: int, state: dict, visible: str) -> str:
+    from ..github_state_proxy import _build_hidden_state_body
+    return _build_hidden_state_body(visible, state)
+
+
+@pytest.mark.asyncio
+async def test_transient_deploying_visible_is_not_archived_as_legacy():
+    """A trusted lifecycle whose visible part is the transient 'Deploying...' must
+    NOT be treated as a legacy lifecycle: no archive comment, normal write."""
+    controller, proxy, policy, github, config = _controller()
+    state = _state()
+
+    from ..comments import BOT_MARKER
+    transient_visible = BOT_MARKER + "\nDeploying..."
+    existing_body = _lifecycle_body("repo", 1, state, transient_visible)
+    proxy.find_trusted_lifecycle_comment = AsyncMock(
+        return_value={"id": 42, "body": existing_body}
+    )
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": existing_body}])
+    proxy.write_hidden_state = AsyncMock()
+
+    event = {"event": "Deploy started", "machine": "test-machine",
+             "timestamp": comments_mod.beijing_now_str()}
+
+    await controller._write_lifecycle_with_history(
+        "repo", 1, state, _lifecycle_visible("repo", 1), event=event,
+    )
+
+    # NO legacy archive comment created
+    proxy.post_issue_comment.assert_not_called()
+    posted_bodies = [c.args[2] for c in proxy.post_issue_comment.call_args_list] if proxy.post_issue_comment.call_args_list else []
+    assert all("Legacy lifecycle snapshot preserved" not in b for b in posted_bodies)
+
+    # Normal lifecycle write happened with the new history event
+    proxy.write_hidden_state.assert_awaited_once()
+    written_visible = proxy.write_hidden_state.call_args.args[2]
+    assert "Deploy started" in written_visible
+
+
+@pytest.mark.asyncio
+async def test_true_legacy_lifecycle_is_archived_once():
+    """A true old-format Deploy Approval lifecycle is archived exactly once on the
+    first meaningful event; a subsequent write must not duplicate the archive."""
+    controller, proxy, policy, github, config = _controller()
+    state = _state()
+
+    from ..comments import BOT_MARKER
+    legacy_visible = "\n".join([
+        BOT_MARKER,
+        "### Deploy Approval",
+        "",
+        "**Status:** `deploy-requested`",
+        "",
+        "Old-format lifecycle content.",
+    ])
+    legacy_body_with_state = _lifecycle_body("repo", 1, state, legacy_visible)
+
+    # Emulate the real store: write_hidden_state UPDATES the trusted comment body,
+    # so a second write reads the migrated new-format visible and must not re-archive.
+    current_body = {"body": legacy_body_with_state}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": current_body["body"]}
+
+    async def _write_hidden_state(_repo, _pr, visible, _state):
+        from ..github_state_proxy import _build_hidden_state_body
+        current_body["body"] = _build_hidden_state_body(visible, _state)
+        return {"id": 42}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.get_issue_comments = AsyncMock(return_value=[{"id": 42, "body": legacy_body_with_state}])
+    proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
+    proxy.post_issue_comment = AsyncMock(return_value={"id": 77})
+
+    event = {"event": "First meaningful event", "machine": "test-machine",
+             "timestamp": comments_mod.beijing_now_str()}
+
+    await controller._write_lifecycle_with_history(
+        "repo", 1, state, _lifecycle_visible("repo", 1), event=event,
+    )
+
+    # First call: ONE legacy archive created
+    assert proxy.post_issue_comment.await_count == 1
+    archive_body = proxy.post_issue_comment.call_args.args[2]
+    assert "Legacy lifecycle snapshot preserved" in archive_body
+    assert "History Archive Page 1" in archive_body
+    # Hidden business state must not be lost: the archive preserves old visible
+    assert "Old-format lifecycle content." in archive_body
+
+    # Second write on the SAME legacy comment must not re-archive the same snapshot
+    proxy.write_hidden_state.reset_mock()
+    await controller._write_lifecycle_with_history(
+        "repo", 1, state, _lifecycle_visible("repo", 1), event=event,
+    )
+    assert proxy.post_issue_comment.await_count == 1  # still just the one archive
+
+
+@pytest.mark.asyncio
+async def test_visible_history_rollover_preserves_oldest_events():
+    """When the visible lifecycle approaches the 48 KiB budget, the preflight archive
+    step (run before any unsafe deploy POST) moves oldest events into a History
+    Archive page; no events are silently dropped and no #N autolink is produced."""
+    repo, pr_number = "repo", 1
+    controller, proxy, policy, github, config = _controller()
+    state = _state()
+
+    visible = _lifecycle_visible(repo, pr_number)
+    posted_bodies: list[str] = []
+
+    async def _post(_repo, _pr, body):
+        posted_bodies.append(body)
+        return {"id": 90}
+
+    proxy.post_issue_comment = AsyncMock(side_effect=_post)
+
+    # Build a large history: many oversized events so the block exceeds 48 KiB
+    from ..github_state_proxy import _build_history_block, _count_visible_bytes
+    events = [
+        {"event": f"Bulk event {i} " + "x" * 900,
+         "machine": "test-machine",
+         "timestamp": f"2026-09-24 10:{i:02d}:00"}
+        for i in reversed(range(60))
+    ]
+    history_block = _build_history_block(events)
+    primed_visible = visible.rstrip() + "\n\n### History\n\n" + history_block + "\n"
+    assert _count_visible_bytes(primed_visible) > 48 * 1024, "precondition: primed body must exceed budget"
+
+    primed_body = _lifecycle_body(repo, pr_number, state, primed_visible)
+
+    # Emulate the real store so the preflight update rewrites the same comment
+    current_body = {"body": primed_body}
+
+    async def _find_trusted(_repo, _pr):
+        return {"id": 42, "body": current_body["body"]}
+
+    async def _update_comment(_repo, comment_id, body):
+        current_body["body"] = body
+        return {"id": comment_id}
+
+    proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
+    proxy.get_issue_comments = AsyncMock(
+        return_value=[{"id": 42, "body": current_body["body"]}]
+    )
+    proxy.update_comment = AsyncMock(side_effect=_update_comment)
+
+    reserved_event = {"event": "Rollover trigger event", "machine": "test-machine",
+                      "timestamp": comments_mod.beijing_now_str()}
+
+    # Preflight runs before the unsafe deploy POST: rollover must happen here
+    await controller._preflight_archive_for_event(
+        repo, pr_number, visible, reserved_event=reserved_event,
+    )
+
+    # An archive comment was created for the oldest events
+    assert proxy.post_issue_comment.await_count == 1
+    archive_body = posted_bodies[0]
+    assert "History Archive Page 1" in archive_body
+    # Oldest events are preserved in the archive (no silent loss)
+    assert "Bulk event 0" in archive_body
+
+    # Main lifecycle bounded: rewritten visible stays within budget
+    rewritten = current_body["body"]
+    rewritten_visible = rewritten.split("<!-- deploy-approval-state:v1")[0]
+    assert _count_visible_bytes(rewritten_visible) <= 48 * 1024
+    # The new event is not silently lost: it stays reserved for the caller's write
+    # and the shrunk main history retains the newest kept events
+    assert "Bulk event 59" in rewritten_visible

@@ -76,15 +76,6 @@ dotenv_has_key() {
     dotenv_parse "$file" | awk -F= -v key="$key" '$1 == key { found = 1 } END { exit(found ? 0 : 1) }'
 }
 
-require_env_value() {
-    local file="$1" key="$2" label="$3"
-    dotenv_has_key "$file" "$key" || die "$label is missing from $file"
-    local value
-    value="$(dotenv_value "$file" "$key")"
-    [ -n "$value" ] || die "$label is empty in $file"
-    printf '%s\n' "$value"
-}
-
 require_github_app_inputs() {
     [ -n "${GITHUB_APP_ID:-}" ] || die "GITHUB_APP_ID is required"
     [ -n "${GITHUB_INSTALLATION_ID:-}" ] || die "GITHUB_INSTALLATION_ID is required"

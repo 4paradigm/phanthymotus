@@ -12,9 +12,7 @@ Tests the full GitHub-comment-based review evidence pipeline:
 """
 from __future__ import annotations
 
-import sys
 import textwrap
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -835,7 +833,7 @@ class TestShortSHAResolution:
         resp.json.return_value = {"sha": "abcdef1234567890abcdef1234567890abcdef12"}
         client._http.send.return_value = resp
 
-        result = client._request = AsyncMock(return_value=resp)
+        client._request = AsyncMock(return_value=resp)
 
         async def _run():
             return await client.resolve_commit_sha("owner/repo", "abcdef1")
@@ -1391,7 +1389,6 @@ async def test_core_component_snapshot_binds_core_runtime_without_driver_resolut
 
     controller, _proxy, github = _core_contract_controller()
     build = BuildInfo(
-        idx=0,
         target="core",
         driver_path="",
         variant="",
@@ -1865,3 +1862,36 @@ def test_fresh_undeployed_non_core_components_drop_runtime_binding(component):
 
     assert rebuilt is not None
     assert "runtime_id" not in rebuilt[0]
+
+
+def test_deploy_ready_components_and_review_evidence_are_unambiguous():
+    from agents.deploy_approval import comments
+    from agents.deploy_approval.models import BuildInfo
+
+    builds = [
+        BuildInfo(target="perception", driver_path="", variant="5.11", success=True,
+                  image_tag="registry/perception:jp5", deployable=True),
+        BuildInfo(target="perception", driver_path="", variant="6.1", success=True,
+                  image_tag="registry/perception:jp6", deployable=True),
+    ]
+    body = comments.deploy_ready(
+        "repo", 1, "a" * 40, builds,
+        review_evidence={"test_comment_id": 2, "test_passed": 12, "test_failed": 3,
+                         "test_skipped": False},
+    )
+    assert "| target | variant/path | build | deploy approval |" in body
+    assert "| perception | 5.11 | success | deployable |" in body
+    assert "| perception | 6.1 | success | deployable |" in body
+    assert "15 passed" not in body
+    assert "12 passed / 3 failed" in body
+    assert "does not interpret Review Agent findings" in body
+
+
+def test_deploy_ready_renders_tests_not_run():
+    from agents.deploy_approval import comments
+    from agents.deploy_approval.models import BuildInfo
+
+    build = BuildInfo(target="core", driver_path="", variant="", success=True,
+                      image_tag="registry/core:v1", deployable=True)
+    body = comments.deploy_ready("repo", 1, "a" * 40, [build], review_evidence={})
+    assert "**Tests:** not run" in body

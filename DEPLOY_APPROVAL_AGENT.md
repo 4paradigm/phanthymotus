@@ -43,7 +43,7 @@ Crash interruption: status remains deploy-requested, command.phase becomes uncer
 | Command | Actor | Description |
 |---------|-------|-------------|
 | `/request_deploy` | PR Author | Request deployment for current HEAD. Binds the latest complete current-HEAD Review Agent GitHub comment evidence and ALL deployable components. |
-| `/approve_deploy machine=<alias>` | Machine Owner or write/maintain/admin collaborator | Approve and bind to a machine. Runs a running_image-only clean gate before any deploy POST. |
+| `/approve_deploy machine=<alias-or-ip>` | Machine Owner or write/maintain/admin collaborator | Approve the compatible undeployed subset on one machine. A literal IPv4 must resolve uniquely; the canonical alias is persisted. |
 | `/record_test result=pass|fail [summary="..."]` | Machine Owner or write/maintain/admin collaborator | Record overall test result. No machine parameter. |
 | `/deploy_status` | Anyone | Read-only deployment status from hidden state. |
 | `/deploy_help [topic]` | Anyone | Help for commands. |
@@ -76,14 +76,16 @@ and are copied into hidden state to make the snapshot restart-safe.
 - **Deployability:** `phanthymotus` deploys `core`, `perception` and `actucore`; `phanthymotus-driver` deploys exact driver paths.
 - **Core self-update contract:** `core` deployment uses Agent Core POST `/api/system/update` with exact image ref to trigger asynchronous self-restart. Deploy Approval polls GET `/api/system/update-check` and waits until `current_tag` (string) matches the target tag parsed from image ref. `up_to_date=True` is NOT sufficient for success. Core has no automated Case; runtime_id is fixed to `"core"`.
 - **Variant contract:** perception variants are canonical `5.11` and `6.1`. Legacy `jetson-jp5.11` / `jetson-jp6.1` are normalized only at config load.
-- **CLEAN gate:** `/approve_deploy` reads `running_image` for the selected machine's compatible components. Non-empty `running_image` is recorded as preflight evidence but does NOT block deployment; Agent Core is responsible for replacing old containers. Controller does not perform stop/remove/cleanup.
-- **Agent Core no-container response:** the current compatibility shape normalizes to `running_image=""` only when `running_image` and `error` are absent, `status` key exists, and `logs` is a string. The `status` VALUE has zero CLEAN/health/case business influence. Error or malformed shapes fail closed.
-- status VALUE has zero CLEAN/health/case business influence.
+- **Runtime preflight evidence:** `/approve_deploy` reads `running_image` for the selected machine's compatible components. Non-empty `running_image` is recorded as evidence and does not block deployment; Agent Core owns replacement of an existing runtime. Controller does not perform stop/remove/cleanup.
+- **Agent Core no-container response:** the current compatibility shape normalizes to `running_image=""` only when `running_image` and `error` are absent, `status` key exists, and `logs` is a string. The `status` value has zero preflight/health/case business influence. Error or malformed shapes fail closed.
+- status value has zero preflight/health/case business influence.
 - error/malformed shapes fail closed.
-- **unsafe deploy POST:** if the POST outcome is unknown after the unsafe attempt begins, the command becomes `command.phase=uncertain`, `status=deploy-requested`, `approve_attempt.outcome=uncertain`, and there is ZERO later POST. Only a NEW `/approve_deploy` can resume, which re-checks fresh HEAD, fresh hidden state, fresh actor, fresh GitHub PR comments, and fresh running_image-only CLEAN gate.
-- **Final unsafe order:** Full-Coverage -> running_image-only CLEAN -> fresh exact approval comment -> final fresh PR/full HEAD -> persist command.phase=executing to GitHub FIRST -> Agent Core deploy POST.
+- **unsafe deploy POST:** if the POST outcome is unknown after the unsafe attempt begins, the command becomes `command.phase=uncertain`, `status=deploy-requested`, `approve_attempt.outcome=uncertain`, and there is ZERO later POST. Only a NEW `/approve_deploy` can resume, which re-checks fresh HEAD, fresh hidden state, fresh actor, fresh GitHub PR comments, and fresh runtime evidence.
+- **Final unsafe order:** select the compatible undeployed subset -> collect runtime preflight evidence -> revalidate the exact approval comment and actor -> final fresh non-draft PR/full HEAD -> persist `command.phase=executing` to GitHub FIRST -> Agent Core deploy POST.
 - **approval_revoked:** final fresh approval comment revalidation checks: comment object valid, comment id exact, actor id exact, body parses as approve_deploy, machine alias exact. If any check fails (comment deleted, changed, malformed, actor mismatch, machine alias mismatch, or cannot be revalidated): `approve_attempt.outcome=approval_revoked`, `status=deploy-requested`, `command.phase=completed`, cursor advances to current comment, ZERO deploy POST. Machine Owner must send a NEW `/approve_deploy`. `approval_revoked` is not a top-level status and does not introduce a new lifecycle state.
-- **Success goes directly to testing:** Full-coverage approval + clean pass + successful deploy = status: testing directly. No intermediate machine-group progress check.
+- **Partial progress:** zero coverage performs ZERO deploy POST and requires a NEW approval for a compatible machine. A successful partial subset is persisted and remains `deploy-requested`; only after every component is durably deployed does status advance to `testing`.
+- **Post-deploy verification:** non-core components require `status=running` and exact target image. Core uses update-check/update and exact non-empty `current_tag == target_tag`; core is deployed last.
+- **Draft hard gate:** `/request_deploy`, `/approve_deploy`, and the final fresh validation before an unsafe POST all require an open, unmerged, non-draft PR.
 - **Evidence lookup:** `/request_deploy` performs an exact current-HEAD Review Agent comment evidence lookup from GitHub PR Conversation.
 - **PR Author only:** Only the GitHub PR author can run `/request_deploy`.
 - **Authorization:** `/approve_deploy` requires the actor to be the selected machine owner OR a write/maintain/admin repo collaborator. `/record_test` requires the actor to be an owner of any actually deployed machine OR a write/maintain/admin repo collaborator. Self-approval is allowed when the actor satisfies one of the above authorization conditions (e.g. PR author is also a machine owner). Numeric GitHub user ID is checked against fresh PR author ID at approval gates only for collaborator permission resolution, not as an additional self-approval gate.
@@ -215,7 +217,7 @@ machines:
       - linux/arm64
 ```
 
-- `alias`: top-level key under `machines`, used in `/approve_deploy machine=<alias>`
+- `alias`: canonical machine identifier (top-level key under `machines`). The command accepts `/approve_deploy machine=<alias-or-ip>`; a literal IPv4 must resolve to exactly one machine and hidden state always persists the canonical alias.
 - `node_id`: Deploy Approval machine-policy internal unique machine identifier
 - `node_host`: fake example literal IPv4; real values live only in the local gitignored `deploy/deploy-approval/machines.yaml`
 - `owners`: GitHub login list (case-insensitive, deduplicated)

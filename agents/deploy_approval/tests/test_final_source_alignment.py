@@ -2,28 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import json
 import inspect
 import os
 import re
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 
-from ..agent_core_client import AgentCoreClient, AgentCoreError
-from ..case_runner import CaseRunner
+from ..agent_core_client import AgentCoreClient
 from ..config import Config
 from ..models import MachineInfo
 from ..policy import Policy
 # registry_client removed: Deploy Approval no longer accesses Registry
 from ..service import DeployController
 from ..github_state_proxy import GitHubStateProxy
-from .conftest import make_config
 
 
 def _text(path: str) -> str:

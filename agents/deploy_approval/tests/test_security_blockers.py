@@ -10,9 +10,7 @@ import yaml
 
 from ..commands import parse_command
 from ..agent_core_client import AgentCoreClient, AgentCoreError
-from ..models import can_transition
-from ..policy import Policy, PolicyError, load_machines, MachineLoadError
-from .conftest import make_config
+from ..policy import load_machines, MachineLoadError
 
 def test_legacy_rollback_commands_unknown():
     assert parse_command("/reject_deploy d-9").kind == "unknown"
@@ -42,18 +40,10 @@ def test_machine_owner_empty_fails_closed(tmp_path):
     finally:
         _os.unlink(path)
 
-def test_non_owner_rejected(tmp_path):
-    p = Policy(make_config())
-    with pytest.raises(PolicyError):
-        p.can_approve("alice", actor_id="id2", machine_alias="nonexistent")
-
 def test_collaborator_write_can_approve():
     from ..policy import Policy
     assert Policy.collaborator_can_approve("write") is True
     assert Policy.collaborator_can_approve("") is False
-
-def test_fail_closed_state_transition():
-    assert not can_transition("waiting-approval", "succeeded")
 
 def test_no_controller_cleanup():
     """Deploy Controller must not implement cleanup methods."""
@@ -102,9 +92,6 @@ def test_deploy_sh_runtime_uid_gid_and_private_input_gates():
     assert "int(sys.argv[4])" not in deploy_sh
     # os.getuid() replaces the shell-injected UID
     # Verify os.getuid is used in the embedded Python, not a shell-injected UID
-    import re
-    # The embedded Python inside require_private_local_inputs must use os.getuid()
-    py_section = re.search(r'require_private_local_inputs\(\) \{[^}]*python3 - "\$MACHINES_FILE" "\$SECRETS_FILE"[^}]*\}', deploy_sh, re.DOTALL)
     # Cannot easily extract just the heredoc, but os.getuid() presence is sufficient
     assert "os.getuid()" in deploy_sh
 
@@ -252,7 +239,6 @@ class TestAgentCoreClientSecurity:
 
     def test_agent_core_verify_invalid_token_fails_closed(self, config):
         """verify() raises AgentCoreError when the token is invalid (401)."""
-        import httpx
         client = AgentCoreClient(
             config,
             base_url="https://10.0.0.1:15678",

@@ -2,7 +2,7 @@
 #
 # version: 1
 # machines:
-#   <alias>:          # unique, non-empty, used in /approve_deploy machine=<alias>
+#   <alias>:          # canonical machine identifier; /approve_deploy accepts alias or unique literal IPv4
 #     node_id: <id>   # unique, non-empty machine-policy identifier
 #     node_host: <ipv4>  # literal IPv4 used to reach Agent Core at https://<node_host>:15678
 #     owners:         # non-empty list of GitHub logins (case-insensitive, deduped)

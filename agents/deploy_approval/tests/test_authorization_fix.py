@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -646,7 +645,7 @@ async def test_startup_main_only_active_repos():
 
     try:
         app = create_app(cfg)
-        with TestClient(app) as client:
+        with TestClient(app):
             # Trigger lifespan by entering the test client context
             pass
     finally:
@@ -1345,7 +1344,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
     single finally block exactly once - no duplicate cleanup from dual
     call sites."""
     import tempfile
-    from fastapi.testclient import TestClient
     from ..server import create_app
     from ..config import Config
     import agents.deploy_approval.server as server_mod
@@ -1359,7 +1357,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
         'stop': 0,
         'aclose': 0,
         'gh_close': 0,
-        'reg_close': 0,
         'auth_close': 0,
     }
 
@@ -1393,11 +1390,6 @@ async def test_lifespan_body_exception_cleanup_runs_once():
         async def aclose(self):
             cleanup_counts['gh_close'] += 1
             raise RuntimeError('github close failed')
-
-
-        async def aclose(self):
-            cleanup_counts['reg_close'] += 1
-            raise RuntimeError('registry close failed')
 
     class FakeAppAuthCounting:
         app_id = 'test-app'
@@ -1476,7 +1468,6 @@ async def test_normal_shutdown_cleanup_exactly_once():
         'stop': 0,
         'aclose': 0,
         'gh_close': 0,
-        'reg_close': 0,
         'auth_close': 0,
     }
 
@@ -1507,10 +1498,6 @@ async def test_normal_shutdown_cleanup_exactly_once():
 
         async def aclose(self):
             cleanup_counts['gh_close'] += 1
-
-
-        async def aclose(self):
-            cleanup_counts['reg_close'] += 1
 
     class FakeAppAuthNormal:
         app_id = 'test-app'

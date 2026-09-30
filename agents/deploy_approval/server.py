@@ -170,7 +170,7 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
                     if name in fresh_exact:
                         repo_summary["available"].append(name)
                         continue
-                except Exception as exc:
+                except Exception:
                     pass
                 logger.warning(
                     "label bootstrap create failed for %s %s: %s",

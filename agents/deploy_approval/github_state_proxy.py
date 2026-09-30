@@ -664,7 +664,7 @@ def _parse_visible_history(body: str) -> tuple[str, list[dict]]:
                 m = re.search(r"`([^`]*)`", line)
                 if m:
                     evt["machine"] = m.group(1)
-                ip_m = re.search(r"\u00b7\s+\**IP:**\s+`([^`]*)`", line)
+                ip_m = re.search("\u00b7\\s+\\*\\*IP:\\*\\*\\s+`([^`]*)`", line)
                 if ip_m:
                     evt["ip"] = ip_m.group(1)
             elif line.startswith("**Components:**"):
@@ -822,7 +822,7 @@ def _build_archive_body(
     archive_lines = [
         BOT_MARKER,
         archive_marker,
-        f"### Deploy Approval — History Archive #{page_num}",
+        f"### Deploy Approval — History Archive Page {page_num}",
         "",
     ]
     if extra_text:

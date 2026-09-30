@@ -149,7 +149,8 @@ NEW approve only
 
 ## Multi-Machine Partial Coverage
 
-`/approve_deploy machine=<alias>` 是 variant/platform generic 的单机审批，
+`/approve_deploy machine=<alias-or-ip>` 是 variant/platform generic 的单机审批。
+literal IPv4 必须唯一匹配本地配置中的机器，否则 fail closed；hidden state 始终持久化 canonical alias。
 但每次只处理该 machine 当前能够兼容的 undeployed components。流程首先分别计算：
 
 1. 所有 undeployed components；
@@ -345,7 +346,7 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 
 `/request_deploy` 的 actor 必须是当前 PR Author。
 
-`/approve_deploy machine=<alias>` 的 actor 必须满足以下任一条件：
+`/approve_deploy machine=<alias-or-ip>` 的 actor 必须满足以下任一条件：
 
 - 是选中机器 `owners[]` 中的 owner
 - repo permission 为 `write`、`maintain` 或 `admin`
@@ -388,7 +389,7 @@ Deploy Controller 命令之间完全无状态。active runtime path 禁止依赖
 
 ## /approve_deploy：selected subset preflight 与 unsafe execution
 
-`/approve_deploy machine=<alias>` 每一条 NEW command 都必须重新读取：
+`/approve_deploy machine=<alias-or-ip>` 每一条 NEW command 都必须重新读取：
 
 - PR state
 - full HEAD
@@ -673,7 +674,7 @@ fetch/filter comments
 
 ### Machine Owner
 
-- `/approve_deploy machine=<alias>`
+- `/approve_deploy machine=<alias-or-ip>`
 - `/record_test result=pass|fail [summary="..."]`
 
 ### Read-only

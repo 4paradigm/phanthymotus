@@ -11,7 +11,6 @@ from ..config import (Config,
     load_config,
     validate_config,
     _env_bool,
-    _env_float,
     _env_int,
 )
 
@@ -116,15 +115,6 @@ def test_env_bool():
     with pytest.raises(ValueError):
         _env_bool("TEST_BOOL")
     del os.environ["TEST_BOOL"]
-
-
-def test_env_float():
-    os.environ["TEST_FLOAT"] = "3.5"
-    assert _env_float("TEST_FLOAT", 1.0) == 3.5
-    os.environ["TEST_FLOAT"] = "0"
-    with pytest.raises(ValueError):
-        _env_float("TEST_FLOAT", 1.0)
-    del os.environ["TEST_FLOAT"]
 
 
 def test_config_env_override(monkeypatch, tmp_path):
@@ -232,7 +222,6 @@ def test_legacy_jetson_variant_is_normalized_once_or_rejected_explicitly(tmp_pat
 
 
 def test_driver_paths_required_for_driver_machine(config):
-    from ..policy import Policy
     import textwrap
     from pathlib import Path
     tmp_path = Path("/tmp/test_driver_paths_required")

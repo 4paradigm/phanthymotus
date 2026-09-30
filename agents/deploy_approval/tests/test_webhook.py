@@ -53,22 +53,14 @@ def test_empty_sig_rejected():
 @pytest.mark.asyncio
 async def test_unknown_repository_fails_closed(config):
     """Unknown repository must fail closed with 404."""
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import MagicMock, patch
     from ..router_webhook import webhook
     from starlette.exceptions import HTTPException
 
     config.webhook_enabled = True
     config.github_webhook_secret = "secret"
 
-    payload = {
-        "action": "created",
-        "repository": {"full_name": "evil/repo"},
-        "issue": {"number": 1, "pull_request": {}},
-        "comment": {"id": 99},
-    }
-
     mock_proxy = MagicMock()
-    mock_controller = MagicMock()
 
     _cfg = config
     class FakeApp:

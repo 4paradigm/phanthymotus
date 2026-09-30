@@ -6,7 +6,6 @@ Uses dummy private_key bytes (no PEM) and mock HTTP transport.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest

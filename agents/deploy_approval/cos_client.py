@@ -10,7 +10,6 @@ import asyncio
 import re
 import logging
 from datetime import datetime
-from typing import Any
 from zoneinfo import ZoneInfo
 
 from .config import Config

@@ -73,14 +73,6 @@ def _compact_image_ref(image_ref: str) -> str:
     return image_ref if image_ref else ""
 
 
-def _compact_running_image(image_ref: str) -> str:
-    """Compact display for running_image evidence."""
-    result = _short_digest(image_ref)
-    if result:
-        return result
-    return "occupied"
-
-
 def _escape(text: str) -> str:
     return (text or "").replace("`", "").replace("\r", " ").replace("\n", " ")[:500]
 
@@ -117,8 +109,8 @@ def _safe_download_url(url: str) -> str:
 def _build_table(builds: list[BuildInfo]) -> str:
     """Render the build results table for deploy-ready comment."""
     lines = [
-        "| build | target | variant/path | build | deploy approval |",
-        "|------:|--------|--------------|-------|-----------------|",
+        "| target | variant/path | build | deploy approval |",
+        "|--------|--------------|-------|-----------------|",
     ]
     for b in builds:
         variant = _escape(b.variant or b.driver_path or chr(0x2014))
@@ -127,7 +119,7 @@ def _build_table(builds: list[BuildInfo]) -> str:
         if not b.success:
             eligibility = "not deployable"
         lines.append(
-            f"| {b.idx} | {_escape(b.target)} | {variant} | {build_status} | {eligibility} |"
+            f"| {_escape(b.target)} | {variant} | {build_status} | {eligibility} |"
         )
     return "\n".join(lines)
 
@@ -217,47 +209,6 @@ def _workflow_lines(status: str) -> str:
 # ── History helpers ──────────────────────────────────────────────
 
 
-def _history_events_block(events: list[dict]) -> str:
-    """Render history events, newest first."""
-    if not events:
-        return "No history events yet."
-
-    lines = []
-    for evt in events:
-        ts = evt.get("timestamp", beijing_now_str())
-        title = evt.get("event", "Event")
-        lines.append(f"#### {ts} \u2014 {title}")
-        lines.append("")
-
-        lifecycle = evt.get("lifecycle", "")
-        if lifecycle:
-            lines.append(f"**Lifecycle:** {lifecycle}")
-            lines.append("")
-
-        machine = evt.get("machine", "")
-        ip = evt.get("ip", "")
-        if machine or ip:
-            if machine and ip:
-                lines.append(f"**Machine:** `{_escape(machine)}` \u00b7 **IP:** `{ip}`")
-            elif machine:
-                lines.append(f"**Machine:** `{_escape(machine)}`")
-            else:
-                lines.append(f"**IP:** `{ip}`")
-            lines.append("")
-
-        components = evt.get("components", "")
-        if components:
-            lines.append(f"**Components:** {components}")
-            lines.append("")
-
-        result = evt.get("result", "")
-        if result:
-            lines.append(f"**Result:** {result}")
-            lines.append("")
-
-    return "\n".join(lines)
-
-
 def _archives_link_block(archives: list[dict]) -> str:
     """Render archived history links."""
     if not archives:
@@ -268,9 +219,9 @@ def _archives_link_block(archives: list[dict]) -> str:
         page = arch.get("page", 1)
         url = arch.get("url", "")
         if url:
-            lines.append(f"- [History Archive #{page}]({url})")
+            lines.append(f"- [History Archive Page {page}]({url})")
         else:
-            lines.append(f"- History Archive #{page}")
+            lines.append(f"- History Archive Page {page}")
     lines.append("")
     return "\n".join(lines)
 
@@ -338,6 +289,7 @@ def reviewing(
 def deploy_ready(
     repo: str, pr_number: int, head_sha: str,
     builds: list[BuildInfo], last_lifecycle_event: str = "",
+    review_evidence: dict | None = None,
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -358,12 +310,32 @@ def deploy_ready(
         "",
         "`/request_deploy`",
         "",
+        "### Review evidence",
+        "",
+        f"- **Build Result:** {'success' if builds and all(b.success for b in builds) else 'failed'}",
+    ]
+    evidence = review_evidence or {}
+    if evidence.get("test_comment_id", 0) == 0:
+        lines.append("- **Tests:** not run")
+    elif evidence.get("test_skipped", False):
+        lines.append("- **Tests:** skipped")
+    else:
+        lines.append(
+            f"- **Tests:** {int(evidence.get('test_passed', 0))} passed / "
+            f"{int(evidence.get('test_failed', 0))} failed"
+        )
+    lines.extend([
+        "- **Code Review:** completed",
+        "",
+        "> Deploy Approval does not interpret Review Agent findings; "
+        "the developer/owner must read the Review Agent review comment.",
+        "",
         "### Components",
         "",
         _build_table(builds),
         "",
         last_lifecycle_event_line(last_lifecycle_event),
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -669,38 +641,6 @@ def failed_comment(
     return "\n".join(lines)
 
 
-def approve_deploy_revoked_comment(
-    repo: str, pr_number: int, head_sha: str, machine_alias: str,
-    last_lifecycle_event: str = "",
-) -> str:
-    lines = [
-        BOT_MARKER,
-        lifecycle_marker(repo, pr_number),
-        "### Deploy Approval \u2014 Lifecycle",
-        "",
-        "**Status:** `deploy-requested`",
-        f"**Bound HEAD:** `{_short(head_sha)}`",
-        f"**Repository:** `{repo}`",
-        "",
-        "### Workflow",
-        "",
-        _workflow_lines("deploy-requested"),
-        "",
-        "The approval command changed, was removed, or could not be revalidated "
-        "before deployment.",
-        "ZERO deployment was performed.",
-        "",
-        "### Next action",
-        "",
-        "**Machine Owner**",
-        "",
-        f"`/approve_deploy machine={machine_alias}`",
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
-    ]
-    return "\n".join(lines)
-
-
 def superseded_comment(
     repo: str, pr_number: int, old_head: str, new_head: str,
     last_lifecycle_event: str = "",
@@ -758,25 +698,6 @@ def uncertain_comment(
         "Only a NEW `/approve_deploy` starts recovery validation.",
         "",
         last_lifecycle_event_line(last_lifecycle_event),
-    ])
-
-
-def command_not_ready(
-    repo: str, pr_number: int, head_sha: str,
-    current_status: str, next_action_text: str,
-) -> str:
-    """Non-error comment for commands that are not yet ready."""
-    return "\n".join([
-        BOT_MARKER,
-        "### Deploy Approval \u2014 Command not ready",
-        "",
-        f"Current lifecycle: `{current_status}`",
-        "",
-        "### Next action",
-        "",
-        next_action_text,
-        "",
-        last_lifecycle_event_line(),
     ])
 
 

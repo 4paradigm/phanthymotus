@@ -99,22 +99,6 @@ def _redact_secrets(text: str) -> str:
 
     return text
 
-def _case_id_for_target(target: str) -> str:
-    if target == "perception":
-        return "perception-health-check"
-    if target == "actucore":
-        return "actucore-health-check"
-    if target == "driver":
-        return "driver-health-check"
-    return ""
-
-
-def _sanitize_text(value: str) -> str:
-    text = str(value or "")
-    # Apply comprehensive secret redaction
-    text = _redact_secrets(text)
-    return text
-
 
 def _sanitize_for_evidence(value: str) -> str:
     """Prepare a string for inclusion in evidence files.

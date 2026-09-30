@@ -10,13 +10,12 @@ import types
 from types import SimpleNamespace
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from ..case_runner import CaseRunner
-from ..config import Config
 from ..cos_client import CosClient
-from ..github_state_proxy import GitHubStateProxy
-from ..models import ALL_STATUSES, MachineInfo
+from ..github_state_proxy import GitHubStateProxy, MalformedHiddenStateError, _validate_hidden_state
+from ..models import MachineInfo
 from ..policy import Policy
 from ..router_webhook import webhook
 from ..service import DeployController
@@ -700,7 +699,7 @@ def _deploy_requested_state(components=None, deployments=None, **overrides):
 
 
 @pytest.mark.asyncio
-async def test_clean_gate_ignores_runtime_status_when_image_empty(controller, proxy, mock_github):
+async def test_final_validation_ignores_runtime_status_when_image_empty(controller, proxy, mock_github):
     state = _deploy_requested_state()
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
@@ -761,7 +760,7 @@ async def test_existing_running_image_allows_normal_agent_core_upgrade(controlle
     assert written_state["last_processed_comment_id"] == 202
 
 @pytest.mark.asyncio
-async def test_clean_gate_preflights_all_components_before_any_deploy(controller, proxy, mock_github):
+async def test_final_validation_preflights_all_components_before_any_deploy(controller, proxy, mock_github):
     controller.policy.machines["test-machine"].variants = ["5.11", "6.1"]
     controller.policy.machines["test-machine"].targets = ["perception", "actucore"]
     components = [
@@ -833,11 +832,11 @@ async def test_new_approve_rechecks_running_image_until_empty(controller, proxy,
     await controller.handle_approve_deploy("repo", 1, 204, "test-machine", "owner1", "1")
     await controller.handle_approve_deploy("repo", 1, 205, "test-machine", "owner1", "1")
 
-    # With the new clean gate, running_image is evidence not a block -> both calls deploy
+    # running_image is preflight evidence, not a block -> both calls deploy
     assert core.deploy_driver.call_count == 2
 
 @pytest.mark.asyncio
-async def test_clean_gate_writes_executing_before_first_deploy_post(controller, proxy, mock_github):
+async def test_final_validation_writes_executing_before_first_deploy_post(controller, proxy, mock_github):
     state = _deploy_requested_state()
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.project_status_label = AsyncMock()
@@ -1009,8 +1008,9 @@ async def test_uncertain_missing_exact_review_job_requires_new_review(controller
     assert written_state["last_processed_comment_id"] == 52
 
 
-def test_top_level_statuses_are_exactly_seven():
-    assert set(ALL_STATUSES) == {
+def test_hidden_state_validator_accepts_exact_canonical_statuses():
+    """The production validator accepts exactly the 7 canonical statuses."""
+    canonical = [
         "review-required",
         "reviewing",
         "deploy-ready",
@@ -1018,7 +1018,15 @@ def test_top_level_statuses_are_exactly_seven():
         "testing",
         "succeeded",
         "failed",
-    }
+    ]
+    for status in canonical:
+        # Use the existing fully-valid hidden-state fixture; the validator
+        # additionally requires test_result == "pass" for "succeeded".
+        state = _state(status=status, test_result="pass" if status == "succeeded" else "")
+        assert _validate_hidden_state(state) == state
+    # Any non-canonical status must fail closed.
+    with pytest.raises(MalformedHiddenStateError):
+        _validate_hidden_state(_state(status="not-a-status"))
 
 
 @pytest.mark.asyncio
@@ -1126,7 +1134,7 @@ async def test_all_machine_groups_deployed_enters_testing(controller, proxy, moc
 
 
 @pytest.mark.asyncio
-async def test_two_machine_approval_sequence_enters_testing_only_after_full_coverage(controller, proxy, mock_github):
+async def test_two_machine_approval_sequence_enters_testing_only_after_all_components_deployed(controller, proxy, mock_github):
     """Two machines sequentially deploy their compatible subsets.
     After both machines have deployed, status transitions to testing."""
     # Four components: perception 5.11, actucore 5.11, perception 6.1, actucore 6.1
@@ -1185,7 +1193,7 @@ async def test_two_machine_approval_sequence_enters_testing_only_after_full_cove
     # First machine: 2 deploy POST (5.11 only)
     assert core.deploy_driver.call_count == 2
     written_state = proxy.write_hidden_state.call_args.args[3]
-    assert written_state["status"] == "deploy-requested"  # not full coverage
+    assert written_state["status"] == "deploy-requested"  # not all components durably deployed yet
     # Only 5.11 components deployed
     dep_components = []
     for dep in written_state["deployments"]:
@@ -1228,7 +1236,7 @@ async def test_two_machine_approval_sequence_enters_testing_only_after_full_cove
     # Second machine: 2 more deploy POST (6.1 only)
     assert core2.deploy_driver.call_count == 2
     final_state = proxy.write_hidden_state.call_args.args[3]
-    assert final_state["status"] == "testing"  # FULL coverage -> testing
+    assert final_state["status"] == "testing"  # all components durably deployed -> testing
     # All 4 components now deployed
     final_dep_components = []
     for dep in final_state["deployments"]:
@@ -1237,7 +1245,7 @@ async def test_two_machine_approval_sequence_enters_testing_only_after_full_cove
     assert "comp-actucore511" in final_dep_components
     assert "comp-perc61" in final_dep_components
     assert "comp-actucore61" in final_dep_components
-    # Automated case runs ONCE after full coverage
+    # Automated case runs ONCE after all components durably deployed
     assert controller._run_automated_case.call_count == 1
 
 
@@ -1376,7 +1384,7 @@ async def test_multi_machine_partial_coverage_is_variant_and_platform_generic(co
     # 2 more deploy POST (beta only)
     assert core2.deploy_driver.call_count == 2
     final_state = proxy.write_hidden_state.call_args.args[3]
-    assert final_state["status"] == "testing"  # FULL coverage
+    assert final_state["status"] == "testing"  # all components durably deployed
     final_dep_components = []
     for dep in final_state["deployments"]:
         final_dep_components.extend(dep.get("component_ids", []))
@@ -1607,7 +1615,6 @@ async def test_post_deploy_old_image_never_becomes_target_is_uncertain_and_not_d
         {"id": "perception", "target": "perception", "image": "registry/repo", "variant": "5.11"},
     ])
     old_image = "registry/repo@sha256:" + "b" * 64
-    target_image = "registry/repo@sha256:" + "a" * 64
     core.driver_status = AsyncMock(return_value={"status": "running", "running_image": old_image})
     core.deploy_driver = AsyncMock(return_value={"ok": True})
     controller._core_for_node = AsyncMock(return_value=core)

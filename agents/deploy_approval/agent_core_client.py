@@ -12,7 +12,6 @@ each machine's Agent Core without certificate pinning.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import httpx
@@ -323,10 +322,9 @@ class AgentCoreClient:
             raise AgentCoreError("deploy_driver driver_id must not contain whitespace")
         driver_id = _validate_api_path_segment(driver_id, "deploy_driver driver_id")
         try:
-            validated_image = validate_image_ref(image)
+            validate_image_ref(image)
         except ValueError as exc:
             raise AgentCoreError(str(exc)) from exc
-        # validated_image == image — passed verbatim as {"image": image}
         path = f"/api/drivers/{driver_id}/deploy"
         url = self.base_url + path
         try:

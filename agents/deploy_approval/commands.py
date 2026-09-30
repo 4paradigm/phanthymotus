@@ -212,7 +212,6 @@ def parse_command(comment_text: str) -> ParsedCommand:
     if not comment_text:
         return ParsedCommand(kind="unknown", raw="")
     for raw_line in _iter_top_level_command_lines(comment_text):
-        line = raw_line.lstrip()[1:]  # strip leading "/" and any whitespace after
         try:
             tokens = shlex.split(raw_line)
         except ValueError:
@@ -276,14 +275,6 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
             kind="deploy_help", help_topic=topic, raw=raw
         )
     return ParsedCommand(kind="unknown", raw="")
-
-
-def command_starts_line(text: str, kind: str) -> bool:
-    prefix = "/" + kind
-    for line in _iter_top_level_command_lines(text):
-        if line.startswith(prefix):
-            return True
-    return False
 
 
 def command_starts_line_any(text: str) -> bool:
