@@ -82,9 +82,32 @@ is already installed in the Perception image. It sees only mp3/wav bytes on stdi
 with the `pipe` protocol allowed; it cannot fetch nested media URLs.
 
 URLs and every redirect require HTTPS without embedded credentials. Connections
-use TLS verification and one DNS resolution pinned to public IPs; private,
+use TLS verification and validated DNS results pinned to public IPs; private,
 loopback and link-local addresses are refused. Environment proxies are bypassed
 for audio. Signed URLs and response bodies are not copied into player errors.
+
+Some system proxy/TUN configurations synthesize `198.18.0.0/15` fake-IP answers.
+If **every** address for an audio hostname is in that range, the client asks the
+fixed [Cloudflare HTTPS DNS endpoint](https://developers.cloudflare.com/1.1.1.1/encryption/dns-over-https/make-api-requests/dns-json/)
+for public IPv4 addresses and connects only to a revalidated numeric address.
+On a transport failure, HTTP 429 or 5xx, it can try the fixed
+[Google HTTPS DNS endpoint](https://developers.google.com/speed/public-dns/docs/doh/json)
+once. Invalid/private DNS answers and redirects fail without trying a different
+resolver.
+Normal public DNS results never trigger this extra lookup. Literal fake IPs,
+other private addresses and mixed public/private answers remain rejected; the
+client never connects the audio request to the fake IP. Redirect destinations go
+through the same checks, with the original hostname retained for TLS/SNI.
+
+The DNS request contains only the hostname (no audio path, signed query or API
+key), disables EDNS client-subnet forwarding, requires verified HTTPS, refuses
+redirects and bounds response size to 16 KiB. Its network timeout is capped at
+3 seconds per resolver within an 8-second DNS budget and the connection budget.
+Resolver bootstrap uses system DNS and certificate/hostname verification;
+no machine-wide DNS/proxy settings are changed. If the resolver is unreachable
+or returns no valid public IPv4 address, playback fails with an actionable DNS
+message. Configure real DNS or exclude audio domains from the proxy's fake-IP
+mode in that environment; private audio access is never an automatic fallback.
 
 Downloads are limited to 50 MiB / 30 minutes of decoded PCM, with 10-second HTTP
 timeouts, a 2-second decoded queue and a 20-second speech queue. Pausing applies

@@ -9,13 +9,16 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlsplit
 import wave
 
 from vision_stubs import _FakeExecutor, _FakeAudioChunk
 import numpy as np
 
 from plugins.music import MusicPlugin, TOOLS, OUTPUT_TOPIC, FORMAT
-from plugins.music_decoder import Decoder, _public_connection, validate_url, _HTTPSRedirect
+from plugins.music_decoder import (Decoder, AudioAddressError, _public_connection,
+                                  _public_dns_addresses, validate_url, _HTTPSRedirect,
+                                  _DNSNoRedirect, _PublicHTTPSConnection)
 from plugins.music_player import MusicPlayer, AUDIO_EOF, FRAME_BYTES, MAX_VOICE_BYTES
 
 
@@ -307,6 +310,10 @@ class PluginTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    @staticmethod
+    def dns_rows(*ips):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, 443)) for ip in ips]
+
     def test_url_validation_and_redirect_downgrade(self):
         for url in ('http://audio.example/a', 'file:///etc/passwd', 'https://user:pass@audio.example/a', 'https://audio.example/a#x'):
             with self.assertRaises(ValueError):
@@ -322,10 +329,110 @@ class TransportTests(unittest.TestCase):
                 sock.assert_not_called()
 
     def test_connect_uses_validated_ip_without_second_dns_lookup(self):
-        with patch('socket.getaddrinfo', return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('1.1.1.1', 443))]) as resolve, patch('socket.socket') as sock:
+        with patch('socket.getaddrinfo', return_value=self.dns_rows('1.1.1.1')) as resolve, \
+             patch('socket.socket') as sock, patch('plugins.music_decoder._public_dns_addresses') as fallback:
             _public_connection(('audio.example', 443))
+            fallback.assert_not_called()
         resolve.assert_called_once()
         sock.return_value.connect.assert_called_once_with(('1.1.1.1', 443))
+
+    def test_fake_ip_uses_verified_resolver_result_and_pins_media_connection(self):
+        opener = Mock()
+        opener.open.return_value = io.BytesIO(json.dumps({'Status': 0, 'Answer': [
+            {'type': 5, 'data': 'cdn.example.'}, {'type': 1, 'data': '1.1.1.1'}]}).encode())
+        with patch('socket.getaddrinfo', return_value=self.dns_rows('198.18.0.7')) as resolve, \
+             patch('urllib.request.build_opener', return_value=opener), patch('socket.socket') as sock:
+            _public_connection(('audio.example', 443))
+        resolve.assert_called_once_with('audio.example', 443, type=socket.SOCK_STREAM)
+        sock.return_value.connect.assert_called_once_with(('1.1.1.1', 443))
+        request = opener.open.call_args.args[0]
+        url = urlsplit(request.full_url)
+        self.assertEqual((url.scheme, url.netloc, url.path), ('https', 'cloudflare-dns.com', '/dns-query'))
+        self.assertEqual(parse_qs(url.query), {'name': ['audio.example'], 'type': ['A'],
+                                              'edns_client_subnet': ['0.0.0.0/0']})
+        self.assertFalse(request.has_header('Authorization'))
+        self.assertLessEqual(opener.open.call_args.kwargs['timeout'], 3)
+
+    def test_fake_ip_fallback_never_exempts_private_mixed_or_literal_targets(self):
+        for host, ips in (
+            ('198.18.0.7', ('198.18.0.7',)), ('audio.example', ('127.0.0.1',)),
+            ('audio.example', ('10.0.0.1',)), ('audio.example', ('169.254.169.254',)),
+            ('audio.example', ('198.18.0.7', '1.1.1.1')),
+            ('audio.example', ('198.18.0.7', '10.0.0.1')),
+        ):
+            with self.subTest(host=host, ips=ips), \
+                 patch('socket.getaddrinfo', return_value=self.dns_rows(*ips)), \
+                 patch('plugins.music_decoder._public_dns_addresses') as fallback, patch('socket.socket') as sock:
+                with self.assertRaises(AudioAddressError):
+                    _public_connection((host, 443))
+                fallback.assert_not_called()
+                sock.assert_not_called()
+
+    def test_fallback_addresses_are_checked_again_at_connection_boundary(self):
+        with patch('socket.getaddrinfo', return_value=self.dns_rows('198.18.0.7')), \
+             patch('plugins.music_decoder._public_dns_addresses', return_value=['10.0.0.1']), \
+             patch('socket.socket') as sock:
+            with self.assertRaises(AudioAddressError):
+                _public_connection(('audio.example', 443))
+            sock.assert_not_called()
+
+    def test_dns_bad_responses_are_bounded_and_fail_closed(self):
+        payloads = [[], {'Status': 2}, {'Status': 0, 'Answer': []},
+                    {'Status': 0, 'TC': True, 'Answer': [{'type': 1, 'data': '1.1.1.1'}]},
+                    {'Status': 0, 'Answer': [{'type': 1, 'data': '1.1.1.1'}, {'type': 1, 'data': '10.0.0.1'}]},
+                    {'Status': 0, 'Answer': [{'type': 1, 'data': '198.18.0.8'}]},
+                    {'Status': 0, 'Answer': [{'type': 1, 'data': 'not-an-ip'}]}, b'x' * 16385]
+        for payload in payloads:
+            opener = Mock()
+            opener.open.return_value = io.BytesIO(payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+            with self.subTest(payload_type=type(payload).__name__), patch('urllib.request.build_opener', return_value=opener):
+                with self.assertRaisesRegex(AudioAddressError, 'proxy fake-IP'):
+                    _public_dns_addresses('audio.example', 10)
+                opener.open.assert_called_once()  # Invalid answers never try another resolver.
+
+    def test_dns_deadline_and_failures_have_at_most_two_resolver_requests(self):
+        with patch('urllib.request.build_opener') as opener:
+            with self.assertRaises(AudioAddressError):
+                _public_dns_addresses('audio.example', 0)
+            opener.assert_not_called()
+        opener = Mock()
+        opener.open.side_effect = TimeoutError()
+        with patch('urllib.request.build_opener', return_value=opener):
+            with self.assertRaisesRegex(AudioAddressError, 'configure real DNS'):
+                _public_dns_addresses('audio.example', 10)
+        self.assertEqual(opener.open.call_count, 2)
+        with self.assertRaises(AudioAddressError):
+            _DNSNoRedirect().redirect_request(None, None, 302, '', {}, 'https://other.example/')
+
+    def test_dns_second_resolver_recovers_from_first_transport_timeout(self):
+        opener = Mock()
+        opener.open.side_effect = [TimeoutError(), io.BytesIO(json.dumps({
+            'Status': 0, 'Answer': [{'type': 1, 'data': '1.1.1.1'}]}).encode())]
+        with patch('urllib.request.build_opener', return_value=opener):
+            self.assertEqual(_public_dns_addresses('audio.example', 10), ['1.1.1.1'])
+        self.assertEqual([urlsplit(call.args[0].full_url).hostname for call in opener.open.call_args_list],
+                         ['cloudflare-dns.com', 'dns.google'])
+
+    def test_media_tls_still_checks_certificate_and_hostname(self):
+        import ssl
+        connection = _PublicHTTPSConnection('audio.example', timeout=10)
+        try:
+            self.assertTrue(connection._context.check_hostname)
+            self.assertEqual(connection._context.verify_mode, ssl.CERT_REQUIRED)
+        finally:
+            connection.close()
+
+    def test_address_failure_is_actionable_without_leaking_url(self):
+        message = 'Audio DNS returned a proxy fake-IP, but public DNS lookup failed; configure real DNS'
+        with patch('plugins.music_decoder.open_audio', side_effect=AudioAddressError(message)):
+            decoder = Decoder('https://audio.example/a.mp3?signature=fake-secret', ffmpeg=ffmpeg_path(self))
+            decoder.start()
+            try:
+                self.assertTrue(decoder.done.wait(3))
+                self.assertEqual(decoder.error, message)
+                self.assertNotIn('fake-secret', decoder.error)
+            finally:
+                decoder.close()
 
     def test_real_ffmpeg_decodes_generated_wav_without_saving_audio(self):
         ffmpeg = ffmpeg_path(self)

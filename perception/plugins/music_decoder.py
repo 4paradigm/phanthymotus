@@ -1,17 +1,95 @@
 """Bounded, cancellable HTTPS → ffmpeg → PCM stream. Audio never goes to disk."""
 import http.client
 import ipaddress
+import json
 import queue
 import socket
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 FRAME_BYTES = 3200  # 100 ms, PCM S16LE / 16 kHz / mono
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 MAX_PCM_BYTES = 1800 * 32000
+_FAKE_IP_RANGE = ipaddress.ip_network('198.18.0.0/15')
+_DNS_RESPONSE_LIMIT = 16384
+
+
+class AudioAddressError(ValueError):
+    """Safe, actionable transport messages: never contain a URL or response body."""
+
+
+class _DNSNoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise AudioAddressError('Public DNS redirect refused; configure real DNS for audio')
+
+
+def _query_public_dns(endpoint, host, timeout):
+    deadline = time.monotonic() + timeout
+    url = endpoint + '?' + urlencode({
+        'name': host.encode('idna').decode('ascii'), 'type': 'A',
+        'edns_client_subnet': '0.0.0.0/0'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _DNSNoRedirect())
+    request = urllib.request.Request(url, headers={'Accept': 'application/dns-json'})
+    with opener.open(request, timeout=timeout) as response:
+        body = bytearray()
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            chunk = response.read1(4096)
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > _DNS_RESPONSE_LIMIT:
+                raise ValueError
+    data = json.loads(body)
+    if not isinstance(data, dict):
+        raise ValueError
+    answers = data.get('Answer')
+    if (type(data.get('Status')) is not int or data['Status'] != 0
+            or data.get('TC') or not isinstance(answers, list)
+            or not 1 <= len(answers) <= 32):
+        raise ValueError
+    addresses = []
+    for record in answers:
+        if not isinstance(record, dict):
+            raise ValueError
+        if record.get('type') == 1:
+            ip = ipaddress.ip_address(record['data'])
+            if ip.version != 4 or not ip.is_global:
+                raise ValueError
+            addresses.append(str(ip))
+    if not addresses:
+        raise ValueError
+    return list(dict.fromkeys(addresses))
+
+
+def _public_dns_addresses(host, timeout):
+    """Recover only proxy fake-IP answers using fixed, verified HTTPS resolvers.
+
+    Send only the hostname, never a media path/query or catalogue credential.
+    Network failures may try the second resolver; an invalid/private answer or
+    redirect fails closed instead of shopping for a more permissive answer.
+    """
+    deadline = time.monotonic() + min(8.0, timeout)
+    for endpoint in ('https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return _query_public_dns(endpoint, host, min(3.0, remaining))
+        except (OSError, http.client.HTTPException) as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
+                if exc.code != 429 and exc.code < 500:
+                    break
+        except (ValueError, TypeError, KeyError):
+            break
+    raise AudioAddressError('Audio DNS returned a proxy fake-IP, but public DNS lookup failed; '
+                            'configure real DNS or exclude audio domains from proxy fake-IP') from None
 
 
 def validate_url(url):
@@ -30,16 +108,29 @@ def validate_url(url):
 
 
 def _public_connection(address, timeout=10, source_address=None):
-    """Resolve once, check every address, connect to that IP (no DNS rebinding)."""
+    """Validate/pin DNS results; replace only an all-fake-IP answer, never private IPs."""
     host, port = address
+    deadline = time.monotonic() + timeout
     addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    ips = [ipaddress.ip_address(item[4][0]) for item in addresses]
+    if ips and all(ip in _FAKE_IP_RANGE for ip in ips):
+        # A literal non-public IP is never a DNS compatibility case.
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            resolved = _public_dns_addresses(host, deadline - time.monotonic())
+            addresses = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (ip, port))
+                         for ip in resolved]
     if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
-        raise ValueError('Audio hosts must resolve only to public addresses')
+        raise AudioAddressError('Audio host must resolve only to public addresses; private/local audio is not allowed')
     last_error = None
     for family, socktype, proto, _, sockaddr in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Audio connection timed out')
         sock = socket.socket(family, socktype, proto)
         try:
-            sock.settimeout(timeout)
+            sock.settimeout(remaining)
             if source_address:
                 sock.bind(source_address)
             sock.connect(sockaddr)
@@ -109,7 +200,8 @@ class Decoder:
         except Exception as exc:
             if not self.cancelled.is_set():
                 # Do not put signed URLs or remote response bodies in status/logs.
-                self.error = ('Audio URL expired or unavailable; refresh the track by ID'
+                self.error = (str(exc) if isinstance(exc, AudioAddressError) else
+                              'Audio URL expired or unavailable; refresh the track by ID'
                               if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403, 404)
                               else 'Audio download failed or exceeded its limit')
                 self._kill()
