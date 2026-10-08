@@ -40,6 +40,66 @@ def make_plugin(cfg=None):
     return vd.VideoDepthPerceptionPlugin(dict(backend='depthart',**(cfg or {})),'test',_FakeExecutor())
 
 
+def test_model_selection_schema_and_manual_fields():
+    p = make_plugin()
+    props = p.get_tools()[0]['configSchema']['properties']
+    assert props['backend']['scope'] == 'shared'
+    assert props['backend']['default'] == 'depthart'
+    assert {o['const'] for o in props['backend']['oneOf']} == {'yolo', 'depthart'}
+    assert props['fps']['title'] == 'Inference FPS'
+    for key in ('cal_a', 'cal_b'):
+        assert props[key]['x-show-when'] == {'calibration_preset': vd.CAL_MANUAL}
+
+
+def test_idle_model_switch_is_lazy_and_resets_calibration():
+    p = make_plugin()
+    calls = []
+    p._model = types.SimpleNamespace(close=lambda: calls.append('closed'))
+    p._instance_configs['a'] = dict(fps=3, cal_a=2., cal_b=.2, calibration_preset=vd.CAL_MANUAL)
+    p._cal_samples = [{'measured_m': 1.}]
+    result = p.dispatch('visual_depth', dict(action='config', backend='yolo'))
+    assert result['status'] == 'configured' and p._backend == 'yolo'
+    assert p._model is None and calls == ['closed']
+    assert p._instance_configs['a'] == {'fps': 3}
+    assert (p._cal_a, p._cal_b) == (1., 0.) and not p._cal_samples
+    p.dispatch('visual_depth', dict(action='config', backend='yolo'))
+    assert calls == ['closed']
+
+
+@pytest.mark.parametrize('busy', ['node', 'loading', 'closing'])
+def test_model_switch_rejected_while_busy(busy):
+    p = make_plugin()
+    if busy == 'node':p._nodes['a'] = object()
+    elif busy == 'loading':p._model_loading = True
+    else:p._closing = True
+    result = p.dispatch('visual_depth', dict(action='config', backend='yolo'))
+    assert result['status'] == 'error' and result['adapter_ok'] is False
+    assert p._backend == 'depthart'
+
+
+def test_model_switch_during_loader_lock_is_nonblocking():
+    p = make_plugin()
+    with p._model_lock:
+        result = p.dispatch('visual_depth', dict(action='config', backend='yolo'))
+    assert result['status'] == 'error' and p._backend == 'depthart'
+
+
+def test_instance_cannot_switch_shared_model():
+    p = make_plugin()
+    result = p.dispatch('visual_depth', dict(action='config', backend='yolo', instance_id='a'))
+    assert result['adapter_ok'] is False and p._backend == 'depthart'
+
+
+def test_depthart_selection_requires_provisioned_assets(tmp_path):
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'error'
+    artifact = tmp_path / 'artifact'
+    artifact.write_bytes(b'test')
+    p._plugin_cfg.update(depthart_engine_path=str(artifact), depthart_plugin_path=str(artifact))
+    assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'configured'
+    assert p._model is None
+
+
 def test_laziness_missing_camera_and_presets(monkeypatch):
     p=make_plugin({'calibration_preset':vd.CAL_AUTO})
     monkeypatch.setattr(p,'_ensure_model',lambda:pytest.fail('unexpected model load'))
@@ -48,7 +108,7 @@ def test_laziness_missing_camera_and_presets(monkeypatch):
     assert p.dispatch('visual_depth',{'action':'start','input_topic':'/a'})['state']=='error'
     preset=next(iter(vd.CALIBRATION_PRESETS))
     assert p.dispatch('visual_depth',{'action':'config','calibration_preset':preset})['status']=='error'
-    assert p.dispatch('visual_depth',{'action':'config','backend':'yolo'})['status']=='error'
+    assert p.dispatch('visual_depth',{'action':'config','backend':'invalid'})['status']=='error'
     assert p._model is None
 
 

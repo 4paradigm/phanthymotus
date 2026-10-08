@@ -292,19 +292,21 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "fps":          {"type": "integer", "description": "Max inference frames per second", "default": 2, "scope": "instance"},
+                "backend": {"type": "string", "title": "Depth model", "description": "Shared by all cameras. Stop all depth instances before switching. DepthART requires provisioned engine/plugin files and camera intrinsics.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "default": "yolo", "scope": "shared"},
+                "fps":          {"type": "integer", "title": "Inference FPS", "description": "Maximum inference frames per second", "default": 2, "scope": "instance"},
                 # Log-affine site calibration, applied on top of the one baked
                 # into the engine: metres_out = metres_in**cal_a * exp(cal_b).
                 # Same two parameters ultralytics' model.calibrate() fits, so a
                 # result from there pastes in here unchanged. 1.0 / 0.0 is
                 # identity — i.e. trust the engine.
-                "cal_a": {"type": "number", "description": "站点标定指数 a（d^a）。默认 1.0 = 不额外修正，直接用 engine 自带的标定", "default": 1.0, "scope": "instance"},
-                "cal_b": {"type": "number", "description": "站点标定偏移 b（乘 e^b）。默认 0.0 = 不额外修正。与 ultralytics model.calibrate() 的 cal_b 同一参数", "default": 0.0, "scope": "instance"},
+                "cal_a": {"type": "number", "title": "Calibration a", "description": "Depth exponent; 1 means no exponent correction.", "default": 1.0, "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
+                "cal_b": {"type": "number", "title": "Calibration b", "description": "Log scale offset; 0 means no scale correction.", "default": 0.0, "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
                 # Presets are for the common case (a known robot, a known
                 # camera); cal_a/cal_b above stay for anything else, and a
                 # non-identity value there wins — see _calibration_from_cfg.
                 "calibration_preset": {
                     "type": "string",
+                    "title": "Calibration",
                     "enum": [CAL_AUTO, CAL_NONE, CAL_MANUAL]
                             + sorted(CALIBRATION_PRESETS),
                     "description": "深度标定从哪来。"
@@ -1521,15 +1523,53 @@ class VideoDepthPerceptionPlugin:
             return None
 
     def get_tools(self) -> list:
+        import copy
+        tools = copy.deepcopy(TOOLS)
+        props = tools[0]["configSchema"]["properties"]
+        props["backend"]["default"] = self._backend
+        tools[0]["configSchema"]["properties"] = {
+            key: props[key] for key in ("backend", "fps", "calibration_preset", "cal_a", "cal_b")
+        }
         if self._backend == "depthart":
-            import copy
-            tools = copy.deepcopy(TOOLS)
             preset = tools[0]["configSchema"]["properties"]["calibration_preset"]
             preset["enum"] = [CAL_NONE, CAL_MANUAL]
             preset["default"] = CAL_NONE
-            preset["description"] = "DepthART 使用相机内参与模型米制输出；可保持原输出，或手动做现场标定。YOLO 相机预设不适用于此模型。"
-            return tools
-        return TOOLS
+            preset["description"] = "Use metric output as-is, or apply manual site calibration. YOLO presets do not apply to DepthART."
+        return tools
+
+    def _select_backend(self, backend):
+        """Switch only an idle plugin; loading stays lazy and files stay external."""
+        if backend not in ("yolo", "depthart"):
+            raise ValueError(f"Unsupported depth model: {backend}")
+        if backend == self._backend:
+            return
+        if not self._model_lock.acquire(blocking=False):
+            raise ValueError("Depth model is busy; wait until loading finishes")
+        try:
+            with self._nodes_lock:
+                if self._nodes or self._model_loading or self._closing:
+                    raise ValueError("Stop all depth instances and wait for loading to finish before switching models")
+                if backend == "depthart":
+                    from pathlib import Path
+                    for key, env in (("depthart_engine_path", "DEPTHART_ENGINE_PATH"),
+                                     ("depthart_plugin_path", "DEPTHART_PLUGIN_PATH")):
+                        path = os.environ.get(env) or self._plugin_cfg.get(key)
+                        if not path or not Path(path).is_file():
+                            raise ValueError("DepthART files are not provisioned; configure matching engine and plugin paths first")
+                if self._model is not None:
+                    self._model.close()
+                    self._model = None
+                self._backend = backend
+                self._plugin_cfg["backend"] = backend
+                for config in [self._plugin_cfg, *self._instance_configs.values()]:
+                    for key in ("cal_a", "cal_b", "depth_scale", "calibration_preset"):
+                        config.pop(key, None)
+                self._cal_a, self._cal_b = 1.0, 0.0
+                self._cal_samples = []
+                self._cal_cfg_backup = None
+                self._model_load_error = self._model_load_status = None
+        finally:
+            self._model_lock.release()
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action", name)
@@ -1540,12 +1580,12 @@ class VideoDepthPerceptionPlugin:
                 # The declaration does not wait for the engine — see the same
                 # spot in plugins/vop.py for what dropping it cost.
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26n-depth", "state": "loading",
+                        "model": "depthart-metric-s" if self._backend == "depthart" else "yolo26n-depth", "state": "loading",
                         "desc": "Loading depth engine...",
                         **self._loading_camera_info(args, instance_id)}
             if self._model_load_error:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26n-depth", "state": "error",
+                        "model": "depthart-metric-s" if self._backend == "depthart" else "yolo26n-depth", "state": "error",
                         "desc": f"Engine load failed: {self._model_load_error}"}
 
             with self._nodes_lock:
@@ -1678,19 +1718,19 @@ class VideoDepthPerceptionPlugin:
                     if self._model_load_error:
                         return {"state": "error", "message": f"Engine failed to load: {self._model_load_error}"}
 
+                    self._model_loading = True
                     def _bg_start():
-                        self._model_loading = True
                         self._model_load_error = None
                         self._model_load_status = None
                         try:
                             self._ensure_model()
-                            self._model_loading = False
                             self._model_load_status = None
                             self._start_node(node_key, input_topic)
                         except Exception as e:
-                            self._model_loading = False
                             self._model_load_error = str(e)
                             log.error(f"[visual_depth] engine load failed: {e}", exc_info=True)
+                        finally:
+                            self._model_loading = False
 
                     threading.Thread(target=_bg_start, daemon=True, name="visual_depth_model_load").start()
                     return {"state": "loading", "input": input_topic,
@@ -1714,8 +1754,15 @@ class VideoDepthPerceptionPlugin:
         elif action == "config":
             cfg = {k: v for k, v in args.items()
                    if k not in ("action", "instance_id") and v is not None and v != ""}
-            if any(k in cfg for k in ("backend", "depthart_engine_path", "depthart_plugin_path")):
-                return {"status": "error", "message": "Model backend and artifact paths are startup settings; update the service configuration and restart"}
+            if any(k in cfg for k in ("depthart_engine_path", "depthart_plugin_path")):
+                return {"status": "error", "message": "Artifact paths are startup settings; update the service configuration and restart"}
+            if "backend" in cfg:
+                if instance_id:
+                    return {"status": "error", "adapter_ok": False, "message": "Depth model is shared; use the tool configuration, not instance configuration"}
+                try:
+                    self._select_backend(cfg.pop("backend"))
+                except ValueError as error:
+                    return {"status": "error", "adapter_ok": False, "message": str(error)}
             try:
                 cfg = self._backend_calibration_cfg(cfg)
             except ValueError as error:
