@@ -19,6 +19,10 @@ TAIL_PADDING_SECONDS = 0.3
 MAX_ACTIVE_PATHS = 3
 HOTWORDS_SCORE = 2.5
 
+# The native decoder reads this process-wide option during Decode, not construction.
+_EARLY_HOTWORD_ENV = "SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE"
+_DECODE_LOCK = threading.Lock()
+
 log = logging.getLogger(__name__)
 
 
@@ -199,6 +203,7 @@ class XASRAdapter:
         encoded_hotwords = root / "hotwords.bpe.txt"
         if not encoded_hotwords.is_file():
             encoded_hotwords = _prepare_hotwords_file(hotwords)
+        self._early_hotword_min_score = None
         if entity_boost:
             if not scale:
                 raise ValueError('Early entity boosting requires prefix LM scoring')
@@ -208,15 +213,13 @@ class XASRAdapter:
             if early_min <= HOTWORDS_SCORE:
                 raise ValueError(f'Entity per-token scores must exceed {HOTWORDS_SCORE + 0.1}')
             encoded_hotwords = _boost_hotwords(encoded_hotwords, entity_boost)
-            os.environ['SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE'] = f'{early_min:g}'
-        else:
-            os.environ.pop('SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE', None)
+            self._early_hotword_min_score = f'{early_min:g}'
         custom_file = _custom_hotwords_file(encoded_hotwords, custom_hotwords)
         if custom_file != encoded_hotwords:
             if not scale or getattr(sherpa_onnx, "XASR_EARLY_HOTWORD_VERSION", 0) != 1:
                 custom_file.unlink()
                 raise RuntimeError("自定义热词需要支持上下文辅助和热词增强的运行库")
-            os.environ["SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE"] = "3.9"
+            self._early_hotword_min_score = "3.9"
         try:
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
                 encoder=str(encoder),
@@ -238,7 +241,6 @@ class XASRAdapter:
         finally:
             if custom_file != encoded_hotwords:
                 custom_file.unlink(missing_ok=True)
-        self._decode_lock = threading.Lock()
         log.info(
             "[asr] X-ASR adapter loaded: encoder=%s, device=%s, provider=%s, "
             "max_active_paths=%d, hotwords_score=%.1f, tail_padding=%.2fs, prefix_lm_scale=%.3f",
@@ -266,9 +268,21 @@ class XASRAdapter:
         ]
         samples.extend([0.0] * int(sample_rate * self._tail_padding_seconds))
 
-        with self._decode_lock:
-            stream = self._recognizer.create_stream()
-            stream.accept_waveform(sample_rate, samples)
-            self._recognizer.decode_streams([stream])
-            result = stream.result
+        # Serialize all X-ASR adapters (plugin and WebSocket), not just this instance.
+        with _DECODE_LOCK:
+            previous = os.environ.get(_EARLY_HOTWORD_ENV)
+            try:
+                if self._early_hotword_min_score is None:
+                    os.environ.pop(_EARLY_HOTWORD_ENV, None)
+                else:
+                    os.environ[_EARLY_HOTWORD_ENV] = self._early_hotword_min_score
+                stream = self._recognizer.create_stream()
+                stream.accept_waveform(sample_rate, samples)
+                self._recognizer.decode_streams([stream])
+                result = stream.result
+            finally:
+                if previous is None:
+                    os.environ.pop(_EARLY_HOTWORD_ENV, None)
+                else:
+                    os.environ[_EARLY_HOTWORD_ENV] = previous
         return str(getattr(result, "text", result or "")).strip()

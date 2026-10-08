@@ -1035,6 +1035,11 @@ These controls and the former entity-score JSON are no longer exposed; saved
 legacy decoder settings do not override this recipe. The matching prefix/entity
 runtime is required. The LM is downloaded on X-ASR loading when missing. Other
 models do not acquire X-ASR hotword support by filling this field.
+Hotword thresholds belong to each adapter. Because the native runtime reads an
+environment variable during decoding, X-ASR decodes within one process are
+serialized while setting and restoring that adapter's threshold, including on
+errors. Constructing a recognizer does not modify the process environment.
+
 The main default model remains SenseVoice on CPU.
 
 ### Removed models
