@@ -83,6 +83,53 @@ def test_camera_requests_are_scoped_and_explicit():
     assert p._request_camera({'camera_info':camera(800)},'')['K'][0]==800
 
 
+@pytest.mark.parametrize('change', ['same', 'scaled', 'focal', 'identity', 'topic', 'missing'])
+def test_live_stream_start_preserves_camera_binding(change):
+    p = make_plugin()
+    bound = camera()
+    p._upstream_camera['a'] = bound
+    p._nodes['a'] = types.SimpleNamespace(_input_topic='/a', start=lambda: {'state': 'running'})
+    requested = camera()
+    topic = '/a'
+    if change == 'scaled':
+        requested['width'] *= 2
+        requested['height'] *= 2
+        requested['K'] = [v * 2 if i < 6 else v for i, v in enumerate(requested['K'])]
+    elif change == 'focal':requested = camera(700)
+    elif change == 'identity':requested['id'] = 'another-camera'
+    elif change == 'topic':topic = '/b'
+    args = dict(action='start', instance_id='a', input_topic=topic)
+    if change != 'missing':args['camera_info'] = {topic: requested}
+    result = p.dispatch('visual_depth', args)
+    assert result['state'] == ('running' if change in ('same', 'scaled') else 'error')
+    assert p._upstream_camera['a'] is bound
+    assert p._nodes['a']._input_topic == '/a'
+
+
+@pytest.mark.parametrize('bound', [False, True])
+def test_repeated_on_demand_start_does_not_rebind(bound):
+    p = make_plugin()
+    if bound:p._upstream_camera['a'] = camera()
+    p._nodes['a'] = types.SimpleNamespace(_input_topic=None, start=lambda: {'state': 'running'})
+    assert p.dispatch('visual_depth', dict(action='start', instance_id='a'))['state'] == 'running'
+    result = p.dispatch('visual_depth', dict(action='start', instance_id='a', camera_info=camera(700)))
+    assert result['state'] == 'error'
+    assert p._upstream_camera.get('a') == (camera() if bound else None)
+
+
+def test_stopped_instance_can_bind_a_new_camera(monkeypatch):
+    p = make_plugin()
+    class Model:
+        def for_camera(self, camera):return self
+    p._model = Model()
+    first = dict(action='start', instance_id='a', camera_info=camera())
+    assert p.dispatch('visual_depth', first)['state'] == 'running'
+    p.dispatch('visual_depth', dict(action='stop', instance_id='a'))
+    assert p.dispatch('visual_depth', dict(first, camera_info=camera(700)))['state'] == 'running'
+    assert p._upstream_camera['a']['K'][0] == 700
+    p.dispatch('visual_depth', dict(action='stop', instance_id='a'))
+
+
 def test_inactive_camera_metadata_is_not_used_for_photo():
     p=make_plugin();p._upstream_camera['failed-start']=camera()
     with pytest.raises(ValueError,match='running camera'):

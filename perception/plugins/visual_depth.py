@@ -1639,39 +1639,36 @@ class VideoDepthPerceptionPlugin:
             # recognize_by_url. It just has nothing to subscribe to.
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
 
-            # Recorded before the node starts, so `info()` can answer with it
-            # even while the engine is still loading — and recorded even when it
-            # is empty, so a restart that no longer carries a declaration
-            # replaces the old one rather than leaving a stale entry claiming a
-            # lens that is no longer wired.
+            declaration = upstream_camera
             if input_topic:
                 from plugins.camera_info import for_topic as _camera_for_topic
                 declaration = _camera_for_topic(upstream_camera, input_topic)
-                if self._backend == "depthart":
-                    from plugins.depthart_runtime import camera_matrix
-                    try:
-                        camera_matrix(declaration)
-                    except ValueError as error:
-                        return {"state": "error", "message": str(error)}
-                with self._nodes_lock:
-                    self._upstream_camera[node_key] = declaration
-            elif self._backend == "depthart" and upstream_camera is not None:
+            if self._backend == "depthart" and (input_topic or declaration is not None):
                 from plugins.depthart_runtime import camera_matrix
                 try:
-                    camera_matrix(upstream_camera)
+                    camera_matrix(declaration)
                 except ValueError as error:
                     return {"state": "error", "message": str(error)}
-                with self._nodes_lock:
-                    self._upstream_camera[node_key] = dict(upstream_camera)
-            elif self._backend == "depthart":
-                # Unbound on-demand cards require K on each photo. Only start
-                # binds a camera; a photo never changes the instance declaration.
-                with self._nodes_lock:
-                    if node_key not in self._nodes:
-                        self._upstream_camera.pop(node_key, None)
 
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
+                if self._backend == "depthart" and running is not None:
+                    if (running._input_topic or None) != (input_topic or None):
+                        return {"state": "error", "message": "Input topic differs from the running instance; stop before rebinding"}
+                    if declaration is not None:
+                        if not self._upstream_camera.get(node_key):
+                            return {"state": "error", "message": "Instance is unbound; stop before binding a camera"}
+                        try:
+                            self._request_camera({"camera_info": declaration}, node_key)
+                        except ValueError as error:
+                            return {"state": "error", "message": str(error)}
+                    return running.start()
+                # Only a new/stopped DepthART instance establishes a binding.
+                # Preserve YOLO's existing declaration-update behavior.
+                if input_topic or (self._backend == "depthart" and declaration is not None):
+                    self._upstream_camera[node_key] = dict(declaration)
+                elif self._backend == "depthart":
+                    self._upstream_camera.pop(node_key, None)
             if running is None:
                 if self._model is None:
                     if self._model_loading:
