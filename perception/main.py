@@ -207,6 +207,19 @@ class PerceptionBundle:
                 log.error("FaceRecognitionPlugin failed to load; continuing without it",
                           exc_info=True)
 
+        if plugins_cfg.get("face", {}).get("enabled", False):
+            # The SCRFD + EdgeFace stack in plugins/face_scrfd.py. A separate
+            # plugin from the face_recognition above, answering the `face.` tool
+            # prefix; guarded the same way — its failure hides its own card and
+            # must never take the neighbouring plugins down.
+            from plugins.face_scrfd import FaceRecognitionPlugin as FaceScrfdPlugin
+            try:
+                self._plugins.append(FaceScrfdPlugin(plugins_cfg["face"], executor))
+                log.info("FaceScrfdPlugin loaded")
+            except Exception:
+                log.error("FaceScrfdPlugin failed to load; continuing without it",
+                          exc_info=True)
+
     def _plugin_for(self, full_name: str):
         """Resolve a tool name to (plugin, action) by longest matching prefix.
 
