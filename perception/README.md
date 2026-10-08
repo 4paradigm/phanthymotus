@@ -1020,11 +1020,21 @@ of this FP32 path. CPU remains the global default. GPU uses additional runtime
 and inference memory; weight-file size is not the process or unified-memory
 footprint, and multiple-instance headroom must be checked on the target.
 
-X-ASR exposes optional `asr_beam_paths`, `asr_tail_pad_ms`,
-`asr_prefix_lm_scale` and `asr_entity_boost` settings. Prefix LM and early entity
-ranking require the corresponding full-runtime capabilities; entity boosts are
-per-token scores for packaged CJK phrases and require prefix LM. With entity
-boosting disabled, the original hotword table and ordinary ranking are restored.
+X-ASR's configuration card exposes a Chinese-labelled `asr_hotwords` text field:
+type a phrase and press Enter to add a removable tag, or paste multiple lines.
+Duplicates are removed and English phrase spaces are preserved. The stored value
+remains one phrase per line. The wake word
+is automatically merged into the hotwords. Clearing either field removes its
+contribution on the next adapter reload; packaged hotwords are never overwritten.
+Chinese characters and intact English words are passed to the runtime's BPE
+encoder. Custom/wake phrases use per-token score 4.0 with early ranking; other
+packaged phrases retain 2.5. These biases do not force an output or guarantee a match.
+
+The product recipe enables prefix LM at 0.05, beam 3 and trailing silence 300 ms.
+These controls and the former entity-score JSON are no longer exposed; saved
+legacy decoder settings do not override this recipe. The matching prefix/entity
+runtime is required. The LM is downloaded on X-ASR loading when missing. Other
+models do not acquire X-ASR hotword support by filling this field.
 The main default model remains SenseVoice on CPU.
 
 ### Removed models

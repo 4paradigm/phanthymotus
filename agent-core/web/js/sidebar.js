@@ -533,6 +533,73 @@ function _isStringList(def) {
   return def.type === 'array' && (def.items || {}).type === 'string';
 }
 
+/** Tags in the UI, newline-separated text on the existing config wire. */
+function _makeHotwordInput(key, def, saved) {
+  const box = document.createElement('div');
+  box.className = 'tool-config-hotwords';
+  box.dataset.key = key;
+  const tags = document.createElement('div');
+  tags.className = 'tool-config-hotword-tags';
+  const entry = document.createElement('input');
+  entry.type = 'text';
+  entry.className = 'tool-config-input';
+  entry.placeholder = '输入词语后按回车；也可粘贴多行';
+  entry.setAttribute('aria-label', '添加自定义热词');
+  const split = text => String(text ?? '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  let words = [...new Set(split(saved ?? def.default))];
+  // Include unfinished input when Save is clicked or keyboard-activated.
+  Object.defineProperty(box, 'value', {
+    get: () => [...new Set([...words, ...split(entry.value)])].join('\n'),
+  });
+  function render() {
+    tags.replaceChildren();
+    for (const word of words) {
+      const tag = document.createElement('span');
+      tag.className = 'tool-config-hotword-tag';
+      const label = document.createElement('span');
+      label.textContent = word;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = '×';
+      remove.setAttribute('aria-label', `删除热词：${word}`);
+      remove.addEventListener('click', () => {
+        words = words.filter(item => item !== word);
+        render();
+        entry.focus();
+      });
+      tag.appendChild(label);
+      tag.appendChild(remove);
+      tags.appendChild(tag);
+    }
+  }
+  function commit() {
+    words = [...new Set([...words, ...split(entry.value)])];
+    entry.value = '';
+    render();
+  }
+  entry.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) {
+      event.preventDefault();
+      commit();
+    }
+  });
+  entry.addEventListener('paste', event => {
+    const text = event.clipboardData.getData('text/plain');
+    if (!/[\r\n]/.test(text)) return;
+    event.preventDefault();
+    const combined = entry.value.slice(0, entry.selectionStart) + text
+      + entry.value.slice(entry.selectionEnd);
+    words = [...new Set([...words, ...split(combined)])];
+    entry.value = '';
+    render();
+  });
+  entry.addEventListener('blur', commit);
+  box.appendChild(tags);
+  box.appendChild(entry);
+  render();
+  return box;
+}
+
 /** Build the input element for a structured (object/array) config field. */
 function _makeStructuredInput(key, def, saved) {
   const value = saved !== undefined ? saved : def.default;
@@ -607,7 +674,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
 
-  titleEl.textContent = `Configure ${toolName}`;
+  titleEl.textContent = toolName === 'asr' ? '语音识别设置' : `Configure ${toolName}`;
   bodyEl.innerHTML = '';
 
   const props = configSchema.properties || {};
@@ -646,7 +713,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         if (String(savedValues[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key] != null) input.value = savedValues[key];
+      input.value = savedValues[key] ?? def.default ?? '';
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -755,6 +822,14 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     } else if (isDisplayOnly(def)) {
       // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
       input = makeQrField(key, def);
+    } else if (def.type === 'string' && def.format === 'hotwords') {
+      input = _makeHotwordInput(key, def, savedValues[key]);
+    } else if (def.type === 'string' && def.format === 'multiline') {
+      input = document.createElement('textarea');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.rows = 4;
+      input.value = savedValues[key] ?? def.default ?? '';
     } else if (_isStructuredField(def)) {
       input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
@@ -822,7 +897,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     if (!(await ensureEdit())) return;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
-      if (!input.value.trim()) continue;
+      if (!input.value.trim() && !props[input.dataset.key]?.['x-allow-empty']) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
       if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
@@ -993,7 +1068,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         if (String(savedValues[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key] != null) input.value = savedValues[key];
+      input.value = savedValues[key] ?? def.default ?? '';
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1102,6 +1177,14 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     } else if (isDisplayOnly(def)) {
       // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
       input = makeQrField(key, def);
+    } else if (def.type === 'string' && def.format === 'hotwords') {
+      input = _makeHotwordInput(key, def, savedValues[key]);
+    } else if (def.type === 'string' && def.format === 'multiline') {
+      input = document.createElement('textarea');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      input.rows = 4;
+      input.value = savedValues[key] ?? def.default ?? '';
     } else if (_isStructuredField(def)) {
       input = _makeStructuredInput(key, def, savedValues[key]);
     } else {
@@ -1132,7 +1215,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     if (!(await ensureEdit())) return;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
-      if (!input.value.trim()) continue;
+      if (!input.value.trim() && !props[input.dataset.key]?.['x-allow-empty']) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
       if (fieldWrapper && fieldWrapper.style.display === 'none') continue;

@@ -406,7 +406,7 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"oneOf": [{"const": "x-asr-zh-en", "title": "X-ASR（中英文）"}, {"const": "parakeet-en", "title": "Parakeet（英文）"}, {"const": "sensevoice-small", "title": "SenseVoice（多语言）"}], "type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "识别模型：X-ASR 支持中英文和自定义热词，Parakeet 支持英文，SenseVoice 支持多语言", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -417,27 +417,15 @@ TOOLS = [
                 # value selected for the previous model. `config` therefore
                 # degrades a carried-over device to cpu instead of rejecting it,
                 # and only rejects a device the request actually changed.
-                "device":        {"type": "string", "enum": ["cpu", "gpu"],
-                                  "description": "Inference device. gpu loads non-quantised weights "
-                                                 "(~2.5x faster per utterance) but costs ~2 GB RAM "
-                                                 "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
-                                                 "never gives back — check headroom before enabling",
+                "device":        {"oneOf": [{"const": "cpu", "title": "CPU"}, {"const": "gpu", "title": "GPU"}], "type": "string", "enum": ["cpu", "gpu"],
+                                  "description": "运行设备：GPU 加速识别，但需要更多内存；CPU 使用更少内存。",
                                   "default": "cpu", "scope": "shared",
                                   "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small", "x-asr-zh-en"]}},
-                "asr_beam_paths": {"type": "integer", "minimum": 1, "default": 3, "scope": "shared", "description": "X-ASR active beam paths", "x-show-when": {"asr_model": "x-asr-zh-en"}},
-                "asr_tail_pad_ms": {"type": "integer", "minimum": 0, "default": 300, "scope": "shared", "description": "X-ASR trailing silence padding (ms)", "x-show-when": {"asr_model": "x-asr-zh-en"}},
-                "asr_prefix_lm_scale": {"type": "number", "minimum": 0, "maximum": 1, "default": 0, "scope": "shared", "description": "X-ASR prefix LM scale; requires the prefix-enabled runtime", "x-show-when": {"asr_model": "x-asr-zh-en"}},
-                "asr_entity_boost": {"type": "object", "default": {}, "scope": "shared", "description": "Optional per-token scores for packaged CJK hotwords; requires prefix LM and the entity-enabled runtime", "x-show-when": {"asr_model": "x-asr-zh-en"}},
+                "asr_hotwords": {"type": "string", "x-allow-empty": True, "format": "hotwords", "default": "", "scope": "shared", "description": "自定义热词：输入后按回车添加，点击 × 删除；支持粘贴多行，自动去重。内置热词自动保留；已默认启用上下文辅助和热词增强，无需调整算法参数。", "x-show-when": {"asr_model": "x-asr-zh-en"}},
                 # `kws` (a second sherpa KeywordSpotter on the raw audio) was
                 # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
-                "trigger_mode":  {"type": "string", "enum": ["vad", "asr_kws"], "description": "Trigger mode (vad = always listen, asr_kws = ASR + phoneme matching)", "default": "asr_kws", "scope": "shared"},
-                "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'小范小范'、'little fancy'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
-                "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
-                "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
-                "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
-                "vad_pre_roll_ms":{"type": "integer", "description": "Audio retained before detected speech (ms)", "default": 500, "scope": "shared"},
-                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
-                "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
+                "trigger_mode":  {"oneOf": [{"const": "vad", "title": "持续聆听"}, {"const": "asr_kws", "title": "唤醒词触发"}], "type": "string", "enum": ["vad", "asr_kws"], "description": "识别方式：vad 持续聆听，asr_kws 唤醒词触发", "default": "asr_kws", "scope": "shared"},
+                "asr_kws_keyword": {"type": "string", "x-allow-empty": True, "description": "唤醒词：例如小范小范、little fancy。使用 X-ASR 时自动加入识别热词，无需重复填写。", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
             },
             "required": []
         },
@@ -578,14 +566,14 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
     def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
                  max_active_paths: int = 3, tail_padding_seconds: float = 0.3,
                  prefix_lm_path: str = "", prefix_lm_scale: float = 0.0,
-                 entity_boost: dict = None):
+                 entity_boost: dict = None, custom_hotwords: str = ""):
         from plugins.x_asr import XASRAdapter
 
         self._delegate = XASRAdapter(model_dir, device, num_threads,
                                      max_active_paths=max_active_paths,
                                      tail_padding_seconds=tail_padding_seconds,
                                      prefix_lm_path=prefix_lm_path, prefix_lm_scale=prefix_lm_scale,
-                                     entity_boost=entity_boost)
+                                     entity_boost=entity_boost, custom_hotwords=custom_hotwords)
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
@@ -869,17 +857,18 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
     _status(f"正在加载模型 '{model_name}' 到内存 …")
     if model_name == "x-asr-zh-en":
         lm_dir = "/models/sherpa-onnx/x-asr-prefix-lm"
-        scale = float(cfg.get('asr_prefix_lm_scale', 0))
+        scale = 0.05
         if scale:
             from utils.model_downloader import ensure_model
             _status("正在获取 X-ASR 语言模型 …")
             ensure_model("asr_x_asr_prefix_lm", lm_dir, progress_cb=_on_progress)
         adapter = model_info["adapter"](
             model_dir, device, num_threads,
-            max_active_paths=int(cfg.get('asr_beam_paths', 3)),
-            tail_padding_seconds=int(cfg.get('asr_tail_pad_ms', 300)) / 1000,
+            max_active_paths=3,
+            tail_padding_seconds=0.3,
             prefix_lm_path=os.path.join(lm_dir, "model.onnx"), prefix_lm_scale=scale,
-            entity_boost=cfg.get('asr_entity_boost'))
+            custom_hotwords='\n'.join((cfg.get('asr_hotwords', ''),
+                                      cfg.get('kws', {}).get('asr_kws_keyword', ''))))
     else:
         adapter = model_info["adapter"](model_dir, device, num_threads)
     if cfg.get('warmup', True):
@@ -1851,7 +1840,8 @@ class ASRPlugin:
             return {"state": "idle"}
 
         elif action == "config":
-            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
+            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and (v != '' or k in ('asr_hotwords', 'asr_kws_keyword'))}
+            previous_wake_word = self._kws_cfg.get('asr_kws_keyword', '')
             # Shared config update
             self._language = cfg.get('language', self._language)
             if 'vad_threshold' in cfg:
@@ -1926,9 +1916,11 @@ class ASRPlugin:
                 new_device = "cpu"
 
             decode_cfg = {key: cfg[key] for key in
-                          ('asr_beam_paths', 'asr_tail_pad_ms', 'asr_prefix_lm_scale', 'asr_entity_boost') if key in cfg}
+                          ('asr_hotwords',) if key in cfg}
             decode_changed = any(self._plugin_cfg.get(key) != value for key, value in decode_cfg.items())
+            decode_changed = decode_changed or previous_wake_word != self._kws_cfg.get('asr_kws_keyword', '')
             with self._nodes_lock:
+                self._plugin_cfg['kws'] = dict(self._kws_cfg)
                 self._plugin_cfg.update(decode_cfg)
             if ((new_model, new_device) != (self._asr_model, self._device)
                     or (new_model == 'x-asr-zh-en' and decode_changed)):

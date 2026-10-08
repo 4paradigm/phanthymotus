@@ -9505,3 +9505,10 @@ html, body {
 @media (max-width: 760px) {
   .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
 }
+
+/* Custom ASR hotwords: removable tags, with no JSON or score editing. */
+.tool-config-hotword-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.tool-config-hotword-tag { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 4px 8px; border-radius: 12px; background: var(--accent-dim); color: var(--text); }
+.tool-config-hotword-tag > span { overflow-wrap: anywhere; min-width: 0; }
+.tool-config-hotword-tag button { border: 0; background: transparent; color: var(--text); cursor: pointer; padding: 2px 5px; font-size: 18px; flex-shrink: 0; }
+.tool-config-hotwords > .tool-config-input { width: 100%; }

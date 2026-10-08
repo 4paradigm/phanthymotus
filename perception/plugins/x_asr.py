@@ -9,6 +9,7 @@ import os
 import struct
 import tempfile
 import threading
+import unicodedata
 import wave
 from pathlib import Path
 
@@ -104,6 +105,40 @@ def _boost_hotwords(encoded: Path, boosts: dict) -> Path:
     return output
 
 
+def _custom_hotwords_file(encoded: Path, words: str) -> Path:
+    """Merge user phrases; the recognizer applies its BPE vocabulary to these units."""
+    additions = {}
+    for phrase in words.splitlines():
+        units, run = [], []
+        for char in phrase.strip():
+            cjk = '\u3400' <= char <= '\u4dbf' or '\u4e00' <= char <= '\u9fff'
+            if cjk or char.isspace() or unicodedata.category(char).startswith(('P', 'S')):
+                if run:
+                    units.append(''.join(run))
+                    run = []
+                if cjk:
+                    units.append(char)
+            else:
+                run.append(char)
+        if run:
+            units.append(''.join(run))
+        if units:
+            additions[' '.join(units)] = 4.0
+    if not additions:
+        return encoded
+    lines = {}
+    for line in encoded.read_text(encoding='utf-8').splitlines():
+        phrase, sep, score = line.rpartition(' :')
+        if sep:
+            lines[phrase] = float(score)
+    lines.update(additions)
+    # A task-local generated file; never change the packaged vocabulary.
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt',
+                                     prefix='asr-hotwords-', delete=False) as stream:
+        stream.writelines(f'{phrase} :{score}\n' for phrase, score in lines.items())
+    return Path(stream.name)
+
+
 class XASRAdapter:
     """Decode complete utterances with X-ASR and the packaged hotword list."""
 
@@ -117,6 +152,7 @@ class XASRAdapter:
         prefix_lm_path: str = "",
         prefix_lm_scale: float = 0.0,
         entity_boost: dict = None,
+        custom_hotwords: str = "",
     ):
         from utils.onnx_provider import provider_for_device
 
@@ -175,23 +211,33 @@ class XASRAdapter:
             os.environ['SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE'] = f'{early_min:g}'
         else:
             os.environ.pop('SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE', None)
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=str(encoder),
-            decoder=str(decoder),
-            joiner=str(joiner),
-            tokens=str(tokens),
-            num_threads=int(num_threads),
-            provider=provider,
-            sample_rate=SAMPLE_RATE,
-            feature_dim=80,
-            decoding_method="modified_beam_search",
-            max_active_paths=self._max_active_paths,
-            hotwords_file=str(encoded_hotwords),
-            hotwords_score=HOTWORDS_SCORE,
-            modeling_unit="bpe",
-            bpe_vocab=str(bpe_vocab),
-            **lm_options,
-        )
+        custom_file = _custom_hotwords_file(encoded_hotwords, custom_hotwords)
+        if custom_file != encoded_hotwords:
+            if not scale or getattr(sherpa_onnx, "XASR_EARLY_HOTWORD_VERSION", 0) != 1:
+                custom_file.unlink()
+                raise RuntimeError("自定义热词需要支持上下文辅助和热词增强的运行库")
+            os.environ["SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE"] = "3.9"
+        try:
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=str(encoder),
+                decoder=str(decoder),
+                joiner=str(joiner),
+                tokens=str(tokens),
+                num_threads=int(num_threads),
+                provider=provider,
+                sample_rate=SAMPLE_RATE,
+                feature_dim=80,
+                decoding_method="modified_beam_search",
+                max_active_paths=self._max_active_paths,
+                hotwords_file=str(custom_file),
+                hotwords_score=HOTWORDS_SCORE,
+                modeling_unit="bpe",
+                bpe_vocab=str(bpe_vocab),
+                **lm_options,
+            )
+        finally:
+            if custom_file != encoded_hotwords:
+                custom_file.unlink(missing_ok=True)
         self._decode_lock = threading.Lock()
         log.info(
             "[asr] X-ASR adapter loaded: encoder=%s, device=%s, provider=%s, "

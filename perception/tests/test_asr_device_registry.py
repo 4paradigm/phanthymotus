@@ -516,3 +516,68 @@ def test_a_token_only_keyword_yields_no_wake_word_rather_than_a_guess():
 
     assert asr.resolve_trigger_mode("kws", cfg) == "asr_kws"
     assert "asr_kws_keyword" not in cfg
+
+
+def test_custom_hotwords_and_wake_word_changes_reload_and_can_be_cleared(monkeypatch):
+    plugin, loads = _plugin_with(monkeypatch, 'x-asr-zh-en', 'cpu')
+    for config in [dict(asr_hotwords='星河展厅'), dict(asr_kws_keyword='小星小星'),
+                   dict(asr_hotwords=''), dict(asr_kws_keyword='')]:
+        result = plugin.dispatch('asr', dict(action='config', **config))
+        assert result['status'] == 'loading'
+    assert len(loads) == 4
+    assert plugin._plugin_cfg['asr_hotwords'] == ''
+    assert plugin._plugin_cfg['kws']['asr_kws_keyword'] == ''
+    plugin.dispatch('asr', dict(action='config', asr_hotwords='', asr_kws_keyword=''))
+    assert len(loads) == 4
+
+
+def test_xasr_factory_uses_enabled_defaults_and_merges_wake_word(monkeypatch):
+    calls = []
+    monkeypatch.setattr(model_downloader, 'ensure_model', lambda *a, **kw: None)
+    monkeypatch.setitem(asr.ASR_MODELS['x-asr-zh-en'], 'adapter',
+                        lambda *a, **kw: calls.append(kw) or object())
+    asr._build_asr_adapter(dict(asr_model='x-asr-zh-en', device='cpu', warmup=False,
+                               asr_prefix_lm_scale=0, asr_beam_paths=16,
+                               asr_hotwords='星河展厅', kws={'asr_kws_keyword':'小星小星'}))
+    assert calls[0]['prefix_lm_scale'] == .05
+    assert calls[0]['max_active_paths'] == 3
+    assert calls[0]['tail_padding_seconds'] == .3
+    assert calls[0]['custom_hotwords'].splitlines() == ['星河展厅', '小星小星']
+
+
+def test_simple_card_hides_algorithm_controls():
+    props = asr.TOOLS[0]['configSchema']['properties']
+    assert set(props) == {'asr_model', 'device', 'trigger_mode', 'asr_kws_keyword', 'asr_hotwords'}
+    assert props['asr_hotwords']['format'] == 'hotwords'
+
+
+def test_hotword_update_during_load_installs_only_latest_adapter(monkeypatch):
+    import threading
+    plugin, _ = _plugin_with(monkeypatch, 'x-asr-zh-en', 'cpu')
+    monkeypatch.setattr(plugin, '_load_model_async',
+                        asr.ASRPlugin._load_model_async.__get__(plugin))
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    calls, adapters = [], []
+    def build(cfg, **kwargs):
+        calls.append((cfg.get('asr_hotwords'), cfg.get('kws', {}).get('asr_kws_keyword')))
+        adapter = object()
+        adapters.append(adapter)
+        if len(calls) == 1:
+            started.set()
+            assert release.wait(3)
+        else:
+            finished.set()
+        return adapter
+    monkeypatch.setattr(asr, '_build_asr_adapter', build)
+    previous_threads = set(threading.enumerate())
+    plugin.dispatch('asr', dict(action='config', asr_hotwords='旧词'))
+    assert started.wait(3)
+    plugin.dispatch('asr', dict(action='config', asr_hotwords='新词', asr_kws_keyword='小星'))
+    release.set()
+    assert finished.wait(3)
+    # Wait for the loader to publish its result, without depending on a sleep duration.
+    for thread in set(threading.enumerate()) - previous_threads:
+        thread.join(timeout=3)
+    assert calls == [('旧词', None), ('新词', '小星')]
+    assert plugin._adapter is adapters[-1]
+    assert plugin._adapter is not adapters[0]

@@ -109,3 +109,34 @@ def test_custom_wheel_wrong_checksum_fails(monkeypatch, tmp_path):
 def test_custom_wheel_missing_checksum_fails(monkeypatch, tmp_path):
     with pytest.raises(AssertionError, match='SHA256'):
         _wheel_download(monkeypatch, tmp_path, '')
+
+
+def test_custom_words_merge_chinese_english_and_keep_packaged_source(bundle):
+    from plugins.x_asr import _custom_hotwords_file
+    source = bundle/'hotwords.bpe.txt'
+    original = source.read_bytes()
+    result = _custom_hotwords_file(source, '语音\n星河展厅\nFancy Robot\nFancy Robot\n\n')
+    try:
+        text = result.read_text()
+        assert '语 音 :4.0' in text
+        assert '测 试 :2.5' in text
+        assert '星 河 展 厅 :4.0' in text
+        assert text.count('Fancy Robot :4.0') == 1
+        assert source.read_bytes() == original
+    finally:
+        result.unlink()
+    assert _custom_hotwords_file(source, ' \n') == source
+
+
+def test_custom_hotwords_enable_early_scoring_and_release_temporary_file(bundle, runtime):
+    import os
+    module, calls = runtime
+    def build(**kwargs):
+        calls.append(kwargs)
+        assert 'Fancy Robot :4.0' in Path(kwargs['hotwords_file']).read_text()
+        return object()
+    module.OfflineRecognizer.from_transducer = build
+    XASRAdapter(str(bundle), prefix_lm_path=str(bundle/'lm.onnx'),
+                prefix_lm_scale=.05, custom_hotwords='Fancy Robot')
+    assert os.environ['SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE'] == '3.9'
+    assert not Path(calls[-1]['hotwords_file']).exists()
