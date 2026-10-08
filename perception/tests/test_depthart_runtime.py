@@ -100,6 +100,60 @@ def test_depthart_selection_requires_provisioned_assets(tmp_path):
     assert p._model is None
 
 
+@pytest.mark.parametrize('target', ['yolo', 'depthart'])
+@pytest.mark.parametrize('tag', [None, 'other'])
+def test_restored_calibration_rejects_missing_or_previous_model(target, tag):
+    # Simulate shared model config followed by a persisted instance row.
+    p = vd.VideoDepthPerceptionPlugin({'backend': target}, 'test', _FakeExecutor())
+    assert p.dispatch('visual_depth', dict(action='config', backend=target))['status'] == 'configured'
+    cfg = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL, cal_a=1., cal_b=.5)
+    if tag:cfg['calibration_backend'] = 'yolo' if target == 'depthart' else 'depthart'
+    result = p.dispatch('visual_depth', cfg)
+    assert result['status'] == 'error' and result['adapter_ok'] is False
+    assert 'a' not in p._instance_configs
+
+
+@pytest.mark.parametrize('backend', ['yolo', 'depthart'])
+def test_matching_calibration_replay_and_no_correction(backend):
+    p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
+    cfg = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
+               calibration_backend=backend, cal_a=1., cal_b=.5)
+    assert p.dispatch('visual_depth', cfg)['status'] == 'configured'
+    assert p._instance_configs['a']['cal_b'] == .5
+    assert p.dispatch('visual_depth', dict(action='config', instance_id='a',
+                      calibration_preset=vd.CAL_NONE))['status'] == 'configured'
+
+
+def test_nonidentity_calibration_cannot_bypass_binding_with_auto_preset():
+    p = make_plugin()
+    result = p.dispatch('visual_depth', dict(action='config', instance_id='a',
+                                           calibration_preset=vd.CAL_AUTO, cal_b=.5))
+    assert result['adapter_ok'] is False
+
+
+def test_calibration_model_is_persistable_but_never_auto_stamped():
+    for backend in ('yolo', 'depthart'):
+        p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
+        prop = p.get_tools()[0]['configSchema']['properties']['calibration_backend']
+        assert prop['scope'] == 'instance'
+        assert 'default' not in prop
+        assert prop['x-show-when'] == {'calibration_preset': vd.CAL_MANUAL}
+
+
+def test_switch_then_restore_old_row_rejected_after_process_restart(tmp_path):
+    artifact = tmp_path / 'artifact'
+    artifact.write_bytes(b'test')
+    p = vd.VideoDepthPerceptionPlugin({'depthart_engine_path': str(artifact),
+        'depthart_plugin_path': str(artifact)}, 'test', _FakeExecutor())
+    old = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
+               calibration_backend='yolo', cal_b=.5)
+    assert p.dispatch('visual_depth', old)['status'] == 'configured'
+    assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'configured'
+    assert p.dispatch('visual_depth', old)['adapter_ok'] is False
+    restarted = make_plugin()
+    assert restarted.dispatch('visual_depth', old)['adapter_ok'] is False
+
+
 def test_laziness_missing_camera_and_presets(monkeypatch):
     p=make_plugin({'calibration_preset':vd.CAL_AUTO})
     monkeypatch.setattr(p,'_ensure_model',lambda:pytest.fail('unexpected model load'))

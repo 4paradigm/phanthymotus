@@ -301,6 +301,7 @@ TOOLS = [
                 # identity — i.e. trust the engine.
                 "cal_a": {"type": "number", "title": "Calibration a", "description": "Depth exponent; 1 means no exponent correction.", "default": 1.0, "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
                 "cal_b": {"type": "number", "title": "Calibration b", "description": "Log scale offset; 0 means no scale correction.", "default": 0.0, "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
+                "calibration_backend": {"type": "string", "title": "Calibration model", "description": "Select the model these measured coefficients belong to. Recalibrate before using a different model.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
                 # Presets are for the common case (a known robot, a known
                 # camera); cal_a/cal_b above stay for anything else, and a
                 # non-identity value there wins — see _calibration_from_cfg.
@@ -1528,7 +1529,7 @@ class VideoDepthPerceptionPlugin:
         props = tools[0]["configSchema"]["properties"]
         props["backend"]["default"] = self._backend
         tools[0]["configSchema"]["properties"] = {
-            key: props[key] for key in ("backend", "fps", "calibration_preset", "cal_a", "cal_b")
+            key: props[key] for key in ("backend", "fps", "calibration_preset", "calibration_backend", "cal_a", "cal_b")
         }
         if self._backend == "depthart":
             preset = tools[0]["configSchema"]["properties"]["calibration_preset"]
@@ -1562,7 +1563,7 @@ class VideoDepthPerceptionPlugin:
                 self._backend = backend
                 self._plugin_cfg["backend"] = backend
                 for config in [self._plugin_cfg, *self._instance_configs.values()]:
-                    for key in ("cal_a", "cal_b", "depth_scale", "calibration_preset"):
+                    for key in ("cal_a", "cal_b", "depth_scale", "calibration_preset", "calibration_backend"):
                         config.pop(key, None)
                 self._cal_a, self._cal_b = 1.0, 0.0
                 self._cal_samples = []
@@ -1764,9 +1765,14 @@ class VideoDepthPerceptionPlugin:
                 except ValueError as error:
                     return {"status": "error", "adapter_ok": False, "message": str(error)}
             try:
+                manual = cfg.get("calibration_preset") == CAL_MANUAL
+                custom = any(float(cfg.get(key, default)) != default
+                             for key, default in (("cal_a", 1.), ("cal_b", 0.), ("depth_scale", 1.)))
+                if (manual or custom) and cfg.get("calibration_backend") != self._backend:
+                    raise ValueError("Calibration model is missing or differs from the selected depth model; review the coefficients and save their model, or choose no calibrate")
                 cfg = self._backend_calibration_cfg(cfg)
-            except ValueError as error:
-                return {"status": "error", "message": str(error)}
+            except (TypeError, ValueError) as error:
+                return {"status": "error", "adapter_ok": False, "message": str(error)}
             if instance_id:
                 with self._nodes_lock:
                     self._instance_configs[instance_id] = cfg

@@ -262,7 +262,7 @@ def test_concurrent_starts_create_exactly_one_node():
 
 def test_config_updates_global_defaults():
     plugin, _ = _plugin()
-    plugin.dispatch("visual_depth", {"action": "config", "fps": 7, "cal_b": 0.25, "max_depth_m": 5.0})
+    plugin.dispatch("visual_depth", {"action": "config", "fps": 7, "cal_b": 0.25, "calibration_backend": "yolo", "max_depth_m": 5.0})
     assert plugin._fps == 7
     assert plugin._cal_b == 0.25
     assert plugin._max_depth_m == 5.0
