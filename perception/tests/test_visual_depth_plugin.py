@@ -179,7 +179,7 @@ def test_model_output_is_resampled_to_the_renderer_size():
 
 
 def test_depth_scale_is_applied():
-    plugin, executor = _plugin(cfg={"depth_scale": 2.0, "calibrated": True},
+    plugin, executor = _plugin(cfg={"depth_scale": 2.0, "calibrated": True, "calibration_backend": "yolo"},
                                model=_FakeModel(depth=np.full((H, W), 1.0, dtype=np.float32)))
     plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
@@ -209,7 +209,7 @@ def test_info_reports_metres_and_says_whose_calibration():
 
 
 def test_info_reports_a_site_calibration_once_one_is_set():
-    plugin, _ = _plugin(cfg={"cal_a": 0.97, "cal_b": 0.12})
+    plugin, _ = _plugin(cfg={"cal_a": 0.97, "cal_b": 0.12, "calibration_backend": "yolo"})
     info = plugin.dispatch("visual_depth", {"action": "info"})
     # The label gained a suffix: a fit typed in by hand, one taken from a preset
     # table and one fitted live against a tape measure are three different
@@ -468,7 +468,7 @@ def test_an_explicit_cal_b_wins_over_legacy_depth_scale():
 
 
 def test_calibration_reaches_the_published_depth_map():
-    plugin, executor = _plugin(cfg={"cal_a": 1.0, "cal_b": float(np.log(2.0)), "fps": 1000},
+    plugin, executor = _plugin(cfg={"cal_a": 1.0, "cal_b": float(np.log(2.0)), "fps": 1000, "calibration_backend": "yolo"},
                                model=_FakeModel(depth=np.full((H, W), 1.5, dtype=np.float32)))
     plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]

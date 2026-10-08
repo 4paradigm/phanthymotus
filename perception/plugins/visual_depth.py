@@ -1091,6 +1091,11 @@ class VideoDepthPerceptionPlugin:
 
     def _backend_calibration_cfg(self, cfg):
         cfg = dict(cfg)
+        manual = cfg.get("calibration_preset") == CAL_MANUAL
+        custom = any(float(cfg.get(key, default)) != default
+                     for key, default in (("cal_a", 1.), ("cal_b", 0.), ("depth_scale", 1.)))
+        if (manual or custom) and cfg.get("calibration_backend") != self._backend:
+            raise ValueError("Calibration model is missing or differs from the selected depth model; review the coefficients and save their model, or choose no calibrate")
         if self._backend == "depthart":
             choice = cfg.get("calibration_preset")
             if choice in CALIBRATION_PRESETS:
@@ -1765,11 +1770,6 @@ class VideoDepthPerceptionPlugin:
                 except ValueError as error:
                     return {"status": "error", "adapter_ok": False, "message": str(error)}
             try:
-                manual = cfg.get("calibration_preset") == CAL_MANUAL
-                custom = any(float(cfg.get(key, default)) != default
-                             for key, default in (("cal_a", 1.), ("cal_b", 0.), ("depth_scale", 1.)))
-                if (manual or custom) and cfg.get("calibration_backend") != self._backend:
-                    raise ValueError("Calibration model is missing or differs from the selected depth model; review the coefficients and save their model, or choose no calibrate")
                 cfg = self._backend_calibration_cfg(cfg)
             except (TypeError, ValueError) as error:
                 return {"status": "error", "adapter_ok": False, "message": str(error)}
@@ -1798,7 +1798,7 @@ class VideoDepthPerceptionPlugin:
                 # engine's own fit.
                 if self._cal_cfg_backup is not None:
                     for key, value in zip(
-                            ("cal_a", "cal_b", "calibration_preset"),
+                            ("cal_a", "cal_b", "calibration_preset", "calibration_backend"),
                             self._cal_cfg_backup):
                         if value is _ABSENT:
                             self._plugin_cfg.pop(key, None)
@@ -1868,13 +1868,15 @@ class VideoDepthPerceptionPlugin:
                 self._cal_cfg_backup = (
                     self._plugin_cfg.get("cal_a", _ABSENT),
                     self._plugin_cfg.get("cal_b", _ABSENT),
-                    self._plugin_cfg.get("calibration_preset", _ABSENT))
+                    self._plugin_cfg.get("calibration_preset", _ABSENT),
+                    self._plugin_cfg.get("calibration_backend", _ABSENT))
             self._plugin_cfg["cal_a"] = 1.0
             self._plugin_cfg["cal_b"] = round(cal_b, 6)
             # ...and switch the selector, or the rule above would ignore the fit
             # that was just measured — writing two numbers nothing reads is
             # worse than not writing them.
             self._plugin_cfg["calibration_preset"] = CAL_MANUAL
+            self._plugin_cfg["calibration_backend"] = self._backend
             log.info(f"[visual_depth] calibrated: {len(self._cal_samples)} sample(s) "
                      f"→ cal_a=1.0 cal_b={cal_b:.4f}")
 
@@ -1885,6 +1887,7 @@ class VideoDepthPerceptionPlugin:
                 # thing that has to survive a restart, and prose does not get
                 # copied accurately.
                 "save_to_config": {"calibration_preset": CAL_MANUAL,
+                                   "calibration_backend": self._backend,
                                    "cal_a": 1.0, "cal_b": round(cal_b, 6)},
                 "message": _calibration_message(self._cal_samples),
             }

@@ -270,8 +270,38 @@ def test_photo_missing_k_does_not_initialize_model(monkeypatch):
 
 
 def test_manual_calibration_preserved():
-    p=make_plugin({'calibration_preset':vd.CAL_MANUAL,'cal_b':.2})
+    p=make_plugin({'calibration_preset':vd.CAL_MANUAL,'cal_b':.2,'calibration_backend':'depthart'})
     assert p._cal_b==pytest.approx(.2)
+
+
+@pytest.mark.parametrize('backend', ['yolo', 'depthart'])
+@pytest.mark.parametrize('tag', [None, 'wrong'])
+@pytest.mark.parametrize('preset', [None, vd.CAL_MANUAL])
+def test_startup_rejects_unbound_or_mismatched_calibration(backend, tag, preset):
+    cfg = {'backend': backend, 'cal_b': .5}
+    if preset:cfg['calibration_preset'] = preset
+    if tag:cfg['calibration_backend'] = 'yolo' if backend == 'depthart' else 'depthart'
+    with pytest.raises(ValueError, match='Calibration model'):
+        vd.VideoDepthPerceptionPlugin(cfg, 'test', _FakeExecutor())
+
+
+@pytest.mark.parametrize('backend', ['yolo', 'depthart'])
+@pytest.mark.parametrize('previous_fit', [False, True])
+def test_calibrate_save_roundtrip_and_reset_provenance(backend, previous_fit, monkeypatch):
+    cfg = {'backend': backend}
+    if previous_fit:cfg.update(calibration_backend=backend, calibration_preset=vd.CAL_MANUAL, cal_b=.2)
+    p = vd.VideoDepthPerceptionPlugin(cfg, 'test', _FakeExecutor())
+    monkeypatch.setattr(p, '_raw_depth_for_calibration',
+                        lambda *args: ([np.full((480,640), 2., np.float32)], 'test'))
+    result = p.dispatch('visual_depth', {'action': 'calibrate', 'distance_m': 3.})
+    saved = result['save_to_config']
+    assert saved['calibration_backend'] == backend
+    restored = vd.VideoDepthPerceptionPlugin(dict(saved, backend=backend), 'test', _FakeExecutor())
+    assert restored._cal_b == pytest.approx(np.log(1.5), abs=1e-6)
+    assert restored.dispatch('visual_depth', dict(saved, action='config', instance_id='a'))['status'] == 'configured'
+    p.dispatch('visual_depth', {'action': 'reset_calibration'})
+    assert p._plugin_cfg.get('calibration_backend') == (backend if previous_fit else None)
+    assert (p._cal_a, p._cal_b) == (1., .2 if previous_fit else 0.)
 
 
 @pytest.mark.parametrize('topic', ['/camera', None])

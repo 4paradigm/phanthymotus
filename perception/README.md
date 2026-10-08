@@ -2108,10 +2108,40 @@ transcribed and TTS still speaks with the card running.
 
 ## Vision: `vop` (detection) and `visual_depth` (depth)
 
-Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
+By default, both run a **prebuilt TensorRT engine** fetched as a pinned bundle
 (`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
 same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
 falls back to PyTorch if the bundle is missing — it fails loudly instead.
+
+### Optional DepthART backend
+
+`visual_depth` also supports DepthART Metric-S. Select **Depth model** in the
+shared tool configuration after stopping all depth instances; loading remains
+lazy. The default is still YOLO26-N Depth. Frame rate and calibration remain
+per-camera settings.
+
+Unlike the default YOLO bundle, DepthART is **externally provisioned**: mount
+its engine and SelectiveScan shared library, and set `depthart_engine_path` and
+`depthart_plugin_path` under `plugins.visual_depth` (or `DEPTHART_ENGINE_PATH`
+and `DEPTHART_PLUGIN_PATH`). Use matching artifacts for the target JetPack,
+TensorRT version and GPU; JP5 and JP6 artifacts are not interchangeable. There
+is no automatic DepthART download, startup compilation or fallback to YOLO.
+
+Supply actual `motus.camera/1` intrinsics (`width`, `height`, row-major nine-value
+`K`) through the upstream camera declaration for streams, or explicitly for
+photos. Photos can inherit a running instance's bound declaration but cannot
+replace it. Unbound on-demand instances require K on every photo. The engine's
+fixed image canvas must support the image aspect ratio; runtime K does not make
+the canvas dynamic. Unsupported ratios fail rather than silently stretch.
+
+DepthART does not use YOLO camera presets. Manual calibration and non-identity
+coefficients require `calibration_backend: yolo` or `depthart`, matching the
+selected model, in **both startup YAML and saved config requests**. Missing or
+mismatched provenance is rejected; old coefficients are not silently relabeled.
+The manual configuration UI exposes **Calibration model** with no default.
+`calibrate` returns a complete `save_to_config` object including this field;
+`reset_calibration` restores the previous coefficients and provenance. Recalibrate
+when changing models rather than changing the provenance of an old fit.
 
 ### Why TensorRT *directly*, and not through ultralytics
 
