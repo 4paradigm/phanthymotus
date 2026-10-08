@@ -1067,12 +1067,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         pcm_history.append(pcm[:n * 2])
         vad.accept_waveform(float_samples)
 
-        # Notify the main thread of both edges so music ducking can recover.
+        # Detect speech onset → notify main thread for on_hearing hook
         _is_speaking = vad.is_speech_detected()
         if _is_speaking and not _was_speaking:
             result_q.put(("speech_start", ts, ts))
-        elif _was_speaking and not _is_speaking:
-            result_q.put(("speech_end", ts, ts))
         _was_speaking = _is_speaking
 
         # Collect completed VAD segments.
@@ -1404,15 +1402,14 @@ class _ASRNode(Node):
         while not self._stop_event.is_set():
             try:
                 item = self._utterance_queue.get(timeout=1)
-                # Handle speech onset/end signals from VAD worker.
-                if len(item) >= 2 and item[0] in ("speech_start", "speech_end"):
+                # Handle speech onset signal from VAD worker
+                if len(item) >= 2 and item[0] == "speech_start":
                     try:
                         import urllib.request as _urllib_req
                         import json as _json_hook
                         _hook_req = _urllib_req.Request(
                             "https://localhost:15678/api/hooks/fire",
-                            data=_json_hook.dumps({"hook": "on_hearing" if item[0] == "speech_start"
-                                                  else "on_hearing_end"}).encode(),
+                            data=_json_hook.dumps({"hook": "on_hearing"}).encode(),
                             headers={"Content-Type": "application/json"},
                             method="POST"
                         )

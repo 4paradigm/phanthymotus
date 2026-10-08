@@ -1,13 +1,12 @@
 """Per-card catalogue metadata and provider, independent of Agent Core and ROS."""
 from copy import deepcopy
-import os
 import threading
 import time
 
 from plugins.music_catalog.contracts import (
     FALLBACK, MusicError, capabilities, envelope, search_request, search_result)
 from plugins.music_catalog.providers import discover
-from plugins.music_catalog.providers.motus_music import check_cancel
+from plugins.music_catalog.providers.motus_music import MotusMusicProvider, check_cancel
 
 
 class MusicService:
@@ -18,26 +17,30 @@ class MusicService:
             raise ValueError('未知音乐曲库类型。')
         if type(self.timeout_ms) is not int or not 100 <= self.timeout_ms <= 30000:
             raise ValueError('曲库超时须为 100–30000 毫秒。')
-        self._provider = None
+        self._endpoint = settings.get('endpoint', '')
+        self._key = settings.get('api_key', '')
+        if not isinstance(self._endpoint, str) or not isinstance(self._key, str):
+            raise ValueError('曲库地址和 API Key 须为字符串。')
+        self._provider = (MotusMusicProvider({'endpoint': self._endpoint, 'api_key': self._key,
+                                             'timeout_ms': self.timeout_ms})
+                          if self.kind == 'motus_music' and self.configured() else None)
         self._caps = deepcopy(FALLBACK)
         self._expires = 0.0
         self._gate = threading.Lock()
 
     def configured(self):
         return self.kind == 'mock' or (self.kind == 'motus_music' and bool(
-            os.environ.get('PHANTHY_MUSIC_ENDPOINT') and os.environ.get('PHANTHY_MUSIC_API_KEY')))
+            self._endpoint and self._key))
 
     def _prepare(self, context):
         if self.kind == 'none':
-            raise MusicError('not_configured', '未配置音乐曲库，请设置 phanthy-music 卡片。')
+            raise MusicError('not_configured', '未配置音乐曲库，请设置 phanthy_music 卡片。')
         if self._provider is None:
             if not self.configured():
-                raise MusicError('not_configured', '请在 Perception 部署环境中注入音乐曲库地址和凭据。')
-            # Fixed deployment variables only; MCP cannot select an environment
-            # variable or change the credential's destination.
+                raise MusicError('not_configured', '请在 phanthy_music 卡片中配置曲库地址和 API Key。')
             self._provider = discover()[self.kind]({
-                'endpoint': os.environ.get('PHANTHY_MUSIC_ENDPOINT', ''),
-                'api_key': os.environ.get('PHANTHY_MUSIC_API_KEY', ''),
+                'endpoint': self._endpoint,
+                'api_key': self._key,
                 'timeout_ms': self.timeout_ms})
         if time.monotonic() >= self._expires:
             try:

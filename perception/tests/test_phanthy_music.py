@@ -26,7 +26,7 @@ class CardTests(unittest.TestCase):
         self.plugin.stop()
 
     def call(self, action, **args):
-        return self.plugin.dispatch('phanthy-music', {'action': action, **args})
+        return self.plugin.dispatch('phanthy_music', {'action': action, **args})
 
     def test_search_works_idle_and_never_starts_audio(self):
         result = self.call('search', language='zh', vocal='female')
@@ -34,58 +34,98 @@ class CardTests(unittest.TestCase):
         self.assertTrue(all(t['vocal'] == 'female' for t in result['tracks']))
         self.assertIsNone(self.plugin._node)
         self.assertEqual(len(self.plugin.get_tools()), 1)
-        self.assertEqual(self.plugin.get_tools()[0]['name'], 'phanthy-music')
+        self.assertEqual(self.plugin.get_tools()[0]['name'], 'phanthy_music')
 
     def test_id_play_refreshes_details_and_forwards_usage(self):
         self.call('start')
         with patch.object(self.plugin._catalogue, 'execute', return_value=detail()) as query, \
              patch.object(self.plugin._node.player, 'play') as play:
-            result = self.call('play', track_id='fictional-1')
+            result = self.call('play_by_id', track_id='fictional-1')
         self.assertFalse(result.get('error'))
         self.assertEqual(query.call_args.kwargs['track_id'], 'fictional-1')
         self.assertEqual(play.call_args.args, ('https://audio.example/song.mp3', 'mp3', 'fictional-1',
                                               None, detail()['track']['usage']))
         self.assertFalse(result['resolving_track'])
+        self.assertEqual(result['track']['id'], 'fictional-1')
 
-    def test_mock_never_claims_playable_audio_and_explicit_url_needs_no_catalogue(self):
+    def test_mock_never_claims_playable_audio(self):
         self.call('start')
-        self.assertEqual(self.call('play', track_id='mock-01')['error']['code'], 'not_playable')
+        self.assertEqual(self.call('play_by_id', track_id='mock-01')['error']['code'], 'not_playable')
+        self.assertEqual(self.call('play_by_genre', genre='pop')['error']['code'], 'not_playable')
         self.call('config', catalogue_type='none')
         with patch.object(self.plugin._node.player, 'play') as play:
-            self.assertFalse(self.call('play', url='https://audio.example/a.mp3').get('error'))
-        play.assert_called_once()
+            self.assertEqual(self.call('play_by_id', track_id='fictional-1')['error']['code'], 'not_configured')
+        play.assert_not_called()
+
+    def test_genre_selects_one_track_and_returns_relaxation_and_attribution(self):
+        self.call('start')
+        found = {'schema': SCHEMA, 'tracks': [detail()['track']], 'relaxed': ['artist'],
+                 'reply_notice': 'Tell the user which conditions were relaxed.'}
+        with patch.object(self.plugin._catalogue, 'execute', return_value=found) as query, \
+             patch.object(self.plugin._node.player, 'play') as play:
+            result = self.call('play_by_genre', genre='pop', language='zh',
+                               artist='Fictional artist', exclude_ids='fictional-0', top_k=10)
+        self.assertEqual(query.call_args.kwargs['top_k'], 1)
+        self.assertEqual(query.call_args.kwargs['genre'], 'pop')
+        self.assertEqual(query.call_args.kwargs['language'], 'zh')
+        self.assertEqual(query.call_args.kwargs['exclude_ids'], 'fictional-0')
+        self.assertEqual(result['relaxed'], ['artist'])
+        self.assertEqual(result['reply_notice'], found['reply_notice'])
+        self.assertEqual(result['track'], detail()['track'])
+        self.assertEqual(play.call_args.args[-1], detail()['track']['usage'])
+
+    def test_genre_requires_value_and_failed_lookup_preserves_current_song(self):
+        self.call('start')
+        for result in ({'schema': SCHEMA, 'request_id': 'fictional-request', 'tracks': [], 'relaxed': ['genre']},
+                       {'error': {'code': 'unavailable'}}):
+            with self.subTest(result=result), \
+                 patch.object(self.plugin._catalogue, 'execute', return_value=result) as query, \
+                 patch.object(self.plugin._node.player, 'play') as play, \
+                 patch.object(self.plugin._node.player, 'interrupt') as interrupt:
+                self.assertIn('error', self.call('play_by_genre'))
+                self.assertIn('error', self.call('play_by_genre', genre='  '))
+                self.assertIn('error', self.call('play_by_genre', genre=' , , '))
+                query.assert_not_called()
+                reply = self.call('play_by_genre', genre='jazz')
+                self.assertIn('error', reply)
+                if 'request_id' in result:
+                    self.assertEqual(reply['request_id'], 'fictional-request')
+                    self.assertEqual(reply['relaxed'], ['genre'])
+                play.assert_not_called(); interrupt.assert_not_called()
 
     def test_network_request_never_blocks_controls_or_resurrects_cancelled_play(self):
-        for control in ('interrupt', 'stop', 'config', 'replacement'):
-            with self.subTest(control=control):
-                self.call('start')
-                entered, release = threading.Event(), threading.Event()
-                result = []
-                def delayed(**args):
-                    entered.set(); release.wait(3)
-                    return detail()  # Deliberately ignores cancellation: final guard must hold.
-                node = self.plugin._node
-                with patch.object(self.plugin._catalogue, 'execute', side_effect=delayed), \
-                     patch.object(node.player, 'play') as play:
-                    worker = threading.Thread(target=lambda: result.append(self.call('play', track_id='fictional-1')))
-                    worker.start()
-                    try:
-                        self.assertTrue(entered.wait(1))
-                        self.assertTrue(self.call('status')['resolving_track'])
-                        self.call('duck'); self.call('unduck')
-                        if control == 'replacement':
-                            self.call('play', url='https://audio.example/new.mp3')
-                        elif control == 'config':
-                            self.call('config', timeout_ms=4000 if self.plugin._cfg.get('timeout_ms') != 4000 else 3000)
-                        else:
-                            self.call(control)
-                    finally:
-                        release.set(); worker.join(2)
-                    self.assertFalse(worker.is_alive())
-                    self.assertEqual(result[0]['error']['code'], 'cancelled')
-                    self.assertEqual(play.call_count, 1 if control == 'replacement' else 0)
-                    if control == 'replacement':
-                        self.assertEqual(play.call_args.args[0], 'https://audio.example/new.mp3')
+        for action, arguments in [('play_by_id', {'track_id': 'fictional-1'}),
+                                  ('play_by_genre', {'genre': 'pop'})]:
+            for control in ('interrupt', 'stop', 'config', 'replacement'):
+                with self.subTest(action=action, control=control):
+                    self.call('start')
+                    entered, release = threading.Event(), threading.Event()
+                    result = []
+                    def delayed(**args):
+                        entered.set(); release.wait(3)
+                        # Deliberately ignores cancellation: final guard must hold.
+                        return detail() if action == 'play_by_id' else {'tracks': [detail()['track']]}
+                    node = self.plugin._node
+                    with patch.object(self.plugin._catalogue, 'execute', side_effect=delayed), \
+                         patch.object(node.player, 'play') as play:
+                        worker = threading.Thread(target=lambda: result.append(self.call(action, **arguments)))
+                        worker.start()
+                        try:
+                            self.assertTrue(entered.wait(1))
+                            self.assertTrue(self.call('status')['resolving_track'])
+                            self.call('duck'); self.call('unduck')
+                            if control == 'replacement':
+                                replacement = self.call('play_by_id', track_id='fictional-2')
+                                self.assertEqual(replacement['error']['code'], 'busy')
+                            elif control == 'config':
+                                self.call('config', timeout_ms=4000 if self.plugin._cfg.get('timeout_ms') != 4000 else 3000)
+                            else:
+                                self.call(control)
+                        finally:
+                            release.set(); worker.join(2)
+                        self.assertFalse(worker.is_alive())
+                        self.assertEqual(result[0]['error']['code'], 'cancelled')
+                        play.assert_not_called()
 
     def test_stop_signals_old_player_before_waiting_for_lifecycle_cleanup(self):
         self.call('start')
@@ -100,13 +140,36 @@ class CardTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(node.destroyed)
 
-    def test_closed_configuration_never_accepts_credentials_or_redirects_key(self):
-        for field in ('api_key', 'endpoint', 'api_key_env', 'api_key_file'):
+    def test_card_credentials_reconfigure_and_clear_without_echo_or_model_exposure(self):
+        result = self.call('config', catalogue_type='motus_music',
+                           endpoint='https://catalogue.example', api_key='fake-private-value')
+        self.assertTrue(result['catalogue_configured'])
+        self.assertEqual(self.plugin._catalogue._provider.endpoint, 'https://catalogue.example')
+        before = self.plugin._catalogue
+        result = self.call('config', api_key='another-fake-key')
+        self.assertIsNot(before, self.plugin._catalogue)
+        self.assertNotIn('another-fake-key', json.dumps(result))
+        self.assertFalse(self.call('config', api_key='')['catalogue_configured'])
+        self.assertEqual(self.call('search')['error']['code'], 'not_configured')
+        for field in ('api_key_env', 'api_key_file'):
             result = self.call('config', **{field: 'fake-private-value'})
             self.assertIn('error', result)
             self.assertNotIn('fake-private-value', json.dumps(result))
             self.assertNotIn(field, self.plugin._cfg)
-        self.assertNotIn('api_key', TOOLS[0]['configSchema']['properties'])
+        self.assertEqual(TOOLS[0]['configSchema']['properties']['api_key']['format'], 'password')
+        self.assertTrue(TOOLS[0]['configSchema']['properties']['endpoint']['x-sensitive'])
+        self.assertNotIn('api_key', TOOLS[0]['inputSchema']['properties'])
+        self.assertNotIn('config', TOOLS[0]['inputSchema']['x-action-params'])
+        self.assertNotIn('fake-private-value', json.dumps(self.plugin.get_tools()))
+
+    def test_invalid_card_credentials_are_rejected_without_echo(self):
+        for settings in ({'endpoint': 'http://catalogue.example', 'api_key': 'fake-private-value'},
+                         {'endpoint': 'https://catalogue.example', 'api_key': 'fake-private-value\n'},
+                         {'endpoint': ['fake-private-value'], 'api_key': 123}):
+            result = self.call('config', catalogue_type='motus_music', **settings)
+            self.assertIn('error', result)
+            self.assertNotIn('fake-private-value', json.dumps(result))
+            self.assertEqual(self.plugin._catalogue.kind, 'mock')
 
     def test_search_timeout_does_not_interrupt_existing_music_or_tts(self):
         self.call('start')
@@ -120,7 +183,7 @@ class CardTests(unittest.TestCase):
 class MCPTests(unittest.TestCase):
     def test_real_http_tools_list_dispatch_and_log_redaction(self):
         import main
-        bundle = main.PerceptionBundle({'plugins': {'phanthy-music': {'enabled': True, 'catalogue_type': 'mock'}}}, _FakeExecutor())
+        bundle = main.PerceptionBundle({'plugins': {'phanthy_music': {'enabled': True, 'catalogue_type': 'mock'}}}, _FakeExecutor())
         captured = io.StringIO()
         handler = logging.StreamHandler(captured)
         main.log.addHandler(handler)
@@ -137,13 +200,14 @@ class MCPTests(unittest.TestCase):
                 return json.load(response)['result']
         try:
             with patch.object(main, '_bundle', bundle):
-                self.assertEqual([t['name'] for t in rpc('tools/list', {})['tools']], ['phanthy-music'])
-                self.assertIsNone(bundle.dispatch('phanthy-music_config', {'volume': 10}))
-                self.assertIsNone(bundle.dispatch('phanthy-music_start', {}))
-                result = rpc('tools/call', {'name': 'phanthy-music', 'arguments': {'action': 'search', 'query': 'fake-private-value'}})
+                self.assertEqual([t['name'] for t in rpc('tools/list', {})['tools']], ['phanthy_music'])
+                self.assertIsNone(bundle.dispatch('phanthy_music_config', {'volume': 10}))
+                self.assertIsNone(bundle.dispatch('phanthy_music_start', {}))
+                result = rpc('tools/call', {'name': 'phanthy_music', 'arguments': {'action': 'search', 'query': 'fake-private-value'}})
                 self.assertTrue(json.loads(result['content'][0]['text'])['tracks'])
-                result = rpc('tools/call', {'name': 'phanthy-music', 'arguments': {'action': 'config', 'api_key': 'fake-private-value'}})
-                self.assertIn('error', json.loads(result['content'][0]['text']))
+                result = rpc('tools/call', {'name': 'phanthy_music', 'arguments': {'action': 'config', 'api_key': 'fake-private-value'}})
+                self.assertNotIn('error', json.loads(result['content'][0]['text']))
+                self.assertNotIn('fake-private-value', result['content'][0]['text'])
                 self.assertNotIn('fake-private-value', captured.getvalue())
         finally:
             server.shutdown(); server.server_close(); worker.join(2)

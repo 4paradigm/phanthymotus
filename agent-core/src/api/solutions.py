@@ -1094,19 +1094,6 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
         })
     card_ids = {c['id'] for c in cards}
 
-    # Validate closed card configs before replacing any layout or stored rows.
-    # In particular, imported Solutions cannot smuggle music credentials into
-    # SQLite through a path that bypasses the normal configuration endpoint.
-    from tool_config import validate_saved_config
-    for key, value in (canvas.get('toolConfigs') or {}).items():
-        parts = key.split(':')
-        if len(parts) >= 2 and mapping.get(parts[0]):
-            if len(parts) < 3 or parts[2] in card_ids:
-                try:
-                    validate_saved_config(mapping[parts[0]], parts[1], value)
-                except ValueError as exc:
-                    raise fastapi.HTTPException(status_code=400, detail=str(exc)) from None
-
     connections = [c for c in canvas.get('connections') or []
                    if c.get('fromCardId') in card_ids and c.get('toCardId') in card_ids]
     exec_connections = []

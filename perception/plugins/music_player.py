@@ -184,7 +184,7 @@ class MusicPlayer:
             if not self._has_reader():
                 if self._decoder and self.state != 'paused' and now - self._wait_started > 5:
                     self._cancel_music()
-                    self.state, self.error = 'error', 'No PCM subscriber; connect phanthy-music output to Speaker'
+                    self.state, self.error = 'error', 'No PCM subscriber; connect phanthy_music output to Speaker'
                 return
             voice = bytes(self._voice[:FRAME_BYTES])
             del self._voice[:len(voice)]

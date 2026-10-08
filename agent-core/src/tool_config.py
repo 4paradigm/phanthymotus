@@ -19,25 +19,6 @@ and api/mcp_manage.py already imports mcp_client — the reverse would cycle.
 import config
 
 
-def validate_saved_config(mcp_id: str, tool_name: str, body) -> None:
-    """Enforce explicitly closed config schemas *before* SQLite or replay.
-
-    phanthy-music intentionally accepts no credentials/endpoint in its card.
-    Missing discovery must not turn that into an arbitrary plaintext store.
-    Existing open schemas retain their current behaviour.
-    """
-    import jsonschema
-    schema = find_tool(mcp_id, tool_name).get('configSchema') or {}
-    if tool_name == 'phanthy-music' and not schema:
-        raise ValueError('Music configuration schema unavailable; reconnect Perception first')
-    if schema.get('additionalProperties') is False:
-        try:
-            jsonschema.validate(body, schema)
-        except (jsonschema.ValidationError, jsonschema.SchemaError):
-            # ValidationError includes input values: never echo it to logs/UI.
-            raise ValueError('Invalid card configuration; use only declared fields and values') from None
-
-
 def find_tool(mcp_id: str, tool_name: str) -> dict:
     """The tool object for mcp_id:tool_name, or {} (tools may be bare strings)."""
     mcps = config.main.get('services', {}).get('mcp', []) or []

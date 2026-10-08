@@ -1,4 +1,4 @@
-"""One phanthy-music card: catalogue search, background playback and speech mix."""
+"""One phanthy_music card: catalogue search, background playback and speech mix."""
 from copy import deepcopy
 import threading
 
@@ -17,29 +17,30 @@ QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                  durability=DurabilityPolicy.VOLATILE)
 SEARCH_PARAMS = ['query', 'genre', 'language', 'vocal', 'tags', 'artist', 'top_k',
                  'exclude_ids', 'duration_min_s', 'duration_max_s']
-CONFIG_PARAMS = ['catalogue_type', 'timeout_ms', 'volume', 'duck_gain']
+CONFIG_PARAMS = ['catalogue_type', 'endpoint', 'api_key', 'timeout_ms', 'volume', 'duck_gain']
 ACTIONS = {
-    'start': ['input_topic'], 'stop': [], 'info': [], 'config': CONFIG_PARAMS,
     'search': SEARCH_PARAMS,
-    'play': ['url', 'audio_format', 'track_id', 'expires_at', 'usage'],
+    'play_by_id': ['track_id'],
+    'play_by_genre': [key for key in SEARCH_PARAMS if key != 'top_k'],
     'pause': [], 'resume': [], 'interrupt': [], 'status': [], 'set_volume': ['volume'],
-    'duck': [], 'unduck': [], 'interrupt_voice': [],
 }
+INTERNAL_ACTIONS = ['start', 'stop', 'info', 'config', 'duck', 'unduck', 'interrupt_voice']
 ACTION_DESCRIPTIONS = {
     'search': '只检索，不播放。换歌时保留条件并传 exclude_ids；如实说明 relaxed。',
-    'play': '优先传 track_id，由本卡查询最新地址后后台播放；或传授权的 HTTPS url。',
+    'play_by_id': '必须传 track_id；查询歌曲最新地址后后台播放。',
+    'play_by_genre': '必须传 genre 曲风代码；按条件找一首并后台播放，返回选中的歌曲及 relaxed。',
     'interrupt': '立即取消取歌和本卡待播音乐，保留 TTS 通路。',
 }
 TOOLS = [{
-    'name': 'phanthy-music', 'type': 'processor', 'multiInstance': False,
-    'description': '在音乐曲库找歌并播放：先 search，再 play(track_id)。'
+    'name': 'phanthy_music', 'type': 'processor', 'multiInstance': False,
+    'description': '在音乐曲库找歌并播放：search 后 play_by_id(track_id)，或 play_by_genre(genre)。'
                    '支持暂停、继续、停歌和音量；TTS → 本卡 → Speaker 支持音乐中对话。'
-                   'play 返回后台会话，不代表播放完成。停歌用 interrupt。'
+                   '播放操作返回后台会话，不代表播放完成。停歌用 interrupt。'
                    'personal_playback 只允许当次播放，不得保存或上传聊天附件。',
     'inputSchema': {
         'type': 'object', 'required': ['action'],
         'properties': {
-            'action': {'type': 'string', 'enum': list(ACTIONS)},
+            'action': {'type': 'string', 'enum': list(ACTIONS) + INTERNAL_ACTIONS},
             'input_topic': {'type': 'string'},
             **{key: {'type': 'string', 'description': description} for key, description in {
                 'query': '情绪、场景、歌名或歌词片段，最多 200 字',
@@ -53,24 +54,15 @@ TOOLS = [{
             'top_k': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'default': 3},
             'duration_min_s': {'type': 'integer', 'minimum': 0, 'default': 0},
             'duration_max_s': {'type': 'integer', 'minimum': 0, 'default': 0},
-            'url': {'type': 'string', 'description': '可选：本次播放的授权公网 HTTPS 音频地址'},
-            'audio_format': {'type': 'string', 'enum': ['mp3', 'wav'], 'default': 'mp3'},
-            'track_id': {'type': 'string', 'maxLength': 200, 'description': '搜索结果的歌曲 ID；不传 url 时查询最新详情'},
-            'expires_at': {'type': ['string', 'null'], 'description': 'ISO 8601 到期时间，null 表示长期有效'},
-            'usage': {'type': 'object', 'properties': {
-                'scope': {'type': 'string', 'enum': ['personal_playback']},
-                'attribution': {'type': 'string'}}, 'required': ['scope']},
+            'track_id': {'type': 'string', 'minLength': 1, 'maxLength': 200,
+                         'description': '歌曲 ID；play_by_id 必填，会查询最新详情'},
             'volume': {'type': 'number', 'minimum': 0, 'maximum': 100},
-            'duck_gain': {'type': 'number', 'minimum': 0, 'maximum': 1},
-            'catalogue_type': {'type': 'string', 'enum': ['none', 'mock', 'motus_music']},
-            'timeout_ms': {'type': 'integer', 'minimum': 100, 'maximum': 30000},
         },
         'x-action-params': {name: {'params': params, 'description': ACTION_DESCRIPTIONS.get(name, name)}
                             for name, params in ACTIONS.items()},
         # Background music never holds the mouth/full-song ACP barrier.
         'x-resource': 'music',
         'x-hooks': {
-            'on_hearing': {'action': 'duck'}, 'on_hearing_end': {'action': 'unduck'},
             'on_interrupt_speak': {'action': 'interrupt_voice'},
             'on_interrupt_all': {'action': 'interrupt_voice'},
             'on_interrupt_music': {'action': 'interrupt'},
@@ -78,7 +70,13 @@ TOOLS = [{
     },
     'configSchema': {'type': 'object', 'additionalProperties': False, 'properties': {
         'catalogue_type': {'type': 'string', 'enum': ['none', 'mock', 'motus_music'], 'default': 'none',
-                           'description': '曲库类型；真实曲库地址和凭据由 Perception 部署环境注入'},
+                           'description': '曲库类型；真实曲库的地址和凭据在本卡配置'},
+        'endpoint': {'type': 'string', 'default': '', 'x-sensitive': True,
+                     'description': '曲库 HTTPS 服务地址',
+                     'x-show-when': {'catalogue_type': 'motus_music'}},
+        'api_key': {'type': 'string', 'format': 'password', 'default': '',
+                    'description': '曲库 API Key；仅在卡片配置填写，分享 Solution 时清空',
+                    'x-show-when': {'catalogue_type': 'motus_music'}},
         'timeout_ms': {'type': 'integer', 'minimum': 100, 'maximum': 30000, 'default': 3000,
                        'description': '曲库请求总时限（毫秒，含能力查询和重试）',
                        'x-show-when': {'catalogue_type': 'motus_music'}},
@@ -117,7 +115,7 @@ class MusicNode(Node):
 
 
 class PhanthyMusicPlugin:
-    PREFIX = 'phanthy-music'
+    PREFIX = 'phanthy_music'
 
     def __init__(self, plugin_cfg, executor):
         self._cfg = {key: value for key, value in plugin_cfg.items() if key in CONFIG_PARAMS}
@@ -169,10 +167,10 @@ class PhanthyMusicPlugin:
     def _start(self, args):
         topics = args.get('input_topics') or []
         if not isinstance(topics, list) or any(not isinstance(t, str) for t in topics) or len(set(topics)) > 1:
-            raise ValueError('phanthy-music accepts one TTS input')
+            raise ValueError('phanthy_music accepts one TTS input')
         topic = args.get('input_topic') or (topics[0] if topics else '')
         if not isinstance(topic, str) or topic == OUTPUT_TOPIC:
-            raise ValueError('phanthy-music needs a valid input other than its own output')
+            raise ValueError('phanthy_music needs a valid input other than its own output')
         with self._lifecycle_lock:
             with self._lock:
                 if self._node and self._node.input_topic == topic:
@@ -209,42 +207,47 @@ class PhanthyMusicPlugin:
         finally:
             self._catalogue_gate.release()
 
-    def _play(self, args):
-        url, track_id = args.get('url', ''), args.get('track_id', '')
-        if not url and (not isinstance(track_id, str) or not track_id):
-            raise ValueError('play requires track_id or an authorised HTTPS url')
+    def _play(self, action, args):
+        field = 'track_id' if action == 'play_by_id' else 'genre'
+        if not isinstance(args.get(field), str) or not args[field].strip():
+            raise ValueError(f'{action} requires {field}')
+        if field == 'genre' and not any(value.strip() for value in args[field].split(',')):
+            raise ValueError('play_by_genre requires genre')
         with self._lock:
             if not self._node:
-                raise ValueError('phanthy-music is not running; start the canvas project first')
+                raise ValueError('phanthy_music is not running; start the canvas project first')
             self._cancel_pending()
             generation, node, catalogue = self._generation, self._node, self._catalogue
             cancel = self._pending_play = threading.Event()
         try:
-            audio_format, expires_at, usage = args.get('audio_format', 'mp3'), args.get('expires_at'), args.get('usage')
-            if not url:
-                result = self._query(catalogue, track_id=track_id, cancel=cancel)
-                if 'error' in result:
-                    return result
-                track = result['track']
-                audio = track.get('audio')
-                if not isinstance(audio, dict):
-                    return MusicError('not_playable', '该歌曲只有元数据，没有可播放音频。').result()
-                url, audio_format = audio.get('url', ''), audio.get('format', 'mp3')
-                expires_at, usage = audio.get('expires_at'), track.get('usage')
+            if action == 'play_by_id':
+                result = self._query(catalogue, track_id=args['track_id'], cancel=cancel)
+            else:
+                filters = {k: args[k] for k in SEARCH_PARAMS if k in args and k != 'top_k'}
+                result = self._query(catalogue, **filters, top_k=1, cancel=cancel)
+            if 'error' in result:
+                return result
+            track = result.get('track') or next(iter(result.get('tracks', [])), None)
+            if track is None:
+                return {**result, **MusicError('not_found', '没有找到可播放的歌曲。').result(),
+                        'request_id': result.get('request_id', '')}
+            audio = track.get('audio')
+            if not isinstance(audio, dict):
+                return MusicError('not_playable', '该歌曲只有元数据，没有可播放音频。').result()
             with self._lock:
                 if cancel.is_set() or generation != self._generation or self._node is not node:
                     return MusicError('cancelled', '播放请求已取消。').result()
-                node.player.play(url, audio_format, track_id, expires_at, usage)
+                node.player.play(audio.get('url', ''), audio.get('format', 'mp3'), track['id'],
+                                 audio.get('expires_at'), track.get('usage'))
                 self._pending_play = None
-                return self._info()
+                return {**result, 'track': track, **self._info()}
         finally:
             with self._lock:
                 if self._pending_play is cancel:
                     self._pending_play = None
 
     def dispatch(self, name, args):
-        # This is one tool with actions. Legacy prefix_action names must not
-        # bypass the registered action schemas and Agent Core permission gate.
+        # One registered tool with actions, using the existing card protocol.
         if name != self.PREFIX:
             return None
         action = args.get('action', 'info')
@@ -254,8 +257,8 @@ class PhanthyMusicPlugin:
                 with self._lock:
                     catalogue = self._catalogue
                 return self._query(catalogue, **{k: args[k] for k in SEARCH_PARAMS if k in args})
-            if action == 'play':
-                return self._play(args)
+            if action in ('play_by_id', 'play_by_genre'):
+                return self._play(action, args)
             if action == 'start':
                 return self._start(args)
             if action == 'stop':
@@ -267,13 +270,13 @@ class PhanthyMusicPlugin:
                     return self._info()
                 if action == 'config':
                     if set(args) - set(CONFIG_PARAMS) - {'action', 'instance_id', '_trace_id'}:
-                        raise ValueError('Unknown music config field; credentials and endpoint belong to the deployment environment')
+                        raise ValueError('Unknown music config field')
                     cfg = {**self._cfg, **{k: args[k] for k in CONFIG_PARAMS if k in args}}
                     for key, high in (('volume', 100), ('duck_gain', 1)):
                         if key in cfg:
                             cfg[key] = bounded_number(cfg[key], 0, high, key)
                     catalogue = MusicService(cfg)
-                    if any(cfg.get(k) != self._cfg.get(k) for k in ('catalogue_type', 'timeout_ms')):
+                    if any(cfg.get(k) != self._cfg.get(k) for k in ('catalogue_type', 'endpoint', 'api_key', 'timeout_ms')):
                         self._cancel_pending()
                         self._catalogue = catalogue
                     self._cfg = cfg
@@ -286,7 +289,7 @@ class PhanthyMusicPlugin:
                 if not self._node:
                     if action in ('duck', 'unduck', 'interrupt', 'interrupt_voice'):
                         return self._info()
-                    raise ValueError('phanthy-music is not running; start the canvas project first')
+                    raise ValueError('phanthy_music is not running; start the canvas project first')
                 player = self._node.player
                 if action == 'set_volume':
                     player.set_volume(args.get('volume'))
@@ -297,5 +300,7 @@ class PhanthyMusicPlugin:
                 else:
                     return None
                 return self._info()
+        except MusicError as error:
+            return error.result()
         except (ValueError, TypeError) as error:
             return {'error': str(error), 'state': 'error' if action == 'start' else ('running' if self._node else 'idle')}

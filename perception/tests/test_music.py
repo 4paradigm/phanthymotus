@@ -258,32 +258,34 @@ class PluginTests(unittest.TestCase):
     def test_schema_and_background_hooks(self):
         import jsonschema
         tool = self.plugin.get_tools()[0]
-        self.assertEqual(tool['name'], 'phanthy-music')
+        self.assertEqual(tool['name'], 'phanthy_music')
         schema = tool['inputSchema']
         self.assertNotIn('x-completion', schema)
         self.assertNotEqual(schema['x-resource'], 'mouth')
-        self.assertEqual(set(schema['properties']['action']['enum']), set(schema['x-action-params']))
+        self.assertEqual(set(schema['x-action-params']),
+                         {'search', 'play_by_id', 'play_by_genre', 'pause', 'resume', 'interrupt', 'status', 'set_volume'})
         self.assertEqual(schema['x-hooks']['on_interrupt_all']['action'], 'interrupt_voice')
-        jsonschema.validate({'action': 'play', 'url': 'https://audio.example/a.mp3', 'expires_at': None}, schema)
+        jsonschema.validate({'action': 'play_by_id', 'track_id': 'fictional-1'}, schema)
+        jsonschema.validate({'action': 'play_by_genre', 'genre': 'pop'}, schema)
 
     def test_start_stop_and_restart_have_one_node_and_no_autoplay(self):
         for _ in range(3):
-            result = self.plugin.dispatch('phanthy-music', {'action': 'start', 'input_topic': '/speech/tts'})
+            result = self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topic': '/speech/tts'})
             self.assertEqual(result['state'], 'running')
             self.assertEqual(result['playback_state'], 'idle')
             self.assertEqual(result['topic_in'][0]['topic'], '/speech/tts')
             self.assertEqual(result['topic_out'][0]['topic'], OUTPUT_TOPIC)
             self.assertEqual(len(self.executor.nodes), 1)
         node = self.plugin._node
-        self.plugin.dispatch('phanthy-music', {'action': 'stop'})
+        self.plugin.dispatch('phanthy_music', {'action': 'stop'})
         self.assertTrue(node.destroyed)
         self.assertEqual(len(self.executor.nodes), 0)
         self.assertFalse(node.player._thread.is_alive())
-        self.plugin.dispatch('phanthy-music', {'action': 'start'})
+        self.plugin.dispatch('phanthy_music', {'action': 'start'})
         self.assertEqual(len(self.executor.nodes), 1)
 
     def test_passes_real_audio_messages_to_output(self):
-        self.plugin.dispatch('phanthy-music', {'action': 'start', 'input_topic': '/speech'})
+        self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topic': '/speech'})
         node = self.plugin._node
         msg = _FakeAudioChunk()
         msg.format, msg.data = FORMAT, pcm(1000)
@@ -295,17 +297,17 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(bytes(node.publisher.messages[0]), pcm(1000))
 
     def test_no_hook_autostart_and_no_feedback_connection(self):
-        self.plugin.dispatch('phanthy-music', {'action': 'duck'})
+        self.plugin.dispatch('phanthy_music', {'action': 'duck'})
         self.assertIsNone(self.plugin._node)
-        result = self.plugin.dispatch('phanthy-music', {'action': 'start', 'input_topic': OUTPUT_TOPIC})
+        result = self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topic': OUTPUT_TOPIC})
         self.assertEqual(result['state'], 'error')
         self.assertEqual(self.executor.nodes, [])
-        self.assertIn('error', self.plugin.dispatch('phanthy-music', {'action': 'start', 'input_topics': ['/a', '/b']}))
+        self.assertIn('error', self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topics': ['/a', '/b']}))
 
     def test_closed_or_invalid_play_returns_error(self):
-        self.assertIn('error', self.plugin.dispatch('phanthy-music', {'action': 'play', 'url': 'https://audio.example/a'}))
-        self.plugin.dispatch('phanthy-music', {'action': 'start'})
-        self.assertIn('error', self.plugin.dispatch('phanthy-music', {'action': 'play', 'url': 'file:///etc/passwd'}))
+        self.assertIn('error', self.plugin.dispatch('phanthy_music', {'action': 'play_by_id', 'track_id': 'fictional-1'}))
+        self.plugin.dispatch('phanthy_music', {'action': 'start'})
+        self.assertIn('error', self.plugin.dispatch('phanthy_music', {'action': 'play_by_id'}))
         self.assertEqual(self.plugin._node.player.state, 'idle')
 
 
@@ -487,40 +489,6 @@ class TransportTests(unittest.TestCase):
         self.assertIn('not installed', decoder.error)
         self.assertEqual(decoder.frames.maxsize, 20)
         decoder.close()
-
-
-class SpeechHookTests(unittest.TestCase):
-    def test_vad_edges_reach_existing_hook_bridge(self):
-        from plugins import asr
-        import sys
-        stop = threading.Event()
-        inputs, outputs = queue.Queue(), queue.Queue()
-        inputs.put((pcm(1000), 1.0))
-        inputs.put((pcm(0), 1.1))
-        vad = Mock()
-        vad.empty.return_value = True
-        def speaking():
-            if inputs.empty():
-                stop.set()
-                return False
-            return True
-        vad.is_speech_detected.side_effect = speaking
-        sherpa = SimpleNamespace(VadModelConfig=Mock(), SileroVadModelConfig=Mock(),
-                                 VoiceActivityDetector=Mock(return_value=vad))
-        with patch.dict(sys.modules, {'sherpa_onnx': sherpa}), patch('utils.model_downloader.ensure_model'):
-            asr._vad_worker(inputs, outputs, stop, 'sherpa_onnx', .5, 400)
-        self.assertEqual([item[0] for item in list(outputs.queue)], ['speech_start', 'speech_end'])
-        stop.clear()
-        node = SimpleNamespace(_kws_cfg={'trigger_mode': 'vad'}, _worker_ready=threading.Event(),
-                               _stop_event=stop, _utterance_queue=outputs)
-        requests = []
-        def send(request, **kwargs):
-            requests.append(json.loads(request.data)['hook'])
-            if outputs.empty():
-                stop.set()
-        with patch('urllib.request.urlopen', side_effect=send):
-            asr._ASRNode._worker_inner(node)
-        self.assertEqual(requests, ['on_hearing', 'on_hearing_end'])
 
 
 if __name__ == '__main__':

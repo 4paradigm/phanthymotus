@@ -198,11 +198,17 @@ class ServiceTests(unittest.TestCase):
                 result = service.execute()
                 self.assertEqual('error' in result, blocks)
 
-    def test_credentials_are_fixed_deployment_only_and_unknown_voice_preserved(self):
-        with patch.dict('os.environ', {}, clear=True):
-            service = MusicService({'catalogue_type': 'motus_music', 'endpoint': 'https://evil.example', 'api_key': 'ignored'})
+    def test_credentials_come_only_from_card_and_unknown_voice_preserved(self):
+        with patch.dict('os.environ', {'PHANTHY_MUSIC_ENDPOINT': 'https://ignored.example',
+                                       'PHANTHY_MUSIC_API_KEY': 'fake-ignored-key'}):
+            service = MusicService({'catalogue_type': 'motus_music'})
             self.assertFalse(service.configured())
             self.assertEqual(service.execute()['error']['code'], 'not_configured')
+            service = MusicService({'catalogue_type': 'motus_music',
+                                    'endpoint': 'https://catalogue.example', 'api_key': 'fake-card-key'})
+            self.assertTrue(service.configured())
+            self.assertEqual(service._provider.endpoint, 'https://catalogue.example')
+            self.assertEqual(service._provider._key, 'fake-card-key')
         service = MusicService({'catalogue_type': 'mock'})
         service.execute()
         with patch.object(service._provider, 'track', return_value={'schema': SCHEMA, 'track': track(vocal=None)}):
