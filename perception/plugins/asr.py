@@ -406,7 +406,7 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, parakeet-en = English offline CTC, noise-robust, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"oneOf": [{"const": "x-asr-zh-en", "title": "X-ASR (Chinese / English)"}, {"const": "parakeet-en", "title": "Parakeet (English)"}, {"const": "sensevoice-small", "title": "SenseVoice (Multilingual)"}], "type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "Recognition model: X-ASR supports Chinese, English and custom hotwords; Parakeet supports English; SenseVoice supports multiple languages.", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -417,23 +417,15 @@ TOOLS = [
                 # value selected for the previous model. `config` therefore
                 # degrades a carried-over device to cpu instead of rejecting it,
                 # and only rejects a device the request actually changed.
-                "device":        {"type": "string", "enum": ["cpu", "gpu"],
-                                  "description": "Inference device. gpu loads non-quantised weights "
-                                                 "(~2.5x faster per utterance) but costs ~2 GB RAM "
-                                                 "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
-                                                 "never gives back — check headroom before enabling",
+                "device":        {"oneOf": [{"const": "cpu", "title": "CPU"}, {"const": "gpu", "title": "GPU"}], "type": "string", "enum": ["cpu", "gpu"],
+                                  "description": "Inference device: GPU accelerates recognition but uses more memory; CPU uses less memory.",
                                   "default": "cpu", "scope": "shared",
-                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small"]}},
+                                  "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small", "x-asr-zh-en"]}},
+                "asr_hotwords": {"type": "string", "x-allow-empty": True, "format": "hotwords", "default": "", "scope": "shared", "description": "Custom hotwords: Enter words to improve their recognition, such as names, places or technical terms. The wake word is included automatically.", "x-show-when": {"asr_model": "x-asr-zh-en"}},
                 # `kws` (a second sherpa KeywordSpotter on the raw audio) was
                 # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
-                "trigger_mode":  {"type": "string", "enum": ["vad", "asr_kws"], "description": "Trigger mode (vad = always listen, asr_kws = ASR + phoneme matching)", "default": "asr_kws", "scope": "shared"},
-                "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'小范小范'、'little fancy'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
-                "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
-                "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
-                "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
-                "vad_pre_roll_ms":{"type": "integer", "description": "Audio retained before detected speech (ms)", "default": 500, "scope": "shared"},
-                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
-                "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
+                "trigger_mode":  {"oneOf": [{"const": "vad", "title": "Continuous listening"}, {"const": "asr_kws", "title": "Wake-word activation"}], "type": "string", "enum": ["vad", "asr_kws"], "description": "Listening mode: Listen continuously (vad) or activate with a wake word (asr_kws).", "default": "asr_kws", "scope": "shared"},
+                "asr_kws_keyword": {"type": "string", "x-allow-empty": True, "description": "Wake word: Enter the phrase used to activate recognition, such as little fancy. X-ASR automatically includes it in the hotwords.", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
             },
             "required": []
         },
@@ -571,10 +563,17 @@ class SherpaOnnxNemoCtcAdapter(ASRAdapter):
 class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
-    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
+                 max_active_paths: int = 3, tail_padding_seconds: float = 0.3,
+                 prefix_lm_path: str = "", prefix_lm_scale: float = 0.0,
+                 entity_boost: dict = None, custom_hotwords: str = ""):
         from plugins.x_asr import XASRAdapter
 
-        self._delegate = XASRAdapter(model_dir, device, num_threads)
+        self._delegate = XASRAdapter(model_dir, device, num_threads,
+                                     max_active_paths=max_active_paths,
+                                     tail_padding_seconds=tail_padding_seconds,
+                                     prefix_lm_path=prefix_lm_path, prefix_lm_scale=prefix_lm_scale,
+                                     entity_boost=entity_boost, custom_hotwords=custom_hotwords)
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
@@ -600,11 +599,10 @@ ASR_MODELS = {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
         "devices": {
-            # No gpu entry: measured 0.80x on CUDA at matched threads. Its bundle
-            # is mixed precision (int8 encoder+joiner, fp32 decoder) and the int8
-            # parts are enough to make the GPU lose.
             "cpu": {"download": "asr_x_asr", "dtype": "int8",
-                    "dir": "/models/sherpa-onnx/x-asr-zh-en"},
+                    "dir": "/models/sherpa-onnx/x-asr-zh-en-v2"},
+            "gpu": {"download": "asr_x_asr_gpu", "dtype": "fp32",
+                    "dir": "/models/sherpa-onnx/x-asr-zh-en-fp32"},
         },
     },
     "parakeet-en": {
@@ -857,7 +855,22 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
 
     num_threads = int(cfg.get('num_threads', 2))
     _status(f"正在加载模型 '{model_name}' 到内存 …")
-    adapter = model_info["adapter"](model_dir, device, num_threads)
+    if model_name == "x-asr-zh-en":
+        lm_dir = "/models/sherpa-onnx/x-asr-prefix-lm"
+        scale = 0.05
+        if scale:
+            from utils.model_downloader import ensure_model
+            _status("正在获取 X-ASR 语言模型 …")
+            ensure_model("asr_x_asr_prefix_lm", lm_dir, progress_cb=_on_progress)
+        adapter = model_info["adapter"](
+            model_dir, device, num_threads,
+            max_active_paths=3,
+            tail_padding_seconds=0.3,
+            prefix_lm_path=os.path.join(lm_dir, "model.onnx"), prefix_lm_scale=scale,
+            custom_hotwords='\n'.join((cfg.get('asr_hotwords', ''),
+                                      cfg.get('kws', {}).get('asr_kws_keyword', ''))))
+    else:
+        adapter = model_info["adapter"](model_dir, device, num_threads)
     if cfg.get('warmup', True):
         _status(f"正在预热模型 '{model_name}' …")
         _warmup_adapter(adapter, model_name, device)
@@ -1509,6 +1522,7 @@ class ASRPlugin:
         # _nodes_lock by every config request; a request that lands mid-load
         # supersedes the one in flight rather than being dropped.
         self._load_target  = (self._asr_model, self._device)
+        self._load_revision = 0
         # start requests that arrived while a model was loading, by node key.
         # `start` answers those with `state: loading` rather than blocking for
         # the whole download, so the loader thread has to run them afterwards.
@@ -1603,21 +1617,24 @@ class ASRPlugin:
             while True:
                 with self._nodes_lock:
                     model, device = self._load_target
+                    revision = self._load_revision
+                    load_cfg = {**self._plugin_cfg, 'asr_model': model, 'device': device}
                 try:
                     log.info(f"[asr] downloading/loading model '{model}' ({device})...")
                     adapter = _build_asr_adapter(
-                        {**self._plugin_cfg, 'asr_model': model, 'device': device},
+                        load_cfg,
                         on_status=lambda text: setattr(self, "_load_status", text))
                     error = None
                 except Exception as e:
                     log.error(f"[asr] failed to load model '{model}': {e}", exc_info=True)
                     adapter, error = None, str(e)
                 with self._nodes_lock:
-                    if self._load_target != (model, device):
+                    if self._load_target != (model, device) or self._load_revision != revision:
                         # Superseded while we were loading — drop this result,
                         # including its error, and load what was asked for last.
                         log.info("[asr] load of '%s' (%s) superseded by '%s' (%s)",
                                  model, device, *self._load_target)
+                        adapter = None
                         continue
                     if adapter is not None:
                         self._adapter = adapter
@@ -1651,6 +1668,7 @@ class ASRPlugin:
 
         with self._nodes_lock:
             self._load_target = (model_name, self._device)
+            self._load_revision += 1
             if self._loading:
                 log.info("[asr] load in flight; queueing '%s' (%s) as the new target",
                          model_name, self._device)
@@ -1822,7 +1840,8 @@ class ASRPlugin:
             return {"state": "idle"}
 
         elif action == "config":
-            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and v != ''}
+            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v is not None and (v != '' or k in ('asr_hotwords', 'asr_kws_keyword'))}
+            previous_wake_word = self._kws_cfg.get('asr_kws_keyword', '')
             # Shared config update
             self._language = cfg.get('language', self._language)
             if 'vad_threshold' in cfg:
@@ -1896,7 +1915,15 @@ class ASRPlugin:
                             "value would fail, so using cpu.", new_model, new_device)
                 new_device = "cpu"
 
-            if (new_model, new_device) != (self._asr_model, self._device):
+            decode_cfg = {key: cfg[key] for key in
+                          ('asr_hotwords',) if key in cfg}
+            decode_changed = any(self._plugin_cfg.get(key) != value for key, value in decode_cfg.items())
+            decode_changed = decode_changed or previous_wake_word != self._kws_cfg.get('asr_kws_keyword', '')
+            with self._nodes_lock:
+                self._plugin_cfg['kws'] = dict(self._kws_cfg)
+                self._plugin_cfg.update(decode_cfg)
+            if ((new_model, new_device) != (self._asr_model, self._device)
+                    or (new_model == 'x-asr-zh-en' and decode_changed)):
                 # Stop all running nodes first
                 with self._nodes_lock:
                     nodes = [(k, self._nodes.pop(k)) for k in list(self._nodes.keys())]
@@ -1904,6 +1931,12 @@ class ASRPlugin:
                     node.request_stop()
                 for key, node in nodes:
                     self._dispose_node(node, key)
+                if (new_model, new_device) == (self._asr_model, self._device):
+                    # A parameter-only rebuild cannot use the stopped adapter;
+                    # release it before allocating another copy of the weights.
+                    nodes.clear()
+                    node = None
+                    self._adapter = None
                 self._asr_model = new_model
                 self._device = new_device
                 self._plugin_cfg['device'] = new_device
