@@ -229,3 +229,183 @@ class _NullExecutor:
 
     def remove_node(self, node):
         pass
+
+
+# ── face_scrfd: the SCRFD/EdgeFace stack added in #284 ──────────────────────
+# Same two rules, checked the same two ways, for the add-on stack: every
+# selectable artifact is pinned, the fetch has a status sink, and the plugin
+# card shows the downloader's line while a cold fetch runs.
+
+def test_face_scrfd_front_door_takes_a_status_sink():
+    """Signature rule, same as every builder above: the fetch entry point and
+    the adapter and plugin that hand it a sink must all accept one."""
+    import plugins.face_scrfd as face_scrfd
+
+    builders = {
+        "face_scrfd._ensure_weights": face_scrfd._ensure_weights,
+        "face_scrfd.EdgeFaceAdapter.__init__": face_scrfd.EdgeFaceAdapter.__init__,
+        "face_scrfd.FaceRecognitionPlugin._ensure_model":
+            face_scrfd.FaceRecognitionPlugin._ensure_model,
+    }
+    missing = [name for name, func in builders.items()
+               if "on_status" not in inspect.signature(func).parameters]
+    assert not missing, f"these cannot report download progress: {missing}"
+
+
+def test_face_scrfd_pins_every_selectable_artifact():
+    """Every `model`/`detector` value config can name resolves to a bundle
+    pinned by exact size + hex SHA256 — the pins are what make cache reuse
+    and source fallback safe. A new selectable weight without a pin fails
+    here, before it can ship unpinned."""
+    import plugins.face_scrfd as face_scrfd
+
+    seen = {}
+    for kind, options in (("model", face_scrfd.FACE_SCRFD_RECOGNIZER_BUNDLES),
+                          ("detector", face_scrfd.FACE_SCRFD_DETECTOR_BUNDLES)):
+        assert options, f"no {kind} bundles"
+        for key, files in options.items():
+            assert files, f"{kind} bundle {key} is empty"
+            for filename, meta in files.items():
+                assert isinstance(meta["size"], int) and meta["size"] > 0, \
+                    f"{filename} has no pinned size"
+                sha = meta["sha256"]
+                assert isinstance(sha, str) and len(sha) == 64, \
+                    f"{filename} has no pinned SHA256"
+                int(sha, 16)  # must be hex
+                assert filename not in seen or seen[filename] == sha, \
+                    f"{filename} pinned twice with different hashes"
+                seen[filename] = sha
+
+
+def _stub_face_bundles(monkeypatch, served):
+    """Re-pin both face bundles onto tiny payloads and stub the one network
+    primitive the downloader uses (`urlopen`), plus its retry backoff.
+    Returns the list of filenames actually fetched."""
+    import plugins.face_scrfd as face_scrfd
+
+    monkeypatch.setattr(face_scrfd, "FACE_SCRFD_RECOGNIZER_BUNDLES",
+                        {"edgeface_base.int8": {"rec.onnx": served["rec.onnx"]}})
+    monkeypatch.setattr(face_scrfd, "FACE_SCRFD_DETECTOR_BUNDLES",
+                        {"yunet": {"det.onnx": served["det.onnx"]}})
+
+    fetches = []
+
+    class _Response:
+        def __init__(self, data):
+            self._data, self._pos = data, 0
+
+        def read(self, size):
+            chunk = self._data[self._pos:self._pos + size]
+            self._pos += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(url, timeout=None):
+        filename = str(url).rsplit("/", 1)[1]
+        fetches.append(filename)
+        return _Response(served[filename]["bytes"])
+
+    monkeypatch.setattr(md, "urlopen", fake_urlopen)
+    monkeypatch.setattr(md.time, "sleep", lambda _s: None)   # skip retry backoff
+    return fetches
+
+
+def test_face_scrfd_fetch_forwards_the_rendered_line(tmp_path, monkeypatch):
+    """downloader line → on_status, through _ensure_weights — the soundevent
+    end-to-end shape for the face stack. Also pins that both halves ride in
+    ONE bundle call, so progress is one monotonic ramp, not two."""
+    import plugins.face_scrfd as face_scrfd
+
+    seen = {}
+
+    def fake_bundle(name, model_dir, base_url, files, progress_cb=None):
+        seen.update(name=name, files=files, progress_cb=progress_cb)
+        if progress_cb is not None:
+            progress_cb(40, 9.0, 22.0)
+        return {f: f"{model_dir}/{f}" for f in files}
+
+    monkeypatch.setattr(face_scrfd, "ensure_verified_bundle", fake_bundle)
+
+    lines = []
+    path = face_scrfd._ensure_weights("edgeface_base.int8", str(tmp_path),
+                                      detector="scrfd_2.5g",
+                                      on_status=lines.append)
+
+    assert path.endswith("edgeface_base.int8.onnx")
+    assert set(seen["files"]) == {"edgeface_base.int8.onnx",
+                                  "scrfd_2.5g_bnkps_hsuyabc.onnx"}
+    assert lines == ["正在下载模型 'face edgeface_base.int8' … 40% (9/22 MB)"]
+
+
+def test_face_scrfd_corrupt_cache_is_reverified_and_replaced(tmp_path, monkeypatch):
+    """A cached file that has the pinned size but the wrong SHA256 (or half
+    its bytes) must never be trusted: the re-check fails, the bundle refetches,
+    and the result is byte-correct. No network — stub host."""
+    import hashlib
+
+    import plugins.face_scrfd as face_scrfd
+
+    rec = b"A" * 96
+    det = b"det"
+    fetches = _stub_face_bundles(monkeypatch, {
+        "rec.onnx": {"size": len(rec),
+                     "sha256": hashlib.sha256(rec).hexdigest(), "bytes": rec},
+        "det.onnx": {"size": len(det),
+                     "sha256": hashlib.sha256(det).hexdigest(), "bytes": det},
+    })
+    # Same length, wrong content — size alone would pass; only the pin catches it.
+    (tmp_path / "rec.onnx").write_bytes(b"B" * 96)
+
+    face_scrfd._ensure_weights("edgeface_base.int8", str(tmp_path))
+
+    assert (tmp_path / "rec.onnx").read_bytes() == rec
+    assert (tmp_path / "det.onnx").read_bytes() == det
+    assert fetches == ["rec.onnx", "det.onnx"]
+
+
+def test_face_scrfd_wrong_hash_is_never_cached(tmp_path, monkeypatch):
+    """A host serving bytes whose SHA256 does not match the pin is refused
+    after its retries, and nothing invalid is left sitting in model_dir to be
+    mistaken for a warm cache by the next start."""
+    import hashlib
+
+    import plugins.face_scrfd as face_scrfd
+
+    rec, det = b"A" * 96, b"det"
+    _stub_face_bundles(monkeypatch, {
+        "rec.onnx": {"size": len(rec),
+                     "sha256": hashlib.sha256(rec).hexdigest(),
+                     "bytes": b"B" * 96},                 # tainted
+        "det.onnx": {"size": len(det),
+                     "sha256": hashlib.sha256(det).hexdigest(), "bytes": det},
+    })
+
+    with pytest.raises(RuntimeError, match="failed to download"):
+        face_scrfd._ensure_weights("edgeface_base.int8", str(tmp_path))
+
+    assert not (tmp_path / "rec.onnx").exists()
+
+
+def test_face_scrfd_card_shows_the_progress_line():
+    """info() during a cold fetch says how far along the download is, not
+    just a frozen 'loading'; the static sentence stays as the gap-filler."""
+    import plugins.face_scrfd as face_scrfd
+
+    plugin = object.__new__(face_scrfd.FaceRecognitionPlugin)
+    plugin._model_name = "edgeface_base.int8"
+    plugin._model_load_error = None
+    plugin._model_loading = True
+    plugin._model_fetch_status = "正在下载模型 'face edgeface_base.int8' … 40% (9/22 MB)"
+
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "loading"
+    assert "40%" in info["desc"]
+
+    plugin._model_fetch_status = None
+    assert plugin.dispatch("info", {})[\
+        "desc"] == "Loading EdgeFace model and identity library..."

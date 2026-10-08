@@ -1418,3 +1418,58 @@ def ensure_pose_model(model_dir: str, family: str | None = None,
     """
     return _ensure_vision_bundle("pose", POSE_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+# ── SCRFD-2.5G + EdgeFace face stack (plugins/face_scrfd.py) ─────────────────
+#
+# A second, independent face artifact set alongside the buffalo_sc front door
+# above: the add-on face_scrfd plugin (#284) lets config select the recognizer
+# and detector separately, so every selectable pair is pinned here by exact
+# size + SHA256 like every other bundle. The plugin merges one recognizer entry
+# with one detector entry into a single ensure_verified_bundle call; base_url
+# comes from the plugin (FACE_MODEL_BASE_URL lets internal evals serve byte-
+# identical files from a mirror — the pins, not the host, are the guarantee).
+FACE_SCRFD_EDGEFACE_BASE = (
+    "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/face/scrfd_edgeface"
+)
+
+FACE_SCRFD_RECOGNIZER_BUNDLES = {
+    # Self-contained Linear-INT8 export — the shipped default.
+    "edgeface_base.int8": {
+        "edgeface_base.int8.onnx": {
+            "size": 22355815,
+            "sha256": "8a97eddb4dbba95511f4160c88957d69a75edaa288d8d93afbbaad9a7b6e997a",
+        },
+    },
+    # Legacy S export; weights live in the external .onnx.data companion.
+    "edgeface_s_gamma_05": {
+        "edgeface_s_gamma_05.onnx": {
+            "size": 1342191,
+            "sha256": "3b4ca373b55b09ca1dd12f13047c5bdd080ad99be328e977308b740264055679",
+        },
+        "edgeface_s_gamma_05.onnx.data": {
+            "size": 14605520,
+            "sha256": "6113a02f22863d6826062b43962c798a97f5bdca4c6fc93d9b6692f73a5180da",
+        },
+    },
+}
+
+FACE_SCRFD_DETECTOR_BUNDLES = {
+    "yunet": {
+        "face_detection_yunet_2023mar.onnx": {
+            "size": 232589,
+            "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+        },
+    },
+    "scrfd": {
+        "scrfd_500m_kps.onnx": {
+            "size": 2524817,
+            "sha256": "5e4447f50245bbd7966bd6c0fa52938c61474a04ec7def48753668a9d8b4ea3a",
+        },
+    },
+    "scrfd_2.5g": {
+        "scrfd_2.5g_bnkps_hsuyabc.onnx": {
+            "size": 3290207,
+            "sha256": "bc24bb349491481c3ca793cf89306723162c280cb284c5a5e49df3760bf5c2ce",
+        },
+    },
+}

@@ -159,10 +159,6 @@ def test_no_standalone_session_is_created_outside_the_worker():
     allowed = {
         "ort_worker.py",          # the child itself, which is the point
         "face_runtime.py",        # `_open_session` fallback, warned about
-        "face_scrfd.py",          # SCRFD + EdgeFace run in-process; `device: cpu`
-                                  # (the default, tested configuration) never opens
-                                  # the CUDA provider, so it cannot collide with
-                                  # sherpa. `*_device: gpu` is an explicit opt-in.
         "kokoro_direct.py",       # `in_process=True` fallback, cpu-only
     }
     offenders = {}

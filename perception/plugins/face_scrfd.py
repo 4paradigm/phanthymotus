@@ -34,24 +34,18 @@ import os
 import queue
 import threading
 import time
-import urllib.request
 from collections import deque
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-# Standalone ONNX Runtime is imported here, at module scope, on purpose: the
-# robot loads sherpa-onnx and standalone ORT in the same process, and the one
-# CUDA provider bridge binds against whichever library's session came first.
-# main.py imports this module during plugin load, before any plugin builds a
-# session, so a module-scope import is what keeps kokoro's TensorSeq graphs
-# intact — the ordering is asserted by tests/test_kokoro_tts_engine.py.
-# Guarded so host-side suites (no ORT installed) can still import this module.
-try:
-    import onnxruntime as _ort  # noqa: F401
-except ImportError:  # pragma: no cover — host-side test environments
-    _ort = None
+# No `import onnxruntime` in this module, at any scope: sherpa-onnx bundles
+# its own libonnxruntime in this process, and a standalone-ORT session here
+# would share the one process-global provider bridge with it (last writer
+# wins — a SIGSEGV on jp5.11 takes the whole perception process). Every ORT
+# session this plugin needs is loaded through plugins/ort_worker.py instead,
+# whose single child process owns all standalone-ORT sessions.
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -59,15 +53,18 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from utils.ros_lifecycle import dispose_node
+from utils.model_downloader import (
+    FACE_SCRFD_DETECTOR_BUNDLES, FACE_SCRFD_EDGEFACE_BASE,
+    FACE_SCRFD_RECOGNIZER_BUNDLES, ensure_verified_bundle,
+)
+from utils.model_progress import fetch_status
+from plugins import ort_worker
 from plugins.face_corpus import corpus_entries, load_image
 
 log = logging.getLogger(__name__)
 
 # ── Model URLs (platform COS; same bucket/dir pattern as buffalo_sc) ────────
-_MODEL_BASE_URL = os.environ.get(
-    "FACE_MODEL_BASE_URL",
-    "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/face/scrfd_edgeface",
-)
+_MODEL_BASE_URL = os.environ.get("FACE_MODEL_BASE_URL", FACE_SCRFD_EDGEFACE_BASE)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_SIMILARITY_THRESHOLD = 0.39  # cosine similarity above this = same person
@@ -293,36 +290,34 @@ TOOLS = [
 
 # ── Model download ────────────────────────────────────────────────────────────
 
-def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet") -> str:
-    """Download model weights from the model base URL if not present. Returns ONNX model path."""
-    os.makedirs(model_dir, exist_ok=True)
+def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet",
+                    on_status=None) -> str:
+    """Fetch the pinned weight bundles. Returns the recognizer ONNX path.
 
-    # The Base INT8 artifact is self-contained; the legacy S export uses external data.
-    filenames = [f"{model_name}.onnx"]
-    if model_name != "edgeface_base.int8":
-        filenames.append(f"{model_name}.onnx.data")
-    for filename in filenames:
-        path = os.path.join(model_dir, filename)
-        if os.path.exists(path):
-            continue
-        url = f"{_MODEL_BASE_URL}/{filename}"
-        log.info(f"[face] downloading {filename} from {url} → {path}")
-        urllib.request.urlretrieve(url, path)
-        log.info(f"[face] download complete: {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    Goes through utils.model_downloader.ensure_verified_bundle like every
+    other platform model: every selectable recognizer/detector artifact is
+    pinned by exact size + SHA256 (FACE_SCRFD_*_BUNDLES), a cached file is
+    trusted only after re-verification, nothing corrupt ever reaches the cache
+    (downloads land in staging and are os.replace'd only after they hash
+    right), and the ten platform instances cold-starting at once serialise on
+    one flock and fetch one copy. `on_status` receives the standard
+    "正在下载模型 …" line so the plugin card shows how far a cold fetch has
+    got; a warm cache emits nothing at all.
+    """
+    recognizer_files = FACE_SCRFD_RECOGNIZER_BUNDLES.get(model_name)
+    if recognizer_files is None:
+        raise ValueError(
+            f"unknown face model {model_name!r}; pick one of "
+            f"{sorted(FACE_SCRFD_RECOGNIZER_BUNDLES)}")
+    detector_files = FACE_SCRFD_DETECTOR_BUNDLES.get(
+        detector if detector in FACE_SCRFD_DETECTOR_BUNDLES else "yunet")
 
-    # Detector ONNX model
-    det_filename = {
-        "yunet": "face_detection_yunet_2023mar.onnx",
-        "scrfd": "scrfd_500m_kps.onnx",
-        "scrfd_2.5g": "scrfd_2.5g_bnkps_hsuyabc.onnx",
-    }.get(detector, "face_detection_yunet_2023mar.onnx")
-    det_path = os.path.join(model_dir, det_filename)
-    if not os.path.exists(det_path):
-        url = f"{_MODEL_BASE_URL}/{det_filename}"
-        log.info(f"[face] downloading {det_filename} from {url}")
-        urllib.request.urlretrieve(url, det_path)
-        log.info(f"[face] download complete: {det_path} ({os.path.getsize(det_path) / 1e6:.1f} MB)")
-
+    # One bundle call over both halves: the downloader reports a single
+    # monotonic 0-100% across recognizer + detector files, not two ramps.
+    files = {**recognizer_files, **detector_files}
+    progress_cb, _stage_cb = fetch_status(on_status, f"face {model_name}")
+    ensure_verified_bundle("face/scrfd_edgeface", model_dir, _MODEL_BASE_URL,
+                           files, progress_cb=progress_cb)
     return os.path.join(model_dir, f"{model_name}.onnx")
 
 
@@ -970,18 +965,21 @@ class YuNetDetector:
 
 
 class SCRFDDetector:
-    """SCRFD-KPS (500M/2.5G) via onnxruntime. Expects RGB input (converts to BGR
+    """SCRFD-KPS (500M/2.5G) via onnxruntime, in the shared ORT worker. Expects RGB input (converts to BGR
     internally), returns original-coord detections."""
 
     def __init__(self, model_dir: str, confidence: float,
                  filename: str = "scrfd_500m_kps.onnx", device: str = "cpu"):
-        import onnxruntime as ort
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = 4
         model_path = os.path.join(model_dir, filename)
         providers = _providers_for_device(device)
-        self._sess = ort.InferenceSession(
-            model_path, sess_options=so, providers=providers
+        # The session lives in the shared ORT worker child, never in this
+        # process (provider-bridge collision with sherpa-onnx's bundled ORT —
+        # see plugins/ort_worker.py). Preprocessing and decode stay here; the
+        # worker owns the session and serialises the ~13 ms forwards.
+        self._sess = ort_worker.get_worker().load(
+            key=f"face.detector.{filename}.{device}",
+            model_path=model_path, providers=providers,
+            options={"intra_op_num_threads": 4},
         )
         log.info(f"[face] SCRFD session on {self._sess.get_providers()}")
         self._input_name = self._sess.get_inputs()[0].name
@@ -1117,21 +1115,24 @@ class EdgeFaceAdapter:
     def __init__(self, model_name: str, model_dir: str, device: str = "cpu",
                  confidence: float = 0.5, detector: str = "yunet",
                  detector_device: str | None = None,
-                 recognizer_device: str | None = None):
-        import onnxruntime as ort
+                 recognizer_device: str | None = None,
+                 on_status=None):
+        # Fetch pinned weights (returns the recognizer ONNX path); on_status
+        # rides along to the downloader's progress line.
+        onnx_path = _ensure_weights(model_name, model_dir, detector=detector,
+                                    on_status=on_status)
 
-        # Download weights from the model base URL (returns the recognizer ONNX path)
-        onnx_path = _ensure_weights(model_name, model_dir, detector=detector)
-
-        # ── Load EdgeFace backbone via ONNX Runtime ──
+        # ── Load EdgeFace backbone via the shared ORT worker ──
+        # Same provider-bridge reason as SCRFDDetector: sessions never live in
+        # this process. The worker applies intra_op_num_threads from `options`
+        # and runs forwards serially, so the old inter_op=1 pin is moot there.
         self._model_name = model_name
         self._inference_lock = threading.Lock()
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = 2
-        so.inter_op_num_threads = 1
         providers = _providers_for_device(recognizer_device or device)
-        self._sess = ort.InferenceSession(
-            onnx_path, sess_options=so, providers=providers
+        self._sess = ort_worker.get_worker().load(
+            key=f"face.recognizer.{model_name}.{recognizer_device or device}",
+            model_path=onnx_path, providers=providers,
+            options={"intra_op_num_threads": 2},
         )
         self._input_name = self._sess.get_inputs()[0].name
         log.info(f"[face] EdgeFace loaded (ONNX): {onnx_path} "
@@ -1370,8 +1371,14 @@ class _FaceNode(Node):
                 self._pub.publish(msg)
 
                 self._detect_count += 1
-                log.info(f"[face] {len(detections)} face(s), result="
-                         f"{result.get('identity', {}).get('person_id')} (detect+match done)")
+                # Sampled: at fps 3 an unconditional line is ~260k records/day
+                # on a busy robot. The first frame proves the loop is live and
+                # every 100th keeps the cadence visible; errors and state
+                # transitions (here and in the plugin) stay unthrottled.
+                if self._detect_count == 1 or self._detect_count % 100 == 0:
+                    log.info(f"[face] frame {self._detect_count}: "
+                             f"{len(detections)} face(s), result="
+                             f"{result.get('identity', {}).get('person_id')} (detect+match done)")
 
             except Exception as e:
                 log.error(f"[face] inference error: {e}", exc_info=True)
@@ -1433,6 +1440,9 @@ class FaceRecognitionPlugin:
         self._model = None
         self._model_loading = False
         self._model_load_error = None
+        # Live "正在下载模型 … 40% …" line from fetch_status; surfaced by
+        # info() while loading, cleared the moment the load settles.
+        self._model_fetch_status = None
         self._model_lock = threading.Lock()
         self._max_batch = int(plugin_cfg.get("max_batch", 1000))
         self._pending_starts: list[tuple[str, str]] = []
@@ -1461,11 +1471,20 @@ class FaceRecognitionPlugin:
         if self._model_loading or self._model is not None:
             return
         self._model_loading = True
+        self._model_fetch_status = None
+
+        def _set_model_status(text):
+            # Runs on the downloader thread. Once loading has settled the
+            # line is stale by definition, so late callbacks are dropped.
+            if self._model_loading:
+                self._model_fetch_status = text
 
         def _bg_load():
             try:
-                self._ensure_model()
+                self._ensure_model(on_status=_set_model_status)
+                self._model_load_error = None
                 self._model_loading = False
+                self._model_fetch_status = None
                 log.info("[face] model loaded, processing pending starts")
                 for node_key, input_topic in self._pending_starts:
                     if node_key not in self._nodes:
@@ -1473,12 +1492,13 @@ class FaceRecognitionPlugin:
                 self._pending_starts.clear()
             except Exception as e:
                 self._model_loading = False
+                self._model_fetch_status = None
                 self._model_load_error = str(e)
                 log.error(f"[face] model load failed: {e}", exc_info=True)
 
         threading.Thread(target=_bg_load, daemon=True, name="face_model_load").start()
 
-    def _ensure_model(self):
+    def _ensure_model(self, on_status=None):
         """Load model and identity library in background."""
         with self._model_lock:
             if self._model is not None:
@@ -1489,6 +1509,7 @@ class FaceRecognitionPlugin:
                 confidence=self._confidence, detector=self._detector,
                 detector_device=self._detector_device,
                 recognizer_device=self._recognizer_device,
+                on_status=on_status,
             )
 
             # Bind snapshots to both the recognizer name and actual weights.
@@ -1784,7 +1805,10 @@ class FaceRecognitionPlugin:
                     "name": "FaceRecognition", "manufacture": "Embodied",
                     "model": self._model_name,
                     "state": "loading",
-                    "desc": "Loading EdgeFace model and identity library...",
+                    # The live download line while a cold fetch runs; the
+                    # static sentence only covers the gaps around it.
+                    "desc": (self._model_fetch_status
+                             or "Loading EdgeFace model and identity library..."),
                 }
             if self._model_load_error:
                 return {

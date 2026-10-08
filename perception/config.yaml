@@ -469,9 +469,10 @@ plugins:
     # provider list, so no `device` value can block startup — hosts and images
     # without CUDA warn and stay on CPU.
     device: cpu
-    detector_device: gpu         # SCRFD-2.5G is all-FP32, runs wholly on CUDA — the only
-                                 # session the GPU speeds up. ~300 MB CUDA context per
-                                 # process; on a shared Orin set cpu when the budget is tight.
+    detector_device: cpu         # GPU is opt-in: SCRFD-2.5G is all-FP32 and the only session
+                                 # CUDA speeds up, but it costs a ~300 MB CUDA context per
+                                 # process — cpu keeps the 10-container budget safe (gpu also
+                                 # runs its forwards in the shared ORT worker now).
     recognizer_device: cpu       # EdgeFace INT8 stays on CPU: its dynamic-quant graph
                                  # partitions across ORT's CUDA EP with 129 inserted Memcpy
                                  # nodes — same accuracy, worse latency on GPU. (Same reason
