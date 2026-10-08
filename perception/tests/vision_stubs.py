@@ -219,6 +219,20 @@ def _install_fake_cv2():
             return None
         return _np.zeros((height, width, 3), dtype=_np.uint8)
 
+    def imencode(ext, img):
+        # The counterpart of the "WxH" marker imdecode parses above: the bytes
+        # are the marker itself, so a test that encodes a frame and hands the
+        # bytes to a plugin gets back a frame of the same dimensions and
+        # nothing else. No real JPEG or PNG exists anywhere in the suite.
+        height, width = img.shape[:2]
+        return True, _np.frombuffer(f"{width}x{height}".encode(), dtype=_np.uint8)
+
+    def imwrite(path, img):
+        height, width = img.shape[:2]
+        with open(path, "wb") as fh:
+            fh.write(f"{width}x{height}".encode())
+        return True
+
     def resize(src, dsize, interpolation=0):
         width, height = dsize
         rows = (_np.arange(height) * src.shape[0] // height).clip(0, src.shape[0] - 1)
@@ -308,6 +322,7 @@ def _install_fake_cv2():
                 labels[r, c] = remap[root]
         return nxt, labels
 
+    cv2.error = type("error", (Exception,), {})  # real cv2 raises cv2.error on bad decodes
     cv2.COLOR_BGR2GRAY = 6
     # ── drawing + encoding, for the pose overlay path ────────────────────
     #
@@ -356,6 +371,8 @@ def _install_fake_cv2():
 
     cv2.COLOR_BGR2HSV = 40
     cv2.imdecode = imdecode
+    cv2.imencode = imencode
+    cv2.imwrite = imwrite
     cv2.resize = resize
     cv2.cvtColor = cvtColor
     cv2.connectedComponents = connectedComponents
