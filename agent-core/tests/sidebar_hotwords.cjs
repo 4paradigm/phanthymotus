@@ -21,9 +21,9 @@ const ctx={document:{getElementById:id=>ids[id]||null,createElement:t=>new El(t)
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(require('path').join(__dirname, '../web/js/sidebar.js'),'utf8').replace(/^import .*;$/gm,'').replace(/\bexport /g,''),ctx);
 ctx.schema = {properties: {
- asr_model: {type:'string', scope:'shared', oneOf:[{const:'x-asr-zh-en',title:'X-ASR（中英文）'}]},
+ asr_model: {type:'string', scope:'shared', oneOf:[{const:'x-asr-zh-en',title:'X-ASR (Chinese / English)'}]},
  device: {type:'string', scope:'shared', enum:['cpu','gpu'], default:'cpu'},
- trigger_mode: {type:'string', scope:'shared', oneOf:[{const:'asr_kws',title:'唤醒词触发'}], default:'asr_kws'},
+ trigger_mode: {type:'string', scope:'shared', oneOf:[{const:'asr_kws',title:'Wake-word activation'}], default:'asr_kws'},
  asr_kws_keyword: {type:'string', scope:'shared', 'x-allow-empty':true},
  asr_hotwords: {type:'string', scope:'shared', format:'hotwords', default:'', 'x-allow-empty':true,
                'x-show-when':{asr_model:'x-asr-zh-en'}},
@@ -36,7 +36,7 @@ ctx.schema = {properties: {
  const hotwords=field('asr_hotwords'), tags=hotwords.children[0], entry=hotwords.children[1];
  assert.equal(entry.tagName,'input');
  assert.equal(field('trigger_mode').value,'asr_kws');
- assert.equal(field('asr_model').children[1].textContent,'X-ASR（中英文）');
+ assert.equal(field('asr_model').children[1].textContent,'X-ASR (Chinese / English)');
  assert.equal(tags.children[0].children[0].textContent,'旧词');
  const enter=()=>entry.listeners.keydown({key:'Enter',preventDefault(){}});
  entry.value='Fancy Robot';enter();

@@ -543,8 +543,8 @@ function _makeHotwordInput(key, def, saved) {
   const entry = document.createElement('input');
   entry.type = 'text';
   entry.className = 'tool-config-input';
-  entry.placeholder = '输入词语后按回车；也可粘贴多行';
-  entry.setAttribute('aria-label', '添加自定义热词');
+  entry.placeholder = 'Type a word and press Enter, or paste multiple lines';
+  entry.setAttribute('aria-label', 'Add custom hotword');
   const split = text => String(text ?? '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   let words = [...new Set(split(saved ?? def.default))];
   // Include unfinished input when Save is clicked or keyboard-activated.
@@ -561,7 +561,7 @@ function _makeHotwordInput(key, def, saved) {
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.textContent = '×';
-      remove.setAttribute('aria-label', `删除热词：${word}`);
+      remove.setAttribute('aria-label', `Remove hotword: ${word}`);
       remove.addEventListener('click', () => {
         words = words.filter(item => item !== word);
         render();
@@ -593,7 +593,8 @@ function _makeHotwordInput(key, def, saved) {
     entry.value = '';
     render();
   });
-  entry.addEventListener('blur', commit);
+  // Do not redraw tags on blur: it can remove the clicked delete button
+  // between mousedown and click. The value getter includes pending input on Save.
   box.appendChild(tags);
   box.appendChild(entry);
   render();
@@ -673,8 +674,11 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
+  saveBtn.textContent = toolName === 'asr' ? 'Save' : '保存';
+  const cancelLabel = document.getElementById('tool-config-cancel');
+  if (cancelLabel) cancelLabel.textContent = toolName === 'asr' ? 'Cancel' : '取消';
 
-  titleEl.textContent = toolName === 'asr' ? '语音识别设置' : `Configure ${toolName}`;
+  titleEl.textContent = toolName === 'asr' ? 'Configure ASR' : `Configure ${toolName}`;
   bodyEl.innerHTML = '';
 
   const props = configSchema.properties || {};
@@ -917,11 +921,11 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         body: JSON.stringify(values),
       });
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        alert(toolName === 'asr' ? `Failed to save settings (HTTP ${resp.status})` : `配置保存失败 (HTTP ${resp.status})`);
         return;
       }
     } catch (err) {
-      alert('配置保存失败: ' + err.message);
+      alert((toolName === 'asr' ? 'Failed to save settings: ' : '配置保存失败: ') + err.message);
       console.error('[config] save failed:', err);
       return;
     }
@@ -1020,6 +1024,9 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
+  saveBtn.textContent = toolName === 'asr' ? 'Save' : '保存';
+  const cancelLabel = document.getElementById('tool-config-cancel');
+  if (cancelLabel) cancelLabel.textContent = toolName === 'asr' ? 'Cancel' : '取消';
 
   titleEl.textContent = `Instance Config: ${toolName}`;
   bodyEl.innerHTML = '';
@@ -1234,11 +1241,11 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         body: JSON.stringify(values),
       });
       if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+        alert(toolName === 'asr' ? `Failed to save settings (HTTP ${resp.status})` : `配置保存失败 (HTTP ${resp.status})`);
         return;
       }
     } catch (err) {
-      alert('配置保存失败: ' + err.message);
+      alert((toolName === 'asr' ? 'Failed to save settings: ' : '配置保存失败: ') + err.message);
       console.error('[config] instance save failed:', err);
       return;
     }

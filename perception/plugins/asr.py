@@ -406,7 +406,7 @@ TOOLS = [
                 # The two paraformers and zipformer-en were dropped for accuracy;
                 # REMOVED_ASR_MODELS maps a card still holding one onto its
                 # replacement rather than letting it fail to resolve.
-                "asr_model":     {"oneOf": [{"const": "x-asr-zh-en", "title": "X-ASR（中英文）"}, {"const": "parakeet-en", "title": "Parakeet（英文）"}, {"const": "sensevoice-small", "title": "SenseVoice（多语言）"}], "type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "识别模型：X-ASR 支持中英文和自定义热词，Parakeet 支持英文，SenseVoice 支持多语言", "default": "sensevoice-small", "scope": "shared"},
+                "asr_model":     {"oneOf": [{"const": "x-asr-zh-en", "title": "X-ASR (Chinese / English)"}, {"const": "parakeet-en", "title": "Parakeet (English)"}, {"const": "sensevoice-small", "title": "SenseVoice (Multilingual)"}], "type": "string", "enum": ["x-asr-zh-en", "parakeet-en", "sensevoice-small"], "description": "Recognition model: X-ASR supports Chinese, English and custom hotwords; Parakeet supports English; SenseVoice supports multiple languages.", "default": "sensevoice-small", "scope": "shared"},
                 # Which weights each device loads is in ASR_MODELS; only models
                 # with a verified gpu entry list one, so x-show-when hides this
                 # field for the rest rather than offering a choice that would be
@@ -418,14 +418,14 @@ TOOLS = [
                 # degrades a carried-over device to cpu instead of rejecting it,
                 # and only rejects a device the request actually changed.
                 "device":        {"oneOf": [{"const": "cpu", "title": "CPU"}, {"const": "gpu", "title": "GPU"}], "type": "string", "enum": ["cpu", "gpu"],
-                                  "description": "运行设备：GPU 加速识别，但需要更多内存；CPU 使用更少内存。",
+                                  "description": "Inference device: GPU accelerates recognition but uses more memory; CPU uses less memory.",
                                   "default": "cpu", "scope": "shared",
                                   "x-show-when": {"asr_model": ["parakeet-en", "sensevoice-small", "x-asr-zh-en"]}},
-                "asr_hotwords": {"type": "string", "x-allow-empty": True, "format": "hotwords", "default": "", "scope": "shared", "description": "自定义热词：输入后按回车添加，点击 × 删除；支持粘贴多行，自动去重。内置热词自动保留；已默认启用上下文辅助和热词增强，无需调整算法参数。", "x-show-when": {"asr_model": "x-asr-zh-en"}},
+                "asr_hotwords": {"type": "string", "x-allow-empty": True, "format": "hotwords", "default": "", "scope": "shared", "description": "Custom hotwords: Enter words to improve their recognition, such as names, places or technical terms. The wake word is included automatically.", "x-show-when": {"asr_model": "x-asr-zh-en"}},
                 # `kws` (a second sherpa KeywordSpotter on the raw audio) was
                 # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
-                "trigger_mode":  {"oneOf": [{"const": "vad", "title": "持续聆听"}, {"const": "asr_kws", "title": "唤醒词触发"}], "type": "string", "enum": ["vad", "asr_kws"], "description": "识别方式：vad 持续聆听，asr_kws 唤醒词触发", "default": "asr_kws", "scope": "shared"},
-                "asr_kws_keyword": {"type": "string", "x-allow-empty": True, "description": "唤醒词：例如小范小范、little fancy。使用 X-ASR 时自动加入识别热词，无需重复填写。", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
+                "trigger_mode":  {"oneOf": [{"const": "vad", "title": "Continuous listening"}, {"const": "asr_kws", "title": "Wake-word activation"}], "type": "string", "enum": ["vad", "asr_kws"], "description": "Listening mode: Listen continuously (vad) or activate with a wake word (asr_kws).", "default": "asr_kws", "scope": "shared"},
+                "asr_kws_keyword": {"type": "string", "x-allow-empty": True, "description": "Wake word: Enter the phrase used to activate recognition, such as little fancy. X-ASR automatically includes it in the hotwords.", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
             },
             "required": []
         },
