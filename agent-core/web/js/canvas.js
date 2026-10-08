@@ -62,15 +62,15 @@ async function _ensureEdit() {
       _isEditor = true;
       _currentEditor = _sessionId;
       _updateEditorUI();
-      _showToast('已自动获取编辑权限');
+      _showToast('Editing enabled');
       return true;
     }
     _currentEditor = data.editor || null;
     _updateEditorUI();
-    _showToast('画布正被其他用户编辑，请稍后重试');
+    _showToast('Another user is editing. Please try again later.');
     return false;
   } catch {
-    _showToast('无法获取编辑权限，请检查网络');
+    _showToast('Unable to enable editing. Check your connection.');
     return false;
   }
 }
