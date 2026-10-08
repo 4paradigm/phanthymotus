@@ -74,8 +74,12 @@ class DepthARTSession:
         if not engine_path.is_file() or not plugin_path.is_file():
             raise FileNotFoundError("DepthART engine/plugin missing; provision artifacts matching this JetPack/TensorRT")
         self._plugin = ctypes.CDLL(str(plugin_path.resolve()), mode=ctypes.RTLD_GLOBAL)
-        self._plugin.depthart_selective_scan_trt_version.restype = ctypes.c_char_p
-        if self._plugin.depthart_selective_scan_trt_version() != b"SelectiveScan-1":
+        try:
+            version = self._plugin.depthart_selective_scan_trt_version
+        except AttributeError as exc:
+            raise ValueError("DepthART plugin is missing its version symbol; provision a matching SelectiveScan plugin") from exc
+        version.restype = ctypes.c_char_p
+        if version() != b"SelectiveScan-1":
             raise ValueError("unsupported DepthART SelectiveScan plugin version")
         self._engine = TensorRTEngine(engine_path, primary_input="image")
         shape = self._engine.input_shape

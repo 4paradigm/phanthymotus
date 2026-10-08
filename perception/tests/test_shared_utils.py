@@ -80,6 +80,44 @@ def test_normalize_family_aliases():
 
 
 # ── read_engine_file ─────────────────────────────────────────────────────────
+def test_auxiliary_input_is_uploaded_every_call(tmp_path,monkeypatch,fake_cuda):
+    module=_install_fake_tensorrt(monkeypatch)
+    class Context(_FakeContext):
+        def set_input_shape(self,name,shape):
+            if name=='out_a':
+                self.aux_shape=tuple(shape)
+                return True
+            return super().set_input_shape(name,shape)
+    class Engine(_FakeEngine):
+        def get_tensor_mode(self,name):
+            return _FakeIOMode.INPUT if name in ('images','out_a') else _FakeIOMode.OUTPUT
+        def get_tensor_shape(self,name):
+            return (1,3,3) if name=='out_a' else super().get_tensor_shape(name)
+        def get_tensor_dtype(self,name):
+            return _FakeDataType.FLOAT if name=='out_a' else super().get_tensor_dtype(name)
+        def create_execution_context(self):
+            return Context(self)
+    monkeypatch.setattr(module.Runtime,'deserialize_cuda_engine',lambda self,data:Engine())
+    path=tmp_path/'multi.engine'; path.write_bytes(b'x')
+    engine=trt_rt.TensorRTEngine(path,primary_input='images')
+    copied={}
+    monkeypatch.setattr(engine._cuda,'copy_host_to_device',lambda ptr,array:copied.update({ptr:array.copy()}))
+    try:
+        image=np.zeros((1,3,64,64),dtype=np.float32)
+        k=np.eye(3,dtype=np.float32)[None]
+        engine.infer(image,auxiliary_inputs={'out_a':k})
+        pointer=engine._device_buffers['out_a']
+        assert np.array_equal(copied[pointer],k)
+        engine.infer(image,auxiliary_inputs={'out_a':k*2})
+        assert np.array_equal(copied[pointer],k*2)
+        with pytest.raises(trt_rt.TensorRTShapeError): engine.infer(image)
+        with pytest.raises(trt_rt.TensorRTShapeError): engine.infer(image,auxiliary_inputs={'out_a':k[0]})
+        engine.infer(np.zeros((3,3,256,256),np.float32),auxiliary_inputs={'out_a':k})
+        assert engine._context.profile==1 and engine._context.aux_shape==(1,3,3)
+    finally:
+        engine.close()
+    assert fake_cuda.streams_destroyed==1
+
 
 def test_read_engine_file_strips_ultralytics_header(tmp_path):
     payload = b"\x00\x01\x02engine-bytes"
@@ -318,6 +356,21 @@ def test_engine_dynamic_profiles_and_buffer_growth(tmp_path, monkeypatch, fake_c
     with pytest.raises(trt_rt.TensorRTError):
         engine.infer(np.zeros((1, 3, 64, 64), dtype=np.float32))
     engine.close()  # idempotent
+
+
+def test_engine_rejects_dynamic_auxiliary_shape(tmp_path, monkeypatch, fake_cuda):
+    module = _install_fake_tensorrt(monkeypatch)
+
+    class Engine(_FakeEngine):
+        def get_tensor_mode(self, name):
+            return _FakeIOMode.INPUT if name in ('images', 'out_a') else _FakeIOMode.OUTPUT
+
+    monkeypatch.setattr(module.Runtime, 'deserialize_cuda_engine', lambda self, data: Engine())
+    path = tmp_path / 'dynamic-aux.engine'
+    path.write_bytes(b'test')
+    with pytest.raises(trt_rt.TensorRTShapeError, match='must have a static shape'):
+        trt_rt.TensorRTEngine(path, primary_input='images')
+    assert fake_cuda.streams_destroyed == fake_cuda.streams_created == 1
 
 
 def test_engine_static_shape(tmp_path, monkeypatch, fake_cuda):

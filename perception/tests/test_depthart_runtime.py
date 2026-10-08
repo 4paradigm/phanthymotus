@@ -1,0 +1,256 @@
+import types
+import numpy as np
+import pytest
+import vision_stubs
+from vision_stubs import _FakeExecutor
+from plugins import visual_depth as vd
+from plugins.depthart_runtime import camera_matrix, prepare_image
+from plugins.vision_runtime import decode_depth
+
+
+def camera(fx=900.):
+    return {'schema':'motus.camera/1','id':'camera-a','width':1600,'height':900,
+            'K':[fx,4.,799.5,0.,fx,449.5,0.,0.,1.]}
+
+
+
+
+def test_preprocess_scales_intrinsics_and_normalizes_rgb():
+    frame=np.zeros((900,1600,3),np.uint8); frame[:,:,2]=255
+    blob,k=prepare_image(frame,camera(),(864,480))
+    expected=np.array(camera()['K'],np.float32).reshape(3,3)
+    expected[0]*=864/1600; expected[1]*=480/900
+    assert blob.shape==(1,3,480,864)
+    np.testing.assert_allclose(k[0],expected)
+    np.testing.assert_allclose(blob[0,:,0,0],(np.array([1.,0.,0.])-[.485,.456,.406])/[.229,.224,.225],rtol=1e-6)
+    assert decode_depth([np.ones((1,480,864))],None).shape==(480,864)
+
+
+@pytest.mark.parametrize('bad',[{}, {'K':[1.]*9,'width':1,'height':1},dict(camera(),K=[np.nan]*9),dict(camera(),width=0)])
+def test_invalid_camera_rejected(bad):
+    with pytest.raises(ValueError):camera_matrix(bad)
+
+
+def test_unsupported_aspect_rejected():
+    with pytest.raises(ValueError,match='aspect ratio'):
+        prepare_image(np.zeros((480,640,3),np.uint8),camera(),(864,480))
+
+
+def make_plugin(cfg=None):
+    return vd.VideoDepthPerceptionPlugin(dict(backend='depthart',**(cfg or {})),'test',_FakeExecutor())
+
+
+def test_laziness_missing_camera_and_presets(monkeypatch):
+    p=make_plugin({'calibration_preset':vd.CAL_AUTO})
+    monkeypatch.setattr(p,'_ensure_model',lambda:pytest.fail('unexpected model load'))
+    assert p.dispatch('visual_depth',{'action':'info'})['model']=='depthart-metric-s'
+    assert p.dispatch('visual_depth',{'action':'config','instance_id':'a','calibration_preset':vd.CAL_AUTO})['config']['calibration_preset']==vd.CAL_NONE
+    assert p.dispatch('visual_depth',{'action':'start','input_topic':'/a'})['state']=='error'
+    preset=next(iter(vd.CALIBRATION_PRESETS))
+    assert p.dispatch('visual_depth',{'action':'config','calibration_preset':preset})['status']=='error'
+    assert p.dispatch('visual_depth',{'action':'config','backend':'yolo'})['status']=='error'
+    assert p._model is None
+
+
+def test_unbound_on_demand_start_discards_stopped_camera(monkeypatch):
+    p = make_plugin()
+    p._model = object()
+    p._upstream_camera['a'] = camera()
+    starts = []
+    monkeypatch.setattr(p, '_start_node', lambda key, topic: starts.append((key, topic)))
+    p.dispatch('visual_depth', dict(action='start', instance_id='a'))
+    assert starts == [('a', None)]
+    assert 'a' not in p._upstream_camera
+
+
+@pytest.mark.parametrize('topic_arg', [{'input_topic': '/a'}, {'input_topics': ['/a']}])
+def test_stream_without_k_never_creates_node(monkeypatch, topic_arg):
+    p = make_plugin()
+    monkeypatch.setattr(p, '_start_node', lambda *a: pytest.fail('invalid stream started'))
+    monkeypatch.setattr(p, '_ensure_model', lambda: pytest.fail('invalid stream loaded model'))
+    result = p.dispatch('visual_depth', dict(action='start', **topic_arg))
+    assert result['state'] == 'error' and not p._nodes
+
+
+def test_camera_requests_are_scoped_and_explicit():
+    p=make_plugin()
+    p._upstream_camera={'a':camera(900),'b':camera(600)}
+    p._nodes={'a':types.SimpleNamespace(_input_topic='/a'),'b':types.SimpleNamespace(_input_topic='/b')}
+    assert p._request_camera({},'a')['K'][0]==900
+    assert p._request_camera({},'b')['K'][0]==600
+    with pytest.raises(ValueError):p._request_camera({},'')
+    with pytest.raises(ValueError):p._request_camera({},'missing')
+    assert p._request_camera({'camera_info':camera(800)},'')['K'][0]==800
+
+
+def test_inactive_camera_metadata_is_not_used_for_photo():
+    p=make_plugin();p._upstream_camera['failed-start']=camera()
+    with pytest.raises(ValueError,match='running camera'):
+        p._request_camera({},'failed-start')
+
+
+def test_bound_stream_camera_reads_latest_declaration():
+    from plugins.depthart_runtime import _CameraSession
+    p=make_plugin(); p._upstream_camera['a']=camera(900)
+    values=[]
+    class Session:
+        def infer(self,frame,decl):values.append(decl['K'][0]);return [],None
+    bound=_CameraSession(Session(),lambda:p._camera_declaration('a'))
+    bound.infer(None); p._upstream_camera['a']=camera(700); bound.infer(None)
+    assert values==[900,700]
+
+
+def test_photo_missing_k_does_not_initialize_model(monkeypatch):
+    p=make_plugin()
+    monkeypatch.setattr(vd,'load_image_bytes',lambda *a,**kw:(vision_stubs.frame_bytes(1600,900),'test'))
+    monkeypatch.setattr(p,'_ensure_model',lambda:pytest.fail('unexpected model load'))
+    result=p.dispatch('visual_depth',{'action':'recognize_by_photo','image_path':'dummy'})
+    assert result['ok'] is False and 'camera_info' in result['detail']
+
+
+def test_manual_calibration_preserved():
+    p=make_plugin({'calibration_preset':vd.CAL_MANUAL,'cal_b':.2})
+    assert p._cal_b==pytest.approx(.2)
+
+
+@pytest.mark.parametrize('topic', ['/camera', None])
+def test_explicit_photo_cannot_relabel_live_camera(topic):
+    p=make_plugin();p._upstream_camera['a']=camera(900)
+    p._nodes['a']=types.SimpleNamespace(_input_topic=topic)
+    with pytest.raises(ValueError,match='differs'):
+        p._request_camera({'camera_info':camera(700)},'a')
+    assert p._request_camera({'camera_info':camera(900)},'a')['K'][0]==900
+
+
+def test_missing_plugin_version_symbol_is_clear(tmp_path, monkeypatch):
+    from plugins import depthart_runtime
+    artifact = tmp_path / 'artifact'
+    artifact.write_bytes(b'test')
+    monkeypatch.setattr(depthart_runtime.ctypes, 'CDLL', lambda *a, **kw: object())
+    with pytest.raises(ValueError, match='version symbol'):
+        depthart_runtime.DepthARTSession(artifact, artifact)
+
+
+def test_unbound_on_demand_photo_does_not_bind_camera(monkeypatch):
+    p = make_plugin()
+    p._nodes['a'] = types.SimpleNamespace(_input_topic=None, _cal_a=1., _cal_b=0., calibration_label='metric')
+    class Model:
+        def for_camera(self, declaration):return self
+        def infer(self, frame):return [np.ones((1,480,864), np.float32)], None
+    p._model = Model()
+    monkeypatch.setattr(vd, 'load_image_bytes', lambda *a, **kw: (vision_stubs.frame_bytes(1600,900), 'test'))
+    monkeypatch.setattr(p, '_publish_one_shot', lambda *a: None)
+    args = dict(action='recognize_by_photo', instance_id='a', image_path='dummy', camera_info=camera())
+    assert p.dispatch('visual_depth', args)['ok']
+    assert not p._upstream_camera.get('a')
+    del args['camera_info']
+    assert not p.dispatch('visual_depth', args)['ok']
+
+
+def test_photo_inherits_live_manual_calibration(monkeypatch):
+    p=make_plugin();p._upstream_camera['a']=camera()
+    p._nodes['a']=types.SimpleNamespace(_input_topic='/camera',_cal_a=1.,_cal_b=np.log(2),calibration_label='manual')
+    class Model:
+        def for_camera(self,c):return self
+        def infer(self,frame):return [np.ones((1,480,864),np.float32)],None
+    p._model=Model()
+    monkeypatch.setattr(vd,'load_image_bytes',lambda *a,**kw:(vision_stubs.frame_bytes(1600,900),'test'))
+    monkeypatch.setattr(p,'_publish_one_shot',lambda *a:None)
+    result=p.dispatch('visual_depth',{'action':'recognize_by_photo','image_path':'dummy','instance_id':'a'})
+    assert result['ok'] and result['range'][0]==pytest.approx(2.) and result['calibration']=='manual'
+
+
+def test_retired_instance_photo_is_not_rerouted():
+    p=make_plugin();calls=[]
+    p._nodes['b']=types.SimpleNamespace(_publish=lambda *a:calls.append(a),_depth_topic='/b/depth',_summary_topic='/b/summary')
+    assert p._publish_one_shot('a',np.ones((480,640),np.float32),{}) is None
+    assert not calls
+
+
+def test_yolo_inference_error_behavior_unchanged(monkeypatch):
+    p=vd.VideoDepthPerceptionPlugin({},'test',_FakeExecutor())
+    class Model:
+        def infer(self,frame):raise ValueError('engine failure')
+    p._model=Model()
+    monkeypatch.setattr(vd,'load_image_bytes',lambda *a,**kw:(vision_stubs.frame_bytes(1600,900),'test'))
+    with pytest.raises(ValueError,match='engine failure'):
+        p.dispatch('visual_depth',{'action':'recognize_by_photo','image_path':'dummy'})
+
+
+def test_depthart_schema_hides_yolo_presets_without_mutating_default():
+    p=make_plugin()
+    prop=p.get_tools()[0]['configSchema']['properties']['calibration_preset']
+    assert prop['enum']==[vd.CAL_NONE,vd.CAL_MANUAL]
+    assert prop['default']==vd.CAL_NONE
+    yolo=vd.VideoDepthPerceptionPlugin({},'test',_FakeExecutor())
+    default=yolo.get_tools()[0]['configSchema']['properties']['calibration_preset']
+    assert vd.CAL_AUTO in default['enum'] and next(iter(vd.CALIBRATION_PRESETS)) in default['enum']
+    assert p._model is None
+
+
+def test_process_shutdown_retires_nodes_before_engine_close():
+    p=vd.VideoDepthPerceptionPlugin({},'test',_FakeExecutor())
+    calls=[]
+    class Model:
+        def close(self):
+            assert p._nodes=={}
+            calls.append('closed')
+    p._model=Model()
+    p.dispatch('visual_depth',{'action':'start','instance_id':'shutdown-probe'})
+    node=p._nodes['shutdown-probe']
+    p._backend='depthart'
+    p.shutdown()
+    assert node.destroyed and calls==['closed'] and p._model is None
+    p.shutdown();assert calls==['closed']
+    assert p.dispatch('visual_depth',{'action':'start'})['state']=='error'
+    with pytest.raises(RuntimeError,match='shutting down'):p._ensure_model()
+
+
+def test_shutdown_waits_for_loading_and_prevents_late_node(monkeypatch):
+    import threading
+    p=vd.VideoDepthPerceptionPlugin({},'test',_FakeExecutor())
+    entered,release=threading.Event(),threading.Event()
+    closed=[]
+    class Model:
+        def close(self):closed.append(True)
+    def load():
+        with p._model_lock:
+            entered.set();assert release.wait(2)
+            p._model=Model()
+    monkeypatch.setattr(p,'_ensure_model',load)
+    loader=threading.Thread(target=lambda:(p._ensure_model(),p._start_node('late',None)))
+    loader.start();assert entered.wait(1)
+    p._backend='depthart'
+    closer=threading.Thread(target=p.shutdown);closer.start()
+    for _ in range(100):
+        if p._closing:break
+        __import__('time').sleep(.001)
+    assert p._closing
+    release.set();loader.join(2);closer.join(2)
+    assert not loader.is_alive() and not closer.is_alive()
+    assert closed==[True] and p._nodes=={} and p._model is None
+
+
+def test_yolo_keeps_original_process_teardown():
+    from plugins.visual_depth import VideoDepthPerceptionPlugin
+    p=VideoDepthPerceptionPlugin({},'test',_FakeExecutor())
+    class Model:
+        def close(self):raise AssertionError('YOLO teardown must remain unchanged')
+    model=Model();p._model=model
+    p.shutdown()
+    assert p._model is model and not p._closing
+
+
+def test_bundle_shutdown_calls_opted_in_hooks_and_continues_after_error():
+    from main import PerceptionBundle
+    calls=[]
+    class Broken:
+        PREFIX='broken'
+        def shutdown(self):calls.append('broken');raise RuntimeError('close failure')
+    class Working:
+        PREFIX='working'
+        def shutdown(self):calls.append('working')
+    bundle=PerceptionBundle.__new__(PerceptionBundle)
+    bundle._plugins=[Broken(),types.SimpleNamespace(PREFIX='no-hook'),Working()]
+    bundle.shutdown()
+    assert calls==['broken','working']

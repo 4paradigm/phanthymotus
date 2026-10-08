@@ -256,7 +256,7 @@ TOOLS = [
                 # path perception can open, with no shared mount.
                 "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/scene.jpg）。常见格式都支持，过大的图会本地缩放"},
                 "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/scene.jpg。下载后本地解码，格式限制同 image_path"},
-                "camera_info": {"anyOf": [{"type": "object"}, {"type": "array", "items": {"type": "object"}}], "description": "DepthART 相机内参：start 接收上游按 topic 组织的 motus.camera/1 声明或声明列表；单图可直接传含 width、height、九个行优先 K 数值的声明。不传时使用指定运行实例的声明，不猜测焦距。"},
+                "camera_info": {"anyOf": [{"type": "object"}, {"type": "array", "items": {"type": "object"}}], "description": "DepthART 相机内参：流式 start 接收按 topic 组织的 motus.camera/1 声明或声明列表；按需 start 或单图可直接传含 width、height、九个行优先 K 数值的声明。start 绑定的相机不能被单图覆盖；未绑定的按需实例每张图必须传声明，不猜测焦距。"},
                 "distance_m": {"type": "number", "description": "标定用：镜头到那面墙/平面的真实距离（米），用卷尺量。墙要正对镜头、填满取样区域"},
                 "region": {"type": "string", "enum": list(CALIBRATION_REGIONS), "description": "标定用：在画面的哪一块取样。默认 center（画面正中 20% 的方框）；墙占满整个画面时可以用 full，取样像素更多"},
                 "reset": {"type": "boolean", "description": "标定用：等同于 reset_calibration，保留给已有调用方"},
@@ -1110,7 +1110,7 @@ class VideoDepthPerceptionPlugin:
         explicit = args.get("camera_info")
         if explicit is not None:
             matrix, width, height = camera_matrix(explicit)
-            if node is not None and node._input_topic:
+            if node is not None and inherited:
                 original, ow, oh = camera_matrix(inherited)
                 matrix[0] /= width
                 matrix[1] /= height
@@ -1464,8 +1464,6 @@ class VideoDepthPerceptionPlugin:
                 live = self._nodes.get(node_key)
                 if live is not None:
                     cal_a, cal_b, calibration = live._cal_a, live._cal_b, live.calibration_label
-                    if not live._input_topic:
-                        self._upstream_camera[node_key] = dict(camera)
         depth_m = apply_site_calibration(decode_depth(outputs, meta), cal_a, cal_b)
         scale_label = "metric"
 
@@ -1665,6 +1663,12 @@ class VideoDepthPerceptionPlugin:
                     return {"state": "error", "message": str(error)}
                 with self._nodes_lock:
                     self._upstream_camera[node_key] = dict(upstream_camera)
+            elif self._backend == "depthart":
+                # Unbound on-demand cards require K on each photo. Only start
+                # binds a camera; a photo never changes the instance declaration.
+                with self._nodes_lock:
+                    if node_key not in self._nodes:
+                        self._upstream_camera.pop(node_key, None)
 
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
