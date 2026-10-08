@@ -746,6 +746,9 @@ async def _push_file(mcp_id: str, url: str, local_path: str) -> str:
     return payload['path']
 
 
+_MUSIC_USER_ACTIONS = frozenset({'search', 'play', 'pause', 'resume', 'interrupt', 'set_volume', 'status'})
+
+
 async def call_tool(full_name: str, args: dict) -> str:
     """
     调用 MCP 工具。full_name 格式: 'mcp__<mcp_id>__<tool_name>'
@@ -800,6 +803,15 @@ async def call_tool(full_name: str, args: dict) -> str:
     info = registry.get(mcp_id)
     if not info:
         return f'MCP {mcp_id} 未注册'
+
+    if tool_name == 'phanthy-music':
+        # This entrypoint is for agent/peer calls. Canvas lifecycle and hooks
+        # use call_tool_direct/the management API, not this public action gate.
+        import canvas_binding
+        if args.get('action') not in _MUSIC_USER_ACTIONS:
+            return 'Error: music lifecycle and hooks are managed by the canvas'
+        if not canvas_binding.is_bound(full_name):
+            return 'Error: phanthy-music is not connected to the decision core'
 
     # Internal tools (agentcore) — dispatch locally
     if info.get('transport') == 'internal':
@@ -1025,6 +1037,11 @@ def present_to_llm(schema: dict, meta: dict | None, split_action: str | None = N
     """
     meta = meta or {}
     tool_type = meta.get('type')
+
+    parts = schema.get('name', '').split('__')
+    if (len(parts) > 2 and parts[2] == 'phanthy-music'
+            and split_action is not None and split_action not in _MUSIC_USER_ACTIONS):
+        return None
 
     if tool_type == 'processor':
         if split_action is not None:

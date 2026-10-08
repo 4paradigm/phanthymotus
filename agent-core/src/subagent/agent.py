@@ -215,7 +215,16 @@ class Subagent:
             if delegated and mcp_bridge.is_peer_mcp(mcp_id):
                 continue
             for name, schema in info.get('schemas', {}).items():
-                schemas.append(schema)
+                split = info.get('split_map', {}).get(name, {})
+                if split.get('tool') == 'phanthy-music':
+                    import canvas_binding
+                    if not canvas_binding.is_bound(name):
+                        continue
+                presented = mcp_client.present_to_llm(
+                    schema, info.get('tool_meta', {}).get(name),
+                    split_action=info.get('split_map', {}).get(name, {}).get('action'))
+                if presented is not None:
+                    schemas.append(presented)
         return schemas
 
     def _get_desktop_tool_schemas(self) -> list[dict]:
@@ -774,6 +783,11 @@ class Subagent:
         # MCP tool call
         if name.startswith('mcp__'):
             try:
+                binding = mcp_client.resolve_tool_binding(name, args)
+                if binding and binding[1] == 'phanthy-music':
+                    allowed = {t['function']['name'] for t in self._get_allowed_tools()}
+                    if name not in allowed:
+                        return '[tool error] Music action is not available to this subagent'
                 # ACP barrier, same judgement the main loop uses. Without it a
                 # subagent's `speak` returned at *enqueue* time, so the subagent
                 # reported "completed / 已排队播放" and `peer_delegate` returned

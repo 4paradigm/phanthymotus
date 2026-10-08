@@ -53,12 +53,16 @@ class MusicPlayer:
         self._thread = threading.Thread(target=self._run, name='music-output', daemon=True)
         self._thread.start()
 
-    def close(self):
+    def request_stop(self):
+        """Signal and discard queued output without waiting for retiring workers."""
         self._stop.set()
         with self._lock:
             self._cancel_music()
             self._voice.clear()
             self._voice_open = False
+
+    def close(self):
+        self.request_stop()
         if self._thread:
             self._thread.join(timeout=2)
         for decoder in list(self._retired):
@@ -172,13 +176,15 @@ class MusicPlayer:
     def tick(self):
         """Emit at most 100 ms. Called only by the output worker (or a fake clock)."""
         with self._lock:
+            if self._stop.is_set():
+                return
             now = self._clock()
             if self._voice_open and now - self._voice_last > 2 and not self._voice:
                 self._voice_open = False
             if not self._has_reader():
                 if self._decoder and self.state != 'paused' and now - self._wait_started > 5:
                     self._cancel_music()
-                    self.state, self.error = 'error', 'No PCM subscriber; connect music output to Speaker'
+                    self.state, self.error = 'error', 'No PCM subscriber; connect phanthy-music output to Speaker'
                 return
             voice = bytes(self._voice[:FRAME_BYTES])
             del self._voice[:len(voice)]

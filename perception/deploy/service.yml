@@ -26,6 +26,9 @@ perception:
     # 否则本容器会与本机其余部分失联。
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
+    # Inherited from the deployment process, never embed values here.
+    - PHANTHY_MUSIC_ENDPOINT
+    - PHANTHY_MUSIC_API_KEY
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml

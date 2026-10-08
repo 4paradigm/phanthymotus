@@ -13,8 +13,10 @@ file_intake:
 
 plugins:
   # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
-  music:
+  phanthy-music:
     enabled: true
+    catalogue_type: none
+    timeout_ms: 3000
     volume: 50
     duck_gain: 0.15
 

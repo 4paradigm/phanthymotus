@@ -1,22 +1,64 @@
-# Music playback card
+# phanthy-music: catalogue search and playback
 
-The Perception **music** card plays a public HTTPS mp3/wav URL and optionally
-mixes TTS speech into the same PCM output. It is usable without a catalogue:
-call `play` with an authorised audio URL. A catalogue client can supply a track's
-URL, format, ID, expiry and usage directly. The card contains no catalogue
-endpoint, key, search implementation or song assets.
+The Perception **phanthy-music** card searches a music catalogue and plays
+public HTTPS mp3/wav audio, optionally mixing TTS into the same PCM output.
+Use `search` followed by `play(track_id)` to fetch current details and play a
+song. An authorised URL can also be supplied directly without a catalogue.
+The repository contains no deployment endpoint, credential, remote search
+implementation or real song assets.
+
+## Catalogue configuration and credentials
+
+The one advertised name is **phanthy-music** (including the hyphen). There is no
+separate MusicSearch built-in and no second music card. Agent Core's existing
+`x-action-params` mechanism presents actions as
+`mcp__<perception-id>__phanthy-music__search` and `__play`; the wire call still uses
+`name: phanthy-music` with `arguments.action`. Lifecycle and internal ducking hooks
+are omitted from both main/subagent tool presentation and rejected at the agent
+call boundary. Human channel viewers may use only the registered, connected
+local search action; this does not grant play/config or untrusted-bot access.
+
+Card settings are `catalogue_type: none | mock | motus_music`, `timeout_ms`
+(default 3000, including capability lookup and retries), `volume`, and `duck_gain`.
+`none` returns `not_configured`; `mock` has 24 fictional metadata records and no
+playable audio. Search needs Perception online and an execution connection, but
+needs neither a running music node nor an audio subscriber. Thus a chat-only
+Agent Core deployment now needs Perception for music catalogue queries.
+
+Inject **both** `PHANTHY_MUSIC_ENDPOINT` and `PHANTHY_MUSIC_API_KEY` into the
+Perception process at deployment time. The service manifest inherits only these
+variable names; no deployment values belong in source, images, a checked-in
+`.env`, Solutions or an ordinary card configuration. The endpoint is fixed with
+the credential so an MCP config call cannot redirect the credential to another
+server. Restart/recreate the service after changing deployment credentials.
+`status` reports only `catalogue_configured`, never the endpoint or key.
+
+The card has no key/endpoint input field. Its closed config schema is validated
+before SQLite writes in both shared/instance config endpoints and Solution
+imports. Unknown keys or invalid values are rejected without echoing their
+values. Music MCP logs omit input/result payloads, including signed audio URLs.
+The HTTP provider also strips a reflected credential from server responses.
+This avoids application config persistence; environment injection is **not**
+encryption at rest and deployment administrators/container tooling can inspect
+the process environment. Use the deployment's credential protection mechanism.
+No existing database or unrelated credential settings are migrated by this PR.
+
+The catalogue client lives in `perception/plugins/music_catalog`, with no
+Agent Core/ROS dependency. It uses the bundle's existing HTTP request threads
+and standard-library HTTPS, so it needs no new runtime package. Protocol and
+failure behaviour are documented in [music-catalog.md](music-catalog.md).
 
 ## Canvas setup
 
-Music is advertised by the Perception bundle when `plugins.music.enabled` is
+Music is advertised by the Perception bundle when `plugins.phanthy-music.enabled` is
 true (the shipped default). Starting the project creates an idle audio path;
 it never starts downloading or playing a song automatically.
 
-For conversation during music, wire **TTS → music → Speaker**, all using
+For conversation during music, wire **TTS → phanthy-music → Speaker**, all using
 `audio/pcm-16k` (mono S16LE, 16 kHz). Remove the old TTS → Speaker wire so Speaker
-has one input. Connect decision_core's execution output to music to expose its
+has one input. Connect decision_core's execution output to phanthy-music to expose its
 actions to the agent. Leave music's data input empty for music-only playback.
-The fixed output is `/perception/music/audio`; only one music card is supported.
+The fixed output is `/perception/music/audio`; only one phanthy-music card is supported.
 Connecting its output back to its input or supplying multiple speech inputs is
 rejected. Ordinary TTS still passes through when no song is playing.
 
@@ -31,7 +73,9 @@ microphone placement/volume and the existing AEC path must be checked on-device.
 | Action | Behaviour |
 |---|---|
 | `start(input_topic?)` | Open the PCM path; optional TTS input |
-| `play(url, audio_format?, track_id?, expires_at?, usage?)` | Replace the current song; return a background session immediately |
+| `search(query?, genre?, language?, vocal?, tags?, artist?, top_k?, exclude_ids?, duration_min_s?, duration_max_s?)` | Return catalogue metadata without starting playback |
+| `play(track_id)` | Fetch current details, then replace the song and return a background session |
+| `play(url, audio_format?, track_id?, expires_at?, usage?)` | Play an authorised public HTTPS URL without catalogue lookup |
 | `pause` / `resume` | Pause/resume music; TTS continues |
 | `interrupt` | Stop the current song and discard this card's pending music |
 | `set_volume(volume)` | Music volume 0–100; never changes TTS volume |
@@ -42,8 +86,8 @@ Say “停歌” by calling `interrupt`, not `stop`, to keep conversation audio 
 `play` defaults to mp3; explicitly pass `audio_format: wav` for WAV. Forward the
 track's `usage` (`scope: personal_playback`, `attribution`) and `expires_at` when
 provided. A passed/invalid expiry is rejected before downloading. On expiry or
-HTTP 401/403/404, refresh the URL by track ID through the catalogue, then call
-`play` again. Credentials for the catalogue never go to the audio host.
+HTTP 401/403/404, refresh the URL by track ID through the catalogue, by calling
+`play(track_id)` again. Automatic indefinite retry is not performed. Credentials for the catalogue never go to the audio host.
 
 Example (replace this fictional URL with an authorised deployment URL):
 
@@ -58,6 +102,21 @@ does not hold the mouth resource or create a pending full-song ACP action, so
 `position_s` is PCM emitted by this card, not a physical speaker clock.
 `completed` means the source has drained; a downstream buffer may still contain
 audio. It must not be presented as confirmed hardware completion.
+
+## Cancellation and concurrency
+
+Catalogue I/O runs outside the card/player lifecycle lock. Only one catalogue
+request per card is admitted; a concurrent request gets `busy`, with no unbounded
+queue. A three-second catalogue timeout must not hold up `interrupt`, `duck`,
+`unduck`, `status` or ongoing TTS. Lookup failures do not stop an existing song.
+
+Every play has a cancellation event and generation. Interrupt, stop, a replacement
+play or catalogue reconfiguration invalidates pending playback. After a detail
+response arrives, the card rechecks both the generation and the current node
+before starting a decoder. A late response cannot restart music after stop or
+overwrite a newer song. A blocking socket operation may finish at its timeout,
+but its result cannot cause playback. Music stays a background session without
+full-song ACP pending state or a mouth-resource barrier.
 
 ## Speech priority
 
@@ -117,14 +176,23 @@ workers are allowed before another skip is refused. A stalled stream or a missin
 PCM subscriber becomes a visible error. An inspector/browser subscription also
 counts as a reader; a reader does not prove a physical Speaker is connected.
 
-Disable `plugins.music.enabled` and restore TTS → Speaker to remove this feature.
+Disable `plugins.phanthy-music.enabled` and restore TTS → Speaker to remove this feature.
 No database migration or new driver API is involved.
+
+## Updating the earlier unmerged prototypes
+
+Replace any prototype `music` canvas card with `phanthy-music`, reattach its
+execution/audio wires, and configure its non-secret fields. Remove prototype
+music fields from decision_core and inject credentials into Perception instead.
+Only the new name is advertised; the two prototype PRs were not released, so
+there is no automatic production database or saved-Solution migration. Existing
+AudioChunk format and the `/perception/music/audio` output topic stay compatible.
 
 ## Validation and five-minute demo
 
 ```bash
 cd perception
-python3 -m unittest discover -s tests -p test_music.py -v
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_music.py tests/test_music_catalog.py tests/test_phanthy_music.py tests/test_bundle_dispatch.py -q
 ```
 
 Offline tests use the repository's ROS stubs and fake clocks. They cover actual

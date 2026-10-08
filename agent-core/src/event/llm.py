@@ -549,6 +549,16 @@ def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) 
     parts = name.split('__')
     entry = mcp_client.registry.get(parts[1] if len(parts) > 1 else '', {})
     meta = entry.get('tool_meta', {}).get(name)
+    # A local mixed-purpose card stays a processor. Only its registered,
+    # split search action is available to human viewers; never its play/config
+    # actions, a peer alias, or a similarly named/unregistered tool.
+    split = entry.get('split_map', {}).get(name, {})
+    if (not bot_restricted and not parts[1].startswith('peer:')
+            and entry.get('transport') != 'peer' and entry.get('online')
+            and meta and meta.get('type') == 'processor'
+            and split == {'tool': 'phanthy-music', 'action': 'search'}):
+        import canvas_binding
+        return canvas_binding.is_bound(name)
     return bool(meta and meta.get('type') in ('sensor', 'resource'))
 
 

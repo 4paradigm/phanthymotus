@@ -1,0 +1,186 @@
+openapi: 3.0.3
+info:
+  title: Motus Music Catalogue
+  version: '1.0.0'
+  description: Generic deterministic catalogue contract. Configure the server at deployment time.
+security:
+  - bearerAuth: []
+paths:
+  /v1/capabilities:
+    get:
+      operationId: capabilities
+      responses:
+        '200':
+          description: Supported filters and limits
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Capabilities'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/music/search:
+    post:
+      operationId: searchMusic
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SearchRequest'}
+      responses:
+        '200':
+          description: Results; unrelaxed filters must hold and language is never relaxed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema, request_id, relaxed, tracks]
+                properties:
+                  schema: {$ref: '#/components/schemas/Version'}
+                  request_id: {type: string}
+                  relaxed:
+                    type: array
+                    items: {type: string, enum: [query, duration_s, vocal, genre, artist]}
+                  tracks:
+                    type: array
+                    maxItems: 10
+                    items: {$ref: '#/components/schemas/Track'}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/music/tracks/{id}:
+    get:
+      operationId: getTrack
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, maxLength: 200}
+      responses:
+        '200':
+          description: Track details with refreshed audio URL
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema, request_id, track]
+                properties:
+                  schema: {$ref: '#/components/schemas/Version'}
+                  request_id: {type: string}
+                  track: {$ref: '#/components/schemas/Track'}
+        default: {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  responses:
+    Error:
+      description: 400 version; 401 authentication; 403 permission; 404 missing track; 422 filter; 429 quota; 5xx server
+      headers:
+        Retry-After:
+          description: On HTTP 429, delay in seconds or an HTTP date
+          schema: {type: string}
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [schema, request_id, error]
+            properties:
+              schema: {$ref: '#/components/schemas/Version'}
+              request_id: {type: string}
+              error:
+                type: object
+                required: [code, message]
+                properties:
+                  code: {type: string}
+                  message: {type: string}
+                  allowed: {type: array, items: {type: string}}
+  schemas:
+    Version: {type: string, enum: [motus.music/1]}
+    Options:
+      type: array
+      items:
+        type: object
+        required: [value, label]
+        properties:
+          value: {type: string}
+          label: {type: string}
+    Capabilities:
+      type: object
+      required: [schema, request_id, provider, limits, audio, filters, features]
+      properties:
+        schema: {$ref: '#/components/schemas/Version'}
+        request_id: {type: string}
+        provider: {type: string}
+        limits:
+          type: object
+          properties:
+            max_top_k: {type: integer, minimum: 1, maximum: 10}
+        audio:
+          type: object
+          properties:
+            url_ttl_s: {type: integer, nullable: true, minimum: 0}
+        features: {type: array, items: {type: string}}
+        filters:
+          type: object
+          properties:
+            genre: {$ref: '#/components/schemas/Options'}
+            language: {$ref: '#/components/schemas/Options'}
+            vocal: {$ref: '#/components/schemas/Options'}
+            tags:
+              type: object
+              additionalProperties: {type: array, items: {type: string}}
+    SearchRequest:
+      type: object
+      required: [schema]
+      properties:
+        schema: {$ref: '#/components/schemas/Version'}
+        query: {type: string, maxLength: 200, default: ''}
+        top_k: {type: integer, minimum: 1, maximum: 10, default: 3}
+        exclude_ids: {type: array, maxItems: 50, items: {type: string}}
+        filters:
+          type: object
+          properties:
+            genre: {type: array, items: {type: string}}
+            language: {type: array, items: {type: string}}
+            vocal: {type: string, enum: [male, female, mixed, instrumental]}
+            tags: {type: array, items: {type: string}}
+            artist: {type: string}
+            duration_s:
+              type: object
+              properties:
+                min: {type: integer, minimum: 0}
+                max: {type: integer, minimum: 0}
+    Track:
+      type: object
+      required: [id, title, artist, genre, language, vocal, duration_s, audio, usage]
+      properties:
+        id: {type: string}
+        title: {type: string}
+        artist:
+          type: object
+          required: [id, name]
+          properties:
+            id: {type: string}
+            name: {type: string}
+            voice: {type: string}
+        genre: {type: string}
+        language: {type: string}
+        vocal:
+          type: string
+          nullable: true
+          enum: [male, female, mixed, instrumental, null]
+          description: Null means unlabelled/unknown, never instrumental; it cannot satisfy an unrelaxed vocal filter.
+        tags: {type: array, items: {type: string}}
+        duration_s: {type: number, minimum: 0}
+        cover_url: {type: string, format: uri}
+        lyrics_excerpt: {type: string}
+        score: {type: number}
+        match_reason: {type: string}
+        audio:
+          type: object
+          required: [url, format, expires_at]
+          properties:
+            url: {type: string, format: uri, pattern: '^https://'}
+            format: {type: string, enum: [mp3, wav]}
+            expires_at: {type: string, format: date-time, nullable: true}
+        usage:
+          type: object
+          required: [scope, attribution]
+          properties:
+            scope: {type: string, enum: [personal_playback]}
+            attribution: {type: string}

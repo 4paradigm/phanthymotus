@@ -6,7 +6,7 @@ perception/main.py — Perception Stack bundle 统一入口。
 
   asr              语音识别（VAD + 唤醒词 + 多后端 ASR）
   tts              语音合成（VITS2 / Matcha / Kokoro，本地 TensorRT 或 ONNX）
-  music            HTTPS 音乐播放与语音优先混音
+  phanthy-music    曲库检索、HTTPS 音乐播放与语音优先混音
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   ocr              文字识别（RapidOCR + TensorRT）
@@ -132,13 +132,13 @@ class PerceptionBundle:
                 log.error("TTSPlugin failed to load; continuing without TTS",
                           exc_info=True)
 
-        if plugins_cfg.get("music", {}).get("enabled", False):
+        if plugins_cfg.get("phanthy-music", {}).get("enabled", False):
             try:
-                from plugins.music import MusicPlugin
-                self._plugins.append(MusicPlugin(plugins_cfg["music"], executor))
-                log.info("MusicPlugin loaded")
+                from plugins.phanthy_music import PhanthyMusicPlugin
+                self._plugins.append(PhanthyMusicPlugin(plugins_cfg["phanthy-music"], executor))
+                log.info("PhanthyMusicPlugin loaded")
             except Exception:
-                log.error("MusicPlugin failed to load; continuing without music",
+                log.error("PhanthyMusicPlugin failed to load; continuing without phanthy-music",
                           exc_info=True)
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
@@ -436,8 +436,12 @@ def make_handler():
                     args   = params.get("arguments") or {}
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
+                    music_call = name == 'phanthy-music' or name.startswith('phanthy-music_')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
+                        if music_call:
+                            log.info("[mcp] tools/call: phanthy-music (payload omitted)")
+                        else:
+                            log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         # `dispatch` returns None for two very different things:
@@ -456,7 +460,10 @@ def make_handler():
                             err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            if music_call:
+                                log.info("[mcp] phanthy-music result received (payload omitted)")
+                            else:
+                                log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
