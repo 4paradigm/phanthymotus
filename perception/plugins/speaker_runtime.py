@@ -280,8 +280,21 @@ class SpeakerEmbedder:
 
         Returns `(embedding, coherence)`. `coherence` is `None` for a clip short
         enough to trust as single-speaker, otherwise the cosine between the
-        **leading window** and the **whole clip** — and a low value means the two
+        **leading** and **trailing** windows — and a low value means the two
         describe different people, i.e. the clip contains a speaker change.
+
+        Leading-vs-trailing rather than leading-vs-whole-clip, and that is a
+        correction: the first version compared the 4 s lead against the whole
+        clip, but `condition()` truncates at `MAX_S`, so on a 29 s segment
+        measured on Orin 5 it was really comparing *the first 4 s against the
+        first 6 s* — both from the same end. Coherence came back 0.954 on clips
+        that had had 23 unexamined seconds. A change after the sixth second was
+        invisible. Comparing the two ends costs the same two embeddings and
+        covers the clip however long it is.
+
+        Clips between `split_above_s` and `2 * split_above_s` have overlapping
+        windows, so a change in their overlap is still softened. That is the
+        floor of what two embeddings can see; widening it means more of them.
 
         This is not a theoretical worry. Truncation was measured against 73 real
         VAD segments longer than 3.5 s on Orin 5: cosine(full, first 3 s) had
@@ -290,25 +303,27 @@ class SpeakerEmbedder:
         tail *is* the multi-speaker rate in captured office audio, and it is why
         a fixed window cannot simply replace the full clip.
 
-        Two embeddings, not a sliding window of N: the leading window is the part
-        most likely to be one person (a VAD segment opens on whoever started
-        talking), and the full clip is the blend. Disagreement between exactly
-        those two is the cheapest signal that the blend exists.
+        Two embeddings, not a sliding window of N. A sliding window would localise
+        *where* the change is; this only answers *whether* there is one, which is
+        all the caller does anything with — and it answers it for a fixed cost
+        instead of one proportional to the clip.
 
-        The returned embedding is the **window's**, not the blend's, whenever a
-        split check ran: if the clip does hold one voice the two agree anyway, and
-        if it does not, the window is the better of the two guesses. The caller
-        decides what to do with a low `coherence` — `plugins/speaker.py` reports
+        The returned embedding is the **leading window's**. A VAD segment opens
+        on whoever started talking, so the lead is the part most likely to be one
+        person; if the clip does hold one voice both ends agree anyway, and if it
+        does not, the lead is the better of the two guesses. The caller decides
+        what to do with a low `coherence` — `plugins/speaker.py` reports
         `multi_speaker` and withholds the identity rather than guessing.
         """
         samples = np.asarray(samples, dtype=np.float32).reshape(-1)
-        duration = len(samples) / float(sample_rate or SAMPLE_RATE)
+        rate = int(sample_rate or SAMPLE_RATE)
+        duration = len(samples) / float(rate)
         if duration <= split_above_s:
             return self.embed(samples, sample_rate), None
-        window = int(sample_rate * min(split_above_s, MAX_S))
+        window = int(rate * min(split_above_s, MAX_S))
         lead = self.embed(samples[:window], sample_rate)
-        whole = self.embed(samples, sample_rate)   # condition() caps it at MAX_S
-        return lead, float(np.dot(lead, whole))
+        tail = self.embed(samples[-window:], sample_rate)
+        return lead, float(np.dot(lead, tail))
 
     def close(self) -> None:
         with self._lock:

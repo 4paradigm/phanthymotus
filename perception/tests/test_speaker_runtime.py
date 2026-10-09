@@ -11,6 +11,10 @@ by accident:
   that widening GRID_S/MAX_S cannot silently reintroduce it.
 * **The speaker-change check.** A VAD segment is not guaranteed to hold one voice,
   and a blend published as one person looks correct, which is worse than no answer.
+  It compares the clip's two *ends*, which is the only version of this that sees
+  past `MAX_S` — the first cut compared lead-vs-whole-clip and therefore examined
+  only the first six seconds of a 29-second segment (measured on Orin 5:
+  coherence 0.954 with 23 seconds unlooked-at).
 
 `SpeakerEmbedder` itself needs sherpa-onnx and 28 MB of weights, neither of which a
 dev host has, so the embedder is faked down to its one real boundary: `embed`.
@@ -202,21 +206,56 @@ def test_long_coherent_clip_reports_high_coherence():
     assert len(embedder.calls) == 2, "恰好两次 embedding，不是滑窗 N 次"
 
 
-def test_long_clip_with_a_speaker_change_reports_low_coherence():
+def test_a_change_past_the_truncation_cap_is_still_caught():
+    """这是改成「两端相比」的全部理由。
+
+    `condition()` 在 MAX_S(6s) 截断，所以「前 4 秒 vs 整段」在一段 29 秒的音频上
+    实际是「前 4 秒 vs 前 6 秒」—— 两者都来自同一端，后面 23 秒根本没看。Orin 5
+    上实测这种段的 coherence 是 0.954。换成比两端之后，同样两次 embedding 覆盖
+    整段。
+    """
     embedder = _FakeEmbedder()
     _vector, coherence = embedder.embed_windowed(
-        clip(6.0, flip_after=4.0), split_above_s=4.0)
+        clip(20.0, flip_after=10.0), split_above_s=4.0)
     assert coherence is not None
-    assert coherence < 0.8, (
-        "前 4 秒是一个人、之后换人的段必须被判为低一致性 —— 否则两个人的混合会"
-        "被当成一个人发布出去，而那看起来是对的"
+    assert coherence < 0.5, (
+        "第 10 秒换人必须被看见 —— 只看开头 6 秒的版本会报 0.95 的高一致性"
     )
 
 
-def test_windowed_returns_the_window_not_the_blend():
-    """返回的是窗口的 embedding：一致时两者等价，不一致时窗口是更好的那个猜测。"""
+def test_windows_come_from_opposite_ends():
+    """两次 embedding 的输入必须是头和尾，不是头和头。"""
+    seen = []
     embedder = _FakeEmbedder()
-    vector, _ = embedder.embed_windowed(clip(6.0, flip_after=4.0),
+    real_embed = embedder.embed
+
+    def spy(samples, sample_rate=SAMPLE_RATE):
+        seen.append(np.asarray(samples).reshape(-1).copy())
+        return real_embed(samples, sample_rate)
+
+    embedder.embed = spy
+    source = clip(20.0, flip_after=10.0)
+    embedder.embed_windowed(source, split_above_s=4.0)
+    assert len(seen) == 2
+    assert np.array_equal(seen[0], source[:int(SAMPLE_RATE * 4)])
+    assert np.array_equal(seen[1], source[-int(SAMPLE_RATE * 4):])
+
+
+def test_long_clip_with_a_speaker_change_reports_low_coherence():
+    embedder = _FakeEmbedder()
+    _vector, coherence = embedder.embed_windowed(
+        clip(10.0, flip_after=5.0), split_above_s=4.0)
+    assert coherence is not None
+    assert coherence < 0.8, (
+        "前半是一个人、后半换人的段必须被判为低一致性 —— 否则两个人的混合会被"
+        "当成一个人发布出去，而那看起来是对的"
+    )
+
+
+def test_windowed_returns_the_leading_window():
+    """返回前导窗口：VAD 段从谁先说话开始，所以它最可能是单个人。"""
+    embedder = _FakeEmbedder()
+    vector, _ = embedder.embed_windowed(clip(10.0, flip_after=5.0),
                                         split_above_s=4.0)
     lead_only = embedder.embed(clip(4.0))
     assert np.allclose(vector, lead_only)

@@ -45,8 +45,9 @@ Both in `plugins/speaker_runtime.py`, with the measurements that forced them. Th
 short version: unquantised input lengths make ONNX Runtime's arena grow without
 bound, and a VAD segment is not guaranteed to hold one voice — measured p05 0.197
 cosine between a long segment and its own leading window on real office audio.
-A clip that fails that check reports `multi_speaker` and **withholds the identity**
-rather than publishing a blend of two people as one person.
+The check compares the clip's two **ends**, so it sees past the truncation cap;
+a clip that fails it reports `multi_speaker` and **withholds the identity** rather
+than publishing a blend of two people as one person.
 """
 
 from __future__ import annotations
@@ -817,9 +818,9 @@ class SpeakerRecognitionPlugin:
         embedding, coherence = engine.embedder.embed_windowed(
             samples, sample_rate=rate, split_above_s=gates["split_above_s"])
 
-        # Gate 2: the clip does not hold one voice. Withholding the identity is
-        # the point — a blend of two people published as one person is worse
-        # than no identity, because it looks correct.
+        # Gate 2: the clip's two ends describe different people. Withholding the
+        # identity is the point — a blend of two people published as one person
+        # is worse than no identity, because it looks correct.
         if coherence is not None:
             payload["coherence"] = round(float(coherence), 3)
             if coherence < gates["coherence_min"]:
