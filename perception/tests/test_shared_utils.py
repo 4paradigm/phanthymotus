@@ -650,6 +650,21 @@ def test_engine_close_waits_for_inflight_infer(monkeypatch, tmp_path):
         engine.infer(np.zeros((1, 3, 64, 64), dtype=np.float32))
 
 
+@pytest.mark.parametrize('family', ['jp511', 'jp61'])
+def test_depthart_bundle_selection_uses_separate_caches(family, monkeypatch):
+    calls = []
+    monkeypatch.setattr(model_downloader, 'ensure_verified_bundle',
+                        lambda *a, **kw: calls.append((a, kw)) or {})
+    progress = lambda *a: None
+    model_downloader.ensure_depthart_model('/models/depthart', family, progress)
+    args, kwargs = calls[0]
+    assert args[1] == '/models/depthart/' + family
+    assert '/resolve/ce158696ba8a5a6cee919b851a879825ea700eea/dynamic-k-v1/' + family in args[2]
+    assert set(args[3]) == {'depthart.engine', 'libdepthart_selective_scan_trt.so'}
+    assert all(v['size'] > 0 and len(v['sha256']) == 64 for v in args[3].values())
+    assert kwargs['progress_cb'] is progress
+
+
 def test_require_models_subpath():
     from utils.model_downloader import require_models_subpath
 

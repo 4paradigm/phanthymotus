@@ -1271,8 +1271,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                         cfg_content = (cfg_result.get('content') or [{}])[0].get('text', '{}')
                         try:
                             parsed = json.loads(cfg_content)
-                            if not parsed.get('adapter_ok', True):
-                                return {'code': 400, 'message': f'[{req.tool}] 配置无效（缺少 url/key），请检查配置。', 'data': None}
+                            from tool_config import config_error_message
+                            config_error = config_error_message(parsed)
+                            if config_error:
+                                return {'code': 400, 'message': f'[{req.tool}] {config_error}', 'data': None}
                         except (json.JSONDecodeError, IndexError):
                             pass
 

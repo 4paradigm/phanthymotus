@@ -2120,12 +2120,20 @@ shared tool configuration after stopping all depth instances; loading remains
 lazy. The default is still YOLO26-N Depth. Frame rate and calibration remain
 per-camera settings.
 
-Unlike the default YOLO bundle, DepthART is **externally provisioned**: mount
-its engine and SelectiveScan shared library, and set `depthart_engine_path` and
-`depthart_plugin_path` under `plugins.visual_depth` (or `DEPTHART_ENGINE_PATH`
-and `DEPTHART_PLUGIN_PATH`). Use matching artifacts for the target JetPack,
-TensorRT version and GPU; JP5 and JP6 artifacts are not interchangeable. There
-is no automatic DepthART download, startup compilation or fallback to YOLO.
+DepthART downloads a pinned engine and SelectiveScan plugin on first use,
+selected from the runtime TensorRT family. Files are size/SHA256 verified and
+cached under `/models/depthart/jp511` or `/models/depthart/jp61`; concurrent
+processes reuse the shared downloader lock. Download progress is exposed through
+the loading status. Selecting the model or calling info/config does not download.
+The fixed release is the `dynamic-k-v1` directory of
+`Flame4pd/depthart-metric-s-jp61-trt`, revision
+`ce158696ba8a5a6cee919b851a879825ea700eea`; despite the repository name it includes
+both JP5/TRT8.5.2.2 and JP6/TRT10.4 Orin artifacts.
+
+For custom provisioning, set both `depthart_engine_path` and
+`depthart_plugin_path` (or `DEPTHART_ENGINE_PATH` and `DEPTHART_PLUGIN_PATH`).
+A partial override fails explicitly. JP5/JP6 artifacts are not interchangeable.
+There is no startup compilation or fallback to another model on download failure.
 
 Supply actual `motus.camera/1` intrinsics (`width`, `height`, row-major nine-value
 `K`) through the upstream camera declaration for streams, or explicitly for

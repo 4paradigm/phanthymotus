@@ -90,14 +90,41 @@ def test_instance_cannot_switch_shared_model():
     assert result['adapter_ok'] is False and p._backend == 'depthart'
 
 
-def test_depthart_selection_requires_provisioned_assets(tmp_path):
+def test_depthart_selection_does_not_load_or_download(monkeypatch):
+    from utils import model_downloader
+    monkeypatch.setattr(model_downloader, 'ensure_depthart_model', lambda *a, **kw: pytest.fail('selection downloaded'))
     p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
-    assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'error'
-    artifact = tmp_path / 'artifact'
-    artifact.write_bytes(b'test')
-    p._plugin_cfg.update(depthart_engine_path=str(artifact), depthart_plugin_path=str(artifact))
     assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'configured'
     assert p._model is None
+
+
+def test_depthart_first_load_downloads_and_reuses_session(monkeypatch):
+    from utils import model_downloader
+    from plugins import depthart_runtime
+    p = make_plugin()
+    downloaded, loaded = [], []
+    def download(model_dir, progress_cb=None):
+        downloaded.append(model_dir)
+        return {'depthart.engine': '/models/depthart/jp61/depthart.engine',
+                'libdepthart_selective_scan_trt.so': '/models/depthart/jp61/libdepthart_selective_scan_trt.so'}
+    monkeypatch.setattr(model_downloader, 'ensure_depthart_model', download)
+    monkeypatch.setattr(depthart_runtime, 'DepthARTSession', lambda *paths: loaded.append(paths) or object())
+    p._ensure_model(); p._ensure_model()
+    assert downloaded == ['/models/depthart'] and len(loaded) == 1
+    assert p._model_load_status == 'Loading DepthART Metric-S engine'
+
+
+def test_depthart_explicit_paths_bypass_download_and_partial_override_fails(monkeypatch):
+    from utils import model_downloader
+    from plugins import depthart_runtime
+    monkeypatch.setattr(model_downloader, 'ensure_depthart_model', lambda *a, **kw: pytest.fail('override downloaded'))
+    loaded = []
+    monkeypatch.setattr(depthart_runtime, 'DepthARTSession', lambda *paths: loaded.append(paths) or object())
+    p = make_plugin({'depthart_engine_path': '/custom/engine', 'depthart_plugin_path': '/custom/plugin'})
+    p._ensure_model()
+    assert loaded == [('/custom/engine', '/custom/plugin')]
+    with pytest.raises(ValueError, match='both'):
+        make_plugin({'depthart_engine_path': '/custom/engine'})._ensure_model()
 
 
 @pytest.mark.parametrize('target', ['yolo', 'depthart'])

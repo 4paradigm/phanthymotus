@@ -19,6 +19,13 @@ and api/mcp_manage.py already imports mcp_client — the reverse would cycle.
 import config
 
 
+def config_error_message(result: dict) -> str:
+    """Preserve the plugin's reason instead of assuming every error is a credential error."""
+    if result.get('adapter_ok', True) and result.get('status') != 'error':
+        return ''
+    return str(result.get('message') or result.get('detail') or 'Configuration rejected by plugin')
+
+
 def find_tool(mcp_id: str, tool_name: str) -> dict:
     """The tool object for mcp_id:tool_name, or {} (tools may be bare strings)."""
     mcps = config.main.get('services', {}).get('mcp', []) or []

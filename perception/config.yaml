@@ -163,8 +163,9 @@ plugins:
   # Was `vdp:` for one release; main.py still reads that spelling from a
   # config.yaml already on a machine, and the tool answers to `vdp_*` too.
   visual_depth:
-    # Shared model selection (change only while stopped). DepthART requires provisioned
-    # TensorRT engine/plugin files and camera_info intrinsics at inference.
+    # Shared model selection (change only while stopped). Missing files download
+    # on first use. DepthART needs camera_info intrinsics; paths below are optional
+    # paired overrides for an explicitly provisioned engine and plugin.
     backend: yolo
     depthart_engine_path: ""
     depthart_plugin_path: ""

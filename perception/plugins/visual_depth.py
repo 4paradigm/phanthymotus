@@ -292,7 +292,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "backend": {"type": "string", "title": "Depth model", "description": "Shared by all cameras. Stop all depth instances before switching. DepthART requires provisioned engine/plugin files and camera intrinsics.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "default": "yolo", "scope": "shared"},
+                "backend": {"type": "string", "title": "Depth model", "description": "Shared by all cameras. Stop all depth instances before switching. Missing model files download on first use; DepthART requires camera intrinsics.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "default": "yolo", "scope": "shared"},
                 "fps":          {"type": "integer", "title": "Inference FPS", "description": "Maximum inference frames per second", "default": 2, "scope": "instance"},
                 # Log-affine site calibration, applied on top of the one baked
                 # into the engine: metres_out = metres_in**cal_a * exp(cal_b).
@@ -1161,10 +1161,20 @@ class VideoDepthPerceptionPlugin:
                 return
             if self._backend == "depthart":
                 from plugins.depthart_runtime import DepthARTSession
-                self._model = DepthARTSession(
-                    os.environ.get("DEPTHART_ENGINE_PATH") or self._plugin_cfg.get("depthart_engine_path"),
-                    os.environ.get("DEPTHART_PLUGIN_PATH") or self._plugin_cfg.get("depthart_plugin_path"),
-                )
+                engine = os.environ.get("DEPTHART_ENGINE_PATH") or self._plugin_cfg.get("depthart_engine_path")
+                plugin = os.environ.get("DEPTHART_PLUGIN_PATH") or self._plugin_cfg.get("depthart_plugin_path")
+                if bool(engine) != bool(plugin):
+                    raise ValueError("Provide both DepthART engine and plugin overrides, or leave both empty for automatic download")
+                if not engine:
+                    from utils.model_downloader import ensure_depthart_model
+                    from utils.model_progress import fetch_status
+                    progress_cb, _ = fetch_status(
+                        lambda text: setattr(self, "_model_load_status", text), "DepthART Metric-S")
+                    paths = ensure_depthart_model(os.environ.get("DEPTHART_MODEL_DIR", "/models/depthart"),
+                                                  progress_cb=progress_cb)
+                    engine, plugin = paths["depthart.engine"], paths["libdepthart_selective_scan_trt.so"]
+                self._model_load_status = "Loading DepthART Metric-S engine"
+                self._model = DepthARTSession(engine, plugin)
                 return
             from plugins.vision_runtime import VisionEngineSession
             from utils.model_downloader import ensure_depth_model
@@ -1555,13 +1565,6 @@ class VideoDepthPerceptionPlugin:
             with self._nodes_lock:
                 if self._nodes or self._model_loading or self._closing:
                     raise ValueError("Stop all depth instances and wait for loading to finish before switching models")
-                if backend == "depthart":
-                    from pathlib import Path
-                    for key, env in (("depthart_engine_path", "DEPTHART_ENGINE_PATH"),
-                                     ("depthart_plugin_path", "DEPTHART_PLUGIN_PATH")):
-                        path = os.environ.get(env) or self._plugin_cfg.get(key)
-                        if not path or not Path(path).is_file():
-                            raise ValueError("DepthART files are not provisioned; configure matching engine and plugin paths first")
                 if self._model is not None:
                     self._model.close()
                     self._model = None
