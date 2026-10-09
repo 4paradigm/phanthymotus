@@ -1590,7 +1590,7 @@ class VideoDepthPerceptionPlugin:
                 # spot in plugins/vop.py for what dropping it cost.
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
                         "model": "depthart-metric-s" if self._backend == "depthart" else "yolo26n-depth", "state": "loading",
-                        "desc": "Loading depth engine...",
+                        "desc": self._model_load_status or "Loading depth engine...",
                         **self._loading_camera_info(args, instance_id)}
             if self._model_load_error:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",

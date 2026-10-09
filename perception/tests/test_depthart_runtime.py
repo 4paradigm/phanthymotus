@@ -115,6 +115,39 @@ def test_depthart_first_load_downloads_and_reuses_session(monkeypatch):
     assert p._model_load_status == 'Loading DepthART Metric-S engine'
 
 
+def test_info_exposes_real_downloader_progress_while_loading(monkeypatch):
+    from utils import model_downloader
+    from plugins import depthart_runtime
+    p = make_plugin()
+    p._model_loading = True
+    observed = []
+    def download(model_dir, progress_cb=None):
+        for percent in (25, 75, 100):
+            progress_cb(percent, percent / 5, 20)
+            info = p.dispatch('visual_depth', {'action': 'info'})
+            assert info['state'] == 'loading'
+            assert info['model'] == 'depthart-metric-s'
+            assert f'{percent}%' in info['desc']
+            observed.append(info['desc'])
+        return {'depthart.engine': '/models/depthart/jp61/depthart.engine',
+                'libdepthart_selective_scan_trt.so': '/models/depthart/jp61/libdepthart_selective_scan_trt.so'}
+    def session(*paths):
+        assert p.dispatch('visual_depth', {'action': 'info'})['desc'] == 'Loading DepthART Metric-S engine'
+        return object()
+    monkeypatch.setattr(model_downloader, 'ensure_depthart_model', download)
+    monkeypatch.setattr(depthart_runtime, 'DepthARTSession', session)
+    p._ensure_model()
+    assert len(observed) == 3
+
+
+@pytest.mark.parametrize('status', [None, ''])
+def test_loading_info_falls_back_without_progress(status):
+    p = make_plugin()
+    p._model_loading = True
+    p._model_load_status = status
+    assert p.dispatch('visual_depth', {'action': 'info'})['desc'] == 'Loading depth engine...'
+
+
 def test_depthart_explicit_paths_bypass_download_and_partial_override_fails(monkeypatch):
     from utils import model_downloader
     from plugins import depthart_runtime
