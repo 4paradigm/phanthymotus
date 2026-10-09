@@ -8,11 +8,15 @@ import json
 import logging
 import os
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
 import urllib.request
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plugins.image_input import BadInput, check_under_roots  # noqa: E402
 
 import cv2
 
@@ -39,7 +43,11 @@ def load_face():
                   "_DEVICE_PROVIDERS",
               } for t in node.targets)]
     ns = dict(np=np, os=os, log=logging.getLogger(__name__), urllib=urllib,
-              DEFAULT_MODEL_NAME="edgeface_s_gamma_05", _MODEL_BASE_URL="https://example.invalid")
+              DEFAULT_MODEL_NAME="edgeface_s_gamma_05", _MODEL_BASE_URL="https://example.invalid",
+              # Extracted plugin methods enforce the shared path confinement;
+              # it must exist in this exec namespace exactly as it does in the
+              # real module, or the contract under test is not the shipped one.
+              check_under_roots=check_under_roots, BadInput=BadInput)
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)] + sorted(nodes, key=lambda n: n.lineno), type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
     return ns
@@ -53,8 +61,17 @@ class FaceContracts(unittest.TestCase):
     def test_detector_files(self):
         self.assertEqual(
             self.ns["_ensure_weights"] and True, True)  # module loads
+        # Every selectable artifact now lives pinned in the downloader; the
+        # plugin resolves detector names through that registry, not a local
+        # filename dict. Assert both halves: pins where they live, wiring
+        # where it lives.
+        md = (Path(__file__).resolve().parents[1] / "utils" / "model_downloader.py").read_text()
+        for needle in ("scrfd_2.5g_bnkps_hsuyabc.onnx", "scrfd_500m_kps.onnx",
+                       "face_detection_yunet_2023mar.onnx", "edgeface_base.int8.onnx",
+                       "edgeface_s_gamma_05.onnx", "edgeface_s_gamma_05.onnx.data"):
+            self.assertIn(needle, md)
         src = (Path(__file__).resolve().parents[1] / "plugins" / "face_scrfd.py").read_text()
-        for needle in ("scrfd_2.5g_bnkps_hsuyabc.onnx", '"scrfd_2.5g"'):
+        for needle in ('"scrfd_2.5g"', "FACE_SCRFD_DETECTOR_BUNDLES", "_detector_key"):
             self.assertIn(needle, src)
 
     def test_bbox_json(self):

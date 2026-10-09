@@ -35,6 +35,7 @@ class RegistrationContracts(unittest.TestCase):
         self.plugin._model_lock = threading.Lock()
         self.plugin._similarity_threshold = .4
         self.plugin._max_batch = 1000
+        self.plugin._input_cfg = {}   # image_input roots default: /models /tmp /work
         class Adapter:
             def detect_and_embed(self, image):
                 if not image.any():
@@ -81,17 +82,23 @@ class RegistrationContracts(unittest.TestCase):
         from unittest.mock import patch
 
         image = np.full((20, 40, 3), 80, np.uint8)
-        for action, args in [('recognize_by_photo', {'image_path': 'sample.png'}),
-                             ('recognize_by_url', {'url': 'https://example.invalid/face.png'})]:
-            with self.subTest(action=action), patch.dict(self.ns, load_image=lambda *a, **k: image):
-                result = self.call(action, **args)
-                self.assertTrue(result['ok'], result)
-                self.assertEqual(result['image_size'], {'width': 40, 'height': 20})
-                self.assertEqual(result['faces'][0]['bbox_relative'], [0., 0., .2, .4])
-                # The grader reads `bbox`; it must carry the same normalized
-                # xywh, with the pixel box demoted to `bbox_px`.
-                self.assertEqual(result['faces'][0]['bbox'], [0., 0., .2, .4])
-                self.assertEqual(result['faces'][0]['bbox_px'], [0., 0., 8., 8.])
+        # image_path goes through the configured-root check before decoding,
+        # so the photo lives under one (temp dirs are /tmp); a relative or
+        # foreign path is rejected on purpose — covered in
+        # test_face_scrfd_plugin.test_photo_and_corpus_paths_stay_inside_configured_roots.
+        with tempfile.TemporaryDirectory() as directory:
+            sample = str(Path(directory) / 'sample.png')
+            for action, args in [('recognize_by_photo', {'image_path': sample}),
+                                 ('recognize_by_url', {'url': 'https://example.invalid/face.png'})]:
+                with self.subTest(action=action), patch.dict(self.ns, load_image=lambda *a, **k: image):
+                    result = self.call(action, **args)
+                    self.assertTrue(result['ok'], result)
+                    self.assertEqual(result['image_size'], {'width': 40, 'height': 20})
+                    self.assertEqual(result['faces'][0]['bbox_relative'], [0., 0., .2, .4])
+                    # The grader reads `bbox`; it must carry the same normalized
+                    # xywh, with the pixel box demoted to `bbox_px`.
+                    self.assertEqual(result['faces'][0]['bbox'], [0., 0., .2, .4])
+                    self.assertEqual(result['faces'][0]['bbox_px'], [0., 0., 8., 8.])
 
     def test_zip_dispatch(self):
         import zipfile
