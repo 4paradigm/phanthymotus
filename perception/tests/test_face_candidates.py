@@ -9,14 +9,27 @@ import logging
 import os
 from pathlib import Path
 import sys
+import threading
+import time
 import unittest
+from typing import Optional
 from unittest.mock import patch
 import urllib.request
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plugins import ort_worker  # noqa: E402
+from plugins.face_corpus import corpus_entries, load_image  # noqa: E402
 from plugins.image_input import BadInput, check_under_roots  # noqa: E402
+from utils.log_sampling import escape_log_text  # noqa: E402
+from utils.model_downloader import (  # noqa: E402
+    FACE_SCRFD_DETECTOR_BUNDLES, FACE_SCRFD_RECOGNIZER_BUNDLES,
+    ensure_verified_bundle,
+)
+from utils.model_progress import fetch_status  # noqa: E402
+from utils.ros_lifecycle import dispose_node  # noqa: E402
+from urllib.parse import urlsplit  # noqa: E402
 
 import cv2
 
@@ -41,13 +54,25 @@ def load_face():
                   "_DETECT_TARGET_W", "_CONTAINER_SWEEP_THRESHOLDS",
                   "_CONTAINER_PORT_BASE", "_CONTAINER_PORT_STRIDE",
                   "_DEVICE_PROVIDERS",
+                  # Plain-data module constants the extracted methods read.
+                  "DEFAULT_SIMILARITY_THRESHOLD", "ENROLL_WINDOW_S",
+                  "ENROLL_WINDOW_MAX_FRAMES", "ENROLL_MAX_ANALYZED",
+                  "VISIT_GAP_S", "TOOLS",
               } for t in node.targets)]
+    # The namespace mirrors the module's globals for everything the extracted
+    # code reads. test_face_scrfd_plugin asserts statically that it stays
+    # complete — adding a module-level dependency here is what twice shipped a
+    # NameError that only the image could see.
     ns = dict(np=np, os=os, log=logging.getLogger(__name__), urllib=urllib,
+              threading=threading, time=time, Path=Path, Optional=Optional,
               DEFAULT_MODEL_NAME="edgeface_s_gamma_05", _MODEL_BASE_URL="https://example.invalid",
-              # Extracted plugin methods enforce the shared path confinement;
-              # it must exist in this exec namespace exactly as it does in the
-              # real module, or the contract under test is not the shipped one.
-              check_under_roots=check_under_roots, BadInput=BadInput)
+              check_under_roots=check_under_roots, BadInput=BadInput,
+              escape_log_text=escape_log_text, urlsplit=urlsplit,
+              dispose_node=dispose_node, corpus_entries=corpus_entries,
+              load_image=load_image, ort_worker=ort_worker,
+              ensure_verified_bundle=ensure_verified_bundle, fetch_status=fetch_status,
+              FACE_SCRFD_RECOGNIZER_BUNDLES=FACE_SCRFD_RECOGNIZER_BUNDLES,
+              FACE_SCRFD_DETECTOR_BUNDLES=FACE_SCRFD_DETECTOR_BUNDLES)
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)] + sorted(nodes, key=lambda n: n.lineno), type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
     return ns

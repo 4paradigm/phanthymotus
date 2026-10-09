@@ -58,6 +58,8 @@ from utils.model_downloader import (
     FACE_SCRFD_RECOGNIZER_BUNDLES, ensure_verified_bundle,
 )
 from utils.model_progress import fetch_status
+from utils.log_sampling import escape_log_text
+from urllib.parse import urlsplit
 from plugins import ort_worker
 from plugins.face_corpus import corpus_entries, load_image
 from plugins.image_input import BadInput, check_under_roots
@@ -663,7 +665,8 @@ class FaceDatabase:
                             self._embeddings.setdefault(person_id, []).append(
                                 np.array(best["embedding"], dtype=np.float32)
                             )
-                            log.info(f"[face] loaded {person_id}/{img_file.name}")
+                            log.info(f"[face] loaded {escape_log_text(person_id)}/"
+                                     f"{escape_log_text(img_file.name)}")
                         else:
                             n_fail += 1
                             log.warning(f"[face] no face detected in {img_file}")
@@ -1589,13 +1592,17 @@ class FaceRecognitionPlugin:
         package = str(args.get("package") or "").strip()
         if not package:
             return {"ok": False, "reason": "bad_input", "detail": "package is required"}
-        try:
-            # A corpus package walks and decodes whole trees — it rides the
-            # same configured-root boundary as single photos.
-            package = check_under_roots(package, self._input_cfg,
-                                        url_action="register_by_url")
-        except BadInput as error:
-            return error.as_result()
+        # A corpus package is either a local tree/archive — which walks and
+        # decodes whole subtrees and so rides the same configured-root
+        # boundary as single photos — or the documented HTTP(S) package URL
+        # that corpus_entries downloads itself. Confining the URL form would
+        # realpath an "https://..." string and reject it.
+        if urlsplit(package).scheme.lower() not in ("http", "https"):
+            try:
+                package = check_under_roots(package, self._input_cfg,
+                                            url_action="an http(s) package URL")
+            except BadInput as error:
+                return error.as_result()
         self._ensure_model()
         results, groups = [], {}
         try:
@@ -1606,7 +1613,8 @@ class FaceRecognitionPlugin:
                             load_image(path), name, profile, groups.get(group) if group else None,
                         )
                     except Exception as error:
-                        log.warning("[face] registration failed for %s: %s", relative, error)
+                        log.warning("[face] registration failed for %s: %s",
+                                    escape_log_text(relative), escape_log_text(error))
                         outcome = {"ok": False, "reason": "bad_input", "detail": str(error)}
                     if outcome.get("ok") and group:
                         groups.setdefault(group, outcome["person_id"])
@@ -1729,7 +1737,7 @@ class FaceRecognitionPlugin:
         if result.get("ok"):
             log.info("[face] registered %s from the live stream (%d/%d frames): %s",
                      result["person_id"], len(agreeing), len(selected),
-                     result["name"])
+                     escape_log_text(result["name"]))
         return {**result, "instance_id": node._input_topic,
                 "frames_used": len(agreeing), "frames_examined": len(selected),
                 "window_s": round(window, 2)}
