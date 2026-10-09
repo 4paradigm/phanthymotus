@@ -58,6 +58,14 @@ SAMPLE_RATE = 16_000
 GRID_S = 0.5
 MAX_S = 6.0
 
+# `model: off` 不是一个模型，是「完全不加载」。选它的时候 extractor 不会被构造，
+# 权重不进内存（cpu 实测 +84 MB，gpu +478 MB），也不占 CPU —— 和「卡片 stop」不同，
+# 后者只是停止归因、引擎还留在内存里等着重新启用。
+#
+# 放在 `model` 的枚举里而不是单独一个 enabled 开关：一个控件三种状态（关闭 / 这个
+# 模型 / 以后的模型），没有「关着但选了模型」这种说不清的组合。
+MODEL_OFF = "off"
+
 DEFAULT_SPEAKER_MODEL = "campplus_zh_en"
 DEFAULT_SPEAKER_MODEL_DIR = "/models/speaker/campplus_zh_en"
 
@@ -91,6 +99,11 @@ SPEAKER_MODELS = {
         "description": "3D-Speaker CAM++ (200k speakers, 中英双语, 192-d, 28 MB)",
     },
 }
+
+
+def is_off(model: str) -> bool:
+    """Is this the sentinel that means "do not load anything"?"""
+    return str(model or "").strip().lower() in (MODEL_OFF, "none", "disabled", "")
 
 
 def speaker_bundle_for(model: str, model_dir: str) -> tuple[str, str]:
@@ -336,10 +349,12 @@ __all__ = [
     "GRID_S",
     "MAX_S",
     "SAMPLE_RATE",
+    "MODEL_OFF",
     "SPEAKER_MODELS",
     "SpeakerEmbedder",
     "SpeakerEmbedderError",
     "grid_samples",
+    "is_off",
     "reachable_shapes",
     "speaker_bundle_for",
 ]

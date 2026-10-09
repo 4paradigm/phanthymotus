@@ -816,3 +816,112 @@ def test_info_reports_the_database_even_before_start(tmp_path):
     assert info["state"] == "running"        # engine 已就绪（测试里直接装好了）
     assert info["embedding_dim"] == DIM
     assert "database" in info
+
+
+# ── model: off —— 真正不加载 ─────────────────────────────────────────────────
+
+def test_off_is_in_the_model_enum():
+    """关闭做成 model 的一个取值，而不是单独的 enabled 开关：
+
+    一个控件三种状态（关闭 / 这个模型 / 以后的模型），没有「关着但选了模型」这种
+    说不清的组合。
+    """
+    enum = speaker_module.TOOLS[0]["configSchema"]["properties"]["model"]["enum"]
+    assert speaker_module.MODEL_OFF in enum
+    assert enum[0] == speaker_module.MODEL_OFF, "关闭排在最前，是显式的一档"
+
+
+@pytest.mark.parametrize("value", ["off", "OFF", "none", "disabled", ""])
+def test_is_off_accepts_the_obvious_spellings(value):
+    from plugins.speaker_runtime import is_off
+    assert is_off(value) is True
+
+
+def test_a_real_model_is_not_off():
+    from plugins.speaker_runtime import is_off
+    assert is_off("campplus_zh_en") is False
+
+
+def test_off_builds_no_embedder(tmp_path):
+    """关键断言：没有 extractor 就没有权重进内存。"""
+    engine = speaker_module._build_engine(
+        {"model": "off", "db_dir": str(tmp_path), "sample_dir": str(tmp_path / "s")})
+    assert engine.embedder is None
+
+
+def test_off_still_opens_an_existing_roster(tmp_path):
+    """关掉它的人往往正是想清掉它收集的东西 —— 让人先打开再删是反的。"""
+    IdentityDB(db_dir=str(tmp_path), dim=DIM, label="speaker_db").add("小王", [VOICE_A])
+    engine = speaker_module._build_engine(
+        {"model": "off", "db_dir": str(tmp_path), "sample_dir": str(tmp_path / "s")})
+    assert engine.embedder is None
+    assert engine.db is not None
+    assert engine.db.get_person("p-1")["name"] == "小王"
+
+
+def test_off_with_no_roster_on_disk_opens_nothing(tmp_path):
+    engine = speaker_module._build_engine(
+        {"model": "off", "db_dir": str(tmp_path), "sample_dir": str(tmp_path / "s")})
+    assert engine.db is None
+
+
+def test_off_adds_no_fields_to_the_asr_payload(tmp_path):
+    """关掉之后 payload 不该因为一个被关掉的功能多出任何 key，连 reason 都不要。"""
+    plugin = make_plugin(tmp_path, model="off")
+    plugin._engine = speaker_module._SpeakerEngine(
+        None, plugin._engine.db, plugin._engine.sample_dir)
+    assert plugin.identify_samples(clip(3.0)) == {}
+
+
+def test_off_reads_as_idle_and_says_why(tmp_path):
+    plugin = make_plugin(tmp_path, model="off")
+    info = plugin.dispatch("speaker_recognition", {"action": "info"})
+    assert info["state"] == "idle"
+    assert "model: off" in info["desc"]
+    assert "不占内存" in info["desc"]
+
+
+def test_start_does_not_load_anything_while_off(tmp_path):
+    """按下 start 也不该把一个被明确关掉的模型拉进内存。"""
+    plugin = SpeakerRecognitionPlugin(
+        {"db_dir": str(tmp_path), "model": "off"}, executor=None)
+    result = plugin.dispatch("speaker_recognition", {"action": "start"})
+    assert result["state"] == "idle"
+    assert plugin._engine is None
+    assert plugin._engine_state == "idle", "没有后台加载被触发"
+
+
+def test_switching_to_off_releases_the_engine(tmp_path):
+    """这是「省内存」那一半：换到 off 必须把带 extractor 的那个引擎放掉。
+
+    放掉之后会换成一个**只有库、没有 extractor** 的引擎 —— 权重不在内存里，但名单
+    还能查还能删。所以判据不是「_engine 变成 None」，是「不再是同一个对象，而且新的
+    那个没有 embedder」。
+    """
+    plugin = make_plugin(tmp_path)
+    plugin.identify_samples(clip(3.0))        # 落一个人到盘上，否则没名单可留
+    loaded = plugin._engine
+    assert loaded.embedder is not None
+    result = plugin.dispatch("speaker_recognition",
+                             {"action": "config", "model": "off"})
+    assert result["state"] == "loading"      # 走重建路径
+    assert _wait_for(lambda: plugin._engine is not loaded and
+                     plugin._engine is not None), "off 的引擎没建起来"
+    assert plugin._engine.embedder is None, "extractor 还在，内存就没省下来"
+    assert plugin._engine.db is not None, "库还该能用"
+    assert plugin._engine.db.get_person("p-1") is not None
+
+
+def test_management_actions_explain_when_nothing_is_open(tmp_path):
+    """off 且磁盘上没有库时，错误要同时说清两件事。
+
+    只说「没有这个人」会被读成「已经删掉了」，而真相是「什么都没打开」。
+    """
+    plugin = SpeakerRecognitionPlugin(
+        {"db_dir": str(tmp_path), "model": "off", "load_timeout_s": 5}, executor=None)
+    plugin._engine = speaker_module._SpeakerEngine(None, None, str(tmp_path))
+    plugin._engine_state = "ready"
+    with pytest.raises(RuntimeError) as excinfo:
+        plugin.dispatch("speaker_recognition", {"action": "list_speakers"})
+    assert "已关闭" in str(excinfo.value)
+    assert "没有名单" in str(excinfo.value)

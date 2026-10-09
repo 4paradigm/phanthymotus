@@ -394,6 +394,10 @@ plugins:
     # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
     # 走 sherpa-onnx 自带的那份 ONNX Runtime —— 和 ASR/TTS 同一份，所以不会触发
     # plugins/face_runtime.py 记录的双 ORT 冲突，也不需要 face 那套子进程隔离。
+    # `off` = **完全不加载**：权重不进内存（cpu 实测 +84 MB，gpu +478 MB）、不占
+    # 算力，ASR 的输出也不再带 speaker_* 字段。和卡片上的 stop 不是一回事 ——
+    # 那个只停止归因，引擎仍留在内存里等着重新启用。
+    # 关闭状态下名单、改名、删除仍然可用（维度从 persons.json 读，不需要模型）。
     model: campplus_zh_en
     # 和 face_db 一样，唯一可写的宿主挂载路径是 /models。
     db_dir: /models/speaker_db

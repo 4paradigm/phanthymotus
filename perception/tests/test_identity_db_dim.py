@@ -155,3 +155,47 @@ def test_dim_is_checked_before_the_generic_consistency_error(tmp_path):
     with pytest.raises(IdentityDBError) as excinfo:
         IdentityDB(db_dir=str(tmp_path), dim=256)
     assert "inconsistent" not in str(excinfo.value)
+
+
+# ── 不加载模型也要能读出维度 ─────────────────────────────────────────────────
+
+def test_dim_on_disk_reads_the_stored_width(tmp_path):
+    """声纹识别关掉（model: off）时没有模型可问，但名单还得能打开。"""
+    from plugins.identity_db import dim_on_disk
+    IdentityDB(db_dir=str(tmp_path), dim=VOICE_DIM).add("甲", [vec(VOICE_DIM, 1)])
+    assert dim_on_disk(str(tmp_path)) == VOICE_DIM
+
+
+def test_dim_on_disk_is_none_for_an_empty_directory(tmp_path):
+    from plugins.identity_db import dim_on_disk
+    assert dim_on_disk(str(tmp_path)) is None
+
+
+def test_dim_on_disk_is_none_for_a_legacy_database(tmp_path):
+    """version 2 没有 dim 字段 —— 拿不到就说拿不到，不能猜一个宽度。"""
+    from plugins.identity_db import dim_on_disk
+    db = IdentityDB(db_dir=str(tmp_path), dim=512)
+    db.add("老库", [vec(512, 2)])
+    path = os.path.join(str(tmp_path), "persons.json")
+    with open(path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    del state["dim"]
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    assert dim_on_disk(str(tmp_path)) is None
+
+
+def test_dim_on_disk_survives_a_corrupt_file(tmp_path):
+    from plugins.identity_db import dim_on_disk
+    with open(os.path.join(str(tmp_path), "persons.json"), "w") as handle:
+        handle.write("{not json")
+    assert dim_on_disk(str(tmp_path)) is None
+
+
+def test_a_db_opened_by_disk_width_matches_the_original(tmp_path):
+    """用磁盘上读出的维度打开，和原来是同一个库。"""
+    from plugins.identity_db import dim_on_disk
+    IdentityDB(db_dir=str(tmp_path), dim=VOICE_DIM,
+               model="campplus_zh_en").add("乙", [vec(VOICE_DIM, 3)])
+    reopened = IdentityDB(db_dir=str(tmp_path), dim=dim_on_disk(str(tmp_path)))
+    assert reopened.get_person("p-1")["name"] == "乙"

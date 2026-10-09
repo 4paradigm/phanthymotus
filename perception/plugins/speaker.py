@@ -75,15 +75,18 @@ from plugins.identity_db import (
     DEFAULT_VISIT_GAP_S,
     DEFAULT_VISIT_LOG_MAX,
     IdentityDB,
+    dim_on_disk,
     parse_time,
 )
 from plugins.speaker_runtime import (
     DEFAULT_SPEAKER_MODEL,
+    MODEL_OFF,
     DEFAULT_SPEAKER_MODEL_DIR,
     MAX_S,
     SAMPLE_RATE,
     SPEAKER_MODELS,
     SpeakerEmbedder,
+    is_off,
 )
 
 log = logging.getLogger(__name__)
@@ -168,6 +171,8 @@ REASON_NO_MATCH = "no_match"
 # auto_enroll 开着、但这一段短到不值得为它建一个身份。和 no_match 分开报，因为
 # 「说长一点就会有 id」和「这个人确实不认识」是两件不同的事。
 REASON_TOO_SHORT_TO_ENROLL = "too_short_to_enroll"
+# model 被设成 off：什么都没加载，所以连「不够像」都谈不上。
+REASON_DISABLED = "speaker_recognition_off"
 
 
 TOOLS = [
@@ -243,7 +248,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "model":            {"type": "string", "enum": sorted(SPEAKER_MODELS), "default": DEFAULT_SPEAKER_MODEL, "description": "声纹模型：" + "；".join(f"{name} = {spec['description']}" for name, spec in sorted(SPEAKER_MODELS.items())) + "。切换模型会使已存声纹失效——不同网络的 embedding 不可比较，数据库会拒绝加载，已注册的人需重新录入"},
+                "model":            {"type": "string", "enum": [MODEL_OFF] + sorted(SPEAKER_MODELS), "default": DEFAULT_SPEAKER_MODEL, "description": "声纹模型。" + "；".join(f"{name} = {spec['description']}" for name, spec in sorted(SPEAKER_MODELS.items())) + f"。选 `{MODEL_OFF}` 则**完全不加载**：权重不进内存（cpu 约 84 MB / gpu 约 478 MB）、不占算力，ASR 的输出也不再带 speaker_* 字段——和卡片上的 stop 不同，那个只是停止归因、引擎仍留在内存里。关闭状态下名单、改名、删除仍然可用。切换模型会使已存声纹失效：不同网络的 embedding 不可比较，数据库会拒绝加载，已注册的人需重新录入"},
                 "device":           {"type": "string", "enum": ["cpu", "gpu"], "default": "cpu", "description": "推理设备。cpu 是默认且通常是对的：实测 gpu 单跑快 1.62 倍，但 ASR 在 cpu 时声纹已完全藏在它后面（净增 2-7ms），ASR 在 gpu 时两个 CUDA session 争同一块 GPU，搬上去只省 3ms 还多占 478MB"},
                 "match_threshold":  {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格。0.6 是起点不是实测值（face 的 0.35 是 ArcFace 的尺度，不能照搬）"},
                 "min_speech_s":     {"type": "number", "minimum": 0.0, "default": DEFAULT_MIN_SPEECH_S, "description": "最短可用语音时长(秒)。低于此值只报听到了、不给身份——声纹在 1.5 秒以下急剧退化，而 VAD 只要 0.5 秒就出段"},
@@ -329,14 +334,16 @@ class _SpeakerEngine:
         self.sample_dir = sample_dir
 
     def close(self) -> None:
-        try:
-            self.db.flush()
-        except Exception:  # noqa: BLE001 - best-effort
-            log.warning("[speaker] db flush on close failed", exc_info=True)
-        try:
-            self.embedder.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if self.db is not None:
+            try:
+                self.db.flush()
+            except Exception:  # noqa: BLE001 - best-effort
+                log.warning("[speaker] db flush on close failed", exc_info=True)
+        if self.embedder is not None:
+            try:
+                self.embedder.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _build_engine(cfg: dict, on_status=None) -> _SpeakerEngine:
@@ -347,14 +354,28 @@ def _build_engine(cfg: dict, on_status=None) -> _SpeakerEngine:
     produce a database whose declared width disagrees with its contents, which is
     the exact failure IdentityDB refuses to let through.
     """
-    embedder = SpeakerEmbedder(**_analyzer_options(cfg), on_status=on_status)
     options = _db_options(cfg)
     sample_dir = str(cfg.get("sample_dir", "")) or os.path.join(
         options["db_dir"], "samples")
+
+    if is_off(options["model"]):
+        # Nothing is loaded: no weights in memory, no CUDA context, no inference.
+        # The roster is still opened when its width can be read off disk, so the
+        # management actions keep working — somebody who switched this off for
+        # privacy reasons wants to *clear* what it collected, and making them
+        # switch it back on first would be backwards.
+        dim = dim_on_disk(options["db_dir"])
+        if dim is None:
+            return _SpeakerEngine(None, None, sample_dir)
+        options = {**options, "model": ""}   # 不比对模型名：这里没有模型
+        return assemble_engine(None, sample_dir, dim=dim, **options)
+
+    embedder = SpeakerEmbedder(**_analyzer_options(cfg), on_status=on_status)
     return assemble_engine(embedder, sample_dir, **options)
 
 
-def assemble_engine(embedder, sample_dir: str, **db_options) -> _SpeakerEngine:
+def assemble_engine(embedder, sample_dir: str, dim: int | None = None,
+                    **db_options) -> _SpeakerEngine:
     """Tie an embedder, a database and the kept clips into one engine.
 
     Separate from `_build_engine` only so the tests can build an engine around a
@@ -377,7 +398,8 @@ def assemble_engine(embedder, sample_dir: str, **db_options) -> _SpeakerEngine:
         for person_id in ids:
             _drop_sample_file(engine.sample_dir, person_id)
 
-    db = IdentityDB(dim=embedder.dim, on_evict=on_evict, **db_options)
+    db = IdentityDB(dim=embedder.dim if embedder is not None else int(dim),
+                    on_evict=on_evict, **db_options)
     engine = _SpeakerEngine(embedder, db, sample_dir)
     engine_box["engine"] = engine
     return engine
@@ -566,6 +588,21 @@ class SpeakerRecognitionPlugin:
                         self._load_error or "speaker engine failed to load")
         raise RuntimeError("speaker engine is still loading; try again shortly")
 
+    def _require_db(self) -> _SpeakerEngine:
+        """`_require_engine`, plus the guarantee that there is a roster to touch.
+
+        With `model: off` and no database on disk there is nothing to list or
+        delete. The error has to say both halves: "no such speaker p-1" alone
+        reads as "it was deleted", when the truth is that nothing is open.
+        """
+        engine = self._require_engine()
+        if engine.db is None:
+            raise RuntimeError(
+                "声纹识别已关闭（model: off），而磁盘上也没有已有的声纹库，"
+                "所以没有名单可以操作。要重新开始识别，把 model 设回一个模型。"
+            )
+        return engine
+
     def engine_if_ready(self) -> _SpeakerEngine | None:
         """The engine, or None — never loads, never blocks.
 
@@ -616,6 +653,10 @@ class SpeakerRecognitionPlugin:
         if not self._enabled:
             return {}
         engine = self.engine_if_ready()
+        if engine is not None and engine.embedder is None:
+            # model: off —— 权重根本没加载。返回空而不是一个 reason：ASR 的 payload
+            # 不该因为一个被关掉的功能而多出字段。
+            return {}
         samples = np.asarray(samples, dtype=np.float32).reshape(-1)
         rate = int(sample_rate or SAMPLE_RATE)
         duration = len(samples) / float(rate)
@@ -858,6 +899,9 @@ class SpeakerRecognitionPlugin:
         if state == "error" and self._load_error:
             return f"Model load failed: {self._load_error}"
         if state == "idle":
+            if is_off(str(self._plugin_cfg.get("model", DEFAULT_SPEAKER_MODEL))):
+                return ("已关闭（model: off）—— 模型未加载，不占内存/显存/算力；"
+                        "ASR 的输出不附带说话人身份。名单与删除仍然可用")
             return "已关闭 —— ASR 的输出不再附带说话人身份"
         return self._DESC
 
@@ -878,6 +922,9 @@ class SpeakerRecognitionPlugin:
         the operator turned off is the *attribution*, not the allocation.
         """
         if not self._enabled:
+            return "idle"
+        if is_off(str(self._plugin_cfg.get("model", DEFAULT_SPEAKER_MODEL))):
+            # 关闭不是「错误」也不是「在加载」—— 它就是停着，而且是被要求停着的。
             return "idle"
         if self._engine_state == "loading":
             return "loading"
@@ -922,7 +969,9 @@ class SpeakerRecognitionPlugin:
         """
         with self._state_lock:
             self._enabled = True
-            if self._engine is None and self._engine_state in ("idle", "error"):
+            off = is_off(str(self._plugin_cfg.get("model", DEFAULT_SPEAKER_MODEL)))
+            if (not off and self._engine is None
+                    and self._engine_state in ("idle", "error")):
                 self._spawn_loader_locked()
             state = self._card_state_locked()
             result = {"state": state, "desc": self._desc_locked(state)}
@@ -999,7 +1048,7 @@ class SpeakerRecognitionPlugin:
                     "detail": "name is required"}
         profile = args.get("profile")
         merge = args.get("merge", True)
-        engine = self._require_engine()
+        engine = self._require_db()
         speaker_id = str(args.get("speaker_id") or "").strip()
 
         if speaker_id:
@@ -1060,7 +1109,7 @@ class SpeakerRecognitionPlugin:
     # ── reads ─────────────────────────────────────────────────────────────
 
     def _do_list_speakers(self, args: dict) -> dict:
-        engine = self._require_engine()
+        engine = self._require_db()
         page = engine.db.list_persons(
             named=str(args.get("named", "all") or "all"),
             query=str(args.get("query", "") or ""),
@@ -1087,7 +1136,7 @@ class SpeakerRecognitionPlugin:
         if not speaker_id:
             return {"ok": False, "reason": REASON_BAD_INPUT,
                     "detail": "speaker_id is required"}
-        engine = self._require_engine()
+        engine = self._require_db()
         try:
             record = engine.db.get_person(speaker_id)
         except KeyError:
@@ -1108,7 +1157,7 @@ class SpeakerRecognitionPlugin:
         return record
 
     def _do_forget(self, args: dict) -> dict:
-        engine = self._require_engine()
+        engine = self._require_db()
         named = str(args.get("named", "") or "").strip()
         ids = args.get("speaker_ids")
         if isinstance(ids, str):
@@ -1142,7 +1191,7 @@ class SpeakerRecognitionPlugin:
         _drop_sample_file(engine.sample_dir, person_id)
 
     def _do_list_heard(self, args: dict) -> dict:
-        engine = self._require_engine()
+        engine = self._require_db()
         return engine.db.list_visits(
             person_id=str(args.get("speaker_id", "") or ""),
             since=parse_time(args.get("since")),
@@ -1159,6 +1208,7 @@ __all__ = [
     "DEFAULT_MATCH_THRESHOLD",
     "DEFAULT_ENROLL_MIN_SPEECH_S",
     "DEFAULT_MIN_SPEECH_S",
+    "REASON_DISABLED",
     "REASON_MULTI_SPEAKER",
     "REASON_NO_MATCH",
     "REASON_NO_RECENT",

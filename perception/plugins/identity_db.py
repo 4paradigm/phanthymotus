@@ -118,6 +118,33 @@ _EMBEDDINGS_SUFFIX = ".npy"
 PERSON_PREFIX = "p-"
 
 
+def dim_on_disk(db_dir: str) -> int | None:
+    """The embedding width a database on disk was written with, without opening it.
+
+    `IdentityDB` needs `dim` up front, and the only honest source is normally the
+    model. But a caller that has deliberately **not** loaded a model still has a
+    roster to show and delete — somebody who switched speaker recognition off for
+    privacy reasons wants to clear what it collected, and making them switch it
+    back on first is backwards.
+
+    Returns None for a directory with no database, or one written before the
+    field existed (every face_db deployed so far). A caller that gets None has
+    nothing it can safely open and should say the database is unavailable rather
+    than guess a width.
+    """
+    path = os.path.join(str(db_dir), _PERSONS_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle).get("dim")
+    except (OSError, ValueError):
+        return None
+    try:
+        value = int(stored)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 class IdentityDBError(RuntimeError):
     """The database on disk exists but cannot be used as-is."""
 
@@ -1216,5 +1243,6 @@ __all__ = [
     "DEFAULT_UNKNOWN_CAPACITY",
     "IdentityDB",
     "IdentityDBError",
+    "dim_on_disk",
     "is_unknown_id",
 ]
