@@ -58,7 +58,7 @@ from utils.model_downloader import (
     FACE_SCRFD_RECOGNIZER_BUNDLES, ensure_verified_bundle,
 )
 from utils.model_progress import fetch_status
-from utils.log_sampling import escape_log_text
+from utils.log_sampling import SampledLogGate, escape_log_text
 from urllib.parse import urlsplit
 from plugins import ort_worker
 from plugins.face_corpus import corpus_entries, load_image
@@ -1266,6 +1266,8 @@ class _FaceNode(Node):
         self._last_inference_time = 0.0
         self._detect_count = 0
         self._diag_db_sent = False
+        # Same transition-then-sample rule as the frame log, for failures.
+        self._error_gate = SampledLogGate(every=100)
 
         # Rolling stream window, kept beside the inference queue rather than in
         # place of it: the worker still wants "newest frame, drop the rest",
@@ -1401,12 +1403,19 @@ class _FaceNode(Node):
                     best = max(faces, key=lambda face: face["detect_confidence"])
                     result.update({key: best[key] for key in
                                    ("detect_confidence", "bbox_relative", "identity")})
-                    # Visit bookkeeping: one sighting per recognised person.
+                    # One sighting per recognised person.
                     for face in faces:
                         if face["person_id"]:
                             self._face_db.record_sighting(
                                 face["person_id"], result["ts"], self._input_topic)
-                    self._face_db.close_stale_visits()
+                # Absence is what closes a visit, so the check runs on every
+                # inference tick — not only on frames carrying a face. Nested
+                # under `if faces` it never advanced once a person left the
+                # camera: no new face meant no empty-frame checks, and
+                # list_visits kept reporting them present until somebody else
+                # appeared or a stop forced it. The sibling face plugin runs
+                # this bookkeeping per worker cycle for the same reason.
+                self._face_db.close_stale_visits()
                 msg = String()
                 msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
@@ -1422,7 +1431,16 @@ class _FaceNode(Node):
                              f"{result.get('identity', {}).get('person_id')} (detect+match done)")
 
             except Exception as e:
-                log.error(f"[face] inference error: {e}", exc_info=True)
+                # A persistent failure at fps 3 would write ~260k records/day
+                # if logged per frame. SampledLogGate logs the first and every
+                # 100th of a run and marks the transition, so the traceback
+                # (the expensive part) is attached only where it is new, while
+                # every line keeps the escaped exception detail.
+                should, transition, occurrence = self._error_gate.check(type(e).__name__)
+                if should:
+                    log.error(f"[face] inference error ({type(e).__name__}, "
+                              f"#{occurrence}): {escape_log_text(e)}",
+                              exc_info=transition)
 
 
 def _face_result(database, detection, shape, threshold):

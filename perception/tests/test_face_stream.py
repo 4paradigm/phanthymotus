@@ -1,5 +1,6 @@
 """Stream window + register_by_stream / recognize_by_stream / list_visits."""
 import ast
+import json
 import collections
 import queue
 import threading
@@ -19,18 +20,20 @@ _NEEDS_REAL_CV2 = not getattr(cv2, "__motus_fake__", False)
 import numpy as np
 
 from test_face_candidates import load_face
+from utils.log_sampling import SampledLogGate
 
 _FACE_PATH = Path(__file__).resolve().parents[1] / "plugins" / "face_scrfd.py"
 
 
 def _face_node_methods():
-    """Extract _FaceNode._image_cb/recent_frames without importing ROS."""
+    """Extract _FaceNode methods without importing ROS."""
     tree = ast.parse(_FACE_PATH.read_text())
     methods = {}
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "_FaceNode":
             for item in node.body:
-                if isinstance(item, ast.FunctionDef) and item.name in ("_image_cb", "recent_frames"):
+                if isinstance(item, ast.FunctionDef) and item.name in (
+                        "_image_cb", "recent_frames", "_inference_worker"):
                     methods[item.name] = item
     constants = {}
     for node in tree.body:
@@ -45,14 +48,34 @@ def _face_node_methods():
 
 _METHODS, _CONSTANTS = _face_node_methods()
 
+# The worker's globals, swappable so a test can record what gets logged.
+_WORKER_NS = {"collections": collections, "queue": queue, "time": time,
+              "Optional": __import__("typing").Optional,
+              "SampledLogGate": SampledLogGate,
+              "CompressedImage": type("CompressedImage", (), {})}
+class _LogShim:
+    """Default stand-in for the module logger in compiled worker code."""
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: None
+
 
 def _compile_methods():
     """Compile the extracted _FaceNode methods into real functions."""
     module = ast.Module(body=list(_METHODS.values()), type_ignores=[])
     code = compile(ast.fix_missing_locations(module), str(_FACE_PATH), "exec")
-    namespace = {"collections": collections, "queue": queue, "time": time,
-                 "Optional": __import__("typing").Optional,
-                 "CompressedImage": type("CompressedImage", (), {})}
+    # _WORKER_NS **is** the exec globals (not a copy): a test swapping its
+    # `log` for a recorder must be visible to the already-compiled functions.
+    namespace = _WORKER_NS
+    # The worker's real dependencies, from the extraction namespace the pixel
+    # suites already build — not hand-stubbed copies that could drift.
+    ns = load_face()
+    namespace.update(np=np, json=json, threading=threading,
+                     log=namespace.setdefault("log", _LogShim()),
+                     String=type("String", (), {}),
+                     _face_result=ns["_face_result"],
+                     escape_log_text=namespace.setdefault("escape_log_text",
+                                                          ns["escape_log_text"]))
     exec(code, namespace)
     return {name: namespace[name] for name in _METHODS}
 
@@ -64,6 +87,49 @@ def _jpeg(mean):
     ok, buf = cv2.imencode('.jpg', np.full((10, 10, 3), mean, np.uint8))
     assert ok
     return buf.tobytes()
+
+
+class _WorkerNode:
+    """Just enough of _FaceNode for _inference_worker, no ROS."""
+
+    def __init__(self, face_db, adapter):
+        self._frame_queue = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._model = adapter
+        self._face_db = face_db
+        self._similarity_threshold = .4
+        self._detect_count = 0
+        self._diag_db_sent = False
+        self._input_topic = '/cam'
+        self._error_gate = _WORKER_NS["SampledLogGate"]()
+        self.published = []
+        node = self
+
+        class _Pub:
+            def publish(self, msg):
+                node.published.append(json.loads(msg.data))
+
+        self._pub = _Pub()
+
+
+def _run_worker_frames(node, frames, until, timeout=5.0):
+    """Push frames through the extracted worker until `until()` holds."""
+    import types
+
+    worker = types.MethodType(_METHOD_FUNCS['_inference_worker'], node)
+    node._stop_event.clear()      # a previous run leaves it set
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        for data in frames:
+            node._frame_queue.put(data)
+        deadline = time.time() + timeout
+        while time.time() < deadline and not until():
+            time.sleep(0.02)
+        assert until(), "the worker never reached the expected state"
+    finally:
+        node._stop_event.set()
+        thread.join(timeout=3)
 
 
 @unittest.skipUnless(_NEEDS_REAL_CV2, "needs real cv2")
@@ -265,6 +331,81 @@ def test_stop_all_also_closes_visits():
 
     assert result['stopped_instances'] == ['/cam-a']
     assert result['visits_closed'] == 1
+
+
+def test_empty_frames_close_a_stale_visit_without_any_face():
+    """Absence closes a visit, and absence arrives as frames with no face:
+    the worker checks on every tick, not only under `if faces`. Before that,
+    a person who walked away stayed 'present' until somebody else showed up
+    or the instance was stopped."""
+    if not _NEEDS_REAL_CV2:
+        import pytest
+        pytest.skip("needs real cv2")
+
+    ns = load_face()
+    ns.update(threading=threading)
+    db = ns['FaceDatabase']()
+    db.record_sighting('p-1', time.time() - (ns['VISIT_GAP_S'] + 5), '/cam')
+
+    class NoFaces:
+        def detect_and_embed(self, image):
+            return []
+
+    node = _WorkerNode(db, NoFaces())
+    _run_worker_frames(node, [_jpeg(0)], until=lambda: len(node.published) >= 1)
+
+    assert node.published[0]['count'] == 0          # the frame indeed had no face
+    visit = db.list_visits()['visits'][0]
+    assert visit.get('open') is not True, "empty frames must close stale visits"
+
+
+def test_repeated_inference_errors_are_sampled_not_per_frame():
+    """One line per failure run, not one per frame: the transition logs with
+    a traceback and escaped detail, repeats stay quiet until the sample
+    cadence (100), and a different failure logs as a new transition."""
+    if not _NEEDS_REAL_CV2:
+        import pytest
+        pytest.skip("needs real cv2")
+
+    ns = load_face()
+    ns.update(threading=threading)
+
+    class _Recorder(_LogShim):
+        def __init__(self):
+            self.errors = []
+
+        def error(self, text, exc_info=False):
+            self.errors.append((text, bool(exc_info)))
+
+    recorder = _Recorder()
+    previous = _WORKER_NS["log"]
+    _WORKER_NS["log"] = recorder
+    try:
+        class Boom:
+            def __init__(self, error):
+                self.calls = 0
+                self.error = error
+
+            def detect_and_embed(self, image):
+                self.calls += 1
+                raise self.error
+
+        boom = Boom(RuntimeError("decoder exploded\nwith newline"))
+        node = _WorkerNode(ns['FaceDatabase'](), boom)
+        _run_worker_frames(node, [_jpeg(0)] * 3, until=lambda: boom.calls >= 3)
+
+        assert len(recorder.errors) == 1, recorder.errors
+        text, exc_info = recorder.errors[0]
+        assert "RuntimeError" in text and "#1" in text
+        assert "\n" not in text                    # escaped, cannot forge a line
+        assert exc_info is True                     # the traceback rides the transition
+
+        boom.error = ValueError("graph changed")
+        _run_worker_frames(node, [_jpeg(0)], until=lambda: boom.calls >= 4)
+        assert len(recorder.errors) == 2, recorder.errors
+        assert "ValueError" in recorder.errors[1][0]
+    finally:
+        _WORKER_NS["log"] = previous
 
 
 if __name__ == '__main__':
