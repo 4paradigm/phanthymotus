@@ -573,8 +573,7 @@ def test_every_action_has_x_action_params_and_a_handler(tmp_path):
     assert set(actions) == set(declared), "enum 与 x-action-params 必须一一对应"
     plugin = make_plugin(tmp_path)
     for action in actions:
-        if action in ("start", "stop", "config"):
-            continue        # 需要 executor / ROS，由 face 的同构路径覆盖
+        # 现在每个 action 都能在没有 ROS 的情况下调 —— 这张卡没有节点了
         assert plugin.dispatch("speaker_recognition", {"action": action}) is not None, \
             f"{action} 没有 handler"
 
@@ -719,3 +718,101 @@ def test_named_identities_are_never_evicted(tmp_path):
     plugin.identify_samples(clip(3.0, level=-0.5))      # 未命名的 p-2
     plugin.identify_samples(clip(3.0, level=0.123))     # 未命名的 p-3，挤掉 p-2
     assert plugin._engine.db.get_person("p-1")["name"] == "小王"
+
+
+# ── 卡片形状：actuator、无输入输出 ──────────────────────────────────────────
+
+def test_the_card_declares_no_topics():
+    """给这张卡画输入输出口会暗示「把音频连进来」，而那恰恰是不该做的事。
+
+    身份是在 ASR 已经切好的 VAD 段上算的，随 ASR 的输出走。把音频也连进这张卡
+    等于再跑一份 VAD、重复登记、重复记出现记录，而且没有任何东西会说出来。
+    """
+    tool = speaker_module.TOOLS[0]
+    assert "topic_in" not in tool
+    assert "topic_out" not in tool
+    assert tool["type"] == "actuator", (
+        "phanthymotus-driver 里 115/277 个工具同样不声明 topic，几乎全是 actuator"
+        " —— 这是这个项目里「一个你调用的东西」既有的形状"
+    )
+    assert "multiInstance" not in tool, "没有流就没有实例"
+    assert "input_topic" not in tool["inputSchema"]["properties"]
+
+
+def test_start_and_stop_are_still_declared():
+    """框架会对画布上每张卡无条件发 start/stop。
+
+    perception 没有 phanthymotus-driver 的 common/lifecycle 兜底，拒绝这两个动作
+    会让卡片失败，而启动序列是严格的 —— 一张卡会把整个项目回滚。
+    """
+    actions = speaker_module.TOOLS[0]["inputSchema"]["properties"]["action"]["enum"]
+    assert "start" in actions and "stop" in actions
+
+
+# ── start / stop 是真开关 ────────────────────────────────────────────────────
+
+def test_stop_turns_off_identity_attribution(tmp_path):
+    plugin = make_plugin(tmp_path)
+    assert plugin.identify_samples(clip(3.0))["speaker_id"] == "p-1"
+    assert plugin.dispatch("speaker_recognition", {"action": "stop"})["state"] == "idle"
+    assert plugin.identify_samples(clip(3.0)) == {}, (
+        "停了之后 ASR 的 payload 不该再带任何 speaker_* 字段"
+    )
+
+
+def test_stop_also_stops_creating_voiceprints(tmp_path):
+    """这是「别再给人建声纹档」那一半，对特意关掉它的人才是重点。"""
+    plugin = make_plugin(tmp_path)
+    plugin.dispatch("speaker_recognition", {"action": "stop"})
+    plugin.identify_samples(clip(3.0))
+    assert plugin._engine.db.stats()["persons"] == 0
+
+
+def test_start_arms_it_again(tmp_path):
+    plugin = make_plugin(tmp_path)
+    plugin.dispatch("speaker_recognition", {"action": "stop"})
+    result = plugin.dispatch("speaker_recognition", {"action": "start"})
+    assert result["state"] == "running"
+    assert plugin.identify_samples(clip(3.0))["speaker_id"] == "p-1"
+
+
+def test_start_needs_no_input_topic(tmp_path):
+    """以前 start 不给 input_topic 会抛 —— 而框架正是不给的。"""
+    plugin = make_plugin(tmp_path)
+    assert plugin.dispatch("speaker_recognition", {"action": "start"})["state"] == "running"
+
+
+def test_stopping_does_not_unload_the_engine(tmp_path):
+    """重新 start 要马上可用，而那块内存也没别人在等。"""
+    plugin = make_plugin(tmp_path)
+    engine = plugin._engine
+    plugin.dispatch("speaker_recognition", {"action": "stop"})
+    assert plugin._engine is engine
+
+
+def test_a_stopped_card_reads_as_stopped(tmp_path):
+    """模型还在内存里，但操作员关掉的是「归因」，所以必须显示为 idle。"""
+    plugin = make_plugin(tmp_path)
+    plugin.dispatch("speaker_recognition", {"action": "stop"})
+    info = plugin.dispatch("speaker_recognition", {"action": "info"})
+    assert info["state"] == "idle"
+    assert "已关闭" in info["desc"]
+
+
+def test_management_actions_work_while_stopped(tmp_path):
+    """停了也要能查名单、改名、删人 —— 库的生命周期独立于这个开关。"""
+    plugin = make_plugin(tmp_path)
+    plugin.identify_samples(clip(3.0))
+    plugin.dispatch("speaker_recognition", {"action": "stop"})
+    page = plugin.dispatch("speaker_recognition", {"action": "list_speakers"})
+    assert page["total"] == 1
+    assert plugin.dispatch("speaker_recognition",
+                           {"action": "forget", "speaker_id": "p-1"})["ok"] is True
+
+
+def test_info_reports_the_database_even_before_start(tmp_path):
+    plugin = make_plugin(tmp_path)
+    info = plugin.dispatch("speaker_recognition", {"action": "info"})
+    assert info["state"] == "running"        # engine 已就绪（测试里直接装好了）
+    assert info["embedding_dim"] == DIM
+    assert "database" in info

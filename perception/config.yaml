@@ -455,12 +455,11 @@ plugins:
     # 未命名声纹上限，超出淘汰最久未听到的；已命名不受影响。
     unknown_capacity: 50
     max_samples_per_person: 8
-    # 独立模式（这张卡直接订阅音频 topic）才用得到的 VAD 参数。被 ASR 喂的时候
-    # 切分由 ASR 的 vad_silence_ms 决定，这里的值无效。独立时用更长的静音间隔，
-    # 出更少、更长、对声纹更可用的段。
-    vad_threshold: 0.5
-    vad_silence_ms: 600
-    vad_max_speech_s: 20.0
+    # 这张卡是 actuator，不订阅任何 topic：身份是在 ASR 已经切好的那个 VAD 段上算
+    # 的，随 ASR 的输出一起走。所以这里没有 VAD 参数 —— 切分完全由 asr.vad 决定。
+    #
+    # 画布上这张卡的作用是对它下命令（命名、查名单、听样本、删人）。start 会预加载
+    # 模型（否则第一句话要多等 1-2 秒），stop 会停止给语音附加身份、也停止建新声纹。
 
   face_recognition:
     enabled: true

@@ -11,13 +11,16 @@ because omitting them orphaned a live node in production.
 
 ## How this is *not* face recognition
 
-**The identity reaches the LLM through ASR, not through this card's topic.** The
-embedding is computed on the VAD segment ASR already cut — the same PCM buffer, the
-same tuple, in a thread beside `transcribe()` — so there is no timestamp join and no
-alignment error to get wrong. `identify_pcm()` is that entry point and it needs only
-the engine, not a running node, so it works whether or not this card is started.
-This card's own `start` subscribes to an audio topic with its own VAD, for the
-canvas visualisation and for the case where ASR is not running at all.
+**The identity reaches the LLM through ASR, and this card has no topics at all.**
+The embedding is computed on the VAD segment ASR already cut — the same PCM buffer,
+the same tuple, in a thread beside `transcribe()` — so there is no timestamp join and
+no alignment error to get wrong. `identify_pcm()` is that entry point.
+
+So this is an `actuator` card with no `topic_in` and no `topic_out`, which is the
+shape 115 of phanthymotus-driver's 277 tools already have. Drawing ports on it would
+invite wiring audio in, and that is the one thing not to do: it would mean a second
+VAD, duplicate enrolment and duplicate sightings, with nothing saying so. What the
+card is *for* on a canvas is being commanded — name, list, listen, forget.
 
 **No file or URL enrolment.** Not an omission — voiceprints carry channel. The
 microphone, the sampling chain, the room and the distance are all baked into the
@@ -62,12 +65,8 @@ from collections import deque
 from typing import Any
 
 import numpy as np
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from std_msgs.msg import String
 
 from utils.log_sampling import escape_log_text
-from utils.ros_lifecycle import dispose_node
 
 from plugins.identity_db import (
     DEFAULT_MAX_SAMPLES_PER_PERSON,
@@ -153,27 +152,7 @@ DEFAULT_SAMPLE_MIN_SPEECH_S = 2.0
 DEFAULT_RECENT_RING = 32
 DEFAULT_RECENT_WINDOW_S = 120.0
 
-# Standalone-mode VAD (this card started on an audio topic directly). ASR's
-# settings are deliberately not reused: when ASR feeds us we inherit its
-# segmentation whether we like it or not, and when it does not, a longer silence
-# gap produces fewer, longer, more usable segments for a voiceprint.
-DEFAULT_VAD_THRESHOLD = 0.5
-DEFAULT_VAD_SILENCE_MS = 600
-DEFAULT_VAD_MAX_SPEECH_S = 20.0
 
-AUDIO_FORMAT = "audio/pcm-16k"
-_AUDIO_FORMATS = frozenset((AUDIO_FORMAT, "pcm_16k_16bit_mono"))
-
-_AUDIO_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    history=HistoryPolicy.KEEP_LAST, depth=50,
-    durability=DurabilityPolicy.VOLATILE,
-)
-_RESULT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,
-    history=HistoryPolicy.KEEP_LAST, depth=10,
-    durability=DurabilityPolicy.VOLATILE,
-)
 
 # ── failure reasons ───────────────────────────────────────────────────────────
 
@@ -194,11 +173,19 @@ REASON_TOO_SHORT_TO_ENROLL = "too_short_to_enroll"
 TOOLS = [
     {
         "name": "speaker_recognition",
-        "type": "processor",
-        "multiInstance": True,
+        # actuator，而且**不声明任何 topic**。声纹不是流水线上的一级：身份是在 ASR
+        # 已经切好的那个 VAD 段上算出来的，随 ASR 的输出一起走（见模块文档）。给这
+        # 张卡画输入输出口会暗示「要把音频连进来」，而那恰恰是不该做的事 —— 连进来
+        # 等于再跑一份 VAD、重复登记、重复记出现记录。
+        #
+        # 这张卡在画布上的作用是**对它下命令**：命名、查名单、听样本、删人。
+        # phanthymotus-driver 里 277 个工具有 115 个同样不声明 topic，几乎全是
+        # actuator —— 这是这个项目里「一个你调用的东西」既有的形状。
+        "type": "actuator",
         "description": (
             "Speaker recognition — tell who is talking from their voice, and give "
-            "a name to a voice the robot has already heard"
+            "a name to a voice the robot has already heard. 身份随 ASR 的输出一起"
+            "走，这张卡不需要连线"
         ),
         "inputSchema": {
             "type": "object",
@@ -212,7 +199,6 @@ TOOLS = [
                     ],
                     "description": "Action to perform",
                 },
-                "input_topic": {"type": "string", "description": "ROS2 音频 topic（如 /hostname/mic/audio，action=start 时必填）。只有独立模式需要——身份随 ASR 的输出一起走，不需要启动这张卡"},
                 "name":       {"type": "string", "description": "姓名（结构化），如 \"小王\"。有 name 才算已注册；每次识别都会随 id 一起输出"},
                 "profile":    {"type": "object", "description": "非结构化画像对象，如 {\"team\":\"运营部\",\"note\":\"说话很快\"}。键名自定；传字符串会被存成 {\"note\":\"...\"}"},
                 "profile_delete": {"type": "array", "items": {"type": "string"}, "description": "要删除的 profile 键名列表"},
@@ -228,9 +214,9 @@ TOOLS = [
             },
             "required": ["action"],
             "x-action-params": {
-                "start":  {"params": ["input_topic"], "description": "独立模式：自己订阅音频 topic 并发布「谁在说话」。ASR 在跑时不需要这个 —— 身份已经随 ASR 的输出走了"},
-                "stop":   {"params": [], "description": "Stop the standalone listener"},
-                "info":   {"params": ["input_topic"], "description": "Report state, topics and database statistics"},
+                "start":  {"params": [], "description": "开启声纹识别：预加载模型（否则第一句话要多等 1-2 秒），并允许给语音附加身份。不需要输入 topic"},
+                "stop":   {"params": [], "description": "停止给语音附加身份。ASR 继续正常转写，只是输出里不再带 speaker_* 字段 —— 也是一个「别再给声音建档」的开关"},
+                "info":   {"params": [], "description": "Report state and database statistics"},
                 "config": {"params": [], "description": "Update configuration"},
                 "name_speaker": {
                     "params": ["name", "profile", "speaker_id"],
@@ -267,14 +253,11 @@ TOOLS = [
                 "unknown_capacity": {"type": "integer", "minimum": 0, "default": DEFAULT_UNKNOWN_CAPACITY, "description": "未命名声纹数量上限，超出时淘汰最久未听到的；已命名的不受影响"},
             },
         },
-        "topic_in":  [{"format": AUDIO_FORMAT, "desc": "16 kHz mono PCM16 audio"}],
-        "topic_out": [{"format": "data/json",  "desc": "who is speaking"}],
+        # 没有 topic_in / topic_out —— 见上面 type 处的注释。
     }
 ]
 
 
-def _speaker_output_topic(input_topic: str) -> str:
-    return f"{input_topic}/speaker"
 
 
 def _analyzer_options(cfg: dict) -> dict:
@@ -457,197 +440,29 @@ class _RecentRing:
             return [dict(item) for item in self._items]
 
 
-class _SpeakerNode(Node):
-    """独立模式：自己订阅音频、自己做 VAD、发布「谁在说话」。
-
-    Not the path identities reach the LLM by — that is `identify_pcm()`, called
-    from `plugins/asr.py` on the segment ASR already cut. This exists for the
-    canvas visualisation and for a robot with no ASR card running, and it carries
-    its own VAD because there is nothing else to segment the stream. Starting it
-    on a topic ASR is also on means two silero instances; that is an explicit
-    choice the operator makes by wiring it, not something that happens silently.
-    """
-
-    def __init__(self, input_topic: str, engine: _SpeakerEngine, cfg: dict,
-                 identify, node_suffix: str = ""):
-        super().__init__(f"speaker_{node_suffix}" if node_suffix else "speaker")
-        self._input_topic = input_topic
-        self._output_topic = _speaker_output_topic(input_topic)
-        self._engine = engine
-        self._cfg = dict(cfg)
-        self._identify = identify
-        self.state = "idle"
-
-        self._sub = None
-        self._pub = self.create_publisher(String, self._output_topic, _RESULT_QOS)
-        self._node_lock = threading.RLock()
-        self._stop_event = threading.Event()
-        self._stop_event.set()
-        self._worker: threading.Thread | None = None
-        self._pcm_lock = threading.Lock()
-        self._pcm_chunks: deque[bytes] = deque()
-        self._retired = False
-        self._stats = {"chunks": 0, "segments": 0, "errors": 0}
-        log.info("[speaker] node created: subscribing=%s, publishing=%s",
-                 input_topic, self._output_topic)
-
-    # ── lifecycle ─────────────────────────────────────────────────────────
-
-    def start(self) -> dict:
-        with self._node_lock:
-            if self._retired or self.state == "running":
-                return self._status_dict()
-            from audio_msgs.msg import AudioChunk
-
-            self._stop_event = threading.Event()
-            with self._pcm_lock:
-                self._pcm_chunks.clear()
-            self._sub = self.create_subscription(
-                AudioChunk, self._input_topic, self._audio_cb, _AUDIO_QOS)
-            self._worker = threading.Thread(
-                target=self._vad_loop, args=(self._stop_event,),
-                name="speaker-vad", daemon=True)
-            self._worker.start()
-            self.state = "running"
-            return self._status_dict()
-
-    def request_stop(self) -> None:
-        """Signal cancellation without taking the lifecycle lock.
-
-        Rule 4 of § "Plugin Concurrency": a `stop` that queues behind a `start`
-        can no longer cancel it.
-        """
-        self._stop_event.set()
-
-    def stop(self) -> dict:
-        self.request_stop()
-        with self._node_lock:
-            if self._sub is not None:
-                try:
-                    self.destroy_subscription(self._sub)
-                except Exception:  # noqa: BLE001
-                    log.warning("[speaker] destroy_subscription failed", exc_info=True)
-                self._sub = None
-            worker, self._worker = self._worker, None
-            self.state = "idle"
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=3.0)
-        return self._status_dict()
-
-    def retire(self) -> dict:
-        self._retired = True
-        return self.stop()
-
-    # ── audio ─────────────────────────────────────────────────────────────
-
-    def _audio_cb(self, message: Any) -> None:
-        if self._stop_event.is_set():
-            return
-        if getattr(message, "format", "") not in _AUDIO_FORMATS:
-            return
-        try:
-            pcm = bytes(message.data)
-        except (TypeError, ValueError):
-            return
-        if not pcm or len(pcm) % 2:
-            return
-        self._stats["chunks"] += 1
-        with self._pcm_lock:
-            # Bounded: a wedged worker must not grow this without limit. 60 s of
-            # 16 kHz PCM16 at ~32 ms a chunk is comfortably above any real
-            # backlog, and dropping the oldest is right for live audio.
-            self._pcm_chunks.append(pcm)
-            while len(self._pcm_chunks) > 2000:
-                self._pcm_chunks.popleft()
-
-    def _drain(self) -> list[bytes]:
-        with self._pcm_lock:
-            chunks = list(self._pcm_chunks)
-            self._pcm_chunks.clear()
-        return chunks
-
-    def _vad_loop(self, stop_event: threading.Event) -> None:
-        """sherpa-onnx silero VAD, in a thread rather than a child process.
-
-        ASR runs its VAD in a `multiprocessing.Process`; that is not copied here
-        because the reason for it does not apply — there is no second ONNX Runtime
-        to isolate (see plugins/speaker_runtime.py), and silero infers one
-        512-sample window at a time.
-        """
-        try:
-            import sherpa_onnx
-
-            from utils.model_downloader import ensure_model
-
-            vad_dir = "/models/sherpa-onnx/vad"
-            ensure_model("vad", vad_dir)
-            config = sherpa_onnx.VadModelConfig(
-                silero_vad=sherpa_onnx.SileroVadModelConfig(
-                    model=os.path.join(vad_dir, "silero_vad.onnx"),
-                    threshold=float(self._cfg.get("vad_threshold",
-                                                  DEFAULT_VAD_THRESHOLD)),
-                    min_silence_duration=float(
-                        self._cfg.get("vad_silence_ms", DEFAULT_VAD_SILENCE_MS)) / 1000.0,
-                    min_speech_duration=0.25,
-                    max_speech_duration=float(
-                        self._cfg.get("vad_max_speech_s", DEFAULT_VAD_MAX_SPEECH_S)),
-                ),
-                sample_rate=SAMPLE_RATE,
-                num_threads=1,
-                provider="cpu",
-            )
-            vad = sherpa_onnx.VoiceActivityDetector(
-                config, buffer_size_in_seconds=float(
-                    self._cfg.get("vad_max_speech_s", DEFAULT_VAD_MAX_SPEECH_S)) + 5.0)
-        except Exception:
-            log.exception("[speaker] standalone VAD could not start")
-            self.state = "error"
-            return
-
-        while not stop_event.is_set():
-            chunks = self._drain()
-            if not chunks:
-                time.sleep(0.05)
-                continue
-            try:
-                samples = SpeakerEmbedder.pcm16_to_float(b"".join(chunks))
-                vad.accept_waveform(samples)
-                while not vad.empty():
-                    if stop_event.is_set():
-                        return
-                    segment = np.asarray(vad.front.samples, dtype=np.float32)
-                    vad.pop()
-                    self._publish(segment)
-            except Exception:
-                self._stats["errors"] += 1
-                log.warning("[speaker] VAD loop error", exc_info=True)
-                time.sleep(0.2)
-
-    def _publish(self, samples: np.ndarray) -> None:
-        self._stats["segments"] += 1
-        payload = self._identify(samples, source=self._input_topic)
-        payload["topic"] = self._input_topic
-        message = String()
-        message.data = json.dumps(payload, ensure_ascii=False)
-        self._pub.publish(message)
-
-    def _status_dict(self) -> dict:
-        return {
-            "state": self.state,
-            "topic_in": [{"topic": self._input_topic, "format": AUDIO_FORMAT, "desc": ""}],
-            "topic_out": [{"topic": self._output_topic, "format": "data/json", "desc": ""}],
-            "statistics": dict(self._stats),
-        }
-
-
 class SpeakerRecognitionPlugin:
     """Speaker recognition MCP plugin.
 
-    The state machine, the single-flight loader and every locking rule are
-    `plugins/face.py`'s; see that docstring and `plugins/ocr.py`'s. What is new
-    here is `identify_pcm`, the in-process entry point ASR calls, and the fact
-    that it works with **no node started** — the engine is plugin-level, so
-    identities flow through ASR whether or not this card is on a canvas.
+    The single-flight loader and its locking are `plugins/face.py`'s; see that
+    docstring and `plugins/ocr.py`'s. What is *not* here is the rest of it: no
+    ROS node, no per-instance bookkeeping, no topics. This plugin owns an engine
+    and a set of commands, and `identify_pcm` — the in-process entry point ASR
+    calls on the segment it already cut.
+
+    An earlier version also ran a standalone mode: its own subscription, its own
+    silero VAD, its own `<topic>/speaker` output. It was removed. Its two stated
+    purposes were canvas visualisation (the identity is already in ASR's payload)
+    and working when ASR is off (which is when nobody is listening anyway), and
+    against that it cost a second VAD plus a real footgun — started on the topic
+    ASR was on, it double-segmented, double-enrolled and double-logged every
+    sighting, with nothing saying so.
+
+    `start`/`stop` are kept and mean something: the framework sends them to every
+    card on the canvas (and perception, unlike the driver bundles, has no
+    `common/lifecycle`-style shim, so declining them fails the card and rolls the
+    whole project back). `start` pre-loads the model so the first utterance does
+    not pay for it; `stop` turns identity attribution off — which doubles as the
+    switch for "stop building voiceprints of people".
     """
 
     PREFIX = "speaker_recognition"
@@ -660,9 +475,10 @@ class SpeakerRecognitionPlugin:
         self._executor = executor
 
         self._state_lock = threading.Lock()
-        self._nodes: dict[str, _SpeakerNode] = {}
-        self._instance_configs: dict[str, dict] = {}
-        self._pending_starts: dict[str, str] = {}
+        # No node, no instances: this card has no stream of its own.
+        # `_enabled` is what `start`/`stop` move, and what `identify_pcm`
+        # checks — see the class docstring.
+        self._enabled = bool(plugin_cfg.get("enabled_on_start", True))
         self._engine: _SpeakerEngine | None = None
         self._engine_state = "idle"          # idle|loading|ready|error
         self._load_error: str | None = None
@@ -719,92 +535,13 @@ class SpeakerRecognitionPlugin:
                 stale = None
         if stale is not None:
             _close_quietly(stale)
-            return
-
-        while True:
-            with self._state_lock:
-                if generation != self._load_generation or not self._pending_starts:
-                    return
-                node_key, input_topic = next(iter(self._pending_starts.items()))
-            try:
-                node = self._create_node(node_key, input_topic, engine)
-            except Exception as error:  # noqa: BLE001 - keep serving others
-                log.error("[speaker] failed to build instance %r on %r: %s",
-                          node_key, input_topic, escape_log_text(error))
-                with self._state_lock:
-                    if self._pending_starts.get(node_key) == input_topic:
-                        del self._pending_starts[node_key]
-                continue
-            registered = False
-            with self._state_lock:
-                still_wanted = (
-                    generation == self._load_generation
-                    and self._pending_starts.get(node_key) == input_topic
-                )
-                if still_wanted:
-                    try:
-                        self._executor.add_node(node)
-                    except Exception as error:  # noqa: BLE001
-                        log.error("[speaker] failed to register instance %r: %s",
-                                  node_key, escape_log_text(error))
-                        del self._pending_starts[node_key]
-                    else:
-                        self._nodes[node_key] = node
-                        del self._pending_starts[node_key]
-                        registered = True
-            if not registered:
-                try:
-                    node.destroy_node()
-                except Exception:  # noqa: BLE001
-                    pass
-                continue
-            try:
-                node.start()
-            except Exception as error:  # noqa: BLE001
-                log.error("[speaker] failed to start instance %r: %s",
-                          node_key, escape_log_text(error))
-                with self._state_lock:
-                    if self._nodes.get(node_key) is node:
-                        del self._nodes[node_key]
-                self._dispose(node_key, node)
-                continue
-            with self._state_lock:
-                still_ours = self._nodes.get(node_key) is node
-            if not still_ours:
-                node.stop()
-
-    def _merged_cfg(self, node_key: str) -> dict:
-        return {**self._plugin_cfg, **self._instance_configs.get(node_key, {})}
-
-    def _create_node(self, node_key: str, input_topic: str,
-                     engine: _SpeakerEngine) -> _SpeakerNode:
-        return _SpeakerNode(
-            input_topic, engine, self._merged_cfg(node_key),
-            identify=self.identify_samples,
-            node_suffix=node_key.replace("/", "_").replace("-", "_"),
-        )
-
-    def _dispose(self, node_key: str, node: _SpeakerNode) -> None:
-        try:
-            node.retire()
-        finally:
-            dispose_node(self._executor, node, label=f"speaker/{node_key}")
-        log.info("[speaker] node disposed: %s", node_key)
-
-    def _instance_state_locked(self, node_key: str) -> str:
-        node = self._nodes.get(node_key)
-        if node is not None:
-            return node.state
-        if node_key in self._pending_starts:
-            return "error" if self._engine_state == "error" else "loading"
-        return "idle"
 
     def _require_engine(self) -> _SpeakerEngine:
         """Block until the engine is up, loading it if nobody has yet.
 
-        The management actions are useful with no node running at all — naming a
+        Every command here is useful with the card never started — naming a
         voice, listing the roster, clearing contaminated unknowns — so they
-        trigger the same single-flight load a `start` would and wait for it. A
+        trigger the same single-flight load `start` would and wait for it. A
         tools/call already has its own thread (ThreadingHTTPServer).
         """
         with self._state_lock:
@@ -861,6 +598,7 @@ class SpeakerRecognitionPlugin:
     def identify_samples(self, samples: np.ndarray,
                          sample_rate: int = SAMPLE_RATE,
                          source: str = "") -> dict:
+        """float32 waveform → who said it. `identify_pcm` is the usual entry."""
         try:
             return self._identify(samples, sample_rate, source)
         except Exception as error:  # noqa: BLE001 - never cost the transcript
@@ -870,6 +608,13 @@ class SpeakerRecognitionPlugin:
 
     def _identify(self, samples: np.ndarray, sample_rate: int,
                   source: str) -> dict:
+        # `stop` on the card lands here, and returning an empty dict is the whole
+        # effect: ASR keeps transcribing and its payload simply carries no
+        # `speaker_*` fields. Checked before the engine is touched so a stopped
+        # card also stops *creating* voiceprints, which is the half of this that
+        # matters for somebody turning it off deliberately.
+        if not self._enabled:
+            return {}
         engine = self.engine_if_ready()
         samples = np.asarray(samples, dtype=np.float32).reshape(-1)
         rate = int(sample_rate or SAMPLE_RATE)
@@ -1084,16 +829,15 @@ class SpeakerRecognitionPlugin:
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name in (self.PREFIX,) + self.ALIASES else name
-        instance_id = args.get("instance_id", "")
 
         if action == "info":
-            return self._do_info(instance_id, args.get("input_topic", ""))
+            return self._do_info()
         if action == "start":
-            return self._do_start(instance_id, args)
+            return self._do_start()
         if action == "stop":
-            return self._do_stop(instance_id)
+            return self._do_stop()
         if action == "config":
-            return self._do_config(instance_id, args)
+            return self._do_config(args)
         if action == "name_speaker":
             return self._do_name_speaker(args)
         if action == "list_speakers":
@@ -1113,9 +857,35 @@ class SpeakerRecognitionPlugin:
             return self._load_status or "Loading the speaker embedding model..."
         if state == "error" and self._load_error:
             return f"Model load failed: {self._load_error}"
+        if state == "idle":
+            return "已关闭 —— ASR 的输出不再附带说话人身份"
         return self._DESC
 
     # ── info / start / stop / config ──────────────────────────────────────
+
+    def _card_state_locked(self) -> str:
+        """One state for the card, derived from the engine and the switch.
+
+        There is no node to ask, so this is the whole state machine:
+
+            _enabled=False            -> idle     (stopped; ASR adds no identity)
+            engine loading            -> loading
+            engine failed             -> error
+            engine ready              -> running
+
+        `idle` wins over the engine's own state on purpose: a stopped card must
+        read as stopped even though the model is still in memory, because what
+        the operator turned off is the *attribution*, not the allocation.
+        """
+        if not self._enabled:
+            return "idle"
+        if self._engine_state == "loading":
+            return "loading"
+        if self._engine_state == "error":
+            return "error"
+        if self._engine is not None:
+            return "running"
+        return "loading"
 
     def _with_db_stats(self, result: dict, engine: _SpeakerEngine | None) -> dict:
         """Attach roster counts. Never fails info — it is the diagnostic path."""
@@ -1129,187 +899,53 @@ class SpeakerRecognitionPlugin:
             log.warning("[speaker] could not read database stats", exc_info=True)
         return result
 
-    def _do_info(self, instance_id: str, input_topic: str) -> dict:
-        base = {"name": "SpeakerRecognition", "manufacture": "Embodied",
-                "model": str(self._plugin_cfg.get("model", DEFAULT_SPEAKER_MODEL))}
+    def _do_info(self) -> dict:
         with self._state_lock:
             engine = self._engine
-            keys = list(self._nodes) + [
-                key for key in self._pending_starts if key not in self._nodes]
-            if instance_id:
-                node = self._nodes.get(instance_id)
-                topic = (node._input_topic if node is not None
-                         else self._pending_starts.get(instance_id, input_topic))
-                state = self._instance_state_locked(instance_id)
-                result = {
-                    **base, "state": state, "desc": self._desc_locked(state),
-                    "topic_in": ([{"topic": topic, "format": AUDIO_FORMAT, "desc": ""}]
-                                 if topic else []),
-                    "topic_out": ([{"topic": _speaker_output_topic(topic),
-                                    "format": "data/json", "desc": ""}]
-                                  if topic else []),
-                }
-                if state == "error" and self._load_error:
-                    result["error"] = self._load_error
-                return self._with_db_stats(result, engine)
-
-            instances = {k: {"state": self._instance_state_locked(k)} for k in keys}
-            topics_in, topics_out = [], []
-            for key in keys:
-                node = self._nodes.get(key)
-                topic = node._input_topic if node else self._pending_starts[key]
-                topics_in.append({"topic": topic, "format": AUDIO_FORMAT, "desc": ""})
-                topics_out.append({"topic": _speaker_output_topic(topic),
-                                   "format": "data/json", "desc": ""})
-            states = {entry["state"] for entry in instances.values()}
-            if "loading" in states or self._engine_state == "loading":
-                state = "loading"
-            elif "running" in states:
-                state = "running"
-            elif "error" in states or self._engine_state == "error":
-                state = "error"
-            else:
-                state = "idle"
-            if not keys and input_topic:
-                topics_in = [{"topic": input_topic, "format": AUDIO_FORMAT, "desc": ""}]
-                topics_out = [{"topic": _speaker_output_topic(input_topic),
-                               "format": "data/json", "desc": ""}]
-            result = {**base, "state": state, "desc": self._desc_locked(state),
-                      "topic_in": topics_in, "topic_out": topics_out}
-            if instances:
-                result["instances"] = instances
-            if self._load_error and state == "error":
+            state = self._card_state_locked()
+            result = {
+                "name": "SpeakerRecognition", "manufacture": "Embodied",
+                "model": str(self._plugin_cfg.get("model", DEFAULT_SPEAKER_MODEL)),
+                "state": state,
+                "desc": self._desc_locked(state),
+            }
+            if state == "error" and self._load_error:
                 result["error"] = self._load_error
-            return self._with_db_stats(result, engine)
+        return self._with_db_stats(result, engine)
 
-    def _do_start(self, instance_id: str, args: dict) -> dict:
-        input_topic = args.get("input_topic")
-        if not input_topic:
-            raise ValueError("input_topic is required for start action")
-        node_key = instance_id or input_topic
+    def _do_start(self) -> dict:
+        """Arm the card and pre-load the model.
 
-        retired = None
+        Pre-loading is the only real work: without it the first utterance pays
+        ~1-2 s for the model load inside the window ASR joins on, and that shows
+        up as a slow first reply with nothing to explain it.
+        """
         with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None and existing._input_topic != input_topic:
-                retired = self._nodes.pop(node_key)
-        if retired is not None:
-            self._dispose(node_key, retired)
-
-        with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None:
-                start_node = existing            # idempotent re-start
-            else:
-                start_node = None
-                # Claim the key before leaving the lock so a concurrent stop
-                # always finds the instance in _pending_starts or _nodes.
-                self._pending_starts[node_key] = input_topic
-                if self._engine_state != "ready":
-                    if self._engine_state in ("idle", "error"):
-                        self._spawn_loader_locked()
-                    return {"state": "loading", "input": input_topic,
-                            "output": _speaker_output_topic(input_topic)}
+            self._enabled = True
+            if self._engine is None and self._engine_state in ("idle", "error"):
+                self._spawn_loader_locked()
+            state = self._card_state_locked()
+            result = {"state": state, "desc": self._desc_locked(state)}
             engine = self._engine
-            generation = self._load_generation
+        return self._with_db_stats(result, engine)
 
-        if start_node is not None:
-            return start_node.start()
+    def _do_stop(self) -> dict:
+        """Stop attributing speech to people.
 
-        node = self._create_node(node_key, input_topic, engine)
+        The engine stays loaded: reloading it on the next `start` would cost
+        seconds, and nothing else is holding that memory for anybody. What stops
+        is `identify_pcm` — ASR keeps transcribing, its payload simply carries no
+        `speaker_*` fields, and no new voiceprints are created. That makes this
+        the switch for "stop building voiceprints of people", which is worth
+        having as one deliberate action rather than three config flips.
+        """
         with self._state_lock:
-            claimed = self._pending_starts.get(node_key) == input_topic
-            current = self._nodes.get(node_key)
-            fresh = generation == self._load_generation
-            registered = False
-            if claimed and current is None and fresh:
-                try:
-                    self._executor.add_node(node)
-                except Exception as error:  # noqa: BLE001
-                    log.error("[speaker] failed to register instance %r: %s",
-                              node_key, escape_log_text(error))
-                    del self._pending_starts[node_key]
-                else:
-                    self._nodes[node_key] = node
-                    del self._pending_starts[node_key]
-                    registered = True
-            elif claimed and not fresh:
-                # A config change invalidated the engine mid-start; leave the
-                # claim so the loader it spawned brings this instance up.
-                pass
-            elif claimed:
-                del self._pending_starts[node_key]
-        if not registered:
-            try:
-                node.destroy_node()
-            except Exception:  # noqa: BLE001
-                pass
-            if current is not None:
-                return current.start()
-            if claimed and not fresh:
-                return {"state": "loading", "input": input_topic,
-                        "output": _speaker_output_topic(input_topic)}
-            return {"state": "idle", "input": input_topic,
-                    "output": _speaker_output_topic(input_topic)}
-        try:
-            result = node.start()
-        except Exception:
-            with self._state_lock:
-                if self._nodes.get(node_key) is node:
-                    del self._nodes[node_key]
-            self._dispose(node_key, node)
-            raise
-        with self._state_lock:
-            still_ours = self._nodes.get(node_key) is node
-        if not still_ours:
-            node.stop()
-            return {"state": "idle", "input": input_topic,
-                    "output": _speaker_output_topic(input_topic)}
-        return result
+            self._enabled = False
+        return {"state": "idle", "desc": self._desc_locked("idle")}
 
-    def _do_stop(self, instance_id: str) -> dict:
-        to_dispose: list[tuple[str, _SpeakerNode]] = []
-        with self._state_lock:
-            if instance_id:
-                self._pending_starts.pop(instance_id, None)
-                node = self._nodes.pop(instance_id, None)
-                if node is not None:
-                    to_dispose.append((instance_id, node))
-            else:
-                self._pending_starts.clear()
-                to_dispose.extend(self._nodes.items())
-                self._nodes = {}
-        # Signal every node before disposing any: rule 4 of § "Plugin
-        # Concurrency" — stop must be able to cancel a start already in flight.
-        for _, node in to_dispose:
-            node.request_stop()
-        for node_key, node in to_dispose:
-            self._dispose(node_key, node)
-        return {"state": "idle"}
-
-    # Per-instance because one microphone may want a different VAD cadence from
-    # another; the model, the thresholds and the database are shared.
-    _INSTANCE_SCOPED = ("vad_threshold", "vad_silence_ms", "vad_max_speech_s")
-
-    def _do_config(self, instance_id: str, args: dict) -> dict:
+    def _do_config(self, args: dict) -> dict:
         cfg = {k: v for k, v in args.items()
                if k not in ("action", "instance_id") and v is not None and v != ""}
-
-        if instance_id:
-            shared = set(cfg) - set(self._INSTANCE_SCOPED)
-            if shared:
-                raise ValueError(
-                    f"{sorted(shared)} are shared by every instance of this "
-                    f"plugin; send them without instance_id"
-                )
-            with self._state_lock:
-                merged = {**self._instance_configs.get(instance_id, {}), **cfg}
-                self._instance_configs[instance_id] = merged
-                node = self._nodes.get(instance_id)
-            if node is not None:
-                node._cfg.update(cfg)
-            return {"state": self._instance_state_locked(instance_id),
-                    "config": dict(cfg)}
 
         with self._state_lock:
             before = _engine_signature(self._plugin_cfg)
@@ -1321,18 +957,16 @@ class SpeakerRecognitionPlugin:
             if before == after:
                 # unknown_capacity applies in place rather than rebuilding.
                 capacity = cfg.get("unknown_capacity")
-                state = self._engine_state
+                state = self._card_state_locked()
+                stale = None
             else:
                 capacity = None
                 self._load_generation += 1
                 stale, self._engine = self._engine, None
-                nodes, self._nodes = self._nodes, {}
-                for key, node in nodes.items():
-                    self._pending_starts[key] = node._input_topic
                 self._spawn_loader_locked()
                 state = "loading"
 
-        if before == after:
+        if stale is None:
             if capacity is not None and engine is not None:
                 try:
                     engine.db.set_unknown_capacity(int(capacity))
@@ -1341,12 +975,7 @@ class SpeakerRecognitionPlugin:
                                 escape_log_text(error))
             return {"state": state, "config": dict(cfg)}
 
-        for key, node in nodes.items():
-            node.request_stop()
-        for key, node in nodes.items():
-            self._dispose(key, node)
-        if stale is not None:
-            _close_quietly(stale)
+        _close_quietly(stale)
         return {"state": "loading", "config": dict(cfg)}
 
     # ── naming ────────────────────────────────────────────────────────────
