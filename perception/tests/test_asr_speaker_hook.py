@@ -203,7 +203,7 @@ def test_identify_is_called_before_the_kws_gate_in_source():
 
 # ── 未触发的话语 → 独立 topic ────────────────────────────────────────────────
 
-def test_overheard_payload_routes_to_the_background():
+def test_background_payload_routes_to_the_background():
     """`priority: 0` 和 `log_type: true` 两个都必需，缺一个就静默丢数据。
 
     priority 决定它进后台而不是打断主 agent（collector._extract_priority 里 JSON
@@ -213,54 +213,54 @@ def test_overheard_payload_routes_to_the_background():
     """
     import json as _json
     node = make_node(None)
-    node._publish_overheard("明天的会改到三点", 100.0, 102.0, pcm(32000),
+    node._publish_background("明天的会改到三点", 100.0, 102.0, pcm(32000),
                             {"speaker_id": "p-3", "speaker_name": "小王"})
-    published = node._overheard_pub.messages
+    published = node._background_pub.messages
     assert len(published) == 1
     payload = _json.loads(published[0])
     assert payload["priority"] == 0
     assert payload["log_type"] is True
-    assert payload["overheard"] is True
+    assert payload["background"] is True
     assert payload["text"] == "明天的会改到三点"
     assert payload["speaker_name"] == "小王"
 
 
-def test_overheard_goes_to_its_own_topic():
+def test_background_goes_to_its_own_topic():
     """独立 topic，不是同一条带 priority 0 —— 否则两种话在 ring buffer、
     raw_input_info 和画布上混在一起，而且共用一个节流桶。"""
     node = make_node(None)
-    assert node._overheard_topic == "/mic/audio/asr_overheard"
-    assert node._overheard_topic != node._output_topic
+    assert node._background_topic == "/mic/audio/asr_background"
+    assert node._background_topic != node._output_topic
 
 
-def test_overheard_without_an_identity_still_publishes():
+def test_background_without_an_identity_still_publishes():
     import json as _json
     node = make_node(None)
-    node._publish_overheard("随便说的", 1.0, 2.0, pcm(16000), {})
-    payload = _json.loads(node._overheard_pub.messages[0])
+    node._publish_background("随便说的", 1.0, 2.0, pcm(16000), {})
+    payload = _json.loads(node._background_pub.messages[0])
     assert "speaker_id" not in payload
     assert payload["text"] == "随便说的"
 
 
-def test_overheard_publish_never_raises():
+def test_background_publish_never_raises():
     """这条路径是附带收益，不能让它影响 ASR 的主输出。"""
     node = make_node(None)
 
     def boom(_msg):
         raise RuntimeError("publisher gone")
 
-    node._overheard_pub.publish = boom
-    node._publish_overheard("x", 1.0, 2.0, b"\x00\x01", {})      # 不抛即通过
+    node._background_pub.publish = boom
+    node._publish_background("x", 1.0, 2.0, b"\x00\x01", {})      # 不抛即通过
 
 
 def test_status_reports_both_output_topics():
     node = make_node(None)
     outs = [entry["topic"] for entry in node._status_dict()["topic_out"]]
     assert node._output_topic in outs
-    assert node._overheard_topic in outs
+    assert node._background_topic in outs
 
 
-def test_overheard_is_published_from_the_unmatched_branch():
+def test_background_is_published_from_the_unmatched_branch():
     """源码守卫：未匹配唤醒词的分支必须在 continue 之前发出去。
 
     这是一行挪动就能静默破坏的 —— 挪到 continue 之后就永远不执行，而测试和日志
@@ -269,55 +269,55 @@ def test_overheard_is_published_from_the_unmatched_branch():
     source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
     branch = source[source.index("if not matched:"):]
     branch = branch[:branch.index("# Extract text after keyword")]
-    assert "_publish_overheard" in branch
-    assert branch.index("_publish_overheard") < branch.index("continue")
+    assert "_publish_background" in branch
+    assert branch.index("_publish_background") < branch.index("continue")
 
 
-# ── publish_overheard 开关 ───────────────────────────────────────────────────
+# ── publish_background 开关 ───────────────────────────────────────────────────
 
-def make_node_with(publish_overheard: bool) -> asr_module._ASRNode:
+def make_node_with(publish_background: bool) -> asr_module._ASRNode:
     return asr_module._ASRNode(
         "/mic/audio", adapter=None, language="zh-CN", kws_cfg={},
-        node_suffix="t", speaker=None, publish_overheard=publish_overheard,
+        node_suffix="t", speaker=None, publish_background=publish_background,
     )
 
 
-def test_publish_overheard_defaults_on():
+def test_publish_background_defaults_on():
     """默认开。关着而操作员想要，表现为「连好线什么都看不到且不知道为什么」。"""
     schema = asr_module.TOOLS[0]["configSchema"]["properties"]
-    assert schema["publish_overheard"]["default"] is True
-    assert make_node_with(True)._publish_overheard_enabled is True
+    assert schema["publish_background"]["default"] is True
+    assert make_node_with(True)._publish_background_enabled is True
 
 
 def test_disabling_it_restores_the_old_behaviour():
     """关掉就是以前的行为：未触发的句子直接丢弃，一个字都不发。"""
     node = make_node_with(False)
-    node._publish_overheard("随便说的", 1.0, 2.0, pcm(16000), {})
-    assert node._overheard_pub.messages == []
+    node._publish_background("随便说的", 1.0, 2.0, pcm(16000), {})
+    assert node._background_pub.messages == []
 
 
 def test_the_publisher_exists_even_when_disabled():
     """publisher 总是建出来，否则改配置得重启节点才生效。"""
     node = make_node_with(False)
-    assert node._overheard_pub is not None
-    assert node._overheard_topic == "/mic/audio/asr_overheard"
+    assert node._background_pub is not None
+    assert node._background_topic == "/mic/audio/asr_background"
 
 
 def test_the_flag_can_be_flipped_live():
     node = make_node_with(False)
-    node._publish_overheard("第一句", 1.0, 2.0, pcm(16000), {})
-    node._publish_overheard_enabled = True          # 模拟 config 下发
-    node._publish_overheard("第二句", 3.0, 4.0, pcm(16000), {})
+    node._publish_background("第一句", 1.0, 2.0, pcm(16000), {})
+    node._publish_background_enabled = True          # 模拟 config 下发
+    node._publish_background("第二句", 3.0, 4.0, pcm(16000), {})
     import json as _json
-    assert len(node._overheard_pub.messages) == 1
-    assert _json.loads(node._overheard_pub.messages[0])["text"] == "第二句"
+    assert len(node._background_pub.messages) == 1
+    assert _json.loads(node._background_pub.messages[0])["text"] == "第二句"
 
 
 def test_config_applies_the_flag_to_running_nodes():
     """_sync_node_cfg 必须带上这个字段，否则 config 看着生效其实没下发到节点。"""
     source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
-    assert "node._publish_overheard_enabled = self._publish_overheard_enabled" in source
-    assert "if 'publish_overheard' in cfg:" in source
+    assert "node._publish_background_enabled = self._publish_background_enabled" in source
+    assert "if 'publish_background' in cfg:" in source
 
 
 # ── 两条输出 topic 必须都解析得出来 ─────────────────────────────────────────
@@ -329,7 +329,7 @@ def test_info_resolves_both_output_topics():
     自己的 topic_out，一份都没改。
     """
     outs = asr_module._asr_topics_out("/mic/audio")
-    assert [t["topic"] for t in outs] == ["/mic/audio/asr", "/mic/audio/asr_overheard"]
+    assert [t["topic"] for t in outs] == ["/mic/audio/asr", "/mic/audio/asr_background"]
     assert all(t["format"] == "data/json" for t in outs)
 
 
@@ -343,9 +343,9 @@ def test_the_two_ports_are_distinguishable():
     assert len(set(static)) == 2, "静态声明同理（未解析时显示的是它）"
 
 
-def test_disabled_overheard_is_said_on_the_port():
+def test_disabled_background_is_said_on_the_port():
     """关掉之后端口还在（静态声明画的），所以要在上面说清楚它现在不发。"""
-    outs = asr_module._asr_topics_out("/mic/audio", publish_overheard=False)
+    outs = asr_module._asr_topics_out("/mic/audio", publish_background=False)
     assert len(outs) == 2
     assert "已关" in outs[1]["desc"]
     assert "已关" not in outs[0]["desc"]
@@ -392,7 +392,7 @@ def make_plugin(**cfg) -> asr_module.ASRPlugin:
     plugin._adapter = None
     plugin._language = "zh-CN"
     plugin._speaker = None
-    plugin._publish_overheard_enabled = True
+    plugin._publish_background_enabled = True
     plugin._vad_backend = "sherpa_onnx"
     plugin._vad_threshold = 0.5
     plugin._vad_silence_ms = 400
@@ -424,7 +424,7 @@ def test_a_loading_card_still_reports_its_topics():
                                    "input_topic": "/mic/audio"})
     assert info["state"] == "loading"
     assert [t["topic"] for t in info["topic_out"]] == [
-        "/mic/audio/asr", "/mic/audio/asr_overheard"]
+        "/mic/audio/asr", "/mic/audio/asr_background"]
     assert [t["topic"] for t in info["topic_in"]] == ["/mic/audio"]
 
 

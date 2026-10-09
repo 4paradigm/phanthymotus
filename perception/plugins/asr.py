@@ -437,7 +437,7 @@ TOOLS = [
                 # 不会发生）；关着而操作员想要，结果是他在画布上连好了线、什么都看
                 # 不到、也不知道为什么 —— 而那正是这个开关被要求加上来的起因。
                 # trigger_mode=vad 时这条路径根本不会被走到。
-                "publish_overheard": {"type": "boolean", "description": "把没有唤醒词的话语发到 <topic>/asr_overheard（priority 0，供后台 subagent 分析旁边听到的对话）。关掉就回到以前的行为：未触发的句子直接丢弃。注意这条 topic **要在画布上连到 decision_core 才会进 LLM** —— 只打开开关不连线，等于只发不收", "default": True, "scope": "shared"},
+                "publish_background": {"type": "boolean", "description": "把没有唤醒词的话语发到 <topic>/asr_background（priority 0，供后台 subagent 分析旁边听到的对话）。关掉就回到以前的行为：未触发的句子直接丢弃。注意这条 topic **要在画布上连到 decision_core 才会进 LLM** —— 只打开开关不连线，等于只发不收", "default": True, "scope": "shared"},
                 "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
@@ -460,7 +460,7 @@ TOOLS = [
 
 # ── WAV helper ────────────────────────────────────────────────────────────────
 
-def _asr_topics_out(input_topic: str, publish_overheard: bool = True) -> list[dict]:
+def _asr_topics_out(input_topic: str, publish_background: bool = True) -> list[dict]:
     """ASR 的两条输出 topic，一处构造。
 
     之前 `info` 里手抄了四份，而 `_status_dict` 是第五份 —— 加第二条输出时只改了
@@ -474,8 +474,8 @@ def _asr_topics_out(input_topic: str, publish_overheard: bool = True) -> list[di
         return []
     out = [{"topic": f"{input_topic}/asr", "format": "data/json",
             "desc": "识别结果（被唤醒词触发的话）"}]
-    note = "" if publish_overheard else "（publish_overheard 已关，当前不发）"
-    out.append({"topic": f"{input_topic}/asr_overheard", "format": "data/json",
+    note = "" if publish_background else "（publish_background 已关，当前不发）"
+    out.append({"topic": f"{input_topic}/asr_background", "format": "data/json",
                 "desc": f"未触发唤醒词的话语，priority 0，走后台 subagent{note}"})
     return out
 
@@ -1179,7 +1179,7 @@ class _ASRNode(Node):
                  kws_cfg: dict = None, node_suffix: str = '',
                  save_vad_segments: bool = False, max_saved_segments: int = 1000,
                  vad_pre_roll_ms: int = 500, speaker=None,
-                 publish_overheard: bool = True):
+                 publish_background: bool = True):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -1187,14 +1187,14 @@ class _ASRNode(Node):
         # 第二条输出：KWS 未触发的话语。独立 topic 而不是同一条带 priority 0，
         # 这样它在 ring buffer / raw_input_info / 画布上有自己的 source 和自己的
         # 节流桶，不和「对机器人说的话」混在一起。
-        self._overheard_topic = f"{input_topic}/asr_overheard"
+        self._background_topic = f"{input_topic}/asr_background"
         self._adapter  = adapter
         self._language = language
         self.state     = "idle"
         self._sub      = None
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
-        self._overheard_pub = self.create_publisher(
-            String, self._overheard_topic, _ASR_PUB_QOS)
+        self._background_pub = self.create_publisher(
+            String, self._background_topic, _ASR_PUB_QOS)
         # VAD runs in a separate process to avoid GIL contention
         self._vad_backend = vad_backend
         self._vad_threshold = vad_threshold
@@ -1204,11 +1204,11 @@ class _ASRNode(Node):
         # utterance with no identity is a complete, publishable result, and ASR
         # must never fail or stall because voiceprints are unavailable.
         self._speaker = speaker
-        # Whether to publish what the robot overheard but was not addressed by.
+        # Whether to publish what the robot heard but was not addressed by.
         # The publisher itself is always created: creating it lazily would mean
         # a config flip could not take effect without restarting the node, and a
         # ROS publisher with no subscriber costs nothing.
-        self._publish_overheard_enabled = bool(publish_overheard)
+        self._publish_background_enabled = bool(publish_background)
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -1492,7 +1492,7 @@ class _ASRNode(Node):
         fields.pop('speech_duration_s', None)
         return fields
 
-    def _publish_overheard(self, text: str, start_ts, end_ts,
+    def _publish_background(self, text: str, start_ts, end_ts,
                            utterance: bytes, speaker_fields: dict) -> None:
         """旁边听到、但没在跟机器人说的话。
 
@@ -1508,12 +1508,12 @@ class _ASRNode(Node):
 
         永不抛：这条路径是附带收益，不能让它影响 ASR 的主输出。
         """
-        if not self._publish_overheard_enabled:
+        if not self._publish_background_enabled:
             return
         try:
             payload = {
                 "text": text,
-                "overheard": True,
+                "background": True,
                 "priority": 0,
                 "log_type": True,
                 "audio_start_ts": start_ts,
@@ -1523,10 +1523,10 @@ class _ASRNode(Node):
             }
             message = String()
             message.data = json.dumps(payload, ensure_ascii=False)
-            self._overheard_pub.publish(message)
-            log.info(f"[asr] overheard {text!r}")
+            self._background_pub.publish(message)
+            log.info(f"[asr] background {text!r}")
         except Exception as error:  # noqa: BLE001
-            log.debug(f"[asr] publish overheard failed: {error}")
+            log.debug(f"[asr] publish background failed: {error}")
 
     def _worker(self):
         try:
@@ -1638,7 +1638,7 @@ class _ASRNode(Node):
                         # 信息、值得记住的事实。发到独立 topic 上、标 priority 0，
                         # agent-core 的 collector 据此送后台 subagent（priority
                         # 字段优先于 source 匹配，见 collector._extract_priority）。
-                        self._publish_overheard(text, start_ts, end_ts,
+                        self._publish_background(text, start_ts, end_ts,
                                                 utterance, _speaker_fields)
                         continue
                     # Extract text after keyword
@@ -1675,7 +1675,7 @@ class _ASRNode(Node):
             "state":     self.state,
             "topic_in":  [{"topic": self._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
             "topic_out": _asr_topics_out(
-                self._input_topic, self._publish_overheard_enabled),
+                self._input_topic, self._publish_background_enabled),
         }
 
 
@@ -1725,8 +1725,8 @@ class ASRPlugin:
         # actually handed the recogniser when a transcription looks wrong. Bounded
         # by _max_saved_segments — see _enforce_retention(), which unlike the
         # previous per-process counter actually prunes.
-        self._publish_overheard_enabled = bool(
-            plugin_cfg.get('publish_overheard', True))
+        self._publish_background_enabled = bool(
+            plugin_cfg.get('publish_background', True))
         self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
         self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
         self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
@@ -1790,7 +1790,7 @@ class ASRPlugin:
         # Live, no restart: the publisher exists either way, so the flag is the
         # only thing that has to change. `save_vad_segments` above is applied the
         # same way and for the same reason.
-        node._publish_overheard_enabled = self._publish_overheard_enabled
+        node._publish_background_enabled = self._publish_background_enabled
 
     def _load_model_async(self, model_name: str):
         """Download and load ASR model in a background thread.
@@ -1892,7 +1892,7 @@ class ASRPlugin:
                     "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
                                    "desc": ""}] if input_topic else []),
                     "topic_out": _asr_topics_out(
-                        input_topic, self._publish_overheard_enabled),
+                        input_topic, self._publish_background_enabled),
                     "desc": self._load_status or f"正在加载模型 '{self._asr_model}' …",
                 }
             if self._load_error:
@@ -1902,7 +1902,7 @@ class ASRPlugin:
                     "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
                                    "desc": ""}] if input_topic else []),
                     "topic_out": _asr_topics_out(
-                        input_topic, self._publish_overheard_enabled),
+                        input_topic, self._publish_background_enabled),
                     "desc": f"Model load failed: {self._load_error}",
                 }
             # Snapshot under the lock: info is a heartbeat probe and iterating
@@ -1916,7 +1916,7 @@ class ASRPlugin:
                     "state": node.state,
                     "topic_in":  [{"topic": node._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
                     "topic_out": _asr_topics_out(
-                        node._input_topic, node._publish_overheard_enabled),
+                        node._input_topic, node._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             if instance_id:
@@ -1927,7 +1927,7 @@ class ASRPlugin:
                     "state": "idle",
                     "topic_in":  [{"topic": input_topic,   "format": "audio/pcm-16k", "desc": ""}] if input_topic else [],
                     "topic_out": _asr_topics_out(
-                        input_topic, self._publish_overheard_enabled),
+                        input_topic, self._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             # Aggregate info for all instances (no instance_id = ping/overview only)
@@ -1935,13 +1935,13 @@ class ASRPlugin:
                 topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in nodes_snapshot]
                 topics_out = [t for n in nodes_snapshot
                               for t in _asr_topics_out(
-                                  n._input_topic, n._publish_overheard_enabled)]
+                                  n._input_topic, n._publish_background_enabled)]
                 states = list(set(n.state for n in nodes_snapshot))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
                 topics_in = [{"topic": input_topic, "format": "audio/pcm-16k", "desc": ""}]
                 topics_out = _asr_topics_out(
-                    input_topic, self._publish_overheard_enabled)
+                    input_topic, self._publish_background_enabled)
                 state = "idle"
             return {
                 "name": "ASR", "manufacture": "Embodied", "model": "asr",
@@ -2003,7 +2003,7 @@ class ASRPlugin:
                                     max_saved_segments=self._max_saved_segments,
                                     vad_pre_roll_ms=self._vad_pre_roll_ms,
                                     speaker=self._speaker,
-                                    publish_overheard=self._publish_overheard_enabled)
+                                    publish_background=self._publish_background_enabled)
                     try:
                         self._executor.add_node(node)
                     except Exception:
@@ -2069,8 +2069,8 @@ class ASRPlugin:
                 self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
             if 'asr_kws_threshold' in cfg:
                 self._kws_cfg['asr_kws_threshold'] = float(cfg['asr_kws_threshold'])
-            if 'publish_overheard' in cfg:
-                self._publish_overheard_enabled = bool(cfg['publish_overheard'])
+            if 'publish_background' in cfg:
+                self._publish_background_enabled = bool(cfg['publish_background'])
             if 'save_vad_segments' in cfg:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:

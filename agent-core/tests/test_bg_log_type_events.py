@@ -40,10 +40,10 @@ def _clean_bg():
 
 
 def speech(text: str, ts: float, speaker: str = "") -> dict:
-    payload = {"text": text, "overheard": True, "priority": 0, "log_type": True}
+    payload = {"text": text, "background": True, "priority": 0, "log_type": True}
     if speaker:
         payload["speaker_name"] = speaker
-    return {"source": "dds:/mic/audio/asr_overheard", "ts": ts,
+    return {"source": "dds:/mic/audio/asr_background", "ts": ts,
             "text": json.dumps(payload, ensure_ascii=False)}
 
 
@@ -178,14 +178,14 @@ def test_an_utterance_with_no_numbers_still_counts_as_substance():
     原本的判据是「JSON 里有没有数值字段」。一句话能通过是**偶然**的（恰好带了
     speaker_similarity 之类），而没有任何数字的一句话会被丢掉。
     """
-    event = {"source": "dds:/mic/audio/asr_overheard", "ts": 100.0,
+    event = {"source": "dds:/mic/audio/asr_background", "ts": 100.0,
              "text": json.dumps({"text": "走吧", "log_type": True,
-                                 "overheard": True})}
+                                 "background": True})}
     assert collector._bg_buffer_has_substance([event]) is True
 
 
 def test_empty_text_is_still_not_substance():
-    event = {"source": "dds:/mic/audio/asr_overheard", "ts": 100.0,
+    event = {"source": "dds:/mic/audio/asr_background", "ts": 100.0,
              "text": json.dumps({"text": "", "log_type": True})}
     # text 字段为空但 JSON 非空 —— 这里判的是事件的 text，不是 payload 里的
     assert collector._bg_buffer_has_substance(
@@ -201,7 +201,7 @@ def test_gauge_substance_rules_unchanged():
 
 # ── 路由 ─────────────────────────────────────────────────────────────────────
 
-def test_overheard_speech_routes_to_bg_despite_asr_in_the_source():
+def test_background_speech_routes_to_bg_despite_asr_in_the_source():
     """`priority` 字段优先于 source 匹配 —— 这是整条路由的全部机制。"""
     assert collector._extract_priority(speech("随便说的", 100.0)) == 0
     # 对照：普通 ASR 事件（priority 1）仍然打断主 agent
