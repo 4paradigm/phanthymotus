@@ -432,6 +432,12 @@ TOOLS = [
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
                 "vad_pre_roll_ms":{"type": "integer", "description": "Audio retained before detected speech (ms)", "default": 500, "scope": "shared"},
+                # 默认开，理由是两种失败的代价不对称：开着而操作员不想要，结果只是
+                # 一条没人读的 topic（loopback DDS，出不了这台机器，不连线就什么也
+                # 不会发生）；关着而操作员想要，结果是他在画布上连好了线、什么都看
+                # 不到、也不知道为什么 —— 而那正是这个开关被要求加上来的起因。
+                # trigger_mode=vad 时这条路径根本不会被走到。
+                "publish_overheard": {"type": "boolean", "description": "把没有唤醒词的话语发到 <topic>/asr_overheard（priority 0，供后台 subagent 分析旁边听到的对话）。关掉就回到以前的行为：未触发的句子直接丢弃。注意这条 topic **要在画布上连到 decision_core 才会进 LLM** —— 只打开开关不连线，等于只发不收", "default": True, "scope": "shared"},
                 "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
@@ -1150,7 +1156,8 @@ class _ASRNode(Node):
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
                  kws_cfg: dict = None, node_suffix: str = '',
                  save_vad_segments: bool = False, max_saved_segments: int = 1000,
-                 vad_pre_roll_ms: int = 500, speaker=None):
+                 vad_pre_roll_ms: int = 500, speaker=None,
+                 publish_overheard: bool = True):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -1175,6 +1182,11 @@ class _ASRNode(Node):
         # utterance with no identity is a complete, publishable result, and ASR
         # must never fail or stall because voiceprints are unavailable.
         self._speaker = speaker
+        # Whether to publish what the robot overheard but was not addressed by.
+        # The publisher itself is always created: creating it lazily would mean
+        # a config flip could not take effect without restarting the node, and a
+        # ROS publisher with no subscriber costs nothing.
+        self._publish_overheard_enabled = bool(publish_overheard)
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -1474,6 +1486,8 @@ class _ASRNode(Node):
 
         永不抛：这条路径是附带收益，不能让它影响 ASR 的主输出。
         """
+        if not self._publish_overheard_enabled:
+            return
         try:
             payload = {
                 "text": text,
@@ -1692,6 +1706,8 @@ class ASRPlugin:
         # actually handed the recogniser when a transcription looks wrong. Bounded
         # by _max_saved_segments — see _enforce_retention(), which unlike the
         # previous per-process counter actually prunes.
+        self._publish_overheard_enabled = bool(
+            plugin_cfg.get('publish_overheard', True))
         self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
         self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
         self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
@@ -1752,6 +1768,10 @@ class ASRPlugin:
         node._kws_cfg = self._kws_cfg
         node._save_vad_segments = self._save_vad_segments
         node._max_saved_segments = self._max_saved_segments
+        # Live, no restart: the publisher exists either way, so the flag is the
+        # only thing that has to change. `save_vad_segments` above is applied the
+        # same way and for the same reason.
+        node._publish_overheard_enabled = self._publish_overheard_enabled
 
     def _load_model_async(self, model_name: str):
         """Download and load ASR model in a background thread.
@@ -1942,7 +1962,8 @@ class ASRPlugin:
                                     save_vad_segments=self._save_vad_segments,
                                     max_saved_segments=self._max_saved_segments,
                                     vad_pre_roll_ms=self._vad_pre_roll_ms,
-                                    speaker=self._speaker)
+                                    speaker=self._speaker,
+                                    publish_overheard=self._publish_overheard_enabled)
                     try:
                         self._executor.add_node(node)
                     except Exception:
@@ -2008,6 +2029,8 @@ class ASRPlugin:
                 self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
             if 'asr_kws_threshold' in cfg:
                 self._kws_cfg['asr_kws_threshold'] = float(cfg['asr_kws_threshold'])
+            if 'publish_overheard' in cfg:
+                self._publish_overheard_enabled = bool(cfg['publish_overheard'])
             if 'save_vad_segments' in cfg:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:

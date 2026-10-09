@@ -271,3 +271,50 @@ def test_overheard_is_published_from_the_unmatched_branch():
     branch = branch[:branch.index("# Extract text after keyword")]
     assert "_publish_overheard" in branch
     assert branch.index("_publish_overheard") < branch.index("continue")
+
+
+# ── publish_overheard 开关 ───────────────────────────────────────────────────
+
+def make_node_with(publish_overheard: bool) -> asr_module._ASRNode:
+    return asr_module._ASRNode(
+        "/mic/audio", adapter=None, language="zh-CN", kws_cfg={},
+        node_suffix="t", speaker=None, publish_overheard=publish_overheard,
+    )
+
+
+def test_publish_overheard_defaults_on():
+    """默认开。关着而操作员想要，表现为「连好线什么都看不到且不知道为什么」。"""
+    schema = asr_module.TOOLS[0]["configSchema"]["properties"]
+    assert schema["publish_overheard"]["default"] is True
+    assert make_node_with(True)._publish_overheard_enabled is True
+
+
+def test_disabling_it_restores_the_old_behaviour():
+    """关掉就是以前的行为：未触发的句子直接丢弃，一个字都不发。"""
+    node = make_node_with(False)
+    node._publish_overheard("随便说的", 1.0, 2.0, pcm(16000), {})
+    assert node._overheard_pub.messages == []
+
+
+def test_the_publisher_exists_even_when_disabled():
+    """publisher 总是建出来，否则改配置得重启节点才生效。"""
+    node = make_node_with(False)
+    assert node._overheard_pub is not None
+    assert node._overheard_topic == "/mic/audio/asr_overheard"
+
+
+def test_the_flag_can_be_flipped_live():
+    node = make_node_with(False)
+    node._publish_overheard("第一句", 1.0, 2.0, pcm(16000), {})
+    node._publish_overheard_enabled = True          # 模拟 config 下发
+    node._publish_overheard("第二句", 3.0, 4.0, pcm(16000), {})
+    import json as _json
+    assert len(node._overheard_pub.messages) == 1
+    assert _json.loads(node._overheard_pub.messages[0])["text"] == "第二句"
+
+
+def test_config_applies_the_flag_to_running_nodes():
+    """_sync_node_cfg 必须带上这个字段，否则 config 看着生效其实没下发到节点。"""
+    source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
+    assert "node._publish_overheard_enabled = self._publish_overheard_enabled" in source
+    assert "if 'publish_overheard' in cfg:" in source

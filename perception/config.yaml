@@ -44,6 +44,16 @@ plugins:
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
+    # 把没有唤醒词的话语发到 <topic>/asr_overheard（priority 0 + log_type，走
+    # agent-core 的后台 subagent）。关掉就回到以前的行为：未触发的句子直接丢弃。
+    #
+    # 默认开，理由是两种失败的代价不对称：开着而不想要，结果只是一条没人读的
+    # topic（DDS 已锁在 loopback，出不了这台机器，不连线什么都不会发生）；关着而
+    # 想要，结果是人在画布上连好了线、什么都看不到、也不知道为什么。
+    #
+    # **要在画布上把 ASR 卡的第二个输出口连到 decision_core 才会进 LLM。**
+    # agent-core 订阅的是连进 decision_core 入口的 topic，不是插件声明的 topic_out。
+    publish_overheard: true
     # Wake-word gating. Still called `kws` for continuity with existing
     # deployments, but there is no longer a keyword-spotting *model*: the old
     # `trigger_mode: kws` ran a second sherpa KeywordSpotter on the raw audio
