@@ -935,7 +935,10 @@ async def call_tool(full_name: str, args: dict) -> str:
         for img in images:
             data   = img.get('data', '')
             mime   = img.get('mimeType', 'image/jpeg')
-            parts_list.append({'type': 'image_url', 'image_url': f'data:{mime};base64,{data}'})
+            parts_list.append({
+                'type': 'image_url',
+                'image_url': {'url': f'data:{mime};base64,{data}'},
+            })
         if texts:
             parts_list.insert(0, {'type': 'text', 'text': '\n'.join(texts)})
         return parts_list   # type: ignore[return-value]  — LLM client accepts list too

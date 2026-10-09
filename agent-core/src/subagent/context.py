@@ -36,9 +36,10 @@ _BASE_PROMPT = """\
 - 如果一个工具调用失败，换一种方式尝试，不要重复相同调用
 
 ## 输出规范
-- subagent_finish 的 output 应简洁有结构（使用 markdown）
+- 优先遵守任务或附加说明指定的输出格式，不添加该格式之外的包装、说明或字段
+- 要求仅输出 JSON 时，subagent_finish 的 output 必须是可直接解析的 JSON 文本，不要代码围栏、标题或解释
+- 未指定格式时，output 默认使用简洁有结构的 markdown；信息较多时可用标题/列表组织
 - 控制在 2000 字以内，抓重点
-- 如果信息量大，用标题/列表组织
 """
 
 
@@ -91,15 +92,20 @@ class SubagentContext:
     def build_messages(self, inbox_messages: list[dict] | None = None) -> list[dict]:
         """Build full message list for LLM call.
 
-        Returns: [system, (summary if exists), history turns..., inbox messages...]
+        Returns: [system, (initial task), (summary), history turns..., inbox messages...]
         """
         messages = [{'role': 'system', 'content': self._system_prompt}]
 
-        # Context seed as first user message
-        if self._spec.context_seed and not self._turns:
+        # Some providers reject system-only requests. The task must reach the
+        # first user message even for agents without inherited context (e.g.
+        # daily summaries or incoming peer delegations).
+        if not self._turns:
+            content = f'[任务]\n{self._spec.goal}'
+            if self._spec.context_seed:
+                content += f'\n\n[上下文信息]\n{self._spec.context_seed}'
             messages.append({
                 'role': 'user',
-                'content': f'[上下文信息]\n{self._spec.context_seed}'
+                'content': content,
             })
 
         # Compressed summary of old turns

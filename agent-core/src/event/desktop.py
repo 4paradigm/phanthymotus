@@ -229,7 +229,7 @@ def _image_mime(p: pathlib.Path) -> str:
 async def _read_image(p: pathlib.Path):
     """把图片文件读成 OpenAI multi-modal 内容块。
 
-    返回值形如 [{'type':'text',...},{'type':'image_url','image_url':'data:...'}]，
+    返回值形如 [{'type':'text',...},{'type':'image_url','image_url':{'url':'data:...'}}]，
     与 mcp_client.call_tool 处理 MCP 图片结果的格式一致；event/llm.py::_trim 已能
     处理 list 型 tool content（超出 max_images 时替换为占位符）。
 
@@ -265,7 +265,7 @@ async def _read_image(p: pathlib.Path):
     # 说明行体现来源：入站附件目录里的文件是**用户发来的**，不是机器人自己取得的图像。
     return [
         {'type': 'text', 'text': f'[{_image_origin(p)}{p} | {mime} | {len(raw)} bytes{note}]'},
-        {'type': 'image_url', 'image_url': f'data:{mime};base64,{b64}'},
+        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
     ]
 
 
