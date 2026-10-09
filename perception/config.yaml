@@ -44,6 +44,16 @@ plugins:
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
+    # 把没有唤醒词的话语发到 <topic>/asr_background（priority 0 + log_type，走
+    # agent-core 的后台 subagent）。关掉就回到以前的行为：未触发的句子直接丢弃。
+    #
+    # 默认开，理由是两种失败的代价不对称：开着而不想要，结果只是一条没人读的
+    # topic（DDS 已锁在 loopback，出不了这台机器，不连线什么都不会发生）；关着而
+    # 想要，结果是人在画布上连好了线、什么都看不到、也不知道为什么。
+    #
+    # **要在画布上把 ASR 卡的第二个输出口连到 decision_core 才会进 LLM。**
+    # agent-core 订阅的是连进 decision_core 入口的 topic，不是插件声明的 topic_out。
+    publish_background: true
     # Wake-word gating. Still called `kws` for continuity with existing
     # deployments, but there is no longer a keyword-spotting *model*: the old
     # `trigger_mode: kws` ran a second sherpa KeywordSpotter on the raw audio
@@ -379,6 +389,82 @@ plugins:
 
   soundevent:
     enabled: true
+  speaker_recognition:
+    enabled: true
+    # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
+    # 走 sherpa-onnx 自带的那份 ONNX Runtime —— 和 ASR/TTS 同一份，所以不会触发
+    # plugins/face_runtime.py 记录的双 ORT 冲突，也不需要 face 那套子进程隔离。
+    # `off` = **完全不加载**：权重不进内存（cpu 实测 +84 MB，gpu +478 MB）、不占
+    # 算力，ASR 的输出也不再带 speaker_* 字段。和卡片上的 stop 不是一回事 ——
+    # 那个只停止归因，引擎仍留在内存里等着重新启用。
+    # 关闭状态下名单、改名、删除仍然可用（维度从 persons.json 读，不需要模型）。
+    model: campplus_zh_en
+    # 和 face_db 一样，唯一可写的宿主挂载路径是 /models。
+    db_dir: /models/speaker_db
+    # 每个声纹留一段可播放的代表音频。/models/vad_segments 只存 1000 条且会滚动，
+    # 几天后就没了，而 get_speaker 要在几个月后还能放出来给人听 —— 声纹是从匿名
+    # 话语建的，判断「这是谁」只能靠听。
+    sample_dir: /models/speaker_db/samples
+    # cpu 是默认且通常是对的。实测（Orin 6, jp6.1）gpu 单跑 62 ms vs cpu 101 ms，
+    # 快 1.62 倍；但端到端换不出收益：ASR 在 cpu 时声纹完全藏在它的 230 ms 后面
+    # （并发净增 2-7 ms），ASR 在 gpu 时两个 CUDA session 争同一块 GPU，搬上去只
+    # 省 3 ms 还多占 478 MB。
+    device: cpu
+    num_threads: 2
+    warmup: true
+    # 余弦相似度阈值。**0.6 是起点，不是实测值** —— sherpa 自己示例的默认值。
+    # face 的 0.35 是 ArcFace 的尺度，不能照搬。认错人就调高，认不出就调低，
+    # 并把看到的现象记下来。定它需要标注语料（几个人各若干句、用机器人自己的
+    # 麦克风录），这件事还没做。
+    # 认不出来时 payload 里分两种 reason，处置相反：
+    #   no_speakers_enrolled —— 库里一个人都没有，去 name_speaker 注册一个；
+    #   no_match + speaker_best_similarity —— 比过了但都不够像，那个分就是调这个
+    #     阈值唯一能靠的依据（看到 0.52 才知道降到 0.5 能认出）。
+    match_threshold: 0.6
+    # 质量门。声纹在 1.5 秒以下急剧退化，而 VAD 只要 0.5 秒就出段，所以
+    # 「嗯」「好」「停」会产生垃圾 embedding。不够长只报听到了、不给身份。
+    # 同样是起点不是实测值。
+    min_speech_s: 1.5
+    # 超过这个时长就检查这一段里是否换过人：算**前 4 秒**和**后 4 秒**两个
+    # embedding，余弦低于 coherence_min 就判定多说话人并**不给身份**。
+    # 比两端而不是「前 4 秒 vs 整段」：后者在 condition() 的 6 秒截断之下，对一段
+    # 29 秒的音频实际只看了开头 6 秒（Orin 5 上实测 coherence 0.954，后面 23 秒
+    # 根本没看）。比两端是同样两次 embedding，但覆盖整段。
+    # 这不是假想的问题：Orin 5 上 73 段真实长语音，cosine(整段, 前3秒) 的
+    # p50 是 0.843 但 p05 只有 0.197 —— 一个窗口不可能和它自己的母段无关，
+    # 除非母段是两个人的混合。
+    split_above_s: 4.0
+    coherence_min: 0.8
+    # 默认**开**，和 face 一致。p-N 这个格式存在的意义就是身份在有名字之前就稳定：
+    # 没有 id 的话，一个没人命名过的声音在 payload 里不带任何信息，于是「刚才那个
+    # 人又说话了」—— 多人对话里唯一真正能让 agent 行动的那条信息 —— 表达不出来。
+    # name_speaker(speaker_id=...) 也需要 id 先存在。
+    #
+    # 代价是 perception 没有回声消除，机器人自己的 TTS、电视、走廊路人都会被登记。
+    # 但一个持续的噪声源**自己和自己匹配**，所以它变成一两条稳定条目而不是淹掉
+    # 整个库；而且可回收也可见：list_speakers 未命名在前、get_speaker 给一段音频
+    # 可以听、forget named=unknown 一键清、unknown_capacity 还会淘汰最久未听到的。
+    auto_enroll: true
+    # 建一个**新**声纹比匹配一条已有的要求更长的片段。face 做了完全相同的区分，
+    # 理由也一样：1.6 秒够冒险匹配一次，但不够成为一条声纹 —— 勉强的 embedding
+    # 会占住一个槽位，而且再也匹配不上任何东西。
+    enroll_min_speech_s: 2.0
+    # 默认开，是免费拿到的最大一档准确率提升。已命名的人每说一句质量够好的话就
+    # 补一条样本；声纹随距离/感冒/情绪/嘈杂漂移比人脸随光照大得多，而打分取样本
+    # 最大值而非质心平均，所以补样本只会更准。写盘在后台线程做 —— ASR 在 publish
+    # 前会 join 声纹，inline 写会把 eMMC 的开销压在每句话上。
+    auto_add_samples: true
+    sample_min_similarity: 0.75
+    sample_min_speech_s: 2.0
+    # 未命名声纹上限，超出淘汰最久未听到的；已命名不受影响。
+    unknown_capacity: 50
+    max_samples_per_person: 8
+    # 这张卡是 actuator，不订阅任何 topic：身份是在 ASR 已经切好的那个 VAD 段上算
+    # 的，随 ASR 的输出一起走。所以这里没有 VAD 参数 —— 切分完全由 asr.vad 决定。
+    #
+    # 画布上这张卡的作用是对它下命令（命名、查名单、听样本、删人）。start 会预加载
+    # 模型（否则第一句话要多等 1-2 秒），stop 会停止给语音附加身份、也停止建新声纹。
+
   face_recognition:
     enabled: true
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
