@@ -2117,7 +2117,9 @@ plus `plugins/face_corpus.py`.
   recognition (22.4 MB) — 25.6 MB combined, inside the 30 MB budget. Weights
   auto-download on first use from the platform COS
   (`public/face/scrfd_edgeface/`, same hosting pattern as buffalo_sc);
-  `FACE_MODEL_BASE_URL` overrides.
+  `FACE_MODEL_BASE_URL` overrides. `enabled` ships false and flips to true
+  once those artifacts are published — an enabled card without weights is a
+  permanent error state.
 - **Identities** persist under `face_db_dir` (default `/models/face_db`, the
   writable mount) across restarts; corpus/stream/visit actions follow the
   leaderboard contract (one face object, `[0-1]` normalized `bbox`).

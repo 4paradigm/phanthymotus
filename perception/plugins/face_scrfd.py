@@ -60,6 +60,7 @@ from utils.model_downloader import (
 from utils.model_progress import fetch_status
 from plugins import ort_worker
 from plugins.face_corpus import corpus_entries, load_image
+from plugins.image_input import BadInput, check_under_roots
 
 log = logging.getLogger(__name__)
 
@@ -152,6 +153,21 @@ _DEVICE_PROVIDERS = {
 def _providers_for_device(device: str) -> list[str]:
     """Providers for a config `device` value; CPU for anything unrecognised."""
     return list(_DEVICE_PROVIDERS.get(str(device).strip().lower(), _DEVICE_PROVIDERS["cpu"]))
+
+
+def _detector_key(detector) -> str:
+    """Canonical detector config value; unknown names run YuNet, loudly.
+
+    One fallback shared by every consumer, so the weights that get downloaded
+    and the session that gets built can never disagree about which detector
+    was asked for (an unnormalised value once fetched YuNet's weights and then
+    built a SCRFD session from a None filename).
+    """
+    key = str(detector or "yunet").strip().lower()
+    if key not in FACE_SCRFD_DETECTOR_BUNDLES:
+        log.warning(f"[face] unknown detector {detector!r}; running yunet instead")
+        return "yunet"
+    return key
 
 
 _LOW_LAT_QOS = QoSProfile(
@@ -309,8 +325,7 @@ def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet",
         raise ValueError(
             f"unknown face model {model_name!r}; pick one of "
             f"{sorted(FACE_SCRFD_RECOGNIZER_BUNDLES)}")
-    detector_files = FACE_SCRFD_DETECTOR_BUNDLES.get(
-        detector if detector in FACE_SCRFD_DETECTOR_BUNDLES else "yunet")
+    detector_files = FACE_SCRFD_DETECTOR_BUNDLES[_detector_key(detector)]
 
     # One bundle call over both halves: the downloader reports a single
     # monotonic 0-100% across recognizer + detector files, not two ramps.
@@ -1139,15 +1154,19 @@ class EdgeFaceAdapter:
                  f"on {self._sess.get_providers()}")
 
         # ── Face detector ──
+        # _detector_key resolves every valid/invalid value to a key of
+        # FACE_SCRFD_DETECTOR_BUNDLES, so weights and session agree by
+        # construction; the filename comes from the same registry entry that
+        # pinned the bytes.
         self._confidence = confidence
+        detector = _detector_key(detector)
         if detector == "yunet":
             self._detector = YuNetDetector(model_dir, confidence)
             log.info(f"[face] YuNet loaded, conf={confidence}")
         else:
             self._detector = SCRFDDetector(
                 model_dir, confidence,
-                {"scrfd": "scrfd_500m_kps.onnx",
-                 "scrfd_2.5g": "scrfd_2.5g_bnkps_hsuyabc.onnx"}.get(detector),
+                next(iter(FACE_SCRFD_DETECTOR_BUNDLES[detector])),
                 device=detector_device or device,
             )
             log.info(f"[face] SCRFD ({detector}) loaded, conf={confidence}")
@@ -1424,12 +1443,15 @@ class FaceRecognitionPlugin:
         # Per-session overrides; None means "follow `device`" (see EdgeFaceAdapter).
         self._detector_device = plugin_cfg.get("detector_device") or None
         self._recognizer_device = plugin_cfg.get("recognizer_device") or None
-        self._detector = plugin_cfg.get("detector", "scrfd_2.5g")
+        self._detector = _detector_key(plugin_cfg.get("detector", "scrfd_2.5g"))
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/models/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
         self._confidence = float(plugin_cfg.get("confidence", 0.5))
         self._fps = int(plugin_cfg.get("fps", 3))
+        # Raw plugin config: image_input reads image_roots / max_image_bytes
+        # from it for the shared local-path confinement (plugins/image_input.py).
+        self._input_cfg = plugin_cfg or {}
 
         # Per-container exploratory sweep (see _container_sweep_overrides).
         # Container 0 / local runs keep the config.yaml values untouched.
@@ -1567,6 +1589,13 @@ class FaceRecognitionPlugin:
         package = str(args.get("package") or "").strip()
         if not package:
             return {"ok": False, "reason": "bad_input", "detail": "package is required"}
+        try:
+            # A corpus package walks and decodes whole trees — it rides the
+            # same configured-root boundary as single photos.
+            package = check_under_roots(package, self._input_cfg,
+                                        url_action="register_by_url")
+        except BadInput as error:
+            return error.as_result()
         self._ensure_model()
         results, groups = [], {}
         try:
@@ -1773,7 +1802,17 @@ class FaceRecognitionPlugin:
             if action == "forget":
                 return self._face_db.forget(person_id=args.get("person_id"),
                                             person_ids=args.get("person_ids"), named=args.get("named"))
-            source = args.get("url") if action.endswith("_url") else args.get("image_path")
+            if action.endswith("_url"):
+                source = args.get("url")
+            else:
+                # Same confinement the platform's face/vop/ocr enforce: the
+                # MCP server is unauthenticated and runs as root, so a local
+                # path may only come from the configured roots (/models, /tmp,
+                # /work unless image_roots says otherwise). Raises BadInput
+                # with a caller-facing "put it here instead" otherwise.
+                source = check_under_roots(
+                    str(args.get("image_path") or ""), self._input_cfg,
+                    url_action=action.replace("_photo", "_url"))
             image = load_image(source, is_url=action.endswith("_url"))
             if action.startswith("register_"):
                 return {**self._register_image(image, args.get("name") or "", args.get("profile")),
@@ -1783,7 +1822,7 @@ class FaceRecognitionPlugin:
             return {"ok": True, "source": source,
                     "image_size": {"width": int(image.shape[1]), "height": int(image.shape[0])},
                     "count": len(faces), "faces": faces}
-        except (ValueError, TypeError, KeyError, OSError) as error:
+        except (ValueError, TypeError, KeyError, OSError, BadInput) as error:
             return {"ok": False, "reason": "bad_input", "detail": str(error)}
 
     def get_tools(self) -> list:
@@ -1907,10 +1946,30 @@ class FaceRecognitionPlugin:
                     del self._nodes[instance_id]
                 return {"status": "configured", "instance_id": instance_id, "config": cfg}
             else:
+                # Keys that decide *what gets loaded* cannot be honoured once
+                # the adapter and database exist — mutating them in place
+                # leaves inference on the old sessions and gallery while the
+                # reply says "configured". After load they are rejected
+                # outright; live-tunable keys keep applying to new nodes.
+                model_affecting = [
+                    key for key, attr in (
+                        ("model", "_model_name"), ("detector", "_detector"),
+                        ("device", "_device"), ("detector_device", "_detector_device"),
+                        ("recognizer_device", "_recognizer_device"),
+                        ("model_dir", "_model_dir"), ("face_db_dir", "_face_db_dir"))
+                    if key in cfg
+                    and str(cfg[key]) != str(getattr(self, attr, None) or "")]
+                if self._model is not None and model_affecting:
+                    return {
+                        "status": "error", "reason": "restart_required",
+                        "detail": ("these keys are read when the model loads; set them "
+                                   "in config.yaml and restart the container: "
+                                   + ", ".join(model_affecting)),
+                    }
                 if "model" in cfg:
                     self._model_name = cfg["model"]
                 if "detector" in cfg:
-                    self._detector = cfg["detector"]
+                    self._detector = _detector_key(cfg["detector"])
                 if "device" in cfg:
                     self._device = cfg["device"]
                 if "detector_device" in cfg:
@@ -1927,6 +1986,11 @@ class FaceRecognitionPlugin:
                     self._confidence = float(cfg["confidence"])
                 if "fps" in cfg:
                     self._fps = int(cfg["fps"])
+                # After a failed load, naming a new model is the retry path —
+                # restart the load instead of only storing the value.
+                if (model_affecting and self._model is None
+                        and self._model_load_error and not self._model_loading):
+                    self._start_model_loading()
                 return {"status": "configured", "config": cfg}
 
         return None

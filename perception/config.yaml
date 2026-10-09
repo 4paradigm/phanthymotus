@@ -459,7 +459,13 @@ plugins:
   # INT8 recognition (25.6 MB combined, inside the 30 MB budget), weights auto-
   # download from the platform COS — FACE_MODEL_BASE_URL overrides.
   face:
-    enabled: true
+    # Off by default until the pinned weights (FACE_SCRFD_*_BUNDLES in
+    # utils/model_downloader.py) are published and verified at the COS
+    # location — enabled-without-weights means every startup lands in
+    # state=error. Flip to true the moment the artifacts are live.
+    # image_roots / max_image_bytes also accepted here (shared local-path
+    # confinement, plugins/image_input.py; default /models /tmp /work, 64 MB).
+    enabled: false
     provider: local
     url: ""
     key: ""
