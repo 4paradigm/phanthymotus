@@ -2115,9 +2115,12 @@ plus `plugins/face_corpus.py`.
 
 - **Models**: SCRFD-2.5G-KPS detection (3.3 MB) + EdgeFace-Base Linear INT8
   recognition (22.4 MB) — 25.6 MB combined, inside the 30 MB budget. Weights
-  auto-download on first use from the platform COS
-  (`public/face/scrfd_edgeface/`, same hosting pattern as buffalo_sc);
-  `FACE_MODEL_BASE_URL` overrides. `enabled` ships false and flips to true
+  prefetch at construction, in the background, so the first frame is not
+  lost to a cold fetch (progress shows in `info()`); they come from the
+  platform COS (`public/face/scrfd_edgeface/`, same hosting pattern as
+  buffalo_sc), and `FACE_MODEL_BASE_URL` overrides the source — a
+  comma-separated list is tried fastest-first, each candidate pinned by the
+  same size + SHA256. `enabled` ships false and flips to true
   once those artifacts are published — an enabled card without weights is a
   permanent error state.
 - **Identities** persist under `face_db_dir` (default `/models/face_db`, the

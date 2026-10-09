@@ -24,8 +24,8 @@ from plugins.face_corpus import corpus_entries, load_image  # noqa: E402
 from plugins.image_input import BadInput, check_under_roots  # noqa: E402
 from utils.log_sampling import escape_log_text  # noqa: E402
 from utils.model_downloader import (  # noqa: E402
-    FACE_SCRFD_DETECTOR_BUNDLES, FACE_SCRFD_RECOGNIZER_BUNDLES,
-    ensure_verified_bundle,
+    FACE_SCRFD_DETECTOR_BUNDLES, FACE_SCRFD_EDGEFACE_BASE,
+    FACE_SCRFD_RECOGNIZER_BUNDLES, ensure_verified_bundle,
 )
 from utils.model_progress import fetch_status  # noqa: E402
 from utils.ros_lifecycle import dispose_node  # noqa: E402
@@ -72,7 +72,8 @@ def load_face():
               load_image=load_image, ort_worker=ort_worker,
               ensure_verified_bundle=ensure_verified_bundle, fetch_status=fetch_status,
               FACE_SCRFD_RECOGNIZER_BUNDLES=FACE_SCRFD_RECOGNIZER_BUNDLES,
-              FACE_SCRFD_DETECTOR_BUNDLES=FACE_SCRFD_DETECTOR_BUNDLES)
+              FACE_SCRFD_DETECTOR_BUNDLES=FACE_SCRFD_DETECTOR_BUNDLES,
+              FACE_SCRFD_EDGEFACE_BASE=FACE_SCRFD_EDGEFACE_BASE)
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)] + sorted(nodes, key=lambda n: n.lineno), type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
     return ns

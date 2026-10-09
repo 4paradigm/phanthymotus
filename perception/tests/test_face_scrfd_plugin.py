@@ -167,6 +167,57 @@ def test_model_change_retries_a_failed_load():
     assert retried == [True]
 
 
+def test_model_change_while_loading_is_rejected():
+    """The background loader reads the load keys as it goes, so a change made
+    mid-flight can be half-applied — the fingerprint step looking for a file
+    that was never fetched, or the old model landing under the new config's
+    name. Refused while loading, with the reason naming the race."""
+    plugin = _stub_plugin(_model_loading=True)
+
+    result = plugin.dispatch("config", {"model": "edgeface_s_gamma_05",
+                                        "detector": "scrfd"})
+
+    assert result["status"] == "error" and result["reason"] == "loading_in_progress"
+    assert "model" in result["detail"] and "detector" in result["detail"]
+    assert plugin._model_name == "edgeface_base.int8"
+    assert plugin._detector == "scrfd_2.5g"
+
+
+def test_live_keys_apply_even_while_loading():
+    """Only the keys the loader reads are gated by it."""
+    plugin = _stub_plugin(_model_loading=True)
+
+    result = plugin.dispatch("config", {"similarity_threshold": "0.45"})
+
+    assert result["status"] == "configured"
+    assert plugin._similarity_threshold == 0.45
+
+
+# ── weight sources ───────────────────────────────────────────────────────────
+
+def test_several_weight_sources_ride_one_pinned_bundle(monkeypatch):
+    """FACE_MODEL_BASE_URL takes a comma-separated list: the downloader probes
+    fastest-first, and the pins make a mirror just a faster route to the very
+    same bytes. One source stays a plain string (no probing cost)."""
+    assert face_scrfd._model_sources("https://a") == "https://a"
+    assert face_scrfd._model_sources("https://a, https://b") == ["https://a", "https://b"]
+    # An exported-but-empty override means "default", not "no source".
+    assert face_scrfd._model_sources("") == face_scrfd.FACE_SCRFD_EDGEFACE_BASE
+
+    seen = {}
+
+    def fake_bundle(name, model_dir, base_url, files, progress_cb=None):
+        seen["base_url"] = base_url
+        return {filename: f"{model_dir}/{filename}" for filename in files}
+
+    monkeypatch.setattr(face_scrfd, "ensure_verified_bundle", fake_bundle)
+    monkeypatch.setattr(face_scrfd, "_MODEL_BASE_URL", "https://cos.invalid, https://mirror.invalid")
+
+    face_scrfd._ensure_weights("edgeface_base.int8", "/tmp/face-test")
+
+    assert seen["base_url"] == ["https://cos.invalid", "https://mirror.invalid"]
+
+
 # ── detector normalisation ───────────────────────────────────────────────────
 
 def test_unknown_detector_falls_back_to_yunet_everywhere():

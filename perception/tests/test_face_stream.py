@@ -199,5 +199,73 @@ class StreamContracts(unittest.TestCase):
         self.assertEqual(self.call('list_visits')['visits'][0]['name'], 'Alice')
 
 
+class _StubNode:
+    def __init__(self, topic):
+        self._input_topic = topic
+
+    def stop(self):
+        return {"state": "stopped", "input": self._input_topic}
+
+
+class _StubExecutor:
+    def add_node(self, node):
+        pass
+
+    def remove_node(self, node):
+        pass
+
+
+def test_stop_closes_open_visits_only_with_the_last_instance():
+    """A stopped instance can never send the frame that would close a visit
+    by absence, so the last stop force-closes what is open. A still-running
+    instance keeps its own visits open — a force-close has no per-instance
+    filter, so it is only safe once nothing is left watching."""
+    if not _NEEDS_REAL_CV2:      # mirrors the class guard: needs the real stack
+        import pytest
+        pytest.skip("needs real cv2")
+
+    ns = load_face()
+    ns.update(threading=threading)
+    plugin = ns['FaceRecognitionPlugin'].__new__(ns['FaceRecognitionPlugin'])
+    plugin._face_db = ns['FaceDatabase']()
+    plugin._executor = _StubExecutor()
+    plugin._nodes = {'/cam-a': _StubNode('/cam-a'), '/cam-b': _StubNode('/cam-b')}
+    plugin._input_cfg = {}
+    now = time.time()
+    plugin._face_db.record_sighting('p-1', now, '/cam-a')
+
+    first = ns['FaceRecognitionPlugin'].dispatch(
+        plugin, 'face', {'action': 'stop', 'instance_id': '/cam-a'})
+    assert first['visits_closed'] == 0, "the other instance is still watching"
+    assert ns['FaceRecognitionPlugin']._stream_action(
+        plugin, 'list_visits', {})['visits'][0]['open'] is True
+
+    last = ns['FaceRecognitionPlugin'].dispatch(
+        plugin, 'face', {'action': 'stop', 'instance_id': '/cam-b'})
+    assert last['visits_closed'] == 1
+    visit = ns['FaceRecognitionPlugin']._stream_action(plugin, 'list_visits', {})['visits'][0]
+    assert visit.get('open') is not True, "no frame can ever close it now"
+
+
+def test_stop_all_also_closes_visits():
+    if not _NEEDS_REAL_CV2:
+        import pytest
+        pytest.skip("needs real cv2")
+
+    ns = load_face()
+    ns.update(threading=threading)
+    plugin = ns['FaceRecognitionPlugin'].__new__(ns['FaceRecognitionPlugin'])
+    plugin._face_db = ns['FaceDatabase']()
+    plugin._executor = _StubExecutor()
+    plugin._nodes = {'/cam-a': _StubNode('/cam-a')}
+    plugin._input_cfg = {}
+    plugin._face_db.record_sighting('p-1', time.time(), '/cam-a')
+
+    result = ns['FaceRecognitionPlugin'].dispatch(plugin, 'face', {'action': 'stop'})
+
+    assert result['stopped_instances'] == ['/cam-a']
+    assert result['visits_closed'] == 1
+
+
 if __name__ == '__main__':
     unittest.main()

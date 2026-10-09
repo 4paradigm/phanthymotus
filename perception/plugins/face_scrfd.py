@@ -69,6 +69,25 @@ log = logging.getLogger(__name__)
 # ── Model URLs (platform COS; same bucket/dir pattern as buffalo_sc) ────────
 _MODEL_BASE_URL = os.environ.get("FACE_MODEL_BASE_URL", FACE_SCRFD_EDGEFACE_BASE)
 
+
+def _model_sources(base=None):
+    """Candidate weight sources; a comma-separated list is tried fastest-first.
+
+    One source is the default. Several are allowed because every artifact is
+    pinned by size + SHA256 (utils/model_downloader.py FACE_SCRFD_*_BUNDLES),
+    so a mirror cannot smuggle in different bytes — only serve the same ones
+    faster or not at all. The downloader probes a list once per bundle and
+    falls through on failure; a single source is returned untouched, so the
+    common case pays nothing for the option.
+    """
+    raw = _MODEL_BASE_URL if base is None else base
+    sources = [item.strip() for item in str(raw).split(",") if item.strip()]
+    if len(sources) == 1:
+        return sources[0]
+    # Empty/whitespace-only (an exported-but-unset override) means "default",
+    # never an empty source list, which would fail deep inside the downloader.
+    return sources or FACE_SCRFD_EDGEFACE_BASE
+
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_SIMILARITY_THRESHOLD = 0.39  # cosine similarity above this = same person
 DEFAULT_MODEL_NAME = "edgeface_base.int8"  # Linear INT8; 25,646,022 bytes including SCRFD-2.5G
@@ -333,7 +352,7 @@ def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet",
     # monotonic 0-100% across recognizer + detector files, not two ramps.
     files = {**recognizer_files, **detector_files}
     progress_cb, _stage_cb = fetch_status(on_status, f"face {model_name}")
-    ensure_verified_bundle("face/scrfd_edgeface", model_dir, _MODEL_BASE_URL,
+    ensure_verified_bundle("face/scrfd_edgeface", model_dir, _model_sources(),
                            files, progress_cb=progress_cb)
     return os.path.join(model_dir, f"{model_name}.onnx")
 
@@ -1558,6 +1577,22 @@ class FaceRecognitionPlugin:
             self._face_db.initialize_persistence(state_path, model_id, self._face_db_dir, model)
             self._model = model
 
+    def _close_visits_if_idle(self) -> int:
+        """Force-close open visits once no camera instance is left.
+
+        A stopped instance can never deliver the later frame that would close
+        its visit by absence, so without this the person stays "present"
+        until the process exits. Only when the last instance goes: open
+        visits belong to whoever is still looking, and a force-close has no
+        per-instance filter (FaceDatabase.close_stale_visits).
+        """
+        if self._nodes:
+            return 0
+        closed = self._face_db.close_stale_visits(force=True)
+        if closed:
+            log.info(f"[face] closed {closed} open visit(s) with the last instance")
+        return closed
+
     def _start_node(self, node_key: str, input_topic: str):
         """Create and start a FaceNode for the given topic."""
         icfg = self._instance_configs.get(node_key, {})
@@ -1930,7 +1965,7 @@ class FaceRecognitionPlugin:
                 result = node.stop()
                 dispose_node(self._executor, node, label=f"face/{instance_id}")
                 del self._nodes[instance_id]
-                return result
+                return {**result, "visits_closed": self._close_visits_if_idle()}
             elif not instance_id and self._nodes:
                 results = []
                 for key in list(self._nodes.keys()):
@@ -1939,7 +1974,8 @@ class FaceRecognitionPlugin:
                     dispose_node(self._executor, node, label=f"face/{key}")
                     del self._nodes[key]
                     results.append(key)
-                return {"state": "idle", "stopped_instances": results}
+                return {"state": "idle", "stopped_instances": results,
+                        "visits_closed": self._close_visits_if_idle()}
             return {"state": "idle"}
 
         elif action == "config":
@@ -1967,7 +2003,20 @@ class FaceRecognitionPlugin:
                         ("model_dir", "_model_dir"), ("face_db_dir", "_face_db_dir"))
                     if key in cfg
                     and str(cfg[key]) != str(getattr(self, attr, None) or "")]
-                if self._model is not None and model_affecting:
+                if model_affecting and (self._model is not None or self._model_loading):
+                    if self._model_loading:
+                        # The loader reads these very fields as it goes, so a
+                        # value changed mid-flight can be half-applied: the
+                        # fingerprint step would look for a .onnx that was
+                        # never fetched, or the old model would land while the
+                        # reply reports the new one.
+                        return {
+                            "status": "error", "reason": "loading_in_progress",
+                            "detail": ("the model is loading right now; changing "
+                                       + ", ".join(model_affecting)
+                                       + " would race the loader — retry once it "
+                                         "settles, or set it in config.yaml"),
+                        }
                     return {
                         "status": "error", "reason": "restart_required",
                         "detail": ("these keys are read when the model loads; set them "
