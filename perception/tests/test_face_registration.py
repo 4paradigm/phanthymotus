@@ -78,6 +78,31 @@ class RegistrationContracts(unittest.TestCase):
             self.assertTrue(deletion['ok'], deletion)
             self.assertEqual(self.db.match(np.array([1., 0.]), .4)[0], 'unknown')
 
+    def test_photo_registration_honours_an_explicit_person_id(self):
+        """person_id is documented on register_by_photo/url: an existing id
+        takes the sample (and may rename it), and an unknown id is rejected —
+        not silently turned into a similarity match or a fresh identity."""
+        with tempfile.TemporaryDirectory() as directory:
+            photo = Path(directory) / 'face.png'
+            cv2.imwrite(str(photo), np.full((10, 10, 3), 80, np.uint8))
+
+            created = self.call('register_by_photo', image_path=str(photo), name='Alice')
+            self.assertTrue(created['ok'], created)
+            pid = created['person_id']
+
+            again = self.call('register_by_photo', image_path=str(photo),
+                              person_id=pid, name='Alice Updated')
+            self.assertTrue(again['ok'], again)
+            self.assertEqual(again['person_id'], pid)
+            self.assertEqual(again['samples'], 2)
+            self.assertEqual(self.call('get_person', person_id=pid)['person']['name'],
+                             'Alice Updated')
+
+            missing = self.call('register_by_photo', image_path=str(photo),
+                                person_id='p-999')
+            self.assertFalse(missing['ok'], missing)
+            self.assertIn('no such person', missing['detail'])
+
     def test_photo_and_url_bbox_dimensions(self):
         from unittest.mock import patch
 

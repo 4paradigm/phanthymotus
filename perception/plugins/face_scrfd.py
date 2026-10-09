@@ -1933,7 +1933,13 @@ class FaceRecognitionPlugin:
                     url_action=action.replace("_photo", "_url"))
             image = load_image(source, is_url=action.endswith("_url"))
             if action.startswith("register_"):
-                return {**self._register_image(image, args.get("name") or "", args.get("profile")),
+                # person_id is documented on these actions and enroll() already
+                # enforces it (existing id merges/renames, unknown id is
+                # rejected) — it was simply not being forwarded, so an explicit
+                # id silently became a similarity match or a new identity.
+                return {**self._register_image(image, args.get("name") or "",
+                                               args.get("profile"),
+                                               args.get("person_id") or None),
                         "source": source}
             faces = [_face_result(self._face_db, d, image.shape, self._similarity_threshold)
                      for d in self._model.detect_and_embed(image)]
