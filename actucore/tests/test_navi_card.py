@@ -252,6 +252,16 @@ def test_roles_come_from_topic_names_not_from_live_publishers():
     assert bound["depth_map"] == "/ubuntu/camera/main/visual_depth"
 
 
+def test_a_driver_camera_depth_topic_binds_as_metric_depth():
+    """A registered hardware depth stream is already the depth map; requiring
+    it to be renamed to perception's `/visual_depth` would force Bumi to run a
+    less accurate monocular model despite having aligned RealSense depth."""
+    bound, problem = _bind(["/ubuntu/camera/color/objects",
+                            "/ubuntu/camera/depth"])
+    assert problem == ""
+    assert bound["depth_map"] == "/ubuntu/camera/depth"
+
+
 def test_the_summary_suffix_is_not_swallowed_by_the_depth_map_suffix():
     """`/visual_depth_summary` starts with `/visual_depth`; matched in the
     wrong order the summary binds as a depth map and every distance is wrong."""

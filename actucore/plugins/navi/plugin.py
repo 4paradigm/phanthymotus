@@ -795,6 +795,12 @@ class NaviPlugin:
     _ROLE_SUFFIXES = (
         ("/visual_depth_summary", "depth_summary"),
         ("/visual_depth", "depth_map"),
+        # Hardware drivers may publish a metric depth stream directly. Keep
+        # this narrower than a bare `/depth`: the `/camera/depth` contract is
+        # specific enough to distinguish it from an arbitrary compressed
+        # camera topic while still covering namespaced drivers such as Bumi's
+        # `/ubuntu/camera/depth`.
+        ("/camera/depth", "depth_map"),
         ("/objects", "objects"),
         ("/state/odom", "odom"),
     )
