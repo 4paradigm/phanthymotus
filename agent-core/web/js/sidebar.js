@@ -646,7 +646,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         if (String(savedValues[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      input.value = savedValues[key] ?? def.default ?? '';
+      if (savedValues[key] != null) input.value = savedValues[key];
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -935,22 +935,6 @@ function _hideDetail() {
  * Open a config modal for a specific canvas card instance.
  * Only shows fields with scope === "instance".
  */
-function _bindInstanceConfigVisibility(bodyEl) {
-  const apply = () => {
-    for (const field of bodyEl.querySelectorAll('.tool-config-field')) {
-      const matches = raw => Object.entries(JSON.parse(raw)).every(([key, expected]) => {
-        const input = bodyEl.querySelector(`[data-key="${key}"]`);
-        return input && (Array.isArray(expected) ? expected.includes(input.value) : input.value === expected);
-      });
-      const shown = !field.dataset.showWhen || matches(field.dataset.showWhen);
-      const hidden = field.dataset.hideWhen && matches(field.dataset.hideWhen);
-      field.style.display = shown && !hidden ? '' : 'none';
-    }
-  };
-  for (const input of bodyEl.querySelectorAll('[data-key]')) input.addEventListener('change', apply);
-  apply();
-}
-
 export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
@@ -989,11 +973,6 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     if (def.scope !== 'instance') continue;
     hasFields = true;
 
-    const fieldWrapper = document.createElement('div');
-    fieldWrapper.className = 'tool-config-field';
-    if (def['x-show-when']) fieldWrapper.dataset.showWhen = JSON.stringify(def['x-show-when']);
-    if (def['x-hide-when']) fieldWrapper.dataset.hideWhen = JSON.stringify(def['x-hide-when']);
-
     const label = document.createElement('label');
     label.className = 'tool-config-label';
     label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
@@ -1014,7 +993,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         if (String(savedValues[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      input.value = savedValues[key] ?? def.default ?? '';
+      if (savedValues[key] != null) input.value = savedValues[key];
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1135,9 +1114,8 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
-    fieldWrapper.appendChild(label);
-    fieldWrapper.appendChild(input);
-    bodyEl.appendChild(fieldWrapper);
+    bodyEl.appendChild(label);
+    bodyEl.appendChild(input);
   }
 
   if (!hasFields) {
@@ -1148,8 +1126,6 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     empty.textContent = 'No instance config fields';
     bodyEl.appendChild(empty);
   }
-
-  _bindInstanceConfigVisibility(bodyEl);
 
   const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {

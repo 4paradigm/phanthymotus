@@ -875,14 +875,12 @@ async def call_tool(full_name: str, args: dict) -> str:
                         'name':      tool_name,
                         'arguments': {'action': 'config', **saved_cfg},
                     })
-                # Stop on rejected configuration and preserve the plugin's reason.
+                # 检查 config 结果，adapter_ok=false 说明凭据无效
                 try:
                     cfg_text = (cfg_result.get('content') or [{}])[0].get('text', '{}')
                     cfg_parsed = json.loads(cfg_text)
-                    from tool_config import config_error_message
-                    config_error = config_error_message(cfg_parsed)
-                    if config_error:
-                        return f'[{tool_name}] {config_error}'
+                    if not cfg_parsed.get('adapter_ok', True):
+                        return f'[{tool_name}] 配置无效（缺少 url/key），请在设备面板中检查配置后再启动。'
                 except (json.JSONDecodeError, IndexError, KeyError):
                     pass
             else:

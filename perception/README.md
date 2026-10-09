@@ -2118,7 +2118,10 @@ falls back to PyTorch if the bundle is missing — it fails loudly instead.
 `visual_depth` also supports DepthART Metric-S. Select **Depth model** in the
 shared tool configuration after stopping all depth instances; loading remains
 lazy. The default is still YOLO26-N Depth. Frame rate and calibration remain
-per-camera settings.
+per-camera settings. This integration uses the existing Agent Core form without
+Core changes: the model selector shows `yolo` / `depthart`, and calibration fields
+remain visible rather than conditionally hidden. Leave a/b at 1/0 when not using
+manual calibration.
 
 DepthART downloads a pinned engine and SelectiveScan plugin on first use,
 selected from the runtime TensorRT family. Files are size/SHA256 verified and

@@ -45,10 +45,11 @@ def test_model_selection_schema_and_manual_fields():
     props = p.get_tools()[0]['configSchema']['properties']
     assert props['backend']['scope'] == 'shared'
     assert props['backend']['default'] == 'depthart'
-    assert {o['const'] for o in props['backend']['oneOf']} == {'yolo', 'depthart'}
+    assert props['backend']['enum'] == ['yolo', 'depthart']
+    assert 'oneOf' not in props['backend']
     assert props['fps']['title'] == 'Inference FPS'
     for key in ('cal_a', 'cal_b'):
-        assert props[key]['x-show-when'] == {'calibration_preset': vd.CAL_MANUAL}
+        assert 'x-show-when' not in props[key]
 
 
 def test_idle_model_switch_is_lazy_and_resets_calibration():
@@ -164,7 +165,7 @@ def test_calibration_model_is_persistable_but_never_auto_stamped():
         prop = p.get_tools()[0]['configSchema']['properties']['calibration_backend']
         assert prop['scope'] == 'instance'
         assert 'default' not in prop
-        assert prop['x-show-when'] == {'calibration_preset': vd.CAL_MANUAL}
+        assert 'x-show-when' not in prop
 
 
 def test_switch_then_restore_old_row_rejected_after_process_restart(tmp_path):

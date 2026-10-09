@@ -292,16 +292,16 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "backend": {"type": "string", "title": "Depth model", "description": "Shared by all cameras. Stop all depth instances before switching. Missing model files download on first use; DepthART requires camera intrinsics.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "default": "yolo", "scope": "shared"},
+                "backend": {"type": "string", "title": "Depth model", "description": "Shared by all cameras. Stop all depth instances before switching. Missing model files download on first use; DepthART requires camera intrinsics.", "enum": ["yolo", "depthart"], "default": "yolo", "scope": "shared"},
                 "fps":          {"type": "integer", "title": "Inference FPS", "description": "Maximum inference frames per second", "default": 2, "scope": "instance"},
                 # Log-affine site calibration, applied on top of the one baked
                 # into the engine: metres_out = metres_in**cal_a * exp(cal_b).
                 # Same two parameters ultralytics' model.calibrate() fits, so a
                 # result from there pastes in here unchanged. 1.0 / 0.0 is
                 # identity — i.e. trust the engine.
-                "cal_a": {"type": "number", "title": "Calibration a", "description": "Depth exponent; 1 means no exponent correction.", "default": 1.0, "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
-                "cal_b": {"type": "number", "title": "Calibration b", "description": "Log scale offset; 0 means no scale correction.", "default": 0.0, "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
-                "calibration_backend": {"type": "string", "title": "Calibration model", "description": "Select the model these measured coefficients belong to. Recalibrate before using a different model.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "scope": "instance", "x-show-when": {"calibration_preset": CAL_MANUAL}},
+                "cal_a": {"type": "number", "title": "Calibration a", "description": "Depth exponent; 1 means no exponent correction.", "default": 1.0, "scope": "instance"},
+                "cal_b": {"type": "number", "title": "Calibration b", "description": "Log scale offset; 0 means no scale correction.", "default": 0.0, "scope": "instance"},
+                "calibration_backend": {"type": "string", "title": "Calibration model", "description": "Select the model these measured coefficients belong to. Recalibrate before using a different model.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "scope": "instance"},
                 # Presets are for the common case (a known robot, a known
                 # camera); cal_a/cal_b above stay for anything else, and a
                 # non-identity value there wins — see _calibration_from_cfg.
