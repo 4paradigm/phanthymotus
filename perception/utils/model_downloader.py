@@ -1415,6 +1415,44 @@ def _ensure_vision_bundle(
     )
 
 
+DEPTHART_MODEL_BUNDLES = {
+    "jp511": {
+        "base_url": "https://modelscope.cn/models/Flame4pd/depthart-metric-s-jp61-trt/resolve/ce158696ba8a5a6cee919b851a879825ea700eea/dynamic-k-v1/jp511",
+        "files": {
+            "depthart.engine": {
+                "size": 19746652,
+                "sha256": "8df5520b57cc4bd6fa98680db6313fec0b8482894cc65bd9532d172fe764942d"
+            },
+            "libdepthart_selective_scan_trt.so": {
+                "size": 1426464,
+                "sha256": "d2bfb2d2697bea76bf2927d4505ccf01fe387f5b69a62c2257e3d2e9f340d4db"
+            }
+        }
+    },
+    "jp61": {
+        "base_url": "https://modelscope.cn/models/Flame4pd/depthart-metric-s-jp61-trt/resolve/ce158696ba8a5a6cee919b851a879825ea700eea/dynamic-k-v1/jp61",
+        "files": {
+            "depthart.engine": {
+                "size": 20422476,
+                "sha256": "6bcd24a11b1383f359cedf76a2f6e112f2a0ecf3ec23656a1cc99ae3e3b83038"
+            },
+            "libdepthart_selective_scan_trt.so": {
+                "size": 1259096,
+                "sha256": "6d76307585ffe615db8e620f1826550f086197e9e834236e03565043eb413c35"
+            }
+        }
+    }
+}
+
+
+def ensure_depthart_model(model_dir: str = "/models/depthart", family: str | None = None,
+                          progress_cb=None) -> dict[str, str]:
+    """Download the dynamic-K engine and paired plugin for the runtime TensorRT."""
+    key = select_bundle_family(DEPTHART_MODEL_BUNDLES, family)
+    return _ensure_vision_bundle("depthart", DEPTHART_MODEL_BUNDLES,
+                                 os.path.join(model_dir, key), key, progress_cb)
+
+
 def ensure_vop_model(model_dir: str, family: str | None = None,
                      progress_cb=None) -> dict[str, str]:
     """Ensure the vop detection engine + its frozen vocabulary are present."""
