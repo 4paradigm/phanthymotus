@@ -12,6 +12,8 @@ import pathlib
 import sys
 import threading
 
+import pytest
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -220,29 +222,49 @@ def test_several_weight_sources_ride_one_pinned_bundle(monkeypatch):
 
 # ── detector normalisation ───────────────────────────────────────────────────
 
-def test_unknown_detector_falls_back_to_yunet_everywhere():
-    """One fallback, shared: the weights fetched and the session built cannot
-    disagree about which detector was asked for."""
-    assert face_scrfd._detector_key("bogus") == "yunet"
+def test_unknown_detector_is_rejected_not_silently_replaced():
+    """A typo must not quietly run a different detector: unknown values are
+    refused with the valid set, while known ones normalise (case/space)."""
     assert face_scrfd._detector_key(None) == "yunet"
     assert face_scrfd._detector_key("SCRFD_2.5G") == "scrfd_2.5g"
     assert face_scrfd._detector_key("yunet") == "yunet"
 
-    seen = {}
-
-    def fake_bundle(name, model_dir, base_url, files, progress_cb=None):
-        seen["files"] = files
-        return {filename: f"{model_dir}/{filename}" for filename in files}
-
-    original = face_scrfd.ensure_verified_bundle
-    face_scrfd.ensure_verified_bundle = fake_bundle
-    try:
+    with pytest.raises(ValueError, match="unknown detector"):
+        face_scrfd._detector_key("bogus")
+    with pytest.raises(ValueError, match="unknown detector"):
         face_scrfd._ensure_weights("edgeface_base.int8", "/tmp/face-test",
                                    detector="bogus")
-    finally:
-        face_scrfd.ensure_verified_bundle = original
 
-    assert "face_detection_yunet_2023mar.onnx" in seen["files"]
+
+def test_unknown_model_and_device_are_rejected_synchronously():
+    """`model` and `device` are validated against the pinned registry and the
+    provider table, not stored to fail later on a background thread."""
+    assert face_scrfd._validate_model("edgeface_base.int8") == "edgeface_base.int8"
+    with pytest.raises(ValueError, match="unknown face model"):
+        face_scrfd._validate_model("nope")
+
+    assert face_scrfd._providers_for_device("gpu") == ["CUDAExecutionProvider",
+                                                       "CPUExecutionProvider"]
+    with pytest.raises(ValueError, match="unknown device"):
+        face_scrfd._providers_for_device("tpu")
+
+
+def test_config_rejects_invalid_values_without_applying_anything():
+    plugin = _stub_plugin()          # nothing loaded yet
+
+    result = plugin.dispatch("config", {"model": "nope", "similarity_threshold": "0.5"})
+
+    assert result["status"] == "error" and result["reason"] == "invalid_config"
+    assert "unknown face model" in result["detail"]
+    # Validated-first, applied-after: the good key did not go through either.
+    assert plugin._model_name == "edgeface_base.int8"
+    assert plugin._similarity_threshold == 0.39
+
+    for field, value in (("device", "tpu"), ("detector", "mtcnn")):
+        result = plugin.dispatch("config", {field: value})
+        assert result["reason"] == "invalid_config", result
+        assert getattr(plugin, "_" + field) == ("cpu" if field == "device"
+                                                else "scrfd_2.5g")
 
 
 # ── the extraction namespace must keep up with the plugin ────────────────────

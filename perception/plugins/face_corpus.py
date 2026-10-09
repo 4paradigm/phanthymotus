@@ -10,7 +10,8 @@ import tarfile
 import tempfile
 from contextlib import contextmanager
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, build_opener
+
+from plugins.image_input import BadInput, open_url
 import zipfile
 
 import cv2
@@ -60,21 +61,20 @@ def _copy(src, dst, limit):
         dst.write(chunk)
 
 
-def _url(url):
-    parsed = urlsplit(url)
-    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
-        raise ValueError("expected an HTTP(S) URL")
-    return url
-
-
-class _HTTPRedirects(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _url(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
 def _download(url, destination, limit):
-    with build_opener(_HTTPRedirects()).open(_url(url), timeout=30) as response:
+    """Stream an http(s) archive to disk under the shared URL policy.
+
+    The scheme and redirect rules live in plugins/image_input.open_url — one
+    centralized answer to "what may a caller make this container fetch" — and
+    this module keeps the size cap because it streams: no request is large
+    enough to buffer here, unlike the image path.
+    """
+    try:
+        response = open_url(url, timeout=30)
+    except BadInput as error:
+        # corpus_entries documents ValueError for an unusable package.
+        raise ValueError(str(error)) from error
+    with response:
         length = response.headers.get("Content-Length")
         if length is not None and (int(length) < 0 or int(length) > limit):
             raise ValueError("download exceeds byte limit")

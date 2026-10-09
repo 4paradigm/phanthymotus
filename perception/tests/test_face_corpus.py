@@ -212,3 +212,45 @@ class CorpusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── archive downloads ride the shared URL policy (plugins/image_input) ──────
+# Module-level and not cv2-gated: these check how the fetch is routed, not
+# what the pixels decode to.
+
+def test_archive_download_rides_the_shared_url_policy():
+    """One place decides what a caller may make this container fetch: the
+    corpus streams its archive through image_input.open_url (same http(s) and
+    redirect rules as every other remote input), not a private downloader."""
+    recorded = {}
+
+    class _Response(io.BytesIO):
+        headers = {}
+
+    def fake_open(url, timeout=20):
+        recorded["url"], recorded["timeout"] = url, timeout
+        return _Response(b"payload")
+
+    with patch.object(corpus, "open_url", fake_open):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "download"
+            corpus._download("https://example.invalid/batch.zip", destination, 1024)
+            assert destination.read_bytes() == b"payload"
+
+    assert recorded["url"] == "https://example.invalid/batch.zip"
+
+
+def test_archive_download_maps_policy_errors_to_corpus_value_error():
+    """corpus_entries documents ValueError for an unusable package; the shared
+    opener's BadInput has to arrive as that rather than leak a foreign type."""
+    def refusing(url, timeout=20):
+        raise corpus.BadInput(f"only http(s) URLs are supported: {url!r}", url)
+
+    with patch.object(corpus, "open_url", refusing):
+        with tempfile.TemporaryDirectory() as directory:
+            try:
+                corpus._download("ftp://x/y.zip", Path(directory) / "d", 1024)
+            except ValueError as error:
+                assert "http(s)" in str(error)
+            else:
+                raise AssertionError("expected ValueError")

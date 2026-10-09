@@ -120,6 +120,23 @@ _CONTAINER_PORT_BASE = 15720
 _CONTAINER_PORT_STRIDE = 100
 
 
+def _window_seconds_arg(args: dict, default: float) -> float:
+    """`window_s` from MCP args: validated, then capped at the window's own
+    length. The schema says minimum 0.1; without the check a negative value
+    became a zero-second window and a misleading "no_frames" answer instead
+    of a bad-input one."""
+    raw = args.get("window_s")
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"window_s must be a number of seconds, got {raw!r}")
+    if value < 0.1:
+        raise ValueError(f"window_s must be at least 0.1 seconds, got {value}")
+    return min(value, ENROLL_WINDOW_S)
+
+
 def _container_index() -> int | None:
     """Container index from MCP_PORT, or None if unset/out of range."""
     try:
@@ -172,22 +189,44 @@ _DEVICE_PROVIDERS = {
 
 
 def _providers_for_device(device: str) -> list[str]:
-    """Providers for a config `device` value; CPU for anything unrecognised."""
-    return list(_DEVICE_PROVIDERS.get(str(device).strip().lower(), _DEVICE_PROVIDERS["cpu"]))
+    """Providers for a config `device` value. Unknown values are rejected.
+
+    Not defaulted to CPU: that hid every typo — a caller asking for a device
+    this build does not offer got CPU with no indication. The valid set is
+    what the config schema advertises (cpu/cuda, `gpu` accepted as `cuda`).
+    """
+    key = str(device).strip().lower()
+    if key not in _DEVICE_PROVIDERS:
+        raise ValueError(f"unknown device {device!r}; pick one of "
+                         f"{sorted(_DEVICE_PROVIDERS)}")
+    return list(_DEVICE_PROVIDERS[key])
 
 
 def _detector_key(detector) -> str:
-    """Canonical detector config value; unknown names run YuNet, loudly.
+    """Canonical detector config value; unknown names are rejected.
 
-    One fallback shared by every consumer, so the weights that get downloaded
-    and the session that gets built can never disagree about which detector
-    was asked for (an unnormalised value once fetched YuNet's weights and then
-    built a SCRFD session from a None filename).
+    Rejected rather than silently replaced: the schema lists exactly these
+    keys, and a typo that quietly ran a different detector is a surprise
+    nobody asked for. One validator serves every consumer, so the weights
+    fetched and the session built can never disagree about the choice.
     """
     key = str(detector or "yunet").strip().lower()
     if key not in FACE_SCRFD_DETECTOR_BUNDLES:
-        log.warning(f"[face] unknown detector {detector!r}; running yunet instead")
-        return "yunet"
+        raise ValueError(f"unknown detector {detector!r}; pick one of "
+                         f"{sorted(FACE_SCRFD_DETECTOR_BUNDLES)}")
+    return key
+
+
+def _validate_model(model) -> str:
+    """The recognizer name, checked against the pinned registry.
+
+    A bad name used to be stored happily and fail later on a background
+    thread; validating here makes the rejection synchronous and specific.
+    """
+    key = str(model or DEFAULT_MODEL_NAME).strip()
+    if key not in FACE_SCRFD_RECOGNIZER_BUNDLES:
+        raise ValueError(f"unknown face model {key!r}; pick one of "
+                         f"{sorted(FACE_SCRFD_RECOGNIZER_BUNDLES)}")
     return key
 
 
@@ -300,20 +339,20 @@ TOOLS = [
                 },
                 "device": {
                     "type": "string",
-                    "enum": ["cuda", "cpu"],
+                    "enum": ["cpu", "cuda", "gpu"],
                     "description": "Inference device for both sessions",
                     "default": "cpu",
                     "scope": "shared",
                 },
                 "detector_device": {
                     "type": "string",
-                    "enum": ["cuda", "cpu"],
+                    "enum": ["cpu", "cuda", "gpu"],
                     "description": "Override `device` for the SCRFD/YuNet detector session",
                     "scope": "shared",
                 },
                 "recognizer_device": {
                     "type": "string",
-                    "enum": ["cuda", "cpu"],
+                    "enum": ["cpu", "cuda", "gpu"],
                     "description": "Override `device` for the EdgeFace recognizer session",
                     "scope": "shared",
                 },
@@ -341,16 +380,17 @@ def _ensure_weights(model_name: str, model_dir: str, detector: str = "yunet",
     "正在下载模型 …" line so the plugin card shows how far a cold fetch has
     got; a warm cache emits nothing at all.
     """
-    recognizer_files = FACE_SCRFD_RECOGNIZER_BUNDLES.get(model_name)
-    if recognizer_files is None:
-        raise ValueError(
-            f"unknown face model {model_name!r}; pick one of "
-            f"{sorted(FACE_SCRFD_RECOGNIZER_BUNDLES)}")
+    recognizer_files = FACE_SCRFD_RECOGNIZER_BUNDLES[_validate_model(model_name)]
     detector_files = FACE_SCRFD_DETECTOR_BUNDLES[_detector_key(detector)]
 
     # One bundle call over both halves: the downloader reports a single
     # monotonic 0-100% across recognizer + detector files, not two ramps.
     files = {**recognizer_files, **detector_files}
+    # fetch_status also hands back a stage_cb for "正在解压…". Every face
+    # bundle is a list of plain files (asserted in the pins test): nothing is
+    # ever extracted, ensure_verified_bundle takes no stage_cb, and there is
+    # no stage to report. If a bundle ever becomes an archive, it moves to
+    # ensure_verified_archive and this line grows the stage callback.
     progress_cb, _stage_cb = fetch_status(on_status, f"face {model_name}")
     ensure_verified_bundle("face/scrfd_edgeface", model_dir, _model_sources(),
                            files, progress_cb=progress_cb)
@@ -1481,12 +1521,18 @@ class FaceRecognitionPlugin:
 
     def __init__(self, plugin_cfg: dict, executor):
         self._executor = executor
-        self._model_name = plugin_cfg.get("model", DEFAULT_MODEL_NAME)
+        self._model_name = _validate_model(plugin_cfg.get("model", DEFAULT_MODEL_NAME))
         self._device = plugin_cfg.get("device", "cpu")
         # Per-session overrides; None means "follow `device`" (see EdgeFaceAdapter).
         self._detector_device = plugin_cfg.get("detector_device") or None
         self._recognizer_device = plugin_cfg.get("recognizer_device") or None
         self._detector = _detector_key(plugin_cfg.get("detector", "scrfd_2.5g"))
+        # Validate the provider selections up front: a typo'd `device` in
+        # config.yaml should hide this card with this log line (main.py's
+        # guard), not surface later as an async load error on a robot.
+        for _value in (self._device, self._detector_device, self._recognizer_device):
+            if _value:
+                _providers_for_device(_value)
         self._face_db_dir = plugin_cfg.get("face_db_dir") or os.getenv("FACE_DB_DIR", "/models/face_db")
         self._model_dir = plugin_cfg.get("model_dir", "/models/face")
         self._similarity_threshold = float(plugin_cfg.get("similarity_threshold", DEFAULT_SIMILARITY_THRESHOLD))
@@ -1728,11 +1774,11 @@ class FaceRecognitionPlugin:
 
     def _register_stream(self, args):
         self._ensure_model()
+        window = _window_seconds_arg(args, ENROLL_WINDOW_S)
         node, failure = self._pick_instance(str(args.get("instance_id") or ""))
         if node is None:
             return failure
 
-        window = min(float(args.get("window_s") or ENROLL_WINDOW_S), ENROLL_WINDOW_S)
         frames = node.recent_frames(window)
         if not frames:
             return {"ok": False, "reason": "no_frames",
@@ -1802,11 +1848,11 @@ class FaceRecognitionPlugin:
 
     def _recognize_stream(self, args):
         self._ensure_model()
+        window = _window_seconds_arg(args, 1.0)
         node, failure = self._pick_instance(str(args.get("instance_id") or ""))
         if node is None:
             return failure
 
-        window = min(float(args.get("window_s") or 1.0), ENROLL_WINDOW_S)
         frames = node.recent_frames(window)
         if not frames:
             return {"ok": False, "reason": "no_frames",
@@ -2049,16 +2095,33 @@ class FaceRecognitionPlugin:
                                    "in config.yaml and restart the container: "
                                    + ", ".join(model_affecting)),
                     }
-                if "model" in cfg:
-                    self._model_name = cfg["model"]
-                if "detector" in cfg:
-                    self._detector = _detector_key(cfg["detector"])
-                if "device" in cfg:
-                    self._device = cfg["device"]
-                if "detector_device" in cfg:
-                    self._detector_device = cfg["detector_device"] or None
-                if "recognizer_device" in cfg:
-                    self._recognizer_device = cfg["recognizer_device"] or None
+                # Validate every supplied value first, apply after — a
+                # partly-applied config with an error reply is the same
+                # dishonesty as an unapplied one with "configured".
+                try:
+                    validated: dict = {}
+                    if "model" in cfg:
+                        validated["_model_name"] = _validate_model(cfg["model"])
+                    if "detector" in cfg:
+                        validated["_detector"] = _detector_key(cfg["detector"])
+                    if "device" in cfg:
+                        _providers_for_device(cfg["device"])
+                        validated["_device"] = cfg["device"]
+                    if "detector_device" in cfg:
+                        value = cfg["detector_device"] or None
+                        if value:
+                            _providers_for_device(value)
+                        validated["_detector_device"] = value
+                    if "recognizer_device" in cfg:
+                        value = cfg["recognizer_device"] or None
+                        if value:
+                            _providers_for_device(value)
+                        validated["_recognizer_device"] = value
+                except ValueError as error:
+                    return {"status": "error", "reason": "invalid_config",
+                            "detail": str(error)}
+                for _attr, _value in validated.items():
+                    setattr(self, _attr, _value)
                 if "face_db_dir" in cfg:
                     self._face_db_dir = cfg["face_db_dir"]
                 if "model_dir" in cfg:

@@ -266,6 +266,12 @@ def test_face_scrfd_pins_every_selectable_artifact():
         for key, files in options.items():
             assert files, f"{kind} bundle {key} is empty"
             for filename, meta in files.items():
+                # Plain files, never archives: _ensure_weights has no
+                # extraction stage to report, which is why it forwards only
+                # fetch_status's progress callback. An archive here would need
+                # ensure_verified_archive and the stage callback with it.
+                assert not filename.endswith((".tar", ".tar.gz", ".tgz", ".zip")), \
+                    f"{filename} is an archive; the bundle fetch has no extract stage"
                 assert isinstance(meta["size"], int) and meta["size"] > 0, \
                     f"{filename} has no pinned size"
                 sha = meta["sha256"]

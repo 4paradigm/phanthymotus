@@ -333,6 +333,28 @@ def test_stop_all_also_closes_visits():
     assert result['visits_closed'] == 1
 
 
+def test_negative_window_s_is_a_bad_input_not_an_empty_window():
+    """The schema says minimum 0.1; a negative request used to clamp to a
+    zero-second window and answer "no_frames", which reads like the camera's
+    fault rather than the caller's."""
+    if not _NEEDS_REAL_CV2:
+        import pytest
+        pytest.skip("needs real cv2")
+
+    ns = load_face()
+    ns.update(threading=threading)
+    plugin = ns['FaceRecognitionPlugin'].__new__(ns['FaceRecognitionPlugin'])
+    plugin._face_db = ns['FaceDatabase']()
+    plugin._nodes = {}
+    plugin._ensure_model = lambda: None
+
+    for action, args in (('register_by_stream', {'window_s': -5}),
+                         ('recognize_by_stream', {'window_s': '-0.1'})):
+        result = ns['FaceRecognitionPlugin']._stream_action(plugin, action, args)
+        assert result['ok'] is False and result['reason'] == 'bad_input', result
+        assert 'at least 0.1' in result['detail']
+
+
 def test_empty_frames_close_a_stale_visit_without_any_face():
     """Absence closes a visit, and absence arrives as frames with no face:
     the worker checks on every tick, not only under `if faces`. Before that,

@@ -211,10 +211,12 @@ class PerceptionBundle:
         if plugins_cfg.get("face", {}).get("enabled", False):
             # The SCRFD + EdgeFace stack in plugins/face_scrfd.py. A separate
             # plugin from the face_recognition above, answering the `face.` tool
-            # prefix; guarded the same way — its failure hides its own card and
-            # must never take the neighbouring plugins down.
-            from plugins.face_scrfd import FaceRecognitionPlugin as FaceScrfdPlugin
+            # prefix. The *import* is inside the guard too: this plugin pulls
+            # cv2/rclpy/helper modules an image may not have, and "optional"
+            # has to include that failure mode — the card simply not appearing
+            # beats taking PerceptionBundle down with it.
             try:
+                from plugins.face_scrfd import FaceRecognitionPlugin as FaceScrfdPlugin
                 self._plugins.append(FaceScrfdPlugin(plugins_cfg["face"], executor))
                 log.info("FaceScrfdPlugin loaded")
             except Exception:

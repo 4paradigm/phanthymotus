@@ -156,16 +156,18 @@ class FaceContracts(unittest.TestCase):
 
     def test_device_provider_selection(self):
         """`device` selects the ORT provider list; CPU stays last so an image or
-        host without CUDA still starts instead of raising at session creation."""
+        host without CUDA still starts instead of raising at session creation.
+        Unknown values are rejected rather than defaulted to CPU — that default
+        silently hid every typo (see _providers_for_device)."""
         providers = self.ns["_providers_for_device"]
         self.assertEqual(providers("cpu"), ["CPUExecutionProvider"])
         self.assertEqual(providers("gpu"),
                          ["CUDAExecutionProvider", "CPUExecutionProvider"])
         self.assertEqual(providers("CUDA"), providers("gpu"))
         self.assertEqual(providers(" GPU "), providers("gpu"))
-        # Anything unrecognised (including the config default) stays on CPU.
         for value in ("", "npu", "tensorrt", None):
-            self.assertEqual(providers(value), ["CPUExecutionProvider"])
+            with self.assertRaises(ValueError):
+                providers(value)
 
     def test_sessions_take_device(self):
         """Both sessions must accept a device kwarg — the hardcoded CPU provider
