@@ -935,13 +935,23 @@ class SpeakerRecognitionPlugin:
         return "loading"
 
     def _with_db_stats(self, result: dict, engine: _SpeakerEngine | None) -> dict:
-        """Attach roster counts. Never fails info — it is the diagnostic path."""
+        """Attach roster counts. Never fails info — it is the diagnostic path.
+
+        Both halves are optional and for different reasons: with `model: off`
+        there is no embedder (so no dim, no device), and with `off` plus nothing
+        on disk there is no database either. Reaching through either one blindly
+        logged a traceback on **every** `info` while switched off — caught, so
+        info still answered, but a stack trace per poll is exactly the noise that
+        buries a real one.
+        """
         if engine is None:
             return result
         try:
-            result["database"] = engine.db.stats()
-            result["embedding_dim"] = engine.embedder.dim
-            result["device"] = engine.embedder.device
+            if engine.db is not None:
+                result["database"] = engine.db.stats()
+            if engine.embedder is not None:
+                result["embedding_dim"] = engine.embedder.dim
+                result["device"] = engine.embedder.device
         except Exception:  # noqa: BLE001
             log.warning("[speaker] could not read database stats", exc_info=True)
         return result

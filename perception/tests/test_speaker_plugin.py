@@ -925,3 +925,55 @@ def test_management_actions_explain_when_nothing_is_open(tmp_path):
         plugin.dispatch("speaker_recognition", {"action": "list_speakers"})
     assert "已关闭" in str(excinfo.value)
     assert "没有名单" in str(excinfo.value)
+
+
+def off_plugin(tmp_path, with_roster: bool = True) -> SpeakerRecognitionPlugin:
+    """The real `model: off` shape —— 引擎没有 embedder。
+
+    `make_plugin` 装的是 FakeEmbedder，所以它永远测不到这个形状。真机上就是这么漏
+    的：每次 info 都打一条 traceback（被 catch 了，info 照常返回），而本地全绿。
+    """
+    if with_roster:
+        IdentityDB(db_dir=str(tmp_path), dim=DIM,
+                   label="speaker_db").add("小王", [VOICE_A])
+    plugin = SpeakerRecognitionPlugin(
+        {"db_dir": str(tmp_path), "model": "off"}, executor=None)
+    plugin._engine = speaker_module._build_engine(
+        {"model": "off", "db_dir": str(tmp_path),
+         "sample_dir": os.path.join(str(tmp_path), "samples")})
+    plugin._engine_state = "ready"
+    return plugin
+
+
+def test_info_while_off_reports_no_dim_and_logs_nothing(tmp_path, caplog):
+    """关闭状态下 info 不该碰 embedder —— 每次轮询打一条堆栈是会埋掉真问题的噪音。"""
+    plugin = off_plugin(tmp_path)
+    with caplog.at_level("WARNING"):
+        info = plugin.dispatch("speaker_recognition", {"action": "info"})
+    assert info["state"] == "idle"
+    assert "embedding_dim" not in info
+    assert "device" not in info
+    assert info["database"]["persons"] == 1, "库还在，名单该报"
+    assert not [r for r in caplog.records if "speaker" in r.name], caplog.text
+
+
+def test_info_while_off_with_no_roster_reports_neither(tmp_path):
+    plugin = off_plugin(tmp_path, with_roster=False)
+    info = plugin.dispatch("speaker_recognition", {"action": "info"})
+    assert info["state"] == "idle"
+    assert "database" not in info
+    assert "embedding_dim" not in info
+
+
+def test_identify_while_off_is_silent(tmp_path):
+    """真实 off 形状下的识别路径 —— 不抛，也不往 payload 里加任何东西。"""
+    plugin = off_plugin(tmp_path)
+    assert plugin.identify_samples(clip(3.0)) == {}
+
+
+def test_management_works_on_the_real_off_engine(tmp_path):
+    plugin = off_plugin(tmp_path)
+    page = plugin.dispatch("speaker_recognition", {"action": "list_speakers"})
+    assert page["total"] == 1
+    assert plugin.dispatch("speaker_recognition",
+                           {"action": "forget", "speaker_id": "p-1"})["ok"] is True
