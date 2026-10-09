@@ -1297,7 +1297,10 @@ class _FaceNode(Node):
         self._worker = threading.Thread(target=self._inference_worker, daemon=True,
                                         name=f"face_worker_{self._input_topic}")
         self._worker.start()
-        log.info(f"[face] started: {self._input_topic} → {self._output_topic}")
+        # Topics come from the caller (face_start/tool args); escape them like
+        # every other externally-influenced string that reaches the log.
+        log.info(f"[face] started: {escape_log_text(self._input_topic)} → "
+                 f"{escape_log_text(self._output_topic)}")
         return {"state": "running", "input": self._input_topic, "output": self._output_topic}
 
     def stop(self) -> dict:
@@ -1308,7 +1311,7 @@ class _FaceNode(Node):
         if self._worker and self._worker.is_alive():
             self._worker.join(timeout=3.0)
         self._worker = None
-        log.info(f"[face] stopped: {self._input_topic}")
+        log.info(f"[face] stopped: {escape_log_text(self._input_topic)}")
         return {"state": "idle", "input": self._input_topic}
 
     def _image_cb(self, msg: CompressedImage):
@@ -1556,7 +1559,9 @@ class FaceRecognitionPlugin:
                 self._model_loading = False
                 self._model_fetch_status = None
                 self._model_load_error = str(e)
-                log.error(f"[face] model load failed: {e}", exc_info=True)
+                # Download/model errors can embed remote response text.
+                log.error(f"[face] model load failed: {escape_log_text(e)}",
+                          exc_info=True)
 
         threading.Thread(target=_bg_load, daemon=True, name="face_model_load").start()
 
@@ -1623,7 +1628,7 @@ class FaceRecognitionPlugin:
         self._executor.add_node(node)
         self._nodes[node_key] = node
         node.start()
-        log.info(f"[face] node started (background): {input_topic}")
+        log.info(f"[face] node started (background): {escape_log_text(input_topic)}")
 
     def _register_image(self, image, name="", profile=None, person_id=None):
         detections = self._model.detect_and_embed(image)
@@ -1915,7 +1920,8 @@ class FaceRecognitionPlugin:
                     "name": "FaceRecognition", "manufacture": "Embodied",
                     "model": self._model_name,
                     "state": "error",
-                    "desc": f"Model load failed: {self._model_load_error}",
+                    "desc": ("Model load failed: "
+                             + escape_log_text(self._model_load_error)),
                 }
             instances = {}
             for key, node in self._nodes.items():
@@ -1965,7 +1971,9 @@ class FaceRecognitionPlugin:
                         return {"state": "loading", "input": input_topic, "output": f"{input_topic}/face",
                                 "message": "Model is loading, node will start automatically when ready"}
                     if self._model_load_error:
-                        return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
+                        return {"state": "error",
+                                "message": ("Model failed to load: "
+                                            + escape_log_text(self._model_load_error))}
                     # Should not reach here since __init__ starts loading, but handle it
                     self._pending_starts.append((node_key, input_topic))
                     self._start_model_loading()

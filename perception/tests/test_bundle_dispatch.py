@@ -179,3 +179,53 @@ def test_get_all_tools_prefixes_sub_tools_only(bundle_cls):
     assert names == {"face_recognition", "asr", "asr_start"}
     for name in names:
         assert bundle.owns(name), name
+
+
+# ── the face_scrfd registration block in main.py ────────────────────────────
+
+def test_enabling_face_registers_the_scrfd_plugin_without_hijacking_prefixes(
+        bundle_cls, tmp_path, monkeypatch):
+    """The wiring main.py gained for #284, exercised as wiring: with
+    `plugins.face.enabled`, PerceptionBundle advertises the `face` card and
+    routes `face.*` to plugins.face_scrfd — while `face_recognition` keeps
+    resolving to its own plugin (longest prefix), the same coexistence the
+    config defaults to."""
+    import plugins.face_scrfd as face_scrfd
+
+    # Construction starts the background weight fetch. It must not touch the
+    # network (or /models) from a test: refuse the fetch and point the dirs at
+    # tmp_path, so the plugin registers and reports its error state instead.
+    def no_bundle(*args, **kwargs):
+        raise RuntimeError("test: weights are not fetched here")
+
+    monkeypatch.setattr(face_scrfd, "ensure_verified_bundle", no_bundle)
+    cfg = {"plugins": {"face": {
+        "enabled": True,
+        "model_dir": str(tmp_path / "models"),
+        "face_db_dir": str(tmp_path / "db"),
+    }}}
+    bundle = bundle_cls(cfg, _StubExecutor())
+
+    face_plugin = next(p for p in bundle._plugins
+                       if type(p).__module__ == "plugins.face_scrfd")
+    assert type(face_plugin).__name__ == "FaceRecognitionPlugin"
+    assert bundle.owns("face") is True
+    assert bundle.dispatch("face", {"action": "info"})["name"] == "FaceRecognition"
+    assert "face" in {t["name"] for t in bundle.get_all_tools()}
+
+    # The original face plugin registers under its own, longer prefix. The
+    # wire spelling is a sub-tool name whose prefix the bundle strips, so both
+    # reach their own plugin and neither shadows the other.
+    original = _StubPlugin("face_recognition", ["face_recognition", "register"])
+    bundle._plugins.append(original)
+    assert bundle.dispatch("face_recognition_register", {})["plugin"] == "face_recognition"
+    assert bundle.dispatch("face_info", {})["name"] == "FaceRecognition"
+    assert bundle.owns("face") and bundle.owns("face_recognition")
+
+
+class _StubExecutor:
+    def add_node(self, node):
+        pass
+
+    def remove_node(self, node):
+        pass

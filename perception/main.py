@@ -11,6 +11,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   ocr              文字识别（RapidOCR + TensorRT）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
+  face             人脸识别与建库（SCRFD-2.5G + EdgeFace INT8；独立于上面，默认关闭）
 
 每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
 不出现在 dashboard 上，这一点是看得见的。
