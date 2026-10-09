@@ -318,3 +318,54 @@ def test_config_applies_the_flag_to_running_nodes():
     source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
     assert "node._publish_overheard_enabled = self._publish_overheard_enabled" in source
     assert "if 'publish_overheard' in cfg:" in source
+
+
+# ── 两条输出 topic 必须都解析得出来 ─────────────────────────────────────────
+
+def test_info_resolves_both_output_topics():
+    """卡片按静态声明画两个输出口，info 只报一个的话第二个永远「未解析」。
+
+    这正是发生过的事：加第二条输出时只改了 `_status_dict`，而 `info` 手抄了四份
+    自己的 topic_out，一份都没改。
+    """
+    outs = asr_module._asr_topics_out("/mic/audio")
+    assert [t["topic"] for t in outs] == ["/mic/audio/asr", "/mic/audio/asr_overheard"]
+    assert all(t["format"] == "data/json" for t in outs)
+
+
+def test_the_two_ports_are_distinguishable():
+    """两个 desc 都空的话，画布上两个口只剩一个 `data/json`，看不出哪个是哪个。"""
+    outs = asr_module._asr_topics_out("/mic/audio")
+    descs = [t["desc"] for t in outs]
+    assert all(descs), "desc 不能为空 —— 端口上显示的就是它"
+    assert len(set(descs)) == 2, "两个口的说明必须不一样"
+    static = [t["desc"] for t in asr_module.TOOLS[0]["topic_out"]]
+    assert len(set(static)) == 2, "静态声明同理（未解析时显示的是它）"
+
+
+def test_disabled_overheard_is_said_on_the_port():
+    """关掉之后端口还在（静态声明画的），所以要在上面说清楚它现在不发。"""
+    outs = asr_module._asr_topics_out("/mic/audio", publish_overheard=False)
+    assert len(outs) == 2
+    assert "已关" in outs[1]["desc"]
+    assert "已关" not in outs[0]["desc"]
+
+
+def test_no_input_topic_resolves_to_nothing():
+    assert asr_module._asr_topics_out("") == []
+
+
+def test_every_info_branch_uses_the_shared_builder():
+    """五份手抄是这个 bug 的成因；守住只有一份。"""
+    source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
+    body = source[source.index("def dispatch(self, name: str"):]
+    body = body[:body.index("elif action == \"start\"")]
+    assert '"format": "data/json"' not in body, (
+        "info 里又出现了手搓的 topic_out —— 走 _asr_topics_out()"
+    )
+    assert body.count("_asr_topics_out(") >= 3
+
+
+def test_status_dict_agrees_with_info():
+    node = make_node(None)
+    assert node._status_dict()["topic_out"] == asr_module._asr_topics_out("/mic/audio")

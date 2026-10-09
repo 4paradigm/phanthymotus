@@ -448,15 +448,37 @@ TOOLS = [
         # 到 LLM**：agent-core 订阅的是画布上连进 decision_core 入口的 topic
         # （api/mcp_manage.py 的 all_topics 来自那次 start 调用的参数），不是这里
         # 声明的 topic_out。要用它就得在画布上连一根线。
+        # desc 要能把两个口分开 —— 画布上未解析时显示的就是这里的文字，两条都写
+        # "data/json" 的话端口之间没有任何区别可言。
         "topic_out": [
-            {"format": "data/json", "desc": "ASR result event"},
-            {"format": "data/json", "desc": "未触发唤醒词的话语（走后台 subagent）"},
+            {"format": "data/json", "desc": "识别结果（被唤醒词触发的话）"},
+            {"format": "data/json", "desc": "未触发唤醒词的话语（priority 0，走后台 subagent）"},
         ],
     }
 ]
 
 
 # ── WAV helper ────────────────────────────────────────────────────────────────
+
+def _asr_topics_out(input_topic: str, publish_overheard: bool = True) -> list[dict]:
+    """ASR 的两条输出 topic，一处构造。
+
+    之前 `info` 里手抄了四份，而 `_status_dict` 是第五份 —— 加第二条输出时只改了
+    `_status_dict`（info 根本不用它），于是卡片按静态声明画了两个输出口，运行时
+    只解析出一个，第二个永远显示「未解析」。这就是四份手抄的代价。
+
+    `desc` 不能留空：画布上解析后的端口显示的是这里的 desc，空字符串会让两个口
+    都只剩一个 `data/json`，看不出哪个是哪个。
+    """
+    if not input_topic:
+        return []
+    out = [{"topic": f"{input_topic}/asr", "format": "data/json",
+            "desc": "识别结果（被唤醒词触发的话）"}]
+    note = "" if publish_overheard else "（publish_overheard 已关，当前不发）"
+    out.append({"topic": f"{input_topic}/asr_overheard", "format": "data/json",
+                "desc": f"未触发唤醒词的话语，priority 0，走后台 subagent{note}"})
+    return out
+
 
 def _pcm16_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
     import io, wave
@@ -1652,11 +1674,8 @@ class _ASRNode(Node):
         return {
             "state":     self.state,
             "topic_in":  [{"topic": self._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
-            "topic_out": [
-                {"topic": self._output_topic, "format": "data/json", "desc": "ASR result"},
-                {"topic": self._overheard_topic, "format": "data/json",
-                 "desc": "未触发唤醒词的话语（priority 0，走后台 subagent）"},
-            ],
+            "topic_out": _asr_topics_out(
+                self._input_topic, self._publish_overheard_enabled),
         }
 
 
@@ -1878,30 +1897,33 @@ class ASRPlugin:
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": node.state,
                     "topic_in":  [{"topic": node._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
-                    "topic_out": [{"topic": node._output_topic, "format": "data/json",     "desc": ""}],
+                    "topic_out": _asr_topics_out(
+                        node._input_topic, node._publish_overheard_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             if instance_id:
                 # Instance requested but not running — return inferred topics for this instance only.
                 # Do NOT fall through to aggregate path (which would mix in other instances' topics).
-                inferred_out = f"{input_topic}/asr" if input_topic else ""
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": "idle",
                     "topic_in":  [{"topic": input_topic,   "format": "audio/pcm-16k", "desc": ""}] if input_topic else [],
-                    "topic_out": [{"topic": inferred_out,  "format": "data/json",     "desc": ""}] if inferred_out else [],
+                    "topic_out": _asr_topics_out(
+                        input_topic, self._publish_overheard_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             # Aggregate info for all instances (no instance_id = ping/overview only)
             if nodes_snapshot:
                 topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in nodes_snapshot]
-                topics_out = [{"topic": n._output_topic, "format": "data/json", "desc": ""} for n in nodes_snapshot]
+                topics_out = [t for n in nodes_snapshot
+                              for t in _asr_topics_out(
+                                  n._input_topic, n._publish_overheard_enabled)]
                 states = list(set(n.state for n in nodes_snapshot))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                inferred_out = f"{input_topic}/asr" if input_topic else ""
                 topics_in = [{"topic": input_topic, "format": "audio/pcm-16k", "desc": ""}]
-                topics_out = [{"topic": inferred_out, "format": "data/json", "desc": ""}]
+                topics_out = _asr_topics_out(
+                    input_topic, self._publish_overheard_enabled)
                 state = "idle"
             return {
                 "name": "ASR", "manufacture": "Embodied", "model": "asr",
