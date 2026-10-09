@@ -402,6 +402,10 @@ plugins:
     # face 的 0.35 是 ArcFace 的尺度，不能照搬。认错人就调高，认不出就调低，
     # 并把看到的现象记下来。定它需要标注语料（几个人各若干句、用机器人自己的
     # 麦克风录），这件事还没做。
+    # 认不出来时 payload 里分两种 reason，处置相反：
+    #   no_speakers_enrolled —— 库里一个人都没有，去 name_speaker 注册一个；
+    #   no_match + speaker_best_similarity —— 比过了但都不够像，那个分就是调这个
+    #     阈值唯一能靠的依据（看到 0.52 才知道降到 0.5 能认出）。
     match_threshold: 0.6
     # 质量门。声纹在 1.5 秒以下急剧退化，而 VAD 只要 0.5 秒就出段，所以
     # 「嗯」「好」「停」会产生垃圾 embedding。不够长只报听到了、不给身份。

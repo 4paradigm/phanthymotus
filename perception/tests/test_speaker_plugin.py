@@ -37,7 +37,9 @@ from plugins.identity_db import IdentityDB  # noqa: E402
 from plugins.speaker import (  # noqa: E402
     REASON_BAD_INPUT,
     REASON_MULTI_SPEAKER,
+    REASON_NO_MATCH,
     REASON_NO_RECENT,
+    REASON_NO_SPEAKERS,
     REASON_TOO_SHORT,
     SpeakerRecognitionPlugin,
     _SpeakerEngine,
@@ -138,12 +140,50 @@ def test_short_clip_is_reported_not_guessed(tmp_path):
     assert plugin._engine.embedder.calls == 0
 
 
-def test_unknown_voice_without_auto_enroll_gives_no_id(tmp_path):
+def test_empty_roster_says_nobody_is_enrolled(tmp_path):
+    """空库和「比过了都不够像」必须分开报 —— 两者的处置相反。
+
+    之前两种都报 `speaker_similarity: 0.0`，而 0.0 读起来像「和库里的人比过、
+    一个都不像」，会把人送去调 match_threshold —— 而阈值跟空库毫无关系，该做的
+    是去注册一个人。
+    """
     plugin = make_plugin(tmp_path, auto_enroll=False)
     payload = plugin.identify_samples(clip(3.0))
+    assert payload["speaker_reason"] == REASON_NO_SPEAKERS
     assert "speaker_id" not in payload
+    assert "speaker_similarity" not in payload, "没有可比的人，就没有相似度可报"
+    assert "speaker_best_similarity" not in payload
     # 但要被记住，否则「我是小王」就无从下手
     assert plugin._recent.latest() is not None
+
+
+def test_a_near_miss_reports_how_close_it_came(tmp_path):
+    """库非空但都不够像：报出最高分，这是调阈值唯一需要的那个数。"""
+    plugin = make_plugin(tmp_path, auto_enroll=False, match_threshold=0.9)
+    plugin._engine.db.add("小王", [VOICE_A])
+    payload = plugin.identify_samples(clip(3.0, level=-0.5))   # VOICE_B
+    assert payload["speaker_reason"] == REASON_NO_MATCH
+    assert payload["speaker_best_similarity"] == pytest.approx(0.0, abs=1e-6)
+    assert "speaker_id" not in payload
+    assert "speaker_similarity" not in payload, (
+        "speaker_similarity 只在认出人时出现 —— 复用它会让「差一点」被读成「认出了」"
+    )
+
+
+def test_a_near_miss_reports_the_real_score_not_a_placeholder(tmp_path):
+    """差一点的那个分必须是真实值。
+
+    这是 `match_threshold` 唯一能靠的调参依据：看到 0.707 才知道把阈值从 0.9 降到
+    0.65 就能认出，而看到一个占位的 0.0 只会让人以为完全不像。
+    """
+    plugin = make_plugin(tmp_path, auto_enroll=False, match_threshold=0.9)
+    # 一个「半像」的声纹：和 VOICE_A 的余弦是 1/sqrt(2) ≈ 0.707
+    halfway = (VOICE_A + BLEND) / np.linalg.norm(VOICE_A + BLEND)
+    plugin._engine.db.add("小王", [halfway])
+    payload = plugin.identify_samples(clip(3.0))               # VOICE_A
+    assert payload["speaker_reason"] == REASON_NO_MATCH
+    assert payload["speaker_best_similarity"] == pytest.approx(0.7071, abs=1e-3)
+    assert "speaker_id" not in payload
 
 
 def test_unknown_voice_with_auto_enroll_creates_an_unnamed_identity(tmp_path):
@@ -179,7 +219,7 @@ def test_a_different_voice_is_not_matched(tmp_path):
     plugin._engine.db.add("小王", [VOICE_A])
     payload = plugin.identify_samples(clip(3.0, level=-0.5))   # VOICE_B
     assert "speaker_id" not in payload
-    assert payload["speaker_similarity"] == pytest.approx(0.0, abs=1e-6)
+    assert payload["speaker_reason"] == REASON_NO_MATCH
 
 
 # ── 多说话人 ─────────────────────────────────────────────────────────────────

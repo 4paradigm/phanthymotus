@@ -162,6 +162,11 @@ REASON_TOO_SHORT = "too_short"
 REASON_MULTI_SPEAKER = "multi_speaker"
 REASON_NO_RECENT = "no_recent_speaker"
 REASON_BAD_INPUT = "bad_input"
+# 「库里一个人都没有」和「比过了但都不够像」必须分开报。两者的处置相反：前者要去
+# 注册一个人，后者要么调低 match_threshold 要么这个人确实不认识。合成一个数字
+# （之前是都报 similarity 0.0）会把人送去调阈值，而阈值跟空库毫无关系。
+REASON_NO_SPEAKERS = "no_speakers_enrolled"
+REASON_NO_MATCH = "no_match"
 
 
 TOOLS = [
@@ -835,9 +840,23 @@ class SpeakerRecognitionPlugin:
                 record = engine.db.enroll_unknown(embedding)
                 person_id = record["id"]
             else:
-                # Remembered anyway: "我是小王" must be able to create the
+                # `match` returns -1.0 as best_score on an empty database, and
+                # that distinction is the whole point: "nobody is enrolled" and
+                # "compared against the roster and nothing was close enough"
+                # need opposite responses, and a single number cannot say which.
+                #
+                # `speaker_best_similarity` is a *different key* from
+                # `speaker_similarity` rather than the same one with a null id:
+                # `speaker_similarity` means "this is the matched person's
+                # score", so reusing it for a miss invites reading a near-miss
+                # as an identification.
+                if score < 0:
+                    payload["speaker_reason"] = REASON_NO_SPEAKERS
+                else:
+                    payload["speaker_reason"] = REASON_NO_MATCH
+                    payload["speaker_best_similarity"] = round(float(score), 4)
+                # Remembered either way: "我是小王" must be able to create the
                 # identity from what was just heard.
-                payload["speaker_similarity"] = round(float(score), 4) if score >= 0 else 0.0
                 self._remember(embedding, None, duration, samples, rate, source)
                 return payload
         else:
@@ -1382,7 +1401,9 @@ __all__ = [
     "DEFAULT_MATCH_THRESHOLD",
     "DEFAULT_MIN_SPEECH_S",
     "REASON_MULTI_SPEAKER",
+    "REASON_NO_MATCH",
     "REASON_NO_RECENT",
+    "REASON_NO_SPEAKERS",
     "REASON_TOO_SHORT",
     "SpeakerRecognitionPlugin",
     "TOOLS",
