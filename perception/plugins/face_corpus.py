@@ -292,25 +292,28 @@ def corpus_entries(package, max_batch=1000):
         yield entries
 
 
-def load_image(source, is_url=False):
+def load_image(source, is_url=False, max_bytes=None):
     """Decode a local photo path or explicit HTTP(S) URL to uint8 HxWx3 RGB.
 
-    Encoded and decoded images are limited to 20 MiB. Invalid inputs raise
-    ValueError. URL loading is explicit and permits localhost file servers.
+    Encoded and decoded images are limited to `max_bytes` (default 20 MiB) —
+    callers with a configured transfer cap pass it, so the card setting and
+    the behaviour cannot drift apart. Invalid inputs raise ValueError. URL
+    loading is explicit and permits localhost file servers.
     """
+    limit = int(max_bytes) if max_bytes else MAX_IMAGE_BYTES
     try:
         if is_url:
             with tempfile.TemporaryDirectory(prefix="face-photo-") as staging:
                 path = Path(staging) / "photo"
-                _download(source, path, MAX_IMAGE_BYTES)
+                _download(source, path, limit)
                 data = path.read_bytes()
         else:
             path = _local(source)
-            if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > MAX_IMAGE_BYTES:
+            if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > limit:
                 raise ValueError("invalid or oversized image")
             with path.open("rb") as src:
-                data = src.read(MAX_IMAGE_BYTES + 1)
-        if not data or len(data) > MAX_IMAGE_BYTES:
+                data = src.read(limit + 1)
+        if not data or len(data) > limit:
             raise ValueError("empty or oversized image")
         image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None or image.nbytes > MAX_IMAGE_BYTES:

@@ -166,6 +166,21 @@ class CorpusTests(unittest.TestCase):
             with self.assertRaises(ValueError), corpus.corpus_entries(archive):
                 pass
 
+    def test_load_image_cap_is_optional_and_honored(self):
+        """Callers with a configured transfer cap pass it; the default stays
+        20 MiB. An over-cap file fails before decode, not after."""
+        path = self.photos / "tiny.png"
+        ok, buf = cv2.imencode(".png", np.full((4, 4, 3), 80, np.uint8))
+        self.assertTrue(ok)
+        path.write_bytes(buf.tobytes())
+
+        image = corpus.load_image(str(path))
+        self.assertEqual(image.shape, (4, 4, 3))
+        image = corpus.load_image(str(path), max_bytes=len(buf.tobytes()))
+        self.assertEqual(image.shape, (4, 4, 3))
+        with self.assertRaises(ValueError):
+            corpus.load_image(str(path), max_bytes=8)
+
     def test_load_image_rgb_and_errors(self):
         photo = self.photo("a.png")
         image = corpus.load_image(photo)

@@ -61,8 +61,8 @@ from utils.model_progress import fetch_status
 from utils.log_sampling import SampledLogGate, escape_log_text
 from urllib.parse import urlsplit
 from plugins import ort_worker
-from plugins.face_corpus import corpus_entries, load_image
-from plugins.image_input import BadInput, check_under_roots
+from plugins.face_corpus import MAX_IMAGE_BYTES, corpus_entries, load_image
+from plugins.image_input import DEFAULT_IMAGE_ROOTS, BadInput, check_under_roots
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +118,23 @@ _CONTAINER_SWEEP_THRESHOLDS = (
 )
 _CONTAINER_PORT_BASE = 15720
 _CONTAINER_PORT_STRIDE = 100
+
+
+def _image_byte_limit(cfg: dict) -> int | None:
+    """The configured per-photo transfer cap, or None for the decoder default.
+
+    `max_image_bytes` is declared on the card schema, so it has to be honored
+    on both local and URL photo inputs (face_corpus.load_image takes the cap)
+    rather than sitting in YAML doing nothing.
+    """
+    raw = cfg.get("max_image_bytes")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"max_image_bytes must be an integer, got {raw!r}")
+    return value or None
 
 
 def _window_seconds_arg(args: dict, default: float) -> float:
@@ -317,6 +334,29 @@ TOOLS = [
                     "type": "string",
                     "description": "Directory for downloaded model weights",
                     "default": "/models/face",
+                    "scope": "shared",
+                },
+                # The three settings below were honored from YAML but missing
+                # from the schema, so card/API users could not discover them.
+                "image_roots": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Roots a local image_path/package must live under",
+                    "default": list(DEFAULT_IMAGE_ROOTS),
+                    "scope": "shared",
+                },
+                "max_image_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Transfer cap for one photo, local or URL",
+                    "default": MAX_IMAGE_BYTES,
+                    "scope": "shared",
+                },
+                "max_batch": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum images accepted in one corpus package",
+                    "default": 1000,
                     "scope": "shared",
                 },
                 "similarity_threshold": {
@@ -1931,7 +1971,8 @@ class FaceRecognitionPlugin:
                 source = check_under_roots(
                     str(args.get("image_path") or ""), self._input_cfg,
                     url_action=action.replace("_photo", "_url"))
-            image = load_image(source, is_url=action.endswith("_url"))
+            image = load_image(source, is_url=action.endswith("_url"),
+                               max_bytes=_image_byte_limit(self._input_cfg))
             if action.startswith("register_"):
                 # person_id is documented on these actions and enroll() already
                 # enforces it (existing id merges/renames, unknown id is

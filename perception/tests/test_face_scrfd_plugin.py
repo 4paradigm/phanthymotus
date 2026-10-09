@@ -220,6 +220,44 @@ def test_several_weight_sources_ride_one_pinned_bundle(monkeypatch):
     assert seen["base_url"] == ["https://cos.invalid", "https://mirror.invalid"]
 
 
+# ── card-discoverable settings ───────────────────────────────────────────────
+
+def test_config_schema_declares_the_settings_the_plugin_honors():
+    """image_roots / max_image_bytes / max_batch were honored from YAML but
+    missing from the schema, so card and API users could not discover them."""
+    schema = face_scrfd.TOOLS[0]["configSchema"]["properties"]
+
+    assert set(schema) >= {"image_roots", "max_image_bytes", "max_batch"}
+    assert schema["image_roots"]["default"] == list(face_scrfd.DEFAULT_IMAGE_ROOTS)
+    assert schema["max_image_bytes"]["default"] == face_scrfd.MAX_IMAGE_BYTES
+    assert schema["max_batch"]["default"] == 1000
+
+
+def test_configured_max_image_bytes_is_honored_on_a_local_photo(tmp_path):
+    """The declared cap must actually cap: a photo over max_image_bytes is a
+    bad_input, not silently decoded."""
+    (tmp_path / "big.png").write_bytes(b"x" * 64)
+    plugin = _stub_plugin(_model=_LoadedModel(),
+                          _input_cfg={"max_image_bytes": 16})
+
+    result = plugin.dispatch("recognize_by_photo",
+                             {"image_path": str(tmp_path / "big.png")})
+
+    assert result["ok"] is False and result["reason"] == "bad_input"
+    assert "oversized" in result["detail"]
+
+
+def test_a_non_numeric_max_image_bytes_is_rejected():
+    plugin = _stub_plugin(_model=_LoadedModel(),
+                          _input_cfg={"max_image_bytes": "lots"})
+
+    result = plugin.dispatch("recognize_by_photo",
+                             {"image_path": "/tmp/anything.png"})
+
+    assert result["ok"] is False and result["reason"] == "bad_input"
+    assert "integer" in result["detail"]
+
+
 # ── detector normalisation ───────────────────────────────────────────────────
 
 def test_unknown_detector_is_rejected_not_silently_replaced():
