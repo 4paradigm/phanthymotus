@@ -154,12 +154,58 @@ def test_auto_enroll_is_on_by_default(tmp_path):
     assert again["speaker_id"] == "p-1"
 
 
+def test_a_new_identity_reports_no_similarity(tmp_path):
+    """刚建的身份没有「相似度」可报 —— 它不是被匹配出来的，是被创建出来的。
+
+    实机上第一句话发出的是 `speaker_similarity: -1.0`（空库哨兵值直接漏出去），
+    而库非空时漏出去的是「和别人比的最高分、没过阈值」—— 读起来像「p-3 以 0.49
+    匹配上了」，而真相是「没匹配上任何人，所以建了 p-3」。
+    """
+    plugin = make_plugin(tmp_path)
+    payload = plugin.identify_samples(clip(3.0))
+    assert payload["speaker_new"] is True
+    assert "speaker_similarity" not in payload
+    assert "speaker_best_similarity" not in payload, "空库没有「差一点」可言"
+    assert payload["speaker_id"] == "p-1"
+
+
+def test_a_new_identity_reports_the_closest_existing_voice(tmp_path):
+    """库非空时，新建身份要报出它和最接近的那个人差多少 —— 调阈值要用。"""
+    plugin = make_plugin(tmp_path)
+    plugin._engine.db.add("小王", [VOICE_A])
+    payload = plugin.identify_samples(clip(3.0, level=-0.5))   # VOICE_B
+    assert payload["speaker_new"] is True
+    assert payload["speaker_best_similarity"] == pytest.approx(0.0, abs=1e-6)
+    assert "speaker_similarity" not in payload
+
+
+def test_a_matched_identity_is_not_marked_new(tmp_path):
+    plugin = make_plugin(tmp_path)
+    plugin._engine.db.add("小王", [VOICE_A])
+    payload = plugin.identify_samples(clip(3.0))
+    assert "speaker_new" not in payload
+    assert payload["speaker_similarity"] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_similarity_is_never_negative_in_any_payload(tmp_path):
+    """-1.0 是 match() 的空库哨兵，不是一个相似度。它不该出现在任何 payload 里。"""
+    plugin = make_plugin(tmp_path)
+    payloads = [plugin.identify_samples(clip(3.0)),
+                plugin.identify_samples(clip(3.0)),
+                plugin.identify_samples(clip(3.0, level=-0.5))]
+    for payload in payloads:
+        for key in ("speaker_similarity", "speaker_best_similarity"):
+            if key in payload:
+                assert payload[key] >= 0.0, f"{key}={payload[key]}"
+
+
 def test_a_second_voice_gets_a_second_id(tmp_path):
     plugin = make_plugin(tmp_path)
     first = plugin.identify_samples(clip(3.0))
     second = plugin.identify_samples(clip(3.0, level=-0.5))
     assert first["speaker_id"] == "p-1"
     assert second["speaker_id"] == "p-2"
+    assert first["speaker_new"] is True and second["speaker_new"] is True
     assert plugin._engine.db.stats()["persons"] == 2
 
 

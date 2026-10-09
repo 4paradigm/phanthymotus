@@ -860,6 +860,7 @@ class SpeakerRecognitionPlugin:
 
         person_id, score = engine.db.match(embedding, gates["match_threshold"])
         record = None
+        created = False
         if person_id is None:
             # Enrolment needs a longer clip than matching — see
             # DEFAULT_ENROLL_MIN_SPEECH_S.
@@ -867,6 +868,7 @@ class SpeakerRecognitionPlugin:
             if gates["auto_enroll"] and long_enough:
                 record = engine.db.enroll_unknown(embedding)
                 person_id = record["id"]
+                created = True
             elif gates["auto_enroll"]:
                 payload["speaker_reason"] = REASON_TOO_SHORT_TO_ENROLL
                 if score >= 0:
@@ -898,7 +900,18 @@ class SpeakerRecognitionPlugin:
 
         engine.db.record_sighting(person_id, time.time(), source)
         payload["speaker_id"] = person_id
-        payload["speaker_similarity"] = round(float(score), 4)
+        if created:
+            # A just-created identity was not *matched*, so it has no similarity.
+            # `score` here is `match`'s best-against-everybody-else — `-1.0` on an
+            # empty roster, otherwise a number that failed the threshold. Either
+            # way, reporting it as `speaker_similarity` reads as "p-3 matched at
+            # 0.49" when p-3 was created *because* nothing matched. Measured on
+            # Orin 5: the first ever utterance published `speaker_similarity: -1.0`.
+            payload["speaker_new"] = True
+            if score >= 0:
+                payload["speaker_best_similarity"] = round(float(score), 4)
+        else:
+            payload["speaker_similarity"] = round(float(score), 4)
         if record.get("name"):
             payload["speaker_name"] = record["name"]
         if record.get("profile"):
