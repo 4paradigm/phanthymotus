@@ -920,6 +920,13 @@ class SpeakerRecognitionPlugin:
         `idle` wins over the engine's own state on purpose: a stopped card must
         read as stopped even though the model is still in memory, because what
         the operator turned off is the *attribution*, not the allocation.
+
+        **An armed card with no engine yet is `running`, not `loading`.** The
+        model loads on the first utterance (see `_do_start`), so "no engine" is
+        the normal resting state of a perfectly healthy card. Calling that
+        `loading` made the start-project poller wait for a load that nobody had
+        started — until its 15-minute timeout, at which point the card failed and
+        took the whole project down with it.
         """
         if not self._enabled:
             return "idle"
@@ -930,9 +937,7 @@ class SpeakerRecognitionPlugin:
             return "loading"
         if self._engine_state == "error":
             return "error"
-        if self._engine is not None:
-            return "running"
-        return "loading"
+        return "running"
 
     def _with_db_stats(self, result: dict, engine: _SpeakerEngine | None) -> dict:
         """Attach roster counts. Never fails info — it is the diagnostic path.
@@ -971,18 +976,31 @@ class SpeakerRecognitionPlugin:
         return self._with_db_stats(result, engine)
 
     def _do_start(self) -> dict:
-        """Arm the card and pre-load the model.
+        """Arm the card. **Does not pre-load the model.**
 
-        Pre-loading is the only real work: without it the first utterance pays
-        ~1-2 s for the model load inside the window ASR joins on, and that shows
-        up as a slow first reply with nothing to explain it.
+        It used to, to spare the first utterance the ~1-2 s model load. That was
+        withdrawn after a wedge on Orin 5: perception stopped answering MCP
+        entirely — 501% CPU, no VAD child process, and its log cut off exactly at
+        `multiprocessing.Process.start()`, i.e. the `fork` ASR does to run its
+        VAD. Everything downstream hung on it, including `stop-project`, so the
+        operator could not even stop the project.
+
+        Not reproduced on the next attempt, and **not proven to be this plugin's
+        doing** — forking a process that holds a CUDA context (ASR was on gpu)
+        and a pile of ONNX Runtime threads is a known hazard whoever creates the
+        threads. What is certain is that pre-loading here put a second model load
+        inside that window, where there was none before: in the wedged run the
+        extractor had finished 6 s *before* the fork, in the healthy one it
+        finished 2 s *after*.
+
+        So the load goes back to being lazy — `identify_pcm` triggers it on the
+        first utterance, long after any fork. The first identification pays for
+        it, which is a cost worth one or two seconds against a hang that takes
+        the whole project down. The real fix is for that child to be `spawn`ed
+        rather than forked; that is ASR's to make, and needs its own evidence.
         """
         with self._state_lock:
             self._enabled = True
-            off = is_off(str(self._plugin_cfg.get("model", DEFAULT_SPEAKER_MODEL)))
-            if (not off and self._engine is None
-                    and self._engine_state in ("idle", "error")):
-                self._spawn_loader_locked()
             state = self._card_state_locked()
             result = {"state": state, "desc": self._desc_locked(state)}
             engine = self._engine

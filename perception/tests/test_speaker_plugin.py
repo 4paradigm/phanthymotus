@@ -977,3 +977,49 @@ def test_management_works_on_the_real_off_engine(tmp_path):
     assert page["total"] == 1
     assert plugin.dispatch("speaker_recognition",
                            {"action": "forget", "speaker_id": "p-1"})["ok"] is True
+
+
+# ── 懒加载：start 不预加载模型 ───────────────────────────────────────────────
+
+def test_start_does_not_load_the_model(tmp_path):
+    """预加载被撤掉了 —— 它把一次模型加载放进了 ASR fork 出 VAD 子进程的窗口里。
+
+    Orin 5 上出现过一次：perception 整体不再应答 MCP（501% CPU、没有 VAD 子进程、
+    日志正好断在 fork 那一行），于是 stop-project 也挂死，操作员连项目都停不掉。
+    没能复现，也没证明是这个插件造成的 —— 但在那个窗口里多加一次模型加载是我加的，
+    收益只是省掉第一句话的 1-2 秒。
+    """
+    plugin = SpeakerRecognitionPlugin({"db_dir": str(tmp_path)}, executor=None)
+    plugin.dispatch("speaker_recognition", {"action": "start"})
+    assert plugin._engine is None
+    assert plugin._engine_state == "idle", "start 不该触发后台加载"
+
+
+def test_an_armed_card_with_no_engine_reads_as_running(tmp_path):
+    """没有引擎是**健康**卡片的常态（模型按需加载），不是「在加载」。
+
+    报 loading 会让 start-project 的轮询去等一个根本没人发起的加载，一直等到
+    15 分钟超时，然后判这张卡失败、把整个项目回滚。
+    """
+    plugin = SpeakerRecognitionPlugin({"db_dir": str(tmp_path)}, executor=None)
+    result = plugin.dispatch("speaker_recognition", {"action": "start"})
+    assert result["state"] == "running"
+    assert plugin.dispatch("speaker_recognition",
+                           {"action": "info"})["state"] == "running"
+
+
+def test_a_real_load_still_reads_as_loading(tmp_path):
+    plugin = SpeakerRecognitionPlugin({"db_dir": str(tmp_path)}, executor=None)
+    plugin._engine_state = "loading"
+    assert plugin.dispatch("speaker_recognition",
+                           {"action": "info"})["state"] == "loading"
+
+
+def test_the_first_utterance_triggers_the_load(tmp_path):
+    """懒加载的另一半：第一句话要真的把它拉起来。"""
+    plugin = SpeakerRecognitionPlugin({"db_dir": str(tmp_path)}, executor=None)
+    plugin.dispatch("speaker_recognition", {"action": "start"})
+    calls = []
+    plugin._spawn_loader_locked = lambda: calls.append(1)
+    plugin.identify_samples(clip(3.0))
+    assert calls, "identify 没有触发加载，模型就永远不会被拉起来"
