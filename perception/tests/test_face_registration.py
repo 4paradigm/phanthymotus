@@ -198,6 +198,23 @@ class PersistenceContracts(unittest.TestCase):
         self.assertEqual(self.adapter.detect_and_embed.call_count, 1)
         self.assertEqual(self.reopen().enroll([1., 0.])['person_id'], 'p-10')
 
+    def test_gallery_import_escapes_hostile_names_in_logs(self):
+        """Gallery names and decoder errors are file-controlled; a writable
+        face-db entry must not be able to forge log records through either."""
+        person = self.root / 'p-8'
+        person.mkdir()
+        (person / 'evil\nline.png').write_bytes(b'not an image')
+
+        db = self.ns['FaceDatabase']()
+        with self.assertLogs(self.ns['log'].name, level='WARNING') as captured:
+            db.load_from_dir(str(self.root), self.adapter)
+
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(any('failed to load' in message for message in messages),
+                        messages)
+        for message in messages:
+            self.assertNotIn('\n', message, message)
+
     def test_model_mismatch_and_corruption_fail_without_reimport(self):
         self.legacy_image()
         self.reopen()

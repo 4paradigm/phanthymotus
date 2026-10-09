@@ -12,6 +12,11 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests -q
 
 from __future__ import annotations
 
+import http.server
+import threading
+import urllib.error
+import urllib.request
+
 import pytest
 
 import vision_stubs  # noqa: F401  (puts the perception root on sys.path)
@@ -134,6 +139,41 @@ def test_bad_input_renders_as_a_dispatch_result():
     result = BadInput("nope", "/x.jpg").as_result()
     assert result == {"ok": False, "reason": "bad_input",
                       "detail": "nope", "source": "/x.jpg"}
+
+
+def test_a_redirect_to_ftp_is_refused():
+    """urllib's redirect allow-list includes ftp:, so an http(s) URL could
+    hand this container to an ftp endpoint. Every redirect target is
+    revalidated against the module's http(s)-only policy."""
+    handler = image_input._Redirect308()
+    with pytest.raises(urllib.error.HTTPError, match="non-http"):
+        handler.redirect_request(
+            urllib.request.Request("http://example.invalid/x"), None,
+            302, "Found", {}, "ftp://evil.invalid/steal")
+
+
+def test_a_redirect_to_ftp_is_refused_end_to_end():
+    """The opener actually in use carries that handler, not just the class."""
+    class _Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", "ftp://evil.invalid/steal")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/a.jpg"
+        with pytest.raises(BadInput, match="non-http"):
+            image_input.fetch_url(url, 1024)
+        with pytest.raises(BadInput, match="non-http"):
+            image_input.open_url(url).read()
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_a_308_redirect_is_followed():

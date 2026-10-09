@@ -728,10 +728,16 @@ class FaceDatabase:
                                      f"{escape_log_text(img_file.name)}")
                         else:
                             n_fail += 1
-                            log.warning(f"[face] no face detected in {img_file}")
+                            log.warning(f"[face] no face detected in "
+                                        f"{escape_log_text(img_file)}")
                     except Exception as e:
                         n_fail += 1
-                        log.warning(f"[face] failed to load {img_file}: {e}")
+                        # Gallery names and decoder errors are file-controlled:
+                        # a writable face-db entry must not be able to forge a
+                        # log record through either (same rule as topics).
+                        log.warning(f"[face] failed to load "
+                                    f"{escape_log_text(img_file)}: "
+                                    f"{escape_log_text(e)}")
 
             self._reserve_ids_locked()
             total = sum(len(v) for v in self._embeddings.values())

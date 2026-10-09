@@ -128,6 +128,20 @@ class _Redirect308(urllib.request.HTTPRedirectHandler):
     def http_error_308(self, req, fp, code, msg, headers):
         return self.http_error_301(req, fp, 301, msg, headers)
 
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Every redirect target is revalidated against the module policy.
+
+        urllib's own allow-list includes ftp:, so without this an http(s) URL
+        could hand this container — unauthenticated MCP, uid 0 — to an ftp
+        endpoint. The scheme check on the initial URL is not enough: the
+        redirect is where the caller stops controlling the destination.
+        """
+        if not str(newurl).lower().startswith(("http://", "https://")):
+            raise urllib.error.HTTPError(
+                newurl, code, f"redirect to non-http(s) URL refused: {newurl!r}",
+                headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 
 _OPENER = urllib.request.build_opener(_Redirect308())
 
