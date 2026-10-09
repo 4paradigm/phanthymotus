@@ -379,6 +379,63 @@ plugins:
 
   soundevent:
     enabled: true
+  speaker_recognition:
+    enabled: true
+    # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
+    # 走 sherpa-onnx 自带的那份 ONNX Runtime —— 和 ASR/TTS 同一份，所以不会触发
+    # plugins/face_runtime.py 记录的双 ORT 冲突，也不需要 face 那套子进程隔离。
+    model: campplus_zh_en
+    # 和 face_db 一样，唯一可写的宿主挂载路径是 /models。
+    db_dir: /models/speaker_db
+    # 每个声纹留一段可播放的代表音频。/models/vad_segments 只存 1000 条且会滚动，
+    # 几天后就没了，而 get_speaker 要在几个月后还能放出来给人听 —— 声纹是从匿名
+    # 话语建的，判断「这是谁」只能靠听。
+    sample_dir: /models/speaker_db/samples
+    # cpu 是默认且通常是对的。实测（Orin 6, jp6.1）gpu 单跑 62 ms vs cpu 101 ms，
+    # 快 1.62 倍；但端到端换不出收益：ASR 在 cpu 时声纹完全藏在它的 230 ms 后面
+    # （并发净增 2-7 ms），ASR 在 gpu 时两个 CUDA session 争同一块 GPU，搬上去只
+    # 省 3 ms 还多占 478 MB。
+    device: cpu
+    num_threads: 2
+    warmup: true
+    # 余弦相似度阈值。**0.6 是起点，不是实测值** —— sherpa 自己示例的默认值。
+    # face 的 0.35 是 ArcFace 的尺度，不能照搬。认错人就调高，认不出就调低，
+    # 并把看到的现象记下来。定它需要标注语料（几个人各若干句、用机器人自己的
+    # 麦克风录），这件事还没做。
+    match_threshold: 0.6
+    # 质量门。声纹在 1.5 秒以下急剧退化，而 VAD 只要 0.5 秒就出段，所以
+    # 「嗯」「好」「停」会产生垃圾 embedding。不够长只报听到了、不给身份。
+    # 同样是起点不是实测值。
+    min_speech_s: 1.5
+    # 超过这个时长就检查这一段里是否换过人：算「前 4 秒窗口」和「整段」两个
+    # embedding，余弦低于 coherence_min 就判定多说话人并**不给身份**。
+    # 这不是假想的问题：Orin 5 上 73 段真实长语音，cosine(整段, 前3秒) 的
+    # p50 是 0.843 但 p05 只有 0.197 —— 一个窗口不可能和它自己的母段无关，
+    # 除非母段是两个人的混合。
+    split_above_s: 4.0
+    coherence_min: 0.8
+    # 默认关，不是胆小：perception 里没有任何回声消除，机器人自己的 TTS 会被
+    # 麦克风收进去。ASR 侧表现为乱文本被过滤掉，声纹侧表现为把机器人自己的声音
+    # 登记成一个人，然后每次它说话都「认出」这个人。电视、音箱、走廊路人同理。
+    # 先跑一周看库里长出什么，确认污染率之后再开。
+    auto_enroll: false
+    # 默认开，是免费拿到的最大一档准确率提升。已命名的人每说一句质量够好的话就
+    # 补一条样本；声纹随距离/感冒/情绪/嘈杂漂移比人脸随光照大得多，而打分取样本
+    # 最大值而非质心平均，所以补样本只会更准。写盘在后台线程做 —— ASR 在 publish
+    # 前会 join 声纹，inline 写会把 eMMC 的开销压在每句话上。
+    auto_add_samples: true
+    sample_min_similarity: 0.75
+    sample_min_speech_s: 2.0
+    # 未命名声纹上限，超出淘汰最久未听到的；已命名不受影响。
+    unknown_capacity: 50
+    max_samples_per_person: 8
+    # 独立模式（这张卡直接订阅音频 topic）才用得到的 VAD 参数。被 ASR 喂的时候
+    # 切分由 ASR 的 vad_silence_ms 决定，这里的值无效。独立时用更长的静音间隔，
+    # 出更少、更长、对声纹更可用的段。
+    vad_threshold: 0.5
+    vad_silence_ms: 600
+    vad_max_speech_s: 20.0
+
   face_recognition:
     enabled: true
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.

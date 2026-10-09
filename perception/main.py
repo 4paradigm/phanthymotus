@@ -114,10 +114,29 @@ class PerceptionBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        # Built before ASR, and that order is load-bearing: ASR takes a handle
+        # to this plugin so the voiceprint can be computed on the VAD segment it
+        # already cut, concurrently with transcription. The handle is optional —
+        # ASR publishes an identity-free payload when it is absent, which is
+        # what happens when speaker_recognition is disabled or still loading.
+        #
+        # Deliberately *not* guarded the way TTSPlugin is: the constructor here
+        # does no model work (the engine loads single-flight in a background
+        # thread on first use), so there is nothing for it to fail on.
+        speaker_plugin = None
+        if plugins_cfg.get("speaker_recognition", {}).get("enabled", False):
+            from plugins.speaker import SpeakerRecognitionPlugin
+            speaker_plugin = SpeakerRecognitionPlugin(
+                plugins_cfg["speaker_recognition"], executor)
+            self._plugins.append(speaker_plugin)
+            log.info("SpeakerRecognitionPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from plugins.asr import ASRPlugin
-            self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
-            log.info("ASRPlugin loaded")
+            self._plugins.append(
+                ASRPlugin(plugins_cfg["asr"], executor, speaker=speaker_plugin))
+            log.info("ASRPlugin loaded (speaker=%s)",
+                     "yes" if speaker_plugin else "no")
 
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin

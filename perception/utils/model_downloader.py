@@ -888,6 +888,51 @@ def ensure_face_model(model_dir: str, bundle: str = "face",
                                   progress_cb=progress_cb)
 
 
+# ── Speaker embedding (voiceprint) ───────────────────────────────────────────
+# Re-hosted on COS for the same reason as the face models: the upstream GitHub
+# release redirects to a signed, expiring URL that cannot be pinned, and the
+# robots have no reliable route to GitHub.
+SPEAKER_MODEL_BASE = os.environ.get(
+    "SPEAKER_MODEL_BASE_URL", f"{COS_BASE}/speaker/campplus_zh_en"
+)
+# Pinned against the COS copy, **re-downloaded and re-hashed after upload**, so
+# this is the bytes a robot will actually receive. Verified 2026-10-09 to be
+# byte-identical to the `checksum.txt` entry in sherpa-onnx's
+# `speaker-recongition-models` release.
+SPEAKER_MODEL_FILES = {
+    # 3D-Speaker CAM++, 200k speakers, Chinese+English, 192-d, 16 kHz.
+    # Apache-2.0. ONNX metadata: output_dim=192, sample_rate=16000,
+    # normalize_samples=1, feature_normalize_type=global-mean.
+    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": {
+        "size": 28281164,
+        "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+    },
+}
+
+SPEAKER_MODEL_BUNDLES = {
+    "campplus_zh_en": (SPEAKER_MODEL_BASE, SPEAKER_MODEL_FILES),
+}
+
+
+def ensure_speaker_model(model_dir: str, bundle: str = "campplus_zh_en",
+                         progress_cb=None) -> dict[str, str]:
+    """Ensure a speaker-embedding ONNX model is present.
+
+    `bundle` selects which pinned set to fetch, so a second model added to
+    `plugins.speaker_runtime.SPEAKER_MODELS` brings its own size and hash rather
+    than reusing these.
+    """
+    spec = SPEAKER_MODEL_BUNDLES.get(bundle)
+    if spec is None:
+        raise ValueError(
+            f"unknown speaker model bundle {bundle!r}; this build has "
+            f"{sorted(SPEAKER_MODEL_BUNDLES)}")
+    base, files = spec
+    model_dir = require_models_subpath(model_dir)
+    return ensure_verified_bundle(bundle, model_dir, base, files,
+                                  progress_cb=progress_cb)
+
+
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict,
                             progress_cb=None, stage_cb=None) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
