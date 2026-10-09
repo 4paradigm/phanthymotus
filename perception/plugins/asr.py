@@ -976,6 +976,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     speech_buf = b''
     start_ts = None
     end_ts = None
+    utterance_pre_roll_bytes = 0
     _was_speaking = False  # Track speech onset for hook notification
 
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx)")
@@ -1096,6 +1097,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 )
                 start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
                 speech_buf = pre_pcm + seg_pcm
+                # Per *utterance*, not per segment: pre-roll is only prepended to
+                # the first segment of an utterance, and the later ones append to
+                # the same buffer.
+                utterance_pre_roll_bytes = len(pre_pcm)
             else:
                 pre_pcm = b''
                 speech_buf += seg_pcm
@@ -1110,12 +1115,23 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 )
                 if save_vad_segments:
                     _save_segment_pcm(speech_buf)
+                # 第四项是这一段开头有多少字节是 pre-roll。对 ASR 它是有益的
+                # （不吃字头），对声纹 embedding 它是污染：vad_pre_roll_ms 默认
+                # 500，而一个 1.5 秒的段里 500 毫秒是静音或别人的尾音，占三分之
+                # 一。消费侧用它把 pre-roll 剥掉再算 embedding，transcribe 仍然
+                # 吃完整的 buffer。
+                #
+                # 必须从这里传出去：speech_buf 是 pre_pcm + seg_pcm 拼好的，
+                # 父进程看不出边界在哪。不传的话，调 vad_pre_roll_ms 会改变声纹
+                # 识别率，而没有人会想到去那里找。
                 result_q.put((speech_buf,
                               seg_end_ts if start_ts is None else start_ts,
-                              seg_end_ts if end_ts is None else end_ts))
+                              seg_end_ts if end_ts is None else end_ts,
+                              utterance_pre_roll_bytes))
                 speech_buf = b''
                 start_ts = None
                 end_ts = None
+                utterance_pre_roll_bytes = 0
 
     _log.info("[vad-worker] process exiting")
 
@@ -1127,7 +1143,7 @@ class _ASRNode(Node):
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
                  kws_cfg: dict = None, node_suffix: str = '',
                  save_vad_segments: bool = False, max_saved_segments: int = 1000,
-                 vad_pre_roll_ms: int = 500):
+                 vad_pre_roll_ms: int = 500, speaker=None):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -1142,6 +1158,10 @@ class _ASRNode(Node):
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
         self._vad_pre_roll_ms = vad_pre_roll_ms
+        # The SpeakerRecognitionPlugin, or None. Optional on purpose: an
+        # utterance with no identity is a complete, publishable result, and ASR
+        # must never fail or stall because voiceprints are unavailable.
+        self._speaker = speaker
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -1372,6 +1392,59 @@ class _ASRNode(Node):
 
         return pcm
 
+    # ── 声纹：并发计算，带 timeout 的收集 ────────────────────────────────
+
+    # 等声纹结果的上限。实测 p90 是 118-192 ms，所以 1 秒是 5-10 倍余量。
+    # **裸 join 是不行的**：ASR 的发布路径今天不可能被声纹拖死，加了 join 之后就
+    # 可能 —— 一次 compute() 卡住就等于 ASR 永久不再发任何东西。超时就不带身份
+    # 发出去、打日志，让那个孤儿线程自己跑完（结果丢弃，短命线程不漏）。
+    _IDENTIFY_TIMEOUT_S = 1.0
+
+    def _start_identify(self, utterance: bytes, pre_roll_bytes: int):
+        """在一个线程里开始算声纹，立刻返回句柄。拿不到 speaker 时返回 None。
+
+        剥掉 pre-roll 再算：那 500 ms 对 ASR 有益（不吃字头），对一个 1.5 秒的段
+        里的 embedding 是三分之一的污染。transcribe 仍然吃完整的 buffer。
+        """
+        speaker = self._speaker
+        if speaker is None:
+            return None
+        pcm = utterance
+        if 0 < pre_roll_bytes < len(utterance):
+            pcm = utterance[pre_roll_bytes:]
+        box: dict = {}
+
+        def run() -> None:
+            # 线程内兜底：异常不能让线程带着它死掉导致 box 永远空着而上面还在等
+            # —— identify_pcm 自己已经不抛了，这一层是防它以后变。
+            try:
+                box['fields'] = speaker.identify_pcm(
+                    pcm, source=self._input_topic)
+            except Exception as error:  # noqa: BLE001
+                log.debug(f"[asr] speaker identify raised: {error}")
+
+        thread = threading.Thread(target=run, name='asr-speaker', daemon=True)
+        thread.start()
+        return thread, box
+
+    def _collect_identity(self, handle) -> dict:
+        """等那个线程，最多 _IDENTIFY_TIMEOUT_S，返回要合并进 payload 的字段。"""
+        if handle is None:
+            return {}
+        thread, box = handle
+        thread.join(timeout=self._IDENTIFY_TIMEOUT_S)
+        if thread.is_alive():
+            log.warning(
+                f"[asr] speaker identify exceeded {self._IDENTIFY_TIMEOUT_S}s; "
+                f"publishing without an identity")
+            return {}
+        fields = box.get('fields') or {}
+        # speech_duration_s 是声纹侧的质量信息（够不够长、是不是多说话人都靠它
+        # 解释），但 audio_duration_ms 已经在 payload 里，两个表达同一件事只会
+        # 让 LLM 困惑。保留声纹自己的 key，丢掉重复的那个。
+        fields.pop('speech_duration_s', None)
+        return fields
+
     def _worker(self):
         try:
             self._worker_inner()
@@ -1422,6 +1495,11 @@ class _ASRNode(Node):
                         log.debug(f"[asr] fire on_hearing failed: {_he}")
                     continue
                 utterance, start_ts, end_ts = item[:3]
+                # Fourth element since speaker recognition: how many leading
+                # bytes are VAD pre-roll. Tolerate its absence so a mismatched
+                # pair of worker/parent (a hot-copied file, a rolling restart)
+                # degrades to "no pre-roll known" instead of raising.
+                pre_roll_bytes = int(item[3]) if len(item) > 3 else 0
             except Exception:
                 continue
             try:
@@ -1429,11 +1507,30 @@ class _ASRNode(Node):
 
                 # 性能 span 记录
                 _spans = []
+                # 声纹和 transcribe **并发**，不是串行相加。实测（25 段真实语音
+                # × 3 轮，串并交替以消掉负载漂移）：
+                #
+                #   ASR 单跑 p50   215 ms (jp5.11) / 232 ms (jp6.1)
+                #   声纹单跑 p50    86 ms          / 102 ms
+                #   串行           299 ms          / 334 ms
+                #   并行           218 ms          / 239 ms   ← 净增 2-7 ms
+                #
+                # 并行只比 max(两者) 高 2-7 ms，即几乎完全重叠：sherpa 在推理里
+                # 放了 GIL，6 核跑 2+2 线程在 vop/OCR/TTS 都在的情况下仍有余量。
+                _identity = self._start_identify(utterance, pre_roll_bytes)
                 _t0 = time.time()
                 text  = self._adapter.transcribe(wav, self._language)
                 _spans.append({"span": "asr_transcribe", "component": "perception",
                                "start_ts": _t0, "end_ts": time.time(),
                                "meta": {"audio_ms": int(len(utterance) / 32)}})
+                # 收声纹结果。**必须在 kws 门之前**，而且分成两件事：
+                #   - 记录在场（record_sighting，在 identify 内部做）：每段无条件；
+                #   - 身份进 payload：只有实际 publish 的那条才附加。
+                # trigger_mode 默认是 asr_kws，没有唤醒词的句子在下面直接
+                # continue 且永不 publish。只挂在 publish 路径上的话，出现记录里
+                # 就只有说过唤醒词的人，而「谁在房间里待过」这个能力基本是空的。
+                # 额外成本为零：transcribe 本来也在门前对每段都跑。
+                _speaker_fields = self._collect_identity(_identity)
                 if not text.strip(): continue
 
                 # ASR-based keyword spotting
@@ -1471,7 +1568,12 @@ class _ASRNode(Node):
                           "text_length": len(text),
                           "priority": 1,
                           "kws_triggered": _kws_was_triggered,
-                          "spans": _spans}
+                          "spans": _spans,
+                          # 空值不进来：plugins/speaker.py 只返回带信息的 key，
+                          # 所以这里直接合并。`"speaker_profile": {}` 这种东西
+                          # LLM 要为它付 token 而拿不到信息，还会让它以为「这个
+                          # 人有 profile，只是空的」。
+                          **_speaker_fields}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
                 log.info(f"[asr] {text!r}")
@@ -1491,7 +1593,7 @@ class _ASRNode(Node):
 class ASRPlugin:
     PREFIX = "asr"
 
-    def __init__(self, plugin_cfg: dict, executor):
+    def __init__(self, plugin_cfg: dict, executor, speaker=None):
         from utils.onnx_provider import normalize_device
         self._language     = plugin_cfg.get('language', 'zh-CN')
         self._asr_model    = plugin_cfg.get('asr_model', DEFAULT_ASR_MODEL)
@@ -1535,6 +1637,12 @@ class ASRPlugin:
         self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
         self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
         self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
+        # plugins/speaker.SpeakerRecognitionPlugin, or None. main.py builds it
+        # first and hands it over; see the comment there. Held as a plain
+        # attribute rather than looked up: the identity is computed on the PCM
+        # this plugin already has, which is below the ASR adapter, so it is
+        # independent of which ASR model is loaded and survives a model switch.
+        self._speaker = speaker
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         # main.py serves MCP over ThreadingHTTPServer, so start/stop/config can
         # run concurrently on this plugin. Guards read-modify-write of _nodes
@@ -1775,7 +1883,8 @@ class ASRPlugin:
                                     node_suffix=node_key.replace('/', '_').replace('-', '_'),
                                     save_vad_segments=self._save_vad_segments,
                                     max_saved_segments=self._max_saved_segments,
-                                    vad_pre_roll_ms=self._vad_pre_roll_ms)
+                                    vad_pre_roll_ms=self._vad_pre_roll_ms,
+                                    speaker=self._speaker)
                     try:
                         self._executor.add_node(node)
                     except Exception:
