@@ -199,3 +199,75 @@ def test_identify_is_called_before_the_kws_gate_in_source():
     assert start_at < collect_at < gate_at, (
         "identify 跑到 KWS 门后面去了 —— 未触发的话语将不再被记录"
     )
+
+
+# ── 未触发的话语 → 独立 topic ────────────────────────────────────────────────
+
+def test_overheard_payload_routes_to_the_background():
+    """`priority: 0` 和 `log_type: true` 两个都必需，缺一个就静默丢数据。
+
+    priority 决定它进后台而不是打断主 agent（collector._extract_priority 里 JSON
+    的 priority 优先于按 source 匹配）。log_type 决定 bg 管道对它追加而不是 1 秒
+    内替换、只渲染最后一条 —— 没有它这条 topic 能发出去、看起来工作，而一场
+    30 秒的旁人对话到 subagent 面前只剩最后半句。
+    """
+    import json as _json
+    node = make_node(None)
+    node._publish_overheard("明天的会改到三点", 100.0, 102.0, pcm(32000),
+                            {"speaker_id": "p-3", "speaker_name": "小王"})
+    published = node._overheard_pub.messages
+    assert len(published) == 1
+    payload = _json.loads(published[0])
+    assert payload["priority"] == 0
+    assert payload["log_type"] is True
+    assert payload["overheard"] is True
+    assert payload["text"] == "明天的会改到三点"
+    assert payload["speaker_name"] == "小王"
+
+
+def test_overheard_goes_to_its_own_topic():
+    """独立 topic，不是同一条带 priority 0 —— 否则两种话在 ring buffer、
+    raw_input_info 和画布上混在一起，而且共用一个节流桶。"""
+    node = make_node(None)
+    assert node._overheard_topic == "/mic/audio/asr_overheard"
+    assert node._overheard_topic != node._output_topic
+
+
+def test_overheard_without_an_identity_still_publishes():
+    import json as _json
+    node = make_node(None)
+    node._publish_overheard("随便说的", 1.0, 2.0, pcm(16000), {})
+    payload = _json.loads(node._overheard_pub.messages[0])
+    assert "speaker_id" not in payload
+    assert payload["text"] == "随便说的"
+
+
+def test_overheard_publish_never_raises():
+    """这条路径是附带收益，不能让它影响 ASR 的主输出。"""
+    node = make_node(None)
+
+    def boom(_msg):
+        raise RuntimeError("publisher gone")
+
+    node._overheard_pub.publish = boom
+    node._publish_overheard("x", 1.0, 2.0, b"\x00\x01", {})      # 不抛即通过
+
+
+def test_status_reports_both_output_topics():
+    node = make_node(None)
+    outs = [entry["topic"] for entry in node._status_dict()["topic_out"]]
+    assert node._output_topic in outs
+    assert node._overheard_topic in outs
+
+
+def test_overheard_is_published_from_the_unmatched_branch():
+    """源码守卫：未匹配唤醒词的分支必须在 continue 之前发出去。
+
+    这是一行挪动就能静默破坏的 —— 挪到 continue 之后就永远不执行，而测试和日志
+    都不会有任何异样。
+    """
+    source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
+    branch = source[source.index("if not matched:"):]
+    branch = branch[:branch.index("# Extract text after keyword")]
+    assert "_publish_overheard" in branch
+    assert branch.index("_publish_overheard") < branch.index("continue")

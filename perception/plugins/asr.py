@@ -438,7 +438,14 @@ TOOLS = [
             "required": []
         },
         "topic_in":  [{"format": "audio/pcm-16k", "desc": "mic audio input"}],
-        "topic_out": [{"format": "data/json",     "desc": "ASR result event"}],
+        # 两条输出。第二条是未触发唤醒词的话语，带 priority 0 —— 它**不会自动流
+        # 到 LLM**：agent-core 订阅的是画布上连进 decision_core 入口的 topic
+        # （api/mcp_manage.py 的 all_topics 来自那次 start 调用的参数），不是这里
+        # 声明的 topic_out。要用它就得在画布上连一根线。
+        "topic_out": [
+            {"format": "data/json", "desc": "ASR result event"},
+            {"format": "data/json", "desc": "未触发唤醒词的话语（走后台 subagent）"},
+        ],
     }
 ]
 
@@ -1148,11 +1155,17 @@ class _ASRNode(Node):
         super().__init__(node_name)
         self._input_topic  = input_topic
         self._output_topic = f"{input_topic}/asr"
+        # 第二条输出：KWS 未触发的话语。独立 topic 而不是同一条带 priority 0，
+        # 这样它在 ring buffer / raw_input_info / 画布上有自己的 source 和自己的
+        # 节流桶，不和「对机器人说的话」混在一起。
+        self._overheard_topic = f"{input_topic}/asr_overheard"
         self._adapter  = adapter
         self._language = language
         self.state     = "idle"
         self._sub      = None
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
+        self._overheard_pub = self.create_publisher(
+            String, self._overheard_topic, _ASR_PUB_QOS)
         # VAD runs in a separate process to avoid GIL contention
         self._vad_backend = vad_backend
         self._vad_threshold = vad_threshold
@@ -1445,6 +1458,40 @@ class _ASRNode(Node):
         fields.pop('speech_duration_s', None)
         return fields
 
+    def _publish_overheard(self, text: str, start_ts, end_ts,
+                           utterance: bytes, speaker_fields: dict) -> None:
+        """旁边听到、但没在跟机器人说的话。
+
+        `priority: 0` 是路由的全部机制：`collector._extract_priority` 读 JSON 里
+        的 priority **优先于**按 source 匹配，所以这条即使 source 里含 `asr`
+        也会落进 bg buffer 而不是打断主 agent。
+
+        `log_type: true` 是第二件必需的事。bg 管道原本只服务仪表读数，对它们
+        「最新值取代旧值」是对的；对话不是读数，丢一条就永久丢了。这个标记让
+        collector 对这条 source 改成追加并渲染全部条目，而不是 1 秒内替换、只给
+        最后一条。没有它的话这条 topic 能发出去、看起来工作，而一场 30 秒的旁人
+        对话到 subagent 面前只剩最后半句。
+
+        永不抛：这条路径是附带收益，不能让它影响 ASR 的主输出。
+        """
+        try:
+            payload = {
+                "text": text,
+                "overheard": True,
+                "priority": 0,
+                "log_type": True,
+                "audio_start_ts": start_ts,
+                "audio_end_ts": end_ts,
+                "audio_duration_ms": int(len(utterance) / 32),
+                **(speaker_fields or {}),
+            }
+            message = String()
+            message.data = json.dumps(payload, ensure_ascii=False)
+            self._overheard_pub.publish(message)
+            log.info(f"[asr] overheard {text!r}")
+        except Exception as error:  # noqa: BLE001
+            log.debug(f"[asr] publish overheard failed: {error}")
+
     def _worker(self):
         try:
             self._worker_inner()
@@ -1550,6 +1597,13 @@ class _ASRNode(Node):
 
                     log.info(f"[asr] asr_kws: text='{text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
                     if not matched:
+                        # 没有唤醒词 —— 不是对机器人说的，所以不进主 agent。但也
+                        # 不是没有用：旁边说的话里有间接指令、和当前任务相关的
+                        # 信息、值得记住的事实。发到独立 topic 上、标 priority 0，
+                        # agent-core 的 collector 据此送后台 subagent（priority
+                        # 字段优先于 source 匹配，见 collector._extract_priority）。
+                        self._publish_overheard(text, start_ts, end_ts,
+                                                utterance, _speaker_fields)
                         continue
                     # Extract text after keyword
                     remaining = _text_after_phoneme(text, text_char_ends, end_pos)
@@ -1584,7 +1638,11 @@ class _ASRNode(Node):
         return {
             "state":     self.state,
             "topic_in":  [{"topic": self._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
-            "topic_out": [{"topic": self._output_topic, "format": "data/json",     "desc": "ASR result"}],
+            "topic_out": [
+                {"topic": self._output_topic, "format": "data/json", "desc": "ASR result"},
+                {"topic": self._overheard_topic, "format": "data/json",
+                 "desc": "未触发唤醒词的话语（priority 0，走后台 subagent）"},
+            ],
         }
 
 
