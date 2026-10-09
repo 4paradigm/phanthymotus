@@ -1870,23 +1870,41 @@ class ASRPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            input_topic = args.get("input_topic", "")
             # Report loading/error state at plugin level. A start that is still
             # queued behind the load counts as loading too: the caller polling
             # this reads anything else as final, and `idle` in that window would
             # be reported as a cancelled card moments before the node comes up.
+            #
+            # **These still report their topics.** The output topics are derived
+            # from `input_topic`, which the caller just handed us — a loading
+            # card knows perfectly well where it is going to publish. Returning
+            # nothing here failed the *wiring* check rather than the card:
+            # start-project resolves every connection from the upstream card's
+            # info(), so on a cold model `asr -> decision_core` came back
+            # 「连线缺少 topic」 and rolled the whole project back. Starting it a
+            # second time worked, because by then the model was warm — which is
+            # exactly the shape of bug that gets written off as a flake.
             if self._loading or self._pending_starts:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "loading",
+                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
+                                   "desc": ""}] if input_topic else []),
+                    "topic_out": _asr_topics_out(
+                        input_topic, self._publish_overheard_enabled),
                     "desc": self._load_status or f"正在加载模型 '{self._asr_model}' …",
                 }
             if self._load_error:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "error",
+                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
+                                   "desc": ""}] if input_topic else []),
+                    "topic_out": _asr_topics_out(
+                        input_topic, self._publish_overheard_enabled),
                     "desc": f"Model load failed: {self._load_error}",
                 }
-            input_topic = args.get("input_topic", "")
             # Snapshot under the lock: info is a heartbeat probe and iterating
             # the live dict can raise "dictionary changed size" mid-start.
             with self._nodes_lock:

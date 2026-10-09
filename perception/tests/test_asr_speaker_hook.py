@@ -369,3 +369,99 @@ def test_every_info_branch_uses_the_shared_builder():
 def test_status_dict_agrees_with_info():
     node = make_node(None)
     assert node._status_dict()["topic_out"] == asr_module._asr_topics_out("/mic/audio")
+
+
+# ── 冷启动：加载中也必须报出 topic ───────────────────────────────────────────
+
+class _StubExecutor:
+    def add_node(self, node): pass
+    def remove_node(self, node): pass
+
+
+def make_plugin(**cfg) -> asr_module.ASRPlugin:
+    """A plugin that never builds an adapter — only the info paths are exercised."""
+    plugin = asr_module.ASRPlugin.__new__(asr_module.ASRPlugin)
+    plugin._asr_model = "sensevoice-small"
+    plugin._device = "cpu"
+    plugin._plugin_cfg = {}
+    plugin._loading = False
+    plugin._load_error = None
+    plugin._load_status = ""
+    plugin._load_target = ("sensevoice-small", "cpu")
+    plugin._pending_starts = {}
+    plugin._adapter = None
+    plugin._language = "zh-CN"
+    plugin._speaker = None
+    plugin._publish_overheard_enabled = True
+    plugin._vad_backend = "sherpa_onnx"
+    plugin._vad_threshold = 0.5
+    plugin._vad_silence_ms = 400
+    plugin._vad_pre_roll_ms = 500
+    plugin._kws_cfg = {"trigger_mode": "vad"}
+    plugin._save_vad_segments = False
+    plugin._max_saved_segments = 1000
+    plugin._nodes = {}
+    plugin._nodes_lock = threading.RLock()
+    plugin._executor = _StubExecutor()
+    for key, value in cfg.items():
+        setattr(plugin, key, value)
+    return plugin
+
+
+def test_a_loading_card_still_reports_its_topics():
+    """冷启动时整个项目会被回滚，而第二次启动就好了 —— 最像偶发的那种 bug。
+
+    start-project 按依赖顺序解析每条连线，用的是**上游卡片 info() 报出的 topic**。
+    模型没加载过时 ASR 的 info 走提前返回，里面一条 topic 都没有，于是
+    `asr → decision_core` 报「连线缺少 topic」并回滚整个项目。模型热了之后走正常
+    分支，就好了。
+
+    输出 topic 完全由 input_topic 推导，而那是调用方刚传进来的 —— 加载中的卡片
+    很清楚自己将要发到哪里。
+    """
+    plugin = make_plugin(_loading=True)
+    info = plugin.dispatch("asr", {"action": "info", "instance_id": "card-x",
+                                   "input_topic": "/mic/audio"})
+    assert info["state"] == "loading"
+    assert [t["topic"] for t in info["topic_out"]] == [
+        "/mic/audio/asr", "/mic/audio/asr_overheard"]
+    assert [t["topic"] for t in info["topic_in"]] == ["/mic/audio"]
+
+
+def test_a_card_with_a_deferred_start_also_reports_topics():
+    plugin = make_plugin(_pending_starts={"card-x": {"input_topic": "/mic/audio"}})
+    info = plugin.dispatch("asr", {"action": "info", "instance_id": "card-x",
+                                   "input_topic": "/mic/audio"})
+    assert info["state"] == "loading"
+    assert len(info["topic_out"]) == 2
+
+
+def test_a_failed_load_reports_topics_too():
+    """加载失败的卡片要失败在它自己身上，而不是把连线也拖下水。"""
+    plugin = make_plugin(_load_error="weights are corrupt")
+    info = plugin.dispatch("asr", {"action": "info", "instance_id": "card-x",
+                                   "input_topic": "/mic/audio"})
+    assert info["state"] == "error"
+    assert len(info["topic_out"]) == 2
+
+
+def test_loading_without_an_input_topic_reports_none():
+    """没给 input_topic 就推不出输出 topic —— 不能瞎编一个。"""
+    plugin = make_plugin(_loading=True)
+    info = plugin.dispatch("asr", {"action": "info"})
+    assert info["topic_out"] == []
+    assert info["topic_in"] == []
+
+
+def test_every_info_return_carries_topic_out():
+    """守住：info 的每一个 return 都要带 topic_out。
+
+    这个 bug 的形状就是「某一条返回路径忘了带」，而它只在冷启动时出现。
+    """
+    source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
+    body = source[source.index('if action == "info":'):]
+    body = body[:body.index('elif action == "start"')]
+    returns = body.count("return {")
+    assert returns == body.count('"topic_out"'), (
+        f"info 有 {returns} 个 return，但只有 {body.count('\"topic_out\"')} 个带 topic_out"
+    )
