@@ -111,14 +111,33 @@ DEFAULT_SPLIT_ABOVE_S = 4.0
 # Cosine below which a long clip is called multi-speaker. Starting point.
 DEFAULT_COHERENCE_MIN = 0.8
 
-# Off by default, and this is not timidity. perception has no acoustic echo
-# cancellation anywhere, so the robot's own TTS reaches the microphone: ASR turns
-# that into junk text that gets filtered, but speaker recognition would enrol the
-# robot's own voice as a person and then "recognise" it every time it speaks. TVs,
-# speakers and corridor passers-by do the same. Turn it on once the review flow
-# (list_speakers → get_speaker → listen → name_speaker, plus forget named=unknown)
-# has been exercised on a real robot and the contamination rate is known.
-DEFAULT_AUTO_ENROLL = False
+# **On** by default, same as face. The point of the `p-N` format is that an
+# identity is stable *before* it has a name: without an id, a voice nobody has
+# named carries no information at all, so "the same person as the previous turn"
+# — the one thing an agent can actually act on in a multi-person conversation —
+# is inexpressible. `name_speaker(speaker_id=...)` also needs ids to exist;
+# without them the only possible flow is naming whoever spoke most recently.
+#
+# This was `False` at first, out of a worry that stands up badly: perception has
+# no acoustic echo cancellation, so the robot's own TTS reaches the microphone
+# and would be enrolled as a person. It would — but a persistent noise source
+# **matches itself**, so it becomes one or two stable entries, not a flood that
+# fills the roster. TVs and corridor passers-by are the same. And the
+# contamination is recoverable and visible: `list_speakers` puts unnamed first,
+# `get_speaker` hands back a clip to listen to, `forget named=unknown` clears
+# them, and `unknown_capacity` evicts the least recently heard anyway.
+#
+# So the trade is: a handful of junk entries that can be listened to and deleted,
+# against silently losing speaker *distinction* in the default configuration.
+DEFAULT_AUTO_ENROLL = True
+
+# Creating an identity needs a longer clip than matching one, and the asymmetry is
+# deliberate — `plugins/face.py` makes exactly the same distinction for exactly
+# the same reason ("auto-enrolling it would spend a person slot on a smear that
+# never matches anything again"). A 1.6 s clip is long enough to risk a match
+# against an existing voiceprint; it is not long enough to become one, because a
+# marginal embedding then occupies a slot and never matches anything again.
+DEFAULT_ENROLL_MIN_SPEECH_S = 2.0
 
 # On by default, and it is the cheapest accuracy win available. A named person's
 # voiceprint drifts with distance, a cold, emotion and background noise far more
@@ -167,6 +186,9 @@ REASON_BAD_INPUT = "bad_input"
 # （之前是都报 similarity 0.0）会把人送去调阈值，而阈值跟空库毫无关系。
 REASON_NO_SPEAKERS = "no_speakers_enrolled"
 REASON_NO_MATCH = "no_match"
+# auto_enroll 开着、但这一段短到不值得为它建一个身份。和 no_match 分开报，因为
+# 「说长一点就会有 id」和「这个人确实不认识」是两件不同的事。
+REASON_TOO_SHORT_TO_ENROLL = "too_short_to_enroll"
 
 
 TOOLS = [
@@ -239,7 +261,8 @@ TOOLS = [
                 "device":           {"type": "string", "enum": ["cpu", "gpu"], "default": "cpu", "description": "推理设备。cpu 是默认且通常是对的：实测 gpu 单跑快 1.62 倍，但 ASR 在 cpu 时声纹已完全藏在它后面（净增 2-7ms），ASR 在 gpu 时两个 CUDA session 争同一块 GPU，搬上去只省 3ms 还多占 478MB"},
                 "match_threshold":  {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格。0.6 是起点不是实测值（face 的 0.35 是 ArcFace 的尺度，不能照搬）"},
                 "min_speech_s":     {"type": "number", "minimum": 0.0, "default": DEFAULT_MIN_SPEECH_S, "description": "最短可用语音时长(秒)。低于此值只报听到了、不给身份——声纹在 1.5 秒以下急剧退化，而 VAD 只要 0.5 秒就出段"},
-                "auto_enroll":      {"type": "boolean", "default": DEFAULT_AUTO_ENROLL, "description": "把没见过的声纹自动登记成未命名条目(p-N)。默认关：perception 没有回声消除，机器人自己的 TTS、电视、路人都会被登记进来。开之前先确认污染率"},
+                "auto_enroll":      {"type": "boolean", "default": DEFAULT_AUTO_ENROLL, "description": "把没见过的声纹自动登记成未命名条目(p-N)。默认开，和 face 一致：没有 id 的话「刚才那个人又说话了」就表达不出来，而那是多人对话里唯一能用的信息。代价是机器人自己的 TTS、电视、路人也会被登记（perception 没有回声消除）—— 用 list_speakers 看、get_speaker 听、forget named=unknown 清"},
+                "enroll_min_speech_s": {"type": "number", "minimum": 0.0, "default": DEFAULT_ENROLL_MIN_SPEECH_S, "description": "自动登记一个**新**声纹所需的最短时长(秒)，比 min_speech_s 严：1.6 秒够冒险匹配一次，但不够成为一条声纹——勉强的 embedding 会占住一个槽位且再也匹配不上任何东西"},
                 "auto_add_samples": {"type": "boolean", "default": DEFAULT_AUTO_ADD_SAMPLES, "description": "已命名的人每说一句质量够好的话就补一条样本。声纹随距离/感冒/情绪漂移很大，而打分取样本最大值而非平均，所以补样本只会更准"},
                 "unknown_capacity": {"type": "integer", "minimum": 0, "default": DEFAULT_UNKNOWN_CAPACITY, "description": "未命名声纹数量上限，超出时淘汰最久未听到的；已命名的不受影响"},
             },
@@ -286,6 +309,8 @@ def _gates(cfg: dict) -> dict:
         "split_above_s": float(cfg.get("split_above_s", DEFAULT_SPLIT_ABOVE_S)),
         "coherence_min": float(cfg.get("coherence_min", DEFAULT_COHERENCE_MIN)),
         "auto_enroll": bool(cfg.get("auto_enroll", DEFAULT_AUTO_ENROLL)),
+        "enroll_min_speech_s": float(
+            cfg.get("enroll_min_speech_s", DEFAULT_ENROLL_MIN_SPEECH_S)),
         "auto_add_samples": bool(
             cfg.get("auto_add_samples", DEFAULT_AUTO_ADD_SAMPLES)),
         "sample_min_similarity": float(
@@ -836,9 +861,18 @@ class SpeakerRecognitionPlugin:
         person_id, score = engine.db.match(embedding, gates["match_threshold"])
         record = None
         if person_id is None:
-            if gates["auto_enroll"]:
+            # Enrolment needs a longer clip than matching — see
+            # DEFAULT_ENROLL_MIN_SPEECH_S.
+            long_enough = duration >= gates["enroll_min_speech_s"]
+            if gates["auto_enroll"] and long_enough:
                 record = engine.db.enroll_unknown(embedding)
                 person_id = record["id"]
+            elif gates["auto_enroll"]:
+                payload["speaker_reason"] = REASON_TOO_SHORT_TO_ENROLL
+                if score >= 0:
+                    payload["speaker_best_similarity"] = round(float(score), 4)
+                self._remember(embedding, None, duration, samples, rate, source)
+                return payload
             else:
                 # `match` returns -1.0 as best_score on an empty database, and
                 # that distinction is the whole point: "nobody is enrolled" and
@@ -1399,12 +1433,14 @@ __all__ = [
     "DEFAULT_AUTO_ENROLL",
     "DEFAULT_DB_DIR",
     "DEFAULT_MATCH_THRESHOLD",
+    "DEFAULT_ENROLL_MIN_SPEECH_S",
     "DEFAULT_MIN_SPEECH_S",
     "REASON_MULTI_SPEAKER",
     "REASON_NO_MATCH",
     "REASON_NO_RECENT",
     "REASON_NO_SPEAKERS",
     "REASON_TOO_SHORT",
+    "REASON_TOO_SHORT_TO_ENROLL",
     "SpeakerRecognitionPlugin",
     "TOOLS",
 ]

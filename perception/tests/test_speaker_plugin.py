@@ -41,6 +41,7 @@ from plugins.speaker import (  # noqa: E402
     REASON_NO_RECENT,
     REASON_NO_SPEAKERS,
     REASON_TOO_SHORT,
+    REASON_TOO_SHORT_TO_ENROLL,
     SpeakerRecognitionPlugin,
     _SpeakerEngine,
 )
@@ -140,6 +141,64 @@ def test_short_clip_is_reported_not_guessed(tmp_path):
     assert plugin._engine.embedder.calls == 0
 
 
+def test_auto_enroll_is_on_by_default(tmp_path):
+    """默认必须给 id。没有 id 的话「刚才那个人又说话了」就表达不出来，而那是
+    多人对话里唯一真正能让 agent 行动的那条信息。"""
+    plugin = make_plugin(tmp_path)            # 不传 auto_enroll
+    payload = plugin.identify_samples(clip(3.0))
+    assert payload["speaker_id"] == "p-1"
+    assert "speaker_name" not in payload      # 有 id 不等于有名字
+    assert plugin._engine.db.get_person("p-1")["named"] is False
+    # 同一个声音第二次必须是同一个 id —— 这才叫「能区分说话人」
+    again = plugin.identify_samples(clip(3.0))
+    assert again["speaker_id"] == "p-1"
+
+
+def test_a_second_voice_gets_a_second_id(tmp_path):
+    plugin = make_plugin(tmp_path)
+    first = plugin.identify_samples(clip(3.0))
+    second = plugin.identify_samples(clip(3.0, level=-0.5))
+    assert first["speaker_id"] == "p-1"
+    assert second["speaker_id"] == "p-2"
+    assert plugin._engine.db.stats()["persons"] == 2
+
+
+def test_enrolment_needs_a_longer_clip_than_matching(tmp_path):
+    """创建身份的门槛比匹配严 —— 勉强的 embedding 会永久占住一个槽位。
+
+    face 做了完全相同的区分（见 face.py 里 usable 为 False 那一段的注释）。
+    """
+    plugin = make_plugin(tmp_path, min_speech_s=1.5, enroll_min_speech_s=2.0)
+    payload = plugin.identify_samples(clip(1.7))
+    assert payload["speaker_reason"] == REASON_TOO_SHORT_TO_ENROLL
+    assert "speaker_id" not in payload
+    assert plugin._engine.db.stats()["persons"] == 0, "没有浪费槽位"
+    # 但仍然被记住，所以「我是小王」还能把它扶成一个身份
+    assert plugin._recent.latest() is not None
+    named = plugin.dispatch("speaker_recognition",
+                            {"action": "name_speaker", "name": "小王"})
+    assert named["ok"] is True and named["created"] is True
+
+
+def test_a_marginal_clip_can_still_match_an_existing_voice(tmp_path):
+    """短到不够建身份，但够匹配已有的 —— 这正是两个门槛不同的意义。"""
+    plugin = make_plugin(tmp_path, min_speech_s=1.5, enroll_min_speech_s=2.0)
+    plugin._engine.db.add("小王", [VOICE_A])
+    payload = plugin.identify_samples(clip(1.7))
+    assert payload["speaker_id"] == "p-1"
+    assert payload["speaker_name"] == "小王"
+
+
+def test_marginal_clip_also_reports_how_close_it_came(tmp_path):
+    plugin = make_plugin(tmp_path, min_speech_s=1.5, enroll_min_speech_s=2.0,
+                         match_threshold=0.9)
+    halfway = (VOICE_A + BLEND) / np.linalg.norm(VOICE_A + BLEND)
+    plugin._engine.db.add("小王", [halfway])
+    payload = plugin.identify_samples(clip(1.7))
+    assert payload["speaker_reason"] == REASON_TOO_SHORT_TO_ENROLL
+    assert payload["speaker_best_similarity"] == pytest.approx(0.7071, abs=1e-3)
+
+
 def test_empty_roster_says_nobody_is_enrolled(tmp_path):
     """空库和「比过了都不够像」必须分开报 —— 两者的处置相反。
 
@@ -187,7 +246,7 @@ def test_a_near_miss_reports_the_real_score_not_a_placeholder(tmp_path):
 
 
 def test_unknown_voice_with_auto_enroll_creates_an_unnamed_identity(tmp_path):
-    plugin = make_plugin(tmp_path, auto_enroll=True)
+    plugin = make_plugin(tmp_path, auto_enroll=True)  # 默认值，显式写明以防默认再变
     payload = plugin.identify_samples(clip(3.0))
     assert payload["speaker_id"] == "p-1"
     assert "speaker_name" not in payload, "未命名的人不该带一个空 name"
@@ -473,6 +532,12 @@ def test_config_schema_defaults_match_the_module_constants():
     props = speaker_module.TOOLS[0]["configSchema"]["properties"]
     assert props["match_threshold"]["default"] == speaker_module.DEFAULT_MATCH_THRESHOLD
     assert props["min_speech_s"]["default"] == speaker_module.DEFAULT_MIN_SPEECH_S
-    assert props["auto_enroll"]["default"] is False
+    assert props["auto_enroll"]["default"] is True
+    assert props["enroll_min_speech_s"]["default"] == \
+        speaker_module.DEFAULT_ENROLL_MIN_SPEECH_S
+    assert (speaker_module.DEFAULT_ENROLL_MIN_SPEECH_S
+            > speaker_module.DEFAULT_MIN_SPEECH_S), (
+        "建身份的门槛必须严于匹配的门槛"
+    )
     assert props["auto_add_samples"]["default"] is True
     assert props["device"]["default"] == "cpu"
