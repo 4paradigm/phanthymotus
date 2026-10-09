@@ -368,8 +368,52 @@ def _build_engine(cfg: dict, on_status=None) -> _SpeakerEngine:
     options = _db_options(cfg)
     sample_dir = str(cfg.get("sample_dir", "")) or os.path.join(
         options["db_dir"], "samples")
-    db = IdentityDB(dim=embedder.dim, **options)
-    return _SpeakerEngine(embedder, db, sample_dir)
+    return assemble_engine(embedder, sample_dir, **options)
+
+
+def assemble_engine(embedder, sample_dir: str, **db_options) -> _SpeakerEngine:
+    """Tie an embedder, a database and the kept clips into one engine.
+
+    Separate from `_build_engine` only so the tests can build an engine around a
+    fake embedder **through the same wiring**. A test helper that constructed
+    `IdentityDB` itself would silently skip `on_evict`, and the first thing that
+    went unnoticed would be exactly what this hook exists to prevent — which is
+    what happened while writing it.
+    """
+    engine_box: dict = {}
+
+    def on_evict(ids) -> None:
+        # Capacity eviction happens deep inside IdentityDB, which has no idea
+        # this plugin keeps a wav per voiceprint. `forget` deletes those files;
+        # without this hook eviction would not, and `samples/` would only ever
+        # grow. The engine does not exist yet when IdentityDB is constructed, so
+        # it is read out of the box at call time.
+        engine = engine_box.get("engine")
+        if engine is None:
+            return
+        for person_id in ids:
+            _drop_sample_file(engine.sample_dir, person_id)
+
+    db = IdentityDB(dim=embedder.dim, on_evict=on_evict, **db_options)
+    engine = _SpeakerEngine(embedder, db, sample_dir)
+    engine_box["engine"] = engine
+    return engine
+
+
+def _drop_sample_file(sample_dir: str, person_id: str) -> None:
+    """Remove one identity's kept clip. Shared by `forget` and by eviction.
+
+    A forgotten or evicted identity must not leave its recording behind: the
+    clip is somebody's voice, and `forget` is how an operator revokes it —
+    leaving the wav would mean "deleted" did not delete.
+    """
+    path = os.path.join(sample_dir, f"{person_id}.wav")
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+    except OSError:
+        log.warning("[speaker] could not remove sample clip %s", path,
+                    exc_info=True)
 
 
 def _close_quietly(engine) -> None:
@@ -917,6 +961,18 @@ class SpeakerRecognitionPlugin:
         if record.get("profile"):
             payload["speaker_profile"] = record["profile"]
         self._remember(embedding, person_id, duration, samples, rate, source)
+        # Keep one playable clip per identity, written on the first sighting that
+        # finds none. This is what makes the review flow possible at all: an
+        # auto-enrolled `p-N` has no name, and the only way to answer "who is
+        # this" is to listen — so `list_speakers` → `get_speaker` → listen →
+        # `name_speaker` needs something to play. It used to be written only when
+        # naming the most recent speaker, which meant every auto-enrolled
+        # identity was unlistenable and the flow was dead on arrival.
+        #
+        # Also self-healing: an identity enrolled before this existed, or named
+        # from the roster rather than from the live ring, gets its clip the next
+        # time it speaks.
+        self._maybe_keep_sample_audio(engine, person_id, samples, rate)
         self._maybe_add_sample(engine, person_id, record, embedding, score,
                                duration, gates)
         return payload
@@ -934,6 +990,36 @@ class SpeakerRecognitionPlugin:
             "samples": samples,
             "sample_rate": rate,
         })
+
+    def _maybe_keep_sample_audio(self, engine: _SpeakerEngine, person_id: str,
+                                 samples: np.ndarray, rate: int) -> None:
+        """Write this identity's representative clip if it has none yet.
+
+        On a thread and never on the critical path: `plugins/asr.py` joins this
+        plugin's work before it publishes, and a 192 kB wav write onto eMMC does
+        not belong in that window. Missing one clip is invisible; the next
+        sighting writes it.
+
+        Bounded by the roster: one file per identity, 6 s each (~192 kB), and
+        unnamed identities are capped by `unknown_capacity` — 50 × 192 kB ≈
+        9.6 MB — with eviction now deleting the file too (see `_drop_sample_file`).
+        """
+        if self._sample_path_if_present(engine, person_id):
+            return
+
+        def write() -> None:
+            # Re-check inside the thread: two sightings can race here, and the
+            # loser would rewrite a file the winner just wrote.
+            if self._sample_path_if_present(engine, person_id):
+                return
+            try:
+                self._save_sample_audio(engine, person_id, samples, rate)
+            except Exception:  # noqa: BLE001 - best-effort enrichment
+                log.debug("[speaker] could not keep a clip for %s", person_id,
+                          exc_info=True)
+
+        threading.Thread(target=write, name="speaker-clip",
+                         daemon=True).start()
 
     def _maybe_add_sample(self, engine, person_id, record, embedding, score,
                           duration, gates) -> None:
@@ -1294,6 +1380,13 @@ class SpeakerRecognitionPlugin:
             except KeyError:
                 return {"ok": False, "reason": REASON_BAD_INPUT,
                         "detail": f"no such speaker {speaker_id}"}
+            # If this id is also the voice in the live ring, back-fill its clip
+            # now rather than waiting for the next sighting — somebody naming
+            # from the roster will want to confirm by listening immediately.
+            entry = self._recent.latest()
+            if entry is not None and entry.get("speaker_id") == speaker_id:
+                self._maybe_keep_sample_audio(
+                    engine, speaker_id, entry["samples"], entry["sample_rate"])
             return self._named_result(engine, record, created=False)
 
         entry = self._recent.latest()
@@ -1417,18 +1510,7 @@ class SpeakerRecognitionPlugin:
         return {"ok": True, "forgotten": [speaker_id]}
 
     def _drop_sample_audio(self, engine: _SpeakerEngine, person_id: str) -> None:
-        """A forgotten identity must not leave its recording behind.
-
-        The clip is somebody's voice, and `forget` is how the operator revokes
-        it. Leaving the wav would mean "deleted" did not delete.
-        """
-        path = os.path.join(engine.sample_dir, f"{person_id}.wav")
-        try:
-            if os.path.exists(path):
-                os.unlink(path)
-        except OSError:
-            log.warning("[speaker] could not remove sample clip %s", path,
-                        exc_info=True)
+        _drop_sample_file(engine.sample_dir, person_id)
 
     def _do_list_heard(self, args: dict) -> dict:
         engine = self._require_engine()
@@ -1456,4 +1538,5 @@ __all__ = [
     "REASON_TOO_SHORT_TO_ENROLL",
     "SpeakerRecognitionPlugin",
     "TOOLS",
+    "assemble_engine",
 ]

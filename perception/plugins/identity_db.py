@@ -215,6 +215,7 @@ class IdentityDB:
         visit_checkpoint_s: float = DEFAULT_VISIT_CHECKPOINT_S,
         model: str = "",
         label: str = "identity_db",
+        on_evict=None,
     ):
         # db_dir arrives over MCP config and this process runs as root in the
         # container; the same validation model_downloader applies to model_dir.
@@ -228,6 +229,9 @@ class IdentityDB:
         # break every face_db written before this field existed.
         self._model = str(model or "")
         self._tag = f"[{label}]"
+        # Called with the list of ids dropped by `unknown_capacity` eviction.
+        # See `_evict_unknowns_locked` for why a count is not enough.
+        self._on_evict = on_evict
         self._unknown_capacity = max(0, int(unknown_capacity))
         self._max_samples = max(1, int(max_samples_per_person))
 
@@ -598,14 +602,16 @@ class IdentityDB:
                 "last_seen_at": timestamp,
             }
             self._add_rows_locked(new_id, vectors)
+            evicted: list[str] = []
             if not named:
-                self._evict_unknowns_locked()
+                evicted = self._evict_unknowns_locked()
             record = self._record_locked(new_id) if new_id in self._persons else None
             self._save_locked()
         if record is None:
             # Capacity 0: the entry was evicted by the same call that made it.
             raise IdentityDBError(
                 "unknown_capacity is 0; cannot enrol unnamed identities")
+        self._fire_evicted(evicted)
         log.info("%s enrolled %s (named=%s, samples=%d): %s", self._tag,
                  new_id, named, record["samples"],
                  escape_log_text(record["name"]))
@@ -784,18 +790,24 @@ class IdentityDB:
 
     # ── capacity ──────────────────────────────────────────────────────────
 
-    def _evict_unknowns_locked(self) -> int:
+    def _evict_unknowns_locked(self) -> list[str]:
         """Trim anonymous entries to `unknown_capacity`, oldest sighting first.
 
         Named people are never candidates: the cap exists to bound automatic
         enrolment, not to expire people somebody deliberately registered.
+
+        Returns the evicted **ids**, not a count. A caller that keeps anything
+        else keyed by person id — `plugins/speaker.py` keeps one playable wav per
+        voiceprint — has to be told *which* ones went, or those files accumulate
+        forever: `forget` deletes them, eviction silently would not. The ids go
+        to `on_evict`, fired by the public callers once they are out of the lock.
         """
         unknowns = [
             person for person in self._persons.values() if not person["named"]
         ]
         excess = len(unknowns) - self._unknown_capacity
         if excess <= 0:
-            return 0
+            return []
         unknowns.sort(key=lambda person: (person["last_seen_at"], person["registered_at"]))
         doomed = {person["id"] for person in unknowns[:excess]}
         for person_id in doomed:
@@ -811,7 +823,24 @@ class IdentityDB:
         )
         log.info("%s evicted %d unknown entr(ies) over capacity %d", self._tag,
                  len(doomed), self._unknown_capacity)
-        return len(doomed)
+        return sorted(doomed)
+
+    def _fire_evicted(self, evicted: list[str]) -> None:
+        """Hand evicted ids to the owner, **outside** the lock.
+
+        Outside on purpose: the callback belongs to the caller and may do
+        anything, including calling back into this database. Firing it while
+        holding `self._lock` would make that a deadlock, and a re-entrant
+        `forget` from an eviction handler is an entirely reasonable thing to
+        write.
+        """
+        if not evicted or self._on_evict is None:
+            return
+        try:
+            self._on_evict(list(evicted))
+        except Exception:  # noqa: BLE001 - eviction already happened
+            log.warning("%s on_evict callback failed for %s", self._tag,
+                        evicted, exc_info=True)
 
     def set_unknown_capacity(self, capacity: int) -> int:
         """Change the ceiling and apply it now. Returns how many were evicted."""
@@ -820,7 +849,8 @@ class IdentityDB:
             evicted = self._evict_unknowns_locked()
             if evicted:
                 self._save_locked()
-        return evicted
+        self._fire_evicted(evicted)
+        return len(evicted)
 
     @property
     def unknown_capacity(self) -> int:

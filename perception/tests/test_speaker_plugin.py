@@ -33,7 +33,7 @@ from vision_stubs import PERCEPTION_ROOT  # noqa: F401  (ROS stubs + sys.path)
 
 import plugins.identity_db as identity_db_module  # noqa: E402
 import plugins.speaker as speaker_module  # noqa: E402
-from plugins.identity_db import IdentityDB  # noqa: E402
+from plugins.identity_db import IdentityDB  # noqa: F401,E402
 from plugins.speaker import (  # noqa: E402
     REASON_BAD_INPUT,
     REASON_MULTI_SPEAKER,
@@ -43,7 +43,9 @@ from plugins.speaker import (  # noqa: E402
     REASON_TOO_SHORT,
     REASON_TOO_SHORT_TO_ENROLL,
     SpeakerRecognitionPlugin,
-    _SpeakerEngine,
+    _db_options,
+    _SpeakerEngine,  # noqa: F401  (kept for readers tracing the engine shape)
+    assemble_engine,
 )
 from plugins.speaker_runtime import SAMPLE_RATE  # noqa: E402
 
@@ -119,12 +121,21 @@ def clip(seconds: float, level: float = 0.5,
 
 
 def make_plugin(tmp_path, **cfg) -> SpeakerRecognitionPlugin:
+    """A plugin with a fake embedder but the **real** engine wiring.
+
+    `assemble_engine` rather than constructing IdentityDB here: a helper that
+    built the database itself would skip `on_evict`, and the two eviction tests
+    below would pass while production leaked a wav per evicted voiceprint.
+    That is not hypothetical — it is what this helper did first.
+    """
     plugin = SpeakerRecognitionPlugin({"db_dir": str(tmp_path), **cfg},
                                       executor=None)
-    embedder = FakeEmbedder()
-    db = IdentityDB(db_dir=str(tmp_path), dim=DIM, label="speaker_db")
-    plugin._engine = _SpeakerEngine(embedder, db,
-                                    os.path.join(str(tmp_path), "samples"))
+    db_options = {
+        key: value for key, value in _db_options({"db_dir": str(tmp_path), **cfg}).items()
+        if key != "model"
+    }
+    plugin._engine = assemble_engine(
+        FakeEmbedder(), os.path.join(str(tmp_path), "samples"), **db_options)
     plugin._engine_state = "ready"
     return plugin
 
@@ -587,3 +598,124 @@ def test_config_schema_defaults_match_the_module_constants():
     )
     assert props["auto_add_samples"]["default"] is True
     assert props["device"]["default"] == "cpu"
+
+
+# ── 代表音频：自动登记的身份也要能听 ────────────────────────────────────────
+
+def _wait_for(predicate, timeout: float = 3.0) -> bool:
+    """等后台线程把文件写出来。写盘故意不在关键路径上，所以这里要等。"""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        _time.sleep(0.02)
+    return False
+
+
+def sample_path(plugin, person_id: str) -> str:
+    return os.path.join(plugin._engine.sample_dir, f"{person_id}.wav")
+
+
+def test_auto_enrolled_identity_gets_a_playable_clip(tmp_path):
+    """这是 auto_enroll 能用的前提。
+
+    自动登记的 p-N 没有名字，而判断「这是谁」唯一的办法是听。之前音频只在
+    「命名最近说话的那个」这条分支里写，于是每一个自动登记的身份都听不了，
+    list_speakers → get_speaker → 听 → name_speaker 这套回收流程是死的。
+    """
+    plugin = make_plugin(tmp_path)
+    payload = plugin.identify_samples(clip(3.0))
+    assert payload["speaker_id"] == "p-1"
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1"))), \
+        "自动登记的身份没有留音频 —— 那就只能靠「最近说话的那个」命名"
+    record = plugin.dispatch("speaker_recognition",
+                             {"action": "get_speaker", "speaker_id": "p-1"})
+    assert record["sample_audio_path"] == sample_path(plugin, "p-1")
+    assert "sample_audio_note" not in record
+
+
+def test_the_clip_is_a_real_wav_capped_at_max_s(tmp_path):
+    import wave
+    plugin = make_plugin(tmp_path)
+    plugin.identify_samples(clip(30.0))
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1")))
+    with wave.open(sample_path(plugin, "p-1"), "rb") as handle:
+        assert handle.getnchannels() == 1
+        assert handle.getframerate() == SAMPLE_RATE
+        # MAX_S 上限：一段 30 秒的音频不能留成 30 秒的文件
+        assert handle.getnframes() <= int(SAMPLE_RATE * 6) + 1
+
+
+def test_a_second_sighting_does_not_rewrite_the_clip(tmp_path):
+    """已有音频就不再写 —— 否则每次听到这个人都是一次 eMMC 写入。"""
+    plugin = make_plugin(tmp_path)
+    plugin.identify_samples(clip(3.0))
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1")))
+    first_mtime = os.stat(sample_path(plugin, "p-1")).st_mtime_ns
+    plugin.identify_samples(clip(3.0))
+    import time as _time
+    _time.sleep(0.3)
+    assert os.stat(sample_path(plugin, "p-1")).st_mtime_ns == first_mtime
+
+
+def test_a_legacy_identity_with_no_clip_heals_on_the_next_sighting(tmp_path):
+    """这个改动之前建的身份、或从名单里命名的身份，下次说话时补上音频。"""
+    plugin = make_plugin(tmp_path)
+    plugin._engine.db.add("小王", [VOICE_A])            # 直接入库，没有音频
+    assert not os.path.exists(sample_path(plugin, "p-1"))
+    plugin.identify_samples(clip(3.0))
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1")))
+
+
+def test_naming_from_the_roster_backfills_the_clip(tmp_path):
+    """用 speaker_id 从名单里命名时，如果它正是刚说话的那个，立刻补音频。
+
+    从名单里命名的人会想马上听一下确认，而不是等下一次开口。
+    """
+    plugin = make_plugin(tmp_path)
+    plugin.identify_samples(clip(3.0))
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1")))
+    os.unlink(sample_path(plugin, "p-1"))               # 模拟音频缺失
+    result = plugin.dispatch("speaker_recognition",
+                             {"action": "name_speaker", "name": "小王",
+                              "speaker_id": "p-1"})
+    assert result["ok"] is True
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1")))
+
+
+# ── 容量淘汰必须带走音频 ─────────────────────────────────────────────────────
+
+def test_capacity_eviction_removes_the_clip(tmp_path):
+    """淘汰以前只返回一个计数，所以插件不知道哪些 id 走了，wav 永远留在盘上。
+
+    `forget` 会删，淘汰不会 —— samples/ 于是只增不减。
+    """
+    plugin = make_plugin(tmp_path, unknown_capacity=1)
+    plugin.identify_samples(clip(3.0))                  # p-1
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1")))
+    plugin.identify_samples(clip(3.0, level=-0.5))      # p-2，把 p-1 挤掉
+    assert plugin._engine.db.stats()["persons"] == 1
+    assert _wait_for(lambda: not os.path.exists(sample_path(plugin, "p-1"))), \
+        "被淘汰的声纹把录音留在了盘上"
+
+
+def test_lowering_the_capacity_also_removes_clips(tmp_path):
+    plugin = make_plugin(tmp_path, unknown_capacity=10)
+    plugin.identify_samples(clip(3.0))
+    plugin.identify_samples(clip(3.0, level=-0.5))
+    assert _wait_for(lambda: os.path.exists(sample_path(plugin, "p-1"))
+                     and os.path.exists(sample_path(plugin, "p-2")))
+    evicted = plugin._engine.db.set_unknown_capacity(1)
+    assert evicted == 1
+    assert _wait_for(lambda: not os.path.exists(sample_path(plugin, "p-1")))
+    assert os.path.exists(sample_path(plugin, "p-2")), "留下的那个不能被删"
+
+
+def test_named_identities_are_never_evicted(tmp_path):
+    """容量是用来约束自动登记的，不是用来过期有人特意注册过的人。"""
+    plugin = make_plugin(tmp_path, unknown_capacity=1)
+    plugin._engine.db.add("小王", [VOICE_A])
+    plugin.identify_samples(clip(3.0, level=-0.5))      # 未命名的 p-2
+    plugin.identify_samples(clip(3.0, level=0.123))     # 未命名的 p-3，挤掉 p-2
+    assert plugin._engine.db.get_person("p-1")["name"] == "小王"
