@@ -736,3 +736,76 @@ def test_whole_frame_hands_come_back_inside_the_frame():
     # degenerate horizontal line, and the refine pass legitimately enlarges
     # it. The centroid is what separates the bug from the stub — the real
     # failure put the whole hand off the left edge, starting at x = -159.
+
+
+# ── holding a hand through a miss ────────────────────────────────────────────
+#
+# Reported as "the fingers keep disappearing". The throttle is not the cause
+# and was measured not to be — with a steady image, 129 of 129 published
+# frames carried both hands, because the frames between inferences reuse the
+# last result. What a miss did was erase the hand outright, and at the
+# throttled rate that is a quarter second of nothing, which on a live camera
+# reads as flicker.
+
+def test_one_miss_does_not_erase_the_hand():
+    found = _HandSession()
+    channel = HandChannel(found, max_rois=2, interval_s=0.0, hold_s=0.5,
+                          retry_scales=(1.0,))
+    first = _person()
+    channel.update([first], _frame(), 0.0)
+    kept = first["hands"]["right"]
+    assert kept is not None
+
+    channel._session = _HandSession(rows=[])          # the engine finds nothing
+    during = _person()
+    channel.update([during], _frame(), 0.1)
+    assert during["hands"]["right"] is not None
+    assert np.array_equal(during["hands"]["right"], kept)
+
+
+def test_a_hand_that_stays_gone_is_forgotten():
+    """The hold is a grace period, not a memory — a hand really put away must
+    stop being reported."""
+    channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
+                          hold_s=0.5, retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    channel._session = _HandSession(rows=[])
+    gone = _person()
+    channel.update([gone], _frame(), 2.0)             # well past the hold
+    assert gone["hands"]["right"] is None
+
+
+def test_the_stale_box_is_dropped_even_while_the_keypoints_are_held():
+    """The two were conflated. Cropping from the previous box after a miss
+    would chase a hand that is no longer there; reporting the previous
+    keypoints for a moment is merely saying "it was here an instant ago"."""
+    channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
+                          hold_s=5.0, retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    assert "box" in channel._state[(1, "right")]
+
+    channel._session = _HandSession(rows=[])
+    channel.update([_person()], _frame(), 0.1)
+    assert "box" not in channel._state[(1, "right")]
+    assert channel._state[(1, "right")].get("kpts") is not None
+
+
+def test_a_blinking_wrist_does_not_erase_the_hand():
+    """Visibility oscillating around the threshold is the other way a hand
+    vanishes — the geometric gate refuses and the cache went with it."""
+    channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
+                          hold_s=0.5, retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    blink = {"id": 1, "keypoints": _body(forearm=200.0, wrist_conf=0.05)}
+    channel.update([blink], _frame(), 0.1)
+    assert blink["hands"]["right"] is not None
+
+
+def test_the_hold_can_be_switched_off():
+    channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
+                          hold_s=0.0, retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    channel._session = _HandSession(rows=[])
+    gone = _person()
+    channel.update([gone], _frame(), 0.01)
+    assert gone["hands"]["right"] is None

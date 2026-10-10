@@ -121,6 +121,24 @@ HAND_PER_FOREARM = 0.9
 #: measurement instead of a guess.
 HAND_RETRY_SCALES = (1.0, 0.55)
 
+#: How long a hand keeps being reported after it stops being found.
+#:
+#: Without this a single miss erases the hand until the next inference, and at
+#: the throttled rate that is a quarter of a second of no fingers — which on a
+#: live camera reads as the hand flickering in and out. The throttle itself is
+#: not the cause and was measured not to be: with a steady image, 129 of 129
+#: published frames carried both hands, because the frames between inferences
+#: reuse the last result. What the rate does is set how *long* each miss
+#: lasts.
+#:
+#: Two things were conflated and only one of them should expire instantly.
+#: The previous frame's **box** must not survive a miss — cropping from it
+#: would chase a hand that is no longer there, so the next attempt re-derives
+#: the ROI from the arm. The previous frame's **keypoints** may survive a
+#: little longer, for the same reason the gesture tracker has a release
+#: window: one dropped frame is not the hand going away.
+DEFAULT_HAND_HOLD_S = 0.5
+
 #: Minimum forearm length in native frame pixels before a hand is attempted.
 #: The floor that matters is about 45 px of *hand*, which is where the measured
 #: curve starts losing detections outright; at HAND_PER_FOREARM that is 50 px
@@ -474,7 +492,8 @@ class HandChannel:
                  min_forearm_px: float = DEFAULT_MIN_FOREARM_PX,
                  min_conf: float = 0.3, confidence: float = 0.4,
                  target_fraction: float = TARGET_HAND_FRACTION,
-                 retry_scales=HAND_RETRY_SCALES):
+                 retry_scales=HAND_RETRY_SCALES,
+                 hold_s: float = DEFAULT_HAND_HOLD_S):
         self._session = session
         self._max_rois = max(1, int(max_rois))
         self._interval_s = max(0.0, float(interval_s))
@@ -483,6 +502,7 @@ class HandChannel:
         self._confidence = float(confidence)
         self._target_fraction = float(target_fraction)
         self._retry_scales = tuple(float(v) for v in retry_scales) or (1.0,)
+        self._hold_s = max(0.0, float(hold_s))
         #: (track_id, side) -> {"box": last box in frame pixels, "kpts": last
         #: keypoints, "t": when it last ran}. The box is what makes the next
         #: crop tighter than the arm extrapolation; the keypoints are what keep
@@ -542,10 +562,13 @@ class HandChannel:
                     if tighter is not None:
                         roi = tighter
                 if roi is None:
-                    # A hand that has gone out of reach must lose its cached
-                    # keypoints too, or the payload keeps reporting a hand
-                    # shape from before the person turned away.
-                    self._state.pop(key, None)
+                    # Out of reach. The hand is held for the grace period and
+                    # then forgotten — a wrist that blinks below the
+                    # visibility threshold for one frame is not the person
+                    # turning away, but one that stays gone is.
+                    held = self._hold(key, now)
+                    if held is not None:
+                        person["hands"][side] = held
                     if reason:
                         self.skipped[reason] += 1
                     continue
@@ -588,10 +611,18 @@ class HandChannel:
                     found = (attempt, boxes, scores, keypoints)
                     break
             if found is None:
-                # Nothing found at any scale. The cache is dropped so the next
-                # frame re-derives the ROI from the arm rather than chasing a
-                # box that found nothing.
-                self._state.pop(key, None)
+                # Nothing found at any scale. The **box** goes immediately —
+                # the next attempt must re-derive the ROI from the arm rather
+                # than chase a hand that is not there — but the keypoints are
+                # held for the grace period, because one miss is not the hand
+                # going away and dropping them instantly is what makes a live
+                # hand flicker.
+                entry = self._state.get(key)
+                if entry is not None:
+                    entry.pop("box", None)
+                held = self._hold(key, now)
+                if held is not None:
+                    person["hands"][side] = held
                 continue
             roi, boxes, scores, keypoints = found
             best = int(np.argmax(scores))
@@ -602,6 +633,20 @@ class HandChannel:
                 "kpts": mapped,
                 "t": now,
             }
+
+    def _hold(self, key, now: float):
+        """The last known keypoints for this hand, while they are still fresh.
+
+        Returns None and forgets the entry once the grace period has passed,
+        so a hand that is really gone does stop being reported.
+        """
+        entry = self._state.get(key)
+        if entry is None:
+            return None
+        if self._hold_s <= 0 or (now - float(entry.get("t", 0.0))) > self._hold_s:
+            self._state.pop(key, None)
+            return None
+        return entry.get("kpts")
 
     def _due(self, key, now: float, track_id) -> bool:
         if self._interval_s <= 0:
