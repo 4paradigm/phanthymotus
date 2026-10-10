@@ -888,6 +888,51 @@ def ensure_face_model(model_dir: str, bundle: str = "face",
                                   progress_cb=progress_cb)
 
 
+# ── Speaker embedding (voiceprint) ───────────────────────────────────────────
+# Re-hosted on COS for the same reason as the face models: the upstream GitHub
+# release redirects to a signed, expiring URL that cannot be pinned, and the
+# robots have no reliable route to GitHub.
+SPEAKER_MODEL_BASE = os.environ.get(
+    "SPEAKER_MODEL_BASE_URL", f"{COS_BASE}/speaker/campplus_zh_en"
+)
+# Pinned against the COS copy, **re-downloaded and re-hashed after upload**, so
+# this is the bytes a robot will actually receive. Verified 2026-10-09 to be
+# byte-identical to the `checksum.txt` entry in sherpa-onnx's
+# `speaker-recongition-models` release.
+SPEAKER_MODEL_FILES = {
+    # 3D-Speaker CAM++, 200k speakers, Chinese+English, 192-d, 16 kHz.
+    # Apache-2.0. ONNX metadata: output_dim=192, sample_rate=16000,
+    # normalize_samples=1, feature_normalize_type=global-mean.
+    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": {
+        "size": 28281164,
+        "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+    },
+}
+
+SPEAKER_MODEL_BUNDLES = {
+    "campplus_zh_en": (SPEAKER_MODEL_BASE, SPEAKER_MODEL_FILES),
+}
+
+
+def ensure_speaker_model(model_dir: str, bundle: str = "campplus_zh_en",
+                         progress_cb=None) -> dict[str, str]:
+    """Ensure a speaker-embedding ONNX model is present.
+
+    `bundle` selects which pinned set to fetch, so a second model added to
+    `plugins.speaker_runtime.SPEAKER_MODELS` brings its own size and hash rather
+    than reusing these.
+    """
+    spec = SPEAKER_MODEL_BUNDLES.get(bundle)
+    if spec is None:
+        raise ValueError(
+            f"unknown speaker model bundle {bundle!r}; this build has "
+            f"{sorted(SPEAKER_MODEL_BUNDLES)}")
+    base, files = spec
+    model_dir = require_models_subpath(model_dir)
+    return ensure_verified_bundle(bundle, model_dir, base, files,
+                                  progress_cb=progress_cb)
+
+
 def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict,
                             progress_cb=None, stage_cb=None) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
@@ -1238,6 +1283,103 @@ DEPTH_MODEL_BUNDLES = {
 }
 
 
+POSE_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp61-trt10.4-orin-640",
+        "files": {
+            "yolo26s-pose.engine": {
+                "size": 24704612,
+                "sha256": "ec90f471e4b3fa793e567b14859ea23aa5ea36602e8a99d9632b05baa9681338",
+            },
+        },
+    },
+    # Built on Orin 5 in a container off the jp5.11 image (TensorRT 8.5.2.2),
+    # 634 s. Not interchangeable with the jp61 plan above and not a rebuild of
+    # the same bytes: a different TensorRT produces a different engine, which is
+    # the whole reason this table is keyed by JetPack family.
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yolo26s-pose.engine": {
+                "size": 23916308,
+                "sha256": "80473d875d6cbfec829a0572e51bdde7785b42b7542f3ae21a55c8f163ab376c",
+            },
+        },
+    },
+}
+
+
+# Skeleton-action recognition for the pose card: ST-GCN++, joint stream,
+# NTU60-XSub, 2D 17-keypoint input. 1.39 M params and 1.95 GFLOPs at 100 frames,
+# top-1 89.3% — the smallest of the options with a published 2D-COCO17
+# checkpoint, and on that benchmark also the most accurate (ST-GCN 3.1 M/3.8 G,
+# AGCN 3.5 M/4.4 G). Single stream, not the four-stream ensemble: 4x the compute
+# for +3.9 points.
+#
+# jp61 is built and pinned: 4,384,468 bytes, 4.66 ms GPU latency on Orin 6,
+# T=100 as the checkpoint was trained. jp511 still has to come from Orin 5 and
+# stays unpinned, so ensure_action_model raises there with the build
+# instructions rather than fetching anything unverified, and the pose card falls
+# back to the `rules` backend with that message in `info` instead of failing.
+#
+# Built by tools/stgcn_export.py (checkpoint -> ONNX, validated against torch to
+# 2.9e-06) then trtexec --fp16 inside the jp6.1 image. The engine agrees with the
+# ONNX to three decimal places on the same inputs.
+# The ST-GCN++ *checkpoint*, mirrored onto COS so the engine build is
+# reproducible and does not depend on download.openmmlab.com being reachable
+# from wherever it runs. Not a runtime download — no robot ever fetches this; it
+# is an input to tools/export_vision_engines.py --model action.
+#
+# Upstream:
+#   http://download.openmmlab.com/mmaction/pyskl/ckpt/stgcnpp/
+#       stgcnpp_ntu60_xsub_hrnet/j.pth
+#   PYSKL's stgcn++_ntu60_xsub_hrnet joint config, 89.3 top-1.
+#
+# PYSKL's code is Apache-2.0. The weights are trained on NTU RGB+D, whose
+# dataset terms are academic-research; a model trained on it inherits that
+# question for a commercial deployment. Recorded here as a fact to check, not
+# settled by this file.
+ACTION_CHECKPOINT_BASE = os.environ.get(
+    "ACTION_CHECKPOINT_BASE_URL",
+    f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/checkpoint")
+
+ACTION_CHECKPOINT = {
+    "stgcnpp_ntu60_xsub_hrnet_j.pth": {
+        "size": 5854105,
+        "sha256": "b274888dd5b7bd8552ce4e3c3073973af84fa0fd18fd94363eac25457f225992",
+    },
+}
+
+
+ACTION_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp61-trt10.4-orin-t100",
+        "files": {
+            "stgcnpp-ntu60-2d.engine": {
+                "size": 4384468,
+                "sha256": "fea60df0ebfa190dd1483705d1e53bd3124480afd6612258c6545e919e6f74f6",
+            },
+        },
+    },
+    # Same checkpoint and the same ONNX graph as jp61 — only the TensorRT that
+    # built the plan differs (8.5.2.2), which is why the bytes and the size do.
+    # Measurably slower on the older line: 8.62 ms GPU latency against jp61's
+    # 4.66 ms for an identical (1, 2, 100, 17, 3) input, so a jp5.11 robot has
+    # roughly half the action-inference headroom. The ~3 Hz per-track throttle
+    # in plugins/pose.py was sized with margin and still holds, but anything
+    # that raises activity_interval_s should be checked here first.
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp511-trt8.5-orin-t100",
+        "files": {
+            "stgcnpp-ntu60-2d.engine": {
+                "size": 3842709,
+                "sha256": "8a627bf92d372ba87eaf81062051ff1da7e2e759543161eb8a5d66c84a871268",
+            },
+        },
+    },
+}
+
+
 def _ensure_vision_bundle(
     kind: str, bundles: dict, model_dir: str, family: str | None = None,
     progress_cb=None,
@@ -1260,9 +1402,11 @@ def _ensure_vision_bundle(
         raise RuntimeError(
             f"{kind.upper()}_MODEL_BUNDLES[{key!r}] has no pinned size/sha256 for "
             f"{sorted(unpinned)} — build the engine with "
-            "tools/export_vision_engines.py on a host of that JetPack line, "
-            "publish it to COS, and record the size and SHA256 of the *uploaded* "
-            "copy here"
+            "tools/export_vision_engines.py in a container built from the "
+            f"{key} perception image (NOT on the Jetson host: the image and the "
+            "host ship different TensorRT versions and an engine only loads on "
+            "the one that built it), publish it to COS, and record the size and "
+            "SHA256 of the *uploaded* copy here"
         )
     log.info(f"[model_downloader] {kind}: using {key} bundle")
     return ensure_verified_bundle(
@@ -1282,4 +1426,40 @@ def ensure_depth_model(model_dir: str, family: str | None = None,
                        progress_cb=None) -> dict[str, str]:
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_action_checkpoint(model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Fetch the pinned ST-GCN++ checkpoint for the engine build.
+
+    Build-time only; nothing on a robot calls this. Pinned by size+SHA256 like
+    every other artefact here, and the pin is the hash of the copy downloaded
+    back from COS — which for this one also matches the upstream openmmlab
+    download byte for byte, so the mirror is verifiably the same weights.
+    """
+    return ensure_verified_bundle("action/checkpoint", model_dir,
+                                  ACTION_CHECKPOINT_BASE, ACTION_CHECKPOINT,
+                                  progress_cb=progress_cb)
+
+
+def ensure_action_model(model_dir: str, family: str | None = None,
+                        progress_cb=None) -> dict[str, str]:
+    """Ensure the skeleton-action engine matching the runtime TensorRT is present."""
+    return _ensure_vision_bundle("action", ACTION_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_pose_model(model_dir: str, family: str | None = None,
+                      progress_cb=None) -> dict[str, str]:
+    """Ensure the human-keypoint engine matching the runtime TensorRT is present.
+
+    The pins above are still zero, so this raises with the build instructions
+    until the engines have been exported inside the jp6.1 and jp5.11 perception
+    images and published. That is the intended behaviour, not a gap:
+    _ensure_vision_bundle refuses an unpinned entry rather than downloading it,
+    because size+SHA256 verification is what makes a multi-source fetch safe at
+    all. A pose card on a machine without the bundle reports `state: error` with
+    that message, and ASR/TTS/VOP/OCR are untouched.
+    """
+    return _ensure_vision_bundle("pose", POSE_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)

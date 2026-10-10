@@ -1341,6 +1341,111 @@ html, body {
     inset 0 1px 0 rgba(255,255,255,0.10);
 }
 
+/* ── 设备收尾芯片 ──────────────────────────────────────────────────────────
+   「停止智能控制」的第 2 段。按钮旁边一条可以不理、但有失败时不会自己消失的提示。
+   刻意比主按钮轻一档：agent 已经停了，这里报的是收尾，不是操作者还要等的事。 */
+.teardown-chip {
+  position: relative;
+  margin-left: 10px;
+  font-family: var(--font-ui);
+  /* **必须显式声明。** 手机上 `.canvas-top-control` 是 `pointer-events: none`（让
+     触摸穿过去落在画布上），子元素要自己 opt in —— `.canvas-main-btn` 和
+     `.auto-start-toggle` 都这么做。少了这一行，手机上这个芯片**完全点不动**：
+     展不开、重试点不到，而那时它正是唯一在屏幕上的提示（活动流在手机上是默认关
+     着的抽屉）。390x844 实测 `tap()` 直接超时。 */
+  pointer-events: auto;
+}
+.teardown-chip.hidden,
+.teardown-detail.hidden { display: none; }
+
+.teardown-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 12px;
+  border-radius: 100px;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text-muted);
+  background: var(--bg-card, #fff);
+  border: 1px solid var(--border, rgba(0,0,0,0.08));
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+  transition: all 0.2s ease;
+}
+.teardown-summary:hover { color: var(--text); box-shadow: 0 2px 6px rgba(0,0,0,0.10); }
+
+/* 三种语气。失败那一档要在工具条上能一眼看见，但不抢主按钮。 */
+.teardown-chip[data-tone="busy"] .teardown-summary { color: var(--text-muted); }
+.teardown-chip[data-tone="ok"]   .teardown-summary { color: var(--green, #0D6B55); }
+.teardown-chip[data-tone="warn"] .teardown-summary {
+  color: var(--red, #B3261E);
+  border-color: rgba(179,38,30,0.35);
+  background: #FFF4F2;
+}
+.teardown-chip[data-tone="busy"] .teardown-icon {
+  display: inline-block;
+  animation: teardown-spin 1.6s linear infinite;
+}
+@keyframes teardown-spin { to { transform: rotate(360deg); } }
+
+.teardown-caret { font-size: 10px; opacity: 0.55; }
+
+.teardown-detail {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 260px;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--bg-card, #fff);
+  border: 1px solid var(--border, rgba(0,0,0,0.08));
+  box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+}
+
+.teardown-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  font-size: 12px;
+  border-radius: 6px;
+  color: var(--text-muted);
+}
+.teardown-row.stopped .teardown-row-icon { color: var(--green, #0D6B55); }
+.teardown-row.error   { color: var(--text); background: #FFF4F2; }
+.teardown-row.error .teardown-row-icon { color: var(--red, #B3261E); }
+.teardown-row-tool { font-family: var(--font-mono, monospace); }
+.teardown-note { margin-left: auto; font-size: 11px; opacity: 0.8; }
+
+.teardown-retry {
+  margin-left: 8px;
+  padding: 2px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  border-radius: 100px;
+  cursor: pointer;
+  color: #fff;
+  background: var(--red, #B3261E);
+  border: none;
+}
+.teardown-retry:disabled { opacity: 0.5; cursor: default; }
+
+/* 触摸尺寸。桌面上这条芯片是一个次要提示，可以小；手上就不行 —— 而「重试」是整个
+   流程里唯一需要动手的控件，它原来是 42x19px，不到地板的一半。44px 是这份样式表
+   在别处用的同一个地板（.btn-icon / .btn-ghost / .sidebar-chip 都是）。 */
+@media (pointer: coarse) {
+  .teardown-summary { min-height: 44px; padding: 10px 14px; font-size: 13px; }
+  .teardown-caret { font-size: 12px; }
+  .teardown-row { padding: 8px 10px; font-size: 13px; }
+  .teardown-retry { min-height: 44px; padding: 10px 18px; font-size: 13px; }
+}
+
+/* 停止请求在飞的时候：按钮禁用，但要看得出它在做事而不是坏了。 */
+.canvas-main-btn:disabled { cursor: progress; opacity: 0.75; }
+
 /* Idle pulse animation */
 @keyframes btn-pulse {
   0%, 100% { box-shadow: 0 1px 2px rgba(0,0,0,0.08), 0 4px 12px rgba(44,37,32,0.25), inset 0 1px 0 rgba(255,255,255,0.05); }
@@ -2159,6 +2264,12 @@ html, body {
 .log-type.trigger       { background: var(--green-bg);  color: var(--green); }
 .log-type.executor      { background: var(--emerald-bg); color: var(--emerald); }
 .log-type.asr_result    { background: #D1FAF0; color: #0D6B55; }
+/* 旁人说的话 —— 和 asr_result 同色系但更淡：同一类信息（听到的话），不同的
+   地位（没在跟机器人说）。 */
+.log-type.asr_background { background: #E8F7F3; color: #3F8C79; }
+.log-type.project_stop_begin,
+.log-type.project_stop_item,
+.log-type.project_stop_done { background: var(--bg-hover); color: var(--text-muted); }
 .log-type.ping          { color: var(--text-dim); background: transparent; }
 .log-msg   { color: var(--text-muted); word-break: break-all; flex: 1; white-space: pre-wrap; }
 
@@ -6519,6 +6630,20 @@ html, body {
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow-sm);
   }
+  /* 工具条在这个断点是 `left:60px; right:60px` 且会换行，所以芯片的下拉不能按自己
+     的左边缘定位 —— 它会跟着芯片换到哪一行、偏到哪一列。拉满容器宽度之后，它在
+     任何换行结果下都不会越过屏幕边缘。 */
+  .teardown-chip { margin-left: 0; width: 100%; }
+  .teardown-summary { width: 100%; justify-content: center; }
+  .teardown-detail {
+    left: 0;
+    right: 0;
+    min-width: 0;
+    max-height: 50vh;
+  }
+  .teardown-row { flex-wrap: wrap; }
+  .teardown-note { margin-left: 26px; width: 100%; }
+  .teardown-retry { margin-left: auto; }
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
   .canvas-controls {

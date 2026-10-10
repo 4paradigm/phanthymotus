@@ -1,14 +1,16 @@
 mcp_port: 15720
 
-# 文件接收 (POST /file/upload)。agent-core 把浏览器/LLM 的上传代理到这里，
-# 本服务写到自己看得见的目录并把「本容器内的绝对路径」回给调用方 ——
-# 两个容器无需共享挂载。详见 utils/file_intake.py。
+# File intake (POST /file/upload). agent-core proxies browser and LLM uploads
+# here; this service writes them somewhere it can see and returns the absolute
+# path **inside this container**, so the two containers need no shared mount.
+# See utils/file_intake.py.
 file_intake:
-  # /models 是本容器唯一可写的宿主机挂载点。
+  # /models is the only host-mounted writable path in this container.
   dir: /models/uploads
   max_bytes: 67108864
-  # 上传只是中转，不是存储：注册人脸留下的是 embedding，从不保留照片。
-  # 不清理会在 57 GB 的 eMMC 上一直涨。
+  # An upload is a transfer, not storage: enrolling a face leaves an embedding
+  # behind and never the photograph. Without cleanup this grows forever on a
+  # 57 GB eMMC.
   retention_days: 7
 
 plugins:
@@ -42,6 +44,16 @@ plugins:
       threshold: 0.5
       silence_ms: 400
       pre_roll_ms: 500
+    # 把没有唤醒词的话语发到 <topic>/asr_background（priority 0 + log_type，走
+    # agent-core 的后台 subagent）。关掉就回到以前的行为：未触发的句子直接丢弃。
+    #
+    # 默认开，理由是两种失败的代价不对称：开着而不想要，结果只是一条没人读的
+    # topic（DDS 已锁在 loopback，出不了这台机器，不连线什么都不会发生）；关着而
+    # 想要，结果是人在画布上连好了线、什么都看不到、也不知道为什么。
+    #
+    # **要在画布上把 ASR 卡的第二个输出口连到 decision_core 才会进 LLM。**
+    # agent-core 订阅的是连进 decision_core 入口的 topic，不是插件声明的 topic_out。
+    publish_background: true
     # Wake-word gating. Still called `kws` for continuity with existing
     # deployments, but there is no longer a keyword-spotting *model*: the old
     # `trigger_mode: kws` ran a second sherpa KeywordSpotter on the raw audio
@@ -134,25 +146,30 @@ plugins:
     model: "yoloe-26s-seg"
     confidence: 0.3
     fps: 5
-    # ── 流式载荷的详略 ────────────────────────────────────────────────────
-    # 只管 topic 上那条流；一次性拍照识别（recognize / recognize_by_url）永远
-    # 发全量 —— 那个回复只被读一次，裁剪它省不下什么，而看不到画面的调用方
-    # 没有别的办法拿回像素框。
+    # ── How much the streamed payload carries ────────────────────────────
+    # Governs the stream on the topic only. The one-shot photo actions
+    # (recognize / recognize_by_url) always answer in full: that reply is asked
+    # for once and read once, so trimming it saves nothing, and a caller who
+    # cannot see the frame has no other way to recover the pixel box.
     #
-    # 为什么值得裁：agent-core 把订阅话题的**整条消息**原样塞进 event_bus 当
-    # 事件文本（agent-core/src/topic_subscriber.py），所以发出去的每个字节都是
-    # 每一帧的 LLM 上下文字节。
+    # Why trimming is worth anything: agent-core copies the **whole message** of
+    # a subscribed topic into the event bus as event text
+    # (agent-core/src/topic_subscriber.py), so every byte published here is a
+    # byte of LLM context on every frame.
     #
-    # 像素框。关掉只剩中心点，下游想按目标区域去采样另一张对齐的图（典型是
-    # visual_depth 的深度图）就只能取中心一小块，也无从知道目标多大。33 B。
+    # The pixel box. Off leaves only the centre point, so a consumer wanting to
+    # sample another aligned map over the object (typically visual_depth's) gets
+    # one small patch and no idea how large the thing is. 33 B.
     publish_bbox: true
-    # 颜色详略 off | name | full。
-    #   name（默认）  {"color": "dim muted azure", "brightness": 120.9}   27 B
-    #   full          原来那 12 个数 + 4 个标签，一字不差                 239 B
-    #   off           不发
-    # name 发的是**三元组**而不是 color_name：后者是前者的有损投影（它根本
-    # 不看饱和度，亮度 6 档也压成 3 档），而反过来可以无损还原。详见
-    # README.md § "vop 的流式载荷" 和 plugins/vop.py 的 color_triple 文档。
+    # Colour detail: off | name | full.
+    #   name (default)  {"color": "dim muted azure", "brightness": 120.9}  27 B
+    #   full            the original 12 numbers + 4 labels, verbatim      239 B
+    #   off             nothing
+    # `name` publishes the **triple**, not color_name: the latter is a lossy
+    # projection of the former (it ignores saturation entirely and collapses six
+    # brightness bands into three), while the triple reconstructs it exactly.
+    # See README.md § "vop's streamed payload" and color_triple in
+    # plugins/vop.py.
     publish_color: name
     # NOTE: there is no `classes` key any more. The engine's open-vocabulary
     # class list is frozen when the engine is exported, so it cannot be changed
@@ -187,26 +204,164 @@ plugins:
     cal_b: 0.0
     max_depth_m: 20.0
 
-    # ── 镜筒（渐晕）遮罩 ─────────────────────────────────────────────────
-    # r1_sz 2026-09-23 实测：主相机透过一个圆形镜筒往外看，每一帧四角都是纯黑的
-    # 外壳。深度模型不知道这回事，照样给它编了距离 —— 四角读 0.64~0.83 m（"我正
-    # 前方 0.7 米有东西"），而中心读 1.76 m，同时深度图的有效像素是 **100%**。
+    # ── Lens-barrel (vignette) mask ──────────────────────────────────────
+    # Measured on r1_sz, 2026-09-23: the main camera looks out through a
+    # circular lens barrel, so all four corners of every frame are solid black
+    # housing. The depth model does not know that and invents a distance for
+    # them anyway — the corners read 0.64-0.83 m ("something is 0.7 m straight
+    # ahead") against 1.76 m at the centre, while the depth map's valid-pixel
+    # count sits at **100%**.
     #
-    # 所以下游那层「不知道 ≠ 没东西」的保护（coverage）永远不触发：**这不是缺失，
-    # 是自信地错**，后者严格更糟。代价是实打实的：navi 用来选避让方向的角度三等分
-    # 读的是镜筒而不是房间（一条通畅的走廊上读出左 0.906 / 右 0.993 / 中 1.368），
-    # 近距离时米制走廊也会被机器人自己的镜头逼停。
+    # So the downstream guard that distinguishes "unknown" from "nothing there"
+    # (coverage) never fires: **this is not missing data, it is confidently
+    # wrong data**, which is strictly worse. The cost was real — navi's angular
+    # thirds, which choose which way to go round an obstacle, were reading the
+    # barrel instead of the room (0.906 left / 0.993 right / 1.368 centre down a
+    # clear corridor), and at close range a metric corridor would be blocked by
+    # the robot's own lens.
     #
-    # 判据是「接近纯黑 **且** 与画面边缘连通」—— 边缘连通这一条是关键，它让房间
-    # 中央的黑色物体不被误伤（它四周是场景，自成一个连通域）。剩下的误判是安全
-    # 方向的：被遮住的像素变成「没有读数」，coverage 下降，机器人不往看不清的地方
-    # 走 —— 那正是「不知道」该有的行为。
+    # The test is "near-black **and** connected to the frame edge". The
+    # edge-connectivity half is what makes it safe: a black object in the middle
+    # of the room is surrounded by scene and forms its own component, so it is
+    # not masked. What misfires does so in the safe direction — a masked pixel
+    # becomes "no reading", coverage drops, and the robot does not drive towards
+    # what it cannot see, which is what "unknown" is supposed to do.
     mask_lens_barrel: true
-    # 亮度阈值（0-255）。镜筒是纯黑的，这个值只需要容纳 JPEG 噪声。
+    # Brightness threshold (0-255). The barrel is solid black, so this only has
+    # to absorb JPEG noise.
     lens_barrel_threshold: 24
-    # 超过这个比例就什么都不遮：房间够暗时整幅画会连成一个边缘连通域，而全遮等于
-    # 让机器人失明。「房间黑」和「镜头被挡」需要人做不同的处置，所以不猜。
+    # Past this fraction, mask nothing. In a dark enough room the whole frame
+    # becomes one edge-connected component, and masking all of it blinds the
+    # robot. "The room is dark" and "the lens is blocked" need different human
+    # responses, so this does not guess between them.
     lens_barrel_max_fraction: 0.6
+
+  # Human keypoints + action classification. COCO-17 keypoints; postures come
+  # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities
+  # from a skeleton-action model. No second inference runtime: a second ONNX
+  # Runtime in this process SIGSEGVs on jp5.11 — see the tts notes.
+  #
+  # Like visual_depth, the engine is loaded lazily on the first `start`, so an
+  # enabled-but-unwired card costs nothing. On an 8 GB Orin the binding
+  # constraint is memory, not GPU time.
+  pose:
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
+    # input to the action rules: a noisy wrist breaks the reversal count that
+    # separates waving from reaching, and a noisy hip breaks the drop ratio that
+    # separates a fall from lying down. The 57.2 -> 63.0 mAP(pose) step buys
+    # fewer misjudged actions, not prettier skeletons. Costs ~12 MB resident and
+    # ~8 ms/frame (extrapolated). On a machine short of memory that does not
+    # need pose, the lever is `enabled`, not a smaller model whose keypoints the
+    # rules cannot rely on.
+    model: "yolo26s-pose"
+    confidence: 0.4     # person-detection threshold
+    # 12 rather than 5. The geometry judges per frame, but the skeleton-action
+    # model judges a **clip**: a 2.5 s window at 5 fps is 13 real frames
+    # resampled up to the engine's 100, most of it interpolation — and the
+    # frequency of a wave and the speed of a fall live in those frames. Below 12
+    # the card's `info` returns an action_fps_note.
+    fps: 12
+    # Per-joint visibility threshold. A joint below it takes no part in the
+    # rules and is not drawn.
+    kpt_confidence: 0.3
+    max_persons: 5
+    # ── Three output topics, and why they are separate ───────────────────
+    #   {topic}/poses              data/json      lean: posture + activity
+    #   {topic}/poses/skeleton     sensor/pose2d  full keypoints, for the dashboard
+    #   {topic}/poses/overlay_img  image/jpeg     skeleton drawn on the frame
+    #
+    # agent-core copies the **whole message** of a subscribed topic into the
+    # event bus as event text (agent-core/src/topic_subscriber.py), so every
+    # byte on the stream wired to decision_core is a byte of LLM context on
+    # every frame. 17 keypoints x 3 floats x N people at 5 fps does not fit that
+    # budget — and a skeleton is useless to a text model anyway, while being
+    # exactly what the dashboard wants to draw. So the fat payload goes on a
+    # topic the LLM does not subscribe to.
+    #
+    # off (default) / compact (17 integer pixel points) / full (17x(x,y,vis)).
+    # Roughly 60 B -> 400 B -> 900 B per person per frame. The skeleton topic is
+    # unaffected by this setting.
+    #
+    # The quotes are required: YAML 1.1 parses a bare `off` as boolean false,
+    # not the string "off". It happens to work here (an unusable value falls
+    # back to off), but `on` would become true and then silently fall back to
+    # off, which reads as the setting not taking effect.
+    publish_keypoints: "off"
+    publish_bbox: true
+    # Publish a second stream with the skeleton drawn on the frame. Costs a draw
+    # and a JPEG encode per frame plus a topic carrying JPEGs, so it is off by
+    # default. (That per-frame cost has not been measured on an Orin; it is
+    # bounded by the encode rather than the drawing, and is paid at the card's
+    # fps, not the camera's.)
+    #
+    # Why it is a published topic rather than something the browser composes: a
+    # dashboard renderer only ever sees one topic (detail-panel.js opens a
+    # single /ws/bus/{topic} for the selected port), so a camera feed and a
+    # keypoint feed cannot be combined client-side.
+    publish_overlay: false
+    # How far back the action rules look. The frequency of a wave and the
+    # cadence of a walk are both counted inside this window.
+    action_window_s: 1.5
+    # ── Action backend ───────────────────────────────────────────────────
+    # hybrid (default) = postures from the geometry, activities from the
+    #                    ST-GCN++ skeleton-action model
+    # rules            = geometry only, no second engine. This is also what the
+    #                    card falls back to when the engine cannot be fetched;
+    #                    selecting it by hand is mainly how "the model is wrong"
+    #                    gets told from "the geometry is wrong" on a robot.
+    #
+    # The model-only `stgcn` mode has been **withdrawn** (no longer offered on
+    # the card; a card saved with it is migrated to hybrid and says so in
+    # `info`). Two measured reasons:
+    #   1. NTU-60 has no `standing` or `sitting` *state* class — only sit down /
+    #      stand up transitions — so a motionless person produces no event.
+    #   2. Worse, a static clip does not make it unsure, it makes it
+    #      **confidently wrong**: a photograph of a real person lying on
+    #      pavement, held still for 100 frames, came back as NTU's "play with
+    #      phone/tablet" at 0.997, entropy 0.03.
+    # An option with only one correct value is not a choice, it is a trap.
+    #
+    # The model is ST-GCN++, joint stream, NTU60-XSub, 2D 17-keypoint input:
+    # 1.39 M params / 1.95 GFLOPs, about 8% of the pose engine's compute
+    # (10.4 M / 24.1 G). Single stream rather than the four-stream ensemble —
+    # 4x the compute for +3.9 points is not worth it.
+    action_backend: hybrid
+    # Score threshold for the model. Before changing it, read the actual scores
+    # in `info` — that is the only way to tell "the model is wrong" from "the
+    # threshold is wrong". Falling is held to a higher bar of its own
+    # (FALL_MIN_SCORE), because the engine returns A43 at 0.62 on pure noise and
+    # a false fall makes the robot interrupt itself to ask whether somebody is
+    # hurt.
+    action_min_score: 0.40
+    # Label hysteresis: how many consecutive frames a new label must win before
+    # it replaces the current one. Every threshold here is a cliff, and at the
+    # boundaries the raw answer flips on every frame. The cost is latency on
+    # every genuine change, exactly `hold - 1` frames — 167 ms at 12 fps. The
+    # raw answer stays visible in evidence.raw_posture / raw_activity.
+    label_hold: 3
+    # ── Fall thresholds ──────────────────────────────────────────────────
+    # These are **not** constants, which is why they are instance config. The
+    # same fall measures differently depending on where the camera is mounted:
+    # drop_ratio for one event differs between a camera at 0.4 m and at 1.2 m,
+    # and pitch and focal length come into it too. The values below are a
+    # starting point, not a conclusion — tune them on the rig with the camera
+    # where it will actually be, and record what you saw (the card's evidence
+    # carries drop_ratio / drop_ms / settle_ms).
+    #
+    # What is being judged is a **transition**, not a terminal pose: lying on
+    # the floor and lying on a sofa are the same final shape. A fall needs the
+    # hips to drop fast, the body to stay horizontal afterwards, and no
+    # `sitting` phase on the way down.
+    #
+    # Known limit: from a single monocular camera facing the person, "fell over"
+    # and "crouched then lay down" are close to indistinguishable; a side view
+    # is far more reliable. A false positive costs more than a miss — each one
+    # makes the robot drop what it is doing to ask whether somebody is hurt.
+    fall_drop_ratio: 0.35
+    fall_drop_window_s: 0.6
+    fall_settle_s: 1.0
 
   ocr:
     enabled: true
@@ -234,6 +389,82 @@ plugins:
 
   soundevent:
     enabled: true
+  speaker_recognition:
+    enabled: true
+    # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
+    # 走 sherpa-onnx 自带的那份 ONNX Runtime —— 和 ASR/TTS 同一份，所以不会触发
+    # plugins/face_runtime.py 记录的双 ORT 冲突，也不需要 face 那套子进程隔离。
+    # `off` = **完全不加载**：权重不进内存（cpu 实测 +84 MB，gpu +478 MB）、不占
+    # 算力，ASR 的输出也不再带 speaker_* 字段。和卡片上的 stop 不是一回事 ——
+    # 那个只停止归因，引擎仍留在内存里等着重新启用。
+    # 关闭状态下名单、改名、删除仍然可用（维度从 persons.json 读，不需要模型）。
+    model: campplus_zh_en
+    # 和 face_db 一样，唯一可写的宿主挂载路径是 /models。
+    db_dir: /models/speaker_db
+    # 每个声纹留一段可播放的代表音频。/models/vad_segments 只存 1000 条且会滚动，
+    # 几天后就没了，而 get_speaker 要在几个月后还能放出来给人听 —— 声纹是从匿名
+    # 话语建的，判断「这是谁」只能靠听。
+    sample_dir: /models/speaker_db/samples
+    # cpu 是默认且通常是对的。实测（Orin 6, jp6.1）gpu 单跑 62 ms vs cpu 101 ms，
+    # 快 1.62 倍；但端到端换不出收益：ASR 在 cpu 时声纹完全藏在它的 230 ms 后面
+    # （并发净增 2-7 ms），ASR 在 gpu 时两个 CUDA session 争同一块 GPU，搬上去只
+    # 省 3 ms 还多占 478 MB。
+    device: cpu
+    num_threads: 2
+    warmup: true
+    # 余弦相似度阈值。**0.6 是起点，不是实测值** —— sherpa 自己示例的默认值。
+    # face 的 0.35 是 ArcFace 的尺度，不能照搬。认错人就调高，认不出就调低，
+    # 并把看到的现象记下来。定它需要标注语料（几个人各若干句、用机器人自己的
+    # 麦克风录），这件事还没做。
+    # 认不出来时 payload 里分两种 reason，处置相反：
+    #   no_speakers_enrolled —— 库里一个人都没有，去 name_speaker 注册一个；
+    #   no_match + speaker_best_similarity —— 比过了但都不够像，那个分就是调这个
+    #     阈值唯一能靠的依据（看到 0.52 才知道降到 0.5 能认出）。
+    match_threshold: 0.6
+    # 质量门。声纹在 1.5 秒以下急剧退化，而 VAD 只要 0.5 秒就出段，所以
+    # 「嗯」「好」「停」会产生垃圾 embedding。不够长只报听到了、不给身份。
+    # 同样是起点不是实测值。
+    min_speech_s: 1.5
+    # 超过这个时长就检查这一段里是否换过人：算**前 4 秒**和**后 4 秒**两个
+    # embedding，余弦低于 coherence_min 就判定多说话人并**不给身份**。
+    # 比两端而不是「前 4 秒 vs 整段」：后者在 condition() 的 6 秒截断之下，对一段
+    # 29 秒的音频实际只看了开头 6 秒（Orin 5 上实测 coherence 0.954，后面 23 秒
+    # 根本没看）。比两端是同样两次 embedding，但覆盖整段。
+    # 这不是假想的问题：Orin 5 上 73 段真实长语音，cosine(整段, 前3秒) 的
+    # p50 是 0.843 但 p05 只有 0.197 —— 一个窗口不可能和它自己的母段无关，
+    # 除非母段是两个人的混合。
+    split_above_s: 4.0
+    coherence_min: 0.8
+    # 默认**开**，和 face 一致。p-N 这个格式存在的意义就是身份在有名字之前就稳定：
+    # 没有 id 的话，一个没人命名过的声音在 payload 里不带任何信息，于是「刚才那个
+    # 人又说话了」—— 多人对话里唯一真正能让 agent 行动的那条信息 —— 表达不出来。
+    # name_speaker(speaker_id=...) 也需要 id 先存在。
+    #
+    # 代价是 perception 没有回声消除，机器人自己的 TTS、电视、走廊路人都会被登记。
+    # 但一个持续的噪声源**自己和自己匹配**，所以它变成一两条稳定条目而不是淹掉
+    # 整个库；而且可回收也可见：list_speakers 未命名在前、get_speaker 给一段音频
+    # 可以听、forget named=unknown 一键清、unknown_capacity 还会淘汰最久未听到的。
+    auto_enroll: true
+    # 建一个**新**声纹比匹配一条已有的要求更长的片段。face 做了完全相同的区分，
+    # 理由也一样：1.6 秒够冒险匹配一次，但不够成为一条声纹 —— 勉强的 embedding
+    # 会占住一个槽位，而且再也匹配不上任何东西。
+    enroll_min_speech_s: 2.0
+    # 默认开，是免费拿到的最大一档准确率提升。已命名的人每说一句质量够好的话就
+    # 补一条样本；声纹随距离/感冒/情绪/嘈杂漂移比人脸随光照大得多，而打分取样本
+    # 最大值而非质心平均，所以补样本只会更准。写盘在后台线程做 —— ASR 在 publish
+    # 前会 join 声纹，inline 写会把 eMMC 的开销压在每句话上。
+    auto_add_samples: true
+    sample_min_similarity: 0.75
+    sample_min_speech_s: 2.0
+    # 未命名声纹上限，超出淘汰最久未听到的；已命名不受影响。
+    unknown_capacity: 50
+    max_samples_per_person: 8
+    # 这张卡是 actuator，不订阅任何 topic：身份是在 ASR 已经切好的那个 VAD 段上算
+    # 的，随 ASR 的输出一起走。所以这里没有 VAD 参数 —— 切分完全由 asr.vad 决定。
+    #
+    # 画布上这张卡的作用是对它下命令（命名、查名单、听样本、删人）。start 会预加载
+    # 模型（否则第一句话要多等 1-2 秒），stop 会停止给语音附加身份、也停止建新声纹。
+
   face_recognition:
     enabled: true
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
@@ -278,26 +509,33 @@ plugins:
     # people are never evicted. Editable from the card.
     unknown_capacity: 500
     max_samples_per_person: 8
-    # 访问记录表 (visits.jsonl): 一次连续出现 = 一条记录，不是一帧一条。
-    # 离开超过 visit_gap_s 才封档落盘；10 分钟避免有人转个头就把一下午切成几十条。
+    # Visit log (visits.jsonl): one continuous appearance is one record, not
+    # one per frame. A visit is closed and written only after the person has
+    # been absent for visit_gap_s; 10 minutes stops somebody turning their head
+    # from cutting an afternoon into dozens of records.
     visit_gap_s: 600.0
-    # 在场的人的 visit 会在内存里挂很久（10 分钟 gap + 一直出现），断电会整条丢，
-    # 所以每 visit_checkpoint_s 把未封档的 visit 落一次小文件，重启后续上。
+    # A present person's visit stays in memory for a long time (10 minute gap
+    # plus continuous presence) and a power cut would lose the whole record, so
+    # open visits are checkpointed to a small file every visit_checkpoint_s and
+    # resumed after a restart.
     visit_checkpoint_s: 60.0
     visit_log_max: 20000
     max_batch: 200
-    # 过大/非常见格式的图片在本地缩放转码，而不是在接口处拒绝。
-    # 检测本身会把图 letterbox 到 det_size(640)，所以 2048 已远超需要，
-    # 在这里用 INTER_AREA 缩一次比让 letterbox 缩更快也更清晰。
+    # Oversized or unusual-format images are rescaled and transcoded locally
+    # rather than refused at the interface. Detection letterboxes to det_size
+    # (640) anyway, so 2048 is already far more than needed, and one INTER_AREA
+    # downscale here is both faster and sharper than letting letterbox do it.
     max_image_side: 2048
-    # 解压炸弹护栏（像素数）：几百 KB 的 PNG 可以声明 30000x30000，
-    # 解出来 2.7 GB 会让 OOM killer 带走整个 perception 进程。
+    # Decompression-bomb guard, in pixels. A few hundred KB of PNG can declare
+    # 30000x30000, and decoding it to 2.7 GB gets the whole perception process
+    # taken out by the OOM killer.
     max_image_pixels: 60000000
-    # 仅为传输/内存护栏，不是策略限制 —— 超大图片会被本地缩放而非拒绝。
+    # A transfer and memory guard, not a policy limit — an oversized image is
+    # rescaled locally rather than refused.
     max_image_bytes: 67108864
     # Caller-supplied image/package paths are confined to these roots — the MCP
     # server has no authentication and runs as root in the container.
     image_roots: ["/models", "/tmp", "/work"]
-    # 检测频率: how many detections per second. Fractional is the point —
+    # Detection rate: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0

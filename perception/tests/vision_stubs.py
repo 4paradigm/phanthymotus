@@ -108,6 +108,17 @@ class _FakeString:
         self.data = ""
 
 
+class _FakeHeader:
+    """`stamp` is the only field anything here sets, but the attribute has to
+    exist: a publisher that stamps its outgoing frames (pose's overlay) would
+    otherwise fail inside its own try/except and publish nothing, which looks
+    like a disabled feature rather than a missing stub."""
+
+    def __init__(self):
+        self.stamp = 0
+        self.frame_id = ""
+
+
 class _FakeCompressedImage:
     # Defaults so a plugin that *publishes* one can construct it the way ROS
     # does — `CompressedImage()` then assign — as well as tests that build an
@@ -115,6 +126,7 @@ class _FakeCompressedImage:
     def __init__(self, data: bytes = b"", fmt="jpeg"):
         self.data = data
         self.format = fmt
+        self.header = _FakeHeader()
 
 
 class _FakeAudioChunk:
@@ -297,6 +309,51 @@ def _install_fake_cv2():
         return nxt, labels
 
     cv2.COLOR_BGR2GRAY = 6
+    # ── drawing + encoding, for the pose overlay path ────────────────────
+    #
+    # Approximations, and deliberately so: their only job is to let a test
+    # assert that the drawing code ran and touched the canvas. Without them
+    # `draw_skeleton` raises AttributeError inside the plugin's own
+    # try/except, the overlay silently publishes nothing, and the test passes
+    # on a host with no OpenCV while the real path is never exercised — which
+    # is precisely the failure mode frame_bytes() exists to prevent.
+
+    def line(img, pt1, pt2, colour, thickness=1, lineType=0):
+        steps = max(abs(pt2[0] - pt1[0]), abs(pt2[1] - pt1[1]), 1) + 1
+        xs = _np.linspace(pt1[0], pt2[0], steps).round().astype(int)
+        ys = _np.linspace(pt1[1], pt2[1], steps).round().astype(int)
+        inside = ((xs >= 0) & (xs < img.shape[1]) & (ys >= 0) & (ys < img.shape[0]))
+        img[ys[inside], xs[inside]] = colour
+        return img
+
+    def circle(img, centre, radius, colour, thickness=1, lineType=0):
+        x, y = int(centre[0]), int(centre[1])
+        r = max(int(radius), 1)
+        y0, y1 = max(y - r, 0), min(y + r + 1, img.shape[0])
+        x0, x1 = max(x - r, 0), min(x + r + 1, img.shape[1])
+        img[y0:y1, x0:x1] = colour       # a square, not a disc
+        return img
+
+    def putText(img, text, org, fontFace, fontScale, colour, thickness=1,
+                lineType=0):
+        cv2.__text_calls__.append((text, tuple(org)))
+        return img
+
+    def imencode(ext, img, params=None):
+        # Returns the same b"WxH" marker frame_bytes() produces, so an encoded
+        # overlay can be handed straight back to imdecode in a test.
+        height, width = img.shape[:2]
+        return True, _np.frombuffer(f"{width}x{height}".encode(), dtype=_np.uint8)
+
+    cv2.LINE_AA = 16
+    cv2.FONT_HERSHEY_SIMPLEX = 0
+    cv2.IMWRITE_JPEG_QUALITY = 1
+    cv2.__text_calls__ = []
+    cv2.line = line
+    cv2.circle = circle
+    cv2.putText = putText
+    cv2.imencode = imencode
+
     cv2.COLOR_BGR2HSV = 40
     cv2.imdecode = imdecode
     cv2.resize = resize

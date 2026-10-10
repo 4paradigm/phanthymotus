@@ -2,7 +2,8 @@
 
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
 vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
-`face_recognition`). Connects to Agent Core via MCP tool calls and exchanges
+`face_recognition`, `pose` human keypoints + actions). Connects to Agent Core via
+MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
@@ -1525,6 +1526,80 @@ asked 「在发生什么了？」. Off-by-one on a syllable also silently change
 in mixed script, where latin and CJK have very different phonemes-per-character and
 one ratio was applied to both.
 
+**And the import itself forked, which wedged perception outright.** The env-var fix
+above stops *phonemizer* from calling `find_library`. It cannot stop `dlinfo` — a
+package phonemizer imports — from calling `find_library('dl')` at **import** time,
+and `ctypes.util.find_library` on Linux `subprocess`es out to `ldconfig -p`.
+
+Forking a 2.4 GB process with dozens of threads, one of them running a TensorRT
+warmup, hangs. Measured on Orin 5: the child never reached `exec` (at fork it
+inherited a lock another thread held), the parent sat in `_execute_child` waiting
+on the error pipe, and both stayed there. Consequences, in the order an operator
+meets them:
+
+| | |
+|---|---|
+| symptom | 「启动控制」卡住 —— the dashboard button never completes |
+| what is actually stuck | every `tools/call`, because the ASR worker holds the import lock |
+| what the logs say | nothing. The last line written is the one before the fork |
+| how it looks | perception dead; CPU at 99% (that is the unrelated TTS warmup thread) |
+
+It is a **race**, which is why it had never been seen: the same card starts cleanly
+when nothing else is loading. It needs the first phonemization (`_worker_inner`
+pre-computes the wake word's IPA at worker start) to land while another thread is
+busy — i.e. exactly what 「启动控制」 does by bringing TTS and ASR up together.
+
+**And it was not one fork, it was four.** Counted on Orin 5 by instrumenting
+`subprocess.Popen` around `from phonemizer.backend import EspeakBackend`:
+
+| | forks | what |
+|---|---|---|
+| before | **4** | `uname -p`, `/sbin/ldconfig -p`, `/usr/bin/gcc -Wl,-t -o /tmp/… -ldl`, `/usr/bin/objdump -p -j .dynamic …/libdl.so` |
+| after | **0** | — |
+
+The gcc/objdump pair is `ctypes.util`'s fallback path: `ldconfig -p` finds nothing,
+because `Dockerfile.jetson` replaces `ldconfig` with a no-op during apt installs and
+the cache is never rebuilt — *the same root cause as the espeak lookup above*. So
+what reads like one library lookup actually **compiles a program** to locate
+`libdl`. Three forks, one of them a compiler, in a process that must not fork.
+
+`uname -p` is **not** `platform.processor()` — that was the obvious guess, it was
+wrong, and patching `processor` measurably changed nothing (still 1 fork). The
+caller is `platform.system()` → `platform.uname()`, which fills its `processor`
+field via `platform._syscmd_uname`. `joblib`, imported by
+`phonemizer.backend.base`, calls `system()` at import time.
+
+So the fix has two halves:
+
+- **`_warm_platform_uname()` at module import.** `platform.uname()` caches, so one
+  call while perception is still loading plugins — nothing inferring, few threads —
+  serves every later caller from `_uname_cache`. This is what actually removes that
+  fork; the `noguard` count above drops 4 → 3 purely from the warm-up being in place.
+- **`_import_without_forking()` around the import.** Resolves the libraries we need
+  from a path list (`_FORK_FREE_LIBRARIES`) and makes `_syscmd_uname` return its
+  `default` instead of forking — which is exactly what `platform` does on a system
+  with no `uname` binary. Both are restored afterwards. A library not in the list
+  falls through to the real implementation, because returning `None` would be read
+  as "not installed". `_syscmd_uname` is private, so its absence is tolerated: a
+  CPython that drops it must not break ASR.
+
+Not a retry and not a timeout: there is no fork left to hang. A tiny child is not a
+safer child, which is why `uname -p` was in scope at all — the hang is *in* fork,
+before exec, so the size of what would have been exec'd is irrelevant.
+
+Verified on Orin 5: 「启动控制」's shape (TTS warmup and the ASR card started
+together) run 4 times in a row, phonemization completing in 5–9 s each time and MCP
+answering in under 130 ms throughout.
+
+Diagnosing the live wedge took `py-spy dump`, which is worth remembering because
+nothing else showed it — `docker logs` was silent, `docker top` showed one busy
+thread (the wrong one), and MCP simply did not answer:
+
+```bash
+docker exec embodied-perception pip3 install -q py-spy
+docker exec --privileged embodied-perception py-spy dump --pid $(pgrep -f "python3 /work/main.py" | head -1)
+```
+
 `_text_to_ipa(text, with_positions=True)` now also returns, per phoneme, the
 character offset in the original string that phoneme ends at — built from growing
 prefixes of each segment, phonemized through the same function that produced the
@@ -1532,6 +1607,113 @@ phonemes. Segments are `(start, end, is_cjk)` offsets rather than `strip()`ed
 substrings, so punctuation and whitespace stay accounted for. `_text_after_phoneme`
 is then a lookup, which also removes the second phonemization pass. Positions are
 opt-in: callers that only need to match pay nothing for the prefix passes.
+
+---
+
+## 语音情绪和音频事件（SenseVoice 顺带给的）
+
+SenseVoice-small 的输出前几个 token 不是文字，而是四个 tag：语种、情绪、音频事件、
+ITN 开关。sherpa-onnx 在把它们从 `text` 里剥掉的同时填进了结果对象的三个字段：
+
+```python
+res = stream.result
+res.text      # 'Yeah.'
+res.lang      # '<|en|>'
+res.emotion   # '<|HAPPY|>' / '<|NEUTRAL|>' / '<|EMO_UNKNOWN|>' …
+res.event     # '<|Laughter|>' / '<|Speech|>' / '<|BGM|>' …
+```
+
+也就是说这些信息**本来就已经算出来了**，而适配器以前 `return text` 把其余三个一起
+扔了。捡回来不加载任何模型、不多跑一次推理、不多占一字节显存 —— 这是它和另一条路
+（emotion2vec+ 作为独立卡片）唯一但决定性的区别。
+
+`emit_audio_tags`（默认 **开**，只对 `sensevoice-small` 显示）把 `lang` 和
+`audio_event` 合进 `<topic>/asr` 和 `<topic>/asr_background` 两条 payload。
+`emit_emotion` 是**第二个开关，默认关** —— 理由在下面，是量出来的，不是谨慎。
+
+### 没信息的取值被压掉，而不是照发
+
+`_UNINFORMATIVE_AUDIO_TAGS` 挡掉 `NEUTRAL` / `EMO_UNKNOWN` / `UNKNOWN` /
+`Speech` / `Event_UNK` / `withitn` / `woitn`。所以一句语气平淡的普通话只多出
+`{"lang": "zh"}`，笑了才会多出 `"audio_event": "Laughter"`。
+
+两个理由，第二个更重要。payload 的每个 key 都会进 L4 trigger 让 LLM 读一遍，每句
+挂一个 `"emotion": "NEUTRAL"` 是让它为零信息付 token；而且它会把「模型没判断出情
+绪」读成「这个人语气平淡」—— 那是两件不同的事。`Speech` 同理：说话这件事由 `text`
+本身证明。这跟 `plugins/speaker.py` 只返回带信息的 key 是同一条规则。
+
+`lang` 不在压掉的名单里：它每次都有值，而值本身就是信息（zh/en/ja/ko/yue）。
+
+字段叫 `audio_event` 而不是 `event`，因为 agent-core 那边 `event` 是事件总线的词
+（`src/event/llm.py`、`config['event']`），payload 里再出现一个同名 key 只会让读日
+志的人以为是同一件事。
+
+### tag 走返回值，不走适配器上的状态
+
+`ASRAdapter.transcribe_rich()` 返回 `(text, extras)`；基类默认实现返回
+`(transcribe(...), {})`，所以 parakeet / x-asr 下这些 key 干脆不出现，而不是出现一
+个空值让 LLM 以为「判断过、没有情绪」。
+
+不要改成在适配器上记一个 `self._last_emotion`：`ASRPlugin._adapter` 是 **plugin 级
+的单个实例**，被所有 `_ASRNode` 共用（见 `_apply_shared`），而每个 node 有自己的
+worker 线程。两个麦克风同时转写时，挂在实例上的状态会把情绪配到另一句话上 —— 不报
+错，也不会有任何日志。
+
+三个字段都用 `getattr(..., "")` 取：它们来自 sherpa 的 C++ binding，换个版本少一个
+就直接取属性会让整条 ASR 路径抛异常。少一个 tag 不值得让机器人听不见。
+
+### 三个字段的实测价值差得很远（351 段真机语音）
+
+Orin 6 上 `/models/vad_segments/` 攒的 351 段真实语音，全部过一遍
+`sensevoice-small` int8：
+
+| 字段 | 分布 | 结论 |
+|---|---|---|
+| `lang` | zh 212 / en 116 / ko 12 / ja 6 / yue 3 / nospeech 2 | 每条都有值，而且都对得上 —— **真有用** |
+| `emotion` | NEUTRAL 180 + EMO_UNKNOWN 160 = **340/351**；SAD 5、HAPPY 6 | 剩下那 11 条基本是**错的**，见下 |
+| `audio_event` | Speech 348 + Event_UNK 3 | 压掉之后**一条都不剩** |
+
+情绪那 11 条长这样：
+
+| 真实句子 | 判成 |
+|---|---|
+| 小范小范，你好呀。 | SAD（同一种误判出现 3 次） |
+| 我的断网了，我断网了吗？ | HAPPY |
+| 也行先试试看吧也好不？对嗯，那我看了一下，好像也没有特别慢吧。 | HAPPY |
+
+不是「信号稀疏」，是噪音。而且它的错误方式最坏：一个挂在愉快问候上的
+`"emotion": "SAD"` 会让 LLM 按一种不存在的低落语气回应 —— 比没有这个字段更糟。
+所以 `emit_emotion` 默认关。开关留着，因为换一批说话人、换个场景也许不一样，而要量
+就得能打开；但默认值要对得起测出来的东西。真要做情绪识别，该上的是 emotion2vec+
+独立卡片，而不是把这个字段当它用。
+
+`audio_event` 全是 `Speech` 还有一个**结构性**原因，不只是语料里没人笑：这些段是
+**VAD 门控之后**的语音段，纯笑声/掌声/音乐根本走不到 ASR。所以在这条管道里，这个
+字段只可能在笑声**混在说话里**时触发。它默认开着是因为成本已经是零，不是因为验证
+过它会响。要检非语音事件，`plugins/soundevent.py` 才是直接订阅原始音频的那个；两者
+在 Laughter/Applause 这类标签上重叠，谁更准没比过。
+
+复现这个测量（只读，不动容器里的代码）：
+
+```bash
+# 拿 351 段真机语音过一遍，统计三个 tag 的分布
+ssh nvidia@10.100.121.16 'docker exec embodied-perception python3 - <<EOF
+import glob, wave, struct, collections, sherpa_onnx
+r = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+    model="/models/sherpa-onnx/sensevoice/model.int8.onnx",
+    tokens="/models/sherpa-onnx/sensevoice/tokens.txt",
+    num_threads=2, use_itn=True, language="auto")
+tally = collections.Counter()
+for f in sorted(glob.glob("/models/vad_segments/*.wav")):
+    with wave.open(f) as wf: pcm = wf.readframes(wf.getnframes())
+    n = len(pcm) // 2
+    st = r.create_stream()
+    st.accept_waveform(16000, [v/32768.0 for v in struct.unpack(f"<{n}h", pcm)] + [0.0]*8000)
+    r.decode_streams([st])
+    if st.result.text.strip(): tally[(st.result.emotion, st.result.event)] += 1
+print(tally)
+EOF'
+```
 
 ---
 
@@ -2436,6 +2618,486 @@ Three traps, all observed:
 Then upload to COS and pin size + SHA256 in `utils/model_downloader.py` — of
 the copy **downloaded back from COS**, not the local file, for the reason the
 other bundles in that file state.
+
+---
+
+## `pose`: human keypoints and action labels
+
+COCO-17 keypoints per person plus **what each person is doing**. Same shape as
+`vop` and `visual_depth` — a prebuilt TensorRT engine fetched as a pinned bundle
+(`ensure_pose_model`), driven directly through `utils.tensorrt_runtime` with the
+letterbox and decode in `plugins/vision_runtime.py` (`decode_poses`). The engine
+loads on the **first `start`**, like `visual_depth`: on an 8 GB Orin already
+running vop, depth, OCR, ASR and TTS the binding constraint is memory, not GPU
+time, so an enabled-but-unwired card has to cost nothing.
+
+Action labels come from `plugins/pose_action.py` — pure numpy geometry over a
+window of keypoints. **No second model and no second inference runtime**, and
+that is not a shortcut: a second ONNX Runtime in this process shares one provider
+bridge with the first, which throws on jp6.1 and SIGSEGVs the whole of perception
+on jp5.11 (see `plugins/kokoro_worker.py`). A learned skeleton-action model
+(ST-GCN and friends) would replace `PoseActionClassifier` and nothing else —
+hence `action_backend`, and hence `classify()` taking plain `PoseFrame`s and
+returning a plain dict.
+
+### Three output topics, and why it is not one
+
+| topic | format | who consumes it |
+|---|---|---|
+| `{input}/poses` | `data/json` | wired to `decision_core` — **lean**: action, centre, bbox |
+| `{input}/poses/skeleton` | `sensor/pose2d` | the dashboard renderer — **full** keypoints |
+| `{input}/poses/overlay_img` | `image/jpeg` | skeleton drawn on the frame (`publish_overlay`, off by default) |
+
+agent-core copies the **whole message** of a subscribed topic into the event bus
+as event text (`agent-core/src/topic_subscriber.py`), so every byte on the topic
+wired to `decision_core` is a byte of LLM context *on every frame*. 17 keypoints x
+3 floats x N people at 5 fps does not fit in that budget — and a skeleton is
+useless to a text model anyway, while being exactly what the dashboard wants to
+draw. So the fat payload goes on a topic the LLM does not subscribe to.
+
+Measured on a 640x480 frame, bytes per published message:
+
+| | lean `off` | lean `compact` | lean `full` | skeleton topic |
+|---|---|---|---|---|
+| 1 person | **196** | 399 | 554 | 982 |
+| 3 people | **441** | 1076 | 1534 | 1936 |
+
+At 5 fps and three people, `publish_keypoints: full` would be ~7.7 kB/s of LLM
+context against 2.2 kB/s — and none of it readable by a text model. (The skeleton
+topic's figures include ~750 B of constant self-description per message, the
+keypoint names and the bone table. It is on the topic nothing reads into a
+prompt, and it is what lets a consumer that is not our renderer work without
+knowing COCO-17 by heart.)
+
+`publish_keypoints` (`off` | `compact` | `full`) can put them on the lean topic
+anyway if something downstream needs them; it does not affect the skeleton topic,
+which is always full. Note `publish_keypoints: "off"` is **quoted** in
+`config.yaml` on purpose — YAML 1.1 parses a bare `off` as boolean `false`.
+
+The one-shot photo actions always answer in full, like vop's: that reply is asked
+for once and read once, so trimming it saves nothing.
+
+### Why the overlay is a third topic rather than drawn in the browser
+
+A dashboard renderer only ever sees **one** topic — `detail-panel.js` opens a
+single `/ws/bus/{topic}` for the selected port — so a camera feed and a keypoint
+feed cannot be combined client-side. Hence `publish_overlay`, which costs a draw
+plus a JPEG encode per frame and a DDS topic carrying JPEGs, and is therefore
+**off** unless asked for. No publisher is created until it is. (The per-frame cost
+has not been measured on an Orin yet — it is bounded by the encode, not the
+drawing, and it is paid at the card's `fps`, not the camera's.)
+
+### Where to look at each one
+
+The card's **查看数据流** button opens the *first* output topic, i.e. the lean
+`data/json` one (`canvas.js` `_openTopicDetailFor` takes the first entry with a
+topic). The skeleton and the overlay are reached from the **监控** tab, which
+gives every resolved output topic its own card with the renderer for its format.
+That ordering is deliberate: the lean topic is the card's primary product — it is
+what the robot acts on — so it stays first and stays the one `camera_info` is
+declared against.
+
+The skeleton renderer is `web/js/renderers/pose2d.js`. It is **not**
+`sensor/skeleton`: that one drives a URDF of the *robot's own* joints and needs a
+`model` resource tool to supply it, with joint names matching the URDF exactly.
+Pointing it at human keypoints gives an empty panel and nothing in any log.
+
+### The action labels
+
+Two fields per person, not one. `action` is the single primary label — what goes
+into the prompt — and `actions` is everything that holds, because "standing while
+waving" is two simultaneously true things.
+
+| group | labels |
+|---|---|
+| posture | `standing` `sitting` `crouching` `bending` `lying` |
+| arms | `raising_hand` `waving` `pointing` `arms_crossed` |
+| motion | `walking` `turning` `still` |
+| event | `fall` |
+| — | `unknown` |
+
+`ACTION_PRIORITY` picks the primary, and it is deliberately **not** "posture
+before motion": a walking person is also standing, and `standing` for someone
+crossing the room in front of the robot is the less useful of two true answers.
+So `walking` sits above `standing` while staying below the postures that
+contradict it, and `still` is last for the mirror-image reason — it says less
+than `standing` does.
+
+Three rules worth knowing before reading the thresholds:
+
+* **Everything is a fraction of the person's bbox height.** The same person at
+  1 m and at 3 m produces the same numbers. A pixel threshold would be a
+  distance threshold wearing a disguise.
+* **`waving` is gated on `raising_hand`.** It is the "someone is calling the
+  robot over" signal, and what separates it from an arm swinging past shoulder
+  height while walking is that the motion *comes back* — reversals in the
+  wrist's horizontal travel, at 0.5-4 Hz. Ungated, every walker waves.
+* **`pointing` reports `point_direction`.** A normalised vector, promoted out of
+  `evidence` to the top level, because "someone is pointing" is far less
+  actionable than where.
+
+### The posture rules use angles, and which angles matters
+
+The first version of these rules was poor enough on a robot that standing,
+sitting, waving and falling were all unreliable. Most of it was two bugs, both
+worth recording because both were a *category* of mistake rather than a bad
+constant.
+
+**Image-space length ratios cannot survive a camera below eye level.**
+`standing` was gated on `hip_knee_dy >= 0.15` — the hip-to-knee vertical gap as
+a fraction of bounding-box height — *on top of* the torso-tilt and knee-angle
+tests. For a person who is definitely standing, with the legs foreshortened as a
+low camera foreshortens them:
+
+| leg compression | `hip_knee_dy` | `knee_deg` | `torso_deg` | verdict |
+|---|---|---|---|---|
+| 1.00 | 0.232 | 180.0 | 0.0 | `standing` |
+| 0.60 | 0.171 | 180.0 | 0.0 | `standing` |
+| **0.45** | 0.140 | **180.0** | **0.0** | **`unknown`** |
+| 0.25 | 0.089 | 180.0 | 0.0 | `unknown` |
+
+The angles were right the whole way down. The ratio added no information and
+only a viewpoint dependence — and a robot camera at 0.4-1.2 m looking at someone
+1-2 m away is well past 0.45. Worse, `sitting` keyed on the *other side of the
+same fragile quantity* (`|hip_knee_dy| <= 0.15`), so a standing person seen from
+below either vanished into `unknown` or landed in the sitting band. Both labels
+being wrong was the consequence, not bad luck.
+
+So `sitting` is a **hip angle** (shoulder-hip-knee: the thigh folded towards the
+chest), `standing` is the absence of folding, and the three `_dy` thresholds are
+gone. A test asserts no length-ratio threshold can come back. Visibility is also
+graded rather than all-or-nothing: legs are readable as soon as *either* the hip
+or the knee angle is available, so the common robot framing — knees in frame,
+feet cropped — reads as standing instead of unknown. A torso-only view still
+refuses, because standing and sitting genuinely share a torso axis.
+
+**And then the same mistake one level down.** Running the fixed rules against
+**real engine keypoints** rather than synthetic bodies caught it: 2D joint angles
+are invariant to scale and rotation but **not to foreshortening**, which is
+anisotropic scaling. With a real skeleton's legs compressed to 0.35, the hip
+angle moved 170.3 → 162.7 deg while the knee angle moved 151.1 → **126.0** —
+thigh and shin are never exactly collinear, and squashing y amplifies whatever
+lateral offset they have. Requiring a straight knee for `standing` was therefore
+a fragile measurement vetoing a robust one: the hip angle spans the torso, the
+longest and best-detected segment, while the knee spans two short noisy ones.
+`standing` now holds on *either* an open hip or a straight knee, and the knee
+keeps exactly one job — objecting to a leg folded past a squat, so a crouch
+cannot read as standing.
+
+"Use angles, they are robust" was too strong. Use the angle over the longest
+segment you can see, and let the short ones corroborate rather than veto.
+
+### The track has to survive the fall
+
+A standing box `[260,100,380,500]` against the same person's lying box
+`[140,436,500,492]` scores **IoU 0.109** — under any usable `iou_min`. So the
+track split at the instant of the fall, the new track began with an empty
+history, and `_fall_evidence` could only ever see horizontal frames and report
+"no fast drop". Fall detection required continuity across the one event that
+destroys box overlap.
+
+Association therefore has a second, independent cue: the centroid of the visible
+joints against the body's own scale. The box changes shape when someone falls;
+the body does not teleport. Either cue passing is enough, because they fail in
+different situations. The gate is 1.0 body height and is a **sanity bound, not
+the discriminator** — greedy nearest-match does the work, since each detection
+and each track is used once and the closest pair is taken first. 0.5 was tried
+and vetoed a real fall by 0.03, which is what a threshold set to the magnitude of
+the thing it must admit does: a fall moves the centroid about half a body height
+*by definition*. Erring loose is the right direction — merging two people costs
+one wrong label, splitting a track makes every temporal label undetectable.
+
+**This fix is a prerequisite for the learned backend, not an alternative to it.**
+ST-GCN++ is fed one continuous `(T, V, C)` sequence per person, so a track that
+splits mid-action hides the action from the model exactly as it did from the
+rules.
+
+Not confirmed, and recorded because it was the first suspicion: **fps is not why
+waving failed.** Simulated 1-4 Hz waves are detected at 5, 10, 15 and 30 fps on
+clean signals, so Nyquist does not explain the field reports. fps matters for a
+different reason — see the backends below.
+
+### Action backends: `hybrid` (default), `rules`, `stgcn`
+
+The first version of this card had one backend — hand-written geometry — and on
+a robot it was poor enough that standing, sitting, waving and falling were all
+unreliable. Two of those were outright bugs (see the two subsections above on
+angles and on track continuity); the rest is a ceiling. Hand-tuned ratios over
+2D keypoints from a low camera will only ever get so far, so the card now
+selects a backend.
+
+| `action_backend` | postures | `fall` / `waving` / `pointing` | needs an engine |
+|---|---|---|---|
+| `hybrid` **(default)** | geometry | ST-GCN++ | yes, degrades to `rules` |
+| `rules` | geometry | geometry | no |
+| `stgcn` | — see below | ST-GCN++ | yes |
+
+**ST-GCN++, joint stream, NTU60-XSub, 2D 17-keypoint input.** 1.39 M parameters
+and 1.95 GFLOPs, top-1 89.3% on that benchmark, where ST-GCN is 3.1 M/3.8 G,
+AGCN 3.5 M/4.4 G and CTR-GCN 1.43 M/2.82 G — so it is both the smallest and the
+most accurate of the options with a published 2D-COCO17 checkpoint. Single
+stream, not the four-stream ensemble: 4x the compute for +3.9 points. Against
+the `yolo26s-pose` engine already running ahead of it (10.4 M / 24.1 G) the
+action model is **13% of the parameters and 8% of the compute**.
+
+It runs on **TensorRT**, not ONNX Runtime, and that is not a performance
+preference: a second ONNX Runtime in this process shares one provider bridge
+with the first, which throws on jp6.1 and SIGSEGVs the whole of perception on
+jp5.11.
+
+**Why the default is `hybrid` and not `stgcn`.** NTU-60's label space is built
+from events and transitions, not postures. It has `sit down` (A08), `stand up`
+(A09), `falling down` (A43), `hand waving` (A23) and `pointing` (A31) — and no
+`standing` class and no `sitting` class, because a motionless person is not an
+action. A bare `stgcn` backend therefore maps those two *transitions* onto our
+two *states*, which only fires while someone is in the act of getting up or
+sitting down; a person who has been standing still for a minute produces no
+event at all and reads as `unknown`. `list_actions` returns
+`transition_derived_actions` so a caller can see which labels are like that.
+NTU's mutual classes (A50-A60) are not mapped at all — they are defined on a
+*pair* of skeletons and this backend is fed one person at a time, which is also
+why `walking` stays with the geometry.
+
+Where both backends have an opinion, the learned one wins on its own classes and
+defers on the transitions. `point_direction` always comes from the geometry: the
+model names the act, only the geometry measures where.
+
+**fps matters now in a way it did not before.** The geometry judges most things
+per frame; a skeleton-action model judges a *clip*. At 5 fps a 2.5 s window is
+13 real frames resampled up to the engine's 48, most of it interpolation — and
+the frequency of a wave and the speed of a fall live in exactly those frames. So
+the default fps is **12**, and below that `info` returns an `action_fps_note`.
+The card does not refuse: a thin window still beats no actions, but a quietly
+starved model looks like a wrong model, and that is weeks of misdirected tuning.
+
+**The preprocessing is where this silently fails.** PYSKL's pipeline is
+`PreNormalize2D` → `GenSkeFeat('j')` → `UniformSample(T)` → `FormatGCNInput`,
+and a model fed a differently-normalised skeleton returns confident nonsense
+rather than an error. It is reimplemented in `plugins/pose_stgcn.py` rather than
+imported, because pulling in pyskl/mmaction2 would drag torch into an image that
+deliberately carries neither. Two details worth knowing:
+
+* Normalisation is by the **frame**, not by the person's box. Where someone
+  stands and how large they appear within the frame is information the network
+  trained with. `PoseFrame` therefore carries `image_size`, and the backend
+  **refuses** rather than deriving it from the bounding box — that substitution
+  looks reasonable and is a silent misnormalisation.
+* `UniformSample` is made deterministic (the centre of each bin). Random offsets
+  are for training; a robot wants the same answer twice for the same input.
+
+**Engine not published yet.** `ACTION_MODEL_BUNDLES` has zero pins, so
+`ensure_action_model` raises with the build instructions instead of fetching
+anything unverified. A card configured `hybrid` therefore runs the geometry
+today and says so — `action_backend_effective`, `action_backend_note` and
+`action_engine_error` in `info`. That reporting is the point: a card running
+geometry while its config names a model is how the model gets blamed for the
+geometry's mistakes.
+
+**The checkpoint is in hand and pinned.** PYSKL's
+`stgcn++_ntu60_xsub_hrnet` joint `j.pth` (89.3 top-1), 5,854,105 bytes,
+`sha256 b274888d…`, mirrored to COS under
+`public/vision/stgcnpp-ntu60-2d/checkpoint/` and verified **byte-identical to the
+upstream openmmlab download**. `tools/export_vision_engines.py --model action`
+fetches it with no arguments; `--action-checkpoint` overrides. Mirroring is not
+about trust — the size+SHA256 pins are what establish that — it is so the engine
+build does not depend on `download.openmmlab.com` being reachable from wherever
+it runs.
+
+One fact to settle outside this file: PYSKL's **code** is Apache-2.0, but the
+weights are trained on **NTU RGB+D**, whose dataset terms are academic-research.
+A model trained on it inherits that question for a commercial deployment.
+
+**The ONNX export is still not implemented** and says so when run, rather than
+emitting a graph whose input is not the tensor the robot has: PYSKL's recogniser
+wraps the backbone in a test-time pipeline that averages over clips and people,
+so the backbone and head must be traced directly on `(1, 1, T, 17, 2)`.
+
+The checkpoint's `state_dict` says exactly what has to be traced —
+`backbone.data_bn`, ten `backbone.gcn.N` blocks each carrying a `.gcn` (with the
+adjacency `A` *stored in the checkpoint*, so the graph does not have to be
+rebuilt) and a six-branch `.tcn`, then `cls_head.fc_cls`. Reimplementing that by
+hand in plain torch is possible and is deliberately **not** the path: a mis-wired
+branch loads without complaint and returns wrong numbers, and there is no
+reference output to check against without pyskl itself. Install pyskl in the
+throwaway container and trace its own modules.
+
+**None of the learned path has run against real weights.** The tests cover the
+tensor layout, the normalisation arithmetic, the sampling, the logit/probability
+handling, the label mapping and every failure path — against a fake engine. They
+cannot establish that ST-GCN++ agrees with these labels on a robot. Read a green
+suite as "the plumbing is right".
+
+### Occlusion is `unknown`, and that is the point
+
+A person behind a desk has no visible hips or knees — and sitting and standing
+have **the same torso axis**. So the posture rules refuse rather than guess.
+`still` carries the same gate, for a reason that only appeared in test: without
+it, a barely-visible motionless person came back as `still`, which turns "I
+cannot see them" into a positive observation *about them*. The arm rules need
+only shoulder/elbow/wrist, so someone visible from the waist up can still be seen
+calling the robot over.
+
+This is the same rule `visual_depth`'s lens-barrel mask exists for: **"I don't
+know" and "nothing is wrong" have to be two different answers**, because the
+second is acted on and the first is not.
+
+### `fall` judges a transition, not a state
+
+Lying on the floor and lying on a sofa are the same terminal pose, so no posture
+test can separate them and neither can any single frame. A fall requires all of:
+
+1. the hip centre drops more than `fall_drop_ratio` of **standing** height,
+2. within `fall_drop_window_s`,
+3. staying horizontal for `fall_settle_s` afterwards,
+4. with **no `sitting` phase** on the way down — sitting is slow and has an
+   unambiguous knee angle.
+
+Standing height is the **tallest bbox in the window**, not the current one: a
+person on the floor has a short, wide box, and normalising by that would divide
+the drop by the post-fall height and overstate it wildly.
+
+Only 2 and 3 holding reports `lying`, and the **rejected evidence comes back
+anyway** (`drop_ratio`, `drop_ms`, `settle_ms`, `had_sitting_phase`, `reason`).
+That is on purpose: "they are lying down and here is why this was not called a
+fall" is what somebody reads when asking why the robot said nothing.
+
+Four things about it that are limitations, not bugs:
+
+* **The thresholds are instance config because they are not constants.** The
+  same fall measures differently with the camera at 0.4 m and at 1.2 m, and pitch
+  and focal length come into it too. The defaults in `config.yaml` are a starting
+  point — tune them on the rig with the camera where it will actually be, and
+  record what you saw.
+* **From a single monocular camera facing the person, "fell over" and "crouched
+  then lay down" are close to indistinguishable.** A side view is far more
+  reliable. `list_actions` says so in its reply, so a caller cannot assume
+  otherwise.
+* **A false positive costs more than a miss.** Every one makes the robot drop
+  what it is doing to ask whether someone is hurt. The plugin therefore only
+  publishes the label — whether to say anything is agent-core's prompt's
+  decision, not this card's.
+* **Occlusion refuses.** Hips not visible at landing yields
+  `is_fall: false` with that as the reason, not a guess.
+
+### Tracking is not re-identification
+
+`PoseTracker` is greedy IoU association, and it exists only to give the action
+rules a timeline. Someone who leaves the frame and comes back gets a **new id**.
+Recognising *who* a person is belongs to the `face_recognition` card; conflating
+the two would promise an identity this cannot keep. `list_actions` states this as
+well.
+
+### What a single photo cannot answer
+
+`recognize_by_photo` / `recognize_by_url` drop the hold requirement on a raised
+hand — that only exists to tell a held gesture from an arm passing through
+shoulder height, and a photo has no "passing through". But `waving`, `walking`,
+`turning`, `still` and `fall` are motion, and one image carries none of them. The
+reply says so (`temporal: false`, `unavailable_actions`) rather than handing back
+`raising_hand` as though it settled "is she waving".
+
+### Which model, and why `s`
+
+`yolo26s-pose` — COCO-17, single class. The ladder, from ultralytics' own table
+(`params`, `mAP`, `FLOPs`) with engine sizes extrapolated from the two engines
+this repo already ships (`yolo26n-depth` 14.0 MB, `yoloe-26s-seg` 24.8 MB, both
+fp16/640):
+
+| | mAP(pose) 50-95 | params | FLOPs | `.pt` | engine (est.) |
+|---|---|---|---|---|---|
+| `yolo26n-pose` | 57.2 | 2.9 M | 7.6 B | 7 MB | ~13 MB |
+| **`yolo26s-pose`** | **63.0** | 10.4 M | 24.1 B | 23 MB | ~25 MB |
+| `yolo26m-pose` | 68.8 | 21.5 M | 73.3 B | 46 MB | ~48 MB |
+| `yolo26l-pose` | 70.4 | 25.9 M | 91.7 B | 55 MB | ~58 MB |
+
+`s` rather than `n`, which is what every other nano-class model here uses,
+because **keypoint precision is the input to the action rules, not a cosmetic
+property**. A noisy wrist breaks the reversal count that separates `waving` from
+reaching; a noisy hip breaks the drop ratio that separates `fall` from `lying`.
+So the 57.2 → 63.0 step buys fewer misjudged actions rather than prettier
+skeletons, which is worth ~12 MB resident and (extrapolating from the 19.8 ms
+measured for the same-class `yoloe-26s-seg`) ~8 ms per frame over `n`. On an
+8 GB Orin that is a real cost — if memory gets tight on a robot that does not
+need pose, `enabled: false` is the lever, not a smaller model whose keypoints
+the rules cannot rely on.
+
+`--pose-weights` picks another size without a code change. Changing it also
+means updating `POSE_MODEL_BUNDLES`, whose COS paths name the model.
+
+### Building the engine
+
+`tools/export_vision_engines.py --model pose`, **inside a container built from
+the target perception image, on an Orin** — two separate requirements, each of
+which has cost a failed build:
+
+* **Not on the Jetson host.** The jp6.1 image ships TensorRT 10.4 while its hosts
+  carry 10.3, and an engine plan only loads on the TensorRT that built it.
+* **Not on the x86 build host either.** `172.18.66.241` has no GPU, and exporting
+  an engine means actually running the TensorRT builder. That host's role in this
+  is the COS upload, because it holds the keys — so the path is: export on the
+  Orin, `scp` to the build host, upload to COS, download the copy back, hash
+  *that*, and pin it.
+
+One bundle per JetPack line, from the Orin on that line: Orin 6 (jp6.1) for
+`jp61`, Orin 5 (jp5.11) for `jp511`. A line with no published bundle reports
+`state: error` on that machine and affects nothing else.
+
+### Measured on the real engine (Orin 6, jp6.1, TensorRT 10.4)
+
+Built in 529 s, 24,704,612 bytes, FP16 at 640. The engine declares one output,
+`output0` with shape `(1, 300, 57)` — pinned as a test, see
+`test_the_real_pose_engine_geometry_decodes`.
+
+| | ms |
+|---|---|
+| `infer()` only, p50 over 20 runs after warmup | **~30** |
+| `decode_poses`, p50 over 50 runs | **0.26** |
+| jpeg decode + infer + decode, 4 people | ~46 |
+
+**These are an upper bound, not the figure to quote.** Orin 6 had its own
+`perception` and `actucore` containers running throughout, so part of this is the
+neighbours — the repo's own rule is that a benchmark taken with services up
+measures them too. An idle number needs those containers stopped first.
+
+Note `decode_poses` measured **10.3 ms on its first call** and 0.26 ms in a loop.
+A single cold timing of a numpy path is almost all first-touch cost; it is not a
+measurement of anything.
+
+30 ms is ~50% worse than the ~20 ms extrapolated from `yoloe-26s-seg`'s 19.8 ms,
+which is what extrapolation across model families is worth. At the default
+`fps: 5` the card asks for 30 ms every 200 ms, so it is not the constraint —
+memory is, as everywhere else on these boxes.
+
+### What the first real photos showed, and why it is the occlusion rule
+
+Two photos, 6 people between them, through the real engine and the real rules:
+
+* **A full-body shot** (4 people): the three with their legs in frame came back
+  `standing` at 0.95-0.98, with torso tilt 1.0-2.7 deg and knee angles
+  151-179 deg — upright and straight-legged, which is what `standing` means. The
+  fourth, half out of frame at the edge with 5 of 17 joints visible, came back
+  `unknown`.
+* **A waist-up shot** (2 people): both `unknown`.
+
+That second result is the design working, not a failure, and the per-keypoint
+visibilities say why. The model reported **hips at v=0.011-0.068, knees at
+0.002-0.004, ankles at 0.001-0.004** — it was explicitly saying it could not see
+the lower body — and it placed those invisible joints at y=696-731 on a
+720-pixel-tall frame, i.e. **pinned to the bottom edge**. That is precisely the
+invented-position-at-the-border effect `undo_letterbox_points` refuses to create
+and `kpt_confidence` refuses to believe. Had the gate not been there, two people
+photographed from the waist up would have been reported standing on the strength
+of coordinates the model itself disclaimed.
+
+It also confirms left/right are not transposed: for a person facing the camera,
+`right_shoulder` came back at x=314 and `left_shoulder` at x=637 — mirrored, as
+COCO defines them.
+
+`POSE_MODEL_BUNDLES` ships with **zero pins**, so `ensure_pose_model` raises with
+the build instructions instead of fetching anything unverified — the standing
+rule for every bundle in that file. Until the engines are exported and published,
+the pose card reports `state: error` with that message and the rest of perception
+is unaffected.
 
 ---
 

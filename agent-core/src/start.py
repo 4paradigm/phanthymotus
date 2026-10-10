@@ -192,9 +192,52 @@ def _register_core_mcp(silent=False):
                     'image_file': {'type': 'string', 'format': 'file', 'accept': 'image/*', 'description': '图片文件'},
                 }, 'required': ['action', 'image_file']},
                 'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+            },
+            {
+                'name': 'remote_camera',
+                'type': 'sensor',
+                'description': (
+                    'Remote camera — stream a video device attached to the '
+                    'browser as a live image source for the robot. Publishes '
+                    'image/jpeg, the same format the on-robot camera drivers '
+                    'emit, so any vision card accepts it directly.'
+                ),
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['start', 'stop', 'info'],
+                               'description': 'Action to perform'},
+                }, 'required': ['action']},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'device_id': {
+                            'type': 'string',
+                            'description': 'Video input device',
+                            'format': 'video-input-device',
+                            'scope': 'instance',
+                        },
+                        'fps': {
+                            'type': 'integer', 'minimum': 1, 'maximum': 30,
+                            'default': 12, 'scope': 'instance',
+                            'description': (
+                                'Frames per second. 12 matches the pose card, '
+                                'whose action model classifies a clip rather '
+                                'than a frame. Capped at 30 because each frame '
+                                'is JPEG-encoded on the browser main thread.'),
+                        },
+                        'width': {
+                            'type': 'integer', 'minimum': 160, 'maximum': 1920,
+                            'default': 640, 'scope': 'instance',
+                            'description': ('Long edge in pixels. Scaled to the '
+                                            'camera\'s own aspect ratio, never '
+                                            'stretched.'),
+                        },
+                    },
+                },
+                'topic_out': [{'topic': '/remote_control/camera',
+                               'format': 'image/jpeg'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}, {'topic': '/remote_control/camera', 'format': 'image/jpeg'}],
         'topic_in': [{'format': 'data/json'}],
     })
 
@@ -898,6 +941,76 @@ async def _ws_mic(ws: fastapi.WebSocket):
                     _mic_chunk_count += 1
     except Exception:
         pass
+
+# ── Camera WebSocket endpoint (receive browser JPEG frames, publish to ROS2) ──
+#
+# The visual twin of /ws/mic: a video device on whatever machine has the browser
+# open becomes an image source for the robot. Published as image/jpeg, the
+# format the on-robot camera drivers emit, so no consumer needs a special case.
+_camera_pub = None
+_camera_frame_count = 0
+_camera_ws_connected = False
+# Arrival times of the last few frames, for the achieved-rate figure in `info`.
+# A configured 12 fps and an achieved 1 fps are indistinguishable from a frame
+# counter alone, and the difference decides whether anything temporal can work
+# at all: at 1 fps a track expires between frames and the action model never
+# accumulates the seconds of history it needs.
+_camera_recent: "collections.deque" = __import__("collections").deque(maxlen=30)
+
+
+def _ensure_camera_pub():
+    """Lazily create the ROS2 publisher for /remote_control/camera."""
+    global _camera_pub
+    if _camera_pub is not None:
+        return _camera_pub
+    try:
+        from sensor_msgs.msg import CompressedImage
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            # BEST_EFFORT with a shallow queue, like every other image topic in
+            # this project: a late frame is worse than a dropped one, because
+            # the action rules measure velocity between frames and a backlog
+            # delivered in a burst reads as motion that did not happen.
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=2,
+                             durability=DurabilityPolicy.VOLATILE)
+            _camera_pub = node.create_publisher(
+                CompressedImage, "/remote_control/camera", qos)
+    except Exception:
+        pass
+    return _camera_pub
+
+
+@app.websocket('/ws/camera')
+async def _ws_camera(ws: fastapi.WebSocket):
+    """Receive JPEG frames from the browser and republish them on DDS."""
+    global _camera_frame_count, _camera_ws_connected
+    await ws.accept()
+    _camera_ws_connected = True
+    try:
+        _ensure_camera_pub()
+        while True:
+            data = await ws.receive_bytes()
+            if not data or _camera_pub is None:
+                continue
+            from sensor_msgs.msg import CompressedImage
+            msg = CompressedImage()
+            try:
+                msg.header.stamp = ros2_bridge._node_main.get_clock().now().to_msg()
+            except Exception:
+                pass
+            msg.format = "jpeg"
+            msg.data = data
+            _camera_pub.publish(msg)
+            _camera_frame_count += 1
+            _camera_recent.append(time.time())
+    except Exception:
+        pass
+    finally:
+        _camera_ws_connected = False
+
 
 class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
     async def __call__(self, scope, receive, send):

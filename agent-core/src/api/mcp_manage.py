@@ -1088,6 +1088,73 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                                                'ws_connected': _start_mod._mic_ws_connected,
                                                'chunks_received': _start_mod._mic_chunk_count}}
             return {'code': 200, 'data': None}
+        if req.tool == 'remote_camera':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                # Same self-check shape as remote_mic: the browser is started in
+                # parallel by the frontend, so wait for real frames rather than
+                # declaring success on a publisher that nothing is feeding. A
+                # card that says `running` while no image is flowing is how a
+                # vision pipeline gets debugged from the wrong end.
+                from start import _ensure_camera_pub
+                import start as _start_mod
+                if _ensure_camera_pub() is None:
+                    return {'code': 200, 'data': {
+                        'state': 'error',
+                        'message': 'ROS2 camera publisher not available'}}
+                import asyncio
+                initial = _start_mod._camera_frame_count
+                for _ in range(20):            # 20 x 0.5s = 10s
+                    if _start_mod._camera_frame_count > initial:
+                        return {'code': 200, 'data': {
+                            'state': 'running', 'ws_path': '/ws/camera',
+                            'frames_received': _start_mod._camera_frame_count}}
+                    await asyncio.sleep(0.5)
+                if _start_mod._camera_ws_connected:
+                    # The browser is attached, so frames are imminent — a
+                    # camera takes a moment to warm up and the first JPEG can
+                    # land after this window closes. Reporting `error` here
+                    # made a card that was merely still starting look broken,
+                    # which is how a 10 s race got read as a permanent fault.
+                    return {'code': 200, 'data': {
+                        'state': 'running', 'ws_path': '/ws/camera',
+                        'frames_received': _start_mod._camera_frame_count,
+                        'warning': 'The browser is connected but has not sent a '
+                                   'frame yet. If nothing appears, the camera may '
+                                   'be in use by another application.'}}
+                return {'code': 200, 'data': {
+                    'state': 'error',
+                    'message': 'The browser has not connected. Open the dashboard, '
+                               'allow camera access when prompted, and keep that '
+                               'tab visible — a background tab is throttled to '
+                               '1 frame per second.'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                import ros2_bridge, start as _start_mod
+                visible = '/remote_control/camera' in ros2_bridge.get_dds_topics()
+                recent = list(_start_mod._camera_recent)
+                achieved = 0.0
+                if len(recent) >= 2 and recent[-1] > recent[0]:
+                    achieved = (len(recent) - 1) / (recent[-1] - recent[0])
+                note = None
+                if achieved and achieved < 4:
+                    note = (f'Only {achieved:.1f} frames/s are arriving. A browser '
+                            f'clamps timers in a background tab to 1 Hz, which '
+                            f'collapses the stream — keep the dashboard tab '
+                            f'visible. Below about 4 fps a tracked person expires '
+                            f'between frames and no activity can be recognised.')
+                return {'code': 200, 'data': {
+                    'state': 'running' if _start_mod._camera_frame_count > 0 else 'idle',
+                    'ws_path': '/ws/camera',
+                    'achieved_fps': round(achieved, 1),
+                    **({'warning': note} if note else {}),
+                    'topic_out': [{'topic': '/remote_control/camera',
+                                   'format': 'image/jpeg'}],
+                    'topic_visible': visible,
+                    'ws_connected': _start_mod._camera_ws_connected,
+                    'frames_received': _start_mod._camera_frame_count}}
+            return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
             action = req.arguments.get('action', 'start')
             if action == 'start':

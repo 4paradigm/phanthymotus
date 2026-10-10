@@ -9,6 +9,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   ocr              文字识别（RapidOCR + TensorRT）
+  pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 
 每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
@@ -113,10 +114,29 @@ class PerceptionBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        # Built before ASR, and that order is load-bearing: ASR takes a handle
+        # to this plugin so the voiceprint can be computed on the VAD segment it
+        # already cut, concurrently with transcription. The handle is optional —
+        # ASR publishes an identity-free payload when it is absent, which is
+        # what happens when speaker_recognition is disabled or still loading.
+        #
+        # Deliberately *not* guarded the way TTSPlugin is: the constructor here
+        # does no model work (the engine loads single-flight in a background
+        # thread on first use), so there is nothing for it to fail on.
+        speaker_plugin = None
+        if plugins_cfg.get("speaker_recognition", {}).get("enabled", False):
+            from plugins.speaker import SpeakerRecognitionPlugin
+            speaker_plugin = SpeakerRecognitionPlugin(
+                plugins_cfg["speaker_recognition"], executor)
+            self._plugins.append(speaker_plugin)
+            log.info("SpeakerRecognitionPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from plugins.asr import ASRPlugin
-            self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
-            log.info("ASRPlugin loaded")
+            self._plugins.append(
+                ASRPlugin(plugins_cfg["asr"], executor, speaker=speaker_plugin))
+            log.info("ASRPlugin loaded (speaker=%s)",
+                     "yes" if speaker_plugin else "no")
 
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin
@@ -161,6 +181,25 @@ class PerceptionBundle:
                 log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
             except Exception:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
+
+        if plugins_cfg.get("pose", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["pose"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.pose import PosePerceptionPlugin
+            # Guarded like TTSPlugin / VideoDepthPerceptionPlugin: this one needs
+            # a TensorRT engine bundle for the running JetPack line, and a
+            # machine that cannot fetch it must still get ASR/TTS/VOP/OCR. The
+            # card simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    PosePerceptionPlugin(plugins_cfg["pose"], namespace, executor)
+                )
+                log.info("PosePerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("PosePerceptionPlugin failed to load; continuing without pose",
                           exc_info=True)
 
         if plugins_cfg.get("ocr", {}).get("enabled", False):

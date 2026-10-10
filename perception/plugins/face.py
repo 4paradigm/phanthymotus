@@ -18,7 +18,7 @@ What this plugin adds over OCR:
 * **A 3-second rolling frame window** per instance. `register_by_stream`
   analyses every frame in it rather than one grab, so a blink, a turned head or
   one motion-blurred frame does not decide the enrolment.
-* **A persistent identity database** (`plugins/face_db.py`), shared by all
+* **A persistent identity database** (`plugins/identity_db.py`), shared by all
   instances of the plugin, holding embeddings, names, free-form profiles and a
   visit log.
 * **Structured failure reasons.** Enrolment fails for mundane physical reasons
@@ -67,19 +67,23 @@ from plugins.image_input import (
     load_image_bytes as _load_image_bytes_shared,
     read_local as _read_local,
 )
-from plugins.face_db import (
-    DEFAULT_DB_DIR,
+# The identity store is modality-agnostic (see its module docstring); face
+# supplies the dimension, the directory and the log label. `plugins/speaker.py`
+# constructs the same class with 192 dims for voiceprints.
+from plugins.identity_db import (
     DEFAULT_VISIT_CHECKPOINT_S,
     DEFAULT_MAX_SAMPLES_PER_PERSON,
     DEFAULT_UNKNOWN_CAPACITY,
     DEFAULT_VISIT_GAP_S,
     DEFAULT_VISIT_LOG_MAX,
-    FaceDB,
+    IdentityDB,
     is_unknown_id,
 )
 from plugins.face_proxy import FaceServiceProxy
 from plugins.face_runtime import (
+    DEFAULT_DB_DIR,
     DEFAULT_FACE_MODEL,
+    EMBEDDING_DIM,
     FACE_MODELS,
     DEFAULT_BLUR_MIN,
     DEFAULT_MAX_IMAGE_PIXELS,
@@ -327,6 +331,13 @@ def _analyzer_options(cfg: dict) -> dict:
 def _db_options(cfg: dict) -> dict:
     return {
         "db_dir": str(cfg.get("db_dir", DEFAULT_DB_DIR)),
+        # Recorded in persons.json and checked on load. `model` is in here rather
+        # than only in the analyzer options because switching the recogniser
+        # invalidates every stored sample, and the database is where that has to
+        # be refused — see IdentityDB._load.
+        "dim": EMBEDDING_DIM,
+        "model": str(cfg.get("model", DEFAULT_FACE_MODEL)),
+        "label": "face_db",
         "unknown_capacity": int(
             cfg.get("unknown_capacity", DEFAULT_UNKNOWN_CAPACITY)
         ),
@@ -384,7 +395,7 @@ class _FaceEngine:
     that never opened.
     """
 
-    def __init__(self, analyzer: FaceAnalyzer, db: FaceDB):
+    def __init__(self, analyzer: FaceAnalyzer, db: IdentityDB):
         self.analyzer = analyzer
         self.db = db
 
@@ -418,7 +429,7 @@ def _build_engine(cfg: dict, on_status=None) -> _FaceEngine:
         # holds them for the life of the child instead of taking them per call.
         max_image_side=decode["max_side"], max_image_pixels=decode["max_pixels"],
     )
-    db = FaceDB(**_db_options(cfg))
+    db = IdentityDB(**_db_options(cfg))
     return _FaceEngine(analyzer, db)
 
 

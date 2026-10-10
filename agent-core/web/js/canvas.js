@@ -16,12 +16,24 @@ import { showToast } from './toast.js';
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
+import { toggleCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
 import { inputArgs, inputKey } from './topic-derive.js';
+// **静态 import,不是 handler 里的 `await import()`。** 停止的那三个事件是同一毫秒
+// 到的(backend 并行跑完健康的卡片),动态 import 的 then 要等一个微任务,于是
+// `project_stop_begin` 还没建好状态,紧随其后的 project_stop_item 全被
+// `if (_teardown)` 丢掉 —— 而 applyDone 把没有结果的项算作失败,界面于是报
+// 「6 台设备未停止」,后端日志同时写着 3/6。真机上复现过一次。
+import {
+  newTeardown as _newTeardown, applyItem as _applyTeardownItem,
+  applyDone as _applyTeardownDone, failedItems as _teardownFailed,
+  chipLabel as _teardownLabel, autoHideMs as _teardownAutoHide,
+  detailHtml as _teardownDetailHtml,
+} from './teardown-chip.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -358,6 +370,35 @@ export async function initCanvas(initialMcps) {
       // authoritative answer some page loads get, and it is what marks the
       // state known.
       if (running !== _projectRunning || !_projectStateKnown) _applyProjectState(running);
+    } else if (event.type === 'project_stop_begin') {
+      // 订阅是全局的，所以**哪个标签页点的停止都一样**显示收尾进度。以前连点的那个
+      // 标签页都看不到任何东西。
+      _teardown = _newTeardown(event.payload?.cards || []);
+      _renderTeardown();
+    } else if (event.type === 'project_stop_item') {
+      if (_teardown) {
+        _applyTeardownItem(_teardown, event.payload || {});
+        _renderTeardown();
+      }
+    } else if (event.type === 'project_stop_done') {
+      if (_teardown) {
+        _applyTeardownDone(_teardown);
+        _renderTeardown();
+        const failed = _teardownFailed(_teardown);
+        if (failed.length) {
+          // 这条必须进活动流：芯片会被收起、页面会被刷新，而「有一台设备没停下来」
+          // 是之后排查时唯一的线索。
+          _logActivity('warn', `设备收尾：${failed.length} 台未停止（`
+            + `${failed.map((f) => f.tool).join('、')}）—— 可能仍在运行`);
+          // 手机上还要再说一次。活动流在 768px 以下是**默认关着的抽屉**，所以上面
+          // 那一行在手机上等于没写；而这是全流程唯一的坏消息。
+          if (window.matchMedia('(max-width: 768px)').matches) {
+            _showToast(`${failed.length} 台设备未停止，可能仍在运行`);
+          }
+        } else {
+          _logActivity('project', '设备收尾完成，全部已停止');
+        }
+      }
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
     } else if (event.type === 'canvas_layout') {
@@ -627,6 +668,7 @@ function _setupControlButtons() {
 
   // Auto-start toggle
   _initAutoStartToggle();
+  _initTeardownChip();
 }
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
@@ -1982,6 +2024,23 @@ async function _startProject() {
     }).catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
   }
 
+  // Same trick as the mic: start the browser camera in parallel with the API
+  // call, because the card's self-check waits for real frames and the browser
+  // cannot be started from the server side.
+  //
+  // The permission prompt is awaited *first*, though. It is a human clicking a
+  // dialog, and it used to sit inside the card's 10 s self-check window: the
+  // first start after a page load timed out with "waiting for the browser
+  // camera", and every start afterwards worked because the grant was
+  // remembered. Warming it here takes the person out of the critical path.
+  const remoteCameraCard = _cards.find(c => c.toolName === 'remote_camera');
+  if (remoteCameraCard && !isCameraActive()) {
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    await warmPermission();
+    toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {})
+      .catch(err => _logActivity('warn', `Camera failed to start: ${err.message}`));
+  }
+
   // Call unified backend start-project
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
@@ -2009,6 +2068,74 @@ async function _startProject() {
   }
 }
 
+// ── 设备收尾芯片 ─────────────────────────────────────────────────────────────
+
+let _teardown = null;            // 当前那一轮的状态，见 teardown-chip.js
+let _teardownHideTimer = null;
+
+function _teardownEls() {
+  return {
+    chip: document.getElementById('teardown-chip'),
+    icon: document.getElementById('teardown-icon'),
+    text: document.getElementById('teardown-text'),
+    caret: document.getElementById('teardown-caret'),
+    detail: document.getElementById('teardown-detail'),
+  };
+}
+
+function _renderTeardown() {
+  const { chip, icon, text, caret, detail } = _teardownEls();
+  if (!chip || !_teardown) return;
+  const label = _teardownLabel(_teardown);
+  chip.classList.remove('hidden');
+  chip.dataset.tone = label.tone;
+  icon.textContent = label.icon;
+  text.textContent = label.text;
+  detail.innerHTML = _teardownDetailHtml(_teardown);
+  // 有失败就自动展开。把唯一需要动手的那条信息折起来，等于没报。
+  const failed = _teardownFailed(_teardown).length;
+  if (_teardown.done && failed > 0) {
+    detail.classList.remove('hidden');
+    caret.textContent = '⌃';
+  }
+  if (_teardownHideTimer) { clearTimeout(_teardownHideTimer); _teardownHideTimer = null; }
+  const hideAfter = _teardownAutoHide(_teardown);
+  if (hideAfter) {
+    _teardownHideTimer = setTimeout(() => {
+      chip.classList.add('hidden');
+      detail.classList.add('hidden');
+      caret.textContent = '⌄';
+    }, hideAfter);
+  }
+}
+
+/** 芯片的展开/收起，和失败项的「重试」。两者都用事件代理 —— 列表是重绘出来的。 */
+function _initTeardownChip() {
+  const summary = document.getElementById('teardown-summary');
+  const detail = document.getElementById('teardown-detail');
+  const caret = document.getElementById('teardown-caret');
+  if (!summary || !detail) return;
+
+  summary.addEventListener('click', () => {
+    const open = detail.classList.toggle('hidden');
+    caret.textContent = open ? '⌄' : '⌃';
+  });
+
+  detail.addEventListener('click', (e) => {
+    const btn = e.target.closest('.teardown-retry');
+    if (!btn) return;
+    e.stopPropagation();
+    const { cardId, tool, mcpId } = btn.dataset;
+    btn.disabled = true;
+    btn.textContent = '重试中';
+    // 走和删卡片时相同的那条单卡 stop 路径，不是再来一次整轮 stop-project：
+    // 整轮会把已经停好的卡片再停一遍（幂等，但进度会整个重画），而操作者点的是
+    // 「这一张」。
+    _triggerAction(mcpId, tool, 'stop', { instance_id: cardId });
+    _logActivity('project', `重试停止 ${tool}`);
+  });
+}
+
 async function _stopProject() {
   // **先请求，确认成功了再改状态** —— 和 _startProject 同一个形状。
   //
@@ -2025,25 +2152,25 @@ async function _stopProject() {
   // 是 true，20 分钟的访问日志里**一条 stop-project 都没有**，而界面显示已停止。
   //
   // 麦克风清理挪到请求之后，并且自己吞掉异常：它是收尾动作，不该挡住停止本身。
-  let ok = false;
-  try {
-    const res = await fetch('/api/config/stop-project', { method: 'POST' });
-    ok = res.ok;
-  } catch (err) {
-    ok = false;
-  }
-  if (!ok) {
-    // 不翻状态：按钮留在「停止智能控制」上，操作者能再点一次。谎报已停止是这个
-    // 函数此前唯一会做的事。
-    _logActivity('warn', '停止智能控制失败 —— 后端仍在运行，请重试');
-    return;
+  // **按下的那一刻就要有反应。** 这个请求以前只是一个裸 await：期间按钮不变、不
+  // 禁用、没有任何提示，而它可能挂住几十秒（一张卡片的 MCP 不回应时甚至永远）。
+  // 于是操作者只会再点一次 —— 而那会再发一次 POST，因为也没有在飞守卫。
+  const btn = document.getElementById('canvas-project-toggle');
+  if (btn) {
+    if (btn.dataset.stopping === '1') return;   // 在飞守卫
+    btn.dataset.stopping = '1';
+    btn.disabled = true;
+    btn.textContent = '停止中…';
   }
 
-  _applyProjectState(false);
-  _logActivity('project', '智能控制已停止');
-
+  // 浏览器侧的采集**先停**，而且在请求之前。它以前在请求之后，所以后端挂住的那段
+  // 时间里麦克风还在往一个正在停止的系统里灌音频。这一段不碰网络，不会失败到挡住
+  // 停止本身。
   try {
     for (const card of _cards) {
+      if (card.toolName === 'remote_camera' && isCameraActive()) {
+        toggleCameraStream('', () => {}).catch(() => {});
+      }
       if (card.toolName === 'remote_mic' && isMicActive()) {
         toggleMicStream('', () => {}).catch(() => {});
         const micBtn = card.el?.querySelector('.canvas-mic-btn');
@@ -2056,11 +2183,42 @@ async function _stopProject() {
   } catch (err) {
     _logActivity('warn', `麦克风收尾失败: ${err.message}`);
   }
+
+  let ok = false;
+  try {
+    const res = await fetch('/api/config/stop-project', { method: 'POST' });
+    ok = res.ok;
+  } catch (err) {
+    ok = false;
+  }
+
+  if (btn) {
+    btn.disabled = false;
+    delete btn.dataset.stopping;
+  }
+
+  if (!ok) {
+    // 不翻状态：按钮留在「停止智能控制」上，操作者能再点一次。谎报已停止是这个
+    // 函数此前唯一会做的事。
+    _syncProjectBtn();
+    _logActivity('warn', '停止智能控制失败 —— 后端仍在运行，请重试');
+    return;
+  }
+
+  // 这个响应只代表**第 1 段**完成：agent loop 已经停了。设备收尾在后台继续，进度
+  // 走 project_stop_item / project_stop_done 到上面那个芯片 —— 所以这里就可以诚实
+  // 地翻状态，而不必等一台坏掉的设备。
+  _applyProjectState(false);
+  _logActivity('project', '智能控制已停止（agent 已停，设备收尾中）');
 }
 
 function _syncProjectBtn() {
   const btn = document.getElementById('canvas-project-toggle');
   if (!btn) return;
+  // 停止请求在飞的时候按钮写着「停止中…」并且是禁用的。这个函数会被 project_state
+  // 的 WS 广播触发（包括第 1 段自己推的那条），不让它在这里改写，否则标签刚变成
+  // 「停止中…」就被广播改回去，看起来又是点了没反应。
+  if (btn.dataset.stopping === '1') return;
   btn.textContent = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.title = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.classList.toggle('running', _projectRunning);
