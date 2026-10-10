@@ -157,6 +157,69 @@ def _extract_asr_text_field(ev: dict) -> str:
     return text
 
 
+# 活动流里要显示的字段。speaker_similarity / coherence / 各种 ts 不在内：它们是
+# 质量与排查信息，一行日志放不下，而 payload 原样在 raw_input_info 里查得到。
+_ASR_BACKGROUND_SHOWN_FIELDS = (
+    'speaker_name', 'speaker_id', 'lang', 'emotion', 'audio_event',
+)
+
+
+def _asr_background_entry(ev: dict) -> dict | None:
+    """这条 P=0 事件是不是「旁边听到的话」—— 是就返回活动流要显示的内容。
+
+    判断同时看 payload 里的 `background` 标记和 source 里的 `asr_background`，
+    因为这两个来源在实现上是独立的：标记由 perception 写进 JSON，topic 名由画布
+    的连线决定。只认其中一个，就会在另一端改动时静默停止显示 —— 而「活动流里少
+    了一类东西」是没人会收到报告的那种故障。
+    """
+    source = ev.get('source', '')
+    text = ev.get('text', '')
+    data: dict = {}
+    if isinstance(text, str) and text.startswith('{'):
+        try:
+            data = _json.loads(text)
+        except (ValueError, TypeError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if not data.get('background') and 'asr_background' not in source.lower():
+        return None
+    spoken = data.get('text') if data else None
+    if not spoken and isinstance(text, str) and not text.startswith('{'):
+        spoken = text
+    if not (spoken or '').strip():
+        return None
+    entry = {'text': spoken, 'source': source}
+    for key in _ASR_BACKGROUND_SHOWN_FIELDS:
+        value = data.get(key)
+        if value:
+            entry[key] = value
+    return entry
+
+
+async def _push_asr_background(ev: dict) -> None:
+    """把旁人说的那句话推到 /ws/motus。
+
+    **只有 ASR 的背景事件进活动流，不是所有 P=0 事件。** P=0 里绝大多数是电量、
+    温度、IMU 这类读数，它们每秒都在来；全推进去等于把活动流冲掉，而活动流的用处
+    恰恰是「能一眼看完」。
+
+    推送点在 `_bg_buffer_add` **之后、但不依赖它的任何判断**：bg subagent 可能被
+    节流窗口合掉、或被 `_bg_buffer_has_substance` 判为没有内容而根本不 spawn，那
+    句话就只在 DDS 上存在过。能看见机器人听到了什么，是这个功能的全部目的。
+
+    永不抛：显示用的东西不能影响事件分流。
+    """
+    entry = _asr_background_entry(ev)
+    if entry is None:
+        return
+    try:
+        from api.motus_stream import push_event
+        await push_event({'type': 'asr_background', 'payload': entry})
+    except Exception as error:  # noqa: BLE001 - 显示失败不影响处理
+        print(f'[collector] push asr_background failed: {error}')
+
+
 def _pending_has_same_asr_text(asr_text: str) -> bool:
     """检查 steering_queue 或 priority_pending 中是否已有相同 ASR 文本。"""
     for item in list(_steering_queue._queue):
@@ -866,6 +929,8 @@ async def _drain_loop():
         else:
             # ── P=0: 送 bg buffer ──
             _bg_buffer_add(ev)
+            # 旁人说的话还要进活动流 —— 见 _push_asr_background 里为什么只有它进。
+            await _push_asr_background(ev)
 
 
 def _bg_buffer_has_substance(batch: list[dict]) -> bool:

@@ -412,6 +412,35 @@ Two rules follow, both of which were learned the hard way:
 
 Frontend tests: `node --test "agent-core/web/js/*.test.mjs"` (no dependencies).
 
+#### The activity log, and what the robot *overheard*
+
+The strip at the bottom subscribes to `/ws/motus` and renders one line per event.
+Each event type gets its own branch in `web/js/activity-summary.js` — a separate,
+import-free module purely so it can be covered by `node --test`; `activity-log.js`
+itself cannot be imported there, because it pulls in `mobile.js` and from there the
+whole renderer tree and three.js.
+
+Speech the robot was addressed with has always shown up (as a `trigger`). Speech it
+merely *overheard* — `<topic>/asr_background`, the utterances with no wake word —
+**had no trace in the log at all**. Those events go to the P=0 pipeline, where a
+background subagent may be collapsed by the 1-second throttle or judged
+substance-free and never spawned at all, so the sentence existed only on DDS. A
+`👂` row is now pushed from `collector._push_asr_background` before any of that is
+decided, carrying whatever the payload actually knows — speaker, language, emotion,
+audio event — and nothing it does not.
+
+Two things about it worth keeping:
+
+- **Only ASR background events go to the activity stream, not every P=0 event.**
+  Most of P=0 is battery, temperature and IMU readings arriving every second;
+  pushing those would flush the log, and being readable at a glance is the whole
+  point of it.
+- **Both the `background` flag and the `asr_background` topic name count as
+  evidence.** The flag is written into the JSON by perception, the topic name comes
+  from the canvas wiring; the two are independent, so recognising only one of them
+  means the rows silently stop appearing when the other end changes — and "a kind
+  of thing that stopped showing up in the log" is a failure nobody reports.
+
 ### Agent Definition
 
 Define the agent's identity, system prompt, and long-term memory directly from the UI.
