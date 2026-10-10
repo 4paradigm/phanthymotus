@@ -2640,13 +2640,20 @@ on jp5.11 (see `plugins/kokoro_worker.py`). A learned skeleton-action model
 hence `action_backend`, and hence `classify()` taking plain `PoseFrame`s and
 returning a plain dict.
 
-### Three output topics, and why it is not one
+### Four output topics, and why it is not one
 
 | topic | format | who consumes it |
 |---|---|---|
-| `{input}/poses` | `data/json` | wired to `decision_core` — **lean**: action, centre, bbox |
+| `{input}/poses` | `data/json` | **lean** per-frame state: action, centre, bbox |
 | `{input}/poses/skeleton` | `sensor/pose2d` | the dashboard renderer — **full** keypoints |
+| `{input}/poses/gesture` | `data/json` | wired to `decision_core` — **sparse**, one message per transition |
 | `{input}/poses/overlay_img` | `image/jpeg` | skeleton drawn on the frame (`publish_overlay`, off by default) |
+
+Two of them are `data/json` and that is not an oversight: the format picks the
+renderer, and what separates these two is the **rate**. One publishes every
+frame; the other only when something changes. See "The gesture topic is the one
+to wire into `decision_core`" below — the lean topic was the obvious thing to
+wire there and it is the wrong one.
 
 agent-core copies the **whole message** of a subscribed topic into the event bus
 as event text (`agent-core/src/topic_subscriber.py`), so every byte on the topic
@@ -2676,6 +2683,82 @@ which is always full. Note `publish_keypoints: "off"` is **quoted** in
 
 The one-shot photo actions always answer in full, like vop's: that reply is asked
 for once and read once, so trimming it saves nothing.
+
+### The gesture topic is the one to wire into `decision_core`
+
+The lean topic publishes every frame, so wiring *it* into `decision_core` means
+a person holding a hand up for three seconds at 12 fps is thirty-six full
+payloads of LLM context all saying the same thing. The robot does not need to be
+told thirty-six times. It needs to be told once, when the gesture starts.
+
+So the activity channel is also published as **transitions**, on a topic that is
+silent the rest of the time (`plugins/gesture_events.py`):
+
+| field | |
+|---|---|
+| `priority` | `1` — see below, this one is load-bearing |
+| `event` | `gesture_start` / `gesture_end` |
+| `gesture` | e.g. `raising hand` |
+| `track` | the person's temporary id, **not** an identity |
+| `position` | normalised lateral offset, so "on your left" is derivable |
+| `point_direction` | present for a pointing gesture, which is its entire content |
+| `held_s`, `reason` | on an end only: `released` or `track_lost` |
+
+**The `priority` field is load-bearing.** `collector._PRIORITY_SOURCES` is
+`{asr, message, channel, subagent, acp, scheduler}` — `dds` is not in it, so a
+DDS-sourced event scores P=0 and lands in the background batch instead of
+reaching the main agent. But `collector._extract_priority()` parses the event
+text first and honours a `priority` field when it finds one. Without it a wave
+is delivered, logged, and ignored, with nothing in any log saying why. That is
+the whole reason the transitions are their own payload rather than a field on
+the per-frame one.
+
+Three thresholds shape the stream, all of them **durations**, not frame counts:
+
+| config | default | what it is for |
+|---|---|---|
+| `gesture_hold_s` | 0.6 | an arm passing through the raised position on its way to scratch a nose reads as `raising hand` for a few frames |
+| `gesture_release_s` | 0.5 | one dropped frame, or one frame of the label stabiliser holding a label back, must not close and reopen the event |
+| `gesture_cooldown_s` | 2.0 | somebody waving in bursts is one request, not one per burst |
+
+They are seconds because the two channels that feed this run at different
+rates: the body channel at the card's `fps` (12), and the hand channel — when it
+arrives — throttled to about 4 Hz. "Hold for three frames" would mean 250 ms in
+one and 750 ms in the other. A gesture is also never announced from a *single*
+sighting however small `gesture_hold_s` is: the first frame a label appears on
+registers it as a candidate and the earliest a start can fire is the frame
+after, because one frame of a label is exactly the case the dwell exists for.
+
+**A lost track ends its gesture.** Somebody who raises a hand and walks out of
+frame would otherwise leave an unmatched open: the cooldown never arms, and a
+consumer tracking state cannot tell "still holding" from "walked away". The end
+carries `reason: "track_lost"` rather than `"released"` so the two stay
+distinguishable.
+
+`gesture_whitelist` defaults to `["raising hand", "hand waving",
+"point to something"]`. All three are read from the **COCO-17 skeleton**, so they
+work at any distance the body is visible at and do not depend on a hand model —
+being called from across a room is this topic's main job. The wider set
+(`clapping`, `salute`, `cross hands in front`, ...) comes from the skeleton-action
+model alone, and that model has no "not gesturing" class, so it is available but
+off. `list_actions` returns both lists under `gestures`.
+
+When the topic is silent, `info` says why: `gesture_whitelist`,
+`gesture_event_count` and `recent_gestures`, per instance. Without those three,
+"no gesture events" is indistinguishable between nobody gesturing, a whitelist
+that excludes what they did, and a dwell nobody satisfies.
+
+The one-shot photo actions do **not** emit transitions. Every threshold here is
+a duration over consecutive frames and a photo is one frame with made-up track
+ids; feeding it in would either emit nothing while polluting the state machine
+with ids belonging to no track, or — with a zero dwell — announce a gesture from
+a still image that cannot support one.
+
+This topic is also the only one of the four published **RELIABLE**. A dropped
+frame on the others is replaced by the next one; a dropped transition is not,
+and the stream would then hold an unmatched open for as long as the gesture
+lasts. Reliability costs nothing on a topic that emits a handful of messages a
+minute.
 
 ### Why the overlay is a third topic rather than drawn in the browser
 

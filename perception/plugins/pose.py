@@ -70,6 +70,14 @@ from plugins.pose_stgcn import (
     action_vocabulary,
     build_backend,
 )
+from plugins.gesture_events import (
+    DEFAULT_COOLDOWN_S,
+    DEFAULT_GESTURES,
+    DEFAULT_HOLD_S,
+    DEFAULT_RELEASE_S,
+    OPTIONAL_GESTURES,
+    GestureEventTracker,
+)
 from plugins.vision_runtime import COCO_KEYPOINTS, COCO_SKELETON, N_KEYPOINTS
 
 log = logging.getLogger(__name__)
@@ -149,6 +157,34 @@ def skeleton_topic_for(input_topic: Optional[str]) -> str:
 
 def overlay_topic_for(input_topic: Optional[str]) -> str:
     return f"{output_topic_for(input_topic)}/overlay_img"
+
+
+def gesture_topic_for(input_topic: Optional[str]) -> str:
+    """Where the sparse gesture transitions go.
+
+    A fourth topic rather than a field on the lean one, because the lean topic
+    publishes every frame and this must publish only on a change — see
+    plugins/gesture_events.py for why that distinction is the whole point.
+    """
+    return f"{output_topic_for(input_topic)}/gesture"
+
+
+def _gesture_whitelist(value) -> tuple:
+    """Normalise the configured gesture whitelist.
+
+    A string is accepted as well as a list because the canvas's config forms
+    hand back a comma-separated string for an array field, and an unsplit
+    string would become a whitelist of one long nonsense label that matches
+    nothing — a silently empty gesture stream.
+    """
+    if value is None or value == "":
+        return tuple(DEFAULT_GESTURES)
+    if isinstance(value, str):
+        items = [part.strip() for part in value.split(",")]
+    else:
+        items = [str(part).strip() for part in value]
+    kept = tuple(item for item in items if item)
+    return kept or tuple(DEFAULT_GESTURES)
 
 
 def _keypoint_level(value) -> str:
@@ -234,6 +270,12 @@ TOOLS = [
                 "publish_keypoints": {"type": "string", "enum": list(KEYPOINT_LEVELS), "description": "data/json 那条流里要不要带关键点：off（默认）只发动作和位置；compact 带 17 个整数像素点；full 带 17×(x,y,可见性)。off→full 每人每帧约 60 B → 900 B，而这条流的每个字节都是每帧的 LLM 上下文字节。画骨架用的是 /skeleton 那条，不受这里影响", "default": "off", "scope": "instance"},
                 "publish_bbox": {"type": "boolean", "description": "lean 流里带上像素框 [x1,y1,x2,y2]", "default": True, "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
+                "publish_gesture_events": {"type": "boolean", "description": "另发一条稀疏的手势事件流（{topic}/poses/gesture）：只在手势开始/结束时各发一条，不是每帧。这条才是接 decision_core 用的 —— agent-core 会把订阅话题的整条消息原样塞进事件总线，逐帧发等于举手三秒烧掉 36 条满payload 的上下文。事件自带 priority 字段，否则 dds 来源算 P=0，只进后台批，挥手唤不醒 agent", "default": True, "scope": "instance"},
+                "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "description": f"哪些动作算「冲着机器人做的手势」。默认 {list(DEFAULT_GESTURES)} —— 这三个都从 COCO-17 骨架读出来，不依赖手部模型，所以人在多远都有效。可选再加 {list(OPTIONAL_GESTURES)}，但那些只有骨架动作模型给，而它没有「没在做手势」这个类", "default": list(DEFAULT_GESTURES), "scope": "instance"},
+                "gesture_hold_s": {"type": "number", "minimum": 0.0, "description": "手势要连续保持多少秒才报开始。手臂路过举起位置（去挠头）也会被几何读成 raising hand，这个窗口就是为了挡它。按秒而不是按帧 —— 身体通道跑卡片 fps、手部通道节流到约 4 Hz，同一个帧数在两边是不同时长", "default": DEFAULT_HOLD_S, "scope": "instance"},
+                "gesture_release_s": {"type": "number", "minimum": 0.0, "description": "手势要消失多少秒才报结束。一帧遮挡或者标签迟滞压住一帧都不该让事件关掉再开", "default": DEFAULT_RELEASE_S, "scope": "instance"},
+                "gesture_cooldown_s": {"type": "number", "minimum": 0.0, "description": "同一个 track 的同一个手势结束后多久才能再次触发。断续挥手是一个请求，不是每一阵一个", "default": DEFAULT_COOLDOWN_S, "scope": "instance"},
+                "gesture_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "手势事件的得分门槛。只作用于带分的标签 —— 几何规则有些动作不给分，把缺分当 0 会在配了门槛的那一刻静默丢掉它们全部", "default": 0.0, "scope": "instance"},
                 "action_window_s": {"type": "number", "minimum": 0.2, "description": "动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的", "default": 1.5, "scope": "instance"},
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型，两者各做擅长的；rules = 只用几何规则，不加载第二个 engine —— 这也是取不到 engine 时自动退到的模式，手动选它主要用于在真机上区分「模型判错」和「几何判错」。只用模型的 stgcn 模式已撤下：NTU-60 里没有「站立」「坐」这两个状态类，静止的人不但报不出来，还会拿到一个自信的错答案", "default": "hybrid", "scope": "instance"},
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "description": "How often the action model runs, in seconds. Its window is 2.5 s, so two runs one frame apart share 97% of their input and cost 20 ms each; with three people in frame, running it every frame measured 98.9 ms per frame against 41 ms throttled. The geometry still runs every frame, so posture stays frame-rate. 0 disables the throttle.", "default": 0.35, "scope": "instance"},
@@ -250,6 +292,7 @@ TOOLS = [
         "topic_out": [
             {"format": "data/json", "desc": "per-person action labels and positions"},
             {"format": "sensor/pose2d", "desc": "COCO-17 keypoints for the skeleton renderer"},
+            {"format": "data/json", "desc": "sparse gesture transitions, one message per change (publish_gesture_events)"},
             {"format": "image/jpeg", "desc": "skeleton drawn on the frame (publish_overlay)"},
         ],
     }
@@ -266,7 +309,9 @@ class _PoseNode(Node):
                  kpt_confidence: float = 0.3, max_persons: int = 5,
                  publish_keypoints: str = "off", publish_bbox: bool = True,
                  publish_overlay: bool = False, label_hold: int = 3,
-                 activity_interval_s: float = 0.35):
+                 activity_interval_s: float = 0.35,
+                 gesture_tracker: Optional[GestureEventTracker] = None,
+                 publish_gesture_events: bool = True):
         super().__init__(f"pose_{node_suffix}" if node_suffix else "pose")
         # Topic-less is a supported mode, as in vop and tts: a card driven only
         # by recognize_by_photo has no camera, but still wants somewhere to
@@ -275,6 +320,7 @@ class _PoseNode(Node):
         self._output_topic = output_topic_for(input_topic)
         self._skeleton_topic = skeleton_topic_for(input_topic)
         self._overlay_topic = overlay_topic_for(input_topic)
+        self._gesture_topic = gesture_topic_for(input_topic)
         self._model = model
         self._classifier = classifier
         self._confidence = confidence
@@ -303,6 +349,28 @@ class _PoseNode(Node):
         self._pub_overlay = (
             self.create_publisher(CompressedImage, self._overlay_topic, _PUB_QOS)
             if self._publish_overlay else None)
+
+        # Sparse by construction, so its QoS is not the others'. A transition
+        # published while a subscriber is momentarily not ready is simply lost
+        # under BEST_EFFORT, and unlike a dropped frame there is no next one to
+        # make up for it — the stream would then hold an unmatched open for as
+        # long as the gesture lasts. RELIABLE costs nothing on a topic that
+        # emits a handful of messages a minute.
+        self._publish_gesture_events = bool(publish_gesture_events)
+        self._gesture_tracker = gesture_tracker
+        self._pub_gesture = (
+            self.create_publisher(
+                String, self._gesture_topic,
+                QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                           history=HistoryPolicy.KEEP_LAST, depth=20,
+                           durability=DurabilityPolicy.VOLATILE))
+            if (self._publish_gesture_events and gesture_tracker is not None)
+            else None)
+        #: Last few transitions, so `info` can show what fired. An empty
+        #: gesture stream is otherwise indistinguishable between "nobody
+        #: gestured", "the whitelist excludes it" and "the dwell never elapsed".
+        self._recent_gestures: list = []
+        self._gesture_count = 0
 
         self._sub: Optional[object] = None
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -335,6 +403,8 @@ class _PoseNode(Node):
             "output": self._output_topic,
             "skeleton_output": self._skeleton_topic,
             "overlay_output": self._overlay_topic if self._publish_overlay else None,
+            "gesture_output": (self._gesture_topic
+                               if self._pub_gesture is not None else None),
             "mode": "stream" if self._input_topic else "on_demand",
         }
 
@@ -377,6 +447,12 @@ class _PoseNode(Node):
             self._worker = None
             self._running = False
             self._tracker.reset()
+            # Drop gesture state with the tracks it belongs to. Keeping it
+            # would mean a restart inherits a held gesture and an armed
+            # cooldown from before the stop, so the first real gesture after
+            # a restart could be silently suppressed.
+            if self._gesture_tracker is not None:
+                self._gesture_tracker.reset()
             log.info(f"[pose] stopped: {self._input_topic or '(no topic)'}")
             return self._status()
 
@@ -573,12 +649,20 @@ class _PoseNode(Node):
 
     def publish_persons(self, persons: list, frame=None,
                         started: Optional[float] = None) -> None:
-        """Publish one frame's worth of results. Used by the stream worker and
-        by the one-shot photo actions, so both emit the same thing."""
-        self._publish(persons, frame, started)
+        """Publish one frame's worth of results from a one-shot photo action.
+
+        Gesture transitions are deliberately NOT emitted here. Every threshold
+        in the gesture tracker is a duration over consecutive frames, and a
+        photo is one frame with made-up track ids — feeding it in would either
+        emit nothing (and pollute the tracker's state with ids that belong to
+        no track) or, with a zero dwell configured, announce a gesture from a
+        still image that cannot support one.
+        """
+        self._publish(persons, frame, started, emit_gestures=False)
 
     def _publish(self, persons: list, frame=None,
-                 started: Optional[float] = None) -> None:
+                 started: Optional[float] = None, *,
+                 emit_gestures: bool = True) -> None:
         self._detect_count += 1
         self._person_count = len(persons)
         payload = {
@@ -612,8 +696,38 @@ class _PoseNode(Node):
         skeleton_message.data = json.dumps(skeleton, ensure_ascii=False)
         self._pub_skeleton.publish(skeleton_message)
 
+        if emit_gestures:
+            self._publish_gesture_events_for(persons, payload["timestamp"])
+
         if self._pub_overlay is not None and frame is not None:
             self._publish_overlay_frame(persons, frame)
+
+    def _publish_gesture_events_for(self, persons: list, now: float) -> None:
+        """Emit whatever transitions this frame caused, if anything.
+
+        The tracker is advanced even when there is no publisher, so that
+        turning the topic on mid-run does not inherit a stale state machine
+        that believes a gesture from minutes ago is still being held.
+        """
+        if self._gesture_tracker is None:
+            return
+        try:
+            events = self._gesture_tracker.update(persons, now)
+        except Exception as error:  # noqa: BLE001 — never lose the real result
+            log.warning(f"[pose] gesture tracking failed: {error}")
+            return
+        for event in events:
+            self._gesture_count += 1
+            self._recent_gestures.append(event)
+            if self._pub_gesture is None:
+                continue
+            message = String()
+            message.data = json.dumps(event, ensure_ascii=False)
+            self._pub_gesture.publish(message)
+            log.info("[pose] gesture %s: %s track=%s",
+                     event.get("event"), event.get("gesture"),
+                     event.get("track"))
+        del self._recent_gestures[:-10]
 
     def _publish_overlay_frame(self, persons: list, frame) -> None:
         try:
@@ -741,6 +855,17 @@ class PosePerceptionPlugin:
         self._publish_keypoints = _keypoint_level(plugin_cfg.get("publish_keypoints"))
         self._publish_bbox = bool(plugin_cfg.get("publish_bbox", True))
         self._publish_overlay = bool(plugin_cfg.get("publish_overlay", False))
+        self._publish_gesture_events = bool(
+            plugin_cfg.get("publish_gesture_events", True))
+        self._gesture_whitelist = _gesture_whitelist(
+            plugin_cfg.get("gesture_whitelist"))
+        self._gesture_hold_s = float(plugin_cfg.get("gesture_hold_s",
+                                                    DEFAULT_HOLD_S))
+        self._gesture_release_s = float(plugin_cfg.get("gesture_release_s",
+                                                       DEFAULT_RELEASE_S))
+        self._gesture_cooldown_s = float(plugin_cfg.get("gesture_cooldown_s",
+                                                        DEFAULT_COOLDOWN_S))
+        self._gesture_min_score = float(plugin_cfg.get("gesture_min_score", 0.0))
         self._action_window_s = float(plugin_cfg.get("action_window_s", 1.5))
         self._backend_migrated: Optional[str] = None
         self._action_backend = self._migrate_backend(
@@ -801,6 +926,19 @@ class PosePerceptionPlugin:
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
             "activity_interval_s": float(icfg.get(
                 "activity_interval_s", self._activity_interval_s)),
+            "publish_gesture_events": bool(icfg.get(
+                "publish_gesture_events", self._publish_gesture_events)),
+            "gesture_whitelist": (_gesture_whitelist(icfg["gesture_whitelist"])
+                                  if "gesture_whitelist" in icfg
+                                  else self._gesture_whitelist),
+            "gesture_hold_s": float(icfg.get("gesture_hold_s",
+                                             self._gesture_hold_s)),
+            "gesture_release_s": float(icfg.get("gesture_release_s",
+                                                self._gesture_release_s)),
+            "gesture_cooldown_s": float(icfg.get("gesture_cooldown_s",
+                                                 self._gesture_cooldown_s)),
+            "gesture_min_score": float(icfg.get("gesture_min_score",
+                                                self._gesture_min_score)),
         }
         for key in _THRESHOLD_KEYS:
             if key in icfg and icfg[key] is not None:
@@ -808,6 +946,22 @@ class PosePerceptionPlugin:
             elif key in self._plugin_cfg and self._plugin_cfg[key] is not None:
                 merged[key] = self._plugin_cfg[key]
         return merged
+
+    def _gesture_tracker_for(self, merged: dict) -> GestureEventTracker:
+        """Build the gesture state machine for one instance.
+
+        Always built, even when `publish_gesture_events` is off: the node
+        advances it either way so that switching the topic on mid-run does not
+        inherit a state machine that still believes a gesture from minutes ago
+        is being held. It is pure logic and costs nothing to run.
+        """
+        return GestureEventTracker(
+            merged["gesture_whitelist"],
+            hold_s=merged["gesture_hold_s"],
+            release_s=merged["gesture_release_s"],
+            cooldown_s=merged["gesture_cooldown_s"],
+            min_score=merged["gesture_min_score"],
+        )
 
     def _classifier_for(self, merged: dict):
         """Build the configured action backend.
@@ -1073,6 +1227,8 @@ class PosePerceptionPlugin:
                 publish_overlay=merged["publish_overlay"],
                 label_hold=merged["label_hold"],
                 activity_interval_s=merged["activity_interval_s"],
+                gesture_tracker=self._gesture_tracker_for(merged),
+                publish_gesture_events=merged["publish_gesture_events"],
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -1167,6 +1323,22 @@ class PosePerceptionPlugin:
                     "跌倒是唯一的告警类，要模型得分过 0.75 且几何同意身体不直立"
                     if effective == "hybrid" else
                     "rules：只用关键点几何，不加载动作模型。没有 activity 这一路"),
+                # Folded in here rather than given its own `list_gestures`
+                # action: a vocabulary split across two queries is one an agent
+                # looks up in the wrong place.
+                "gestures": {
+                    "enabled": self._publish_gesture_events,
+                    "topic_suffix": "/poses/gesture",
+                    "whitelist": list(self._gesture_whitelist),
+                    "available": list(DEFAULT_GESTURES),
+                    "optional": list(OPTIONAL_GESTURES),
+                    "note": ("手势是 activity 的一个子集，单独发在稀疏的 "
+                             "{topic}/poses/gesture 上：只在开始/结束各一条，"
+                             "带 priority 字段。默认那三个都从 COCO-17 骨架读，"
+                             "不依赖手部模型，所以人在多远都有效 —— 远处召唤走的"
+                             "就是这条。optional 里的只有骨架动作模型给，而它没有"
+                             "「没在做手势」这个类，所以默认不开"),
+                },
                 "actions": action_catalogue(),
                 "note": ("姿态标签来自关键点几何，事件标签（跌倒）判的是「转换」"
                          "而不是终态 —— 躺在地上和躺在沙发上是同一个终态。"
@@ -1223,6 +1395,16 @@ class PosePerceptionPlugin:
                 "detect_count": node._detect_count,
                 "persons_last_frame": node._person_count,
                 "last_actions": dict(node._last_actions),
+                "gesture_output": (node._gesture_topic
+                                   if node._pub_gesture is not None else None),
+                # Why an empty gesture stream is empty. Without these three a
+                # silent topic is indistinguishable between "nobody gestured",
+                # "the whitelist excludes what they did" and "the dwell is set
+                # longer than anybody holds a hand up".
+                "gesture_whitelist": (list(node._gesture_tracker.gestures)
+                                      if node._gesture_tracker else []),
+                "gesture_event_count": node._gesture_count,
+                "recent_gestures": list(node._recent_gestures[-5:]),
             }
             for key, node in nodes.items()
         }
@@ -1245,6 +1427,10 @@ class PosePerceptionPlugin:
                 {"topic": output_topic_for(input_topic), "format": "data/json"},
                 {"topic": skeleton_topic_for(input_topic), "format": "sensor/pose2d"},
             ]
+            if any(node._pub_gesture is not None for node in nodes.values()) or (
+                    not nodes and self._publish_gesture_events):
+                topics_out.append({"topic": gesture_topic_for(input_topic),
+                                   "format": "data/json"})
             if any(node._publish_overlay for node in nodes.values()) or (
                     not nodes and self._publish_overlay):
                 topics_out.append({"topic": overlay_topic_for(input_topic),
@@ -1447,6 +1633,18 @@ class PosePerceptionPlugin:
             self._publish_bbox = bool(cfg["publish_bbox"])
         if "publish_overlay" in cfg:
             self._publish_overlay = bool(cfg["publish_overlay"])
+        if "publish_gesture_events" in cfg:
+            self._publish_gesture_events = bool(cfg["publish_gesture_events"])
+        if "gesture_whitelist" in cfg:
+            self._gesture_whitelist = _gesture_whitelist(cfg["gesture_whitelist"])
+        if "gesture_hold_s" in cfg:
+            self._gesture_hold_s = float(cfg["gesture_hold_s"])
+        if "gesture_release_s" in cfg:
+            self._gesture_release_s = float(cfg["gesture_release_s"])
+        if "gesture_cooldown_s" in cfg:
+            self._gesture_cooldown_s = float(cfg["gesture_cooldown_s"])
+        if "gesture_min_score" in cfg:
+            self._gesture_min_score = float(cfg["gesture_min_score"])
         if "action_window_s" in cfg:
             self._action_window_s = float(cfg["action_window_s"])
         if "action_backend" in cfg:
