@@ -33,7 +33,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         # Even an HTTPS redirect must not forward the card credential.
         if fp is not None:
             fp.close()
-        raise MusicError('http_error', '曲库重定向被拒绝，请检查卡片配置的地址。')
+        raise MusicError('http_error', '曲库重定向被拒绝，请联系卡片维护者检查内置地址。')
 
 
 class MotusMusicProvider:
@@ -44,7 +44,7 @@ class MotusMusicProvider:
         self._key = config.get('api_key', '')
         if (not isinstance(self._key, str) or not self._key
                 or len(self._key) > 4096 or any(not 33 <= ord(c) <= 126 for c in self._key)):
-            raise MusicError('invalid_config', '请在卡片中配置有效的音乐曲库 API Key。')
+            raise MusicError('invalid_config', '曲库凭据无效，请联系卡片维护者。')
         timeout = config.get('timeout_ms', 3000)
         if type(timeout) is not int or not 100 <= timeout <= 30000:
             raise MusicError('invalid_config', '曲库超时须为 100–30000 毫秒。')

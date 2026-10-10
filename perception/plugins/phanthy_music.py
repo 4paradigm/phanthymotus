@@ -10,6 +10,10 @@ from plugins.music_player import MusicPlayer, bounded_number
 from plugins.music_catalog.contracts import MusicError
 from plugins.music_catalog.service import MusicService
 
+# Fixed card integration; these values are not user-editable card settings.
+CATALOGUE_ENDPOINT = 'https://api.phanthy.com/open'
+CATALOGUE_API_KEY = 'pmk_315eeccf191e_NkXhERRw1L3squK-Grffb-a7ds-rXL5X1YhDhpx3-E0'
+
 FORMAT = 'audio/pcm-16k'
 OUTPUT_TOPIC = '/perception/music/audio'  # Existing AudioChunk/Speaker contract.
 QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -17,7 +21,7 @@ QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                  durability=DurabilityPolicy.VOLATILE)
 SEARCH_PARAMS = ['query', 'genre', 'language', 'vocal', 'tags', 'artist', 'top_k',
                  'exclude_ids', 'duration_min_s', 'duration_max_s']
-CONFIG_PARAMS = ['catalogue_type', 'endpoint', 'api_key', 'timeout_ms', 'volume', 'duck_gain']
+CONFIG_PARAMS = ['catalogue_type', 'timeout_ms', 'volume', 'duck_gain']
 ACTIONS = {
     'search': SEARCH_PARAMS,
     'play_by_id': ['track_id'],
@@ -69,14 +73,8 @@ TOOLS = [{
         },
     },
     'configSchema': {'type': 'object', 'additionalProperties': False, 'properties': {
-        'catalogue_type': {'type': 'string', 'enum': ['none', 'mock', 'motus_music'], 'default': 'none',
-                           'description': '曲库类型；真实曲库的地址和凭据在本卡配置'},
-        'endpoint': {'type': 'string', 'default': '', 'x-sensitive': True,
-                     'description': '曲库 HTTPS 服务地址',
-                     'x-show-when': {'catalogue_type': 'motus_music'}},
-        'api_key': {'type': 'string', 'format': 'password', 'default': '',
-                    'description': '曲库 API Key；仅在卡片配置填写，分享 Solution 时清空',
-                    'x-show-when': {'catalogue_type': 'motus_music'}},
+        'catalogue_type': {'type': 'string', 'enum': ['none', 'mock', 'motus_music'], 'default': 'motus_music',
+                           'description': '默认使用内置曲库连接；mock 仅用于离线元数据测试'},
         'timeout_ms': {'type': 'integer', 'minimum': 100, 'maximum': 30000, 'default': 3000,
                        'description': '曲库请求总时限（毫秒，含能力查询和重试）',
                        'x-show-when': {'catalogue_type': 'motus_music'}},
@@ -119,13 +117,18 @@ class PhanthyMusicPlugin:
 
     def __init__(self, plugin_cfg, executor):
         self._cfg = {key: value for key, value in plugin_cfg.items() if key in CONFIG_PARAMS}
-        self._catalogue = MusicService(self._cfg)
+        self._cfg.setdefault('catalogue_type', 'motus_music')
+        self._catalogue = self._new_catalogue(self._cfg)
         self._executor, self._node = executor, None
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
         self._catalogue_gate = threading.Lock()
         self._generation = 0
         self._pending_play = None
+
+    @staticmethod
+    def _new_catalogue(cfg):
+        return MusicService({**cfg, 'endpoint': CATALOGUE_ENDPOINT, 'api_key': CATALOGUE_API_KEY})
 
     def get_tools(self):
         return deepcopy(TOOLS)
@@ -275,8 +278,8 @@ class PhanthyMusicPlugin:
                     for key, high in (('volume', 100), ('duck_gain', 1)):
                         if key in cfg:
                             cfg[key] = bounded_number(cfg[key], 0, high, key)
-                    catalogue = MusicService(cfg)
-                    if any(cfg.get(k) != self._cfg.get(k) for k in ('catalogue_type', 'endpoint', 'api_key', 'timeout_ms')):
+                    catalogue = self._new_catalogue(cfg)
+                    if any(cfg.get(k) != self._cfg.get(k) for k in ('catalogue_type', 'timeout_ms')):
                         self._cancel_pending()
                         self._catalogue = catalogue
                     self._cfg = cfg

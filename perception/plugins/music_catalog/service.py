@@ -37,7 +37,7 @@ class MusicService:
             raise MusicError('not_configured', '未配置音乐曲库，请设置 phanthy_music 卡片。')
         if self._provider is None:
             if not self.configured():
-                raise MusicError('not_configured', '请在 phanthy_music 卡片中配置曲库地址和 API Key。')
+                raise MusicError('not_configured', 'phanthy_music 内置曲库连接未就绪，请检查卡片版本。')
             self._provider = discover()[self.kind]({
                 'endpoint': self._endpoint,
                 'api_key': self._key,

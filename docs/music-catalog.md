@@ -2,8 +2,10 @@
 
 PhanthyMotus calls a deterministic music catalogue over HTTPS. The public
 repository contains this contract, [OpenAPI](openapi/motus-music-v1.yaml), a generic
-client and fictional mock metadata. Deployment endpoints, keys, real catalogue
-records and the remote search implementation are not published.
+client and fictional mock metadata. The Phanthy Music card commits a fixed
+endpoint and API key in its source for its built-in integration; these are not
+editable UI settings. Real catalogue records, audio assets and the remote search
+implementation are not included. The REST contract remains provider-independent.
 
 The client belongs to the [phanthy_music card](phanthy_music.md). A model extracts
 intent into `search` arguments, then calls `play_by_id(track_id)` on that same card.

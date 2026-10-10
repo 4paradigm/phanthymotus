@@ -20,6 +20,10 @@ def detail():
 
 class CardTests(unittest.TestCase):
     def setUp(self):
+        fixed = patch.multiple('plugins.phanthy_music', CATALOGUE_ENDPOINT='https://catalogue.example',
+                               CATALOGUE_API_KEY='fake-internal-key')
+        fixed.start()
+        self.addCleanup(fixed.stop)
         self.plugin = PhanthyMusicPlugin({'catalogue_type': 'mock'}, _FakeExecutor())
 
     def tearDown(self):
@@ -140,36 +144,42 @@ class CardTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(node.destroyed)
 
-    def test_card_credentials_reconfigure_and_clear_without_echo_or_model_exposure(self):
-        result = self.call('config', catalogue_type='motus_music',
-                           endpoint='https://catalogue.example', api_key='fake-private-value')
+    def test_card_uses_fixed_credentials_without_exposing_configuration(self):
+        result = self.call('config', catalogue_type='motus_music')
         self.assertTrue(result['catalogue_configured'])
         self.assertEqual(self.plugin._catalogue._provider.endpoint, 'https://catalogue.example')
+        self.assertEqual(self.plugin._catalogue._provider._key, 'fake-internal-key')
         before = self.plugin._catalogue
-        result = self.call('config', api_key='another-fake-key')
+        result = self.call('config', timeout_ms=4000)
         self.assertIsNot(before, self.plugin._catalogue)
-        self.assertNotIn('another-fake-key', json.dumps(result))
-        self.assertFalse(self.call('config', api_key='')['catalogue_configured'])
-        self.assertEqual(self.call('search')['error']['code'], 'not_configured')
-        for field in ('api_key_env', 'api_key_file'):
+        self.assertTrue(result['catalogue_configured'])
+        self.assertEqual(self.plugin._catalogue._provider._key, 'fake-internal-key')
+        for reply in (result, self.call('info'), self.plugin.get_tools()):
+            self.assertNotIn('fake-internal-key', json.dumps(reply))
+            self.assertNotIn('https://catalogue.example', json.dumps(reply))
+        for field in ('endpoint', 'api_key', 'api_key_env', 'api_key_file'):
             result = self.call('config', **{field: 'fake-private-value'})
             self.assertIn('error', result)
             self.assertNotIn('fake-private-value', json.dumps(result))
             self.assertNotIn(field, self.plugin._cfg)
-        self.assertEqual(TOOLS[0]['configSchema']['properties']['api_key']['format'], 'password')
-        self.assertTrue(TOOLS[0]['configSchema']['properties']['endpoint']['x-sensitive'])
-        self.assertNotIn('api_key', TOOLS[0]['inputSchema']['properties'])
+            self.assertNotIn(field, TOOLS[0]['configSchema']['properties'])
+            self.assertNotIn(field, TOOLS[0]['inputSchema']['properties'])
         self.assertNotIn('config', TOOLS[0]['inputSchema']['x-action-params'])
-        self.assertNotIn('fake-private-value', json.dumps(self.plugin.get_tools()))
 
-    def test_invalid_card_credentials_are_rejected_without_echo(self):
-        for settings in ({'endpoint': 'http://catalogue.example', 'api_key': 'fake-private-value'},
-                         {'endpoint': 'https://catalogue.example', 'api_key': 'fake-private-value\n'},
-                         {'endpoint': ['fake-private-value'], 'api_key': 123}):
-            result = self.call('config', catalogue_type='motus_music', **settings)
-            self.assertIn('error', result)
-            self.assertNotIn('fake-private-value', json.dumps(result))
-            self.assertEqual(self.plugin._catalogue.kind, 'mock')
+    def test_default_card_ignores_external_credential_settings_and_environment(self):
+        with patch.dict('os.environ', {'PHANTHY_MUSIC_ENDPOINT': 'https://ignored.example',
+                                       'PHANTHY_MUSIC_API_KEY': 'fake-ignored-env-key'}):
+            plugin = PhanthyMusicPlugin({'endpoint': 'https://ignored.example',
+                                        'api_key': 'fake-ignored-config-key'}, _FakeExecutor())
+        try:
+            self.assertEqual(plugin._catalogue.kind, 'motus_music')
+            self.assertTrue(plugin.dispatch('phanthy_music', {'action': 'info'})['catalogue_configured'])
+            self.assertEqual(plugin._catalogue._provider.endpoint, 'https://catalogue.example')
+            self.assertEqual(plugin._catalogue._provider._key, 'fake-internal-key')
+            self.assertNotIn('api_key', plugin._cfg)
+            self.assertNotIn('endpoint', plugin._cfg)
+        finally:
+            plugin.stop()
 
     def test_search_timeout_does_not_interrupt_existing_music_or_tts(self):
         self.call('start')
@@ -206,7 +216,7 @@ class MCPTests(unittest.TestCase):
                 result = rpc('tools/call', {'name': 'phanthy_music', 'arguments': {'action': 'search', 'query': 'fake-private-value'}})
                 self.assertTrue(json.loads(result['content'][0]['text'])['tracks'])
                 result = rpc('tools/call', {'name': 'phanthy_music', 'arguments': {'action': 'config', 'api_key': 'fake-private-value'}})
-                self.assertNotIn('error', json.loads(result['content'][0]['text']))
+                self.assertIn('error', json.loads(result['content'][0]['text']))
                 self.assertNotIn('fake-private-value', result['content'][0]['text'])
                 self.assertNotIn('fake-private-value', captured.getvalue())
         finally:

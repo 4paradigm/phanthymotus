@@ -7,34 +7,37 @@ not generate songs, run another model or maintain a local music library.
 
 ## Card configuration
 
-Add **phanthy_music** to the canvas and fill in its sidebar settings:
+Add **phanthy_music** to the canvas. The catalogue endpoint and API key are fixed
+inside `perception/plugins/phanthy_music.py`; users do not enter them. The sidebar
+contains only these optional settings:
 
 | Field | Meaning |
 |---|---|
-| `catalogue_type` | `none` (default), `mock`, or `motus_music` |
-| `endpoint` | Catalogue's HTTPS base address, supplied by the operator |
-| `api_key` | Catalogue credential, supplied through the card's password field |
+| `catalogue_type` | `motus_music` (default), `none`, or metadata-only `mock` |
 | `timeout_ms` | Catalogue request budget including capabilities/retries; default 3000 |
 | `volume` | Music volume 0–100; default 50 |
 | `duck_gain` | Music's relative level during TTS; default 0.15 |
 
-The card receives `endpoint` and `api_key` through the existing `config` action.
-There are no music credential environment variables or deployment changes.
-Changing either value replaces the provider/cache and cancels pending playback
-lookups. Setting the key to an empty string clears it. `none` reports
+There are no music credential environment variables, external credential files
+or deployment changes. `config` rejects endpoint/key overrides; startup plugin
+settings cannot replace the fixed values either. Changing provider/timeout
+replaces the provider/cache and cancels pending playback lookups. `none` reports
 `not_configured`; `mock` has 24 fictional metadata records and no playable audio.
 
-`api_key` has `format: password`, and `endpoint` has `x-sensitive: true`.
-The existing Solution exporter clears both. The input schema shown to the model
-contains neither credential nor configuration actions. Status/config replies
-never return the key or endpoint; music MCP logs omit payloads. The HTTPS
-provider sends the key only in its Authorization header and rejects redirects.
-Real endpoints, keys and song assets must not be committed.
+The endpoint/key are absent from both configSchema and model parameters.
+Status/config replies never return them, and music MCP logs omit payloads.
+The HTTPS provider sends the key only in its Authorization header and rejects
+redirects. Fresh card configurations and Solutions have no credential fields.
 
-**Storage limitation:** the existing card framework saves configuration in the
-local SQLite database as plaintext. A password input and Solution redaction do
-not encrypt that database. This card uses the existing storage behaviour; it
-does not change Agent Core or introduce a credential vault.
+**Source visibility:** the fixed endpoint and real API key are committed in the
+card source and included in builds. Hiding the UI fields does not keep these
+values secret from repository readers or image recipients. Changing/revoking
+the integration key requires a card update and redeployment; no encryption or
+secret-management system is introduced.
+
+If an earlier unmerged prototype saved endpoint/key fields, clear its old card
+configuration before sharing a Solution. Removing schema fields does not erase
+existing database entries or old exported Solutions.
 
 ## Actions
 
@@ -129,9 +132,11 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_music.py tests/tes
 
 Offline unittest cases use ROS stubs and fictional metadata. They cover search,
 ID/genre playback, empty/error/relaxed responses, cancellation during lookups,
-credential updates/clearing, log redaction, PCM mixing and transport validation.
+fixed credential selection, rejected overrides, log redaction, PCM mixing and
+transport validation. Credential assertions use fictional constants, and offline
+tests perform no remote requests.
 Generated WAV/MP3 checks use real ffmpeg and explicitly skip if it is absent.
-For deployment acceptance, configure the real service through the card and test
+For deployment acceptance, use the card's built-in service connection and test
 both playback actions, pause/resume, TTS priority and interruption. Robot audible
 output, ASR and driver behaviour must be verified separately.
 
