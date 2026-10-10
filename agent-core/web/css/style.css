@@ -1348,6 +1348,12 @@ html, body {
   position: relative;
   margin-left: 10px;
   font-family: var(--font-ui);
+  /* **必须显式声明。** 手机上 `.canvas-top-control` 是 `pointer-events: none`（让
+     触摸穿过去落在画布上），子元素要自己 opt in —— `.canvas-main-btn` 和
+     `.auto-start-toggle` 都这么做。少了这一行，手机上这个芯片**完全点不动**：
+     展不开、重试点不到，而那时它正是唯一在屏幕上的提示（活动流在手机上是默认关
+     着的抽屉）。390x844 实测 `tap()` 直接超时。 */
+  pointer-events: auto;
 }
 .teardown-chip.hidden,
 .teardown-detail.hidden { display: none; }
@@ -1426,6 +1432,16 @@ html, body {
   border: none;
 }
 .teardown-retry:disabled { opacity: 0.5; cursor: default; }
+
+/* 触摸尺寸。桌面上这条芯片是一个次要提示，可以小；手上就不行 —— 而「重试」是整个
+   流程里唯一需要动手的控件，它原来是 42x19px，不到地板的一半。44px 是这份样式表
+   在别处用的同一个地板（.btn-icon / .btn-ghost / .sidebar-chip 都是）。 */
+@media (pointer: coarse) {
+  .teardown-summary { min-height: 44px; padding: 10px 14px; font-size: 13px; }
+  .teardown-caret { font-size: 12px; }
+  .teardown-row { padding: 8px 10px; font-size: 13px; }
+  .teardown-retry { min-height: 44px; padding: 10px 18px; font-size: 13px; }
+}
 
 /* 停止请求在飞的时候：按钮禁用，但要看得出它在做事而不是坏了。 */
 .canvas-main-btn:disabled { cursor: progress; opacity: 0.75; }
@@ -6614,6 +6630,20 @@ html, body {
     border-radius: var(--radius-sm);
     box-shadow: var(--shadow-sm);
   }
+  /* 工具条在这个断点是 `left:60px; right:60px` 且会换行，所以芯片的下拉不能按自己
+     的左边缘定位 —— 它会跟着芯片换到哪一行、偏到哪一列。拉满容器宽度之后，它在
+     任何换行结果下都不会越过屏幕边缘。 */
+  .teardown-chip { margin-left: 0; width: 100%; }
+  .teardown-summary { width: 100%; justify-content: center; }
+  .teardown-detail {
+    left: 0;
+    right: 0;
+    min-width: 0;
+    max-height: 50vh;
+  }
+  .teardown-row { flex-wrap: wrap; }
+  .teardown-note { margin-left: 26px; width: 100%; }
+  .teardown-retry { margin-left: auto; }
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
   .canvas-controls {

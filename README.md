@@ -465,6 +465,34 @@ Four things in there are deliberate and easy to undo by accident:
 - **A second click does not start a second teardown.** Stop is idempotent, but two
   overlapping rounds make the per-item progress overwrite itself.
 
+Two conventions this toolbar has that break **silently, and only in the hand** — the
+teardown chip got both wrong first time round, and the desktop looked perfect:
+
+- **`pointer-events` is opt-in below 768px.** `.canvas-top-control` is
+  `pointer-events: none` there so touches fall through to the canvas, and every
+  interactive child declares `auto` for itself. The chip did not, so on a 390x844
+  phone `tap()` simply timed out — while the chip was the *only* thing on screen
+  saying a device had not stopped, because the activity log is a closed drawer at
+  that width. (Hence the extra toast on failure: a row written into a drawer nobody
+  opened is not a report.)
+- **Touch sizing is keyed on `pointer: coarse`, not on width** — a tablet is a wide
+  screen with a coarse pointer, and keying on 768px hands it desktop-sized targets.
+  Measured first cut: the 「重试」 button was **42x19 px**, under half the 44px floor
+  the rest of this stylesheet uses.
+
+Measured after fixing, on Orin 5 through Playwright:
+
+| | summary row | 重试 | dropdown |
+|---|---|---|---|
+| phone 390x844, coarse | 270x**44** | 63x**44** | within viewport, full container width |
+| tablet 1024x768, coarse | 123x**59** | 63x**44** | within viewport |
+| desktop 1440x900, mouse | 141x33 | 42x19 | within viewport |
+
+`tests/test_canvas_toolbar_touch.py` asserts both conventions against the stylesheet
+itself, so the next control added to that toolbar cannot quietly repeat it. Those
+assertions were mutation-checked: putting each of the three original mistakes back
+makes them fail.
+
 #### The activity log, and what the robot *overheard*
 
 The strip at the bottom subscribes to `/ws/motus` and renders one line per event.

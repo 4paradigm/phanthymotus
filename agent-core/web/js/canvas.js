@@ -390,6 +390,11 @@ export async function initCanvas(initialMcps) {
           // 是之后排查时唯一的线索。
           _logActivity('warn', `设备收尾：${failed.length} 台未停止（`
             + `${failed.map((f) => f.tool).join('、')}）—— 可能仍在运行`);
+          // 手机上还要再说一次。活动流在 768px 以下是**默认关着的抽屉**，所以上面
+          // 那一行在手机上等于没写；而这是全流程唯一的坏消息。
+          if (window.matchMedia('(max-width: 768px)').matches) {
+            _showToast(`${failed.length} 台设备未停止，可能仍在运行`);
+          }
         } else {
           _logActivity('project', '设备收尾完成，全部已停止');
         }
