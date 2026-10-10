@@ -967,7 +967,7 @@ def test_the_overlay_label_reads_the_two_channel_verdict():
     assert pose_plugin.overlay_label({"posture": None, "activity": None}) == "unknown"
     # A published record carries the activity as a plain string, not a dict.
     assert pose_plugin.overlay_label(
-        {"posture": "sitting", "activity": "reading"}) == "sitting · reading"
+        {"posture": "sitting", "activity": "reading"}) == "sitting | reading"
     # Either alone is shown on its own.
     assert pose_plugin.overlay_label(
         {"posture": None, "activity": "reading"}) == "reading"

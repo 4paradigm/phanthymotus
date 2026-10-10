@@ -904,7 +904,7 @@ def is_alerting(verdict: dict) -> bool:
 def overlay_label(verdict: dict, hand_gestures: Optional[dict] = None) -> str:
     """The one line drawn over a person.
 
-    Both channels when both are there — `upright · hand waving` — because they
+    Both channels when both are there — `upright | hand waving` — because they
     answer different questions and showing only one hides the other. Posture
     first: it is the thing that is always available, so the label does not
     change shape when an activity comes and goes.
