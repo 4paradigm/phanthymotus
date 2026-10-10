@@ -31,6 +31,20 @@ export function summarizeEvent(event) {
       return `👂 "${p.text || ''}"${tags.length ? ` · ${tags.join(' · ')}` : ''}`;
     }
     case 'trigger':        return p.text || _trunc(JSON.stringify(p), 400);
+    // 停止的第 2 段。逐项和汇总都进活动流,因为工具条上那个芯片会被收起、页面会被
+    // 刷新,而「有一台设备没停下来」之后排查时只剩这里能找到。
+    case 'project_stop_begin':
+      return `正在收尾 ${(p.cards || []).length} 台设备…`;
+    case 'project_stop_item':
+      return p.status === 'stopped'
+        ? `✓ ${p.tool} 已停止`
+        : `✗ ${p.tool} 未停止${p.message ? `：${p.message}` : ''} —— 该设备可能仍在运行`;
+    case 'project_stop_done': {
+      const failed = p.failed || [];
+      if (!failed.length) return `设备收尾完成：${p.stopped}/${p.total} 已停止`;
+      return `设备收尾完成：${p.stopped}/${p.total} 已停止，`
+        + `${failed.length} 台未停止（${failed.map((f) => f.tool).join('、')}）`;
+    }
     case 'peer_pair_request': return `${p.display_name || p.peer_id?.slice(0, 12) || 'peer'} 请求配对 · 验证码 ${p.code}`;
     case 'peer_tool_call':   return `${p.peer || 'peer'} → ${p.tool}${p.action ? `(${p.action})` : ''}`;
     case 'peer_tool_result': return p.ok
