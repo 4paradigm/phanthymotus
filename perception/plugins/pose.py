@@ -284,39 +284,52 @@ TOOLS = [
             },
         },
         "configSchema": {
+            # Two rules here, both learned from this card growing to 26 fields
+            # of Chinese prose: `title` is the *name* of a setting and
+            # `description` is what it does — they were one field, so an
+            # explanation of a trade-off became the form's label — and anything
+            # only its author would touch is `advanced`, which the config
+            # dialog folds away. The reasoning behind each number lives in the
+            # code and in perception/README.md, not in a form field.
             "type": "object",
             "properties": {
-                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "人体检测置信度阈值", "default": 0.4, "scope": "instance"},
-                "fps": {"type": "integer", "minimum": 1, "description": "每秒最多推理几帧。12 而不是 5：几何规则逐帧就能判，但骨架动作模型判的是一段视频 —— 2.5s 窗口在 5 fps 下只有 13 帧真实数据，要重采样到 engine 的 48 帧，大部分是插值。低于 12 时 info 会给出 action_fps_note", "default": 12, "scope": "instance"},
-                "kpt_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "单个关键点的可见性阈值。低于此值的关节既不参与动作判定也不绘制 —— 比把它当成 (0,0) 画出来强", "default": 0.3, "scope": "instance"},
-                "max_persons": {"type": "integer", "minimum": 1, "description": "单帧最多处理几个人（按检测置信度取前 N 个）", "default": 5, "scope": "instance"},
-                # Governs the LEAN topic only. The skeleton topic always carries
-                # full keypoints — it is not in the LLM's context, so there is
-                # nothing to save there.
-                "publish_keypoints": {"type": "string", "enum": list(KEYPOINT_LEVELS), "description": "data/json 那条流里要不要带关键点：off（默认）只发动作和位置；compact 带 17 个整数像素点；full 带 17×(x,y,可见性)。off→full 每人每帧约 60 B → 900 B，而这条流的每个字节都是每帧的 LLM 上下文字节。画骨架用的是 /skeleton 那条，不受这里影响", "default": "off", "scope": "instance"},
-                "publish_bbox": {"type": "boolean", "description": "lean 流里带上像素框 [x1,y1,x2,y2]", "default": True, "scope": "instance"},
-                "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
-                "hands": {"type": "string", "enum": list(HAND_LEVELS), "description": "要不要跑手部 21 关键点。off（默认）完全不加载第二个 engine —— 8GB 的 Orin 上同时还跑 vop/depth/OCR/ASR/TTS，瓶颈是内存不是算力，所以没开的卡片必须零成本。keypoints 只出关键点、不判手势。注意手部只在近处有效：从原生分辨率裁 ROI 上采样后约 3.5m 以内，整帧模式只到 0.7m —— 远处招手靠身体层的 raising hand / hand waving，不需要这个 engine", "default": "off", "scope": "instance"},
-                "hand_interval_s": {"type": "number", "minimum": 0.0, "description": "手部推理间隔（秒）。Orin5 空载实测 448 每只手端到端 11.26ms，和整个身体 pose 一趟差不多；12fps 下两只手每帧跑是 22.5ms，而身体通道三个人已占 41ms/83ms。0.25（4Hz）摊到约 7.5ms/帧。按 track 错峰，避免两个人同帧付账（那表现为周期性卡顿而非均值升高）。0 = 不节流", "default": 0.25, "scope": "instance"},
-                "hand_max_rois": {"type": "integer", "minimum": 1, "description": "单帧最多跑几只手，按手的像素大小取前 N 只 —— 大就是近，近的手既更可能在跟机器人打招呼，也是唯一能分辨出手指的", "default": 2, "scope": "instance"},
-                "hand_min_forearm_px": {"type": "number", "minimum": 1.0, "description": "前臂短于这个像素数就不跑手部。手宽约 0.45×前臂长，90px 前臂约合 40px 手，正是实测曲线开始直接漏检的地方。**用几何量而不是模型置信度**：实测手只有 100px 时模型给 conf 0.92 而关键点误差达手宽的 17%（约一个指节）—— 置信度一路 0.9、形状误差翻三倍，所以它判不了远近。这个阈值和机位强相关（像素换米取决于视场角），务必在真机上调", "default": DEFAULT_MIN_FOREARM_PX, "scope": "instance"},
-                "publish_hand_keypoints": {"type": "string", "enum": list(KEYPOINT_LEVELS), "description": "lean 流里要不要带手部关键点。off（默认）只带哪只手被看到了 —— 这条流的每个字节都是每帧的 LLM 上下文字节，而 42 个坐标对文本模型毫无意义。画手用 /skeleton 那条，不受这里影响", "default": "off", "scope": "instance"},
-                "publish_gesture_events": {"type": "boolean", "description": "另发一条稀疏的手势事件流（{topic}/poses/gesture）：只在手势开始/结束时各发一条，不是每帧。这条才是接 decision_core 用的 —— agent-core 会把订阅话题的整条消息原样塞进事件总线，逐帧发等于举手三秒烧掉 36 条满payload 的上下文。事件自带 priority 字段，否则 dds 来源算 P=0，只进后台批，挥手唤不醒 agent", "default": True, "scope": "instance"},
-                "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "description": f"哪些动作算「冲着机器人做的手势」。默认 {list(DEFAULT_GESTURES)} —— 这三个都从 COCO-17 骨架读出来，不依赖手部模型，所以人在多远都有效。可选再加 {list(OPTIONAL_GESTURES)}，但那些只有骨架动作模型给，而它没有「没在做手势」这个类", "default": list(DEFAULT_GESTURES), "scope": "instance"},
-                "gesture_hold_s": {"type": "number", "minimum": 0.0, "description": "手势要连续保持多少秒才报开始。手臂路过举起位置（去挠头）也会被几何读成 raising hand，这个窗口就是为了挡它。按秒而不是按帧 —— 身体通道跑卡片 fps、手部通道节流到约 4 Hz，同一个帧数在两边是不同时长", "default": DEFAULT_HOLD_S, "scope": "instance"},
-                "gesture_release_s": {"type": "number", "minimum": 0.0, "description": "手势要消失多少秒才报结束。一帧遮挡或者标签迟滞压住一帧都不该让事件关掉再开", "default": DEFAULT_RELEASE_S, "scope": "instance"},
-                "gesture_cooldown_s": {"type": "number", "minimum": 0.0, "description": "同一个 track 的同一个手势结束后多久才能再次触发。断续挥手是一个请求，不是每一阵一个", "default": DEFAULT_COOLDOWN_S, "scope": "instance"},
-                "gesture_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "手势事件的得分门槛。只作用于带分的标签 —— 几何规则有些动作不给分，把缺分当 0 会在配了门槛的那一刻静默丢掉它们全部", "default": 0.0, "scope": "instance"},
-                "action_window_s": {"type": "number", "minimum": 0.2, "description": "动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的", "default": 1.5, "scope": "instance"},
-                "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型，两者各做擅长的；rules = 只用几何规则，不加载第二个 engine —— 这也是取不到 engine 时自动退到的模式，手动选它主要用于在真机上区分「模型判错」和「几何判错」。只用模型的 stgcn 模式已撤下：NTU-60 里没有「站立」「坐」这两个状态类，静止的人不但报不出来，还会拿到一个自信的错答案", "default": "hybrid", "scope": "instance"},
-                "activity_interval_s": {"type": "number", "minimum": 0.0, "description": "How often the action model runs, in seconds. Its window is 2.5 s, so two runs one frame apart share 97% of their input and cost 20 ms each; with three people in frame, running it every frame measured 98.9 ms per frame against 41 ms throttled. The geometry still runs every frame, so posture stays frame-rate. 0 disables the throttle.", "default": 0.35, "scope": "instance"},
-                "label_hold": {"type": "integer", "minimum": 1, "description": "标签迟滞：新动作要连续赢多少帧才换。每个阈值都是悬崖，实测在边界上原始答案会逐帧翻（模型得分在 0.40 附近摆动时 9 次比较全翻）。一个每秒跳十几次的标签比一个稳定的错标签更糟 —— 下游没法用、人读不了。代价是每次真实变化也要晚这么多帧（12 fps 下 3 帧 = 250 ms）。原始答案在 evidence.raw_action 里", "default": 3, "scope": "instance"},
-                "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "骨架动作模型的得分阈值，低于它不报。跌倒单独用更高的 0.75 —— 实测该 engine 对纯噪声会给出 A43「跌倒」0.62，而误报跌倒的代价是机器人丢下手上的事去问人有没有受伤。调之前先看 info 里的实际得分，那是区分「模型判错」和「阈值定错」的唯一办法", "default": DEFAULT_MIN_SCORE, "scope": "instance"},
-                # Exposed because they are NOT constants: the same fall measures
-                # differently depending on where the camera is mounted.
-                "fall_drop_ratio": {"type": "number", "minimum": 0.05, "maximum": 1.0, "description": "判定跌倒所需的髋部下降幅度，按站立身高的比例。和机位强相关 —— 相机离地 0.4 m 和 1.2 m 量同一次跌倒得到的数不一样，务必在真机上调", "default": DEFAULT_THRESHOLDS["fall_drop_ratio"], "scope": "instance"},
-                "fall_drop_window_s": {"type": "number", "minimum": 0.1, "description": "上面那个下降必须在多少秒内完成。慢慢躺下不算跌倒", "default": DEFAULT_THRESHOLDS["fall_drop_window_s"], "scope": "instance"},
-                "fall_settle_s": {"type": "number", "minimum": 0.2, "description": "落地后保持水平多久才报跌倒。弯腰捡东西也是短暂水平的", "default": DEFAULT_THRESHOLDS["fall_settle_s"], "scope": "instance"},
+                # ── everyday ────────────────────────────────────────────────
+                "hands": {"type": "string", "enum": list(HAND_LEVELS), "title": "Hand keypoints", "description": "Adds 21 points per hand. Off by default because it loads a second model. Works close up (roughly within 3.5 m) — calling the robot from across a room is handled by the body gestures below and does not need this.", "default": "off", "scope": "instance"},
+                "publish_gesture_events": {"type": "boolean", "title": "Send gesture events", "description": "Tell the robot when someone gestures at it. One message when a gesture starts and one when it ends — not every frame.", "default": True, "scope": "instance"},
+                "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "title": "Gestures to report", "description": f"Which actions count as gesturing at the robot. Default: {', '.join(DEFAULT_GESTURES)}. Also available: {', '.join(OPTIONAL_GESTURES)}.", "default": list(DEFAULT_GESTURES), "scope": "instance"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.4, "scope": "instance"},
+                "fps": {"type": "integer", "minimum": 1, "title": "Frames per second", "description": "How often to look. Below 12 the action model gets too few frames to judge movement, and `info` will say so.", "default": 12, "scope": "instance"},
+                "max_persons": {"type": "integer", "minimum": 1, "title": "Max people per frame", "description": "Most confident first when there are more.", "default": 5, "scope": "instance"},
+                "publish_overlay": {"type": "boolean", "title": "Draw skeleton on the video", "description": "Publishes a second video stream with the skeleton drawn on it. Costs a draw and a JPEG encode per frame, so it is off unless you want to watch or record it.", "default": False, "scope": "instance"},
+
+                # ── advanced: what gets published ───────────────────────────
+                "publish_keypoints": {"type": "string", "enum": list(KEYPOINT_LEVELS), "title": "Body keypoints in the agent stream", "description": "The agent's stream is text the model reads every frame, and a skeleton means nothing to it. The dashboard gets the full skeleton on its own topic either way.", "default": "off", "scope": "instance", "advanced": True},
+                "publish_hand_keypoints": {"type": "string", "enum": list(KEYPOINT_LEVELS), "title": "Hand keypoints in the agent stream", "description": "Same trade-off as above, for the 42 hand points.", "default": "off", "scope": "instance", "advanced": True},
+                "publish_bbox": {"type": "boolean", "title": "Include pixel boxes", "description": "Adds each person's box in pixels to the agent stream.", "default": True, "scope": "instance", "advanced": True},
+                "kpt_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Joint visibility threshold", "description": "A joint below this is treated as not seen — neither drawn nor used to judge posture. Better than placing it at a guess.", "default": 0.3, "scope": "instance", "advanced": True},
+
+                # ── advanced: gesture timing ────────────────────────────────
+                "gesture_hold_s": {"type": "number", "minimum": 0.0, "title": "Hold before reporting (s)", "description": "An arm on its way past the raised position reads as a raised hand for a moment. This is how long it has to stay.", "default": DEFAULT_HOLD_S, "scope": "instance", "advanced": True},
+                "gesture_release_s": {"type": "number", "minimum": 0.0, "title": "Gone before ending (s)", "description": "So one dropped frame does not close and immediately reopen the event.", "default": DEFAULT_RELEASE_S, "scope": "instance", "advanced": True},
+                "gesture_cooldown_s": {"type": "number", "minimum": 0.0, "title": "Cooldown per person (s)", "description": "Waving in bursts is one request, not one per burst.", "default": DEFAULT_COOLDOWN_S, "scope": "instance", "advanced": True},
+                "gesture_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Gesture score threshold", "description": "Only applies to gestures that come with a score; the geometric ones do not and are never dropped by this.", "default": 0.0, "scope": "instance", "advanced": True},
+
+                # ── advanced: hand channel ──────────────────────────────────
+                "hand_interval_s": {"type": "number", "minimum": 0.0, "title": "Hand inference interval (s)", "description": "One hand costs about as much as the whole body pass, so hands run a few times a second rather than every frame. 0 disables the throttle.", "default": 0.25, "scope": "instance", "advanced": True},
+                "hand_max_rois": {"type": "integer", "minimum": 1, "title": "Max hands per frame", "description": "Largest hands first — largest means nearest, and a nearer hand is both likelier to be aimed at the robot and the only one fingers can be resolved on.", "default": 2, "scope": "instance", "advanced": True},
+                "hand_min_forearm_px": {"type": "number", "minimum": 1.0, "title": "Minimum forearm (pixels)", "description": "Below this the person is too far for their hands to be readable. Measured in pixels rather than metres because that depends on the camera's lens; tune it on the robot.", "default": DEFAULT_MIN_FOREARM_PX, "scope": "instance", "advanced": True},
+
+                # ── advanced: action recognition ────────────────────────────
+                "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "title": "Action recognition", "description": "hybrid uses geometry for posture and a trained model for movement. rules uses geometry only and loads no second model — useful for telling a model mistake apart from a geometry mistake.", "default": "hybrid", "scope": "instance", "advanced": True},
+                "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 1.5, "scope": "instance", "advanced": True},
+                "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.35, "scope": "instance", "advanced": True},
+                "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 3, "scope": "instance", "advanced": True},
+                "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": DEFAULT_MIN_SCORE, "scope": "instance", "advanced": True},
+
+                # ── advanced: fall detection, camera-dependent ──────────────
+                "fall_drop_ratio": {"type": "number", "minimum": 0.05, "maximum": 1.0, "title": "Fall: hip drop", "description": "How far the hips must drop, as a fraction of standing height. Depends on where the camera is mounted — a lens at 0.4 m and one at 1.2 m measure the same fall differently, so tune this on the robot.", "default": DEFAULT_THRESHOLDS["fall_drop_ratio"], "scope": "instance", "advanced": True},
+                "fall_drop_window_s": {"type": "number", "minimum": 0.1, "title": "Fall: drop window (s)", "description": "The drop has to happen within this. Lying down slowly is not a fall.", "default": DEFAULT_THRESHOLDS["fall_drop_window_s"], "scope": "instance", "advanced": True},
+                "fall_settle_s": {"type": "number", "minimum": 0.2, "title": "Fall: time on the ground (s)", "description": "How long they must stay down. Bending to pick something up is briefly horizontal too.", "default": DEFAULT_THRESHOLDS["fall_settle_s"], "scope": "instance", "advanced": True},
             },
         },
         "topic_in": [{"format": "image/jpeg", "desc": "camera image input"}],

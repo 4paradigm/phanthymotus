@@ -1322,3 +1322,57 @@ def test_a_photo_survives_a_missing_hand_engine(monkeypatch):
     assert result["ok"] is True                      # the bodies still answer
     assert result["hands"]["ok"] is False
     assert result["hands"]["reason"] == "engine_unavailable"
+
+
+# ── the config form ──────────────────────────────────────────────────────────
+#
+# The dialog labels each field with `title || description || key`, so a
+# description written to explain a trade-off becomes the label. This card had
+# 26 fields each labelled with its own paragraph, which is not a form anyone
+# can fill in.
+
+def test_every_instance_field_has_a_short_title():
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key, spec in props.items():
+        if spec.get("scope") != "instance":
+            continue
+        assert spec.get("title"), key
+        assert len(spec["title"]) <= 40, (key, spec["title"])
+
+
+def test_the_everyday_form_stays_small():
+    """What a non-author sees before opening the fold. Nobody can configure a
+    card by reading two dozen knobs."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    everyday = [k for k, v in props.items()
+                if v.get("scope") == "instance" and not v.get("advanced")]
+    assert len(everyday) <= 8, everyday
+    # the ones a person actually reaches for
+    assert {"hands", "fps", "confidence", "publish_gesture_events"} <= set(everyday)
+
+
+def test_the_camera_dependent_thresholds_are_advanced():
+    """They are exposed because they are not constants, not because anybody
+    should meet them on first open."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key in ("fall_drop_ratio", "fall_drop_window_s", "fall_settle_s",
+                "hand_min_forearm_px", "label_hold", "activity_interval_s"):
+        assert props[key].get("advanced") is True, key
+
+
+def test_titles_and_descriptions_are_english():
+    """Asked for explicitly: the form was entirely Chinese prose."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key, spec in props.items():
+        if spec.get("scope") != "instance":
+            continue
+        for field in ("title", "description"):
+            text = spec.get(field) or ""
+            assert not any("一" <= ch <= "鿿" for ch in text), (key, field)
+
+
+def test_the_thresholds_still_match_the_rules_defaults():
+    """The rewrite must not have retyped a default by hand."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key in ("fall_drop_ratio", "fall_drop_window_s", "fall_settle_s"):
+        assert props[key]["default"] == DEFAULT_THRESHOLDS[key]
