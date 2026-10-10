@@ -2773,70 +2773,61 @@ from the COCO-17 skeleton, so they work at whatever distance the body is
 visible at. The hand channel is for near-range detail: which way a finger
 points, an open palm versus a fist.
 
-Measured on real photographs, with the hand occupying N pixels of the network
-input:
+**The model is RTMPose-m (hand5), and it replaced a YOLO26-pose model
+fine-tuned on hand keypoints.** That one was not good enough to build gestures
+on: on a real camera an OK sign came back with the wrist in the middle of the
+palm, an open hand came back as a clump, and motion blur collapsed the joints
+— while its detection score stayed around 0.8, so nothing downstream could
+tell. Compared on the same crops, RTMPose was right on every picture it was
+wrong on, and it is also cheaper: 3.58 ms against 7.99 ms per hand on an Orin
+NX at 1020 MHz, 4.33 against 8.19 on jp5.11.
 
-| hand px | detected | shape error |
-|---|---|---|
-| 320 | 5/5 | 0.047 |
-| **200** | **5/5** | **0.023** |
-| 120 | 5/5 | 0.041 |
-| 100 | 4/5 | 0.169 |
-| 55 | 2/5 | 0.242 |
+Three things follow from it being a **top-down** model rather than a detector:
 
-So the usable band is 120–320 px and the card crops to land the hand at about
-31% of the input edge. A 1920x1080 frame letterboxed whole into the network
-puts a hand in that band only within ~0.7 m, which is why the channel crops the
-hand's neighbourhood out of the **native** frame and scales that up instead:
-same photographs, hand at 82 native px (roughly 3 m for a 70° lens on 1080p),
-whole-frame error 0.154 against 0.059 cropped.
+- **The box must be roughly right, and the arm supplies it.** Measured on a
+  real photograph, RTMPose read the hand correctly from an arm-derived box
+  anywhere between 0.30 and 0.65 of the crop the old model needed — a 2.2x
+  range. An early comparison appeared to show RTMPose losing on one of three
+  pictures; it had been handed the loose crop the *old* model wanted, and that
+  was a mistake in the test, not in the model.
+- **There is no detection step and no detection score.** It returns 21 joints
+  for whatever is in the box. `hand_confidence` therefore answers "was there a
+  hand in this box at all", not "did I find one", and it was calibrated by
+  measuring both distributions: a box with no hand in it (grey, shirt,
+  background, face, jeans, noise) scored 0.11–0.37, a real hand 0.48–0.74. The
+  default sits in the gap at 0.42. It was 0.25 while the old model was in
+  place, where the same field meant a detection score — at that setting every
+  one of those negatives except the flat grey reads as a hand.
+- **It does not measure blur.** Sharp and blurred frames of the same hand
+  scored 0.55/0.67 and 0.55/0.65. The confidence is a localisation peak, so it
+  can reject an absent hand and cannot reject a badly fitted one.
 
-**The failure mode is a confident wrong answer, not a missing one.** At a
-100 px hand the model returned confidence 0.92 with a shape error of 0.169 —
-an average joint off by 17% of the hand's width, about a finger segment, which
-makes any extended/curled decision noise. Confidence stayed at 0.9 while the
-error tripled. That is why the distance gate is `hand_min_forearm_px` and not a
-confidence threshold: hand size is about 0.9 of forearm length, the forearm is
-already in COCO-17, and the gate therefore costs nothing and runs before the
-inference rather than after it.
+The budget, per hand, through the production runtime: 3.58 ms on an Orin NX at
+1020 MHz. `hand_interval_s: 0.25` throttles per hand and staggers by track id
+so two people do not both pay on the same frame. `hand_max_rois` is spent on
+the largest hands in frame — largest means nearest, and a nearer hand is both
+likelier to be addressing the robot and the one whose fingers resolve.
 
-That 0.9 is a **correction made on a rig**, and it is worth knowing why. It
-shipped as 0.45, which is hand *width* — but the box the model draws covers the
-hand with its fingers extended, which is hand *length*. The crop therefore came
-out half the size it should be and the hand filled 70% of it rather than 31%,
-which is the oversized end of the band above where detection collapses. On the
-first real photograph one hand missed outright and the other scored 0.71 while
-sitting at the cliff; sweeping the constant moved both to 0.76/0.78 at 0.9. The
-symptom reads as "the hand model is unreliable", not as "the crop is half the
-size it should be", which is why the measurement is recorded next to the
-constant.
+Three more things worth knowing before changing any of it:
 
-The budget, measured end-to-end per ROI on an **idle** Orin 5 (jp5.11) at the
-published 448 input: 11.26 ms, which is roughly what the whole body pass costs.
-Two hands every frame at 12 fps is 22.5 ms on top of the 41 ms the body channel
-spends with three people in frame, out of an 83 ms frame shared with everything
-else on the GPU. `hand_interval_s: 0.25` amortises the same two hands to
-7.5 ms/frame; the throttle is per hand and staggered by track id, so two people
-do not both pay on the same frame.
-
-Three things worth knowing before changing any of it:
-
-- **`hand_max_rois` is spent on the largest hands in frame.** Largest means
-  nearest, and a nearer hand is both likelier to be addressing the robot and the
-  only one fingers can be resolved on. Dropped candidates are counted as
-  `throttled` in `info` rather than vanishing.
 - **The body gate applies on every frame, not just the first.** The previous
   frame's hand box makes the next crop tighter, but it does not decide whether
   to crop at all — otherwise a hand would keep being tracked from a stale box
   after the wrist went out of view, and the distance gate would hold for one
   frame and then stop existing.
+- **A hand is held briefly after a bad read** (`hand_hold_s`, 0.5 s). Without
+  it a single bad frame erases the hand until the next inference, which at the
+  throttled rate is a quarter of a second of nothing and reads as flickering
+  fingers. The stale *box* is dropped immediately all the same — reporting a
+  hand that was there an instant ago is reasonable, cropping from where it
+  used to be is not.
 - **Hand keypoints are appended to the skeleton payload, never interleaved.**
-  Indices 0–16 stay the body, 17–37 the left hand, 38–58 the right. `pose2d.js`
-  prefers a payload-carried `keypoint_names`/`skeleton` over its own copy, so
-  the renderer draws 59 joints with no frontend change — and any consumer
-  already indexing the first 17 keeps reading what it read before. The hand
-  names carry a `_hand_` infix because COCO-17 already has a `left_wrist` and
-  so does the hand set.
+  Indices 0–16 stay the body, 17–37 the left hand, 38–58 the right.
+  `pose2d.js` prefers a payload-carried `keypoint_names`/`skeleton` over its
+  own copy, so the renderer draws 59 joints with no frontend change — and any
+  consumer already indexing the first 17 keeps reading what it read before.
+  The hand names carry a `_hand_` infix because COCO-17 already has a
+  `left_wrist` and so does the hand set.
 
 `info` reports `hand_ran` and `hand_skipped` broken down by `too_far`,
 `wrist_occluded`, `elbow_occluded` and `throttled`, plus `hand_engine_error` if
@@ -2846,17 +2837,16 @@ than refusing to start: the body channel is what answers "is somebody calling
 me", and losing that because a second engine could not be downloaded would be
 the wrong trade.
 
-The engines are built with `tools/export_vision_engines.py --model hand` from a
-pinned ONNX, inside a container off the target perception image. Two traps are
-recorded at `HAND_MODEL_BUNDLES` and are worth repeating here: a non-end2end
-export is one column narrower and `vision_runtime._pose_layout` accepts exactly
-that width as a valid layout, so thousands of un-suppressed anchors decode as
-thousands of hands with nothing raising — `hand_runtime.assert_end2end` is the
-guard, and it checks the output shape because a trtexec-built plan has no
-metadata to check. And the same weights exported by two different ultralytics
-versions disagree by about thirty times the fp16 quantisation difference while
-every size and SHA256 check still passes, so the exporter version is recorded
-beside the pins.
+Two traps are recorded at `HAND_MODEL_BUNDLES` and worth repeating here. The
+engine's two outputs, `simcc_x` and `simcc_y`, are **identical in shape**
+(N, 21, 512), so they can only be told apart by name — and TensorRT has
+already been observed listing an engine's outputs in a different order on the
+two JetPack lines. Reading them the wrong way round transposes every hand and
+still draws a plausible one. And RTMPose normalises with **ImageNet mean/std
+on RGB**, not the [0, 1] scaling the YOLO engines use, which is why the hand
+path has its own `HandEngine` wrapper instead of reusing
+`VisionEngineSession`: feeding the wrong normalisation produces a confident
+hand in the wrong place, with nothing raising.
 
 ### Why the overlay is a third topic rather than drawn in the browser
 

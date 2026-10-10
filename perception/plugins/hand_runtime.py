@@ -137,25 +137,31 @@ HAND_PER_FOREARM = 0.9
 #: window: one dropped frame is not the hand going away.
 DEFAULT_HAND_HOLD_S = 0.5
 
-#: Score threshold for the hand detector, separate from the person detector's.
+#: Confidence below which a read is treated as "no hand in this box".
 #:
-#: These were one number, and that was simply the wrong wiring: a hand and a
-#: person are different detectors with different score distributions, and
-#: using the person threshold for both meant tightening person detection
-#: silently dropped hands. Measured on a moving stream, with the hold
-#: disabled so the threshold is the only variable:
+#: Separate from the person detector's threshold, and a different kind of
+#: number from it: RTMPose always returns 21 joints for whatever is in the box,
+#: so this is not "did I find something" but "how sharp were the peaks". The
+#: gate's job is to reject a box that landed on no hand at all, which happens
+#: because the box is derived from an estimate and can land on a torso, a face
+#: or empty wall.
 #:
-#:     threshold   hand at the side   hand raised
-#:     0.40              35%              100%
-#:     0.30              47%              100%
-#:     0.25              52%              100%
-#:     0.20              52%              100%
+#: Measured on one scene, both distributions:
 #:
-#: A raised hand is found at any of them. What the threshold buys is the
-#: *relaxed* hand hanging at the side — small, half-turned, against clothing —
-#: and it saturates at 0.25, so there is nothing to gain by going lower and a
-#: false-positive budget to lose.
-DEFAULT_HAND_CONFIDENCE = 0.25
+#:     no hand in the box   flat grey 0.11 · shirt 0.26 · background 0.28
+#:                          face 0.30 · jeans 0.37 · random noise 0.37
+#:     a real hand          0.48 - 0.74, including motion-blurred frames
+#:
+#: 0.42 sits in the gap with about 0.05 either side. **This was 0.25**, carried
+#: over from the model that preceded this one, where the same field held a
+#: detection score and meant something else entirely — at 0.25 every negative
+#: above except the flat grey would have been reported as a hand.
+#:
+#: Note what the number does *not* measure: blur. Sharp and blurred frames of
+#: the same hand scored 0.55/0.67 and 0.55/0.65 — indistinguishable. It is a
+#: localisation peak, not a quality score, so it cannot be used to reject a
+#: badly-fitted hand, only an absent one.
+DEFAULT_HAND_CONFIDENCE = 0.42
 
 #: Minimum forearm length in native frame pixels before a hand is attempted.
 #: The floor that matters is about 45 px of *hand*, which is where the measured

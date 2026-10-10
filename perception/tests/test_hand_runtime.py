@@ -835,15 +835,18 @@ def test_the_hold_can_be_switched_off():
     assert gone["hands"]["right"] is None
 
 
-def test_the_hand_detector_has_its_own_threshold():
-    """It used the person detector's. They are different detectors with
-    different score distributions, so tightening person detection silently
-    dropped hands. Measured on a moving stream with the hold off: the hand at
-    the person's side went 35% -> 52% between 0.40 and 0.25, while the raised
-    hand was 100% at every setting."""
+def test_the_confidence_gate_sits_between_the_measured_distributions():
+    """A top-down model always returns 21 joints, so this gate rejects a box
+    that landed on no hand — not a failure to detect. Measured: no hand in the
+    box scored 0.11-0.37 (grey, shirt, background, face, jeans, noise), a real
+    hand 0.48-0.74 including blurred frames. The default must sit in the gap.
+
+    It was 0.25, inherited from the model this replaced, where the same field
+    held a detection score — at which every one of those negatives except the
+    flat grey would have been reported as a hand."""
     from plugins.hand_runtime import DEFAULT_HAND_CONFIDENCE
 
-    assert DEFAULT_HAND_CONFIDENCE < 0.4
+    assert 0.37 < DEFAULT_HAND_CONFIDENCE < 0.48
     channel = HandChannel(_HandSession(), max_rois=1)
     assert channel._confidence == DEFAULT_HAND_CONFIDENCE
 
