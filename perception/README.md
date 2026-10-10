@@ -2796,9 +2796,20 @@ whole-frame error 0.154 against 0.059 cropped.
 an average joint off by 17% of the hand's width, about a finger segment, which
 makes any extended/curled decision noise. Confidence stayed at 0.9 while the
 error tripled. That is why the distance gate is `hand_min_forearm_px` and not a
-confidence threshold: hand width is about 0.45 of forearm length, the forearm is
+confidence threshold: hand size is about 0.9 of forearm length, the forearm is
 already in COCO-17, and the gate therefore costs nothing and runs before the
 inference rather than after it.
+
+That 0.9 is a **correction made on a rig**, and it is worth knowing why. It
+shipped as 0.45, which is hand *width* — but the box the model draws covers the
+hand with its fingers extended, which is hand *length*. The crop therefore came
+out half the size it should be and the hand filled 70% of it rather than 31%,
+which is the oversized end of the band above where detection collapses. On the
+first real photograph one hand missed outright and the other scored 0.71 while
+sitting at the cliff; sweeping the constant moved both to 0.76/0.78 at 0.9. The
+symptom reads as "the hand model is unreliable", not as "the crop is half the
+size it should be", which is why the measurement is recorded next to the
+constant.
 
 The budget, measured end-to-end per ROI on an **idle** Orin 5 (jp5.11) at the
 published 448 input: 11.26 ms, which is roughly what the whole body pass costs.

@@ -1646,8 +1646,15 @@ class PosePerceptionPlugin:
         if self._backend_migrated:
             info["action_backend_migrated"] = self._backend_migrated
 
-        info["hands"] = self._hands
-        if self._hands != "off":
+        # The *effective* state, not the card-level default. A card whose hand
+        # channel was switched on per instance reported `hands: off` here while
+        # plainly running hands — the same class of mistake as a card looking
+        # like it chose to have no hands. Found on Orin 5, not in any test,
+        # because the tests all configured the card level.
+        running_hands = any(node._hand_channel is not None
+                            for node in nodes.values())
+        info["hands"] = "keypoints" if running_hands else self._hands
+        if info["hands"] != "off":
             info["hand_model"] = HAND_MODEL
             info["hand_keypoint_names"] = list(HAND_KEYPOINTS)
             info["hand_note"] = (
