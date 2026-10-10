@@ -39,8 +39,10 @@ def calls(monkeypatch):
     """Record every MCP call the layout write makes."""
     seen = []
 
-    async def _fake_call(mcp_id, req):
-        seen.append((mcp_id, req.tool, dict(req.arguments)))
+    async def _fake_call(mcp_id, req, timeout_s=None):
+        # `timeout_s` 不是可选的摆设：`_stop_cards` 现在每张卡片都带死线，而这个
+        # 替身不接受它的话，TypeError 会被那边的 except 吞成「这张卡片没停下来」。
+        seen.append((mcp_id, req.tool, dict(req.arguments), timeout_s))
         return {'state': 'idle'}
 
     class _Req:
@@ -63,7 +65,9 @@ def _run(old, new):
 def test_the_orphan_case_stops_exactly_the_deleted_card(calls):
     """The reported layout: the old TTS card is replaced by a new one."""
     assert _run([TTS_OLD, ASR], [TTS_NEW, ASR]) == 1
-    assert calls == [('mcp-1', 'tts', {'action': 'stop', 'instance_id': 'card_mt4rkb752py8'})]
+    assert calls == [('mcp-1', 'tts',
+                      {'action': 'stop', 'instance_id': 'card_mt4rkb752py8'},
+                      config_api.STOP_CARD_TIMEOUT_S)]
 
 
 def test_an_unchanged_layout_calls_nothing(calls):
@@ -82,6 +86,8 @@ def test_a_moved_card_is_not_a_removed_card(calls):
 def test_clearing_the_canvas_stops_every_card(calls):
     assert _run([TTS_OLD, ASR], []) == 2
     assert {c[2]['instance_id'] for c in calls} == {'card_mt4rkb752py8', 'card_asr'}
+    assert all(c[3] == config_api.STOP_CARD_TIMEOUT_S for c in calls), \
+        '删卡片的清理也要带死线 —— 一台不回应的设备不能卡住保存布局'
 
 
 def test_adding_a_card_stops_nothing(calls):
@@ -104,7 +110,7 @@ def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
     """The layout must still be saved even if one device is unreachable."""
     seen = []
 
-    async def _flaky(mcp_id, req):
+    async def _flaky(mcp_id, req, timeout_s=None):
         seen.append(req.arguments['instance_id'])
         if req.arguments['instance_id'] == 'card_mt4rkb752py8':
             raise RuntimeError('connection refused')
@@ -112,7 +118,8 @@ def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
 
     sys.modules['api.mcp_manage'].mcp_call_tool = _flaky
     assert _run([TTS_OLD, ASR], []) == 1          # one of two succeeded
-    assert seen == ['card_mt4rkb752py8', 'card_asr']
+    # 并行了，所以到达顺序不再保证 —— 要断言的是「两张都试过」，而不是先后。
+    assert sorted(seen) == ['card_asr', 'card_mt4rkb752py8']
 
 
 def test_none_layouts_are_tolerated(calls):
