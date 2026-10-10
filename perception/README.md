@@ -1526,6 +1526,44 @@ asked 「在发生什么了？」. Off-by-one on a syllable also silently change
 in mixed script, where latin and CJK have very different phonemes-per-character and
 one ratio was applied to both.
 
+**And the import itself forked, which wedged perception outright.** The env-var fix
+above stops *phonemizer* from calling `find_library`. It cannot stop `dlinfo` — a
+package phonemizer imports — from calling `find_library('dl')` at **import** time,
+and `ctypes.util.find_library` on Linux `subprocess`es out to `ldconfig -p`.
+
+Forking a 2.4 GB process with dozens of threads, one of them running a TensorRT
+warmup, hangs. Measured on Orin 5: the child never reached `exec` (at fork it
+inherited a lock another thread held), the parent sat in `_execute_child` waiting
+on the error pipe, and both stayed there. Consequences, in the order an operator
+meets them:
+
+| | |
+|---|---|
+| symptom | 「启动控制」卡住 —— the dashboard button never completes |
+| what is actually stuck | every `tools/call`, because the ASR worker holds the import lock |
+| what the logs say | nothing. The last line written is the one before the fork |
+| how it looks | perception dead; CPU at 99% (that is the unrelated TTS warmup thread) |
+
+It is a **race**, which is why it had never been seen: the same card starts cleanly
+when nothing else is loading. It needs the first phonemization (`_worker_inner`
+pre-computes the wake word's IPA at worker start) to land while another thread is
+busy — i.e. exactly what 「启动控制」 does by bringing TTS and ASR up together.
+
+`_find_library_without_forking()` therefore resolves the handful of libraries we
+actually need from a path list (`_FORK_FREE_LIBRARIES`) for the duration of the
+import, and restores `ctypes.util.find_library` afterwards. Anything not in the
+list falls through to the real implementation — returning `None` would be read as
+"not installed". Not a retry and not a timeout: there is no fork left to hang.
+
+Diagnosing the live wedge took `py-spy dump`, which is worth remembering because
+nothing else showed it — `docker logs` was silent, `docker top` showed one busy
+thread (the wrong one), and MCP simply did not answer:
+
+```bash
+docker exec embodied-perception pip3 install -q py-spy
+docker exec --privileged embodied-perception py-spy dump --pid $(pgrep -f "python3 /work/main.py" | head -1)
+```
+
 `_text_to_ipa(text, with_positions=True)` now also returns, per phoneme, the
 character offset in the original string that phoneme ends at — built from growing
 prefixes of each segment, phonemized through the same function that produced the

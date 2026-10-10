@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing
+import contextlib
+import ctypes.util
 import os
 import re
 import struct
@@ -126,16 +128,87 @@ def _point_phonemizer_at_espeak() -> None:
                 ", ".join(_ESPEAK_LIB_CANDIDATES))
 
 
+# Libraries we resolve by path rather than by forking `ldconfig` — see
+# `_find_library_without_forking`. Keyed by the name the caller passes to
+# `ctypes.util.find_library`; anything not listed here falls through to the real
+# implementation, fork and all.
+#
+# `dl` is the one that matters: `dlinfo/_glibc.py` calls
+# `find_library('dl')` at **import** time, and `phonemizer` imports `dlinfo`.
+# `espeak-ng` is listed too, even though PHONEMIZER_ESPEAK_LIBRARY normally
+# makes phonemizer skip the lookup, so a deployment that unsets that variable
+# does not quietly get the fork back.
+_FORK_FREE_LIBRARIES = {
+    "dl": ("/lib/aarch64-linux-gnu/libdl.so.2",
+           "/lib/x86_64-linux-gnu/libdl.so.2",
+           "/usr/lib/aarch64-linux-gnu/libdl.so.2",
+           "/usr/lib/x86_64-linux-gnu/libdl.so.2",
+           "/lib/libdl.so.2",
+           "/usr/lib/libdl.so.2"),
+    "espeak-ng": _ESPEAK_LIB_CANDIDATES,
+}
+
+# One import at a time, so two worker threads cannot nest the patch below and
+# leave the replacement installed when the inner one restores.
+_PHONEMIZER_IMPORT_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _find_library_without_forking():
+    """Resolve a few known libraries by path for the duration of a block.
+
+    **`ctypes.util.find_library` forks.** On Linux it shells out to
+    `ldconfig -p` through `subprocess`, and `dlinfo` — which `phonemizer` imports
+    — calls it at import time. Forking a 2.4 GB process with dozens of threads,
+    one of which is running a TensorRT warmup, is how the ASR worker wedged
+    forever on Orin 5: the child never reached `exec` (it inherited a lock held
+    by another thread at fork time) and the parent sat in `_execute_child`
+    waiting on the error pipe. The import lock stayed held, the worker never
+    transcribed anything, and perception's whole MCP surface stopped answering —
+    with nothing in any log, because the last line written was the one before
+    the fork.
+
+    It is a race: the same card starts cleanly when nothing else is loading,
+    which is why this only ever showed up right after 「启动控制」 (TTS warmup and
+    the ASR card come up together). That is exactly the kind of bug that must be
+    removed rather than made less likely, so this does not retry or time-bound
+    the fork — it makes sure there is no fork.
+
+    Same family as the espeak lookup documented in perception/README.md
+    (「asr_kws and espeak」); that fix used PHONEMIZER_ESPEAK_LIBRARY to skip
+    phonemizer's *own* `find_library`, which an env var cannot do for an import
+    inside a third-party package.
+    """
+    original = ctypes.util.find_library
+
+    def resolver(name):
+        for path in _FORK_FREE_LIBRARIES.get(name, ()):
+            if os.path.exists(path):
+                return path
+        # Unknown library: keep the stdlib behaviour rather than returning None,
+        # which the caller would read as "not installed".
+        return original(name)
+
+    ctypes.util.find_library = resolver
+    try:
+        yield
+    finally:
+        ctypes.util.find_library = original
+
+
 def _get_espeak_backend(lang):
     global _ESPEAK_SEP
-    if _ESPEAK_SEP is None:
-        _point_phonemizer_at_espeak()
-        from phonemizer.separator import Separator
-        _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
-    if lang not in _ESPEAK_BACKENDS:
-        from phonemizer.backend import EspeakBackend
-        _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
-    return _ESPEAK_BACKENDS[lang]
+    # The import is what forks, so the guard has to cover it. Everything else in
+    # here is cheap and holding the lock across it keeps the patch un-nested.
+    with _PHONEMIZER_IMPORT_LOCK, _find_library_without_forking():
+        if _ESPEAK_SEP is None:
+            _point_phonemizer_at_espeak()
+            from phonemizer.separator import Separator
+            _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
+        if lang not in _ESPEAK_BACKENDS:
+            from phonemizer.backend import EspeakBackend
+            _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
+        return _ESPEAK_BACKENDS[lang]
 
 
 def _phonemize_safe(text: str, lang: str) -> str:
