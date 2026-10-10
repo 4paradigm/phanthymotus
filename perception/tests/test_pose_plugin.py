@@ -605,8 +605,8 @@ def test_a_comma_separated_whitelist_is_split():
 
 def test_an_empty_whitelist_falls_back_to_the_default():
     plugin, node = _started({"gesture_whitelist": []})
-    assert node._gesture_tracker.gestures == tuple(
-        sorted(pose_plugin.DEFAULT_GESTURES))
+    assert node._gesture_tracker.gestures == tuple(sorted(
+        pose_plugin.DEFAULT_GESTURES + pose_plugin.DEFAULT_HAND_GESTURES))
 
 
 def test_no_gesture_publisher_exists_when_the_topic_is_off():
@@ -653,8 +653,8 @@ def test_info_reports_what_the_gesture_channel_has_done():
     _fire(node, [_gesture_person()])
     instance = plugin.dispatch("pose", {"action": "info"})["instances"]["/cam/rgb"]
     assert instance["gesture_event_count"] == 1
-    assert instance["gesture_whitelist"] == list(
-        sorted(pose_plugin.DEFAULT_GESTURES))
+    assert instance["gesture_whitelist"] == list(sorted(
+        pose_plugin.DEFAULT_GESTURES + pose_plugin.DEFAULT_HAND_GESTURES))
     assert instance["recent_gestures"][-1]["gesture"] == "raising hand"
 
 
@@ -961,13 +961,13 @@ def test_the_overlay_label_reads_the_two_channel_verdict():
     renderer keeps drawing after its data has moved underneath it."""
     assert pose_plugin.overlay_label(
         {"posture": "lying", "activity": {"name": "falling down"}}
-    ) == "lying · falling down"
+    ) == "lying | falling down"
     assert pose_plugin.overlay_label(
         {"posture": "standing", "activity": None}) == "standing"
     assert pose_plugin.overlay_label({"posture": None, "activity": None}) == "unknown"
     # A published record carries the activity as a plain string, not a dict.
     assert pose_plugin.overlay_label(
-        {"posture": "sitting", "activity": "reading"}) == "sitting · reading"
+        {"posture": "sitting", "activity": "reading"}) == "sitting | reading"
     # Either alone is shown on its own.
     assert pose_plugin.overlay_label(
         {"posture": None, "activity": "reading"}) == "reading"
@@ -1028,7 +1028,7 @@ def test_a_zero_interval_disables_the_throttle():
 
 def test_the_alert_colour_keys_on_the_channels_not_the_label():
     """`overlay_label` became a compound string once both channels are shown
-    ("lying · falling down"), so testing it for membership in a label set
+    ("lying | falling down"), so testing it for membership in a label set
     silently stopped matching and a fallen person was drawn in a track colour."""
     assert pose_plugin.is_alerting({"posture": "lying", "activity": None})
     assert pose_plugin.is_alerting(
@@ -1082,7 +1082,7 @@ class _FakeHandSession:
 
 def _hand_plugin(cfg=None, hand_session=None):
     """A card with both engines pre-set, so no download is attempted."""
-    merged = {"hands": "keypoints", "hand_interval_s": 0.0}
+    merged = {"hands": True, "hand_interval_s": 0.0}
     merged.update(cfg or {})
     plugin, _ = _plugin(merged)
     plugin._hand_model = hand_session or _FakeHandSession()
@@ -1100,14 +1100,22 @@ def test_hands_off_never_loads_the_second_engine():
 
 def test_hands_off_is_the_default():
     plugin, _ = _plugin()
-    assert plugin._hands == "off"
-    assert pose_plugin.TOOLS[0]["configSchema"]["properties"]["hands"]["default"] == "off"
+    assert plugin._hands is False
+    spec = pose_plugin.TOOLS[0]["configSchema"]["properties"]["hands"]
+    assert spec["default"] is False and spec["type"] == "boolean"
 
 
-def test_an_unknown_hands_level_falls_back_to_off():
-    """A typo must not quietly enable a second engine."""
-    plugin, _ = _plugin({"hands": "gesture"})      # not offered yet
-    assert plugin._hands == "off"
+def test_an_unknown_value_does_not_quietly_enable_a_second_engine():
+    assert _plugin({"hands": "keypoitns"})[0]._hands is False
+    assert _plugin({"hands": None})[0]._hands is False
+
+
+def test_the_old_three_way_values_still_turn_it_on():
+    """It was briefly off / keypoints / gesture, which is a distinction only
+    its author could care about — naming a shape is arithmetic on keypoints
+    already computed. A card saved while that was offered keeps working."""
+    for value in ("keypoints", "gesture", True, "on"):
+        assert _plugin({"hands": value})[0]._hands is True, value
 
 
 def test_hands_on_attaches_a_channel():
@@ -1115,7 +1123,7 @@ def test_hands_on_attaches_a_channel():
     plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
     node = plugin._nodes["/cam/rgb"]
     assert node._hand_channel is not None
-    assert node._status()["hands"] == "keypoints"
+    assert node._status()["hands"] is True
 
 
 def test_the_skeleton_payload_grows_to_fifty_nine_and_says_so():
@@ -1190,31 +1198,31 @@ def test_info_explains_a_handless_frame():
     _feed(plugin, "/cam/rgb")
     info = plugin.dispatch("pose", {"action": "info"})
     instance = info["instances"]["/cam/rgb"]
-    assert instance["hands"] == "keypoints"
+    assert instance["hands"] is True
     assert instance["hand_input"] == 256      # RTMPose-m hand5
     from plugins.hand_runtime import SKIP_REASONS
 
     assert set(instance["hand_skipped"]) == set(SKIP_REASONS)
     assert "hand_ran" in instance
-    assert info["hands"] == "keypoints"
+    assert info["hands"] is True
     assert len(info["hand_keypoint_names"]) == 21
 
 
 def test_info_reports_a_failed_hand_engine_rather_than_looking_hand_free():
-    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin, _ = _plugin({"hands": True})
     # No pre-set session, so the channel build hits the downloader and fails
     # (no COS in the test environment) — which must not stop the card.
     plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
     info = plugin.dispatch("pose", {"action": "info"})
-    assert info["hands"] == "keypoints"
+    assert info["hands"] is True
     assert "hand_engine_error" in info
-    assert info["instances"]["/cam/rgb"]["hands"] == "off"
+    assert info["instances"]["/cam/rgb"]["hands"] is False
 
 
 def test_the_body_channel_survives_a_hand_engine_failure():
     """The body channel answers "is somebody calling me" at any distance;
     losing it because a second engine could not be fetched is the wrong trade."""
-    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin, _ = _plugin({"hands": True})
     plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
     node = _feed(plugin, "/cam/rgb")
     lean = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])
@@ -1229,12 +1237,12 @@ def test_info_reports_the_effective_hand_state_not_the_card_default():
     plugin, _ = _plugin()                      # card level: hands off
     plugin._hand_model = _FakeHandSession()
     plugin.dispatch("pose", {"action": "config", "instance_id": "/cam/rgb",
-                             "hands": "keypoints", "hand_interval_s": 0})
+                             "hands": True, "hand_interval_s": 0})
     plugin.dispatch("pose", {"action": "start", "instance_id": "/cam/rgb",
                              "input_topic": "/cam/rgb"})
     info = plugin.dispatch("pose", {"action": "info"})
-    assert info["instances"]["/cam/rgb"]["hands"] == "keypoints"
-    assert info["hands"] == "keypoints"
+    assert info["instances"]["/cam/rgb"]["hands"] is True
+    assert info["hands"] is True
     assert info["hand_model"] == pose_plugin.HAND_MODEL
 
 
@@ -1251,7 +1259,7 @@ def _photo_args(path="/tmp/x.jpg"):
 
 
 def test_a_photo_answers_with_hands_when_the_channel_is_on(tmp_path, monkeypatch):
-    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin, _ = _plugin({"hands": True})
     plugin._hand_model = _FakeHandSession()
     monkeypatch.setattr(pose_plugin, "load_image_bytes",
                         lambda args, cfg, url_action: (b"640x480", "test"))
@@ -1283,7 +1291,7 @@ def test_a_photo_with_no_usable_arm_falls_back_to_the_whole_frame():
     the frame itself becomes the crop. The stream deliberately does not do
     this: there it would run on exactly the frames where nobody's arms show.
     """
-    plugin, _ = _plugin({"hands": "keypoints", "hand_min_forearm_px": 10000.0})
+    plugin, _ = _plugin({"hands": True, "hand_min_forearm_px": 10000.0})
     plugin._hand_model = _FakeHandSession()
     import plugins.pose as _p
     _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
@@ -1299,7 +1307,7 @@ def test_an_unattached_hand_carries_no_side():
     """Left/right comes from which wrist the crop was derived from. With no
     body there is nothing that knows, and guessing it from appearance is what
     deriving it from the wrist exists to avoid."""
-    plugin, _ = _plugin({"hands": "keypoints", "hand_min_forearm_px": 10000.0})
+    plugin, _ = _plugin({"hands": True, "hand_min_forearm_px": 10000.0})
     plugin._hand_model = _FakeHandSession()
     import plugins.pose as _p
     _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
@@ -1312,7 +1320,7 @@ def test_an_unattached_hand_carries_no_side():
 def test_the_whole_frame_fallback_is_not_used_when_a_hand_was_attached():
     """It is a fallback, not a second opinion — a hand already attached to an
     arm must not also appear as an unattached one."""
-    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin, _ = _plugin({"hands": True})
     plugin._hand_model = _FakeHandSession()
     import plugins.pose as _p
     _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
@@ -1322,7 +1330,7 @@ def test_the_whole_frame_fallback_is_not_used_when_a_hand_was_attached():
 
 
 def test_a_photo_survives_a_missing_hand_engine(monkeypatch):
-    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin, _ = _plugin({"hands": True})
     monkeypatch.setattr(pose_plugin, "load_image_bytes",
                         lambda args, cfg, url_action: (b"640x480", "test"))
     result = plugin.dispatch("pose", _photo_args())
@@ -1383,3 +1391,167 @@ def test_the_thresholds_still_match_the_rules_defaults():
     props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
     for key in ("fall_drop_ratio", "fall_drop_window_s", "fall_settle_s"):
         assert props[key]["default"] == DEFAULT_THRESHOLDS[key]
+
+
+# ── naming hand shapes ───────────────────────────────────────────────────────
+
+def _open_palm_session():
+    """A fake engine whose hand reads as an open palm through the real rules."""
+    session = _FakeHandSession()
+    from plugins.hand_runtime import HAND_INDEX, N_HAND_KEYPOINTS
+
+    def infer(blob, _s=session):
+        _s.calls += 1
+        net, bins = _s.net, _s.net * 2
+        sx = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        sy = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        # wrist low, every middle joint at mid-height, every tip well above:
+        # reach comes out around +0.5 for all five fingers.
+        def put(idx, x, y):
+            # Cleared first: these are argmax'd, so leaving an earlier peak in
+            # place lets the lower bin win and silently relocates the joint.
+            sx[0, idx] = 0.0
+            sy[0, idx] = 0.0
+            sx[0, idx, int(x * 2)] = 0.9
+            sy[0, idx, int(y * 2)] = 0.9
+        put(0, net * 0.5, net * 0.90)                       # wrist
+        for name, tip in (("thumb", 4), ("index", 8), ("middle", 12),
+                          ("ring", 16), ("pinky", 20)):
+            pip = tip - 2
+            put(pip, net * 0.5, net * 0.60)
+            put(tip, net * 0.5, net * 0.45)
+        put(HAND_INDEX["middle_mcp"], net * 0.5, net * 0.60)
+        put(HAND_INDEX["index_mcp"], net * 0.4, net * 0.63)
+        put(HAND_INDEX["pinky_mcp"], net * 0.6, net * 0.63)
+        put(4, net * 0.9, net * 0.45)                       # thumb tip, far off
+        return [sx, sy]
+
+    session.infer = infer
+    return session
+
+
+def test_hands_gesture_names_the_shape_on_the_lean_topic():
+    plugin, _ = _plugin({"hands": True, "hand_interval_s": 0})
+    plugin._hand_model = _open_palm_session()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    person = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])["persons"][0]
+    assert person.get("hand_gestures"), person
+    assert set(person["hand_gestures"].values()) == {"open_palm"}
+
+
+def test_hands_off_says_nothing_about_hands_at_all():
+    plugin, _ = _plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    person = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])["persons"][0]
+    assert "hand_gestures" not in person and "hands_seen" not in person
+
+
+def test_list_actions_offers_the_hand_shapes_and_says_what_they_need():
+    result = _plugin()[0].dispatch("pose", {"action": "list_actions"})
+    shapes = result["gestures"]["hand_shapes"]
+    assert {e["name"] for e in shapes} >= {"open_palm", "fist", "ok", "victory"}
+    assert any(e["name"] == "thumbs_up" and e["default"] is False for e in shapes)
+    assert "hands: gesture" in result["gestures"]["hand_shapes_note"]
+
+
+def test_a_photo_names_the_hand_shapes_too():
+    """The photo actions were left out of the keypoint wiring once already.
+    A card reporting 21 joints with no name while `hands: gesture` is set
+    looks broken rather than unimplemented."""
+    plugin, _ = _plugin({"hands": True})
+    plugin._hand_model = _open_palm_session()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    person = result["persons"][0]
+    assert person.get("hand_gestures")
+    assert "hand_gesture_evidence" in person
+
+
+def test_an_unattached_hand_is_named_but_still_has_no_side():
+    """The shape rules read the hand's own geometry and need no body. Which
+    hand it is, they cannot say."""
+    plugin, _ = _plugin({"hands": True, "hand_min_forearm_px": 10000.0})
+    plugin._hand_model = _open_palm_session()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    loose = result["unattached_hands"][0]
+    assert "gesture" in loose
+    assert "side" not in loose and "hand" not in loose
+
+
+# ── the overlay draws hands too ──────────────────────────────────────────────
+
+def test_the_overlay_draws_the_hand_bones_when_hands_are_on():
+    """The overlay builds its picture in the plugin rather than from the
+    published payload, so it kept drawing 17 joints long after the topic
+    carried 59."""
+    drawn = []
+
+    canvas = np.zeros((480, 640, 3), dtype=np.uint8)
+    import plugins.pose as _p
+    import cv2 as _cv2
+    original_line = _cv2.line
+    _cv2.line = lambda img, a, b, *rest: drawn.append((a, b))
+    try:
+        person = _gesture_person()
+        person["keypoints"] = np.full((N_KEYPOINTS, 3), 0.9, dtype=np.float32)
+        person["keypoints"][:, :2] = 100.0
+        from plugins.hand_runtime import N_HAND_KEYPOINTS
+        hand = np.full((N_HAND_KEYPOINTS, 3), 0.9, dtype=np.float32)
+        hand[:, :2] = 200.0
+        person["hands"] = {"left": hand, "right": None}
+        _p.draw_skeleton(canvas, [person], 0.3, with_hands=True)
+        body_only = len(drawn)
+        drawn.clear()
+        _p.draw_skeleton(canvas, [person], 0.3, with_hands=False)
+        assert body_only > len(drawn), "no extra bones were drawn for the hand"
+    finally:
+        _cv2.line = original_line
+
+
+def test_the_overlay_label_shows_the_hand_shape_and_which_hand():
+    """An overlay is looked at to check a judgement, and "ok" on the wrong
+    hand is the kind of mistake only the side makes visible."""
+    label = pose_plugin.overlay_label(
+        {"posture": "standing"}, {"left": None, "right": "ok"})
+    assert label == "standing | r:ok"
+
+
+def test_the_hand_shape_is_appended_not_substituted():
+    """It is a third channel, not a better answer to the same question."""
+    label = pose_plugin.overlay_label(
+        {"posture": "standing", "activity": "raising hand"}, {"left": "fist"})
+    assert label == "standing | raising hand | l:fist"
+
+
+def test_the_overlay_label_is_ascii_only():
+    """cv2.putText draws with a Hershey font, which has no glyph outside
+    ASCII. The middle dot this used to join on came out as "??" in every
+    overlay with both a posture and an activity, and nothing logged it
+    because nothing was wrong anywhere except on the picture."""
+    label = pose_plugin.overlay_label(
+        {"posture": "standing", "activity": "raising hand"},
+        {"left": "fist", "right": "ok"})
+    assert label.isascii(), label
+
+
+def test_a_global_config_call_keeps_the_fall_thresholds():
+    """Every one of the schema's twenty-eight fields is scope: instance, and
+    twenty-five of them had a branch in the no-instance_id path. The three
+    fall thresholds had none, so setting them that way dropped them on the
+    floor — while the call still answered "configured" and echoed the value
+    back, which is the shape of failure that costs an afternoon."""
+    plugin, _ = _plugin()
+
+    plugin.dispatch("pose", {"action": "config", "fall_settle_s": 2.5,
+                             "fall_drop_ratio": 0.4,
+                             "fall_drop_window_s": 1.5})
+
+    merged = plugin._merged_config("whatever-no-instance-config-exists")
+    assert merged["fall_settle_s"] == 2.5
+    assert merged["fall_drop_ratio"] == 0.4
+    assert merged["fall_drop_window_s"] == 1.5

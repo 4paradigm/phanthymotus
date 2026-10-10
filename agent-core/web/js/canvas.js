@@ -176,6 +176,74 @@ function _syncProjectState(delay = 500) {
     });
 }
 
+/**
+ * Re-arm the browser camera and microphone after a page load.
+ *
+ * These two are the only parts of a running project that live in the page
+ * rather than on the robot: the dashboard's own video and audio devices are
+ * captured here and republished as `/remote_control/camera` and
+ * `/remote_control/mic`. Everything else survives a refresh because it is
+ * server-side state — which is exactly what made this hard to see. After a
+ * refresh the backend still said "running", every card still said "running",
+ * and the camera panel still showed a picture (the last frame, which new
+ * WebSocket connections are sent from cache). The one thing that had actually
+ * stopped was the source, so every downstream topic — poses, overlay, gestures
+ * — went quiet while the UI claimed everything was fine.
+ *
+ * Both were only ever started inside the start-project handler, so nothing
+ * restarted them on load. Guarded three ways: the project must already be
+ * running, the card must be on the canvas, and the permission must already be
+ * granted. The last one matters — a page that pops a camera dialog on every
+ * load would be worse than the bug. Where the permission cannot be queried
+ * (Safari does not implement it for camera), we say so rather than prompting.
+ */
+async function _granted(name) {
+  try {
+    const status = await navigator.permissions.query({ name });
+    return status.state === 'granted';
+  } catch {
+    return null;  // cannot tell — not the same as "no"
+  }
+}
+
+async function _rearmBrowserSources() {
+  if (!_projectRunning) return;
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+
+  const cameraCard = _cards.find(c => c.toolName === 'remote_camera');
+  if (cameraCard && !isCameraActive()) {
+    const ok = await _granted('camera');
+    if (ok === false || ok === null) {
+      _logActivity('warn', ok === null
+        ? '浏览器摄像头需要手动重新开启（此浏览器无法查询权限状态）'
+        : '浏览器摄像头未授权，刷新后未自动恢复');
+    } else {
+      toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {})
+        .then(() => _logActivity('project', '刷新后已恢复浏览器摄像头'))
+        .catch(err => _logActivity('warn', `摄像头恢复失败: ${err.message}`));
+    }
+  }
+
+  const micCard = _cards.find(c => c.toolName === 'remote_mic');
+  if (micCard && !isMicActive()) {
+    const ok = await _granted('microphone');
+    if (ok === false || ok === null) {
+      _logActivity('warn', ok === null
+        ? '浏览器麦克风需要手动重新开启（此浏览器无法查询权限状态）'
+        : '浏览器麦克风未授权，刷新后未自动恢复');
+    } else {
+      toggleMicStream(`${wsProto}://${location.host}/ws/mic`, (active) => {
+        const micBtn = micCard.el?.querySelector('.canvas-mic-btn');
+        if (micBtn) {
+          micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+          micBtn.classList.toggle('recording', active);
+        }
+      }).then(() => _logActivity('project', '刷新后已恢复浏览器麦克风'))
+        .catch(err => _logActivity('warn', `麦克风恢复失败: ${err.message}`));
+    }
+  }
+}
+
 /** Record what the backend says about the run state, and unblock editing. */
 function _applyProjectState(running) {
   _projectRunning = !!running;
@@ -184,6 +252,9 @@ function _applyProjectState(running) {
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
     btn.classList.toggle('locked', !_projectRunning);
   });
+  // Idempotent: both helpers no-op when their stream is already active, so the
+  // start-project path and the cross-tab project_state event cannot double-start.
+  if (_projectRunning) _rearmBrowserSources();
 }
 export function redrawCanvas() { _scheduleRedraw(); }
 export function ensureEdit() { return _ensureEdit(); }

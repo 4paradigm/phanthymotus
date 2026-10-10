@@ -180,8 +180,31 @@ DEFAULT_MIN_FOREARM_PX = 50.0
 HAND_CENTRE_OFFSET = 0.35
 
 #: Why a hand was not attempted. Reported per instance so that "no hands" is
-#: never ambiguous between these three and a broken engine.
-SKIP_REASONS = ("wrist_occluded", "elbow_occluded", "too_far", "throttled")
+#: never ambiguous between these and a broken engine.
+SKIP_REASONS = ("wrist_occluded", "no_scale", "too_far", "throttled")
+
+#: Where the hand's expected size came from, best first. The wrist says where
+#: the hand is; something else has to say how big it is, and the elbow is only
+#: the most direct of several answers.
+#:
+#: **The elbow used to be required, and that was a leftover.** The model this
+#: replaced worked in a narrow band of crop sizes and failed at both ends, so
+#: a guessed scale was dangerous; RTMPose reads the same hand correctly across
+#: a 2.2x range, which an estimate from the shoulder comfortably fits inside.
+#: Requiring the elbow meant refusing every frame where it sat outside the
+#: picture or behind the body — common exactly when somebody steps close to
+#: the camera to gesture at it.
+#:
+#: Measured against the true forearm on real photographs:
+#:
+#:     shoulder -> wrist, halved     1.04 · 0.89 · 0.86 · 1.46
+#:     shoulder width, x0.85         0.93 · 0.97 · 1.09 · 2.10
+#:
+#: The outlier in both is the same arm, foreshortened towards the camera so
+#: that its forearm measures short in the picture — the estimate is not wrong
+#: there so much as the thing it is being compared against.
+SHOULDER_WRIST_TO_FOREARM = 0.5
+SHOULDER_WIDTH_TO_FOREARM = 0.85
 
 
 #: ImageNet statistics, in RGB. RTMPose normalises with these rather than
@@ -330,13 +353,7 @@ def _joint(keypoints: np.ndarray, index: int, min_conf: float):
 
 def forearm_length(keypoints: np.ndarray, side: str, min_conf: float,
                    coco_index: Optional[dict] = None) -> Optional[float]:
-    """Elbow-to-wrist distance in frame pixels, or None if either is occluded.
-
-    This is the scale everything else is derived from, so it returns None
-    rather than a guess: a hand attempted at the wrong scale produces keypoints
-    that look fine and are wrong, which is the failure this module is built to
-    avoid.
-    """
+    """Elbow-to-wrist distance in frame pixels, or None if either is occluded."""
     if coco_index is None:
         from plugins.vision_runtime import COCO_INDEX as coco_index
     wrist = _joint(keypoints, coco_index[f"{side}_wrist"], min_conf)
@@ -345,6 +362,51 @@ def forearm_length(keypoints: np.ndarray, side: str, min_conf: float,
         return None
     length = float(np.linalg.norm(wrist - elbow))
     return length if length > 1e-3 else None
+
+
+def hand_scale(keypoints: np.ndarray, side: str, min_conf: float,
+               coco_index: Optional[dict] = None) -> tuple:
+    """How big this hand should be, and where that estimate came from.
+
+    Returns `(forearm_equivalent_px, source)` or `(None, None)`. The sources
+    are tried best-first and all of them are expressed as a forearm length, so
+    everything downstream — the distance gate included — keeps working in one
+    unit no matter which one answered.
+    """
+    if coco_index is None:
+        from plugins.vision_runtime import COCO_INDEX as coco_index
+
+    direct = forearm_length(keypoints, side, min_conf, coco_index)
+    if direct:
+        return direct, "forearm"
+
+    # Shoulder width before shoulder-to-wrist, because shoulder width does not
+    # depend on what the arm is doing and the span does. SHOULDER_WRIST_TO_FOREARM
+    # assumes a roughly straight arm; a person gesturing at a robot holds the arm
+    # bent, hand up beside the head, where the shoulder-to-wrist straight line is
+    # a fraction of the arm's actual length. Measured on a real camera frame of a
+    # raised OK sign: true forearm 194 px, shoulder width gave 211, the span gave
+    # 53. At 53 the crop is a fingertip, the decode is noise, the confidence gate
+    # drops it — and "no keypoints" is indistinguishable from having no fallback
+    # at all, which is exactly how this read from the outside.
+    left = _joint(keypoints, coco_index["left_shoulder"], min_conf)
+    right = _joint(keypoints, coco_index["right_shoulder"], min_conf)
+    if left is not None and right is not None:
+        width = float(np.linalg.norm(left - right))
+        if width > 1e-3:
+            return width * SHOULDER_WIDTH_TO_FOREARM, "shoulder_width"
+
+    # Last resort: one shoulder, no other. Pose-dependent, so it is only ever
+    # reached when the person is side-on or half out of frame and the far
+    # shoulder is gone.
+    wrist = _joint(keypoints, coco_index[f"{side}_wrist"], min_conf)
+    shoulder = _joint(keypoints, coco_index[f"{side}_shoulder"], min_conf)
+    if wrist is not None and shoulder is not None:
+        span = float(np.linalg.norm(wrist - shoulder))
+        if span > 1e-3:
+            return span * SHOULDER_WRIST_TO_FOREARM, "shoulder_wrist"
+
+    return None, None
 
 
 def roi_from_body(keypoints: np.ndarray, side: str, *,
@@ -363,26 +425,30 @@ def roi_from_body(keypoints: np.ndarray, side: str, *,
         from plugins.vision_runtime import COCO_INDEX as coco_index
     wrist = _joint(keypoints, coco_index[f"{side}_wrist"], min_conf)
     if wrist is None:
+        # The wrist is the one joint with no substitute: it is the position,
+        # and nothing else in the skeleton says where the hand is.
         return None, "wrist_occluded"
-    elbow = _joint(keypoints, coco_index[f"{side}_elbow"], min_conf)
-    if elbow is None:
-        # The wrist alone gives a position but no scale, and guessing the scale
-        # is exactly how a crop ends up with the hand at 500 px — a size the
-        # measured curve says loses 3 of 5 detections.
-        return None, "elbow_occluded"
 
-    forearm = float(np.linalg.norm(wrist - elbow))
+    forearm, source = hand_scale(keypoints, side, min_conf, coco_index)
+    if forearm is None:
+        return None, "no_scale"
     if forearm < min_forearm_px:
         return None, "too_far"
 
     hand_px = forearm * HAND_PER_FOREARM
     # A hand hangs off the end of the forearm, so the crop follows that
-    # direction rather than centring on the wrist joint itself.
-    direction = wrist - elbow
-    norm = float(np.linalg.norm(direction))
-    centre = wrist + (direction / norm) * (forearm * HAND_CENTRE_OFFSET) if norm > 1e-6 else wrist
+    # direction rather than centring on the wrist joint itself. Without an
+    # elbow there is no direction to follow, and the crop centres on the wrist
+    # — which is why the box is generous enough to hold the hand either way.
+    elbow = _joint(keypoints, coco_index[f"{side}_elbow"], min_conf)
+    centre = wrist
+    if elbow is not None:
+        direction = wrist - elbow
+        norm = float(np.linalg.norm(direction))
+        if norm > 1e-6:
+            centre = wrist + (direction / norm) * (forearm * HAND_CENTRE_OFFSET)
     side_px = hand_px / max(target_fraction, 1e-6)
-    return HandRoi(centre[0], centre[1], side_px, side, "wrist", hand_px), None
+    return HandRoi(centre[0], centre[1], side_px, side, source, hand_px), None
 
 
 def roi_from_previous(box, side: str, *,
