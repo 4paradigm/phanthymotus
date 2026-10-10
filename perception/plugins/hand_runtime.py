@@ -39,6 +39,8 @@ from typing import Optional
 
 import numpy as np
 
+from plugins.vision_runtime import decode_poses
+
 #: The 21 joints, in the order the weights emit them. Read out of the engine's
 #: own metadata (`kpt_names`) rather than copied from a paper — same rule as
 #: COCO_KEYPOINTS in vision_runtime: the order is part of the weights, and
@@ -98,6 +100,26 @@ TARGET_HAND_FRACTION = 200.0 / 640.0
 #: half the size it should be". n is one subject and two hands, so 0.9 is a
 #: correction of a clear error rather than a tuned optimum.
 HAND_PER_FOREARM = 0.9
+
+#: Crop scales to try, as multiples of the nominal one, until a hand is found.
+#:
+#: **No single ratio works, and that is not a tuning failure.** Both the
+#: forearm and the hand are projections, and they foreshorten independently: an
+#: arm raised in the image plane shows its full forearm beside a hand seen
+#: end-on, while an arm angled towards the camera shows a short forearm beside
+#: a full hand. Measured on two real photographs, sweeping HAND_PER_FOREARM and
+#: reading the engine's score for the hand that was hardest to find:
+#:
+#:     photo                     0.45   0.55   0.65   0.90   1.20
+#:     child, V sign, both hands miss   0.30   0.69   0.76   0.77
+#:     adult, one hand raised    0.65   miss   miss   miss   miss
+#:
+#: Opposite answers from the same constant. So the nominal crop is a starting
+#: guess and a miss is retried at a tighter one, which costs an extra inference
+#: only when the first attempt found nothing — and nothing at all once a hand
+#: has been found, because the previous frame's box then sizes the crop from a
+#: measurement instead of a guess.
+HAND_RETRY_SCALES = (1.0, 0.55)
 
 #: Minimum forearm length in native frame pixels before a hand is attempted.
 #: The floor that matters is about 45 px of *hand*, which is where the measured
@@ -451,7 +473,8 @@ class HandChannel:
     def __init__(self, session, *, max_rois: int = 2, interval_s: float = 0.25,
                  min_forearm_px: float = DEFAULT_MIN_FOREARM_PX,
                  min_conf: float = 0.3, confidence: float = 0.4,
-                 target_fraction: float = TARGET_HAND_FRACTION):
+                 target_fraction: float = TARGET_HAND_FRACTION,
+                 retry_scales=HAND_RETRY_SCALES):
         self._session = session
         self._max_rois = max(1, int(max_rois))
         self._interval_s = max(0.0, float(interval_s))
@@ -459,6 +482,7 @@ class HandChannel:
         self._min_conf = float(min_conf)
         self._confidence = float(confidence)
         self._target_fraction = float(target_fraction)
+        self._retry_scales = tuple(float(v) for v in retry_scales) or (1.0,)
         #: (track_id, side) -> {"box": last box in frame pixels, "kpts": last
         #: keypoints, "t": when it last ran}. The box is what makes the next
         #: crop tighter than the arm extrapolation; the keypoints are what keep
@@ -542,23 +566,34 @@ class HandChannel:
                 person["hands"][side] = previous["kpts"]
 
         for hand_px, person, side, key, roi in candidates[:self._max_rois]:
-            try:
-                crop = crop_roi(frame, roi, self.input_size)
-                outputs, _ = self._session.infer(crop)
-                boxes, scores, keypoints = decode_poses(
-                    outputs, _identity_meta(self.input_size), self._confidence,
-                    n_kpts=N_HAND_KEYPOINTS)
-            except Exception as error:  # noqa: BLE001 — one hand must not kill the frame
-                self.last_error = f"{type(error).__name__}: {error}"
+            found = None
+            # Scales are only retried on a miss, and the loop stops at the
+            # first hit — a hand that is found at the nominal crop costs
+            # exactly one inference, as before.
+            for scale in self._retry_scales:
+                attempt = roi if scale == 1.0 else HandRoi(
+                    roi.cx, roi.cy, roi.side * scale, roi.side_name,
+                    roi.source, roi.hand_px * scale)
+                try:
+                    crop = crop_roi(frame, attempt, self.input_size)
+                    outputs, _ = self._session.infer(crop)
+                    boxes, scores, keypoints = decode_poses(
+                        outputs, _identity_meta(self.input_size),
+                        self._confidence, n_kpts=N_HAND_KEYPOINTS)
+                except Exception as error:  # noqa: BLE001 — one hand must not kill the frame
+                    self.last_error = f"{type(error).__name__}: {error}"
+                    break
+                self.ran += 1
+                if len(scores):
+                    found = (attempt, boxes, scores, keypoints)
+                    break
+            if found is None:
+                # Nothing found at any scale. The cache is dropped so the next
+                # frame re-derives the ROI from the arm rather than chasing a
+                # box that found nothing.
                 self._state.pop(key, None)
                 continue
-            self.ran += 1
-            if not len(scores):
-                # Nothing found in a crop we chose to spend an inference on.
-                # The cache is dropped so the next frame re-derives the ROI
-                # from the arm rather than chasing a box that found nothing.
-                self._state.pop(key, None)
-                continue
+            roi, boxes, scores, keypoints = found
             best = int(np.argmax(scores))
             mapped = keypoints_to_frame(keypoints[best], roi, self.input_size)
             person["hands"][side] = mapped
@@ -584,6 +619,102 @@ class HandChannel:
         except (TypeError, ValueError):
             offset = 0.0
         return elapsed >= (self._interval_s + offset)
+
+
+def hands_in_frame(session, frame, *, confidence: float = 0.4,
+                   scales=(1.0, 0.6, 1.6), max_hands: int = 4) -> list:
+    """Find hands in a whole image, with no body to crop from.
+
+    The ROI path needs an elbow and a wrist, and a photograph of a hand alone
+    has neither — the body detector reports no arm, the geometric gate refuses,
+    and the engine never runs. But this engine is a hand *detector* as well as
+    a keypoint model, so when there is no arm to crop from, the frame itself
+    is the crop.
+
+    **Photographs only.** On a stream this would run the engine on every frame
+    in which nobody's arms are visible, which is exactly the frames where the
+    per-frame budget has nothing to spend. There the body gate is the right
+    answer; here it is in the way.
+
+    Returns a list of (keypoints_in_frame_pixels, score), largest first. No
+    left/right: without an arm there is nothing that knows which hand it is,
+    and guessing it from appearance is what the body keypoints exist to avoid.
+    """
+    import cv2
+
+    height, width = frame.shape[:2]
+    net = int(session.input_size[0])
+    best: list = []
+    for scale in scales:
+        if scale == 1.0:
+            view, offset_x, offset_y, used = frame, 0.0, 0.0, max(width, height)
+        else:
+            side = int(round(max(width, height) * scale))
+            cx, cy = width / 2.0, height / 2.0
+            roi = HandRoi(cx, cy, side, "", "frame", side)
+            try:
+                view = crop_roi(frame, roi, net)
+            except HandDecodeError:
+                continue
+            offset_x, offset_y, used = cx - side / 2.0, cy - side / 2.0, side
+        try:
+            outputs, meta = session.infer(view)
+            boxes, scores, keypoints = decode_poses(
+                outputs, meta, confidence, n_kpts=N_HAND_KEYPOINTS)
+        except Exception:  # noqa: BLE001 — a photo must still answer
+            continue
+        if not len(scores):
+            continue
+        order = np.argsort(np.asarray(scores, dtype=np.float32))[::-1][:max_hands]
+        for index in order:
+            points = np.array(keypoints[index], dtype=np.float32, copy=True)
+            if scale == 1.0:
+                # Nothing to do: `session.infer` letterboxed the frame and
+                # `decode_poses` already undid it, so these are frame pixels.
+                # Undoing it a second time here inflated every hand by 1/scale
+                # and pushed it off the left edge — a 500x917 photo came back
+                # with a 770x634 hand starting at x = -159.
+                pass
+            else:
+                factor = used / float(net)
+                points[:, 0] = points[:, 0] * factor + offset_x
+                points[:, 1] = points[:, 1] * factor + offset_y
+            best.append((points, float(scores[index])))
+        if best:
+            break
+    best.sort(key=lambda item: item[1], reverse=True)
+
+    # **Second pass, sized from the measurement rather than from a guess.**
+    # The first pass only has the frame to go on, and a photograph of a hand
+    # fills most of it — about 90% against the 31% the model wants. It still
+    # returns something (0.81 on the picture this was found with), and that
+    # something is wrong in a way the score does not show: the skeleton came
+    # back about 40% too small, with the wrist in the middle of the palm and
+    # the fingertips stopping at the knuckles. Now that a box exists, re-crop
+    # so the hand lands where the model is accurate and read it again.
+    refined = []
+    for points, score in best:
+        xs, ys = points[:, 0], points[:, 1]
+        span = max(float(xs.max() - xs.min()), float(ys.max() - ys.min()))
+        if span <= 1.0:
+            refined.append((points, score)); continue
+        roi = HandRoi(float((xs.min() + xs.max()) / 2.0),
+                      float((ys.min() + ys.max()) / 2.0),
+                      span / TARGET_HAND_FRACTION, "", "refined", span)
+        try:
+            crop = crop_roi(frame, roi, net)
+            outputs, _ = session.infer(crop)
+            boxes2, scores2, kpts2 = decode_poses(
+                outputs, _identity_meta(net), confidence,
+                n_kpts=N_HAND_KEYPOINTS)
+        except Exception:  # noqa: BLE001 — keep the first pass rather than fail
+            refined.append((points, score)); continue
+        if not len(scores2):
+            refined.append((points, score)); continue
+        pick = int(np.argmax(scores2))
+        refined.append((keypoints_to_frame(kpts2[pick], roi, net),
+                        float(scores2[pick])))
+    return refined[:max_hands]
 
 
 def _identity_meta(size: int):

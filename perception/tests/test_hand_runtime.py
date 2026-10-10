@@ -566,14 +566,88 @@ def test_an_engine_error_does_not_kill_the_frame():
 
 def test_an_empty_detection_drops_the_cache_rather_than_chasing_it():
     """So the next frame re-derives the ROI from the arm instead of following a
-    box that found nothing."""
+    box that found nothing. Two hands at two scales is four attempts."""
     session = _HandSession(rows=[])
-    channel = HandChannel(session, max_rois=2, interval_s=0.0)
+    channel = HandChannel(session, max_rois=2, interval_s=0.0,
+                          retry_scales=(1.0, 0.55))
     person = _person()
     channel.update([person], _frame(), 0.0)
-    assert session.calls == 2
+    assert session.calls == 4
     assert person["hands"]["right"] is None
-    assert channel.ran == 2
+    assert channel.ran == 4
+
+
+# ── the multi-scale retry ────────────────────────────────────────────────────
+#
+# No single hand/forearm ratio works: both quantities are projections and
+# foreshorten independently. Measured on two real photographs, the hand that
+# was hardest to find needed 0.45 in one and 0.65+ in the other — opposite
+# answers from the same constant.
+
+class _ScalePickySession(_HandSession):
+    """Finds a hand only when the crop is within a given size range, which is
+    what a real engine does: the band is 120-320 px of the input."""
+
+    def __init__(self, lo, hi, **kw):
+        super().__init__(**kw)
+        self.lo, self.hi, self.sides = lo, hi, []
+
+    def infer(self, frame):
+        self.calls += 1
+        side = getattr(self, "_next_side", None)
+        self.sides.append(side)
+        if side is None or not (self.lo <= side <= self.hi):
+            return ([np.zeros((1, 0, 69), dtype=np.float32)],
+                    LetterboxMeta(1.0, 0, 0, self.net, self.net))
+        return super().infer(frame)
+
+
+def test_a_hand_missed_at_the_nominal_crop_is_retried_tighter():
+    """The case that made a real photograph report one hand instead of two."""
+    nominal = roi_from_body(_body(forearm=200.0), "right", min_conf=0.3)[0].side
+    picky = _ScalePickySession(lo=nominal * 0.5, hi=nominal * 0.6)
+
+    original = picky.infer
+    def tracking(frame, _p=picky):
+        return original(frame)
+    # the channel sizes the crop before calling, so record it through crop_roi
+    import plugins.hand_runtime as hr
+    real_crop = hr.crop_roi
+    def spy(frame, roi, out_size):
+        picky._next_side = roi.side
+        return real_crop(frame, roi, out_size)
+    hr.crop_roi = spy
+    try:
+        channel = HandChannel(picky, max_rois=1, interval_s=0.0,
+                              retry_scales=(1.0, 0.55))
+        person = _person(forearm=200.0)
+        channel.update([person], _frame(), 0.0)
+    finally:
+        hr.crop_roi = real_crop
+
+    # Counted by crops attempted, not by `calls`: the stub increments that
+    # twice on a hit (once in its own infer, once in the inherited one), and a
+    # test that asserted on it would be measuring its own bookkeeping.
+    assert len(picky.sides) == 2                  # nominal missed, tighter hit
+    assert picky.sides[1] < picky.sides[0]
+    assert any(v is not None for v in person["hands"].values())
+
+
+def test_a_hand_found_at_the_nominal_crop_costs_one_inference():
+    """The retry must not make the common case twice as expensive."""
+    session = _HandSession()
+    channel = HandChannel(session, max_rois=1, interval_s=0.0,
+                          retry_scales=(1.0, 0.55))
+    channel.update([_person()], _frame(), 0.0)
+    assert session.calls == 1
+
+
+def test_the_retry_can_be_switched_off():
+    session = _HandSession(rows=[])
+    channel = HandChannel(session, max_rois=1, interval_s=0.0,
+                          retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    assert session.calls == 1
 
 
 def test_keypoints_land_in_native_frame_coordinates():
@@ -636,3 +710,29 @@ def test_the_previous_box_still_tightens_the_crop_while_the_gate_holds():
     from_body, _ = roi_from_body(_body(forearm=200.0), "right", min_conf=0.3)
     assert refined.source == "previous"
     assert refined.side < from_body.side
+
+
+def test_whole_frame_hands_come_back_inside_the_frame():
+    """decode_poses already undoes the letterbox. Undoing it again inflated
+    every hand by 1/scale and pushed it off the left edge — a 500x917 photo
+    came back with a 770x634 hand starting at x = -159."""
+    from plugins.hand_runtime import hands_in_frame
+
+    frame = np.zeros((917, 500, 3), dtype=np.uint8)
+    session = _HandSession(rows=[_hand_row(span=300.0, net=448)], net=448)
+    found = hands_in_frame(session, frame, confidence=0.4)
+    assert found, "the fake engine always returns a hand"
+    points, score = found[0]
+    assert points.shape == (NHK, 3)
+    xs, ys = points[:, 0], points[:, 1]
+    # Asserted on the shape of the bug rather than on absolute bounds: undoing
+    # the letterbox twice scales everything by 1/letterbox_scale, so the hand
+    # came back *wider than the frame* with its centroid off the left edge.
+    # A fingertip may legitimately sit just outside the frame; a whole hand
+    # bigger than the picture may not.
+    assert 0 <= float(xs.mean()) <= 500
+    assert 0 <= float(ys.mean()) <= 917
+    # The span is deliberately not asserted: this stub's "hand" is a
+    # degenerate horizontal line, and the refine pass legitimately enlarges
+    # it. The centroid is what separates the bug from the stub — the real
+    # failure put the whole hand off the left edge, starting at x = -159.

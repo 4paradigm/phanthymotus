@@ -1229,3 +1229,96 @@ def test_info_reports_the_effective_hand_state_not_the_card_default():
     assert info["instances"]["/cam/rgb"]["hands"] == "keypoints"
     assert info["hands"] == "keypoints"
     assert info["hand_model"] == pose_plugin.HAND_MODEL
+
+
+# ── hands from a single photo ────────────────────────────────────────────────
+#
+# Reported from Orin 6: a card with `hands: keypoints` answered
+# recognize_by_photo with a body skeleton and no fingers. The hand channel was
+# wired into the stream path only. Unlike the gesture transitions — durations
+# over consecutive frames, which a still cannot support — 21 keypoints are
+# perfectly readable from one image.
+
+def _photo_args(path="/tmp/x.jpg"):
+    return {"action": "recognize_by_photo", "image_path": path}
+
+
+def test_a_photo_answers_with_hands_when_the_channel_is_on(tmp_path, monkeypatch):
+    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin._hand_model = _FakeHandSession()
+    monkeypatch.setattr(pose_plugin, "load_image_bytes",
+                        lambda args, cfg, url_action: (b"640x480", "test"))
+    result = plugin.dispatch("pose", _photo_args())
+    assert result["ok"] is True
+    assert len(result["keypoint_names"]) == 59
+    person = result["persons"][0]
+    assert "hands" in person
+    assert result["hands"]["ok"] is True
+
+
+def test_a_photo_without_the_channel_is_unchanged(monkeypatch):
+    plugin, _ = _plugin()
+    monkeypatch.setattr(pose_plugin, "load_image_bytes",
+                        lambda args, cfg, url_action: (b"640x480", "test"))
+    result = plugin.dispatch("pose", _photo_args())
+    assert len(result["keypoint_names"]) == N_KEYPOINTS
+    assert "hands" not in result["persons"][0]
+    assert "hands" not in result
+
+
+def test_a_photo_with_no_usable_arm_falls_back_to_the_whole_frame():
+    """A photograph of a hand alone has no elbow and no wrist, so the ROI path
+    refuses it and the engine never runs — which from the caller's side is
+    indistinguishable from "the model cannot see hands". Reported from Orin 6
+    with exactly that picture.
+
+    The engine is a hand detector too and a photo has no per-frame budget, so
+    the frame itself becomes the crop. The stream deliberately does not do
+    this: there it would run on exactly the frames where nobody's arms show.
+    """
+    plugin, _ = _plugin({"hands": "keypoints", "hand_min_forearm_px": 10000.0})
+    plugin._hand_model = _FakeHandSession()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    note = result["hands"]
+    assert note["found"] == 0
+    assert note["skipped"]["too_far"] >= 1
+    assert note["unattached"] >= 1
+    assert "没有身体就无从判断" in note["note"]
+
+
+def test_an_unattached_hand_carries_no_side():
+    """Left/right comes from which wrist the crop was derived from. With no
+    body there is nothing that knows, and guessing it from appearance is what
+    deriving it from the wrist exists to avoid."""
+    plugin, _ = _plugin({"hands": "keypoints", "hand_min_forearm_px": 10000.0})
+    plugin._hand_model = _FakeHandSession()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    loose = result["unattached_hands"]
+    assert loose and len(loose[0]["keypoints"]) == 21
+    assert "side" not in loose[0] and "hand" not in loose[0]
+
+
+def test_the_whole_frame_fallback_is_not_used_when_a_hand_was_attached():
+    """It is a fallback, not a second opinion — a hand already attached to an
+    arm must not also appear as an unattached one."""
+    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin._hand_model = _FakeHandSession()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    assert result["hands"]["found"] >= 1
+    assert "unattached_hands" not in result
+
+
+def test_a_photo_survives_a_missing_hand_engine(monkeypatch):
+    plugin, _ = _plugin({"hands": "keypoints"})
+    monkeypatch.setattr(pose_plugin, "load_image_bytes",
+                        lambda args, cfg, url_action: (b"640x480", "test"))
+    result = plugin.dispatch("pose", _photo_args())
+    assert result["ok"] is True                      # the bodies still answer
+    assert result["hands"]["ok"] is False
+    assert result["hands"]["reason"] == "engine_unavailable"

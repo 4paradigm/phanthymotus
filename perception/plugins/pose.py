@@ -83,6 +83,7 @@ from plugins.hand_runtime import (
     HAND_KEYPOINTS,
     N_HAND_KEYPOINTS,
     HandChannel,
+    hands_in_frame,
     merge_keypoints,
     merged_keypoint_names,
     merged_skeleton,
@@ -1309,6 +1310,21 @@ class PosePerceptionPlugin:
                 "verdict": verdict,
             })
 
+        # Hands, for a photo too. Unlike the gesture transitions — which are
+        # durations over consecutive frames and cannot come from one image —
+        # a hand's 21 keypoints are perfectly readable from a still, and a
+        # card answering `recognize_by_photo` with a body skeleton and no
+        # fingers while `hands` is on looks broken rather than unimplemented.
+        #
+        # A fresh channel per call, not the node's: the node's carries a
+        # per-track cache and a throttle, and a photo has neither consecutive
+        # frames nor real track ids to key them on.
+        loose_hands = []
+        if merged["hands"] != "off":
+            hand_note, loose_hands = self._hands_for_photo(persons, frame, merged)
+        else:
+            hand_note = None
+
         # Echo onto the card's topics when an instance is running, so a
         # topic-less card wired into the canvas shows data flowing — the only
         # reason it is startable without a camera. Purely additive, and
@@ -1327,7 +1343,9 @@ class PosePerceptionPlugin:
             "confidence_threshold": confidence,
             "count": len(persons),
             "latency_ms": int((time.time() - started) * 1000),
-            "keypoint_names": list(COCO_KEYPOINTS),
+            "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
+                               if merged["hands"] != "off"
+                               else list(COCO_KEYPOINTS)),
             # Said plainly rather than left for the caller to notice: a single
             # image cannot support waving, walking, turning or a fall, so
             # answering "raising_hand" to "is she waving" would be answering a
@@ -1353,10 +1371,84 @@ class PosePerceptionPlugin:
                     **({"point_direction": person["verdict"]["point_direction"]}
                        if person["verdict"].get("point_direction") else {}),
                     "keypoints": _full_keypoints(person["keypoints"]),
+                    **({"hands": {
+                        side: _full_keypoints(value)
+                        for side, value in (person.get("hands") or {}).items()
+                        if value is not None}}
+                       if merged["hands"] != "off" else {}),
                 }
                 for person in persons
             ],
+            **({"hands": hand_note} if hand_note else {}),
+            # Hands found without an arm to attach them to. Reported apart from
+            # `persons` and without a left/right, because without the body
+            # there is nothing that knows whose hand it is or which one — and
+            # guessing that from appearance is exactly what deriving the side
+            # from the wrist exists to avoid.
+            **({"unattached_hands": [
+                {"score": round(score, 2), "keypoints": _full_keypoints(points)}
+                for points, score in loose_hands]} if loose_hands else {}),
         }
+
+    def _hands_for_photo(self, persons: list, frame, merged: dict) -> tuple:
+        """Run the hand channel over one photo. Returns a note for the reply.
+
+        The note matters as much as the keypoints: a photo that produced no
+        hands has four innocent explanations (too far, wrist occluded, elbow
+        occluded, nothing found in the crop) and one real failure, and from
+        the caller's side they all look like "no fingers".
+        """
+        try:
+            session = self._ensure_hand_model()
+        except Exception as error:  # noqa: BLE001 — the bodies still answer
+            self._hand_load_error = str(error)
+            return ({"ok": False, "reason": "engine_unavailable",
+                     "detail": str(error)}, [])
+        channel = HandChannel(
+            session,
+            # Every hand in the picture: a photo is asked for once and read
+            # once, so the per-frame budget that protects the stream does not
+            # apply.
+            max_rois=max(1, 2 * len(persons)),
+            interval_s=0.0,
+            min_forearm_px=merged["hand_min_forearm_px"],
+            min_conf=merged["kpt_confidence"],
+            confidence=merged["confidence"],
+        )
+        if persons:
+            channel.update(persons, frame, 0.0)
+        found = sum(1 for p in persons
+                    for v in (p.get("hands") or {}).values() if v is not None)
+        note = {"ok": True, "found": found, "ran": channel.ran,
+                "skipped": dict(channel.skipped)}
+        if channel.last_error:
+            note["infer_error"] = channel.last_error
+
+        # No arm to crop from — a photograph of a hand alone, or a body whose
+        # elbows are out of frame. The engine is a hand detector too, and a
+        # photo has no per-frame budget, so look at the whole image. The
+        # stream deliberately does not do this: there it would run the engine
+        # on exactly the frames where nobody's arms are visible.
+        loose = []
+        if not found:
+            loose = hands_in_frame(session, frame,
+                                   confidence=merged["confidence"])
+            if loose:
+                note["unattached"] = len(loose)
+                note["note"] = (
+                    "画面里没有可用的手臂（肘或腕不可见），所以这些手是直接在整幅"
+                    "图上检到的，没有归属到人、也没有左右之分 —— 左右手是由它接在"
+                    "哪只手腕上决定的，没有身体就无从判断。"
+                    "**这条兜底路径的坐标精度明显低于正常路径**：手占满画面时模型"
+                    "会拟合出一只偏小的手（实测整体小约 40%，腕点落在掌心），手指"
+                    "的相对关系仍可用，但绝对位置不要当准。正常路径（画面里有人、"
+                    "手由手臂推出）目视验证是准的")
+        if not found and not loose:
+            note["hint"] = (
+                "没有解出手。too_far / wrist_occluded / elbow_occluded 是几何闸门"
+                "（手腕或肘看不见、或人太远），ran>0 而 found=0 则是裁剪框里没检到手"
+                "—— 手在画面里太小或太大都会这样。整幅图兜底也没检到")
+        return note, loose
 
     def _publish_one_shot(self, instance_id: str, persons: list, frame,
                           started: Optional[float] = None) -> Optional[str]:
