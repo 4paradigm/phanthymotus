@@ -1536,6 +1536,69 @@ opt-in: callers that only need to match pay nothing for the prefix passes.
 
 ---
 
+## 语音情绪和音频事件（SenseVoice 顺带给的）
+
+SenseVoice-small 的输出前几个 token 不是文字，而是四个 tag：语种、情绪、音频事件、
+ITN 开关。sherpa-onnx 在把它们从 `text` 里剥掉的同时填进了结果对象的三个字段：
+
+```python
+res = stream.result
+res.text      # 'Yeah.'
+res.lang      # '<|en|>'
+res.emotion   # '<|HAPPY|>' / '<|NEUTRAL|>' / '<|EMO_UNKNOWN|>' …
+res.event     # '<|Laughter|>' / '<|Speech|>' / '<|BGM|>' …
+```
+
+也就是说这些信息**本来就已经算出来了**，而适配器以前 `return text` 把其余三个一起
+扔了。捡回来不加载任何模型、不多跑一次推理、不多占一字节显存 —— 这是它和另一条路
+（emotion2vec+ 作为独立卡片）唯一但决定性的区别。
+
+`emit_audio_tags`（默认开，只对 `sensevoice-small` 显示）把它们合进 `<topic>/asr`
+和 `<topic>/asr_background` 两条 payload：`emotion`、`audio_event`、`lang`。
+
+### 没信息的取值被压掉，而不是照发
+
+`_UNINFORMATIVE_AUDIO_TAGS` 挡掉 `NEUTRAL` / `EMO_UNKNOWN` / `UNKNOWN` /
+`Speech` / `Event_UNK` / `withitn` / `woitn`。所以一句语气平淡的普通话只多出
+`{"lang": "zh"}`，笑了才会多出 `"audio_event": "Laughter"`。
+
+两个理由，第二个更重要。payload 的每个 key 都会进 L4 trigger 让 LLM 读一遍，每句
+挂一个 `"emotion": "NEUTRAL"` 是让它为零信息付 token；而且它会把「模型没判断出情
+绪」读成「这个人语气平淡」—— 那是两件不同的事。`Speech` 同理：说话这件事由 `text`
+本身证明。这跟 `plugins/speaker.py` 只返回带信息的 key 是同一条规则。
+
+`lang` 不在压掉的名单里：它每次都有值，而值本身就是信息（zh/en/ja/ko/yue）。
+
+字段叫 `audio_event` 而不是 `event`，因为 agent-core 那边 `event` 是事件总线的词
+（`src/event/llm.py`、`config['event']`），payload 里再出现一个同名 key 只会让读日
+志的人以为是同一件事。
+
+### tag 走返回值，不走适配器上的状态
+
+`ASRAdapter.transcribe_rich()` 返回 `(text, extras)`；基类默认实现返回
+`(transcribe(...), {})`，所以 parakeet / x-asr 下这些 key 干脆不出现，而不是出现一
+个空值让 LLM 以为「判断过、没有情绪」。
+
+不要改成在适配器上记一个 `self._last_emotion`：`ASRPlugin._adapter` 是 **plugin 级
+的单个实例**，被所有 `_ASRNode` 共用（见 `_apply_shared`），而每个 node 有自己的
+worker 线程。两个麦克风同时转写时，挂在实例上的状态会把情绪配到另一句话上 —— 不报
+错，也不会有任何日志。
+
+三个字段都用 `getattr(..., "")` 取：它们来自 sherpa 的 C++ binding，换个版本少一个
+就直接取属性会让整条 ASR 路径抛异常。少一个 tag 不值得让机器人听不见。
+
+### 情绪这一项的实测价值还没测
+
+合成音上拿到的是 `<|EMO_UNKNOWN|>`。SenseVoice 的情绪标注本身偏弱，真实语音上大概
+率绝大多数是 `NEUTRAL`/`EMO_UNKNOWN`，所以这个字段**在真机上到底有多少条非空，还
+没量过**。音频事件（Laughter / Cry / Applause / BGM）比情绪可靠得多。
+
+如果实测下来情绪基本全空，那正是去做 emotion2vec+ 独立卡片的依据 —— 而不是说明这
+条改动没用：`audio_event` 和 `lang` 的成本已经是零。另外 `plugins/soundevent.py`
+在做非语音事件检测，两者在 Laughter/Applause 这类标签上重叠，谁更准也还没比过。
+
+---
+
 ## Plugin Concurrency
 
 **`dispatch()` is not single-threaded.** `main.py` serves MCP over
