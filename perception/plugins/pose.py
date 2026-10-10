@@ -82,6 +82,7 @@ from plugins.hand_runtime import (
     DEFAULT_MIN_FOREARM_PX,
     HAND_KEYPOINTS,
     N_HAND_KEYPOINTS,
+    DEFAULT_HAND_CONFIDENCE,
     DEFAULT_HAND_HOLD_S,
     HandChannel,
     hands_in_frame,
@@ -318,6 +319,7 @@ TOOLS = [
                 # ── advanced: hand channel ──────────────────────────────────
                 "hand_interval_s": {"type": "number", "minimum": 0.0, "title": "Hand inference interval (s)", "description": "One hand costs about as much as the whole body pass, so hands run a few times a second rather than every frame. 0 disables the throttle.", "default": 0.25, "scope": "instance", "advanced": True},
                 "hand_max_rois": {"type": "integer", "minimum": 1, "title": "Max hands per frame", "description": "Largest hands first — largest means nearest, and a nearer hand is both likelier to be aimed at the robot and the only one fingers can be resolved on.", "default": 2, "scope": "instance", "advanced": True},
+                "hand_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Hand detection threshold", "description": "Separate from the person threshold above — they are different detectors. A raised hand is found at any setting; this mostly decides whether a relaxed hand hanging at the side is picked up.", "default": DEFAULT_HAND_CONFIDENCE, "scope": "instance", "advanced": True},
                 "hand_hold_s": {"type": "number", "minimum": 0.0, "title": "Keep a hand after losing it (s)", "description": "One frame where the hand is not found is not the hand going away. Without a grace period a single miss erases it until the next inference, which looks like flickering fingers.", "default": DEFAULT_HAND_HOLD_S, "scope": "instance", "advanced": True},
                 "hand_min_forearm_px": {"type": "number", "minimum": 1.0, "title": "Minimum forearm (pixels)", "description": "Below this the person is too far for their hands to be readable. Measured in pixels rather than metres because that depends on the camera's lens; tune it on the robot.", "default": DEFAULT_MIN_FOREARM_PX, "scope": "instance", "advanced": True},
 
@@ -973,6 +975,8 @@ class PosePerceptionPlugin:
             plugin_cfg.get("hand_min_forearm_px", DEFAULT_MIN_FOREARM_PX))
         self._hand_hold_s = float(plugin_cfg.get("hand_hold_s",
                                                  DEFAULT_HAND_HOLD_S))
+        self._hand_confidence = float(plugin_cfg.get("hand_confidence",
+                                                     DEFAULT_HAND_CONFIDENCE))
         self._publish_hand_keypoints = _keypoint_level(
             plugin_cfg.get("publish_hand_keypoints"))
         self._action_window_s = float(plugin_cfg.get("action_window_s", 1.5))
@@ -1063,6 +1067,8 @@ class PosePerceptionPlugin:
             "hand_min_forearm_px": float(icfg.get("hand_min_forearm_px",
                                                   self._hand_min_forearm_px)),
             "hand_hold_s": float(icfg.get("hand_hold_s", self._hand_hold_s)),
+            "hand_confidence": float(icfg.get("hand_confidence",
+                                              self._hand_confidence)),
             "publish_hand_keypoints": (
                 _keypoint_level(icfg["publish_hand_keypoints"])
                 if "publish_hand_keypoints" in icfg
@@ -1137,7 +1143,8 @@ class PosePerceptionPlugin:
             interval_s=merged["hand_interval_s"],
             min_forearm_px=merged["hand_min_forearm_px"],
             min_conf=merged["kpt_confidence"],
-            confidence=merged["confidence"],
+            # The hand detector's own threshold, not the person detector's.
+            confidence=merged["hand_confidence"],
             hold_s=merged["hand_hold_s"],
         )
 
@@ -1432,7 +1439,7 @@ class PosePerceptionPlugin:
             interval_s=0.0,
             min_forearm_px=merged["hand_min_forearm_px"],
             min_conf=merged["kpt_confidence"],
-            confidence=merged["confidence"],
+            confidence=merged["hand_confidence"],
             # No hold: there is no previous frame to hold anything from, and a
             # fresh channel has nothing cached anyway.
             hold_s=0.0,
@@ -1454,7 +1461,7 @@ class PosePerceptionPlugin:
         loose = []
         if not found:
             loose = hands_in_frame(session, frame,
-                                   confidence=merged["confidence"])
+                                   confidence=merged["hand_confidence"])
             if loose:
                 note["unattached"] = len(loose)
                 note["note"] = (
@@ -1979,6 +1986,8 @@ class PosePerceptionPlugin:
             self._hand_min_forearm_px = float(cfg["hand_min_forearm_px"])
         if "hand_hold_s" in cfg:
             self._hand_hold_s = float(cfg["hand_hold_s"])
+        if "hand_confidence" in cfg:
+            self._hand_confidence = float(cfg["hand_confidence"])
         if "publish_hand_keypoints" in cfg:
             self._publish_hand_keypoints = _keypoint_level(
                 cfg["publish_hand_keypoints"])

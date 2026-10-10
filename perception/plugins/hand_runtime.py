@@ -139,6 +139,26 @@ HAND_RETRY_SCALES = (1.0, 0.55)
 #: window: one dropped frame is not the hand going away.
 DEFAULT_HAND_HOLD_S = 0.5
 
+#: Score threshold for the hand detector, separate from the person detector's.
+#:
+#: These were one number, and that was simply the wrong wiring: a hand and a
+#: person are different detectors with different score distributions, and
+#: using the person threshold for both meant tightening person detection
+#: silently dropped hands. Measured on a moving stream, with the hold
+#: disabled so the threshold is the only variable:
+#:
+#:     threshold   hand at the side   hand raised
+#:     0.40              35%              100%
+#:     0.30              47%              100%
+#:     0.25              52%              100%
+#:     0.20              52%              100%
+#:
+#: A raised hand is found at any of them. What the threshold buys is the
+#: *relaxed* hand hanging at the side — small, half-turned, against clothing —
+#: and it saturates at 0.25, so there is nothing to gain by going lower and a
+#: false-positive budget to lose.
+DEFAULT_HAND_CONFIDENCE = 0.25
+
 #: Minimum forearm length in native frame pixels before a hand is attempted.
 #: The floor that matters is about 45 px of *hand*, which is where the measured
 #: curve starts losing detections outright; at HAND_PER_FOREARM that is 50 px
@@ -490,7 +510,8 @@ class HandChannel:
 
     def __init__(self, session, *, max_rois: int = 2, interval_s: float = 0.25,
                  min_forearm_px: float = DEFAULT_MIN_FOREARM_PX,
-                 min_conf: float = 0.3, confidence: float = 0.4,
+                 min_conf: float = 0.3,
+                 confidence: float = DEFAULT_HAND_CONFIDENCE,
                  target_fraction: float = TARGET_HAND_FRACTION,
                  retry_scales=HAND_RETRY_SCALES,
                  hold_s: float = DEFAULT_HAND_HOLD_S):

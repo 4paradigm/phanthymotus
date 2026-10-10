@@ -809,3 +809,16 @@ def test_the_hold_can_be_switched_off():
     gone = _person()
     channel.update([gone], _frame(), 0.01)
     assert gone["hands"]["right"] is None
+
+
+def test_the_hand_detector_has_its_own_threshold():
+    """It used the person detector's. They are different detectors with
+    different score distributions, so tightening person detection silently
+    dropped hands. Measured on a moving stream with the hold off: the hand at
+    the person's side went 35% -> 52% between 0.40 and 0.25, while the raised
+    hand was 100% at every setting."""
+    from plugins.hand_runtime import DEFAULT_HAND_CONFIDENCE
+
+    assert DEFAULT_HAND_CONFIDENCE < 0.4
+    channel = HandChannel(_HandSession(), max_rois=1)
+    assert channel._confidence == DEFAULT_HAND_CONFIDENCE
