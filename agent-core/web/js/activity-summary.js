@@ -19,6 +19,8 @@ export function summarizeEvent(event) {
     // 轮数维度已删（纯时间触发），payload 里只剩秒数 —— 再读 silent_rounds 会渲染成
     // 「静默undefined轮」。in_turn 区分"turn 还在跑"和"turn 结束后子代理还在干"。
     case 'narration':      return `📢 ${p.text || ''} (静默${p.silent_seconds}s${p.in_turn ? '' : '·后台'})`;
+    case 'qr_detected':
+      return `扫码成功：${_escapeHtml(_trunc(String(p.text || ''), 160))}${p.text_truncated ? '（内容已截断）' : ''}`;
     case 'asr_result':     return `"${p.text || ''}"`;
     // 旁边听到、没在跟机器人说的话。在活动流里它此前没有任何痕迹：bg subagent
     // 可能被节流、或被判为「没有内容」而根本不 spawn，那句话就只存在于 DDS 上。
@@ -77,4 +79,11 @@ function _trunc(str, n) {
   if (str.length <= n) return str;
   const tail = Math.min(Math.floor(n / 3), 200);
   return `${str.slice(0, n - tail)}…（省略 ${str.length - n} 字）…${str.slice(-tail)}`;
+}
+
+// Activity rows use innerHTML; QR text is untrusted content from the camera.
+function _escapeHtml(text) {
+  return text.replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[char]));
 }
