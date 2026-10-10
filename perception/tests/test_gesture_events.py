@@ -298,3 +298,71 @@ def test_a_geometry_label_with_no_score_is_not_rejected_by_min_score():
 
 def test_default_and_optional_vocabularies_do_not_overlap():
     assert not set(DEFAULT_GESTURES) & set(OPTIONAL_GESTURES)
+
+
+# ── hands as their own gesture sources ───────────────────────────────────────
+#
+# A person has one body and two hands. They are independent channels: the body
+# gestures work across a room and the hand ones do not, so neither may
+# suppress the other.
+
+def hand_person(track_id=1, body=None, left=None, right=None):
+    p = person(track_id, activity=body)
+    p["hand_gestures"] = {"left": left, "right": right}
+    return p
+
+
+def test_each_hand_is_its_own_channel():
+    tracker = GestureEventTracker(gestures=("open_palm", "pointing"), hold_s=0.3)
+    frames = [[hand_person(left="open_palm", right="pointing")]] * 6
+    events, _ = feed(tracker, frames)
+    started = {(e["gesture"], e.get("hand")) for e in events
+               if e["event"] == "gesture_start"}
+    assert started == {("open_palm", "left"), ("pointing", "right")}
+
+
+def test_a_hand_gesture_does_not_suppress_the_body_one():
+    """They answer different questions at different distances."""
+    tracker = GestureEventTracker(gestures=("raising hand", "open_palm"),
+                                  hold_s=0.3)
+    frames = [[hand_person(body="raising hand", right="open_palm")]] * 6
+    events, _ = feed(tracker, frames)
+    kinds = {(e["gesture"], e.get("hand")) for e in events}
+    assert ("raising hand", None) in kinds
+    assert ("open_palm", "right") in kinds
+
+
+def test_one_hand_changing_does_not_disturb_the_other():
+    tracker = GestureEventTracker(gestures=("open_palm", "fist"), hold_s=0.3,
+                                  release_s=0.2, cooldown_s=0.0)
+    frames = [[hand_person(left="open_palm", right="open_palm")]] * 6
+    frames += [[hand_person(left="open_palm", right="fist")]] * 8
+    events, _ = feed(tracker, frames)
+    left_events = [e for e in events if e.get("hand") == "left"]
+    assert [e["event"] for e in left_events] == ["gesture_start"]
+
+
+def test_a_hand_that_stops_being_reported_closes_its_gesture():
+    tracker = GestureEventTracker(gestures=("open_palm",), hold_s=0.3,
+                                  release_s=0.2)
+    events, t = feed(tracker, [[hand_person(right="open_palm")]] * 6)
+    assert [e["event"] for e in events] == ["gesture_start"]
+    more, _ = feed(tracker, [[hand_person(right=None)]] * 8, t0=t)
+    assert [e["event"] for e in more] == ["gesture_end"]
+    assert more[0]["hand"] == "right"
+
+
+def test_a_lost_track_closes_both_hands():
+    tracker = GestureEventTracker(gestures=("open_palm",), hold_s=0.3)
+    events, t = feed(tracker, [[hand_person(left="open_palm",
+                                            right="open_palm")]] * 6)
+    assert len(events) == 2
+    gone, _ = feed(tracker, [[]], t0=t)
+    assert {e["hand"] for e in gone} == {"left", "right"}
+    assert all(e["reason"] == "track_lost" for e in gone)
+
+
+def test_an_unlisted_hand_gesture_is_ignored():
+    tracker = GestureEventTracker(gestures=("open_palm",), hold_s=0.3)
+    events, _ = feed(tracker, [[hand_person(right="victory")]] * 10)
+    assert events == []

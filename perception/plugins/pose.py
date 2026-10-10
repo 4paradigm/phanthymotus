@@ -70,6 +70,12 @@ from plugins.pose_stgcn import (
     action_vocabulary,
     build_backend,
 )
+from plugins.hand_gesture import (
+    DEFAULT_HAND_GESTURES,
+    GESTURE_LABELS_ZH,
+    classify as classify_hand,
+    gesture_catalogue,
+)
 from plugins.gesture_events import (
     DEFAULT_COOLDOWN_S,
     DEFAULT_GESTURES,
@@ -125,11 +131,9 @@ DEFAULT_MODEL = "yolo26s-pose"
 
 KEYPOINT_LEVELS = ("off", "compact", "full")
 
-#: What the hand channel can be set to. `gesture` is deliberately absent until
-#: the hand gesture rules exist — offering a mode that silently behaves like
-#: `keypoints` is worse than not offering it, which is the call vop's removed
-#: `classes` config and this card's withdrawn `stgcn` backend both record.
-HAND_LEVELS = ("off", "keypoints")
+#: What the hand channel can be set to. `gesture` adds the shape rules on top
+#: of the keypoints; it costs no inference, only arithmetic.
+HAND_LEVELS = ("off", "keypoints", "gesture")
 
 #: Input size of the published hand engine, for `info`. Not configurable: the
 #: crop is sized to land the hand on a *fraction* of this, so a mismatched
@@ -201,13 +205,13 @@ def _gesture_whitelist(value) -> tuple:
     nothing — a silently empty gesture stream.
     """
     if value is None or value == "":
-        return tuple(DEFAULT_GESTURES)
+        return tuple(DEFAULT_GESTURES) + tuple(DEFAULT_HAND_GESTURES)
     if isinstance(value, str):
         items = [part.strip() for part in value.split(",")]
     else:
         items = [str(part).strip() for part in value]
     kept = tuple(item for item in items if item)
-    return kept or tuple(DEFAULT_GESTURES)
+    return kept or (tuple(DEFAULT_GESTURES) + tuple(DEFAULT_HAND_GESTURES))
 
 
 def _hand_level(value) -> str:
@@ -296,9 +300,9 @@ TOOLS = [
             "type": "object",
             "properties": {
                 # ── everyday ────────────────────────────────────────────────
-                "hands": {"type": "string", "enum": list(HAND_LEVELS), "title": "Hand keypoints", "description": "Adds 21 points per hand. Off by default because it loads a second model. Works close up (roughly within 3.5 m) — calling the robot from across a room is handled by the body gestures below and does not need this.", "default": "off", "scope": "instance"},
+                "hands": {"type": "string", "enum": list(HAND_LEVELS), "title": "Hand keypoints", "description": "Adds 21 points per hand. Off by default because it loads a second model. `gesture` also names the shape — open palm, fist, pointing, V, OK — which costs no extra inference. Works close up (roughly within 3.5 m); calling the robot from across a room is handled by the body gestures below and does not need this.", "default": "off", "scope": "instance"},
                 "publish_gesture_events": {"type": "boolean", "title": "Send gesture events", "description": "Tell the robot when someone gestures at it. One message when a gesture starts and one when it ends — not every frame.", "default": True, "scope": "instance"},
-                "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "title": "Gestures to report", "description": f"Which actions count as gesturing at the robot. Default: {', '.join(DEFAULT_GESTURES)}. Also available: {', '.join(OPTIONAL_GESTURES)}.", "default": list(DEFAULT_GESTURES), "scope": "instance"},
+                "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "title": "Gestures to report", "description": f"Which actions count as gesturing at the robot. Default: {', '.join(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES)}. The last five need `hands: gesture`. Also available: {', '.join(OPTIONAL_GESTURES)}, thumbs_up.", "default": list(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES), "scope": "instance"},
                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.4, "scope": "instance"},
                 "fps": {"type": "integer", "minimum": 1, "title": "Frames per second", "description": "How often to look. Below 12 the action model gets too few frames to judge movement, and `info` will say so.", "default": 12, "scope": "instance"},
                 "max_persons": {"type": "integer", "minimum": 1, "title": "Max people per frame", "description": "Most confident first when there are more.", "default": 5, "scope": "instance"},
@@ -360,7 +364,8 @@ class _PoseNode(Node):
                  activity_interval_s: float = 0.35,
                  gesture_tracker: Optional[GestureEventTracker] = None,
                  publish_gesture_events: bool = True,
-                 hand_channel=None, publish_hand_keypoints: str = "off"):
+                 hand_channel=None, publish_hand_keypoints: str = "off",
+                 hand_gestures=()):
         super().__init__(f"pose_{node_suffix}" if node_suffix else "pose")
         # Topic-less is a supported mode, as in vop and tts: a card driven only
         # by recognize_by_photo has no camera, but still wants somewhere to
@@ -383,6 +388,8 @@ class _PoseNode(Node):
         # unloaded: the channel owns the session.
         self._hand_channel = hand_channel
         self._publish_hand_keypoints = _keypoint_level(publish_hand_keypoints)
+        #: Which hand shapes to name, or empty for keypoints only.
+        self._hand_gestures = tuple(hand_gestures or ())
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._activity_interval_s = float(activity_interval_s)
@@ -658,6 +665,10 @@ class _PoseNode(Node):
             except Exception as error:  # noqa: BLE001 — never lose the bodies
                 log.warning(f"[pose] hand channel failed: {error}")
 
+        if self._hand_channel is not None and self._hand_gestures:
+            for person in persons:
+                name_hand_shapes(person, self._hand_gestures)
+
         self._last_actions = {
             p["id"]: (p["verdict"].get("activity") or {}).get("name")
                      or p["verdict"].get("posture") or "unknown"
@@ -708,6 +719,10 @@ class _PoseNode(Node):
             # skeleton topic instead.
             record["hands_seen"] = sorted(side for side, value in hands.items()
                                           if value is not None)
+            named = {side: name for side, name
+                     in (person.get("hand_gestures") or {}).items() if name}
+            if named:
+                record["hand_gestures"] = named
             if self._publish_hand_keypoints != "off":
                 detail = (_compact_keypoints
                           if self._publish_hand_keypoints == "compact"
@@ -931,6 +946,35 @@ def draw_skeleton(canvas, persons: list, kpt_confidence: float) -> None:
             cv2.putText(canvas, f"#{person.get('id', '?')} {label}",
                         (int(box[0]), max(int(box[1]) - 6, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
+
+
+def name_hand_shapes(person: dict, allowed) -> dict:
+    """Name the shape of each of a person's hands, in place.
+
+    A free function because both paths need it and only one of them is a
+    streaming node: the photo actions were left out of the keypoint wiring
+    once already, and a card that reports 21 joints with no name while
+    `hands: gesture` is set looks broken rather than unimplemented.
+    """
+    shapes, evidence = {}, {}
+    for side, points in (person.get("hands") or {}).items():
+        if points is None:
+            continue
+        verdict = classify_hand(points, allowed=allowed)
+        shapes[side] = verdict.get("gesture")
+        if verdict.get("gesture"):
+            evidence[side] = verdict.get("evidence")
+        if verdict.get("point_direction"):
+            # The finger beats the forearm at saying where somebody is
+            # pointing, so it replaces the body channel's guess rather than
+            # sitting beside it.
+            verdict_out = person.setdefault("verdict", {})
+            verdict_out["point_direction"] = verdict["point_direction"]
+            verdict_out["point_vector"] = verdict.get("point_vector")
+    if shapes:
+        person["hand_gestures"] = shapes
+        person["hand_gesture_evidence"] = evidence
+    return shapes
 
 
 # ── Plugin class ──────────────────────────────────────────────────────────────
@@ -1404,6 +1448,10 @@ class PosePerceptionPlugin:
                         for side, value in (person.get("hands") or {}).items()
                         if value is not None}}
                        if merged["hands"] != "off" else {}),
+                    **({"hand_gestures": person["hand_gestures"],
+                        "hand_gesture_evidence": person.get(
+                            "hand_gesture_evidence", {})}
+                       if person.get("hand_gestures") else {}),
                 }
                 for person in persons
             ],
@@ -1414,7 +1462,14 @@ class PosePerceptionPlugin:
             # guessing that from appearance is exactly what deriving the side
             # from the wrist exists to avoid.
             **({"unattached_hands": [
-                {"score": round(score, 2), "keypoints": _full_keypoints(points)}
+                {"score": round(score, 2),
+                 "keypoints": _full_keypoints(points),
+                 # Named too, when asked. The shape rules need no body — they
+                 # read the hand's own geometry — so the one thing an
+                 # unattached hand cannot say is which hand it is.
+                 **({"gesture": classify_hand(
+                     points, allowed=merged["gesture_whitelist"]).get("gesture")}
+                    if merged["hands"] == "gesture" else {})}
                 for points, score in loose_hands]} if loose_hands else {}),
         }
 
@@ -1448,6 +1503,9 @@ class PosePerceptionPlugin:
         )
         if persons:
             channel.update(persons, frame, 0.0)
+            if merged["hands"] == "gesture":
+                for person in persons:
+                    name_hand_shapes(person, merged["gesture_whitelist"])
         found = sum(1 for p in persons
                     for v in (p.get("hands") or {}).values() if v is not None)
         note = {"ok": True, "found": found, "ran": channel.ran,
@@ -1528,6 +1586,8 @@ class PosePerceptionPlugin:
                 publish_gesture_events=merged["publish_gesture_events"],
                 hand_channel=self._hand_channel_for(merged),
                 publish_hand_keypoints=merged["publish_hand_keypoints"],
+                hand_gestures=(merged["gesture_whitelist"]
+                               if merged["hands"] == "gesture" else ()),
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -1631,6 +1691,11 @@ class PosePerceptionPlugin:
                     "whitelist": list(self._gesture_whitelist),
                     "available": list(DEFAULT_GESTURES),
                     "optional": list(OPTIONAL_GESTURES),
+                    "hand_shapes": gesture_catalogue(),
+                    "hand_shapes_note": (
+                        "需要 hands: gesture。这些是单帧的手型，由 21 个关键点的"
+                        "几何判定，不额外跑模型。thumbs_up 在词表里但默认不开 —— "
+                        "拇指的判据只在三张照片上标定过，不够"),
                     "note": ("手势是 activity 的一个子集，单独发在稀疏的 "
                              "{topic}/poses/gesture 上：只在开始/结束各一条，"
                              "带 priority 字段。默认那三个都从 COCO-17 骨架读，"

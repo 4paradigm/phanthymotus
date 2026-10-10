@@ -605,8 +605,8 @@ def test_a_comma_separated_whitelist_is_split():
 
 def test_an_empty_whitelist_falls_back_to_the_default():
     plugin, node = _started({"gesture_whitelist": []})
-    assert node._gesture_tracker.gestures == tuple(
-        sorted(pose_plugin.DEFAULT_GESTURES))
+    assert node._gesture_tracker.gestures == tuple(sorted(
+        pose_plugin.DEFAULT_GESTURES + pose_plugin.DEFAULT_HAND_GESTURES))
 
 
 def test_no_gesture_publisher_exists_when_the_topic_is_off():
@@ -653,8 +653,8 @@ def test_info_reports_what_the_gesture_channel_has_done():
     _fire(node, [_gesture_person()])
     instance = plugin.dispatch("pose", {"action": "info"})["instances"]["/cam/rgb"]
     assert instance["gesture_event_count"] == 1
-    assert instance["gesture_whitelist"] == list(
-        sorted(pose_plugin.DEFAULT_GESTURES))
+    assert instance["gesture_whitelist"] == list(sorted(
+        pose_plugin.DEFAULT_GESTURES + pose_plugin.DEFAULT_HAND_GESTURES))
     assert instance["recent_gestures"][-1]["gesture"] == "raising hand"
 
 
@@ -1106,8 +1106,13 @@ def test_hands_off_is_the_default():
 
 def test_an_unknown_hands_level_falls_back_to_off():
     """A typo must not quietly enable a second engine."""
-    plugin, _ = _plugin({"hands": "gesture"})      # not offered yet
+    plugin, _ = _plugin({"hands": "keypoitns"})    # typo
     assert plugin._hands == "off"
+
+
+def test_the_gesture_level_is_offered_now_that_the_rules_exist():
+    plugin, _ = _plugin({"hands": "gesture"})
+    assert plugin._hands == "gesture"
 
 
 def test_hands_on_attaches_a_channel():
@@ -1383,3 +1388,96 @@ def test_the_thresholds_still_match_the_rules_defaults():
     props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
     for key in ("fall_drop_ratio", "fall_drop_window_s", "fall_settle_s"):
         assert props[key]["default"] == DEFAULT_THRESHOLDS[key]
+
+
+# ── naming hand shapes ───────────────────────────────────────────────────────
+
+def _open_palm_session():
+    """A fake engine whose hand reads as an open palm through the real rules."""
+    session = _FakeHandSession()
+    from plugins.hand_runtime import HAND_INDEX, N_HAND_KEYPOINTS
+
+    def infer(blob, _s=session):
+        _s.calls += 1
+        net, bins = _s.net, _s.net * 2
+        sx = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        sy = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        # wrist low, every middle joint at mid-height, every tip well above:
+        # reach comes out around +0.5 for all five fingers.
+        def put(idx, x, y):
+            # Cleared first: these are argmax'd, so leaving an earlier peak in
+            # place lets the lower bin win and silently relocates the joint.
+            sx[0, idx] = 0.0
+            sy[0, idx] = 0.0
+            sx[0, idx, int(x * 2)] = 0.9
+            sy[0, idx, int(y * 2)] = 0.9
+        put(0, net * 0.5, net * 0.90)                       # wrist
+        for name, tip in (("thumb", 4), ("index", 8), ("middle", 12),
+                          ("ring", 16), ("pinky", 20)):
+            pip = tip - 2
+            put(pip, net * 0.5, net * 0.60)
+            put(tip, net * 0.5, net * 0.45)
+        put(HAND_INDEX["middle_mcp"], net * 0.5, net * 0.60)
+        put(HAND_INDEX["index_mcp"], net * 0.4, net * 0.63)
+        put(HAND_INDEX["pinky_mcp"], net * 0.6, net * 0.63)
+        put(4, net * 0.9, net * 0.45)                       # thumb tip, far off
+        return [sx, sy]
+
+    session.infer = infer
+    return session
+
+
+def test_hands_gesture_names_the_shape_on_the_lean_topic():
+    plugin, _ = _plugin({"hands": "gesture", "hand_interval_s": 0})
+    plugin._hand_model = _open_palm_session()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    person = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])["persons"][0]
+    assert person.get("hand_gestures"), person
+    assert set(person["hand_gestures"].values()) == {"open_palm"}
+
+
+def test_hands_keypoints_names_nothing():
+    """`keypoints` is keypoints. Naming shapes is what `gesture` is for."""
+    plugin, _ = _plugin({"hands": "keypoints", "hand_interval_s": 0})
+    plugin._hand_model = _open_palm_session()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    person = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])["persons"][0]
+    assert "hand_gestures" not in person
+    assert person["hands_seen"]
+
+
+def test_list_actions_offers_the_hand_shapes_and_says_what_they_need():
+    result = _plugin()[0].dispatch("pose", {"action": "list_actions"})
+    shapes = result["gestures"]["hand_shapes"]
+    assert {e["name"] for e in shapes} >= {"open_palm", "fist", "ok", "victory"}
+    assert any(e["name"] == "thumbs_up" and e["default"] is False for e in shapes)
+    assert "hands: gesture" in result["gestures"]["hand_shapes_note"]
+
+
+def test_a_photo_names_the_hand_shapes_too():
+    """The photo actions were left out of the keypoint wiring once already.
+    A card reporting 21 joints with no name while `hands: gesture` is set
+    looks broken rather than unimplemented."""
+    plugin, _ = _plugin({"hands": "gesture"})
+    plugin._hand_model = _open_palm_session()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    person = result["persons"][0]
+    assert person.get("hand_gestures")
+    assert "hand_gesture_evidence" in person
+
+
+def test_an_unattached_hand_is_named_but_still_has_no_side():
+    """The shape rules read the hand's own geometry and need no body. Which
+    hand it is, they cannot say."""
+    plugin, _ = _plugin({"hands": "gesture", "hand_min_forearm_px": 10000.0})
+    plugin._hand_model = _open_palm_session()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    loose = result["unattached_hands"][0]
+    assert "gesture" in loose
+    assert "side" not in loose and "hand" not in loose

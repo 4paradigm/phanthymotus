@@ -88,8 +88,12 @@ DEFAULT_COOLDOWN_S = 2.0
 
 
 class _TrackState:
-    """Per-track gesture state. One active gesture at a time, by construction:
-    the activity channel reports one label per person per frame."""
+    """State for one (track, source) pair.
+
+    One active gesture at a time *per source*, which is why the source is part
+    of the key rather than the state: a person has one body but two hands, and
+    an open palm on the left while the right points is two gestures, not a
+    contested one."""
 
     __slots__ = ("candidate", "candidate_since", "active", "active_since",
                  "last_seen", "cooldown_until")
@@ -143,8 +147,9 @@ class GestureEventTracker:
         """Feed one frame's people, get back the transitions it caused.
 
         `persons` are the records the node already built — each needs `id`,
-        and the verdict's `activity` / `position` / `point_direction`. Returns
-        a list of ready-to-publish dicts, usually empty.
+        the verdict's `activity` / `position` / `point_direction`, and
+        optionally `hand_gestures` keyed by side. Returns a list of
+        ready-to-publish dicts, usually empty.
         """
         events = []
         seen = set()
@@ -152,17 +157,37 @@ class GestureEventTracker:
             track_id = person.get("id")
             if track_id is None:
                 continue
-            seen.add(track_id)
-            events.extend(self._update_one(track_id, person, now))
+            for source, name, score, extra in self._sources(person):
+                key = (track_id, source)
+                seen.add(key)
+                events.extend(
+                    self._update_one(key, person, now, name, score, extra))
         events.extend(self._prune(seen, now))
         return events
 
-    def _update_one(self, track_id, person: dict, now: float) -> list:
-        state = self._tracks.get(track_id)
-        if state is None:
-            state = self._tracks[track_id] = _TrackState()
+    def _sources(self, person: dict) -> list:
+        """Every independent gesture channel this person offers.
 
-        label, score = self._gesture_of(person)
+        The body is one; each hand is another. They are independent because
+        they answer different questions at different distances — the body
+        works across a room and the hands do not — so one must not suppress
+        the other.
+        """
+        name, score = self._gesture_of(person)
+        out = [("body", name, score, {})]
+        for side, label in (person.get("hand_gestures") or {}).items():
+            if label and label in self._gestures:
+                out.append((f"hand:{side}", label, None, {"hand": side}))
+            else:
+                out.append((f"hand:{side}", None, None, {"hand": side}))
+        return out
+
+    def _update_one(self, key, person: dict, now: float, label, score,
+                    extra: dict) -> list:
+        state = self._tracks.get(key)
+        if state is None:
+            state = self._tracks[key] = _TrackState()
+        track_id = key[0]
         events = []
 
         if state.active is not None:
@@ -177,7 +202,7 @@ class GestureEventTracker:
             events.append(self._event("gesture_end", state.active, person, now,
                                       held_s=round(max(0.0, state.last_seen
                                                        - state.active_since), 2),
-                                      reason="released"))
+                                      reason="released", **extra))
             state.cooldown_until[state.active] = now + self._cooldown_s
             state.active = None
             state.candidate = None
@@ -204,7 +229,7 @@ class GestureEventTracker:
             state.last_seen = now
             state.candidate = None
             events.append(self._event("gesture_start", label, person, now,
-                                      score=score))
+                                      score=score, **extra))
         return events
 
     def _prune(self, seen: set, now: float) -> list:
@@ -215,14 +240,17 @@ class GestureEventTracker:
         "still holding" from "walked away".
         """
         events = []
-        for track_id in [k for k in self._tracks if k not in seen]:
-            state = self._tracks.pop(track_id)
+        for key in [k for k in self._tracks if k not in seen]:
+            state = self._tracks.pop(key)
+            track_id, source = key
             if state.active is not None:
                 events.append({
                     "priority": self._priority,
                     "event": "gesture_end",
                     "gesture": state.active,
                     "track": track_id,
+                    **({"hand": source.split(":", 1)[1]}
+                       if source.startswith("hand:") else {}),
                     "held_s": round(max(0.0, state.last_seen - state.active_since), 2),
                     "reason": "track_lost",
                     "t": round(now, 3),
