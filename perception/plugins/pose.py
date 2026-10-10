@@ -78,6 +78,15 @@ from plugins.gesture_events import (
     OPTIONAL_GESTURES,
     GestureEventTracker,
 )
+from plugins.hand_runtime import (
+    DEFAULT_MIN_FOREARM_PX,
+    HAND_KEYPOINTS,
+    N_HAND_KEYPOINTS,
+    HandChannel,
+    merge_keypoints,
+    merged_keypoint_names,
+    merged_skeleton,
+)
 from plugins.vision_runtime import COCO_KEYPOINTS, COCO_SKELETON, N_KEYPOINTS
 
 log = logging.getLogger(__name__)
@@ -112,6 +121,17 @@ _DEFAULT_INSTANCE = "_default"
 DEFAULT_MODEL = "yolo26s-pose"
 
 KEYPOINT_LEVELS = ("off", "compact", "full")
+
+#: What the hand channel can be set to. `gesture` is deliberately absent until
+#: the hand gesture rules exist — offering a mode that silently behaves like
+#: `keypoints` is worse than not offering it, which is the call vop's removed
+#: `classes` config and this card's withdrawn `stgcn` backend both record.
+HAND_LEVELS = ("off", "keypoints")
+
+#: Input size of the published hand engine, for `info`. Not configurable: the
+#: crop is sized to land the hand on a *fraction* of this, so a mismatched
+#: engine moves the hand out of the band it was measured in.
+HAND_MODEL = "yolo26s-hand21"
 
 # What the card offers. `stgcn` is deliberately NOT here, although
 # `build_backend` can still construct it for tests and deliberate experiments.
@@ -185,6 +205,11 @@ def _gesture_whitelist(value) -> tuple:
         items = [str(part).strip() for part in value]
     kept = tuple(item for item in items if item)
     return kept or tuple(DEFAULT_GESTURES)
+
+
+def _hand_level(value) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in HAND_LEVELS else "off"
 
 
 def _keypoint_level(value) -> str:
@@ -270,6 +295,11 @@ TOOLS = [
                 "publish_keypoints": {"type": "string", "enum": list(KEYPOINT_LEVELS), "description": "data/json 那条流里要不要带关键点：off（默认）只发动作和位置；compact 带 17 个整数像素点；full 带 17×(x,y,可见性)。off→full 每人每帧约 60 B → 900 B，而这条流的每个字节都是每帧的 LLM 上下文字节。画骨架用的是 /skeleton 那条，不受这里影响", "default": "off", "scope": "instance"},
                 "publish_bbox": {"type": "boolean", "description": "lean 流里带上像素框 [x1,y1,x2,y2]", "default": True, "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
+                "hands": {"type": "string", "enum": list(HAND_LEVELS), "description": "要不要跑手部 21 关键点。off（默认）完全不加载第二个 engine —— 8GB 的 Orin 上同时还跑 vop/depth/OCR/ASR/TTS，瓶颈是内存不是算力，所以没开的卡片必须零成本。keypoints 只出关键点、不判手势。注意手部只在近处有效：从原生分辨率裁 ROI 上采样后约 3.5m 以内，整帧模式只到 0.7m —— 远处招手靠身体层的 raising hand / hand waving，不需要这个 engine", "default": "off", "scope": "instance"},
+                "hand_interval_s": {"type": "number", "minimum": 0.0, "description": "手部推理间隔（秒）。Orin5 空载实测 448 每只手端到端 11.26ms，和整个身体 pose 一趟差不多；12fps 下两只手每帧跑是 22.5ms，而身体通道三个人已占 41ms/83ms。0.25（4Hz）摊到约 7.5ms/帧。按 track 错峰，避免两个人同帧付账（那表现为周期性卡顿而非均值升高）。0 = 不节流", "default": 0.25, "scope": "instance"},
+                "hand_max_rois": {"type": "integer", "minimum": 1, "description": "单帧最多跑几只手，按手的像素大小取前 N 只 —— 大就是近，近的手既更可能在跟机器人打招呼，也是唯一能分辨出手指的", "default": 2, "scope": "instance"},
+                "hand_min_forearm_px": {"type": "number", "minimum": 1.0, "description": "前臂短于这个像素数就不跑手部。手宽约 0.45×前臂长，90px 前臂约合 40px 手，正是实测曲线开始直接漏检的地方。**用几何量而不是模型置信度**：实测手只有 100px 时模型给 conf 0.92 而关键点误差达手宽的 17%（约一个指节）—— 置信度一路 0.9、形状误差翻三倍，所以它判不了远近。这个阈值和机位强相关（像素换米取决于视场角），务必在真机上调", "default": DEFAULT_MIN_FOREARM_PX, "scope": "instance"},
+                "publish_hand_keypoints": {"type": "string", "enum": list(KEYPOINT_LEVELS), "description": "lean 流里要不要带手部关键点。off（默认）只带哪只手被看到了 —— 这条流的每个字节都是每帧的 LLM 上下文字节，而 42 个坐标对文本模型毫无意义。画手用 /skeleton 那条，不受这里影响", "default": "off", "scope": "instance"},
                 "publish_gesture_events": {"type": "boolean", "description": "另发一条稀疏的手势事件流（{topic}/poses/gesture）：只在手势开始/结束时各发一条，不是每帧。这条才是接 decision_core 用的 —— agent-core 会把订阅话题的整条消息原样塞进事件总线，逐帧发等于举手三秒烧掉 36 条满payload 的上下文。事件自带 priority 字段，否则 dds 来源算 P=0，只进后台批，挥手唤不醒 agent", "default": True, "scope": "instance"},
                 "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "description": f"哪些动作算「冲着机器人做的手势」。默认 {list(DEFAULT_GESTURES)} —— 这三个都从 COCO-17 骨架读出来，不依赖手部模型，所以人在多远都有效。可选再加 {list(OPTIONAL_GESTURES)}，但那些只有骨架动作模型给，而它没有「没在做手势」这个类", "default": list(DEFAULT_GESTURES), "scope": "instance"},
                 "gesture_hold_s": {"type": "number", "minimum": 0.0, "description": "手势要连续保持多少秒才报开始。手臂路过举起位置（去挠头）也会被几何读成 raising hand，这个窗口就是为了挡它。按秒而不是按帧 —— 身体通道跑卡片 fps、手部通道节流到约 4 Hz，同一个帧数在两边是不同时长", "default": DEFAULT_HOLD_S, "scope": "instance"},
@@ -311,7 +341,8 @@ class _PoseNode(Node):
                  publish_overlay: bool = False, label_hold: int = 3,
                  activity_interval_s: float = 0.35,
                  gesture_tracker: Optional[GestureEventTracker] = None,
-                 publish_gesture_events: bool = True):
+                 publish_gesture_events: bool = True,
+                 hand_channel=None, publish_hand_keypoints: str = "off"):
         super().__init__(f"pose_{node_suffix}" if node_suffix else "pose")
         # Topic-less is a supported mode, as in vop and tts: a card driven only
         # by recognize_by_photo has no camera, but still wants somewhere to
@@ -330,6 +361,10 @@ class _PoseNode(Node):
         self._publish_keypoints = _keypoint_level(publish_keypoints)
         self._publish_bbox = bool(publish_bbox)
         self._publish_overlay = bool(publish_overlay)
+        # None when `hands` is off, which is also what keeps the second engine
+        # unloaded: the channel owns the session.
+        self._hand_channel = hand_channel
+        self._publish_hand_keypoints = _keypoint_level(publish_hand_keypoints)
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._activity_interval_s = float(activity_interval_s)
@@ -406,6 +441,7 @@ class _PoseNode(Node):
             "gesture_output": (self._gesture_topic
                                if self._pub_gesture is not None else None),
             "mode": "stream" if self._input_topic else "on_demand",
+            "hands": "keypoints" if self._hand_channel is not None else "off",
         }
 
     def start(self) -> dict:
@@ -453,6 +489,11 @@ class _PoseNode(Node):
             # a restart could be silently suppressed.
             if self._gesture_tracker is not None:
                 self._gesture_tracker.reset()
+            # Cached hand boxes belong to track ids that will not survive the
+            # stop; keeping them would crop the next run at the previous run's
+            # hand positions.
+            if self._hand_channel is not None:
+                self._hand_channel.reset()
             log.info(f"[pose] stopped: {self._input_topic or '(no topic)'}")
             return self._status()
 
@@ -590,6 +631,15 @@ class _PoseNode(Node):
                              round((cy - half_h) / half_h, 3)],
                 "verdict": verdict,
             })
+        # Hands last, and over the whole frame rather than inside the loop:
+        # the channel spends its budget on the largest hands in frame, which it
+        # cannot decide one person at a time.
+        if self._hand_channel is not None:
+            try:
+                self._hand_channel.update(persons, frame, now_wall)
+            except Exception as error:  # noqa: BLE001 — never lose the bodies
+                log.warning(f"[pose] hand channel failed: {error}")
+
         self._last_actions = {
             p["id"]: (p["verdict"].get("activity") or {}).get("name")
                      or p["verdict"].get("posture") or "unknown"
@@ -633,6 +683,20 @@ class _PoseNode(Node):
             record["keypoints"] = _compact_keypoints(person["keypoints"])
         elif self._publish_keypoints == "full":
             record["keypoints"] = _full_keypoints(person["keypoints"])
+        if self._hand_channel is not None:
+            hands = person.get("hands") or {}
+            # *Which* hands were resolvable is cheap and is the part a text
+            # model can act on; the 42 coordinates are not, and ride on the
+            # skeleton topic instead.
+            record["hands_seen"] = sorted(side for side, value in hands.items()
+                                          if value is not None)
+            if self._publish_hand_keypoints != "off":
+                detail = (_compact_keypoints
+                          if self._publish_hand_keypoints == "compact"
+                          else _full_keypoints)
+                record["hand_keypoints"] = {
+                    side: detail(value) for side, value in hands.items()
+                    if value is not None}
         return record
 
     def _skeleton_record(self, person: dict) -> dict:
@@ -644,8 +708,21 @@ class _PoseNode(Node):
             "posture": verdict.get("posture"),
             "activity": (verdict["activity"]["name"]
                          if verdict.get("activity") else None),
-            "keypoints": _full_keypoints(person["keypoints"]),
+            "keypoints": _full_keypoints(self._payload_keypoints(person)),
         }
+
+    def _payload_keypoints(self, person: dict):
+        """Body keypoints, with both hands appended when the channel is on.
+
+        Appended and never interleaved: pose2d.js keeps its own copy of the
+        COCO bone table and any already-wired consumer indexes the first 17.
+        See hand_runtime.merge_keypoints.
+        """
+        if self._hand_channel is None:
+            return person["keypoints"]
+        hands = person.get("hands") or {}
+        return merge_keypoints(person["keypoints"], hands.get("left"),
+                               hands.get("right"))
 
     def publish_persons(self, persons: list, frame=None,
                         started: Optional[float] = None) -> None:
@@ -688,8 +765,15 @@ class _PoseNode(Node):
             # The renderer has no other way to know what the coordinates are
             # relative to — keypoints are in source-frame pixels.
             "image_size": [int(width), int(height)],
-            "keypoint_names": list(COCO_KEYPOINTS),
-            "skeleton": [list(edge) for edge in COCO_SKELETON],
+            # The payload describes its own layout, which is what lets the
+            # renderer draw 59 keypoints with no frontend change at all —
+            # pose2d.js already prefers a payload-carried table over its copy.
+            "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
+                               if self._hand_channel is not None
+                               else list(COCO_KEYPOINTS)),
+            "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
+                         if self._hand_channel is not None
+                         else [list(edge) for edge in COCO_SKELETON]),
             "persons": [self._skeleton_record(p) for p in persons],
         }
         skeleton_message = String()
@@ -866,6 +950,13 @@ class PosePerceptionPlugin:
         self._gesture_cooldown_s = float(plugin_cfg.get("gesture_cooldown_s",
                                                         DEFAULT_COOLDOWN_S))
         self._gesture_min_score = float(plugin_cfg.get("gesture_min_score", 0.0))
+        self._hands = _hand_level(plugin_cfg.get("hands"))
+        self._hand_interval_s = float(plugin_cfg.get("hand_interval_s", 0.25))
+        self._hand_max_rois = int(plugin_cfg.get("hand_max_rois", 2))
+        self._hand_min_forearm_px = float(
+            plugin_cfg.get("hand_min_forearm_px", DEFAULT_MIN_FOREARM_PX))
+        self._publish_hand_keypoints = _keypoint_level(
+            plugin_cfg.get("publish_hand_keypoints"))
         self._action_window_s = float(plugin_cfg.get("action_window_s", 1.5))
         self._backend_migrated: Optional[str] = None
         self._action_backend = self._migrate_backend(
@@ -888,6 +979,13 @@ class PosePerceptionPlugin:
         # progress is indistinguishable from a hung one.
         self._model_load_status = None
         self._model_lock = threading.Lock()
+
+        # The hand engine is a *second* engine, loaded only when a card asks
+        # for hands. Its own lock, not the body engine's: a hand fetch must not
+        # block a body start, and the two are fetched independently.
+        self._hand_model = None
+        self._hand_load_error: Optional[str] = None
+        self._hand_model_lock = threading.Lock()
 
         self._nodes: dict[str, _PoseNode] = {}
         self._instance_configs: dict[str, dict] = {}
@@ -939,6 +1037,17 @@ class PosePerceptionPlugin:
                                                  self._gesture_cooldown_s)),
             "gesture_min_score": float(icfg.get("gesture_min_score",
                                                 self._gesture_min_score)),
+            "hands": (_hand_level(icfg["hands"]) if "hands" in icfg
+                      else self._hands),
+            "hand_interval_s": float(icfg.get("hand_interval_s",
+                                              self._hand_interval_s)),
+            "hand_max_rois": int(icfg.get("hand_max_rois", self._hand_max_rois)),
+            "hand_min_forearm_px": float(icfg.get("hand_min_forearm_px",
+                                                  self._hand_min_forearm_px)),
+            "publish_hand_keypoints": (
+                _keypoint_level(icfg["publish_hand_keypoints"])
+                if "publish_hand_keypoints" in icfg
+                else self._publish_hand_keypoints),
         }
         for key in _THRESHOLD_KEYS:
             if key in icfg and icfg[key] is not None:
@@ -946,6 +1055,71 @@ class PosePerceptionPlugin:
             elif key in self._plugin_cfg and self._plugin_cfg[key] is not None:
                 merged[key] = self._plugin_cfg[key]
         return merged
+
+    def _ensure_hand_model(self):
+        """Load the hand engine, once, on first use.
+
+        Separate from `_ensure_model` rather than folded into it: the body
+        engine is what a pose card always needs, the hand engine is what it
+        only sometimes needs, and on an 8 GB Orin already running vop, depth,
+        OCR, ASR and TTS the binding constraint is memory. Folding them would
+        make every pose card pay for a channel most of them have off.
+        """
+        if self._hand_model is not None:
+            return self._hand_model
+        with self._hand_model_lock:
+            if self._hand_model is not None:
+                return self._hand_model
+            from plugins.hand_runtime import assert_end2end
+            from plugins.vision_runtime import VisionEngineSession
+            from utils.model_downloader import ensure_hand_model
+            from utils.model_progress import fetch_status
+
+            model_dir = os.environ.get("HAND_MODEL_DIR", "/models/hand")
+            progress_cb, _ = fetch_status(
+                lambda text: setattr(self, "_model_load_status", text),
+                HAND_MODEL)
+            paths = ensure_hand_model(model_dir, progress_cb=progress_cb)
+            engine_path = next(path for name, path in paths.items()
+                               if name.endswith(".engine"))
+            log.info(f"[pose] loading hand engine: {engine_path}")
+            session = VisionEngineSession(engine_path)
+            # Refuse a non-end2end plan here rather than decoding thousands of
+            # un-suppressed anchors as hands. hand_runtime.assert_end2end says
+            # why decode_poses cannot catch that itself.
+            shape = assert_end2end(session)
+            log.info(f"[pose] hand engine loaded: input={session.input_size}, "
+                     f"output={shape}, {N_HAND_KEYPOINTS} keypoints")
+            self._hand_model = session
+            return self._hand_model
+
+    def _hand_channel_for(self, merged: dict):
+        """Build the hand channel for one instance, or None.
+
+        A load failure is recorded and the card continues **without** hands
+        rather than refusing to start. The body channel is what answers "is
+        somebody calling me" and it works at any distance; losing it because a
+        second engine could not be fetched would be the wrong trade. `info`
+        carries the error, so this is not silent.
+        """
+        if merged["hands"] == "off":
+            return None
+        try:
+            session = self._ensure_hand_model()
+        except Exception as error:  # noqa: BLE001 — the card must still work
+            self._hand_load_error = str(error)
+            log.warning("[pose] hand engine unavailable, running without "
+                        "hands: %s", error)
+            return None
+        self._hand_load_error = None
+        return HandChannel(
+            session,
+            max_rois=merged["hand_max_rois"],
+            interval_s=merged["hand_interval_s"],
+            min_forearm_px=merged["hand_min_forearm_px"],
+            min_conf=merged["kpt_confidence"],
+            confidence=merged["confidence"],
+        )
 
     def _gesture_tracker_for(self, merged: dict) -> GestureEventTracker:
         """Build the gesture state machine for one instance.
@@ -1229,6 +1403,8 @@ class PosePerceptionPlugin:
                 activity_interval_s=merged["activity_interval_s"],
                 gesture_tracker=self._gesture_tracker_for(merged),
                 publish_gesture_events=merged["publish_gesture_events"],
+                hand_channel=self._hand_channel_for(merged),
+                publish_hand_keypoints=merged["publish_hand_keypoints"],
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -1405,6 +1581,18 @@ class PosePerceptionPlugin:
                                       if node._gesture_tracker else []),
                 "gesture_event_count": node._gesture_count,
                 "recent_gestures": list(node._recent_gestures[-5:]),
+                "hands": "keypoints" if node._hand_channel is not None else "off",
+                # Why there are no hands, when there are none. Four innocent
+                # reasons and one broken one, and from outside they look the
+                # same: too_far / wrist_occluded / elbow_occluded are the
+                # geometry gate, throttled is the budget, and hand_infer_error
+                # is the real failure.
+                **({"hand_ran": node._hand_channel.ran,
+                    "hand_skipped": dict(node._hand_channel.skipped),
+                    "hand_input": node._hand_channel.input_size,
+                    **({"hand_infer_error": node._hand_channel.last_error}
+                       if node._hand_channel.last_error else {})}
+                   if node._hand_channel is not None else {}),
             }
             for key, node in nodes.items()
         }
@@ -1457,6 +1645,21 @@ class PosePerceptionPlugin:
             info["action_backend_note"] = self._backend_fallback
         if self._backend_migrated:
             info["action_backend_migrated"] = self._backend_migrated
+
+        info["hands"] = self._hands
+        if self._hands != "off":
+            info["hand_model"] = HAND_MODEL
+            info["hand_keypoint_names"] = list(HAND_KEYPOINTS)
+            info["hand_note"] = (
+                "手部只在近处有效：从原生分辨率裁 ROI 上采样后约 3.5m 以内，"
+                "整帧模式只到 0.7m。远处招手请用身体层的 raising hand / "
+                "hand waving（见 {topic}/poses/gesture），它们从 COCO-17 读出来，"
+                "不依赖这个 engine。手部的失效方式是「自信地判错」而不是判不出来，"
+                "所以距离闸门是 hand_min_forearm_px 这个几何量，不是模型置信度")
+        # A card configured for hands and running without them, with the
+        # reason. Without this the card looks like it chose to have no hands.
+        if self._hand_load_error:
+            info["hand_engine_error"] = self._hand_load_error
 
         # A backend can construct fine and then fail on every inference — the
         # engine is fetched lazily, and there is no published action engine yet.
@@ -1645,6 +1848,17 @@ class PosePerceptionPlugin:
             self._gesture_cooldown_s = float(cfg["gesture_cooldown_s"])
         if "gesture_min_score" in cfg:
             self._gesture_min_score = float(cfg["gesture_min_score"])
+        if "hands" in cfg:
+            self._hands = _hand_level(cfg["hands"])
+        if "hand_interval_s" in cfg:
+            self._hand_interval_s = float(cfg["hand_interval_s"])
+        if "hand_max_rois" in cfg:
+            self._hand_max_rois = int(cfg["hand_max_rois"])
+        if "hand_min_forearm_px" in cfg:
+            self._hand_min_forearm_px = float(cfg["hand_min_forearm_px"])
+        if "publish_hand_keypoints" in cfg:
+            self._publish_hand_keypoints = _keypoint_level(
+                cfg["publish_hand_keypoints"])
         if "action_window_s" in cfg:
             self._action_window_s = float(cfg["action_window_s"])
         if "action_backend" in cfg:

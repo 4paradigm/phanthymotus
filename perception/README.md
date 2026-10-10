@@ -2760,6 +2760,93 @@ and the stream would then hold an unmatched open for as long as the gesture
 lasts. Reliability costs nothing on a topic that emits a handful of messages a
 minute.
 
+### The hand channel is off by default, and near-range only
+
+`hands: keypoints` adds 21 joints per hand from a **second** engine
+(`plugins/hand_runtime.py`). It is off unless asked for, and the engine is not
+even fetched until it is: on an 8 GB Orin already running vop, depth, OCR, ASR
+and TTS the binding constraint is memory, not GPU time.
+
+**It does not help with being called from across the room.** That is what
+`raising hand` and `hand waving` on the gesture topic are for — both are read
+from the COCO-17 skeleton, so they work at whatever distance the body is
+visible at. The hand channel is for near-range detail: which way a finger
+points, an open palm versus a fist.
+
+Measured on real photographs, with the hand occupying N pixels of the network
+input:
+
+| hand px | detected | shape error |
+|---|---|---|
+| 320 | 5/5 | 0.047 |
+| **200** | **5/5** | **0.023** |
+| 120 | 5/5 | 0.041 |
+| 100 | 4/5 | 0.169 |
+| 55 | 2/5 | 0.242 |
+
+So the usable band is 120–320 px and the card crops to land the hand at about
+31% of the input edge. A 1920x1080 frame letterboxed whole into the network
+puts a hand in that band only within ~0.7 m, which is why the channel crops the
+hand's neighbourhood out of the **native** frame and scales that up instead:
+same photographs, hand at 82 native px (roughly 3 m for a 70° lens on 1080p),
+whole-frame error 0.154 against 0.059 cropped.
+
+**The failure mode is a confident wrong answer, not a missing one.** At a
+100 px hand the model returned confidence 0.92 with a shape error of 0.169 —
+an average joint off by 17% of the hand's width, about a finger segment, which
+makes any extended/curled decision noise. Confidence stayed at 0.9 while the
+error tripled. That is why the distance gate is `hand_min_forearm_px` and not a
+confidence threshold: hand width is about 0.45 of forearm length, the forearm is
+already in COCO-17, and the gate therefore costs nothing and runs before the
+inference rather than after it.
+
+The budget, measured end-to-end per ROI on an **idle** Orin 5 (jp5.11) at the
+published 448 input: 11.26 ms, which is roughly what the whole body pass costs.
+Two hands every frame at 12 fps is 22.5 ms on top of the 41 ms the body channel
+spends with three people in frame, out of an 83 ms frame shared with everything
+else on the GPU. `hand_interval_s: 0.25` amortises the same two hands to
+7.5 ms/frame; the throttle is per hand and staggered by track id, so two people
+do not both pay on the same frame.
+
+Three things worth knowing before changing any of it:
+
+- **`hand_max_rois` is spent on the largest hands in frame.** Largest means
+  nearest, and a nearer hand is both likelier to be addressing the robot and the
+  only one fingers can be resolved on. Dropped candidates are counted as
+  `throttled` in `info` rather than vanishing.
+- **The body gate applies on every frame, not just the first.** The previous
+  frame's hand box makes the next crop tighter, but it does not decide whether
+  to crop at all — otherwise a hand would keep being tracked from a stale box
+  after the wrist went out of view, and the distance gate would hold for one
+  frame and then stop existing.
+- **Hand keypoints are appended to the skeleton payload, never interleaved.**
+  Indices 0–16 stay the body, 17–37 the left hand, 38–58 the right. `pose2d.js`
+  prefers a payload-carried `keypoint_names`/`skeleton` over its own copy, so
+  the renderer draws 59 joints with no frontend change — and any consumer
+  already indexing the first 17 keeps reading what it read before. The hand
+  names carry a `_hand_` infix because COCO-17 already has a `left_wrist` and
+  so does the hand set.
+
+`info` reports `hand_ran` and `hand_skipped` broken down by `too_far`,
+`wrist_occluded`, `elbow_occluded` and `throttled`, plus `hand_engine_error` if
+the engine could not be fetched at all. From outside, all five look like "no
+hands". A card whose hand engine fails keeps running **without** hands rather
+than refusing to start: the body channel is what answers "is somebody calling
+me", and losing that because a second engine could not be downloaded would be
+the wrong trade.
+
+The engines are built with `tools/export_vision_engines.py --model hand` from a
+pinned ONNX, inside a container off the target perception image. Two traps are
+recorded at `HAND_MODEL_BUNDLES` and are worth repeating here: a non-end2end
+export is one column narrower and `vision_runtime._pose_layout` accepts exactly
+that width as a valid layout, so thousands of un-suppressed anchors decode as
+thousands of hands with nothing raising — `hand_runtime.assert_end2end` is the
+guard, and it checks the output shape because a trtexec-built plan has no
+metadata to check. And the same weights exported by two different ultralytics
+versions disagree by about thirty times the fp16 quantisation difference while
+every size and SHA256 check still passes, so the exporter version is recorded
+beside the pins.
+
 ### Why the overlay is a third topic rather than drawn in the browser
 
 A dashboard renderer only ever sees **one** topic — `detail-panel.js` opens a
