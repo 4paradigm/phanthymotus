@@ -892,7 +892,7 @@ def is_alerting(verdict: dict) -> bool:
     """Is this person on the ground?
 
     Decided from the channels, never from `overlay_label`'s output: that is a
-    compound string once both channels are present ("lying · falling down"), so
+    compound string once both channels are present ("lying | falling down"), so
     testing it for membership in a label set silently stops matching.
     """
     activity = verdict.get("activity")

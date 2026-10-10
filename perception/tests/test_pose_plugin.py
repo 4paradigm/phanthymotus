@@ -961,7 +961,7 @@ def test_the_overlay_label_reads_the_two_channel_verdict():
     renderer keeps drawing after its data has moved underneath it."""
     assert pose_plugin.overlay_label(
         {"posture": "lying", "activity": {"name": "falling down"}}
-    ) == "lying · falling down"
+    ) == "lying | falling down"
     assert pose_plugin.overlay_label(
         {"posture": "standing", "activity": None}) == "standing"
     assert pose_plugin.overlay_label({"posture": None, "activity": None}) == "unknown"
@@ -1028,7 +1028,7 @@ def test_a_zero_interval_disables_the_throttle():
 
 def test_the_alert_colour_keys_on_the_channels_not_the_label():
     """`overlay_label` became a compound string once both channels are shown
-    ("lying · falling down"), so testing it for membership in a label set
+    ("lying | falling down"), so testing it for membership in a label set
     silently stopped matching and a fallen person was drawn in a track colour."""
     assert pose_plugin.is_alerting({"posture": "lying", "activity": None})
     assert pose_plugin.is_alerting(
