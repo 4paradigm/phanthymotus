@@ -23,6 +23,17 @@ import { getToken } from './auth.js';
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
 import { inputArgs, inputKey } from './topic-derive.js';
+// **静态 import,不是 handler 里的 `await import()`。** 停止的那三个事件是同一毫秒
+// 到的(backend 并行跑完健康的卡片),动态 import 的 then 要等一个微任务,于是
+// `project_stop_begin` 还没建好状态,紧随其后的 project_stop_item 全被
+// `if (_teardown)` 丢掉 —— 而 applyDone 把没有结果的项算作失败,界面于是报
+// 「6 台设备未停止」,后端日志同时写着 3/6。真机上复现过一次。
+import {
+  newTeardown as _newTeardown, applyItem as _applyTeardownItem,
+  applyDone as _applyTeardownDone, failedItems as _teardownFailed,
+  chipLabel as _teardownLabel, autoHideMs as _teardownAutoHide,
+  detailHtml as _teardownDetailHtml,
+} from './teardown-chip.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -362,32 +373,26 @@ export async function initCanvas(initialMcps) {
     } else if (event.type === 'project_stop_begin') {
       // 订阅是全局的，所以**哪个标签页点的停止都一样**显示收尾进度。以前连点的那个
       // 标签页都看不到任何东西。
-      import('./teardown-chip.js').then((tc) => {
-        _teardown = tc.newTeardown(event.payload?.cards || []);
-        _renderTeardown();
-      });
+      _teardown = _newTeardown(event.payload?.cards || []);
+      _renderTeardown();
     } else if (event.type === 'project_stop_item') {
       if (_teardown) {
-        import('./teardown-chip.js').then((tc) => {
-          tc.applyItem(_teardown, event.payload || {});
-          _renderTeardown();
-        });
+        _applyTeardownItem(_teardown, event.payload || {});
+        _renderTeardown();
       }
     } else if (event.type === 'project_stop_done') {
       if (_teardown) {
-        import('./teardown-chip.js').then((tc) => {
-          tc.applyDone(_teardown);
-          _renderTeardown();
-          const failed = tc.failedItems(_teardown);
-          if (failed.length) {
-            // 这条必须进活动流：芯片会被收起、页面会被刷新，而「有一台设备没停下来」
-            // 是之后排查时唯一的线索。
-            _logActivity('warn', `设备收尾：${failed.length} 台未停止（`
-              + `${failed.map((f) => f.tool).join('、')}）—— 可能仍在运行`);
-          } else {
-            _logActivity('project', '设备收尾完成，全部已停止');
-          }
-        });
+        _applyTeardownDone(_teardown);
+        _renderTeardown();
+        const failed = _teardownFailed(_teardown);
+        if (failed.length) {
+          // 这条必须进活动流：芯片会被收起、页面会被刷新，而「有一台设备没停下来」
+          // 是之后排查时唯一的线索。
+          _logActivity('warn', `设备收尾：${failed.length} 台未停止（`
+            + `${failed.map((f) => f.tool).join('、')}）—— 可能仍在运行`);
+        } else {
+          _logActivity('project', '设备收尾完成，全部已停止');
+        }
       }
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
@@ -2073,24 +2078,23 @@ function _teardownEls() {
   };
 }
 
-async function _renderTeardown() {
+function _renderTeardown() {
   const { chip, icon, text, caret, detail } = _teardownEls();
   if (!chip || !_teardown) return;
-  const tc = await import('./teardown-chip.js');
-  const label = tc.chipLabel(_teardown);
+  const label = _teardownLabel(_teardown);
   chip.classList.remove('hidden');
   chip.dataset.tone = label.tone;
   icon.textContent = label.icon;
   text.textContent = label.text;
-  detail.innerHTML = tc.detailHtml(_teardown);
+  detail.innerHTML = _teardownDetailHtml(_teardown);
   // 有失败就自动展开。把唯一需要动手的那条信息折起来，等于没报。
-  const failed = tc.failedItems(_teardown).length;
+  const failed = _teardownFailed(_teardown).length;
   if (_teardown.done && failed > 0) {
     detail.classList.remove('hidden');
     caret.textContent = '⌃';
   }
   if (_teardownHideTimer) { clearTimeout(_teardownHideTimer); _teardownHideTimer = null; }
-  const hideAfter = tc.autoHideMs(_teardown);
+  const hideAfter = _teardownAutoHide(_teardown);
   if (hideAfter) {
     _teardownHideTimer = setTimeout(() => {
       chip.classList.add('hidden');
