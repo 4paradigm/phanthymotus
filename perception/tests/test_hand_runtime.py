@@ -822,3 +822,70 @@ def test_the_hand_detector_has_its_own_threshold():
     assert DEFAULT_HAND_CONFIDENCE < 0.4
     channel = HandChannel(_HandSession(), max_rois=1)
     assert channel._confidence == DEFAULT_HAND_CONFIDENCE
+
+
+def test_a_hand_that_cannot_be_found_is_throttled_too():
+    """The throttle only ever applied to hands that were already working: a
+    miss cleared the cache, `_due` then saw no entry and said yes, and an
+    unfindable hand cost an inference on every frame — at two scales. On a
+    stream where one of two hands was marginal that measured as +49 ms per
+    frame."""
+    session = _HandSession(rows=[])
+    channel = HandChannel(session, max_rois=2, interval_s=1.0, hold_s=0.2,
+                          retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    first = session.calls
+    assert first == 2                       # both hands attempted once
+
+    for step in range(1, 10):               # ~0.75 s of frames, inside the interval
+        channel.update([_person()], _frame(), step * 1 / 12.0)
+    assert session.calls == first, "an unfindable hand was retried every frame"
+
+
+def test_the_throttle_lapses_for_a_missing_hand_too():
+    """It is a throttle, not a blacklist — a hand that comes back must be
+    found again."""
+    session = _HandSession(rows=[])
+    channel = HandChannel(session, max_rois=2, interval_s=0.25, hold_s=0.2,
+                          retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    calls = session.calls
+    channel.update([_person()], _frame(), 5.0)
+    assert session.calls > calls
+
+
+def test_the_hold_expires_on_the_last_success_not_the_last_attempt():
+    """Recording a failed attempt against the hold would keep a stale hand on
+    screen forever."""
+    channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
+                          hold_s=0.3, retry_scales=(1.0,))
+    channel.update([_person()], _frame(), 0.0)
+    channel._session = _HandSession(rows=[])
+    for step in range(1, 12):               # keeps attempting, never succeeds
+        p = _person()
+        channel.update([p], _frame(), step * 0.1)
+    assert p["hands"]["right"] is None, "a stale hand outlived its hold"
+
+
+# ── which hand the crop is for ───────────────────────────────────────────────
+
+def test_the_detection_nearest_the_crop_centre_wins_not_the_loudest():
+    """Reported as "with two hands it is completely scrambled, the hands
+    overlap". The crop is 3.2x the hand box and centred on where the arm says
+    the hand is, so hands held near each other put *both* in *both* crops —
+    and picking by score then lets the two crops land on the same hand."""
+    from plugins.hand_runtime import _nearest_to_centre
+
+    net = 448
+    #            the other hand, loud and off to the side | ours, centred
+    boxes = np.array([[20.0, 20.0, 120.0, 120.0],
+                      [174.0, 174.0, 274.0, 274.0]], dtype=np.float32)
+    assert _nearest_to_centre(boxes, net) == 1
+    # ...and the order must not matter
+    assert _nearest_to_centre(boxes[::-1], net) == 0
+
+
+def test_a_single_detection_is_always_taken():
+    from plugins.hand_runtime import _nearest_to_centre
+
+    assert _nearest_to_centre(np.array([[0.0, 0.0, 50.0, 50.0]], np.float32), 448) == 0

@@ -524,10 +524,14 @@ class HandChannel:
         self._target_fraction = float(target_fraction)
         self._retry_scales = tuple(float(v) for v in retry_scales) or (1.0,)
         self._hold_s = max(0.0, float(hold_s))
-        #: (track_id, side) -> {"box": last box in frame pixels, "kpts": last
-        #: keypoints, "t": when it last ran}. The box is what makes the next
-        #: crop tighter than the arm extrapolation; the keypoints are what keep
-        #: the payload stable on the frames the throttle skips.
+        #: (track_id, side) -> {"box", "kpts", "t", "seen"}.
+        #:
+        #: Two timestamps, and they are not the same thing. `t` is the last
+        #: *attempt* and drives the throttle; `seen` is the last *success* and
+        #: drives the hold. Sharing one made a hand that could not be found
+        #: cost an inference on every single frame — the throttle only ever
+        #: applied to hands that were already working — while a shared
+        #: timestamp updated on a miss would also mean the hold never expired.
         self._state: dict = {}
         #: Why hands were not produced, cumulative. Reported through `info`,
         #: because "no hands" has four innocent explanations and one broken one.
@@ -586,8 +590,13 @@ class HandChannel:
                     # Out of reach. The hand is held for the grace period and
                     # then forgotten — a wrist that blinks below the
                     # visibility threshold for one frame is not the person
-                    # turning away, but one that stays gone is.
+                    # turning away, but one that stays gone is. The whole
+                    # entry goes once there is nothing left to hold: with no
+                    # arm there is nothing to retry either, so there is no
+                    # attempt to throttle.
                     held = self._hold(key, now)
+                    if held is None:
+                        self._state.pop(key, None)
                     if held is not None:
                         person["hands"][side] = held
                     if reason:
@@ -638,34 +647,45 @@ class HandChannel:
                 # held for the grace period, because one miss is not the hand
                 # going away and dropping them instantly is what makes a live
                 # hand flicker.
-                entry = self._state.get(key)
-                if entry is not None:
-                    entry.pop("box", None)
+                # Record the attempt so the throttle applies to a hand that
+                # cannot be found, not only to one that can. Without this a
+                # hand the engine keeps missing is retried every frame — at
+                # two scales — which measured as +49 ms per frame on a stream
+                # where one of the two hands was marginal.
+                entry = self._state.setdefault(key, {})
+                entry.pop("box", None)
+                entry["t"] = now
                 held = self._hold(key, now)
                 if held is not None:
                     person["hands"][side] = held
                 continue
             roi, boxes, scores, keypoints = found
-            best = int(np.argmax(scores))
+            best = _nearest_to_centre(boxes, self.input_size)
             mapped = keypoints_to_frame(keypoints[best], roi, self.input_size)
             person["hands"][side] = mapped
             self._state[key] = {
                 "box": box_to_frame(boxes[best], roi, self.input_size),
                 "kpts": mapped,
-                "t": now,
+                "t": now,        # last attempt  -> throttle
+                "seen": now,     # last success  -> hold
             }
 
     def _hold(self, key, now: float):
         """The last known keypoints for this hand, while they are still fresh.
 
-        Returns None and forgets the entry once the grace period has passed,
-        so a hand that is really gone does stop being reported.
+        Measured against `seen` (the last success), not `t` (the last
+        attempt), or recording a failed attempt would keep the hold alive
+        forever.
+
+        The entry itself survives an expired hold: it still carries `t`, which
+        is what stops an unfindable hand from being retried on every frame.
+        Only the stale keypoints are dropped.
         """
         entry = self._state.get(key)
         if entry is None:
             return None
-        if self._hold_s <= 0 or (now - float(entry.get("t", 0.0))) > self._hold_s:
-            self._state.pop(key, None)
+        if self._hold_s <= 0 or (now - float(entry.get("seen", 0.0))) > self._hold_s:
+            entry.pop("kpts", None)
             return None
         return entry.get("kpts")
 
@@ -781,6 +801,33 @@ def hands_in_frame(session, frame, *, confidence: float = 0.4,
         refined.append((keypoints_to_frame(kpts2[pick], roi, net),
                         float(scores2[pick])))
     return refined[:max_hands]
+
+
+def _nearest_to_centre(boxes, net: int) -> int:
+    """Which detection in this crop is the hand the crop was cut for.
+
+    **Not the highest-scoring one.** The crop is 3.2x the estimated hand box
+    and is centred on where the arm says the hand is, so when a person holds
+    their hands near each other — in front of the chest, or one over the
+    other — both crops contain both hands. Picking by score then lets the two
+    crops pick the *same* hand, and the card reports two skeletons stacked on
+    one hand while the other has none.
+
+    The crop's own centre is the prior: we cut it there because that is where
+    the hand should be. A detection far from it is somebody else's hand, or
+    the other one. This is the same trade the distance gate makes — geometry
+    is reliable here and the score is not, and the score cannot even express
+    "this is the wrong hand" because it is a perfectly good hand.
+    """
+    centre = net / 2.0
+    best, best_d = 0, None
+    for i, box in enumerate(boxes):
+        cx = (float(box[0]) + float(box[2])) / 2.0
+        cy = (float(box[1]) + float(box[3])) / 2.0
+        d = (cx - centre) ** 2 + (cy - centre) ** 2
+        if best_d is None or d < best_d:
+            best, best_d = i, d
+    return best
 
 
 def _identity_meta(size: int):
