@@ -224,9 +224,21 @@ def test_the_distance_gate_is_configurable():
                          min_forearm_px=50.0)[1] is None
 
 
-def test_the_default_gate_is_about_forty_pixels_of_hand():
-    """Where the measured curve starts losing detections outright."""
-    assert DEFAULT_MIN_FOREARM_PX * HAND_PER_FOREARM == pytest.approx(40.5)
+def test_the_default_gate_is_about_forty_five_pixels_of_hand():
+    """Where the measured curve starts losing detections outright.
+
+    Asserted as a *product* on purpose: the gate and the hand/forearm ratio
+    have to move together. They were once consistent with each other and both
+    wrong — a 0.45 ratio with a 90 px gate — and a test on either number alone
+    would have passed throughout."""
+    assert DEFAULT_MIN_FOREARM_PX * HAND_PER_FOREARM == pytest.approx(45.0)
+
+
+def test_the_ratio_is_hand_length_not_hand_width():
+    """0.45 is hand width; what the crop must contain is the box the model
+    draws, which covers the fingers. Shipping the width halved every crop and
+    put the hand at 70% of it, the oversized end where detection collapses."""
+    assert HAND_PER_FOREARM > 0.7
 
 
 def test_the_previous_box_gives_a_tighter_roi():

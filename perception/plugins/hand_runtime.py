@@ -73,18 +73,41 @@ HAND_SKELETON = (
 #: does not silently move the hand out of the band it was chosen for.
 TARGET_HAND_FRACTION = 200.0 / 640.0
 
-#: Hand width as a multiple of forearm length, for turning a COCO-17 forearm
-#: into an expected hand size. Anthropometric and approximate; it only has to
-#: be good enough to put the crop in the right ballpark, because the crop is
-#: then sized from it and the model tolerates 120–320 px.
-HAND_PER_FOREARM = 0.45
+#: Hand size as a multiple of forearm length, for turning a COCO-17 forearm
+#: into the crop scale.
+#:
+#: **0.9, not 0.45.** This shipped at 0.45 and that was a reasoning error, not
+#: a tuning choice: 0.45 is hand *width*, while what the crop has to contain is
+#: what the model's box covers — the hand with its fingers extended, which is
+#: hand *length* and runs 0.75–1.0 of the forearm.
+#:
+#: It was wrong in the direction that hides itself. The crop came out about
+#: half the size it should be, so the hand filled 70% of it instead of 31%, and
+#: 70% is the oversized end of the measured band where detection collapses.
+#: Measured on Orin 5 against a real photograph of a person making a V sign
+#: with both hands, sweeping this constant and reading the engine's score:
+#:
+#:     ratio  left          right         hand as % of crop
+#:     0.45   miss          0.71          70%
+#:     0.65   0.69          0.75          49–60%
+#:     0.90   0.76          0.78          39%
+#:     1.20   0.77          0.72          32–35%
+#:
+#: One hand missed outright and the other scored while sitting right at the
+#: cliff — which looks like "the model is unreliable" rather than "the crop is
+#: half the size it should be". n is one subject and two hands, so 0.9 is a
+#: correction of a clear error rather than a tuned optimum.
+HAND_PER_FOREARM = 0.9
 
 #: Minimum forearm length in native frame pixels before a hand is attempted.
-#: 90 px of forearm is about 40 px of hand, which is where the measured curve
-#: starts losing detections outright. Exposed as config rather than frozen
-#: here: the pixel-to-distance mapping depends on the camera's field of view,
-#: which this process does not know.
-DEFAULT_MIN_FOREARM_PX = 90.0
+#: The floor that matters is about 45 px of *hand*, which is where the measured
+#: curve starts losing detections outright; at HAND_PER_FOREARM that is 50 px
+#: of forearm. (This was 90 px while HAND_PER_FOREARM was half its correct
+#: value — the two were consistent with each other and both wrong, so the gate
+#: moves with the ratio rather than independently of it.) Exposed as config
+#: rather than frozen here: the pixel-to-distance mapping depends on the
+#: camera's field of view, which this process does not know.
+DEFAULT_MIN_FOREARM_PX = 50.0
 
 #: How far past the wrist, along the forearm, the hand's centre is assumed to
 #: be — in forearm lengths. A hand hangs off the end of the arm, so centring

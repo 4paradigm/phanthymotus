@@ -1213,3 +1213,19 @@ def test_the_body_channel_survives_a_hand_engine_failure():
     lean = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])
     assert lean["count"] == 1
     assert lean["persons"][0]["posture"] == "standing"
+
+
+def test_info_reports_the_effective_hand_state_not_the_card_default():
+    """Found on Orin 5: a card switched on per instance reported `hands: off`
+    at the top level while plainly running hands, which is the same class of
+    mistake as a card looking like it chose to have no hands."""
+    plugin, _ = _plugin()                      # card level: hands off
+    plugin._hand_model = _FakeHandSession()
+    plugin.dispatch("pose", {"action": "config", "instance_id": "/cam/rgb",
+                             "hands": "keypoints", "hand_interval_s": 0})
+    plugin.dispatch("pose", {"action": "start", "instance_id": "/cam/rgb",
+                             "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pose", {"action": "info"})
+    assert info["instances"]["/cam/rgb"]["hands"] == "keypoints"
+    assert info["hands"] == "keypoints"
+    assert info["hand_model"] == pose_plugin.HAND_MODEL
