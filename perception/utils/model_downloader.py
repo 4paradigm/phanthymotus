@@ -1309,6 +1309,86 @@ POSE_MODEL_BUNDLES = {
 }
 
 
+# Hand keypoints for the pose card: 21 joints per hand, YOLO26s-pose fine-tuned
+# on the Ultralytics hand-keypoints dataset (26,768 images, 21 points, labels
+# generated with MediaPipe). Same architecture and same NMS-free one2one head as
+# the body pose engine, so `vision_runtime.decode_poses(..., n_kpts=21)` reads it
+# unchanged — the row width (6 + 3*21 = 69) is what picks the layout.
+#
+# **448, not 640.** The model wants the hand to occupy 120-320 px of its input
+# and the card crops the hand's neighbourhood out of the native frame to put it
+# there, so the input only has to be big enough to hold that band. Measured on
+# an idle Orin 5 (jp5.11), end-to-end per ROI including crop, upscale and decode:
+# 640 -> 17.43 ms, 448 -> 11.26 ms, 320 -> 7.95 ms. 320 was rejected: its
+# accuracy curve keeps up but it drops detections (3 of 4 at three different
+# hand sizes, against 4 of 4 for 448), and a hand that is not found is a hand
+# whose gesture never happens. Scaling is sublinear because about 4.1 ms of each
+# inference is fixed cost (H2D/D2H plus the sync), which is also why batching
+# several ROIs is worth ~27% and is left as a later change.
+#
+# **Exported with ultralytics 8.4.175, and that is recorded because it matters.**
+# The same weights exported by 8.4.33 and by 8.4.175 do not agree: measured
+# median NME 0.0145 with 1 of 70 finger extended/curled decisions flipped. For
+# scale, fp16-vs-fp32 on the engine is 0.0005 with 0 of 150 flipped — so the
+# version of the exporter moves the numbers roughly thirty times as much as the
+# quantisation does, while every size and SHA256 check still passes. Anyone
+# rebuilding this must use the same version or re-measure.
+#
+# Also: **8.4.175 needs `nms=True` to produce the end-to-end head at all.**
+# Without it the export is the raw head, which is `5 + 3*21 = 68` wide — and
+# `vision_runtime._pose_layout` accepts exactly that as its offset-5 layout,
+# with every content check passing, so several thousand un-suppressed anchors
+# decode as several thousand hands and nothing raises.
+# `plugins.hand_runtime.assert_end2end` is the guard; it cannot read the
+# `end2end` metadata flag because trtexec-built plans carry no ultralytics
+# header at all.
+#
+# fp16 is equivalent *inside* the operating band. One caveat at the edge: on
+# jp6.1 (TensorRT 10.4) one frame of 30 flipped a finger decision, at a hand of
+# 55 native pixels — past the distance gate, and where the model's own error is
+# already 6.5x larger than the quantisation difference. jp5.11 flipped none.
+HAND_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-hand21/tensorrt-jp61-trt10.4-orin-448",
+        "files": {
+            "yolo26s-hand21.engine": {
+                "size": 26074788,
+                "sha256": "e9234328fd16bbc4ce1fa8a3c70163e5fd3757dfe72562c3fc7e26b557be5d07",
+            },
+        },
+    },
+    # Built on Orin 5 in a container off the jp5.11 image (TensorRT 8.5.2.2).
+    # Not a rebuild of the same bytes: a different TensorRT produces a different
+    # plan, which is the whole reason this table is keyed by JetPack family.
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-hand21/tensorrt-jp511-trt8.5-orin-448",
+        "files": {
+            "yolo26s-hand21.engine": {
+                "size": 25305865,
+                "sha256": "e20daf227849f1f2bccc7606300d61b6a813fffaf9a8982a3d5cc150ca501bf6",
+            },
+        },
+    },
+}
+
+
+# The ONNX both plans were built from, mirrored so the engine build is
+# reproducible without re-running an export on somebody's laptop — the same
+# reason ACTION_CHECKPOINT is mirrored. **Build-time only; no robot fetches
+# this.** It is also the artefact that makes the exporter-version note above
+# checkable: rebuild from this file and the plan is comparable, re-export from
+# the .pt with a different ultralytics and it is not.
+HAND_ONNX = {
+    "yolo26s-hand21-448.onnx": {
+        "size": 42901907,
+        "sha256": "f0008d8b6935750c52f79e3e39b2025c11869bd0e233bb2225105436bd5479b3",
+    },
+}
+
+HAND_ONNX_BASE = os.environ.get(
+    "HAND_ONNX_BASE_URL", f"{VISION_MODEL_BASE}/yolo26s-hand21/onnx")
+
+
 # Skeleton-action recognition for the pose card: ST-GCN++, joint stream,
 # NTU60-XSub, 2D 17-keypoint input. 1.39 M params and 1.95 GFLOPs at 100 frames,
 # top-1 89.3% — the smallest of the options with a published 2D-COCO17
@@ -1447,6 +1527,31 @@ def ensure_action_model(model_dir: str, family: str | None = None,
     """Ensure the skeleton-action engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("action", ACTION_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+
+def ensure_hand_model(model_dir: str, family: str | None = None,
+                      progress_cb=None) -> dict[str, str]:
+    """Ensure the 21-keypoint hand engine matching the runtime TensorRT is present.
+
+    Fetched lazily and only when the pose card's `hands` setting asks for it:
+    on an 8 GB Orin already running body pose, vop, depth, OCR, ASR and TTS,
+    memory rather than GPU time is the binding constraint, so a card whose hand
+    channel is off must cost nothing.
+    """
+    return _ensure_vision_bundle("hand", HAND_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_hand_onnx(model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Fetch the ONNX the hand engines are built from. Build-time only.
+
+    Nothing on a robot calls this; it is an input to
+    tools/export_vision_engines.py --model hand, and the reason an engine can be
+    rebuilt without re-exporting from the .pt (which would change the numbers if
+    the ultralytics version differs — see HAND_MODEL_BUNDLES).
+    """
+    return ensure_verified_bundle("hand/onnx", model_dir, HAND_ONNX_BASE,
+                                  HAND_ONNX, progress_cb=progress_cb)
 
 
 def ensure_pose_model(model_dir: str, family: str | None = None,
