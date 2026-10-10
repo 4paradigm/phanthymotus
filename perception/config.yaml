@@ -539,3 +539,38 @@ plugins:
     # Detection rate: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
+
+  # Second, independent face stack (next to face_recognition above). Answers
+  # the `face.` tool prefix; SCRFD-2.5G-KPS detection + EdgeFace-Base Linear
+  # INT8 recognition (25.6 MB combined, inside the 30 MB budget), weights auto-
+  # download from the platform COS — FACE_MODEL_BASE_URL overrides.
+  face:
+    # Off by default until the pinned weights (FACE_SCRFD_*_BUNDLES in
+    # utils/model_downloader.py) are published and verified at the COS
+    # location — enabled-without-weights means every startup lands in
+    # state=error. Flip to true the moment the artifacts are live.
+    # image_roots / max_image_bytes also accepted here (shared local-path
+    # confinement, plugins/image_input.py; default /models /tmp /work, 64 MB).
+    enabled: false
+    provider: local
+    url: ""
+    key: ""
+    model: edgeface_base.int8    # single-file Linear INT8, 22.4 MB
+    detector: scrfd_2.5g         # eval-proven best: IoU ~1.0, detection was never the bottleneck
+    # Providers are per-session and fail-open: CPU is the fallback entry of every
+    # provider list, so no `device` value can block startup — hosts and images
+    # without CUDA warn and stay on CPU.
+    device: cpu
+    detector_device: cpu         # GPU is opt-in: SCRFD-2.5G is all-FP32 and the only session
+                                 # CUDA speeds up, but it costs a ~300 MB CUDA context per
+                                 # process — cpu keeps the 10-container budget safe (gpu also
+                                 # runs its forwards in the shared ORT worker now).
+    recognizer_device: cpu       # EdgeFace INT8 stays on CPU: its dynamic-quant graph
+                                 # partitions across ORT's CUDA EP with 129 inserted Memcpy
+                                 # nodes — same accuracy, worse latency on GPU. (Same reason
+                                 # ASR keeps int8 on cpu: README "Why int8 loses on the GPU".)
+    model_dir: /models/face
+    face_db_dir: /models/face_db # /models is the only host-mounted writable path (service.yml)
+    similarity_threshold: 0.39   # best of the eval sweep: identity accuracy 0.977
+    confidence: 0.5              # det threshold; zero-det frames retry once @0.3 on 2x upscale
+    fps: 3

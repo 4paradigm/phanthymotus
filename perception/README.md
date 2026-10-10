@@ -2288,6 +2288,33 @@ transcribed and TTS still speaks with the card running.
 
 ---
 
+## Face: `face_scrfd` (SCRFD-2.5G + EdgeFace INT8)
+
+A second, independent face plugin that leaves `face_recognition` above untouched:
+config key `plugins.face`, tool prefix `face.`, code in `plugins/face_scrfd.py`
+plus `plugins/face_corpus.py`.
+
+- **Models**: SCRFD-2.5G-KPS detection (3.3 MB) + EdgeFace-Base Linear INT8
+  recognition (22.4 MB) — 25.6 MB combined, inside the 30 MB budget. Weights
+  prefetch at construction, in the background, so the first frame is not
+  lost to a cold fetch (progress shows in `info()`); they come from the
+  platform COS (`public/face/scrfd_edgeface/`, same hosting pattern as
+  buffalo_sc), and `FACE_MODEL_BASE_URL` overrides the source — a
+  comma-separated list is tried fastest-first, each candidate pinned by the
+  same size + SHA256. `enabled` ships false and flips to true
+  once those artifacts are published — an enabled card without weights is a
+  permanent error state.
+- **Identities** persist under `face_db_dir` (default `/models/face_db`, the
+  writable mount) across restarts; corpus/stream/visit actions follow the
+  leaderboard contract (one face object, `[0-1]` normalized `bbox`).
+- **Devices**: `detector_device` may take CUDA; the INT8 recognizer stays CPU —
+  its dynamic-quant graph partitions badly on the CUDA EP. Every provider list
+  ends on CPU, so no `device` value can block startup.
+- **Tests**: `tests/test_face_candidates.py`, `tests/test_face_corpus.py`,
+  `tests/test_face_registration.py`, `tests/test_face_stream.py` — the
+  pixel-content ones skip on hosts with the fake cv2 and run for real inside the
+  perception image.
+
 ## Vision: `vop` (detection) and `visual_depth` (depth)
 
 Both run a **prebuilt TensorRT engine** fetched as a pinned bundle

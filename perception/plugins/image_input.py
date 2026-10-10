@@ -41,6 +41,7 @@ __all__ = [
     "load_image_bytes",
     "read_local",
     "fetch_url",
+    "open_url",
     "check_under_roots",
     "image_roots",
 ]
@@ -127,6 +128,20 @@ class _Redirect308(urllib.request.HTTPRedirectHandler):
     def http_error_308(self, req, fp, code, msg, headers):
         return self.http_error_301(req, fp, 301, msg, headers)
 
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Every redirect target is revalidated against the module policy.
+
+        urllib's own allow-list includes ftp:, so without this an http(s) URL
+        could hand this container — unauthenticated MCP, uid 0 — to an ftp
+        endpoint. The scheme check on the initial URL is not enough: the
+        redirect is where the caller stops controlling the destination.
+        """
+        if not str(newurl).lower().startswith(("http://", "https://")):
+            raise urllib.error.HTTPError(
+                newurl, code, f"redirect to non-http(s) URL refused: {newurl!r}",
+                headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
 
 _OPENER = urllib.request.build_opener(_Redirect308())
 
@@ -144,6 +159,23 @@ def fetch_url(url: str, max_bytes: int) -> bytes:
     if not data:
         raise BadInput(f"{url!r} returned no data", url)
     return data
+
+
+def open_url(url: str, timeout: int = 20):
+    """Open an http(s) URL under the shared policy, for streaming consumers.
+
+    `fetch_url` is the buffered form (images are small); this is for payloads
+    too large to hold in memory — the face corpus accepts archives up to
+    512 MB and copies them to disk. Same policy either way: only http(s), and
+    redirects ride urllib's own scheme check, so one place decides what a
+    caller may make this container fetch. The caller owns reading and capping.
+    """
+    if not str(url).lower().startswith(("http://", "https://")):
+        raise BadInput(f"only http(s) URLs are supported: {url!r}", url)
+    try:
+        return _OPENER.open(url, timeout=timeout)
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise BadInput(f"cannot fetch {url!r}: {error}", url) from error
 
 
 def load_image_bytes(args: dict, cfg: dict,

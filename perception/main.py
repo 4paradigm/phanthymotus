@@ -11,6 +11,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   ocr              文字识别（RapidOCR + TensorRT）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
+  face             人脸识别与建库（SCRFD-2.5G + EdgeFace INT8；独立于上面，默认关闭）
 
 每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
 不出现在 dashboard 上，这一点是看得见的。
@@ -224,6 +225,21 @@ class PerceptionBundle:
                 log.info("FaceRecognitionPlugin loaded")
             except Exception:
                 log.error("FaceRecognitionPlugin failed to load; continuing without it",
+                          exc_info=True)
+
+        if plugins_cfg.get("face", {}).get("enabled", False):
+            # The SCRFD + EdgeFace stack in plugins/face_scrfd.py. A separate
+            # plugin from the face_recognition above, answering the `face.` tool
+            # prefix. The *import* is inside the guard too: this plugin pulls
+            # cv2/rclpy/helper modules an image may not have, and "optional"
+            # has to include that failure mode — the card simply not appearing
+            # beats taking PerceptionBundle down with it.
+            try:
+                from plugins.face_scrfd import FaceRecognitionPlugin as FaceScrfdPlugin
+                self._plugins.append(FaceScrfdPlugin(plugins_cfg["face"], executor))
+                log.info("FaceScrfdPlugin loaded")
+            except Exception:
+                log.error("FaceScrfdPlugin failed to load; continuing without it",
                           exc_info=True)
 
     def _plugin_for(self, full_name: str):
