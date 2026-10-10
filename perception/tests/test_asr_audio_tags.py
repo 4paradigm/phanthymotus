@@ -9,6 +9,9 @@ SenseVoice-small 的解码结果里 `emotion` / `event` / `lang` 三个字段**�
 * **没信息的取值必须被压掉。** `NEUTRAL` / `EMO_UNKNOWN` / `Speech` 不是信息。
   每句话都挂一个 `"emotion": "NEUTRAL"`，LLM 要为它付 token，还会把「模型没判断
   出情绪」读成「这个人语气平淡」—— 那是两件不同的事。
+* **情绪默认不发。** 351 段真机语音实测：340 段中性/未知，剩下 11 段基本是误判
+  （「小范小范，你好呀。」→ SAD，三次）。默认值要对得起测出来的东西，所以这里守的
+  是「默认关」和「打开了要真的一路传到适配器」两件事 —— 后者错了就是开关开了没用。
 * **tag 走返回值，不走适配器上的状态。** `ASRPlugin._adapter` 是被所有 node 共享
   的**一个**实例，每个 node 有自己的 worker 线程。挂在实例上的情绪会在两个麦克风
   同时转写时串到另一句话上，而那不会报错也不会有日志。
@@ -55,23 +58,34 @@ def test_strip_tag_passes_through_anything_else():
 
 def test_informative_tags_become_fields():
     fields = asr_module._audio_tag_fields(
-        lang="<|zh|>", emotion="<|HAPPY|>", event="<|Laughter|>")
+        lang="<|zh|>", emotion="<|HAPPY|>", event="<|Laughter|>",
+        include_emotion=True)
     assert fields == {"lang": "zh", "emotion": "HAPPY",
                       "audio_event": "Laughter"}
+
+
+def test_emotion_is_off_unless_asked_for():
+    """实测 351 段真机语音：97% 中性/未知，剩下 3% 基本是误判。默认不发。"""
+    fields = asr_module._audio_tag_fields(
+        lang="<|zh|>", emotion="<|SAD|>", event="<|Laughter|>")
+    assert fields == {"lang": "zh", "audio_event": "Laughter"}
 
 
 @pytest.mark.parametrize("emotion", ["<|NEUTRAL|>", "<|EMO_UNKNOWN|>",
                                      "<|UNKNOWN|>", ""])
 def test_uninformative_emotion_is_dropped(emotion):
+    """打开了情绪也一样：没判断出情绪 ≠ 语气平淡。"""
     fields = asr_module._audio_tag_fields(lang="<|zh|>", emotion=emotion,
-                                          event="<|Speech|>")
+                                          event="<|Speech|>",
+                                          include_emotion=True)
     assert "emotion" not in fields, "没判断出情绪 ≠ 语气平淡"
 
 
 def test_speech_event_is_dropped_but_lang_is_kept():
     """说话这件事由 text 本身证明；语种每次都有值，而值本身是信息。"""
     fields = asr_module._audio_tag_fields(
-        lang="<|en|>", emotion="<|NEUTRAL|>", event="<|Speech|>")
+        lang="<|en|>", emotion="<|NEUTRAL|>", event="<|Speech|>",
+        include_emotion=True)
     assert fields == {"lang": "en"}
 
 
@@ -146,10 +160,17 @@ def _wav(n_samples: int = 1600) -> bytes:
 def test_sensevoice_returns_text_and_tags():
     adapter = _sensevoice_adapter(_FakeResult(
         " 哈哈哈 ", lang="<|zh|>", emotion="<|HAPPY|>", event="<|Laughter|>"))
-    text, tags = adapter.transcribe_rich(_wav(), "zh-CN")
+    text, tags = adapter.transcribe_rich(_wav(), "zh-CN", include_emotion=True)
     assert text == "哈哈哈"
     assert tags == {"lang": "zh", "emotion": "HAPPY",
                     "audio_event": "Laughter"}
+
+
+def test_sensevoice_omits_emotion_by_default():
+    adapter = _sensevoice_adapter(_FakeResult(
+        "你好", lang="<|zh|>", emotion="<|SAD|>", event="<|Laughter|>"))
+    _text, tags = adapter.transcribe_rich(_wav(), "zh-CN")
+    assert tags == {"lang": "zh", "audio_event": "Laughter"}
 
 
 def test_sensevoice_transcribe_still_returns_only_text():
@@ -199,23 +220,31 @@ def test_tags_are_not_kept_on_the_adapter():
 # ── 发布路径 ─────────────────────────────────────────────────────────────────
 
 class _TagAdapter(asr_module.ASRAdapter):
+    """照 SenseVoice 适配器的契约行事，包括 include_emotion 这个参数。"""
+
     def __init__(self, text="小范小范 你好", tags=None):
         self._text = text
-        self._tags = tags or {"lang": "zh", "emotion": "HAPPY",
-                              "audio_event": "Laughter"}
+        self._tags = tags or {"lang": "zh", "audio_event": "Laughter"}
+        self.include_emotion_seen: list[bool] = []
 
     def transcribe(self, wav_bytes, language):
         return self._text
 
-    def transcribe_rich(self, wav_bytes, language):
-        return self._text, dict(self._tags)
+    def transcribe_rich(self, wav_bytes, language, include_emotion=False):
+        self.include_emotion_seen.append(include_emotion)
+        tags = dict(self._tags)
+        if include_emotion:
+            tags["emotion"] = "HAPPY"
+        return self._text, tags
 
 
-def _make_node(adapter, emit_audio_tags=True, kws_cfg=None):
+def _make_node(adapter, emit_audio_tags=True, emit_emotion=False,
+               kws_cfg=None):
     return asr_module._ASRNode(
         "/mic/audio", adapter=adapter, language="zh-CN",
         kws_cfg=kws_cfg if kws_cfg is not None else {"trigger_mode": "vad"},
         node_suffix="t", emit_audio_tags=emit_audio_tags,
+        emit_emotion=emit_emotion,
     )
 
 
@@ -244,17 +273,28 @@ def _run_one_utterance(node, timeout=5.0) -> dict:
 
 
 def test_foreground_payload_carries_the_tags():
-    published = _run_one_utterance(_make_node(_TagAdapter()))
+    adapter = _TagAdapter()
+    published = _run_one_utterance(_make_node(adapter))
     assert len(published["asr"]) == 1, published
     payload = published["asr"][0]
     assert payload["text"] == "小范小范 你好"
-    assert payload["emotion"] == "HAPPY"
     assert payload["audio_event"] == "Laughter"
     assert payload["lang"] == "zh"
+    assert adapter.include_emotion_seen == [False], "情绪默认不该被要"
+    assert "emotion" not in payload
+
+
+def test_emit_emotion_switch_reaches_the_adapter():
+    """开关必须一路传到适配器 —— 只改 node 上的字段而不传下去就是开了也没用。"""
+    adapter = _TagAdapter()
+    node = _make_node(adapter, emit_emotion=True)
+    payload = _run_one_utterance(node)["asr"][0]
+    assert adapter.include_emotion_seen == [True]
+    assert payload["emotion"] == "HAPPY"
 
 
 def test_emit_audio_tags_off_returns_to_text_only():
-    node = _make_node(_TagAdapter(), emit_audio_tags=False)
+    node = _make_node(_TagAdapter(), emit_audio_tags=False, emit_emotion=True)
     payload = _run_one_utterance(node)["asr"][0]
     assert payload["text"] == "小范小范 你好"
     for key in ("emotion", "audio_event", "lang"):
@@ -272,7 +312,7 @@ def test_a_plain_adapter_adds_no_keys():
 def test_background_payload_carries_the_tags():
     """旁边那个人的笑声/哭声，对后台 subagent 一样是信息。"""
     node = _make_node(
-        _TagAdapter(text="今天天气不错"),
+        _TagAdapter(text="今天天气不错"), emit_emotion=True,
         kws_cfg={"trigger_mode": "asr_kws", "asr_kws_keyword": "小范小范"})
     published = _run_one_utterance(node)
     assert published["asr"] == [], "没说唤醒词的话不该进主 agent"
@@ -307,3 +347,13 @@ def test_schema_declares_the_switch_only_for_sensevoice():
     assert field["default"] is True
     assert field["scope"] == "shared"
     assert field["x-show-when"] == {"asr_model": ["sensevoice-small"]}
+
+
+def test_schema_defaults_emotion_off():
+    """实测它是噪音；默认值要对得起测出来的东西。"""
+    schema = None
+    for tool in asr_module.TOOLS:
+        if "configSchema" in tool:
+            schema = tool["configSchema"]["properties"]
+            break
+    assert schema["emit_emotion"]["default"] is False

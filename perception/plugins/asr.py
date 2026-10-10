@@ -447,6 +447,13 @@ TOOLS = [
                 # 只对 sensevoice-small 有意义：别的模型的结果里没有这些字段，
                 # 开着也只是调一个返回空 dict 的默认实现。
                 "emit_audio_tags": {"type": "boolean", "description": "把 SenseVoice 顺带给出的语音情绪（HAPPY/SAD/ANGRY…）、音频事件（Laughter/Cry/Applause/BGM…）和语种一起发到 <topic>/asr。零额外模型、零额外内存：这些字段模型本来就算了，以前被丢掉。平淡的普通话只会多一个 lang 字段", "default": True, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"]}},
+                # 默认 **关**，而上面那个默认开。不是保守，是实测：Orin 6 上 351
+                # 段真机语音里 340 段是 NEUTRAL/EMO_UNKNOWN，剩下 11 段基本是错的
+                # （「小范小范，你好呀。」→ SAD，出现三次；「我的断网了？」→ HAPPY）。
+                # 一个挂在愉快问候上的 "emotion": "SAD" 比没有这个字段更糟 —— LLM
+                # 会据此改口气。开关留着，因为换一批说话人/换个场景也许不一样，而
+                # 要量就得能打开；但默认值要对得起测出来的东西。见 README。
+                "emit_emotion": {"type": "boolean", "description": "把 SenseVoice 的语音情绪（HAPPY/SAD/ANGRY…）也发出来。默认关：351 段真机语音实测，97% 是 NEUTRAL/EMO_UNKNOWN，剩下 3% 基本是误判（「你好呀」被判成 SAD），开着会让 LLM 按错的语气回应。要真的做情绪识别应该上 emotion2vec+ 独立卡片", "default": False, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"], "emit_audio_tags": [True]}},
                 "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
@@ -526,19 +533,24 @@ def _strip_tag(raw: str) -> str:
 
 
 def _audio_tag_fields(lang: str = "", emotion: str = "",
-                      event: str = "") -> dict:
+                      event: str = "", include_emotion: bool = False) -> dict:
     """把 SenseVoice 的三个 tag 变成要合进 payload 的字段。
 
     没信息的值不进 payload —— 理由见 `_UNINFORMATIVE_AUDIO_TAGS`。所以一句语气
     平淡的普通话只多出 `{"lang": "zh"}`，笑了才会多出 `audio_event`。
+
+    `include_emotion` 默认 **False**，因为 351 段真机语音实测下来这一项是噪音而
+    不是稀疏信号 —— 见 README「语音情绪和音频事件」。打开它是操作员的选择。
 
     `event` 叫 `audio_event` 而不是 `event`：agent-core 那边 `event` 是触发器/
     事件总线的词（`src/event/llm.py`、`config['event']`），payload 里再出现一个
     同名 key 只会让读日志的人以为是同一件事。
     """
     fields = {}
-    for key, raw in (("lang", lang), ("emotion", emotion),
-                     ("audio_event", event)):
+    pairs = [("lang", lang), ("audio_event", event)]
+    if include_emotion:
+        pairs.insert(1, ("emotion", emotion))
+    for key, raw in pairs:
         value = _strip_tag(raw)
         if not value or value in _UNINFORMATIVE_AUDIO_TAGS:
             continue
@@ -550,8 +562,8 @@ class ASRAdapter(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, language: str) -> str: ...
 
-    def transcribe_rich(self, wav_bytes: bytes,
-                        language: str) -> tuple[str, dict]:
+    def transcribe_rich(self, wav_bytes: bytes, language: str,
+                        include_emotion: bool = False) -> tuple[str, dict]:
         """转写，外加这个模型顺带算出的非文字信息（情绪 / 音频事件 / 语种）。
 
         返回 `(text, extras)`，`extras` 直接合进发布的 payload。默认是空 dict：
@@ -603,8 +615,9 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self.transcribe_rich(wav_bytes, language)[0]
 
-    def transcribe_rich(self, wav_bytes: bytes,
-                        language: str) -> tuple[str, dict]:
+
+    def transcribe_rich(self, wav_bytes: bytes, language: str,
+                        include_emotion: bool = False) -> tuple[str, dict]:
         """一次解码，文字和 tag 一起拿。
 
         `emotion` / `event` / `lang` 是 SenseVoice 的前几个输出 token，sherpa 在
@@ -630,7 +643,8 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         tags = _audio_tag_fields(
             lang=getattr(result, "lang", "") or "",
             emotion=getattr(result, "emotion", "") or "",
-            event=getattr(result, "event", "") or "")
+            event=getattr(result, "event", "") or "",
+            include_emotion=include_emotion)
         return result.text.strip(), tags
 
 
@@ -1268,7 +1282,8 @@ class _ASRNode(Node):
                  save_vad_segments: bool = False, max_saved_segments: int = 1000,
                  vad_pre_roll_ms: int = 500, speaker=None,
                  publish_background: bool = True,
-                 emit_audio_tags: bool = True):
+                 emit_audio_tags: bool = True,
+                 emit_emotion: bool = False):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -1300,6 +1315,8 @@ class _ASRNode(Node):
         self._publish_background_enabled = bool(publish_background)
         # 情绪 / 音频事件 / 语种是否进 payload。关掉就回到以前的行为：只发 text。
         self._emit_audio_tags = bool(emit_audio_tags)
+        # 情绪单独一个开关，默认关 —— 实测它是噪音，见 configSchema 里的说明。
+        self._emit_emotion = bool(emit_emotion)
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -1699,7 +1716,7 @@ class _ASRNode(Node):
                 _t0 = time.time()
                 if self._emit_audio_tags:
                     text, _audio_tags = self._adapter.transcribe_rich(
-                        wav, self._language)
+                        wav, self._language, self._emit_emotion)
                 else:
                     text = self._adapter.transcribe(wav, self._language)
                     _audio_tags = {}
@@ -1832,6 +1849,7 @@ class ASRPlugin:
         self._publish_background_enabled = bool(
             plugin_cfg.get('publish_background', True))
         self._emit_audio_tags = bool(plugin_cfg.get('emit_audio_tags', True))
+        self._emit_emotion = bool(plugin_cfg.get('emit_emotion', False))
         self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
         self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
         self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
@@ -1897,6 +1915,7 @@ class ASRPlugin:
         # same way and for the same reason.
         node._publish_background_enabled = self._publish_background_enabled
         node._emit_audio_tags = self._emit_audio_tags
+        node._emit_emotion = self._emit_emotion
 
     def _load_model_async(self, model_name: str):
         """Download and load ASR model in a background thread.
@@ -2110,7 +2129,8 @@ class ASRPlugin:
                                     vad_pre_roll_ms=self._vad_pre_roll_ms,
                                     speaker=self._speaker,
                                     publish_background=self._publish_background_enabled,
-                                    emit_audio_tags=self._emit_audio_tags)
+                                    emit_audio_tags=self._emit_audio_tags,
+                                    emit_emotion=self._emit_emotion)
                     try:
                         self._executor.add_node(node)
                     except Exception:
@@ -2180,6 +2200,8 @@ class ASRPlugin:
                 self._publish_background_enabled = bool(cfg['publish_background'])
             if 'emit_audio_tags' in cfg:
                 self._emit_audio_tags = bool(cfg['emit_audio_tags'])
+            if 'emit_emotion' in cfg:
+                self._emit_emotion = bool(cfg['emit_emotion'])
             if 'save_vad_segments' in cfg:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:

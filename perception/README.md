@@ -1553,8 +1553,9 @@ res.event     # '<|Laughter|>' / '<|Speech|>' / '<|BGM|>' …
 扔了。捡回来不加载任何模型、不多跑一次推理、不多占一字节显存 —— 这是它和另一条路
 （emotion2vec+ 作为独立卡片）唯一但决定性的区别。
 
-`emit_audio_tags`（默认开，只对 `sensevoice-small` 显示）把它们合进 `<topic>/asr`
-和 `<topic>/asr_background` 两条 payload：`emotion`、`audio_event`、`lang`。
+`emit_audio_tags`（默认 **开**，只对 `sensevoice-small` 显示）把 `lang` 和
+`audio_event` 合进 `<topic>/asr` 和 `<topic>/asr_background` 两条 payload。
+`emit_emotion` 是**第二个开关，默认关** —— 理由在下面，是量出来的，不是谨慎。
 
 ### 没信息的取值被压掉，而不是照发
 
@@ -1587,15 +1588,58 @@ worker 线程。两个麦克风同时转写时，挂在实例上的状态会把�
 三个字段都用 `getattr(..., "")` 取：它们来自 sherpa 的 C++ binding，换个版本少一个
 就直接取属性会让整条 ASR 路径抛异常。少一个 tag 不值得让机器人听不见。
 
-### 情绪这一项的实测价值还没测
+### 三个字段的实测价值差得很远（351 段真机语音）
 
-合成音上拿到的是 `<|EMO_UNKNOWN|>`。SenseVoice 的情绪标注本身偏弱，真实语音上大概
-率绝大多数是 `NEUTRAL`/`EMO_UNKNOWN`，所以这个字段**在真机上到底有多少条非空，还
-没量过**。音频事件（Laughter / Cry / Applause / BGM）比情绪可靠得多。
+Orin 6 上 `/models/vad_segments/` 攒的 351 段真实语音，全部过一遍
+`sensevoice-small` int8：
 
-如果实测下来情绪基本全空，那正是去做 emotion2vec+ 独立卡片的依据 —— 而不是说明这
-条改动没用：`audio_event` 和 `lang` 的成本已经是零。另外 `plugins/soundevent.py`
-在做非语音事件检测，两者在 Laughter/Applause 这类标签上重叠，谁更准也还没比过。
+| 字段 | 分布 | 结论 |
+|---|---|---|
+| `lang` | zh 212 / en 116 / ko 12 / ja 6 / yue 3 / nospeech 2 | 每条都有值，而且都对得上 —— **真有用** |
+| `emotion` | NEUTRAL 180 + EMO_UNKNOWN 160 = **340/351**；SAD 5、HAPPY 6 | 剩下那 11 条基本是**错的**，见下 |
+| `audio_event` | Speech 348 + Event_UNK 3 | 压掉之后**一条都不剩** |
+
+情绪那 11 条长这样：
+
+| 真实句子 | 判成 |
+|---|---|
+| 小范小范，你好呀。 | SAD（同一种误判出现 3 次） |
+| 我的断网了，我断网了吗？ | HAPPY |
+| 也行先试试看吧也好不？对嗯，那我看了一下，好像也没有特别慢吧。 | HAPPY |
+
+不是「信号稀疏」，是噪音。而且它的错误方式最坏：一个挂在愉快问候上的
+`"emotion": "SAD"` 会让 LLM 按一种不存在的低落语气回应 —— 比没有这个字段更糟。
+所以 `emit_emotion` 默认关。开关留着，因为换一批说话人、换个场景也许不一样，而要量
+就得能打开；但默认值要对得起测出来的东西。真要做情绪识别，该上的是 emotion2vec+
+独立卡片，而不是把这个字段当它用。
+
+`audio_event` 全是 `Speech` 还有一个**结构性**原因，不只是语料里没人笑：这些段是
+**VAD 门控之后**的语音段，纯笑声/掌声/音乐根本走不到 ASR。所以在这条管道里，这个
+字段只可能在笑声**混在说话里**时触发。它默认开着是因为成本已经是零，不是因为验证
+过它会响。要检非语音事件，`plugins/soundevent.py` 才是直接订阅原始音频的那个；两者
+在 Laughter/Applause 这类标签上重叠，谁更准没比过。
+
+复现这个测量（只读，不动容器里的代码）：
+
+```bash
+# 拿 351 段真机语音过一遍，统计三个 tag 的分布
+ssh nvidia@10.100.121.16 'docker exec embodied-perception python3 - <<EOF
+import glob, wave, struct, collections, sherpa_onnx
+r = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+    model="/models/sherpa-onnx/sensevoice/model.int8.onnx",
+    tokens="/models/sherpa-onnx/sensevoice/tokens.txt",
+    num_threads=2, use_itn=True, language="auto")
+tally = collections.Counter()
+for f in sorted(glob.glob("/models/vad_segments/*.wav")):
+    with wave.open(f) as wf: pcm = wf.readframes(wf.getnframes())
+    n = len(pcm) // 2
+    st = r.create_stream()
+    st.accept_waveform(16000, [v/32768.0 for v in struct.unpack(f"<{n}h", pcm)] + [0.0]*8000)
+    r.decode_streams([st])
+    if st.result.text.strip(): tally[(st.result.emotion, st.result.event)] += 1
+print(tally)
+EOF'
+```
 
 ---
 
