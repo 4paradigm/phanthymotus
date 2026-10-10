@@ -41,7 +41,7 @@ def test_known_library_resolves_without_subprocess(monkeypatch):
                         lambda name: calls.append(name) or "forked")
     monkeypatch.setattr(asr_module, "_FORK_FREE_LIBRARIES",
                         {"dl": ("/dev/null",)})
-    with asr_module._find_library_without_forking():
+    with asr_module._import_without_forking():
         assert ctypes.util.find_library("dl") == "/dev/null"
     assert calls == [], f"仍然 fork 了：{calls}"
 
@@ -51,20 +51,20 @@ def test_missing_candidate_falls_back_to_the_real_lookup(monkeypatch):
     monkeypatch.setattr(ctypes.util, "find_library", lambda name: f"real:{name}")
     monkeypatch.setattr(asr_module, "_FORK_FREE_LIBRARIES",
                         {"dl": ("/nonexistent/libdl.so.2",)})
-    with asr_module._find_library_without_forking():
+    with asr_module._import_without_forking():
         assert ctypes.util.find_library("dl") == "real:dl"
 
 
 def test_unknown_library_is_untouched(monkeypatch):
     monkeypatch.setattr(ctypes.util, "find_library", lambda name: f"real:{name}")
-    with asr_module._find_library_without_forking():
+    with asr_module._import_without_forking():
         assert ctypes.util.find_library("sqlite3") == "real:sqlite3"
 
 
 def test_the_patch_is_restored(monkeypatch):
     sentinel = lambda name: "sentinel"          # noqa: E731
     monkeypatch.setattr(ctypes.util, "find_library", sentinel)
-    with asr_module._find_library_without_forking():
+    with asr_module._import_without_forking():
         assert ctypes.util.find_library is not sentinel
     assert ctypes.util.find_library is sentinel
 
@@ -73,7 +73,7 @@ def test_the_patch_is_restored_after_an_exception(monkeypatch):
     sentinel = lambda name: "sentinel"          # noqa: E731
     monkeypatch.setattr(ctypes.util, "find_library", sentinel)
     try:
-        with asr_module._find_library_without_forking():
+        with asr_module._import_without_forking():
             raise RuntimeError("espeak exploded mid-import")
     except RuntimeError:
         pass
@@ -96,6 +96,20 @@ def test_dl_is_covered_on_linux():
         f"本机找不到 libdl，候选表要补：{candidates}"
 
 
+def test_processor_lookup_is_substituted_on_linux(monkeypatch):
+    """`platform.processor()` 跑 `uname -p`，joblib 在 import 时就调它。
+
+    子进程小不等于更安全 —— 挂的是 fork 本身、在 exec 之前，所以要 exec 什么无关。
+    """
+    import platform
+    monkeypatch.setattr(platform, "processor", lambda: "forked")
+    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+    with asr_module._import_without_forking():
+        expected = "aarch64" if sys.platform.startswith("linux") else "forked"
+        assert platform.processor() == expected
+    assert platform.processor() == "forked", "出了块必须还原"
+
+
 def test_two_threads_do_not_nest_the_patch():
     """两个 worker 线程同时音素化时，不能有线程在外层还活着时被还原。"""
     original = ctypes.util.find_library
@@ -103,7 +117,7 @@ def test_two_threads_do_not_nest_the_patch():
     barrier = threading.Barrier(2, timeout=5)
 
     def body():
-        with asr_module._find_library_without_forking():
+        with asr_module._import_without_forking():
             barrier.wait()
             seen_inside.append(ctypes.util.find_library is not original)
 

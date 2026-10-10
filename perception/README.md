@@ -1549,11 +1549,33 @@ when nothing else is loading. It needs the first phonemization (`_worker_inner`
 pre-computes the wake word's IPA at worker start) to land while another thread is
 busy — i.e. exactly what 「启动控制」 does by bringing TTS and ASR up together.
 
-`_find_library_without_forking()` therefore resolves the handful of libraries we
-actually need from a path list (`_FORK_FREE_LIBRARIES`) for the duration of the
-import, and restores `ctypes.util.find_library` afterwards. Anything not in the
-list falls through to the real implementation — returning `None` would be read as
-"not installed". Not a retry and not a timeout: there is no fork left to hang.
+**And it was not one fork, it was four.** Counted on Orin 5 by instrumenting
+`subprocess.Popen` around `from phonemizer.backend import EspeakBackend`:
+
+| | forks | what |
+|---|---|---|
+| before | **4** | `uname -p`, `/sbin/ldconfig -p`, `/usr/bin/gcc -Wl,-t -o /tmp/… -ldl`, `/usr/bin/objdump -p -j .dynamic …/libdl.so` |
+| after | **0** | — |
+
+The gcc/objdump pair is `ctypes.util`'s fallback path: `ldconfig -p` finds nothing,
+because `Dockerfile.jetson` replaces `ldconfig` with a no-op during apt installs and
+the cache is never rebuilt — *the same root cause as the espeak lookup above*. So
+what reads like one library lookup actually **compiles a program** to locate
+`libdl`. Three forks, one of them a compiler, in a process that must not fork.
+
+`uname -p` is `platform.processor()`, which `joblib` (imported by
+`phonemizer.backend.base`) calls at import time.
+
+`_import_without_forking()` therefore, for the duration of the import, resolves the
+handful of libraries we need from a path list (`_FORK_FREE_LIBRARIES`) and points
+`platform.processor` at `platform.machine` — both read `os.uname()` and both say
+`aarch64` on the Orins, and `uname -p` is the one that answers `unknown` on plenty
+of distributions. Both are restored afterwards; a library not in the list falls
+through to the real implementation, because returning `None` would be read as "not
+installed". Not a retry and not a timeout: there is no fork left to hang.
+
+A tiny child is not a safer child, which is why `uname -p` is in scope too: the hang
+is *in* fork, before exec, so the size of what would have been exec'd is irrelevant.
 
 Diagnosing the live wedge took `py-spy dump`, which is worth remembering because
 nothing else showed it — `docker logs` was silent, `docker top` showed one busy

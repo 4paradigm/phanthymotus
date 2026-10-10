@@ -13,8 +13,10 @@ import multiprocessing
 import contextlib
 import ctypes.util
 import os
+import platform
 import re
 import struct
+import sys
 import threading
 import time
 import wave
@@ -129,7 +131,7 @@ def _point_phonemizer_at_espeak() -> None:
 
 
 # Libraries we resolve by path rather than by forking `ldconfig` — see
-# `_find_library_without_forking`. Keyed by the name the caller passes to
+# `_import_without_forking`. Keyed by the name the caller passes to
 # `ctypes.util.find_library`; anything not listed here falls through to the real
 # implementation, fork and all.
 #
@@ -154,8 +156,8 @@ _PHONEMIZER_IMPORT_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
-def _find_library_without_forking():
-    """Resolve a few known libraries by path for the duration of a block.
+def _import_without_forking():
+    """Stop the `phonemizer` import shelling out, for the duration of a block.
 
     **`ctypes.util.find_library` forks.** On Linux it shells out to
     `ldconfig -p` through `subprocess`, and `dlinfo` — which `phonemizer` imports
@@ -178,8 +180,33 @@ def _find_library_without_forking():
     (「asr_kws and espeak」); that fix used PHONEMIZER_ESPEAK_LIBRARY to skip
     phonemizer's *own* `find_library`, which an env var cannot do for an import
     inside a third-party package.
+
+    Measured on Orin 5 — every fork during `from phonemizer.backend import
+    EspeakBackend`, with `subprocess.Popen` instrumented:
+
+        without this guard   4   uname -p
+                                 /sbin/ldconfig -p
+                                 /usr/bin/gcc -Wl,-t -o /tmp/… -ldl
+                                 /usr/bin/objdump -p -j .dynamic …/libdl.so
+        with it              0
+
+    The gcc/objdump pair is `ctypes.util`'s fallback: `ldconfig -p` finds
+    nothing, because `Dockerfile.jetson` replaces `ldconfig` with a no-op during
+    apt installs and the cache is never rebuilt — the same root cause as the
+    espeak lookup above. So what reads like one library lookup actually
+    *compiles a program* to find `libdl`: three forks, one of them a compiler,
+    in a process that must not fork at all.
+
+    `platform.processor()` is the fourth — it runs `uname -p`, and `joblib`
+    (imported by `phonemizer.backend.base`) calls it at import time.
+    `platform.machine()` is an exact substitute on Linux: both read `os.uname()`
+    and both say `aarch64` on the Orins, while `uname -p` is the one that
+    answers `unknown` on plenty of distributions. A tiny child is not a safer
+    child — the hang is *in* fork, before exec, so what would have been exec'd
+    does not matter.
     """
-    original = ctypes.util.find_library
+    original_find_library = ctypes.util.find_library
+    original_processor = platform.processor
 
     def resolver(name):
         for path in _FORK_FREE_LIBRARIES.get(name, ()):
@@ -187,20 +214,26 @@ def _find_library_without_forking():
                 return path
         # Unknown library: keep the stdlib behaviour rather than returning None,
         # which the caller would read as "not installed".
-        return original(name)
+        return original_find_library(name)
 
     ctypes.util.find_library = resolver
+    # macOS's processor() does not fork and does not equal machine() there, so
+    # the substitution is Linux-only. The find_library one above is harmless
+    # everywhere: it only ever answers for paths that exist.
+    if sys.platform.startswith("linux"):
+        platform.processor = platform.machine
     try:
         yield
     finally:
-        ctypes.util.find_library = original
+        ctypes.util.find_library = original_find_library
+        platform.processor = original_processor
 
 
 def _get_espeak_backend(lang):
     global _ESPEAK_SEP
     # The import is what forks, so the guard has to cover it. Everything else in
     # here is cheap and holding the lock across it keeps the patch un-nested.
-    with _PHONEMIZER_IMPORT_LOCK, _find_library_without_forking():
+    with _PHONEMIZER_IMPORT_LOCK, _import_without_forking():
         if _ESPEAK_SEP is None:
             _point_phonemizer_at_espeak()
             from phonemizer.separator import Separator
