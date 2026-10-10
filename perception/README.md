@@ -1563,19 +1563,33 @@ the cache is never rebuilt — *the same root cause as the espeak lookup above*.
 what reads like one library lookup actually **compiles a program** to locate
 `libdl`. Three forks, one of them a compiler, in a process that must not fork.
 
-`uname -p` is `platform.processor()`, which `joblib` (imported by
-`phonemizer.backend.base`) calls at import time.
+`uname -p` is **not** `platform.processor()` — that was the obvious guess, it was
+wrong, and patching `processor` measurably changed nothing (still 1 fork). The
+caller is `platform.system()` → `platform.uname()`, which fills its `processor`
+field via `platform._syscmd_uname`. `joblib`, imported by
+`phonemizer.backend.base`, calls `system()` at import time.
 
-`_import_without_forking()` therefore, for the duration of the import, resolves the
-handful of libraries we need from a path list (`_FORK_FREE_LIBRARIES`) and points
-`platform.processor` at `platform.machine` — both read `os.uname()` and both say
-`aarch64` on the Orins, and `uname -p` is the one that answers `unknown` on plenty
-of distributions. Both are restored afterwards; a library not in the list falls
-through to the real implementation, because returning `None` would be read as "not
-installed". Not a retry and not a timeout: there is no fork left to hang.
+So the fix has two halves:
 
-A tiny child is not a safer child, which is why `uname -p` is in scope too: the hang
-is *in* fork, before exec, so the size of what would have been exec'd is irrelevant.
+- **`_warm_platform_uname()` at module import.** `platform.uname()` caches, so one
+  call while perception is still loading plugins — nothing inferring, few threads —
+  serves every later caller from `_uname_cache`. This is what actually removes that
+  fork; the `noguard` count above drops 4 → 3 purely from the warm-up being in place.
+- **`_import_without_forking()` around the import.** Resolves the libraries we need
+  from a path list (`_FORK_FREE_LIBRARIES`) and makes `_syscmd_uname` return its
+  `default` instead of forking — which is exactly what `platform` does on a system
+  with no `uname` binary. Both are restored afterwards. A library not in the list
+  falls through to the real implementation, because returning `None` would be read
+  as "not installed". `_syscmd_uname` is private, so its absence is tolerated: a
+  CPython that drops it must not break ASR.
+
+Not a retry and not a timeout: there is no fork left to hang. A tiny child is not a
+safer child, which is why `uname -p` was in scope at all — the hang is *in* fork,
+before exec, so the size of what would have been exec'd is irrelevant.
+
+Verified on Orin 5: 「启动控制」's shape (TTS warmup and the ASR card started
+together) run 4 times in a row, phonemization completing in 5–9 s each time and MCP
+answering in under 130 ms throughout.
 
 Diagnosing the live wedge took `py-spy dump`, which is worth remembering because
 nothing else showed it — `docker logs` was silent, `docker top` showed one busy

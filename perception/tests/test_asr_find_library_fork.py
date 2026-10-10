@@ -24,6 +24,7 @@ Run: python -m pytest perception/tests -q
 from __future__ import annotations
 
 import ctypes.util
+import platform
 import sys
 import threading
 
@@ -96,18 +97,35 @@ def test_dl_is_covered_on_linux():
         f"本机找不到 libdl，候选表要补：{candidates}"
 
 
-def test_processor_lookup_is_substituted_on_linux(monkeypatch):
-    """`platform.processor()` 跑 `uname -p`，joblib 在 import 时就调它。
+@pytest.mark.skipif(not hasattr(platform, "_syscmd_uname"),
+                    reason="这个私有函数在较新的 CPython 上没有了；镜像是 3.8/3.10，"
+                           "有它，守卫在那里才有意义")
+def test_uname_lookup_does_not_fork_inside_the_block():
+    """第四次 fork 来自 `platform.uname()` 跑 `uname -p`，不是 `processor()`。
 
-    子进程小不等于更安全 —— 挂的是 fork 本身、在 exec 之前，所以要 exec 什么无关。
+    那是个显而易见的猜测，而且是错的：调用方是 `platform.system()` →
+    `platform.uname()` → `platform._syscmd_uname`。改 `processor` 实测毫无作用。
+    子进程小不等于更安全 —— 挂的是 fork 本身、在 exec 之前，要 exec 什么无关。
     """
-    import platform
-    monkeypatch.setattr(platform, "processor", lambda: "forked")
-    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+    original = platform._syscmd_uname
     with asr_module._import_without_forking():
-        expected = "aarch64" if sys.platform.startswith("linux") else "forked"
-        assert platform.processor() == expected
-    assert platform.processor() == "forked", "出了块必须还原"
+        assert platform._syscmd_uname is not original
+        assert platform._syscmd_uname("-p", "fallback") == "fallback", \
+            "块内必须不 fork，直接给 platform 自己的降级值"
+    assert platform._syscmd_uname is original
+
+
+def test_uname_cache_is_warm_after_import():
+    """真正的修法是 import 时就把缓存灌好，这样后面谁都不用 fork。"""
+    assert platform._uname_cache is not None, \
+        "plugins.asr 导入时应已调过 platform.uname()"
+
+
+def test_a_missing_syscmd_uname_is_tolerated(monkeypatch):
+    """那是私有 API —— 以后 CPython 拿掉它，不能让 ASR 跟着挂。"""
+    monkeypatch.delattr(platform, "_syscmd_uname", raising=False)
+    with asr_module._import_without_forking():
+        pass
 
 
 def test_two_threads_do_not_nest_the_patch():

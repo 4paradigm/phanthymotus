@@ -16,7 +16,6 @@ import os
 import platform
 import re
 import struct
-import sys
 import threading
 import time
 import wave
@@ -155,6 +154,24 @@ _FORK_FREE_LIBRARIES = {
 _PHONEMIZER_IMPORT_LOCK = threading.Lock()
 
 
+def _warm_platform_uname() -> None:
+    """Fill `platform`'s uname cache now, while this process is still small.
+
+    `platform.uname()` runs `uname -p` to fill its `processor` field, and caches
+    the result for the life of the process. Doing that once at import — perception
+    is loading plugins, nothing is inferring yet — means the later callers
+    (`joblib` during the phonemizer import, among others) are served from the
+    cache and never fork. See `_import_without_forking` for why a fork from the
+    loaded process is not survivable.
+
+    Never raises: a missing `uname` is not a reason for ASR to fail to load.
+    """
+    try:
+        platform.uname()
+    except Exception as error:  # noqa: BLE001 - informational only
+        log.debug("[asr] platform.uname() warm-up failed: %s", error)
+
+
 @contextlib.contextmanager
 def _import_without_forking():
     """Stop the `phonemizer` import shelling out, for the duration of a block.
@@ -197,16 +214,28 @@ def _import_without_forking():
     *compiles a program* to find `libdl`: three forks, one of them a compiler,
     in a process that must not fork at all.
 
-    `platform.processor()` is the fourth — it runs `uname -p`, and `joblib`
-    (imported by `phonemizer.backend.base`) calls it at import time.
-    `platform.machine()` is an exact substitute on Linux: both read `os.uname()`
-    and both say `aarch64` on the Orins, while `uname -p` is the one that
-    answers `unknown` on plenty of distributions. A tiny child is not a safer
-    child — the hang is *in* fork, before exec, so what would have been exec'd
-    does not matter.
+    `uname -p` is the fourth, and it is **not** `platform.processor()` — that was
+    the obvious guess and it was wrong. The caller is `platform.system()`, which
+    goes through `platform.uname()`, which fills its `processor` field by running
+    `uname -p` (`platform._syscmd_uname`). `joblib`, imported by
+    `phonemizer.backend.base`, calls `system()` at import time. Patching
+    `processor` therefore changed nothing — measured, still 1 fork.
+
+    `platform.uname()` caches, so `_warm_platform_uname()` at module import does
+    the real work: one fork while the process is small and quiet, and every later
+    caller is served from `_uname_cache`. The patch here is the belt to that
+    braces — if the warm-up ever fails, `_syscmd_uname` returns its `default`
+    instead of forking, which is exactly what `platform` itself does on a system
+    with no `uname` binary.
+
+    A tiny child is not a safer child, which is why `uname -p` is in scope at
+    all: the hang is *in* fork, before exec, so what would have been exec'd does
+    not matter.
     """
     original_find_library = ctypes.util.find_library
-    original_processor = platform.processor
+    # Private, so do not assume it exists — a future CPython may drop it, and
+    # losing this guard must not break ASR.
+    original_syscmd_uname = getattr(platform, "_syscmd_uname", None)
 
     def resolver(name):
         for path in _FORK_FREE_LIBRARIES.get(name, ()):
@@ -217,16 +246,17 @@ def _import_without_forking():
         return original_find_library(name)
 
     ctypes.util.find_library = resolver
-    # macOS's processor() does not fork and does not equal machine() there, so
-    # the substitution is Linux-only. The find_library one above is harmless
-    # everywhere: it only ever answers for paths that exist.
-    if sys.platform.startswith("linux"):
-        platform.processor = platform.machine
+    if original_syscmd_uname is not None:
+        platform._syscmd_uname = lambda option, default='': default
     try:
         yield
     finally:
         ctypes.util.find_library = original_find_library
-        platform.processor = original_processor
+        if original_syscmd_uname is not None:
+            platform._syscmd_uname = original_syscmd_uname
+
+
+_warm_platform_uname()
 
 
 def _get_espeak_backend(lang):
