@@ -147,12 +147,19 @@ def _feed(plugin, node_key, *, frames=1, interval=0.25, topic="/cam/rgb"):
 
 # ── tool declaration ─────────────────────────────────────────────────────────
 
-def test_the_card_declares_three_output_ports_with_distinct_formats():
-    """A renderer only ever sees one topic, so the lean JSON, the skeleton and
-    the overlay image cannot share a port."""
+def test_the_card_declares_four_output_ports():
+    """A renderer only ever sees one topic, so the lean JSON, the skeleton, the
+    gesture events and the overlay image each need their own port.
+
+    Two of them are `data/json` and that is correct: the format picks the
+    renderer, and a per-frame state payload and a sparse transition payload are
+    both text. What separates them is the rate — one publishes every frame and
+    the other only on a change, which is why they cannot be one port even
+    though they render the same way.
+    """
     tool = pose_plugin.TOOLS[0]
     formats = [port["format"] for port in tool["topic_out"]]
-    assert formats == ["data/json", "sensor/pose2d", "image/jpeg"]
+    assert formats == ["data/json", "sensor/pose2d", "data/json", "image/jpeg"]
     assert [port["format"] for port in tool["topic_in"]] == ["image/jpeg"]
     assert tool["type"] == "processor" and tool["multiInstance"] is True
 
@@ -453,16 +460,30 @@ def test_info_on_an_idle_card_reports_the_label_set():
     assert info["action_backend"] == "hybrid"       # the default
 
 
-def test_info_on_a_running_card_lists_both_output_topics():
+def test_info_on_a_running_card_lists_its_output_topics():
     plugin, _ = _plugin()
     plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
     info = plugin.dispatch("pose", {"action": "info"})
     assert info["state"] == "running"
     topics = {port["topic"]: port["format"] for port in info["topic_out"]}
     assert topics == {"/cam/rgb/poses": "data/json",
-                      "/cam/rgb/poses/skeleton": "sensor/pose2d"}
+                      "/cam/rgb/poses/skeleton": "sensor/pose2d",
+                      # On by default: it is the port a robot is meant to wire
+                      # into decision_core, and it is silent unless something
+                      # actually happens.
+                      "/cam/rgb/poses/gesture": "data/json"}
     instance = info["instances"]["/cam/rgb"]
     assert instance["overlay_output"] is None
+    assert instance["gesture_output"] == "/cam/rgb/poses/gesture"
+
+
+def test_info_omits_the_gesture_topic_when_it_is_switched_off():
+    plugin, _ = _plugin({"publish_gesture_events": False})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pose", {"action": "info"})
+    topics = {port["topic"] for port in info["topic_out"]}
+    assert "/cam/rgb/poses/gesture" not in topics
+    assert info["instances"]["/cam/rgb"]["gesture_output"] is None
 
 
 def test_info_lists_the_overlay_topic_once_it_is_enabled():
@@ -472,6 +493,169 @@ def test_info_lists_the_overlay_topic_once_it_is_enabled():
     assert [port["format"] for port in info["topic_out"]][-1] == "image/jpeg"
     assert (info["instances"]["/cam/rgb"]["overlay_output"]
             == "/cam/rgb/poses/overlay_img")
+
+
+# ── gesture events: the wiring ───────────────────────────────────────────────
+#
+# The state machine itself — dwell, release, cooldown, track loss — is covered
+# in tests/test_gesture_events.py against synthetic labels, and the rules that
+# produce those labels in tests/test_pose_action.py. What is left to check here
+# is only that the node is plumbed to it: the right topic, one message per
+# transition, real JSON on the wire, and the one-shot path kept out.
+
+def _gesture_person(track_id=1, activity="raising hand", score=0.9):
+    """A record in the shape `_describe` builds, with a gesture in it."""
+    return {
+        "id": track_id,
+        "score": 0.9,
+        "box": [100.0, 40.0, 220.0, 440.0],
+        "keypoints": np.zeros((N_KEYPOINTS, 3), dtype=np.float32),
+        "position": [0.1, -0.2],
+        "verdict": {"posture": "standing", "posture_confidence": 0.8,
+                    "activity": {"name": activity, "name_zh": "举手",
+                                 "score": score}},
+    }
+
+
+def _started(cfg=None, topic="/cam/rgb"):
+    merged = {"gesture_hold_s": 0.0}
+    merged.update(cfg or {})
+    plugin, _ = _plugin(merged)
+    plugin.dispatch("pose", {"action": "start", "input_topic": topic})
+    return plugin, plugin._nodes[topic]
+
+
+def _fire(node, persons, times=2):
+    """Publish enough frames for a gesture to be confirmed.
+
+    Two, not one, even with `gesture_hold_s` at zero: the first sighting of a
+    label only registers it as a candidate. That floor is deliberate — a single
+    frame of `raising hand` is exactly what an arm on its way somewhere else
+    produces — so a test that published once would be asserting the absence of
+    a guard we want.
+    """
+    for _ in range(times):
+        node._publish(persons)
+
+
+def test_a_gesture_transition_reaches_the_gesture_topic():
+    plugin, node = _started()
+    _fire(node, [_gesture_person()])
+    published = _publisher(node, "/cam/rgb/poses/gesture")
+    assert published is not None
+    assert len(published.messages) == 1
+    event = json.loads(published.messages[0])
+    assert event["event"] == "gesture_start"
+    assert event["gesture"] == "raising hand"
+    assert event["track"] == 1
+
+
+def test_the_gesture_event_carries_a_priority_on_the_wire():
+    """collector._PRIORITY_SOURCES has no `dds` entry, so this field is the
+    only thing that makes a wave reach the main agent rather than a background
+    batch. Asserted on the serialised payload, because that is what
+    topic_subscriber copies into the event bus verbatim."""
+    plugin, node = _started()
+    _fire(node, [_gesture_person()])
+    event = json.loads(_publisher(node, "/cam/rgb/poses/gesture").messages[0])
+    assert event["priority"] == 1
+
+
+def test_the_gesture_topic_stays_silent_while_the_gesture_is_held():
+    """The whole reason this is a separate topic: the lean port publishes every
+    frame and this one must not."""
+    plugin, node = _started()
+    for _ in range(20):
+        node._publish([_gesture_person()])
+    gesture = _publisher(node, "/cam/rgb/poses/gesture")
+    lean = _publisher(node, "/cam/rgb/poses")
+    assert len(gesture.messages) == 1
+    assert len(lean.messages) == 20
+
+
+def test_a_single_sighting_is_never_announced():
+    """Even with the dwell at zero. One frame of a label is what a limb passing
+    through a pose produces, and that is the case the dwell exists for."""
+    plugin, node = _started()
+    node._publish([_gesture_person()])
+    assert _publisher(node, "/cam/rgb/poses/gesture").messages == []
+
+
+def test_an_unlisted_activity_produces_no_event():
+    plugin, node = _started()
+    for _ in range(5):
+        node._publish([_gesture_person(activity="walking")])
+    assert _publisher(node, "/cam/rgb/poses/gesture").messages == []
+
+
+def test_the_whitelist_is_configurable_through_the_card():
+    plugin, node = _started({"gesture_whitelist": ["clapping"]})
+    _fire(node, [_gesture_person(activity="clapping")])
+    event = json.loads(_publisher(node, "/cam/rgb/poses/gesture").messages[0])
+    assert event["gesture"] == "clapping"
+
+
+def test_a_comma_separated_whitelist_is_split():
+    """The canvas's config form hands an array field back as a string; left
+    unsplit it would be one nonsense label matching nothing, and the gesture
+    stream would be silently empty."""
+    plugin, node = _started({"gesture_whitelist": "clapping, salute"})
+    assert node._gesture_tracker.gestures == ("clapping", "salute")
+
+
+def test_an_empty_whitelist_falls_back_to_the_default():
+    plugin, node = _started({"gesture_whitelist": []})
+    assert node._gesture_tracker.gestures == tuple(
+        sorted(pose_plugin.DEFAULT_GESTURES))
+
+
+def test_no_gesture_publisher_exists_when_the_topic_is_off():
+    plugin, node = _started({"publish_gesture_events": False})
+    assert _publisher(node, "/cam/rgb/poses/gesture") is None
+    # ...and publishing must not raise on the way past it.
+    node._publish([_gesture_person()])
+    assert len(_publisher(node, "/cam/rgb/poses").messages) == 1
+
+
+def test_the_tracker_still_advances_with_the_topic_off():
+    """So that switching the topic on mid-run does not inherit a state machine
+    which believes a gesture from minutes ago is still being held."""
+    plugin, node = _started({"publish_gesture_events": False})
+    _fire(node, [_gesture_person()])
+    assert node._gesture_count == 1
+
+
+def test_a_one_shot_photo_emits_no_gesture_event():
+    """Every threshold in the tracker is a duration over consecutive frames,
+    and a photo is one frame with made-up ids."""
+    plugin, node = _started()
+    for _ in range(4):
+        node.publish_persons([_gesture_person()])
+    assert _publisher(node, "/cam/rgb/poses/gesture").messages == []
+    assert len(_publisher(node, "/cam/rgb/poses").messages) == 4
+
+
+def test_stop_drops_gesture_state():
+    """A restart must not inherit a held gesture and an armed cooldown."""
+    plugin, node = _started({"gesture_cooldown_s": 60.0})
+    _fire(node, [_gesture_person()])
+    node.stop()
+    _fire(node, [_gesture_person()])
+    messages = _publisher(node, "/cam/rgb/poses/gesture").messages
+    kinds = [json.loads(m)["event"] for m in messages]
+    assert kinds.count("gesture_start") == 2
+
+
+def test_info_reports_what_the_gesture_channel_has_done():
+    """A silent gesture topic is otherwise indistinguishable between nobody
+    gesturing, a whitelist that excludes it, and a dwell nobody satisfies."""
+    plugin, node = _started()
+    _fire(node, [_gesture_person()])
+    instance = plugin.dispatch("pose", {"action": "info"})["instances"]["/cam/rgb"]
+    assert instance["gesture_event_count"] == 1
+    assert instance["gesture_whitelist"] == list(
+        sorted(pose_plugin.DEFAULT_GESTURES))
+    assert instance["recent_gestures"][-1]["gesture"] == "raising hand"
 
 
 def test_info_while_loading_says_so_without_an_engine():
