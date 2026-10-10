@@ -250,11 +250,42 @@ def test_an_occluded_wrist_is_refused_rather_than_guessed():
     assert roi is None and reason == "wrist_occluded"
 
 
-def test_an_occluded_elbow_is_refused_because_there_is_no_scale():
-    """The wrist alone gives a position but no size, and a guessed size is how
-    a crop ends up with the hand at 500 px — 3 of 5 detections lost."""
-    roi, reason = roi_from_body(_body(elbow_conf=0.1), "right", min_conf=0.3)
-    assert roi is None and reason == "elbow_occluded"
+def test_an_occluded_elbow_falls_back_to_the_shoulder():
+    """The elbow is a scale, not a position, and it is not the only one.
+    Requiring it refused every frame where it sat outside the picture or
+    behind the body — which is most selfies, and exactly when somebody has
+    stepped close to gesture at the robot."""
+    k = _body(elbow_conf=0.1)
+    k[COCO_INDEX["right_shoulder"]] = (400.0, 100.0, 0.9)
+    roi, reason = roi_from_body(k, "right", min_conf=0.3)
+    assert reason is None and roi is not None
+    assert roi.source == "shoulder_wrist"
+
+
+def test_with_no_elbow_and_no_shoulder_the_shoulder_width_answers():
+    k = _body(elbow_conf=0.1)
+    k[COCO_INDEX["right_shoulder"]] = (0.0, 0.0, 0.05)
+    k[COCO_INDEX["left_shoulder"]] = (200.0, 200.0, 0.9)
+    k[COCO_INDEX["right_shoulder"]] = (440.0, 200.0, 0.9)
+    roi, reason = roi_from_body(k, "right", min_conf=0.3)
+    assert reason is None and roi.source in ("shoulder_wrist", "shoulder_width")
+
+
+def test_with_no_scale_at_all_the_hand_is_refused():
+    """A guessed size is still worse than none — it is the one input that
+    makes the model confident and wrong."""
+    k = _body(elbow_conf=0.1)
+    for name in ("left_shoulder", "right_shoulder"):
+        k[COCO_INDEX[name]] = (0.0, 0.0, 0.05)
+    roi, reason = roi_from_body(k, "right", min_conf=0.3)
+    assert roi is None and reason == "no_scale"
+
+
+def test_the_wrist_has_no_substitute():
+    """Every other joint supplies a scale; only the wrist supplies the
+    position."""
+    roi, reason = roi_from_body(_body(wrist_conf=0.1), "right", min_conf=0.3)
+    assert roi is None and reason == "wrist_occluded"
 
 
 def test_a_short_forearm_is_too_far():

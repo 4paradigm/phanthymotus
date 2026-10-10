@@ -131,9 +131,13 @@ DEFAULT_MODEL = "yolo26s-pose"
 
 KEYPOINT_LEVELS = ("off", "compact", "full")
 
-#: What the hand channel can be set to. `gesture` adds the shape rules on top
-#: of the keypoints; it costs no inference, only arithmetic.
-HAND_LEVELS = ("off", "keypoints", "gesture")
+#: Values that used to mean "on". The channel was briefly a three-way choice
+#: — off / keypoints / keypoints-and-names — and that was a distinction only
+#: its author could care about: naming a shape is arithmetic on keypoints that
+#: have already been computed, so there was never a reason to offer the joints
+#: without the names. A card saved while it was offered keeps working, the
+#: same way the withdrawn `stgcn` backend is carried onto its replacement.
+_HANDS_ON_ALIASES = ("keypoints", "gesture", "on", "true", "yes", "1")
 
 #: Input size of the published hand engine, for `info`. Not configurable: the
 #: crop is sized to land the hand on a *fraction* of this, so a mismatched
@@ -214,9 +218,13 @@ def _gesture_whitelist(value) -> tuple:
     return kept or (tuple(DEFAULT_GESTURES) + tuple(DEFAULT_HAND_GESTURES))
 
 
-def _hand_level(value) -> str:
-    text = str(value or "").strip().lower()
-    return text if text in HAND_LEVELS else "off"
+def _hands_enabled(value) -> bool:
+    """Is the hand channel on? Accepts the old three-way strings."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _HANDS_ON_ALIASES
 
 
 def _keypoint_level(value) -> str:
@@ -300,7 +308,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 # ── everyday ────────────────────────────────────────────────
-                "hands": {"type": "string", "enum": list(HAND_LEVELS), "title": "Hand keypoints", "description": "Adds 21 points per hand. Off by default because it loads a second model. `gesture` also names the shape — open palm, fist, pointing, V, OK — which costs no extra inference. Works close up (roughly within 3.5 m); calling the robot from across a room is handled by the body gestures below and does not need this.", "default": "off", "scope": "instance"},
+                "hands": {"type": "boolean", "title": "Hand keypoints and gestures", "description": "21 points per hand, and the shape they make — open palm, fist, pointing, V, OK. Off by default because it loads a second model; naming the shape on top of the points costs nothing. Near range only: calling the robot from across a room is handled by the body gestures below and does not need this.", "default": False, "scope": "instance"},
                 "publish_gesture_events": {"type": "boolean", "title": "Send gesture events", "description": "Tell the robot when someone gestures at it. One message when a gesture starts and one when it ends — not every frame.", "default": True, "scope": "instance"},
                 "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "title": "Gestures to report", "description": f"Which actions count as gesturing at the robot. Default: {', '.join(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES)}. The last five need `hands: gesture`. Also available: {', '.join(OPTIONAL_GESTURES)}, thumbs_up.", "default": list(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES), "scope": "instance"},
                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.4, "scope": "instance"},
@@ -466,7 +474,7 @@ class _PoseNode(Node):
             "gesture_output": (self._gesture_topic
                                if self._pub_gesture is not None else None),
             "mode": "stream" if self._input_topic else "on_demand",
-            "hands": "keypoints" if self._hand_channel is not None else "off",
+            "hands": self._hand_channel is not None,
         }
 
     def start(self) -> dict:
@@ -851,7 +859,8 @@ class _PoseNode(Node):
             import cv2
 
             canvas = frame.copy()
-            draw_skeleton(canvas, persons, self._kpt_confidence)
+            draw_skeleton(canvas, persons, self._kpt_confidence,
+                          with_hands=self._hand_channel is not None)
             ok, buffer = cv2.imencode(".jpg", canvas,
                                       [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if not ok:
@@ -892,7 +901,7 @@ def is_alerting(verdict: dict) -> bool:
     return verdict.get("posture") in _ALERT_LABELS or activity in _ALERT_LABELS
 
 
-def overlay_label(verdict: dict) -> str:
+def overlay_label(verdict: dict, hand_gestures: Optional[dict] = None) -> str:
     """The one line drawn over a person.
 
     Both channels when both are there — `upright · hand waving` — because they
@@ -909,38 +918,72 @@ def overlay_label(verdict: dict) -> str:
     if isinstance(activity, dict):
         activity = activity.get("name")
     posture = verdict.get("posture")
-    if posture and activity:
-        return f"{posture} · {activity}"
-    return posture or activity or "unknown"
+    parts = [p for p in (posture, activity) if p]
+    # The hand shape goes on the end rather than replacing anything: it is a
+    # third channel, not a better answer to the same question. Which hand is
+    # named because an overlay is looked at to check a judgement, and "ok" on
+    # the wrong hand is the kind of thing only the side makes visible.
+    for side in ("left", "right"):
+        name = (hand_gestures or {}).get(side)
+        if name:
+            parts.append(f"{side[0]}:{name}")
+    # ASCII only. cv2.putText draws with a Hershey font, which has no glyph
+    # for anything outside ASCII — the middle dot this used to join on came
+    # out as "??" in every overlay that had both a posture and an activity,
+    # and had done since the separator was introduced. Nothing logged it,
+    # because nothing was wrong anywhere except on the picture.
+    return " | ".join(parts) if parts else "unknown"
 
 
-def draw_skeleton(canvas, persons: list, kpt_confidence: float) -> None:
+def draw_skeleton(canvas, persons: list, kpt_confidence: float,
+                  skeleton=None, with_hands: bool = False) -> None:
     """Draw bones, joints and the action label onto a BGR frame, in place.
 
     A joint below `kpt_confidence` is skipped rather than drawn: the engine
-    emits a coordinate for every one of the 17 whether it saw it or not, so
-    drawing them all puts a limb through whatever (0, 0) happens to be.
+    emits a coordinate for every joint whether it saw it or not, so drawing
+    them all puts a limb through whatever (0, 0) happens to be. That gate is
+    also what lets a hand that was not read be *appended* as zeros rather than
+    omitted — it simply does not draw.
+
+    `with_hands` makes this draw the 59-joint skeleton instead of the body's
+    17, using the same merged bone table the dashboard renderer is handed. The
+    overlay had to be told separately because it builds its picture here
+    rather than from the published payload, so it kept drawing 17 joints long
+    after the topic carried 59.
     """
     import cv2
 
+    if skeleton is None:
+        skeleton = (merged_skeleton(COCO_SKELETON, N_KEYPOINTS) if with_hands
+                    else COCO_SKELETON)
     for person in persons:
-        keypoints = np.asarray(person["keypoints"], dtype=np.float32)
+        points = person["keypoints"]
+        if with_hands:
+            hands = person.get("hands") or {}
+            points = merge_keypoints(points, hands.get("left"),
+                                     hands.get("right"))
+        keypoints = np.asarray(points, dtype=np.float32)
         verdict = person.get("verdict") or {}
-        label = overlay_label(verdict)
+        label = overlay_label(verdict, person.get("hand_gestures"))
         colour = (_ALERT_COLOUR if is_alerting(verdict)
                   else _TRACK_COLOURS[int(person.get("id", 0)) % len(_TRACK_COLOURS)])
         visible = keypoints[:, 2] >= kpt_confidence
-        for a, b in COCO_SKELETON:
+        for a, b in skeleton:
             if a < len(visible) and b < len(visible) and visible[a] and visible[b]:
                 cv2.line(canvas,
                          (int(keypoints[a, 0]), int(keypoints[a, 1])),
                          (int(keypoints[b, 0]), int(keypoints[b, 1])),
                          colour, 2, cv2.LINE_AA)
-        for index in range(min(len(visible), N_KEYPOINTS)):
-            if visible[index]:
-                cv2.circle(canvas, (int(keypoints[index, 0]),
-                                    int(keypoints[index, 1])), 3, colour, -1,
-                           cv2.LINE_AA)
+        for index in range(len(visible)):
+            if not visible[index]:
+                continue
+            # Hand joints are drawn smaller: there are 21 of them inside a
+            # span the body uses two or three for, and at body-joint size they
+            # merge into one blob exactly where the detail is.
+            radius = 3 if index < N_KEYPOINTS else 2
+            cv2.circle(canvas, (int(keypoints[index, 0]),
+                                int(keypoints[index, 1])), radius, colour, -1,
+                       cv2.LINE_AA)
         box = person.get("box") or person.get("bbox")
         if box:
             cv2.putText(canvas, f"#{person.get('id', '?')} {label}",
@@ -1012,7 +1055,7 @@ class PosePerceptionPlugin:
         self._gesture_cooldown_s = float(plugin_cfg.get("gesture_cooldown_s",
                                                         DEFAULT_COOLDOWN_S))
         self._gesture_min_score = float(plugin_cfg.get("gesture_min_score", 0.0))
-        self._hands = _hand_level(plugin_cfg.get("hands"))
+        self._hands = _hands_enabled(plugin_cfg.get("hands"))
         self._hand_interval_s = float(plugin_cfg.get("hand_interval_s", 0.25))
         self._hand_max_rois = int(plugin_cfg.get("hand_max_rois", 2))
         self._hand_min_forearm_px = float(
@@ -1103,7 +1146,7 @@ class PosePerceptionPlugin:
                                                  self._gesture_cooldown_s)),
             "gesture_min_score": float(icfg.get("gesture_min_score",
                                                 self._gesture_min_score)),
-            "hands": (_hand_level(icfg["hands"]) if "hands" in icfg
+            "hands": (_hands_enabled(icfg["hands"]) if "hands" in icfg
                       else self._hands),
             "hand_interval_s": float(icfg.get("hand_interval_s",
                                               self._hand_interval_s)),
@@ -1173,7 +1216,7 @@ class PosePerceptionPlugin:
         second engine could not be fetched would be the wrong trade. `info`
         carries the error, so this is not silent.
         """
-        if merged["hands"] == "off":
+        if not merged["hands"]:
             return None
         try:
             session = self._ensure_hand_model()
@@ -1392,7 +1435,7 @@ class PosePerceptionPlugin:
         # per-track cache and a throttle, and a photo has neither consecutive
         # frames nor real track ids to key them on.
         loose_hands = []
-        if merged["hands"] != "off":
+        if merged["hands"]:
             hand_note, loose_hands = self._hands_for_photo(persons, frame, merged)
         else:
             hand_note = None
@@ -1416,7 +1459,7 @@ class PosePerceptionPlugin:
             "count": len(persons),
             "latency_ms": int((time.time() - started) * 1000),
             "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
-                               if merged["hands"] != "off"
+                               if merged["hands"]
                                else list(COCO_KEYPOINTS)),
             # Said plainly rather than left for the caller to notice: a single
             # image cannot support waving, walking, turning or a fall, so
@@ -1447,7 +1490,7 @@ class PosePerceptionPlugin:
                         side: _full_keypoints(value)
                         for side, value in (person.get("hands") or {}).items()
                         if value is not None}}
-                       if merged["hands"] != "off" else {}),
+                       if merged["hands"] else {}),
                     **({"hand_gestures": person["hand_gestures"],
                         "hand_gesture_evidence": person.get(
                             "hand_gesture_evidence", {})}
@@ -1467,9 +1510,8 @@ class PosePerceptionPlugin:
                  # Named too, when asked. The shape rules need no body — they
                  # read the hand's own geometry — so the one thing an
                  # unattached hand cannot say is which hand it is.
-                 **({"gesture": classify_hand(
+                 "gesture": classify_hand(
                      points, allowed=merged["gesture_whitelist"]).get("gesture")}
-                    if merged["hands"] == "gesture" else {})}
                 for points, score in loose_hands]} if loose_hands else {}),
         }
 
@@ -1503,9 +1545,8 @@ class PosePerceptionPlugin:
         )
         if persons:
             channel.update(persons, frame, 0.0)
-            if merged["hands"] == "gesture":
-                for person in persons:
-                    name_hand_shapes(person, merged["gesture_whitelist"])
+            for person in persons:
+                name_hand_shapes(person, merged["gesture_whitelist"])
         found = sum(1 for p in persons
                     for v in (p.get("hands") or {}).values() if v is not None)
         note = {"ok": True, "found": found, "ran": channel.ran,
@@ -1586,8 +1627,7 @@ class PosePerceptionPlugin:
                 publish_gesture_events=merged["publish_gesture_events"],
                 hand_channel=self._hand_channel_for(merged),
                 publish_hand_keypoints=merged["publish_hand_keypoints"],
-                hand_gestures=(merged["gesture_whitelist"]
-                               if merged["hands"] == "gesture" else ()),
+                hand_gestures=merged["gesture_whitelist"],
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -1769,7 +1809,7 @@ class PosePerceptionPlugin:
                                       if node._gesture_tracker else []),
                 "gesture_event_count": node._gesture_count,
                 "recent_gestures": list(node._recent_gestures[-5:]),
-                "hands": "keypoints" if node._hand_channel is not None else "off",
+                "hands": node._hand_channel is not None,
                 # Why there are no hands, when there are none. Four innocent
                 # reasons and one broken one, and from outside they look the
                 # same: too_far / wrist_occluded / elbow_occluded are the
@@ -1841,8 +1881,8 @@ class PosePerceptionPlugin:
         # because the tests all configured the card level.
         running_hands = any(node._hand_channel is not None
                             for node in nodes.values())
-        info["hands"] = "keypoints" if running_hands else self._hands
-        if info["hands"] != "off":
+        info["hands"] = bool(running_hands or self._hands)
+        if info["hands"]:
             info["hand_model"] = HAND_MODEL
             info["hand_keypoint_names"] = list(HAND_KEYPOINTS)
             info["hand_note"] = (
@@ -2044,7 +2084,7 @@ class PosePerceptionPlugin:
         if "gesture_min_score" in cfg:
             self._gesture_min_score = float(cfg["gesture_min_score"])
         if "hands" in cfg:
-            self._hands = _hand_level(cfg["hands"])
+            self._hands = _hands_enabled(cfg["hands"])
         if "hand_interval_s" in cfg:
             self._hand_interval_s = float(cfg["hand_interval_s"])
         if "hand_max_rois" in cfg:
