@@ -380,19 +380,31 @@ def hand_scale(keypoints: np.ndarray, side: str, min_conf: float,
     if direct:
         return direct, "forearm"
 
-    wrist = _joint(keypoints, coco_index[f"{side}_wrist"], min_conf)
-    shoulder = _joint(keypoints, coco_index[f"{side}_shoulder"], min_conf)
-    if wrist is not None and shoulder is not None:
-        span = float(np.linalg.norm(wrist - shoulder))
-        if span > 1e-3:
-            return span * SHOULDER_WRIST_TO_FOREARM, "shoulder_wrist"
-
+    # Shoulder width before shoulder-to-wrist, because shoulder width does not
+    # depend on what the arm is doing and the span does. SHOULDER_WRIST_TO_FOREARM
+    # assumes a roughly straight arm; a person gesturing at a robot holds the arm
+    # bent, hand up beside the head, where the shoulder-to-wrist straight line is
+    # a fraction of the arm's actual length. Measured on a real camera frame of a
+    # raised OK sign: true forearm 194 px, shoulder width gave 211, the span gave
+    # 53. At 53 the crop is a fingertip, the decode is noise, the confidence gate
+    # drops it — and "no keypoints" is indistinguishable from having no fallback
+    # at all, which is exactly how this read from the outside.
     left = _joint(keypoints, coco_index["left_shoulder"], min_conf)
     right = _joint(keypoints, coco_index["right_shoulder"], min_conf)
     if left is not None and right is not None:
         width = float(np.linalg.norm(left - right))
         if width > 1e-3:
             return width * SHOULDER_WIDTH_TO_FOREARM, "shoulder_width"
+
+    # Last resort: one shoulder, no other. Pose-dependent, so it is only ever
+    # reached when the person is side-on or half out of frame and the far
+    # shoulder is gone.
+    wrist = _joint(keypoints, coco_index[f"{side}_wrist"], min_conf)
+    shoulder = _joint(keypoints, coco_index[f"{side}_shoulder"], min_conf)
+    if wrist is not None and shoulder is not None:
+        span = float(np.linalg.norm(wrist - shoulder))
+        if span > 1e-3:
+            return span * SHOULDER_WRIST_TO_FOREARM, "shoulder_wrist"
 
     return None, None
 

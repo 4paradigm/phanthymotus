@@ -2063,6 +2063,14 @@ class PosePerceptionPlugin:
             self._fps = int(cfg["fps"])
         if "kpt_confidence" in cfg:
             self._kpt_confidence = float(cfg["kpt_confidence"])
+        # The fall thresholds reach a node through _merged_config, which falls
+        # back to _plugin_cfg — so this branch has to write there rather than
+        # to an attribute. They were the only three of the twenty-eight schema
+        # fields with no branch here at all: set without an instance_id they
+        # were dropped on the floor while the call still answered "configured".
+        for key in _THRESHOLD_KEYS:
+            if key != "kpt_confidence" and key in cfg:
+                self._plugin_cfg[key] = float(cfg[key])
         if "max_persons" in cfg:
             self._max_persons = int(cfg["max_persons"])
         if "publish_keypoints" in cfg:

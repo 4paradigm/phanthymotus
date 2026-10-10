@@ -1537,3 +1537,21 @@ def test_the_overlay_label_is_ascii_only():
         {"posture": "standing", "activity": "raising hand"},
         {"left": "fist", "right": "ok"})
     assert label.isascii(), label
+
+
+def test_a_global_config_call_keeps_the_fall_thresholds():
+    """Every one of the schema's twenty-eight fields is scope: instance, and
+    twenty-five of them had a branch in the no-instance_id path. The three
+    fall thresholds had none, so setting them that way dropped them on the
+    floor — while the call still answered "configured" and echoed the value
+    back, which is the shape of failure that costs an afternoon."""
+    plugin, _ = _plugin()
+
+    plugin.dispatch("pose", {"action": "config", "fall_settle_s": 2.5,
+                             "fall_drop_ratio": 0.4,
+                             "fall_drop_window_s": 1.5})
+
+    merged = plugin._merged_config("whatever-no-instance-config-exists")
+    assert merged["fall_settle_s"] == 2.5
+    assert merged["fall_drop_ratio"] == 0.4
+    assert merged["fall_drop_window_s"] == 1.5
