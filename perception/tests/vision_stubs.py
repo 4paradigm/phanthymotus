@@ -209,6 +209,9 @@ def _install_fake_cv2():
     cv2.IMREAD_COLOR = 1
     cv2.INTER_NEAREST = 0
     cv2.INTER_LINEAR = 1
+    cv2.INTER_CUBIC = 2
+    cv2.INTER_AREA = 3
+    cv2.BORDER_REFLECT_101 = 4
 
     def imdecode(buf, flags):
         # Tests hand in a raw "WxH" marker rather than a real JPEG; anything
@@ -224,6 +227,23 @@ def _install_fake_cv2():
         rows = (_np.arange(height) * src.shape[0] // height).clip(0, src.shape[0] - 1)
         cols = (_np.arange(width) * src.shape[1] // width).clip(0, src.shape[1] - 1)
         return src[rows][:, cols]
+
+    def copyMakeBorder(src, top, bottom, left, right, borderType):
+        """Only BORDER_REFLECT_101, which is what the hand crop asks for.
+
+        numpy's `reflect` is exactly OpenCV's REFLECT_101 — it mirrors without
+        repeating the edge pixel. The other border modes raise rather than
+        falling back to this one: a stub that silently substituted a different
+        extension would change the pixels the hand engine sees at the frame
+        edge, which is precisely where a raised hand sits.
+        """
+        if borderType != cv2.BORDER_REFLECT_101:
+            raise NotImplementedError(
+                f"fake cv2.copyMakeBorder only implements BORDER_REFLECT_101, "
+                f"got {borderType}")
+        pad = [(int(top), int(bottom)), (int(left), int(right))]
+        pad += [(0, 0)] * (src.ndim - 2)
+        return _np.pad(src, pad, mode="reflect")
 
     def _bgr2hsv(src):
         """OpenCV's 8-bit HSV ranges, not the textbook ones.
@@ -357,6 +377,7 @@ def _install_fake_cv2():
     cv2.COLOR_BGR2HSV = 40
     cv2.imdecode = imdecode
     cv2.resize = resize
+    cv2.copyMakeBorder = copyMakeBorder
     cv2.cvtColor = cvtColor
     cv2.connectedComponents = connectedComponents
     cv2.__motus_fake__ = True
