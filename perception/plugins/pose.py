@@ -134,7 +134,7 @@ HAND_LEVELS = ("off", "keypoints")
 #: Input size of the published hand engine, for `info`. Not configurable: the
 #: crop is sized to land the hand on a *fraction* of this, so a mismatched
 #: engine moves the hand out of the band it was measured in.
-HAND_MODEL = "yolo26s-hand21"
+HAND_MODEL = "rtmpose-m-hand5"
 
 # What the card offers. `stgcn` is deliberately NOT here, although
 # `build_backend` can still construct it for tests and deliberate experiments.
@@ -1095,8 +1095,7 @@ class PosePerceptionPlugin:
         with self._hand_model_lock:
             if self._hand_model is not None:
                 return self._hand_model
-            from plugins.hand_runtime import assert_end2end
-            from plugins.vision_runtime import VisionEngineSession
+            from plugins.hand_runtime import HandEngine, assert_simcc
             from utils.model_downloader import ensure_hand_model
             from utils.model_progress import fetch_status
 
@@ -1108,11 +1107,14 @@ class PosePerceptionPlugin:
             engine_path = next(path for name, path in paths.items()
                                if name.endswith(".engine"))
             log.info(f"[pose] loading hand engine: {engine_path}")
-            session = VisionEngineSession(engine_path)
-            # Refuse a non-end2end plan here rather than decoding thousands of
-            # un-suppressed anchors as hands. hand_runtime.assert_end2end says
-            # why decode_poses cannot catch that itself.
-            shape = assert_end2end(session)
+            # HandEngine, not VisionEngineSession: RTMPose normalises with
+            # ImageNet statistics on an unpadded square crop, and the other
+            # wrapper letterboxes and scales to [0, 1].
+            session = HandEngine(engine_path)
+            # Refuse anything that is not a 21-keypoint SimCC head before a
+            # frame reaches it: the two output tensors are identical in shape,
+            # so a wrong engine cannot be detected from the numbers later.
+            shape = assert_simcc(session)
             log.info(f"[pose] hand engine loaded: input={session.input_size}, "
                      f"output={shape}, {N_HAND_KEYPOINTS} keypoints")
             self._hand_model = session
@@ -1468,10 +1470,10 @@ class PosePerceptionPlugin:
                     "画面里没有可用的手臂（肘或腕不可见），所以这些手是直接在整幅"
                     "图上检到的，没有归属到人、也没有左右之分 —— 左右手是由它接在"
                     "哪只手腕上决定的，没有身体就无从判断。"
-                    "**这条兜底路径的坐标精度明显低于正常路径**：手占满画面时模型"
-                    "会拟合出一只偏小的手（实测整体小约 40%，腕点落在掌心），手指"
-                    "的相对关系仍可用，但绝对位置不要当准。正常路径（画面里有人、"
-                    "手由手臂推出）目视验证是准的")
+                    "整幅图当作框喂给一个 top-down 模型，正是它本来的用法，所以"
+                    "这条路径的精度和正常路径相当 —— 真机上拿一张手部特写目视"
+                    "验证过。（上一个手部模型在这条路径上会拟合出一只偏小 40% 的"
+                    "手，换模型后不再如此。）")
         if not found and not loose:
             note["hint"] = (
                 "没有解出手。too_far / wrist_occluded / elbow_occluded 是几何闸门"

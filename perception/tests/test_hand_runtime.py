@@ -27,20 +27,22 @@ from plugins.hand_runtime import (  # noqa: E402
     HAND_PER_FOREARM,
     HAND_SKELETON,
     N_HAND_KEYPOINTS,
+    RTMPOSE_MEAN,
+    RTMPOSE_STD,
     TARGET_HAND_FRACTION,
     HandDecodeError,
-    assert_end2end,
+    assert_simcc,
     box_to_frame,
     crop_roi,
-    expected_row_width,
+    decode_simcc,
     forearm_length,
     keypoints_to_frame,
     merge_keypoints,
     merged_keypoint_names,
     merged_skeleton,
-    raw_head_width,
     roi_from_body,
     roi_from_previous,
+    to_rtmpose_blob,
 )
 from plugins.vision_runtime import (  # noqa: E402
     COCO_INDEX, COCO_KEYPOINTS, COCO_SKELETON, N_KEYPOINTS, LetterboxMeta,
@@ -69,21 +71,26 @@ def _body(forearm=120.0, conf=0.9, wrist_conf=None, elbow_conf=None):
 
 
 class _FakeSession:
-    """Stands in for VisionEngineSession in the guard tests."""
+    """Stands in for the engine in the guard tests.
 
-    def __init__(self, shape, net=448):
-        self._shape = shape
+    Returns tensors under given names, because the two SimCC outputs have the
+    same shape and can only be told apart by name.
+    """
+
+    def __init__(self, shapes, names=("simcc_x", "simcc_y"), net=256):
+        self._shapes = shapes
+        self.output_names = list(names)
         self._net = net
         self.calls = 0
+        self.input_dtype = np.float32
 
     @property
     def input_size(self):
         return (self._net, self._net)
 
-    def infer(self, frame):
+    def infer(self, blob):
         self.calls += 1
-        h, w = frame.shape[:2]
-        return [np.zeros(self._shape, dtype=np.float32)], LetterboxMeta(1.0, 0, 0, w, h)
+        return [np.zeros(sh, dtype=np.float32) for sh in self._shapes]
 
 
 # ── the keypoint set ─────────────────────────────────────────────────────────
@@ -108,50 +115,91 @@ def test_the_bone_table_only_references_real_joints():
         assert 0 <= a < N_HAND_KEYPOINTS and 0 <= b < N_HAND_KEYPOINTS
 
 
-# ── the end2end guard ────────────────────────────────────────────────────────
+# ── the SimCC head ──────────────────────────────────────────────────────────
 
-def test_the_two_widths_differ_by_exactly_one_column():
-    """Which is the whole problem: `_pose_layout` reads the narrower one as a
-    valid offset-5 layout."""
-    assert expected_row_width() == 69
-    assert raw_head_width() == 68
-
-
-def test_an_end2end_engine_passes_the_guard():
-    session = _FakeSession((1, 300, 69))
-    assert assert_end2end(session) == (1, 300, 69)
+def test_a_simcc_engine_passes_the_guard():
+    session = _FakeSession([(1, 21, 512), (1, 21, 512)])
+    assert assert_simcc(session) == ((1, 21, 512), (1, 21, 512))
     assert session.calls == 1
 
 
-def test_a_raw_head_engine_is_refused():
-    """68 channels x 4116 anchors is what a non-end2end 448 export emits, and
-    `decode_poses` would read it as 4116 hands with xywh boxes read as xyxy."""
-    session = _FakeSession((1, 68, 4116))
+def test_an_engine_that_does_not_name_its_outputs_is_refused():
+    """The two tensors are the same shape, so there is nothing in the numbers
+    to tell x from y. Swapping them transposes every hand and still draws a
+    perfectly plausible one — and this repository has already been bitten by
+    TensorRT listing outputs in a different order on the two JetPack lines."""
+    session = _FakeSession([(1, 21, 512), (1, 21, 512)],
+                           names=("output0", "output1"))
     with pytest.raises(HandDecodeError) as excinfo:
-        assert_end2end(session)
-    assert "68" in str(excinfo.value)
-    assert "nms=True" in str(excinfo.value)
+        assert_simcc(session)
+    assert "simcc_x" in str(excinfo.value)
 
 
-def test_the_guard_reports_what_it_actually_saw():
-    session = _FakeSession((1, 68, 2100))
-    with pytest.raises(HandDecodeError) as excinfo:
-        assert_end2end(session)
-    assert "(1, 68, 2100)" in str(excinfo.value)
+def test_a_wrong_keypoint_count_is_refused():
+    session = _FakeSession([(1, 17, 512), (1, 17, 512)])
+    with pytest.raises(HandDecodeError):
+        assert_simcc(session)
 
 
-def test_the_guard_accepts_either_axis_order():
-    """Output orientation is not stable across TensorRT versions, which is why
-    decode_poses picks by content; the guard must not be stricter."""
-    assert assert_end2end(_FakeSession((1, 69, 300))) == (1, 69, 300)
+def test_a_bin_count_that_is_not_a_whole_split_ratio_is_refused():
+    """A different RTMPose size changes the ratio, and a wrong one scales
+    every hand by a constant while still looking like a hand."""
+    session = _FakeSession([(1, 21, 500), (1, 21, 500)])
+    with pytest.raises(HandDecodeError):
+        assert_simcc(session)
 
 
 def test_the_guard_runs_at_load_not_per_frame():
-    """A card that comes up `running` and then fails on every frame is much
-    harder to diagnose than one that refuses to start."""
-    session = _FakeSession((1, 300, 69))
-    assert_end2end(session)
+    session = _FakeSession([(1, 21, 512), (1, 21, 512)])
+    assert_simcc(session)
     assert session.calls == 1
+
+
+def test_simcc_decodes_an_argmax_to_input_pixels():
+    net, bins = 256, 512
+    sx = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+    sy = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+    sx[0, :, 100] = 0.9          # 100 bins / (512/256) = 50 px
+    sy[0, :, 300] = 0.7          # 300 / 2 = 150 px
+    out = decode_simcc(sx, sy, net)
+    assert out.shape == (1, N_HAND_KEYPOINTS, 3)
+    assert out[0, 0, 0] == pytest.approx(50.0)
+    assert out[0, 0, 1] == pytest.approx(150.0)
+
+
+def test_the_split_ratio_is_read_from_the_tensor_not_hardcoded():
+    """A different input size changes it, and a constant would scale every
+    hand by a fixed factor while still producing a hand-shaped thing."""
+    sx = np.zeros((1, N_HAND_KEYPOINTS, 768), np.float32)
+    sy = np.zeros((1, N_HAND_KEYPOINTS, 768), np.float32)
+    sx[0, :, 300] = 1.0; sy[0, :, 300] = 1.0
+    out = decode_simcc(sx, sy, 384)              # ratio 2 again
+    assert out[0, 0, 0] == pytest.approx(150.0)
+
+
+def test_joint_confidence_is_the_worse_of_the_two_axes():
+    """A joint is only as well located as its worse axis; taking the larger
+    would report a joint certain in x and guessed in y as certain."""
+    sx = np.zeros((1, N_HAND_KEYPOINTS, 512), np.float32)
+    sy = np.zeros((1, N_HAND_KEYPOINTS, 512), np.float32)
+    sx[0, 0, 10] = 0.9
+    sy[0, 0, 10] = 0.2
+    assert decode_simcc(sx, sy, 256)[0, 0, 2] == pytest.approx(0.2)
+
+
+def test_the_blob_is_imagenet_normalised_rgb_not_zero_to_one():
+    """RTMPose subtracts a mean and divides by a standard deviation. Feeding
+    it /255 yields a confident hand in the wrong place."""
+    crop = np.zeros((256, 256, 3), np.uint8)
+    crop[:, :, 0] = 10      # B
+    crop[:, :, 1] = 20      # G
+    crop[:, :, 2] = 30      # R
+    blob = to_rtmpose_blob(crop, np.float32)
+    assert blob.shape == (1, 3, 256, 256)
+    # channel 0 of the blob is R, because the model wants RGB
+    assert blob[0, 0, 0, 0] == pytest.approx((30 - RTMPOSE_MEAN[0]) / RTMPOSE_STD[0])
+    assert blob[0, 2, 0, 0] == pytest.approx((10 - RTMPOSE_MEAN[2]) / RTMPOSE_STD[2])
+    assert blob.min() < 0, "normalised input must not be in [0, 1]"
 
 
 # ── forearm scale ────────────────────────────────────────────────────────────
@@ -399,13 +447,13 @@ def test_the_two_lines_are_different_plans():
 
 
 def test_the_bundle_url_names_the_input_size_it_was_built_for():
-    """448 is not interchangeable with 640: the crop is sized to land the hand
-    at a fraction of the input, so a swapped engine moves the hand out of the
-    band the measurements were taken in."""
+    """The crop is sized to land the hand at a fraction of the *input*, so an
+    engine built for another size moves the hand out of the band the
+    measurements were taken in."""
     from utils.model_downloader import HAND_MODEL_BUNDLES
 
     for entry in HAND_MODEL_BUNDLES.values():
-        assert entry["base_url"].endswith("-448")
+        assert entry["base_url"].endswith("-256")
 
 
 def test_the_source_onnx_is_mirrored_and_pinned():
@@ -421,38 +469,45 @@ def test_the_source_onnx_is_mirrored_and_pinned():
 
 # ── HandChannel: the budget and the bookkeeping ──────────────────────────────
 
-from plugins.hand_runtime import HandChannel, N_HAND_KEYPOINTS as NHK  # noqa: E402
+from plugins.hand_runtime import (  # noqa: E402
+    HandChannel, N_HAND_KEYPOINTS as NHK, hands_in_frame)
 
 
-def _hand_row(cx=224.0, cy=224.0, span=140.0, score=0.9, net=448):
-    """One 69-column hand row in crop coordinates: box, score, class, triples."""
-    half = span / 2.0
-    row = [cx - half, cy - half, cx + half, cy + half, score, 0.0]
-    for i in range(NHK):
-        row += [cx - half + (span * i / max(NHK - 1, 1)), cy, 0.9]
-    return row
+def _simcc(span_frac=0.6, conf=0.9, net=256, n=1):
+    """SimCC tensors for a hand spanning `span_frac` of the input, centred."""
+    bins = net * 2
+    sx = np.zeros((n, NHK, bins), np.float32)
+    sy = np.zeros((n, NHK, bins), np.float32)
+    lo = (0.5 - span_frac / 2) * net
+    for j in range(NHK):
+        x = lo + span_frac * net * j / max(NHK - 1, 1)
+        sx[:, j, int(x * 2)] = conf
+        sy[:, j, int(net * 0.5 * 2)] = conf
+    return sx, sy
 
 
 class _HandSession:
-    """Fake hand engine. Counts inferences, so the budget is observable."""
+    """Fake RTMPose engine. Counts inferences, so the budget is observable."""
 
-    def __init__(self, rows=None, net=448, raises=False):
+    def __init__(self, conf=0.9, net=256, raises=False, span_frac=0.6):
         self.calls = 0
         self.net = net
         self.raises = raises
-        self._rows = [_hand_row(net=net)] if rows is None else rows
+        self.conf = conf
+        self.span_frac = span_frac
+        self.output_names = ["simcc_x", "simcc_y"]
+        self.input_dtype = np.float32
 
     @property
     def input_size(self):
         return (self.net, self.net)
 
-    def infer(self, frame):
+    def infer(self, blob):
         self.calls += 1
         if self.raises:
             raise RuntimeError("engine exploded")
-        array = (np.asarray(self._rows, dtype=np.float32).reshape(1, -1, 69)
-                 if self._rows else np.zeros((1, 0, 69), dtype=np.float32))
-        return [array], LetterboxMeta(1.0, 0, 0, self.net, self.net)
+        sx, sy = _simcc(self.span_frac, self.conf, self.net)
+        return [sx, sy]
 
 
 def _frame():
@@ -565,87 +620,57 @@ def test_an_engine_error_does_not_kill_the_frame():
 
 
 def test_an_empty_detection_drops_the_cache_rather_than_chasing_it():
-    """So the next frame re-derives the ROI from the arm instead of following a
-    box that found nothing. Two hands at two scales is four attempts."""
-    session = _HandSession(rows=[])
-    channel = HandChannel(session, max_rois=2, interval_s=0.0,
-                          retry_scales=(1.0, 0.55))
+    """So the next frame re-derives the ROI from the arm instead of following
+    a box the model could not read. One call per hand, not two: there is no
+    second scale to try."""
+    session = _HandSession(conf=0.05)
+    channel = HandChannel(session, max_rois=2, interval_s=0.0)
     person = _person()
     channel.update([person], _frame(), 0.0)
-    assert session.calls == 4
+    assert session.calls == 2
     assert person["hands"]["right"] is None
-    assert channel.ran == 4
+    assert channel.ran == 2
 
 
-# ── the multi-scale retry ────────────────────────────────────────────────────
-#
-# No single hand/forearm ratio works: both quantities are projections and
-# foreshorten independently. Measured on two real photographs, the hand that
-# was hardest to find needed 0.45 in one and 0.65+ in the other — opposite
-# answers from the same constant.
-
-class _ScalePickySession(_HandSession):
-    """Finds a hand only when the crop is within a given size range, which is
-    what a real engine does: the band is 120-320 px of the input."""
-
-    def __init__(self, lo, hi, **kw):
-        super().__init__(**kw)
-        self.lo, self.hi, self.sides = lo, hi, []
-
-    def infer(self, frame):
-        self.calls += 1
-        side = getattr(self, "_next_side", None)
-        self.sides.append(side)
-        if side is None or not (self.lo <= side <= self.hi):
-            return ([np.zeros((1, 0, 69), dtype=np.float32)],
-                    LetterboxMeta(1.0, 0, 0, self.net, self.net))
-        return super().infer(frame)
-
-
-def test_a_hand_missed_at_the_nominal_crop_is_retried_tighter():
-    """The case that made a real photograph report one hand instead of two."""
-    nominal = roi_from_body(_body(forearm=200.0), "right", min_conf=0.3)[0].side
-    picky = _ScalePickySession(lo=nominal * 0.5, hi=nominal * 0.6)
-
-    original = picky.infer
-    def tracking(frame, _p=picky):
-        return original(frame)
-    # the channel sizes the crop before calling, so record it through crop_roi
-    import plugins.hand_runtime as hr
-    real_crop = hr.crop_roi
-    def spy(frame, roi, out_size):
-        picky._next_side = roi.side
-        return real_crop(frame, roi, out_size)
-    hr.crop_roi = spy
-    try:
-        channel = HandChannel(picky, max_rois=1, interval_s=0.0,
-                              retry_scales=(1.0, 0.55))
-        person = _person(forearm=200.0)
-        channel.update([person], _frame(), 0.0)
-    finally:
-        hr.crop_roi = real_crop
-
-    # Counted by crops attempted, not by `calls`: the stub increments that
-    # twice on a hit (once in its own infer, once in the inherited one), and a
-    # test that asserted on it would be measuring its own bookkeeping.
-    assert len(picky.sides) == 2                  # nominal missed, tighter hit
-    assert picky.sides[1] < picky.sides[0]
-    assert any(v is not None for v in person["hands"].values())
-
-
-def test_a_hand_found_at_the_nominal_crop_costs_one_inference():
-    """The retry must not make the common case twice as expensive."""
+def test_an_out_of_reach_hand_loses_its_cached_shape():
+    """A cached hand would otherwise keep being reported after the person
+    turned away — a hand shape from a moment that has passed."""
     session = _HandSession()
-    channel = HandChannel(session, max_rois=1, interval_s=0.0,
-                          retry_scales=(1.0, 0.55))
-    channel.update([_person()], _frame(), 0.0)
-    assert session.calls == 1
+    channel = HandChannel(session, max_rois=2, interval_s=0.0)
+    channel.update([_person(1, forearm=200.0)], _frame(), 0.0)
+
+    gone = {"id": 1, "keypoints": _body(forearm=200.0, wrist_conf=0.05)}
+    channel.update([gone], _frame(), 1.0)
+    assert gone["hands"]["left"] is None and gone["hands"]["right"] is None
+    assert channel.skipped["wrist_occluded"] >= 2
 
 
-def test_the_retry_can_be_switched_off():
-    session = _HandSession(rows=[])
-    channel = HandChannel(session, max_rois=1, interval_s=0.0,
-                          retry_scales=(1.0,))
+def test_a_too_far_person_is_counted_as_such():
+    session = _HandSession()
+    channel = HandChannel(session, max_rois=2, interval_s=0.0,
+                          min_forearm_px=300.0)
+    person = _person(forearm=100.0)
+    channel.update([person], _frame(), 0.0)
+    assert session.calls == 0
+    assert channel.skipped["too_far"] == 2
+
+
+def test_an_engine_error_does_not_kill_the_frame():
+    """One hand failing must not cost the body result that was already
+    computed for this frame."""
+    session = _HandSession(raises=True)
+    channel = HandChannel(session, max_rois=2, interval_s=0.0)
+    person = _person()
+    channel.update([person], _frame(), 0.0)
+    assert person["hands"] == {"left": None, "right": None}
+    assert "engine exploded" in (channel.last_error or "")
+
+
+def test_a_hand_costs_exactly_one_inference():
+    """No detector pass and no retry: this model reads the same hand across a
+    2.2x range of box sizes, so there is nothing to retry at a second scale."""
+    session = _HandSession()
+    channel = HandChannel(session, max_rois=1, interval_s=0.0)
     channel.update([_person()], _frame(), 0.0)
     assert session.calls == 1
 
@@ -702,7 +727,7 @@ def test_the_previous_box_still_tightens_the_crop_while_the_gate_holds():
     """The default fake row happens to span exactly the target fraction, which
     makes the refined ROI identical to the arm-derived one and the assertion
     vacuous — so this uses a deliberately smaller hand."""
-    session = _HandSession(rows=[_hand_row(span=70.0)])
+    session = _HandSession(span_frac=0.25)
     channel = HandChannel(session, max_rois=2, interval_s=0.0)
     channel.update([_person(1, forearm=200.0)], _frame(), 0.0)
     cached = channel._state[(1, "right")]["box"]
@@ -719,7 +744,7 @@ def test_whole_frame_hands_come_back_inside_the_frame():
     from plugins.hand_runtime import hands_in_frame
 
     frame = np.zeros((917, 500, 3), dtype=np.uint8)
-    session = _HandSession(rows=[_hand_row(span=300.0, net=448)], net=448)
+    session = _HandSession(net=256)
     found = hands_in_frame(session, frame, confidence=0.4)
     assert found, "the fake engine always returns a hand"
     points, score = found[0]
@@ -749,14 +774,13 @@ def test_whole_frame_hands_come_back_inside_the_frame():
 
 def test_one_miss_does_not_erase_the_hand():
     found = _HandSession()
-    channel = HandChannel(found, max_rois=2, interval_s=0.0, hold_s=0.5,
-                          retry_scales=(1.0,))
+    channel = HandChannel(found, max_rois=2, interval_s=0.0, hold_s=0.5)
     first = _person()
     channel.update([first], _frame(), 0.0)
     kept = first["hands"]["right"]
     assert kept is not None
 
-    channel._session = _HandSession(rows=[])          # the engine finds nothing
+    channel._session = _HandSession(conf=0.05)          # the engine finds nothing
     during = _person()
     channel.update([during], _frame(), 0.1)
     assert during["hands"]["right"] is not None
@@ -767,9 +791,9 @@ def test_a_hand_that_stays_gone_is_forgotten():
     """The hold is a grace period, not a memory — a hand really put away must
     stop being reported."""
     channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
-                          hold_s=0.5, retry_scales=(1.0,))
+                          hold_s=0.5)
     channel.update([_person()], _frame(), 0.0)
-    channel._session = _HandSession(rows=[])
+    channel._session = _HandSession(conf=0.05)
     gone = _person()
     channel.update([gone], _frame(), 2.0)             # well past the hold
     assert gone["hands"]["right"] is None
@@ -780,11 +804,11 @@ def test_the_stale_box_is_dropped_even_while_the_keypoints_are_held():
     would chase a hand that is no longer there; reporting the previous
     keypoints for a moment is merely saying "it was here an instant ago"."""
     channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
-                          hold_s=5.0, retry_scales=(1.0,))
+                          hold_s=5.0)
     channel.update([_person()], _frame(), 0.0)
     assert "box" in channel._state[(1, "right")]
 
-    channel._session = _HandSession(rows=[])
+    channel._session = _HandSession(conf=0.05)
     channel.update([_person()], _frame(), 0.1)
     assert "box" not in channel._state[(1, "right")]
     assert channel._state[(1, "right")].get("kpts") is not None
@@ -794,7 +818,7 @@ def test_a_blinking_wrist_does_not_erase_the_hand():
     """Visibility oscillating around the threshold is the other way a hand
     vanishes — the geometric gate refuses and the cache went with it."""
     channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
-                          hold_s=0.5, retry_scales=(1.0,))
+                          hold_s=0.5)
     channel.update([_person()], _frame(), 0.0)
     blink = {"id": 1, "keypoints": _body(forearm=200.0, wrist_conf=0.05)}
     channel.update([blink], _frame(), 0.1)
@@ -803,9 +827,9 @@ def test_a_blinking_wrist_does_not_erase_the_hand():
 
 def test_the_hold_can_be_switched_off():
     channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
-                          hold_s=0.0, retry_scales=(1.0,))
+                          hold_s=0.0)
     channel.update([_person()], _frame(), 0.0)
-    channel._session = _HandSession(rows=[])
+    channel._session = _HandSession(conf=0.05)
     gone = _person()
     channel.update([gone], _frame(), 0.01)
     assert gone["hands"]["right"] is None
@@ -830,9 +854,8 @@ def test_a_hand_that_cannot_be_found_is_throttled_too():
     unfindable hand cost an inference on every frame — at two scales. On a
     stream where one of two hands was marginal that measured as +49 ms per
     frame."""
-    session = _HandSession(rows=[])
-    channel = HandChannel(session, max_rois=2, interval_s=1.0, hold_s=0.2,
-                          retry_scales=(1.0,))
+    session = _HandSession(conf=0.05)
+    channel = HandChannel(session, max_rois=2, interval_s=1.0, hold_s=0.2)
     channel.update([_person()], _frame(), 0.0)
     first = session.calls
     assert first == 2                       # both hands attempted once
@@ -845,9 +868,8 @@ def test_a_hand_that_cannot_be_found_is_throttled_too():
 def test_the_throttle_lapses_for_a_missing_hand_too():
     """It is a throttle, not a blacklist — a hand that comes back must be
     found again."""
-    session = _HandSession(rows=[])
-    channel = HandChannel(session, max_rois=2, interval_s=0.25, hold_s=0.2,
-                          retry_scales=(1.0,))
+    session = _HandSession(conf=0.05)
+    channel = HandChannel(session, max_rois=2, interval_s=0.25, hold_s=0.2)
     channel.update([_person()], _frame(), 0.0)
     calls = session.calls
     channel.update([_person()], _frame(), 5.0)
@@ -858,34 +880,37 @@ def test_the_hold_expires_on_the_last_success_not_the_last_attempt():
     """Recording a failed attempt against the hold would keep a stale hand on
     screen forever."""
     channel = HandChannel(_HandSession(), max_rois=2, interval_s=0.0,
-                          hold_s=0.3, retry_scales=(1.0,))
+                          hold_s=0.3)
     channel.update([_person()], _frame(), 0.0)
-    channel._session = _HandSession(rows=[])
+    channel._session = _HandSession(conf=0.05)
     for step in range(1, 12):               # keeps attempting, never succeeds
         p = _person()
         channel.update([p], _frame(), step * 0.1)
     assert p["hands"]["right"] is None, "a stale hand outlived its hold"
 
 
-# ── which hand the crop is for ───────────────────────────────────────────────
-
-def test_the_detection_nearest_the_crop_centre_wins_not_the_loudest():
-    """Reported as "with two hands it is completely scrambled, the hands
-    overlap". The crop is 3.2x the hand box and centred on where the arm says
-    the hand is, so hands held near each other put *both* in *both* crops —
-    and picking by score then lets the two crops land on the same hand."""
-    from plugins.hand_runtime import _nearest_to_centre
-
-    net = 448
-    #            the other hand, loud and off to the side | ours, centred
-    boxes = np.array([[20.0, 20.0, 120.0, 120.0],
-                      [174.0, 174.0, 274.0, 274.0]], dtype=np.float32)
-    assert _nearest_to_centre(boxes, net) == 1
-    # ...and the order must not matter
-    assert _nearest_to_centre(boxes[::-1], net) == 0
 
 
-def test_a_single_detection_is_always_taken():
-    from plugins.hand_runtime import _nearest_to_centre
+def test_the_hand_engine_wrapper_refuses_a_non_square_input():
+    """The crop is a square cut out of the frame; a non-square input would
+    stretch it and put every joint on a hand shape nobody has."""
+    import plugins.hand_runtime as hr
 
-    assert _nearest_to_centre(np.array([[0.0, 0.0, 50.0, 50.0]], np.float32), 448) == 0
+    class _Eng:
+        input_shape = (1, 3, 256, 192)
+        optimization_shape = (1, 3, 256, 192)
+        input_dtype = np.float32
+        output_names = ["simcc_x", "simcc_y"]
+        def __init__(self, *a, **k): pass
+        def infer(self, blob): return []
+        def close(self): pass
+
+    import utils.tensorrt_runtime as trt
+    original = trt.TensorRTEngine
+    trt.TensorRTEngine = _Eng
+    try:
+        with pytest.raises(HandDecodeError) as excinfo:
+            hr.HandEngine("/nowhere.engine")
+        assert "square" in str(excinfo.value)
+    finally:
+        trt.TensorRTEngine = original

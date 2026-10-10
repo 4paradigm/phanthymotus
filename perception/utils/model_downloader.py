@@ -1309,84 +1309,76 @@ POSE_MODEL_BUNDLES = {
 }
 
 
-# Hand keypoints for the pose card: 21 joints per hand, YOLO26s-pose fine-tuned
-# on the Ultralytics hand-keypoints dataset (26,768 images, 21 points, labels
-# generated with MediaPipe). Same architecture and same NMS-free one2one head as
-# the body pose engine, so `vision_runtime.decode_poses(..., n_kpts=21)` reads it
-# unchanged — the row width (6 + 3*21 = 69) is what picks the layout.
+# Hand keypoints for the pose card: RTMPose-m, hand5, 21 joints, 256x256.
 #
-# **448, not 640.** The model wants the hand to occupy 120-320 px of its input
-# and the card crops the hand's neighbourhood out of the native frame to put it
-# there, so the input only has to be big enough to hold that band. Measured on
-# an idle Orin 5 (jp5.11), end-to-end per ROI including crop, upscale and decode:
-# 640 -> 17.43 ms, 448 -> 11.26 ms, 320 -> 7.95 ms. 320 was rejected: its
-# accuracy curve keeps up but it drops detections (3 of 4 at three different
-# hand sizes, against 4 of 4 for 448), and a hand that is not found is a hand
-# whose gesture never happens. Scaling is sublinear because about 4.1 ms of each
-# inference is fixed cost (H2D/D2H plus the sync), which is also why batching
-# several ROIs is worth ~27% and is left as a later change.
+# **This replaced a YOLO26-pose model fine-tuned on hand keypoints, and the
+# reason was accuracy, not speed.** On a real camera that model put the wrist
+# in the middle of the palm on an OK sign, returned an open hand as a clump,
+# and collapsed the joints under motion blur — while its detection score
+# stayed around 0.8, so nothing downstream could tell. Compared on the same
+# crops, RTMPose was right on every picture it was wrong on.
 #
-# **Exported with ultralytics 8.4.175, and that is recorded because it matters.**
-# The same weights exported by 8.4.33 and by 8.4.175 do not agree: measured
-# median NME 0.0145 with 1 of 70 finger extended/curled decisions flipped. For
-# scale, fp16-vs-fp32 on the engine is 0.0005 with 0 of 150 flipped — so the
-# version of the exporter moves the numbers roughly thirty times as much as the
-# quantisation does, while every size and SHA256 check still passes. Anyone
-# rebuilding this must use the same version or re-measure.
+# It is also cheaper, which was not expected. Per hand, through the production
+# runtime:
 #
-# Also: **8.4.175 needs `nms=True` to produce the end-to-end head at all.**
-# Without it the export is the raw head, which is `5 + 3*21 = 68` wide — and
-# `vision_runtime._pose_layout` accepts exactly that as its offset-5 layout,
-# with every content check passing, so several thousand un-suppressed anchors
-# decode as several thousand hands and nothing raises.
-# `plugins.hand_runtime.assert_end2end` is the guard; it cannot read the
-# `end2end` metadata flag because trtexec-built plans carry no ultralytics
-# header at all.
+#     engine                     Orin 6 @1020MHz   Orin 5 (jp5.11)
+#     yolo26s-hand21 @448            7.99 ms           8.19 ms
+#     rtmpose-m-hand5 @256           3.58 ms           4.33 ms
+#     rtmpose-m-hand5, batch 2       2.52 ms/hand      3.14 ms/hand
 #
-# fp16 is equivalent *inside* the operating band. One caveat at the edge: on
-# jp6.1 (TensorRT 10.4) one frame of 30 flipped a finger decision, at a hand of
-# 55 native pixels — past the distance gate, and where the model's own error is
-# already 6.5x larger than the quantisation difference. jp5.11 flipped none.
+# Built from the ONNX in OpenMMLab's own deployment bundle
+# (rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320), with
+# trtexec --fp16 inside the target perception image. Dynamic batch, 1..4.
+#
+# Two things about this model that the YOLO one did not have:
+#
+# * **It is top-down.** There is no detector and no detection score; it
+#   assumes whatever is in the box is a hand. The box comes from the arm, and
+#   it has to be roughly right — measured, anywhere from 0.30 to 0.65 of the
+#   crop the YOLO model wanted produced a correct hand, which is a 2.2x range.
+# * **It normalises with ImageNet mean/std on RGB**, not /255. Feeding it the
+#   other one produces a confident hand in the wrong place.
+#
+# The two outputs are both (N, 21, 512) — identical shapes — so they can only
+# be told apart by name. plugins/hand_runtime indexes them by name for that
+# reason; this repository has already been bitten by TensorRT listing an
+# engine's outputs in a different order on the two JetPack lines.
 HAND_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26s-hand21/tensorrt-jp61-trt10.4-orin-448",
+        "base_url": f"{VISION_MODEL_BASE}/rtmpose-m-hand5/tensorrt-jp61-trt10.4-orin-256",
         "files": {
-            "yolo26s-hand21.engine": {
-                "size": 26074788,
-                "sha256": "e9234328fd16bbc4ce1fa8a3c70163e5fd3757dfe72562c3fc7e26b557be5d07",
+            "rtmpose-m-hand5.engine": {
+                "size": 30486172,
+                "sha256": "b1d182c7376a220153ffd6bdaadab7674c6f660a711086f1e5b92e399bde2a72",
             },
         },
     },
-    # Built on Orin 5 in a container off the jp5.11 image (TensorRT 8.5.2.2).
-    # Not a rebuild of the same bytes: a different TensorRT produces a different
-    # plan, which is the whole reason this table is keyed by JetPack family.
+    # Same ONNX, different TensorRT (8.5.2.2), therefore different bytes —
+    # which is the whole reason this table is keyed by JetPack family.
     "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26s-hand21/tensorrt-jp511-trt8.5-orin-448",
+        "base_url": f"{VISION_MODEL_BASE}/rtmpose-m-hand5/tensorrt-jp511-trt8.5-orin-256",
         "files": {
-            "yolo26s-hand21.engine": {
-                "size": 25305865,
-                "sha256": "e20daf227849f1f2bccc7606300d61b6a813fffaf9a8982a3d5cc150ca501bf6",
+            "rtmpose-m-hand5.engine": {
+                "size": 30313545,
+                "sha256": "c162de4333771769b50309db16b651f3ce40f627b3719dc3fbb75ef305a5b212",
             },
         },
     },
 }
 
 
-# The ONNX both plans were built from, mirrored so the engine build is
-# reproducible without re-running an export on somebody's laptop — the same
-# reason ACTION_CHECKPOINT is mirrored. **Build-time only; no robot fetches
-# this.** It is also the artefact that makes the exporter-version note above
-# checkable: rebuild from this file and the plan is comparable, re-export from
-# the .pt with a different ultralytics and it is not.
+# The ONNX both plans were built from, mirrored so an engine rebuild is
+# reproducible without re-downloading from openmmlab. **Build-time only; no
+# robot fetches this.**
 HAND_ONNX = {
-    "yolo26s-hand21-448.onnx": {
-        "size": 42901907,
-        "sha256": "f0008d8b6935750c52f79e3e39b2025c11869bd0e233bb2225105436bd5479b3",
+    "rtmpose-m-hand5-256.onnx": {
+        "size": 55080248,
+        "sha256": "39e858936bca0f94c09847d4e70b68a51d6c0adac61f36b457fcadb54621cd29",
     },
 }
 
 HAND_ONNX_BASE = os.environ.get(
-    "HAND_ONNX_BASE_URL", f"{VISION_MODEL_BASE}/yolo26s-hand21/onnx")
+    "HAND_ONNX_BASE_URL", f"{VISION_MODEL_BASE}/rtmpose-m-hand5/onnx")
 
 
 # Skeleton-action recognition for the pose card: ST-GCN++, joint stream,

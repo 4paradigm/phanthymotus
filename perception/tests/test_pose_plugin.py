@@ -1051,26 +1051,33 @@ def test_the_alert_colour_keys_on_the_channels_not_the_label():
 # describes its own enlarged layout, and `info` can explain a hand-less frame.
 
 class _FakeHandSession:
-    def __init__(self, net=448, span=140.0):
+    """Fake RTMPose engine: two SimCC tensors, named so they can be told apart."""
+
+    def __init__(self, net=256, span_frac=0.6, conf=0.9):
         self.calls = 0
         self.net = net
-        self.span = span
+        self.span_frac = span_frac
+        self.conf = conf
+        self.output_names = ["simcc_x", "simcc_y"]
+        self.input_dtype = np.float32
 
     @property
     def input_size(self):
         return (self.net, self.net)
 
-    def infer(self, frame):
+    def infer(self, blob):
         self.calls += 1
         from plugins.hand_runtime import N_HAND_KEYPOINTS
 
-        half = self.span / 2.0
-        cx = cy = self.net / 2.0
-        row = [cx - half, cy - half, cx + half, cy + half, 0.9, 0.0]
-        for i in range(N_HAND_KEYPOINTS):
-            row += [cx - half + self.span * i / (N_HAND_KEYPOINTS - 1), cy, 0.9]
-        array = np.asarray([row], dtype=np.float32).reshape(1, 1, 69)
-        return [array], LetterboxMeta(1.0, 0, 0, self.net, self.net)
+        bins = self.net * 2
+        sx = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        sy = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        lo = (0.5 - self.span_frac / 2) * self.net
+        for j in range(N_HAND_KEYPOINTS):
+            x = lo + self.span_frac * self.net * j / max(N_HAND_KEYPOINTS - 1, 1)
+            sx[0, j, int(x * 2)] = self.conf
+            sy[0, j, int(self.net * 0.5 * 2)] = self.conf
+        return [sx, sy]
 
 
 def _hand_plugin(cfg=None, hand_session=None):
@@ -1184,7 +1191,7 @@ def test_info_explains_a_handless_frame():
     info = plugin.dispatch("pose", {"action": "info"})
     instance = info["instances"]["/cam/rgb"]
     assert instance["hands"] == "keypoints"
-    assert instance["hand_input"] == 448
+    assert instance["hand_input"] == 256      # RTMPose-m hand5
     from plugins.hand_runtime import SKIP_REASONS
 
     assert set(instance["hand_skipped"]) == set(SKIP_REASONS)
