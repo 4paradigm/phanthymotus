@@ -15,8 +15,7 @@ import uuid
 
 
 AGENT_CORE = pathlib.Path(__file__).resolve().parents[1]
-RUNTIME = AGENT_CORE / "skills/multi-robot-registration/scripts/mrr_runtime.py"
-SKILL = AGENT_CORE / "skills/multi-robot-registration/SKILL.md"
+RUNTIME = AGENT_CORE / "tools/multi-robot-registration/mrr_runtime.py"
 
 
 def _run(root: pathlib.Path, command: str, payload: dict) -> dict:
@@ -37,9 +36,8 @@ def _run(root: pathlib.Path, command: str, payload: dict) -> dict:
 class BuiltinMrrSkillTests(unittest.TestCase):
     def test_runtime_is_baked_into_agent_core_image(self):
         dockerfile = (AGENT_CORE / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("COPY skills/   /work/skills/", dockerfile)
+        self.assertIn("COPY tools/    /work/tools/", dockerfile)
         self.assertTrue(RUNTIME.is_file())
-        self.assertTrue(SKILL.is_file())
 
     def test_runtime_reports_expected_version(self):
         result = subprocess.run(
@@ -105,17 +103,8 @@ class BuiltinMrrSkillTests(unittest.TestCase):
             self.assertEqual(committed["status"], "ok")
             self.assertTrue(committed["event_id"])
 
-    def test_skill_contains_no_install_workflow(self):
-        text = SKILL.read_text(encoding="utf-8")
-        self.assertNotIn("固定安装块", text)
-        self.assertNotIn("mrr_runtime_guard", text)
-        self.assertNotIn("systemd", text)
-        self.assertNotIn(
-            "/work/resource/multi-robot-registration/.runtime/mrr_runtime.py", text
-        )
-        self.assertIn(
-            "/work/skills/multi-robot-registration/scripts/mrr_runtime.py", text
-        )
+    def test_skill_definition_is_not_baked_into_the_image(self):
+        self.assertFalse((AGENT_CORE / "skills/multi-robot-registration/SKILL.md").exists())
 
 
 if __name__ == "__main__":
