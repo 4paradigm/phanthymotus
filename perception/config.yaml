@@ -14,6 +14,14 @@ file_intake:
   retention_days: 7
 
 plugins:
+  # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
+  phanthy_music:
+    enabled: true
+    catalogue_type: motus_music
+    timeout_ms: 3000
+    volume: 50
+    duck_gain: 0.15
+
   asr:
     enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
