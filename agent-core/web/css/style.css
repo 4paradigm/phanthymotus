@@ -2159,6 +2159,9 @@ html, body {
 .log-type.trigger       { background: var(--green-bg);  color: var(--green); }
 .log-type.executor      { background: var(--emerald-bg); color: var(--emerald); }
 .log-type.asr_result    { background: #D1FAF0; color: #0D6B55; }
+/* 旁人说的话 —— 和 asr_result 同色系但更淡：同一类信息（听到的话），不同的
+   地位（没在跟机器人说）。 */
+.log-type.asr_background { background: #E8F7F3; color: #3F8C79; }
 .log-type.ping          { color: var(--text-dim); background: transparent; }
 .log-msg   { color: var(--text-muted); word-break: break-all; flex: 1; white-space: pre-wrap; }
 

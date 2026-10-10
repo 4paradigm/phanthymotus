@@ -1526,6 +1526,80 @@ asked 「在发生什么了？」. Off-by-one on a syllable also silently change
 in mixed script, where latin and CJK have very different phonemes-per-character and
 one ratio was applied to both.
 
+**And the import itself forked, which wedged perception outright.** The env-var fix
+above stops *phonemizer* from calling `find_library`. It cannot stop `dlinfo` — a
+package phonemizer imports — from calling `find_library('dl')` at **import** time,
+and `ctypes.util.find_library` on Linux `subprocess`es out to `ldconfig -p`.
+
+Forking a 2.4 GB process with dozens of threads, one of them running a TensorRT
+warmup, hangs. Measured on Orin 5: the child never reached `exec` (at fork it
+inherited a lock another thread held), the parent sat in `_execute_child` waiting
+on the error pipe, and both stayed there. Consequences, in the order an operator
+meets them:
+
+| | |
+|---|---|
+| symptom | 「启动控制」卡住 —— the dashboard button never completes |
+| what is actually stuck | every `tools/call`, because the ASR worker holds the import lock |
+| what the logs say | nothing. The last line written is the one before the fork |
+| how it looks | perception dead; CPU at 99% (that is the unrelated TTS warmup thread) |
+
+It is a **race**, which is why it had never been seen: the same card starts cleanly
+when nothing else is loading. It needs the first phonemization (`_worker_inner`
+pre-computes the wake word's IPA at worker start) to land while another thread is
+busy — i.e. exactly what 「启动控制」 does by bringing TTS and ASR up together.
+
+**And it was not one fork, it was four.** Counted on Orin 5 by instrumenting
+`subprocess.Popen` around `from phonemizer.backend import EspeakBackend`:
+
+| | forks | what |
+|---|---|---|
+| before | **4** | `uname -p`, `/sbin/ldconfig -p`, `/usr/bin/gcc -Wl,-t -o /tmp/… -ldl`, `/usr/bin/objdump -p -j .dynamic …/libdl.so` |
+| after | **0** | — |
+
+The gcc/objdump pair is `ctypes.util`'s fallback path: `ldconfig -p` finds nothing,
+because `Dockerfile.jetson` replaces `ldconfig` with a no-op during apt installs and
+the cache is never rebuilt — *the same root cause as the espeak lookup above*. So
+what reads like one library lookup actually **compiles a program** to locate
+`libdl`. Three forks, one of them a compiler, in a process that must not fork.
+
+`uname -p` is **not** `platform.processor()` — that was the obvious guess, it was
+wrong, and patching `processor` measurably changed nothing (still 1 fork). The
+caller is `platform.system()` → `platform.uname()`, which fills its `processor`
+field via `platform._syscmd_uname`. `joblib`, imported by
+`phonemizer.backend.base`, calls `system()` at import time.
+
+So the fix has two halves:
+
+- **`_warm_platform_uname()` at module import.** `platform.uname()` caches, so one
+  call while perception is still loading plugins — nothing inferring, few threads —
+  serves every later caller from `_uname_cache`. This is what actually removes that
+  fork; the `noguard` count above drops 4 → 3 purely from the warm-up being in place.
+- **`_import_without_forking()` around the import.** Resolves the libraries we need
+  from a path list (`_FORK_FREE_LIBRARIES`) and makes `_syscmd_uname` return its
+  `default` instead of forking — which is exactly what `platform` does on a system
+  with no `uname` binary. Both are restored afterwards. A library not in the list
+  falls through to the real implementation, because returning `None` would be read
+  as "not installed". `_syscmd_uname` is private, so its absence is tolerated: a
+  CPython that drops it must not break ASR.
+
+Not a retry and not a timeout: there is no fork left to hang. A tiny child is not a
+safer child, which is why `uname -p` was in scope at all — the hang is *in* fork,
+before exec, so the size of what would have been exec'd is irrelevant.
+
+Verified on Orin 5: 「启动控制」's shape (TTS warmup and the ASR card started
+together) run 4 times in a row, phonemization completing in 5–9 s each time and MCP
+answering in under 130 ms throughout.
+
+Diagnosing the live wedge took `py-spy dump`, which is worth remembering because
+nothing else showed it — `docker logs` was silent, `docker top` showed one busy
+thread (the wrong one), and MCP simply did not answer:
+
+```bash
+docker exec embodied-perception pip3 install -q py-spy
+docker exec --privileged embodied-perception py-spy dump --pid $(pgrep -f "python3 /work/main.py" | head -1)
+```
+
 `_text_to_ipa(text, with_positions=True)` now also returns, per phoneme, the
 character offset in the original string that phoneme ends at — built from growing
 prefixes of each segment, phonemized through the same function that produced the
@@ -1533,6 +1607,113 @@ phonemes. Segments are `(start, end, is_cjk)` offsets rather than `strip()`ed
 substrings, so punctuation and whitespace stay accounted for. `_text_after_phoneme`
 is then a lookup, which also removes the second phonemization pass. Positions are
 opt-in: callers that only need to match pay nothing for the prefix passes.
+
+---
+
+## 语音情绪和音频事件（SenseVoice 顺带给的）
+
+SenseVoice-small 的输出前几个 token 不是文字，而是四个 tag：语种、情绪、音频事件、
+ITN 开关。sherpa-onnx 在把它们从 `text` 里剥掉的同时填进了结果对象的三个字段：
+
+```python
+res = stream.result
+res.text      # 'Yeah.'
+res.lang      # '<|en|>'
+res.emotion   # '<|HAPPY|>' / '<|NEUTRAL|>' / '<|EMO_UNKNOWN|>' …
+res.event     # '<|Laughter|>' / '<|Speech|>' / '<|BGM|>' …
+```
+
+也就是说这些信息**本来就已经算出来了**，而适配器以前 `return text` 把其余三个一起
+扔了。捡回来不加载任何模型、不多跑一次推理、不多占一字节显存 —— 这是它和另一条路
+（emotion2vec+ 作为独立卡片）唯一但决定性的区别。
+
+`emit_audio_tags`（默认 **开**，只对 `sensevoice-small` 显示）把 `lang` 和
+`audio_event` 合进 `<topic>/asr` 和 `<topic>/asr_background` 两条 payload。
+`emit_emotion` 是**第二个开关，默认关** —— 理由在下面，是量出来的，不是谨慎。
+
+### 没信息的取值被压掉，而不是照发
+
+`_UNINFORMATIVE_AUDIO_TAGS` 挡掉 `NEUTRAL` / `EMO_UNKNOWN` / `UNKNOWN` /
+`Speech` / `Event_UNK` / `withitn` / `woitn`。所以一句语气平淡的普通话只多出
+`{"lang": "zh"}`，笑了才会多出 `"audio_event": "Laughter"`。
+
+两个理由，第二个更重要。payload 的每个 key 都会进 L4 trigger 让 LLM 读一遍，每句
+挂一个 `"emotion": "NEUTRAL"` 是让它为零信息付 token；而且它会把「模型没判断出情
+绪」读成「这个人语气平淡」—— 那是两件不同的事。`Speech` 同理：说话这件事由 `text`
+本身证明。这跟 `plugins/speaker.py` 只返回带信息的 key 是同一条规则。
+
+`lang` 不在压掉的名单里：它每次都有值，而值本身就是信息（zh/en/ja/ko/yue）。
+
+字段叫 `audio_event` 而不是 `event`，因为 agent-core 那边 `event` 是事件总线的词
+（`src/event/llm.py`、`config['event']`），payload 里再出现一个同名 key 只会让读日
+志的人以为是同一件事。
+
+### tag 走返回值，不走适配器上的状态
+
+`ASRAdapter.transcribe_rich()` 返回 `(text, extras)`；基类默认实现返回
+`(transcribe(...), {})`，所以 parakeet / x-asr 下这些 key 干脆不出现，而不是出现一
+个空值让 LLM 以为「判断过、没有情绪」。
+
+不要改成在适配器上记一个 `self._last_emotion`：`ASRPlugin._adapter` 是 **plugin 级
+的单个实例**，被所有 `_ASRNode` 共用（见 `_apply_shared`），而每个 node 有自己的
+worker 线程。两个麦克风同时转写时，挂在实例上的状态会把情绪配到另一句话上 —— 不报
+错，也不会有任何日志。
+
+三个字段都用 `getattr(..., "")` 取：它们来自 sherpa 的 C++ binding，换个版本少一个
+就直接取属性会让整条 ASR 路径抛异常。少一个 tag 不值得让机器人听不见。
+
+### 三个字段的实测价值差得很远（351 段真机语音）
+
+Orin 6 上 `/models/vad_segments/` 攒的 351 段真实语音，全部过一遍
+`sensevoice-small` int8：
+
+| 字段 | 分布 | 结论 |
+|---|---|---|
+| `lang` | zh 212 / en 116 / ko 12 / ja 6 / yue 3 / nospeech 2 | 每条都有值，而且都对得上 —— **真有用** |
+| `emotion` | NEUTRAL 180 + EMO_UNKNOWN 160 = **340/351**；SAD 5、HAPPY 6 | 剩下那 11 条基本是**错的**，见下 |
+| `audio_event` | Speech 348 + Event_UNK 3 | 压掉之后**一条都不剩** |
+
+情绪那 11 条长这样：
+
+| 真实句子 | 判成 |
+|---|---|
+| 小范小范，你好呀。 | SAD（同一种误判出现 3 次） |
+| 我的断网了，我断网了吗？ | HAPPY |
+| 也行先试试看吧也好不？对嗯，那我看了一下，好像也没有特别慢吧。 | HAPPY |
+
+不是「信号稀疏」，是噪音。而且它的错误方式最坏：一个挂在愉快问候上的
+`"emotion": "SAD"` 会让 LLM 按一种不存在的低落语气回应 —— 比没有这个字段更糟。
+所以 `emit_emotion` 默认关。开关留着，因为换一批说话人、换个场景也许不一样，而要量
+就得能打开；但默认值要对得起测出来的东西。真要做情绪识别，该上的是 emotion2vec+
+独立卡片，而不是把这个字段当它用。
+
+`audio_event` 全是 `Speech` 还有一个**结构性**原因，不只是语料里没人笑：这些段是
+**VAD 门控之后**的语音段，纯笑声/掌声/音乐根本走不到 ASR。所以在这条管道里，这个
+字段只可能在笑声**混在说话里**时触发。它默认开着是因为成本已经是零，不是因为验证
+过它会响。要检非语音事件，`plugins/soundevent.py` 才是直接订阅原始音频的那个；两者
+在 Laughter/Applause 这类标签上重叠，谁更准没比过。
+
+复现这个测量（只读，不动容器里的代码）：
+
+```bash
+# 拿 351 段真机语音过一遍，统计三个 tag 的分布
+ssh nvidia@10.100.121.16 'docker exec embodied-perception python3 - <<EOF
+import glob, wave, struct, collections, sherpa_onnx
+r = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+    model="/models/sherpa-onnx/sensevoice/model.int8.onnx",
+    tokens="/models/sherpa-onnx/sensevoice/tokens.txt",
+    num_threads=2, use_itn=True, language="auto")
+tally = collections.Counter()
+for f in sorted(glob.glob("/models/vad_segments/*.wav")):
+    with wave.open(f) as wf: pcm = wf.readframes(wf.getnframes())
+    n = len(pcm) // 2
+    st = r.create_stream()
+    st.accept_waveform(16000, [v/32768.0 for v in struct.unpack(f"<{n}h", pcm)] + [0.0]*8000)
+    r.decode_streams([st])
+    if st.result.text.strip(): tally[(st.result.emotion, st.result.event)] += 1
+print(tally)
+EOF'
+```
 
 ---
 

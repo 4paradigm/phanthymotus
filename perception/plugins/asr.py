@@ -10,7 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing
+import contextlib
+import ctypes.util
 import os
+import platform
+import re
 import struct
 import threading
 import time
@@ -125,16 +129,149 @@ def _point_phonemizer_at_espeak() -> None:
                 ", ".join(_ESPEAK_LIB_CANDIDATES))
 
 
+# Libraries we resolve by path rather than by forking `ldconfig` — see
+# `_import_without_forking`. Keyed by the name the caller passes to
+# `ctypes.util.find_library`; anything not listed here falls through to the real
+# implementation, fork and all.
+#
+# `dl` is the one that matters: `dlinfo/_glibc.py` calls
+# `find_library('dl')` at **import** time, and `phonemizer` imports `dlinfo`.
+# `espeak-ng` is listed too, even though PHONEMIZER_ESPEAK_LIBRARY normally
+# makes phonemizer skip the lookup, so a deployment that unsets that variable
+# does not quietly get the fork back.
+_FORK_FREE_LIBRARIES = {
+    "dl": ("/lib/aarch64-linux-gnu/libdl.so.2",
+           "/lib/x86_64-linux-gnu/libdl.so.2",
+           "/usr/lib/aarch64-linux-gnu/libdl.so.2",
+           "/usr/lib/x86_64-linux-gnu/libdl.so.2",
+           "/lib/libdl.so.2",
+           "/usr/lib/libdl.so.2"),
+    "espeak-ng": _ESPEAK_LIB_CANDIDATES,
+}
+
+# One import at a time, so two worker threads cannot nest the patch below and
+# leave the replacement installed when the inner one restores.
+_PHONEMIZER_IMPORT_LOCK = threading.Lock()
+
+
+def _warm_platform_uname() -> None:
+    """Fill `platform`'s uname cache now, while this process is still small.
+
+    `platform.uname()` runs `uname -p` to fill its `processor` field, and caches
+    the result for the life of the process. Doing that once at import — perception
+    is loading plugins, nothing is inferring yet — means the later callers
+    (`joblib` during the phonemizer import, among others) are served from the
+    cache and never fork. See `_import_without_forking` for why a fork from the
+    loaded process is not survivable.
+
+    Never raises: a missing `uname` is not a reason for ASR to fail to load.
+    """
+    try:
+        platform.uname()
+    except Exception as error:  # noqa: BLE001 - informational only
+        log.debug("[asr] platform.uname() warm-up failed: %s", error)
+
+
+@contextlib.contextmanager
+def _import_without_forking():
+    """Stop the `phonemizer` import shelling out, for the duration of a block.
+
+    **`ctypes.util.find_library` forks.** On Linux it shells out to
+    `ldconfig -p` through `subprocess`, and `dlinfo` — which `phonemizer` imports
+    — calls it at import time. Forking a 2.4 GB process with dozens of threads,
+    one of which is running a TensorRT warmup, is how the ASR worker wedged
+    forever on Orin 5: the child never reached `exec` (it inherited a lock held
+    by another thread at fork time) and the parent sat in `_execute_child`
+    waiting on the error pipe. The import lock stayed held, the worker never
+    transcribed anything, and perception's whole MCP surface stopped answering —
+    with nothing in any log, because the last line written was the one before
+    the fork.
+
+    It is a race: the same card starts cleanly when nothing else is loading,
+    which is why this only ever showed up right after 「启动控制」 (TTS warmup and
+    the ASR card come up together). That is exactly the kind of bug that must be
+    removed rather than made less likely, so this does not retry or time-bound
+    the fork — it makes sure there is no fork.
+
+    Same family as the espeak lookup documented in perception/README.md
+    (「asr_kws and espeak」); that fix used PHONEMIZER_ESPEAK_LIBRARY to skip
+    phonemizer's *own* `find_library`, which an env var cannot do for an import
+    inside a third-party package.
+
+    Measured on Orin 5 — every fork during `from phonemizer.backend import
+    EspeakBackend`, with `subprocess.Popen` instrumented:
+
+        without this guard   4   uname -p
+                                 /sbin/ldconfig -p
+                                 /usr/bin/gcc -Wl,-t -o /tmp/… -ldl
+                                 /usr/bin/objdump -p -j .dynamic …/libdl.so
+        with it              0
+
+    The gcc/objdump pair is `ctypes.util`'s fallback: `ldconfig -p` finds
+    nothing, because `Dockerfile.jetson` replaces `ldconfig` with a no-op during
+    apt installs and the cache is never rebuilt — the same root cause as the
+    espeak lookup above. So what reads like one library lookup actually
+    *compiles a program* to find `libdl`: three forks, one of them a compiler,
+    in a process that must not fork at all.
+
+    `uname -p` is the fourth, and it is **not** `platform.processor()` — that was
+    the obvious guess and it was wrong. The caller is `platform.system()`, which
+    goes through `platform.uname()`, which fills its `processor` field by running
+    `uname -p` (`platform._syscmd_uname`). `joblib`, imported by
+    `phonemizer.backend.base`, calls `system()` at import time. Patching
+    `processor` therefore changed nothing — measured, still 1 fork.
+
+    `platform.uname()` caches, so `_warm_platform_uname()` at module import does
+    the real work: one fork while the process is small and quiet, and every later
+    caller is served from `_uname_cache`. The patch here is the belt to that
+    braces — if the warm-up ever fails, `_syscmd_uname` returns its `default`
+    instead of forking, which is exactly what `platform` itself does on a system
+    with no `uname` binary.
+
+    A tiny child is not a safer child, which is why `uname -p` is in scope at
+    all: the hang is *in* fork, before exec, so what would have been exec'd does
+    not matter.
+    """
+    original_find_library = ctypes.util.find_library
+    # Private, so do not assume it exists — a future CPython may drop it, and
+    # losing this guard must not break ASR.
+    original_syscmd_uname = getattr(platform, "_syscmd_uname", None)
+
+    def resolver(name):
+        for path in _FORK_FREE_LIBRARIES.get(name, ()):
+            if os.path.exists(path):
+                return path
+        # Unknown library: keep the stdlib behaviour rather than returning None,
+        # which the caller would read as "not installed".
+        return original_find_library(name)
+
+    ctypes.util.find_library = resolver
+    if original_syscmd_uname is not None:
+        platform._syscmd_uname = lambda option, default='': default
+    try:
+        yield
+    finally:
+        ctypes.util.find_library = original_find_library
+        if original_syscmd_uname is not None:
+            platform._syscmd_uname = original_syscmd_uname
+
+
+_warm_platform_uname()
+
+
 def _get_espeak_backend(lang):
     global _ESPEAK_SEP
-    if _ESPEAK_SEP is None:
-        _point_phonemizer_at_espeak()
-        from phonemizer.separator import Separator
-        _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
-    if lang not in _ESPEAK_BACKENDS:
-        from phonemizer.backend import EspeakBackend
-        _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
-    return _ESPEAK_BACKENDS[lang]
+    # The import is what forks, so the guard has to cover it. Everything else in
+    # here is cheap and holding the lock across it keeps the patch un-nested.
+    with _PHONEMIZER_IMPORT_LOCK, _import_without_forking():
+        if _ESPEAK_SEP is None:
+            _point_phonemizer_at_espeak()
+            from phonemizer.separator import Separator
+            _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
+        if lang not in _ESPEAK_BACKENDS:
+            from phonemizer.backend import EspeakBackend
+            _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
+        return _ESPEAK_BACKENDS[lang]
 
 
 def _phonemize_safe(text: str, lang: str) -> str:
@@ -438,6 +575,21 @@ TOOLS = [
                 # 不到、也不知道为什么 —— 而那正是这个开关被要求加上来的起因。
                 # trigger_mode=vad 时这条路径根本不会被走到。
                 "publish_background": {"type": "boolean", "description": "把没有唤醒词的话语发到 <topic>/asr_background（priority 0，供后台 subagent 分析旁边听到的对话）。关掉就回到以前的行为：未触发的句子直接丢弃。注意这条 topic **要在画布上连到 decision_core 才会进 LLM** —— 只打开开关不连线，等于只发不收", "default": True, "scope": "shared"},
+                # SenseVoice 的解码结果本来就带情绪 / 音频事件 / 语种（见
+                # SherpaOnnxSenseVoiceAdapter.transcribe_rich），以前整段丢掉只
+                # 留 text。打开它不加载模型、不多一次推理 —— 只是别再扔掉。
+                # 默认开，且无信息的取值（NEUTRAL / Speech / EMO_UNKNOWN）会被
+                # 压掉，所以普通一句话只多出一个 lang 字段。
+                # 只对 sensevoice-small 有意义：别的模型的结果里没有这些字段，
+                # 开着也只是调一个返回空 dict 的默认实现。
+                "emit_audio_tags": {"type": "boolean", "description": "把 SenseVoice 顺带给出的语音情绪（HAPPY/SAD/ANGRY…）、音频事件（Laughter/Cry/Applause/BGM…）和语种一起发到 <topic>/asr。零额外模型、零额外内存：这些字段模型本来就算了，以前被丢掉。平淡的普通话只会多一个 lang 字段", "default": True, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"]}},
+                # 默认 **关**，而上面那个默认开。不是保守，是实测：Orin 6 上 351
+                # 段真机语音里 340 段是 NEUTRAL/EMO_UNKNOWN，剩下 11 段基本是错的
+                # （「小范小范，你好呀。」→ SAD，出现三次；「我的断网了？」→ HAPPY）。
+                # 一个挂在愉快问候上的 "emotion": "SAD" 比没有这个字段更糟 —— LLM
+                # 会据此改口气。开关留着，因为换一批说话人/换个场景也许不一样，而
+                # 要量就得能打开；但默认值要对得起测出来的东西。见 README。
+                "emit_emotion": {"type": "boolean", "description": "把 SenseVoice 的语音情绪（HAPPY/SAD/ANGRY…）也发出来。默认关：351 段真机语音实测，97% 是 NEUTRAL/EMO_UNKNOWN，剩下 3% 基本是误判（「你好呀」被判成 SAD），开着会让 LLM 按错的语气回应。要真的做情绪识别应该上 emotion2vec+ 独立卡片", "default": False, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"], "emit_audio_tags": [True]}},
                 "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
@@ -491,9 +643,76 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
 
 # ── ASR Adapters ──────────────────────────────────────────────────────────────
 
+# SenseVoice 的解码结果里那三个 tag 的「没说出什么」取值。
+#
+# 这些值要被压掉，而不是照发。payload 里每个 key 都要被塞进 L4 trigger 让 LLM 读
+# 一遍，而每一句都挂一个 `"emotion": "NEUTRAL"` 是让它为零信息付 token —— 更糟的
+# 是它会把「模型没判断出情绪」读成「这个人语气平淡」，那是两件不同的事。
+# 同理 `Speech`：说话这件事由 text 本身证明，不需要一个字段重复一遍。
+# `withitn` / `woitn` 是 ITN 开关的回显，连信息都不是。
+#
+# `lang` 不在这里：它每次都有值，而值本身就是信息（中/英/日/韩/粤），见
+# `_audio_tag_fields`。
+_UNINFORMATIVE_AUDIO_TAGS = frozenset({
+    "EMO_UNKNOWN", "UNKNOWN", "NEUTRAL",
+    "Speech", "Event_UNK", "withitn", "woitn",
+})
+
+_TAG_RE = re.compile(r"<\|(.*?)\|>")
+
+
+def _strip_tag(raw: str) -> str:
+    """`<|HAPPY|>` → `HAPPY`。不是 tag 形状的原样返回（去空白）。"""
+    text = (raw or "").strip()
+    match = _TAG_RE.fullmatch(text)
+    return (match.group(1) if match else text).strip()
+
+
+def _audio_tag_fields(lang: str = "", emotion: str = "",
+                      event: str = "", include_emotion: bool = False) -> dict:
+    """把 SenseVoice 的三个 tag 变成要合进 payload 的字段。
+
+    没信息的值不进 payload —— 理由见 `_UNINFORMATIVE_AUDIO_TAGS`。所以一句语气
+    平淡的普通话只多出 `{"lang": "zh"}`，笑了才会多出 `audio_event`。
+
+    `include_emotion` 默认 **False**，因为 351 段真机语音实测下来这一项是噪音而
+    不是稀疏信号 —— 见 README「语音情绪和音频事件」。打开它是操作员的选择。
+
+    `event` 叫 `audio_event` 而不是 `event`：agent-core 那边 `event` 是触发器/
+    事件总线的词（`src/event/llm.py`、`config['event']`），payload 里再出现一个
+    同名 key 只会让读日志的人以为是同一件事。
+    """
+    fields = {}
+    pairs = [("lang", lang), ("audio_event", event)]
+    if include_emotion:
+        pairs.insert(1, ("emotion", emotion))
+    for key, raw in pairs:
+        value = _strip_tag(raw)
+        if not value or value in _UNINFORMATIVE_AUDIO_TAGS:
+            continue
+        fields[key] = value
+    return fields
+
+
 class ASRAdapter(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, language: str) -> str: ...
+
+    def transcribe_rich(self, wav_bytes: bytes, language: str,
+                        include_emotion: bool = False) -> tuple[str, dict]:
+        """转写，外加这个模型顺带算出的非文字信息（情绪 / 音频事件 / 语种）。
+
+        返回 `(text, extras)`，`extras` 直接合进发布的 payload。默认是空 dict：
+        只有 SenseVoice 的解码结果带这些字段，别的适配器下这些 key 干脆不出现，
+        而不是出现一个空值让 LLM 以为「这句话判断过、没有情绪」。
+
+        为什么是返回值，而不是适配器上记一个 `self._last_emotion`：
+        `ASRPlugin._adapter` 是 **plugin 级的单个实例**，被所有 _ASRNode 共用
+        （见 `_apply_shared`），而每个 node 有自己的 worker 线程。挂在实例上的
+        状态在两个输入 topic 同时转写时会互相串，而串出来的结果是「情绪对了但
+        配到了另一句话上」—— 不会报错，也不会有任何日志。
+        """
+        return self.transcribe(wav_bytes, language), {}
 
 
 class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
@@ -530,6 +749,18 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
                  f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        return self.transcribe_rich(wav_bytes, language)[0]
+
+
+    def transcribe_rich(self, wav_bytes: bytes, language: str,
+                        include_emotion: bool = False) -> tuple[str, dict]:
+        """一次解码，文字和 tag 一起拿。
+
+        `emotion` / `event` / `lang` 是 SenseVoice 的前几个输出 token，sherpa 在
+        把它们从 text 里剥掉的同时填进了 result 的这三个字段。也就是说这些信息
+        **本来就已经算出来了**，以前只是被 `return text` 扔掉：这里不加载任何
+        模型、不多跑一次推理、不多占一字节显存。
+        """
         import io as _io, wave as _wave
         with _wave.open(_io.BytesIO(wav_bytes)) as wf:
             pcm = wf.readframes(wf.getnframes())
@@ -542,8 +773,15 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
         self._recognizer.decode_streams([stream])
-        text = stream.result.text
-        return text.strip()
+        result = stream.result
+        # getattr 而不是直接取：这三个字段是 sherpa 的 C++ binding 给的，换个
+        # 版本少一个就会让 ASR 整条路径抛异常。少一个 tag 不值得让机器人听不见。
+        tags = _audio_tag_fields(
+            lang=getattr(result, "lang", "") or "",
+            emotion=getattr(result, "emotion", "") or "",
+            event=getattr(result, "event", "") or "",
+            include_emotion=include_emotion)
+        return result.text.strip(), tags
 
 
 class SherpaOnnxNemoCtcAdapter(ASRAdapter):
@@ -1179,7 +1417,9 @@ class _ASRNode(Node):
                  kws_cfg: dict = None, node_suffix: str = '',
                  save_vad_segments: bool = False, max_saved_segments: int = 1000,
                  vad_pre_roll_ms: int = 500, speaker=None,
-                 publish_background: bool = True):
+                 publish_background: bool = True,
+                 emit_audio_tags: bool = True,
+                 emit_emotion: bool = False):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -1209,6 +1449,10 @@ class _ASRNode(Node):
         # a config flip could not take effect without restarting the node, and a
         # ROS publisher with no subscriber costs nothing.
         self._publish_background_enabled = bool(publish_background)
+        # 情绪 / 音频事件 / 语种是否进 payload。关掉就回到以前的行为：只发 text。
+        self._emit_audio_tags = bool(emit_audio_tags)
+        # 情绪单独一个开关，默认关 —— 实测它是噪音，见 configSchema 里的说明。
+        self._emit_emotion = bool(emit_emotion)
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -1493,7 +1737,8 @@ class _ASRNode(Node):
         return fields
 
     def _publish_background(self, text: str, start_ts, end_ts,
-                           utterance: bytes, speaker_fields: dict) -> None:
+                           utterance: bytes, speaker_fields: dict,
+                           audio_tags: Optional[dict] = None) -> None:
         """旁边听到、但没在跟机器人说的话。
 
         `priority: 0` 是路由的全部机制：`collector._extract_priority` 读 JSON 里
@@ -1520,6 +1765,9 @@ class _ASRNode(Node):
                 "audio_end_ts": end_ts,
                 "audio_duration_ms": int(len(utterance) / 32),
                 **(speaker_fields or {}),
+                # 旁边那个人的情绪和笑声/哭声，对后台 subagent 和前台一样是信息
+                # —— 「谁在房间里、在干什么」这件事上甚至更是。
+                **(audio_tags or {}),
             }
             message = String()
             message.data = json.dumps(payload, ensure_ascii=False)
@@ -1602,7 +1850,12 @@ class _ASRNode(Node):
                 # 放了 GIL，6 核跑 2+2 线程在 vop/OCR/TTS 都在的情况下仍有余量。
                 _identity = self._start_identify(utterance, pre_roll_bytes)
                 _t0 = time.time()
-                text  = self._adapter.transcribe(wav, self._language)
+                if self._emit_audio_tags:
+                    text, _audio_tags = self._adapter.transcribe_rich(
+                        wav, self._language, self._emit_emotion)
+                else:
+                    text = self._adapter.transcribe(wav, self._language)
+                    _audio_tags = {}
                 _spans.append({"span": "asr_transcribe", "component": "perception",
                                "start_ts": _t0, "end_ts": time.time(),
                                "meta": {"audio_ms": int(len(utterance) / 32)}})
@@ -1639,7 +1892,8 @@ class _ASRNode(Node):
                         # agent-core 的 collector 据此送后台 subagent（priority
                         # 字段优先于 source 匹配，见 collector._extract_priority）。
                         self._publish_background(text, start_ts, end_ts,
-                                                utterance, _speaker_fields)
+                                                utterance, _speaker_fields,
+                                                _audio_tags)
                         continue
                     # Extract text after keyword
                     remaining = _text_after_phoneme(text, text_char_ends, end_pos)
@@ -1663,7 +1917,10 @@ class _ASRNode(Node):
                           # 所以这里直接合并。`"speaker_profile": {}` 这种东西
                           # LLM 要为它付 token 而拿不到信息，还会让它以为「这个
                           # 人有 profile，只是空的」。
-                          **_speaker_fields}
+                          **_speaker_fields,
+                          # 同一条规则：SenseVoice 判断不出情绪时这里什么都不加，
+                          # 而不是加一个 NEUTRAL —— 见 _UNINFORMATIVE_AUDIO_TAGS。
+                          **_audio_tags}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
                 log.info(f"[asr] {text!r}")
@@ -1727,6 +1984,8 @@ class ASRPlugin:
         # previous per-process counter actually prunes.
         self._publish_background_enabled = bool(
             plugin_cfg.get('publish_background', True))
+        self._emit_audio_tags = bool(plugin_cfg.get('emit_audio_tags', True))
+        self._emit_emotion = bool(plugin_cfg.get('emit_emotion', False))
         self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
         self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
         self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
@@ -1791,6 +2050,8 @@ class ASRPlugin:
         # only thing that has to change. `save_vad_segments` above is applied the
         # same way and for the same reason.
         node._publish_background_enabled = self._publish_background_enabled
+        node._emit_audio_tags = self._emit_audio_tags
+        node._emit_emotion = self._emit_emotion
 
     def _load_model_async(self, model_name: str):
         """Download and load ASR model in a background thread.
@@ -2003,7 +2264,9 @@ class ASRPlugin:
                                     max_saved_segments=self._max_saved_segments,
                                     vad_pre_roll_ms=self._vad_pre_roll_ms,
                                     speaker=self._speaker,
-                                    publish_background=self._publish_background_enabled)
+                                    publish_background=self._publish_background_enabled,
+                                    emit_audio_tags=self._emit_audio_tags,
+                                    emit_emotion=self._emit_emotion)
                     try:
                         self._executor.add_node(node)
                     except Exception:
@@ -2071,6 +2334,10 @@ class ASRPlugin:
                 self._kws_cfg['asr_kws_threshold'] = float(cfg['asr_kws_threshold'])
             if 'publish_background' in cfg:
                 self._publish_background_enabled = bool(cfg['publish_background'])
+            if 'emit_audio_tags' in cfg:
+                self._emit_audio_tags = bool(cfg['emit_audio_tags'])
+            if 'emit_emotion' in cfg:
+                self._emit_emotion = bool(cfg['emit_emotion'])
             if 'save_vad_segments' in cfg:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:
