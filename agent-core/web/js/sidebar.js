@@ -991,6 +991,25 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // Expert settings go in a fold. A card whose every tuning knob is laid out
+  // flat is a card nobody can configure: the pose card reached 26 fields, each
+  // labelled with its own paragraph of rationale, and finding `fps` in it meant
+  // reading all of them. A schema says which of its fields are everyday by
+  // leaving `advanced` unset; one that marks nothing keeps the flat layout it
+  // had, so this changes no card that has not opted in.
+  let advancedBox = null;
+  const advancedHost = () => {
+    if (advancedBox) return advancedBox;
+    const details = document.createElement('details');
+    details.className = 'tool-config-advanced';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced settings';
+    details.appendChild(summary);
+    bodyEl.appendChild(details);
+    advancedBox = details;
+    return details;
+  };
+
   let hasFields = false;
   for (const [key, def] of Object.entries(props)) {
     // Only show instance-scope fields
@@ -999,6 +1018,10 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
+    // `title` is the name of the setting; `description` is what it does. They
+    // were one field, so a description written to explain a trade-off became
+    // the label and the form turned into an essay. A schema with no title
+    // still falls back to its description, as before.
     label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
@@ -1099,8 +1122,19 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
-    bodyEl.appendChild(label);
-    bodyEl.appendChild(input);
+    // Help text, only when there is a separate title to help — otherwise the
+    // description is already serving as the label and repeating it is noise.
+    let help = null;
+    if (def.title && def.description) {
+      help = document.createElement('p');
+      help.className = 'tool-config-help';
+      help.textContent = def.description;
+    }
+
+    const host = def.advanced ? advancedHost() : bodyEl;
+    host.appendChild(label);
+    host.appendChild(input);
+    if (help) host.appendChild(help);
   }
 
   if (!hasFields) {

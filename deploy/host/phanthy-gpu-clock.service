@@ -1,0 +1,22 @@
+# Applies the GPU minimum clock at boot. See gpu-min-clock.sh for why this is
+# a host unit and not something a container does to itself, and for the
+# measured power/latency trade-off behind the default.
+#
+#   sudo cp phanthy-gpu-clock.service /etc/systemd/system/
+#   sudo cp gpu-min-clock.sh /opt/phanthy-motus/
+#   sudo systemctl enable --now phanthy-gpu-clock
+#
+# Change the frequency by editing ExecStart; `--reset` returns the machine to
+# its stock behaviour and nothing else in the stack depends on this being set.
+[Unit]
+Description=Phanthy Motus: raise the Jetson GPU minimum clock
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/phanthy-motus/gpu-min-clock.sh 1020
+ExecStop=/opt/phanthy-motus/gpu-min-clock.sh --reset
+
+[Install]
+WantedBy=multi-user.target
