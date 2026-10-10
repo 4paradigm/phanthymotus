@@ -1309,6 +1309,78 @@ POSE_MODEL_BUNDLES = {
 }
 
 
+# Hand keypoints for the pose card: RTMPose-m, hand5, 21 joints, 256x256.
+#
+# **This replaced a YOLO26-pose model fine-tuned on hand keypoints, and the
+# reason was accuracy, not speed.** On a real camera that model put the wrist
+# in the middle of the palm on an OK sign, returned an open hand as a clump,
+# and collapsed the joints under motion blur — while its detection score
+# stayed around 0.8, so nothing downstream could tell. Compared on the same
+# crops, RTMPose was right on every picture it was wrong on.
+#
+# It is also cheaper, which was not expected. Per hand, through the production
+# runtime:
+#
+#     engine                     Orin 6 @1020MHz   Orin 5 (jp5.11)
+#     yolo26s-hand21 @448            7.99 ms           8.19 ms
+#     rtmpose-m-hand5 @256           3.58 ms           4.33 ms
+#     rtmpose-m-hand5, batch 2       2.52 ms/hand      3.14 ms/hand
+#
+# Built from the ONNX in OpenMMLab's own deployment bundle
+# (rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320), with
+# trtexec --fp16 inside the target perception image. Dynamic batch, 1..4.
+#
+# Two things about this model that the YOLO one did not have:
+#
+# * **It is top-down.** There is no detector and no detection score; it
+#   assumes whatever is in the box is a hand. The box comes from the arm, and
+#   it has to be roughly right — measured, anywhere from 0.30 to 0.65 of the
+#   crop the YOLO model wanted produced a correct hand, which is a 2.2x range.
+# * **It normalises with ImageNet mean/std on RGB**, not /255. Feeding it the
+#   other one produces a confident hand in the wrong place.
+#
+# The two outputs are both (N, 21, 512) — identical shapes — so they can only
+# be told apart by name. plugins/hand_runtime indexes them by name for that
+# reason; this repository has already been bitten by TensorRT listing an
+# engine's outputs in a different order on the two JetPack lines.
+HAND_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/rtmpose-m-hand5/tensorrt-jp61-trt10.4-orin-256",
+        "files": {
+            "rtmpose-m-hand5.engine": {
+                "size": 30486172,
+                "sha256": "b1d182c7376a220153ffd6bdaadab7674c6f660a711086f1e5b92e399bde2a72",
+            },
+        },
+    },
+    # Same ONNX, different TensorRT (8.5.2.2), therefore different bytes —
+    # which is the whole reason this table is keyed by JetPack family.
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/rtmpose-m-hand5/tensorrt-jp511-trt8.5-orin-256",
+        "files": {
+            "rtmpose-m-hand5.engine": {
+                "size": 30313545,
+                "sha256": "c162de4333771769b50309db16b651f3ce40f627b3719dc3fbb75ef305a5b212",
+            },
+        },
+    },
+}
+
+
+# The ONNX both plans were built from, mirrored so an engine rebuild is
+# reproducible without re-downloading from openmmlab. **Build-time only; no
+# robot fetches this.**
+HAND_ONNX = {
+    "rtmpose-m-hand5-256.onnx": {
+        "size": 55080248,
+        "sha256": "39e858936bca0f94c09847d4e70b68a51d6c0adac61f36b457fcadb54621cd29",
+    },
+}
+
+HAND_ONNX_BASE = os.environ.get(
+    "HAND_ONNX_BASE_URL", f"{VISION_MODEL_BASE}/rtmpose-m-hand5/onnx")
+
+
 # Skeleton-action recognition for the pose card: ST-GCN++, joint stream,
 # NTU60-XSub, 2D 17-keypoint input. 1.39 M params and 1.95 GFLOPs at 100 frames,
 # top-1 89.3% — the smallest of the options with a published 2D-COCO17
@@ -1447,6 +1519,31 @@ def ensure_action_model(model_dir: str, family: str | None = None,
     """Ensure the skeleton-action engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("action", ACTION_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+
+def ensure_hand_model(model_dir: str, family: str | None = None,
+                      progress_cb=None) -> dict[str, str]:
+    """Ensure the 21-keypoint hand engine matching the runtime TensorRT is present.
+
+    Fetched lazily and only when the pose card's `hands` setting asks for it:
+    on an 8 GB Orin already running body pose, vop, depth, OCR, ASR and TTS,
+    memory rather than GPU time is the binding constraint, so a card whose hand
+    channel is off must cost nothing.
+    """
+    return _ensure_vision_bundle("hand", HAND_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_hand_onnx(model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Fetch the ONNX the hand engines are built from. Build-time only.
+
+    Nothing on a robot calls this; it is an input to
+    tools/export_vision_engines.py --model hand, and the reason an engine can be
+    rebuilt without re-exporting from the .pt (which would change the numbers if
+    the ultralytics version differs — see HAND_MODEL_BUNDLES).
+    """
+    return ensure_verified_bundle("hand/onnx", model_dir, HAND_ONNX_BASE,
+                                  HAND_ONNX, progress_cb=progress_cb)
 
 
 def ensure_pose_model(model_dir: str, family: str | None = None,

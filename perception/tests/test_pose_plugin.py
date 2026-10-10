@@ -1041,3 +1041,345 @@ def test_the_alert_colour_keys_on_the_channels_not_the_label():
     assert pose_plugin.overlay_label(
         {"posture": "lying", "activity": {"name": "falling down"}}
     ) not in pose_plugin._ALERT_LABELS
+
+
+# ── the hand channel: the wiring ─────────────────────────────────────────────
+#
+# The ROI geometry, the budget and the 59-point merge are covered in
+# tests/test_hand_runtime.py. What is left here is that the card is plumbed to
+# it: the second engine stays unloaded unless asked for, the skeleton payload
+# describes its own enlarged layout, and `info` can explain a hand-less frame.
+
+class _FakeHandSession:
+    """Fake RTMPose engine: two SimCC tensors, named so they can be told apart."""
+
+    def __init__(self, net=256, span_frac=0.6, conf=0.9):
+        self.calls = 0
+        self.net = net
+        self.span_frac = span_frac
+        self.conf = conf
+        self.output_names = ["simcc_x", "simcc_y"]
+        self.input_dtype = np.float32
+
+    @property
+    def input_size(self):
+        return (self.net, self.net)
+
+    def infer(self, blob):
+        self.calls += 1
+        from plugins.hand_runtime import N_HAND_KEYPOINTS
+
+        bins = self.net * 2
+        sx = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        sy = np.zeros((1, N_HAND_KEYPOINTS, bins), np.float32)
+        lo = (0.5 - self.span_frac / 2) * self.net
+        for j in range(N_HAND_KEYPOINTS):
+            x = lo + self.span_frac * self.net * j / max(N_HAND_KEYPOINTS - 1, 1)
+            sx[0, j, int(x * 2)] = self.conf
+            sy[0, j, int(self.net * 0.5 * 2)] = self.conf
+        return [sx, sy]
+
+
+def _hand_plugin(cfg=None, hand_session=None):
+    """A card with both engines pre-set, so no download is attempted."""
+    merged = {"hands": "keypoints", "hand_interval_s": 0.0}
+    merged.update(cfg or {})
+    plugin, _ = _plugin(merged)
+    plugin._hand_model = hand_session or _FakeHandSession()
+    return plugin
+
+
+def test_hands_off_never_loads_the_second_engine():
+    """The whole reason the channel is opt-in: on an 8 GB Orin already running
+    vop, depth, OCR, ASR and TTS the binding constraint is memory."""
+    plugin, _ = _plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    assert plugin._hand_model is None
+    assert plugin._nodes["/cam/rgb"]._hand_channel is None
+
+
+def test_hands_off_is_the_default():
+    plugin, _ = _plugin()
+    assert plugin._hands == "off"
+    assert pose_plugin.TOOLS[0]["configSchema"]["properties"]["hands"]["default"] == "off"
+
+
+def test_an_unknown_hands_level_falls_back_to_off():
+    """A typo must not quietly enable a second engine."""
+    plugin, _ = _plugin({"hands": "gesture"})      # not offered yet
+    assert plugin._hands == "off"
+
+
+def test_hands_on_attaches_a_channel():
+    plugin = _hand_plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = plugin._nodes["/cam/rgb"]
+    assert node._hand_channel is not None
+    assert node._status()["hands"] == "keypoints"
+
+
+def test_the_skeleton_payload_grows_to_fifty_nine_and_says_so():
+    """pose2d.js prefers a payload-carried table over its own copy, so this is
+    what lets the renderer draw hands with no frontend change at all."""
+    plugin = _hand_plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    skeleton = json.loads(_publisher(node, "/cam/rgb/poses/skeleton").messages[-1])
+    assert len(skeleton["keypoint_names"]) == 59
+    assert skeleton["keypoint_names"][N_KEYPOINTS] == "left_hand_wrist"
+    assert len(skeleton["persons"][0]["keypoints"]) == 59
+    flat = {i for edge in skeleton["skeleton"] for i in edge}
+    assert max(flat) == 58
+
+
+def test_the_first_seventeen_keypoints_do_not_move():
+    """Any already-wired consumer indexes them, including the renderer's own
+    COCO bone table."""
+    plugin = _hand_plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    with_hands = json.loads(
+        _publisher(node, "/cam/rgb/poses/skeleton").messages[-1])
+
+    plain, _ = _plugin()
+    plain.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    plain_node = _feed(plain, "/cam/rgb")
+    without = json.loads(
+        _publisher(plain_node, "/cam/rgb/poses/skeleton").messages[-1])
+
+    assert (with_hands["persons"][0]["keypoints"][:N_KEYPOINTS]
+            == without["persons"][0]["keypoints"][:N_KEYPOINTS])
+    assert without["keypoint_names"] == list(pose_plugin.COCO_KEYPOINTS)
+
+
+def test_the_lean_topic_gets_which_hands_were_seen_but_not_the_coordinates():
+    """Every byte of this topic is a byte of LLM context on every frame, and 42
+    coordinates are of no use to a text model."""
+    plugin = _hand_plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    person = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])["persons"][0]
+    assert "hands_seen" in person
+    assert "hand_keypoints" not in person
+
+
+def test_hand_keypoints_can_be_put_on_the_lean_topic_on_request():
+    plugin = _hand_plugin({"publish_hand_keypoints": "compact"})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    person = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])["persons"][0]
+    if person["hands_seen"]:
+        side = person["hands_seen"][0]
+        assert len(person["hand_keypoints"][side]) == 21
+        assert len(person["hand_keypoints"][side][0]) == 2       # compact
+
+
+def test_a_card_without_hands_says_nothing_about_them_on_the_lean_topic():
+    plugin, _ = _plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    person = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])["persons"][0]
+    assert "hands_seen" not in person
+
+
+def test_info_explains_a_handless_frame():
+    """too_far / wrist_occluded / elbow_occluded / throttled look identical from
+    outside, and so does a broken engine."""
+    plugin = _hand_plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    _feed(plugin, "/cam/rgb")
+    info = plugin.dispatch("pose", {"action": "info"})
+    instance = info["instances"]["/cam/rgb"]
+    assert instance["hands"] == "keypoints"
+    assert instance["hand_input"] == 256      # RTMPose-m hand5
+    from plugins.hand_runtime import SKIP_REASONS
+
+    assert set(instance["hand_skipped"]) == set(SKIP_REASONS)
+    assert "hand_ran" in instance
+    assert info["hands"] == "keypoints"
+    assert len(info["hand_keypoint_names"]) == 21
+
+
+def test_info_reports_a_failed_hand_engine_rather_than_looking_hand_free():
+    plugin, _ = _plugin({"hands": "keypoints"})
+    # No pre-set session, so the channel build hits the downloader and fails
+    # (no COS in the test environment) — which must not stop the card.
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pose", {"action": "info"})
+    assert info["hands"] == "keypoints"
+    assert "hand_engine_error" in info
+    assert info["instances"]["/cam/rgb"]["hands"] == "off"
+
+
+def test_the_body_channel_survives_a_hand_engine_failure():
+    """The body channel answers "is somebody calling me" at any distance;
+    losing it because a second engine could not be fetched is the wrong trade."""
+    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    lean = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])
+    assert lean["count"] == 1
+    assert lean["persons"][0]["posture"] == "standing"
+
+
+def test_info_reports_the_effective_hand_state_not_the_card_default():
+    """Found on Orin 5: a card switched on per instance reported `hands: off`
+    at the top level while plainly running hands, which is the same class of
+    mistake as a card looking like it chose to have no hands."""
+    plugin, _ = _plugin()                      # card level: hands off
+    plugin._hand_model = _FakeHandSession()
+    plugin.dispatch("pose", {"action": "config", "instance_id": "/cam/rgb",
+                             "hands": "keypoints", "hand_interval_s": 0})
+    plugin.dispatch("pose", {"action": "start", "instance_id": "/cam/rgb",
+                             "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pose", {"action": "info"})
+    assert info["instances"]["/cam/rgb"]["hands"] == "keypoints"
+    assert info["hands"] == "keypoints"
+    assert info["hand_model"] == pose_plugin.HAND_MODEL
+
+
+# ── hands from a single photo ────────────────────────────────────────────────
+#
+# Reported from Orin 6: a card with `hands: keypoints` answered
+# recognize_by_photo with a body skeleton and no fingers. The hand channel was
+# wired into the stream path only. Unlike the gesture transitions — durations
+# over consecutive frames, which a still cannot support — 21 keypoints are
+# perfectly readable from one image.
+
+def _photo_args(path="/tmp/x.jpg"):
+    return {"action": "recognize_by_photo", "image_path": path}
+
+
+def test_a_photo_answers_with_hands_when_the_channel_is_on(tmp_path, monkeypatch):
+    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin._hand_model = _FakeHandSession()
+    monkeypatch.setattr(pose_plugin, "load_image_bytes",
+                        lambda args, cfg, url_action: (b"640x480", "test"))
+    result = plugin.dispatch("pose", _photo_args())
+    assert result["ok"] is True
+    assert len(result["keypoint_names"]) == 59
+    person = result["persons"][0]
+    assert "hands" in person
+    assert result["hands"]["ok"] is True
+
+
+def test_a_photo_without_the_channel_is_unchanged(monkeypatch):
+    plugin, _ = _plugin()
+    monkeypatch.setattr(pose_plugin, "load_image_bytes",
+                        lambda args, cfg, url_action: (b"640x480", "test"))
+    result = plugin.dispatch("pose", _photo_args())
+    assert len(result["keypoint_names"]) == N_KEYPOINTS
+    assert "hands" not in result["persons"][0]
+    assert "hands" not in result
+
+
+def test_a_photo_with_no_usable_arm_falls_back_to_the_whole_frame():
+    """A photograph of a hand alone has no elbow and no wrist, so the ROI path
+    refuses it and the engine never runs — which from the caller's side is
+    indistinguishable from "the model cannot see hands". Reported from Orin 6
+    with exactly that picture.
+
+    The engine is a hand detector too and a photo has no per-frame budget, so
+    the frame itself becomes the crop. The stream deliberately does not do
+    this: there it would run on exactly the frames where nobody's arms show.
+    """
+    plugin, _ = _plugin({"hands": "keypoints", "hand_min_forearm_px": 10000.0})
+    plugin._hand_model = _FakeHandSession()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    note = result["hands"]
+    assert note["found"] == 0
+    assert note["skipped"]["too_far"] >= 1
+    assert note["unattached"] >= 1
+    assert "没有身体就无从判断" in note["note"]
+
+
+def test_an_unattached_hand_carries_no_side():
+    """Left/right comes from which wrist the crop was derived from. With no
+    body there is nothing that knows, and guessing it from appearance is what
+    deriving it from the wrist exists to avoid."""
+    plugin, _ = _plugin({"hands": "keypoints", "hand_min_forearm_px": 10000.0})
+    plugin._hand_model = _FakeHandSession()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    loose = result["unattached_hands"]
+    assert loose and len(loose[0]["keypoints"]) == 21
+    assert "side" not in loose[0] and "hand" not in loose[0]
+
+
+def test_the_whole_frame_fallback_is_not_used_when_a_hand_was_attached():
+    """It is a fallback, not a second opinion — a hand already attached to an
+    arm must not also appear as an unattached one."""
+    plugin, _ = _plugin({"hands": "keypoints"})
+    plugin._hand_model = _FakeHandSession()
+    import plugins.pose as _p
+    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    result = plugin.dispatch("pose", _photo_args())
+    assert result["hands"]["found"] >= 1
+    assert "unattached_hands" not in result
+
+
+def test_a_photo_survives_a_missing_hand_engine(monkeypatch):
+    plugin, _ = _plugin({"hands": "keypoints"})
+    monkeypatch.setattr(pose_plugin, "load_image_bytes",
+                        lambda args, cfg, url_action: (b"640x480", "test"))
+    result = plugin.dispatch("pose", _photo_args())
+    assert result["ok"] is True                      # the bodies still answer
+    assert result["hands"]["ok"] is False
+    assert result["hands"]["reason"] == "engine_unavailable"
+
+
+# ── the config form ──────────────────────────────────────────────────────────
+#
+# The dialog labels each field with `title || description || key`, so a
+# description written to explain a trade-off becomes the label. This card had
+# 26 fields each labelled with its own paragraph, which is not a form anyone
+# can fill in.
+
+def test_every_instance_field_has_a_short_title():
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key, spec in props.items():
+        if spec.get("scope") != "instance":
+            continue
+        assert spec.get("title"), key
+        assert len(spec["title"]) <= 40, (key, spec["title"])
+
+
+def test_the_everyday_form_stays_small():
+    """What a non-author sees before opening the fold. Nobody can configure a
+    card by reading two dozen knobs."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    everyday = [k for k, v in props.items()
+                if v.get("scope") == "instance" and not v.get("advanced")]
+    assert len(everyday) <= 8, everyday
+    # the ones a person actually reaches for
+    assert {"hands", "fps", "confidence", "publish_gesture_events"} <= set(everyday)
+
+
+def test_the_camera_dependent_thresholds_are_advanced():
+    """They are exposed because they are not constants, not because anybody
+    should meet them on first open."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key in ("fall_drop_ratio", "fall_drop_window_s", "fall_settle_s",
+                "hand_min_forearm_px", "label_hold", "activity_interval_s"):
+        assert props[key].get("advanced") is True, key
+
+
+def test_titles_and_descriptions_are_english():
+    """Asked for explicitly: the form was entirely Chinese prose."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key, spec in props.items():
+        if spec.get("scope") != "instance":
+            continue
+        for field in ("title", "description"):
+            text = spec.get(field) or ""
+            assert not any("一" <= ch <= "鿿" for ch in text), (key, field)
+
+
+def test_the_thresholds_still_match_the_rules_defaults():
+    """The rewrite must not have retyped a default by hand."""
+    props = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key in ("fall_drop_ratio", "fall_drop_window_s", "fall_settle_s"):
+        assert props[key]["default"] == DEFAULT_THRESHOLDS[key]
