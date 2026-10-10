@@ -58,22 +58,3 @@ test('截断是从中间切的，两头都留着', () => {
   assert.ok(out.includes('…（省略'));
   assert.ok(out.endsWith('x"'), out.slice(-20));
 });
-
-test('扫码新事件显示识别内容', () => {
-  assert.equal(summarizeEvent({ type: 'qr_detected', payload: { text: 'U1-001' } }),
-    '扫码成功：U1-001');
-});
-
-test('二维码文字不能注入 Activity HTML', () => {
-  const result = summarizeEvent({ type: 'qr_detected', payload: {
-    text: '<img src=x onerror="alert(1)">&\'中文' } });
-  assert.equal(result, '扫码成功：&lt;img src=x onerror=&quot;alert(1)&quot;&gt;&amp;&#39;中文');
-  assert.ok(!result.includes('<img'));
-});
-
-test('扫码长文本限制行宽并标记截断', () => {
-  const result = summarizeEvent({ type: 'qr_detected', payload: {
-    text: '字'.repeat(512), text_truncated: true } });
-  assert.ok(result.length < 250);
-  assert.ok(result.endsWith('（内容已截断）'));
-});

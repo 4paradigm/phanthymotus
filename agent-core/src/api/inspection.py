@@ -22,7 +22,6 @@ import time
 import fastapi
 
 import ros2_bridge
-from qr_activity import QrActivity
 
 router    = fastapi.APIRouter(tags=['inspection'])
 ws_router = fastapi.APIRouter(tags=['inspection'])
@@ -44,9 +43,6 @@ _logged_topic_collisions: set[tuple] = set()
 
 # Last frame cache per topic (for initial snapshot push on new WS connect)
 _last_frame: dict[str, bytes] = {}
-
-# Shared across subscription rebuilds; independent of viewer/agent-loop state.
-_qr_activity = QrActivity()
 
 
 # ── Status helpers ─────────────────────────────────────────────────────────────
@@ -78,11 +74,6 @@ def _push_factory(topic: str):
                 q.put_nowait(data)
             except asyncio.QueueFull:
                 pass  # drop frame for slow consumer
-        # QR success belongs in Activity even without an LLM turn or open data panel.
-        for event in _qr_activity.consume(topic, data, msg_fmt):
-            from api.motus_stream import push_event
-            event['mcp_id'] = _topic_registry.get(topic, {}).get('mcp_id', '')
-            await push_event(event)
         # 处理 perf_span 类型消息（来自 perception TTS 等组件）
         if topic == '/perception/perf_spans':
             try:
