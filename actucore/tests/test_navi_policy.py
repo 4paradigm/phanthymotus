@@ -1157,6 +1157,18 @@ def test_ceilings_are_also_pulled_down_into_the_descriptor():
     assert any("超过下游允许" in note for note in notes)
 
 
+def test_search_rate_is_also_clamped_to_the_yaw_limit():
+    """Searching is a twist too; it cannot bypass the descriptor's yaw cap."""
+    config = _cfg(search_rate=1.0)
+    bumi = {"limits": dict(_R1_DESC["limits"],
+                             lower=[-0.55, -0.2, 0, 0, 0, -0.83],
+                             upper=[0.55, 0.2, 0, 0, 0, 0.83],
+                             min_magnitude=[0.25, 0.12, 0, 0, 0, 0.33])}
+    notes = P.adopt_limits(config, bumi)
+    assert config.search_rate == 0.83
+    assert any("search_rate" in note for note in notes)
+
+
 def test_an_axis_the_chassis_does_not_have_is_switched_off():
     config = _cfg()
     pinned = {"limits": dict(_R1_DESC["limits"],

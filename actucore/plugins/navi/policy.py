@@ -634,6 +634,17 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             notes.append(f"{name}_max 超过下游允许的 {bound:g}，已压回")
             setattr(config, ceiling_attr, bound)
 
+        # Searching is a yaw-only motion, but it does not go through
+        # ``wz_max``: it deliberately uses a fixed rate so a lost target does
+        # not make the robot creep around its own deadband.  It is still a
+        # chassis command, so it must obey the same hardware ceiling.  Bumi
+        # exposed this gap: its 0.83 rad/s yaw limit accepted normal steering
+        # after negotiation while the default 1.0 rad/s search was rejected at
+        # every tick.
+        if index == 5 and bound is not None and config.search_rate > bound:
+            notes.append(f"search_rate 超过下游允许的 {bound:g}，已压回")
+            config.search_rate = bound
+
     return notes
 
 
