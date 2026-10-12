@@ -87,7 +87,7 @@ def test_direction_buffer_ignores_invalid_time_and_no_event_keeps_history():
     assert list(node._direction_windows) == [(90, 1700000000000000, 1700000000020000)]
 
 
-def test_timestamp_trust_is_scoped_to_speech_chunks(monkeypatch):
+def test_timestamp_trust_covers_each_vad_segment_including_early_speech(monkeypatch):
     class Stop:
         done = False
 
@@ -97,12 +97,16 @@ def test_timestamp_trust_is_scoped_to_speech_chunks(monkeypatch):
     stop = Stop()
 
     class Input:
-        chunks = iter([(b'\0\0' * 1000, 1.0, False),  # idle, untrusted
-                       (b'\0\0' * 1000, 2.0, True),   # first utterance
-                       (b'\0\0' * 1000, 3.0, True),
-                       (b'\0\0' * 1000, 4.0, True),   # idle again
-                       (b'\0\0' * 1000, 5.0, False),  # second utterance
-                       (b'\0\0' * 1000, 6.0, True)])
+        pcm = b'\0\0' * 10000
+        chunks = iter([(pcm, 1.0, False),  # idle, outside either utterance
+                       (pcm, 2.0, False),  # early speech before VAD reports it
+                       (pcm, 3.0, True),
+                       (pcm, 4.0, True),   # first segment completes
+                       (pcm, 5.0, False),  # idle again
+                       (pcm, 6.0, True),   # second utterance
+                       (pcm, 7.0, True),
+                       (pcm, 8.0, True),   # third utterance
+                       (pcm, 9.0, False)])  # untrusted completion timestamp
 
         def get(self, timeout):
             try:
@@ -114,17 +118,23 @@ def test_timestamp_trust_is_scoped_to_speech_chunks(monkeypatch):
     class Vad:
         frame = 0
         popped = False
-        front = SimpleNamespace(start=0, samples=[0] * 10000)
+
+        @property
+        def front(self):
+            return (SimpleNamespace(start=10000, samples=[0] * 20000)
+                    if self.frame == 4 else
+                    SimpleNamespace(start=50000 if self.frame == 7 else 70000,
+                                    samples=[0] * 10000))
 
         def accept_waveform(self, samples):
             self.frame += 1
             self.popped = False
 
         def is_speech_detected(self):
-            return self.frame in (2, 5)
+            return self.frame in (3, 6, 8)
 
         def empty(self):
-            return self.frame not in (3, 6) or self.popped
+            return self.frame not in (4, 7, 9) or self.popped
 
         def pop(self):
             self.popped = True
@@ -138,7 +148,7 @@ def test_timestamp_trust_is_scoped_to_speech_chunks(monkeypatch):
     results = []
     asr._vad_worker(Input(), SimpleNamespace(put=results.append), stop,
                     'sherpa_onnx', 0.5, 0, pre_roll_ms=0)
-    assert [item[4] for item in results if isinstance(item[0], bytes)] == [True, False]
+    assert [item[4] for item in results if isinstance(item[0], bytes)] == [False, True, False]
 
 
 def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):

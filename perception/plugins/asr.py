@@ -1297,6 +1297,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # One second past the longest segment the VAD can hand us, so pre_roll()
     # can still address the samples just before a maximum-length segment.
     pcm_history = PcmHistory(SAMPLE_RATE * (VAD_BUFFER_S + 1))
+    capture_history = deque()
     _log.info(
         f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, "
         f"silence_ms={silence_ms}, pre_roll_ms={pre_roll_ms})"
@@ -1397,17 +1398,17 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         float_samples = [s / 32768.0 for s in samples]
 
         # Feed VAD
+        chunk_start = pcm_history.total_samples
         pcm_history.append(pcm[:n * 2])
+        capture_history.append((chunk_start, pcm_history.total_samples, capture_trusted))
+        while capture_history and capture_history[0][1] <= pcm_history.start_sample:
+            capture_history.popleft()
         vad.accept_waveform(float_samples)
 
         # Detect speech onset → notify main thread for on_hearing hook
         _is_speaking = vad.is_speech_detected()
         if _is_speaking and not _was_speaking:
-            if not speech_buf:
-                utterance_capture_trusted = True
             result_q.put(("speech_start", ts, ts))
-        if _is_speaking and not capture_trusted:
-            utterance_capture_trusted = False
         _was_speaking = _is_speaking
 
         # Collect completed VAD segments.
@@ -1422,6 +1423,18 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             seg = vad.front
             seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                    *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+            segment_start = getattr(seg, 'start', None)
+            if segment_start is None:
+                segment_start = max(0, pcm_history.total_samples - len(seg.samples) - silence_samples)
+            segment_end = segment_start + len(seg.samples)
+            # VAD reports speech after it has heard enough samples. Use the
+            # completed segment's range so early speech counts too. The current
+            # chunk anchors seg_end_ts, so its timestamp must also be trusted.
+            utterance_capture_trusted &= capture_trusted and bool(capture_history) and (
+                capture_history[0][0] <= segment_start and
+                capture_history[-1][1] >= segment_end and
+                all(trusted for begin, end, trusted in capture_history
+                    if begin < segment_end and end > segment_start))
             # `is None`, not falsy: a legitimate start_ts of 0.0 would
             # otherwise be re-stamped.
             if start_ts is None:
