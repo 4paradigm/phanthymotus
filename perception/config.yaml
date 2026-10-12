@@ -16,6 +16,9 @@ file_intake:
 plugins:
   qr_scan:
     enabled: true
+    auto_announce: false
+    announce_cooldown_s: 10
+    announce_max_chars: 80
     scan_hz: 2
     stale_after_s: 3
     rearm_after_s: 3

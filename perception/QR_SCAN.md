@@ -28,7 +28,8 @@ read 返回缓存而非触发新扫描，同一缓存可以读到同一事件；
 输入更换会释放旧订阅和工作线程；输入回调只缓存最新帧，扫描在线程中限频执行。
 
 本版不支持 RTSP/H264/H265 或 sensor_msgs/Image；这些应先转换成 JPEG 话题。
-不执行二维码内容、不访问其中的网址、不自动播报、不新增 Activity 日志。
+不执行二维码内容、不访问其中的网址、不新增 Activity 日志。
+可以在同一卡片开启 auto_announce，生成独立的播报文字输出。
 
 ## 配置
 
@@ -80,3 +81,21 @@ PYTHONPATH="$PWD/perception:$PYTHONPATH" python3 perception/tests/qr_scan_dds_ch
    需要时通过旧卡片 stop 停止旧扫码插件；不要停止整个 U1 驱动，以免失去相机输入。
 
 成功读取仍不代表大脑会主动说话。任务规则、事件路由和 TTS 属于另一个功能。
+
+## 同一卡片的自动播报
+
+在 qr_scan 配置中开启 `auto_announce: true`，第二个输出口“自动播报文字”发布
+`{"text": "扫码成功，内容是：U1-001", "session_id": ..., "sequence": ...}`。
+连线为 `camera → qr_scan（自动播报文字端口）→ 感知层 tts → speaker`。
+第一个输出口仍是完整识别 JSON，不要把第一个口接到 TTS。
+无需 Decision Core、Skill 或额外 qr_announce 卡片。
+
+默认关闭自动播报。announce_cooldown_s 默认 10 秒，冷却期间的新事件跳过，不排队；
+多个同时识别的码先播报第一个。普通文本最多朗读 announce_max_chars（默认 80）；
+http/https/weixin 链接仅说“识别到一个链接”，不朗读长链接、不访问网址。
+请先启动 TTS 和 speaker 并确认工作，再展示二维码；播报文字端口是实时事件，不是持久队列。
+停止 qr_scan 不会停止下游 TTS 已接收的语音，停止整个测试时也应停止 TTS。
+
+U1 最小验证脚本 `perception/tests/u1_qr_announce_mvp.py --speak` 使用隔离的测试 JPEG
+验证卡片输出，并通过临时测试适配器调用 U1 原生 TTS；不修改画布或服务部署。
+这是测试适配器，正式通用卡片的语音输出仍按上面的 TTS 数据流连接。

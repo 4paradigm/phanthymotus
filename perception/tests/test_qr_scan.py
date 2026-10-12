@@ -138,3 +138,40 @@ def test_bundle_registers_qr_with_enabled_config():
     finally:
         for p in plugin._plugins:
             p.stop()
+
+
+def test_integrated_announcement_once_and_cooldown():
+    from plugins.qr_scan import _QrStream
+    stream = _QrStream(None, '/camera', '/test/result', {'auto_announce': True})
+    result = {'status': 'detected', 'new_events': [{'sequence': 1, 'text': 'U1-001'}]}
+    assert stream._announcement(result, 0)['text'] == '扫码成功，内容是：U1-001'
+    assert stream._announcement(result, 1) is None
+    assert stream._announcement({'status': 'detected', 'new_events': []}, 11) is None
+    result['new_events'] = [{'sequence': 2, 'text': 'https://example.com/private'}]
+    assert stream._announcement(result, 11)['text'] == '扫码成功，识别到一个链接。'
+    result['new_events'] = [{'sequence': 3, 'text': '字'*1000}]
+    message = stream._announcement(result, 22)['text']
+    assert len(message) < 120 and '已省略' in message
+    disabled = _QrStream(None, '/camera', '/test/result', {})
+    assert disabled._announcement(result, 0) is None
+
+
+def test_integrated_announcement_published_from_real_qr():
+    executor = _FakeExecutor()
+    plugin = QrScanPlugin({'auto_announce': True, 'scan_hz': 10}, executor)
+    try:
+        started = plugin.dispatch('qr_scan', {'action': 'start', 'input_topic': '/camera'})
+        stream = plugin._streams['/camera']
+        send(stream, 'U1-001')
+        wait(plugin, '/camera', 'detected', 1)
+        until = time.monotonic()+2
+        publisher = stream.node.publishers[1]
+        while not publisher.messages and time.monotonic()<until:
+            time.sleep(0.01)
+        assert json.loads(publisher.messages[0])['text'] == '扫码成功，内容是：U1-001'
+        send(stream, 'U1-001')
+        wait(plugin, '/camera', 'detected', 2)
+        assert len(publisher.messages) == 1
+        assert publisher.topic == started['topic_out'][1]['topic']
+    finally:
+        plugin.stop()

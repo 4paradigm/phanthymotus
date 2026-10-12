@@ -28,6 +28,14 @@ class _QrStream:
         self.scan_hz = self._number(cfg, "scan_hz", 2, 0.2, 10)
         self.stale_s = self._number(cfg, "stale_after_s", 3, 0.5, 30)
         self.rearm_s = self._number(cfg, "rearm_after_s", 3, 0.5, 300)
+        self.auto_announce = cfg.get('auto_announce', False)
+        if type(self.auto_announce) is not bool:
+            raise ValueError('auto_announce must be boolean')
+        self.announce_cooldown_s = self._number(cfg, 'announce_cooldown_s', 10, 0, 300)
+        self.announce_max_chars = self._number(cfg, 'announce_max_chars', 80, 10, 300)
+        self.announce_topic = output_topic.rsplit('/', 1)[0] + '/announce'
+        self._announcer = None
+        self._last_announcement = None
         self.decoder = decoder
         self._lock = threading.RLock()
         self._lifecycle = threading.Lock()
@@ -73,6 +81,8 @@ class _QrStream:
             try:
                 # The node belongs to the perception executor.
                 self._publisher = self.node.create_publisher(String, self.output_topic, qos)
+                self._announcer = self.node.create_publisher(String, self.announce_topic, qos)
+                self._last_announcement = None
                 self._subscription = self.node.create_subscription(
                     CompressedImage, self.input_topic, self._on_frame, qos)
                 self._thread = threading.Thread(target=self._run, name="perception-qr-scan", daemon=True)
@@ -83,6 +93,7 @@ class _QrStream:
                 raise
 
     def _destroy_io(self):
+        self._announcer = None
         if self._subscription is not None:
             self.node.destroy_subscription(self._subscription)
             self._subscription = None
@@ -173,10 +184,35 @@ class _QrStream:
                     with self._lock:
                         self._result = result
                     self._publisher.publish(message)
+                    self._announce(result)
             except Exception as exc:
                 with self._lock:
                     self._result = self._empty("error", f"{type(exc).__name__}: {str(exc)[:160]}")
             self._stop.wait(max(0, 1 / self.scan_hz - (time.monotonic() - started)))
+
+    def _announcement(self, result, now):
+        if not self.auto_announce or result.get('status') != 'detected' or not result.get('new_events'):
+            return None
+        if self._last_announcement is not None and now - self._last_announcement < self.announce_cooldown_s:
+            return None  # Skip during cooldown; never accumulate stale speech.
+        event = result['new_events'][0]
+        content = event['text']
+        if content.lower().startswith(('https://', 'http://', 'weixin://')):
+            text = '扫码成功，识别到一个链接。'
+        else:
+            limit = int(self.announce_max_chars)
+            text = '扫码成功，内容是：' + content[:limit]
+            if len(content) > limit:
+                text += '。内容较长，已省略后续部分。'
+        self._last_announcement = now
+        return {'text': text, 'session_id': self._session, 'sequence': event['sequence']}
+
+    def _announce(self, result):
+        message_data = self._announcement(result, time.monotonic())
+        if message_data is not None and self._announcer is not None and not self._stop.is_set():
+            message = self._message_type()
+            message.data = json.dumps(message_data, ensure_ascii=False)
+            self._announcer.publish(message)
 
     def info(self):
         with self._lock:
@@ -189,7 +225,9 @@ class _QrStream:
         running = self._thread is not None and self._thread.is_alive() and not self._stop.is_set()
         return {"state": "running" if running else "idle", "input_topic": self.input_topic,
                 "topic_in": [{"topic": self.input_topic, "format": "image/jpeg"}],
-                "topic_out": [{"topic": self.output_topic, "format": "data/json"}], **result}
+                "auto_announce": self.auto_announce,
+                "topic_out": [{"topic": self.output_topic, "format": "data/json", "desc": "识别结果"},
+                              {"topic": self.announce_topic, "format": "data/json", "desc": "自动播报文字"}], **result}
 
 
 TOOLS = [{
@@ -206,11 +244,14 @@ TOOLS = [{
         'config': {'params': [], 'description': '更新本实例配置；运行中的实例需重新 start'},
     }},
     'configSchema': {'type': 'object', 'properties': {
+        'auto_announce': {'type': 'boolean', 'default': False, 'scope': 'instance', 'description': '生成自动播报文字，需将播报输出连接 TTS'},
+        'announce_cooldown_s': {'type': 'number', 'minimum': 0, 'maximum': 300, 'default': 10, 'scope': 'instance'},
+        'announce_max_chars': {'type': 'integer', 'minimum': 10, 'maximum': 300, 'default': 80, 'scope': 'instance'},
         'scan_hz': {'type': 'number', 'minimum': 0.2, 'maximum': 10, 'default': 2, 'scope': 'instance'},
         'stale_after_s': {'type': 'number', 'minimum': 0.5, 'maximum': 30, 'default': 3, 'scope': 'instance'},
         'rearm_after_s': {'type': 'number', 'minimum': 0.5, 'maximum': 300, 'default': 3, 'scope': 'instance'},
     }},
-    'topic_in': [{'format': 'image/jpeg'}], 'topic_out': [{'format': 'data/json'}],
+    'topic_in': [{'format': 'image/jpeg'}], 'topic_out': [{'format': 'data/json', 'desc': '识别结果'}, {'format': 'data/json', 'desc': '自动播报文字'}],
 }]
 
 
@@ -301,9 +342,9 @@ class QrScanPlugin:
                     return {'state': 'idle', 'status': 'idle', 'codes': [], 'new_events': [],
                             'input_topic': topic,
                             'topic_in': [{'topic': topic, 'format': 'image/jpeg'}] if topic else [],
-                            'topic_out': [{'topic': self._output(key), 'format': 'data/json'}]}
+                            'topic_out': [{'topic': self._output(key), 'format': 'data/json', 'desc': '识别结果'},
+                                          {'topic': self._output(key).rsplit('/', 1)[0] + '/announce', 'format': 'data/json', 'desc': '自动播报文字'}]}
                 return {'state': 'running' if self._streams else 'idle',
                         'instances': {k: s.info() for k, s in self._streams.items()},
-                        'topic_out': [{'topic': s.output_topic, 'format': 'data/json'}
-                                      for s in self._streams.values()]}
+                        'topic_out': [t for s in self._streams.values() for t in s.info()['topic_out']]}
             return {'state': 'error', 'error': f'Unknown action: {action}'}
