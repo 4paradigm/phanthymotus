@@ -58,7 +58,7 @@ def send(stream, text):
 
 def test_two_robot_streams_independent_and_stop_restart():
     executor = _FakeExecutor()
-    plugin = QrScanPlugin({'scan_hz': 10, 'stale_after_s': 0.5}, executor)
+    plugin = QrScanPlugin({'scan_hz': 10, 'stale_after_s': 30}, executor)
     try:
         for key, topic in [('source_a', '/camera_a/image'), ('source_b', '/camera_b/image')]:
             predicted = plugin.dispatch('qr_scan', {'action': 'info', 'instance_id': key, 'input_topic': topic})
@@ -81,6 +81,11 @@ def test_two_robot_streams_independent_and_stop_restart():
         assert any(json.loads(m)['status'] == 'detected' for m in messages)
         send(plugin._streams['source_a'], 'ITEM-A')
         assert wait(plugin, 'source_a', 'detected', 2)['new_events'] == []
+        # Expire the cached frame explicitly: decoding speed must not determine
+        # whether a multi-instance test sees detected before stale (ARM/QEMU).
+        stream = plugin._streams['source_a']
+        with stream._lock:
+            stream._frame['received_monotonic'] -= stream.stale_s + 1
         assert wait(plugin, 'source_a', 'stale')['codes'] == []
         old_node = plugin._streams['source_a'].node
         plugin.dispatch('qr_scan', {'action': 'stop', 'instance_id': 'source_a'})
