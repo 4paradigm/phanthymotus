@@ -5,7 +5,6 @@ import copy
 import json
 import math
 import re
-import queue
 import threading
 import time
 from datetime import datetime, timezone
@@ -17,7 +16,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from utils.qr_decoder import QrDecoder, QrTracker
 from utils.ros_lifecycle import dispose_node
-from utils.qr_tts import LocalTTS
 
 
 class _QrStream:
@@ -36,13 +34,6 @@ class _QrStream:
             raise ValueError('auto_announce must be boolean')
         self.announce_cooldown_s = self._number(cfg, 'announce_cooldown_s', 10, 0, 300)
         self.announce_max_chars = self._number(cfg, 'announce_max_chars', 80, 10, 300)
-        self.announce_backend = cfg.get('announce_backend', 'topic')
-        if self.announce_backend not in ('topic', 'native_mcp'):
-            raise ValueError('announce_backend must be topic or native_mcp')
-        self._native_tts = LocalTTS(cfg.get('tts_mcp_url', '')) if self.announce_backend == 'native_mcp' else None
-        self._speech_queue = queue.Queue(maxsize=1)
-        self._speech_thread = None
-        self._speech_state = {'state': 'idle'}
         self.announce_topic = output_topic.rsplit('/', 1)[0] + '/announce'
         self._announcer = None
         self._last_announcement = None
@@ -93,19 +84,12 @@ class _QrStream:
                 self._publisher = self.node.create_publisher(String, self.output_topic, qos)
                 self._announcer = self.node.create_publisher(String, self.announce_topic, qos)
                 self._last_announcement = None
-                self._speech_queue = queue.Queue(maxsize=1)
-                self._speech_state = {'state': 'idle'}
-                if self._native_tts is not None:
-                    self._speech_thread = threading.Thread(target=self._native_worker, name='qr-native-tts', daemon=True)
-                    self._speech_thread.start()
                 self._subscription = self.node.create_subscription(
                     CompressedImage, self.input_topic, self._on_frame, qos)
                 self._thread = threading.Thread(target=self._run, name="perception-qr-scan", daemon=True)
                 self._thread.start()
             except Exception:
                 self._stop.set()
-                if self._speech_thread is not None:
-                    self._speech_thread.join(timeout=6)
                 self._destroy_io()
                 raise
 
@@ -125,12 +109,6 @@ class _QrStream:
                 if self._thread.is_alive():
                     raise RuntimeError("QR worker has not stopped; retry stop before restarting")
             self._thread = None
-            if self._speech_thread is not None:
-                self._speech_thread.join(timeout=6)
-                if self._speech_thread.is_alive():
-                    raise RuntimeError('Native speech worker has not stopped; retry stop')
-            self._speech_thread = None
-            self._speech_queue = queue.Queue(maxsize=1)
             self._destroy_io()
             with self._lock:
                 self._frame = None
@@ -237,30 +215,9 @@ class _QrStream:
     def _announce(self, result):
         message_data = self._announcement(result, time.monotonic())
         if message_data is not None and self._announcer is not None and not self._stop.is_set():
-            if self._native_tts is not None:
-                try:
-                    self._speech_queue.put_nowait((message_data, time.monotonic()))
-                except queue.Full:
-                    pass
-            else:
-                message = self._message_type()
-                message.data = json.dumps(message_data, ensure_ascii=False)
-                self._announcer.publish(message)
-
-    def _native_worker(self):
-        while not self._stop.is_set():
-            try:
-                job, created = self._speech_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if self._stop.is_set() or time.monotonic() - created > self.stale_s:
-                continue
-            try:
-                response = self._native_tts.speak(job['text'], 'qr-' + job['session_id'] + '-' + str(job['sequence']))
-            except Exception:
-                response = {'state': 'error', 'message': 'Native TTS call failed; check local driver and playback'}
-            with self._lock:
-                self._speech_state = response
+            message = self._message_type()
+            message.data = json.dumps(message_data, ensure_ascii=False)
+            self._announcer.publish(message)
 
     def info(self):
         with self._lock:
@@ -273,8 +230,7 @@ class _QrStream:
         running = self._thread is not None and self._thread.is_alive() and not self._stop.is_set()
         return {"state": "running" if running else "idle", "input_topic": self.input_topic,
                 "topic_in": [{"topic": self.input_topic, "format": "image/jpeg"}],
-                "auto_announce": self.auto_announce, "announce_backend": self.announce_backend,
-                "speech": copy.deepcopy(self._speech_state),
+                "auto_announce": self.auto_announce,
                 "topic_out": [{"topic": self.output_topic, "format": "data/json", "desc": "识别结果"},
                               {"topic": self.announce_topic, "format": "data/json", "desc": "自动播报文字"}], **result}
 
@@ -293,8 +249,6 @@ TOOLS = [{
         'config': {'params': [], 'description': '更新本实例配置；运行中的实例需重新 start'},
     }},
     'configSchema': {'type': 'object', 'properties': {
-        'announce_backend': {'type': 'string', 'enum': ['topic', 'native_mcp'], 'default': 'topic', 'scope': 'instance'},
-        'tts_mcp_url': {'type': 'string', 'x-sensitive': True, 'scope': 'instance', 'description': '本机原生 TTS 的 MCP 地址，例如 http://127.0.0.1:15740/mcp；不支持远程地址'},
         'auto_announce': {'type': 'boolean', 'default': False, 'scope': 'instance', 'description': '生成自动播报文字，需将播报输出连接 TTS'},
         'announce_cooldown_s': {'type': 'number', 'minimum': 0, 'maximum': 300, 'default': 10, 'scope': 'instance'},
         'announce_max_chars': {'type': 'integer', 'minimum': 10, 'maximum': 300, 'default': 80, 'scope': 'instance'},

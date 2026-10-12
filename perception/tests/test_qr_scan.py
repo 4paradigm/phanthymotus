@@ -20,7 +20,7 @@ def jpeg(text=None):
     return data.tobytes()
 
 
-@pytest.mark.parametrize('text', ['U1-001', '展品编号：001', 'https://example.com/001'])
+@pytest.mark.parametrize('text', ['ITEM-A', '展品编号：001', 'https://example.com/001'])
 def test_real_decode(text):
     result = QrDecoder().decode(jpeg(text))
     assert result[0]['text'] == text
@@ -60,7 +60,7 @@ def test_two_robot_streams_independent_and_stop_restart():
     executor = _FakeExecutor()
     plugin = QrScanPlugin({'scan_hz': 10, 'stale_after_s': 0.5}, executor)
     try:
-        for key, topic in [('u1', '/vision/camera/left'), ('tianyi', '/tianyi/camera/head')]:
+        for key, topic in [('source_a', '/camera_a/image'), ('source_b', '/camera_b/image')]:
             predicted = plugin.dispatch('qr_scan', {'action': 'info', 'instance_id': key, 'input_topic': topic})
             started = plugin.dispatch('qr_scan', {'action': 'start', 'instance_id': key, 'input_topic': topic})
             assert started['state'] == 'running'
@@ -68,26 +68,26 @@ def test_two_robot_streams_independent_and_stop_restart():
             assert all(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', part) for part in started['topic_out'][0]['topic'].split('/')[1:])
             assert plugin._streams[key].node.subscriptions[0].topic == topic
         assert len(executor.nodes) == 2
-        assert plugin._streams['u1'].output_topic != plugin._streams['tianyi'].output_topic
-        send(plugin._streams['u1'], 'U1-001')
-        send(plugin._streams['tianyi'], 'TIANYI-001')
-        a = wait(plugin, 'u1', 'detected', 1)
-        b = wait(plugin, 'tianyi', 'detected', 1)
-        assert a['codes'][0]['text'] == 'U1-001'
-        assert b['codes'][0]['text'] == 'TIANYI-001'
+        assert plugin._streams['source_a'].output_topic != plugin._streams['source_b'].output_topic
+        send(plugin._streams['source_a'], 'ITEM-A')
+        send(plugin._streams['source_b'], 'ITEM-B')
+        a = wait(plugin, 'source_a', 'detected', 1)
+        b = wait(plugin, 'source_b', 'detected', 1)
+        assert a['codes'][0]['text'] == 'ITEM-A'
+        assert b['codes'][0]['text'] == 'ITEM-B'
         assert a['new_events'][0]['sequence'] == b['new_events'][0]['sequence'] == 1
         # Check actual JSON published by the fake endpoint, not just read().
-        messages = plugin._streams['u1'].node.publishers[0].messages
+        messages = plugin._streams['source_a'].node.publishers[0].messages
         assert any(json.loads(m)['status'] == 'detected' for m in messages)
-        send(plugin._streams['u1'], 'U1-001')
-        assert wait(plugin, 'u1', 'detected', 2)['new_events'] == []
-        assert wait(plugin, 'u1', 'stale')['codes'] == []
-        old_node = plugin._streams['u1'].node
-        plugin.dispatch('qr_scan', {'action': 'stop', 'instance_id': 'u1'})
+        send(plugin._streams['source_a'], 'ITEM-A')
+        assert wait(plugin, 'source_a', 'detected', 2)['new_events'] == []
+        assert wait(plugin, 'source_a', 'stale')['codes'] == []
+        old_node = plugin._streams['source_a'].node
+        plugin.dispatch('qr_scan', {'action': 'stop', 'instance_id': 'source_a'})
         assert old_node.destroyed and len(executor.nodes) == 1
-        assert plugin.dispatch('qr_scan', {'action': 'read', 'instance_id': 'u1'})['state'] == 'idle'
-        plugin.dispatch('qr_scan', {'action': 'start', 'instance_id': 'u1', 'input_topic': '/vision/camera/left'})
-        assert wait(plugin, 'u1', 'waiting_for_frame')['session_id'] != a['session_id']
+        assert plugin.dispatch('qr_scan', {'action': 'read', 'instance_id': 'source_a'})['state'] == 'idle'
+        plugin.dispatch('qr_scan', {'action': 'start', 'instance_id': 'source_a', 'input_topic': '/camera_a/image'})
+        assert wait(plugin, 'source_a', 'waiting_for_frame')['session_id'] != a['session_id']
     finally:
         plugin.stop()
     assert executor.nodes == []
@@ -134,7 +134,7 @@ def test_bundle_registers_qr_with_enabled_config():
     try:
         tool = next(t for t in plugin.get_all_tools() if t['name'] == 'qr_scan')
         assert tool['type'] == 'processor' and tool['multiInstance'] is True
-        assert plugin.dispatch('qr_scan', {'action': 'info', 'input_topic': '/vision/camera/left'})['state'] == 'idle'
+        assert plugin.dispatch('qr_scan', {'action': 'info', 'input_topic': '/camera_a/image'})['state'] == 'idle'
     finally:
         for p in plugin._plugins:
             p.stop()
@@ -143,8 +143,8 @@ def test_bundle_registers_qr_with_enabled_config():
 def test_integrated_announcement_once_and_cooldown():
     from plugins.qr_scan import _QrStream
     stream = _QrStream(None, '/camera', '/test/result', {'auto_announce': True})
-    result = {'status': 'detected', 'new_events': [{'sequence': 1, 'text': 'U1-001'}]}
-    assert stream._announcement(result, 0)['text'] == '扫码成功，内容是：U1-001'
+    result = {'status': 'detected', 'new_events': [{'sequence': 1, 'text': 'ITEM-A'}]}
+    assert stream._announcement(result, 0)['text'] == '扫码成功，内容是：ITEM-A'
     assert stream._announcement(result, 1) is None
     assert stream._announcement({'status': 'detected', 'new_events': []}, 11) is None
     result['new_events'] = [{'sequence': 2, 'text': 'https://example.com/private'}]
@@ -162,14 +162,14 @@ def test_integrated_announcement_published_from_real_qr():
     try:
         started = plugin.dispatch('qr_scan', {'action': 'start', 'input_topic': '/camera'})
         stream = plugin._streams['/camera']
-        send(stream, 'U1-001')
+        send(stream, 'ITEM-A')
         wait(plugin, '/camera', 'detected', 1)
         until = time.monotonic()+2
         publisher = stream.node.publishers[1]
         while not publisher.messages and time.monotonic()<until:
             time.sleep(0.01)
-        assert json.loads(publisher.messages[0])['text'] == '扫码成功，内容是：U1-001'
-        send(stream, 'U1-001')
+        assert json.loads(publisher.messages[0])['text'] == '扫码成功，内容是：ITEM-A'
+        send(stream, 'ITEM-A')
         wait(plugin, '/camera', 'detected', 2)
         assert len(publisher.messages) == 1
         assert publisher.topic == started['topic_out'][1]['topic']
@@ -185,70 +185,10 @@ def test_application_links_are_not_read_as_raw_text(content):
     assert stream._announcement(result, 0)['text'] == '扫码成功，识别到一个链接。'
 
 
-def test_announcement_disabled_instance_does_not_affect_other_robot():
+def test_announcement_disabled_instance_does_not_affect_other_input():
     from plugins.qr_scan import _QrStream
-    u1 = _QrStream(None, '/vision/camera/left', '/u1/result', {'auto_announce': True})
-    tianyi = _QrStream(None, '/tianyi/camera/head', '/tianyi/result', {'auto_announce': False})
+    source_a = _QrStream(None, '/camera_a/image', '/a/result', {'auto_announce': True})
+    source_b = _QrStream(None, '/camera_b/image', '/b/result', {'auto_announce': False})
     event = {'status': 'detected', 'new_events': [{'sequence': 1, 'text': 'ITEM-001'}]}
-    assert u1._announcement(event, 0) is not None
-    assert tianyi._announcement(event, 0) is None
-
-
-def test_native_tts_for_u1_and_tianyi_isolated(monkeypatch):
-    import plugins.qr_scan as module
-    clients = []
-    class Client:
-        def __init__(self, url):
-            self.url, self.calls = url, []
-            clients.append(self)
-        def speak(self, text, action_id):
-            self.calls.append((text, action_id))
-            return {'state': 'submitted'}
-    monkeypatch.setattr(module, 'LocalTTS', Client)
-    executor = _FakeExecutor()
-    plugin = QrScanPlugin({'auto_announce': True, 'scan_hz': 10}, executor)
-    try:
-        for key, topic, port in [('u1', '/vision/camera/left', 15740), ('tianyi', '/tianyi/camera/head', 15707)]:
-            configured = plugin.dispatch('qr_scan', {'action': 'config', 'instance_id': key,
-                'config': {'announce_backend': 'native_mcp', 'tts_mcp_url': f'http://127.0.0.1:{port}/mcp'}})
-            assert configured['state'] == 'idle'
-            plugin.dispatch('qr_scan', {'action': 'start', 'instance_id': key, 'input_topic': topic})
-            send(plugin._streams[key], key.upper()+'-001')
-        wait(plugin, 'u1', 'detected')
-        wait(plugin, 'tianyi', 'detected')
-        deadline = time.monotonic()+3
-        # config validation creates disposable clients too; select active ones.
-        active = [s._native_tts for s in plugin._streams.values()]
-        while not all(c.calls for c in active) and time.monotonic()<deadline:
-            time.sleep(0.01)
-        assert active[0].url.endswith(':15740/mcp') and active[1].url.endswith(':15707/mcp')
-        assert active[0].calls[0][0] == '扫码成功，内容是：U1-001'
-        assert active[1].calls[0][0] == '扫码成功，内容是：TIANYI-001'
-        assert not plugin._streams['u1'].node.publishers[1].messages
-    finally:
-        plugin.stop()
-    assert not executor.nodes
-
-
-def test_native_tts_failure_does_not_stop_scan(monkeypatch):
-    import plugins.qr_scan as module
-    class Broken:
-        def __init__(self, url):
-            pass
-        def speak(self, *args):
-            raise RuntimeError('offline')
-    monkeypatch.setattr(module, 'LocalTTS', Broken)
-    plugin = QrScanPlugin({'auto_announce': True, 'announce_backend': 'native_mcp',
-                         'tts_mcp_url': 'http://127.0.0.1:15740/mcp', 'scan_hz': 10}, _FakeExecutor())
-    try:
-        plugin.dispatch('qr_scan', {'action': 'start', 'input_topic': '/camera'})
-        stream = plugin._streams['/camera']
-        send(stream, 'U1-001')
-        deadline = time.monotonic()+3
-        while stream.info()['speech']['state'] != 'error' and time.monotonic()<deadline:
-            time.sleep(0.01)
-        assert stream.info()['speech']['state'] == 'error'
-        send(stream, 'SECOND')
-        assert wait(plugin, '/camera', 'detected', 2)['codes'][0]['text'] == 'SECOND'
-    finally:
-        plugin.stop()
+    assert source_a._announcement(event, 0) is not None
+    assert source_b._announcement(event, 0) is None

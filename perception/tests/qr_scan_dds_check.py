@@ -18,12 +18,12 @@ def main():
     peer = Node('qr_test_camera')
     executor.add_node(peer)
     plugin = QrScanPlugin({'scan_hz': 2, 'stale_after_s': 3, 'auto_announce': True}, executor)
-    outputs = {'u1': [], 'tianyi': []}
-    announcements = {'u1': [], 'tianyi': []}
+    outputs = {'source_a': [], 'source_b': []}
+    announcements = {'source_a': [], 'source_b': []}
     publishers = {}
     messages = {}
     try:
-        for key, topic in [('u1', '/vision/camera/left'), ('tianyi', '/tianyi/camera/head')]:
+        for key, topic in [('source_a', '/camera_a/image'), ('source_b', '/camera_b/image')]:
             args = {'instance_id': key, 'input_topic': topic}
             info = plugin.dispatch('qr_scan', {**args, 'action': 'info'})
             peer.create_subscription(String, info['topic_out'][0]['topic'],
@@ -65,7 +65,7 @@ def main():
             stale = next((r for r in values if r['status'] == 'stale'), None)
             assert stale and stale['codes'] == []
         print(json.dumps({'dds': 'passed', 'independent_inputs': 2,
-                          'decoded': ['U1-DDS', 'TIANYI-DDS'], 'stale': 'passed', 'announcement_per_input': 1}))
+                          'decoded': ['SOURCE_A-DDS', 'SOURCE_B-DDS'], 'stale': 'passed', 'announcement_per_input': 1}))
     finally:
         plugin.stop()
         executor.remove_node(peer)
