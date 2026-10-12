@@ -92,10 +92,18 @@ PYTHONPATH="$PWD/perception:$PYTHONPATH" python3 perception/tests/qr_scan_dds_ch
 
 默认关闭自动播报。announce_cooldown_s 默认 10 秒，冷却期间的新事件跳过，不排队；
 多个同时识别的码先播报第一个。普通文本最多朗读 announce_max_chars（默认 80）；
-http/https/weixin 链接仅说“识别到一个链接”，不朗读长链接、不访问网址。
+URI 和常见域名链接仅说“识别到一个链接”，不朗读长链接、不访问网址。
 请先启动 TTS 和 speaker 并确认工作，再展示二维码；播报文字端口是实时事件，不是持久队列。
 停止 qr_scan 不会停止下游 TTS 已接收的语音，停止整个测试时也应停止 TTS。
 
 U1 最小验证脚本 `perception/tests/u1_qr_announce_mvp.py --speak` 使用隔离的测试 JPEG
 验证卡片输出，并通过临时测试适配器调用 U1 原生 TTS；不修改画布或服务部署。
 这是测试适配器，正式通用卡片的语音输出仍按上面的 TTS 数据流连接。
+
+## U1 / 天弈原生播报模式
+
+现支持可配置的 announce_backend=native_mcp，通过本机 driver 的 tts.speak 播报。
+U1 地址为 http://127.0.0.1:15740/mcp，天弈为 http://127.0.0.1:15707/mcp。
+tts_mcp_url 是按实例的敏感配置，分享画布时应清空并重新填写。
+此模式只需相机连接 qr_scan，不需要感知 TTS 和 PCM speaker。
+详细配置、适配范围与验收步骤见 QR_U1_TIANYI.md。

@@ -17,16 +17,19 @@ def main():
     executor = SingleThreadedExecutor()
     peer = Node('qr_test_camera')
     executor.add_node(peer)
-    plugin = QrScanPlugin({'scan_hz': 2, 'stale_after_s': 3}, executor)
-    outputs = {'u1': [], 'g1': []}
+    plugin = QrScanPlugin({'scan_hz': 2, 'stale_after_s': 3, 'auto_announce': True}, executor)
+    outputs = {'u1': [], 'tianyi': []}
+    announcements = {'u1': [], 'tianyi': []}
     publishers = {}
     messages = {}
     try:
-        for key, topic in [('u1', '/vision/camera/left'), ('g1', '/g1/camera/rgb')]:
+        for key, topic in [('u1', '/vision/camera/left'), ('tianyi', '/tianyi/camera/head')]:
             args = {'instance_id': key, 'input_topic': topic}
             info = plugin.dispatch('qr_scan', {**args, 'action': 'info'})
             peer.create_subscription(String, info['topic_out'][0]['topic'],
                 lambda msg, key=key: outputs[key].append(json.loads(msg.data)), CAMERA_QOS)
+            peer.create_subscription(String, info['topic_out'][1]['topic'],
+                lambda msg, key=key: announcements[key].append(json.loads(msg.data)), CAMERA_QOS)
             started = plugin.dispatch('qr_scan', {**args, 'action': 'start'})
             assert started['state'] == 'running', started
             publishers[key] = peer.create_publisher(CompressedImage, topic, CAMERA_QOS)
@@ -38,16 +41,21 @@ def main():
             message.format = 'jpeg'
             message.data = data.tobytes()
             messages[key] = message
+        ready = time.monotonic() + 2
+        while time.monotonic() < ready:
+            executor.spin_once(timeout_sec=0.03)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             for key, publisher in publishers.items():
                 publisher.publish(messages[key])
             executor.spin_once(timeout_sec=0.03)
-            if all(any(r['status'] == 'detected' for r in values) for values in outputs.values()):
+            if all(any(r['status'] == 'detected' for r in values) for values in outputs.values()) and all(announcements.values()):
                 break
         for key, values in outputs.items():
             detected = next((r for r in values if r['status'] == 'detected'), None)
             assert detected and detected['codes'][0]['text'] == key.upper()+'-DDS', values[-3:]
+        for key, values in announcements.items():
+            assert len(values) == 1 and values[0]['text'] == '扫码成功，内容是：' + key.upper()+'-DDS', values
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             executor.spin_once(timeout_sec=0.03)
@@ -57,7 +65,7 @@ def main():
             stale = next((r for r in values if r['status'] == 'stale'), None)
             assert stale and stale['codes'] == []
         print(json.dumps({'dds': 'passed', 'independent_inputs': 2,
-                          'decoded': ['U1-DDS', 'G1-DDS'], 'stale': 'passed'}))
+                          'decoded': ['U1-DDS', 'TIANYI-DDS'], 'stale': 'passed', 'announcement_per_input': 1}))
     finally:
         plugin.stop()
         executor.remove_node(peer)
