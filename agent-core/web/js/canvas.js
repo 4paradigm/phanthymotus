@@ -22,7 +22,7 @@ import { getToken } from './auth.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
-import { inputArgs, inputKey } from './topic-derive.js';
+import { inputArgs, inputBindingsOf, inputKey } from './topic-derive.js';
 // **静态 import,不是 handler 里的 `await import()`。** 停止的那三个事件是同一毫秒
 // 到的(backend 并行跑完健康的卡片),动态 import 的 then 要等一个微任务,于是
 // `project_stop_begin` 还没建好状态,紧随其后的 project_stop_item 全被
@@ -1592,7 +1592,7 @@ function _setupPortDrag() {
           const topics = _inputTopicsFor(toCardData);
           const resolvedInPort = toCard.querySelector(`.canvas-port.in[data-idx="${inPort.dataset.idx}"]`);
           const args = topics.length
-            ? inputArgs(topics)
+            ? inputArgs(topics, inputBindingsOf(toCardData, _cards, _connections))
             : { input_topic: resolvedInPort?.dataset.topic || _draggingConn.topic };
           _triggerAction(toCardData.mcpId, toCardData.toolName, 'start',
                          { ...args, instance_id: toCardData.id });
@@ -2473,7 +2473,7 @@ async function _fetchTopicsFromDriver(card, inputTopics) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tool: card.toolName,
                              arguments: { action: 'info', instance_id: card.id,
-                                          ...inputArgs(topics) } }),
+                                          ...inputArgs(topics, inputBindingsOf(card, _cards, _connections)) } }),
     });
     const data = await resp.json();
     const parsed = _parseMcpCallResult(data);
@@ -2552,7 +2552,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
         body: JSON.stringify({
           tool: card.toolName,
           arguments: { action: 'info', instance_id: card.id,
-                       ...inputArgs(_inputTopicsFor(card)) },
+                       ...inputArgs(_inputTopicsFor(card), inputBindingsOf(card, _cards, _connections)) },
         }),
       });
       const parsed = _parseMcpCallResult(await resp.json());

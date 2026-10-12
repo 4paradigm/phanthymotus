@@ -425,7 +425,7 @@ def test_a_loading_card_still_reports_its_topics():
     assert info["state"] == "loading"
     assert [t["topic"] for t in info["topic_out"]] == [
         "/mic/audio/asr", "/mic/audio/asr_background"]
-    assert [t["topic"] for t in info["topic_in"]] == ["/mic/audio"]
+    assert [t["topic"] for t in info["topic_in"]] == ["/mic/audio", ""]
 
 
 def test_a_card_with_a_deferred_start_also_reports_topics():
@@ -450,7 +450,8 @@ def test_loading_without_an_input_topic_reports_none():
     plugin = make_plugin(_loading=True)
     info = plugin.dispatch("asr", {"action": "info"})
     assert info["topic_out"] == []
-    assert info["topic_in"] == []
+    assert [t["format"] for t in info["topic_in"]] == [
+        "audio/pcm-16k", "sensor/sound-direction-v1"]
 
 
 def test_every_info_return_carries_topic_out():

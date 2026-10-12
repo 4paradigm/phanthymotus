@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import multiprocessing
 import contextlib
 import ctypes.util
@@ -19,6 +20,7 @@ import struct
 import threading
 import time
 import wave
+from collections import deque
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -509,6 +511,59 @@ def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
     return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
 
+def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
+                           keyword_phones: int, start_ts: float,
+                           pre_roll_bytes: int, windows: list,
+                           has_input: bool, trusted_audio: bool = True) -> dict:
+    """Match a leading wake word to direction windows on the capture clock."""
+    state = {"wake_direction_state": "unknown" if has_input else "no_input"}
+    if not has_input or not trusted_audio:
+        return state
+    kw_start = end_pos - keyword_phones
+    if kw_start < 0 or kw_start > len(char_ends):
+        return state
+    prefix_end = char_ends[kw_start - 1] if kw_start else 0
+    prefix = re.sub(r'[\W_]+', '', text[:prefix_end])
+    if prefix and (len(prefix) > 2 or prefix not in
+                   {"嗯", "呃", "啊", "哦", "唉", "喂", "那个", "就是"}):
+        return state
+    onset_us = int((start_ts + pre_roll_bytes / 2 / SAMPLE_RATE) * 1_000_000)
+    selected = [(angle, begin, end) for angle, begin, end in windows
+                if (begin >= 1_000_000_000_000_000 and begin < end
+                    and end - begin <= 3_000_000
+                    and begin < onset_us + 500_000 and end > onset_us
+                    and math.isfinite(angle) and -180 <= angle <= 180)]
+    if not selected:
+        return state
+    x = sum(math.cos(math.radians(angle)) for angle, _, _ in selected) / len(selected)
+    y = sum(math.sin(math.radians(angle)) for angle, _, _ in selected) / len(selected)
+    if math.hypot(x, y) < 0.5:
+        return state
+    angle = math.degrees(math.atan2(y, x))
+    if abs(angle + 180) < 1e-6 or abs(angle - 180) < 1e-6:
+        angle = 180
+    return {"wake_direction_state": "valid", "wake_direction_deg": round(angle, 2),
+            "wake_direction_window_start_us": min(begin for _, begin, _ in selected),
+            "wake_direction_window_end_us": max(end for _, _, end in selected)}
+
+
+def _resolve_asr_inputs(args: dict) -> tuple[str, str]:
+    bindings = args.get("input_bindings") or []
+    if bindings:
+        by_format = {item.get("format"): item.get("topic", "") for item in bindings}
+        return by_format.get(AUDIO_FORMAT, ""), by_format.get("sensor/sound-direction-v1", "")
+    topics = args.get("input_topics") or []
+    if len(topics) > 1:
+        log.warning("[asr] multiple input_topics without format bindings; assuming audio then direction")
+    return (topics[0] if topics else args.get("input_topic", "")), (topics[1] if len(topics) > 1 else "")
+
+
+def _asr_topics_in(audio_topic: str = "", direction_topic: str = "") -> list[dict]:
+    return [{"topic": audio_topic, "format": AUDIO_FORMAT, "desc": "mic audio input"},
+            {"topic": direction_topic, "format": "sensor/sound-direction-v1",
+             "desc": "sound direction input"}]
+
+
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -595,7 +650,8 @@ TOOLS = [
             },
             "required": []
         },
-        "topic_in":  [{"format": "audio/pcm-16k", "desc": "mic audio input"}],
+        "topic_in":  [{"format": AUDIO_FORMAT, "desc": "mic audio input"},
+                      {"format": "sensor/sound-direction-v1", "desc": "sound direction input"}],
         # 两条输出。第二条是未触发唤醒词的话语，带 priority 0 —— 它**不会自动流
         # 到 LLM**：agent-core 订阅的是画布上连进 decision_core 入口的 topic
         # （api/mcp_manage.py 的 all_topics 来自那次 start 调用的参数），不是这里
@@ -1250,6 +1306,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     start_ts = None
     end_ts = None
     utterance_pre_roll_bytes = 0
+    utterance_capture_trusted = True
     _was_speaking = False  # Track speech onset for hook notification
 
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx)")
@@ -1321,7 +1378,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
     while not stop_evt.is_set():
         try:
-            pcm, ts = pcm_q.get(timeout=1)
+            audio_item = pcm_q.get(timeout=1)
+            pcm, ts = audio_item[:2]
+            if len(audio_item) > 2 and not audio_item[2]:
+                utterance_capture_trusted = False
         except Exception:
             continue
 
@@ -1400,11 +1460,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 result_q.put((speech_buf,
                               seg_end_ts if start_ts is None else start_ts,
                               seg_end_ts if end_ts is None else end_ts,
-                              utterance_pre_roll_bytes))
+                              utterance_pre_roll_bytes,
+                              utterance_capture_trusted))
                 speech_buf = b''
                 start_ts = None
                 end_ts = None
                 utterance_pre_roll_bytes = 0
+                utterance_capture_trusted = True
 
     _log.info("[vad-worker] process exiting")
 
@@ -1419,10 +1481,14 @@ class _ASRNode(Node):
                  vad_pre_roll_ms: int = 500, speaker=None,
                  publish_background: bool = True,
                  emit_audio_tags: bool = True,
-                 emit_emotion: bool = False):
+                 emit_emotion: bool = False, direction_topic: str = ''):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
+        self._direction_topic = direction_topic
+        self._direction_sub = None
+        self._direction_windows = deque(maxlen=50)
+        self._direction_lock = threading.Lock()
         self._output_topic = f"{input_topic}/asr"
         # 第二条输出：KWS 未触发的话语。独立 topic 而不是同一条带 priority 0，
         # 这样它在 ring buffer / raw_input_info / 画布上有自己的 source 和自己的
@@ -1505,6 +1571,10 @@ class _ASRNode(Node):
         self._first_chunk_event = threading.Event()
         self._worker_ready = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
+        if self._direction_topic:
+            from audio_msgs.msg import SoundDirection
+            self._direction_sub = self.create_subscription(
+                SoundDirection, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
         # A fresh event, not .clear(): the previous worker thread and _audio_cb
         # closures still hold a reference to the old one.
         self._stop_event = threading.Event()
@@ -1578,6 +1648,11 @@ class _ASRNode(Node):
             except Exception:
                 pass  # may already be invalid
             self._sub = None
+        if self._direction_sub:
+            self.destroy_subscription(self._direction_sub)
+            self._direction_sub = None
+        with self._direction_lock:
+            self._direction_windows.clear()
         self.request_stop()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
         for q in (self._pcm_queue, self._utterance_queue):
@@ -1614,6 +1689,20 @@ class _ASRNode(Node):
         self._utterance_queue = None
         self._vad_stop = None
 
+    def _direction_cb(self, msg) -> None:
+        if msg.state != 1:
+            return
+        begin, end, angle = msg.window_start_us, msg.window_end_us, msg.angle_deg
+        if (begin < 1_000_000_000_000_000 or end <= begin
+                or end - begin > 3_000_000 or not math.isfinite(angle)
+                or not -180 <= angle <= 180):
+            return
+        with self._direction_lock:
+            self._direction_windows.append((angle, begin, end))
+            while (self._direction_windows
+                   and self._direction_windows[0][2] < end - 3_000_000):
+                self._direction_windows.popleft()
+
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
             return
@@ -1641,7 +1730,7 @@ class _ASRNode(Node):
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
         try:
-            self._pcm_queue.put_nowait((pcm, ts))
+            self._pcm_queue.put_nowait((pcm, ts, msg.header.stamp.sec >= 1_000_000_000))
         except Exception:
             pass  # drop if severely behind
 
@@ -1831,6 +1920,7 @@ class _ASRNode(Node):
                 # pair of worker/parent (a hot-copied file, a rolling restart)
                 # degrades to "no pre-roll known" instead of raising.
                 pre_roll_bytes = int(item[3]) if len(item) > 3 else 0
+                trusted_audio = bool(item[4]) if len(item) > 4 else False
             except Exception:
                 continue
             try:
@@ -1869,6 +1959,7 @@ class _ASRNode(Node):
                 _speaker_fields = self._collect_identity(_identity)
                 if not text.strip(): continue
 
+                direction_fields = {}
                 # ASR-based keyword spotting
                 if trigger_mode == 'asr_kws' and keyword_ipa:
                     _t1 = time.time()
@@ -1895,6 +1986,12 @@ class _ASRNode(Node):
                                                 utterance, _speaker_fields,
                                                 _audio_tags)
                         continue
+                    with self._direction_lock:
+                        windows = list(self._direction_windows)
+                    direction_fields = _wake_direction_fields(
+                        text, text_char_ends, end_pos, len(keyword_ipa),
+                        start_ts, pre_roll_bytes, windows,
+                        bool(self._direction_topic), trusted_audio)
                     # Extract text after keyword
                     remaining = _text_after_phoneme(text, text_char_ends, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
@@ -1913,6 +2010,7 @@ class _ASRNode(Node):
                           "priority": 1,
                           "kws_triggered": _kws_was_triggered,
                           "spans": _spans,
+                          **direction_fields,
                           # 空值不进来：plugins/speaker.py 只返回带信息的 key，
                           # 所以这里直接合并。`"speaker_profile": {}` 这种东西
                           # LLM 要为它付 token 而拿不到信息，还会让它以为「这个
@@ -1930,7 +2028,7 @@ class _ASRNode(Node):
     def _status_dict(self) -> dict:
         return {
             "state":     self.state,
-            "topic_in":  [{"topic": self._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
+            "topic_in": _asr_topics_in(self._input_topic, self._direction_topic),
             "topic_out": _asr_topics_out(
                 self._input_topic, self._publish_background_enabled),
         }
@@ -2131,7 +2229,7 @@ class ASRPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
-            input_topic = args.get("input_topic", "")
+            input_topic, direction_topic = _resolve_asr_inputs(args)
             # Report loading/error state at plugin level. A start that is still
             # queued behind the load counts as loading too: the caller polling
             # this reads anything else as final, and `idle` in that window would
@@ -2150,8 +2248,7 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "loading",
-                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
-                                   "desc": ""}] if input_topic else []),
+                    "topic_in": _asr_topics_in(input_topic, direction_topic),
                     "topic_out": _asr_topics_out(
                         input_topic, self._publish_background_enabled),
                     "desc": self._load_status or f"正在加载模型 '{self._asr_model}' …",
@@ -2160,8 +2257,7 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "error",
-                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
-                                   "desc": ""}] if input_topic else []),
+                    "topic_in": _asr_topics_in(input_topic, direction_topic),
                     "topic_out": _asr_topics_out(
                         input_topic, self._publish_background_enabled),
                     "desc": f"Model load failed: {self._load_error}",
@@ -2175,7 +2271,7 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": node.state,
-                    "topic_in":  [{"topic": node._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
+                    "topic_in": _asr_topics_in(node._input_topic, node._direction_topic),
                     "topic_out": _asr_topics_out(
                         node._input_topic, node._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
@@ -2186,21 +2282,22 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": "idle",
-                    "topic_in":  [{"topic": input_topic,   "format": "audio/pcm-16k", "desc": ""}] if input_topic else [],
+                    "topic_in": _asr_topics_in(input_topic, direction_topic),
                     "topic_out": _asr_topics_out(
                         input_topic, self._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             # Aggregate info for all instances (no instance_id = ping/overview only)
             if nodes_snapshot:
-                topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in nodes_snapshot]
+                topics_in = [port for n in nodes_snapshot
+                             for port in _asr_topics_in(n._input_topic, n._direction_topic)]
                 topics_out = [t for n in nodes_snapshot
                               for t in _asr_topics_out(
                                   n._input_topic, n._publish_background_enabled)]
                 states = list(set(n.state for n in nodes_snapshot))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                topics_in = [{"topic": input_topic, "format": "audio/pcm-16k", "desc": ""}]
+                topics_in = _asr_topics_in(input_topic, direction_topic)
                 topics_out = _asr_topics_out(
                     input_topic, self._publish_background_enabled)
                 state = "idle"
@@ -2240,12 +2337,7 @@ class ASRPlugin:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
                 return {"state": "error", "message": "ASR model not loaded"}
-            input_topic = args.get("input_topic")
-            # Also accept input_topics list (sent by canvas when multiple connections exist)
-            if not input_topic:
-                topics_list = args.get("input_topics") or []
-                if topics_list:
-                    input_topic = topics_list[0]
+            input_topic, direction_topic = _resolve_asr_inputs(args)
             if not input_topic:
                 raise ValueError("input_topic is required")
             node_key = instance_id or input_topic
@@ -2266,7 +2358,8 @@ class ASRPlugin:
                                     speaker=self._speaker,
                                     publish_background=self._publish_background_enabled,
                                     emit_audio_tags=self._emit_audio_tags,
-                                    emit_emotion=self._emit_emotion)
+                                    emit_emotion=self._emit_emotion,
+                                    direction_topic=direction_topic)
                     try:
                         self._executor.add_node(node)
                     except Exception:
@@ -2276,6 +2369,9 @@ class ASRPlugin:
                 else:
                     # Sync latest config into existing node before restart
                     self._sync_cfg(node)
+                    if node._direction_topic != direction_topic:
+                        node.stop()
+                        node._direction_topic = direction_topic
             # Outside the lock on purpose: node.start() blocks up to 15s, and the
             # node is already registered, so a concurrent stop can find it, set
             # its _stop_event, and have start() roll itself back to idle.

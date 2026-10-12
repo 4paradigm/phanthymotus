@@ -205,6 +205,27 @@ def test_asr_is_started_with_the_mic_topic(driver):
     assert driver.starts[ASR]['input_topic'] == '/ubuntu/mic/audio'
 
 
+def test_asr_bindings_identify_ports_when_direction_connects_first(driver):
+    layout = {
+        'cards': [
+            _card('direction', 'sound_direction', [
+                {'topic': '/robot/direction', 'format': 'sensor/sound-direction-v1'}]),
+            _card(MIC, 'mic', [
+                {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k'}]),
+            _card(ASR, 'asr')],
+        'connections': [
+            {**_conn('direction', ASR, '/robot/direction'),
+             'toPortIdx': '1', 'format': 'sensor/sound-direction-v1'},
+            {**_conn(MIC, ASR, '/ubuntu/mic/audio'),
+             'format': 'audio/pcm-16k'}],
+    }
+    _start(layout)
+    assert driver.starts[ASR]['input_bindings'] == [
+        {'topic': '/robot/direction', 'format': 'sensor/sound-direction-v1', 'port_index': 1},
+        {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k', 'port_index': 0},
+    ]
+
+
 def test_a_derived_topic_reaches_the_bus(driver):
     """The dashboard subscribes to what start-project registers."""
     _start(R1_LAYOUT)

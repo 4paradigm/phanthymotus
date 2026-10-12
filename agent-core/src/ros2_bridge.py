@@ -22,6 +22,7 @@ cb 签名: async def cb(data: bytes, fmt: str) -> None
 """
 
 import asyncio
+import json
 import sys
 import threading
 
@@ -142,9 +143,15 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
 
     def _on_msg(msg):
         try:
-            raw = msg.data
-            data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
-            msg_fmt = getattr(msg, 'format', fmt)
+            if fmt == 'sensor/sound-direction-v1':
+                data = json.dumps({key: getattr(msg, key) for key in (
+                    'state', 'angle_deg', 'window_start_us', 'window_end_us',
+                    'published_us')}).encode('utf-8')
+                msg_fmt = fmt
+            else:
+                raw = msg.data
+                data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
+                msg_fmt = getattr(msg, 'format', fmt)
         except Exception as e:
             print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
             return
@@ -208,6 +215,12 @@ def publish(topic: str, data: str) -> None:
 
 def _resolve_msg_type(fmt: str):
     """根据 data format 返回对应的 ROS2 消息类型，未知返回 None。"""
+    if fmt == 'sensor/sound-direction-v1':
+        try:
+            from audio_msgs.msg import SoundDirection
+            return SoundDirection
+        except ImportError:
+            return None
     if fmt.startswith('audio/'):
         try:
             from audio_msgs.msg import AudioChunk

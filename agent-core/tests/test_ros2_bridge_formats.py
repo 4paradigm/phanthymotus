@@ -8,6 +8,8 @@ produces nothing. That happened on r1_sz with `control/velocity`.
 from __future__ import annotations
 
 import os
+import asyncio
+import json
 import sys
 import types
 
@@ -45,3 +47,45 @@ def test_an_unknown_format_still_returns_none():
     """Declining is right for a format nobody can decode; the bug was the set
     of formats, not the declining."""
     assert ros2_bridge._resolve_msg_type("application/x-nonsense") is None
+
+
+def test_sound_direction_uses_structured_ros_message_and_delivers_json_bytes(monkeypatch):
+    class SoundDirection:
+        state = 1
+        angle_deg = -90.0
+        window_start_us = 1700000000000000
+        window_end_us = 1700000000020000
+        published_us = 1700000000030000
+
+    audio = types.ModuleType("audio_msgs")
+    audio_msg = types.ModuleType("audio_msgs.msg")
+    audio_msg.SoundDirection = SoundDirection
+    audio.msg = audio_msg
+    monkeypatch.setitem(sys.modules, "audio_msgs", audio)
+    monkeypatch.setitem(sys.modules, "audio_msgs.msg", audio_msg)
+    assert ros2_bridge._resolve_msg_type("sensor/sound-direction-v1") is SoundDirection
+
+    callbacks = []
+    received = []
+    node = types.SimpleNamespace(create_subscription=lambda *args: callbacks.append(args[2]) or object())
+    monkeypatch.setattr(ros2_bridge, "_HAS_RCLPY", True)
+    monkeypatch.setattr(ros2_bridge, "_running", True)
+    monkeypatch.setattr(ros2_bridge, "_node_main", node)
+    monkeypatch.setattr(ros2_bridge, "_executor", None)
+    monkeypatch.setattr(ros2_bridge, "_low_lat_qos", lambda: None)
+    monkeypatch.setattr(ros2_bridge, "unsubscribe", lambda _: None)
+    monkeypatch.setattr(ros2_bridge.asyncio, "run_coroutine_threadsafe",
+                        lambda coro, loop: asyncio.run(coro))
+
+    async def receive(data, fmt):
+        received.append((json.loads(data), fmt, type(data)))
+
+    ros2_bridge.subscribe("test-sound-direction", "/direction",
+                          "sensor/sound-direction-v1", None, receive)
+    callbacks[0](SoundDirection())
+    assert received == [({
+        "state": 1, "angle_deg": -90.0,
+        "window_start_us": 1700000000000000,
+        "window_end_us": 1700000000020000,
+        "published_us": 1700000000030000,
+    }, "sensor/sound-direction-v1", bytes)]
