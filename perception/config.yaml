@@ -14,6 +14,12 @@ file_intake:
   retention_days: 7
 
 plugins:
+  qr_scan:
+    enabled: true
+    scan_hz: 2
+    stale_after_s: 3
+    rearm_after_s: 3
+
   asr:
     enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of

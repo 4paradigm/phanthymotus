@@ -582,6 +582,9 @@ COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 COPY perception/deploy/    /deploy/
 
+# Validate the base image QR decoder (do not replace Jetson CUDA OpenCV).
+RUN python3 -c "from utils.qr_decoder import self_check; self_check()"
+
 # ── Thai frontend self-check, on the real interpreter ──────────────────────────
 # Runs the frontend that was just copied in, on the Python this image actually
 # ships, and asserts the one invariant the Thai engine depends on: every character
