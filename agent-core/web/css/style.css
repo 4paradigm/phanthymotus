@@ -756,6 +756,36 @@ html, body {
 .tool-config-desc + .tool-config-label {
   margin-top: 14px;
 }
+/* Per-field help. Sits under its input, quieter than the label, so the label
+   can stay a short name and the explanation still has somewhere to live. */
+.tool-config-help {
+  margin: 4px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+/* Expert settings, folded away. A card with two dozen tuning knobs laid out
+   flat cannot be configured by anyone who did not write it. */
+.tool-config-advanced {
+  margin-top: 18px;
+  border-top: 1px solid var(--border, rgba(127, 127, 127, 0.25));
+  padding-top: 10px;
+}
+.tool-config-advanced > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  user-select: none;
+  list-style: revert;
+}
+.tool-config-advanced > summary:hover {
+  color: var(--text-primary, var(--text-secondary));
+}
+.tool-config-advanced > .tool-config-label:first-of-type {
+  margin-top: 12px;
+}
 .tool-config-input {
   width: 100%;
   padding: 10px 12px;

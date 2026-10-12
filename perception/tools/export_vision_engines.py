@@ -216,6 +216,92 @@ def export_pose(out_dir: str, imgsz: int, workspace: float | None,
 DEFAULT_ACTION_WINDOW = 48
 
 
+DEFAULT_HAND_IMGSZ = 448
+
+#: The ultralytics that produced the published ONNX. Recorded, not just for
+#: provenance: the same weights exported by 8.4.33 and 8.4.175 disagree by a
+#: median NME of 0.0145 with one finger decision in seventy flipped, which is
+#: about thirty times the fp16 quantisation difference — and every size and
+#: SHA256 check still passes. See HAND_MODEL_BUNDLES.
+HAND_ONNX_ULTRALYTICS = "8.4.175"
+
+
+def export_hand(out_dir: str, workspace: float | None,
+                onnx_path: str | None = None,
+                imgsz: int = DEFAULT_HAND_IMGSZ) -> list[str]:
+    """Build the 21-keypoint hand engine for plugins/hand_runtime.py.
+
+    Unlike vop/depth/pose this one does **not** go through ultralytics'
+    exporter. It builds with `trtexec` from the pinned ONNX, for two reasons:
+
+    * The plugins load these plans through `utils.tensorrt_runtime` directly,
+      not through `YOLO("...engine")`, so the metadata header the ultralytics
+      exporter embeds is not needed. (The header-free plan is also why
+      `hand_runtime.assert_end2end` checks the output *shape* rather than an
+      `end2end` metadata flag — there is no metadata at all.)
+    * Re-exporting from the `.pt` would re-run whatever ultralytics the
+      container happens to have, and that changes the numbers. Building from
+      the pinned ONNX keeps the plan comparable across rebuilds.
+
+    So a rebuild is reproducible and does not need torch, ultralytics or the
+    `.pt` in the container — only TensorRT, which the perception image has.
+
+    If you *do* need to regenerate the ONNX, the export is
+    `YOLO(weights).export(format="onnx", imgsz=448, opset=17, simplify=True,
+    nms=True)` — and `nms=True` is not optional on ultralytics >= 8.4.17x:
+    without it the export is the raw head, which is one column narrower and
+    decodes silently as a valid pose layout. Then re-pin HAND_ONNX.
+    """
+    if onnx_path is None:
+        from utils.model_downloader import ensure_hand_onnx
+        paths = ensure_hand_onnx(os.environ.get("HAND_MODEL_DIR", "/models/hand"))
+        onnx_path = next(iter(paths.values()))
+        print(f"[export] hand ONNX: {onnx_path}", flush=True)
+    if not os.path.isfile(onnx_path):
+        raise RuntimeError(f"hand ONNX not found: {onnx_path!r}")
+
+    trtexec = "/usr/src/tensorrt/bin/trtexec"
+    if not os.path.isfile(trtexec):
+        found = shutil.which("trtexec")
+        if not found:
+            raise RuntimeError(
+                "trtexec not found. Run this inside a container built from the "
+                "target perception image, which ships it at "
+                f"{trtexec} — not on the Jetson host, whose TensorRT is a "
+                "different version and whose plans load nowhere.")
+        trtexec = found
+
+    engine = os.path.join(out_dir, "yolo26s-hand21.engine")
+    command = [trtexec, f"--onnx={onnx_path}", f"--saveEngine={engine}", "--fp16"]
+    if workspace:
+        command.append(f"--memPoolSize=workspace:{int(workspace * 1024)}")
+
+    print(f"[export] building {engine} at {imgsz}x{imgsz} (fp16)", flush=True)
+    import subprocess
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.isfile(engine):
+        tail = "\n".join((result.stderr or result.stdout or "").splitlines()[-25:])
+        raise RuntimeError(f"trtexec failed ({result.returncode}):\n{tail}")
+
+    # Verified here rather than left to the robot: a plan that deserializes and
+    # then reports the wrong row width is the one failure mode that produces
+    # thousands of plausible hands instead of an error.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from plugins.hand_runtime import assert_end2end
+        from plugins.vision_runtime import VisionEngineSession
+
+        session = VisionEngineSession(engine)
+        shape = assert_end2end(session)
+        print(f"[export] end2end check passed, output {shape}", flush=True)
+        session.close()
+    except Exception as error:
+        raise RuntimeError(
+            f"the plan built but failed its end2end check: {error}") from error
+
+    return [engine]
+
+
 def export_action(out_dir: str, window: int, workspace: float | None,
                   checkpoint: str | None) -> list[str]:
     """Build the ST-GCN++ skeleton-action engine for plugins/pose_stgcn.py.
@@ -288,7 +374,8 @@ def export_action(out_dir: str, window: int, workspace: float | None,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model",
-                        choices=("vop", "depth", "pose", "action", "both"),
+                        choices=("vop", "depth", "pose", "hand", "action",
+                                 "both"),
                         default="both")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--out", default="./engines")
@@ -296,6 +383,11 @@ def main() -> int:
     # builder workspace is not a soft preference — on an 8 GB Orin already
     # running the perception stack it gets the build OOM-killed outright
     # (observed on jp5.11: "Killed" mid-[GpuLayer], no Python traceback). Cap it.
+    parser.add_argument("--hand-onnx", default=None,
+                        help="hand ONNX to build from for --model hand "
+                             "(default: the pinned copy from COS). Exported "
+                             f"with ultralytics {HAND_ONNX_ULTRALYTICS}; see "
+                             "export_hand on why a re-export is not free")
     parser.add_argument("--action-checkpoint", default=None,
                         help="PYSKL ST-GCN++ NTU60-XSub-2D joint checkpoint "
                              "(.pth) for --model action")
@@ -328,6 +420,11 @@ def main() -> int:
     if args.model in ("both", "pose"):
         produced += export_pose(args.out, args.imgsz, workspace,
                                 weights=args.pose_weights)
+    # Not in "both": the hand engine is an opt-in channel on the pose card, and
+    # its input size is 448 rather than --imgsz, so folding it into a bulk build
+    # would silently build it at whatever the others were asked for.
+    if args.model == "hand":
+        produced += export_hand(args.out, workspace, onnx_path=args.hand_onnx)
     # Not in "both": it needs a checkpoint the caller supplies, so it would
     # break every vop/depth/pose export if it were on by default.
     if args.model == "action":

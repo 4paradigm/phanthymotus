@@ -9,6 +9,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   ocr              文字识别（RapidOCR + TensorRT）
+  barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 
@@ -210,6 +211,15 @@ class PerceptionBundle:
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
+
+        if plugins_cfg.get("barcode", {}).get("enabled", False):
+            from plugins.barcode import BarcodeScanPlugin
+            # No try/except and no model: zxing-cpp is imported lazily by
+            # plugins.barcode_runtime on the first scan, so a build missing it
+            # yields a card that reports the reason in `info` rather than a
+            # plugin that fails to load and silently disappears.
+            self._plugins.append(BarcodeScanPlugin(plugins_cfg["barcode"], executor))
+            log.info("BarcodeScanPlugin loaded")
 
         if plugins_cfg.get("soundevent", {}).get("enabled", False):
             from plugins.soundevent import SoundEventPlugin

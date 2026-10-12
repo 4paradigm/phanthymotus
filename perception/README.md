@@ -2,8 +2,8 @@
 
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
 vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
-`face_recognition`, `pose` human keypoints + actions). Connects to Agent Core via
-MCP tool calls and exchanges
+`face_recognition`, `pose` human keypoints + actions, `barcode` QR/条码扫码).
+Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
@@ -2640,13 +2640,20 @@ on jp5.11 (see `plugins/kokoro_worker.py`). A learned skeleton-action model
 hence `action_backend`, and hence `classify()` taking plain `PoseFrame`s and
 returning a plain dict.
 
-### Three output topics, and why it is not one
+### Four output topics, and why it is not one
 
 | topic | format | who consumes it |
 |---|---|---|
-| `{input}/poses` | `data/json` | wired to `decision_core` — **lean**: action, centre, bbox |
+| `{input}/poses` | `data/json` | **lean** per-frame state: action, centre, bbox |
 | `{input}/poses/skeleton` | `sensor/pose2d` | the dashboard renderer — **full** keypoints |
+| `{input}/poses/gesture` | `data/json` | wired to `decision_core` — **sparse**, one message per transition |
 | `{input}/poses/overlay_img` | `image/jpeg` | skeleton drawn on the frame (`publish_overlay`, off by default) |
+
+Two of them are `data/json` and that is not an oversight: the format picks the
+renderer, and what separates these two is the **rate**. One publishes every
+frame; the other only when something changes. See "The gesture topic is the one
+to wire into `decision_core`" below — the lean topic was the obvious thing to
+wire there and it is the wrong one.
 
 agent-core copies the **whole message** of a subscribed topic into the event bus
 as event text (`agent-core/src/topic_subscriber.py`), so every byte on the topic
@@ -2676,6 +2683,170 @@ which is always full. Note `publish_keypoints: "off"` is **quoted** in
 
 The one-shot photo actions always answer in full, like vop's: that reply is asked
 for once and read once, so trimming it saves nothing.
+
+### The gesture topic is the one to wire into `decision_core`
+
+The lean topic publishes every frame, so wiring *it* into `decision_core` means
+a person holding a hand up for three seconds at 12 fps is thirty-six full
+payloads of LLM context all saying the same thing. The robot does not need to be
+told thirty-six times. It needs to be told once, when the gesture starts.
+
+So the activity channel is also published as **transitions**, on a topic that is
+silent the rest of the time (`plugins/gesture_events.py`):
+
+| field | |
+|---|---|
+| `priority` | `1` — see below, this one is load-bearing |
+| `event` | `gesture_start` / `gesture_end` |
+| `gesture` | e.g. `raising hand` |
+| `track` | the person's temporary id, **not** an identity |
+| `position` | normalised lateral offset, so "on your left" is derivable |
+| `point_direction` | present for a pointing gesture, which is its entire content |
+| `held_s`, `reason` | on an end only: `released` or `track_lost` |
+
+**The `priority` field is load-bearing.** `collector._PRIORITY_SOURCES` is
+`{asr, message, channel, subagent, acp, scheduler}` — `dds` is not in it, so a
+DDS-sourced event scores P=0 and lands in the background batch instead of
+reaching the main agent. But `collector._extract_priority()` parses the event
+text first and honours a `priority` field when it finds one. Without it a wave
+is delivered, logged, and ignored, with nothing in any log saying why. That is
+the whole reason the transitions are their own payload rather than a field on
+the per-frame one.
+
+Three thresholds shape the stream, all of them **durations**, not frame counts:
+
+| config | default | what it is for |
+|---|---|---|
+| `gesture_hold_s` | 0.6 | an arm passing through the raised position on its way to scratch a nose reads as `raising hand` for a few frames |
+| `gesture_release_s` | 0.5 | one dropped frame, or one frame of the label stabiliser holding a label back, must not close and reopen the event |
+| `gesture_cooldown_s` | 2.0 | somebody waving in bursts is one request, not one per burst |
+
+They are seconds because the two channels that feed this run at different
+rates: the body channel at the card's `fps` (12), and the hand channel — when it
+arrives — throttled to about 4 Hz. "Hold for three frames" would mean 250 ms in
+one and 750 ms in the other. A gesture is also never announced from a *single*
+sighting however small `gesture_hold_s` is: the first frame a label appears on
+registers it as a candidate and the earliest a start can fire is the frame
+after, because one frame of a label is exactly the case the dwell exists for.
+
+**A lost track ends its gesture.** Somebody who raises a hand and walks out of
+frame would otherwise leave an unmatched open: the cooldown never arms, and a
+consumer tracking state cannot tell "still holding" from "walked away". The end
+carries `reason: "track_lost"` rather than `"released"` so the two stay
+distinguishable.
+
+`gesture_whitelist` defaults to `["raising hand", "hand waving",
+"point to something"]`. All three are read from the **COCO-17 skeleton**, so they
+work at any distance the body is visible at and do not depend on a hand model —
+being called from across a room is this topic's main job. The wider set
+(`clapping`, `salute`, `cross hands in front`, ...) comes from the skeleton-action
+model alone, and that model has no "not gesturing" class, so it is available but
+off. `list_actions` returns both lists under `gestures`.
+
+When the topic is silent, `info` says why: `gesture_whitelist`,
+`gesture_event_count` and `recent_gestures`, per instance. Without those three,
+"no gesture events" is indistinguishable between nobody gesturing, a whitelist
+that excludes what they did, and a dwell nobody satisfies.
+
+The one-shot photo actions do **not** emit transitions. Every threshold here is
+a duration over consecutive frames and a photo is one frame with made-up track
+ids; feeding it in would either emit nothing while polluting the state machine
+with ids belonging to no track, or — with a zero dwell — announce a gesture from
+a still image that cannot support one.
+
+This topic is also the only one of the four published **RELIABLE**. A dropped
+frame on the others is replaced by the next one; a dropped transition is not,
+and the stream would then hold an unmatched open for as long as the gesture
+lasts. Reliability costs nothing on a topic that emits a handful of messages a
+minute.
+
+### The hand channel is off by default, and near-range only
+
+`hands: keypoints` adds 21 joints per hand from a **second** engine
+(`plugins/hand_runtime.py`). It is off unless asked for, and the engine is not
+even fetched until it is: on an 8 GB Orin already running vop, depth, OCR, ASR
+and TTS the binding constraint is memory, not GPU time.
+
+**It does not help with being called from across the room.** That is what
+`raising hand` and `hand waving` on the gesture topic are for — both are read
+from the COCO-17 skeleton, so they work at whatever distance the body is
+visible at. The hand channel is for near-range detail: which way a finger
+points, an open palm versus a fist.
+
+**The model is RTMPose-m (hand5), and it replaced a YOLO26-pose model
+fine-tuned on hand keypoints.** That one was not good enough to build gestures
+on: on a real camera an OK sign came back with the wrist in the middle of the
+palm, an open hand came back as a clump, and motion blur collapsed the joints
+— while its detection score stayed around 0.8, so nothing downstream could
+tell. Compared on the same crops, RTMPose was right on every picture it was
+wrong on, and it is also cheaper: 3.58 ms against 7.99 ms per hand on an Orin
+NX at 1020 MHz, 4.33 against 8.19 on jp5.11.
+
+Three things follow from it being a **top-down** model rather than a detector:
+
+- **The box must be roughly right, and the arm supplies it.** Measured on a
+  real photograph, RTMPose read the hand correctly from an arm-derived box
+  anywhere between 0.30 and 0.65 of the crop the old model needed — a 2.2x
+  range. An early comparison appeared to show RTMPose losing on one of three
+  pictures; it had been handed the loose crop the *old* model wanted, and that
+  was a mistake in the test, not in the model.
+- **There is no detection step and no detection score.** It returns 21 joints
+  for whatever is in the box. `hand_confidence` therefore answers "was there a
+  hand in this box at all", not "did I find one", and it was calibrated by
+  measuring both distributions: a box with no hand in it (grey, shirt,
+  background, face, jeans, noise) scored 0.11–0.37, a real hand 0.48–0.74. The
+  default sits in the gap at 0.42. It was 0.25 while the old model was in
+  place, where the same field meant a detection score — at that setting every
+  one of those negatives except the flat grey reads as a hand.
+- **It does not measure blur.** Sharp and blurred frames of the same hand
+  scored 0.55/0.67 and 0.55/0.65. The confidence is a localisation peak, so it
+  can reject an absent hand and cannot reject a badly fitted one.
+
+The budget, per hand, through the production runtime: 3.58 ms on an Orin NX at
+1020 MHz. `hand_interval_s: 0.25` throttles per hand and staggers by track id
+so two people do not both pay on the same frame. `hand_max_rois` is spent on
+the largest hands in frame — largest means nearest, and a nearer hand is both
+likelier to be addressing the robot and the one whose fingers resolve.
+
+Three more things worth knowing before changing any of it:
+
+- **The body gate applies on every frame, not just the first.** The previous
+  frame's hand box makes the next crop tighter, but it does not decide whether
+  to crop at all — otherwise a hand would keep being tracked from a stale box
+  after the wrist went out of view, and the distance gate would hold for one
+  frame and then stop existing.
+- **A hand is held briefly after a bad read** (`hand_hold_s`, 0.5 s). Without
+  it a single bad frame erases the hand until the next inference, which at the
+  throttled rate is a quarter of a second of nothing and reads as flickering
+  fingers. The stale *box* is dropped immediately all the same — reporting a
+  hand that was there an instant ago is reasonable, cropping from where it
+  used to be is not.
+- **Hand keypoints are appended to the skeleton payload, never interleaved.**
+  Indices 0–16 stay the body, 17–37 the left hand, 38–58 the right.
+  `pose2d.js` prefers a payload-carried `keypoint_names`/`skeleton` over its
+  own copy, so the renderer draws 59 joints with no frontend change — and any
+  consumer already indexing the first 17 keeps reading what it read before.
+  The hand names carry a `_hand_` infix because COCO-17 already has a
+  `left_wrist` and so does the hand set.
+
+`info` reports `hand_ran` and `hand_skipped` broken down by `too_far`,
+`wrist_occluded`, `elbow_occluded` and `throttled`, plus `hand_engine_error` if
+the engine could not be fetched at all. From outside, all five look like "no
+hands". A card whose hand engine fails keeps running **without** hands rather
+than refusing to start: the body channel is what answers "is somebody calling
+me", and losing that because a second engine could not be downloaded would be
+the wrong trade.
+
+Two traps are recorded at `HAND_MODEL_BUNDLES` and worth repeating here. The
+engine's two outputs, `simcc_x` and `simcc_y`, are **identical in shape**
+(N, 21, 512), so they can only be told apart by name — and TensorRT has
+already been observed listing an engine's outputs in a different order on the
+two JetPack lines. Reading them the wrong way round transposes every hand and
+still draws a plausible one. And RTMPose normalises with **ImageNet mean/std
+on RGB**, not the [0, 1] scaling the YOLO engines use, which is why the hand
+path has its own `HandEngine` wrapper instead of reusing
+`VisionEngineSession`: feeding the wrong normalisation produces a confident
+hand in the wrong place, with nothing raising.
 
 ### Why the overlay is a third topic rather than drawn in the browser
 
@@ -3100,6 +3271,229 @@ the pose card reports `state: error` with that message and the rest of perceptio
 is unaffected.
 
 ---
+
+## Barcode Scanning (`barcode`)
+
+扫码：QR / 条形码，按需识别。`plugins/barcode.py` + `plugins/barcode_runtime.py`.
+
+Zero models and nothing to download — zxing-cpp is a decoder, not a network. The
+card is up the moment the container is.
+
+### It is an actuator, and that is the design
+
+The card declares `topic_in` (a camera, optional) and **no `topic_out`**, which is
+what `canvas.js` reads as an actuator: one input port, no output port.
+
+Nothing wants a barcode *stream*. A code is read because somebody is holding one
+up — 扫码配网, 读物料码, 读快递单 — and the answer belongs to whoever asked, as the
+tool's return value. A processor publishing at camera rate would be putting "no
+code in this frame" on the bus 30 times a second.
+
+What follows from that:
+
+| | |
+|---|---|
+| no worker thread, no model | `start` has nothing to wait for; the node holds a subscription and a 1s frame window, nothing else |
+| `scan_by_stream` | reads the window newest-first, stops at the first frame that decodes, reports `frames_examined` |
+| `scan_by_photo` / `scan_by_url` | work with no camera and no `start` at all — shared `plugins/image_input.py`, so the path confinement and transfer caps are the same ones vop/ocr/face use |
+
+**Nothing found is a success.** `ok: true, count: 0` — `ok: false` is reserved for
+a scan that could not happen (bad path, dead URL, no frames, no decoder), because
+an LLM handed `ok: false` retries a scan that worked fine.
+
+**Several frames, not several votes.** A code either decodes or it does not;
+there is nothing to average. Scanning up to `max_frames_scanned` (3) frames only
+guards motion blur, which is why it stops at the first hit rather than
+cross-checking.
+
+### A decoded payload is untrusted text
+
+It is chosen by whoever printed the sticker, and this card feeds it straight into
+an LLM's context. Hence, and please keep all three:
+
+* `max_text_chars` (2048) truncates, and says `truncated: true` — never silently,
+  because an LLM acting on a URL that lost its tail acts on a different URL;
+* every logged payload goes through `escape_log_text`;
+* the warning rides along in both the tool description *and* every hit's `note`.
+  The description is read once at registration; the note travels with the payload
+  it is about.
+
+### The two JetPack lines cannot run the same zxing-cpp
+
+```
+jp6.1   cp310   PyPI wheel, pinned 3.1.1
+jp5.11  cp38    in-house wheel on COS, built from the 2.2.0 sdist
+```
+
+Two independent reasons, either one sufficient:
+
+* **zxing-cpp has never published a cp38 aarch64 wheel**, at any version — the
+  oldest release carrying aarch64 wheels starts at cp310. Checked against the
+  PyPI JSON API rather than inferred from `requires_python`, which lies (see the
+  Thai deps section for the same trap).
+* **2.3.0 and up do not compile on focal's gcc 9.** `core/src/WriteBarcode.h`
+  uses a C++20 `requires` clause and gcc 9 answers `'requires' does not name a
+  type`. This was first written here as "2.3.0 leaves
+  `CMAKE_CXX_STANDARD_REQUIRED OFF` so it builds on gcc 9" — a reasonable read
+  of the CMakeLists that the build then disproved at 4%. The CMake flag is
+  irrelevant when the *source* is C++20.
+
+**2.2.0 is the version to build**, for two reasons that happen to agree: it is
+the newest release whose core has no reachable C++20 (`Generator.h` includes
+`<concepts>`, but nothing includes `Generator.h`), and it is the newest release
+below 2.3.0 that exists on PyPI at all — 2.2.1 is a git tag only, so
+`pip wheel "zxing-cpp==2.2.1"` fails with "no matching distribution".
+
+Building the sdist inside `Dockerfile.jetson` is not the answer: the x86 build
+host cross-compiles this image under qemu, where this compile took ~8 minutes
+single-threaded — payable once on COS, or on every image build. The
+in-house-wheel-on-COS route is the one sherpa-onnx already uses.
+
+`plugins/barcode_runtime.py` absorbs the API difference by reading
+`read_barcodes`' real signature out of its docstring, which both pybind11 (2.x)
+and nanobind (3.x) generate from the actual binding. Not from the `TypeError`:
+pybind11 answers an unexpected keyword with
+`Invoked with: ... kwargs: try_rotate=True, try_invert=True`, listing *every*
+keyword passed rather than the one it rejected, so retry-on-error cannot tell
+them apart and would drop all of them.
+
+What the two shipped builds actually declare, read off the installed wheels
+rather than a changelog:
+
+| | 2.2.0 (jp5.11) | 3.1.1 (jp6.1) |
+|---|---|---|
+| `try_rotate`, `try_downscale`, `is_pure`, `formats` | yes | yes |
+| `try_invert` | **no** | yes |
+| `max_number_of_symbols` | **no** | **no** |
+| writer | `write_barcode` | `create_barcode` |
+| `__version__` on the module | yes | **no** (use `importlib.metadata`) |
+
+`max_number_of_symbols` is therefore capped in Python on both lines, and the
+round-trip test feature-detects the writer rather than picking one.
+
+A missing wheel does not fail the image build: the import is lazy and `info`
+reports `decoder.available: false` with the reason on the card. The build log
+says `[build] zxing-cpp: NOT INSTALLED` — if you see that, the image cannot scan
+anything.
+
+#### Rebuilding the cp38 wheel
+
+Done once on the **x86 build host** (`172.18.66.241`) under qemu, not on a rig:
+the rigs are what the image is tested on, and installing a toolchain on one to
+produce a build artefact is the wrong place for it. The jp5.11 image is already
+present there, and running the build *inside that image* is the point — the
+wheel is then tagged for, and linked against, the exact interpreter and
+libstdc++ that will import it.
+
+```bash
+# on 172.18.66.241 (x86_64, qemu-aarch64 binfmt registered; ~8 min)
+IMG=bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:<tag>-jetson-jp5.11
+docker run --rm -v /root/zxwheels:/out "$IMG" bash -lc '
+  pip3 wheel "zxing-cpp==2.2.0" --no-binary zxing-cpp \
+    -i https://mirrors.tencentyun.com/pypi/simple/ -w /out'
+```
+
+`--no-binary zxing-cpp`, **not** `--no-binary :all:`: the latter also forbids
+wheels for the build dependencies, so pip starts compiling hatchling, cmake and
+ninja from source under qemu and the run sits on "Installing build
+dependencies: still running..." for as long as you let it. No `apt-get` is
+needed — the image already has g++ 9.4, cmake 3.27 and `Python.h`.
+
+Then verify in a **clean** container of the same image, which is the step that
+proves there is no ABI mismatch and that the keyword set is what the code
+expects:
+
+```bash
+docker run --rm -v /root/zxwheels:/w "$IMG" bash -lc '
+  pip3 install /w/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl &&
+  python3 -c "import zxingcpp, numpy as np;
+sig=zxingcpp.read_barcodes.__doc__.splitlines()[0];
+print(\"try_invert\" in sig);
+a=np.asarray(zxingcpp.write_barcode(zxingcpp.BarcodeFormat.QRCode, \"x\", width=240, height=240));
+print([b.text for b in zxingcpp.read_barcodes(a)])"'
+```
+
+Upload with the artefact script (`upload-figs.js` cannot be used — it forces the
+`resource-center/uploads/` prefix and image MIME types):
+
+```bash
+cd resource-center && node prisma/articles/upload-artifact.js deploy/values.env \
+  /tmp/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl \
+  public/zxing-cpp/jp511/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl
+curl -sI <the printed URL> | head -1     # must be 200 before building the image
+```
+
+That key is what `ZXING_WHEEL_511` names.
+
+### ArUco / AprilTag are deliberately not here
+
+Their output is a 6-DoF pose, not text, and producing it needs the marker's
+printed size plus camera intrinsics. That is a different card with a different
+config and a different output port; `info` says so in `markers` rather than
+leaving the question open. `cv2.aruco`'s presence in the JetPack base OpenCV is
+also unverified, and the only clean way to add it would be replacing OpenCV —
+`opencv-contrib-python` from pip would shadow the base `cv2` the whole vision
+stack and rapidocr are built against (see the `pip uninstall opencv-python` step
+in `Dockerfile.jetson`).
+
+### Verifying
+
+```bash
+# in the container
+curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"barcode","arguments":{"action":"info"}}}'   # decoder + formats
+# a photo, no camera needed
+curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"barcode","arguments":{"action":"scan_by_photo",
+  "image_path":"/tmp/qr.png"}}}'
+```
+
+### The card stores a mode, not format names
+
+`scan_mode` is `all` | `qr` | `2d` | `1d`, and `plugins/barcode_runtime.resolve_scan_mode`
+turns it into the names **this build actually has** at scan time. Two separate
+reasons, and the first one alone settles it:
+
+* **The names are not portable between the two lines.** 3.1.1 spells the
+  aggregates `AllMatrix` / `AllLinear`; 2.2.0 spells them `MatrixCodes` /
+  `LinearCodes`. A card configured on Orin 6 and moved to Orin 5 would be
+  rejected with `unknown barcode format(s): AllMatrix` — and the blame would
+  land on whoever typed it. Storing the mode means the card survives the move.
+* **Nobody is choosing between 51 symbologies.** What a person configuring this
+  decides is what they are pointing the camera at.
+
+`info`'s `decoder.formats` still reports the real list per build (51 names on
+3.1.1, 20 on 2.2.0) — it is the answer to "what does this image support", not a
+thing to copy into config.
+
+`formats` remains readable from `config.yaml` as a raw list, for a narrowing no
+mode expresses (`[DataMatrix]`). A non-empty list wins over the mode: somebody
+who wrote one meant it. It is deliberately offered neither on the card nor to
+the LLM.
+
+### What is on the card, and what is not
+
+Two fields: **Code types to scan** (a dropdown, via `oneOf` titles) and
+**Stream look-back (seconds)**. Everything else — `try_rotate`, `try_invert`,
+`try_downscale`, `is_pure`, `max_frames_scanned`, `max_symbols`,
+`max_text_chars`, `window_max_frames`, `image_roots` — is `config.yaml`-only and
+still honoured by dispatch.
+
+The cut is "can the person in front of this card answer the question". Nobody
+knows what to put in *max symbols per frame*, and a field like that is worse
+than no field. Three things about the rendering, all of them learned by looking
+at the form rather than the schema (`web/js/sidebar.js`):
+
+* **An array of strings is not a multi-select.** `_isStringList` catches it
+  first and renders a comma-separated text box — carrying vop's placeholder,
+  `逗号分隔，如 person, chair`, which is nonsense on a barcode card. `oneOf`
+  with `const` + `title` is the only path to a real dropdown with readable
+  option text; a bare `enum` renders the raw values.
+* **Without `title`, the whole `description` becomes the label.** Set `title`
+  for the label and keep `description` for the explanation.
+* **The config panel is English.** The LLM-facing `inputSchema` is not bound by
+  this — it is read by a model, not shown in the form.
+
 
 ## Camera Parameters (`camera_info`)
 
