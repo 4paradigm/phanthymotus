@@ -1920,6 +1920,13 @@ html, body {
   gap: 6px;
 }
 
+.canvas-card-guidance {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
 /* Input fields from schema */
 .canvas-field {
   display: flex;
