@@ -462,6 +462,7 @@ def test_every_info_return_carries_topic_out():
     body = source[source.index('if action == "info":'):]
     body = body[:body.index('elif action == "start"')]
     returns = body.count("return {")
-    assert returns == body.count('"topic_out"'), (
-        f"info 有 {returns} 个 return，但只有 {body.count('\"topic_out\"')} 个带 topic_out"
+    topic_out_count = body.count('"topic_out"')
+    assert returns == topic_out_count, (
+        f"info 有 {returns} 个 return，但只有 {topic_out_count} 个带 topic_out"
     )
