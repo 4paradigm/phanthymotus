@@ -1262,7 +1262,7 @@ def test_a_photo_answers_with_hands_when_the_channel_is_on(tmp_path, monkeypatch
     plugin, _ = _plugin({"hands": True})
     plugin._hand_model = _FakeHandSession()
     monkeypatch.setattr(pose_plugin, "load_image_bytes",
-                        lambda args, cfg, url_action: (b"640x480", "test"))
+                        lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test"))
     result = plugin.dispatch("pose", _photo_args())
     assert result["ok"] is True
     assert len(result["keypoint_names"]) == 59
@@ -1274,7 +1274,7 @@ def test_a_photo_answers_with_hands_when_the_channel_is_on(tmp_path, monkeypatch
 def test_a_photo_without_the_channel_is_unchanged(monkeypatch):
     plugin, _ = _plugin()
     monkeypatch.setattr(pose_plugin, "load_image_bytes",
-                        lambda args, cfg, url_action: (b"640x480", "test"))
+                        lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test"))
     result = plugin.dispatch("pose", _photo_args())
     assert len(result["keypoint_names"]) == N_KEYPOINTS
     assert "hands" not in result["persons"][0]
@@ -1294,7 +1294,7 @@ def test_a_photo_with_no_usable_arm_falls_back_to_the_whole_frame():
     plugin, _ = _plugin({"hands": True, "hand_min_forearm_px": 10000.0})
     plugin._hand_model = _FakeHandSession()
     import plugins.pose as _p
-    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    _p.load_image_bytes = lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test")
     result = plugin.dispatch("pose", _photo_args())
     note = result["hands"]
     assert note["found"] == 0
@@ -1310,7 +1310,7 @@ def test_an_unattached_hand_carries_no_side():
     plugin, _ = _plugin({"hands": True, "hand_min_forearm_px": 10000.0})
     plugin._hand_model = _FakeHandSession()
     import plugins.pose as _p
-    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    _p.load_image_bytes = lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test")
     result = plugin.dispatch("pose", _photo_args())
     loose = result["unattached_hands"]
     assert loose and len(loose[0]["keypoints"]) == 21
@@ -1323,7 +1323,7 @@ def test_the_whole_frame_fallback_is_not_used_when_a_hand_was_attached():
     plugin, _ = _plugin({"hands": True})
     plugin._hand_model = _FakeHandSession()
     import plugins.pose as _p
-    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    _p.load_image_bytes = lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test")
     result = plugin.dispatch("pose", _photo_args())
     assert result["hands"]["found"] >= 1
     assert "unattached_hands" not in result
@@ -1332,7 +1332,7 @@ def test_the_whole_frame_fallback_is_not_used_when_a_hand_was_attached():
 def test_a_photo_survives_a_missing_hand_engine(monkeypatch):
     plugin, _ = _plugin({"hands": True})
     monkeypatch.setattr(pose_plugin, "load_image_bytes",
-                        lambda args, cfg, url_action: (b"640x480", "test"))
+                        lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test"))
     result = plugin.dispatch("pose", _photo_args())
     assert result["ok"] is True                      # the bodies still answer
     assert result["hands"]["ok"] is False
@@ -1463,7 +1463,7 @@ def test_a_photo_names_the_hand_shapes_too():
     plugin, _ = _plugin({"hands": True})
     plugin._hand_model = _open_palm_session()
     import plugins.pose as _p
-    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    _p.load_image_bytes = lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test")
     result = plugin.dispatch("pose", _photo_args())
     person = result["persons"][0]
     assert person.get("hand_gestures")
@@ -1476,7 +1476,7 @@ def test_an_unattached_hand_is_named_but_still_has_no_side():
     plugin, _ = _plugin({"hands": True, "hand_min_forearm_px": 10000.0})
     plugin._hand_model = _open_palm_session()
     import plugins.pose as _p
-    _p.load_image_bytes = lambda args, cfg, url_action: (b"640x480", "test")
+    _p.load_image_bytes = lambda args, cfg, url_action: (frame_bytes(FRAME_W, FRAME_H), "test")
     result = plugin.dispatch("pose", _photo_args())
     loose = result["unattached_hands"][0]
     assert "gesture" in loose
