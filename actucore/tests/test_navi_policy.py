@@ -1166,6 +1166,8 @@ def test_search_rate_is_also_clamped_to_the_yaw_limit():
                              min_magnitude=[0.25, 0.12, 0, 0, 0, 0.33])}
     notes = P.adopt_limits(config, bumi)
     assert config.search_rate == 0.83
+    assert config.search_rate <= bumi["limits"]["upper"][5]
+    assert config.search_rate >= bumi["limits"]["min_magnitude"][5]
     assert any("search_rate" in note for note in notes)
 
 
