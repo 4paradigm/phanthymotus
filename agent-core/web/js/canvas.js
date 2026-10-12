@@ -13,6 +13,7 @@
 
 import { showToast } from './toast.js';
 import { fieldOptions, confirmedAction } from './card-controls.js';
+import { piperDevices, switchPiperDevice } from './piper-selector.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -43,6 +44,90 @@ let _zoomLabel  = null;
 let _connSvg    = null;
 let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
+let _piperTarget = null;
+let _piperSwitching = false;
+let _piperCalls = 0;
+let _piperKnownDevices = [];
+
+function _piperDevice(mcpId) {
+  return _piperKnownDevices.find(d => d.id === mcpId);
+}
+
+function _syncPiperSelector() {
+  if (!_canvasEl) return;
+  const detected = piperDevices(_allMcps);
+  if (detected.length) _piperKnownDevices = detected;
+  const devices = _piperKnownDevices;
+  let panel = _canvasEl.querySelector('.piper-target-card');
+  if (!devices.length) {
+    panel?.remove();
+    for (const card of _cards) card.el.classList.remove('piper-unselected');
+    return;
+  }
+  if (_piperTarget === null) _piperTarget = devices[0].id;
+  if (!panel) {
+    panel = document.createElement('section');
+    panel.className = 'piper-target-card';
+    panel.innerHTML = '<strong>选择控制的机械臂</strong><select aria-label="选择机械臂"></select><p>切换关闭两边许可；确认后请重新开启本次许可。</p><button type="button">切换操作对象</button><div class="piper-target-message" role="status"></div>';
+    _canvasEl.appendChild(panel);
+    panel.addEventListener('pointerdown', e => e.stopPropagation());
+    panel.addEventListener('wheel', e => e.stopPropagation());
+    panel.querySelector('button').addEventListener('click', async () => {
+      const message = panel.querySelector('.piper-target-message');
+      if (_piperCalls || _piperSwitching) { message.textContent = '正在提交操作，请稍后切换'; return; }
+      _piperSwitching = true;
+      const button = panel.querySelector('button');
+      button.disabled = true;
+      message.textContent = '检查两台状态并关闭许可…';
+      try {
+        const target = await switchPiperDevice(piperDevices(_allMcps), panel.querySelector('select').value, {
+          projectStopped: async () => {
+            const response = await fetch('/api/config/project-running');
+            if (!response.ok) throw new Error('无法确认智能控制状态');
+            const state = await response.json();
+            return state.running === false;
+          },
+          call: async (id, tool, args) => {
+            const response = await fetch(`/api/mcp/${encodeURIComponent(id)}/call`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({tool, arguments: args}),
+            });
+            const payload = await response.json();
+            if (!response.ok || payload.code !== 200) throw new Error(payload.message || '设备不可达');
+            return _parseMcpCallResult(payload) ?? payload.data;
+          },
+        });
+        _piperTarget = target;
+        _syncPiperSelector();
+        _fitToViewport();
+        _scheduleRedraw();
+        message.textContent = `已选择 ${_piperDevice(target)?.label}；许可已关闭，请重新开启。`;
+      } catch (error) {
+        message.textContent = `未切换：${error.message}`;
+      } finally {
+        _piperSwitching = false;
+        button.disabled = false;
+      }
+    });
+  }
+  const select = panel.querySelector('select');
+  const selected = select.value;
+  select.replaceChildren(...devices.map(d => {
+    const option = document.createElement('option');
+    option.value = d.id; option.textContent = d.label; return option;
+  }));
+  select.value = devices.some(d => d.id === selected) ? selected : _piperTarget;
+  if (!_piperSwitching) panel.querySelector('button').disabled = !detected.length;
+  if (!detected.length) panel.querySelector('.piper-target-message').textContent = '设备信息不完整，请刷新或检查连接；保留当前操作对象。';
+  for (const card of _cards) {
+    const device = devices.find(d => d.id === card.mcpId);
+    card.el.classList.toggle('piper-unselected', !!device && device.id !== _piperTarget);
+    if (device) {
+      const name = card.el.querySelector('.canvas-card-driver');
+      if (name) name.textContent = device.label;
+    }
+  }
+}
 
 // ── Editor Lock ──────────────────────────────────────────────────────────────
 // The session id comes from session.js (per-tab, see the rationale there) and is
@@ -425,6 +510,7 @@ export async function initCanvas(initialMcps) {
 
   // Show editor status bar
   _updateEditorUI();
+  _syncPiperSelector();
 
   // Restore project running state from backend. Editing stays refused until
   // this answers, so a failure must not leave the canvas locked for good —
@@ -555,6 +641,7 @@ export function updateCanvasMcps(mcps) {
     _scheduleRedraw();
     _debouncedSave();
   }
+  _syncPiperSelector();
 }
 
 // ── Zoom / Pan ────────────────────────────────────────────────────────────────
@@ -565,13 +652,14 @@ function _applyTransform() {
 }
 
 function _fitToViewport() {
-  if (!_cards.length) return;
+  const visibleCards = _cards.filter(c => !c.el.classList.contains('piper-unselected'));
+  if (!visibleCards.length) return;
   const rect = _canvasEl.getBoundingClientRect();
   const padding = 30;
   // Find bounding box of all cards in world coords (with port margins)
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   const cardW = window.innerWidth <= 768 ? 220 : 260;
-  for (const c of _cards) {
+  for (const c of visibleCards) {
     minX = Math.min(minX, c.x - 20); // port extends left
     minY = Math.min(minY, c.y);
     maxX = Math.max(maxX, c.x + cardW + 20); // port extends right
@@ -1848,7 +1936,7 @@ function _redrawConnections() {
   for (const conn of _connections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
-    if (!fromCard || !toCard) continue;
+    if (!fromCard || !toCard || fromCard.el.classList.contains('piper-unselected') || toCard.el.classList.contains('piper-unselected')) continue;
 
     const fromPort = _findPort(fromCard.el, 'out', conn.fromPortIdx, conn.format);
     const toPort = _findPort(toCard.el, 'in', conn.toPortIdx, conn.format);
@@ -1883,7 +1971,7 @@ function _redrawConnections() {
   for (const conn of _execConnections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
-    if (!fromCard || !toCard) continue;
+    if (!fromCard || !toCard || fromCard.el.classList.contains('piper-unselected') || toCard.el.classList.contains('piper-unselected')) continue;
 
     const execPort = fromCard.el.querySelector('.canvas-port.executor');
     if (!execPort) { _warnUnresolved(conn, '执行器端口已消失'); continue; }
@@ -2704,6 +2792,12 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 // ── Execute ───────────────────────────────────────────────────────────────────
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
+  const device = _piperDevice(mcpId);
+  if (device && (_piperSwitching || mcpId !== _piperTarget)) {
+    _showToast('请先选择这台机械臂，等待切换完成');
+    return;
+  }
+  if (device) _piperCalls++;
   const btn = el.querySelector('.canvas-exec-btn');
   btn.disabled = true;
   btn.textContent = '执行中…';
@@ -2765,7 +2859,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
         return _parseMcpCallResult(payload) ?? payload.data;
       };
       const value = await confirmedAction(liveSchema, args, {
-        call, confirm: message => window.confirm(message),
+        call, confirm: message => window.confirm(device ? `${device.label}\n\n${message}` : message),
         showPreview: value => _showResult(el, JSON.stringify(value, null, 2), false),
       });
       const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -2794,6 +2888,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     _showResult(el, String(err), true);
     _logActivity('mcp_error', `${toolName} error: ${err}`);
   } finally {
+    if (device) _piperCalls--;
     btn.disabled = false;
     btn.textContent = '▶ 执行';
   }
@@ -3194,6 +3289,7 @@ async function _reloadLayout() {
     _resolveAllTopics();
     _scheduleRedraw();
     _syncEmptyState();
+    _syncPiperSelector();
     // Update editor info
     _currentEditor = layoutJson.editor || null;
     _isEditor = _currentEditor === _sessionId;

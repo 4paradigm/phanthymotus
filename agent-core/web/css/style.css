@@ -9667,3 +9667,17 @@ html, body {
 @media (max-width: 760px) {
   .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
 }
+.piper-unselected { display: none !important; }
+.piper-target-card {
+  position: absolute; top: 48px; right: 14px; z-index: 30; width: 250px;
+  padding: 14px; border: 1px solid #52657d; border-radius: 10px;
+  background: #17212f; color: #f0f4fa; box-shadow: 0 4px 16px #0005;
+  font-size: 12px;
+}
+.piper-target-card strong { display: block; margin-bottom: 10px; font-size: 14px; }
+.piper-target-card select, .piper-target-card button {
+  width: 100%; padding: 8px; color: inherit; background: #27364b;
+  border: 1px solid #64748b; border-radius: 6px;
+}
+.piper-target-card p { line-height: 1.5; margin: 10px 0; }
+.piper-target-message { margin-top: 8px; line-height: 1.5; }

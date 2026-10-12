@@ -34,3 +34,12 @@ Test: `node --test agent-core/web/js/card-controls.test.mjs`.
 `x-manual-execution: true` opts a card into manual use while the project/agent loop is stopped.
 The canvas starts that card with its passive lifecycle `start` before a manual call; it never starts
 the project loop. Drivers opting in must keep `start` passive and enforce physical controls on the server.
+
+For a manual two-PiPER installation, explicitly name the MCP registrations `机械臂 1` and `机械臂 2`.
+When both expose `piper_joint` and `piper_photo`, the canvas adds a device selection card. Each existing
+card retains its original MCP ID, arguments, and topics; selection only shows that device's cards.
+Switching requires the project loop stopped and both devices idle with fresh feedback, closes both
+manual permissions (invalidating previews), then rechecks before changing the visible device.
+A failed check retains the previous selection. The selector never enables, disables, moves or captures.
+Selection is local to a browser tab, not an access-control or multi-client ownership boundary. Independent
+MCP clients still reach either registered device; hardware binding must be enforced in each driver config.
