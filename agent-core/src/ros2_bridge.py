@@ -156,7 +156,11 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
             print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
             return
         _last_seen[topic] = _time.time()
-        asyncio.run_coroutine_threadsafe(cb(data, msg_fmt), _cb_loop)
+        coro = cb(data, msg_fmt)
+        try:
+            asyncio.run_coroutine_threadsafe(coro, _cb_loop)
+        except RuntimeError:  # loop closed during shutdown
+            coro.close()
 
     sub = _node_main.create_subscription(msg_type, topic, _on_msg, _low_lat_qos())
     with _lock:

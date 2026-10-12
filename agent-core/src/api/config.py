@@ -865,7 +865,8 @@ async def _do_start_project_impl():
             fmt = (conn.get('format') or
                    (source_ports[source_index].get('format') if source_index < len(source_ports) else '') or
                    (destination_ports[port_index].get('format') if port_index < len(destination_ports) else ''))
-            bindings.append({'topic': topic, 'format': fmt, 'port_index': port_index})
+            if fmt:
+                bindings.append({'topic': topic, 'format': fmt, 'port_index': port_index})
         return bindings
 
     def _upstream_camera_info(card_id: str) -> dict:

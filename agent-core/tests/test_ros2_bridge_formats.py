@@ -89,3 +89,13 @@ def test_sound_direction_uses_structured_ros_message_and_delivers_json_bytes(mon
         "window_end_us": 1700000000020000,
         "published_us": 1700000000030000,
     }, "sensor/sound-direction-v1", bytes)]
+
+    pending = []
+
+    def closed_loop(coro, loop):
+        pending.append(coro)
+        raise RuntimeError("Event loop is closed")
+
+    monkeypatch.setattr(ros2_bridge.asyncio, "run_coroutine_threadsafe", closed_loop)
+    callbacks[0](SoundDirection())
+    assert pending[0].cr_frame is None

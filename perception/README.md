@@ -41,6 +41,15 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 
 > **Why 512 samples?** The Silero VAD model requires at least one 512-sample window to compute a speech probability. WebRTC VAD requires 480-sample (30 ms) frames. Both backends use 512 samples as the minimum chunk size.
 
+### Wake Direction Timing
+
+When ASR is connected to `sensor/sound-direction-v1`, `AudioChunk.header.stamp`
+must be the Unix capture time of the chunk's first sample. The direction
+message's `window_start_us` and `window_end_us` use the same clock in
+microseconds. ASR reports an unknown wake direction when the audio stamp is
+missing or either capture window is untrusted. Confirm clock alignment on the
+robot before relying on direction results.
+
 ### Common Pitfalls
 
 #### External USB mic (ALSA, 48 kHz native rate)

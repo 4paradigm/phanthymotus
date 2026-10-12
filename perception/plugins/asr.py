@@ -1380,8 +1380,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         try:
             audio_item = pcm_q.get(timeout=1)
             pcm, ts = audio_item[:2]
-            if len(audio_item) > 2 and not audio_item[2]:
-                utterance_capture_trusted = False
+            capture_trusted = len(audio_item) <= 2 or bool(audio_item[2])
         except Exception:
             continue
 
@@ -1404,7 +1403,11 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # Detect speech onset → notify main thread for on_hearing hook
         _is_speaking = vad.is_speech_detected()
         if _is_speaking and not _was_speaking:
+            if not speech_buf:
+                utterance_capture_trusted = True
             result_q.put(("speech_start", ts, ts))
+        if _is_speaking and not capture_trusted:
+            utterance_capture_trusted = False
         _was_speaking = _is_speaking
 
         # Collect completed VAD segments.

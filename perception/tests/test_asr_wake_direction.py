@@ -1,8 +1,10 @@
 """Wake direction is attached only to a leading wake word's capture window."""
 
-from vision_stubs import PERCEPTION_ROOT  # noqa: F401
+from vision_stubs import PERCEPTION_ROOT, _FakeExecutor  # noqa: F401
 
 from plugins import asr
+import sys
+import types
 from types import SimpleNamespace
 
 
@@ -83,3 +85,84 @@ def test_direction_buffer_ignores_invalid_time_and_no_event_keeps_history():
     node._direction_cb(SimpleNamespace(state=1, angle_deg=180,
         window_start_us=0, window_end_us=0))
     assert list(node._direction_windows) == [(90, 1700000000000000, 1700000000020000)]
+
+
+def test_timestamp_trust_is_scoped_to_speech_chunks(monkeypatch):
+    class Stop:
+        done = False
+
+        def is_set(self):
+            return self.done
+
+    stop = Stop()
+
+    class Input:
+        chunks = iter([(b'\0\0' * 1000, 1.0, False),  # idle, untrusted
+                       (b'\0\0' * 1000, 2.0, True),   # first utterance
+                       (b'\0\0' * 1000, 3.0, True),
+                       (b'\0\0' * 1000, 4.0, True),   # idle again
+                       (b'\0\0' * 1000, 5.0, False),  # second utterance
+                       (b'\0\0' * 1000, 6.0, True)])
+
+        def get(self, timeout):
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                stop.done = True
+                raise
+
+    class Vad:
+        frame = 0
+        popped = False
+        front = SimpleNamespace(start=0, samples=[0] * 10000)
+
+        def accept_waveform(self, samples):
+            self.frame += 1
+            self.popped = False
+
+        def is_speech_detected(self):
+            return self.frame in (2, 5)
+
+        def empty(self):
+            return self.frame not in (3, 6) or self.popped
+
+        def pop(self):
+            self.popped = True
+
+    fake_sherpa = types.ModuleType('sherpa_onnx')
+    fake_sherpa.SileroVadModelConfig = lambda **kwargs: None
+    fake_sherpa.VadModelConfig = lambda **kwargs: None
+    fake_sherpa.VoiceActivityDetector = lambda *args, **kwargs: Vad()
+    monkeypatch.setitem(sys.modules, 'sherpa_onnx', fake_sherpa)
+    monkeypatch.setattr('utils.model_downloader.ensure_model', lambda *args: None)
+    results = []
+    asr._vad_worker(Input(), SimpleNamespace(put=results.append), stop,
+                    'sherpa_onnx', 0.5, 0, pre_roll_ms=0)
+    assert [item[4] for item in results if isinstance(item[0], bytes)] == [True, False]
+
+
+def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):
+    monkeypatch.setattr(asr, '_build_asr_adapter', lambda cfg: object())
+
+    def start_pipeline(node):
+        node._sub = node.create_subscription(object, node._input_topic, None, None)
+        if node._direction_topic:
+            node._direction_sub = node.create_subscription(
+                object, node._direction_topic, None, None)
+        node.state = 'running'
+        return {'state': 'running'}
+
+    monkeypatch.setattr(asr._ASRNode, '_start_inner', start_pipeline)
+    plugin = asr.ASRPlugin({}, _FakeExecutor())
+
+    def start(direction):
+        return plugin.dispatch('asr', {'action': 'start', 'instance_id': 'card-1',
+            'input_bindings': [
+                {'topic': direction, 'format': 'sensor/sound-direction-v1', 'port_index': 1},
+                {'topic': '/mic', 'format': 'audio/pcm-16k', 'port_index': 0}]})
+
+    assert start('/direction/old')['state'] == 'running'
+    node = plugin._nodes['card-1']
+    assert start('/direction/new')['state'] == 'running'
+    assert node.state == 'running'
+    assert [sub.topic for sub in node.subscriptions] == ['/mic', '/direction/new']

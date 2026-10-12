@@ -226,6 +226,16 @@ def test_asr_bindings_identify_ports_when_direction_connects_first(driver):
     ]
 
 
+def test_formatless_connection_does_not_create_a_binding(driver):
+    layout = {
+        'cards': [_card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio'}]),
+                  _card(ASR, 'asr')],
+        'connections': [_conn(MIC, ASR, '/ubuntu/mic/audio')],
+    }
+    assert _start(layout) is True
+    assert 'input_bindings' not in driver.starts[ASR]
+
+
 def test_a_derived_topic_reaches_the_bus(driver):
     """The dashboard subscribes to what start-project registers."""
     _start(R1_LAYOUT)

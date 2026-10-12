@@ -43,6 +43,14 @@ test('direction and audio bindings retain their formats regardless of link order
   assert.deepEqual(inputArgs(['/direction', '/mic'], bindings).input_bindings, bindings);
 });
 
+test('a connection with no declared format has no input binding', () => {
+  const mic = { id: 'mic', topicOut: [{ topic: '/mic' }] };
+  const asr = { id: 'asr' };
+  const conns = [{ fromCardId: 'mic', fromPortIdx: '0',
+                   toCardId: 'asr', toPortIdx: '0', fromTopic: '/mic' }];
+  assert.deepEqual(inputBindingsOf(asr, [mic, asr], conns), []);
+});
+
 /** A driver that infers `input + '/' + tool`, like the real topic inference. */
 function driver(log = []) {
   return async (url, init) => {
