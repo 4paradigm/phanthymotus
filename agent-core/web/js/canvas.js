@@ -251,7 +251,7 @@ function _applyProjectState(running) {
   _projectStateKnown = true;
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-    btn.classList.toggle('locked', !_projectRunning);
+    btn.classList.toggle('locked', !_projectRunning && btn.dataset.manualExecution !== 'true');
   });
   // Idempotent: both helpers no-op when their stream is already active, so the
   // start-project path and the cross-tab project_state event cannot double-start.
@@ -1068,7 +1068,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         </div>
         ${sensorFieldsHtml ? `<div class="canvas-card-body">${sensorFieldsHtml}</div>` : ''}
         <div class="canvas-card-footer" style="padding:8px 10px">
-          ${hasSensorActions ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
+          ${hasSensorActions ? `<button class="canvas-exec-btn${_projectRunning || schema?.['x-manual-execution'] === true ? '' : ' locked'}" data-manual-execution="${schema?.['x-manual-execution'] === true}">▶ 执行</button>` : ''}
           ${hasSensorActions ? '<hr class="canvas-footer-divider">' : ''}
           <button class="canvas-view-btn">📡 查看数据流</button>
         </div>
@@ -1253,7 +1253,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         </div>
         ${fieldsHtml ? `<div class="canvas-card-body">${toolObj?.title && toolObj?.description ? `<p class="canvas-card-guidance">${_esc(toolObj.description)}</p>` : ''}${fieldsHtml}</div>` : ''}
         <div class="canvas-card-footer"${!fieldsHtml ? ' style="padding:8px 10px"' : ''}>
-          ${hasUsableFields ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
+          ${hasUsableFields ? `<button class="canvas-exec-btn${_projectRunning || schema?.['x-manual-execution'] === true ? '' : ' locked'}" data-manual-execution="${schema?.['x-manual-execution'] === true}">▶ 执行</button>` : ''}
           ${hasUsableFields && showViewBtn ? '<hr class="canvas-footer-divider">' : ''}
           ${showViewBtn ? '<button class="canvas-view-btn">📡 查看数据流</button>' : ''}
         </div>
@@ -2746,6 +2746,14 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
 
   try {
     const liveSchema = (typeof _toolObj === 'object' ? _toolObj.inputSchema : null);
+    if (!_projectRunning && liveSchema?.['x-manual-execution'] === true) {
+      const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool: toolName, arguments: { action: 'start', ...(instanceId ? {instance_id: instanceId} : {}) } }),
+      });
+      const result = await response.json();
+      if (result.code !== 200) throw new Error(result.message || '手动卡片启动失败');
+    }
     if (liveSchema?.['x-confirmation']?.[args.action]) {
       const call = async arguments_ => {
         const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {

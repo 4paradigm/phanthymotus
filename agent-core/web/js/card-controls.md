@@ -30,3 +30,7 @@ operator confirmations, one-use preview binding/expiry, state freshness and mutu
 A long operation still follows its driver's ACP completion contract; submitting is not completion.
 
 Test: `node --test agent-core/web/js/card-controls.test.mjs`.
+
+`x-manual-execution: true` opts a card into manual use while the project/agent loop is stopped.
+The canvas starts that card with its passive lifecycle `start` before a manual call; it never starts
+the project loop. Drivers opting in must keep `start` passive and enforce physical controls on the server.
