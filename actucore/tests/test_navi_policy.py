@@ -1171,6 +1171,27 @@ def test_search_rate_is_also_clamped_to_the_yaw_limit():
     assert any("search_rate" in note for note in notes)
 
 
+
+def test_search_rate_uses_the_tighter_signed_yaw_limit():
+    """A search sweeps both signs, so the smaller side is the safe rate."""
+    config = _cfg(search_rate=1.0)
+    asymmetric = {"limits": dict(_R1_DESC["limits"],
+                                  lower=[-1, -1, 0, 0, 0, -0.55],
+                                  upper=[1, 1, 0, 0, 0, 0.83])}
+    P.adopt_limits(config, asymmetric)
+    assert config.search_rate == 0.55
+
+
+def test_search_is_disabled_when_the_chassis_has_no_yaw_axis():
+    config = _cfg(search_rate=1.0)
+    no_yaw = {"limits": dict(_R1_DESC["limits"],
+                               lower=[-1, -1, 0, 0, 0, 0],
+                               upper=[1, 1, 0, 0, 0, 0])}
+    notes = P.adopt_limits(config, no_yaw)
+    assert config.wz_max == 0.0
+    assert config.search_rate == 0.0
+    assert any("搜索转身" in note for note in notes)
+
 def test_an_axis_the_chassis_does_not_have_is_switched_off():
     config = _cfg()
     pinned = {"limits": dict(_R1_DESC["limits"],

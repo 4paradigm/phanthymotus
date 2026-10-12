@@ -589,6 +589,12 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         except (IndexError, TypeError, ValueError):
             return None
 
+    def signed_at(row, index):
+        try:
+            return float(row[index])
+        except (IndexError, TypeError, ValueError):
+            return None
+
     # The three twist axes this policy drives, by their index in the six-wide
     # vector. vz/wx/wy are not here because nothing here produces them.
     for index, name, ceiling_attr, floor_attr in (
@@ -617,6 +623,9 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             if getattr(config, ceiling_attr) > 0:
                 notes.append(f"下游底盘没有 {name} 这个自由度，已停用该轴")
             setattr(config, ceiling_attr, 0.0)
+            if index == 5 and config.search_rate != 0.0:
+                config.search_rate = 0.0
+                notes.append("下游底盘没有 wz 这个自由度，已停用搜索转身")
             continue
 
         ceiling = float(getattr(config, ceiling_attr))
@@ -637,13 +646,25 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         # Searching is a yaw-only motion, but it does not go through
         # ``wz_max``: it deliberately uses a fixed rate so a lost target does
         # not make the robot creep around its own deadband.  It is still a
-        # chassis command, so it must obey the same hardware ceiling.  Bumi
-        # exposed this gap: its 0.83 rad/s yaw limit accepted normal steering
-        # after negotiation while the default 1.0 rad/s search was rejected at
-        # every tick.
-        if index == 5 and bound is not None and config.search_rate > bound:
-            notes.append(f"search_rate 超过下游允许的 {bound:g}，已压回")
-            config.search_rate = bound
+        # chassis command and alternates signs while sweeping, so its usable
+        # magnitude is the smaller of the positive and negative yaw bounds.
+        # Bumi exposed this gap: its 0.83 rad/s yaw limit accepted normal
+        # steering after negotiation while the default 1.0 rad/s search was
+        # rejected at every tick.
+        if index == 5:
+            yaw_lower = signed_at(lower, index)
+            yaw_upper = signed_at(upper, index)
+            if yaw_lower is not None and yaw_upper is not None:
+                search_cap = max(0.0, min(yaw_upper, -yaw_lower))
+            elif yaw_upper is not None:
+                search_cap = max(0.0, yaw_upper)
+            elif yaw_lower is not None:
+                search_cap = max(0.0, -yaw_lower)
+            else:
+                search_cap = None
+            if search_cap is not None and config.search_rate > search_cap:
+                notes.append(f"search_rate 超过下游双向允许的 {search_cap:g}，已压回")
+                config.search_rate = search_cap
 
     return notes
 
