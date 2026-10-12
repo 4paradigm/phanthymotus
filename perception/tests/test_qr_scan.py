@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import pytest
-from vision_stubs import _FakeExecutor
+from vision_stubs import _FakeExecutor, _wait_until
 from plugins.qr_scan import QrScanPlugin
 from utils.qr_decoder import QrDecoder, QrTracker, self_check
 
@@ -118,6 +118,37 @@ def test_rebind_idempotent_and_bad_input():
         assert len(executor.nodes) == 1
         plugin.dispatch('qr_scan', {'action': 'config', 'instance_id': 'one', 'config': {'scan_hz': 3}})
         assert executor.nodes == []
+    finally:
+        plugin.stop()
+
+
+@pytest.mark.parametrize('nested', [False, True])
+def test_canvas_config_enables_and_disables_announcement(nested):
+    plugin = QrScanPlugin({}, _FakeExecutor())
+    target = {'instance_id': 'configured', 'input_topic': '/camera/image'}
+    try:
+        for enabled in (True, False):
+            cfg = {'auto_announce': enabled, 'announce_cooldown_s': 0,
+                   'scan_hz': 10, 'stale_after_s': 30}
+            args = {'config': cfg} if nested else cfg
+            result = plugin.dispatch('qr_scan', {**target, 'action': 'config', **args})
+            assert result['config']['auto_announce'] is enabled
+            assert 'action' not in result['config']
+            started = plugin.dispatch('qr_scan', {**target, 'action': 'start'})
+            assert started['auto_announce'] is enabled
+            stream = plugin._streams['configured']
+            send(stream, 'CONFIG-QR')
+            wait(plugin, 'configured', 'detected', 1)
+            announcements = stream.node.publishers[1].messages
+            if enabled:
+                assert _wait_until(lambda: bool(announcements))
+            assert bool(announcements) is enabled
+            if enabled:
+                assert json.loads(announcements[0])['text'] == '扫码成功，内容是：CONFIG-QR'
+        # Instance options must not become defaults for other cameras.
+        other = plugin.dispatch('qr_scan', {'action': 'start', 'instance_id': 'other',
+                                          'input_topic': '/other/image'})
+        assert other['auto_announce'] is False
     finally:
         plugin.stop()
 

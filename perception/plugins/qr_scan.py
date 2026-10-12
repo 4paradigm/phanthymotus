@@ -305,9 +305,14 @@ class QrScanPlugin:
             if action == 'config':
                 if not key:
                     return {'state': 'error', 'error': 'instance_id or input_topic required'}
-                cfg = args.get('config', {})
-                if not isinstance(cfg, dict):
+                nested = args.get('config', {})
+                if not isinstance(nested, dict):
                     return {'state': 'error', 'error': 'config must be an object'}
+                # Canvas instance configuration sends properties at the top
+                # level; accept the nested form used by API clients as well.
+                fields = TOOLS[0]['configSchema']['properties']
+                cfg = {k: args[k] for k in fields if k in args}
+                cfg.update(nested)
                 merged = {**self._config, **self._configs.get(key, {}), **cfg}
                 try:
                     # Validate before mutating a running instance.
