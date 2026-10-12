@@ -112,11 +112,13 @@ function _syncPiperSelector() {
   }
   const select = panel.querySelector('select');
   const selected = select.value;
-  select.replaceChildren(...devices.map(d => {
-    const option = document.createElement('option');
-    option.value = d.id; option.textContent = d.label; return option;
-  }));
-  select.value = devices.some(d => d.id === selected) ? selected : _piperTarget;
+  if ([...select.options].map(o => o.value).join(',') !== devices.map(d => d.id).join(',')) {
+    select.replaceChildren(...devices.map(d => {
+      const option = document.createElement('option');
+      option.value = d.id; option.textContent = d.label; return option;
+    }));
+    select.value = devices.some(d => d.id === selected) ? selected : _piperTarget;
+  }
   if (!_piperSwitching) panel.querySelector('button').disabled = !detected.length;
   if (!detected.length) panel.querySelector('.piper-target-message').textContent = '设备信息不完整，请刷新或检查连接；保留当前操作对象。';
   for (const card of _cards) {
