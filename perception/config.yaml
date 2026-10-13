@@ -20,7 +20,18 @@ plugins:
     catalogue_type: motus_music
     timeout_ms: 3000
     volume: 50
+    # 一首放完自动续下一首（电台模式）。duck_gain 搬到 audio_mixer 了 —— 压低音乐
+    # 是混音的事，这张卡现在只出音乐。
+    continuous: true
+
+  audio_mixer:
+    enabled: true
+    # auto = 问本进程里的 TTS 插件它在发哪个话题。接到本卡的其余输入都算背景音乐。
+    speech_topics: auto
     duck_gain: 0.15
+    duck_ramp_ms: 200
+    duck_hold_ms: 300
+    background_gain: 100
 
   asr:
     enabled: true

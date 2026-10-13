@@ -1,0 +1,270 @@
+"""The mixer: speech always audible, background ducked under it, no clicks.
+
+These assertions used to live in test_music.py's MixerTests, because the music
+card was the mixer. They moved with the code. Everything here runs on a fake
+clock against `audio_mix.Mixer` — no ROS, no catalogue, no ffmpeg.
+"""
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+
+from vision_stubs import _FakeExecutor
+from plugins.audio_mix import AUDIO_EOF, MAX_VOICE_BYTES, Mixer, paced_loop
+
+
+def pcm(value, samples=1600):
+    return np.full(samples, value, dtype='<i2').tobytes()
+
+
+def mean(frame):
+    return abs(np.frombuffer(frame, dtype='<i2').astype(np.float32)).mean()
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+class MixerTests(unittest.TestCase):
+    def setUp(self):
+        self.output = []
+        self.clock = FakeClock()
+        self.mixer = Mixer(self.output.append, clock=self.clock)
+
+    def tearDown(self):
+        self.mixer.close()
+
+    def step(self, *, speech=None, background=None):
+        if speech is not None:
+            self.mixer.feed(speech, speech=True)
+        if background is not None:
+            self.mixer.feed(background, speech=False)
+        self.mixer.tick()
+        self.clock.now += 0.1
+
+    def test_speech_passes_through_with_no_background_at_all(self):
+        self.step(speech=pcm(3000))
+        self.assertEqual(self.output[-1], pcm(3000))
+
+    def test_speech_is_never_attenuated(self):
+        """duck_gain and background_gain must not touch the robot's own voice."""
+        self.mixer.configure(duck_gain=0.0, background_gain=0)
+        self.step(speech=pcm(3000))
+        self.assertAlmostEqual(mean(self.output[-1]), 3000, delta=2)
+
+    def test_background_alone_plays_at_full_level(self):
+        for _ in range(8):
+            self.step(background=pcm(10000))
+        self.assertGreater(mean(self.output[-1]), 9500)
+
+    def test_speech_ducks_the_background_and_it_restores_after(self):
+        for _ in range(8):
+            self.step(background=pcm(10000))
+        full = mean(self.output[-1])
+        for _ in range(4):
+            self.step(speech=pcm(1), background=pcm(10000))
+        ducked = mean(self.output[-1])
+        self.assertLess(ducked, full / 2)
+        # The utterance ends the way a real one does — with an EOF. Letting the
+        # buffer merely run dry is not enough: the stream stays open for another
+        # two seconds, and the duck correctly stays on for all of it.
+        self.mixer.feed(AUDIO_EOF, speech=True)
+        self.clock.now += 0.5           # past duck_hold_ms
+        for _ in range(12):
+            self.step(background=pcm(10000))
+        self.assertGreater(mean(self.output[-1]), full * 0.95)
+
+    def test_the_gain_moves_gradually_rather_than_stepping(self):
+        """A step change in gain is audible as a click at every utterance."""
+        for _ in range(8):
+            self.step(background=pcm(10000))
+        levels = []
+        for _ in range(4):
+            self.step(speech=pcm(1), background=pcm(10000))
+            levels.append(mean(self.output[-1]))
+        self.assertTrue(all(b <= a for a, b in zip(levels, levels[1:])),
+                        f'gain should fall monotonically, got {levels}')
+        self.assertGreater(levels[0], levels[-1])
+
+    def test_a_speech_eof_is_not_forwarded_while_background_is_live(self):
+        """Only the *combined* stream's end is a boundary for the speaker."""
+        for _ in range(4):
+            self.step(background=pcm(8000))
+        self.mixer.feed(AUDIO_EOF, speech=True)
+        for _ in range(3):
+            self.step(background=pcm(8000))
+        self.assertNotIn(AUDIO_EOF, self.output)
+
+    def test_the_combined_stream_emits_one_eof_when_everything_stops(self):
+        self.step(speech=pcm(3000))
+        self.mixer.feed(AUDIO_EOF, speech=True)
+        self.step()
+        self.assertEqual(self.output[-1], AUDIO_EOF)
+
+    def test_flush_speech_drops_buffered_speech_but_not_the_next_utterance(self):
+        """Barge-in: synthesis is told to stop, but up to 500 ms of it is
+        already buffered here (tts.py bursts a 5-frame prebuffer).
+        """
+        self.mixer.feed(pcm(3000), speech=True)
+        self.mixer.flush_speech()
+        self.step(background=pcm(9000))
+        self.assertLess(mean(self.output[-1]), 9000)   # no speech in it
+        # Stale frames of the interrupted utterance stay dropped...
+        self.step(speech=pcm(5000))
+        self.assertEqual(self.mixer.status()['speech_buffered_ms'], 0)
+        # ...until the next EOF, after which the next utterance is heard.
+        self.mixer.feed(AUDIO_EOF, speech=True)
+        self.step(speech=pcm(5000))
+        self.assertGreater(mean(self.output[-1]), 100)
+
+    def test_flush_speech_does_not_cancel_the_background(self):
+        for _ in range(8):
+            self.step(background=pcm(10000))
+        self.mixer.flush_speech()
+        self.step(background=pcm(10000))
+        self.assertGreater(mean(self.output[-1]), 9000)
+
+    def test_flush_speech_while_idle_does_not_mute_future_speech(self):
+        self.mixer.flush_speech()
+        self.step(speech=pcm(4000))
+        self.assertAlmostEqual(mean(self.output[-1]), 4000, delta=2)
+
+    def test_an_explicit_duck_lifts_itself_after_a_failsafe(self):
+        """A lost end-of-speech must not leave music permanently inaudible."""
+        self.mixer.duck(True)
+        for _ in range(6):
+            self.step(background=pcm(10000))
+        self.assertLess(mean(self.output[-1]), 3000)
+        self.clock.now += 61            # past DUCK_FAILSAFE_S
+        for _ in range(12):
+            self.step(background=pcm(10000))
+        self.assertGreater(mean(self.output[-1]), 9000)
+
+    def test_the_sum_is_clipped_rather_than_wrapped(self):
+        self.step(speech=pcm(30000), background=pcm(30000))
+        self.assertLessEqual(np.frombuffer(self.output[-1], dtype='<i2').max(), 32767)
+
+    def test_each_source_buffer_is_bounded(self):
+        for speech in (True, False):
+            with self.subTest(speech=speech):
+                mixer = Mixer(lambda _p: None, clock=FakeClock())
+                mixer.feed(b'\x00' * (MAX_VOICE_BYTES + 2), speech=speech)
+                self.assertIn('bounded', mixer.status()['error'])
+                mixer.close()
+
+    def test_odd_length_pcm_is_rejected_not_misread(self):
+        self.mixer.feed(b'\x01\x02\x03', speech=True)
+        self.assertIn('S16LE', self.mixer.status()['error'])
+
+    def test_a_silent_source_stops_ducking_without_an_eof(self):
+        """A source that went away without saying so is not still speaking."""
+        self.step(speech=pcm(3000), background=pcm(10000))
+        self.clock.now += 3
+        for _ in range(12):
+            self.step(background=pcm(10000))
+        self.assertFalse(self.mixer.ducked())
+
+    def test_no_subscriber_is_reported_rather_than_buffered_forever(self):
+        mixer = Mixer(self.output.append, has_reader=lambda: False, clock=self.clock)
+        self.addCleanup(mixer.close)
+        for _ in range(70):
+            mixer.feed(pcm(3000), speech=True)
+            mixer.tick()
+            self.clock.now += 0.1
+        self.assertIn('Speaker', mixer.status()['error'])
+
+
+class PacedLoopTests(unittest.TestCase):
+    def test_a_late_frame_is_dropped_rather_than_burst(self):
+        """Chasing a missed deadline publishes several frames back to back, and
+        a speaker fed a burst plays it as a chirp.
+        """
+        import threading
+        clock = FakeClock()
+        stop = threading.Event()
+        calls = []
+
+        def tick():
+            calls.append(clock.now)
+            clock.now += 5          # every tick overruns its 100 ms budget
+            if len(calls) >= 3:
+                stop.set()
+
+        waits = []
+        with patch.object(stop, 'wait', side_effect=lambda t: waits.append(t)):
+            paced_loop(stop, tick, clock=clock)
+        self.assertEqual(waits, [0, 0, 0])   # never negative, never catching up
+
+
+class MixerCardTests(unittest.TestCase):
+    """The card around the mixer: roles, and what `info()` has to report."""
+
+    def _plugin(self, **cfg):
+        from plugins.audio_mixer import AudioMixerPlugin
+        return AudioMixerPlugin(cfg, _FakeExecutor())
+
+    def test_the_declaration_offers_the_model_nothing_to_call(self):
+        """Mixing is wiring, not a decision an agent makes."""
+        tool = self._plugin().get_tools()[0]
+        self.assertNotIn('x-action-params', tool['inputSchema'])
+        self.assertEqual(tool['inputSchema']['x-resource'], 'speaker_mix')
+        self.assertEqual(set(tool['inputSchema']['x-hooks']),
+                         {'on_interrupt_speak', 'on_interrupt_all'})
+
+    def test_one_in_port_because_port_identity_does_not_survive_to_start(self):
+        """api/config.py's _resolve_input_topics discards toPortIdx, so a
+        'speech' port and a 'background' port would be resolved by a coin flip.
+        """
+        tool = self._plugin().get_tools()[0]
+        self.assertEqual(len(tool['topic_in']), 1)
+
+    def test_info_reports_every_bound_topic_with_its_role(self):
+        """_dropped_inputs fails a card's start when it was handed >=2 topics
+        and info() does not account for all of them.
+        """
+        plugin = self._plugin(speech_topics='/speech/tts')
+        plugin.dispatch('audio_mixer', {
+            'action': 'start',
+            'input_topics': ['/speech/tts', '/perception/music/audio']})
+        self.addCleanup(plugin.stop)
+        info = plugin.dispatch('audio_mixer', {'action': 'info'})
+        roles = {t['topic']: t['role'] for t in info['topic_in']}
+        self.assertEqual(roles, {'/speech/tts': 'speech',
+                                 '/perception/music/audio': 'background'})
+        self.assertNotIn('degraded', info)
+
+    def test_no_identifiable_speech_source_is_reported_as_degraded(self):
+        """Otherwise every input is background and the robot's own voice gets
+        ducked by its own music, with nothing saying why.
+        """
+        plugin = self._plugin()        # `auto`, and no TTS handle
+        plugin.dispatch('audio_mixer', {'action': 'start',
+                                        'input_topics': ['/a', '/b']})
+        self.addCleanup(plugin.stop)
+        info = plugin.dispatch('audio_mixer', {'action': 'info'})
+        self.assertIn('degraded', info)
+        self.assertEqual(info['speech_topics'], [])
+
+    def test_its_own_output_is_refused_as_an_input(self):
+        plugin = self._plugin()
+        from plugins.audio_mixer import OUTPUT_TOPIC
+        reply = plugin.dispatch('audio_mixer', {'action': 'start',
+                                                'input_topics': [OUTPUT_TOPIC]})
+        self.assertIn('error', reply)
+
+    def test_starting_with_no_input_says_what_to_connect(self):
+        reply = self._plugin().dispatch('audio_mixer', {'action': 'start'})
+        self.assertIn('phanthy_music', reply['error']['message'])
+
+    def test_an_interrupt_hook_while_idle_is_not_an_error(self):
+        plugin = self._plugin()
+        self.assertEqual(plugin.dispatch(
+            'audio_mixer', {'action': 'flush_speech'})['state'], 'idle')
+
+
+if __name__ == '__main__':
+    unittest.main()

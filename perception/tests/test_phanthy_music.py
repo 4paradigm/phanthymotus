@@ -61,45 +61,113 @@ class CardTests(unittest.TestCase):
             self.assertEqual(self.call('play_by_id', track_id='fictional-1')['error']['code'], 'not_configured')
         play.assert_not_called()
 
-    def test_genre_selects_one_track_and_returns_relaxation_and_attribution(self):
+    def test_play_selects_one_track_and_returns_relaxation_and_attribution(self):
         self.call('start')
         found = {'schema': SCHEMA, 'tracks': [detail()['track']], 'relaxed': ['artist'],
                  'reply_notice': 'Tell the user which conditions were relaxed.'}
         with patch.object(self.plugin._catalogue, 'execute', return_value=found) as query, \
              patch.object(self.plugin._node.player, 'play') as play:
-            result = self.call('play_by_genre', genre='pop', language='zh',
-                               artist='Fictional artist', exclude_ids='fictional-0', top_k=10)
+            result = self.call('play', genre='pop', language='zh',
+                               artist='Fictional artist')
         self.assertEqual(query.call_args.kwargs['top_k'], 1)
         self.assertEqual(query.call_args.kwargs['genre'], 'pop')
         self.assertEqual(query.call_args.kwargs['language'], 'zh')
-        self.assertEqual(query.call_args.kwargs['exclude_ids'], 'fictional-0')
         self.assertEqual(result['relaxed'], ['artist'])
         self.assertEqual(result['reply_notice'], found['reply_notice'])
         self.assertEqual(result['track'], detail()['track'])
         self.assertEqual(play.call_args.args[-1], detail()['track']['usage'])
+        # A play opens one ACP session.
+        self.assertTrue(result['action_id'].startswith('music-'))
+        # This fixture carries no duration, so none is claimed. Declaring a
+        # duration we do not know would be worse than declaring none: it sizes
+        # a barrier.
+        self.assertNotIn('expected_duration_s', result)
 
-    def test_genre_requires_value_and_failed_lookup_preserves_current_song(self):
+    def test_a_known_duration_is_declared_so_the_pending_is_not_reaped(self):
+        """A track has no `text` for agent-core to estimate from, so without
+        this every track shares one static ceiling and an overrun silently
+        reaps the pending mid-playback.
+        """
         self.call('start')
-        for result in ({'schema': SCHEMA, 'request_id': 'fictional-request', 'tracks': [], 'relaxed': ['genre']},
+        track = {**detail()['track'], 'duration_s': 214}
+        found = {'schema': SCHEMA, 'tracks': [track], 'relaxed': []}
+        with patch.object(self.plugin._catalogue, 'execute', return_value=found), \
+             patch.object(self.plugin._node.player, 'play'):
+            result = self.call('play', genre='pop')
+        self.assertEqual(result['expected_duration_s'], 214)
+
+    def test_next_continues_the_same_session_rather_than_opening_another(self):
+        """One action_id per listening session. A second pending per skip would
+        have the barrier believing two songs play at once.
+        """
+        self.call('start')
+        found = {'schema': SCHEMA, 'tracks': [detail()['track']], 'relaxed': []}
+        with patch.object(self.plugin._catalogue, 'execute', return_value=found), \
+             patch.object(self.plugin._node.player, 'play'):
+            first = self.call('play', genre='pop')['action_id']
+            second = self.call('next')
+        self.assertEqual(second.get('action_id'), first)
+
+    def test_next_needs_no_arguments_and_excludes_what_already_played(self):
+        """`exclude_ids` used to be a list the model had to maintain by hand."""
+        self.call('start')
+        found = {'schema': SCHEMA, 'tracks': [detail()['track']], 'relaxed': []}
+        with patch.object(self.plugin._catalogue, 'execute', return_value=found), \
+             patch.object(self.plugin._node.player, 'play'):
+            self.call('play', genre='pop')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=found) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            self.call('next')
+        # The station's criteria are reused, and the track just played is excluded.
+        self.assertEqual(query.call_args.kwargs['genre'], 'pop')
+        self.assertIn(detail()['track']['id'],
+                      query.call_args.kwargs['exclude_ids'])
+
+    def test_an_unknown_genre_becomes_free_text_instead_of_an_error(self):
+        """A model that says "city pop" should get music, not invalid_filter.
+
+        Before this, the only way to learn a real code was to fail a search and
+        read `error.allowed`.
+        """
+        self.call('start')
+        found = {'schema': SCHEMA, 'tracks': [detail()['track']], 'relaxed': []}
+        with patch.object(self.plugin, '_known_values',
+                          return_value=('pop', 'jazz')), \
+             patch.object(self.plugin._catalogue, 'execute',
+                          return_value=found) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            result = self.call('play', genre='city pop')
+        self.assertNotIn('genre', query.call_args.kwargs)
+        self.assertIn('city pop', query.call_args.kwargs['query'])
+        self.assertEqual(result['genre_as_query'], ['city pop'])
+
+    def test_a_failed_lookup_preserves_the_current_song(self):
+        """`play` with no criteria is now legal — "放点歌" means anything, and
+        the catalogue picks. What must not happen is a failed lookup killing
+        whatever is already playing.
+        """
+        self.call('start')
+        for result in ({'schema': SCHEMA, 'request_id': 'fictional-request',
+                        'tracks': [], 'relaxed': ['genre']},
                        {'error': {'code': 'unavailable'}}):
             with self.subTest(result=result), \
-                 patch.object(self.plugin._catalogue, 'execute', return_value=result) as query, \
+                 patch.object(self.plugin._catalogue, 'execute',
+                              return_value=result) as query, \
                  patch.object(self.plugin._node.player, 'play') as play, \
                  patch.object(self.plugin._node.player, 'interrupt') as interrupt:
-                self.assertIn('error', self.call('play_by_genre'))
-                self.assertIn('error', self.call('play_by_genre', genre='  '))
-                self.assertIn('error', self.call('play_by_genre', genre=' , , '))
-                query.assert_not_called()
-                reply = self.call('play_by_genre', genre='jazz')
+                reply = self.call('play', genre='jazz')
                 self.assertIn('error', reply)
+                self.assertIsInstance(reply['error'], dict)
+                query.assert_called()
                 if 'request_id' in result:
                     self.assertEqual(reply['request_id'], 'fictional-request')
                     self.assertEqual(reply['relaxed'], ['genre'])
                 play.assert_not_called(); interrupt.assert_not_called()
 
     def test_network_request_never_blocks_controls_or_resurrects_cancelled_play(self):
-        for action, arguments in [('play_by_id', {'track_id': 'fictional-1'}),
-                                  ('play_by_genre', {'genre': 'pop'})]:
+        for action, arguments in [('play', {'track_id': 'fictional-1'}),
+                                  ('play', {'genre': 'pop'})]:
             for control in ('interrupt', 'stop', 'config', 'replacement'):
                 with self.subTest(action=action, control=control):
                     self.call('start')
@@ -197,7 +265,8 @@ class MCPTests(unittest.TestCase):
         # explicitly for the bundle to hold just this card — the tool list
         # below is asserted exactly.
         bundle = main.PerceptionBundle({'plugins': {'phanthy_music': {'enabled': True, 'catalogue_type': 'mock'},
-                                                   'echo_cancellation': {'enabled': False}}}, _FakeExecutor())
+                                                   'echo_cancellation': {'enabled': False},
+                                                   'audio_mixer': {'enabled': False}}}, _FakeExecutor())
         captured = io.StringIO()
         handler = logging.StreamHandler(captured)
         main.log.addHandler(handler)

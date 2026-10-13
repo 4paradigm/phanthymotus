@@ -77,7 +77,13 @@ class FakeDecoder:
         return self.done.is_set()
 
 
-class MixerTests(unittest.TestCase):
+class SessionTests(unittest.TestCase):
+    """One music session: decoder lifecycle, transport states, rapid-skip bound.
+
+    The speech/duck half of these moved to test_audio_mixer.py along with the
+    mixing itself — this card no longer takes speech in.
+    """
+
     def setUp(self):
         self.output = []
         self.clock = FakeClock()
@@ -96,14 +102,6 @@ class MixerTests(unittest.TestCase):
     def play(self):
         return self.player.play('https://audio.example/fictional.mp3')
 
-    def test_speech_passthrough_without_catalogue_or_song(self):
-        voice = pcm(14000)
-        self.player.feed_voice(voice)
-        self.player.feed_voice(AUDIO_EOF)
-        self.step()
-        self.step()
-        self.assertEqual(self.output, [voice, AUDIO_EOF])
-
     def test_background_session_and_terminal_state(self):
         started = self.play()
         self.assertEqual(started['playback_state'], 'buffering')
@@ -116,40 +114,13 @@ class MixerTests(unittest.TestCase):
         self.assertEqual(self.player.state, 'completed')
         self.assertEqual(self.output[-1], AUDIO_EOF)
 
-    def test_speech_ducks_music_and_restores_without_forwarding_speech_eof(self):
-        self.play()
-        for _ in range(12):
-            self.step(pcm(10000))
-        full = np.frombuffer(self.output[-1], dtype='<i2').mean()
-        self.player.feed_voice(pcm(1000, 16000))
-        self.player.feed_voice(AUDIO_EOF)
-        for _ in range(10):
-            self.step(pcm(10000))
-        ducked = np.frombuffer(self.output[-1], dtype='<i2').mean()
-        self.assertLess(ducked, full / 2)
-        self.assertNotIn(AUDIO_EOF, self.output)
-        for _ in range(12):
-            self.step(pcm(10000))
-        self.assertGreater(np.frombuffer(self.output[-1], dtype='<i2').mean(), full * .95)
-
-    def test_user_speech_end_restores_music(self):
-        self.play()
-        self.player.hearing(True)
-        for _ in range(10):
-            self.step(pcm(10000))
-        self.assertLess(np.frombuffer(self.output[-1], dtype='<i2').mean(), 2000)
-        self.player.hearing(False)
-        for _ in range(15):
-            self.step(pcm(10000))
-        self.assertGreater(np.frombuffer(self.output[-1], dtype='<i2').mean(), 9500)
-
     def test_pause_preserves_music_buffer_but_speech_continues(self):
         self.play()
         self.player._decoder.frames.put(pcm(10000))
         self.player.pause()
-        self.player.feed_voice(pcm(3000))
         self.step()
-        self.assertEqual(self.output[-1], pcm(3000))
+        # Pause must not drain what was already decoded: resuming has to
+        # continue the song, not skip the buffered 100 ms.
         self.assertEqual(self.player._decoder.frames.qsize(), 1)
         self.player.resume()
         self.step()
@@ -161,30 +132,8 @@ class MixerTests(unittest.TestCase):
         old.frames.put(pcm(25000))
         self.player.interrupt()
         self.assertTrue(old.cancelled.is_set())
-        self.player.feed_voice(pcm(3000))
-        self.step()
-        self.assertEqual(self.output[-1], pcm(3000))
         self.assertNotEqual(self.play()['playback_id'], first)
         self.assertTrue(self.player._decoder.frames.empty())
-
-    def test_voice_interrupt_does_not_cancel_song_or_swallow_next_utterance(self):
-        self.play()
-        self.player.feed_voice(pcm(9000))
-        self.player.interrupt_voice()
-        self.player.feed_voice(pcm(9000))  # old late frame
-        self.assertEqual(len(self.player._voice), 0)
-        self.player.feed_voice(AUDIO_EOF)
-        self.player.feed_voice(pcm(2000))
-        self.player.feed_voice(AUDIO_EOF)
-        self.step()
-        self.assertEqual(self.output[-1], pcm(2000))
-        self.assertIsNotNone(self.player._decoder)
-
-    def test_idle_interrupt_does_not_mute_future_speech(self):
-        self.player.interrupt_voice()
-        self.player.feed_voice(pcm(3000))
-        self.step()
-        self.assertEqual(self.output[-1], pcm(3000))
 
     def test_finished_decoder_with_pending_reader_still_limits_rapid_skip(self):
         for _ in range(2):
@@ -219,24 +168,6 @@ class MixerTests(unittest.TestCase):
         self.assertEqual(self.player.state, 'error')
         self.assertEqual(self.player.status()['error'], 'broken media')
 
-    def test_clip_and_volume_apply_only_to_music(self):
-        self.play()
-        self.player._music_gain = 1
-        self.player.duck_gain = 1
-        self.player.feed_voice(pcm(30000))
-        self.step(pcm(30000))
-        self.assertEqual(np.frombuffer(self.output[-1], dtype='<i2').max(), 32767)
-        self.player.set_volume(0)
-        for _ in range(20):
-            self.player.feed_voice(pcm(3000))
-            self.step(pcm(30000))
-        self.assertLess(abs(np.frombuffer(self.output[-1], dtype='<i2').mean() - 3000), 2)
-
-    def test_voice_buffer_has_a_limit(self):
-        self.player.feed_voice(b'\0' * (MAX_VOICE_BYTES + 2))
-        self.assertIn('bounded', self.player.error)
-        self.assertEqual(len(self.player._voice), 0)
-
     def test_invalid_expiry_usage_and_volume(self):
         for kwargs in ({'expires_at': '2000-01-01T00:00:00Z'}, {'expires_at': 'bad'},
                        {'usage': {'scope': 'redistribute'}}):
@@ -255,25 +186,67 @@ class PluginTests(unittest.TestCase):
     def tearDown(self):
         self.plugin.stop()
 
-    def test_schema_and_background_hooks(self):
+    def test_schema_declares_an_actuator_that_only_emits_music(self):
         import jsonschema
         tool = self.plugin.get_tools()[0]
         self.assertEqual(tool['name'], 'phanthy_music')
+        # An actuator with an output topic and no input: mixing is audio_mixer's
+        # job now, so this card has nothing to subscribe to.
+        self.assertEqual(tool['type'], 'actuator')
+        self.assertEqual(tool['topic_in'], [])
+        self.assertEqual(tool['topic_out'][0]['topic'], OUTPUT_TOPIC)
         schema = tool['inputSchema']
-        self.assertNotIn('x-completion', schema)
-        self.assertNotEqual(schema['x-resource'], 'mouth')
+        # Its own channel, not the mouth: music and speech are summed downstream
+        # and must not make each other wait.
+        self.assertEqual(schema['x-resource'], 'music')
         self.assertEqual(set(schema['x-action-params']),
-                         {'search', 'play_by_id', 'play_by_genre', 'pause', 'resume', 'interrupt', 'status', 'set_volume'})
-        self.assertEqual(schema['x-hooks']['on_interrupt_all']['action'], 'interrupt_voice')
-        jsonschema.validate({'action': 'play_by_id', 'track_id': 'fictional-1'}, schema)
-        jsonschema.validate({'action': 'play_by_genre', 'genre': 'pop'}, schema)
+                         {'list_genres', 'play', 'next', 'previous', 'pause',
+                          'resume', 'stop_music', 'now_playing', 'set_volume',
+                          'search'})
+        jsonschema.validate({'action': 'play', 'genre': 'pop'}, schema)
+        jsonschema.validate({'action': 'next'}, schema)
+        jsonschema.validate({'action': 'list_genres'}, schema)
+
+    def test_the_system_actions_are_not_offered_to_the_model(self):
+        """`present_to_llm` only filters them for `processor` cards, and this is
+        an `actuator` — so leaving them in the enum would hand the model a
+        `stop` that tears the ROS node down, next to the `stop_music` it means.
+        Exactly the confusion measured on Orin5 with `tts(action="stop")`.
+        """
+        enum = self.plugin.get_tools()[0]['inputSchema']['properties']['action']['enum']
+        for hidden in ('start', 'stop', 'info', 'config'):
+            self.assertNotIn(hidden, enum)
+        # Still dispatchable — the canvas calls them directly and never reads
+        # the enum.
+        self.assertEqual(self.plugin.dispatch(
+            'phanthy_music', {'action': 'start'})['state'], 'running')
+
+    def test_the_session_is_declared_background_and_silent(self):
+        """A four-minute track must not block `finish`, the agent's next call,
+        or suppress anything — and its end is a receipt, not a message.
+        """
+        completion = self.plugin.get_tools()[0]['inputSchema']['x-completion']
+        self.assertEqual(completion['actions'], ['play'])
+        self.assertTrue(completion['background'])
+        self.assertTrue(completion['silent_completion'])
+        # 0 = no deadline: a track has no `text` to estimate from, and a static
+        # ceiling would reap the pending mid-playback.
+        self.assertEqual(completion['timeout'], 0)
+
+    def test_barge_in_must_not_stop_the_music(self):
+        """on_interrupt_all fires on every new user turn. Binding it here would
+        mean the song dies whenever somebody speaks.
+        """
+        hooks = self.plugin.get_tools()[0]['inputSchema']['x-hooks']
+        self.assertEqual(set(hooks), {'on_interrupt_music'})
+        self.assertEqual(hooks['on_interrupt_music']['action'], 'stop_music')
 
     def test_start_stop_and_restart_have_one_node_and_no_autoplay(self):
         for _ in range(3):
-            result = self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topic': '/speech/tts'})
+            result = self.plugin.dispatch('phanthy_music', {'action': 'start'})
             self.assertEqual(result['state'], 'running')
             self.assertEqual(result['playback_state'], 'idle')
-            self.assertEqual(result['topic_in'][0]['topic'], '/speech/tts')
+            self.assertEqual(result['topic_in'], [])
             self.assertEqual(result['topic_out'][0]['topic'], OUTPUT_TOPIC)
             self.assertEqual(len(self.executor.nodes), 1)
         node = self.plugin._node
@@ -284,30 +257,49 @@ class PluginTests(unittest.TestCase):
         self.plugin.dispatch('phanthy_music', {'action': 'start'})
         self.assertEqual(len(self.executor.nodes), 1)
 
-    def test_passes_real_audio_messages_to_output(self):
-        self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topic': '/speech'})
+    def test_music_pcm_reaches_the_output_topic(self):
+        self.plugin.dispatch('phanthy_music', {'action': 'start'})
         node = self.plugin._node
-        msg = _FakeAudioChunk()
-        msg.format, msg.data = FORMAT, pcm(1000)
-        node.subscription.callback(msg)
-        deadline = time.monotonic() + 1
+        node.player._factory = FakeDecoder
+        node.player.play('https://audio.example/fictional.mp3')
+        node.player._decoder.frames.put(pcm(1000))
+        deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not node.publisher.messages:
             time.sleep(.01)
         self.assertTrue(node.publisher.messages)
-        self.assertEqual(bytes(node.publisher.messages[0]), pcm(1000))
+        # Volume defaults to 50 and the gain ramps in from silence, so the first
+        # frame is attenuated — what matters is that music, and only music,
+        # reaches the topic.
+        self.assertTrue(any(bytes(m) for m in node.publisher.messages))
 
-    def test_no_hook_autostart_and_no_feedback_connection(self):
-        self.plugin.dispatch('phanthy_music', {'action': 'duck'})
+    def test_legacy_mix_wiring_fails_loudly_instead_of_going_mute(self):
+        """An old canvas has `TTS → phanthy_music → Speaker`. Ignoring that
+        input would leave TTS publishing into nothing — a mute robot reporting
+        已就绪, which `_dropped_inputs` cannot catch at a single topic.
+        """
+        for args in ({'action': 'start', 'input_topic': '/speech/tts'},
+                     {'action': 'start', 'input_topics': ['/speech/tts']}):
+            result = self.plugin.dispatch('phanthy_music', args)
+            self.assertEqual(result['error']['code'], 'legacy_wiring')
+            self.assertIn('audio_mixer', result['error']['message'])
+            self.assertEqual(self.executor.nodes, [])
+
+    def test_an_interrupt_hook_while_idle_is_not_an_error(self):
+        self.plugin.dispatch('phanthy_music', {'action': 'stop_music'})
         self.assertIsNone(self.plugin._node)
-        result = self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topic': OUTPUT_TOPIC})
-        self.assertEqual(result['state'], 'error')
-        self.assertEqual(self.executor.nodes, [])
-        self.assertIn('error', self.plugin.dispatch('phanthy_music', {'action': 'start', 'input_topics': ['/a', '/b']}))
 
-    def test_closed_or_invalid_play_returns_error(self):
-        self.assertIn('error', self.plugin.dispatch('phanthy_music', {'action': 'play_by_id', 'track_id': 'fictional-1'}))
+    def test_closed_or_invalid_play_returns_one_error_shape(self):
+        """`error` is always absent or a dict with a `code`. It used to be a
+        plain string on this path and a dict on the MusicError path, so a
+        caller could not read `error.code` without checking the type first.
+        """
+        reply = self.plugin.dispatch('phanthy_music',
+                                     {'action': 'play', 'track_id': 'fictional-1'})
+        self.assertIsInstance(reply['error'], dict)
+        self.assertIn('code', reply['error'])
         self.plugin.dispatch('phanthy_music', {'action': 'start'})
-        self.assertIn('error', self.plugin.dispatch('phanthy_music', {'action': 'play_by_id'}))
+        reply = self.plugin.dispatch('phanthy_music', {'action': 'previous'})
+        self.assertIsInstance(reply['error'], dict)
         self.assertEqual(self.plugin._node.player.state, 'idle')
 
 

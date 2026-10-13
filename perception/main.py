@@ -172,6 +172,20 @@ class PerceptionBundle:
             log.info("EchoCancellationPlugin loaded (tts=%s)",
                      "yes" if tts_plugin else "no")
 
+        # After TTS and holding its handle, for the same reason echo_cancellation
+        # does: `speech_topics: auto` means "ask the local TTS card what it
+        # publishes", and in-process is the only place that answer is free.
+        if plugins_cfg.get("audio_mixer", {}).get("enabled", True):
+            try:
+                from plugins.audio_mixer import AudioMixerPlugin
+                self._plugins.append(AudioMixerPlugin(
+                    plugins_cfg.get("audio_mixer", {}), executor, tts=tts_plugin))
+                log.info("AudioMixerPlugin loaded (tts=%s)",
+                         "yes" if tts_plugin else "no")
+            except Exception:
+                log.error("AudioMixerPlugin failed to load; continuing without it",
+                          exc_info=True)
+
         if plugins_cfg.get("phanthy_music", {}).get("enabled", False):
             try:
                 from plugins.phanthy_music import PhanthyMusicPlugin
@@ -504,7 +518,8 @@ def make_handler():
                     args   = params.get("arguments") or {}
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
-                    music_call = name == 'phanthy_music' or name.startswith('phanthy_music_')
+                    music_call = (name == 'phanthy_music' or name.startswith('phanthy_music_')
+                  or name == 'audio_mixer' or name.startswith('audio_mixer_'))
                     if not is_info:
                         if music_call:
                             log.info("[mcp] tools/call: phanthy_music (payload omitted)")

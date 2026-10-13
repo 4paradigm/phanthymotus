@@ -4,7 +4,8 @@ import threading
 import time
 
 from plugins.music_catalog.contracts import (
-    FALLBACK, MusicError, capabilities, envelope, search_request, search_result)
+    FALLBACK, SCHEMA, MusicError, capabilities, envelope, search_request,
+    search_result)
 from plugins.music_catalog.providers import discover
 from plugins.music_catalog.providers.motus_music import MotusMusicProvider, check_cancel
 
@@ -52,6 +53,54 @@ class MusicService:
                 self._caps, self._expires = deepcopy(FALLBACK), time.monotonic() + 60
         return self._provider, self._caps
 
+    def cached_capabilities(self):
+        """Whatever vocabulary we last knew, without touching the network.
+
+        The card consults this per `play` to decide whether a filter value is
+        one the catalogue knows. It must therefore never block and never raise —
+        before the first successful capabilities call this is `FALLBACK`, which
+        is the honest answer ("these are the codes we assume").
+        """
+        return deepcopy(self._caps)
+
+    def vocabulary(self, *, cancel=None):
+        """The filter vocabularies, for `list_genres`.
+
+        Reuses `_prepare` and therefore the same 24 h capability cache as
+        `execute` — no new network path, and normally no request at all. The
+        vocabularies were already being fetched and cached here; `execute` just
+        never surfaced anything but `tags`, so the only way a model could learn
+        a valid genre code was to fail a search and read `error.allowed`.
+
+        `source` matters: on a transient catalogue failure `_prepare` falls back
+        to the built-in list for 60 s, and a caller reading these values as
+        authoritative would then confidently offer codes this provider may not
+        have.
+        """
+        if not self._gate.acquire(blocking=False):
+            return MusicError('busy', '曲库请求正在进行，请稍后重试。').result()
+        try:
+            try:
+                _provider, caps = self._prepare({'cancel': cancel} if cancel else {})
+            except MusicError as error:
+                return error.result()
+            filters = caps.get('filters') or {}
+            fallback = caps.get('provider') in (None, '', 'unavailable')
+            return {
+                'schema': SCHEMA,
+                'genres': deepcopy(filters.get('genre') or []),
+                'languages': deepcopy(filters.get('language') or []),
+                'vocals': deepcopy(filters.get('vocal') or []),
+                'tag_groups': deepcopy(filters.get('tags') or {}),
+                'max_top_k': (caps.get('limits') or {}).get('max_top_k', 10),
+                'provider': caps.get('provider', ''),
+                'source': 'fallback' if fallback else 'catalogue',
+                'reply_notice': '曲风/语种/人声只能用这里列出的 value；'
+                                '用户说的词不在表里时，放进 query 当自由描述。',
+            }
+        finally:
+            self._gate.release()
+
     def execute(self, *, track_id='', cancel=None, **kwargs):
         # Do not queue unbounded HTTP workers or block player controls behind
         # a slow catalogue. Capabilities and quota state have one owner.
@@ -78,6 +127,11 @@ class MusicService:
                 data = search_result(provider.search(request, **context), request, mock=self.kind == 'mock')
             check_cancel(cancel)
             return {**data, 'available_tags': deepcopy(caps['filters'].get('tags', {})),
+                    # Values only, no labels: cheap, and enough for a model to
+                    # notice it used a code the catalogue does not have.
+                    'available_genres': [e.get('value') for e
+                                         in (caps['filters'].get('genre') or [])
+                                         if isinstance(e, dict) and e.get('value')],
                     'usage_notice': 'personal_playback 仅限当次播放；不得保存音频、上传聊天附件或二次分发。',
                     'reply_notice': 'relaxed 非空须如实说明放宽条件；空结果不能编造歌曲；vocal 为 null 表示人声未知。'}
         except MusicError as exc:
