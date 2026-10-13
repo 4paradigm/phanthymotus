@@ -175,10 +175,17 @@ def test_machine_and_cos_config_are_fixed_read_only_files():
 
     deploy_sh = _text("deploy/deploy-approval/deploy.sh")
     compose = _text("deploy/deploy-approval/docker-compose.yml")
-    assert "./machines.yaml" in deploy_sh
-    assert "./secrets.yaml" in deploy_sh
-    assert "./machines.yaml:/run/deploy-approval/machines.yaml:ro" in compose
-    assert "./secrets.yaml:/run/deploy-approval/secrets.yaml:ro" in compose
+    # Configuration directory must come from DEPLOY_APPROVAL_CONFIG_DIR env var,
+    # NOT be hardcoded to any server path.
+    assert "DEPLOY_APPROVAL_CONFIG_DIR" in deploy_sh
+    assert 'PERSISTENT_DIR="${DEPLOY_APPROVAL_CONFIG_DIR:' in deploy_sh
+    assert "/var/lib/deploy-approval" not in deploy_sh
+    assert "/var/lib/deploy-approval" not in compose
+    assert "DEPLOY_APPROVAL_CONFIG_DIR" in compose
+    # Long-form volumes: check key elements are present in the YAML text
+    assert 'target: /run/deploy-approval/machines.yaml' in compose
+    assert 'target: /run/deploy-approval/secrets.yaml' in compose
+    assert 'read_only: true' in compose
 
 
 def test_deploy_script_has_no_stateful_purge():

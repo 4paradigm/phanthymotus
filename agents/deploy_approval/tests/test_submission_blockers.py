@@ -116,7 +116,7 @@ def _review_state(**overrides):
         "case_results": {},
         "test_result": "",
         "cos": {"object_key": "", "sha256": "", "size": 0},
-        "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
+        "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {"result": "pass"}},
         "last_processed_comment_id": 0,
     }
     state.update(overrides)
@@ -527,26 +527,28 @@ async def test_record_test_cos_rebind_uses_fresh_terminal_state(controller, prox
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
-        command={"comment_id": 77, "kind": "record_test", "phase": "completed", "args": {}},
+        command={"comment_id": 77, "kind": "record_test", "phase": "completed", "args": {"result": "pass"}},
+        last_processed_comment_id=77,
     )
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
 
+    cos_key = "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz"
     result = await controller._rebind_terminal_cos_if_current(
-        "repo",
+        "4paradigm/phanthymotus",
         1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
         expected_comment_id=77,
         expected_command_kind="record_test",
         expected_test_result="pass",
-        cos_metadata={"object_key": "obj", "sha256": "c" * 64, "size": 12},
+        cos_metadata={"object_key": cos_key, "sha256": "c" * 64, "size": 12},
         markdown="terminal",
     )
 
     assert result is True
     written = proxy.write_hidden_state.call_args.args[3]
-    assert written["cos"] == {"object_key": "obj", "sha256": "c" * 64, "size": 12}
+    assert written["cos"] == {"object_key": cos_key, "sha256": "c" * 64, "size": 12}
 
 
 @pytest.mark.asyncio
@@ -558,7 +560,7 @@ async def test_record_test_cos_rebind_skips_after_head_drift(controller, proxy):
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
-        command={"comment_id": 77, "kind": "record_test", "phase": "completed", "args": {}},
+        command={"comment_id": 77, "kind": "record_test", "phase": "completed", "args": {"result": "pass"}},
     )
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
@@ -587,7 +589,7 @@ async def test_record_test_cos_rebind_skips_after_command_changed(controller, pr
         components=[_component()],
         deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}],
         test_result="pass",
-        command={"comment_id": 78, "kind": "approve_deploy", "phase": "completed", "args": {}},
+        command={"comment_id": 78, "kind": "approve_deploy", "phase": "completed", "args": {"result": "pass"}},
     )
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()
@@ -615,7 +617,7 @@ async def test_failed_deploy_cos_rebind_skips_after_lifecycle_changed(controller
         review_evidence={},
         components=[],
         deployments=[],
-        command={"comment_id": 88, "kind": "approve_deploy", "phase": "completed", "args": {}},
+        command={"comment_id": 88, "kind": "approve_deploy", "phase": "completed", "args": {"result": "pass"}},
     )
     proxy.read_hidden_state = AsyncMock(return_value=state)
     proxy.write_hidden_state = AsyncMock()

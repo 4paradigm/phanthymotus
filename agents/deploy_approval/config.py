@@ -14,6 +14,7 @@ from collections.abc import Mapping
 import logging
 import os
 import ipaddress
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -333,6 +334,32 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("agent_core_tokens keys must be non-empty strings")
         if not isinstance(v, str) or not v.strip():
             raise ValueError("agent_core_tokens values must be non-empty strings")
+    # ── Production COS guard: reject invalid region, bucket, placeholders ──
+    # This prevents the Controller from starting with obviously wrong or
+    # unfilled-in COS configuration, even if someone bypasses deploy.sh.
+    # No len-based bypass: all values are strictly validated.
+    # No empty/whitespace-only values are allowed.
+    _placeholder_re = re.compile(r"<[^>]+>", re.IGNORECASE)
+    for field_name in ("cos_region", "cos_bucket", "cos_secret_id", "cos_secret_key"):
+        val = getattr(cfg, field_name, "")
+        if not isinstance(val, str) or not val.strip():
+            raise ValueError(
+                f"cos.{field_name} must be a non-empty string"
+            )
+        if _placeholder_re.search(val):
+            raise ValueError(
+                f"cos.{field_name} contains an unreplaced placeholder"
+            )
+    # Region: must match Tencent COS pattern (e.g. "ap-beijing")
+    if not re.fullmatch(r"[a-z]+-[a-z]+[0-9]*", cfg.cos_region.strip()):
+        raise ValueError(
+            f"cos.region has invalid format: {cfg.cos_region!r}"
+        )
+    # Bucket: must be alphanumeric with hyphens
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", cfg.cos_bucket.strip()):
+        raise ValueError(
+            f"cos.bucket has invalid format: {cfg.cos_bucket!r}"
+        )
     # Fail closed: review_comment_trust must match authoritative Review Agent identity.
     if cfg.review_comment_author_id != REVIEW_AGENT_GITHUB_USER_ID:
         raise ValueError(

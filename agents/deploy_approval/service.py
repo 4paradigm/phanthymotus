@@ -22,6 +22,7 @@ import inspect
 import asyncio
 import logging
 import time
+import copy
 from typing import Any
 
 from . import comments as comments_mod
@@ -588,17 +589,68 @@ class DeployController:
         if expected_test_result and fresh_state.get("test_result", "") != expected_test_result:
             return False
 
+        # T4: expected_comment_id must be a valid positive integer (not bool)
+        if isinstance(expected_comment_id, bool) or not isinstance(expected_comment_id, int):
+            return False
+        if expected_comment_id <= 0:
+            return False
+
+        # T4: cursor drift check — last_processed_comment_id must match expected_comment_id
+        cursor_val = int(fresh_state.get("last_processed_comment_id", 0) or 0)
+        if cursor_val != expected_comment_id:
+            return False
+
+        # T4: command.args.result must match expected_test_result
+        if expected_test_result:
+            cmd_args = cmd.get("args", {})
+            if not isinstance(cmd_args, dict):
+                cmd_args = {}
+            if cmd_args.get("result", "") != expected_test_result:
+                return False
+
         metadata = cos_metadata or {}
         object_key = str(metadata.get("object_key", "") or "")
-        sha256 = str(metadata.get("sha256", "") or "")
-        size = int(metadata.get("size", 0) or 0)
+        sha256_val = str(metadata.get("sha256", "") or "")
+        size_val = metadata.get("size", 0)
+
         if not object_key:
             return False
 
+        # Strict object_key layout validation
+        try:
+            from .cos_client import CosClient
+            CosClient.validate_object_key(
+                repo, pr_number, expected_head, object_key,
+            )
+        except Exception:
+            return False
+
+        # SHA256 must be 64-char lowercase hex
+        if not sha256_val or not re.fullmatch(r"[0-9a-f]{64}", sha256_val):
+            return False
+
+        # Size must be int (not bool) in range 1..10MiB
+        if not (isinstance(size_val, int) and not isinstance(size_val, bool)
+                and 1 <= size_val <= 10485760):
+            return False
+
+        # Existing COS conflict check — do not overwrite different evidence
+        existing_cos = fresh_state.get("cos", {}) or {}
+        existing_key = str(existing_cos.get("object_key", "") or "")
+        if existing_key:
+            if existing_key != object_key:
+                return False
+            if existing_cos.get("sha256", "") != sha256_val:
+                return False
+            existing_size = existing_cos.get("size", 0)
+            if not (isinstance(existing_size, int) and not isinstance(existing_size, bool)
+                    and existing_size == size_val):
+                return False
+
         fresh_state["cos"] = {
             "object_key": object_key,
-            "sha256": sha256,
-            "size": size,
+            "sha256": sha256_val,
+            "size": size_val,
         }
         if markdown:
             # Terminal rebind must NOT bypass the history-aware lifecycle writer:
@@ -1681,7 +1733,92 @@ class DeployController:
                 repo, actor, state,
             )
 
-            # Write terminal state FIRST, before COS upload
+            # Save original command deep copy, cursor, HEAD for concurrency checks
+            original_command = copy.deepcopy(state.get("command", {}))
+            original_cursor = state.get("last_processed_comment_id", comment_id)
+            original_head = state.get("head_sha", "")
+
+            # Snapshot runtime logs BEFORE any state mutation
+            runtime_logs = await self._snapshot_terminal_runtime_logs(
+                state.get("components", []),
+                state.get("deployments", []),
+            )
+
+            # Upload COS evidence FIRST — failure does not roll back (nothing written yet)
+            state["cos"] = self._empty_cos()
+            cos_metadata = {"object_key": "", "sha256": "", "size": 0}
+            try:
+                cos_metadata = await self._upload_evidence(
+                    repo, pr_number, pr_head, state, result, summary,
+                    deploy_error="",
+                    runtime_logs=runtime_logs,
+                )
+            except Exception as e:
+                logger.warning(
+                    "record_test evidence upload failed %s#%s: %s",
+                    repo, pr_number, e,
+                )
+                return False
+
+            # Validate COS metadata — pass path REQUIRES valid COS; fail path is best-effort
+            cos_valid = False
+            if cos_metadata.get("object_key"):
+                object_key = cos_metadata.get("object_key", "")
+                sha256_val = cos_metadata.get("sha256", "")
+                size_val = cos_metadata.get("size", 0)
+                try:
+                    CosClient.validate_object_key(
+                        repo, pr_number, pr_head, str(object_key),
+                    )
+                except Exception:
+                    logger.warning(
+                        "record_test COS object_key validation failed %s#%s: %s",
+                        repo, pr_number, object_key,
+                    )
+                else:
+                    if (sha256_val and isinstance(sha256_val, str)
+                            and re.fullmatch(r"[0-9a-f]{64}", sha256_val)
+                            and isinstance(size_val, int) and not isinstance(size_val, bool)
+                            and 1 <= size_val <= 10485760):
+                        cos_valid = True
+
+            if result == "pass" and not cos_valid:
+                logger.warning(
+                    "record_test pass but COS invalid %s#%s — keeping testing",
+                    repo, pr_number,
+                )
+                return False
+
+            # Concurrency check: re-read PR + Hidden State before writing terminal state
+            pr_data_check = await self.proxy.get_pr(repo, pr_number)
+            if inspect.isawaitable(pr_data_check):
+                pr_data_check = await pr_data_check
+            fresh_pr_state = pr_data_check.get("state", "")
+            fresh_pr_merged = pr_data_check.get("merged", False)
+            fresh_pr_head = pr_data_check.get("head", {}).get("sha", "")
+            fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+            if fresh_state is None:
+                return False
+            if fresh_pr_state != "open" or fresh_pr_merged:
+                return False
+            if fresh_pr_head and fresh_pr_head != original_head:
+                return False
+            # T2: fresh_status must be strictly "testing" for both pass and fail
+            fresh_status = fresh_state.get("status", "")
+            if fresh_status != "testing":
+                return False
+            fresh_cmd = fresh_state.get("command", {})
+            if not isinstance(fresh_cmd, dict):
+                return False
+            if fresh_cmd != original_command:
+                return False
+            fresh_cursor = int(fresh_state.get("last_processed_comment_id", 0) or 0)
+            if fresh_cursor != original_cursor:
+                return False
+
+            # All checks passed — write terminal state, lifecycle, and COS
+            state["status"] = "succeeded" if result == "pass" else "failed"
+            state["test_result"] = "pass" if result == "pass" else "fail"
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "record_test",
@@ -1689,15 +1826,13 @@ class DeployController:
                 "args": {"result": result, "summary": summary, "actor": actor},
             }
             state["last_processed_comment_id"] = comment_id
+            state["cos"] = {
+                "object_key": str(cos_metadata.get("object_key", "") or ""),
+                "sha256": str(cos_metadata.get("sha256", "") or ""),
+                "size": int(cos_metadata.get("size", 0) or 0),
+            }
 
-            if result == "pass":
-                state["status"] = "succeeded"
-                state["test_result"] = "pass"
-            else:
-                state["status"] = "failed"
-                state["test_result"] = "fail"
-
-            # Write a REAL terminal visible lifecycle comment immediately
+            # Write the terminal visible lifecycle comment
             if result == "pass":
                 enriched = self._enrich_deployments_for_render(
                     state.get("deployments", []),
@@ -1706,6 +1841,9 @@ class DeployController:
                     repo, pr_number, pr_head,
                     deployments=enriched,
                     components=state.get("components", []),
+                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
                 )
                 event = {
                     "event": "Test recorded",
@@ -1722,46 +1860,29 @@ class DeployController:
                     "timestamp": comments_mod.beijing_now_str(),
                 }
 
-            # Terminal state is written to GitHub before COS upload
             await self._write_lifecycle_with_history(
                 repo, pr_number, state, terminal_markdown, event=event,
             )
             await self.proxy.project_status_label(repo, pr_number, state["status"])
 
-            # One-shot runtime log snapshot for record_test terminal evidence
-            runtime_logs = await self._snapshot_terminal_runtime_logs(
-                state.get("components", []),
-                state.get("deployments", []),
-            )
-
-            # Upload COS evidence (failure does not roll back terminal state)
-            state["cos"] = self._empty_cos()
-            try:
-                cos_metadata = await self._upload_evidence(
-                    repo, pr_number, pr_head, state, result, summary,
-                    deploy_error="",
-                    runtime_logs=runtime_logs,
-                )
-            except Exception as e:
-                logger.warning(
-                    "record_test evidence upload failed %s#%s: %s",
-                    repo, pr_number, e,
-                )
-                return True
-
             if cos_metadata.get("object_key"):
                 # Step 1: rebind terminal state with COS metadata FIRST
-                markdown_no_url = comments_mod.succeeded_comment(
-                    repo, pr_number, pr_head,
-                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                ) if result == "pass" else comments_mod.failed_comment(
-                    repo, pr_number, pr_head,
-                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                )
+                if result == "pass":
+                    markdown_no_url = comments_mod.succeeded_comment(
+                        repo, pr_number, pr_head,
+                        deployments=enriched,
+                        components=state.get("components", []),
+                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                    )
+                else:
+                    markdown_no_url = comments_mod.failed_comment(
+                        repo, pr_number, pr_head,
+                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                    )
                 await self._rebind_terminal_cos_if_current(
                     repo,
                     pr_number,
@@ -1785,19 +1906,24 @@ class DeployController:
                         repo, pr_number,
                     )
                 # Step 3: rebind final comment with download URL
-                markdown_with_url = comments_mod.succeeded_comment(
-                    repo, pr_number, pr_head,
-                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                    cos_download_url=cos_download_url,
-                ) if result == "pass" else comments_mod.failed_comment(
-                    repo, pr_number, pr_head,
-                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                    cos_download_url=cos_download_url,
-                )
+                if result == "pass":
+                    markdown_with_url = comments_mod.succeeded_comment(
+                        repo, pr_number, pr_head,
+                        deployments=enriched,
+                        components=state.get("components", []),
+                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                        cos_download_url=cos_download_url,
+                    )
+                else:
+                    markdown_with_url = comments_mod.failed_comment(
+                        repo, pr_number, pr_head,
+                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
+                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
+                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                        cos_download_url=cos_download_url,
+                    )
                 await self._rebind_terminal_cos_if_current(
                     repo,
                     pr_number,
@@ -1810,6 +1936,8 @@ class DeployController:
                     markdown=markdown_with_url,
                 )
             return True
+
+
 
         except PolicyError as e:
             await self._post_error(repo, pr_number, str(e))
@@ -2634,15 +2762,14 @@ class DeployController:
                 )
 
             if archive_bytes:
-                ok = await self.cos.upload_evidence_archive(
-                    object_key, archive_bytes,
+                return await self.cos.ensure_evidence_archive(
+                    object_key=object_key,
+                    archive_bytes=archive_bytes,
+                    repo=repo,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    result=result,
                 )
-                if ok:
-                    return {
-                        "object_key": object_key,
-                        "sha256": sha256,
-                        "size": size,
-                    }
             return {"object_key": "", "sha256": "", "size": 0}
         except Exception as e:
             logger.warning(
@@ -3189,7 +3316,244 @@ class DeployController:
                     )
                 return
 
-            if state.get("status") in {"succeeded", "failed"}:
+            if state.get("status") == "succeeded":
+                try:
+                    await self.proxy.project_status_label(
+                        repo, pr_number, state.get("status", "review-required"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "reconcile label projection %s#%s: %s", repo, pr_number, e,
+                    )
+                return
+
+            if state.get("status") == "failed":
+                # Check for missing COS evidence on record_test failures
+                cmd = state.get("command", {})
+                cos_state = state.get("cos", {}) or {}
+                is_missing_cos = (
+                    isinstance(cmd, dict)
+                    and cmd.get("kind") == "record_test"
+                    and cmd.get("phase") == "completed"
+                    and not cos_state.get("object_key")
+                )
+
+                if is_missing_cos:
+                    # Validate recovery eligibility
+                    args = cmd.get("args", {})
+                    if not isinstance(args, dict):
+                        args = {}
+                    if args.get("result") != "fail":
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    comment_id_val = cmd.get("comment_id", 0)
+                    if isinstance(comment_id_val, bool) or not isinstance(comment_id_val, int):
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+                    if comment_id_val <= 0:
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    cursor_val = int(state.get("last_processed_comment_id", 0) or 0)
+                    if cursor_val != comment_id_val:
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    test_result_val = state.get("test_result", "")
+                    if test_result_val != "fail":
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    # Verify PR still open/unmerged and HEAD matches
+                    if pr_state != "open" or pr_merged:
+                        return
+                    if current_head != state.get("head_sha", ""):
+                        return
+
+                    # Upload fail evidence
+                    pre_upload_cmd = copy.deepcopy(cmd)
+                    pre_upload_cursor = cursor_val
+                    pre_upload_head = state.get("head_sha", "")
+
+                    upload_state = dict(state)
+                    try:
+                        uploaded_meta = await self._upload_evidence(
+                            repo, pr_number, current_head, upload_state, "fail",
+                            summary=str(args.get("summary", "")),
+                            deploy_error=str(args.get("deploy_error", "") or ""),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "reconcile evidence upload %s#%s: %s",
+                            repo, pr_number, e,
+                        )
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    # Validate uploaded metadata
+                    if not (uploaded_meta and isinstance(uploaded_meta, dict)
+                            and uploaded_meta.get("object_key")):
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    upload_key = str(uploaded_meta.get("object_key", "") or "")
+                    upload_sha = str(uploaded_meta.get("sha256", "") or "")
+                    upload_size = uploaded_meta.get("size", 0)
+                    try:
+                        from .cos_client import CosClient
+                        CosClient.validate_object_key(
+                            repo, pr_number, current_head, upload_key,
+                        )
+                    except Exception:
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+                    if not (upload_sha and re.fullmatch(r"[0-9a-f]{64}", upload_sha)):
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+                    if not (isinstance(upload_size, int) and not isinstance(upload_size, bool)
+                            and 1 <= upload_size <= 10485760):
+                        try:
+                            await self.proxy.project_status_label(
+                                repo, pr_number, "failed",
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    # Post-upload concurrency re-check
+                    try:
+                        post_pr = await self.proxy.get_pr(repo, pr_number)
+                        if inspect.isawaitable(post_pr):
+                            post_pr = await post_pr
+                    except Exception:
+                        post_pr = {}
+                    post_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    if post_state is None:
+                        return
+                    if post_pr.get("state", "") != "open" or post_pr.get("merged", False):
+                        return
+                    if post_pr.get("head", {}).get("sha", "") != pre_upload_head:
+                        return
+                    if post_state.get("status") != "failed":
+                        return
+                    if post_state.get("test_result") != "fail":
+                        return
+                    post_cmd = post_state.get("command", {})
+                    if not isinstance(post_cmd, dict):
+                        return
+                    if post_cmd != pre_upload_cmd:
+                        return
+                    post_cursor = int(post_state.get("last_processed_comment_id", 0) or 0)
+                    if post_cursor != pre_upload_cursor:
+                        return
+                    if post_cursor != comment_id_val:
+                        return
+
+                    # Idempotent reuse: check for existing COS in post_state
+                    post_cos = post_state.get("cos", {}) or {}
+                    post_cos_key = ""
+                    if post_cos.get("object_key"):
+                        post_cos_key = str(post_cos.get("object_key", "") or "")
+                        if post_cos_key != upload_key:
+                            # Conflict: different COS evidence — do not overwrite
+                            return
+                        if post_cos.get("sha256", "") != upload_sha:
+                            return
+                        post_size = post_cos.get("size", 0)
+                        if not (isinstance(post_size, int) and not isinstance(post_size, bool)
+                                and post_size == upload_size):
+                            return
+
+                    # Write COS metadata via history-aware writer, event=None
+                    # Generate full failed comment body with COS evidence (not empty markdown)
+                    failed_markdown = comments_mod.failed_comment(
+                        repo, pr_number, current_head,
+                        cos_object_key=upload_key,
+                        cos_bundle_sha256=upload_sha,
+                        cos_bundle_size=upload_size,
+                    )
+                    # Try to generate presigned URL; keep metadata even if signing fails
+                    cos_download_url = ""
+                    try:
+                        cos_download_url = self.cos.generate_evidence_download_url(
+                            upload_key,
+                        )
+                        if cos_download_url:
+                            failed_markdown = comments_mod.failed_comment(
+                                repo, pr_number, current_head,
+                                cos_object_key=upload_key,
+                                cos_bundle_sha256=upload_sha,
+                                cos_bundle_size=upload_size,
+                                cos_download_url=cos_download_url,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "reconcile COS presign failed %s#%s, keeping metadata without URL",
+                            repo, pr_number,
+                        )
+                    post_state["cos"] = {
+                        "object_key": upload_key,
+                        "sha256": upload_sha,
+                        "size": upload_size,
+                    }
+                    await self._write_lifecycle_with_history(
+                        repo, pr_number, post_state, failed_markdown, event=None,
+                    )
+                    try:
+                        await self.proxy.project_status_label(
+                            repo, pr_number, "failed",
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                # Normal failed path: project label
                 try:
                     await self.proxy.project_status_label(
                         repo, pr_number, state.get("status", "review-required"),

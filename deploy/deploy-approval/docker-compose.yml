@@ -24,9 +24,27 @@ services:
       WEBHOOK_ENABLED: "${WEBHOOK_ENABLED:-false}"
       GITHUB_WEBHOOK_SECRET: "${GITHUB_WEBHOOK_SECRET:-}"
     volumes:
-      - ./machines.yaml:/run/deploy-approval/machines.yaml:ro
-      - ./secrets.yaml:/run/deploy-approval/secrets.yaml:ro
-      - "${GITHUB_APP_PRIVATE_KEY_FILE}:${GITHUB_APP_PRIVATE_KEY_FILE}:ro"
+      # Persistent machine policy — fixed host path, read-only inside container
+      - type: bind
+        source: "${DEPLOY_APPROVAL_CONFIG_DIR:?config directory required}/machines.yaml"
+        target: /run/deploy-approval/machines.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      # Persistent COS secrets — fixed host path, read-only inside container
+      - type: bind
+        source: "${DEPLOY_APPROVAL_CONFIG_DIR:?config directory required}/secrets.yaml"
+        target: /run/deploy-approval/secrets.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      # GitHub App private key (absolute path supplied via env var)
+      - type: bind
+        source: "${GITHUB_APP_PRIVATE_KEY_FILE:?GITHUB_APP_PRIVATE_KEY_FILE is required}"
+        target: "${GITHUB_APP_PRIVATE_KEY_FILE:?GITHUB_APP_PRIVATE_KEY_FILE is required}"
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
       - "25001:25001"
     read_only: true

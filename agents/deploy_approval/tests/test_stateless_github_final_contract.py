@@ -189,9 +189,25 @@ def _fake_cos_sdk(*, put_error=None):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+    class CosServiceError(Exception):
+        def __init__(self, code, msg):
+            self._code = code
+            super().__init__(msg)
+        def get_status_code(self):
+            try:
+                return int(self._code)
+            except (ValueError, TypeError):
+                return self._code
+
     class CosS3Client:
         def __init__(self, cfg):
             self.cfg = cfg
+
+        def head_object(self, **kwargs):
+            raise CosServiceError("404", "Not Found")
+
+        def get_bucket_versioning(self, **kwargs):
+            return {}
 
         def put_object(self, **kwargs):
             calls["put"].append(kwargs)
@@ -199,6 +215,7 @@ def _fake_cos_sdk(*, put_error=None):
                 raise put_error
 
     module.CosConfig = CosConfig
+    module.CosServiceError = CosServiceError
     module.CosS3Client = CosS3Client
     return module, calls
 
@@ -619,10 +636,11 @@ def test_cos_production_path_calls_real_sdk_put_object(config):
     sdk, calls = _fake_cos_sdk()
     client = CosClient(config)
 
-    with patch.dict(sys.modules, {"qcloud_cos": sdk}):
+    cos_svc_err = sdk.CosServiceError
+    with patch.dict(sys.modules, {"qcloud_cos": sdk, "qcloud_cos.CosServiceError": cos_svc_err}):
         import asyncio
 
-        assert asyncio.run(client.upload_evidence_archive("key", b"payload")) is True
+        assert asyncio.run(client.upload_evidence_archive('phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz', b'\x1f\x8b\x08\x00\x0b\xe9\xccj\x02\xff\x8b\xceM-ILI,I\x8c\xe5*J-\xc8\xb75)H,JL\xc9L\xcf\xd5/\xc8H\xcc+\xc9\xa8\xcc\xcd/)-\xe6*(\xb25\xe4\xcaHML\xb1M$\x12\x00\x8d+.\xcd)\xb1-H,.\xe6\xe2\x02\x00\xad\x8a?Gg\x00\x00\x00')) is True
 
     assert calls["put"]
     assert calls["put"][0]["Bucket"] == "bucket-1"
@@ -639,7 +657,7 @@ def test_cos_production_path_upload_failure_returns_false(config):
     with patch.dict(sys.modules, {"qcloud_cos": sdk}):
         import asyncio
 
-        assert asyncio.run(client.upload_evidence_archive("key", b"payload")) is False
+        assert asyncio.run(client.upload_evidence_archive('phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz', b'\x1f\x8b\x08\x00\x0b\xe9\xccj\x02\xff\x8b\xceM-ILI,I\x8c\xe5*J-\xc8\xb75)H,JL\xc9L\xcf\xd5/\xc8H\xcc+\xc9\xa8\xcc\xcd/)-\xe6*(\xb25\xe4\xcaHML\xb1M$\x12\x00\x8d+.\xcd)\xb1-H,.\xe6\xe2\x02\x00\xad\x8a?Gg\x00\x00\x00')) is False
 
 
 def test_cos_production_path_missing_sdk_fails_closed(config):
@@ -659,7 +677,7 @@ def test_cos_production_path_missing_sdk_fails_closed(config):
     with patch("builtins.__import__", side_effect=_missing_sdk):
         import asyncio
 
-        assert asyncio.run(client.upload_evidence_archive("key", b"payload")) is False
+        assert asyncio.run(client.upload_evidence_archive('phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz', b'\x1f\x8b\x08\x00\x0b\xe9\xccj\x02\xff\x8b\xceM-ILI,I\x8c\xe5*J-\xc8\xb75)H,JL\xc9L\xcf\xd5/\xc8H\xcc+\xc9\xa8\xcc\xcd/)-\xe6*(\xb25\xe4\xcaHML\xb1M$\x12\x00\x8d+.\xcd)\xb1-H,.\xe6\xe2\x02\x00\xad\x8a?Gg\x00\x00\x00')) is False
 
 
 def test_cos_production_source_contains_no_placeholder_signed_url():
@@ -677,19 +695,20 @@ async def test_cos_metadata_written_only_after_real_upload_success(controller, p
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
     mock_github.collaborator_permission = AsyncMock(return_value="admin")
-    controller._upload_evidence = AsyncMock(return_value={"object_key": "key", "sha256": "b" * 64, "size": 12})
+    valid_cos_key = "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz"
+    controller._upload_evidence = AsyncMock(return_value={"object_key": valid_cos_key, "sha256": "b" * 64, "size": 12})
 
-    await controller.handle_record_test("repo", 1, 101, "pass", "", "owner1", "")
+    await controller.handle_record_test("4paradigm/phanthymotus", 1, 101, "pass", "", "owner1", "")
 
     written_state = proxy.write_hidden_state.call_args_list[-1].args[3]
-    assert written_state["cos"]["object_key"] == "key"
+    assert written_state["cos"]["object_key"] == valid_cos_key
     assert written_state["cos"]["sha256"] == "b" * 64
 
     proxy.write_hidden_state.reset_mock()
     # Use _state() with no components so bound_ids is empty and A4 check passes
     proxy.read_hidden_state = AsyncMock(return_value=_state(components=[], deployments=[]))
     controller._upload_evidence = AsyncMock(return_value={"object_key": "", "sha256": "", "size": 0})
-    await controller.handle_record_test("repo", 1, 102, "pass", "", "owner1", "")
+    await controller.handle_record_test("4paradigm/phanthymotus", 1, 102, "fail", "", "owner1", "")
 
     written_state = proxy.write_hidden_state.call_args_list[-1].args[3]
     assert written_state["cos"]["object_key"] == ""
@@ -1420,9 +1439,10 @@ async def test_case_fail_does_not_block_overall_manual_pass(controller, proxy, m
     proxy.project_status_label = AsyncMock()
     mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
     mock_github.collaborator_permission = AsyncMock(return_value="admin")
-    controller._upload_evidence = AsyncMock(return_value={"object_key": "", "sha256": "", "size": 0})
+    cos_key = "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz"
+    controller._upload_evidence = AsyncMock(return_value={"object_key": cos_key, "sha256": "c" * 64, "size": 12})
 
-    await controller.handle_record_test("repo", 1, 501, "pass", "", "owner1", "")
+    await controller.handle_record_test("4paradigm/phanthymotus", 1, 501, "pass", "", "owner1", "")
 
     assert proxy.write_hidden_state.call_args.args[3]["status"] == "succeeded"
 

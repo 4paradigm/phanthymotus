@@ -105,9 +105,9 @@ def test_deploy_sh_start_uses_require_runtime_inputs():
 def test_deploy_sh_start_uses_no_build():
     from pathlib import Path
     deploy_sh = Path("deploy/deploy-approval/deploy.sh").read_text(encoding="utf-8")
-    # Find the cmd_start section
+    # Find the cmd_start section — use MULTILINE so ^}\s*$ matches the function-ending brace
     import re
-    start_match = re.search(r'cmd_start\(\) \{[^}]+\}', deploy_sh, re.DOTALL)
+    start_match = re.search(r'cmd_start\(\)\s*\{\n(.*?)^\}\s*$', deploy_sh, re.MULTILINE | re.DOTALL)
     assert start_match is not None
     start_body = start_match.group()
     assert "require_runtime_inputs" in start_body
@@ -117,7 +117,7 @@ def test_deploy_sh_restart_uses_no_build_force_recreate():
     from pathlib import Path
     deploy_sh = Path("deploy/deploy-approval/deploy.sh").read_text(encoding="utf-8")
     import re
-    restart_match = re.search(r'cmd_restart\(\) \{[^}]+\}', deploy_sh, re.DOTALL)
+    restart_match = re.search(r'cmd_restart\(\)\s*\{\n(.*?)^\}\s*$', deploy_sh, re.MULTILINE | re.DOTALL)
     assert restart_match is not None
     restart_body = restart_match.group()
     assert "require_runtime_inputs" in restart_body

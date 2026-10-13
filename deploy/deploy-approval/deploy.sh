@@ -2,11 +2,12 @@
 # deploy.sh — manage the Deploy Approval Agent container.
 #
 # Commands:
-#   ./deploy.sh up|rebuild|start|stop|restart|down|status|logs
+#   ./deploy.sh up|rebuild|start|stop|restart|down|status|logs|preflight
 #
-# Fixed inputs:
-#   machine policy: ./machines.yaml
-#   COS secrets: ./secrets.yaml
+# Fixed persistent inputs (survive release directory changes):
+#   machine policy: ${DEPLOY_APPROVAL_CONFIG_DIR}/machines.yaml
+#   COS secrets:    ${DEPLOY_APPROVAL_CONFIG_DIR}/secrets.yaml
+# DEPLOY_APPROVAL_CONFIG_DIR must be set before running this script.
 #
 # No purge mode, no runtime API token, no env indirection for file locations.
 
@@ -14,13 +15,21 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/deploy.sh"
-cd "$SCRIPT_DIR"
-COMPOSE="docker compose"
-MACHINES_FILE="./machines.yaml"
-SECRETS_FILE="./secrets.yaml"
-TMP_ENV=""
+COMPOSE=(docker compose -f "$SCRIPT_DIR/docker-compose.yml")
 
+# ── Portable configuration directory ────────────────────────────────
+# DEPLOY_APPROVAL_CONFIG_DIR must be set to an absolute directory
+# containing machines.yaml and secrets.yaml.  This makes the deploy
+# script portable across development, test, and production machines
+# without hardcoding any server-specific path.
+PERSISTENT_DIR="${DEPLOY_APPROVAL_CONFIG_DIR:?DEPLOY_APPROVAL_CONFIG_DIR is required — set it to the absolute directory containing machines.yaml and secrets.yaml}"
+# Reject relative paths — DEPLOY_APPROVAL_CONFIG_DIR must be absolute
 die() { echo "ERROR: $*" >&2; exit 1; }
+case "$PERSISTENT_DIR" in /*) ;; *) die "DEPLOY_APPROVAL_CONFIG_DIR must be an absolute path, got: $PERSISTENT_DIR" ;; esac
+MACHINES_FILE="${PERSISTENT_DIR}/machines.yaml"
+SECRETS_FILE="${PERSISTENT_DIR}/secrets.yaml"
+
+TMP_ENV=""
 
 require_runtime_user() {
     RUNTIME_UID="$(id -u)"
@@ -119,17 +128,17 @@ print("GITHUB_APP_PRIVATE_KEY_OK")
 PY
 }
 
-
-
 require_private_local_inputs() {
-    python3 - "$MACHINES_FILE" "$SECRETS_FILE" <<'PY'
+    python3 - "$MACHINES_FILE" "$SECRETS_FILE" "$PERSISTENT_DIR" <<'PY'
 import os
+import re
 import stat
 import sys
 from pathlib import Path
 
 machines_file = Path(sys.argv[1])
 secrets_file = Path(sys.argv[2])
+persistent_dir = Path(sys.argv[3])
 expected_uid = os.getuid()
 
 
@@ -153,8 +162,12 @@ def _check_owned_private(path: Path, *, label: str, directory: bool) -> None:
         raise SystemExit(f"{label} must not grant group/world permissions")
 
 
+# --- machines.yaml ---
 _check_owned_private(machines_file, label="machines.yaml", directory=False)
+
+# --- secrets.yaml ---
 _check_owned_private(secrets_file, label="secrets.yaml", directory=False)
+
 print("LOCAL_INPUT_PERMISSIONS_OK")
 PY
 }
@@ -163,9 +176,10 @@ require_machine_policy() {
     [ -f "$MACHINES_FILE" ] && [ ! -L "$MACHINES_FILE" ] || die "Machine policy file must be a regular file: $MACHINES_FILE"
     [ -r "$MACHINES_FILE" ] || die "Machine policy file not readable: $MACHINES_FILE"
     python3 - "$MACHINES_FILE" <<'PY'
-import sys, yaml
+import sys, yaml, re
 from pathlib import Path
-path = sys.argv[1]
+
+path = Path(sys.argv[1])
 with open(path, "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh)
 if not isinstance(data, dict) or data.get("version") != 1:
@@ -194,6 +208,35 @@ for alias, machine in machines.items():
     node_host = machine.get("node_host")
     if not isinstance(node_host, str) or not node_host.strip():
         raise SystemExit(f"machine {alias!r} must define a non-empty node_host")
+    # ── Reject unreplaced placeholder values ──────────────────────────
+    # Common placeholder patterns that indicate the YAML was copied from
+    # an example but never filled in with real values.
+    placeholder_re = re.compile(r'<[^>]+>', re.IGNORECASE)
+    for field_name in ("node_id", "node_host"):
+        val = machine.get(field_name, "")
+        if isinstance(val, str) and placeholder_re.search(val):
+            raise SystemExit(
+                f"machine {alias!r} field '{field_name}' contains an "
+                f"unreplaced placeholder: {val!r}"
+            )
+    for platform in machine.get("platforms", []):
+        if isinstance(platform, str) and placeholder_re.search(platform):
+            raise SystemExit(
+                f"machine {alias!r} has an unreplaced platform placeholder: "
+                f"{platform!r}"
+            )
+    for variant in machine.get("variants", []):
+        if isinstance(variant, str) and placeholder_re.search(variant):
+            raise SystemExit(
+                f"machine {alias!r} has an unreplaced variant placeholder: "
+                f"{variant!r}"
+            )
+    for target in machine.get("targets", []):
+        if isinstance(target, str) and placeholder_re.search(target):
+            raise SystemExit(
+                f"machine {alias!r} has an unreplaced target placeholder: "
+                f"{target!r}"
+            )
 print("MACHINE_POLICY_OK")
 PY
 }
@@ -202,23 +245,51 @@ require_secrets() {
     [ -f "$SECRETS_FILE" ] && [ ! -L "$SECRETS_FILE" ] || die "COS secrets file must be a regular file: $SECRETS_FILE"
     [ -r "$SECRETS_FILE" ] || die "COS secrets file not readable: $SECRETS_FILE"
     python3 - "$SECRETS_FILE" <<'PY'
-import sys, yaml
-path = sys.argv[1]
+import sys, yaml, re
+from pathlib import Path
+
+path = Path(sys.argv[1])
 with open(path, "r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh)
 if not isinstance(data, dict):
     raise SystemExit("secrets file must be a mapping")
 if data.get("version") != 1:
     raise SystemExit("secrets file must be version 1")
+
 cos = data.get("cos", {})
 if cos is None:
     cos = {}
 if not isinstance(cos, dict):
     raise SystemExit("cos section must be a mapping")
-for key in ("region", "bucket", "secret_id", "secret_key"):
+
+# ── Region validation ───────────────────────────────────────────────
+region = cos.get("region", "")
+if not isinstance(region, str) or not region.strip():
+    raise SystemExit("cos.region must be a non-empty string")
+# Tencent COS regions match patterns like "ap-beijing", "ap-guangzhou", etc.
+if not re.fullmatch(r"[a-z]+-[a-z]+[0-9]*", region.strip()):
+    raise SystemExit(f"cos.region has invalid format: {region!r}")
+
+# ── Bucket validation ───────────────────────────────────────────────
+bucket = cos.get("bucket", "")
+if not isinstance(bucket, str) or not bucket.strip():
+    raise SystemExit("cos.bucket must be a non-empty string")
+# Buckets are alphanumeric with hyphens, typically 10-23 digits for Tencent
+if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", bucket.strip()):
+    raise SystemExit(f"cos.bucket has invalid format: {bucket!r}")
+
+# ── Secret ID / Secret Key — reject obvious placeholders ─────────────
+placeholder_re = re.compile(r'<[^>]+>', re.IGNORECASE)
+for key in ("secret_id", "secret_key"):
     value = cos.get(key, "")
-    if value is not None and not isinstance(value, str):
-        raise SystemExit(f"cos.{key} must be a string")
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"cos.{key} must be a non-empty string")
+    if placeholder_re.search(value):
+        raise SystemExit(
+            f"cos.{key} contains an unreplaced placeholder"
+        )
+
+# ── Agent Core tokens ───────────────────────────────────────────────
 tokens = data.get("agent_core_tokens")
 if not isinstance(tokens, dict) or not tokens:
     raise SystemExit("agent_core_tokens must be a non-empty mapping")
@@ -227,6 +298,12 @@ for alias, token in tokens.items():
         raise SystemExit("agent_core_tokens keys must be non-empty strings")
     if not isinstance(token, str) or not token.strip():
         raise SystemExit(f"agent_core_tokens[{alias!r}] must be a non-empty string")
+    if placeholder_re.search(token):
+        raise SystemExit(
+            f"agent_core_tokens[{alias!r}] contains an unreplaced placeholder"
+        )
+
+# ── Review comment trust ────────────────────────────────────────────
 rct = data.get("review_comment_trust")
 if rct is None:
     raise SystemExit("review_comment_trust must be present in secrets.yaml")
@@ -242,6 +319,7 @@ if aid != "7950763":
     raise SystemExit("review_comment_trust.author_id must be \"7950763\"")
 if al != "kentcyq":
     raise SystemExit("review_comment_trust.author_login must be \"kentcyq\"")
+
 print("SECRETS_OK")
 PY
 }
@@ -270,52 +348,130 @@ build_env_file() {
     echo "$tmp"
 }
 
+cmd_preflight() {
+    # Read-only preflight: validate persistent configuration directory,
+    # machine policy, COS secrets, and private key — without building
+    # or starting any container.
+    # DEPLOY_APPROVAL_CONFIG_DIR must be set; no fallback to hardcoded path.
+    local PREFLIGHT_DIR="${DEPLOY_APPROVAL_CONFIG_DIR:?DEPLOY_APPROVAL_CONFIG_DIR is required — set it to the absolute directory containing machines.yaml and secrets.yaml}"
+    # Reject relative paths at preflight boundary too
+    case "$PREFLIGHT_DIR" in /*) ;; *) echo "FAIL: PREFLIGHT_DIR must be an absolute path"; exit 1 ;; esac
+    local PREFLIGHT_MACHINES="${PREFLIGHT_DIR}/machines.yaml"
+    local PREFLIGHT_SECRETS="${PREFLIGHT_DIR}/secrets.yaml"
+
+    echo "=== Deploy Approval Preflight ==="
+    echo "Persistent directory : $PREFLIGHT_DIR"
+    echo "Machines file        : $PREFLIGHT_MACHINES"
+    echo "Secrets file         : $PREFLIGHT_SECRETS"
+    echo ""
+
+    # 1. Persistent directory check
+    if [ ! -d "$PREFLIGHT_DIR" ]; then
+        echo "FAIL: Persistent directory does not exist: $PREFLIGHT_DIR"
+        exit 1
+    fi
+    if [ -L "$PREFLIGHT_DIR" ]; then
+        echo "FAIL: Persistent directory must not be a symlink: $PREFLIGHT_DIR"
+        exit 1
+    fi
+    echo "OK: Persistent directory exists and is not a symlink"
+
+    # 2. machines.yaml check (matches Compose mount path)
+    if [ ! -f "$PREFLIGHT_MACHINES" ] || [ -L "$PREFLIGHT_MACHINES" ]; then
+        echo "FAIL: Machine policy file must be a regular file (not missing/symlink): $PREFLIGHT_MACHINES"
+        exit 1
+    fi
+    if [ ! -r "$PREFLIGHT_MACHINES" ]; then
+        echo "FAIL: Machine policy file not readable: $PREFLIGHT_MACHINES"
+        exit 1
+    fi
+    # Check path matches Compose mount target
+    local expected_mount="/run/deploy-approval/machines.yaml"
+    echo "OK: Machine policy file exists at expected path (mounted to $expected_mount)"
+
+    # 3. secrets.yaml check (matches Compose mount path)
+    if [ ! -f "$PREFLIGHT_SECRETS" ] || [ -L "$PREFLIGHT_SECRETS" ]; then
+        echo "FAIL: COS secrets file must be a regular file (not missing/symlink): $PREFLIGHT_SECRETS"
+        exit 1
+    fi
+    if [ ! -r "$PREFLIGHT_SECRETS" ]; then
+        echo "FAIL: COS secrets file not readable: $PREFLIGHT_SECRETS"
+        exit 1
+    fi
+    local expected_secrets_mount="/run/deploy-approval/secrets.yaml"
+    echo "OK: COS secrets file exists at expected path (mounted to $expected_secrets_mount)"
+
+    # 4. Permission checks (same as require_private_local_inputs)
+    SECRETS_FILE="$PREFLIGHT_SECRETS" MACHINES_FILE="$PREFLIGHT_MACHINES" PERSISTENT_DIR="$PREFLIGHT_DIR" require_private_local_inputs
+    echo "OK: Private input permissions verified"
+
+    # 5. Machine policy content validation
+    require_machine_policy
+    echo "OK: Machine policy content valid"
+
+    # 6. Secrets content validation
+    require_secrets
+    echo "OK: COS secrets content valid"
+
+    # 7. GitHub App key validation — REQUIRED
+    require_github_app_inputs
+    echo "OK: GitHub App private key valid"
+
+    echo ""
+    echo "=== Preflight PASSED — configuration is ready ==="
+}
+
 cmd_up() {
+    cmd_preflight
     require_runtime_inputs
     TMP_ENV="$(build_env_file)"
     trap 'rm -f "$TMP_ENV"' EXIT
-    $COMPOSE --env-file "$TMP_ENV" build
-    $COMPOSE --env-file "$TMP_ENV" up -d
+    "${COMPOSE[@]}" --env-file "$TMP_ENV" build
+    "${COMPOSE[@]}" --env-file "$TMP_ENV" up -d
     echo "Deploy Approval Agent is running on http://127.0.0.1:25001"
 }
 
 cmd_rebuild() {
+    cmd_preflight
     require_runtime_inputs
     TMP_ENV="$(build_env_file)"
     trap 'rm -f "$TMP_ENV"' EXIT
-    $COMPOSE --env-file "$TMP_ENV" build --no-cache
-    $COMPOSE --env-file "$TMP_ENV" up -d --force-recreate
+    "${COMPOSE[@]}" --env-file "$TMP_ENV" build --no-cache
+    "${COMPOSE[@]}" --env-file "$TMP_ENV" up -d --force-recreate
 }
 
-cmd_stop() { $COMPOSE stop; }
+cmd_stop() { "${COMPOSE[@]}" stop; }
 cmd_start() {
+    cmd_preflight
     require_runtime_inputs
     TMP_ENV="$(build_env_file)"
     trap 'rm -f "$TMP_ENV"' EXIT
-    $COMPOSE --env-file "$TMP_ENV" up -d --no-build
+    "${COMPOSE[@]}" --env-file "$TMP_ENV" up -d --no-build
 }
 cmd_restart() {
+    cmd_preflight
     require_runtime_inputs
     TMP_ENV="$(build_env_file)"
     trap 'rm -f "$TMP_ENV"' EXIT
-    $COMPOSE --env-file "$TMP_ENV" up -d --no-build --force-recreate
+    "${COMPOSE[@]}" --env-file "$TMP_ENV" up -d --no-build --force-recreate
 }
-cmd_down() { $COMPOSE down; }
+cmd_down() { "${COMPOSE[@]}" down; }
 
 cmd_status() {
     curl -sf --max-time 5 http://127.0.0.1:25001/healthz >/dev/null \
         && echo "deploy-approval: healthy" || echo "deploy-approval: not responding"
-    $COMPOSE ps
+    "${COMPOSE[@]}" ps
 }
 
 cmd_logs() {
-    $COMPOSE logs -f --tail "${1:-100}"
+    "${COMPOSE[@]}" logs -f --tail "${1:-100}"
 }
 
 usage() { sed -n '1,22p' "$SCRIPT_PATH"; }
 
 case "${1:-up}" in
     up|"") cmd_up ;;
+    preflight) cmd_preflight ;;
     rebuild) cmd_rebuild ;;
     stop) cmd_stop ;;
     start) cmd_start ;;

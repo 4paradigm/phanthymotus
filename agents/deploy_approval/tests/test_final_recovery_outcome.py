@@ -2402,7 +2402,7 @@ def _make_history_state(status: str = "succeeded", test_result: str = "pass") ->
     st["test_result"] = test_result
     st["command"] = {
         "comment_id": 17, "kind": "record_test", "phase": "completed",
-        "args": {"actor": "alice"},
+        "args": {"actor": "alice", "result": "pass"},
     }
     st["last_processed_comment_id"] = 17
     return st
@@ -2510,18 +2510,18 @@ async def test_terminal_cos_metadata_rebind_preserves_visible_history():
 
     rebind_md = comments_mod.succeeded_comment(
         "repo", 1, "a" * 40,
-        cos_object_key="phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence.log.gz",
+        cos_object_key="phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz",
         cos_bundle_sha256="ab" * 32,
         cos_bundle_size=1024,
     )
     rebound = await controller._rebind_terminal_cos_if_current(
-        "repo", 1,
+        "4paradigm/phanthymotus", 1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
         expected_comment_id=17,
         expected_command_kind="record_test",
         expected_test_result="pass",
-        cos_metadata={"object_key": "phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence.log.gz",
+        cos_metadata={"object_key": "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz",
                       "sha256": "ab" * 32, "size": 1024},
         markdown=rebind_md,
     )
@@ -2531,7 +2531,7 @@ async def test_terminal_cos_metadata_rebind_preserves_visible_history():
     # state.cos updated correctly
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert written_state["cos"]["object_key"] == \
-        "phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence.log.gz"
+        "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz"
     assert written_state["cos"]["size"] == 1024
 
     # Terminal History intact; no new event; exactly one History section
@@ -2553,7 +2553,7 @@ async def test_terminal_cos_presigned_url_rebind_preserves_visible_history():
     body_holder = _seed_lifecycle_with_history(proxy, "repo", 1, state)
     _prime_history(body_holder, "repo", 1, state)
 
-    object_key = "phanthymotus_pr/phanthymotus/2026-09/pr-1/evidence-" + "a" * 40 + ".log.gz"
+    object_key = "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-" + "a" * 40 + ".log.gz"
 
     # Phase 0: terminal write with Test recorded event
     terminal_md = comments_mod.succeeded_comment("repo", 1, "a" * 40)
@@ -2583,7 +2583,7 @@ async def test_terminal_cos_presigned_url_rebind_preserves_visible_history():
         cos_object_key=object_key, cos_bundle_sha256="cd" * 32, cos_bundle_size=2048,
     )
     ok1 = await controller._rebind_terminal_cos_if_current(
-        "repo", 1,
+        "4paradigm/phanthymotus", 1,
         expected_head="a" * 40, expected_terminal_status="succeeded",
         expected_comment_id=17, expected_command_kind="record_test",
         expected_test_result="pass", cos_metadata=cos_metadata, markdown=md_no_url,
@@ -2597,7 +2597,7 @@ async def test_terminal_cos_presigned_url_rebind_preserves_visible_history():
         cos_download_url="https://bucket.cos.ap-beijing.myqcloud.com/signed?token=x",
     )
     ok2 = await controller._rebind_terminal_cos_if_current(
-        "repo", 1,
+        "4paradigm/phanthymotus", 1,
         expected_head="a" * 40, expected_terminal_status="succeeded",
         expected_comment_id=17, expected_command_kind="record_test",
         expected_test_result="pass", cos_metadata=cos_metadata, markdown=md_with_url,
@@ -3547,12 +3547,12 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
 
     # Mock _upload_evidence to return valid COS metadata
     controller._upload_evidence = AsyncMock(return_value={
-        "object_key": "evidence/repo/1/abc123.tar.gz",
+        "object_key": "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz",
         "sha256": "d4" + "a" * 62,
         "size": 2048,
     })
 
-    await controller.handle_record_test("repo", 1, 70, "pass", "all good", "owner1", "111")
+    await controller.handle_record_test("4paradigm/phanthymotus", 1, 70, "pass", "all good", "owner1", "111")
 
     # Re-bind mocks after record_test
     proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
@@ -3561,15 +3561,15 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
     proxy.read_hidden_state = AsyncMock(side_effect=_get_read_state)
 
     # ── Stage 5: Simulate COS metadata rebind (event=None) ──
-    cos_meta = {"object_key": "evidence/repo/1/abc123.tar.gz", "sha256": "d4" + "a" * 62, "size": 2048}
+    cos_meta = {"object_key": "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz", "sha256": "d4" + "a" * 62, "size": 2048}
     markdown_meta = comments_mod.succeeded_comment(
-        "repo", 1, "a" * 40,
+        "4paradigm/phanthymotus", 1, "a" * 40,
         cos_object_key=cos_meta["object_key"],
         cos_bundle_sha256=cos_meta["sha256"],
         cos_bundle_size=cos_meta["size"],
     )
     await controller._rebind_terminal_cos_if_current(
-        "repo", 1,
+        "4paradigm/phanthymotus", 1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
         expected_comment_id=70,
@@ -3591,10 +3591,10 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
         cos_object_key=cos_meta["object_key"],
         cos_bundle_sha256=cos_meta["sha256"],
         cos_bundle_size=cos_meta["size"],
-        cos_download_url="https://cos.example.com/download/evidence/repo/1/abc123.tar.gz",
+        cos_download_url="https://cos.example.com/download/phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz",
     )
     await controller._rebind_terminal_cos_if_current(
-        "repo", 1,
+        "4paradigm/phanthymotus", 1,
         expected_head="a" * 40,
         expected_terminal_status="succeeded",
         expected_comment_id=70,
@@ -3621,7 +3621,7 @@ async def test_two_machine_full_lifecycle_history_survives_record_test_and_cos_r
     final_visible = body_holder["body"].split("<!-- deploy-approval-state:v1")[0]
     assert "Download COS evidence" in final_visible, \
         f"Expected 'Download COS evidence' in visible"
-    assert "evidence/repo/1/abc123.tar.gz" in final_visible, \
+    assert "evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz" in final_visible, \
         f"Expected object_key in visible"
     assert "https://cos.example.com/download" in final_visible, \
         f"Expected presigned URL in visible"

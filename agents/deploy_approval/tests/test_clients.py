@@ -96,6 +96,10 @@ def test_validate_config_requires_exact_runtime_repo_set(github_repos, should_pa
         github_webhook_secret="secret",
         review_comment_author_id="7950763",
         agent_core_tokens={"test-machine": "test-token"},
+        cos_region="ap-beijing",
+        cos_bucket="testbucket123",
+        cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+        cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
     )
     if should_pass:
         validate_config(cfg)

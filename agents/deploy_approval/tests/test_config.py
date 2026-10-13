@@ -30,6 +30,10 @@ def test_validate_config_no_longer_requires_github_token():
             github_repos=list(DEFAULT_GITHUB_REPOS),
             review_comment_author_id="7950763",
             agent_core_tokens={"test": "token"},
+            cos_region="ap-beijing",
+            cos_bucket="testbucket123",
+            cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+            cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
         )
     )
 
@@ -63,6 +67,10 @@ def test_github_repos_requires_exact_runtime_repo_set(repos, should_pass):
         github_repos=repos,
         agent_core_tokens={"test": "token"},
         review_comment_author_id="7950763",
+        cos_region="ap-beijing",
+        cos_bucket="testbucket123",
+        cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+        cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
     )
     if should_pass:
         validate_config(cfg)
@@ -122,7 +130,7 @@ def test_config_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus,4paradigm/phanthymotus-driver")
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     secrets = tmp_path / "secrets.yaml"
-    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "kentcyq"\nagent_core_tokens:\n  test-machine: test-token\n')
+    secrets.write_text('version: 1\ncos:\n  region: ap-beijing\n  bucket: testbucket123\n  secret_id: TEST_FAKE_SECRET_ID_AAAA\n  secret_key: TEST_FAKE_SECRET_KEY_AAAA\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "kentcyq"\nagent_core_tokens:\n  test-machine: test-token\n')
     import agents.deploy_approval.config as config_mod
     orig = config_mod._load_secrets_config
     def patched(path):
@@ -146,7 +154,7 @@ def test_config_env_unset_uses_default(monkeypatch, tmp_path):
     monkeypatch.setenv("POLL_INTERVAL_SECONDS", "30")
     monkeypatch.delenv("GITHUB_REPOS", raising=False)
     secrets = tmp_path / "secrets.yaml"
-    secrets.write_text('version: 1\ncos:\n  region: test\n  bucket: test\n  secret_id: test\n  secret_key: test\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "kentcyq"\nagent_core_tokens:\n  test-machine: test-token\n')
+    secrets.write_text('version: 1\ncos:\n  region: ap-beijing\n  bucket: testbucket123\n  secret_id: TEST_FAKE_SECRET_ID_AAAA\n  secret_key: TEST_FAKE_SECRET_KEY_AAAA\nreview_comment_trust:\n  author_id: "7950763"\n  author_login: "kentcyq"\nagent_core_tokens:\n  test-machine: test-token\n')
     import agents.deploy_approval.config as config_mod
     orig = config_mod._load_secrets_config
     def patched(path):
@@ -333,6 +341,10 @@ def test_validate_config_accepts_canonical_identity():
             review_comment_author_id=REVIEW_AGENT_GITHUB_USER_ID,
             review_comment_author_login=REVIEW_AGENT_GITHUB_LOGIN,
             agent_core_tokens={"test": "token"},
+            cos_region="ap-beijing",
+            cos_bucket="testbucket123",
+            cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+            cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
         )
     )
 
@@ -346,6 +358,10 @@ def test_validate_config_rejects_haohao_end_as_review_agent():
                 review_comment_author_id="184792454",
                 review_comment_author_login="Haohao-end",
                 agent_core_tokens={"test": "token"},
+                cos_region="ap-beijing",
+                cos_bucket="testbucket123",
+                cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+                cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
             )
         )
 
@@ -359,6 +375,10 @@ def test_validate_config_rejects_correct_id_wrong_login():
                 review_comment_author_id="7950763",
                 review_comment_author_login="wrong-login",
                 agent_core_tokens={"test": "token"},
+                cos_region="ap-beijing",
+                cos_bucket="testbucket123",
+                cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+                cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
             )
         )
 
@@ -372,6 +392,10 @@ def test_validate_config_rejects_wrong_id_correct_login():
                 review_comment_author_id="12345",
                 review_comment_author_login="kentcyq",
                 agent_core_tokens={"test": "token"},
+                cos_region="ap-beijing",
+                cos_bucket="testbucket123",
+                cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+                cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
             )
         )
 
@@ -386,10 +410,10 @@ def test_load_config_reads_canonical_secrets(tmp_path, monkeypatch):
     secrets.write_text(
         'version: 1\n'
         'cos:\n'
-        '  region: test\n'
-        '  bucket: test\n'
-        '  secret_id: test\n'
-        '  secret_key: test\n'
+        '  region: ap-beijing\n'
+        '  bucket: testbucket123\n'
+        '  secret_id: TEST_FAKE_SECRET_ID_AAAA\n'
+        '  secret_key: TEST_FAKE_SECRET_KEY_AAAA\n'
         'review_comment_trust:\n'
         '  author_id: "7950763"\n'
         '  author_login: "kentcyq"\n'
@@ -457,10 +481,10 @@ def test_deploy_sh_rejects_wrong_trust(tmp_path):
     bad_secrets.write_text(
         "version: 1\n"
         "cos:\n"
-        "  region: test\n"
-        "  bucket: test\n"
-        "  secret_id: test\n"
-        "  secret_key: test\n"
+        "  region: ap-beijing\n"
+        "  bucket: testbucket123\n"
+        "  secret_id: TEST_FAKE_SECRET_ID_AAAA\n"
+        "  secret_key: TEST_FAKE_SECRET_KEY_AAAA\n"
         "review_comment_trust:\n"
         "  author_id: \"184792454\"\n"
         "  author_login: \"Haohao-end\"\n"
@@ -570,6 +594,10 @@ def test_agent_core_tokens_valid_mapping_passes():
             github_repos=list(DEFAULT_GITHUB_REPOS),
             review_comment_author_id="7950763",
             agent_core_tokens={"machine1": "token1", "machine2": "token2"},
+            cos_region="ap-beijing",
+            cos_bucket="testbucket123",
+            cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
+            cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
         )
     )
 
@@ -588,10 +616,10 @@ def test_load_config_ignores_legacy_registry_environment(tmp_path, monkeypatch):
     secrets.write_text(
         'version: 1\n'
         'cos:\n'
-        '  region: test\n'
-        '  bucket: test\n'
-        '  secret_id: test\n'
-        '  secret_key: test\n'
+        '  region: ap-beijing\n'
+        '  bucket: testbucket123\n'
+        '  secret_id: TEST_FAKE_SECRET_ID_AAAA\n'
+        '  secret_key: TEST_FAKE_SECRET_KEY_AAAA\n'
         'review_comment_trust:\n'
         '  author_id: "7950763"\n'
         '  author_login: "kentcyq"\n'
@@ -613,8 +641,8 @@ def test_load_config_ignores_legacy_registry_environment(tmp_path, monkeypatch):
     assert not hasattr(cfg, "registry_auth_host_allowlist"), "Config must not have registry_auth_host_allowlist"
 
     # Normal canonical config must load successfully
-    assert cfg.cos_region == "test"
-    assert cfg.cos_bucket == "test"
+    assert cfg.cos_region == "ap-beijing"
+    assert cfg.cos_bucket == "testbucket123"
     assert cfg.review_comment_author_id == "7950763"
     assert cfg.review_comment_author_login == "kentcyq"
     assert "test-machine" in cfg.agent_core_tokens
