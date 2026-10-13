@@ -298,7 +298,9 @@ class NaviPlugin:
                          "「机器人是否在对这里做反应」做透明度，压在真实画面上，"
                          "于是一眼能同时看到它看见了什么和它在反应什么"},
                 {"format": "image/depth-zlib",
-                 "desc": "深度图 640x480 uint16 mm（与深度摘要二选一）"},
+                 "desc": "zlib 压缩深度图 640x480 uint16 mm（与深度摘要二选一）"},
+                {"format": "image/depth-z16",
+                 "desc": "原始 16UC1/mono16 深度图 640x480 uint16 mm（与深度摘要二选一）"},
                 {"format": "state/odom",
                  "desc": "motus.odom/1（可选，接上才有卡死检测）"},
             ],
@@ -859,13 +861,21 @@ class NaviPlugin:
         # on the canvas. It goes into the degradations.
         bound["unknown"] = unknown
 
-        from sensor_msgs.msg import CompressedImage
+        from sensor_msgs.msg import CompressedImage, Image
         from std_msgs.msg import String
 
         qos = _sensor_qos()
         if bound["depth_map"]:
+            # Canvas startup intentionally does not wait for a producer to
+            # appear, so there may be no ROS graph type to inspect here.  Both
+            # declared depth wire formats are safe to subscribe to: DDS only
+            # delivers a matching type, and the inactive subscription receives
+            # nothing.  This avoids guessing raw z16 from a topic name while
+            # retaining Bumi's zlib path during upstream camera startup.
             node.create_subscription(CompressedImage, bound["depth_map"],
                                      self._on_depth_map, qos)
+            node.create_subscription(Image, bound["depth_map"],
+                                     self._on_depth_z16, qos)
         if bound["image"]:
             # Kept as bytes and decoded only when a frame is drawn: the camera
             # runs at 15 fps and the overlay at 5, so decoding on arrival would
@@ -980,6 +990,28 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
+    def _set_depth_map(self, depth):
+        with self._obs_lock:
+            self._depth_map = depth
+            self._depth_bands = depth_mod.nearest_by_band(depth)
+            self._depth_ms = int(time.time() * 1000)
+
+    def _on_depth_z16(self, message):
+        try:
+            depth = depth_mod.decode_z16(
+                bytes(getattr(message, "data", b"") or b""),
+                width=int(getattr(message, "width", 0)),
+                height=int(getattr(message, "height", 0)),
+                step=int(getattr(message, "step", 0)),
+                is_bigendian=bool(getattr(message, "is_bigendian", False)),
+                encoding=str(getattr(message, "encoding", "")),
+            )
+        except (ValueError, depth_mod.DepthError) as error:
+            with self._lock:
+                self._last_error = f"深度图解码失败：{error}"
+            return
+        self._set_depth_map(depth)
+
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")
         if not data:
@@ -990,10 +1022,7 @@ class NaviPlugin:
             with self._lock:
                 self._last_error = f"深度图解码失败：{error}"
             return
-        with self._obs_lock:
-            self._depth_map = depth
-            self._depth_bands = depth_mod.nearest_by_band(depth)
-            self._depth_ms = int(time.time() * 1000)
+        self._set_depth_map(depth)
 
     def _open_publisher(self):
         from rclpy.node import Node

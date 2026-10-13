@@ -1177,10 +1177,23 @@ def test_search_rate_uses_the_tighter_signed_yaw_limit():
     config = _cfg(search_rate=1.0)
     asymmetric = {"limits": dict(_R1_DESC["limits"],
                                   lower=[-1, -1, 0, 0, 0, -0.55],
-                                  upper=[1, 1, 0, 0, 0, 0.83])}
+                                  upper=[1, 1, 0, 0, 0, 0.83],
+                                  min_magnitude=[0.4, 0.4, 0, 0, 0, 0.33])}
     P.adopt_limits(config, asymmetric)
     assert config.search_rate == 0.55
 
+
+
+def test_search_is_disabled_when_yaw_ceiling_is_below_its_deadband():
+    """A capped rate below the declared floor would be zeroed downstream."""
+    config = _cfg(search_rate=1.0)
+    impossible = {"limits": dict(_R1_DESC["limits"],
+                                  lower=[-1, -1, 0, 0, 0, -0.2],
+                                  upper=[1, 1, 0, 0, 0, 0.2],
+                                  min_magnitude=[0, 0, 0, 0, 0, 0.33])}
+    notes = P.adopt_limits(config, impossible)
+    assert config.search_rate == 0.0
+    assert any("最小可执行量" in note for note in notes)
 
 def test_search_is_disabled_when_the_chassis_has_no_yaw_axis():
     config = _cfg(search_rate=1.0)

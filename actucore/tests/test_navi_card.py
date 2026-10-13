@@ -146,7 +146,8 @@ def test_the_prefix_has_no_underscore():
 
 def test_it_declares_every_input_format_it_accepts():
     formats = {entry["format"] for entry in _tool()["topic_in"]}
-    assert formats == {"data/json", "image/depth-zlib", "state/odom",
+    assert formats == {"data/json", "image/depth-zlib", "image/depth-z16",
+                       "state/odom",
                        # The raw camera, optional and only for the overlay.
                        "image/jpeg"}
 
@@ -229,12 +230,14 @@ class _FakeNode:
     def __init__(self, graph=None):
         self.graph = graph or {}
         self.subscriptions = []
+        self.subscription_details = []
 
     def get_topic_names_and_types(self):
         return list(self.graph.items())
 
     def create_subscription(self, msg_type, topic, cb, depth):
         self.subscriptions.append(topic)
+        self.subscription_details.append((msg_type, topic, cb, depth))
 
 
 def _bind(topics, graph=None):
@@ -261,6 +264,27 @@ def test_a_driver_camera_depth_topic_binds_as_metric_depth():
     assert problem == ""
     assert bound["depth_map"] == "/ubuntu/camera/depth"
 
+
+
+def test_a_raw_driver_depth_topic_uses_image_subscription_and_z16_decoder():
+    """A hardware z16 stream must not be subscribed/decoded as zlib."""
+    from types import SimpleNamespace
+
+    card = _card()
+    node = _FakeNode()  # producer may still be loading when the canvas starts
+    bound, problem = card._bind_inputs(
+        node, ["/ubuntu/camera/color/objects", "/ubuntu/camera/depth"])
+    assert problem == ""
+    depth_subscriptions = [item for item in node.subscription_details
+                           if item[1] == "/ubuntu/camera/depth"]
+    assert {item[0].__name__ for item in depth_subscriptions} == {"Image", "CompressedImage"}
+    callback = next(item[2] for item in depth_subscriptions if item[0].__name__ == "Image")
+
+    raw = bytearray(640 * 480 * 2)
+    raw[:2] = (1500).to_bytes(2, "little")
+    callback(SimpleNamespace(data=raw, width=640, height=480, step=1280,
+                             is_bigendian=False, encoding="16UC1"))
+    assert card._depth_map[0, 0] == pytest.approx(1.5)
 
 def test_the_summary_suffix_is_not_swallowed_by_the_depth_map_suffix():
     """`/visual_depth_summary` starts with `/visual_depth`; matched in the

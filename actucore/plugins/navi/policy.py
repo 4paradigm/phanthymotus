@@ -662,9 +662,18 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
                 search_cap = max(0.0, -yaw_lower)
             else:
                 search_cap = None
-            if search_cap is not None and config.search_rate > search_cap:
-                notes.append(f"search_rate 超过下游双向允许的 {search_cap:g}，已压回")
-                config.search_rate = search_cap
+            candidate = config.search_rate
+            if search_cap is not None:
+                candidate = min(candidate, search_cap)
+            if floor and candidate < floor:
+                if config.search_rate != 0.0:
+                    notes.append(
+                        f"search_rate 的可用上限 {candidate:g} 低于偏航最小可执行量 "
+                        f"{floor:g}，已停用搜索转身")
+                config.search_rate = 0.0
+            elif candidate < config.search_rate:
+                notes.append(f"search_rate 超过下游双向允许的 {candidate:g}，已压回")
+                config.search_rate = candidate
 
     return notes
 
