@@ -84,6 +84,22 @@ _interrupt_mode: str = "steer"
 _barge_in_threshold_ms: int = 500
 
 
+def _completion_is_silent(data: dict) -> bool:
+    """这条 action_complete 要不要唤醒 LLM。
+
+    首选驱动在 `x-completion` 里申报的 `silent_completion`（由 /api/acp/complete 与
+    SSE 两条路写进事件的 `silent` 字段）。
+
+    `speak-` / `tts-` 前缀是**遗留兜底**，保留给仓库外的驱动：原先判断「是不是回执」
+    全靠 action_id 拼写成什么样，一个把 id 叫 `music-…` 的播放卡于是每放完一首歌就
+    唤醒一个 turn。申报比拼写可靠，但删掉前缀会让没升级的驱动突然开始刷 turn。
+    """
+    if data.get('silent'):
+        return True
+    aid = data.get('action_id', '') or ''
+    return aid.startswith('speak-') or aid.startswith('tts-')
+
+
 def _extract_priority(ev: dict) -> int:
     """从事件中解析 priority。JSON text 中的 priority 字段优先，否则按 source 匹配。"""
     text = ev.get('text', '')
@@ -93,10 +109,9 @@ def _extract_priority(ev: dict) -> int:
             p = data.get('priority')
             if p is not None:
                 return int(p)
-            # ACP: action_complete 事件 — speak/tts completions are silent (barrier handles sync)
+            # ACP: action_complete 事件 — 播放类的「播完了」是回执，不是新消息
             if data.get('type') == 'action_complete':
-                aid = data.get('action_id', '')
-                if aid.startswith('speak-') or aid.startswith('tts-'):
+                if _completion_is_silent(data):
                     return 0  # don't steer into LLM — just a playback ack
                 return 1
         except (ValueError, TypeError):
@@ -105,8 +120,7 @@ def _extract_priority(ev: dict) -> int:
     payload = ev.get('payload', {})
     if isinstance(payload, dict):
         if payload.get('type') == 'action_complete':
-            aid = payload.get('action_id', '')
-            if aid.startswith('speak-') or aid.startswith('tts-'):
+            if _completion_is_silent(payload):
                 return 0
             return 1
         # Subagent 完成事件：继承 subagent 的 priority（反转映射回 event priority）
