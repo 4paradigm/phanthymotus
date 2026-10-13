@@ -226,6 +226,19 @@ def test_asr_bindings_identify_ports_when_direction_connects_first(driver):
     ]
 
 
+def test_malformed_saved_port_index_falls_back_to_first_port(driver):
+    layout = {
+        'cards': [_card(MIC, 'mic', [
+            {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k'}]),
+            {**_card(ASR, 'asr'), 'topicIn': [{'format': 'audio/pcm-16k'}]}],
+        'connections': [{**_conn(MIC, ASR, '/ubuntu/mic/audio'),
+                         'fromPortIdx': 'bad', 'toPortIdx': 'bad'}],
+    }
+    assert _start(layout) is True
+    assert driver.starts[ASR]['input_bindings'] == [
+        {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k', 'port_index': 0}]
+
+
 def test_formatless_connection_does_not_create_a_binding(driver):
     layout = {
         'cards': [_card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio'}]),

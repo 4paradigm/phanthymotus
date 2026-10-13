@@ -857,14 +857,20 @@ async def _do_start_project_impl():
             topic = _topic_of_connection(conn)
             if not topic:
                 continue
-            port_index = int(conn.get('toPortIdx') or 0)
+            try:
+                port_index = int(conn.get('toPortIdx') or 0)
+            except (TypeError, ValueError):
+                port_index = 0
             source = next((c for c in cards if c.get('id') == conn.get('fromCardId')), {})
             source_ports = source.get('topicOut') or []
             destination_ports = card.get('topicIn') or []
-            source_index = int(conn.get('fromPortIdx') or 0)
+            try:
+                source_index = int(conn.get('fromPortIdx') or 0)
+            except (TypeError, ValueError):
+                source_index = 0
             fmt = (conn.get('format') or
-                   (source_ports[source_index].get('format') if source_index < len(source_ports) else '') or
-                   (destination_ports[port_index].get('format') if port_index < len(destination_ports) else ''))
+                   (source_ports[source_index].get('format') if 0 <= source_index < len(source_ports) else '') or
+                   (destination_ports[port_index].get('format') if 0 <= port_index < len(destination_ports) else ''))
             if fmt:
                 bindings.append({'topic': topic, 'format': fmt, 'port_index': port_index})
         return bindings

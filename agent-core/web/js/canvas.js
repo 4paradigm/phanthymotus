@@ -22,7 +22,7 @@ import { getToken } from './auth.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
-import { inputArgs, inputBindingsOf, inputKey } from './topic-derive.js';
+import { inputArgs, inputBindingsOf, inputKey, mergeInputPorts } from './topic-derive.js';
 // **静态 import,不是 handler 里的 `await import()`。** 停止的那三个事件是同一毫秒
 // 到的(backend 并行跑完健康的卡片),动态 import 的 then 要等一个微任务,于是
 // `project_stop_begin` 还没建好状态,紧随其后的 project_stop_item 全被
@@ -514,7 +514,11 @@ export function updateCanvasMcps(mcps) {
     const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
     const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
     if (typeof toolObj === 'object' && toolObj.multiInstance) {
-      // (skip topic update — fall through to configSchema check below)
+      const merged = mergeInputPorts(card.topicIn, liveTopicIn);
+      if (JSON.stringify(merged) !== JSON.stringify(card.topicIn)) {
+        card.topicIn = merged;
+        topicsChanged = true;
+      }
     } else {
       if (liveTopicIn  && liveTopicIn.length  && JSON.stringify(liveTopicIn)  !== JSON.stringify(card.topicIn))  {
         // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
@@ -852,9 +856,6 @@ function _addCard(data, save = true) {
     driverName = mcp ? (mcp.server_name || mcp.name || mcp.id) : mcpId;
   }
 
-  const el = _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: data.topicIn, topicOut: data.topicOut });
-  _viewport.appendChild(el);
-
   // Restore or initialize persisted topic data
   let topicInData  = data.topicIn  || [];
   let topicOutData = data.topicOut || [];
@@ -868,6 +869,12 @@ function _addCard(data, save = true) {
       if (!topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
     }
   }
+
+  const mcp = _allMcps.find(m => m.id === mcpId);
+  const tool = (mcp?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  if (tool?.multiInstance) topicInData = mergeInputPorts(topicInData, tool.topic_in);
+  const el = _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: topicInData, topicOut: topicOutData });
+  _viewport.appendChild(el);
 
   const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData };
   _cards.push(cardData);
@@ -948,7 +955,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const staticOutHasReal = toolTopicOut?.some(t => t.topic);
   const savedInHasReal = savedTopicIn?.some(t => t.topic);
   const staticInHasReal = toolTopicIn?.some(t => t.topic);
-  const topicIn  = (savedInHasReal  ? savedTopicIn  : null) || (staticInHasReal  ? toolTopicIn  : null) || (savedTopicIn?.length  ? savedTopicIn  : null) || (toolTopicIn?.length  ? toolTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
+  const topicIn  = toolObj?.multiInstance ? mergeInputPorts(savedTopicIn, toolTopicIn) :
+    (savedInHasReal  ? savedTopicIn  : null) || (staticInHasReal  ? toolTopicIn  : null) || (savedTopicIn?.length  ? savedTopicIn  : null) || (toolTopicIn?.length  ? toolTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
   const topicOut = (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : null) || (toolTopicOut?.length ? toolTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
   const effectiveType = toolType || (topicIn.length && topicOut.length ? 'processor' : topicOut.length ? 'sensor' : topicIn.length ? 'actuator' : '');
 

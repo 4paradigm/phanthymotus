@@ -12,7 +12,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, inputBindingsOf, inputArgs, topicOfPort } from './topic-derive.js';
+import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, inputBindingsOf, inputArgs, topicOfPort, mergeInputPorts } from './topic-derive.js';
+
+test('upgraded ASR keeps its audio topic and gains the direction input', () => {
+  const saved = [{ topic: '/robot/mic/audio', format: 'audio/pcm-16k' }];
+  const declared = [{ format: 'audio/pcm-16k' }, { format: 'sensor/sound-direction-v1' }];
+  assert.deepEqual(mergeInputPorts(saved, declared), [
+    { topic: '/robot/mic/audio', format: 'audio/pcm-16k' },
+    { format: 'sensor/sound-direction-v1' },
+  ]);
+});
 
 // The layout that produced the report: mic → asr → tts, both derived cards saved
 // with no topic because nothing had asked the driver yet.

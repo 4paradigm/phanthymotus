@@ -87,6 +87,23 @@ def test_direction_buffer_ignores_invalid_time_and_no_event_keeps_history():
     assert list(node._direction_windows) == [(90, 1700000000000000, 1700000000020000)]
 
 
+def test_unstamped_audio_chunk_uses_arrival_time_without_trusting_capture_clock(monkeypatch):
+    node = asr._ASRNode.__new__(asr._ASRNode)
+    node._stop_event = asr.threading.Event()
+    node._first_chunk_event = asr.threading.Event()
+    node._vad_proc = None
+    queued = []
+    node._pcm_queue = SimpleNamespace(put_nowait=queued.append)
+    node._check_audio_contract = lambda fmt, data: data
+    monkeypatch.setattr(asr.time, 'time', lambda: 1700000000.25)
+    msg = SimpleNamespace(format='audio/pcm-16k', data=b'\0\0',
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=0, nanosec=0)))
+
+    node._audio_cb(msg)
+
+    assert queued == [(b'\0\0', 1700000000.25, False)]
+
+
 def test_timestamp_trust_covers_each_vad_segment_including_early_speech(monkeypatch):
     class Stop:
         done = False

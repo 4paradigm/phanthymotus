@@ -14,6 +14,15 @@
  *   node --test "agent-core/web/js/*.test.mjs"
  */
 
+/** Refresh declared input ports while retaining resolved topics for unchanged ports. */
+export function mergeInputPorts(saved = [], declared = []) {
+  if (!declared?.length) return saved || [];
+  return declared.map((port, index) => {
+    const old = saved?.[index];
+    return old?.format === port.format && old.topic ? { ...port, topic: old.topic } : port;
+  });
+}
+
 /**
  * The topic a card publishes on `portIdx`, or '' if not known yet.
  *
