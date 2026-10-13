@@ -216,6 +216,26 @@ class MixerTests(unittest.TestCase):
                 self.assertIn('bounded', mixer.status()['error'])
                 mixer.close()
 
+    def test_a_background_backlog_is_trimmed_instead_of_growing(self):
+        """Orin5 实测：background_buffered_ms 涨到 9875，音频一卡一卡。
+
+        背景是实时流 —— 听众要的是「现在」的音乐。攒着只会让延迟一直涨到撞
+        MAX_VOICE_BYTES 的 20 秒上限、整个清空、报错、重来。
+        """
+        for _ in range(60):                       # 6 秒音频，只喂不消费
+            self.mixer.feed(pcm(9000), speech=False)
+        status = self.mixer.status()
+        self.assertLessEqual(status['background_buffered_ms'], 1000)
+        self.assertGreater(status['background_dropped_ms'], 0,
+                           '丢弃必须是可见的事实，不是悄悄的自我修正')
+        self.assertEqual(status['error'], '', '裁剪是正常止损，不该报成错误')
+
+    def test_speech_is_never_trimmed_that_way(self):
+        """丢背景只是过时；丢语音就是少说字。"""
+        for _ in range(8):
+            self.mixer.feed(pcm(3000), speech=True)
+        self.assertGreater(self.mixer.status()['speech_buffered_ms'], 700)
+
     def test_odd_length_pcm_is_rejected_not_misread(self):
         self.mixer.feed(b'\x01\x02\x03', speech=True)
         self.assertIn('S16LE', self.mixer.status()['error'])
@@ -274,6 +294,37 @@ class MixerCardTests(unittest.TestCase):
         self.assertEqual(tool['inputSchema']['x-resource'], 'speaker_mix')
         self.assertEqual(set(tool['inputSchema']['x-hooks']),
                          {'on_interrupt_speak', 'on_interrupt_all'})
+
+    def test_auto_finds_the_tts_topic_through_its_info_action(self):
+        """TTSPlugin 是个 facade，它自己没有 _nodes —— 节点字典在当前加载的引擎里。
+
+        猜属性名会一无所获，于是 auto 解析出空的语音集合，**每一个**输入都被当成
+        背景音乐，包括 TTS 本身。Orin5 上实测到的就是这个。
+        """
+        class FakeTTS:
+            def dispatch(self, name, args):
+                return {'topic_out': [{'topic': '/perception/tts',
+                                       'format': 'audio/pcm-16k'}]}
+        from plugins.audio_mixer import AudioMixerPlugin
+        plugin = AudioMixerPlugin({}, _FakeExecutor(), tts=FakeTTS())
+        plugin.dispatch('audio_mixer', {
+            'action': 'start',
+            'input_topics': ['/perception/tts', '/perception/music/audio']})
+        self.addCleanup(plugin.stop)
+        info = plugin.dispatch('audio_mixer', {'action': 'info'})
+        self.assertEqual(info['speech_topics'], ['/perception/tts'])
+        self.assertNotIn('degraded', info)
+        roles = {t['topic']: t['role'] for t in info['topic_in']}
+        self.assertEqual(roles['/perception/tts'], 'speech')
+        self.assertEqual(roles['/perception/music/audio'], 'background')
+
+    def test_a_broken_tts_does_not_stop_the_card_answering(self):
+        class AngryTTS:
+            def dispatch(self, name, args):
+                raise RuntimeError('engine is loading')
+        from plugins.audio_mixer import AudioMixerPlugin
+        plugin = AudioMixerPlugin({}, _FakeExecutor(), tts=AngryTTS())
+        self.assertTrue(plugin.get_tools())
 
     def test_one_in_port_because_port_identity_does_not_survive_to_start(self):
         """api/config.py's _resolve_input_topics discards toPortIdx, so a

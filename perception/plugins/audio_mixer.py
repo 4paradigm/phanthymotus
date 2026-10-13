@@ -164,29 +164,30 @@ class AudioMixerPlugin:
 
     # ── the speech role ──────────────────────────────────────────────────────
     def _tts_topics(self):
-        """Audio topics the local TTS card publishes, asked of the plugin itself.
+        """Audio topics the TTS card publishes, asked through its own `info`.
 
-        Same trick as echo_cancellation's reference signal: in-process is the one
-        place that knows the answer without configuration, because the TTS output
-        topic is derived from whatever input topic the canvas wired to it.
+        Via the dispatch action the dashboard uses, **not** by reaching into
+        TTSPlugin's attributes. `echo_cancellation._tts_audio_topics` already
+        said why and I wrote it the other way anyway: TTSPlugin is a facade over
+        a swappable engine, so it has no `_nodes` of its own — the node dict
+        lives inside whichever engine is loaded, and the output topic is on
+        `SherpaOnnxTTSPlugin`. Guessing attribute names returned nothing, so
+        `auto` resolved to an empty speech set and **every** input was treated
+        as background music, including the TTS. Measured on Orin5.
+
+        Never raises: a TTS in a bad state must not stop this card answering.
         """
-        topics = []
-        for attr in ('audio_topics', '_tts_audio_topics'):
-            getter = getattr(self._tts, attr, None)
-            if callable(getter):
-                try:
-                    topics = [t for t in (getter() or []) if isinstance(t, str) and t]
-                    break
-                except Exception:   # noqa: BLE001
-                    log.warning('[audio_mixer] TTS handle refused to list topics',
-                                exc_info=True)
-        if topics:
-            return topics
-        for node in getattr(self._tts, '_nodes', {}).values() or {}:
-            topic = getattr(node, '_output_topic', '')
-            if topic:
-                topics.append(topic)
-        return topics
+        if self._tts is None:
+            return []
+        try:
+            info = self._tts.dispatch('tts', {'action': 'info'}) or {}
+            topics = [str(entry.get('topic') or '')
+                      for entry in (info.get('topic_out') or [])
+                      if (entry.get('format') or '') == FORMAT]
+        except Exception as error:   # noqa: BLE001
+            log.debug('[audio_mixer] could not ask TTS for its topics: %s', error)
+            return []
+        return list(dict.fromkeys(t for t in topics if t))
 
     def _resolve_speech(self, bound_topics):
         """Which of the bound topics count as speech, and how we decided."""

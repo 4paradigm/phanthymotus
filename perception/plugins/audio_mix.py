@@ -43,6 +43,18 @@ NO_READER_GRACE_S = 5.0
 # 200ms 而不是更多：tts.py 本来就先突发 5 帧再按节奏发，所以这点余量几乎立刻就
 # 攒满，不会给首字增加可感知的延迟 —— 而延迟直接影响打断响应。
 SPEECH_PREFILL_MS = 200
+# 背景积压的上限，以及触发后裁到多少。
+#
+# 背景是**实时流**：积压的音频没有价值，听众要的是「现在」的音乐，不是 10 秒前的。
+# 而语音不能这么丢 —— 丢了就是少说字。
+#
+# 为什么需要这个：多个源会写进同一个背景缓冲，而消费速率固定是一帧/tick。Orin5 上
+# 实测到 background_buffered_ms = 9875 —— TTS 因为角色判错也被当成了背景，于是两个
+# 源各自 100ms/帧写入、只有 100ms/帧流出，每秒净积压一秒，一路涨到 MAX_VOICE_BYTES
+# 的 20 秒上限、清空、报错、重来。听感就是放一段、卡一下、再放。
+# 角色判错是另外修的，但速率失配本身也该有个止损，而不是靠撞上限。
+BACKGROUND_MAX_MS = 1000
+BACKGROUND_TRIM_MS = 400
 # A lost end-of-speech must not leave the background permanently inaudible.
 DUCK_FAILSAFE_S = 60.0
 
@@ -118,6 +130,9 @@ class Mixer:
         self._discard_speech = False
         self._background = bytearray()
         self._background_open = False
+        # 累计丢掉了多少背景音频。不为零就说明产出比消费快 —— 这是个该被看见的
+        # 事实，而不是悄悄发生的自我修正。
+        self._background_dropped_ms = 0.0
         self._background_last = 0.0
 
         self._duck_until = 0.0
@@ -180,6 +195,14 @@ class Mixer:
             else:
                 self._background_open = True
                 self._background_last = self._clock()
+                # 追上实时，而不是把落后攒起来。丢最旧的那一段：它已经过时了，
+                # 而留着它只会让延迟一直涨到撞上限被整个清空。
+                limit = BACKGROUND_MAX_MS / 1000 * BYTES_PER_SECOND
+                if len(buffer) > limit:
+                    keep = int(BACKGROUND_TRIM_MS / 1000 * BYTES_PER_SECOND)
+                    dropped_ms = (len(buffer) - keep) / BYTES_PER_SECOND * 1000
+                    del buffer[:len(buffer) - keep]
+                    self._background_dropped_ms += dropped_ms
 
     def flush_speech(self):
         """Drop buffered speech and ignore the rest of this utterance.
@@ -233,6 +256,7 @@ class Mixer:
         with self._lock:
             return {'speech_buffered_ms': len(self._speech) / BYTES_PER_SECOND * 1000,
                     'background_buffered_ms': len(self._background) / BYTES_PER_SECOND * 1000,
+                    'background_dropped_ms': round(self._background_dropped_ms, 1),
                     'speaking': bool(self._speech or self._speech_open),
                     'speech_prefill_ms': self.speech_prefill_ms,
                     'ducked': self.ducked(),
