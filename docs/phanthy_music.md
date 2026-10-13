@@ -26,16 +26,21 @@ redeploying. They are deliberately absent from `configSchema`, from
 `get_tools()` and from every reply, and `config` refuses any attempt to override
 them — but that is about not *leaking them further*, not about keeping them.
 
-## Card configuration
+## 卡片配置：没有
 
-| Key | Default | Meaning |
+这张卡没有任何设置项，`configSchema` 被整个去掉了。原来有四项，没有一项经得起
+「谁比默认值更有资格回答这个问题」的追问：
+
+| 原设置 | 现在 | 为什么不是配置 |
 |---|---|---|
-| `catalogue_type` | `motus_music` | `mock` is offline metadata only (no audio); `none` disables lookups. |
-| `timeout_ms` | `3000` | Whole-request budget, including the capability query and the one retry. |
-| `volume` | `50` | Music volume. Never affects speech. |
-| `continuous` | `true` | Station mode: when a track drains, automatically play the next one matching the same criteria. |
+| `catalogue_type` | 固定 `motus_music` | 曲库连接内置在卡片源码里，没得选 |
+| `timeout_ms` | 固定 3000 ms | 跟曲库说话的实现细节，不是产品问题 |
+| `volume` | `set_volume` 动作 | 听的人当场说的，画布上预设的人不知道你想放多大声 |
+| `continuous` | `set_autoplay` 动作，**默认关** | 同上。而且「自己一直放下去」是个决定，该被明确要求 |
 
-`duck_gain` moved to `audio_mixer`, where the ducking happens.
+后两项之所以曾经是设置，是因为它们是**状态**，而卡片上的状态看起来很像配置。
+
+`duck_gain` 在 [`audio_mixer`](audio-mixer.md) 那边 —— 压低音乐是混音的事。
 
 ## Actions
 
@@ -48,7 +53,8 @@ them — but that is about not *leaking them further*, not about keeping them.
 | `pause` / `resume` | — | Pause keeps the decoded buffer, so resuming continues rather than skipping. |
 | `stop_music` | — | Stops the music. Does not affect speech. |
 | `now_playing` | — | Title, artist, genre, position, remaining, volume, station criteria. Call this before telling a user what is on. |
-| `set_volume` | `volume` | 0–100. Music only. |
+| `set_volume` | `volume` | 0–100。只管音乐。 |
+| `set_autoplay` | `autoplay` | 一首放完要不要自动接下一首。**默认关**：放完就停。只接受 true/false —— 一个说不清要开还是要关的调用，猜错的后果是歌自己一直放下去。 |
 | `search` | `query`, `genre`, `language`, `vocal`, `tags`, `artist`, `top_k` | Answers "is there any…" without playing. Keeps the filters `play` drops. Works with the card idle. |
 
 `start`, `stop`, `info` and `config` are dispatchable but are **not** in the

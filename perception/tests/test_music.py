@@ -202,7 +202,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(set(schema['x-action-params']),
                          {'list_genres', 'play', 'next', 'previous', 'pause',
                           'resume', 'stop_music', 'now_playing', 'set_volume',
-                          'search'})
+                          'set_autoplay', 'search'})
         jsonschema.validate({'action': 'play', 'genre': 'pop'}, schema)
         jsonschema.validate({'action': 'next'}, schema)
         jsonschema.validate({'action': 'list_genres'}, schema)
@@ -251,6 +251,30 @@ class PluginTests(unittest.TestCase):
         # there — the point is that it got that far rather than being ignored.
         self.assertIn('error', reply)
         self.assertIn(reply['error']['code'], ('not_playable', 'not_found'))
+
+    def test_the_card_has_nothing_to_configure(self):
+        """四项设置没有一项经得起「谁比默认值更有资格回答」的追问：连接内置在卡里，
+        超时是实现细节，音量和自动续播是听的人当场说的（set_volume/set_autoplay）。
+        """
+        self.assertNotIn('configSchema', self.plugin.get_tools()[0])
+
+    def test_autoplay_is_off_until_asked_for(self):
+        """放一首就停。自己接着往下放是个决定，应该被明确要求。"""
+        self.plugin.dispatch('phanthy_music', {'action': 'start'})
+        self.assertFalse(self.plugin.dispatch(
+            'phanthy_music', {'action': 'now_playing'})['autoplay'])
+        self.plugin.dispatch('phanthy_music',
+                             {'action': 'set_autoplay', 'autoplay': True})
+        self.assertTrue(self.plugin.dispatch(
+            'phanthy_music', {'action': 'now_playing'})['autoplay'])
+
+    def test_autoplay_refuses_a_value_it_would_have_to_guess_at(self):
+        """猜错的后果是歌自己一直放下去，比报错糟。"""
+        self.plugin.dispatch('phanthy_music', {'action': 'start'})
+        for bad in ('true', 1, 'on', None):
+            reply = self.plugin.dispatch('phanthy_music',
+                                         {'action': 'set_autoplay', 'autoplay': bad})
+            self.assertEqual(reply['error']['code'], 'invalid_argument')
 
     def test_the_system_actions_are_not_offered_to_the_model(self):
         """`present_to_llm` only filters them for `processor` cards, and this is

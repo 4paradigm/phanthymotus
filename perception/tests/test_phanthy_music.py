@@ -168,7 +168,7 @@ class CardTests(unittest.TestCase):
     def test_network_request_never_blocks_controls_or_resurrects_cancelled_play(self):
         for action, arguments in [('play', {'track_id': 'fictional-1'}),
                                   ('play', {'genre': 'pop'})]:
-            for control in ('interrupt', 'stop', 'config', 'replacement'):
+            for control in ('stop_music', 'stop', 'config', 'replacement'):
                 with self.subTest(action=action, control=control):
                     self.call('start')
                     entered, release = threading.Event(), threading.Event()
@@ -185,12 +185,21 @@ class CardTests(unittest.TestCase):
                         try:
                             self.assertTrue(entered.wait(1))
                             self.assertTrue(self.call('status')['resolving_track'])
-                            self.call('duck'); self.call('unduck')
+                            # 控制路径在网络卡住时必须照常应答。duck/unduck 已随混音搬到
+                            # audio_mixer，这里改用同样不碰网络的只读动作。
+                            self.call('now_playing'); self.call('list_genres')
                             if control == 'replacement':
-                                replacement = self.call('play_by_id', track_id='fictional-2')
+                                replacement = self.call('play', track_id='fictional-2')
                                 self.assertEqual(replacement['error']['code'], 'busy')
                             elif control == 'config':
-                                self.call('config', timeout_ms=4000 if self.plugin._cfg.get('timeout_ms') != 4000 else 3000)
+                                # timeout_ms 不再是设置项；换曲库才是会让在途请求作废的
+                                # 那种改动。来回切（而不是切到 none）：subTest 之间
+                                # 共用同一张卡，切到 none 会让后面几轮的 _query 直接
+                                # 抛 not_configured，连 delayed 都不会被调用。
+                                self.call('config', catalogue_type=(
+                                    'motus_music'
+                                    if self.plugin._cfg.get('catalogue_type') == 'mock'
+                                    else 'mock'))
                             else:
                                 self.call(control)
                         finally:
@@ -217,10 +226,15 @@ class CardTests(unittest.TestCase):
         self.assertTrue(result['catalogue_configured'])
         self.assertEqual(self.plugin._catalogue._provider.endpoint, 'https://catalogue.example')
         self.assertEqual(self.plugin._catalogue._provider._key, 'fake-internal-key')
+        # 换走再换回来：重建出的 service 依然用源码里内置的连接 —— 凭据不是从某处
+        # 记住的，而是每次构造时重新从卡片源码里取。（这里原本改 timeout_ms 来触发
+        # 重建，而 timeout_ms 已经不再是设置项。）
         before = self.plugin._catalogue
-        result = self.call('config', timeout_ms=4000)
+        self.call('config', catalogue_type='mock')
         self.assertIsNot(before, self.plugin._catalogue)
+        result = self.call('config', catalogue_type='motus_music')
         self.assertTrue(result['catalogue_configured'])
+        self.assertEqual(self.plugin._catalogue._provider.endpoint, 'https://catalogue.example')
         self.assertEqual(self.plugin._catalogue._provider._key, 'fake-internal-key')
         for reply in (result, self.call('info'), self.plugin.get_tools()):
             self.assertNotIn('fake-internal-key', json.dumps(reply))
@@ -230,7 +244,8 @@ class CardTests(unittest.TestCase):
             self.assertIn('error', result)
             self.assertNotIn('fake-private-value', json.dumps(result))
             self.assertNotIn(field, self.plugin._cfg)
-            self.assertNotIn(field, TOOLS[0]['configSchema']['properties'])
+            # 这张卡已经完全没有 configSchema —— 没有任何需要操作者回答的问题。
+            self.assertNotIn('configSchema', TOOLS[0])
             self.assertNotIn(field, TOOLS[0]['inputSchema']['properties'])
         self.assertNotIn('config', TOOLS[0]['inputSchema']['x-action-params'])
 

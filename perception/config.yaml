@@ -16,13 +16,9 @@ file_intake:
 plugins:
   # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
   phanthy_music:
+    # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作
+    # （set_volume / set_autoplay）不是配置。duck_gain 在 audio_mixer 那边。
     enabled: true
-    catalogue_type: motus_music
-    timeout_ms: 3000
-    volume: 50
-    # 一首放完自动续下一首（电台模式）。duck_gain 搬到 audio_mixer 了 —— 压低音乐
-    # 是混音的事，这张卡现在只出音乐。
-    continuous: true
 
   audio_mixer:
     enabled: true

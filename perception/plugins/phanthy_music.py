@@ -38,6 +38,16 @@ from utils import acp
 CATALOGUE_ENDPOINT = 'https://api.phanthy.com/open'
 CATALOGUE_API_KEY = 'pmk_315eeccf191e_NkXhERRw1L3squK-Grffb-a7ds-rXL5X1YhDhpx3-E0'
 
+# 这四项都不是卡片设置。卡片设置的本质是「向操作者提一个问题」，而这四个问题没有
+# 一个是操作者比默认值更有资格回答的：曲库连接内置在卡里、超时是跟它说话的实现细节、
+# 音量和自动续播是**听的人当场说的**（set_volume / set_autoplay），不是画布上预设的。
+CATALOGUE_TYPE = 'motus_music'
+CATALOGUE_TIMEOUT_MS = 3000
+DEFAULT_VOLUME = 50
+# 默认关：点一次歌就放一首。「自己接着往下放」是个决定，就该被明确要求 ——
+# 要么 set_autoplay，要么直接 next。
+DEFAULT_AUTOPLAY = False
+
 FORMAT = 'audio/pcm-16k'
 OUTPUT_TOPIC = '/perception/music/audio'  # Existing AudioChunk contract.
 QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -63,7 +73,9 @@ FILTER_PARAMS = ['query', 'genre', 'language', 'vocal', 'tags', 'artist']
 # returned 5/5 tracks genuinely carrying it. `query` cannot substitute — query is
 # relaxable, tags are not.
 PLAY_PARAMS = ['query', 'genre', 'language', 'artist', 'tags']
-CONFIG_PARAMS = ['catalogue_type', 'timeout_ms', 'volume', 'continuous']
+# 仍然接受来自 config.yaml 和构造函数的这些键（测试用 catalogue_type='mock' 建卡），
+# 但**不**出现在 configSchema 里 —— 见 TOOLS 里的说明，没有任何界面会为它们渲染表单。
+CONFIG_PARAMS = ['catalogue_type', 'timeout_ms', 'volume', 'autoplay']
 HISTORY_LIMIT = 50
 
 ACTIONS = {
@@ -76,6 +88,7 @@ ACTIONS = {
     'stop_music': [],
     'now_playing': [],
     'set_volume': ['volume'],
+    'set_autoplay': ['autoplay'],
     'search': FILTER_PARAMS + ['top_k'],
 }
 # Not in the declared enum, so they never reach the model. `present_to_llm`
@@ -104,6 +117,8 @@ ACTION_DESCRIPTIONS = {
     'stop_music': '停止音乐。不影响说话。',
     'now_playing': '现在放的是什么：歌名、歌手、曲风、进度、音量。要向用户报歌名时先调它。',
     'set_volume': '音乐音量 0–100。不改变说话的音量。',
+    'set_autoplay': '一首放完要不要自动接下一首（电台模式）。默认关：放完就停。'
+                    '用户说「一直放」「别停」时打开，说「放完这首就停」时关掉。',
     'search': '只回答「有没有/有哪些」，不播放。想听直接用 play。'
               '比 play 多 vocal 和 top_k，用于需要精确挑选的场合。',
 }
@@ -134,6 +149,8 @@ TOOLS = [{
             # through `query`. The dispatch path is kept so the `play_by_id`
             # alias and any stored canvas call still work.
             'volume': {'type': 'number', 'minimum': 0, 'maximum': 100},
+            'autoplay': {'type': 'boolean',
+                         'description': '一首放完是否自动接下一首；默认关'},
         },
         'x-action-params': {name: {'params': params,
                                    'description': ACTION_DESCRIPTIONS.get(name, name)}
@@ -163,18 +180,14 @@ TOOLS = [{
             'on_interrupt_music': {'action': 'stop_music'},
         },
     },
-    'configSchema': {'type': 'object', 'additionalProperties': False, 'properties': {
-        'catalogue_type': {'type': 'string', 'enum': ['none', 'mock', 'motus_music'],
-                           'default': 'motus_music',
-                           'description': '默认使用内置曲库连接；mock 仅用于离线元数据测试'},
-        'timeout_ms': {'type': 'integer', 'minimum': 100, 'maximum': 30000, 'default': 3000,
-                       'description': '曲库请求总时限（毫秒，含能力查询和重试）',
-                       'x-show-when': {'catalogue_type': 'motus_music'}},
-        'volume': {'type': 'number', 'minimum': 0, 'maximum': 100, 'default': 50,
-                   'description': '音乐音量，不改变说话音量'},
-        'continuous': {'type': 'boolean', 'default': True,
-                       'description': '一首放完自动续下一首（电台模式）；关掉则播完即停'},
-    }},
+    # **故意没有 configSchema —— 这张卡没有任何需要配置的东西。**
+    # 原来有四项，没有一项经得起「谁比默认值更有资格回答这个问题」的追问：
+    #   catalogue_type  曲库连接是内置在卡片源码里的
+    #   timeout_ms      跟曲库说话的实现细节，不是产品问题
+    #   volume          听的人当场说的 —— set_volume
+    #   continuous      听的人当场说的 —— set_autoplay
+    # 后两项之所以曾是设置，是因为它们是**状态**，而卡片上的状态看起来很像配置。
+    # 它不是：在画布上预设的人并不知道你此刻想放多大声。
     # No topic_in: this card no longer mixes. See the module docstring.
     'topic_in': [],
     'topic_out': [{'topic': OUTPUT_TOPIC, 'format': FORMAT, 'desc': 'music only (no speech)'}],
@@ -205,7 +218,8 @@ class PhanthyMusicPlugin:
     def __init__(self, plugin_cfg, executor):
         self._cfg = {key: value for key, value in (plugin_cfg or {}).items()
                      if key in CONFIG_PARAMS}
-        self._cfg.setdefault('catalogue_type', 'motus_music')
+        self._cfg.setdefault('volume', DEFAULT_VOLUME)
+        self._cfg.setdefault('catalogue_type', CATALOGUE_TYPE)
         self._catalogue = self._new_catalogue(self._cfg)
         self._executor, self._node = executor, None
         self._lock = threading.RLock()
@@ -224,7 +238,9 @@ class PhanthyMusicPlugin:
     def _new_catalogue(cfg):
         # Spread after cfg so the built-in values always win, whatever a YAML or
         # a UI edit tried to put there.
-        return MusicService({**cfg, 'endpoint': CATALOGUE_ENDPOINT,
+        return MusicService({'catalogue_type': cfg.get('catalogue_type', CATALOGUE_TYPE),
+                             'timeout_ms': CATALOGUE_TIMEOUT_MS,
+                             'endpoint': CATALOGUE_ENDPOINT,
                              'api_key': CATALOGUE_API_KEY})
 
     def get_tools(self):
@@ -256,7 +272,7 @@ class PhanthyMusicPlugin:
             'position_s': position,
             'remaining_s': round(max(0.0, duration - position), 2) if duration else None,
             'volume': status.get('volume', self._cfg.get('volume', 50)),
-            'continuous': bool(self._cfg.get('continuous', True)),
+            'autoplay': bool(self._cfg.get('autoplay', DEFAULT_AUTOPLAY)),
             'station': station,
             'played_count': len(history),
             'can_previous': cursor > 0,
@@ -514,7 +530,8 @@ class PhanthyMusicPlugin:
         with self._lock:
             if not self._node or state not in ('completed', 'error'):
                 return
-            if error or not self._cfg.get('continuous', True) or not self._station:
+            if (error or not self._cfg.get('autoplay', DEFAULT_AUTOPLAY)
+                    or not self._station):
                 return
             filters = dict(self._station.get('criteria') or {})
         try:
@@ -593,6 +610,13 @@ class PhanthyMusicPlugin:
                 player = self._node.player
                 if action == 'set_volume':
                     player.set_volume(args.get('volume'))
+                elif action == 'set_autoplay':
+                    wanted = args.get('autoplay')
+                    # 不接受 'true' / 1 这类：一个说不清自己要开还是要关的调用，
+                    # 猜一个比报错更糟 —— 猜错的后果是歌自己一直放下去。
+                    if not isinstance(wanted, bool):
+                        raise ValueError('autoplay 需要 true 或 false')
+                    self._cfg['autoplay'] = wanted
                 elif action == 'stop_music':
                     player.interrupt()
                 elif action in ('pause', 'resume'):
@@ -620,7 +644,7 @@ class PhanthyMusicPlugin:
         if 'volume' in cfg:
             cfg['volume'] = bounded_number(cfg['volume'], 0, 100, 'volume')
         catalogue = self._new_catalogue(cfg)
-        if any(cfg.get(k) != self._cfg.get(k) for k in ('catalogue_type', 'timeout_ms')):
+        if cfg.get('catalogue_type') != self._cfg.get('catalogue_type'):
             self._cancel_pending()
             self._catalogue = catalogue
         self._cfg = cfg
