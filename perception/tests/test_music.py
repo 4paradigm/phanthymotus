@@ -207,6 +207,51 @@ class PluginTests(unittest.TestCase):
         jsonschema.validate({'action': 'next'}, schema)
         jsonschema.validate({'action': 'list_genres'}, schema)
 
+    def test_play_only_takes_what_a_person_actually_says(self):
+        """Pins the param set against drift back toward the REST shape.
+
+        Every one of these has to be reachable from a spoken sentence. The
+        catalogue can filter on more than this — duration is genuinely indexed,
+        measured on the live service — but nobody utters a duration bound, and
+        a filter that exists only because SearchRequest has it is a field the
+        model can get wrong for no benefit.
+        """
+        params = self.plugin.get_tools()[0]['inputSchema']['x-action-params']
+        self.assertEqual(set(params['play']['params']),
+                         {'query', 'genre', 'language', 'artist', 'tags'})
+        # `tags` in particular: the catalogue's scene vocabulary is
+        # 驾驶/通勤/工作/夜晚, so "放点适合开车的歌" has somewhere to land. query
+        # cannot substitute for it — query is relaxable, tags are not.
+        self.assertIn('tags', params['play']['params'])
+
+    def test_search_keeps_the_precision_filters_play_dropped(self):
+        """Nothing is lost, it just moves: search stays the precise path."""
+        params = self.plugin.get_tools()[0]['inputSchema']['x-action-params']
+        self.assertIn('vocal', params['search']['params'])
+        self.assertIn('top_k', params['search']['params'])
+
+    def test_the_dropped_filters_are_gone_from_the_schema_entirely(self):
+        """Declared nowhere means the model never sees them, not even as a
+        property it could pass to the wrong action.
+        """
+        schema = self.plugin.get_tools()[0]['inputSchema']
+        for gone in ('duration_min_s', 'duration_max_s', 'track_id'):
+            self.assertNotIn(gone, schema['properties'])
+            for action in schema['x-action-params'].values():
+                self.assertNotIn(gone, action['params'])
+
+    def test_playing_a_specific_track_still_works_for_stored_callers(self):
+        """`track_id` left the declared surface, not the dispatch path — the
+        play_by_id alias and any saved canvas call keep working.
+        """
+        self.plugin.dispatch('phanthy_music', {'action': 'start'})
+        reply = self.plugin.dispatch('phanthy_music',
+                                     {'action': 'play_by_id', 'track_id': 'fictional-1'})
+        # mock catalogue has no audio, so it reaches the player and is refused
+        # there — the point is that it got that far rather than being ignored.
+        self.assertIn('error', reply)
+        self.assertIn(reply['error']['code'], ('not_playable', 'not_found'))
+
     def test_the_system_actions_are_not_offered_to_the_model(self):
         """`present_to_llm` only filters them for `processor` cards, and this is
         an `actuator` — so leaving them in the enum would hand the model a

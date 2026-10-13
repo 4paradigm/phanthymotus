@@ -46,14 +46,29 @@ QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
 
 # Filters a caller may express. `exclude_ids` is deliberately absent: it is the
 # card's bookkeeping now, not the model's.
-FILTER_PARAMS = ['query', 'genre', 'language', 'vocal', 'tags', 'artist',
-                 'duration_min_s', 'duration_max_s']
+#
+# `duration_min_s` / `duration_max_s` are gone from both actions. The catalogue
+# does index them — measured on the live service, `>=240` returned 241-480s and
+# `<=120` returned 61-115s — but no spoken sentence maps to a duration bound.
+# They were here because the REST SearchRequest has them, which is not a reason.
+FILTER_PARAMS = ['query', 'genre', 'language', 'vocal', 'tags', 'artist']
+
+# What `play` accepts, which is deliberately narrower than what the catalogue
+# can filter on. Each one has to be reachable from something a person says:
+#   query  放点伤感的 / 放那首下雨天的歌      genre  放点爵士
+#   artist 来首周杰伦                        tags   放点适合开车的歌
+#   language 放英文歌
+# `tags` earns its place here more than anything else in an in-car product: the
+# catalogue's `scene` vocabulary is 驾驶/通勤/工作/夜晚/旅行/下雨天, and 驾驶
+# returned 5/5 tracks genuinely carrying it. `query` cannot substitute — query is
+# relaxable, tags are not.
+PLAY_PARAMS = ['query', 'genre', 'language', 'artist', 'tags']
 CONFIG_PARAMS = ['catalogue_type', 'timeout_ms', 'volume', 'continuous']
 HISTORY_LIMIT = 50
 
 ACTIONS = {
     'list_genres': [],
-    'play': FILTER_PARAMS + ['track_id'],
+    'play': PLAY_PARAMS,
     'next': [],
     'previous': [],
     'pause': [],
@@ -77,9 +92,11 @@ ALIAS_ACTIONS = {'interrupt': 'stop_music', 'status': 'now_playing',
 
 ACTION_DESCRIPTIONS = {
     'list_genres': '先查可用的曲风/语种/人声代码，再 play。代码来自曲库，不要凭译名猜。',
-    'play': '点歌并开始播放：给 genre（见 list_genres）或 query（情绪/场景/歌名/歌词），'
-            '也可给 track_id 精确点播；什么都不给 = 随便放。'
-            '返回即表示已开始取歌，不代表播完；换歌用 next，停歌用 stop_music。',
+    'play': '点歌并开始播放。按用户怎么说选参数：说曲风用 genre（取值见 list_genres），'
+            '说场景/心情（开车、睡前、下雨天、治愈）用 tags，说歌手用 artist，'
+            '说语种用 language，其余（歌名、歌词、随口描述）都放 query。'
+            '什么都不给 = 随便放。返回即表示已开始取歌，不代表播完；'
+            '换歌用 next，停歌用 stop_music。',
     'next': '换下一首。不用传参数 —— 沿用上次 play 的条件，并自动排除刚放过的歌。',
     'previous': '回到上一首，从头开始播（记不住上一首播到哪儿了）。',
     'pause': '暂停当前这首，位置保留，resume 继续。',
@@ -87,7 +104,8 @@ ACTION_DESCRIPTIONS = {
     'stop_music': '停止音乐。不影响说话。',
     'now_playing': '现在放的是什么：歌名、歌手、曲风、进度、音量。要向用户报歌名时先调它。',
     'set_volume': '音乐音量 0–100。不改变说话的音量。',
-    'search': '只回答「有没有/有哪些」，不播放。想听直接用 play。',
+    'search': '只回答「有没有/有哪些」，不播放。想听直接用 play。'
+              '比 play 多 vocal 和 top_k，用于需要精确挑选的场合。',
 }
 
 TOOLS = [{
@@ -111,10 +129,10 @@ TOOLS = [{
                 'artist': '歌手名或歌手 ID',
             }.items()},
             'top_k': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'default': 3},
-            'duration_min_s': {'type': 'integer', 'minimum': 0, 'default': 0},
-            'duration_max_s': {'type': 'integer', 'minimum': 0, 'default': 0},
-            'track_id': {'type': 'string', 'minLength': 1, 'maxLength': 200,
-                         'description': '精确点播某首歌；通常来自 search 的结果'},
+            # `track_id` is no longer declared: by voice nobody searches and then
+            # plays a result by id, and a named song reaches the same place
+            # through `query`. The dispatch path is kept so the `play_by_id`
+            # alias and any stored canvas call still work.
             'volume': {'type': 'number', 'minimum': 0, 'maximum': 100},
         },
         'x-action-params': {name: {'params': params,

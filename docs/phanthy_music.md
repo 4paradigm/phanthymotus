@@ -42,14 +42,14 @@ them — but that is about not *leaking them further*, not about keeping them.
 | Action | Takes | Does |
 |---|---|---|
 | `list_genres` | — | The catalogue's own genre / language / vocal / tag vocabularies. **Call this before guessing a code.** Says whether the values came from the catalogue or from the built-in fallback. |
-| `play` | `genre`, `query`, `language`, `vocal`, `tags`, `artist`, `duration_min_s`, `duration_max_s`, `track_id` | Picks one track and starts playing. No criteria at all is valid — "放点歌" means anything. Returns as soon as fetching starts, not when the song ends. |
+| `play` | `query`, `genre`, `language`, `artist`, `tags` | Picks one track and starts playing. No criteria at all is valid — "放点歌" means anything. Returns as soon as fetching starts, not when the song ends. |
 | `next` | — | Next track. Takes no arguments: it reuses the last `play`'s criteria and excludes what already played. |
 | `previous` | — | Back one track, from the beginning. Costs one catalogue call, because signed audio URLs expire. |
 | `pause` / `resume` | — | Pause keeps the decoded buffer, so resuming continues rather than skipping. |
 | `stop_music` | — | Stops the music. Does not affect speech. |
 | `now_playing` | — | Title, artist, genre, position, remaining, volume, station criteria. Call this before telling a user what is on. |
 | `set_volume` | `volume` | 0–100. Music only. |
-| `search` | filters + `top_k` | Answers "is there any…" without playing. Works with the card idle. |
+| `search` | `query`, `genre`, `language`, `vocal`, `tags`, `artist`, `top_k` | Answers "is there any…" without playing. Keeps the filters `play` drops. Works with the card idle. |
 
 `start`, `stop`, `info` and `config` are dispatchable but are **not** in the
 declared action enum, so the model never sees them. `present_to_llm` only
@@ -60,6 +60,37 @@ next to the `stop_music` it means. That confusion was measured on a rig with
 
 Old spellings still dispatch, undeclared: `interrupt` → `stop_music`, `status` →
 `now_playing`, `play_by_id` / `play_by_genre` → `play`.
+
+### Why `play` takes five filters and not nine
+
+`play` is the voice path; `search` is the precision path. A filter earns a place
+on `play` only if it is reachable from something a person says:
+
+| | |
+|---|---|
+| `query` | 放点伤感的 / 放那首下雨天的歌 |
+| `genre` | 放点爵士 |
+| `artist` | 来首周杰伦 |
+| `language` | 放英文歌 |
+| `tags` | 放点适合开车的歌 |
+
+`tags` matters most in a vehicle, and is easy to mistake for a duplicate of
+`query`. It is not: the catalogue's `scene` vocabulary is
+驾驶/通勤/工作/夜晚/旅行/下雨天, filtering on 驾驶 returns tracks that genuinely
+carry that tag, and — unlike `query` — **tags are never relaxed**.
+
+Dropped from `play`, measured against the live catalogue rather than assumed:
+
+- **`duration_min_s` / `duration_max_s`** — the index is real and precise
+  (`>=240` returned 241–480 s, `<=120` returned 61–115 s). Nobody says it. They
+  were here because `SearchRequest` has them. Gone from `search` too.
+- **`vocal`** — works for `male`/`female`, but the one value a driver would ask
+  for, 纯音乐 → `instrumental`, is relaxed by the catalogue: the reply comes back
+  `relaxed: ['vocal']` with vocal tracks in it. Kept on `search`, where a caller
+  can see the relaxation and decide.
+- **`track_id`** — by voice, nobody searches and then plays a result by id; a
+  named song reaches the same place through `query`. The *dispatch* path is
+  retained, so the `play_by_id` alias and any stored canvas call still work.
 
 ### Unknown filter values are not errors
 
