@@ -1588,9 +1588,14 @@ class _ASRNode(Node):
         self._worker_ready = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
         if self._direction_topic:
-            from audio_msgs.msg import SoundDirection
-            self._direction_sub = self.create_subscription(
-                SoundDirection, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
+            try:
+                from audio_msgs.msg import SoundDirection
+            except ImportError:
+                log.warning("[asr] SoundDirection interface unavailable; continuing without direction input")
+                self._direction_topic = ''
+            else:
+                self._direction_sub = self.create_subscription(
+                    SoundDirection, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
         # A fresh event, not .clear(): the previous worker thread and _audio_cb
         # closures still hold a reference to the old one.
         self._stop_event = threading.Event()

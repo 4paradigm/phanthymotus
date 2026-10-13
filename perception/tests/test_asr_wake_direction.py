@@ -193,3 +193,31 @@ def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):
     assert start('/direction/new')['state'] == 'running'
     assert node.state == 'running'
     assert [sub.topic for sub in node.subscriptions] == ['/mic', '/direction/new']
+
+
+def test_missing_optional_direction_interface_does_not_stop_asr(monkeypatch):
+    message_module = types.ModuleType('audio_msgs.msg')
+    message_module.AudioChunk = object
+    monkeypatch.setitem(sys.modules, 'audio_msgs.msg', message_module)
+    node = asr._ASRNode('/mic', object(), 'zh-CN', direction_topic='/direction')
+
+    class Event:
+        def set(self): pass
+        def is_set(self): return False
+        def wait(self, timeout=None): return False
+
+    class Worker:
+        pid = 123
+        def __init__(self, *args, **kwargs): pass
+        def start(self): pass
+
+    monkeypatch.setattr(asr.threading, 'Event', Event)
+    monkeypatch.setattr(asr.threading, 'Thread', Worker)
+    monkeypatch.setattr(asr.multiprocessing, 'Event', Event)
+    monkeypatch.setattr(asr.multiprocessing, 'Queue', lambda **kwargs: object())
+    monkeypatch.setattr(asr.multiprocessing, 'Process', Worker)
+
+    result = node._start_inner()
+    assert result['state'] == 'running'
+    assert node._direction_topic == ''
+    assert [sub.topic for sub in node.subscriptions] == ['/mic']
