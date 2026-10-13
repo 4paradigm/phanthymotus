@@ -511,11 +511,43 @@ def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
     return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
 
+def _aligned_wake_offset(text: str, prefix_end: int, alignment: dict | None) -> float | None:
+    """Locate the keyword's text boundary in the model's timed audio tokens."""
+    if not alignment:
+        return None
+    tokens = alignment.get('tokens', [])
+    times = alignment.get('timestamps', [])
+    duration = alignment.get('duration_s', 0)
+    if (not tokens or len(tokens) != len(times)
+            or not all(isinstance(token, str) for token in tokens)
+            or not all(type(t) in (int, float) and math.isfinite(t) and t >= 0 for t in times)
+            or any(a > b for a, b in zip(times, times[1:]))):
+        return None
+
+    def compact(value):
+        return re.sub(r'[\W_]+', '', value.replace('▁', ' ')).lower()
+
+    # ITN or other text rewriting can invalidate token-to-text correspondence.
+    pieces = [compact(token) for token in tokens]
+    if ''.join(pieces) != compact(text):
+        return None
+    target = len(compact(text[:prefix_end]))
+    position = 0
+    for piece, timestamp in zip(pieces, times):
+        if not piece:
+            continue
+        if position == target:
+            return timestamp if timestamp < duration else None
+        position += len(piece)
+    return None
+
+
 def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
                            keyword_phones: int, start_ts: float,
                            pre_roll_bytes: int, windows: list,
-                           has_input: bool, trusted_audio: bool = True) -> dict:
-    """Match a leading wake word to direction windows on the capture clock."""
+                           has_input: bool, trusted_audio: bool = True,
+                           alignment: dict | None = None) -> dict:
+    """Match a timed wake word to direction windows on the capture clock."""
     state = {"wake_direction_state": "unknown" if has_input else "no_input"}
     if not has_input or not trusted_audio:
         return state
@@ -524,10 +556,13 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
         return state
     prefix_end = char_ends[kw_start - 1] if kw_start else 0
     prefix = re.sub(r'[\W_]+', '', text[:prefix_end])
-    if prefix and (len(prefix) > 2 or prefix not in
-                   {"嗯", "呃", "啊", "哦", "唉", "喂", "那个", "就是"}):
-        return state
-    onset_us = int((start_ts + pre_roll_bytes / 2 / SAMPLE_RATE) * 1_000_000)
+    offset = _aligned_wake_offset(text, prefix_end, alignment)
+    if offset is None:
+        # Without token timing, utterance onset is usable only for a leading wake.
+        if prefix:
+            return state
+        offset = pre_roll_bytes / 2 / SAMPLE_RATE
+    onset_us = int((start_ts + offset) * 1_000_000)
     selected = [(angle, begin, end) for angle, begin, end in windows
                 if (begin >= 1_000_000_000_000_000 and begin < end
                     and end - begin <= 3_000_000
@@ -754,6 +789,11 @@ class ASRAdapter(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, language: str) -> str: ...
 
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict | None]:
+        text, tags = self.transcribe_rich(wav_bytes, language, include_emotion)
+        return text, tags, None
+
     def transcribe_rich(self, wav_bytes: bytes, language: str,
                         include_emotion: bool = False) -> tuple[str, dict]:
         """转写，外加这个模型顺带算出的非文字信息（情绪 / 音频事件 / 语种）。
@@ -817,6 +857,11 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         **本来就已经算出来了**，以前只是被 `return text` 扔掉：这里不加载任何
         模型、不多跑一次推理、不多占一字节显存。
         """
+        text, tags, _ = self.transcribe_aligned(wav_bytes, language, include_emotion)
+        return text, tags
+
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict]:
         import io as _io, wave as _wave
         with _wave.open(_io.BytesIO(wav_bytes)) as wf:
             pcm = wf.readframes(wf.getnframes())
@@ -837,7 +882,10 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
             emotion=getattr(result, "emotion", "") or "",
             event=getattr(result, "event", "") or "",
             include_emotion=include_emotion)
-        return result.text.strip(), tags
+        alignment = {'tokens': list(getattr(result, 'tokens', ()) or ()),
+                     'timestamps': list(getattr(result, 'timestamps', ()) or ()),
+                     'duration_s': n / SAMPLE_RATE}
+        return result.text.strip(), tags, alignment
 
 
 class SherpaOnnxNemoCtcAdapter(ASRAdapter):
@@ -883,6 +931,10 @@ class SherpaOnnxNemoCtcAdapter(ASRAdapter):
                  f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        return self.transcribe_aligned(wav_bytes, language)[0]
+
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict]:
         import io as _io, wave as _wave
         with _wave.open(_io.BytesIO(wav_bytes)) as wf:
             pcm = wf.readframes(wf.getnframes())
@@ -893,8 +945,11 @@ class SherpaOnnxNemoCtcAdapter(ASRAdapter):
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
         self._recognizer.decode_streams([stream])
-        text = stream.result.text
-        return text.strip()
+        result = stream.result
+        alignment = {'tokens': list(getattr(result, 'tokens', ()) or ()),
+                     'timestamps': list(getattr(result, 'timestamps', ()) or ()),
+                     'duration_s': n / SAMPLE_RATE}
+        return result.text.strip(), {}, alignment
 
 
 class SherpaOnnxXASRAdapter(ASRAdapter):
@@ -907,6 +962,11 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
+
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict]:
+        text, alignment = self._delegate.transcribe_aligned(wav_bytes, language)
+        return text, {}, alignment
 
 
 # ASR model registry.
@@ -1961,7 +2021,14 @@ class _ASRNode(Node):
                 # 放了 GIL，6 核跑 2+2 线程在 vop/OCR/TTS 都在的情况下仍有余量。
                 _identity = self._start_identify(utterance, pre_roll_bytes)
                 _t0 = time.time()
-                if self._emit_audio_tags:
+                alignment = None
+                aligned_transcribe = getattr(self._adapter, 'transcribe_aligned', None)
+                if self._direction_topic and callable(aligned_transcribe):
+                    text, _audio_tags, alignment = aligned_transcribe(
+                        wav, self._language, self._emit_emotion)
+                    if not self._emit_audio_tags:
+                        _audio_tags = {}
+                elif self._emit_audio_tags:
                     text, _audio_tags = self._adapter.transcribe_rich(
                         wav, self._language, self._emit_emotion)
                 else:
@@ -2012,7 +2079,7 @@ class _ASRNode(Node):
                     direction_fields = _wake_direction_fields(
                         text, text_char_ends, end_pos, len(keyword_ipa),
                         start_ts, pre_roll_bytes, windows,
-                        bool(self._direction_topic), trusted_audio)
+                        bool(self._direction_topic), trusted_audio, alignment)
                     # Extract text after keyword
                     remaining = _text_after_phoneme(text, text_char_ends, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")

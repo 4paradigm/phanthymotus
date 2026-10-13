@@ -7,6 +7,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
 
 def window(angle, start, end):
     return (angle, start, end)
@@ -24,14 +26,108 @@ def test_leading_wake_matches_voice_onset_after_preroll():
     }
 
 
-def test_filler_prefix_allowed_but_mid_sentence_not_matched():
-    candidate = [window(-45, 1700000000000000, 1700000000020000)]
-    assert asr._wake_direction_fields("嗯，小范小范", list(range(1, 8)), 5, 4,
-                                      1700000000.0, 0, candidate, True)[
-        "wake_direction_state"] == "valid"
-    assert asr._wake_direction_fields("先说别的，小范小范", list(range(1, 12)), 8, 4,
-                                      1700000000.0, 0, candidate, True) == {
-        "wake_direction_state": "unknown"}
+@pytest.mark.parametrize('prefix', ['嗯', '那个', '就是', '先说别的'])
+@pytest.mark.parametrize('candidates', [
+    [window(-45, 1700000000000000, 1700000000020000)],
+    [window(90, 1700000000800000, 1700000000820000)],
+    [window(-45, 1700000000000000, 1700000000020000),
+     window(90, 1700000000800000, 1700000000820000)],
+])
+def test_prefix_without_audio_alignment_never_supplies_wake_direction(prefix, candidates):
+    text = prefix + '，小范小范'
+    char_ends = list(range(1, len(prefix) + 1)) + list(range(len(prefix) + 2, len(text) + 1))
+    assert asr._wake_direction_fields(text, char_ends, len(char_ends), 4,
+                                      1700000000.0, 0, candidates, True) == {
+        'wake_direction_state': 'unknown'}
+
+
+@pytest.mark.parametrize('prefix', ['嗯', '那个', '先说别的'])
+def test_aligned_wake_uses_keyword_time_instead_of_prefix_time(prefix):
+    text = prefix + '，小范小范'
+    char_ends = list(range(1, len(prefix) + 1)) + list(range(len(prefix) + 2, len(text) + 1))
+    alignment = {'tokens': list(prefix + '小范小范'),
+                 'timestamps': [0.2] * len(prefix) + [1.0, 1.1, 1.2, 1.3],
+                 'duration_s': 2.0}
+    fields = asr._wake_direction_fields(text, char_ends, len(char_ends), 4,
+        1700000000.0, 16000,
+        [window(-45, 1700000000500000, 1700000000600000),
+         window(90, 1700000001000000, 1700000001100000)], True,
+        alignment=alignment)
+    assert fields['wake_direction_state'] == 'valid'
+    assert fields['wake_direction_deg'] == 90
+    assert fields['wake_direction_window_start_us'] == 1700000001000000
+
+
+@pytest.mark.parametrize('alignment', [
+    {'tokens': ['嗯', '小范'], 'timestamps': [0.2], 'duration_s': 2},
+    {'tokens': ['啊', '小范'], 'timestamps': [0.2, 1.0], 'duration_s': 2},
+    {'tokens': ['嗯小范'], 'timestamps': [0.2], 'duration_s': 2},
+    {'tokens': ['嗯', '小范'], 'timestamps': [0.2, float('nan')], 'duration_s': 2},
+    {'tokens': ['嗯', '小范'], 'timestamps': [0.2, 3.0], 'duration_s': 2},
+    {'tokens': ['嗯', '小范'], 'timestamps': [1.0, 0.2], 'duration_s': 2},
+])
+def test_unusable_alignment_does_not_guess_prefix_duration(alignment):
+    assert asr._wake_direction_fields('嗯，小范', [1, 3, 4], 3, 2,
+        1700000000.0, 0, [window(90, 1700000000000000, 1700000000020000)],
+        True, alignment=alignment) == {'wake_direction_state': 'unknown'}
+
+
+def test_english_token_boundaries_map_to_custom_wake_time():
+    alignment = {'tokens': ['▁well', '▁little', '▁fan'],
+                 'timestamps': [0.2, 0.8, 1.0], 'duration_s': 2.0}
+    assert asr._aligned_wake_offset('well, Little Fan', 4, alignment) == 0.8
+
+
+@pytest.mark.parametrize('prefix', ['嗯', '先说别的'])
+@pytest.mark.parametrize('emit_tags', [True, False])
+def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, prefix, emit_tags):
+    import json
+    import queue
+
+    text = prefix + '，小范小范你好'
+    result = SimpleNamespace(text=text, lang='<|zh|>',
+        tokens=list(prefix + '小范小范你好'),
+        timestamps=[0.5] * len(prefix) + [1.0, 1.1, 1.2, 1.3, 1.4, 1.5])
+    decoded = []
+    adapter = asr.SherpaOnnxSenseVoiceAdapter.__new__(asr.SherpaOnnxSenseVoiceAdapter)
+    adapter._recognizer = SimpleNamespace(
+        create_stream=lambda: SimpleNamespace(result=result, accept_waveform=lambda *args: None),
+        decode_streams=lambda streams: decoded.append(streams))
+    node = asr._ASRNode('/mic', adapter, 'zh-CN', direction_topic='/direction',
+        emit_audio_tags=emit_tags,
+        kws_cfg={'trigger_mode': 'asr_kws', 'asr_kws_keyword': '小范小范'})
+    node._direction_windows.extend([
+        window(-45, 1700000000500000, 1700000000600000),
+        window(90, 1700000001000000, 1700000001100000)])
+    node._stop_event = asr.threading.Event()
+    node._worker_ready = asr.threading.Event()
+    items = iter([(b'\0\0' * 32000, 1700000000.0, 1700000002.0, 16000, True)])
+
+    def get(timeout):
+        try:
+            return next(items)
+        except StopIteration:
+            node._stop_event.set()
+            raise queue.Empty
+
+    def phones(value, with_positions=False):
+        chars = [(char, i + 1) for i, char in enumerate(value) if char.isalnum()]
+        return ([char for char, _ in chars], [end for _, end in chars]) if with_positions else [char for char, _ in chars]
+
+    monkeypatch.setattr(asr, '_text_to_ipa', phones)
+    monkeypatch.setattr(asr.time, 'time', lambda: 1900000000.0)
+    node._utterance_queue = SimpleNamespace(get=get)
+    node._worker_inner()
+    payload = json.loads(node._pub.messages[0])
+    assert payload['text'] == '你好'
+    assert payload['wake_direction_state'] == 'valid'
+    assert payload['wake_direction_deg'] == 90
+    assert payload['wake_direction_window_start_us'] == 1700000001000000
+    assert payload['audio_start_ts'] == 1700000000.0
+    assert payload['asr_complete_ts'] == 1900000000.0
+    assert ('lang' in payload) is emit_tags
+    assert 'tokens' not in payload and 'timestamps' not in payload
+    assert len(decoded) == 1
 
 
 def test_circular_angles_and_conflicts():

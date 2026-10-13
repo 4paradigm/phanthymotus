@@ -50,6 +50,17 @@ microseconds. ASR reports an unknown wake direction when the audio stamp is
 missing or either capture window is untrusted. Confirm clock alignment on the
 robot before relying on direction results.
 
+SenseVoice, Parakeet and X-ASR retain the recognizer's token timestamps from
+the same decode. ASR maps the matched wake word's text boundary to a timed
+token and adds its offset to the utterance's capture start before selecting
+direction windows. This supports filler and other speech before a custom wake
+word. Token timing must be finite, ordered, inside the original audio, and
+consistent with the recognized text; a wake boundary inside an indivisible
+token is unavailable. If timing is unavailable, a wake word at the utterance
+start can use the VAD onset; a spoken prefix returns `unknown`. Recognition
+and wake triggering continue normally. Check token timing accuracy on the
+robot; the timestamps do not establish the physical alignment error by themselves.
+
 ### Common Pitfalls
 
 #### External USB mic (ALSA, 48 kHz native rate)
