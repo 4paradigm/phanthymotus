@@ -1034,29 +1034,76 @@ async def _do_start_project_impl():
     return True
 
 
-async def _stop_cards(cards) -> int:
-    """Send `stop` to each card's instance. Returns how many calls were made.
+# 每张卡片 `stop` 的死线。
+#
+# `start` 合法地可能要几分钟（下载权重、warmup），`stop` 不是：它是取消，正常是
+# 毫秒级。所以它必须有死线，而且要短 —— 真正要防的不是慢，是**无界**：
+# `mcp_call_tool` 的默认是不限时，于是一个 accept 了却不回应的 MCP 服务器（被同
+# 进程的线程把 GIL 饿死、容器正在重启）会让停止永远挂着。容器内实测：
+# `timeout=None` 对着一个只 accept 不回的端口 25 秒仍未返回；给 5 秒则 5.3 秒失败。
+STOP_CARD_TIMEOUT_S = 5.0
+
+
+async def _stop_cards(cards, progress: bool = False) -> list[dict]:
+    """Send `stop` to each card's instance. Returns one result per card.
 
     `stop` is idempotent — a plugin that is already idle returns
     `{"state": "idle"}` — so this is safe to call on cards that were never
     started.
-    """
-    from api.mcp_manage import mcp_call_tool, MCPCallRequest
 
-    stopped = 0
-    for card in cards:
-        mcp_id = card.get('mcpId', '')
+    **并行，而且每张卡片各自有死线。** 以前是串行 `await`，总耗时是各卡之和，
+    而其中任何一张卡片不回应就卡住后面所有卡片 —— 一台设备坏了，于是别的设备都
+    停不下来，这是最不该有的耦合方向。现在总耗时是 max() 而不是 sum()，坏掉的那
+    张卡片只花掉它自己的 5 秒。
+
+    `progress=True` 时每张卡片有结果就推一条 `project_stop_item`，给界面逐项显示
+    用。removed-card 清理走的是同一个函数但不该推 —— 那不是操作者按下的「停止」。
+    """
+    import asyncio as _aio
+
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.motus_stream import push_event
+
+    targets = [c for c in (cards or [])
+               if c.get('mcpId') and c.get('toolName')]
+    if not targets:
+        return []
+
+    async def stop_one(card: dict) -> dict:
         tool_name = card.get('toolName', '')
-        card_id = card.get('id', '')
-        if not mcp_id or not tool_name:
-            continue
+        entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                 'card_id': card.get('id', ''), 'ok': False, 'error': ''}
         try:
-            req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
-            await mcp_call_tool(mcp_id, req)
-            stopped += 1
-        except Exception:
-            pass
-    return stopped
+            req = MCPCallRequest(tool=tool_name,
+                                 arguments={'action': 'stop',
+                                            'instance_id': card.get('id', '')})
+            # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
+            # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
+            # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
+            await _aio.wait_for(
+                mcp_call_tool(card.get('mcpId', ''), req,
+                              timeout_s=STOP_CARD_TIMEOUT_S),
+                STOP_CARD_TIMEOUT_S)
+            entry['ok'] = True
+        except _aio.TimeoutError:
+            # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
+            # 下来的卡片意味着那台设备可能还在跑。
+            entry['error'] = f'无响应（{STOP_CARD_TIMEOUT_S:g}s 死线）'
+        except Exception as error:  # noqa: BLE001
+            entry['error'] = str(error) or type(error).__name__
+        if progress:
+            try:
+                await push_event({'type': 'project_stop_item', 'payload': {
+                    'tool': entry['tool'], 'mcp_id': entry['mcp_id'],
+                    'card_id': entry['card_id'],
+                    'status': 'stopped' if entry['ok'] else 'error',
+                    'message': entry['error'],
+                }})
+            except Exception as error:  # noqa: BLE001 - 显示失败不影响停止
+                print(f'[stop-project] push item failed: {error}')
+        return entry
+
+    return list(await _aio.gather(*(stop_one(c) for c in targets)))
 
 
 async def stop_removed_cards(old_cards, new_cards) -> int:
@@ -1079,24 +1126,78 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
     removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
     if not removed:
         return 0
-    count = await _stop_cards(removed)
-    print(f'[layout] stopped {count} instance(s) for removed card(s): '
-          f'{", ".join(c.get("id", "") for c in removed)}')
+    results = await _stop_cards(removed)
+    count = sum(1 for r in results if r.get('ok'))
+    print(f'[layout] stopped {count}/{len(results)} instance(s) for removed '
+          f'card(s): {", ".join(c.get("id", "") for c in removed)}')
     return count
 
 
-async def _do_stop_project():
-    """停止所有 canvas cards。"""
-    from api.motus_stream import push_event
+# 正在进行中的设备收尾。再点一次停止不会并发出第二轮 —— 停止是幂等的，但两轮
+# 并行会让界面上的逐项进度互相覆盖。
+_stop_teardown_task = None
 
-    layout = config.main.get('canvas_layout', {})
-    await _stop_cards(layout.get('cards', []))
+
+def teardown_running() -> bool:
+    """设备收尾还在跑吗（给 `/stop-project` 和测试用）。"""
+    task = _stop_teardown_task
+    return task is not None and not task.done()
+
+
+async def _do_stop_project():
+    """停止智能控制。**两段，保证不同。**
+
+    第 1 段 —— 关掉 agent loop。本地一个赋值，≤1ms，不可能失败。
+    第 2 段 —— 设备收尾：逐卡 `stop`，并行、每卡 5s 死线，可能部分失败。
+
+    **顺序以前是反的,而那是个安全问题,不只是体验问题。** 原来先逐卡 stop、最后才
+    把 `project_running` 翻成 False。于是只要有一张卡片的 MCP 不回应（它本来没有
+    死线，见 `_stop_cards`），在那段挂住的时间里 **agent loop 还活着** —— 还会调
+    TTS、还会驱动执行器。操作者按下「停止」要的恰恰是这件事立刻停下来，而界面在
+    那整段时间里没有任何变化,所以他只会再点一次。
+
+    现在第 1 段先做完并立刻广播,界面可以诚实地说「已停止」;第 2 段的结果单独报,
+    因为「agent 不再行动」和「每台设备都已停下」是两件不同的事,合成一个状态必然
+    有一件是假的。
+    """
+    await _do_stop_project_agent()
+    return await _do_stop_project_teardown()
+
+
+async def _do_stop_project_agent() -> None:
+    """第 1 段：关掉 agent loop。一个本地赋值加一次广播,不可能失败。"""
+    from api.motus_stream import push_event
 
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
     await push_event({'type': 'project_state', 'payload': {'running': False}})
-    print('[stop-project] done')
+    print('[stop-project] agent loop stopped')
+
+
+async def _do_stop_project_teardown() -> list[dict]:
+    """第 2 段：设备收尾。并行、每卡死线、逐项报进度、允许部分失败。"""
+    from api.motus_stream import push_event
+
+    layout = config.main.get('canvas_layout', {})
+    cards = [c for c in (layout.get('cards', []) or [])
+             if c.get('mcpId') and c.get('toolName')]
+    await push_event({'type': 'project_stop_begin', 'payload': {
+        'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', ''),
+                   'card_id': c.get('id', '')} for c in cards],
+    }})
+    results = await _stop_cards(cards, progress=True)
+    failed = [r for r in results if not r.get('ok')]
+    await push_event({'type': 'project_stop_done', 'payload': {
+        'stopped': len(results) - len(failed),
+        'total': len(results),
+        'failed': [{'tool': r['tool'], 'card_id': r['card_id'],
+                    'message': r['error']} for r in failed],
+    }})
+    print(f'[stop-project] teardown done: {len(results) - len(failed)}/'
+          f'{len(results)} stopped'
+          + (f', failed: {", ".join(r["tool"] for r in failed)}' if failed else ''))
+    return results
 
 
 @router.post('/start-project')
@@ -1118,11 +1219,37 @@ async def api_start_project():
 
 @router.post('/stop-project')
 async def api_stop_project():
+    """停 agent loop,然后在后台收尾设备。
+
+    **这个请求只等第 1 段。** 第 2 段（逐卡 stop）丢进 background task,进度走
+    `project_stop_item` / `project_stop_done`。这样做是因为前端要靠这个响应翻按
+    钮状态:让它等完收尾,就等于让「已停止」这件已经为真的事,被一台坏掉的设备拖
+    着不敢显示 —— 那正是原来点下去什么也不发生的原因。
+    """
+    import asyncio as _aio
+
+    global _stop_teardown_task
+
     # **先取消在飞的那次启动，再停卡片。** 顺序是有意的：反过来的话被停掉的卡片
     # 会被那次仍在继续的启动重新拉起来，而操作者看到的是"停了又自己起来了"。
     cancelled = _cancel_start_project()
-    await _do_stop_project()
-    return {'ok': True, 'cancelled_start': cancelled}
+
+    if teardown_running():
+        # 已经在收尾了。不开第二轮：停止本身是幂等的,但两轮并行会让界面上的逐项
+        # 进度互相覆盖。agent loop 此时已经是停的,所以照常回 ok。
+        return {'ok': True, 'cancelled_start': cancelled,
+                'teardown_running': True}
+
+    await _do_stop_project_agent()
+
+    async def _teardown():
+        try:
+            await _do_stop_project_teardown()
+        except Exception as error:  # noqa: BLE001
+            print(f'[stop-project] teardown failed: {error}')
+
+    _stop_teardown_task = _aio.ensure_future(_teardown())
+    return {'ok': True, 'cancelled_start': cancelled, 'teardown_running': True}
 
 
 

@@ -140,6 +140,10 @@ DEFAULT_MAX_IMAGE_SIDE = 2048
 DEFAULT_MAX_IMAGE_PIXELS = 60_000_000
 
 EMBEDDING_DIM = 512
+# The identity store lives beside the models, under the one host-mounted writable
+# path this container has. It sits here rather than in plugins/identity_db.py
+# because that module is modality-agnostic — voiceprints get their own directory.
+DEFAULT_DB_DIR = "/models/face_db"
 _REC_INPUT_SIZE = 112
 
 # SCRFD wire format for a 3-level, 2-anchor, keypoint-carrying model. Upstream
@@ -625,6 +629,7 @@ __all__ = [
     "DEFAULT_MIN_FACE_PX",
     "DEFAULT_NMS_THRESH",
     "DET_MODEL_FILE",
+    "DEFAULT_DB_DIR",
     "EMBEDDING_DIM",
     "REC_MODEL_FILE",
     "DetectedFace",
