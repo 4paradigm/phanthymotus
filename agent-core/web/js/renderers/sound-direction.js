@@ -14,10 +14,18 @@ export const SoundDirectionRenderer = {
   },
   onData(buffer) {
     try {
-      this._el.textContent = formatSoundDirection(JSON.parse(new TextDecoder().decode(buffer)));
+      const message = JSON.parse(new TextDecoder().decode(buffer));
+      this._el.textContent = formatSoundDirection(message);
+      if (this._clearTimer) clearTimeout(this._clearTimer);
+      this._clearTimer = message?.state === 1 ? setTimeout(() => {
+        if (this._el) this._el.textContent = '暂无声源';
+        this._clearTimer = null;
+      }, 2000) : null;
     } catch { /* Ignore malformed frames. */ }
   },
   unmount() {
+    if (this._clearTimer) clearTimeout(this._clearTimer);
+    this._clearTimer = null;
     this._el?.remove();
     this._el = null;
   },
