@@ -50,6 +50,37 @@ role, and sets `degraded` when no speech source was identified. That matters:
 with no speech source every input is background, so the robot's own voice would
 be ducked by its own music, and nothing else would say why.
 
+## The speech jitter buffer
+
+Before starting an utterance the mixer accumulates `speech_prefill_ms`
+(default 200 ms).
+
+This is not tuning — it fixes a bug observed on a rig: **with music playing,
+speech breaks up.** The cause is neither decoding nor gain, it is *what drives
+the output cadence*. With a background source present the mixer publishes on
+every frame, so each late speech frame becomes a 100 ms silent hole in the
+output. Without background the same lateness produces no hole: that tick has
+nothing from either source, so nothing is published and the cadence follows
+speech naturally. Which is why the bug appears **only** when both play at once,
+and why testing each alone showed nothing. Reproduced with one late frame:
+
+```
+with music:    [3000, 3000, 0, 3000, 3000, 3000]   ← hole
+without music: [3000, 3000, 3000, 3000, 3000]      ← none
+```
+
+Speech arrival is inherently jittery (ROS callbacks plus synthesis pacing), so
+this is not a rare race.
+
+200 ms and not more because `tts.py` already bursts 5 frames before pacing, so
+the buffer fills almost immediately and the first syllable is not delayed —
+and that delay is paid directly in barge-in responsiveness. An EOF releases
+immediately, so a short utterance is never held back by the prefill.
+
+The music is already ducked while the buffer fills: `_speech_open` is one of the
+duck triggers, so by the time speech is emitted the music has long since moved
+out of the way.
+
 ## Two tiers, not a priority matrix
 
 One speaker carries one foreground voice over one background bed. A general
