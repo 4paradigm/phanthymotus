@@ -1708,8 +1708,18 @@ class Event:
 
     # ── 打断：中止正在进行的输出 ─────────────────────────────────────────────
 
-    async def _interrupt_active_outputs(self, reason: str = ''):
-        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled / 新用户 turn 时调用。
+    async def _interrupt_active_outputs(self, reason: str = '',
+                                        scope: frozenset | None = None):
+        """中止正在进行的输出（TTS + 动作）。在 TurnCancelled / 新用户 turn 时调用。
+
+        `scope` 是这次打断**有权**碰的物理通道，None = 全部（急停、TurnCancelled）。
+        通道名不写在这里 —— 由 `hooks.notify_resources(hook_id)` 从绑定自己申报的
+        `x-resource` 推出来，和 `on_notify` 的判断同一条规则（「不能按工具名猜，机器人
+        的嘴叫 tts / speaker / audio_play 各有各的叫法」）。
+
+        加 scope 的原因：这个函数原先无条件 `for aid in _pending_actions` 全标 cancelled。
+        一旦有「长时间后台播放」这种动作（音乐），「别说了」就会把它的 pending 一起标
+        掉 —— 播放器还在放，而 agent-core 认为通道空了，之后没有任何东西知道它还在响。
 
         **hook 与硬编码兜底都跑，不是二选一。** 这两条路覆盖的是**不相交**的两组
         卡片：hook 覆盖「自己声明了 `on_interrupt_all` 绑定」的卡，兜底覆盖「叫
@@ -1736,8 +1746,15 @@ class Event:
         import hooks
         from peer import mcp_bridge
 
+        # on_interrupt_all **和** on_interrupt_speak 都发。后者被 tts / 模拟器 / 天轶
+        # 的卡申报了很久，而 agent-core 生产代码里一次都没有 fire 过它 —— 只有测试手动
+        # 发过。一个只绑了 on_interrupt_speak 的卡（比如混音卡的 flush_speech）在今天
+        # 的代码里永远收不到打断。
+        _hook_ids = ('on_interrupt_all', 'on_interrupt_speak')
         try:
-            hook_results = await hooks.fire('on_interrupt_all')
+            hook_results = []
+            for _hid in _hook_ids:
+                hook_results += await hooks.fire(_hid) or []
         except Exception as exc:
             # 打断路径是最不该抛异常的地方：它跑在 TurnCancelled 处理里，抛出去就
             # 连兜底一起丢了 —— 而兜底恰恰是这时候唯一还能停住机器人的东西。
@@ -1781,7 +1798,12 @@ class Event:
             if mcp_bridge.is_peer_mcp(mcp_id):
                 continue
             tools = info.get('tools', [])
-            for short_name, action in (('tts', 'interrupt'), ('loco', 'stop_move')):
+            # 兜底也受 scope 约束：一次「别说了」不该顺手停掉底盘。叫 phanthy_music
+            # 的卡**故意**不列在这里 —— 停歌只走 on_interrupt_music。
+            _fallback = (('tts', 'interrupt'), ('loco', 'stop_move'))
+            if scope is not None:
+                _fallback = tuple(p for p in _fallback if p[0] == 'tts')
+            for short_name, action in _fallback:
                 if short_name in tools and (mcp_id, short_name) not in covered:
                     tasks.append((f'{mcp_id}:{short_name}',
                                   mcp_client.call_tool_direct(mcp_id, short_name,
@@ -1804,7 +1826,7 @@ class Event:
         # bound, so a robot with no binding kept its pending ACP actions blocked —
         # the barrier never released — and the silence countdown kept running
         # through a barge-in.
-        for aid in list(mcp_client._pending_actions.keys()):
+        for aid in mcp_client.cancellable_by(scope):
             if reason:
                 mcp_client._pending_results[aid] = {'status': 'cancelled', 'reason': reason}
             mcp_client._pending_actions[aid].set()
@@ -2239,12 +2261,18 @@ class Event:
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
         # 自己触发的 turn（subagent 完成 / ACP 回调 / 定时器）不打断：那会掐掉
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
-        if (mcp_client.get_pending_actions() and not bot_restricted
+        # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
+        # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
+        if (mcp_client.has_blocking_pendings() and not bot_restricted
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
             # hook 被触发两遍；而有绑定时兜底被整个跳过。两个问题同源：把 hook 和
             # 兜底当成了二选一，它们覆盖的其实是不相交的两组卡片。
+            # scope 故意留 None（打断一切，含底盘）。把它收窄成「只停嘴」很诱人 ——
+            # 新消息通常只是想让机器人别说了 —— 但这个函数的兜底是本机**唯一**会停
+            # 底盘的路径（见它的 docstring），收窄就等于用户开口不再能叫停正在走的
+            # 机器人。音乐不需要靠收窄来保护：cancellable_by 本身就放过后台动作。
             await self._interrupt_active_outputs(
                 reason='auto-interrupted by new user message')
 
@@ -2634,7 +2662,14 @@ class Event:
                             _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
                             _act = _split.get('action', args.get('action', ''))
                             if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
-                                for aid in list(mcp_client._pending_actions.keys()):
+                                # 取消范围从「这个工具挂在哪个 interrupt hook 下」推出来：
+                                # on_interrupt_all 是整体打断（None = 全部），其余按那个
+                                # hook 的绑定申报的通道。于是 tts.interrupt 碰不到音乐的
+                                # pending，phanthy_music.stop_music 也碰不到嘴的。
+                                _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
+                                _scope = (None if _hook_id == 'on_interrupt_all'
+                                          else _hooks.notify_resources(_hook_id))
+                                for aid in mcp_client.cancellable_by(_scope):
                                     mcp_client._pending_results[aid] = {
                                         "status": "cancelled",
                                         "reason": "interrupted by user instruction",
@@ -2642,10 +2677,11 @@ class Event:
                                     mcp_client._pending_actions[aid].set()
                                 _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
                                 # Fire hook to notify ALL registered parties (e.g. perception TTS)
-                                _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
                                 if _hook_id:
                                     asyncio.create_task(_hooks.fire(_hook_id, exclude_mcp_id=_mcp_id))
-                                print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
+                                print(f'[acp] interrupt: cancelled pending + fired {_hook_id} '
+                                      f'(source: {_tool}.{_act}, scope='
+                                      f'{",".join(sorted(_scope)) if _scope else "all"})')
                 else:
                     result = f'未知工具: {name}'
 

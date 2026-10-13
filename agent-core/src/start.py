@@ -685,17 +685,22 @@ async def acp_complete(request: fastapi.Request):
     import benchmark_facts
     benchmark_facts.note_acp_post(body)
 
+    # **必须在 mark_action_complete 之前问**：一个并发的 barrier 随时可能把这一项
+    # 回收掉，回收之后 _pending_silent 里就查不到了，于是一句「播完了」的回执会被
+    # 当成新消息唤醒一个 turn。
+    silent = mcp_client.completion_is_silent(action_id)
+
     # 通道1: 解锁 sync() 等待
     mcp_client.mark_action_complete(action_id, body)
 
     # 通道2: 进 event_bus → steering 注入 LLM
     import event_bus
+    _event = {'type': 'action_complete', 'action_id': action_id,
+              'status': status, 'result': result, 'silent': silent}
     await event_bus.enqueue(
         source=f'acp:{action_id}',
-        text=json.dumps({'type': 'action_complete', 'action_id': action_id,
-                         'status': status, 'result': result}, ensure_ascii=False),
-        payload={'type': 'action_complete', 'action_id': action_id,
-                 'status': status, 'result': result},
+        text=json.dumps(_event, ensure_ascii=False),
+        payload=dict(_event),
     )
 
     return {'ok': True, 'action_id': action_id}

@@ -14,6 +14,21 @@ file_intake:
   retention_days: 7
 
 plugins:
+  # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
+  phanthy_music:
+    # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作
+    # （set_volume / set_autoplay）不是配置。duck_gain 在 audio_mixer 那边。
+    enabled: true
+
+  audio_mixer:
+    enabled: true
+    # auto = 问本进程里的 TTS 插件它在发哪个话题。接到本卡的其余输入都算背景音乐。
+    speech_topics: auto
+    duck_gain: 0.15
+    duck_ramp_ms: 200
+    duck_hold_ms: 300
+    background_gain: 100
+
   asr:
     enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
