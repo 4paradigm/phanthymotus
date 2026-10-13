@@ -193,7 +193,11 @@ class CardTests(unittest.TestCase):
 class MCPTests(unittest.TestCase):
     def test_real_http_tools_list_dispatch_and_log_redaction(self):
         import main
-        bundle = main.PerceptionBundle({'plugins': {'phanthy_music': {'enabled': True, 'catalogue_type': 'mock'}}}, _FakeExecutor())
+        # echo_cancellation is default-on, so it has to be switched off
+        # explicitly for the bundle to hold just this card — the tool list
+        # below is asserted exactly.
+        bundle = main.PerceptionBundle({'plugins': {'phanthy_music': {'enabled': True, 'catalogue_type': 'mock'},
+                                                   'echo_cancellation': {'enabled': False}}}, _FakeExecutor())
         captured = io.StringIO()
         handler = logging.StreamHandler(captured)
         main.log.addHandler(handler)
@@ -221,5 +225,10 @@ class MCPTests(unittest.TestCase):
                 self.assertNotIn('fake-private-value', captured.getvalue())
         finally:
             server.shutdown(); server.server_close(); worker.join(2)
-            bundle._plugins[0].stop()
+            # Selected by type, not by position: the bundle also loads any
+            # other default-on plugin (e.g. echo_cancellation), so an index
+            # here would clean up the wrong one.
+            for plugin in bundle._plugins:
+                if isinstance(plugin, PhanthyMusicPlugin):
+                    plugin.stop()
             main.log.removeHandler(handler); main.log.setLevel(old_level)
