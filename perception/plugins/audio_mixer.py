@@ -83,8 +83,9 @@ TOOLS = [{
                 # oneOf is rebuilt per get_tools() from the live TTS topics,
                 # exactly like echo_cancellation.robot_voice_topic.
                 'oneOf': [{'const': SPEECH_AUTO, 'title': '自动 — 跟随本机 TTS 卡'}],
-                'description': '说话永远听得见、不被压低；其余输入算背景音乐。'
-                               '只有 TTS 在别的容器里才需要在这里写死话题名。'},
+                'description': '从接进本卡的话题里选哪些算「说话」：说话永远听得见、'
+                               '不被压低，其余输入算背景音乐。auto = 跟随本机 TTS 卡。'
+                               '下拉项在卡片启动、连线解析之后才会列全。'},
             'duck_gain': {'type': 'number', 'minimum': 0, 'maximum': 1, 'default': 0.15,
                           'title': '说话时音乐压到', 'description': '0 = 全静音，1 = 不压低'},
             'duck_ramp_ms': {'type': 'integer', 'minimum': 20, 'maximum': 1000,
@@ -196,19 +197,34 @@ class AudioMixerPlugin:
         return {t for t in bound_topics if t in set(self._tts_topics())}, SPEECH_AUTO
 
     def get_tools(self):
+        """The dropdown lists the topics actually wired into this card.
+
+        It used to list what the local TTS plugin publishes, which was a guess
+        at *who the speech source is*. But the thing this card has to assign a
+        role to is its **inputs** — and a TTS in another container, a driver's
+        own voice card, or a second audio source never appears in that guess.
+        The inputs are known exactly, from the connections the canvas resolved,
+        so that is what the operator should be choosing among.
+        """
         from copy import deepcopy
         tools = deepcopy(TOOLS)
         options = tools[0]['configSchema']['properties']['speech_topics']['oneOf']
         known = {SPEECH_AUTO}
-        for topic in self._tts_topics():
+        with self._lock:
+            node = self._node
+        speech = self._resolve_speech(node.topics)[0] if node else set()
+        for topic in (node.topics if node else []):
             if topic not in known:
-                options.append({'const': topic, 'title': topic})
+                # Say which one `auto` already picked, so choosing explicitly is
+                # a confirmation rather than a guess.
+                suffix = ' — auto 认为这是说话' if topic in speech else ''
+                options.append({'const': topic, 'title': f'{topic}{suffix}'})
                 known.add(topic)
         configured = str(self._cfg.get('speech_topics') or '').strip()
         if configured and configured not in known:
             # A topic set in config.yaml stays selectable even when its publisher
             # is down; otherwise the form silently resets it to `auto`.
-            options.append({'const': configured, 'title': f'{configured} (configured)'})
+            options.append({'const': configured, 'title': f'{configured}（已配置，当前未接入）'})
         return tools
 
     # ── lifecycle ────────────────────────────────────────────────────────────

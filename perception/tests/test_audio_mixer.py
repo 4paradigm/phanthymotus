@@ -297,6 +297,29 @@ class MixerCardTests(unittest.TestCase):
                                  '/perception/music/audio': 'background'})
         self.assertNotIn('degraded', info)
 
+    def test_the_dropdown_lists_the_topics_actually_wired_in(self):
+        """选「哪些算说话」应该在**接进来的话题**之间选。
+
+        原先列的是本进程 TTS 卡在发什么 —— 那是在猜谁是语音源，而别的容器里的
+        TTS、驱动自带的语音卡、第二个音源，都不在那份猜测里。输入是确切已知的。
+        """
+        plugin = self._plugin(speech_topics='/speech/tts')
+        plugin.dispatch('audio_mixer', {
+            'action': 'start',
+            'input_topics': ['/speech/tts', '/perception/music/audio']})
+        self.addCleanup(plugin.stop)
+        options = (plugin.get_tools()[0]['configSchema']['properties']
+                   ['speech_topics']['oneOf'])
+        consts = [o['const'] for o in options]
+        self.assertEqual(set(consts),
+                         {'auto', '/speech/tts', '/perception/music/audio'})
+
+    def test_before_wiring_there_is_nothing_to_choose_among(self):
+        """没接线就没有候选，只有 auto —— 这是诚实的，不该凭空列出猜来的话题。"""
+        options = (self._plugin().get_tools()[0]['configSchema']['properties']
+                   ['speech_topics']['oneOf'])
+        self.assertEqual([o['const'] for o in options], ['auto'])
+
     def test_no_identifiable_speech_source_is_reported_as_degraded(self):
         """Otherwise every input is background and the robot's own voice gets
         ducked by its own music, with nothing saying why.

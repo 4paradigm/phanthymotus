@@ -35,7 +35,7 @@ Roles therefore come from config, not from which wire went where.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `speech_topics` | `auto` | Which inputs count as speech. `auto` asks the in-process TTS plugin what it publishes. Everything else connected is background. |
+| `speech_topics` | `auto` | Which **of this card's inputs** count as speech. `auto` resolves by asking the in-process TTS plugin what it publishes. Everything else connected is background. |
 | `duck_gain` | `0.15` | What the background drops to while speech is present. 0 = silent, 1 = no ducking. |
 | `duck_ramp_ms` | `200` | Ramp length. Too short is audible as a click. |
 | `duck_hold_ms` | `300` | How long the duck is held after speech ends, so sentence gaps do not pump. |
@@ -44,6 +44,13 @@ Roles therefore come from config, not from which wire went where.
 `speech_topics` is the only setting most deployments touch, and `auto` is right
 in every in-tree configuration. Set it explicitly only when TTS runs in another
 container, where this process cannot ask it anything.
+
+The dropdown lists the topics **actually wired into this card**, so the choice is
+made among real inputs. It used to list whatever the local TTS plugin published,
+which was a guess at who the speech source is — and a TTS in another container, a
+driver's own voice card, or a second audio source never appeared in that guess.
+Because the list comes from resolved connections, it is only complete once the
+card has started.
 
 **Check `info()` after wiring.** It reports every bound topic with its resolved
 role, and sets `degraded` when no speech source was identified. That matters:
