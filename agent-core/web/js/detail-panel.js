@@ -103,7 +103,7 @@ export function showTopicDetail(topicPath, format) {
   _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
-  _renderer.mount(body, 'detail');
+  _renderer.mount(body, 'detail', { topicPath });
 
   _frames = 0;
   _status = document.createElement('div');

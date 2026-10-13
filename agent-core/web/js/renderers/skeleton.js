@@ -5,6 +5,8 @@
  */
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { createJointAngleView } from './joint-angles.js';
+import { resolveSkeletonMcp } from './skeleton-model.js';
 
 // Motor index → URDF joint name mapping (G1 43 DOF: 29 body + 14 hand)
 const MOTOR_INDEX_MAP = [
@@ -49,27 +51,40 @@ export const SkeletonRenderer = {
   _pelvisGroup: null, // IMU orientation applied here
   _loaded: false,
   _mcpId: null,
+  _viewport: null,
+  _angles: null,
+  _modelNotice: null,
+  _modelSession: null,
 
-  mount(container, mcpId) {
+  mount(container, mcpId, { topicPath } = {}) {
     this._mcpId = mcpId;
     this._joints = {};
     this._links = {};
     this._loaded = false;
     this._el = document.createElement('div');
     this._el.className = 'renderer-skeleton';
+    this._el.style.cssText = 'display:flex;flex-direction:column;';
     container.appendChild(this._el);
+    this._modelSession = {};
+    this._modelNotice = document.createElement('div');
+    this._modelNotice.style.cssText = 'display:none;padding:4px 8px;color:#ffbd75;background:#202020;font-size:12px;';
+    this._el.appendChild(this._modelNotice);
+    this._viewport = document.createElement('div');
+    this._viewport.style.cssText = 'flex:1 1 auto;min-height:100px;overflow:hidden;';
+    this._el.appendChild(this._viewport);
+    this._angles = createJointAngleView(this._el);
 
     this._initThree();
-    this._loadModel(mcpId);
+    this._loadModel(mcpId, topicPath);
     this._animate();
 
     this._ro = new ResizeObserver(() => this._resize());
-    this._ro.observe(this._el);
+    this._ro.observe(this._viewport);
   },
 
   _initThree() {
-    const w = this._el.clientWidth || 400;
-    const h = this._el.clientHeight || 400;
+    const w = this._viewport.clientWidth || 400;
+    const h = this._viewport.clientHeight || 400;
 
     this._scene = new THREE.Scene();
     this._scene.background = new THREE.Color(0x1c1c1e);
@@ -81,7 +96,7 @@ export const SkeletonRenderer = {
     this._threeRenderer = new THREE.WebGLRenderer({ antialias: true });
     this._threeRenderer.setSize(w, h);
     this._threeRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this._el.appendChild(this._threeRenderer.domElement);
+    this._viewport.appendChild(this._threeRenderer.domElement);
 
     this._controls = new OrbitControls(this._camera, this._threeRenderer.domElement);
     this._controls.target.set(0, 0.4, 0);
@@ -101,32 +116,41 @@ export const SkeletonRenderer = {
     this._scene.add(grid);
   },
 
-  async _loadModel(mcpId) {
-    if (!mcpId || mcpId === 'dashboard') {
-      this._buildFallbackSkeleton();
-      return;
-    }
+  async _loadModel(mcpId, topicPath) {
+    const session = this._modelSession;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
     try {
+      mcpId = await resolveSkeletonMcp(mcpId, topicPath, fetch, { signal: controller.signal });
+      if (this._modelSession !== session) return;
+      if (!mcpId) throw new Error('No skeleton model service');
       const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tool: 'model', arguments: {} }),
+        signal: controller.signal,
       });
       const json = await res.json();
+      if (this._modelSession !== session) return;
       // API returns { code, data } where data is the content array
       const content = json.data?.[0]?.text ?? json.result?.content?.[0]?.text;
-      if (!content) { this._buildFallbackSkeleton(); return; }
+      if (!res.ok || !content) throw new Error('Skeleton model response is missing');
       const data = JSON.parse(content);
       if (data.urdf) {
         this._parseAndBuild(data.urdf);
       } else if (data.type === 'quadruped') {
         this._buildQuadrupedSkeleton(data);
       } else {
-        this._buildFallbackSkeleton();
+        throw new Error('Skeleton model response has no URDF');
       }
     } catch (e) {
+      if (this._modelSession !== session) return;
       console.warn('[skeleton] Failed to load URDF model:', e);
+      this._modelNotice.textContent = '模型未加载，当前显示默认骨架';
+      this._modelNotice.style.display = 'block';
       this._buildFallbackSkeleton();
+    } finally {
+      clearTimeout(timer);
     }
   },
 
@@ -500,13 +524,16 @@ export const SkeletonRenderer = {
   },
 
   onData(buffer, fmt) {
-    if (!this._loaded) return;
     try {
       const text = new TextDecoder().decode(buffer);
       const data = JSON.parse(text);
+      this._angles?.update(data);
+      if (!this._loaded || data.status?.available === false) return;
 
       // Apply pelvis orientation from IMU quaternion
-      if (data.imu_quat && this._pelvisGroup) {
+      if (Array.isArray(data.imu_quat) && data.imu_quat.length === 4
+          && data.imu_quat.every(value => typeof value === 'number' && Number.isFinite(value))
+          && this._pelvisGroup) {
         const [w, x, y, z] = data.imu_quat;
         this._pelvisGroup.quaternion.set(x, y, z, w);
       }
@@ -522,6 +549,7 @@ export const SkeletonRenderer = {
         if (!obj) continue;
 
         const angle = j.q;
+        if (typeof angle !== 'number' || !Number.isFinite(angle)) continue;
         const axis = obj.userData.axis;
         if (!axis) continue;
 
@@ -542,8 +570,8 @@ export const SkeletonRenderer = {
 
   _resize() {
     if (!this._el || !this._threeRenderer) return;
-    const w = this._el.clientWidth;
-    const h = this._el.clientHeight;
+    const w = this._viewport.clientWidth;
+    const h = this._viewport.clientHeight;
     if (w === 0 || h === 0) return;
     this._camera.aspect = w / h;
     this._camera.updateProjectionMatrix();
@@ -551,6 +579,8 @@ export const SkeletonRenderer = {
   },
 
   unmount() {
+    this._modelSession = null;
+    this._angles?.dispose();
     if (this._raf) cancelAnimationFrame(this._raf);
     this._ro?.disconnect();
     this._controls?.dispose();
@@ -575,6 +605,9 @@ export const SkeletonRenderer = {
     this._joints = {};
     this._links = {};
     this._el = null;
+    this._viewport = null;
+    this._angles = null;
+    this._modelNotice = null;
     this._raf = null;
     this._ro = null;
     this._loaded = false;

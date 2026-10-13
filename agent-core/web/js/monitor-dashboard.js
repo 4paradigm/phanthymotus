@@ -357,7 +357,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const body = el.querySelector('.monitor-card-body');
   const renderer = _createRenderer(format, defaultMode);
-  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard', { topicPath });
 
   const ws = _connectWs(topicPath, format, renderer);
   const card = { el, renderer, ws, format, mode: defaultMode, col, row, colSpan, rowSpan };
@@ -470,7 +470,7 @@ function _refreshRenderer(topicPath) {
   card.renderer?.unmount?.();
   body.innerHTML = '';
   const renderer = _createRenderer(card.format, card.mode);
-  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard', { topicPath });
   card.renderer = renderer;
   // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
   // not resolved yet, and a mode switch on such a card must not throw.
