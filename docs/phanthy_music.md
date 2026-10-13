@@ -1,145 +1,136 @@
 # phanthy_music card
 
-One independent Perception card provides catalogue search and background music
-playback. Agent Core, ASR, deployment manifests and drivers require no changes.
-The remote catalogue implements [motus.music/1](music-catalog.md); the card does
-not generate songs, run another model or maintain a local music library.
+A music player, written for the two callers it has: a person speaking, and the
+LLM relaying them. It is an **actuator** that emits music PCM on its own topic
+and nothing else — mixing and "duck the music while the robot talks" belong to
+[`audio_mixer`](audio-mixer.md).
+
+```
+phanthy_music ──► audio_mixer ──► Speaker
+TTS           ──►
+```
+
+An earlier version of this card *was* the mixer: it took TTS in on its own
+input, ducked the song under it and published the combined stream. If you have
+a canvas wired `TTS → phanthy_music → Speaker`, `start` will refuse with
+`legacy_wiring` and name the fix. That refusal is deliberate — silently ignoring
+the input would leave a **mute robot reporting 已就绪**, because TTS would be
+publishing into nothing.
+
+## Source visibility of the catalogue connection
+
+**The catalogue address and API key are fixed in this card's source.** Anyone who
+can read the repository or pull the image can read them. Hiding them from the
+card's UI is not secrecy. Rotating the key means editing the card and
+redeploying. They are deliberately absent from `configSchema`, from
+`get_tools()` and from every reply, and `config` refuses any attempt to override
+them — but that is about not *leaking them further*, not about keeping them.
 
 ## Card configuration
 
-Add **phanthy_music** to the canvas. The catalogue endpoint and API key are fixed
-inside `perception/plugins/phanthy_music.py`; users do not enter them. The sidebar
-contains only these optional settings:
+| Key | Default | Meaning |
+|---|---|---|
+| `catalogue_type` | `motus_music` | `mock` is offline metadata only (no audio); `none` disables lookups. |
+| `timeout_ms` | `3000` | Whole-request budget, including the capability query and the one retry. |
+| `volume` | `50` | Music volume. Never affects speech. |
+| `continuous` | `true` | Station mode: when a track drains, automatically play the next one matching the same criteria. |
 
-| Field | Meaning |
-|---|---|
-| `catalogue_type` | `motus_music` (default), `none`, or metadata-only `mock` |
-| `timeout_ms` | Catalogue request budget including capabilities/retries; default 3000 |
-| `volume` | Music volume 0–100; default 50 |
-| `duck_gain` | Music's relative level during TTS; default 0.15 |
-
-There are no music credential environment variables, external credential files
-or deployment changes. `config` rejects endpoint/key overrides; startup plugin
-settings cannot replace the fixed values either. Changing provider/timeout
-replaces the provider/cache and cancels pending playback lookups. `none` reports
-`not_configured`; `mock` has 24 fictional metadata records and no playable audio.
-
-The endpoint/key are absent from both configSchema and model parameters.
-Status/config replies never return them, and music MCP logs omit payloads.
-The HTTPS provider sends the key only in its Authorization header and rejects
-redirects. Fresh card configurations and Solutions have no credential fields.
-
-**Source visibility:** the fixed endpoint and real API key are committed in the
-card source and included in builds. Hiding the UI fields does not keep these
-values secret from repository readers or image recipients. Changing/revoking
-the integration key requires a card update and redeployment; no encryption or
-secret-management system is introduced.
-
-If an earlier unmerged prototype saved endpoint/key fields, clear its old card
-configuration before sharing a Solution. Removing schema fields does not erase
-existing database entries or old exported Solutions.
+`duck_gain` moved to `audio_mixer`, where the ducking happens.
 
 ## Actions
 
-| Model action | Behaviour |
-|---|---|
-| `search(...)` | Find songs and return metadata; no playback |
-| `play_by_id(track_id)` | Fetch current details/URL and play the selected song |
-| `play_by_genre(genre, ...)` | Search with `top_k=1`, then play the returned song |
-| `pause` / `resume` | Pause/resume music; TTS continues |
-| `interrupt` | Cancel pending playback lookup and stop the current song |
-| `set_volume(volume)` | Set music volume; does not change speech volume |
-| `status` | Return playback state, position, attribution and error |
+| Action | Takes | Does |
+|---|---|---|
+| `list_genres` | — | The catalogue's own genre / language / vocal / tag vocabularies. **Call this before guessing a code.** Says whether the values came from the catalogue or from the built-in fallback. |
+| `play` | `genre`, `query`, `language`, `vocal`, `tags`, `artist`, `duration_min_s`, `duration_max_s`, `track_id` | Picks one track and starts playing. No criteria at all is valid — "放点歌" means anything. Returns as soon as fetching starts, not when the song ends. |
+| `next` | — | Next track. Takes no arguments: it reuses the last `play`'s criteria and excludes what already played. |
+| `previous` | — | Back one track, from the beginning. Costs one catalogue call, because signed audio URLs expire. |
+| `pause` / `resume` | — | Pause keeps the decoded buffer, so resuming continues rather than skipping. |
+| `stop_music` | — | Stops the music. Does not affect speech. |
+| `now_playing` | — | Title, artist, genre, position, remaining, volume, station criteria. Call this before telling a user what is on. |
+| `set_volume` | `volume` | 0–100. Music only. |
+| `search` | filters + `top_k` | Answers "is there any…" without playing. Works with the card idle. |
 
-`search` accepts query, genre, language, vocal, tags, artist, top_k, exclude_ids,
-duration_min_s and duration_max_s. Array-like filters are comma-separated strings.
-`play_by_genre` requires genre and accepts the same optional filters except top_k.
-It uses the service's first result and returns the selected `track`, `relaxed`
-and matching information. If the service relaxes a requested condition, the
-caller must say so; it must not claim an exact match. Empty/error results do not
-start playback or interrupt an existing song. No global last-user search is stored.
+`start`, `stop`, `info` and `config` are dispatchable but are **not** in the
+declared action enum, so the model never sees them. `present_to_llm` only
+filters those four for `processor` cards, and this is an `actuator` — leaving
+them visible would offer the model a `stop` that tears the ROS node down, right
+next to the `stop_music` it means. That confusion was measured on a rig with
+`tts(action="stop")`.
 
-Example card calls (fictional ID):
+Old spellings still dispatch, undeclared: `interrupt` → `stop_music`, `status` →
+`now_playing`, `play_by_id` / `play_by_genre` → `play`.
 
-```json
-{"action":"search","query":"下雨天 慵懒","vocal":"female"}
-{"action":"play_by_id","track_id":"fictional-track-id"}
-{"action":"play_by_genre","genre":"pop","language":"zh","exclude_ids":"fictional-track-id"}
-{"action":"interrupt"}
-```
+### Unknown filter values are not errors
 
-The existing `x-action-params` mechanism exposes names such as
-`mcp__<perception-id>__phanthy_music__play_by_genre`; MCP still calls the single
-`phanthy_music` tool with `arguments.action`. Lifecycle (`start`, `stop`, `info`,
-`config`) and internal hooks are handled by the card but omitted from that action
-map. Existing Agent Core permissions and subagent policy apply without exceptions.
+If `genre` carries a value the catalogue does not list, it is moved into `query`
+as free text and reported back in `genre_as_query`. So "city pop" returns music
+rather than `invalid_filter`. The catalogue protocol's strict validation is
+unchanged; the demotion happens in the card, above it.
 
-## Canvas and audio
+Every `search` / `play` reply also carries `available_genres`, so a caller that
+used a wrong code can see the right ones without a second call.
 
-The bundle advertises the card when `plugins.phanthy_music.enabled` is true
-(the shipped default). Connect decision_core's execution output to this card.
-Search works while the audio node is idle. To play, start the canvas project.
-Starting opens the PCM path without playing anything automatically.
+## Errors
 
-For conversation during playback, connect **TTS → phanthy_music → Speaker**, with
-one Speaker input. All audio is mono S16LE at 16 kHz (`audio/pcm-16k`); the existing
-output topic is `/perception/music/audio`. Leave the card's input empty for
-music-only playback. One music card is supported; feedback or multiple speech
-inputs are rejected. Existing AudioChunk/Speaker drivers need no new API.
+`error` is always either absent or a dict with a `code`, plus a `hint` where
+there is something actionable to do. Common codes: `not_found` (loosen the
+filters), `not_playable` (metadata only, pick another), `busy` (a catalogue call
+is already in flight — retry), `invalid_filter` (call `list_genres`),
+`legacy_wiring` (insert `audio_mixer`), `not_configured`.
 
-TTS PCM automatically reduces the music level and restores it when speech ends.
-Speech retains its original level, mixed samples saturate safely, and gain
-changes ramp. Existing speech-interrupt hooks discard speech without stopping
-music. User microphone/VAD end detection is not added by this card; ASR is
-unchanged. Say “停歌” using `interrupt`; canvas `stop` closes the entire PCM path.
+## Playback completion
 
-Playback returns a background `playback_id`, with buffering/playing/paused/
-completed/cancelled/error states. It does not hold the mouth resource or wait
-for the whole song before allowing further conversation. Position and completion
-refer to this card's emitted PCM, not confirmed hardware output. Driver buffers,
-stop latency, AEC and microphone self-triggering require robot testing.
+`play` returns an `action_id` and, when the catalogue reports a duration, an
+`expected_duration_s`. The session is declared `background`, so nothing waits on
+it: a four-minute track does not block `finish`, nor the agent's next tool call.
+Its completion is declared `silent_completion`, so the end of a song is a
+receipt rather than a message that wakes a turn.
+
+`next` and `previous` continue the *same* session and do not open a second one.
+
+Completion means the **source** drained; a speaker's own buffer may still hold
+audio. `now_playing` says so in `completion_scope`.
+
+## Interrupts
+
+Only `on_interrupt_music` is bound, to `stop_music`. `on_interrupt_all` is
+deliberately **not** bound: it fires on every new user turn, and barge-in must
+stop the robot talking, not the music. The cost, stated plainly: an emergency
+stop does not silence the song. Music is not an actuation hazard, so that is the
+intended trade — use `stop_music`.
+
+## Deliberately not supported
+
+- **Seek / scrub.** The decoder is a one-shot forward HTTPS → ffmpeg pipe, and a
+  seek needs a fresh signed URL that may already have expired. Nobody scrubs by
+  voice.
+- **Playlists, collections, favourites.** `motus.music/1` has no playlist
+  concept, and `usage.scope: personal_playback` forbids persisting audio.
+- **An explicit queue.** The station plus `next` covers the intent with no
+  state for the caller to hold or re-describe.
+- **`repeat` / `shuffle` as actions.** The station already picks fresh,
+  de-duplicated tracks. Single-track repeat would replay one signed URL until it
+  expires mid-loop.
+- **Time-aligned lyrics.** The protocol carries `lyrics_excerpt` only, no
+  timings.
 
 ## Limits and failures
 
-Catalogue I/O runs outside the player/lifecycle lock. Only one catalogue request
-per card is admitted; concurrent calls receive `busy`. Stop, interrupt, replacement
-play and catalogue reconfiguration invalidate pending playback, so a late response
-cannot restart a cancelled song. Lookup errors preserve current playback.
+50 MiB or 30 minutes per track; a 2 s decoded buffer; HTTPS only, public
+addresses only, redirects refused. One catalogue request at a time — a second
+returns `busy` rather than queueing, so `now_playing` and `stop_music` stay
+responsive while a lookup is slow. No subscriber on the output topic for 5 s, or
+a stalled stream for 15 s, is reported as an error rather than hung on.
 
-Track details supply format, expiry and usage. Expired URLs are rejected; retry
-`play_by_id` to get fresh details. `personal_playback` audio travels through HTTPS
-and ffmpeg pipes to bounded memory and PCM output. No audio files, persistent
-caches or chat attachments are created. ffmpeg is already in the Perception image.
-
-Audio URLs/redirects require verified HTTPS and public IPs, with DNS addresses
-validated and pinned. Audio downloads carry no catalogue credential and bypass
-environment proxies. When all system DNS answers are proxy fake-IP addresses
-(`198.18.0.0/15`), bounded Cloudflare/Google HTTPS DNS lookup can resolve a public
-IPv4 address. Only the hostname is sent, never signed paths or keys. Private,
-literal fake-IP and mixed public/private answers are refused.
-
-Limits include 50 MiB / 30 minutes of audio, a two-second decoded queue and a
-20-second speech queue. Cancellation stops ffmpeg; an outstanding socket operation
-may finish at its timeout. Missing subscribers and stalled streams become visible
-errors. A subscriber or successful local PCM write is not robot acceptance.
+Audio is used for the current playback only: never written to disk, never
+uploaded as a chat attachment.
 
 ## Verification
 
 ```bash
 cd perception
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_music.py tests/test_music_catalog.py tests/test_phanthy_music.py tests/test_bundle_dispatch.py -q
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest \
+  tests/test_music.py tests/test_music_catalog.py tests/test_phanthy_music.py \
+  tests/test_audio_mixer.py tests/test_bundle_dispatch.py -q
 ```
-
-Offline unittest cases use ROS stubs and fictional metadata. They cover search,
-ID/genre playback, empty/error/relaxed responses, cancellation during lookups,
-fixed credential selection, rejected overrides, log redaction, PCM mixing and
-transport validation. Credential assertions use fictional constants, and offline
-tests perform no remote requests.
-Generated WAV/MP3 checks use real ffmpeg and explicitly skip if it is absent.
-For deployment acceptance, use the card's built-in service connection and test
-both playback actions, pause/resume, TTS priority and interruption. Robot audible
-output, ASR and driver behaviour must be verified separately.
-
-Earlier unmerged `music` / `phanthy-music` prototypes should be replaced with
-`phanthy_music`, rewired and configured in the sidebar. No published-card or
-production database migration is included.

@@ -96,3 +96,20 @@ For deployment acceptance, exercise real capabilities, filtered search, next
 song, condition relaxation and `play_by_id(track_id)` through the registered card;
 then check actual PCM output and interruption. Do not count mock success as
 remote compatibility or local audio output as robot acceptance.
+
+## Filter vocabularies reach the card
+
+`GET /v1/capabilities` carries `filters.genre`, `filters.language` and
+`filters.vocal` as `{value,label}` lists, cached for 24 h (60 s on a transient
+failure, with the built-in fallback). `MusicService.vocabulary()` surfaces them
+for the card's `list_genres`, and `execute()` adds `available_genres` beside the
+`available_tags` it already returned.
+
+This used to be fetched, validated, cached — and never surfaced. A model could
+only learn a valid genre code by sending a wrong one and reading `allowed` off
+the `invalid_filter` error. `vocabulary()` adds no network path: it reuses the
+same `_prepare` and the same cache.
+
+`source` is `catalogue` or `fallback`. It matters: after a transient failure the
+values are the built-in list for 60 s, and a caller treating those as
+authoritative would confidently offer codes this provider may not have.
