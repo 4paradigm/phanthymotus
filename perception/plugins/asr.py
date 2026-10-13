@@ -1474,11 +1474,14 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # Collect completed VAD segments.
         # The VAD only reports a segment after min_silence_duration of
         # trailing silence has elapsed, and that silence is not part of
-        # seg.samples — so the current chunk timestamp sits one silence
-        # window past the real end of speech. Rewind it, the same way
+        # seg.samples. A trusted capture stamp marks the first sample;
+        # advance to the chunk end before rewinding the trailing silence.
+        # Arrival-time fallback and legacy queue items retain their old anchor.
+        # Rewind it, the same way
         # PcmHistory.pre_roll() rewinds by silence_samples to locate the
         # segment start in the sample domain.
-        seg_end_ts = ts - silence_samples / SAMPLE_RATE
+        chunk_end_ts = ts + n / SAMPLE_RATE if len(audio_item) > 2 and capture_trusted else ts
+        seg_end_ts = chunk_end_ts - silence_samples / SAMPLE_RATE
         while not vad.empty():
             seg = vad.front
             seg_pcm = _struct.pack(f'<{len(seg.samples)}h',

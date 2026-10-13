@@ -264,6 +264,56 @@ def test_timestamp_trust_covers_each_vad_segment_including_early_speech(monkeypa
     assert [item[4] for item in results if isinstance(item[0], bytes)] == [False, True, False]
 
 
+@pytest.mark.parametrize('capture_trusted', [True, False, None])
+def test_vad_first_sample_stamps_align_utterance_and_wake_direction(monkeypatch, capture_trusted):
+    base = 1700000000.0
+    stop = SimpleNamespace(done=False)
+    stop.is_set = lambda: stop.done
+    frames = iter(range(24))
+
+    def get(timeout):
+        try:
+            i = next(frames)
+        except StopIteration:
+            stop.done = True
+            raise
+        item = (b'\0\0' * 512, base + i * 512 / asr.SAMPLE_RATE)
+        return item if capture_trusted is None else (*item, capture_trusted)
+
+    class Vad:
+        frame = 0
+        popped = False
+        front = SimpleNamespace(start=0, samples=[0] * (20 * 512))
+        def accept_waveform(self, samples): self.frame += 1
+        def is_speech_detected(self): return self.frame <= 20
+        def empty(self): return self.frame != 24 or self.popped
+        def pop(self): self.popped = True
+
+    sherpa = types.ModuleType('sherpa_onnx')
+    sherpa.SileroVadModelConfig = lambda **kwargs: None
+    sherpa.VadModelConfig = lambda **kwargs: None
+    sherpa.VoiceActivityDetector = lambda *args, **kwargs: Vad()
+    monkeypatch.setitem(sys.modules, 'sherpa_onnx', sherpa)
+    monkeypatch.setattr('utils.model_downloader.ensure_model', lambda *args: None)
+    results = []
+    asr._vad_worker(SimpleNamespace(get=get), SimpleNamespace(put=results.append),
+                    stop, 'sherpa_onnx', 0.5, 128, pre_roll_ms=0)
+    utterance = next(item for item in results if isinstance(item[0], bytes))
+    expected_start = base if capture_trusted is True else base - 0.032
+    assert utterance[1] == pytest.approx(expected_start, abs=1e-6, rel=0)
+    assert utterance[2] == pytest.approx(expected_start + 0.640, abs=1e-6, rel=0)
+    if capture_trusted is True:
+        fields = asr._wake_direction_fields('嗯，小范', [1, 3, 4], 3, 2,
+            utterance[1], utterance[3],
+            [window(-45, 1700000000160000, 1700000000190000),
+             window(90, 1700000000200000, 1700000000240000)], True,
+            trusted_audio=utterance[4],
+            alignment={'tokens': ['嗯', '小', '范'],
+                       'timestamps': [0.05, 0.2, 0.25], 'duration_s': 0.64})
+        assert fields['wake_direction_deg'] == 90
+        assert fields['wake_direction_window_start_us'] == 1700000000200000
+
+
 def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):
     monkeypatch.setattr(asr, '_build_asr_adapter', lambda cfg: object())
 
