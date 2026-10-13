@@ -2668,7 +2668,19 @@ class DeployController:
 
             node_id = machine.node_id
 
-            # Resolve core client
+            # Select case for this component before network access
+            runner = self._get_case_runner()
+            try:
+                case_id = runner.select_case(target, variant, node_id)
+            except Exception as e:
+                logger.warning("case select %s: %s", cid, e)
+                results[cid] = "fail"
+                continue
+            if case_id is None:
+                results[cid] = "n/a"
+                continue
+
+            # Resolve core client (only for components with cases)
             try:
                 core = await self._core_for_node(node_id)
             except Exception as e:
@@ -2687,13 +2699,6 @@ class DeployController:
                     cid,
                 )
                 results[cid] = "fail"
-                continue
-
-            # Select case for this component
-            runner = self._get_case_runner()
-            case_id = runner.select_case(target, variant, node_id)
-            if case_id is None:
-                results[cid] = "n/a"
                 continue
 
             # Run case with actual binding
