@@ -33,7 +33,10 @@ class MixerTests(unittest.TestCase):
     def setUp(self):
         self.output = []
         self.clock = FakeClock()
-        self.mixer = Mixer(self.output.append, clock=self.clock)
+        # prefill 关掉：这一组用例测的是**每帧的混音数学**（原音量语音、渐变、裁剪、
+        # EOF 边界），每次只喂一帧就 tick —— 而抖动缓冲按设计就会把单独一帧先攒着。
+        # 默认 prefill 的行为由下面三个专门的用例覆盖，它们各自建自己的 Mixer。
+        self.mixer = Mixer(self.output.append, clock=self.clock, speech_prefill_ms=0)
 
     def tearDown(self):
         self.mixer.close()
@@ -120,6 +123,63 @@ class MixerTests(unittest.TestCase):
         self.mixer.feed(AUDIO_EOF, speech=True)
         self.step(speech=pcm(5000))
         self.assertGreater(mean(self.output[-1]), 100)
+
+    def test_speech_does_not_break_up_when_music_is_playing(self):
+        """实测到的 bug：一边放音乐一边说话，说话断断续续。
+
+        根因不是解码也不是音量，是**输出节奏由谁驱动**。背景一在，
+        `if speech or background` 就每帧必发，于是语音每一次晚到都被固化成输出流
+        里一个 100ms 的静音洞。没有背景时同样的晚到不会有洞 —— 那一拍两个源都空，
+        什么都不发，节奏自然跟着语音走。所以这个 bug 只在两者同时存在时出现，
+        这个用例也必须同时断言这两种情形。
+        """
+        gaps = {}
+        for label, with_music in (('music', True), ('silence', False)):
+            out = []
+            clock = FakeClock()
+            mixer = Mixer(out.append, clock=clock, duck_gain=1.0, background_gain=0)
+            self.addCleanup(mixer.close)
+            for i in range(8):
+                if i != 4:                      # 第 5 帧晚到一拍
+                    mixer.feed(pcm(3000), speech=True)
+                if with_music:
+                    mixer.feed(pcm(0), speech=False)
+                mixer.tick()
+                clock.now += 0.1
+            levels = [mean(f) for f in out if f != AUDIO_EOF]
+            # 开头的攒包不算断：那是延迟，不是中断。只看语音开始之后。
+            started = next((i for i, v in enumerate(levels) if v > 0), len(levels))
+            gaps[label] = [v for v in levels[started:]].count(0)
+        self.assertEqual(gaps['music'], 0,
+                         '音乐在播时语音被切出了洞 —— 正是这个 bug')
+        self.assertEqual(gaps['silence'], 0)
+
+    def test_the_prefill_does_not_delay_a_real_utterance(self):
+        """tts.py 先突发 5 帧再按节奏发，所以余量几乎立刻攒满。
+
+        抖动缓冲换来的延迟直接影响打断响应，所以它必须便宜。
+        """
+        out = []
+        clock = FakeClock()
+        mixer = Mixer(out.append, clock=clock, duck_gain=1.0, background_gain=0)
+        self.addCleanup(mixer.close)
+        for _ in range(5):                      # PREBUF_FRAMES
+            mixer.feed(pcm(3000), speech=True)
+        mixer.feed(pcm(0), speech=False)
+        mixer.tick()
+        self.assertGreater(mean(out[0]), 0, '第一帧就该有语音')
+
+    def test_an_utterance_shorter_than_the_prefill_still_plays(self):
+        """EOF 到了就说明这段话只有这么多，再等也不会更多。"""
+        out = []
+        clock = FakeClock()
+        mixer = Mixer(out.append, clock=clock, duck_gain=1.0, background_gain=0)
+        self.addCleanup(mixer.close)
+        mixer.feed(pcm(3000), speech=True)
+        mixer.feed(AUDIO_EOF, speech=True)
+        mixer.feed(pcm(0), speech=False)
+        mixer.tick()
+        self.assertGreater(mean(out[-1]), 0)
 
     def test_flush_speech_does_not_cancel_the_background(self):
         for _ in range(8):

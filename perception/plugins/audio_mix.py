@@ -33,6 +33,16 @@ BYTES_PER_SECOND = 32000
 # into an OOM.
 MAX_VOICE_BYTES = 20 * BYTES_PER_SECOND
 NO_READER_GRACE_S = 5.0
+# 语音的抖动缓冲：开始播一段话之前，先攒够这么多。
+#
+# 没有这个的话，只要背景在响，混音器就每帧必发（`if speech or background`），于是
+# 语音每一次晚到都被固化成输出流里一个 100ms 的静音洞 —— 听感就是说话断断续续。
+# 而**没有**背景时同样的晚到不会有洞：那一拍两个源都空，什么都不发，节奏自然跟着
+# 语音走。所以这个 bug 只在"一边放音乐一边说话"时出现。
+#
+# 200ms 而不是更多：tts.py 本来就先突发 5 帧再按节奏发，所以这点余量几乎立刻就
+# 攒满，不会给首字增加可感知的延迟 —— 而延迟直接影响打断响应。
+SPEECH_PREFILL_MS = 200
 # A lost end-of-speech must not leave the background permanently inaudible.
 DUCK_FAILSAFE_S = 60.0
 
@@ -85,6 +95,7 @@ class Mixer:
 
     def __init__(self, publish, *, duck_gain=0.15, duck_ramp_ms=200,
                  duck_hold_ms=300, background_gain=100,
+                 speech_prefill_ms=SPEECH_PREFILL_MS,
                  has_reader=lambda: True, clock=time.monotonic):
         self._publish, self._has_reader, self._clock = publish, has_reader, clock
         self._lock = threading.RLock()
@@ -95,9 +106,14 @@ class Mixer:
         self.duck_ramp_ms = bounded_number(duck_ramp_ms, 20, 1000, 'duck_ramp_ms')
         self.duck_hold_ms = bounded_number(duck_hold_ms, 0, 5000, 'duck_hold_ms')
         self.background_gain = bounded_number(background_gain, 0, 100, 'background_gain')
+        self.speech_prefill_ms = bounded_number(speech_prefill_ms, 0, 2000,
+                                                'speech_prefill_ms')
 
         self._speech = bytearray()
         self._speech_open = False
+        # 这一段话是否已经开始输出。一旦开始就一直放到说完，中途的欠载由上面攒的
+        # 余量吸收，而不是变成一个洞。
+        self._speech_playing = False
         self._speech_last = 0.0
         self._discard_speech = False
         self._background = bytearray()
@@ -121,6 +137,7 @@ class Mixer:
             self._speech.clear()
             self._background.clear()
             self._speech_open = self._background_open = False
+            self._speech_playing = False
 
     def close(self):
         self.request_stop()
@@ -175,7 +192,7 @@ class Mixer:
         with self._lock:
             self._discard_speech = self._speech_open
             self._speech.clear()
-            self._speech_open = False
+            self._speech_open = self._speech_playing = False
             return self.status()
 
     def duck(self, active: bool):
@@ -189,10 +206,22 @@ class Mixer:
         with self._lock:
             for name, (low, high) in (('duck_gain', (0, 1)), ('duck_ramp_ms', (20, 1000)),
                                       ('duck_hold_ms', (0, 5000)),
+                                      ('speech_prefill_ms', (0, 2000)),
                                       ('background_gain', (0, 100))):
                 if kw.get(name) is not None:
                     setattr(self, name, bounded_number(kw[name], low, high, name))
             return self.status()
+
+    def _speech_ready(self) -> bool:
+        """这一段话可以开始往外送了吗。调用方持有 `_lock`。"""
+        if self._speech_playing:
+            return True
+        if not self._speech:
+            return False
+        # EOF 已经到了：这段话就这么多，再等也不会更多。短句不能被 prefill 卡住。
+        if not self._speech_open:
+            return True
+        return len(self._speech) >= (self.speech_prefill_ms / 1000 * BYTES_PER_SECOND)
 
     # ── output ───────────────────────────────────────────────────────────────
     def ducked(self) -> bool:
@@ -205,6 +234,7 @@ class Mixer:
             return {'speech_buffered_ms': len(self._speech) / BYTES_PER_SECOND * 1000,
                     'background_buffered_ms': len(self._background) / BYTES_PER_SECOND * 1000,
                     'speaking': bool(self._speech or self._speech_open),
+                    'speech_prefill_ms': self.speech_prefill_ms,
                     'ducked': self.ducked(),
                     'background_gain_now': round(self._gain, 4),
                     'duck_gain': self.duck_gain, 'duck_ramp_ms': self.duck_ramp_ms,
@@ -233,8 +263,16 @@ class Mixer:
                 return
             self._wait_started = now
 
-            speech = bytes(self._speech[:FRAME_BYTES])
-            del self._speech[:len(speech)]
+            if self._speech_ready():
+                speech = bytes(self._speech[:FRAME_BYTES])
+                del self._speech[:len(speech)]
+                self._speech_playing = True
+            else:
+                # 还在攒。背景照常走，语音这一帧先不动 —— 攒的过程中已经在 duck 了
+                # （`_speech_open` 就是 duck 的触发条件之一），所以音乐早就让开了。
+                speech = b''
+            if self._speech_playing and not self._speech and not self._speech_open:
+                self._speech_playing = False      # 这段话说完了
             background = bytes(self._background[:FRAME_BYTES])
             del self._background[:len(background)]
 
