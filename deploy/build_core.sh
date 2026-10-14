@@ -45,7 +45,7 @@ fi
 select_mirror
 
 do_build "${REPO_ROOT}/agent-core/Dockerfile" \
-         "${REPO_ROOT}/agent-core" \
+         "${REPO_ROOT}" \
          "${FULL_IMAGE}" \
          "IMAGE_TAG=${TAG}"
 
