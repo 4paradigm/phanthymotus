@@ -551,7 +551,12 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
                            pre_roll_bytes: int, windows: list,
                            has_input: bool, trusted_audio: bool = True,
                            alignment: dict | None = None) -> dict:
-    """Match a timed wake word to direction windows on the capture clock."""
+    """Match a timed wake word to direction windows on the capture clock.
+
+    `wake_direction_deg` uses the robot frame: front 0, left positive
+    (counter-clockwise, REP-103) — the same sign as the locomotion `vyaw`
+    command, so the angle can be passed to a turn without negation.
+    """
     state = {"wake_direction_state": "unknown" if has_input else "no_input"}
     if not has_input or not trusted_audio:
         return state
