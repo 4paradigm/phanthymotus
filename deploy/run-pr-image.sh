@@ -32,7 +32,9 @@
 # For a lasting deployment, use the web console instead. This script is the
 # quick "does it work" path.
 #
-# Requires: docker with the compose plugin. Nothing else — no python, no yq.
+# Requires: docker with the compose plugin. PiPER dual-arm setup also uses python3.
+# PiPER: first run confirms left/right CAN, then replaces the two idle single-arm
+# containers. Bindings and recovery files persist in /opt/phanthy-motus/data/piper.
 set -euo pipefail
 
 PR_IMAGE_DIR="${PR_IMAGE_DIR:-/tmp/pr-image}"
@@ -248,6 +250,15 @@ cmd_up() {
     mv -f "$fragment" "${dir}/service.yml"
 
     local project; project="$(project_name "$service")"
+    if [ "$service" = "agilex-piper" ]; then
+        command -v python3 >/dev/null 2>&1 || die "PiPER dual-arm setup requires python3."
+        python3 "$(dirname "${BASH_SOURCE[0]}")/piper_dual_deploy.py" \
+            "$image" "${dir}/service.yml" "$project"
+        info "Running. Container: embodied-agilex-piper"
+        info "Inspect with: $0 --status"
+        return
+    fi
+
     generate_compose "${dir}/service.yml" "$image" "$service" \
                      "$(compose_file "$service")" "$project" "$(state_file "$service")"
     info "Generated $(compose_file "$service") (service: $service, project: $project)"

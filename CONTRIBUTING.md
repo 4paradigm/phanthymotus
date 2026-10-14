@@ -47,6 +47,27 @@ cp .env.example .env  # Configure registry settings
 ./build_actucore.sh
 ```
 
+### Test a PiPER dual-arm image
+
+From the current main repository, run `./deploy/run-pr-image.sh <PiPER-image>`.
+Use a new PiPER image containing `config.dual.example.yaml`; old release tags are not overwritten.
+The first run lists CAN interfaces, asks for left/right bindings and confirms replacement of
+`embodied-agilex-piper` and `embodied-agilex-piper-2`. Python 3 is required on the Linux host;
+`sudo` may request a password to read Core authentication and write the existing data directory.
+The script checks the stopped Canvas project and idle Drivers before changing containers.
+
+Bindings persist in `/opt/phanthy-motus/data/piper/config.dual.yaml`; later runs reuse them,
+including without a terminal. Missing interfaces or unknown/busy status abort the switch.
+The second single-arm container stays stopped with restart disabled. Do not start it from the
+old Compose while the dual-arm driver owns both CAN interfaces. Other services are unchanged.
+The new container starts with motion and camera disabled; MCP and Core must expose
+`piper_teleop` and `piper_motion` before deployment succeeds. Calibration and physical acceptance
+remain separate. Ordinary platform deployments retain the single-arm default.
+
+Backups and failure diagnostics are private files under the data directory's `deploy-backups/`.
+On failure, the script does not restart old controllers. Inspect `previous.json` and the saved
+Compose files before an operator restores service. `--down` does not restore the retired single-arm instance.
+
 ## Project Structure
 
 ```
