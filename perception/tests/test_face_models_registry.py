@@ -126,6 +126,19 @@ def test_an_unknown_model_names_the_ones_that_exist():
 # both — 0.35 lets four of the latter's impostor pairs through.
 
 
+def test_the_shipped_defaults_are_the_edgeface_pair_at_0_55():
+    """The configured product default, pinned so a drift is visible in review."""
+    assert DEFAULT_FACE_MODEL == "scrfd25g_edgeface_s"
+    assert DEFAULT_MATCH_THRESHOLD == 0.55
+    import yaml
+    with open(PERCEPTION_ROOT / "config.yaml") as handle:
+        face = yaml.safe_load(handle)["plugins"]["face_recognition"]
+    # config.yaml and the registry must agree, or the card's default and the
+    # file's default disagree depending on which one a robot was built from
+    assert face["model"] == DEFAULT_FACE_MODEL
+    assert face["match_threshold"] == DEFAULT_MATCH_THRESHOLD
+
+
 def test_the_two_shipped_models_disagree_about_the_threshold():
     """Pins the measurement, not just the mechanism.
 
@@ -190,21 +203,33 @@ def test_the_card_offers_every_model_and_states_each_threshold():
 # with the model, and the refusal is a backstop again.
 
 
-def test_the_default_model_keeps_the_deployed_roster_path():
-    """Non-negotiable: every deployed robot's roster is at exactly this path.
+def test_buffalo_sc_owns_the_deployed_roster_path_whatever_the_default_is():
+    """Non-negotiable, and NOT keyed on being the default — it no longer is.
 
-    Giving buffalo_sc a suffixed directory would hand all of them an empty one.
+    Every robot deployed before the default moved has its roster at exactly
+    `/models/face_db`. The first cut of face_db_dir_for keyed the pin on
+    DEFAULT_FACE_MODEL, so flipping the default would have handed the new default a
+    store written by buffalo_sc — the `state: error` this function exists to
+    prevent — and orphaned the real roster behind `face_db-buffalo_sc`.
     """
-    assert face_db_dir_for(DEFAULT_FACE_MODEL, DEFAULT_DB_DIR) == DEFAULT_DB_DIR
     assert DEFAULT_DB_DIR == "/models/face_db"
+    assert face_db_dir_for("buffalo_sc", DEFAULT_DB_DIR) == DEFAULT_DB_DIR
+    assert FACE_MODELS["buffalo_sc"]["db_dir"] == DEFAULT_DB_DIR
+    # specifically: the pin must survive buffalo_sc not being the default
+    assert DEFAULT_FACE_MODEL != "buffalo_sc"
 
 
-@pytest.mark.parametrize("model", [m for m in MODEL_NAMES if m != DEFAULT_FACE_MODEL])
-def test_every_other_model_gets_its_own_roster(model):
+@pytest.mark.parametrize("model", [m for m in MODEL_NAMES if m != "buffalo_sc"])
+def test_every_model_without_a_pin_gets_its_own_roster(model):
     resolved = face_db_dir_for(model, DEFAULT_DB_DIR)
     assert resolved != DEFAULT_DB_DIR
     assert resolved.startswith("/models/")
     assert model in resolved
+
+
+def test_the_shipped_default_does_not_claim_the_old_roster():
+    """The upgrade must land on a fresh store, not read buffalo_sc's embeddings."""
+    assert face_db_dir_for(DEFAULT_FACE_MODEL, DEFAULT_DB_DIR) != DEFAULT_DB_DIR
 
 
 def test_no_two_models_share_a_roster():

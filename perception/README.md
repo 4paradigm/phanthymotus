@@ -2256,17 +2256,19 @@ enrols new people from a photo, the live stream, or a batch package.
 ### Models
 
 Two detector+recogniser pairs, selected by `model` on the card (registry:
-`plugins/face_runtime.FACE_MODELS`). **`buffalo_sc` is the default.**
+`plugins/face_runtime.FACE_MODELS`). **`scrfd25g_edgeface_s` is the default**, at
+`match_threshold` 0.55 — see the table below for why that number and not 0.35.
 
-`buffalo_sc` — InsightFace's smallest pack that still ships landmarks (alignment
-needs them):
+`buffalo_sc` — the previous default. InsightFace's smallest pack that still ships
+landmarks (alignment needs them):
 
 | File | Size | Role |
 |------|------|------|
 | `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
 | `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
 
-`scrfd25g_edgeface_s` — a bigger detector and a stronger recogniser, same contract:
+`scrfd25g_edgeface_s` — the default. A bigger detector and a stronger recogniser,
+same contract:
 
 | File | Size | Role |
 |------|------|------|
@@ -2306,17 +2308,67 @@ samples are never re-embedded.
 That refusal is right, but with one shared default it fired on the act of *selecting*
 a second model — the card went to `state: error` and the only way out was inventing a
 `db_dir` by hand. So `db_dir` is resolved per model (`face_db_dir_for`):
-`buffalo_sc` keeps **`/models/face_db`** — unchanged, because that is where every
-deployed robot's roster already is — and any other model gets
+`buffalo_sc` **pins `/models/face_db`** and any model without a pin gets
 `/models/face_db-<model>`. An explicit `db_dir` different from the default pins it
 and disables the suffix. The refusal stays as a backstop against pointing a model at
 a foreign store.
+
+The pin lives on buffalo_sc's row and **not** on "whichever model is the default",
+which matters now that the default has moved: keying it on `DEFAULT_FACE_MODEL`
+would hand the new default a store written by buffalo_sc — recreating the very
+`state: error` above — and orphan the real roster behind a `face_db-buffalo_sc` path
+nothing looks at. `tests/test_face_models_registry.py` pins exactly that.
+
+> **Upgrading an existing robot changes what it recognises.** The default moved to
+> `scrfd25g_edgeface_s`, and the roster moves with it, so a robot that had people
+> enrolled comes up with an **empty** roster and recognises nobody until they are
+> re-enrolled. Nothing is destroyed — selecting `buffalo_sc` on the card brings the
+> old roster back intact — but the upgrade itself is silent apart from
+> `database.persons` dropping to 0. There is no migration, and § Why there is no
+> migration explains why not.
 
 So switching is **not destructive** and switching back restores the previous roster
 intact. But the newly selected model **starts empty and recognises nobody** until
 people are re-enrolled, which no amount of plumbing can avoid — the old embeddings
 are in the wrong space. `info()`'s `database.persons` and `database.db_dir` say
 which roster is loaded, so an empty one does not read as lost people.
+
+#### Why there is no migration
+
+The obvious ask is a backfill: carry the roster across a model switch so nobody has
+to be re-enrolled. It cannot be done from what is on disk, and the reason is worth
+stating once so it is not re-proposed.
+
+An identity is stored as a 512-d embedding. An embedding is only meaningful inside
+the network that produced it — there is no transform from ArcFace's space to
+EdgeFace's, learned or otherwise, because the two were trained independently and
+their axes mean nothing to each other. So the stored rows cannot be converted.
+
+The other route is to re-embed the original faces, and **the database keeps no
+imagery to re-embed from**. That is deliberate, not an oversight: a face DB is three
+files — `persons.json`, `embeddings-<n>.npy`, `visits.jsonl` — and
+`config.yaml`'s `image_input` block says it outright, *"an upload is a transfer, not
+storage: enrolling a face leaves an embedding behind and never the photograph."*
+`/models/uploads` holds registration photos for `retention_days` (7) but it is a
+transfer buffer keyed by upload, not by person, and stream-enrolled people never had
+a photo there at all. It is not a roster.
+
+So the two things that *would* make a switch free both have to be decided before
+enrolment, not after:
+
+| Approach | What it costs | What it buys |
+|---|---|---|
+| Store the aligned 112x112 crop per sample | ~6 KB/sample JPEG (≈24 MB at 500 people x 8). **Reverses the no-imagery policy** — this is storing biometric images, a policy decision, not a technical one | Re-embedding under *any* future model, offline, with nobody present |
+| Embed under every installed model at enrolment | Both models resident; enrolment latency x N; an IdentityDB schema change that also lands on voiceprints | Instant lossless switching between *those* models only |
+| Dual-model transition window | Both models resident during migration; each person must appear once | Migrates an *existing* roster automatically: match with the old model to recover the name, enrol that name under the new one |
+
+The third is the only one that helps a roster that already exists, because it
+recovers the identity from the old model while the person is in frame rather than
+from storage. None of them is implemented today.
+
+Until one is, the practical path is the cheap one: auto-enrolment re-learns people
+as they appear, so only **named** people need their name re-attached — on the Orin 5
+rig that was 4 names out of 44 identities.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that

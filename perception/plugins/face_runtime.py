@@ -69,6 +69,19 @@ except ImportError:  # pragma: no cover - exercised on dev hosts, not on device
 
 log = logging.getLogger(__name__)
 
+# The identity store lives beside the models, under the one host-mounted writable
+# path this container has. It sits here rather than in plugins/identity_db.py
+# because that module is modality-agnostic — voiceprints get their own directory.
+# Also the sentinel meaning "the operator did not choose a db_dir" — see
+# face_db_dir_for.
+DEFAULT_DB_DIR = "/models/face_db"
+
+# The sentinel meaning "the operator did not choose a model_dir", which
+# `face_bundle_for` swaps for the selected row's own directory. Its value stays
+# buffalo_sc's path even though buffalo_sc is no longer the default model, and must:
+# it is what `config.yaml` ships and what agent-core has already persisted into
+# every deployed card, so changing it would make all of those look like a
+# deliberate override and point the new default at the old model's weights.
 DEFAULT_FACE_MODEL_DIR = "/models/face/buffalo_sc"
 
 # Which model pair to run. The point of the registry is that adding one is a table row
@@ -107,6 +120,11 @@ FACE_MODELS = {
         # them out is what makes the card's dropdown readable.
         "description": "InsightFace buffalo_sc（SCRFD-500M 检测 + ArcFace MobileFaceNet，512 维）",
         "match_threshold": 0.35,
+        # Pinned, and pinned *here* rather than derived from being the default —
+        # which it no longer is. Every robot deployed before the default moved has
+        # its roster at exactly this path, so buffalo_sc must keep owning it no
+        # matter what else becomes the default later. See face_db_dir_for.
+        "db_dir": DEFAULT_DB_DIR,
     },
     # SCRFD-2.5G-BNKPS detection + EdgeFace-S-GAMMA-0.5 recognition. 3.3 MB +
     # 14.8 MB. A bigger detector than buffalo_sc's (2.5G vs 500M FLOPs) and a
@@ -143,7 +161,16 @@ FACE_MODELS = {
         "match_threshold": 0.55,
     },
 }
-DEFAULT_FACE_MODEL = "buffalo_sc"
+# The shipped default. Moved from `buffalo_sc` to the stronger pair: it separates
+# identities better on the same images (margin +0.252 vs +0.199; see each row).
+#
+# This is a **breaking change for an existing roster**, and deliberately so rather
+# than silently: the default db_dir moves with the model, so a robot upgrading into
+# this comes up with an empty roster and recognises nobody until its people are
+# re-enrolled. Embeddings cannot be migrated — they are in a different space. The
+# previous roster is not destroyed; selecting `buffalo_sc` on the card restores it
+# intact, because that row pins `/models/face_db`.
+DEFAULT_FACE_MODEL = "scrfd25g_edgeface_s"
 # Per-model, because a cosine threshold is a property of the embedding space and
 # not of the plugin: see the measurements on each row above. An explicit
 # `match_threshold` in config still wins, so a robot that was tuned by hand keeps
@@ -198,12 +225,6 @@ DEFAULT_MAX_IMAGE_SIDE = 2048
 DEFAULT_MAX_IMAGE_PIXELS = 60_000_000
 
 EMBEDDING_DIM = 512
-# The identity store lives beside the models, under the one host-mounted writable
-# path this container has. It sits here rather than in plugins/identity_db.py
-# because that module is modality-agnostic — voiceprints get their own directory.
-DEFAULT_DB_DIR = "/models/face_db"
-
-
 def face_db_dir_for(model: str, db_dir: str) -> str:
     """Resolve the identity-store directory for `model`.
 
@@ -215,9 +236,14 @@ def face_db_dir_for(model: str, db_dir: str) -> str:
     invent a `db_dir` by hand. So the default moves with the model and the refusal
     goes back to being a backstop against pointing a model at a foreign store.
 
-    The default model keeps `/models/face_db` unchanged. That is not cosmetic: every
-    deployed robot's roster is at that exact path, and giving `buffalo_sc` a suffixed
-    directory would present all of them with an empty one.
+    A row may pin its directory with a `db_dir` key, and `buffalo_sc` does: it owns
+    `/models/face_db` permanently. That pin is attached to **buffalo_sc itself, not
+    to whichever model is currently the default** — which matters, because the
+    default has since moved to `scrfd25g_edgeface_s`. Keying this on
+    DEFAULT_FACE_MODEL instead (as the first cut did) would have handed the new
+    default a roster written by buffalo_sc, reproducing the `state: error` this
+    function exists to prevent, and simultaneously orphaned the existing roster
+    behind a `face_db-buffalo_sc` path nothing would look at.
 
     Mirrors `face_bundle_for`'s treatment of `model_dir`, including why an explicit
     value is detected by comparing against the default rather than by absence:
@@ -231,8 +257,6 @@ def face_db_dir_for(model: str, db_dir: str) -> str:
     """
     if db_dir != DEFAULT_DB_DIR:
         return db_dir
-    if model == DEFAULT_FACE_MODEL:
-        return DEFAULT_DB_DIR
     spec = FACE_MODELS.get(model)
     if spec is None:
         return DEFAULT_DB_DIR

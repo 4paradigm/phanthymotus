@@ -552,7 +552,12 @@ plugins:
     # Leave `match_threshold` unset when changing this — the default follows the
     # model (0.35 / 0.55). A threshold copied across models is wrong in whichever
     # direction the embedding space moved.
-    model: buffalo_sc
+    #
+    # **Changing this on a robot that already has a roster is a one-way door for
+    # that roster**: the default db_dir moves with the model, so the robot comes up
+    # recognising nobody until its people are re-enrolled. The old roster is not
+    # destroyed — selecting buffalo_sc again restores it intact.
+    model: scrfd25g_edgeface_s
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
     # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
     # Left at the buffalo_sc path, which `model` overrides when it names another
@@ -581,16 +586,17 @@ plugins:
     warmup: true
     det_size: [640, 640]
     det_thresh: 0.5
-    # Cosine similarity between L2-normalised embeddings. 0.35 is a starting
-    # point for w600k_mbf, NOT a measured value — raise it if the robot confuses
-    # people, lower it if it fails to recognise them, and record what you saw.
-    # Editable from the card.
+    # Cosine similarity between L2-normalised embeddings. Raise it if the robot
+    # confuses people, lower it if it fails to recognise them, and record what you
+    # saw. Editable from the card.
     #
-    # This is the **buffalo_sc** scale. It belongs to the embedding space, not to
-    # the plugin: scrfd25g_edgeface_s wants 0.55, and reusing 0.35 there put four
-    # impostor pairs out of 4849 over the line in the LFW sample. Delete this key
-    # to take whichever value the configured `model` recommends.
-    match_threshold: 0.35
+    # 0.55 is the **scrfd25g_edgeface_s** scale, matching the `model` above. A
+    # threshold belongs to the embedding space, not to the plugin: buffalo_sc wants
+    # 0.35, and carrying 0.55 over to it would only ever fail to recognise people
+    # (the safe direction), while carrying 0.35 the other way put four impostor
+    # pairs out of 4849 over the line in the LFW sample. Delete this key to take
+    # whichever value the configured `model` recommends.
+    match_threshold: 0.55
     # Quality gate. A face below either bound is reported with person_id: null
     # rather than matched or auto-enrolled: matching a blurred 30 px face is a
     # coin flip, and enrolling one wastes an unknown-N slot forever.
