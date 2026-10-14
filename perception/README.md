@@ -2392,16 +2392,19 @@ to date — there is still nothing to re-embed, so the cheap path applies:
 auto-enrolment re-learns people as they appear, and only **named** people need
 their name re-attached. On the Orin 5 rig that was 4 names out of 44 identities.
 
-#### Migrating a roster: `reembed_from`
+#### Migrating a roster
 
-The pass itself is the `reembed_from` action. Select the new model, then ask it to
-pull the old model's roster across:
+Migration is automatic and has **exactly one entry point**: `auto_migrate_roster`,
+the background pass described below. There is no action to call.
 
-| | |
-|---|---|
-| `source_model` | the model to migrate *from*. Its database is opened read-only |
-| `dry_run` | count what would move and what cannot, write nothing, do not even run the model |
-| `include_unknown` | carry the unnamed `p-N` people too (default true) |
+There used to be a `reembed_from` action for triggering it by hand. It is removed,
+and the reason is worth keeping: `agent-core`'s `_to_openai_schema` splits **every**
+`x-action-params` entry into an LLM-callable function, unconditionally — there is no
+allowlist and no way to mark one as internal. `canvas_binding.is_bound` then matches
+sub-tools by prefix, so they inherit the parent card's binding. The upshot was that
+a maintenance operation which blocks for tens of seconds became a tool in the
+robot's own toolbox, on a `processor` card where an ACP barrier would wait for it.
+Nobody needed to migrate by hand, so the action was the wrong side of that trade.
 
 **It is neither an overwrite nor an extra column.** Each model owns its own
 database, so this reads the source, re-embeds, and writes into the *target's*
@@ -2446,14 +2449,15 @@ samples, named in the log rather than guessed silently — with more than two ro
 bumps the load generation and the pass notices within one person and stops, rather
 than keeping on writing into a database the plugin has moved on from.
 
-`reembed_from` remains the manual, synchronous form for migrating on demand or from
-a specific source. Selecting a different `model` by itself still migrates nothing
-beyond that automatic pass — it swaps which database is in use.
+Selecting a different `model` by itself migrates nothing beyond that automatic
+pass — it swaps which database is in use.
 
-**The manual `reembed_from` call blocks**; the automatic startup pass does not.
-The action runs inside its own `tools/call` thread (ThreadingHTTPServer), so the
-rest of perception keeps serving, but the call does not return until the pass is
-done. The cost is dominated by one decode-plus-embed per stored crop, measured at
+**Turning `auto_migrate_roster` off means no migration at all**, now that the manual
+action is gone: changing model then requires re-enrolling every person. That is a
+legitimate choice for a deployment that does not want the background writes, but it
+is the whole cost, not a reduced one.
+
+The work is dominated by one decode-plus-embed per stored crop, measured at
 **6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
 
 | roster | crops | embedding time alone |
@@ -2462,19 +2466,16 @@ done. The cost is dominated by one decode-plus-embed per stored crop, measured a
 | 100 persons x 4 | 400 | ~2.6 s |
 | 500 persons x 8 | 4000 | ~26 s |
 
-Add one `persons.json` + full-matrix rewrite per person on top. A maxed-out roster
-is therefore ~30-60 s of work — long enough to hit an HTTP client timeout if you
-call `reembed_from` synchronously, which is the main reason the startup pass exists:
-the same work with nobody waiting on it. Use `dry_run` to size it first (14 ms warm
-on Orin 5, against 7.4 s cold, where the difference is the lazy model load and not
-the migration).
+Add one `persons.json` + full-matrix rewrite per person on top. A maxed-out 500x8
+roster is therefore ~30-60 s of work — which is exactly why it runs with nobody
+waiting on it. `info()`'s `migration.persons_done` against `persons_total` is how
+you watch it; there is no synchronous form to time out.
 
 **Re-running is idempotent, including at sample level.** Crops this person already
 has here are skipped, keyed on content — the stored bytes are the source crop
 verbatim, so no provenance column is needed and the same face arriving by two
-routes collapses too. A person with nothing left to migrate comes back in
-`skipped` as `already migrated`, distinct from `unmigratable` which means it could
-not be done at all.
+routes collapses too. So restarting perception, or coming back to a model later,
+re-embeds nothing.
 
 That distinction is load-bearing and was a real defect first: without the content
 check a second pass re-embedded the same crops and *appended* them, taking one
@@ -2485,10 +2486,10 @@ test asserted only that the person *count* was unchanged, which it was, the whol
 time it was happening.
 
 What it cannot do is invent crops. Samples enrolled before `store_sample_crops`
-have nothing to re-embed and come back in `unmigratable` with a reason, alongside
-`source_samples` and `source_samples_with_crop` so the shortfall is a number rather
-than a surprise. One corrupt crop or one failing person is reported and skipped,
-not allowed to abandon a 500-person pass.
+have nothing to re-embed and are simply left behind — `migration.persons_total`
+counts only the people that *can* move, against `source_crops` for the samples that
+had one, so the shortfall is visible rather than a surprise. One corrupt crop, or
+one person that fails, is logged and skipped rather than abandoning the pass.
 
 The embedding step deliberately **skips detection and alignment**
 (`FaceService.embed_aligned`). The stored crop is already aligned, so re-detecting
