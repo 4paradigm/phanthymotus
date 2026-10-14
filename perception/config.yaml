@@ -538,6 +538,13 @@ plugins:
     # deployment that must not retain any face image; the cost is that the next
     # model change starts from an empty roster.
     store_sample_crops: true
+    # 启动时在后台把另一个模型的花名册迁移过来：读它存的人脸切图，用当前模型重算
+    # embedding，写进当前模型自己的库。**不阻塞**——引擎先发布并开始识别，花名册边
+    # 跑边补，认得出的人越来越多；进度看 info 的 migration 字段。
+    #
+    # 每个 (切图, 模型) 只算一次并永久存在该模型自己的库里，所以来回切模型不会重算。
+    # 关掉之后只能手动调 reembed_from。
+    auto_migrate_roster: true
     # 这张卡是 actuator，不订阅任何 topic：身份是在 ASR 已经切好的那个 VAD 段上算
     # 的，随 ASR 的输出一起走。所以这里没有 VAD 参数 —— 切分完全由 asr.vad 决定。
     #
@@ -643,6 +650,13 @@ plugins:
     # deployment that must not retain any face image; the cost is that the next
     # model change starts from an empty roster.
     store_sample_crops: true
+    # 启动时在后台把另一个模型的花名册迁移过来：读它存的人脸切图，用当前模型重算
+    # embedding，写进当前模型自己的库。**不阻塞**——引擎先发布并开始识别，花名册边
+    # 跑边补，认得出的人越来越多；进度看 info 的 migration 字段。
+    #
+    # 每个 (切图, 模型) 只算一次并永久存在该模型自己的库里，所以来回切模型不会重算。
+    # 关掉之后只能手动调 reembed_from。
+    auto_migrate_roster: true
     # Visit log (visits.jsonl): one continuous appearance is one record, not
     # one per frame. A visit is closed and written only after the person has
     # been absent for visit_gap_s; 10 minutes stops somebody turning their head

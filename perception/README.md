@@ -2422,16 +2422,39 @@ Carried across: `person_id` (so `visits.jsonl` stays attributable), name, profil
 named/unnamed, and `registered_at` — resetting that would make everybody look newly
 met against a visit log that disagrees.
 
-**Nothing is automatic.** Selecting a different `model` migrates nothing; it only
-swaps which database is in use. The pass runs when, and only when, somebody calls
-`reembed_from`. So switching models back and forth as much as you like costs
-nothing — each model's roster simply sits where it was.
+**Each model's vectors live in that model's own database, not in a shared column
+that gets rewritten.** This is what makes switching cheap: every `(crop, model)`
+pair is embedded **once** and kept in that model's store permanently, so going
+A -> B -> A recomputes nothing — A's roster is still sitting there, complete. Only
+a genuinely new model costs a pass. Within a model, the content-hash check below
+makes a repeat pass a no-op too, so the guarantee is exactly-once per pair rather
+than once-per-switch.
 
-**It blocks, and on a large roster for a noticeable time.** The action runs inside
-its own `tools/call` thread (ThreadingHTTPServer), so the rest of perception keeps
-serving, but the call does not return until the pass is done and there is no
-progress reporting. The cost is dominated by one decode-plus-embed per stored crop,
-measured at **6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
+**It runs in the background at startup, and does not gate service.** When
+`auto_migrate_roster` is true (the default) the engine loader publishes the engine
+first and *then* starts the pass on a daemon thread: recognition answers
+immediately against whatever is in the roster and recognises more people as the
+pass proceeds. `IdentityDB` takes its `RLock` per call, so a `match()` at frame
+rate and an `add()` from the migration interleave safely. Progress is in `info()`
+under `migration` (`state`, `persons_done`, `persons_total`, `samples_done`), which
+matters because a roster that is still filling looks exactly like one that is
+simply empty.
+
+The source is chosen automatically: the other model with the most re-embeddable
+samples, named in the log rather than guessed silently — with more than two rows in
+`FACE_MODELS` "the other one" stops being well defined. A config change or a stop
+bumps the load generation and the pass notices within one person and stops, rather
+than keeping on writing into a database the plugin has moved on from.
+
+`reembed_from` remains the manual, synchronous form for migrating on demand or from
+a specific source. Selecting a different `model` by itself still migrates nothing
+beyond that automatic pass — it swaps which database is in use.
+
+**The manual `reembed_from` call blocks**; the automatic startup pass does not.
+The action runs inside its own `tools/call` thread (ThreadingHTTPServer), so the
+rest of perception keeps serving, but the call does not return until the pass is
+done. The cost is dominated by one decode-plus-embed per stored crop, measured at
+**6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
 
 | roster | crops | embedding time alone |
 |---|---|---|
@@ -2440,9 +2463,11 @@ measured at **6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
 | 500 persons x 8 | 4000 | ~26 s |
 
 Add one `persons.json` + full-matrix rewrite per person on top. A maxed-out roster
-is therefore a **~30-60 s blocking call**, which is long enough to hit an HTTP
-client timeout — run it from a direct MCP call rather than expecting the card to
-sit through it, and treat `dry_run` as the cheap way to see the scale first.
+is therefore ~30-60 s of work — long enough to hit an HTTP client timeout if you
+call `reembed_from` synchronously, which is the main reason the startup pass exists:
+the same work with nobody waiting on it. Use `dry_run` to size it first (14 ms warm
+on Orin 5, against 7.4 s cold, where the difference is the lazy model load and not
+the migration).
 
 **Re-running is idempotent, including at sample level.** Crops this person already
 has here are skipped, keyed on content — the stored bytes are the source crop

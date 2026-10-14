@@ -285,6 +285,7 @@ TOOLS = [
                 # reading the card has no way to know it means SCRFD-500M + ArcFace
                 # MobileFaceNet. Generated from the registry so a second entry
                 # documents itself.
+                "auto_migrate_roster": {"type": "boolean", "default": True, "description": "启动时在后台把另一个模型的花名册迁移到当前模型（用已存的人脸切图重算 embedding）。不阻塞识别——引擎先服务、花名册边跑边补，进度在 info 的 migration 字段里。每个(切图,模型)只算一次并永久保存，所以来回切模型不会重算。关掉则只能手动调 reembed_from"},
                 "model":             {"type": "string", "enum": sorted(FACE_MODELS), "default": DEFAULT_FACE_MODEL, "description": "识别模型：" + "；".join(f"{name} = {spec['description']}" for name, spec in sorted(FACE_MODELS.items())) + "。切换模型会重新加载，并使已存样本失效——不同网络的 embedding 不可比较，已注册人员需重新录入"},
                 "device":            {"type": "string", "enum": ["auto", "cpu", "gpu"], "default": "auto", "description": "推理设备。auto=有 GPU 用 GPU，没有则用 CPU"},
                 "detect_fps":        {"type": "number", "minimum": 0, "default": DEFAULT_DETECT_FPS, "description": "检测频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都检测", "scope": "instance"},
@@ -1163,6 +1164,9 @@ class FaceRecognitionPlugin:
         self._engine_state = "loading"
         self._load_error = None
         self._load_status = None
+        # Progress of the background roster migration, surfaced in info(). None
+        # until one starts; see _maybe_start_roster_migration.
+        self._migration: dict | None = None
         generation = self._load_generation
         cfg = dict(self._plugin_cfg)
         threading.Thread(
@@ -1193,6 +1197,16 @@ class FaceRecognitionPlugin:
         if stale is not None:
             _close_quietly(stale)
             return
+
+        # After publishing, never before: the roster fills in while the plugin is
+        # already answering.
+        try:
+            with self._state_lock:
+                model = str(self._plugin_cfg.get("model", DEFAULT_FACE_MODEL))
+            self._maybe_start_roster_migration(generation, engine, cfg, model)
+        except Exception:  # noqa: BLE001 - serving matters more than migrating
+            log.warning("[face] could not start the roster migration",
+                        exc_info=True)
 
         while True:
             with self._state_lock:
@@ -1318,6 +1332,231 @@ class FaceRecognitionPlugin:
 
     # ── roster migration ──────────────────────────────────────────────────
 
+    # ── background startup migration ──────────────────────────────────────
+
+    def _auto_migration_source(self, cfg: dict, target_model: str):
+        """Which other model's roster is worth pulling across, if any.
+
+        Returns `(model, db_dir, crop_count)` or None. Picks the candidate with the
+        most re-embeddable samples, deterministically, and says so in the log —
+        with more than two models in FACE_MODELS "the other one" stops being
+        well-defined and silently guessing would be worse than naming the choice.
+        """
+        base_dir = str(cfg.get("db_dir", DEFAULT_DB_DIR))
+        best = None
+        for name in sorted(FACE_MODELS):
+            if name == target_model:
+                continue
+            directory = face_db_dir_for(name, base_dir)
+            if os.path.abspath(directory) == os.path.abspath(
+                    face_db_dir_for(target_model, base_dir)):
+                continue
+            if not os.path.exists(os.path.join(directory, "persons.json")):
+                continue
+            try:
+                probe = IdentityDB(db_dir=directory, dim=EMBEDDING_DIM,
+                                   model=name, label="face_db:probe",
+                                   artifact_suffix=".jpg")
+                crops = probe.stats()["samples_with_artifact"]
+            except Exception:  # noqa: BLE001 - a roster we cannot read is not a
+                # reason to fail the engine load
+                log.warning("[face] could not probe %s for migration", name,
+                            exc_info=True)
+                continue
+            if crops and (best is None or crops > best[2]):
+                best = (name, directory, crops)
+        return best
+
+    def _maybe_start_roster_migration(self, generation: int, engine, cfg: dict,
+                                      target_model: str) -> None:
+        """Fill this model's roster from another model's crops, in the background.
+
+        Migration is **part of coming up, not a precondition for it**. The engine is
+        already published and serving by the time this starts: recognition works
+        against whatever is in the roster right now and simply recognises more
+        people as the pass proceeds. IdentityDB takes its RLock per call, so a
+        `match()` at frame rate and an `add()` from here interleave safely.
+
+        Nothing about this is ACP's business — there is no action to complete and
+        no caller waiting on a result. It is a thread that stops when the engine it
+        belongs to is replaced.
+        """
+        if not bool(cfg.get("auto_migrate_roster", True)):
+            return
+        if not engine.db.artifacts_enabled:
+            return
+        found = self._auto_migration_source(cfg, target_model)
+        if found is None:
+            return
+        source_model, source_dir, crops = found
+        with self._state_lock:
+            if generation != self._load_generation:
+                return
+            self._migration = {
+                "state": "running", "source_model": source_model,
+                "target_model": target_model, "persons_done": 0,
+                "samples_done": 0, "persons_total": 0,
+                "source_crops": crops,
+            }
+        thread = threading.Thread(
+            target=self._roster_migration_worker,
+            args=(generation, engine, source_model, source_dir),
+            name="face-roster-migration", daemon=True)
+        thread.start()
+        log.info("[face] migrating the %s roster into %s in the background "
+                 "(%d sample(s) with crops); recognition is already serving",
+                 source_model, target_model, crops)
+
+    def _mark_migration(self, progress: dict, **fields) -> bool:
+        """Update the progress dict **only while it is still the current one**.
+
+        A cancelled pass must not write into the dict a newer engine's pass has
+        already installed, or the card shows one migration's numbers under
+        another's. Identity comparison rather than a generation check, because the
+        dict is the thing being published and it is what must still be ours.
+        """
+        with self._state_lock:
+            if self._migration is not progress:
+                return False
+            progress.update(fields)
+            return True
+
+    def _roster_migration_worker(self, generation: int, engine,
+                                 source_model: str, source_dir: str) -> None:
+        with self._state_lock:
+            progress = self._migration
+        try:
+            source = IdentityDB(db_dir=source_dir, dim=EMBEDDING_DIM,
+                                model=source_model, label="face_db:source",
+                                artifact_suffix=".jpg")
+            by_person: dict[str, list[dict]] = {}
+            for item in source.sample_artifacts():
+                by_person.setdefault(item["person_id"], []).append(item)
+            records = [record for record in source.list_persons(limit=0)["persons"]
+                       if by_person.get(record["id"])]
+            if not self._mark_migration(progress, persons_total=len(records)):
+                return
+
+            done = samples = 0
+            for record in records:
+                # Cancellation: a stop, or any config change that rebuilds the
+                # engine, bumps the generation. Checked every person rather than
+                # once, so a 500-person pass does not keep writing into a database
+                # the plugin has moved on from.
+                #
+                # Checked again *after* the person too: the generation can change
+                # while one person is being embedded, and returning bare there used
+                # to leave the progress dict reading "running" forever — a
+                # migration that info() reported as live when nothing was.
+                with self._state_lock:
+                    cancelled = generation != self._load_generation
+                if cancelled:
+                    self._mark_migration(progress, state="cancelled")
+                    log.info("[face] roster migration cancelled after %d "
+                             "person(s)", done)
+                    return
+                outcome, detail = self._migrate_one_person(
+                    engine, record, by_person[record["id"]])
+                if outcome == "migrated":
+                    done += 1
+                    samples += detail
+                with self._state_lock:
+                    cancelled = generation != self._load_generation
+                if cancelled:
+                    self._mark_migration(progress, state="cancelled",
+                                         persons_done=done, samples_done=samples)
+                    log.info("[face] roster migration cancelled after %d "
+                             "person(s)", done)
+                    return
+                self._mark_migration(progress, persons_done=done,
+                                     samples_done=samples)
+            self._mark_migration(progress, state="done", persons_done=done,
+                                 samples_done=samples)
+            log.info("[face] roster migration finished: %d person(s), %d sample(s) "
+                     "from %s", done, samples, source_model)
+        except Exception as error:  # noqa: BLE001 - a failed migration must not
+            # take down a plugin that is already serving
+            log.exception("[face] roster migration failed")
+            self._mark_migration(progress, state="error", error=str(error))
+
+    def _migrate_one_person(self, engine, record: dict, items: list):
+        """Re-embed one person's stored crops into `engine`'s database.
+
+        Returns `(outcome, detail)` where outcome is "migrated" (detail = how many
+        samples), "skipped" (detail = why there was nothing to do) or
+        "unmigratable" (detail = why it could not be done). Shared by the
+        synchronous `reembed_from` action and the background startup pass, so the
+        two cannot drift on the idempotency rule — which is the part that, when it
+        was wrong, ate real samples.
+        """
+        person_id = record["id"]
+        crops = []
+        for item in items:
+            try:
+                with open(item["path"], "rb") as handle:
+                    crops.append(handle.read())
+            except OSError:
+                crops.append(None)
+        usable = [crop for crop in crops if crop]
+
+        # Skip crops this person already has here, keyed on content. Without it a
+        # second pass re-embeds the same crops and *appends* them: the sample list
+        # fills with duplicates and, once it hits max_samples_per_person, the
+        # oldest-first trim starts evicting the genuinely new captures made since
+        # the migration. Measured: a second pass took one person from 5 samples to
+        # 8, three of them duplicates.
+        #
+        # Content rather than a recorded source id, because the stored bytes are
+        # the source crop verbatim — so this needs no schema change and also
+        # collapses the same face arriving by two routes.
+        already = set()
+        for existing_item in (engine.db.sample_artifacts()
+                              if engine.db.artifacts_enabled else []):
+            if existing_item["person_id"] != person_id:
+                continue
+            try:
+                with open(existing_item["path"], "rb") as handle:
+                    already.add(hashlib.sha256(handle.read()).hexdigest())
+            except OSError:
+                continue
+        if already:
+            fresh = [crop for crop in usable
+                     if hashlib.sha256(crop).hexdigest() not in already]
+            if not fresh:
+                return "skipped", "already migrated"
+            usable = fresh
+
+        vectors = engine.analyzer.embed_aligned(usable) if usable else []
+        pairs = [(vec, crop) for vec, crop in zip(vectors, usable)
+                 if vec is not None]
+        if not pairs:
+            return "unmigratable", "every stored crop failed to re-embed"
+
+        embeddings = [pair[0] for pair in pairs]
+        artifacts = [pair[1] for pair in pairs]
+        try:
+            try:
+                existing = engine.db.get_person(person_id)
+            except KeyError:
+                existing = None
+            if existing is not None:
+                engine.db.add_samples(person_id, embeddings, artifacts)
+            else:
+                engine.db.add(
+                    record.get("name", ""), embeddings,
+                    named=bool(record.get("named")),
+                    profile=record.get("profile"),
+                    person_id=person_id,
+                    artifacts=artifacts,
+                    registered_at=record.get("registered_at"),
+                )
+        except Exception as error:  # noqa: BLE001 - one person must not abandon
+            # a 500-person migration half-done
+            log.error("[face] could not migrate %s: %s", person_id,
+                      escape_log_text(error))
+            return "unmigratable", str(error)
+        return "migrated", len(embeddings)
+
     def _do_reembed_from(self, args: dict) -> dict:
         """Migrate another model's roster into the current model's database.
 
@@ -1412,87 +1651,20 @@ class FaceRecognitionPlugin:
                 samples_done += len(items)
                 continue
 
-            crops = []
-            for item in items:
-                try:
-                    with open(item["path"], "rb") as handle:
-                        crops.append(handle.read())
-                except OSError:
-                    crops.append(None)
-            usable = [crop for crop in crops if crop]
-
-            # Skip crops this person already has here, keyed on content. Without
-            # it a second run re-embeds the same crops and *appends* them: the
-            # person's sample list fills with duplicates and, once it hits
-            # max_samples_per_person, the oldest-first trim starts evicting the
-            # genuinely new captures made since the migration. Measured: a second
-            # pass took one person from 5 samples to 8, three of them duplicates.
-            #
-            # Content rather than a recorded source id, because the stored bytes
-            # are the source crop verbatim — so this needs no schema change and
-            # also collapses the same face arriving by two routes.
-            already = set()
-            for existing_item in (engine.db.sample_artifacts()
-                                  if engine.db.artifacts_enabled else []):
-                if existing_item["person_id"] != person_id:
-                    continue
-                try:
-                    with open(existing_item["path"], "rb") as handle:
-                        already.add(hashlib.sha256(handle.read()).hexdigest())
-                except OSError:
-                    continue
-            if already:
-                fresh = [crop for crop in usable
-                         if hashlib.sha256(crop).hexdigest() not in already]
-                if not fresh:
-                    skipped.append({"person_id": person_id,
-                                    "name": record.get("name", ""),
-                                    "reason": "already migrated"})
-                    continue
-                usable = fresh
-            vectors = engine.analyzer.embed_aligned(usable) if usable else []
-            pairs = [(vec, crop) for vec, crop in zip(vectors, usable)
-                     if vec is not None]
-            if not pairs:
-                unmigratable.append({
-                    "person_id": person_id, "name": record.get("name", ""),
-                    "reason": "every stored crop failed to re-embed",
-                })
-                continue
-
-            embeddings = [pair[0] for pair in pairs]
-            artifacts = [pair[1] for pair in pairs]
-            try:
-                existing = None
-                try:
-                    existing = engine.db.get_person(person_id)
-                except KeyError:
-                    existing = None
-                if existing is not None:
-                    # Idempotent re-run: the person is already here, so add the
-                    # samples rather than failing the whole pass on a duplicate id.
-                    engine.db.add_samples(person_id, embeddings, artifacts)
-                else:
-                    engine.db.add(
-                        record.get("name", ""), embeddings,
-                        named=bool(record.get("named")),
-                        profile=record.get("profile"),
-                        person_id=person_id,
-                        artifacts=artifacts,
-                        registered_at=record.get("registered_at"),
-                    )
-            except Exception as error:  # noqa: BLE001 - one person must not
-                # abandon a 500-person migration half-done
-                log.error("[face] could not migrate %s: %s", person_id,
-                          escape_log_text(error))
+            outcome, detail = self._migrate_one_person(engine, record, items)
+            if outcome == "migrated":
+                migrated.append({"person_id": person_id,
+                                 "name": record.get("name", ""),
+                                 "samples": detail})
+                samples_done += detail
+            elif outcome == "skipped":
+                skipped.append({"person_id": person_id,
+                                "name": record.get("name", ""),
+                                "reason": detail})
+            else:
                 unmigratable.append({"person_id": person_id,
                                      "name": record.get("name", ""),
-                                     "reason": str(error)})
-                continue
-            migrated.append({"person_id": person_id,
-                             "name": record.get("name", ""),
-                             "samples": len(embeddings)})
-            samples_done += len(embeddings)
+                                     "reason": detail})
 
         source_stats = source.stats()
         result = {
@@ -1598,6 +1770,11 @@ class FaceRecognitionPlugin:
         """Attach roster counts. Never fails info — it is the diagnostic path."""
         if engine is None:
             return result
+        migration = self._migration
+        if migration:
+            # Visible because an empty-looking roster that is still filling is a
+            # different situation from one that is simply empty.
+            result["migration"] = dict(migration)
         try:
             result["database"] = engine.db.stats()
         except Exception:  # noqa: BLE001

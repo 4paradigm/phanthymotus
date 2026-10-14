@@ -76,6 +76,8 @@ def _plugin(tmp_path, target_model="scrfd25g_edgeface_s"):
         face_plugin.FaceRecognitionPlugin)
     import threading
     plugin._state_lock = threading.RLock()
+    plugin._migration = None          # __init__ is bypassed by __new__ here
+    plugin._load_generation = 0
     plugin._plugin_cfg = {"model": target_model,
                           "db_dir": face_plugin.DEFAULT_DB_DIR}
     target = identity_db.IdentityDB(
@@ -91,10 +93,14 @@ def _plugin(tmp_path, target_model="scrfd25g_edgeface_s"):
 def setup(tmp_path, monkeypatch):
     source = _source_db(tmp_path)
     plugin, engine = _plugin(tmp_path)
-    # the plugin resolves the source directory from the model name; point that at
-    # the tmp roster rather than /models
-    monkeypatch.setattr(face_plugin, "face_db_dir_for",
-                        lambda model, db_dir: str(tmp_path / "face_db"))
+    # The plugin resolves each model's directory by name; point both at tmp rather
+    # than /models. Model-aware on purpose: a stub returning one path for every
+    # model would collide source with target, which the guard correctly refuses —
+    # and the background pass would then find nothing to do for the wrong reason.
+    monkeypatch.setattr(
+        face_plugin, "face_db_dir_for",
+        lambda model, db_dir: str(tmp_path / ("face_db" if model == "buffalo_sc"
+                                              else "face_db-target")))
     return plugin, engine, source
 
 
@@ -282,3 +288,102 @@ def test_a_pinned_db_dir_that_collides_is_refused_with_the_real_reason(
                         lambda model, db_dir: engine.db.path)
     with pytest.raises(ValueError, match="both resolve to"):
         plugin._do_reembed_from({"source_model": "buffalo_sc"})
+
+
+# ── the background startup pass ──────────────────────────────────────────────
+#
+# Migration is part of coming up, not a precondition for it: the engine is already
+# published and recognising when this starts, and simply recognises more people as
+# it proceeds. These tests are about that property and about stopping cleanly.
+
+
+def test_the_background_pass_fills_the_roster_without_being_waited_on(setup):
+    import time
+    plugin, engine, source = setup
+    plugin._load_generation = 7
+    cfg = {"model": "scrfd25g_edgeface_s", "db_dir": face_plugin.DEFAULT_DB_DIR,
+           "auto_migrate_roster": True}
+
+    plugin._maybe_start_roster_migration(7, engine, cfg, "scrfd25g_edgeface_s")
+    # the call returns immediately — it must not have done the work inline
+    assert plugin._migration["state"] in ("running", "done")
+
+    deadline = time.time() + 5
+    while time.time() < deadline and plugin._migration["state"] == "running":
+        time.sleep(0.02)
+    assert plugin._migration["state"] == "done", plugin._migration
+    assert plugin._migration["persons_done"] == 3
+    assert plugin._migration["samples_done"] == 4
+    assert {person["id"] for person
+            in engine.db.list_persons(limit=0)["persons"]} == {"p-1", "p-2", "p-3"}
+
+
+def test_the_background_pass_is_cancelled_when_the_engine_is_replaced(setup):
+    import time
+    plugin, engine, source = setup
+    plugin._load_generation = 1
+    cfg = {"model": "scrfd25g_edgeface_s", "db_dir": face_plugin.DEFAULT_DB_DIR}
+
+    # a config change or stop bumps the generation; the pass must notice and stop
+    # rather than keep writing into a database the plugin has moved on from
+    slow = engine.analyzer.embed_aligned
+
+    def stall(crops):
+        plugin._load_generation = 2        # simulate the rebuild mid-pass
+        return slow(crops)
+    engine.analyzer.embed_aligned = stall
+
+    plugin._maybe_start_roster_migration(1, engine, cfg, "scrfd25g_edgeface_s")
+    deadline = time.time() + 5
+    while time.time() < deadline and plugin._migration["state"] == "running":
+        time.sleep(0.02)
+    assert plugin._migration["state"] == "cancelled", plugin._migration
+
+
+def test_auto_migrate_roster_false_starts_nothing(setup):
+    plugin, engine, source = setup
+    plugin._load_generation = 1
+    plugin._maybe_start_roster_migration(
+        1, engine, {"model": "scrfd25g_edgeface_s",
+                    "db_dir": face_plugin.DEFAULT_DB_DIR,
+                    "auto_migrate_roster": False}, "scrfd25g_edgeface_s")
+    assert plugin._migration is None
+    assert engine.db.stats()["persons"] == 0
+
+
+def test_no_source_with_crops_means_no_pass(tmp_path, monkeypatch):
+    """A fresh robot has nothing to migrate and must not report a migration."""
+    plugin, engine = _plugin(tmp_path)
+    plugin._load_generation = 1
+    monkeypatch.setattr(face_plugin, "face_db_dir_for",
+                        lambda model, db_dir: str(tmp_path / "absent"))
+    plugin._maybe_start_roster_migration(
+        1, engine, {"model": "scrfd25g_edgeface_s",
+                    "db_dir": face_plugin.DEFAULT_DB_DIR}, "scrfd25g_edgeface_s")
+    assert plugin._migration is None
+
+
+def test_a_rerun_of_the_background_pass_is_also_idempotent(setup):
+    """Restarting perception must not re-migrate what is already across.
+
+    This is the switching question: every (crop, model) pair is computed once and
+    kept in that model's own database, so coming back to a model costs nothing.
+    """
+    import time
+    plugin, engine, source = setup
+    cfg = {"model": "scrfd25g_edgeface_s", "db_dir": face_plugin.DEFAULT_DB_DIR}
+    for generation in (1, 2, 3):
+        plugin._load_generation = generation
+        plugin._maybe_start_roster_migration(generation, engine, cfg,
+                                             "scrfd25g_edgeface_s")
+        deadline = time.time() + 5
+        while time.time() < deadline and plugin._migration["state"] == "running":
+            time.sleep(0.02)
+        assert plugin._migration["state"] == "done"
+    assert engine.db.stats()["samples"] == 4        # not 12
+    payloads = [open(item["path"], "rb").read()
+                for item in engine.db.sample_artifacts()]
+    assert len(payloads) == len(set(payloads))
+    # the model ran exactly once per crop across all three passes
+    embedded = [crop for call in engine.analyzer.calls for crop in call]
+    assert len(embedded) == 4, embedded
