@@ -262,8 +262,11 @@ def test_include_current_reads_configdb(tmp_path):
     g = groups[0]
     assert g.name == 'current/glm-5.3'
     assert g.source == 'configdb'
-    # think_mode=false 时生产会带这个 extra_body（src/client/llm.py:136-139）
+    # think_mode=false 时生产会带整组关闭参数，评测必须一模一样——少一种写法，
+    # 测出来的延迟就不是生产会拿到的那个
+    assert g.extra_body == cfgmod.THINKING_OFF_EXTRA
     assert g.extra_body['chat_template_kwargs'] == {'enable_thinking': False}
+    assert g.extra_body['thinking'] == {'type': 'disabled'}
 
 
 def test_configdb_absent_is_not_fatal_when_groups_exist(tmp_path):
