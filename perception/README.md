@@ -2255,13 +2255,247 @@ enrols new people from a photo, the live stream, or a batch package.
 
 ### Models
 
-InsightFace **buffalo_sc**, the smallest pack that still ships landmarks (alignment
-needs them):
+Two detector+recogniser pairs, selected by `model` on the card (registry:
+`plugins/face_runtime.FACE_MODELS`). **`scrfd25g_edgeface_s` is the default**, at
+`match_threshold` 0.55 — see the table below for why that number and not 0.35.
+
+`buffalo_sc` — the previous default. InsightFace's smallest pack that still ships
+landmarks (alignment needs them):
 
 | File | Size | Role |
 |------|------|------|
 | `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
 | `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
+
+`scrfd25g_edgeface_s` — the default. A bigger detector and a stronger recogniser,
+same contract:
+
+| File | Size | Role |
+|------|------|------|
+| `scrfd_2.5g_bnkps.onnx` | 3.3 MB | SCRFD-2.5G-BNKPS — detection + 5 keypoints |
+| `edgeface_s_gamma_05.onnx` | 15 MB | EdgeFace-S-GAMMA-0.5 — 512-d embedding |
+
+Measured over a 100-image LFW sample (4849 impostor pairs, 2 genuine pairs), both
+pairs detected 99 of the 100 faces:
+
+| | impostor p99 | impostor max | genuine | margin | `match_threshold` |
+|---|---|---|---|---|---|
+| `buffalo_sc` | 0.158 | 0.323 | 0.52 / 0.71 | +0.199 | 0.35 |
+| `scrfd25g_edgeface_s` | 0.246 | 0.450 | 0.70 / 0.88 | +0.252 | 0.55 |
+
+EdgeFace separates identities better, but its whole similarity distribution sits
+higher — which is why **`match_threshold` is per-model** and why reusing 0.35 on
+the second pair puts four of those impostor pairs over the line. Leave the key out
+of config to get the configured model's recommended value; an explicit value still
+wins, so a hand-tuned robot keeps its number.
+
+**Adding a third pair is a row in `FACE_MODELS`, not a plugin.** What a candidate
+has to satisfy: the detector emits **nine** outputs (score/bbox/kps for strides
+8/16/32, 2 anchors) because `plugins/scrfd_decode.py` decodes exactly that and
+alignment needs the landmarks; the recogniser takes 112x112 and returns 512-d,
+because every stored sample and FaceDB row is that. Pre/post-processing is
+*shared* — RGB `(x-127.5)/128` into the detector, RGB `(x-127.5)/127.5` into the
+recogniser — so a model with different normalisation does not belong in the table,
+it belongs behind a branch in `embed()`. All of this is asserted at load time
+rather than discovered as bad embeddings, and
+`tests/test_face_models_registry.py` pins the table-level invariants.
+
+**Each model keeps its own roster, and switching means re-enrolling.** Embeddings
+from different networks are not comparable, so `IdentityDB._load` refuses a store
+written by another model rather than silently confusing people, and already-stored
+samples are never re-embedded.
+
+That refusal is right, but with one shared default it fired on the act of *selecting*
+a second model — the card went to `state: error` and the only way out was inventing a
+`db_dir` by hand. So `db_dir` is resolved per model (`face_db_dir_for`):
+`buffalo_sc` **pins `/models/face_db`** and any model without a pin gets
+`/models/face_db-<model>`. An explicit `db_dir` different from the default pins it
+and disables the suffix. The refusal stays as a backstop against pointing a model at
+a foreign store.
+
+The pin lives on buffalo_sc's row and **not** on "whichever model is the default",
+which matters now that the default has moved: keying it on `DEFAULT_FACE_MODEL`
+would hand the new default a store written by buffalo_sc — recreating the very
+`state: error` above — and orphan the real roster behind a `face_db-buffalo_sc` path
+nothing looks at. `tests/test_face_models_registry.py` pins exactly that.
+
+> **Upgrading an existing robot changes what it recognises.** The default moved to
+> `scrfd25g_edgeface_s`, and the roster moves with it, so a robot that had people
+> enrolled comes up with an **empty** roster and recognises nobody until they are
+> re-enrolled. Nothing is destroyed — selecting `buffalo_sc` on the card brings the
+> old roster back intact — but the upgrade itself is silent apart from
+> `database.persons` dropping to 0. There is no migration, and § Why there is no
+> migration explains why not.
+
+So switching is **not destructive** and switching back restores the previous roster
+intact. But the newly selected model **starts empty and recognises nobody** until
+people are re-enrolled, which no amount of plumbing can avoid — the old embeddings
+are in the wrong space. `info()`'s `database.persons` and `database.db_dir` say
+which roster is loaded, so an empty one does not read as lost people.
+
+#### Why there is no migration
+
+The obvious ask is a backfill: carry the roster across a model switch so nobody has
+to be re-enrolled. It cannot be done from what is on disk, and the reason is worth
+stating once so it is not re-proposed.
+
+An identity is stored as a 512-d embedding. An embedding is only meaningful inside
+the network that produced it — there is no transform from ArcFace's space to
+EdgeFace's, learned or otherwise, because the two were trained independently and
+their axes mean nothing to each other. So the stored rows cannot be converted.
+
+The other route is to re-embed the original faces, and **the database keeps no
+imagery to re-embed from**. That is deliberate, not an oversight: a face DB is three
+files — `persons.json`, `embeddings-<n>.npy`, `visits.jsonl` — and
+`config.yaml`'s `image_input` block says it outright, *"an upload is a transfer, not
+storage: enrolling a face leaves an embedding behind and never the photograph."*
+`/models/uploads` holds registration photos for `retention_days` (7) but it is a
+transfer buffer keyed by upload, not by person, and stream-enrolled people never had
+a photo there at all. It is not a roster.
+
+So the two things that *would* make a switch free both have to be decided before
+enrolment, not after:
+
+| Approach | What it costs | What it buys |
+|---|---|---|
+| Store the aligned 112x112 crop per sample — **implemented**, `store_sample_crops: true` | ~6 KB/sample JPEG (≈24 MB at 500 people x 8). Keeps face imagery on disk, bounded and deleted with its sample | Re-embedding under *any* future model, offline, with nobody present |
+| Embed under every installed model at enrolment | Both models resident; enrolment latency x N; an IdentityDB schema change that also lands on voiceprints | Instant lossless switching between *those* models only |
+| Dual-model transition window | Both models resident during migration; each person must appear once | Migrates an *existing* roster automatically: match with the old model to recover the name, enrol that name under the new one |
+
+The third is the only one that helps a roster that already exists, because it
+recovers the identity from the old model while the person is in frame rather than
+from storage.
+
+**The first is now implemented**, so this is the last switch that has to be painful.
+Every sample enrolled from here on stores the aligned crop it was embedded from
+under `<db_dir>/samples/<sample_id>.jpg`, and `stats()` reports
+`samples_with_artifact` against `samples` so the shortfall on an older roster is
+visible rather than discovered at switch time. `IdentityDB.sample_artifacts()` is
+the surface a re-embedding pass reads.
+
+Two things about that storage are load-bearing:
+
+- **Crops are keyed by a stable sample id, never by row index.** Rows get reindexed
+  by the max-samples trim, by `forget`, by capacity eviction and by the orphan
+  filter on load; a crop filed under an index would, after any of those, be served
+  up as a different person's face — which is worse than having no crop, because it
+  is wrong rather than absent. Ids come from a counter that only ever increases and
+  is restored from disk, so a retired id can never be handed to a new sample and
+  adopt its file.
+- **Files are written before the commit and swept after it**, the same ordering and
+  for the same reason as the embeddings file: a crash then leaves an unreferenced
+  file, which the next commit removes, rather than a referenced id with nothing
+  behind it.
+
+For a roster enrolled *before* this existed — which includes every robot deployed
+to date — there is still nothing to re-embed, so the cheap path applies:
+auto-enrolment re-learns people as they appear, and only **named** people need
+their name re-attached. On the Orin 5 rig that was 4 names out of 44 identities.
+
+#### Migrating a roster: `reembed_from`
+
+The pass itself is the `reembed_from` action. Select the new model, then ask it to
+pull the old model's roster across:
+
+| | |
+|---|---|
+| `source_model` | the model to migrate *from*. Its database is opened read-only |
+| `dry_run` | count what would move and what cannot, write nothing, do not even run the model |
+| `include_unknown` | carry the unnamed `p-N` people too (default true) |
+
+**It is neither an overwrite nor an extra column.** Each model owns its own
+database, so this reads the source, re-embeds, and writes into the *target's*
+store, leaving the source byte-for-byte intact — which is what makes it safe to
+retry and trivial to abandon: if the migrated roster is worse, select the old model
+again and the original is still there, untouched.
+
+A single database with one embedding column per model was the alternative, and is
+worse here for three independent reasons. `dim` is a per-database property and a
+future recogniser need not be 512-d. `IdentityDB` is deliberately
+modality-agnostic and shared with voiceprints, so widening its schema for
+face-specific multi-model rows taxes a module with no stake in it. And every
+`match()` would then have to choose a column — which is exactly the "matching
+across two networks does not fail, it silently confuses identities" failure the
+model check exists to prevent.
+
+Carried across: `person_id` (so `visits.jsonl` stays attributable), name, profile,
+named/unnamed, and `registered_at` — resetting that would make everybody look newly
+met against a visit log that disagrees.
+
+**Each model's vectors live in that model's own database, not in a shared column
+that gets rewritten.** This is what makes switching cheap: every `(crop, model)`
+pair is embedded **once** and kept in that model's store permanently, so going
+A -> B -> A recomputes nothing — A's roster is still sitting there, complete. Only
+a genuinely new model costs a pass. Within a model, the content-hash check below
+makes a repeat pass a no-op too, so the guarantee is exactly-once per pair rather
+than once-per-switch.
+
+**It runs in the background at startup, and does not gate service.** When
+`auto_migrate_roster` is true (the default) the engine loader publishes the engine
+first and *then* starts the pass on a daemon thread: recognition answers
+immediately against whatever is in the roster and recognises more people as the
+pass proceeds. `IdentityDB` takes its `RLock` per call, so a `match()` at frame
+rate and an `add()` from the migration interleave safely. Progress is in `info()`
+under `migration` (`state`, `persons_done`, `persons_total`, `samples_done`), which
+matters because a roster that is still filling looks exactly like one that is
+simply empty.
+
+The source is chosen automatically: the other model with the most re-embeddable
+samples, named in the log rather than guessed silently — with more than two rows in
+`FACE_MODELS` "the other one" stops being well defined. A config change or a stop
+bumps the load generation and the pass notices within one person and stops, rather
+than keeping on writing into a database the plugin has moved on from.
+
+`reembed_from` remains the manual, synchronous form for migrating on demand or from
+a specific source. Selecting a different `model` by itself still migrates nothing
+beyond that automatic pass — it swaps which database is in use.
+
+**The manual `reembed_from` call blocks**; the automatic startup pass does not.
+The action runs inside its own `tools/call` thread (ThreadingHTTPServer), so the
+rest of perception keeps serving, but the call does not return until the pass is
+done. The cost is dominated by one decode-plus-embed per stored crop, measured at
+**6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
+
+| roster | crops | embedding time alone |
+|---|---|---|
+| 45 persons x 1 | 45 | ~0.3 s |
+| 100 persons x 4 | 400 | ~2.6 s |
+| 500 persons x 8 | 4000 | ~26 s |
+
+Add one `persons.json` + full-matrix rewrite per person on top. A maxed-out roster
+is therefore ~30-60 s of work — long enough to hit an HTTP client timeout if you
+call `reembed_from` synchronously, which is the main reason the startup pass exists:
+the same work with nobody waiting on it. Use `dry_run` to size it first (14 ms warm
+on Orin 5, against 7.4 s cold, where the difference is the lazy model load and not
+the migration).
+
+**Re-running is idempotent, including at sample level.** Crops this person already
+has here are skipped, keyed on content — the stored bytes are the source crop
+verbatim, so no provenance column is needed and the same face arriving by two
+routes collapses too. A person with nothing left to migrate comes back in
+`skipped` as `already migrated`, distinct from `unmigratable` which means it could
+not be done at all.
+
+That distinction is load-bearing and was a real defect first: without the content
+check a second pass re-embedded the same crops and *appended* them, taking one
+person from 5 samples to 8 with three duplicates. Once that fills
+`max_samples_per_person`, the oldest-first trim starts evicting the genuinely new
+captures made since the migration — the migration eating real data. The original
+test asserted only that the person *count* was unchanged, which it was, the whole
+time it was happening.
+
+What it cannot do is invent crops. Samples enrolled before `store_sample_crops`
+have nothing to re-embed and come back in `unmigratable` with a reason, alongside
+`source_samples` and `source_samples_with_crop` so the shortfall is a number rather
+than a surprise. One corrupt crop or one failing person is reported and skipped,
+not allowed to abandon a 500-person pass.
+
+The embedding step deliberately **skips detection and alignment**
+(`FaceService.embed_aligned`). The stored crop is already aligned, so re-detecting
+would at best apply a second similarity transform on top of the first and at worst
+find no face at all — a 112x112 image letterboxed to 640x640 is not what SCRFD was
+trained on. Re-embedding has to put the new network on the *same pixels* the old one
+saw, or the migrated embedding is not comparable to a fresh capture of that person.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
@@ -2362,6 +2596,28 @@ be pinned, and the robots have no reliable route to GitHub. To refresh, download
 (`prisma/articles/upload-figs.js` cannot do it — it only accepts image extensions
 and forces its own key shape), then re-download from COS and paste the *verified*
 `size`/`sha256` into `FACE_MODEL_FILES`.
+
+`scrfd25g_edgeface_s` lives at `public/face/scrfd25g_edgeface_s/`
+(`FACE_SCRFD25G_BASE`, pins in `FACE_SCRFD25G_FILES`) and its two halves come from
+different places:
+
+- **The detector** is insightface's own `scrfd_2.5g_bnkps`, re-hosted from
+  `hsuyabc/scrfd_2.5g_bnkps.onnx` on HuggingFace. Its pinned size and SHA256 are
+  that repo's LFS oid, so the re-host is verifiable against upstream.
+- **The recogniser ONNX does not exist upstream.** Idiap publish EdgeFace as
+  PyTorch weights only, so this file is *our* export from `anjith2006/edgeface` —
+  fp32, opset 17, single-file (weights inlined, no `.onnx.data` companion), one
+  input `(batch,3,112,112)` and one output `(batch,512)`. It was checked against
+  the reference implementation before upload: worst cosine 0.9999999 over 8
+  inputs. Re-exporting is therefore the only way to refresh it, and a new export
+  means a new hash.
+- **Not the INT8 export.** On the same graph it measured no faster at all (16.0 ms
+  vs 15.7 ms p50, 2 threads) while moving the embedding by cosine 0.84 — it buys
+  disk in exchange for an unvalidated recogniser. If someone wants it, validate it
+  against a real face set first and give it its own row and threshold.
+
+Either way the rule is the same as everywhere else: **re-download from COS and pin
+the hash of what came back**, not of what you uploaded.
 
 ### The person record: `name` vs `profile`
 
@@ -2514,7 +2770,9 @@ is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
 smear that never matches anything again. Relax `min_face_px` / `blur_min` if you
 want identities at greater distance.
 
-`match_threshold` defaults to **0.35**. Measured separations on this model, same
+`match_threshold` defaults to the configured model's value — **0.35** for
+`buffalo_sc`, **0.55** for `scrfd25g_edgeface_s`; see § Models for how those were
+measured and why they differ. Measured separations on `buffalo_sc`, same
 photo transformed: same face at half resolution **0.983**, same face +35
 brightness **0.979**, a different person **-0.108**. Real same-person /
 different-photo scores sit well below the first two, so **tune this against your own
