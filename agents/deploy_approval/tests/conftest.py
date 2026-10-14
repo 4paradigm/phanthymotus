@@ -52,6 +52,10 @@ def make_config(**overrides):
         agent_core_tokens={"test-machine": "test-token"},
     )
     defaults.update(overrides)
+    # Offline fixtures model an already authorized installation. Negative
+    # authorization tests explicitly override these fields.
+    defaults.setdefault("active_repos", list(defaults["github_repos"]))
+    defaults.setdefault("auth_valid", True)
     return Config(**defaults)
 
 

@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from .config import Config, DEFAULT_GITHUB_REPOS, load_config
+from .config import Config, DEFAULT_GITHUB_REPOS, load_config, resolve_authorized_repos, validate_repository_names
 from .github_state_proxy import _ALLOWED_STATUS_LABELS
 from .github_client import GitHubClient
 from agents import github_app_auth
@@ -132,7 +132,8 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
     Returns a summary dict keyed by repo name.
     """
     if repos is None:
-        repos = list(getattr(getattr(github, "config", None), "github_repos", DEFAULT_GITHUB_REPOS))
+        cfg = getattr(github, "config", None)
+        repos = (list(cfg.active_repos) if cfg.auth_valid else []) if cfg is not None else list(DEFAULT_GITHUB_REPOS)
     summary: dict = {}
 
     for repo in repos:
@@ -213,27 +214,12 @@ async def _resolve_active_repos(
 ) -> list[str]:
     """Resolve ACTIVE_REPOS = desired ∩ installation repositories.
 
-    Required repo: 4paradigm/phanthymotus
-    Optional repo:  4paradigm/phanthymotus-driver
-
-    Fails startup if the required repo is not authorized.
+    The first configured repository is required; the others are optional.
+    Installation permissions never expand the configured allowlist.
     """
     authorized_names = await github.list_installation_repositories()
-    authorized_set = set(authorized_names)
-    active: list[str] = []
-    inactive: list[str] = []
-    for repo in desired_repos:
-        if repo in authorized_set:
-            active.append(repo)
-        else:
-            inactive.append(repo)
-    # Required repo check
-    required = "4paradigm/phanthymotus"
-    if required not in active:
-        raise RuntimeError(
-            f"required repo {required!r} is not authorized for this GitHub App "
-            f"installation. Active repos: {active}. Inactive desired repos: {inactive}."
-        )
+    active = resolve_authorized_repos(desired_repos, authorized_names)
+    inactive = [repo for repo in desired_repos if repo.lower() not in active]
     logger.info("github desired repos: %s", desired_repos)
     logger.info("github authorized desired repos: %s", active)
     if inactive:
@@ -284,6 +270,7 @@ def create_app(config: Config | None = None):
     and GitHubStateProxy.  No startup bot-identity lookup.
     """
     config = config or load_config()
+    config.github_repos = validate_repository_names(config.github_repos)
     policy = Policy(config)
     policy.load_machines()
 
@@ -316,12 +303,12 @@ def create_app(config: Config | None = None):
         desired_repos = list(config.github_repos)
         try:
             active_repos = await _resolve_active_repos(github, desired_repos)
-            # config.github_repos now becomes ACTIVE_REPOS for all runtime code
+            # Keep the configured allowlist separate from runtime authorization.
             config.active_repos = active_repos
             config.auth_valid = True
             watcher.mark_repos_pending_baseline(active_repos)
             try:
-                await _bootstrap_status_labels(github)
+                await _bootstrap_status_labels(github, repos=active_repos)
             except Exception as exc:
                 logger.warning(
                     "label bootstrap failed "

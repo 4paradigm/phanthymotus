@@ -32,7 +32,7 @@ from .agent_core_client import (
     AgentCoreError,
 )
 from .case_runner import CaseRunner
-from .config import Config
+from .config import Config, DEFAULT_GITHUB_REPOS, validate_repository_names
 from .cos_client import CosClient
 from .evidence_builder import EvidenceBuilder
 from .github_client import GitHubClient, GitHubError
@@ -144,7 +144,7 @@ def _normalize_variant(value: str) -> str:
     raise DeployControllerError(f"unsupported variant: {raw!r}")
 
 
-def _is_deployable_build(repo: str, build) -> bool:
+def _is_deployable_build(repo: str, build, configured_repos: list[str] | None = None) -> bool:
     target = str(build.target or "").strip()
     if not _is_supported_target(target):
         return False
@@ -152,9 +152,14 @@ def _is_deployable_build(repo: str, build) -> bool:
         return False
     if not build.image_tag:
         return False
-    # Repo-aware deployability matrix — exact known identities only
+    # The protected configuration selects the main repository, not its owner.
+    # Additional controlled repositories retain the driver-only contract.
+    try:
+        repos = validate_repository_names(list(DEFAULT_GITHUB_REPOS) if configured_repos is None else configured_repos)
+    except ValueError:
+        return False
     repo_lower = (repo or "").lower()
-    if repo_lower in ("4paradigm/phanthymotus-driver", "haohao-end/phanthymotus-driver"):
+    if repo_lower in repos[1:]:
         # Driver family: only driver with non-empty driver_path is deployable
         if target != "driver":
             return False
@@ -162,7 +167,7 @@ def _is_deployable_build(repo: str, build) -> bool:
         if not driver_path.strip():
             return False
         return True
-    if repo_lower in ("4paradigm/phanthymotus", "haohao-end/phanthymotus"):
+    if repo_lower == repos[0]:
         # Core family: core, perception, and actucore are deployable; driver is NOT
         if target == "driver":
             return False
@@ -275,6 +280,15 @@ class DeployController:
         if self._case_runner is None:
             self._case_runner = CaseRunner(self.config)
         return self._case_runner
+
+    def _extract_trusted_review_evidence(self, comments: list[dict]):
+        # Even an injected/incomplete Config must not turn exact login matching
+        # into the parser's optional ID-only compatibility path.
+        author_id = self.config.review_comment_author_id
+        author_login = self.config.review_comment_author_login
+        if not isinstance(author_id, str) or not author_id or not isinstance(author_login, str) or not author_login:
+            return None
+        return extract_review_evidence(comments, author_id, author_login)
 
     @staticmethod
     def _empty_cos() -> dict[str, Any]:
@@ -842,11 +856,7 @@ class DeployController:
                 comments = await self.github.get_issue_comments(repo, pr_number)
                 if not isinstance(comments, list):
                     comments = []
-                evidence = extract_review_evidence(
-                    comments,
-                    self.config.review_comment_author_id,
-                    self.config.review_comment_author_login,
-                )
+                evidence = self._extract_trusted_review_evidence(comments)
             except Exception as e:
                 logger.warning(
                     "request_deploy comment evidence %s#%s: %s",
@@ -887,7 +897,7 @@ class DeployController:
                             "success": eb.success,
                             "image_tag": eb.image_tag,
                             "driver_path": eb.driver_path,
-                        })()
+                        })(), configured_repos=self.config.github_repos,
                     ),
                 )
                 builds.append(bi)
@@ -3824,11 +3834,7 @@ class DeployController:
                     build_infos = []
                 elif latest_anchor.state == "build-succeeded":
                     # Build completed successfully — get full evidence for deploy-ready check
-                    evidence = extract_review_evidence(
-                        comments,
-                        self.config.review_comment_author_id,
-                        self.config.review_comment_author_login,
-                    )
+                    evidence = self._extract_trusted_review_evidence(comments)
                     if evidence is None:
                         # Build succeeded but Test/Code Review not yet complete
                         desired_status = "reviewing"
@@ -3860,7 +3866,7 @@ class DeployController:
                                             "success": eb.success,
                                             "image_tag": eb.image_tag,
                                             "driver_path": eb.driver_path,
-                                        })()
+                                        })(), configured_repos=self.config.github_repos,
                                     ),
                                 )
                                 build_infos.append(bi)
@@ -4071,11 +4077,7 @@ class DeployController:
             comments = await self.github.get_issue_comments(repo, pr_number)
             if not isinstance(comments, list):
                 comments = []
-            evidence = extract_review_evidence(
-                comments,
-                self.config.review_comment_author_id,
-                self.config.review_comment_author_login,
-            )
+            evidence = self._extract_trusted_review_evidence(comments)
         except Exception as e:
             logger.warning(
                 "refresh_uncertain comment evidence %s#%s: %s",
@@ -4164,7 +4166,7 @@ class DeployController:
                         "success": eb.success,
                         "image_tag": eb.image_tag,
                         "driver_path": eb.driver_path,
-                    })()
+                    })(), configured_repos=self.config.github_repos,
                 ),
             )
             builds.append(bi)
@@ -4526,9 +4528,7 @@ class DeployController:
             comments = await self.proxy.get_issue_comments(repo, pr_number)
         except Exception:
             return False
-        review_trust = self.config.review_comment_author_id or ""
-        review_login = self.config.review_comment_author_login or ""
-        evidence = extract_review_evidence(comments, review_trust, review_login)
+        evidence = self._extract_trusted_review_evidence(comments)
         if evidence is None:
             return False
         resolved_head = await self._resolve_review_evidence_for_head(

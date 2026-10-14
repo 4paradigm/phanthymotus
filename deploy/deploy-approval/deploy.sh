@@ -85,6 +85,25 @@ dotenv_has_key() {
     dotenv_parse "$file" | awk -F= -v key="$key" '$1 == key { found = 1 } END { exit(found ? 0 : 1) }'
 }
 
+require_github_repos() {
+    # Preserve the legacy default when unset, but never hide an explicitly
+    # empty/duplicate/malformed server allowlist through Compose interpolation.
+    [ "${GITHUB_REPOS+x}" = x ] || return 0
+    python3 - "$GITHUB_REPOS" <<'PY'
+import re, sys
+repos = [item.strip() for item in sys.argv[1].split(",")]
+owner = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+seen = set()
+for repo in repos:
+    if (not re.fullmatch(owner + r"/[A-Za-z0-9_.-]{1,100}", repo)
+            or repo.split("/")[-1] in (".", "..") or "--" in repo.split("/")[0]):
+        raise SystemExit("GITHUB_REPOS contains an empty or invalid owner/repo")
+    if repo.lower() in seen:
+        raise SystemExit("GITHUB_REPOS must not contain duplicates")
+    seen.add(repo.lower())
+PY
+}
+
 require_github_app_inputs() {
     [ -n "${GITHUB_APP_ID:-}" ] || die "GITHUB_APP_ID is required"
     [ -n "${GITHUB_INSTALLATION_ID:-}" ] || die "GITHUB_INSTALLATION_ID is required"
@@ -315,10 +334,10 @@ if aid is None or not isinstance(aid, str):
 al = rct.get("author_login", "")
 if al is None or not isinstance(al, str):
     raise SystemExit("review_comment_trust.author_login must be a string")
-if aid != "7950763":
-    raise SystemExit("review_comment_trust.author_id must be \"7950763\"")
-if al != "kentcyq":
-    raise SystemExit("review_comment_trust.author_login must be \"kentcyq\"")
+if not re.fullmatch(r"[1-9][0-9]*", aid):
+    raise SystemExit("review_comment_trust.author_id must be a positive decimal string")
+if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?", al):
+    raise SystemExit("review_comment_trust.author_login must be a valid GitHub login")
 
 # ── Mandatory per-machine Agent Core CA PEM ──────────────────────────
 machines_path = path.with_name("machines.yaml")
@@ -362,6 +381,7 @@ PY
 
 require_runtime_inputs() {
     require_runtime_user
+    require_github_repos
     require_github_app_inputs
     require_private_local_inputs
     require_machine_policy
@@ -370,11 +390,12 @@ require_runtime_inputs() {
 
 build_env_file() {
     local tmp
+    require_github_repos
     tmp="$(mktemp)"
     chmod 600 "$tmp"
     {        printf 'DEPLOY_APPROVAL_RUNTIME_UID=%s\n' "$RUNTIME_UID"
         printf 'DEPLOY_APPROVAL_RUNTIME_GID=%s\n' "$RUNTIME_GID"
-        for key in GITHUB_REPOS POLL_ENABLED POLL_INTERVAL_SECONDS WEBHOOK_ENABLED GITHUB_WEBHOOK_SECRET; do
+        for key in GITHUB_REPOS POLL_ENABLED POLL_INTERVAL_SECONDS WEBHOOK_ENABLED GITHUB_WEBHOOK_SECRET DEPLOY_APPROVAL_BIND_IP; do
             value="${!key:-}"
             if [ -n "$value" ]; then
                 printf '%s=%s\n' "$key" "$value"
@@ -450,6 +471,7 @@ cmd_preflight() {
     echo "OK: COS secrets content valid"
 
     # 7. GitHub App key validation — REQUIRED
+    require_github_repos
     require_github_app_inputs
     echo "OK: GitHub App private key valid"
 

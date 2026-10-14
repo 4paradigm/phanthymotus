@@ -366,7 +366,8 @@ async def test_server_bootstrap_happens_before_watcher_start_without_identity_lo
         async def list_installation_repositories(self):
             return list(DEFAULT_GITHUB_REPOS)
 
-    async def _bootstrap(_github):
+    async def _bootstrap(_github, repos=None):
+        assert repos == list(DEFAULT_GITHUB_REPOS)
         order.append("bootstrap")
 
     def _start(self):
@@ -403,7 +404,7 @@ async def test_server_does_not_start_watcher_when_bootstrap_fails(tmp_path, monk
         async def list_installation_repositories(self):
             return list(DEFAULT_GITHUB_REPOS)
 
-    async def _bootstrap(_github):
+    async def _bootstrap(_github, repos=None):
         raise RuntimeError("boom")
 
     def _start(self):

@@ -24,7 +24,7 @@ import time
 import logging
 
 from . import commands as commands_mod
-from .config import Config, SUPPORTED_GITHUB_REPOS
+from .config import Config, resolve_authorized_repos
 from .github_client import GitHubClient, GitHubError
 from .github_state_proxy import GitHubStateProxy, GitHubStateProxyError
 
@@ -112,18 +112,12 @@ class GitHubCommandWatcher:
     def mark_repos_pending_baseline(self, repos: list[str]) -> None:
         """Seed the pending-baseline gate for externally resolved repos.
 
-        Used by server startup: the Controller resolves authorization BEFORE
-        the watcher's first poll, so newly active non-required repos (e.g.
-        the Driver repo) must be baselined BEFORE their first dispatch.
-        Without this, authorization-gap comments (posted during downtime or
-        revocation) could be replayed as fresh approvals.
-
-        The required Core repo is intentionally NOT touched — its polling is
-        unaffected.  Each seeded repo starts a fresh baseline generation.
+        Startup and authorization recovery both establish a new generation.
+        This includes the configured primary repository: commands posted during
+        an authorization outage must never become fresh approvals on recovery.
         """
-        required = "4paradigm/phanthymotus"
         for repo in repos:
-            if repo == required:
+            if repo not in self.config.github_repos or repo not in self.config.active_repos:
                 continue
             self._pending_baseline_repos.add(repo)
             self._baseline_progress[repo] = set()
@@ -168,8 +162,7 @@ class GitHubCommandWatcher:
         1. Force fresh installation token under existing single-flight lock.
         2. GET /installation/repositories with the refreshed token.
         3. Validate complete paginated response.
-        4. Compute new_active = config.github_repos \u2229 SUPPORTED_REPOS
-           \u2229 authorized_names — never expands the user's allowlist.
+        4. Intersect config.github_repos with authorized_names.
         5. Ensure required repo is present.
         6. Atomically publish new_active + auth_valid together.
 
@@ -194,108 +187,26 @@ class GitHubCommandWatcher:
 
             # Step 2: Query repos with refreshed token
             authorized_names = await self._github.list_installation_repositories()
-            if not isinstance(authorized_names, list):
-                logger.warning(
-                    "auth refresh: /installation/repositories returned non-list \u2014 "
-                    "keeping previous active repos: %s", old_active,
-                )
-                self.config.auth_valid = False
-                return
-
-            # Step 3: Validate each entry is a dict with full_name OR a plain string
-            authorized_set: set[str] = set()
-            for entry in authorized_names:
-                if isinstance(entry, dict):
-                    fn = entry.get("full_name")
-                    if not isinstance(fn, str):
-                        logger.warning(
-                            "auth refresh: malformed repo entry (no full_name) \u2014 "
-                            "keeping previous active repos: %s", old_active,
-                        )
-                        self.config.auth_valid = False
-                        return
-                    authorized_set.add(fn)
-                elif isinstance(entry, str):
-                    authorized_set.add(entry)
-                else:
-                    logger.warning(
-                        "auth refresh: malformed repo entry \u2014 "
-                        "keeping previous active repos: %s", old_active,
-                    )
-                    self.config.auth_valid = False
-                    return
-
-            # Step 4: Compute intersection of user-configured repos
-            # (config.github_repos) ∩ SUPPORTED_REPOS ∩ authorized_set.
-            # Iterate over config.github_repos to preserve stable ordering
-            # (Core first), preventing list-equality comparison flakiness.
-            new_active: list[str] = []
-            for repo in self.config.github_repos:
-                if repo in SUPPORTED_GITHUB_REPOS and repo in authorized_set:
-                    new_active.append(repo)
-
-            # Step 5: Required repo check \u2014 fail closed if lost
-            required = "4paradigm/phanthymotus"
-            if required not in new_active:
-                logger.warning(
-                    "auth refresh: required repo %r not authorized; "
-                    "failing closed",
-                    required,
-                )
+            try:
+                new_active = resolve_authorized_repos(self.config.github_repos, authorized_names)
+            except RuntimeError:
                 self.config.auth_valid = False
                 self.config.active_repos = []
+                logger.warning("auth refresh: configured primary repository is not authorized")
                 return
 
             # Step 6: Atomically publish new_active + auth_valid
             self.config.active_repos = new_active
             self.config.auth_valid = True
 
-            # Auth recovery: if auth was previously invalid and is now valid
-            # again, mark the optional Driver repo pending for a new durable
-            # baseline EVEN IF authorized repo membership is identical to
-            # old_active.  This prevents replaying commands posted during the
-            # authorization outage.
             old_active_set = set(old_active)
             new_active_set = set(new_active)
-            # A1-02: clear any stale Core entries from pending/progress
-            # before evaluating the current cycle.  Core must NEVER enter
-            # the pending-baseline gate, period.
-            self._pending_baseline_repos.discard(required)
-            self._baseline_progress.pop(required, None)
-            if not old_auth_valid and old_active_set == new_active_set:
-                # Auth recovered with the same authorized set (order-independent).
-                # Only require Driver re-baseline when the Driver repo is
-                # actually authorized — adding it when absent would create
-                # a pending repo that can never be baselined and would
-                # interfere with Core polling.
-                driver = "4paradigm/phanthymotus-driver"
-                if driver in new_active_set:
-                    logger.info(
-                        "auth refresh: auth recovered with same repos %s — "
-                        "requiring Driver baseline",
-                        sorted(new_active_set),
-                    )
-                    self._pending_baseline_repos.add(driver)
-                    self._baseline_progress[driver] = set()
-            elif new_active_set != old_active_set:
-                added = set(new_active) - set(old_active)
-                # A1-02: only optional repos (Driver) enter pending-baseline; Core never does.
-                optional_added = {r for r in added if r != required}
-                removed = set(old_active) - set(new_active)
-                if added:
-                    logger.info("auth refresh: activated repos %s", sorted(added))
-                    self._pending_baseline_repos.update(optional_added)
-                    # Start a fresh baseline generation — do not carry over
-                    # PRs baselined under a prior authorization period.
-                    for r in optional_added:
-                        self._baseline_progress[r] = set()
-                if removed:
-                    logger.info("auth refresh: deactivated repos %s", sorted(removed))
-                    # Clear generation state for revoked repos; preserve
-                    # persisted lifecycle / History / cursor on disk.
-                    for r in removed:
-                        self._pending_baseline_repos.discard(r)
-                        self._baseline_progress.pop(r, None)
+            removed = old_active_set - new_active_set
+            for repo in removed:
+                self._pending_baseline_repos.discard(repo)
+                self._baseline_progress.pop(repo, None)
+            newly_active = new_active_set if not old_auth_valid else new_active_set - old_active_set
+            self.mark_repos_pending_baseline(sorted(newly_active))
         except Exception as e:
             logger.warning(
                 "auth refresh failed: %s \u2014 failing closed",
@@ -315,8 +226,11 @@ class GitHubCommandWatcher:
         """
         if not self.config.active_repos or not getattr(self.config, "auth_valid", True):
             return
-        repos = self.config.active_repos
+        repos = list(self.config.active_repos)
         for repo in repos:
+            if (not self.config.auth_valid or repo not in self.config.active_repos
+                    or repo not in self.config.github_repos):
+                continue
             try:
                 prs = await self.proxy.get_open_prs(repo)
             except GitHubError as e:
@@ -324,6 +238,8 @@ class GitHubCommandWatcher:
                 continue
             baseline_all = repo in self._pending_baseline_repos
             for pr in prs:
+                if not self.config.auth_valid or repo not in self.config.active_repos:
+                    break
                 pr_number = int(pr.get("number") or 0)
                 if not pr_number:
                     continue
@@ -693,7 +609,8 @@ class GitHubCommandWatcher:
             # TOCTOU recheck: the auth snapshot was validated at cycle start,
             # but awaits have run since. Fail closed if authorization was
             # revoked while we were reading GitHub state.
-            if not getattr(self.config, "auth_valid", True) or repo not in self.config.active_repos:
+            if (not self.config.auth_valid or repo not in self.config.active_repos
+                    or repo not in self.config.github_repos):
                 logger.warning(
                     "watcher auth snapshot invalid before dispatch %s#%s \u2014 fail closed",
                     repo, pr_number,

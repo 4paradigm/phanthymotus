@@ -10,10 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import logging
+from urllib.parse import urlparse
 
 import httpx
 
-from .config import Config
+from .config import Config, validate_repository_names
 from .clients_common import (
     SecurityError,
     enforce_body_size,
@@ -73,19 +74,53 @@ class GitHubClient:
         Accepts both relative paths (e.g. ``/repos/...``) and absolute URLs.
         Absolute URLs are passed through verbatim (no double-prefixing).
         """
-        if self._token_provider is not None:
-            token = await self._token_provider()
-        else:
+        url = self._resolve_api_url(path)
+        mutating = method.upper() not in ("GET", "HEAD", "OPTIONS")
+        if mutating:
+            self._require_write_authorization(url)
+        if self._token_provider is None:
             raise GitHubError("No token provider configured for GitHubClient")
+        try:
+            token = await self._token_provider()
+        except Exception as exc:
+            self.config.auth_valid = False
+            raise GitHubError("GitHub App authorization unavailable") from exc
+        if not isinstance(token, str) or not token.strip():
+            self.config.auth_valid = False
+            raise GitHubError("GitHub App authorization unavailable")
+        # Token acquisition is asynchronous; recheck the current authorization
+        # snapshot immediately before any request with a side effect.
+        if mutating:
+            self._require_write_authorization(url)
         headers = dict(kwargs.pop("headers", {}) or {})
         headers["Authorization"] = "Bearer " + token
         headers.setdefault("Accept", "application/vnd.github+json")
         headers.setdefault("X-GitHub-Api-Version", "2026-03-10")
-        url = self._resolve_api_url(path)
         require_http_policy(url, self.config, allow_private=self.config.allow_private_http)
-        return await stream_request(
+        kwargs.setdefault("timeout", self.config.total_timeout)
+        resp = await stream_request(
             self.http, method, url, self.config.max_response_bytes,
             headers=headers, **kwargs)
+        # Label permissions are optional UI projection; a 403 there must not
+        # disable the controller. Invalid credentials always close the gate.
+        path_parts = urlparse(url).path.split("/")
+        label_projection = len(path_parts) >= 5 and path_parts[1] == "repos" and (
+            path_parts[4] == "labels" or (
+                len(path_parts) >= 7 and path_parts[4] == "issues" and path_parts[6] == "labels"))
+        if resp.status_code == 401 or (resp.status_code == 403 and not label_projection):
+            self.config.auth_valid = False
+        return resp
+
+    def _require_write_authorization(self, url: str) -> None:
+        pieces = urlparse(url).path.split("/")
+        repo = "/".join(pieces[2:4]).lower() if len(pieces) >= 5 and pieces[1] == "repos" else ""
+        try:
+            controlled = validate_repository_names(self.config.github_repos)
+        except ValueError as exc:
+            raise GitHubError("GitHub repository configuration is invalid") from exc
+        if (self.config.auth_valid is not True or not repo
+                or repo not in controlled or repo not in self.config.active_repos):
+            raise GitHubError("GitHub write requires current installation authorization for a configured repository")
 
     def _resolve_api_url(self, path: str) -> str:
         """Resolve a path to a full URL without double-prefixing.

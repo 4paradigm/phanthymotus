@@ -18,7 +18,7 @@ services:
       GITHUB_APP_ID: "${GITHUB_APP_ID}"
       GITHUB_INSTALLATION_ID: "${GITHUB_INSTALLATION_ID}"
       GITHUB_APP_PRIVATE_KEY_FILE: "${GITHUB_APP_PRIVATE_KEY_FILE}"
-      GITHUB_REPOS: "${GITHUB_REPOS:-4paradigm/phanthymotus,4paradigm/phanthymotus-driver}"
+      GITHUB_REPOS: "${GITHUB_REPOS-4paradigm/phanthymotus,4paradigm/phanthymotus-driver}"
       POLL_ENABLED: "${POLL_ENABLED:-true}"
       POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-30}"
       WEBHOOK_ENABLED: "${WEBHOOK_ENABLED:-false}"
@@ -46,7 +46,8 @@ services:
         bind:
           create_host_path: false
     ports:
-      - "25001:25001"
+      # External webhooks require an explicit bind IP and network access controls.
+      - "${DEPLOY_APPROVAL_BIND_IP:-127.0.0.1}:25001:25001"
     read_only: true
     tmpfs:
       - /tmp

@@ -17,6 +17,8 @@ def config():
     return Config(
 
         github_repos=["4paradigm/phanthymotus"],
+        review_comment_author_id="7950763",
+        review_comment_author_login="kentcyq",
         machine_owners_file="/dev/null",
         poll_interval_seconds=30,
     )

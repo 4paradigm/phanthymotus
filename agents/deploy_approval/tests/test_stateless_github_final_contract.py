@@ -965,6 +965,7 @@ async def test_restart_old_approve_comment_never_replayed(controller, proxy, con
 
     from ..github_command_watcher import GitHubCommandWatcher
 
+    config.github_repos = ["repo"]
     config.active_repos = ["repo"]
     config.auth_valid = True
 

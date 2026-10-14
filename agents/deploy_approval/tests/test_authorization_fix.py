@@ -27,11 +27,16 @@ def _make_config(**overrides) -> Config:
         poll_enabled=True,
         poll_interval_seconds=30,
         review_comment_author_id="7950763",
+        review_comment_author_login="kentcyq",
         machine_owners_file="/dev/null",
         secrets_file="/dev/null",
     )
     for k, v in overrides.items():
         setattr(cfg, k, v)
+    if "active_repos" not in overrides:
+        cfg.active_repos = list(cfg.github_repos)
+    if "auth_valid" not in overrides:
+        cfg.auth_valid = True
     return cfg
 
 
@@ -1480,6 +1485,120 @@ async def test_lifespan_body_exception_cleanup_runs_once():
     assert cleanup_counts['aclose'] == 1, f"aclose called {cleanup_counts['aclose']} times"
     assert cleanup_counts['gh_close'] == 1, f"gh_close called {cleanup_counts['gh_close']} times"
     assert cleanup_counts['auth_close'] == 1, f"auth_close called {cleanup_counts['auth_close']} times"
+
+
+@pytest.mark.asyncio
+async def test_primary_repo_requires_installation_authorization():
+    """Use the real installation API reader and primary intersection, offline."""
+    cfg = _make_config(github_repos=["team/main", "team/drivers"], active_repos=[], auth_valid=False)
+    installed = ["team/drivers", "outside/authorized"]
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        assert request.method == "GET" and request.url.path == "/installation/repositories"
+        return httpx.Response(200, json={
+            "total_count": len(installed),
+            "repositories": [{"full_name": repo} for repo in installed],
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = GitHubClient(cfg, http=http, token_provider=AsyncMock(return_value="OFFLINE_INSTALLATION_TOKEN"))
+        with pytest.raises(RuntimeError, match="required repo.*team/main.*not authorized"):
+            await _resolve_active_repos(gh, cfg.github_repos)
+        assert cfg.active_repos == [] and cfg.auth_valid is False
+        installed[:] = ["TEAM/Main", "team/drivers", "outside/authorized"]
+        assert await _resolve_active_repos(gh, cfg.github_repos) == ["team/main", "team/drivers"]
+        installed[:] = ["team/main", "outside/authorized"]
+        assert await _resolve_active_repos(gh, cfg.github_repos) == ["team/main"]
+    assert len(requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_watcher_dynamic_repo_refresh_no_expansion():
+    """Refresh, durable baseline, auth recovery and the real write gate fail closed."""
+    import copy
+    cfg = _make_config(github_repos=["team/main", "team/drivers"],
+                       active_repos=["team/main"], auth_valid=True)
+    github = MagicMock()
+    github.list_installation_repositories = AsyncMock(
+        return_value=["team/main", "team/drivers", "outside/authorized"])
+    auth = MagicMock()
+    auth.refresh_installation_token = AsyncMock(return_value="OFFLINE_TOKEN")
+    state = {
+        "head_sha": "a" * 40, "last_processed_comment_id": 10, "status": "uncertain",
+        "command": {"comment_id": 10, "kind": "approve_deploy", "phase": "uncertain",
+                    "args": {"machine": "test-machine"}},
+        "deployments": [{"machine": "test-machine", "phase": "uncertain"}],
+    }
+    original_command = copy.deepcopy(state["command"])
+    original_deployments = copy.deepcopy(state["deployments"])
+    proxy = MagicMock()
+    proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 1}] if repo == "team/drivers" else [])
+    proxy.get_pr = AsyncMock(return_value={"state": "open"})
+    proxy.read_hidden_state = AsyncMock(side_effect=lambda *_args: copy.deepcopy(state))
+    proxy.get_issue_comments = AsyncMock(return_value=[
+        {"id": 20, "body": "/approve_deploy machine=test-machine"}])
+
+    async def persist(_repo, _pr, cursor):
+        state["last_processed_comment_id"] = max(state["last_processed_comment_id"], cursor)
+        return copy.deepcopy(state)
+
+    proxy.persist_cursor = AsyncMock(side_effect=persist)
+    controller = MagicMock()
+    controller.on_command = AsyncMock()
+    watcher = GitHubCommandWatcher(cfg, proxy, controller, github=github, github_auth=auth)
+    await watcher._refresh_active_repos()
+    assert cfg.active_repos == ["team/main", "team/drivers"] and cfg.auth_valid
+    assert watcher._pending_baseline_repos == {"team/drivers"}
+    await watcher._poll_once()
+    assert state["last_processed_comment_id"] == 20
+    controller.on_command.assert_not_awaited()
+    assert state["command"] == original_command and state["deployments"] == original_deployments
+    assert {c.args[0] for c in proxy.get_open_prs.await_args_list} == set(cfg.github_repos)
+
+    auth.refresh_installation_token.side_effect = RuntimeError("offline auth outage")
+    await watcher._refresh_active_repos()
+    assert cfg.auth_valid is False
+    calls_before = proxy.get_open_prs.await_count
+    await watcher._poll_once()
+    assert proxy.get_open_prs.await_count == calls_before
+    transport_calls = []
+
+    async def transport(request):
+        transport_calls.append(request)
+        return httpx.Response(201, json={"id": 1})
+
+    provider = AsyncMock(return_value="OFFLINE_TOKEN")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        actual = GitHubClient(cfg, http=http, token_provider=provider)
+        with pytest.raises(GitHubError, match="current installation authorization"):
+            await actual.post_issue_comment("team/main", 1, "offline comment")
+        provider.assert_not_awaited()
+        assert transport_calls == []
+        auth.refresh_installation_token.side_effect = None
+        await watcher._refresh_active_repos()
+        assert watcher._pending_baseline_repos == {"team/main", "team/drivers"}
+        proxy.get_issue_comments.return_value.append(
+            {"id": 30, "body": "/approve_deploy machine=test-machine"})
+        await watcher._poll_once()
+        assert state["last_processed_comment_id"] == 30
+        controller.on_command.assert_not_awaited()
+        assert state["command"] == original_command and state["deployments"] == original_deployments
+
+        async def revoke_during_token_acquisition():
+            cfg.auth_valid = False
+            return "OFFLINE_TOKEN"
+
+        actual._token_provider = revoke_during_token_acquisition
+        with pytest.raises(GitHubError, match="current installation authorization"):
+            await actual.post_issue_comment("team/main", 1, "offline comment")
+        assert transport_calls == []
+    github.list_installation_repositories.return_value = ["team/drivers", "outside/authorized"]
+    await watcher._refresh_active_repos()
+    assert cfg.active_repos == [] and cfg.auth_valid is False
+    controller.on_command.assert_not_awaited()
+
 
 
 @pytest.mark.asyncio

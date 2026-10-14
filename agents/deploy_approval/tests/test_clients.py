@@ -81,21 +81,22 @@ def _open_pr(number: int, updated_at: str, *, marker: str = "") -> dict:
     "github_repos, should_pass, expected_error",
     [
         ([], False, "GITHUB_REPOS is required"),
-        (["4paradigm/phanthymotus"], False, "GITHUB_REPOS must contain exactly"),
-        (["4paradigm/phanthymotus-driver"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus"], True, ""),
+        (["4paradigm/phanthymotus-driver"], True, ""),
         (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False, "GITHUB_REPOS must not contain duplicates"),
         (["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"], True, ""),
         (["4paradigm/phanthymotus-driver", "4paradigm/phanthymotus"], True, ""),
-        (["4paradigm/phanthymotus", "some/other-repo"], False, "GITHUB_REPOS must contain exactly"),
-        (["example/unsupported-repo"], False, "GITHUB_REPOS must contain exactly"),
+        (["4paradigm/phanthymotus", "some/other-repo"], True, ""),
+        (["example/unsupported-repo"], True, ""),
     ],
 )
-def test_validate_config_requires_exact_runtime_repo_set(github_repos, should_pass, expected_error):
+def test_validate_config_validates_runtime_repo_set(github_repos, should_pass, expected_error):
     cfg = Config(
         github_repos=github_repos,
         poll_enabled=True,
         github_webhook_secret="secret",
         review_comment_author_id="7950763",
+        review_comment_author_login="kentcyq",
         agent_core_tokens={"test-machine": "test-token"},
         cos_region="ap-beijing",
         cos_bucket="testbucket123",
@@ -1053,3 +1054,69 @@ def test_github_self_created_client_disables_proxy_env(monkeypatch):
         assert result == {"status": "running", "running_image": "registry/repo:tag"}
         with pytest.raises(AgentCoreError, match="status must be a non-empty string"):
             asyncio.run(c.driver_status("invalid-driver"))
+
+
+@pytest.mark.asyncio
+async def test_stream_total_timeout_includes_response_headers():
+    """Entering the real HTTPX stream context must consume the total deadline."""
+    from ..clients_common import SecurityError, stream_request
+    requests = []
+    cancelled = []
+
+    async def slow_headers(request):
+        requests.append(request)
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return httpx.Response(200, content=b"late headers")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(slow_headers),
+                                 timeout=10, follow_redirects=True) as http:
+        with pytest.raises(SecurityError, match="total timeout"):
+            await asyncio.wait_for(
+                stream_request(http, "GET", "https://offline.invalid/headers", 100, timeout=0.03),
+                timeout=1)
+    assert len(requests) == 1 and cancelled == [True]
+
+
+@pytest.mark.asyncio
+async def test_stream_total_timeout_includes_body():
+    """Headers and an indefinitely dripping body share one bounded request."""
+    from ..clients_common import SecurityError, stream_request
+
+    class DrippingBody(httpx.AsyncByteStream):
+        def __init__(self):
+            self.chunks = 0
+            self.closed = False
+            self.cancelled = False
+
+        async def __aiter__(self):
+            try:
+                while True:
+                    self.chunks += 1
+                    yield b"."
+                    await asyncio.sleep(0.005)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+        async def aclose(self):
+            self.closed = True
+
+    body = DrippingBody()
+    requests = []
+
+    async def headers_then_body(request):
+        requests.append(request)
+        await asyncio.sleep(0.01)
+        return httpx.Response(200, stream=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(headers_then_body), timeout=10) as http:
+        with pytest.raises(SecurityError, match="total timeout"):
+            await asyncio.wait_for(
+                stream_request(http, "GET", "https://offline.invalid/drip", 10_000, timeout=0.04),
+                timeout=1)
+    assert len(requests) == 1
+    assert body.chunks >= 1 and body.cancelled and body.closed

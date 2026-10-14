@@ -1392,7 +1392,7 @@ TAG_B = "bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:release.260923
 
 
 def _fake_config():
-    from ..config import REVIEW_AGENT_GITHUB_LOGIN, REVIEW_AGENT_GITHUB_USER_ID
+    REVIEW_AGENT_GITHUB_LOGIN, REVIEW_AGENT_GITHUB_USER_ID = "kentcyq", "7950763"
     from ..tests.conftest import make_config
     return make_config(
         review_comment_author_id=REVIEW_AGENT_GITHUB_USER_ID,
@@ -1424,7 +1424,7 @@ def _make_policy():
 
 
 def _make_controller(fake_proxy, policy, fake_github):
-    from ..config import REVIEW_AGENT_GITHUB_LOGIN, REVIEW_AGENT_GITHUB_USER_ID
+    REVIEW_AGENT_GITHUB_LOGIN, REVIEW_AGENT_GITHUB_USER_ID = "kentcyq", "7950763"
     from ..service import DeployController
     config = _fake_config()
     config.review_comment_author_id = REVIEW_AGENT_GITHUB_USER_ID
@@ -5055,7 +5055,7 @@ async def test_driver_repo_removed_after_start_is_deactivated():
     from ..config import DESIRED_REPOS
     from ..github_client import GitHubClient
 
-    config = make_config()
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
     config.active_repos = [
         "4paradigm/phanthymotus",
         "4paradigm/phanthymotus-driver",
@@ -5450,7 +5450,7 @@ async def test_driver_token_refresh_precedes_repo_discovery():
     list_installation_repositories in every auth refresh cycle."""
     from ..github_client import GitHubClient
 
-    config = make_config()
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
     config.active_repos = ["4paradigm/phanthymotus"]
 
     proxy = MagicMock()
@@ -5687,7 +5687,9 @@ async def test_driver_authorized_new_pr_command_dispatch():
     from ..github_client import GitHubClient
     from ..github_command_watcher import GitHubCommandWatcher
 
-    config = make_config()
+    config = make_config(github_repos=[
+        "4paradigm/phanthymotus", "4paradigm/phanthymotus-driver",
+    ])
     config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
     config.auth_valid = True
 
@@ -5833,7 +5835,7 @@ async def test_driver_required_repo_authorization_lost_fails_closed():
     active_repos=[], no further polling."""
     from ..github_client import GitHubClient
 
-    config = make_config()
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
     config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
 
     proxy = MagicMock()
@@ -7218,7 +7220,7 @@ async def test_driver_baseline_enumeration_failure_fails_closed():
     from ..github_client import GitHubClient, GitHubError
     from ..github_command_watcher import GitHubCommandWatcher
 
-    config = make_config()
+    config = make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"])
     config.active_repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]
     config.auth_valid = True
 

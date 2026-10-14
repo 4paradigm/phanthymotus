@@ -19,6 +19,7 @@ import logging
 import os
 import ipaddress
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,25 +34,45 @@ DEFAULT_GITHUB_REPOS = (
 )
 
 
-SUPPORTED_GITHUB_REPOS = frozenset({
-    "4paradigm/phanthymotus",
-    "4paradigm/phanthymotus-driver",
-})
+# Compatibility names for the legacy defaults, not runtime authorization gates.
+SUPPORTED_GITHUB_REPOS = frozenset(DEFAULT_GITHUB_REPOS)
+DESIRED_REPOS = DEFAULT_GITHUB_REPOS
 
-# ── Authoritative desired (allowlisted) repositories ─────────────────
-# These are the ONLY repos that can ever be activated.
-# Runtime active repos = DESIRED_REPOS ∩ GitHub App installation repositories.
-DESIRED_REPOS = (
-    "4paradigm/phanthymotus",
-    "4paradigm/phanthymotus-driver",
-)
+_OWNER_RE = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+_REPOSITORY_RE = re.compile(rf"{_OWNER_RE}/[A-Za-z0-9_.-]{{1,100}}")
+_LOGIN_RE = re.compile(rf"{_OWNER_RE}(?:\[bot\])?")
 
-# ── Authoritative production Review Agent GitHub identity ──────────────
-# This is the ONLY accepted identity for Review Agent PR comments.
-# It is NOT an env var. It is NOT configurable at runtime.
-# Secrets.yaml review_comment_trust MUST match these exact values.
-REVIEW_AGENT_GITHUB_USER_ID = "7950763"
-REVIEW_AGENT_GITHUB_LOGIN = "kentcyq"
+
+def validate_repository_names(repos: list[str], *, label: str = "GITHUB_REPOS", allow_empty: bool = False) -> list[str]:
+    """Validate a controlled list and canonicalize GitHub's case-insensitive names."""
+    if not isinstance(repos, list):
+        raise ValueError(f"{label} must be a list")
+    if not repos and not allow_empty:
+        raise ValueError(f"{label} is required")
+    result = []
+    for repo in repos:
+        if (not isinstance(repo, str) or not _REPOSITORY_RE.fullmatch(repo)
+                or repo.split("/")[-1] in (".", "..")
+                or "--" in repo.split("/")[0]):
+            raise ValueError(f"{label} contains an invalid owner/repo")
+        canonical = repo.lower()
+        if canonical in result:
+            raise ValueError(f"{label} must not contain duplicates")
+        result.append(canonical)
+    return result
+
+
+def resolve_authorized_repos(desired: list[str], authorized: list) -> list[str]:
+    """Intersect the configured allowlist with a complete installation snapshot."""
+    desired = validate_repository_names(desired)
+    if not isinstance(authorized, list):
+        raise ValueError("installation repositories must be a list")
+    names = [entry.get("full_name") if isinstance(entry, dict) else entry for entry in authorized]
+    authorized_set = set(validate_repository_names(names, label="installation repositories", allow_empty=True))
+    active = [repo for repo in desired if repo in authorized_set]
+    if desired[0] not in active:
+        raise RuntimeError(f"required repo {desired[0]!r} is not authorized for this GitHub App installation")
+    return active
 
 
 @dataclass
@@ -74,10 +95,10 @@ class Config:
     github_comment_max_bytes: int = 4 * 1024 * 1024
 
     # Review comment trust configuration
-    # Defaults align with authoritative production Review Agent identity.
-    # Production startup validate_config() enforces exact match.
-    review_comment_author_id: str = REVIEW_AGENT_GITHUB_USER_ID
-    review_comment_author_login: str = REVIEW_AGENT_GITHUB_LOGIN
+    # Production loads BOTH values exclusively from protected secrets.yaml.
+    # There is no fallback identity or environment override.
+    review_comment_author_id: str = ""
+    review_comment_author_login: str = ""
 
     # Machine owners configuration
     machine_owners_file: str = "/run/deploy-approval/machines.yaml"
@@ -110,6 +131,10 @@ class Config:
         default_factory=dict,
         repr=False,
     )
+
+    @property
+    def primary_repo(self) -> str:
+        return validate_repository_names(self.github_repos)[0]
 
 
 def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int | None = None) -> int:
@@ -171,12 +196,27 @@ def _load_yaml_mapping(path: str) -> dict:
     if not path:
         return {}
     p = Path(path)
+    if p.is_symlink():
+        raise ValueError(f"{path} must be a protected regular file")
     if not p.exists():
         return {}
-    if not p.is_file():
-        raise ValueError(f"{path} must be a regular file")
-    with p.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
+    # Trust comes from the protected server file, not a comment or environment.
+    # Inspect the opened descriptor so replacing the pathname cannot change
+    # the object whose ownership/permissions were checked.
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ValueError(f"{path} must be a protected regular file") from exc
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        info = os.fstat(fh.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            raise ValueError(f"{path} must be a protected regular file")
+        try:
+            data = yaml.safe_load(fh)
+        except yaml.YAMLError:
+            # Parser diagnostics can quote a line containing a token or key.
+            raise ValueError(f"{path} must contain valid protected YAML") from None
     if data is None:
         return {}
     if not isinstance(data, dict):
@@ -280,7 +320,8 @@ def load_config() -> Config:
         poll_interval_seconds=_env_int("POLL_INTERVAL_SECONDS", 30),
         github_repos=list(
             DEFAULT_GITHUB_REPOS if os.getenv("GITHUB_REPOS") is None
-            else _env_str_list("GITHUB_REPOS")
+            else ([] if not os.environ["GITHUB_REPOS"].strip()
+                  else [repo.strip() for repo in os.environ["GITHUB_REPOS"].split(",")])
         ),
         review_comment_author_id=review_trust.get("author_id", ""),
         review_comment_author_login=review_trust.get("author_login", ""),
@@ -303,27 +344,10 @@ def load_config() -> Config:
 
 
 def validate_config(cfg: Config) -> None:
-    if not isinstance(cfg.github_repos, list):
-        raise ValueError("GITHUB_REPOS must be a list")
-    if not cfg.github_repos:
-        raise ValueError("GITHUB_REPOS is required")
+    cfg.github_repos = validate_repository_names(cfg.github_repos)
     if not cfg.poll_enabled:
         raise ValueError(
             "Deploy Approval requires polling; webhook does not replace the GitHubCommandWatcher"
-        )
-    for r in cfg.github_repos:
-        if not isinstance(r, str):
-            raise ValueError(f"GITHUB_REPOS member must be a string, got {r!r}")
-    if len(cfg.github_repos) != len(set(cfg.github_repos)):
-        raise ValueError("GITHUB_REPOS must not contain duplicates")
-    required_repos = set(DEFAULT_GITHUB_REPOS)
-    if (
-        len(cfg.github_repos) != len(DEFAULT_GITHUB_REPOS)
-        or set(cfg.github_repos) != required_repos
-    ):
-        raise ValueError(
-            "GITHUB_REPOS must contain exactly: "
-            + ", ".join(DEFAULT_GITHUB_REPOS)
         )
     if cfg.webhook_enabled and not cfg.github_webhook_secret:
         raise ValueError(
@@ -407,14 +431,7 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(
             f"cos.bucket has invalid format: {cfg.cos_bucket!r}"
         )
-    # Fail closed: review_comment_trust must match authoritative Review Agent identity.
-    if cfg.review_comment_author_id != REVIEW_AGENT_GITHUB_USER_ID:
-        raise ValueError(
-            "review_comment_trust.author_id does not match authoritative Review Agent "
-            f"(expected {REVIEW_AGENT_GITHUB_USER_ID!r}, got {cfg.review_comment_author_id!r})"
-        )
-    if cfg.review_comment_author_login != REVIEW_AGENT_GITHUB_LOGIN:
-        raise ValueError(
-            "review_comment_trust.author_login does not match authoritative Review Agent "
-            f"(expected {REVIEW_AGENT_GITHUB_LOGIN!r}, got {cfg.review_comment_author_login!r})"
-        )
+    if not re.fullmatch(r"[1-9][0-9]*", cfg.review_comment_author_id):
+        raise ValueError("review_comment_trust.author_id must be a positive decimal string")
+    if not _LOGIN_RE.fullmatch(cfg.review_comment_author_login):
+        raise ValueError("review_comment_trust.author_login must be a valid GitHub login")

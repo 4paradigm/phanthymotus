@@ -15,7 +15,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .config import Config
+from .config import Config, validate_repository_names
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +28,21 @@ EVIDENCE_PRESIGNED_URL_TTL_SECONDS = 120
 
 
 
-# Repo directory mapping: full repo -> short directory name.
+# Immutable historical object directories. This map is NOT an allowlist.
 _REPO_DIR_MAP = {
     "4paradigm/phanthymotus": "phanthymotus",
     "4paradigm/phanthymotus-driver": "phanthymotus-driver",
 }
+
+
+def _repo_directory(repo: str) -> str:
+    canonical = validate_repository_names([repo])[0]
+    if canonical in _REPO_DIR_MAP:
+        return _REPO_DIR_MAP[canonical]
+    owner, name = canonical.split("/")
+    # Reversible, injective encoding. No slashes, dots, or ambiguous separators;
+    # the reserved prefix cannot collide with either historical short directory.
+    return f"repo-v1-{owner.encode('ascii').hex()}-{name.encode('ascii').hex()}"
 
 
 class CosError(Exception):
@@ -63,6 +73,17 @@ class CosClient:
             for value in values
         )
 
+    def _is_controlled_key(self, object_key: str) -> bool:
+        try:
+            repo = self._repo_from_key(object_key)
+            if repo not in validate_repository_names(self.config.github_repos):
+                return False
+            self.validate_object_key(repo, self._pr_number_from_key(object_key),
+                                     self._head_sha_from_key(object_key), object_key)
+            return True
+        except (ValueError, TypeError, AttributeError):
+            return False
+
     def generate_evidence_download_url(
         self,
         object_key: str,
@@ -71,7 +92,7 @@ class CosClient:
 
         Returns empty string on failure (fail-closed).  Never leaks secrets.
         """
-        if not object_key or not isinstance(object_key, str):
+        if not self._is_controlled_key(object_key):
             logger.warning(
                 "COS_EVIDENCE_PRESIGN=INVALID_KEY",
             )
@@ -166,11 +187,12 @@ class CosClient:
         Raises:
             ValueError: On invalid pr_number, head_sha, or repo.
         """
-        repo_dir = _REPO_DIR_MAP.get(repo)
-        if repo_dir is None:
+        canonical = validate_repository_names([repo])[0]
+        if canonical not in validate_repository_names(self.config.github_repos):
             raise ValueError(
-                f"repo {repo!r} is not a supported repo for COS evidence"
+                "repo is not configured for COS evidence"
             )
+        repo_dir = _repo_directory(canonical)
 
         # PR number: must be int, not bool, and > 0
         if isinstance(pr_number, bool) or not isinstance(pr_number, int):
@@ -220,6 +242,8 @@ class CosClient:
         versioning is confirmed absent (empty/None response).
         Enabled, Suspended, or unknown versioning -> fail closed.
         """
+        if not self._is_controlled_key(object_key):
+            return False
         if self._fake:
             # T1LAST Issue 2: Validate incoming archive_bytes BEFORE any existing lookup.
             # Prevents passing invalid bytes through when existing object happens to match.
@@ -632,6 +656,15 @@ class CosClient:
             for full_repo, repo_dir in _REPO_DIR_MAP.items():
                 if repo_dir == short_dir:
                     return full_repo
+            if short_dir.startswith("repo-v1-"):
+                try:
+                    owner_hex, name_hex = short_dir[len("repo-v1-"):].split("-")
+                    repo = bytes.fromhex(owner_hex).decode("ascii") + "/" + bytes.fromhex(name_hex).decode("ascii")
+                    canonical = validate_repository_names([repo])[0]
+                    if _repo_directory(canonical) == short_dir:
+                        return canonical
+                except (ValueError, UnicodeDecodeError):
+                    pass
         return ""
 
     @staticmethod
@@ -819,6 +852,8 @@ class CosClient:
         Upload-time pre-check: if a matching object already exists with
         matching metadata, return True immediately (idempotent retry).
         """
+        if not self._is_controlled_key(object_key):
+            return False
         if self._fake:
             # In fake mode, find the upload and verify real bytes, SHA, size,
             # gzip integrity, and identity binding — same contract as real COS.
@@ -1004,9 +1039,7 @@ class CosClient:
 
     @staticmethod
     def _expected_object_key_prefix(repo: str, pr_number: int, head_sha: str) -> tuple[str, str]:
-        repo_dir = _REPO_DIR_MAP.get(repo)
-        if repo_dir is None:
-            raise ValueError("unsupported repo")
+        repo_dir = _repo_directory(repo)
         if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
             raise ValueError("invalid PR number")
         if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
@@ -1016,6 +1049,8 @@ class CosClient:
     async def download_evidence_archive(
         self, object_key: str, max_bytes: int,
     ) -> bytes:
+        if not self._is_controlled_key(object_key):
+            raise CosError("COS object key is not configured or has invalid identity")
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         if self._fake:
@@ -1092,7 +1127,7 @@ class CosClient:
             {"object_key": str, "sha256": str (64-hex), "size": int (>0)}
         Returns empty metadata on any failure.
         """
-        if not archive_bytes:
+        if not archive_bytes or not self._is_controlled_key(object_key):
             return {"object_key": "", "sha256": "", "size": 0}
 
         try:

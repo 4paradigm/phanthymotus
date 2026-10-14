@@ -127,6 +127,8 @@ async def stream_request(
             params=params,
             json=json,
             content=content,
+            # Keep this policy even for an externally supplied client.
+            follow_redirects=False,
         ) as resp:
             total = 0
             chunks = []

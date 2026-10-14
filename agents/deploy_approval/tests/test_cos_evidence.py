@@ -87,7 +87,7 @@ def test_real_record_test_contains_test_section():
 
 
 def test_cos_object_key_exact_layout():
-    client = CosClient(make_config())
+    client = CosClient(make_config(github_repos=["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver"]))
     now = datetime(2026, 9, 17, 20, 30)
     for repo, expected in [
         ("4paradigm/phanthymotus", "phanthymotus_pr/phanthymotus/2026-09/2026-09-17/pr-7/evidence-" + HEAD + ".log.gz"),
@@ -138,23 +138,24 @@ def _install_qcloud(monkeypatch, client, body, length):
 
 def test_cos_download_head_before_get_and_hard_bound(monkeypatch):
     client = CosClient(make_config())
+    key = client.build_object_key("4paradigm/phanthymotus", 7, HEAD)
     body = _Body([b"evidence"])
     events = _install_qcloud(monkeypatch, client, body, 8)
-    assert asyncio.run(client.download_evidence_archive("key", 10)) == b"evidence"
+    assert asyncio.run(client.download_evidence_archive(key, 10)) == b"evidence"
     assert events == ["HEAD", "GET"] and body.closed
     events = _install_qcloud(monkeypatch, client, _Body([b"not-read"]), EVIDENCE_MAX_ARCHIVE_BYTES + 1)
     with pytest.raises(CosError):
-        asyncio.run(client.download_evidence_archive("key", EVIDENCE_MAX_ARCHIVE_BYTES))
+        asyncio.run(client.download_evidence_archive(key, EVIDENCE_MAX_ARCHIVE_BYTES))
     assert events == ["HEAD"]
     body = _Body([b"x" * (EVIDENCE_MAX_ARCHIVE_BYTES + 1)])
     _install_qcloud(monkeypatch, client, body, EVIDENCE_MAX_ARCHIVE_BYTES)
     with pytest.raises(CosError):
-        asyncio.run(client.download_evidence_archive("key", EVIDENCE_MAX_ARCHIVE_BYTES))
+        asyncio.run(client.download_evidence_archive(key, EVIDENCE_MAX_ARCHIVE_BYTES))
     assert body.closed
     body = _Body([b"short"])
     _install_qcloud(monkeypatch, client, body, 99)
     with pytest.raises(CosError):
-        asyncio.run(client.download_evidence_archive("key", EVIDENCE_MAX_ARCHIVE_BYTES))
+        asyncio.run(client.download_evidence_archive(key, EVIDENCE_MAX_ARCHIVE_BYTES))
     assert body.closed
 
 
@@ -170,7 +171,7 @@ def test_cos_presign_ttl_is_120():
 async def test_cos_presign_missing_credentials_returns_empty(monkeypatch):
     """When credentials are missing, generate_evidence_download_url returns ''."""
     client = CosClient(make_config(cos_secret_id="", cos_secret_key=""))
-    result = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+    result = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
     assert result == ""
 
 
@@ -232,7 +233,7 @@ async def test_cos_presign_https_accepted_http_rejected(monkeypatch):
             self._test_url = "https://bucket-123456.cos.ap-shanghai.myqcloud.com/phanthymotus_pr/test/evidence.gz"
         FakeCosS3Client.__init__ = patched_init
 
-        result = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+        result = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
         assert result.startswith("https://"), f"expected https URL, got {result!r}"
 
         # HTTP -> rejected
@@ -241,7 +242,7 @@ async def test_cos_presign_https_accepted_http_rejected(monkeypatch):
             self._test_url = "http://bucket-123456.cos.ap-shanghai.myqcloud.com/phanthymotus_pr/test/evidence.gz"
         FakeCosS3Client.__init__ = patched_init_http
 
-        result2 = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+        result2 = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
         assert result2 == "", f"expected empty for http URL, got {result2!r}"
     finally:
         FakeCosS3Client.__init__ = orig_init
@@ -274,8 +275,9 @@ async def test_cos_presign_sdk_exception_returns_empty(monkeypatch):
     saved = sys.modules.get("qcloud_cos")
     sys.modules["qcloud_cos"] = fake_module
     try:
-        client = CosClient(make_config())
-        result = client.generate_evidence_download_url("phanthymotus_pr/test/evidence.gz")
+        client = CosClient(make_config(cos_region="ap-shanghai", cos_bucket="test-bucket",
+                                      cos_secret_id="OFFLINE_ID", cos_secret_key="OFFLINE_KEY"))
+        result = client.generate_evidence_download_url(client.build_object_key("4paradigm/phanthymotus", 7, HEAD))
         assert result == ""
     finally:
         if saved:
@@ -405,3 +407,39 @@ async def test_no_post_deploy_health_gate():
     assert "_wait_for_deploy_health" not in source, (
         "_wait_for_deploy_health method must be removed"
     )
+
+
+@pytest.mark.asyncio
+async def test_cos_runtime_repo_key_legacy_and_collision_safe():
+    """Exercise actual gzip identity/upload/read-back for configured namespaces."""
+    repos = ["4paradigm/phanthymotus", "4paradigm/phanthymotus-driver",
+             "team/phanthymotus", "other/phanthymotus", "team-a/b", "team/a-b"]
+    cfg = make_config(github_repos=repos)
+    client = CosClient(cfg, _fake=True)
+    now = datetime(2026, 10, 14)
+    keys = {repo: client.build_object_key(repo, 7, HEAD, now=now) for repo in repos}
+    assert keys[repos[0]] == f"phanthymotus_pr/phanthymotus/2026-10/2026-10-14/pr-7/evidence-{HEAD}.log.gz"
+    assert keys[repos[1]] == f"phanthymotus_pr/phanthymotus-driver/2026-10/2026-10-14/pr-7/evidence-{HEAD}.log.gz"
+    assert len(set(keys.values())) == len(repos)
+    for repo, key in keys.items():
+        assert key.split("/")[1] not in (".", "..")
+        assert CosClient._repo_from_key(key) == repo
+        assert CosClient.validate_object_key(repo, 7, HEAD, key) == key
+        archive, sha, size = await EvidenceBuilder(cfg).build_evidence(
+            repo=repo, pr_number=7, head_sha=HEAD, state=_state(), result="pass")
+        metadata = await client.ensure_evidence_archive(
+            object_key=key, archive_bytes=archive, repo=repo,
+            pr_number=7, head_sha=HEAD, result="pass")
+        assert metadata == {"object_key": key, "sha256": sha, "size": size}
+        assert await client.download_evidence_archive(key, size) == archive
+        assert await client.verify_upload(key, sha, size)
+        with pytest.raises(ValueError, match="identity"):
+            CosClient.validate_object_key("outside/same-name", 7, HEAD, key)
+    previous = list(client._uploads)
+    wrong_repo_archive, _, _ = await EvidenceBuilder(cfg).build_evidence(
+        repo=repos[2], pr_number=7, head_sha=HEAD, state=_state(), result="pass")
+    assert not await client.upload_evidence_archive(keys[repos[0]], wrong_repo_archive, expected_result="pass")
+    assert client._uploads == previous
+    for invalid in ("outside/unconfigured", "team/../name", "team/..", "team/name/extra"):
+        with pytest.raises(ValueError):
+            client.build_object_key(invalid, 7, HEAD)

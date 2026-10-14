@@ -664,10 +664,15 @@ class FakeBuild:
     driver_path: str = ""
 
 
-def _is_deployable_build(repo, build):
+_FORK_CONFIGURED_REPOS = [
+    "haohao-end/phanthymotus", "haohao-end/phanthymotus-driver",
+]
+
+
+def _is_deployable_build(repo, build, configured_repos=None):
     """Import the production function and expose it for testing."""
     from ..service import _is_deployable_build as _pdb
-    return _pdb(repo, build)
+    return _pdb(repo, build, configured_repos=configured_repos)
 
 
 class TestSourceMatrixOfficialCore:
@@ -691,19 +696,33 @@ class TestSourceMatrixOfficialCore:
 
 
 class TestSourceMatrixForkCore:
-    """Fork haohao-end/phanthymotus: only perception and actucore are deployable."""
+    """Configured fork main repo: only core, perception and actucore are deployable."""
 
     def test_fork_phanthymotus_perception_is_deployable(self):
         build = FakeBuild(target="perception")
-        assert _is_deployable_build("haohao-end/phanthymotus", build) is True
+        assert _is_deployable_build(
+            "haohao-end/phanthymotus", build, configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is True
+        assert _is_deployable_build("haohao-end/phanthymotus", build) is False
+        assert _is_deployable_build(
+            "haohao-end/phanthymotus", FakeBuild(target="core"),
+            configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is True
 
     def test_fork_phanthymotus_actucore_is_deployable(self):
         build = FakeBuild(target="actucore")
-        assert _is_deployable_build("haohao-end/phanthymotus", build) is True
+        assert _is_deployable_build(
+            "haohao-end/phanthymotus", build, configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is True
+        assert _is_deployable_build("haohao-end/phanthymotus", build) is False
 
     def test_fork_phanthymotus_driver_is_not_deployable(self):
         build = FakeBuild(target="driver")
         assert _is_deployable_build("haohao-end/phanthymotus", build) is False
+        assert _is_deployable_build(
+            "haohao-end/phanthymotus", FakeBuild(target="driver", driver_path="custom/driver"),
+            configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is False
 
 
 class TestSourceMatrixDriverRepos:
@@ -720,14 +739,25 @@ class TestSourceMatrixDriverRepos:
     def test_official_driver_repo_perception_is_not_deployable(self):
         build = FakeBuild(target="perception")
         assert _is_deployable_build("4paradigm/phanthymotus-driver", build) is False
+        for target in ("core", "perception", "actucore"):
+            assert _is_deployable_build(
+                "haohao-end/phanthymotus-driver", FakeBuild(target=target, driver_path="custom/driver"),
+                configured_repos=_FORK_CONFIGURED_REPOS,
+            ) is False
 
     def test_fork_driver_repo_driver_with_path_is_deployable(self):
         build = FakeBuild(target="driver", driver_path="custom/driver")
-        assert _is_deployable_build("haohao-end/phanthymotus-driver", build) is True
+        assert _is_deployable_build(
+            "haohao-end/phanthymotus-driver", build, configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is True
+        assert _is_deployable_build("haohao-end/phanthymotus-driver", build) is False
 
     def test_fork_driver_repo_driver_without_path_is_not_deployable(self):
         build = FakeBuild(target="driver", driver_path="  ")
         assert _is_deployable_build("haohao-end/phanthymotus-driver", build) is False
+        assert _is_deployable_build(
+            "haohao-end/phanthymotus-driver", build, configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is False
 
 
 class TestSourceMatrixUnknownRepos:
@@ -736,14 +766,23 @@ class TestSourceMatrixUnknownRepos:
     def test_unknown_repo_perception_is_not_deployable(self):
         build = FakeBuild(target="perception")
         assert _is_deployable_build("some-user/phanthymotus", build) is False
+        assert _is_deployable_build(
+            "some-user/phanthymotus", build, configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is False
 
     def test_unknown_repo_driver_is_not_deployable(self):
         build = FakeBuild(target="driver", driver_path="unitree/go2")
         assert _is_deployable_build("some-user/phanthymotus-driver", build) is False
+        assert _is_deployable_build(
+            "some-user/phanthymotus-driver", build, configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is False
 
     def test_random_repo_is_not_deployable(self):
         build = FakeBuild(target="perception")
         assert _is_deployable_build("org/not-related", build) is False
+        assert _is_deployable_build(
+            "org/not-related", build, configured_repos=_FORK_CONFIGURED_REPOS,
+        ) is False
 
 
 class TestSourceMatrixFailedBuilds:

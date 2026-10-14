@@ -1028,7 +1028,9 @@ async def test_existing_history_lifecycle_write_executes_without_nameerror():
     from agents.deploy_approval.policy import Policy
     from agents.deploy_approval.service import DeployController
 
-    config = Config(github_repos=["4paradigm/phanthymotus"])
+    config = Config(github_repos=["4paradigm/phanthymotus"],
+                    review_comment_author_id=TRUSTED_AUTHOR_ID,
+                    review_comment_author_login=TRUSTED_AUTHOR_LOGIN)
     proxy = MagicMock()
     github = MagicMock()
     policy = Policy(config)
@@ -1200,7 +1202,8 @@ No blocking findings.
         "command": {"comment_id": 0, "kind": "", "phase": "completed", "args": {}},
         "last_processed_comment_id": 0,
     }
-    config = Config(github_repos=[repo])
+    config = Config(github_repos=[repo], review_comment_author_id=TRUSTED_AUTHOR_ID,
+                    review_comment_author_login=TRUSTED_AUTHOR_LOGIN)
     proxy = MagicMock()
     github = MagicMock()
     controller = DeployController(config, proxy, Policy(config), github)
@@ -1308,7 +1311,9 @@ def _core_contract_controller():
     from agents.deploy_approval.policy import Policy
     from agents.deploy_approval.service import DeployController
 
-    config = Config(github_repos=["4paradigm/phanthymotus"])
+    config = Config(github_repos=["4paradigm/phanthymotus"],
+                    review_comment_author_id=TRUSTED_AUTHOR_ID,
+                    review_comment_author_login=TRUSTED_AUTHOR_LOGIN)
     proxy = MagicMock()
     github = MagicMock()
     controller = DeployController(config, proxy, Policy(config), github)
@@ -1902,3 +1907,82 @@ def test_deploy_ready_renders_tests_not_run():
                       image_tag="registry/core:v1", deployable=True)
     body = comments.deploy_ready("repo", 1, "a" * 40, [build], review_evidence={})
     assert "**Tests:** not run" in body
+
+
+@pytest.mark.asyncio
+async def test_review_author_runtime_trust_provenance_fail_closed(tmp_path, monkeypatch):
+    """Protected file trust applies to actual API comments, never env/payload claims."""
+    import httpx
+    import yaml
+    from .. import config as config_mod
+    from ..github_client import GitHubClient
+    from ..service import DeployController
+    from ..policy import Policy
+
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text(yaml.safe_dump({
+        "version": 1,
+        "cos": {"region": "ap-beijing", "bucket": "offline-bucket-123",
+                "secret_id": "OFFLINE_ID", "secret_key": "OFFLINE_KEY"},
+        "review_comment_trust": {"author_id": "987654", "author_login": "configured-review"},
+        "agent_core_tokens": {"test-machine": "OFFLINE_TOKEN"},
+    }))
+    secrets.chmod(0o600)
+    real_loader = config_mod._load_secrets_config
+    monkeypatch.setattr(config_mod, "_load_secrets_config", lambda _path: real_loader(str(secrets)))
+    monkeypatch.setenv("GITHUB_REPOS", "4paradigm/phanthymotus")
+    monkeypatch.setenv("REVIEW_COMMENT_AUTHOR_ID", TRUSTED_AUTHOR_ID)
+    monkeypatch.setenv("REVIEW_COMMENT_AUTHOR_LOGIN", TRUSTED_AUTHOR_LOGIN)
+    cfg = config_mod.load_config()
+    assert cfg.review_comment_author_id == "987654"
+    assert cfg.review_comment_author_login == "configured-review"
+    actual_comments = []
+
+    async def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == "/repos/4paradigm/phanthymotus/issues/279/comments"
+        return httpx.Response(200, json=actual_comments)
+
+    async def token():
+        return "OFFLINE_INSTALLATION_TOKEN"
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        gh = GitHubClient(cfg, http=http, token_provider=token)
+        controller = DeployController(cfg, MagicMock(), Policy(cfg), gh)
+        for aid, login, accepted in (
+            (987654, "configured-review", True),
+            (987654, "forged-login", False),
+            (987655, "configured-review", False),
+            (int(TRUSTED_AUTHOR_ID), TRUSTED_AUTHOR_LOGIN, False),
+        ):
+            actual_comments[:] = [
+                _make_comment(_BUILD_COMMENT_BODY, cid=1001, author_id=aid, author_login=login),
+                _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z",
+                              author_id=aid, author_login=login),
+            ]
+            fetched = await gh.get_issue_comments(cfg.primary_repo, 279)
+            evidence = controller._extract_trusted_review_evidence(fetched)
+            assert (evidence is not None) is accepted
+            if accepted:
+                assert evidence.review_author_id == "987654"
+                assert evidence.review_author_login == "configured-review"
+                cfg.review_comment_author_login = ""
+                assert controller._extract_trusted_review_evidence(fetched) is None
+                cfg.review_comment_author_login = "configured-review"
+
+    link = tmp_path / "symlink-secrets.yaml"
+    link.symlink_to(secrets)
+    with pytest.raises(ValueError, match="protected regular file"):
+        real_loader(str(link))
+    secrets.chmod(0o666)
+    with pytest.raises(ValueError, match="protected regular file"):
+        real_loader(str(secrets))
+    secrets.chmod(0o600)
+    data = yaml.safe_load(secrets.read_text())
+    for field, value in (("author_id", ""), ("author_id", "not-numeric"),
+                         ("author_login", ""), ("author_login", "bad/login")):
+        invalid = dict(data)
+        invalid["review_comment_trust"] = dict(data["review_comment_trust"], **{field: value})
+        secrets.write_text(yaml.safe_dump(invalid))
+        with pytest.raises(ValueError, match="review_comment_trust"):
+            config_mod.load_config()

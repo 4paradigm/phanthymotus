@@ -16,7 +16,7 @@ from ..config import (Config,
 
 
 def test_config_defaults():
-    c = Config(github_repos=["org/repo"], review_comment_author_id="7950763")
+    c = Config(github_repos=["org/repo"], review_comment_author_id="7950763", review_comment_author_login="kentcyq")
     assert c.host == "0.0.0.0"
     assert c.port == 25001
     assert c.poll_enabled is True
@@ -29,6 +29,7 @@ def test_validate_config_no_longer_requires_github_token():
         Config(
             github_repos=list(DEFAULT_GITHUB_REPOS),
             review_comment_author_id="7950763",
+            review_comment_author_login="kentcyq",
             agent_core_tokens={"test": "token"},
             cos_region="ap-beijing",
             cos_bucket="testbucket123",
@@ -40,7 +41,7 @@ def test_validate_config_no_longer_requires_github_token():
 
 def test_validate_config_default_repos():
     """Default github_repos contains both production repositories."""
-    c = Config(review_comment_author_id="7950763", agent_core_tokens={"test": "token"})
+    c = Config(review_comment_author_id="7950763", review_comment_author_login="kentcyq", agent_core_tokens={"test": "token"})
     assert "4paradigm/phanthymotus" in c.github_repos
     assert "4paradigm/phanthymotus-driver" in c.github_repos
     # Explicit empty overrides defaults — must fail closed
@@ -53,20 +54,21 @@ def test_validate_config_default_repos():
     [
         (list(DEFAULT_GITHUB_REPOS), True),
         (list(reversed(DEFAULT_GITHUB_REPOS)), True),
-        (["4paradigm/phanthymotus"], False),
-        (["4paradigm/phanthymotus-driver"], False),
+        (["4paradigm/phanthymotus"], True),
+        (["4paradigm/phanthymotus-driver"], True),
         (["4paradigm/phanthymotus", "4paradigm/phanthymotus"], False),
-        (["4paradigm/phanthymotus", "some/fork-repo"], False),
-        (["some/other"], False),
+        (["4paradigm/phanthymotus", "some/fork-repo"], True),
+        (["some/other"], True),
         ([], False),
-        ([*DEFAULT_GITHUB_REPOS, "some/other"], False),
+        ([*DEFAULT_GITHUB_REPOS, "some/other"], True),
     ],
 )
-def test_github_repos_requires_exact_runtime_repo_set(repos, should_pass):
+def test_github_repos_validates_configured_runtime_repo_set(repos, should_pass):
     cfg = Config(
         github_repos=repos,
         agent_core_tokens={"test": "token"},
         review_comment_author_id="7950763",
+        review_comment_author_login="kentcyq",
         cos_region="ap-beijing",
         cos_bucket="testbucket123",
         cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
@@ -86,6 +88,7 @@ def test_validate_config_requires_webhook_secret():
                 github_repos=list(DEFAULT_GITHUB_REPOS),
                 webhook_enabled=True,
                 review_comment_author_id="7950763",
+                review_comment_author_login="kentcyq",
                 agent_core_tokens={"test-machine": "test-token"},
             )
         )
@@ -100,6 +103,7 @@ def test_validate_config_requires_polling():
                 poll_enabled=False,
                 github_webhook_secret="secret",
                 review_comment_author_id="7950763",
+                review_comment_author_login="kentcyq",
                 agent_core_tokens={"test-machine": "test-token"},
             )
         )
@@ -330,16 +334,11 @@ def test_driver_paths_are_trimmed_deduped_and_exact_case_preserved(config):
 
 def test_validate_config_accepts_canonical_identity():
     """A. canonical author_id=7950763, author_login=kentcyq => PASS."""
-    from ..config import REVIEW_AGENT_GITHUB_USER_ID, REVIEW_AGENT_GITHUB_LOGIN
-
-    assert REVIEW_AGENT_GITHUB_USER_ID == "7950763"
-    assert REVIEW_AGENT_GITHUB_LOGIN == "kentcyq"
-
     validate_config(
         Config(
             github_repos=list(DEFAULT_GITHUB_REPOS),
-            review_comment_author_id=REVIEW_AGENT_GITHUB_USER_ID,
-            review_comment_author_login=REVIEW_AGENT_GITHUB_LOGIN,
+            review_comment_author_id="7950763",
+            review_comment_author_login="kentcyq",
             agent_core_tokens={"test": "token"},
             cos_region="ap-beijing",
             cos_bucket="testbucket123",
@@ -349,55 +348,55 @@ def test_validate_config_accepts_canonical_identity():
     )
 
 
-def test_validate_config_rejects_haohao_end_as_review_agent():
-    """B. author_id=184792454, author_login=Haohao-end => fail closed."""
-    with pytest.raises(ValueError, match="does not match authoritative Review Agent"):
-        validate_config(
-            Config(
-                github_repos=list(DEFAULT_GITHUB_REPOS),
-                review_comment_author_id="184792454",
-                review_comment_author_login="Haohao-end",
-                agent_core_tokens={"test": "token"},
-                cos_region="ap-beijing",
-                cos_bucket="testbucket123",
-                cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
-                cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
-            )
-        )
+def test_runtime_review_rejects_unconfigured_author():
+    """Actual comments must match BOTH fields of the configured identity."""
+    from ..review_comment_parser import extract_review_evidence
+    from .test_review_agent_contract import _make_comment, _BUILD_COMMENT_BODY, _CODE_REVIEW_BODY
+
+    def evidence_for(author_id, author_login):
+        comments = [
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, author_id=author_id, author_login=author_login),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z",
+                          author_id=author_id, author_login=author_login),
+        ]
+        return extract_review_evidence(comments, "7950763", "kentcyq")
+
+    assert evidence_for("7950763", "kentcyq") is not None
+    assert evidence_for("184792454", "Haohao-end") is None
 
 
-def test_validate_config_rejects_correct_id_wrong_login():
-    """C. author_id correct but login wrong => fail closed."""
-    with pytest.raises(ValueError, match="does not match authoritative Review Agent"):
-        validate_config(
-            Config(
-                github_repos=list(DEFAULT_GITHUB_REPOS),
-                review_comment_author_id="7950763",
-                review_comment_author_login="wrong-login",
-                agent_core_tokens={"test": "token"},
-                cos_region="ap-beijing",
-                cos_bucket="testbucket123",
-                cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
-                cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
-            )
-        )
+def test_runtime_review_rejects_correct_id_wrong_login():
+    """Actual comments must match BOTH fields of the configured identity."""
+    from ..review_comment_parser import extract_review_evidence
+    from .test_review_agent_contract import _make_comment, _BUILD_COMMENT_BODY, _CODE_REVIEW_BODY
+
+    def evidence_for(author_id, author_login):
+        comments = [
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, author_id=author_id, author_login=author_login),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z",
+                          author_id=author_id, author_login=author_login),
+        ]
+        return extract_review_evidence(comments, "7950763", "kentcyq")
+
+    assert evidence_for("7950763", "kentcyq") is not None
+    assert evidence_for("7950763", "wrong-login") is None
 
 
-def test_validate_config_rejects_wrong_id_correct_login():
-    """D. author_id wrong but login correct => fail closed."""
-    with pytest.raises(ValueError, match="does not match authoritative Review Agent"):
-        validate_config(
-            Config(
-                github_repos=list(DEFAULT_GITHUB_REPOS),
-                review_comment_author_id="12345",
-                review_comment_author_login="kentcyq",
-                agent_core_tokens={"test": "token"},
-                cos_region="ap-beijing",
-                cos_bucket="testbucket123",
-                cos_secret_id="TEST_FAKE_SECRET_ID_AAAA",
-                cos_secret_key="TEST_FAKE_SECRET_KEY_AAAA",
-            )
-        )
+def test_runtime_review_rejects_wrong_id_correct_login():
+    """Actual comments must match BOTH fields of the configured identity."""
+    from ..review_comment_parser import extract_review_evidence
+    from .test_review_agent_contract import _make_comment, _BUILD_COMMENT_BODY, _CODE_REVIEW_BODY
+
+    def evidence_for(author_id, author_login):
+        comments = [
+            _make_comment(_BUILD_COMMENT_BODY, cid=1001, author_id=author_id, author_login=author_login),
+            _make_comment(_CODE_REVIEW_BODY, cid=1003, created_at="2026-09-18T03:57:00Z",
+                          author_id=author_id, author_login=author_login),
+        ]
+        return extract_review_evidence(comments, "7950763", "kentcyq")
+
+    assert evidence_for("7950763", "kentcyq") is not None
+    assert evidence_for("12345", "kentcyq") is None
 
 
 def test_load_config_reads_canonical_secrets(tmp_path, monkeypatch):
@@ -457,13 +456,14 @@ def test_no_env_var_override_for_review_trust():
 
 # ── deploy.sh review_comment_trust contract regression ─────────────────
 
-def test_deploy_sh_validates_canonical_review_agent_trust():
-    """6. deploy.sh require_secrets contains and enforces canonical review_comment_trust."""
+def test_deploy_sh_validates_runtime_review_agent_trust():
+    """deploy.sh validates protected runtime identity without a hardcoded user."""
     ROOT = Path(__file__).parent.parent.parent.parent
     deploy_sh = ROOT / "deploy" / "deploy-approval" / "deploy.sh"
     text = deploy_sh.read_text(encoding="utf-8")
-    assert '"7950763"' in text, "deploy.sh must validate author_id == 7950763"
-    assert '"kentcyq"' in text, "deploy.sh must validate author_login == kentcyq"
+    assert "review_comment_trust.author_id must be a positive decimal string" in text
+    assert "review_comment_trust.author_login must be a valid GitHub login" in text
+    assert '"7950763"' not in text and '"kentcyq"' not in text
 
 
 def test_deploy_sh_rejects_wrong_trust(tmp_path):
@@ -486,7 +486,7 @@ def test_deploy_sh_rejects_wrong_trust(tmp_path):
         "  secret_id: TEST_FAKE_SECRET_ID_AAAA\n"
         "  secret_key: TEST_FAKE_SECRET_KEY_AAAA\n"
         "review_comment_trust:\n"
-        "  author_id: \"184792454\"\n"
+        "  author_id: \"not-a-numeric-id\"\n"
         "  author_login: \"Haohao-end\"\n"
         "agent_core_tokens:\n"
         "  m1: token\n"
@@ -511,7 +511,7 @@ def test_deploy_sh_rejects_wrong_trust(tmp_path):
         capture_output=True, text=True,
     )
     assert r.returncode != 0
-    assert "7950763" in (r.stdout + r.stderr)
+    assert "author_id must be a positive decimal string" in (r.stdout + r.stderr)
 
 
 def test_service_has_no_self_approval_prohibition():
@@ -546,6 +546,7 @@ def test_agent_core_tokens_empty_mapping_fails():
             Config(
                 github_repos=list(DEFAULT_GITHUB_REPOS),
                 review_comment_author_id="7950763",
+                review_comment_author_login="kentcyq",
                 agent_core_tokens={},
             )
         )
@@ -558,6 +559,7 @@ def test_agent_core_tokens_non_mapping_fails():
             Config(
                 github_repos=list(DEFAULT_GITHUB_REPOS),
                 review_comment_author_id="7950763",
+                review_comment_author_login="kentcyq",
                 agent_core_tokens="not-a-mapping",
             )
         )
@@ -570,6 +572,7 @@ def test_agent_core_tokens_empty_key_fails():
             Config(
                 github_repos=list(DEFAULT_GITHUB_REPOS),
                 review_comment_author_id="7950763",
+                review_comment_author_login="kentcyq",
                 agent_core_tokens={"": "token"},
             )
         )
@@ -582,6 +585,7 @@ def test_agent_core_tokens_empty_value_fails():
             Config(
                 github_repos=list(DEFAULT_GITHUB_REPOS),
                 review_comment_author_id="7950763",
+                review_comment_author_login="kentcyq",
                 agent_core_tokens={"machine": ""},
             )
         )
@@ -593,6 +597,7 @@ def test_agent_core_tokens_valid_mapping_passes():
         Config(
             github_repos=list(DEFAULT_GITHUB_REPOS),
             review_comment_author_id="7950763",
+            review_comment_author_login="kentcyq",
             agent_core_tokens={"machine1": "token1", "machine2": "token2"},
             cos_region="ap-beijing",
             cos_bucket="testbucket123",
@@ -646,3 +651,40 @@ def test_load_config_ignores_legacy_registry_environment(tmp_path, monkeypatch):
     assert cfg.review_comment_author_id == "7950763"
     assert cfg.review_comment_author_login == "kentcyq"
     assert "test-machine" in cfg.agent_core_tokens
+
+
+def test_config_runtime_repos_dynamic_and_validated(monkeypatch):
+    """The server allowlist defines the primary; malformed entries never disappear."""
+    import agents.deploy_approval.config as config_mod
+    from ..models import BuildInfo
+    from ..service import _is_deployable_build
+
+    monkeypatch.setattr(config_mod, "_load_secrets_config", lambda _path: {
+        "cos": {"region": "ap-beijing", "bucket": "offline-bucket-123",
+                "secret_id": "OFFLINE_ID", "secret_key": "OFFLINE_KEY"},
+        "review_comment_trust": {"author_id": "123456", "author_login": "ci-review"},
+        "agent_core_tokens": {"test-machine": "OFFLINE_TOKEN"}, "agent_core_ca_pem": {},
+    })
+    for raw, expected in (
+        ("4paradigm/phanthymotus,4paradigm/phanthymotus-driver", list(DEFAULT_GITHUB_REPOS)),
+        ("Example-Team/Main, example-team/drivers", ["example-team/main", "example-team/drivers"]),
+    ):
+        monkeypatch.setenv("GITHUB_REPOS", raw)
+        cfg = load_config()
+        assert cfg.github_repos == expected and cfg.primary_repo == expected[0]
+        assert cfg.active_repos == [] and cfg.auth_valid is False
+        for target in ("core", "perception", "actucore"):
+            build = BuildInfo(target=target, driver_path="", variant="", success=True,
+                              image_tag="registry/component:v1", deployable=False)
+            assert _is_deployable_build(expected[0], build, cfg.github_repos)
+            assert not _is_deployable_build("outside/unconfigured", build, cfg.github_repos)
+        driver = BuildInfo(target="driver", driver_path="unitree/g1", variant="",
+                           success=True, image_tag="registry/driver:v1", deployable=False)
+        assert not _is_deployable_build(expected[0], driver, cfg.github_repos)
+        assert _is_deployable_build(expected[1], driver, cfg.github_repos)
+    for raw in ("", "team/main,", ",team/main", "team/main,,team/drivers",
+                "team/main,TEAM/Main", "team/../main", "../main",
+                "team/..", "team/main?extra", "https://github.com/team/main", "team main/repo"):
+        monkeypatch.setenv("GITHUB_REPOS", raw)
+        with pytest.raises(ValueError, match="GITHUB_REPOS"):
+            load_config()

@@ -446,7 +446,7 @@ def test_cos_path_rejects_unsupported_repo():
     cfg = Config()
     client = CosClient(cfg, _fake=True)
     head_sha = "c" * 40
-    with pytest.raises(ValueError, match="not a supported repo"):
+    with pytest.raises(ValueError, match="not configured for COS evidence"):
         client.build_object_key("other/repo", 1, head_sha)
 
 
@@ -966,3 +966,19 @@ def test_source_does_not_auto_create_config_dir():
     # The deploy.sh preflight checks for directory existence but doesn't create it
     preflight_section = deploy_text.split("cmd_preflight()")[1].split("\n\ncmd_")[0]
     assert "mkdir" not in preflight_section
+
+
+def test_compose_port_loopback_default():
+    """Inspect parsed production Compose and retain the existing hardening."""
+    svc = _compose()["services"]["deploy-approval"]
+    assert svc["ports"] == ["${DEPLOY_APPROVAL_BIND_IP:-127.0.0.1}:25001:25001"]
+    assert svc["user"] == "${DEPLOY_APPROVAL_RUNTIME_UID:-65532}:${DEPLOY_APPROVAL_RUNTIME_GID:-65532}"
+    assert svc["read_only"] is True
+    assert "no-new-privileges:true" in svc["security_opt"]
+    assert svc["cap_drop"] == ["ALL"]
+    assert "network_mode" not in svc
+    assert "deploy" not in svc or svc["deploy"].get("replicas", 1) == 1
+    assert all(v.get("read_only") is True for v in svc["volumes"])
+    assert all("docker.sock" not in str(v) for v in svc["volumes"])
+    assert {v["target"] for v in svc["volumes"]} >= {
+        "/run/deploy-approval/machines.yaml", "/run/deploy-approval/secrets.yaml"}
