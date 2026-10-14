@@ -72,6 +72,10 @@ MODEL_LOAD_GRACE_S = 3.0
 # buffer drains — a spurious 1.1 s fragment cut immediately after it.
 VAD_MAX_SPEECH_S = 30
 VAD_BUFFER_S     = 35
+# Retain a maximum VAD segment plus 30 s of queueing margin, at Bumi's 20 Hz
+# maximum direction rate. Snapshot at dequeue so transcription cannot evict it.
+DIRECTION_HISTORY_S = VAD_MAX_SPEECH_S + 30
+DIRECTION_HISTORY_MAX_EVENTS = DIRECTION_HISTORY_S * 20 + 1
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1566,7 +1570,7 @@ class _ASRNode(Node):
         self._input_topic  = input_topic
         self._direction_topic = direction_topic
         self._direction_sub = None
-        self._direction_windows = deque(maxlen=50)
+        self._direction_windows = deque(maxlen=DIRECTION_HISTORY_MAX_EVENTS)
         self._direction_lock = threading.Lock()
         self._output_topic = f"{input_topic}/asr"
         # 第二条输出：KWS 未触发的话语。独立 topic 而不是同一条带 priority 0，
@@ -1784,7 +1788,7 @@ class _ASRNode(Node):
         with self._direction_lock:
             self._direction_windows.append((angle, begin, end))
             while (self._direction_windows
-                   and self._direction_windows[0][2] < end - 3_000_000):
+                   and self._direction_windows[0][2] < end - DIRECTION_HISTORY_S * 1_000_000):
                 self._direction_windows.popleft()
 
     def _audio_cb(self, msg):
@@ -2005,6 +2009,8 @@ class _ASRNode(Node):
                 # degrades to "no pre-roll known" instead of raising.
                 pre_roll_bytes = int(item[3]) if len(item) > 3 else 0
                 trusted_audio = bool(item[4]) if len(item) > 4 else False
+                with self._direction_lock:
+                    windows = list(self._direction_windows)
             except Exception:
                 continue
             try:
@@ -2077,8 +2083,6 @@ class _ASRNode(Node):
                                                 utterance, _speaker_fields,
                                                 _audio_tags)
                         continue
-                    with self._direction_lock:
-                        windows = list(self._direction_windows)
                     direction_fields = _wake_direction_fields(
                         text, text_char_ends, end_pos, len(keyword_ipa),
                         start_ts, pre_roll_bytes, windows,

@@ -60,6 +60,10 @@ token is unavailable. If timing is unavailable, a wake word at the utterance
 start can use the VAD onset; a spoken prefix returns `unknown`. Recognition
 and wake triggering continue normally. Check token timing accuracy on the
 robot; the timestamps do not establish the physical alignment error by themselves.
+Direction history keeps up to 60 seconds / 1201 events, covering a 30-second
+VAD segment plus queueing margin at Bumi's maximum 20 Hz publication rate.
+The worker snapshots history before transcription, so later direction events
+cannot evict a wake window while that utterance is being decoded.
 
 ### Common Pitfalls
 

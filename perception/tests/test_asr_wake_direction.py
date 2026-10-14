@@ -80,7 +80,8 @@ def test_english_token_boundaries_map_to_custom_wake_time():
 
 @pytest.mark.parametrize('prefix', ['嗯', '先说别的'])
 @pytest.mark.parametrize('emit_tags', [True, False])
-def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, prefix, emit_tags):
+@pytest.mark.parametrize('evict_during_decode', [True, False])
+def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, prefix, emit_tags, evict_during_decode):
     import json
     import queue
 
@@ -99,6 +100,14 @@ def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, pr
     node._direction_windows.extend([
         window(-45, 1700000000500000, 1700000000600000),
         window(90, 1700000001000000, 1700000001100000)])
+
+    def decode(streams):
+        decoded.append(streams)
+        if evict_during_decode:
+            node._direction_cb(SimpleNamespace(state=1, angle_deg=-90,
+                window_start_us=1700000120000000, window_end_us=1700000120050000))
+
+    adapter._recognizer.decode_streams = decode
     node._stop_event = asr.threading.Event()
     node._worker_ready = asr.threading.Event()
     items = iter([(b'\0\0' * 32000, 1700000000.0, 1700000002.0, 16000, True)])
@@ -128,6 +137,21 @@ def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, pr
     assert ('lang' in payload) is emit_tags
     assert 'tokens' not in payload and 'timestamps' not in payload
     assert len(decoded) == 1
+
+
+def test_long_utterance_retains_leading_wake_window_despite_later_direction_samples():
+    node = asr._ASRNode('/mic', None, 'zh-CN', direction_topic='/direction')
+    base_us = 1700000000000000
+    # 32 seconds at Bumi's maximum 20 Hz, beyond one maximum-length VAD segment.
+    for i in range(650):
+        begin = base_us + i * 50000
+        node._direction_cb(SimpleNamespace(state=1, angle_deg=90 if i < 20 else -45,
+            window_start_us=begin, window_end_us=begin + 50000))
+    fields = asr._wake_direction_fields('小范你好', [1, 2, 3, 4], 2, 2,
+        base_us / 1000000, 0, list(node._direction_windows), True,
+        alignment={'tokens': list('小范你好'), 'timestamps': [0.2, 0.4, 10, 25], 'duration_s': 30})
+    assert fields['wake_direction_state'] == 'valid'
+    assert fields['wake_direction_deg'] == 90
 
 
 def test_circular_angles_and_conflicts():
