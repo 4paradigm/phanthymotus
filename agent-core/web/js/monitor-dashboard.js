@@ -328,7 +328,8 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const fmtClass = _formatClass(format);
   const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
-  const isJson = format === 'data/json' || format?.startsWith('text/');
+  const isJson = format === 'data/json' || format?.startsWith('text/')
+    || format === 'sensor/sound-direction-v1';
   const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
   const modeHtml = isJson
@@ -490,6 +491,9 @@ function _switchMode(topicPath, newMode, modeBtns) {
 }
 
 function _createRenderer(format, mode) {
+  if (SoundDirectionRenderer.canRender(format)) {
+    return Object.assign({}, SoundDirectionRenderer, { mode });
+  }
   if (mode === 'kv') {
     return Object.assign(Object.create(Object.getPrototypeOf(KvLatestRenderer)), KvLatestRenderer);
   }
