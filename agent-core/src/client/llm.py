@@ -74,6 +74,11 @@ TOTAL_TIMEOUT_S = _env_float('LLM_TOTAL_TIMEOUT', 600.0)
 # 在飞请求的心跳日志间隔；0 关闭。事中可见，不必等失败后才蹦一行
 HEARTBEAT_S = _env_float('LLM_HEARTBEAT', 15.0)
 
+# 思考内容落盘时保留的字符数。整条留会把历史和 data.db 撑大（实测单轮 870 字，
+# 长的更多），全丢又等于看不见——所以留一段，长度照完整值记。设 0 关掉保留，
+# 只留长度。
+REASONING_KEEP_CHARS = int(_env_float('LLM_REASONING_KEEP_CHARS', 4000))
+
 
 async def _log_request(request: httpx.Request):
     """httpx event hook: dump the real HTTP request body to disk for debugging.
@@ -190,6 +195,7 @@ class _StreamAccumulator:
 
     def __init__(self):
         self.content_parts: list[str] = []
+        self.reasoning_parts: list[str] = []
         self.tool_calls: dict[int, dict] = {}
         self.finish_reason: str | None = None
         self.usage = None
@@ -224,6 +230,14 @@ class _StreamAccumulator:
         if text:
             self.content_parts.append(text)
 
+        # think_mode=True 时模型的思考逐帧到达（实测 126 帧 / 870 字），而这里原先
+        # 只取 content 和 tool_calls，于是它在进入任何日志之前就被丢掉：整个容器
+        # 日志和落盘的请求文件里 `reasoning_content` 命中数都是 0。开着 think 的
+        # token 和首 token 延迟照付，内容却无从复盘。
+        reasoning = _attr(delta, 'reasoning_content', '')
+        if reasoning:
+            self.reasoning_parts.append(reasoning)
+
         for tcd in (_attr(delta, 'tool_calls') or []):
             idx = _attr(tcd, 'index', 0) or 0
             slot = self.tool_calls.setdefault(idx, {
@@ -250,11 +264,35 @@ class _StreamAccumulator:
             if args:
                 slot['function']['arguments'] += args
 
+    @property
+    def reasoning(self) -> str:
+        return ''.join(self.reasoning_parts)
+
     def message(self) -> dict:
         msg: dict = {'role': 'assistant', 'content': ''.join(self.content_parts)}
         if self.tool_calls:
             msg['tool_calls'] = [self.tool_calls[i] for i in sorted(self.tool_calls)]
+        _attach_reasoning(msg, self.reasoning)
         return msg
+
+
+def _attach_reasoning(msg: dict, text: str) -> dict:
+    """把思考内容挂成内部字段，让它在日志和落盘文件里可见。
+
+    下划线开头是本仓库既有的约定：`event/llm.py` 出门前会摘掉所有 `_` 字段，
+    所以它能进历史、进 recent 文件，却不会随历史回到请求体里被服务端拒。
+    （`_usage` 走的就是这条路。）
+
+    正文截断而不是整条丢弃：思考可以很长，而历史是要落 data.db 的；长度始终
+    按完整值记，截断了就说出来，免得把「被截断」读成「模型只想了这么多」。
+    """
+    if not text:
+        return msg
+    limit = REASONING_KEEP_CHARS
+    kept = text if len(text) <= limit else text[:limit]
+    msg['_reasoning'] = {'chars': len(text), 'text': kept,
+                         'truncated': len(text) > limit}
+    return msg
 
 
 def _finalize_message(msg: dict) -> dict:
@@ -529,15 +567,17 @@ class Client():
 
                 elapsed = time.perf_counter() - t0
                 usage = _usage_dict(acc.usage, elapsed)
+                think = f' | reasoning={len(acc.reasoning)}字' if acc.reasoning else ''
                 if usage:
                     print(
                         f'[llm] {model} ok {elapsed:.2f}s | '
                         f'prompt={usage["prompt_tokens"]} completion={usage["completion_tokens"]} '
                         f'total={usage["total_tokens"]} cached={usage["cached_tokens"]} '
-                        f'| stream chunks={acc.chunks}'
+                        f'| stream chunks={acc.chunks}{think}'
                     )
                 else:
-                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A | stream chunks={acc.chunks}')
+                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A '
+                          f'| stream chunks={acc.chunks}{think}')
 
                 msg = _finalize_message(acc.message())
                 if usage:
@@ -568,14 +608,16 @@ class Client():
                 ))
                 elapsed = time.perf_counter() - t0
                 usage = _usage_dict(response.usage, elapsed)
+                _r = _attr(response.choices[0].message, 'reasoning_content', '') or ''
+                think = f' | reasoning={len(_r)}字' if _r else ''
                 if usage:
                     print(
                         f'[llm] {model} ok {elapsed:.2f}s | '
                         f'prompt={usage["prompt_tokens"]} completion={usage["completion_tokens"]} '
-                        f'total={usage["total_tokens"]} cached={usage["cached_tokens"]}'
+                        f'total={usage["total_tokens"]} cached={usage["cached_tokens"]}{think}'
                     )
                 else:
-                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A')
+                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A{think}')
                 try:
                     msg = response.choices[0].message.to_dict()
                 except (KeyError, AttributeError, IndexError) as parse_err:
@@ -590,6 +632,8 @@ class Client():
                             pass
                     print(f'[llm] WARNING: message.to_dict() failed ({parse_err}), using fallback parse')
                 msg = _finalize_message(msg)
+                _attach_reasoning(msg, _attr(response.choices[0].message,
+                                             'reasoning_content', '') or '')
                 # 附加 token 用量信息（内部字段，下划线前缀）
                 if usage:
                     msg['_usage'] = usage

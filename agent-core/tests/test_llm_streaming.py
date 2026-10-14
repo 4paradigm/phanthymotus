@@ -48,11 +48,14 @@ from event.llm import RoundReconsider, TurnCancelled  # noqa: E402
 
 # ── 假的流式响应 ──────────────────────────────────────────────────────────────
 
-def _chunk(content=None, tool_calls=None, finish_reason=None, usage=None):
+def _chunk(content=None, tool_calls=None, finish_reason=None, usage=None,
+           reasoning=None):
     """OpenAI chunk 的最小 dict 形态；`_attr` 对 dict 和 pydantic 一视同仁。"""
     delta = {}
     if content is not None:
         delta['content'] = content
+    if reasoning is not None:
+        delta['reasoning_content'] = reasoning
     if tool_calls is not None:
         delta['tool_calls'] = tool_calls
     out = {'choices': [{'delta': delta, 'finish_reason': finish_reason}]}
@@ -337,6 +340,69 @@ def test_unnamed_400_drops_the_whole_group_once():
     assert 'extra_body' in calls[0]
     assert 'extra_body' not in calls[1]
     assert not getattr(fake, '_thinking_rejected', None)
+
+
+# ── 思考内容要能在日志里看见 ─────────────────────────────────────────────────
+
+def test_reasoning_deltas_are_captured():
+    """think_mode=True 时思考逐帧到达，累加器原先只取 content/tool_calls 就丢了它。
+
+    真机实测：一轮 126 帧 / 870 字，而整个容器日志和落盘请求文件里
+    `reasoning_content` 命中数都是 0——token 和首 token 延迟照付，内容无从复盘。
+    """
+    msg = _call(_FakeClient([
+        _chunk(reasoning='先想一下：'),
+        _chunk(reasoning='这首歌不适合小孩。'),
+        _chunk('换一首'),
+        _chunk(finish_reason='stop'),
+    ]))
+    assert msg['content'] == '换一首'
+    assert msg['_reasoning']['text'] == '先想一下：这首歌不适合小孩。'
+    assert msg['_reasoning']['chars'] == 14
+    assert msg['_reasoning']['truncated'] is False
+
+
+def test_no_reasoning_field_when_thinking_is_off():
+    """关掉 think 时不能留一个空壳字段——它会进历史、进 recent 文件。"""
+    msg = _call(_FakeClient([_chunk('2'), _chunk(finish_reason='stop')]))
+    assert '_reasoning' not in msg
+
+
+def test_long_reasoning_is_truncated_but_length_is_honest():
+    """历史要落 data.db，长思考不能整条留；但长度必须记完整值。
+
+    否则「被截断」会被读成「模型只想了这么多」。
+    """
+    saved = llm_mod.REASONING_KEEP_CHARS
+    llm_mod.REASONING_KEEP_CHARS = 10
+    try:
+        msg = _call(_FakeClient([_chunk(reasoning='思' * 50), _chunk('ok')]))
+    finally:
+        llm_mod.REASONING_KEEP_CHARS = saved
+    assert msg['_reasoning']['chars'] == 50          # 完整长度
+    assert len(msg['_reasoning']['text']) == 10      # 只留一段
+    assert msg['_reasoning']['truncated'] is True
+
+
+def test_reasoning_is_an_internal_field_and_never_goes_back_out():
+    """`_` 前缀是本仓库的既有约定：出门前被 event/llm.py 摘掉。
+
+    钉住这一点，否则思考内容会随历史回到请求体，被严格的服务端按未知字段拒。
+    """
+    import sys as _sys, pathlib as _pl
+    _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1] / 'src'))
+    from event.llm import _scrub as _san
+    msg = _call(_FakeClient([_chunk(reasoning='想'), _chunk('ok')]))
+    assert '_reasoning' in msg
+    out = _san([msg])
+    assert '_reasoning' not in out[0]
+    assert out[0]['content'] == 'ok'
+
+
+def test_reasoning_shows_up_in_the_log_line(capsys):
+    """日志行要带思考字数——这正是这次要解决的「看不见」。"""
+    _call(_FakeClient([_chunk(reasoning='想了想'), _chunk('ok')]))
+    assert 'reasoning=3字' in capsys.readouterr().out
 
 
 # ── 卡死必须被及时发现 ────────────────────────────────────────────────────────
