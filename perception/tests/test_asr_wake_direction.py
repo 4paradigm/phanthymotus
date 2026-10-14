@@ -391,3 +391,32 @@ def test_missing_optional_direction_interface_does_not_stop_asr(monkeypatch):
     assert result['state'] == 'running'
     assert node._direction_topic == ''
     assert [sub.topic for sub in node.subscriptions] == ['/mic']
+
+
+@pytest.mark.parametrize('angle, accepted', [
+    (-180, False), (-180.001, False), (180.001, False),
+    (-179.999, True), (180, True),
+])
+def test_direction_subscription_enforces_open_negative_endpoint(angle, accepted):
+    node = asr._ASRNode.__new__(asr._ASRNode)
+    node._direction_windows = asr.deque(maxlen=50)
+    node._direction_lock = asr.threading.Lock()
+    node._direction_cb(SimpleNamespace(state=1, angle_deg=angle,
+        window_start_us=1700000000000000, window_end_us=1700000000020000))
+    assert bool(node._direction_windows) is accepted
+
+
+@pytest.mark.parametrize('angle, expected', [
+    (-180, {'wake_direction_state': 'unknown'}),
+    (180.001, {'wake_direction_state': 'unknown'}),
+    (-179.999, {'wake_direction_state': 'valid', 'wake_direction_deg': 180,
+                'wake_direction_window_start_us': 1700000000000000,
+                'wake_direction_window_end_us': 1700000000020000}),
+    (180, {'wake_direction_state': 'valid', 'wake_direction_deg': 180,
+           'wake_direction_window_start_us': 1700000000000000,
+           'wake_direction_window_end_us': 1700000000020000}),
+])
+def test_wake_direction_rejects_negative_endpoint_and_canonicalizes_rounding(angle, expected):
+    assert asr._wake_direction_fields('小范', [1, 2], 2, 2,
+        1700000000.0, 0, [window(angle, 1700000000000000, 1700000000020000)],
+        True) == expected

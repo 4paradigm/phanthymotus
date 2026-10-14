@@ -571,7 +571,7 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
                 if (begin >= 1_000_000_000_000_000 and begin < end
                     and end - begin <= 3_000_000
                     and begin < onset_us + 500_000 and end > onset_us
-                    and math.isfinite(angle) and -180 <= angle <= 180)]
+                    and math.isfinite(angle) and -180 < angle <= 180)]
     if not selected:
         return state
     x = sum(math.cos(math.radians(angle)) for angle, _, _ in selected) / len(selected)
@@ -581,7 +581,10 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
     angle = math.degrees(math.atan2(y, x))
     if abs(angle + 180) < 1e-6 or abs(angle - 180) < 1e-6:
         angle = 180
-    return {"wake_direction_state": "valid", "wake_direction_deg": round(angle, 2),
+    angle = round(angle, 2)
+    if angle == -180:
+        angle = 180
+    return {"wake_direction_state": "valid", "wake_direction_deg": angle,
             "wake_direction_window_start_us": min(begin for _, begin, _ in selected),
             "wake_direction_window_end_us": max(end for _, _, end in selected)}
 
@@ -1783,7 +1786,7 @@ class _ASRNode(Node):
         begin, end, angle = msg.window_start_us, msg.window_end_us, msg.angle_deg
         if (begin < 1_000_000_000_000_000 or end <= begin
                 or end - begin > 3_000_000 or not math.isfinite(angle)
-                or not -180 <= angle <= 180):
+                or not -180 < angle <= 180):
             return
         with self._direction_lock:
             self._direction_windows.append((angle, begin, end))

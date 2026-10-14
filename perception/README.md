@@ -3732,14 +3732,28 @@ downloads the solution. Full spec: `phanthymotus-driver/README_dev.md`
 
 ## Running the tests inside a perception image
 
-`python3 -m pytest tests -q` from a checkout works anywhere. Running the same
-suite **inside a perception container** — which is how you confirm a fix behaves on
-the Python the device actually ships — needs one flag:
+From the `perception` checkout, install the maintained test-only dependencies
+into your test environment before running pytest:
+
+```bash
+python3 -m pip install -r requirements-test.txt
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q -p pytest_mock
+```
+
+This includes `jsonschema`, used to validate the music tool schema. The pinned
+versions support both Python 3.8 (JP5.1.1) and Python 3.10 (JP6.1); they are not
+production-image dependencies. The application dependencies are still required.
+
+Running the same suite **inside a perception container** confirms behavior on
+the Python the device actually ships. Copy both the tests and their dependency
+file, then install them in the test container:
 
 ```bash
 docker cp tests <container>:/work/
+docker cp requirements-test.txt <container>:/work/requirements-test.txt
 docker exec <container> bash -c 'source /opt/ros/humble/install/setup.bash && \
   source /ros_ws/install/setup.bash && cd /work && \
+  python3 -m pip install -r requirements-test.txt && \
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q -p pytest_mock'
 ```
 
