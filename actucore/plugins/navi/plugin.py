@@ -946,6 +946,9 @@ class NaviPlugin:
                 callback = self._on_depth_z16 if selected is Image else self._on_depth_map
                 node.create_subscription(selected, topic, callback, qos)
                 self._cancel_pending_depth_bind(node)
+                with self._lock:
+                    if self._last_error.startswith(f"深度话题 {topic} 等待超过"):
+                        self._last_error = ""
                 return True
 
             try:
@@ -970,9 +973,12 @@ class NaviPlugin:
                     if time.monotonic() >= self._depth_bind_deadline:
                         with self._lock:
                             self._last_error = (
-                                f"深度话题 {topic} 在 {_DEPTH_TYPE_WAIT_S:g}s 内没有声明"
-                                " image/depth-zlib 或 image/depth-z16，也没有可识别的 ROS 类型")
-                        self._cancel_pending_depth_bind(node)
+                                f"深度话题 {topic} 等待超过 {_DEPTH_TYPE_WAIT_S:g}s，"
+                                "尚未发现可识别的 ROS 消息类型；持续等待发布者"
+                            )
+                        # Keep retrying while Navi is running. A late driver
+                        # must not leave depth permanently unsubscribed.
+                        self._depth_bind_deadline = float("inf")
 
                 self._depth_bind_topic = topic
                 self._depth_bind_deadline = time.monotonic() + _DEPTH_TYPE_WAIT_S

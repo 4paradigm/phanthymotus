@@ -1046,8 +1046,18 @@ def test_unknown_depth_type_has_a_bounded_diagnostic_and_cancels_its_retry(monke
     monkeypatch.setattr(navi_plugin.time, 'monotonic',
                         lambda: card._depth_bind_deadline + 0.01)
     node.timers[0]()
+    assert len(node.timers) == 1
+    assert "深度话题" in card._last_error
+
+    # Publisher appears after the initial deadline: retry must recover.
+    node.graph["/camera/depth"] = ["sensor_msgs/msg/CompressedImage"]
+    node.timers[0]()
     assert node.timers == []
-    assert '没有声明' in card._last_error
+    assert any(
+        msg_type.__name__ == "CompressedImage" and topic == "/camera/depth"
+        for msg_type, topic, _, _ in node.subscription_details
+    )
+    assert card._last_error == ""
 
 
 def test_start_stop_start_destroys_old_node_and_does_not_duplicate_depth_subscriptions():
