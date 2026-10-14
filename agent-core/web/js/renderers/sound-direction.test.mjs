@@ -5,10 +5,10 @@ import { directionDisplayData, SoundDirectionRenderer } from './sound-direction.
 const direction = { state: 1, angle_deg: -90, published_us: 1700000000040000,
   window_start_us: 1700000000000000, window_end_us: 1700000000020000 };
 
-test('typed direction uses the previous JSON display fields and clockwise angle', () => {
+test('typed direction uses the previous JSON display fields and signed angle', () => {
   assert.deepEqual(directionDisplayData(direction), {
     state: 'fresh', trigger: 'sound_activity', timestamp_ms: 1700000000040,
-    angle: 270, unit: 'deg', reference: 'robot_front_clockwise',
+    angle: -90, unit: 'deg', reference: 'robot_front_clockwise',
     audio_window_start_us: 1700000000000000, audio_window_end_us: 1700000000020000,
   });
   assert.equal(direction.angle_deg, -90); // Transport/ASR contract is unchanged.
@@ -24,7 +24,7 @@ function element() {
 }
 
 for (const mode of ['log', 'kv']) {
-  test(`${mode} mode reuses JSON rendering and clears live direction on expiry`, () => {
+  test(`${mode} mode reuses JSON rendering and retains the last reading with an explicit stale status`, () => {
     const oldDocument = globalThis.document;
     const oldSetTimeout = globalThis.setTimeout;
     const oldClearTimeout = globalThis.clearTimeout;
@@ -40,16 +40,22 @@ for (const mode of ['log', 'kv']) {
         mode === 'kv' ? 'renderer-kv-latest' : 'renderer-text');
       renderer.onData(new TextEncoder().encode(JSON.stringify(direction)));
       if (mode === 'kv') {
-        assert.equal(renderer._renderer._cells.angle.valueEl.textContent, '270');
+        assert.equal(renderer._renderer._cells.angle.valueEl.textContent, '-90');
       } else {
         assert.match(renderer._renderer._textEl.children[0].innerHTML, /angle/);
       }
       expire();
       if (mode === 'kv') {
-        assert.equal(renderer._renderer._cells.angle.valueEl.textContent, '—');
-        assert.equal(renderer._renderer._cells.state.valueEl.textContent, 'no_event');
+        assert.equal(renderer._renderer._cells.angle.valueEl.textContent, '-90');
+        assert.equal(renderer._renderer._cells.state.valueEl.textContent, 'stale');
+        assert.equal(renderer._renderer._cells.angle_status.valueEl.textContent, '上次读数（非实时）');
       } else {
-        assert.match(renderer._renderer._textEl.children.at(-1).innerHTML, /no_event/);
+        assert.match(renderer._renderer._textEl.children.at(-1).innerHTML, /stale/);
+      }
+      renderer.onData(new TextEncoder().encode(JSON.stringify({ state: 0 })));
+      if (mode === 'kv') {
+        assert.equal(renderer._renderer._cells.angle.valueEl.textContent, '-90');
+        assert.equal(renderer._renderer._cells.state.valueEl.textContent, 'no_event');
       }
     } finally {
       renderer.unmount();
@@ -57,5 +63,11 @@ for (const mode of ['log', 'kv']) {
       globalThis.setTimeout = oldSetTimeout;
       globalThis.clearTimeout = oldClearTimeout;
     }
+  });
+}
+
+for (const angle of [0, 90, -90, 180, -179]) {
+  test(`monitor does not change the transport angle ${angle}`, () => {
+    assert.equal(directionDisplayData({ ...direction, angle_deg: angle }).angle, angle);
   });
 }
