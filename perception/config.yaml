@@ -14,6 +14,21 @@ file_intake:
   retention_days: 7
 
 plugins:
+  # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
+  phanthy_music:
+    # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作
+    # （set_volume / set_autoplay）不是配置。duck_gain 在 audio_mixer 那边。
+    enabled: true
+
+  audio_mixer:
+    enabled: true
+    # auto = 问本进程里的 TTS 插件它在发哪个话题。接到本卡的其余输入都算背景音乐。
+    speech_topics: auto
+    duck_gain: 0.15
+    duck_ramp_ms: 200
+    duck_hold_ms: 300
+    background_gain: 100
+
   asr:
     enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
@@ -385,7 +400,7 @@ plugins:
       enabled: true
       det_thresh: 0.1
       det_box_thresh: 0.1
-    min_interval_ms: 0
+    ocr_fps: 1.0
 
   # 扫码：二维码 / 条形码，按需识别（actuator，没有输出 topic）
   # 零模型零下载 —— zxing-cpp 是解码库。
@@ -412,6 +427,33 @@ plugins:
 
   soundevent:
     enabled: true
+  # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的
+  # 一个开关 —— soundevent 也直接订麦克风，声纹又跑在 ASR 切出来的段上，装在
+  # ASR 里面只治 ASR 一家。详见 plugins/echo_cancellation.py 的模块文档。
+  #
+  # 默认开着：这张卡不加载任何模型、不占显存，没被拖到画布上连线时什么都不做。
+  # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
+  echo_cancellation:
+    enabled: true
+    # auto = 问本进程里的 TTS 插件它正在发哪个 topic。几乎总是对的；只有 TTS 在
+    # 别的容器里才需要在这里写死一个 topic 名（写死的值在卡片下拉框里也保留）。
+    # 这是卡片上**唯一**的设置项。
+    robot_voice_topic: auto
+    #
+    # 下面两个不出现在卡片上，但在这里改得动 —— 用来在真机上做对比实验，不用重
+    # 新构建镜像。它们不是提给操作者的问题。
+    #
+    # removal_strength: gentle | normal | aggressive。只影响"有人在机器人说话
+    #   时插话"这一种情况。实测（人声是机器人的四分之一）：gentle 去 18 dB 回声、
+    #   人声保留 18 dB；normal 去 23 保留 12；aggressive 去 28 保留 7。默认 normal
+    #   ——插话的人声仍比残余高 12 dB，对 ASR 够用，而比 gentle 多消掉的 5 dB 正是
+    #   "机器人自己说的话别进 ASR"的余量。
+    # removal_strength: normal
+    #
+    # mute_tail: auto | 300ms | 800ms | 1500ms。只在"还没量到延迟"的热身阶段有
+    #   意义（量到之后就一直在消除、不再静音）。auto 跟着这张卡自己量出来的延迟走。
+    # mute_tail: auto
+
   speaker_recognition:
     enabled: true
     # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.

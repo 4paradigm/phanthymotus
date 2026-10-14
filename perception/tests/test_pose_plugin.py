@@ -134,6 +134,12 @@ def _feed(plugin, node_key, *, frames=1, interval=0.25, topic="/cam/rgb"):
     node = plugin._nodes[node_key]
     subscription = node.subscriptions[0]
     lean = _publisher(node, node._output_topic)
+    # Waiting on the lean topic alone is not enough. `_publish` emits lean
+    # first and the skeleton a few lines later on the same thread, so a test
+    # that reads the skeleton can be scheduled into that gap and find an empty
+    # list. The window is small, which is why this only ever bit under a loaded
+    # suite — wait for both and the gap stops existing.
+    skeleton = _publisher(node, node._skeleton_topic)
     for index in range(frames):
         if index:
             # The node gates on monotonic time, so the cap has to be respected
@@ -142,6 +148,8 @@ def _feed(plugin, node_key, *, frames=1, interval=0.25, topic="/cam/rgb"):
             node._last_inference_time -= interval
         subscription.callback(_FakeCompressedImage(frame_bytes(FRAME_W, FRAME_H)))
         _wait_until(lambda n=index: len(lean.messages) > n, timeout=3.0)
+        if skeleton is not None:
+            _wait_until(lambda n=index: len(skeleton.messages) > n, timeout=3.0)
     return node
 
 

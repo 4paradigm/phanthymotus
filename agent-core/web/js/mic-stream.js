@@ -25,8 +25,30 @@ export async function toggleMicStream(wsUrl, onStateChange) {
   }
 
   try {
+    // The browser's own echo canceller, noise suppressor and AGC, on by
+    // default because this microphone is usually an operator's laptop with the
+    // agent's audio coming out of the same speakers — exactly what they are for.
+    //
+    // They also make this path useless as a test rig for the robot's own echo
+    // cancellation: the browser plays the TTS itself, so its canceller has a
+    // perfect reference and removes the echo before a single sample reaches
+    // Agent Core. The perception card downstream then has nothing to cancel,
+    // with or without it, which is indistinguishable from the card not working.
+    //
+    // `localStorage.phanthy_raw_mic = '1'` (or ?rawmic=1) turns all three off
+    // and hands over whatever the microphone actually heard. AGC matters as
+    // much as the canceller here: it changes the gain over time, which makes
+    // the echo path time-varying and is a different thing to debug.
+    const rawMic = localStorage.getItem('phanthy_raw_mic') === '1'
+      || new URLSearchParams(location.search).get('rawmic') === '1';
+    if (rawMic) console.warn('[mic] raw capture: browser AEC/NS/AGC are OFF');
     _stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
+      audio: {
+        channelCount: 1, sampleRate: 16000,
+        echoCancellation: !rawMic,
+        noiseSuppression: !rawMic,
+        autoGainControl: !rawMic,
+      },
     });
 
     // 目标采样率 16kHz
