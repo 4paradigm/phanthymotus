@@ -1082,3 +1082,69 @@ def test_start_stop_start_destroys_old_node_and_does_not_duplicate_depth_subscri
     assert card.dispatch('navi', args)['state'] == 'running'
     assert [item[0].__name__ for item in second.subscription_details
             if item[1] == '/camera/depth'] == ['CompressedImage']
+
+
+@pytest.mark.parametrize("first_yaw_limit,expected_first", [
+    (0.83, 0.83),  # Bumi -> R1
+    (0.0, 0.0),    # No yaw -> R1
+])
+def test_search_rate_recovers_after_switching_chassis(
+        monkeypatch, first_yaw_limit, expected_first):
+    card = _card(search_rate=1.0)
+
+    class Executor:
+        def remove_node(self, node):
+            pass
+
+    card._executor = Executor()
+    graph = {
+        "/camera/depth": ["sensor_msgs/msg/CompressedImage"],
+    }
+    nodes = iter((_FakeNode(graph.copy()), _FakeNode(graph.copy())))
+    card._open_publisher = lambda: setattr(card, "_node", next(nodes))
+
+    # This test focuses on per-start limit negotiation.
+    monkeypatch.setattr(navi_plugin.negotiate, "check",
+                        lambda *args, **kwargs: [])
+
+    def descriptor(yaw):
+        return {
+            "mode": card._capabilities()["control_mode"],
+            "limits": {
+                "lower": [-1.0, -1.0, 0, 0, 0, -yaw],
+                "upper": [1.0, 1.0, 0, 0, 0, yaw],
+                "min_magnitude": [0, 0, 0, 0, 0, 0.1],
+            },
+        }
+
+    first = card._start({
+        "control_interface": descriptor(first_yaw_limit),
+        "input_topics": ["/cam/objects", "/camera/depth"],
+    })
+    assert first["state"] == "running", first
+    assert card._config.search_rate == pytest.approx(expected_first)
+
+    card._stop()
+
+    second = card._start({
+        "control_interface": descriptor(2.0),
+        "input_topics": ["/cam/objects", "/camera/depth"],
+    })
+    assert second["state"] == "running", second
+    assert card._config.search_rate == pytest.approx(1.0)
+    card._stop()
+
+
+def test_user_search_rate_setting_survives_next_start():
+    card = _card(search_rate=1.0)
+    result = card._config_action({"search_rate": 0.7})
+
+    assert result["config"]["search_rate"] == pytest.approx(0.7)
+    assert card._cfg["search_rate"] == pytest.approx(0.7)
+
+    # Same reconstruction that happens before each start.
+    restored = navi_plugin.policy_mod.Config(**{
+        k: v for k, v in card._cfg.items()
+        if k in navi_plugin.policy_mod.Config.__dataclass_fields__
+    })
+    assert restored.search_rate == pytest.approx(0.7)

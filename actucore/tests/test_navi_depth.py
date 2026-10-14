@@ -292,3 +292,40 @@ def test_native_grid_right_edge_sampling_and_metric_corridor(width):
     clearance, _ = D.corridor(image, half_width_m=.15, half_fov_rad=.55,
                               lateral_offset_m=.5, reference_m=1.)
     assert clearance == pytest.approx(1.)
+
+
+def test_raw_z16_padded_rows_preserve_distances_and_invalid_pixels():
+    """ROS step padding must not shift pixels; zero is missing depth."""
+    width, height = 640, 480
+    step = width * 2 + 8
+
+    pixels = np.full((height, width), 2000, dtype="<u2")
+    pixels[0, 0] = 1500
+    pixels[0, -1] = 3000
+    pixels[1, 0] = 4500
+    pixels[1, 1] = 0
+
+    raw = np.full((height, step), 0xFF, dtype=np.uint8)
+    raw[:, :width * 2] = pixels.view(np.uint8).reshape(height, width * 2)
+
+    decoded = D.decode_z16(
+        raw.tobytes(),
+        width=width,
+        height=height,
+        step=step,
+        encoding="16UC1",
+        is_bigendian=False,
+    )
+
+    assert decoded.shape == (height, width)
+    assert decoded[0, 0] == pytest.approx(1.5)
+    assert decoded[0, -1] == pytest.approx(3.0)
+    assert decoded[1, 0] == pytest.approx(4.5)
+    assert decoded[100, 100] == pytest.approx(2.0)
+    assert np.isnan(decoded[1, 1])
+
+    # A region containing only invalid depth must not return 0 metres.
+    invalid = np.zeros((height, width), dtype="<u2")
+    raw[:, :width * 2] = invalid.view(np.uint8).reshape(height, width * 2)
+    empty = D.decode_z16(raw.tobytes(), width=width, height=height, step=step)
+    assert D.sample_box(empty, (0.4, 0.4, 0.6, 0.6)) is None

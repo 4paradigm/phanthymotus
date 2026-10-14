@@ -386,6 +386,13 @@ class NaviPlugin:
         # command snaps to all-or-nothing, and nothing anywhere says so. The
         # notes go into `degraded` so the adjustment is visible rather than
         # merely correct.
+        # Rebuild the effective policy configuration for every start.
+        # adopt_limits mutates its input; reusing the previous Config would
+        # preserve the former chassis's yaw and velocity restrictions.
+        self._config = policy_mod.Config(**{
+            k: v for k, v in self._cfg.items()
+            if k in policy_mod.Config.__dataclass_fields__
+        })
         self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
 
         rate = negotiate.effective_rate(capabilities, descriptor,
@@ -691,6 +698,8 @@ class NaviPlugin:
                     else int if field.type in ("int", int) else float)
             setattr(self._config, key, cast(value))
             changed[key] = getattr(self._config, key)
+            # Preserve user-configured values across subsequent starts.
+            self._cfg[key] = changed[key]
         return {"status": "configured", "config": changed}
 
     def _info(self):
