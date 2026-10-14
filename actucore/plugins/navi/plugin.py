@@ -823,12 +823,13 @@ class NaviPlugin:
     _ROLE_SUFFIXES = (
         ("/visual_depth_summary", "depth_summary"),
         ("/visual_depth", "depth_map"),
-        # Hardware drivers may publish a metric depth stream directly. Keep
-        # this narrower than a bare `/depth`: the `/camera/depth` contract is
-        # specific enough to distinguish it from an arbitrary compressed
-        # camera topic while still covering namespaced drivers such as Bumi's
-        # `/ubuntu/camera/depth`.
+
+        # Hardware drivers may publish metric depth directly. Support both
+        # normal camera/depth paths and namespaced head cameras (Tianyi).
+        ("/camera/head/depth", "depth_map"),
         ("/camera/depth", "depth_map"),
+        ("/depth", "depth_map"),
+
         ("/objects", "objects"),
         ("/state/odom", "odom"),
     )
@@ -1018,6 +1019,20 @@ class NaviPlugin:
         到这里才看发布者是合理的 —— 名字已经没能给出答案，图是仅剩的线索。
         """
         types = dict(node.get_topic_names_and_types()).get(topic) or []
+
+        # Hardware depth topics do not always follow perception's
+        # `/visual_depth` naming convention. If ROS tells us this is an Image
+        # stream and the topic itself is clearly depth, bind it as metric depth
+        # instead of treating it as a camera preview.
+        # Only accept real depth endpoints. Avoid turning topics such as
+        # `/camera/depth_preview` (JPEG preview) into metric depth.
+        topic_lower = topic.lower()
+        if topic_lower.endswith("/depth"):
+            if any(n.endswith("Image") for n in types):
+                return "depth_map", "raw depth Image"
+            if any(n.endswith("CompressedImage") for n in types):
+                return "depth_map", "compressed depth"
+
         if any(n.endswith(("CompressedImage", "Image")) for n in types):
             # **The camera, not the depth map.** perception derives its depth
             # topic from the camera's (`<camera>/visual_depth`), so a

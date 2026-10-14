@@ -1148,3 +1148,39 @@ def test_user_search_rate_setting_survives_next_start():
         if k in navi_plugin.policy_mod.Config.__dataclass_fields__
     })
     assert restored.search_rate == pytest.approx(0.7)
+
+
+def test_tianyi_head_depth_topic_binds_as_metric_depth():
+    """Tianyi publishes metric depth as camera/head/depth."""
+    bound, problem = _bind([
+        "/nvidia_desktop/camera/head/objects",
+        "/nvidia_desktop/camera/head/depth",
+    ])
+
+    assert problem == ""
+    assert bound["depth_map"] == "/nvidia_desktop/camera/head/depth"
+
+
+def test_tianyi_head_depth_raw_image_uses_image_subscription():
+    card = _card()
+    node = _FakeNode({
+        "/nvidia_desktop/camera/head/depth":
+            ["sensor_msgs/msg/Image"]
+    })
+
+    bound, problem = card._bind_inputs(
+        node,
+        [
+            "/cam/objects",
+            "/nvidia_desktop/camera/head/depth",
+        ],
+    )
+
+    assert problem == ""
+
+    depth = [
+        x for x in node.subscription_details
+        if x[1] == "/nvidia_desktop/camera/head/depth"
+    ]
+
+    assert [x[0].__name__ for x in depth] == ["Image"]
