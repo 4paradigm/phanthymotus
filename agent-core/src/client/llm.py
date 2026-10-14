@@ -336,6 +336,43 @@ async def _heartbeat(model: str, url: str, t0: float, acc: _StreamAccumulator) -
               f'(chunks={acc.chunks} chars={acc.chars})')
 
 
+# ── 关闭 thinking ─────────────────────────────────────────────────────────────
+#
+# 同一个模型换一个供应商就换一种关法：vLLM/SGLang 自建的走 chat template，
+# 智谱和 Anthropic 兼容层走 `thinking.type`，DashScope 把开关放在顶层，
+# OpenRouter 又是另一个名字。单带 chat_template_kwargs 时实测会遇到「参数发了
+# 但照样在想」——那不是模型不听话，是这个网关压根不看这个字段。
+#
+# 所以几种写法全带上：多出来的字段绝大多数网关直接忽略，而真有网关认了 400，
+# 下面 _create() 会按报错点名的字段逐个撤掉并记在这个 client 上，不让一次
+# 400 变成整次调用失败。
+THINKING_OFF_EXTRA = {
+    # vLLM / SGLang 托管的 Qwen3、GLM 系列（经 chat template 透传）
+    "chat_template_kwargs": {"enable_thinking": False},
+    # 智谱 GLM-4.5/4.6 的 OpenAI 接口、Anthropic 兼容网关
+    "thinking": {"type": "disabled"},
+    # DashScope 及部分自建网关放在顶层的同名开关
+    "enable_thinking": False,
+    # budget 形式：0 等价于不思考
+    "thinking_budget": 0,
+    # OpenRouter
+    "reasoning": {"enabled": False},
+    # OpenAI 风格的 reasoning_effort，部分网关用它关
+    "reasoning_effort": "none",
+}
+
+
+def _looks_like_unknown_param(err: str) -> bool:
+    """400 的文案像不像「有个参数我不认识」。"""
+    low = err.lower()
+    if any(k in low for k in ('context length', 'context_length', 'maximum context',
+                             'token limit', 'too many tokens')):
+        return False
+    return any(k in low for k in ('parameter', 'argument', 'field', 'property',
+                                  'extra_body', 'unknown', 'unsupported',
+                                  'unrecognized', 'not allowed', 'invalid request'))
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class Client():
@@ -371,10 +408,58 @@ class Client():
         model_override: 'str | None' = None,
     ) -> dict:
 
-        def _extra(think_mode: bool) -> dict:
+        def _extra(client, think_mode: bool) -> dict:
             if think_mode:
                 return {}
-            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+            # 之前被这个 endpoint 400 掉的字段不再发
+            rejected = getattr(client, '_thinking_rejected', ())
+            extra = {k: v for k, v in THINKING_OFF_EXTRA.items() if k not in rejected}
+            return {"extra_body": extra} if extra else {}
+
+        async def _create(client, model, url, kwargs):
+            """发起 create()，并对「网关不认某个字段」逐级降级后重试。
+
+            每一轮都严格减少 kwargs，所以循环必然收敛。
+            """
+            while True:
+                try:
+                    return await client.chat.completions.create(**kwargs)
+                except openai.BadRequestError as e:
+                    err = str(e)
+                    if 'stream_options' in kwargs and 'stream_options' in err:
+                        print(f'[llm] {model} @ {url} rejects stream_options — '
+                              f'retrying without usage')
+                        client._no_stream_options = True
+                        kwargs.pop('stream_options')
+                        continue
+                    extra = kwargs.get('extra_body') or {}
+                    # 必须按词边界匹配：`thinking` 是 `thinking_budget` 的前缀，
+                    # 子串匹配会因为后者被拒而把前者一起撤掉——而前者正是对智谱
+                    # 那条线唯一管用的关法。
+                    named = [k for k in extra
+                             if re.search(rf'(?<![\w.]){re.escape(k)}(?![\w])', err)]
+                    if named:
+                        # 报错点了名：记在 client 上，这个 endpoint 以后都不发了
+                        client._thinking_rejected = set(
+                            getattr(client, '_thinking_rejected', ())) | set(named)
+                        drop = named
+                    elif extra and _looks_like_unknown_param(err):
+                        # 没点名（有些网关只回一句 unsupported parameter）：把整组
+                        # 关闭参数一起撤掉再试一次，但不记账——这个 400 也可能压根
+                        # 与 thinking 无关，不该让该 endpoint 永久退回带 thinking。
+                        #
+                        # 要先确认它真像「参数不认识」：context overflow 在一些网关
+                        # 上也是 400，无条件重发等于把一个 36k 的请求白发两遍。
+                        drop = list(extra)
+                    else:
+                        raise
+                    print(f'[llm] {model} @ {url} rejects {",".join(drop)} — retrying without')
+                    extra = {k: v for k, v in extra.items() if k not in drop}
+                    if extra:
+                        kwargs['extra_body'] = extra
+                    else:
+                        kwargs.pop('extra_body', None)
+                    continue
 
         async def _go_stream(client, model, think_mode: bool, attempt: int) -> dict:
             url = str(client.base_url)
@@ -387,7 +472,7 @@ class Client():
                 tools=tool_list,
                 max_tokens=10240,
                 stream=True,
-                **_extra(think_mode),
+                **_extra(client, think_mode),
             )
             # include_usage 让最后一帧带 usage。个别网关不认这个字段，认了 400
             # 就记住并降级——usage 没了只是统计缺一行，不该让整次调用失败。
@@ -401,16 +486,7 @@ class Client():
                 # httpx 的 120s read timeout 管着。不把它一起纳入首 token 预算，
                 # 卡在响应头上的请求照样能干等两分钟——那正是这次要修的故障。
                 async def _open():
-                    try:
-                        return await client.chat.completions.create(**kwargs)
-                    except openai.BadRequestError as e:
-                        if 'stream_options' not in kwargs or 'stream_options' not in str(e):
-                            raise
-                        print(f'[llm] {model} @ {url} rejects stream_options — '
-                              f'retrying without usage')
-                        client._no_stream_options = True
-                        kwargs.pop('stream_options')
-                        return await client.chat.completions.create(**kwargs)
+                    return await _create(client, model, url, kwargs)
 
                 try:
                     stream = await asyncio.wait_for(_open(), timeout=first_timeout)
@@ -461,14 +537,14 @@ class Client():
             url = str(client.base_url)
             t0 = time.perf_counter()
             try:
-                response = await client.chat.completions.create(
+                response = await _create(client, model, url, dict(
                     model=model,
                     messages=message_list,
                     tools=tool_list,
                     max_tokens=10240,
                     stream=False,
-                    **_extra(think_mode),
-                )
+                    **_extra(client, think_mode),
+                ))
                 elapsed = time.perf_counter() - t0
                 usage = _usage_dict(response.usage, elapsed)
                 if usage:

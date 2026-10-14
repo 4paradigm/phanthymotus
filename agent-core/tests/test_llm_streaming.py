@@ -30,6 +30,8 @@ import sys
 import tempfile
 import time
 
+import httpx
+import openai
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
@@ -232,7 +234,109 @@ def test_think_mode_off_still_sends_extra_body():
     """think_mode=False 的 extra_body 是生产在用的，流式不能把它弄丢。"""
     fake = _FakeClient([_chunk('hi')])
     _call(fake)
-    assert fake.kwargs['extra_body'] == {'chat_template_kwargs': {'enable_thinking': False}}
+    assert fake.kwargs['extra_body'] == llm_mod.THINKING_OFF_EXTRA
+
+
+def test_thinking_off_sends_every_known_spelling():
+    """同一个模型换个供应商就换一种关法，少发一种就有网关照样在想。
+
+    实测过只发 chat_template_kwargs 关不掉、补上 thinking.type 才关掉的情况——
+    所以这几个键是回归锁，不是可选项。
+    """
+    fake = _FakeClient([_chunk('hi')])
+    _call(fake)
+    extra = fake.kwargs['extra_body']
+    assert extra['chat_template_kwargs'] == {'enable_thinking': False}
+    assert extra['thinking'] == {'type': 'disabled'}
+    assert extra['enable_thinking'] is False
+    assert extra['thinking_budget'] == 0
+    assert extra['reasoning'] == {'enabled': False}
+    assert extra['reasoning_effort'] == 'none'
+
+
+def test_think_mode_on_sends_no_extra_body():
+    fake = _FakeClient([_chunk('hi')])
+    # ConfigDB.__getitem__ 每次反序列化一份新 dict，改嵌套键改的是副本——
+    # 必须整段回写才算数。
+    saved = config.main['client']
+    config.main['client'] = {'llm': [{**saved['llm'][0], 'think_mode': True}]}
+    try:
+        _call(fake)
+    finally:
+        config.main['client'] = saved
+    assert 'extra_body' not in fake.kwargs
+
+
+# ── 网关不认某个关闭参数时的降级 ──────────────────────────────────────────────
+
+class _RejectingCompletions(_FakeCompletions):
+    """前 N 次按 `reject` 里的字段名报 400，之后正常返回。"""
+
+    async def create(self, **kwargs):
+        o = self._outer
+        o.calls.append(dict(kwargs))
+        for field in list(o.reject):
+            if field in (kwargs.get('extra_body') or {}):
+                o.reject.remove(field)
+                raise openai.BadRequestError(
+                    f'unrecognized parameter: {field}',
+                    response=httpx.Response(400, request=httpx.Request('POST', o.base_url)),
+                    body=None)
+        return await super().create(**kwargs)
+
+
+class _RejectingClient(_FakeClient):
+    def __init__(self, script=(), reject=()):
+        super().__init__(script)
+        self.reject = list(reject)
+        self.calls = []
+        self.chat = type('C', (), {'completions': _RejectingCompletions(self)})()
+
+
+def test_rejected_thinking_field_is_dropped_and_remembered():
+    """一次 400 不该变成一次失败：撤掉被点名的字段重发，并记住别再发。"""
+    fake = _RejectingClient([_chunk('hi')], reject=['thinking_budget'])
+    msg = _call(fake)
+    assert msg['content'] == 'hi'
+    assert 'thinking_budget' in fake.calls[0]['extra_body']
+    assert 'thinking_budget' not in fake.calls[1]['extra_body']
+    # 仍然带着其余几种写法——不能因为一个字段被拒就整组放弃
+    assert fake.calls[1]['extra_body']['thinking'] == {'type': 'disabled'}
+    # `thinking` 是 `thinking_budget` 的前缀——按子串匹配会把它一起撤掉，
+    # 那正好撤掉最管用的那一种关法。
+    assert fake._thinking_rejected == {'thinking_budget'}
+
+    # 第二次调用直接就不发了，不再浪费一个往返
+    fake.script = [_chunk('hi')]
+    _call(fake)
+    assert 'thinking_budget' not in fake.calls[2]['extra_body']
+
+
+def test_unnamed_400_drops_the_whole_group_once():
+    """网关只回一句 invalid request 时，整组撤掉重试一次，但不永久记账。"""
+    fake = _RejectingClient([_chunk('hi')], reject=['thinking'])
+    fake.reject = ['*']
+
+    calls = fake.calls
+    orig = fake.chat.completions.create
+
+    async def create(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise openai.BadRequestError(
+                'invalid request',
+                response=httpx.Response(400, request=httpx.Request('POST', fake.base_url)),
+                body=None)
+        fake.stream = _FakeStream(fake.script)
+        fake.kwargs = kwargs
+        return fake.stream
+
+    fake.chat.completions.create = create
+    msg = _call(fake)
+    assert msg['content'] == 'hi'
+    assert 'extra_body' in calls[0]
+    assert 'extra_body' not in calls[1]
+    assert not getattr(fake, '_thinking_rejected', None)
 
 
 # ── 卡死必须被及时发现 ────────────────────────────────────────────────────────
@@ -396,6 +500,7 @@ def test_stream_can_be_turned_off():
     fake.chat.completions.create = create
     msg = _call(fake)
     assert fake.kwargs['stream'] is False
+    assert fake.kwargs['extra_body'] == llm_mod.THINKING_OFF_EXTRA
     assert msg == {'role': 'assistant', 'content': 'hi'}
 
 
