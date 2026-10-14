@@ -184,6 +184,7 @@ class ActuCoreBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: ActuCoreBundle | None = None
+_server_name = "actucore-bundle"
 
 
 def make_handler():
@@ -272,7 +273,7 @@ def make_handler():
                 if method == "initialize":
                     log.debug(f"[mcp] initialize request from client")
                     ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "actucore-bundle", "version": "1.0.0"}})
+                        "serverInfo": {"name": _server_name, "version": "1.0.0"}})
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
                 elif method == "tools/call":
@@ -360,10 +361,12 @@ def _start_registration(mcp_port: int, name: str, category: str):
 
 
 def main():
-    global _bundle
+    global _bundle, _server_name
 
     cfg      = _load_config()
-    mcp_port = int(cfg.get("mcp_port", 15730))
+    mcp_port = int(os.environ.get("MCP_PORT", cfg.get("mcp_port", 15730)))
+    _server_name = (os.environ.get("MCP_SERVER_NAME", "actucore-bundle").strip()
+                    or "actucore-bundle")
 
     plugins_cfg = cfg.get("plugins") or {}
     enabled = [k for k, v in plugins_cfg.items() if isinstance(v, dict) and v.get("enabled")]
@@ -383,7 +386,9 @@ def main():
     spin_thread = threading.Thread(target=_spin, daemon=True, name="actucore_spin")
     spin_thread.start()
 
-    _start_registration(mcp_port, "ActuCore", "actucore")
+    registration_name = (os.environ.get("MCP_REGISTRATION_NAME", "ActuCore").strip()
+                         or "ActuCore")
+    _start_registration(mcp_port, registration_name, "actucore")
 
     server = ThreadingHTTPServer(("", mcp_port), make_handler())
     log.info(f"MCP server → http://0.0.0.0:{mcp_port}")

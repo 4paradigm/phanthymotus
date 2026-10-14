@@ -272,3 +272,23 @@ def test_the_offset_corridor_is_the_space_a_sidestep_moves_into():
     depth_map = _with_patch(5.0, lateral_m=0.35, distance_m=1.0, width_m=0.2)
     assert _corridor(depth_map, lateral_offset_m=0.33)[0] == pytest.approx(1.0)
     assert _corridor(depth_map, lateral_offset_m=-0.33)[0] == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize('width', [640, 848])
+def test_native_grid_right_edge_sampling_and_metric_corridor(width):
+    # A far-right obstacle must not disappear into the old fixed 640 columns.
+    import math
+    scene = np.full((480, width), 5000, dtype=np.uint16)
+    scene[:, int(width*.85):] = 1000
+    image = D.decode_z16(scene.astype('>u2').tobytes(), width=width, height=480,
+                         step=width*2, is_bigendian=True, encoding='16UC1')
+    assert image.shape == (480, width)
+    assert D.sample_box(image, [.9,.3,1.,.8]) == pytest.approx(1.)
+    assert D.sample_point(image, [.9,0]) == pytest.approx(1.)
+    assert D.nearest_by_band(image)['right'] == pytest.approx(1.)
+    clearance, coverage = D.corridor(image, half_width_m=.33, half_fov_rad=.55, reference_m=.8)
+    assert clearance == pytest.approx(5.)  # obstacle outside the forward corridor
+    assert coverage > .9
+    clearance, _ = D.corridor(image, half_width_m=.15, half_fov_rad=.55,
+                              lateral_offset_m=.5, reference_m=1.)
+    assert clearance == pytest.approx(1.)

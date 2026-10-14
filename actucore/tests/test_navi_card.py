@@ -231,6 +231,8 @@ class _FakeNode:
         self.graph = graph or {}
         self.subscriptions = []
         self.subscription_details = []
+        self.timers = []
+        self.destroyed = False
 
     def get_topic_names_and_types(self):
         return list(self.graph.items())
@@ -238,6 +240,18 @@ class _FakeNode:
     def create_subscription(self, msg_type, topic, cb, depth):
         self.subscriptions.append(topic)
         self.subscription_details.append((msg_type, topic, cb, depth))
+
+    def create_timer(self, period, callback):
+        self.timers.append(callback)
+        return callback
+
+    def destroy_timer(self, timer):
+        if timer in self.timers:
+            self.timers.remove(timer)
+
+    def destroy_node(self):
+        self.destroyed = True
+        self.timers.clear()
 
 
 def _bind(topics, graph=None):
@@ -271,13 +285,13 @@ def test_a_raw_driver_depth_topic_uses_image_subscription_and_z16_decoder():
     from types import SimpleNamespace
 
     card = _card()
-    node = _FakeNode()  # producer may still be loading when the canvas starts
+    node = _FakeNode({"/ubuntu/camera/depth": ["sensor_msgs/msg/Image"]})
     bound, problem = card._bind_inputs(
         node, ["/ubuntu/camera/color/objects", "/ubuntu/camera/depth"])
     assert problem == ""
     depth_subscriptions = [item for item in node.subscription_details
                            if item[1] == "/ubuntu/camera/depth"]
-    assert {item[0].__name__ for item in depth_subscriptions} == {"Image", "CompressedImage"}
+    assert {item[0].__name__ for item in depth_subscriptions} == {"Image"}
     callback = next(item[2] for item in depth_subscriptions if item[0].__name__ == "Image")
 
     raw = bytearray(640 * 480 * 2)
@@ -939,3 +953,122 @@ def test_the_bearing_is_snapshotted_as_a_number_not_as_the_track():
     card._publish_view()
     snapshot = card._view_queue.get_nowait()
     assert snapshot["bearing"] is None or isinstance(snapshot["bearing"], float)
+
+
+def test_depth_loading_defers_one_type_until_publisher_is_known():
+    card = _card(); node = _FakeNode()
+    card._running = True
+    card._node = node
+    bound, problem = card._bind_inputs(node, ['/cam/objects', '/q5/camera/depth'])
+    assert problem == '' and bound['depth_map'] == '/q5/camera/depth'
+    assert not any(t[1] == '/q5/camera/depth' for t in node.subscription_details)
+    node.graph['/q5/camera/depth'] = ['sensor_msgs/msg/Image']
+    node.timers[0]()
+    assert [t[0].__name__ for t in node.subscription_details if t[1] == '/q5/camera/depth'] == ['Image']
+    assert node.timers == []
+
+
+def test_bumi_zlib_and_q5_raw_declarations_each_bind_one_type_without_graph():
+    for fmt, name in [('image/depth-zlib', 'CompressedImage'), ('image/depth-z16', 'Image')]:
+        card = _card(); node = _FakeNode()
+        _, problem = card._bind_inputs(node, ['/cam/objects', '/camera/depth'], {'/camera/depth': {'format': fmt}})
+        assert problem == ''
+        assert [t[0].__name__ for t in node.subscription_details if t[1] == '/camera/depth'] == [name]
+
+
+def test_jpeg_preview_never_becomes_metric_depth_and_type_conflicts_refuse():
+    card = _card(); node = _FakeNode({'/camera/depth_preview': ['sensor_msgs/msg/CompressedImage']})
+    _, problem = card._bind_inputs(node, ['/cam/objects', '/camera/depth_preview'])
+    assert problem
+    for types, declaration in [(['sensor_msgs/msg/Image','sensor_msgs/msg/CompressedImage'],None),
+                               (['sensor_msgs/msg/Image'], {'/camera/depth':{'format':'image/depth-zlib'}})]:
+        node = _FakeNode({'/camera/depth':types})
+        _, problem = card._bind_inputs(node, ['/cam/objects','/camera/depth'],declaration)
+        assert problem
+        assert not any(t[1] == '/camera/depth' for t in node.subscription_details)
+
+
+def test_bumi_compressed_depth_creates_only_the_compressed_subscription():
+    card = _card()
+    node = _FakeNode({'/ubuntu/camera/depth': ['sensor_msgs/msg/CompressedImage']})
+    _, problem = card._bind_inputs(node, ['/cam/objects', '/ubuntu/camera/depth'])
+    assert problem == ''
+    details = [entry for entry in node.subscription_details
+               if entry[1] == '/ubuntu/camera/depth']
+    assert [entry[0].__name__ for entry in details] == ['CompressedImage']
+    assert details[0][2] == card._on_depth_map
+
+
+def test_raw_depth_creates_only_the_image_subscription():
+    card = _card()
+    node = _FakeNode({'/robot/camera/depth': ['sensor_msgs/msg/Image']})
+    _, problem = card._bind_inputs(node, ['/cam/objects', '/robot/camera/depth'])
+    assert problem == ''
+    details = [entry for entry in node.subscription_details
+               if entry[1] == '/robot/camera/depth']
+    assert [entry[0].__name__ for entry in details] == ['Image']
+    assert details[0][2] == card._on_depth_z16
+
+
+def test_explicit_input_binding_selects_depth_type_while_ros_graph_is_empty():
+    card = _card()
+    node = _FakeNode()
+    _, problem = card._bind_inputs(
+        node, ['/cam/objects', '/camera/depth'], None,
+        {'bindings': [{'topic': '/camera/depth', 'format': 'image/depth-zlib',
+                       'port_index': 2}]},
+    )
+    assert problem == ''
+    assert [entry[0].__name__ for entry in node.subscription_details
+            if entry[1] == '/camera/depth'] == ['CompressedImage']
+    assert node.timers == []
+
+
+def test_type_conflict_is_reported_before_any_depth_subscription_is_created():
+    card = _card()
+    node = _FakeNode({'/camera/depth': ['sensor_msgs/msg/Image']})
+    _, problem = card._bind_inputs(
+        node, ['/cam/objects', '/camera/depth'], None,
+        {'/camera/depth': {'format': 'image/depth-zlib', 'port_index': 2}},
+    )
+    assert '不一致' in problem
+    assert not [entry for entry in node.subscription_details
+                if entry[1] == '/camera/depth']
+
+
+def test_unknown_depth_type_has_a_bounded_diagnostic_and_cancels_its_retry(monkeypatch):
+    card = _card()
+    node = _FakeNode()
+    card._running = True
+    card._node = node
+    _, problem = card._bind_inputs(node, ['/cam/objects', '/camera/depth'])
+    assert problem == '' and len(node.timers) == 1
+    monkeypatch.setattr(navi_plugin.time, 'monotonic',
+                        lambda: card._depth_bind_deadline + 0.01)
+    node.timers[0]()
+    assert node.timers == []
+    assert '没有声明' in card._last_error
+
+
+def test_start_stop_start_destroys_old_node_and_does_not_duplicate_depth_subscriptions():
+    class _Executor:
+        def remove_node(self, node):
+            self.removed.append(node)
+
+        def __init__(self):
+            self.removed = []
+
+    card = _card()
+    executor = _Executor()
+    card._executor = executor
+    first, second = _FakeNode({'/camera/depth': ['sensor_msgs/msg/CompressedImage']}), \
+                    _FakeNode({'/camera/depth': ['sensor_msgs/msg/CompressedImage']})
+    nodes = iter((first, second))
+    card._open_publisher = lambda: setattr(card, '_node', next(nodes))
+    args = {'action': 'start', 'input_topics': ['/cam/objects', '/camera/depth']}
+    assert card.dispatch('navi', args)['state'] == 'running'
+    assert card.dispatch('navi', {'action': 'stop'})['state'] == 'stopped'
+    assert first.destroyed and executor.removed == [first]
+    assert card.dispatch('navi', args)['state'] == 'running'
+    assert [item[0].__name__ for item in second.subscription_details
+            if item[1] == '/camera/depth'] == ['CompressedImage']

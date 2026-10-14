@@ -57,6 +57,11 @@ TOPIC_FORMAT = "control/velocity"
 # How often the descriptor is echoed back into the stream. See next_command.
 _DESCRIPTOR_EVERY = 50
 
+# A direct hardware depth topic is allowed to come up after Navi.  Do not wait
+# in ``start`` (that would turn an upstream loading delay into a canvas-wide
+# timeout), but do not leave an untyped input retrying forever either.
+_DEPTH_TYPE_WAIT_S = 5.0
+
 # The six twist axes. **The order is fixed by the protocol** — motus.control/1's
 # MODES comment, loco_servo's AXIS_NAMES on the driver side and motus.odom/1's
 # AXES are all this same list — so a twist producer knows what its six numbers
@@ -172,6 +177,12 @@ class NaviPlugin:
         # `_limit_notes` only because they are populated at different points in
         # `_start`; both end up in `degraded`.
         self._camera_notes: list = []
+        # A depth input whose producer has not appeared yet.  Kept separately
+        # from the policy timer so stop/unwind can cancel it explicitly instead
+        # of relying on node destruction happening at the right instant.
+        self._depth_bind_timer = None
+        self._depth_bind_deadline = 0.0
+        self._depth_bind_topic = ""
 
     # ── tool ─────────────────────────────────────────────────────────────────
 
@@ -300,7 +311,7 @@ class NaviPlugin:
                 {"format": "image/depth-zlib",
                  "desc": "zlib 压缩深度图 640x480 uint16 mm（与深度摘要二选一）"},
                 {"format": "image/depth-z16",
-                 "desc": "原始 16UC1/mono16 深度图 640x480 uint16 mm（与深度摘要二选一）"},
+                 "desc": "原始 16UC1/mono16 深度图 640x480 或 848x480 uint16 mm（与深度摘要二选一）"},
                 {"format": "state/odom",
                  "desc": "motus.odom/1（可选，接上才有卡死检测）"},
             ],
@@ -400,7 +411,10 @@ class NaviPlugin:
 
         try:
             self._open_publisher()
-            binding, problem = self._bind_inputs(self._node, inputs)
+            binding, problem = self._bind_inputs(
+                self._node, inputs, args.get("camera_info"),
+                args.get("input_bindings"),
+            )
         except Exception as error:                            # noqa: BLE001
             self._unwind()
             return self._error(f"启动失败：{error}")
@@ -635,6 +649,7 @@ class NaviPlugin:
             timer, self._timer = self._timer, None
             self._publisher = None
 
+        self._cancel_pending_depth_bind(node)
         if timer is not None and node is not None:
             try:
                 node.destroy_timer(timer)
@@ -642,15 +657,17 @@ class NaviPlugin:
                 pass
         if node is not None:
             try:
-                self._executor.remove_node(node)
+                if self._executor is not None:
+                    self._executor.remove_node(node)
+            except Exception:                                 # noqa: BLE001
+                pass
+            try:
                 node.destroy_node()
             except Exception:                                 # noqa: BLE001
                 pass
         return {"state": "stopped"}
 
     def _unwind(self):
-        with self._lock:
-            self._running = False
         self._stop_view_thread()
         self._stop()
 
@@ -807,7 +824,41 @@ class NaviPlugin:
         ("/state/odom", "odom"),
     )
 
-    def _bind_inputs(self, node, topics):
+    @staticmethod
+    def _declared_format(bindings, topic: str) -> str:
+        """Return the explicit format for one bound topic, if one was sent.
+
+        Agent Core may carry bindings as a topic-keyed mapping or as entries
+        containing ``topic``, ``format`` and ``port_index``.  Port index is not
+        used to infer a type: the resolved topic is the stable identity once
+        the canvas is started.  Accepting both shapes keeps this reader
+        compatible with existing callers while avoiding a positional guess.
+        """
+        if isinstance(bindings, dict):
+            entry = bindings.get(topic)
+            if isinstance(entry, str):
+                return entry
+            if isinstance(entry, dict):
+                return str(entry.get("format") or "")
+            entries = bindings.get("bindings") or bindings.get("inputs") or ()
+        else:
+            entries = bindings or ()
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("topic") == topic:
+                return str(entry.get("format") or "")
+        return ""
+
+    def _cancel_pending_depth_bind(self, node=None):
+        timer, self._depth_bind_timer = self._depth_bind_timer, None
+        self._depth_bind_deadline = 0.0
+        self._depth_bind_topic = ""
+        if timer is not None and node is not None:
+            try:
+                node.destroy_timer(timer)
+            except Exception:                                 # noqa: BLE001
+                pass
+
+    def _bind_inputs(self, node, topics, declarations=None, input_bindings=None):
         """把连上来的话题分派到角色。
 
         **上游此刻有没有在发布，不参与这个判断。** 这一条是真机上换来的：
@@ -866,16 +917,66 @@ class NaviPlugin:
 
         qos = _sensor_qos()
         if bound["depth_map"]:
-            # Canvas startup intentionally does not wait for a producer to
-            # appear, so there may be no ROS graph type to inspect here.  Both
-            # declared depth wire formats are safe to subscribe to: DDS only
-            # delivers a matching type, and the inactive subscription receives
-            # nothing.  This avoids guessing raw z16 from a topic name while
-            # retaining Bumi's zlib path during upstream camera startup.
-            node.create_subscription(CompressedImage, bound["depth_map"],
-                                     self._on_depth_map, qos)
-            node.create_subscription(Image, bound["depth_map"],
-                                     self._on_depth_z16, qos)
+            topic = bound["depth_map"]
+            # ``camera_info`` is optical metadata, not a wire-format registry.
+            # Prefer the canvas binding when supplied; keep the declaration
+            # fallback for callers that already attach format to it.
+            fmt = self._declared_format(input_bindings, topic)
+            if not fmt:
+                fmt = self._declared_format(declarations, topic)
+            declared = {"image/depth-z16": Image,
+                        "image/depth-zlib": CompressedImage}.get(fmt)
+            if fmt and declared is None:
+                return bound, f"深度输入格式不兼容：{fmt}（JPEG预览不能作米制深度）"
+
+            def bind_depth():
+                types = set(dict(node.get_topic_names_and_types()).get(topic) or [])
+                supported = {"sensor_msgs/msg/Image": Image,
+                             "sensor_msgs/msg/CompressedImage": CompressedImage}
+                observed = [supported[t] for t in types if t in supported]
+                if len(types) > 1 or (types and not observed):
+                    raise ValueError(f"深度话题类型冲突：{topic}: {sorted(types)}")
+                if declared and observed and observed[0] is not declared:
+                    raise ValueError(f"深度声明与ROS类型不一致：{topic}")
+                selected = declared or (observed[0] if observed else None)
+                if selected is None and topic.endswith("/visual_depth"):
+                    selected = CompressedImage
+                if selected is None:
+                    return False
+                callback = self._on_depth_z16 if selected is Image else self._on_depth_map
+                node.create_subscription(selected, topic, callback, qos)
+                self._cancel_pending_depth_bind(node)
+                return True
+
+            try:
+                ready = bind_depth()
+            except ValueError as error:
+                return bound, str(error)
+            if not ready:
+                def retry_depth():
+                    # A stopped/restarted card must never let a timer from its
+                    # previous node create a late duplicate subscription.
+                    if not self._running or self._node is not node:
+                        self._cancel_pending_depth_bind(node)
+                        return
+                    try:
+                        if bind_depth():
+                            return
+                    except Exception as error:
+                        with self._lock:
+                            self._last_error = f"深度订阅失败：{error}"
+                        self._cancel_pending_depth_bind(node)
+                        return
+                    if time.monotonic() >= self._depth_bind_deadline:
+                        with self._lock:
+                            self._last_error = (
+                                f"深度话题 {topic} 在 {_DEPTH_TYPE_WAIT_S:g}s 内没有声明"
+                                " image/depth-zlib 或 image/depth-z16，也没有可识别的 ROS 类型")
+                        self._cancel_pending_depth_bind(node)
+
+                self._depth_bind_topic = topic
+                self._depth_bind_deadline = time.monotonic() + _DEPTH_TYPE_WAIT_S
+                self._depth_bind_timer = node.create_timer(0.1, retry_depth)
         if bound["image"]:
             # Kept as bytes and decoded only when a frame is drawn: the camera
             # runs at 15 fps and the overlay at 5, so decoding on arrival would
