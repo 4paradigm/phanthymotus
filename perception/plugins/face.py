@@ -50,6 +50,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.cv2_compat import load_cv2
 from utils.latest_frame import LatestFrame
 from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
@@ -349,6 +350,14 @@ def _db_options(cfg: dict) -> dict:
         # invalidates every stored sample, and the database is where that has to
         # be refused — see IdentityDB._load.
         "dim": EMBEDDING_DIM,
+        # Storing the aligned crop per sample is what makes a later model switch
+        # migratable rather than a manual re-enrolment of everybody. It is face
+        # imagery on disk, bounded by max_samples_per_person x unknown_capacity
+        # (8 x 500 ~= 24 MB at ~6 kB a crop), and `store_sample_crops: false`
+        # turns it off for a deployment that must not keep any.
+        "artifact_suffix": (
+            ".jpg" if bool(cfg.get("store_sample_crops", True)) else ""
+        ),
         "model": str(cfg.get("model", DEFAULT_FACE_MODEL)),
         "label": "face_db",
         "unknown_capacity": int(
@@ -371,6 +380,30 @@ def _decode_options(cfg: dict) -> dict:
         "max_side": int(cfg.get("max_image_side", DEFAULT_MAX_IMAGE_SIDE)),
         "max_pixels": int(cfg.get("max_image_pixels", DEFAULT_MAX_IMAGE_PIXELS)),
     }
+
+
+def _encode_crop(aligned) -> bytes | None:
+    """JPEG-encode an aligned 112x112 crop for storage, or None if there is none.
+
+    JPEG at quality 92, not PNG or raw: ~6 kB against 37 kB raw, and the crop is
+    only ever fed back through a detector-free embedding step, which is far less
+    sensitive to compression than it would be to the 6x disk cost on a 57 GB eMMC.
+
+    Best-effort — a failure here costs the ability to re-embed this one sample and
+    must not fail the enrolment the operator is waiting on.
+    """
+    if aligned is None:
+        return None
+    try:
+        cv2 = load_cv2()
+        ok, buffer = cv2.imencode(".jpg", aligned,
+                                  [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if not ok:
+            return None
+        return bytes(buffer.tobytes())
+    except Exception:  # noqa: BLE001 - never break enrolment over a crop
+        log.warning("[face] could not encode the sample crop", exc_info=True)
+        return None
 
 
 def _gates(cfg: dict) -> dict:
@@ -1586,8 +1619,16 @@ class FaceRecognitionPlugin:
 
     def _analyze_subject(
         self, engine: _FaceEngine, image_bytes: bytes, gates: dict
-    ) -> tuple[np.ndarray | None, dict | None]:
-        """One image → the subject's embedding, or the failure record."""
+    ) -> tuple[np.ndarray | None, bytes | None, dict | None]:
+        """One image → the subject's embedding and crop, or the failure record.
+
+        The crop is the aligned 112x112 the embedding was actually computed from,
+        JPEG-encoded, and it is what makes a future model switch migratable: an
+        embedding means nothing outside its own network, so without the source there
+        is no re-embedding, only re-enrolling every person by hand. Requested only
+        when the database is storing artifacts, because it costs 37 kB across the
+        ORT worker boundary per face.
+        """
         # embed_all here, unlike the recognition path: `select_subject` picks the
         # subject *after* seeing every candidate's geometry, so the embedding has to
         # exist for whichever one it chooses — including a marginal face that the
@@ -1600,9 +1641,10 @@ class FaceRecognitionPlugin:
             min_face_px=gates["min_face_px"],
             blur_min=gates["blur_min"],
             embed_all=True,
+            want_aligned=engine.db.artifacts_enabled,
         )
         if shape is None:
-            return None, {
+            return None, None, {
                 "ok": False, "reason": REASON_BAD_INPUT,
                 "detail": (
                     "image could not be decoded (cv2 and Pillow both refused it; "
@@ -1612,8 +1654,8 @@ class FaceRecognitionPlugin:
             }
         subject, failure = select_subject(faces, shape, gates)
         if subject is None:
-            return None, failure
-        return subject.embedding, None
+            return None, None, failure
+        return subject.embedding, _encode_crop(subject.aligned), None
 
     def _commit_enrolment(
         self,
@@ -1623,8 +1665,13 @@ class FaceRecognitionPlugin:
         profile: Any,
         person_id: str | None,
         gates: dict,
+        artifacts: list | None = None,
     ) -> dict:
-        """Attach embeddings to the right identity, creating one if needed."""
+        """Attach embeddings to the right identity, creating one if needed.
+
+        `artifacts` is parallel to `embeddings` — the crop each was computed from,
+        stored so the roster can be re-embedded under another model later.
+        """
         database = engine.db
 
         if person_id:
@@ -1636,7 +1683,7 @@ class FaceRecognitionPlugin:
                     "detail": f"no such person: {person_id!r}",
                 }
             was_unknown = not existing["named"]
-            record = database.add_samples(person_id, embeddings)
+            record = database.add_samples(person_id, embeddings, artifacts)
             if name or profile is not None:
                 record = database.update_person(
                     person_id, name=name or None, profile=profile
@@ -1653,7 +1700,7 @@ class FaceRecognitionPlugin:
         # No id given: does this face already exist under some identity?
         matched, score = database.match(embeddings[0], gates["match_threshold"])
         if matched is not None:
-            record = database.add_samples(matched, embeddings)
+            record = database.add_samples(matched, embeddings, artifacts)
             promoted = False
             if is_unknown_id(matched) or not record["named"]:
                 # The face was already being tracked anonymously; naming it now
@@ -1673,7 +1720,8 @@ class FaceRecognitionPlugin:
                 "score_to_existing": round(float(score), 4),
             }
 
-        record = database.add(name, embeddings, named=True, profile=profile)
+        record = database.add(name, embeddings, named=True, profile=profile,
+                              artifacts=artifacts)
         return {
             "ok": True,
             "person_id": record["id"],
@@ -1693,7 +1741,7 @@ class FaceRecognitionPlugin:
         except _BadInput as error:
             return error.as_result()
 
-        embedding, failure = self._analyze_subject(engine, data, gates)
+        embedding, crop, failure = self._analyze_subject(engine, data, gates)
         if embedding is None:
             return {**failure, "source": source}
         # No person_id input: which identity a photo belongs to is decided by
@@ -1704,7 +1752,7 @@ class FaceRecognitionPlugin:
         # batch manifest's `person` key.
         result = self._commit_enrolment(
             engine, [embedding], str(args.get("name") or ""),
-            args.get("profile"), None, gates,
+            args.get("profile"), None, gates, [crop],
         )
         if result.get("ok"):
             log.info("[face] registered %s from %s: %s", result["person_id"],
@@ -1740,13 +1788,15 @@ class FaceRecognitionPlugin:
         selected = list(reversed(frames))[:budget]
 
         embeddings: list[np.ndarray] = []
+        crops: list = []
         failures: list[dict] = []
         for image_bytes, _ts in selected:
-            embedding, failure = self._analyze_subject(engine, image_bytes, gates)
+            embedding, crop, failure = self._analyze_subject(engine, image_bytes, gates)
             if embedding is None:
                 failures.append(failure)
             else:
                 embeddings.append(embedding)
+                crops.append(crop)
 
         if not embeddings:
             return {
@@ -1759,10 +1809,15 @@ class FaceRecognitionPlugin:
         # turns being the dominant face would otherwise be enrolled as one
         # identity whose embeddings match neither of them well.
         anchor = embeddings[0]
-        agreeing = [
-            embedding for embedding in embeddings
+        # Filter embeddings and crops by the same index set rather than in two
+        # comprehensions: they must stay parallel all the way into the database, or
+        # a person is stored with somebody else's face as the artifact behind it.
+        kept = [
+            index for index, embedding in enumerate(embeddings)
             if float(np.dot(anchor, embedding)) >= gates["match_threshold"]
         ]
+        agreeing = [embeddings[index] for index in kept]
+        agreeing_crops = [crops[index] for index in kept]
         if len(agreeing) * 2 < len(embeddings):
             return {
                 "ok": False,
@@ -1778,7 +1833,7 @@ class FaceRecognitionPlugin:
 
         result = self._commit_enrolment(
             engine, agreeing, str(args.get("name") or ""),
-            args.get("profile"), None, gates,
+            args.get("profile"), None, gates, agreeing_crops,
         )
         if result.get("ok"):
             log.info("[face] registered %s from the live stream (%d/%d frames): %s",
@@ -1864,13 +1919,14 @@ class FaceRecognitionPlugin:
                                     "detail": f"cannot read: {error}"})
                     continue
 
-                embedding, failure = self._analyze_subject(engine, data, gates)
+                embedding, crop, failure = self._analyze_subject(engine, data, gates)
                 if embedding is None:
                     results.append({"file": relative, "name": name, **failure})
                     continue
                 try:
                     outcome = self._commit_enrolment(
-                        engine, [embedding], name, profile, person_id, gates
+                        engine, [embedding], name, profile, person_id, gates,
+                        [crop],
                     )
                 except Exception as error:  # noqa: BLE001 - one bad photo must
                     # not abandon the rest of a 200-image batch half-registered

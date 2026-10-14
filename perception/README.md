@@ -2358,17 +2358,44 @@ enrolment, not after:
 
 | Approach | What it costs | What it buys |
 |---|---|---|
-| Store the aligned 112x112 crop per sample | ~6 KB/sample JPEG (≈24 MB at 500 people x 8). **Reverses the no-imagery policy** — this is storing biometric images, a policy decision, not a technical one | Re-embedding under *any* future model, offline, with nobody present |
+| Store the aligned 112x112 crop per sample — **implemented**, `store_sample_crops: true` | ~6 KB/sample JPEG (≈24 MB at 500 people x 8). Keeps face imagery on disk, bounded and deleted with its sample | Re-embedding under *any* future model, offline, with nobody present |
 | Embed under every installed model at enrolment | Both models resident; enrolment latency x N; an IdentityDB schema change that also lands on voiceprints | Instant lossless switching between *those* models only |
 | Dual-model transition window | Both models resident during migration; each person must appear once | Migrates an *existing* roster automatically: match with the old model to recover the name, enrol that name under the new one |
 
 The third is the only one that helps a roster that already exists, because it
 recovers the identity from the old model while the person is in frame rather than
-from storage. None of them is implemented today.
+from storage.
 
-Until one is, the practical path is the cheap one: auto-enrolment re-learns people
-as they appear, so only **named** people need their name re-attached — on the Orin 5
-rig that was 4 names out of 44 identities.
+**The first is now implemented**, so this is the last switch that has to be painful.
+Every sample enrolled from here on stores the aligned crop it was embedded from
+under `<db_dir>/samples/<sample_id>.jpg`, and `stats()` reports
+`samples_with_artifact` against `samples` so the shortfall on an older roster is
+visible rather than discovered at switch time. `IdentityDB.sample_artifacts()` is
+the surface a re-embedding pass reads.
+
+Two things about that storage are load-bearing:
+
+- **Crops are keyed by a stable sample id, never by row index.** Rows get reindexed
+  by the max-samples trim, by `forget`, by capacity eviction and by the orphan
+  filter on load; a crop filed under an index would, after any of those, be served
+  up as a different person's face — which is worse than having no crop, because it
+  is wrong rather than absent. Ids come from a counter that only ever increases and
+  is restored from disk, so a retired id can never be handed to a new sample and
+  adopt its file.
+- **Files are written before the commit and swept after it**, the same ordering and
+  for the same reason as the embeddings file: a crash then leaves an unreferenced
+  file, which the next commit removes, rather than a referenced id with nothing
+  behind it.
+
+For a roster enrolled *before* this existed — which includes every robot deployed
+to date — there is still nothing to re-embed, so the cheap path applies:
+auto-enrolment re-learns people as they appear, and only **named** people need
+their name re-attached. On the Orin 5 rig that was 4 names out of 44 identities.
+
+What is **not** built yet is the re-embedding pass itself — the offline job that
+reads `sample_artifacts()`, runs each crop through the newly selected model and
+writes that model's database. The data it needs is now being kept; the job is not
+written.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that

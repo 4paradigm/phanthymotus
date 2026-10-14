@@ -106,6 +106,8 @@ DEFAULT_VISIT_LOG_MAX = 20000
 DEFAULT_VISIT_CHECKPOINT_S = 60.0
 
 _PERSONS_FILE = "persons.json"
+# Per-sample source artifacts (face crops), one file per sample id.
+_SAMPLES_DIR = "samples"
 _VISITS_FILE = "visits.jsonl"
 _OPEN_VISITS_FILE = "visits-open.json"
 _LOCK_FILE = ".identity_db.lock"
@@ -243,6 +245,7 @@ class IdentityDB:
         model: str = "",
         label: str = "identity_db",
         on_evict=None,
+        artifact_suffix: str = "",
     ):
         # db_dir arrives over MCP config and this process runs as root in the
         # container; the same validation model_downloader applies to model_dir.
@@ -262,12 +265,32 @@ class IdentityDB:
         self._unknown_capacity = max(0, int(unknown_capacity))
         self._max_samples = max(1, int(max_samples_per_person))
 
+        # When set (e.g. ".jpg"), each sample may carry the source artifact it was
+        # embedded from, stored under `samples/<sample_id><suffix>`. Empty disables
+        # the whole mechanism, which is the default — voiceprints do not use it and
+        # must not pay for it.
+        #
+        # The point is re-embedding: an embedding is only meaningful inside the
+        # network that produced it, so without the artifact a model switch can
+        # never be migrated, only re-enrolled by hand. See `sample_artifacts`.
+        self._artifact_suffix = str(artifact_suffix or "")
+
         self._lock = threading.RLock()
         self._persons: dict[str, dict] = {}
         self._row_owners: list[str] = []
+        # Parallel to `_row_owners`: the stable id of the artifact backing each row,
+        # or "" for a row that has none (every row written before this existed).
+        #
+        # Keyed by id and NOT by row index, which is the whole design: rows are
+        # reindexed by the max-samples trim, by `forget`, by capacity eviction and by
+        # the orphan filter in `_load`. An artifact filed under a row index would,
+        # after any of those, be served up as a different person's face. Ids are
+        # allocated from a counter that only ever increases, so a retired id is never
+        # handed to a new sample and a stale file can never be adopted.
+        self._row_samples: list[str] = []
         self._matrix = np.zeros((0, self._dim), dtype=np.float32)
         # Single counter for all person IDs (p-N format)
-        self._next_ids = {"named": 1}
+        self._next_ids = {"named": 1, "sample": 1}
         self._generation = 0
 
         self._visit_gap = max(0.0, float(visit_gap_s))
@@ -293,6 +316,24 @@ class IdentityDB:
 
     def _embeddings_name(self, generation: int) -> str:
         return f"{_EMBEDDINGS_PREFIX}{generation}{_EMBEDDINGS_SUFFIX}"
+
+    @property
+    def artifacts_enabled(self) -> bool:
+        return bool(self._artifact_suffix)
+
+    def _samples_dir(self) -> str:
+        return os.path.join(self._dir, _SAMPLES_DIR)
+
+    def _artifact_path(self, sample_id: str) -> str:
+        """Where `sample_id`'s artifact lives. Ids are generated here, never
+        caller-supplied, so they cannot traverse out of the directory."""
+        return os.path.join(self._samples_dir(),
+                            f"{sample_id}{self._artifact_suffix}")
+
+    def _allocate_sample_id_locked(self) -> str:
+        index = max(1, int(self._next_ids.get("sample", 1)))
+        self._next_ids["sample"] = index + 1
+        return f"s-{index}"
 
     def _load(self) -> None:
         persons_path = self._persons_path()
@@ -383,16 +424,31 @@ class IdentityDB:
         # A row owned by a person that is not in the table would make
         # `_person_scores` attribute a sample to nobody; drop those rows rather
         # than carry a matrix the metadata cannot explain.
+        # Sample ids run parallel to `rows`. Absent (every database written before
+        # artifacts existed) or the wrong length (a hand-edited persons.json) means
+        # "no artifacts here" rather than a guess: a wrong id would attach one
+        # person's face to another's embedding, which is the one outcome worse than
+        # having no artifact at all.
+        sample_rows = state.get("sample_rows") or []
+        if len(sample_rows) != len(rows):
+            if sample_rows:
+                log.warning("%s sample_rows is %d long for %d row(s); ignoring it",
+                            self._tag, len(sample_rows), len(rows))
+            sample_rows = [""] * len(rows)
+        sample_rows = [str(item or "") for item in sample_rows]
+
         keep = [index for index, owner in enumerate(rows) if owner in persons]
         if len(keep) != len(rows):
             log.warning("%s dropping %d orphaned embedding row(s)", self._tag,
                         len(rows) - len(keep))
             rows = [rows[index] for index in keep]
+            sample_rows = [sample_rows[index] for index in keep]
             matrix = matrix[keep] if matrix.size else matrix
 
         next_ids = state.get("next_ids") or {}
         self._persons = persons
         self._row_owners = [str(owner) for owner in rows]
+        self._row_samples = sample_rows
         self._matrix = matrix if matrix.size else np.zeros(
             (0, self._dim), dtype=np.float32
         )
@@ -400,8 +456,13 @@ class IdentityDB:
         # Take the max of both counters to ensure no ID collisions
         old_named = max(1, int(next_ids.get("named", 1)))
         old_unknown = max(1, int(next_ids.get("unknown", 1)))
+        # Never below the highest id already on disk: a reused id would adopt the
+        # retired sample's artifact file and serve the wrong face.
+        used = [int(item[2:]) for item in sample_rows
+                if item.startswith("s-") and item[2:].isdigit()]
         self._next_ids = {
             "named": max(old_named, old_unknown),
+            "sample": max([int(next_ids.get("sample", 1) or 1), 1] + [n + 1 for n in used]),
         }
         self._generation = max(0, int(state.get("generation") or 0))
         log.info("%s loaded %d person(s), %d sample(s) from %s", self._tag,
@@ -450,6 +511,7 @@ class IdentityDB:
                     "embeddings_file": matrix_name,
                     "next_ids": dict(self._next_ids),
                     "rows": list(self._row_owners),
+                    "sample_rows": list(self._row_samples),
                     "persons": [
                         dict(person) for person in self._persons.values()
                     ],
@@ -474,6 +536,13 @@ class IdentityDB:
                             os.unlink(os.path.join(self._dir, name))
                         except OSError:  # noqa: PERF203 - best-effort cleanup
                             pass
+
+                # Same discipline for sample artifacts, and only after the commit:
+                # until persons.json lands, the ids it still names must keep their
+                # files. This also sweeps what a crashed earlier write left behind,
+                # since anything not named by the committed state is unreachable —
+                # ids are never reused, so an unreferenced file is always garbage.
+                self._sweep_artifacts_locked()
             finally:
                 if fcntl is not None:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -534,12 +603,21 @@ class IdentityDB:
 
     # ── writes ────────────────────────────────────────────────────────────
 
-    def _add_rows_locked(self, person_id: str, vectors: list[np.ndarray]) -> None:
+    def _add_rows_locked(self, person_id: str, vectors: list[np.ndarray],
+                         artifacts: list | None = None) -> None:
         """Append samples for one person, capped at `max_samples_per_person`.
 
         Oldest-first eviction: rows are appended in enrolment order, so keeping
         the tail keeps the most recent captures — the ones most likely to match
         how the person looks now.
+
+        `artifacts` is parallel to `vectors` and may hold the encoded bytes each
+        embedding was produced from, or None for an embedding whose source was not
+        kept. Ignored entirely unless this database was opened with an
+        `artifact_suffix`. Files are written *before* `persons.json` commits, which
+        is the same ordering the embeddings file uses and for the same reason: a
+        crash then leaves an unreferenced file, which the next commit sweeps, rather
+        than a referenced id with no file behind it.
         """
         if not vectors:
             return
@@ -551,12 +629,91 @@ class IdentityDB:
         )
         self._row_owners.extend([person_id] * len(vectors))
 
+        payloads = list(artifacts or [])
+        payloads += [None] * (len(vectors) - len(payloads))
+        for payload in payloads[: len(vectors)]:
+            self._row_samples.append(
+                self._write_artifact_locked(payload) if self._artifact_suffix else "")
+
         owned = [i for i, owner in enumerate(self._row_owners) if owner == person_id]
         if len(owned) > self._max_samples:
             drop = set(owned[: len(owned) - self._max_samples])
             keep = [i for i in range(len(self._row_owners)) if i not in drop]
             self._row_owners = [self._row_owners[i] for i in keep]
+            self._row_samples = [self._row_samples[i] for i in keep]
             self._matrix = self._matrix[keep]
+
+    def _sweep_artifacts_locked(self) -> int:
+        """Delete artifact files no committed sample id names. Best-effort."""
+        if not self._artifact_suffix:
+            return 0
+        directory = self._samples_dir()
+        if not os.path.isdir(directory):
+            return 0
+        live = {item for item in self._row_samples if item}
+        removed = 0
+        for name in os.listdir(directory):
+            if not name.endswith(self._artifact_suffix):
+                continue
+            if name[: -len(self._artifact_suffix)] in live:
+                continue
+            try:
+                os.unlink(os.path.join(directory, name))
+                removed += 1
+            except OSError:  # noqa: PERF203 - best-effort cleanup
+                pass
+        return removed
+
+    def sample_artifacts(self) -> list[dict]:
+        """Every sample that still has its source artifact on disk.
+
+        This is the backfill surface: re-embedding a roster under another model
+        means reading these, running them through the new network, and writing a
+        fresh database — which is the only migration possible, because embeddings
+        cannot be converted between networks and nothing else here retains the face.
+
+        Rows whose artifact is missing are omitted rather than reported as empty:
+        every row enrolled before artifacts existed is in that state, and a caller
+        re-embedding needs the list it can actually act on. Compare the length
+        against `stats()["samples"]` to see the shortfall.
+        """
+        with self._lock:
+            out = []
+            for index, (owner, sample_id) in enumerate(
+                    zip(self._row_owners, self._row_samples)):
+                if not sample_id:
+                    continue
+                path = self._artifact_path(sample_id)
+                if not os.path.exists(path):
+                    continue
+                out.append({"row": index, "person_id": owner,
+                            "sample_id": sample_id, "path": path})
+            return out
+
+    def _write_artifact_locked(self, payload) -> str:
+        """Persist one sample artifact and return its id, or "" if there is none.
+
+        Best-effort: a full or read-only /models must not take enrolment down, so a
+        write failure costs the artifact (and with it the ability to re-embed that
+        one sample) and nothing else.
+        """
+        if not payload:
+            return ""
+        sample_id = self._allocate_sample_id_locked()
+        path = self._artifact_path(sample_id)
+        try:
+            os.makedirs(self._samples_dir(), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            log.warning("%s could not store the sample artifact for %s",
+                        self._tag, sample_id, exc_info=True)
+            return ""
+        return sample_id
 
     def _samples_locked(self, person_id: str) -> int:
         """Sample count, always derived from the row owners rather than stored.
@@ -605,8 +762,12 @@ class IdentityDB:
         named: bool = True,
         profile: Any = None,
         person_id: str | None = None,
+        artifacts: list | None = None,
     ) -> dict:
-        """Enrol a new identity and return its record."""
+        """Enrol a new identity and return its record.
+
+        `artifacts` is parallel to `embeddings`; see `_add_rows_locked`.
+        """
         vectors = [_normalize(item, self._dim) for item in embeddings]
         if not vectors:
             raise ValueError("at least one embedding is required")
@@ -628,7 +789,7 @@ class IdentityDB:
                 "updated_at": timestamp,
                 "last_seen_at": timestamp,
             }
-            self._add_rows_locked(new_id, vectors)
+            self._add_rows_locked(new_id, vectors, artifacts)
             evicted: list[str] = []
             if not named:
                 evicted = self._evict_unknowns_locked()
@@ -644,7 +805,8 @@ class IdentityDB:
                  escape_log_text(record["name"]))
         return record
 
-    def add_samples(self, person_id: str, embeddings: Iterable[np.ndarray]) -> dict:
+    def add_samples(self, person_id: str, embeddings: Iterable[np.ndarray],
+                    artifacts: list | None = None) -> dict:
         """Attach more samples to an existing person."""
         vectors = [_normalize(item, self._dim) for item in embeddings]
         if not vectors:
@@ -652,19 +814,19 @@ class IdentityDB:
         with self._lock:
             if person_id not in self._persons:
                 raise KeyError(person_id)
-            self._add_rows_locked(person_id, vectors)
+            self._add_rows_locked(person_id, vectors, artifacts)
             self._persons[person_id]["updated_at"] = _now()
             record = self._record_locked(person_id)
             self._save_locked()
         return record
 
-    def enroll_unknown(self, embedding: np.ndarray) -> dict:
+    def enroll_unknown(self, embedding: np.ndarray, artifact=None) -> dict:
         """Create an anonymous entry for somebody nobody has named.
 
         It gets an ordinary `p-N` id like everyone else — `named=False` is what
         marks it anonymous, not the id format.
         """
-        return self.add("", [embedding], named=False)
+        return self.add("", [embedding], named=False, artifacts=[artifact])
 
     def promote(
         self, person_id: str, name: str, profile: Any = None, merge: bool = True
@@ -764,6 +926,7 @@ class IdentityDB:
         keep = [i for i, owner in enumerate(self._row_owners) if owner not in doomed]
         if len(keep) != len(self._row_owners):
             self._row_owners = [self._row_owners[i] for i in keep]
+            self._row_samples = [self._row_samples[i] for i in keep]
             self._matrix = (
                 self._matrix[keep] if keep
                 else np.zeros((0, self._dim), dtype=np.float32)
@@ -844,6 +1007,7 @@ class IdentityDB:
             if owner not in doomed
         ]
         self._row_owners = [self._row_owners[i] for i in keep]
+        self._row_samples = [self._row_samples[i] for i in keep]
         self._matrix = (
             self._matrix[keep] if keep
             else np.zeros((0, self._dim), dtype=np.float32)
@@ -1231,6 +1395,11 @@ class IdentityDB:
                 "unknown_capacity": self._unknown_capacity,
                 "open_visits": len(self._open_visits),
                 "db_dir": self._dir,
+                # How much of this roster could survive a model switch. Equal to
+                # `samples` once every row carries its source; lower on any database
+                # that predates artifacts, and 0 when they are disabled.
+                "samples_with_artifact": sum(1 for item in self._row_samples if item),
+                "artifacts_enabled": bool(self._artifact_suffix),
             }
 
 

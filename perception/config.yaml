@@ -524,6 +524,20 @@ plugins:
     # 未命名声纹上限，超出淘汰最久未听到的；已命名不受影响。
     unknown_capacity: 50
     max_samples_per_person: 8
+    # Keep the aligned 112x112 crop each sample was embedded from, under
+    # `<db_dir>/samples/`. This is **the only thing that makes a model switch
+    # migratable**: an embedding means nothing outside the network that produced
+    # it, so without the crop a new model can only be populated by re-enrolling
+    # everyone by hand (see README § "Why there is no migration").
+    #
+    # It is face imagery on disk, which the rest of this system deliberately avoids
+    # keeping — `image_input` above discards registration photos after
+    # retention_days. The difference is that this is bounded: at most
+    # max_samples_per_person x (unknown_capacity + named) crops at ~6 KB, so ~24 MB
+    # at the defaults, and crops are deleted with their sample. Set false for a
+    # deployment that must not retain any face image; the cost is that the next
+    # model change starts from an empty roster.
+    store_sample_crops: true
     # 这张卡是 actuator，不订阅任何 topic：身份是在 ASR 已经切好的那个 VAD 段上算
     # 的，随 ASR 的输出一起走。所以这里没有 VAD 参数 —— 切分完全由 asr.vad 决定。
     #
@@ -615,6 +629,20 @@ plugins:
     # people are never evicted. Editable from the card.
     unknown_capacity: 500
     max_samples_per_person: 8
+    # Keep the aligned 112x112 crop each sample was embedded from, under
+    # `<db_dir>/samples/`. This is **the only thing that makes a model switch
+    # migratable**: an embedding means nothing outside the network that produced
+    # it, so without the crop a new model can only be populated by re-enrolling
+    # everyone by hand (see README § "Why there is no migration").
+    #
+    # It is face imagery on disk, which the rest of this system deliberately avoids
+    # keeping — `image_input` above discards registration photos after
+    # retention_days. The difference is that this is bounded: at most
+    # max_samples_per_person x (unknown_capacity + named) crops at ~6 KB, so ~24 MB
+    # at the defaults, and crops are deleted with their sample. Set false for a
+    # deployment that must not retain any face image; the cost is that the next
+    # model change starts from an empty roster.
+    store_sample_crops: true
     # Visit log (visits.jsonl): one continuous appearance is one record, not
     # one per frame. A visit is closed and written only after the person has
     # been absent for visit_gap_s; 10 minutes stops somebody turning their head
