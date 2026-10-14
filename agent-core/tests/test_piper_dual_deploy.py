@@ -35,8 +35,13 @@ class DeploymentTests(unittest.TestCase):
         self.fragment = self.run_dir / 'service.yml'
         self.fragment.write_text(yaml.safe_dump({'agilex-piper': {
             'image': '__IMAGE__', 'container_name': deploy.PRIMARY, 'network_mode': 'host',
-            'volumes': [{'type': 'bind', 'source': str(self.data), 'target': str(self.data)}],
-            'environment': {'CONFIG_PATH': 'old-config', 'PIPER_MOTION_ENABLED': '1', 'PIPER_CAMERA_ENABLED': '1'},
+            'volumes': [{'type': 'bind', 'source': str(self.data), 'target': str(self.data)},
+                        {'type': 'bind', 'source': '/opt/phanthy-motus/dds-local.xml',
+                         'target': '/opt/phanthy-motus/dds-local.xml', 'read_only': True}],
+            'environment': {'CONFIG_PATH': 'old-config', 'PIPER_MOTION_ENABLED': '1', 'PIPER_CAMERA_ENABLED': '1',
+                            'FASTRTPS_DEFAULT_PROFILES_FILE': '/opt/phanthy-motus/dds-local.xml',
+                            'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp'},
+            'logging': {'driver': 'local', 'options': {'max-size': '10m', 'max-file': '3'}},
         }}))
         self.template = {'mcp_port': 15741, 'data_dir': str(self.data),
                          'arms': {'left': {'can_interface': 'can0'}, 'right': {'can_interface': 'can1'}},
@@ -149,7 +154,9 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(saved['arms']['right']['can_interface'], 'can0')
         compose = json.loads((self.run_dir / 'docker-compose.yml').read_text())
         self.assertEqual(compose['services'][deploy.SERVICE]['environment'], {
-            'CONFIG_PATH': str(self.config), 'PIPER_MOTION_ENABLED': '0', 'PIPER_CAMERA_ENABLED': '0'})
+            'CONFIG_PATH': str(self.config), 'PIPER_MOTION_ENABLED': '0', 'PIPER_CAMERA_ENABLED': '0',
+            'FASTRTPS_DEFAULT_PROFILES_FILE': '/opt/phanthy-motus/dds-local.xml',
+            'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp'})
         self.assertFalse(self.items[deploy.SECONDARY]['State']['Running'])
         self.assertEqual(self.items[deploy.SECONDARY]['HostConfig']['RestartPolicy']['Name'], 'no')
         for name, item in unrelated.items():
@@ -223,6 +230,30 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(deploy, 'info', return_value={'state': 'ready'}), self.assertRaises(RuntimeError):
             self.perform()
         self.assertEqual(self.mutations(), [])
+
+    def test_missing_dds_or_log_rotation_cannot_stop_services(self):
+        original = yaml.safe_load(self.fragment.read_text())
+        for defect in ('mount', 'writable', 'profile', 'rmw', 'logging', 'rotation'):
+            with self.subTest(defect=defect):
+                fragment = copy.deepcopy(original)
+                service = fragment[deploy.SERVICE]
+                if defect == 'mount':
+                    service['volumes'].pop()
+                elif defect == 'writable':
+                    service['volumes'][-1]['read_only'] = False
+                elif defect == 'profile':
+                    service['environment'].pop('FASTRTPS_DEFAULT_PROFILES_FILE')
+                elif defect == 'rmw':
+                    service['environment']['RMW_IMPLEMENTATION'] = 'rmw_cyclonedds_cpp'
+                elif defect == 'logging':
+                    service.pop('logging')
+                else:
+                    service['logging']['options'].pop('max-file')
+                self.fragment.write_text(yaml.safe_dump(fragment))
+                with self.assertRaises(ValueError):
+                    self.perform()
+                self.assertEqual(self.mutations(), [])
+                self.assertFalse(self.config.exists())
 
     def test_failed_health_stops_new_container_and_preserves_recovery(self):
         with patch.object(deploy, 'health', side_effect=RuntimeError('missing cards')):

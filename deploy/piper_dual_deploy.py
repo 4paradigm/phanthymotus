@@ -185,6 +185,17 @@ def prepare_compose(image, fragment, project):
     if not any(v.get('type') == 'bind' and v.get('source') == str(DATA) and v.get('target') == str(DATA)
                for v in service.get('volumes', [])):
         raise ValueError('PiPER 服务缺少持久数据目录挂载。')
+    dds = '/opt/phanthy-motus/dds-local.xml'
+    if not any(v.get('type') == 'bind' and v.get('source') == dds and v.get('target') == dds
+               and v.get('read_only') is True for v in service.get('volumes', [])):
+        raise ValueError('PiPER 服务缺少只读的本机 DDS 配置挂载。')
+    environment = service.get('environment', {})
+    if (environment.get('FASTRTPS_DEFAULT_PROFILES_FILE') != dds
+            or environment.get('RMW_IMPLEMENTATION') != 'rmw_fastrtps_cpp'):
+        raise ValueError('PiPER 服务未选择本机 FastDDS 配置。')
+    logging = service.get('logging', {})
+    if logging.get('driver') != 'local' or logging.get('options') != {'max-size': '10m', 'max-file': '3'}:
+        raise ValueError('PiPER 服务缺少约定的日志轮转设置。')
     service.setdefault('environment', {}).update({
         'CONFIG_PATH': str(CONFIG), 'PIPER_MOTION_ENABLED': '0', 'PIPER_CAMERA_ENABLED': '0'})
     return compose
