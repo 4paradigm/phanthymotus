@@ -75,6 +75,9 @@ SUITES: dict[str, dict] = {
         "workdir": "perception",
         "target": BuildTarget.PERCEPTION,
         "python": "python3",
+        # Schema validation is used by tests, not by the deployed plugin.
+        # 4.19.2 also supports jp5.11's Python 3.8.
+        "test_dependencies": ("jsonschema==4.19.2",),
         "env": {
             # A globally-installed fugue_test plugin fails to import
             # (`No module named 'pkg_resources'`) and aborts collection before
@@ -245,6 +248,9 @@ def _inner_script(component: str, config: Config) -> str:
     suite = SUITES[component]
     python = suite["python"]
     spec = config.test_pytest_spec  # unquoted: may legitimately be two specs
+    extras = suite.get("test_dependencies", ())
+    if extras:
+        spec += " " + " ".join(shlex.quote(dep) for dep in extras)
     install = (
         f"{python} -m pip install --no-cache-dir "
         f"-i {shlex.quote(config.test_pypi_index)} {spec}"
