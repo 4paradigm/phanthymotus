@@ -97,6 +97,7 @@ from plugins.face_runtime import (
     DetectedFace,
     FaceAnalyzer,
     default_match_threshold,
+    face_db_dir_for,
 )
 
 log = logging.getLogger(__name__)
@@ -335,7 +336,14 @@ def _analyzer_options(cfg: dict) -> dict:
 
 def _db_options(cfg: dict) -> dict:
     return {
-        "db_dir": str(cfg.get("db_dir", DEFAULT_DB_DIR)),
+        # Per model, so selecting a second model starts its own roster instead of
+        # erroring against the first one's. buffalo_sc keeps /models/face_db — see
+        # face_db_dir_for, which also explains why an explicit value is detected by
+        # comparing against the default rather than by a missing key.
+        "db_dir": face_db_dir_for(
+            str(cfg.get("model", DEFAULT_FACE_MODEL)),
+            str(cfg.get("db_dir", DEFAULT_DB_DIR)),
+        ),
         # Recorded in persons.json and checked on load. `model` is in here rather
         # than only in the analyzer options because switching the recogniser
         # invalidates every stored sample, and the database is where that has to

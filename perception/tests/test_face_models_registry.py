@@ -23,12 +23,14 @@ from vision_stubs import PERCEPTION_ROOT  # noqa: F401  (installs stubs, sets sy
 
 import plugins.face as face_plugin  # noqa: E402
 from plugins.face_runtime import (  # noqa: E402
+    DEFAULT_DB_DIR,
     DEFAULT_FACE_MODEL,
     DEFAULT_FACE_MODEL_DIR,
     DEFAULT_MATCH_THRESHOLD,
     FACE_MODELS,
     default_match_threshold,
     face_bundle_for,
+    face_db_dir_for,
 )
 from utils.model_downloader import FACE_MODEL_BUNDLES  # noqa: E402
 
@@ -177,3 +179,75 @@ def test_the_card_offers_every_model_and_states_each_threshold():
         # operator switching models has no way to know the old one is wrong
         assert str(FACE_MODELS[model]["match_threshold"]) in \
             schema["match_threshold"]["description"]
+
+
+# ── per-model identity store ─────────────────────────────────────────────────
+#
+# Embeddings from different networks are not comparable, so IdentityDB refuses a
+# store written by another model. With one shared default that refusal fired on the
+# act of *selecting* a second model: the card went to `state: error` and the only
+# way out was for the operator to invent a db_dir by hand. The default now moves
+# with the model, and the refusal is a backstop again.
+
+
+def test_the_default_model_keeps_the_deployed_roster_path():
+    """Non-negotiable: every deployed robot's roster is at exactly this path.
+
+    Giving buffalo_sc a suffixed directory would hand all of them an empty one.
+    """
+    assert face_db_dir_for(DEFAULT_FACE_MODEL, DEFAULT_DB_DIR) == DEFAULT_DB_DIR
+    assert DEFAULT_DB_DIR == "/models/face_db"
+
+
+@pytest.mark.parametrize("model", [m for m in MODEL_NAMES if m != DEFAULT_FACE_MODEL])
+def test_every_other_model_gets_its_own_roster(model):
+    resolved = face_db_dir_for(model, DEFAULT_DB_DIR)
+    assert resolved != DEFAULT_DB_DIR
+    assert resolved.startswith("/models/")
+    assert model in resolved
+
+
+def test_no_two_models_share_a_roster():
+    """A collision would reintroduce the refusal this is meant to remove."""
+    dirs = [face_db_dir_for(m, DEFAULT_DB_DIR) for m in MODEL_NAMES]
+    assert len(set(dirs)) == len(dirs), dirs
+
+
+@pytest.mark.parametrize("model", MODEL_NAMES)
+def test_an_explicit_db_dir_pins_it_for_every_model(model):
+    """The operator's own path must not get a per-model suffix appended."""
+    assert face_db_dir_for(model, "/models/my_own_db") == "/models/my_own_db"
+
+
+def test_an_unknown_model_does_not_invent_a_directory():
+    """A bad name must not silently create a roster; FaceAnalyzer raises instead."""
+    assert face_db_dir_for("no-such-model", DEFAULT_DB_DIR) == DEFAULT_DB_DIR
+
+
+@pytest.mark.parametrize("model", MODEL_NAMES)
+def test_db_options_resolve_the_roster_per_model(model):
+    """The wiring, through the function the plugin actually calls."""
+    options = face_plugin._db_options({"model": model})
+    assert options["db_dir"] == face_db_dir_for(model, DEFAULT_DB_DIR)
+    # the model is recorded in the store too, which is what makes the backstop work
+    assert options["model"] == model
+
+
+def test_db_options_honour_the_config_yaml_default_as_unset():
+    """config.yaml ships `db_dir` set, and agent-core persists it into every card.
+
+    So "the caller did not choose" cannot be observed as a missing key — only as
+    the default value. If this regresses, selecting a second model silently reuses
+    the first one's roster and the card errors, which is the bug being fixed.
+    """
+    options = face_plugin._db_options({"model": "scrfd25g_edgeface_s",
+                                       "db_dir": DEFAULT_DB_DIR})
+    assert options["db_dir"] == "/models/face_db-scrfd25g_edgeface_s"
+
+
+def test_switching_back_and_forth_is_stable():
+    """Each model must land on the same roster every time, so nothing is orphaned."""
+    for _ in range(3):
+        for model in MODEL_NAMES:
+            assert face_plugin._db_options({"model": model})["db_dir"] == \
+                face_db_dir_for(model, DEFAULT_DB_DIR)

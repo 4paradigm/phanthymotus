@@ -202,6 +202,42 @@ EMBEDDING_DIM = 512
 # path this container has. It sits here rather than in plugins/identity_db.py
 # because that module is modality-agnostic — voiceprints get their own directory.
 DEFAULT_DB_DIR = "/models/face_db"
+
+
+def face_db_dir_for(model: str, db_dir: str) -> str:
+    """Resolve the identity-store directory for `model`.
+
+    Each model gets **its own roster**, because embeddings from different networks
+    are not comparable: `IdentityDB._load` refuses a store written by another model
+    rather than silently confusing identities. That refusal is correct, but with a
+    single shared default it fired on the very act of selecting a second model —
+    the card went to `state: error` and the only way out was for the operator to
+    invent a `db_dir` by hand. So the default moves with the model and the refusal
+    goes back to being a backstop against pointing a model at a foreign store.
+
+    The default model keeps `/models/face_db` unchanged. That is not cosmetic: every
+    deployed robot's roster is at that exact path, and giving `buffalo_sc` a suffixed
+    directory would present all of them with an empty one.
+
+    Mirrors `face_bundle_for`'s treatment of `model_dir`, including why an explicit
+    value is detected by comparing against the default rather than by absence:
+    `config.yaml` ships `db_dir` set, and agent-core persists it into every card's
+    stored config, so "the caller did not choose" cannot be observed as a missing
+    key — only as the default value.
+
+    Switching models therefore starts an empty roster rather than erroring. `info()`
+    reports `database.db_dir` and the person count so that is visible rather than
+    looking like forgotten people.
+    """
+    if db_dir != DEFAULT_DB_DIR:
+        return db_dir
+    if model == DEFAULT_FACE_MODEL:
+        return DEFAULT_DB_DIR
+    spec = FACE_MODELS.get(model)
+    if spec is None:
+        return DEFAULT_DB_DIR
+    return spec.get("db_dir") or f"{DEFAULT_DB_DIR}-{model}"
+
 _REC_INPUT_SIZE = 112
 
 # SCRFD wire format for a 3-level, 2-anchor, keypoint-carrying model. Upstream
@@ -697,4 +733,5 @@ __all__ = [
     "FaceAnalyzer",
     "default_match_threshold",
     "face_bundle_for",
+    "face_db_dir_for",
 ]

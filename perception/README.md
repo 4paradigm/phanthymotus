@@ -2298,10 +2298,25 @@ it belongs behind a branch in `embed()`. All of this is asserted at load time
 rather than discovered as bad embeddings, and
 `tests/test_face_models_registry.py` pins the table-level invariants.
 
-**Switching `model` invalidates the identity database.** Embeddings from different
-networks are not comparable, so `IdentityDB._load` refuses a store written by
-another model rather than silently confusing people; already-stored samples are
-not re-embedded. Pick the pair on a fresh deploy, or accept re-enrolling everyone.
+**Each model keeps its own roster, and switching means re-enrolling.** Embeddings
+from different networks are not comparable, so `IdentityDB._load` refuses a store
+written by another model rather than silently confusing people, and already-stored
+samples are never re-embedded.
+
+That refusal is right, but with one shared default it fired on the act of *selecting*
+a second model — the card went to `state: error` and the only way out was inventing a
+`db_dir` by hand. So `db_dir` is resolved per model (`face_db_dir_for`):
+`buffalo_sc` keeps **`/models/face_db`** — unchanged, because that is where every
+deployed robot's roster already is — and any other model gets
+`/models/face_db-<model>`. An explicit `db_dir` different from the default pins it
+and disables the suffix. The refusal stays as a backstop against pointing a model at
+a foreign store.
+
+So switching is **not destructive** and switching back restores the previous roster
+intact. But the newly selected model **starts empty and recognises nobody** until
+people are re-enrolled, which no amount of plumbing can avoid — the old embeddings
+are in the wrong space. `info()`'s `database.persons` and `database.db_dir` say
+which roster is loaded, so an empty one does not read as lost people.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that

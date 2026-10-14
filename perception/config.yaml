@@ -541,10 +541,13 @@ plugins:
     # `scrfd25g_edgeface_s` is the more accurate pair — measured over a 100-image
     # LFW sample it separates identities by +0.252 against buffalo_sc's +0.199,
     # and both detectors found 99 of the 100 faces. It is **not** the default, and
-    # that is deliberate: switching recognisers invalidates every stored sample
-    # (embeddings from different networks are not comparable), so a robot with a
-    # populated roster would have to re-enrol everyone. Pick it on a fresh deploy,
-    # or accept re-enrolment.
+    # that is deliberate: embeddings from different networks are not comparable, so
+    # every already-registered person has to be re-enrolled under the new model.
+    #
+    # Each model keeps its **own roster** (see `db_dir`), so switching is not
+    # destructive and switching back restores the old one intact — but the new
+    # model starts empty and recognises nobody until people are re-enrolled. Check
+    # `database.persons` in the card's info to see which roster is loaded.
     #
     # Leave `match_threshold` unset when changing this — the default follows the
     # model (0.35 / 0.55). A threshold copied across models is wrong in whichever
@@ -557,6 +560,13 @@ plugins:
     model_dir: /models/face/buffalo_sc
     # The only host-mounted writable path in this container is /models (see
     # perception/deploy/service.yml), so the identity database lives under it.
+    # The identity store. Per **model**, not per plugin: this value is the one
+    # `buffalo_sc` uses, and any other model gets `/models/face_db-<model>` so that
+    # selecting it starts its own roster instead of being refused against this one
+    # (IdentityDB refuses a store written by another model — that stays, as a
+    # backstop). Setting this to anything other than the value below pins it
+    # explicitly and disables the per-model suffix. See
+    # plugins/face_runtime.face_db_dir_for.
     db_dir: /models/face_db
     # auto | cpu | gpu. auto (the default) uses the GPU when the installed
     # onnxruntime offers a CUDA/TensorRT provider and falls back to cpu when it
