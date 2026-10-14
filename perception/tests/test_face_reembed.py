@@ -175,6 +175,48 @@ def test_rerunning_adds_samples_rather_than_failing_on_duplicate_ids(setup):
     assert [item["person_id"] for item in second["unmigratable"]] == ["p-4"]
     assert all("already exists" not in item["reason"]
                for item in second["unmigratable"])
+    # Person count alone is far too weak an assertion — it was the original one
+    # here, and it passed while every sample was being duplicated. Pin the
+    # samples.
+    assert second["persons_migrated"] == 0
+    assert second["samples_reembedded"] == 0
+    assert {item["reason"] for item in second["skipped"]} == {"already migrated"}
+
+
+def test_a_rerun_does_not_duplicate_samples_or_evict_fresh_captures(setup):
+    """The defect this guards, measured before it was fixed.
+
+    A second pass re-embedded the same crops and appended them, taking one person
+    from 5 samples to 8 with three duplicates. Once that fills
+    max_samples_per_person, the oldest-first trim starts evicting the genuinely
+    new captures made *since* the migration — the migration eating real data.
+    """
+    plugin, engine, source = setup
+    plugin._do_reembed_from({"source_model": "buffalo_sc"})
+    after_first = engine.db.stats()["samples"]
+
+    # a real capture enrolled under the new model after migrating
+    engine.db.add_samples("p-1", [_vec(777)], artifacts=[b"FRESH-CAPTURE"])
+    assert engine.db.stats()["samples"] == after_first + 1
+
+    for _ in range(3):
+        plugin._do_reembed_from({"source_model": "buffalo_sc"})
+
+    assert engine.db.stats()["samples"] == after_first + 1, "a rerun duplicated samples"
+    payloads = [open(item["path"], "rb").read()
+                for item in engine.db.sample_artifacts()]
+    assert b"FRESH-CAPTURE" in payloads, "a rerun evicted a real capture"
+    assert len(payloads) == len(set(payloads)), "duplicate crops stored"
+
+
+def test_a_person_whose_crops_are_all_migrated_is_skipped_not_reported_as_failed(setup):
+    """`skipped` means nothing to do; `unmigratable` means it could not be done."""
+    plugin, engine, source = setup
+    plugin._do_reembed_from({"source_model": "buffalo_sc"})
+    again = plugin._do_reembed_from({"source_model": "buffalo_sc"})
+    skipped = {item["person_id"] for item in again["skipped"]}
+    assert {"p-1", "p-2", "p-3"} <= skipped
+    assert "p-1" not in {item["person_id"] for item in again["unmigratable"]}
 
 
 def test_include_unknown_false_leaves_the_unnamed_behind(setup):

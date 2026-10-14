@@ -30,6 +30,7 @@ What this plugin adds over OCR:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -1419,6 +1420,36 @@ class FaceRecognitionPlugin:
                 except OSError:
                     crops.append(None)
             usable = [crop for crop in crops if crop]
+
+            # Skip crops this person already has here, keyed on content. Without
+            # it a second run re-embeds the same crops and *appends* them: the
+            # person's sample list fills with duplicates and, once it hits
+            # max_samples_per_person, the oldest-first trim starts evicting the
+            # genuinely new captures made since the migration. Measured: a second
+            # pass took one person from 5 samples to 8, three of them duplicates.
+            #
+            # Content rather than a recorded source id, because the stored bytes
+            # are the source crop verbatim — so this needs no schema change and
+            # also collapses the same face arriving by two routes.
+            already = set()
+            for existing_item in (engine.db.sample_artifacts()
+                                  if engine.db.artifacts_enabled else []):
+                if existing_item["person_id"] != person_id:
+                    continue
+                try:
+                    with open(existing_item["path"], "rb") as handle:
+                        already.add(hashlib.sha256(handle.read()).hexdigest())
+                except OSError:
+                    continue
+            if already:
+                fresh = [crop for crop in usable
+                         if hashlib.sha256(crop).hexdigest() not in already]
+                if not fresh:
+                    skipped.append({"person_id": person_id,
+                                    "name": record.get("name", ""),
+                                    "reason": "already migrated"})
+                    continue
+                usable = fresh
             vectors = engine.analyzer.embed_aligned(usable) if usable else []
             pairs = [(vec, crop) for vec, crop in zip(vectors, usable)
                      if vec is not None]

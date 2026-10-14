@@ -2420,8 +2420,44 @@ model check exists to prevent.
 
 Carried across: `person_id` (so `visits.jsonl` stays attributable), name, profile,
 named/unnamed, and `registered_at` — resetting that would make everybody look newly
-met against a visit log that disagrees. Re-running is idempotent at person level: an
-id already present gets samples added rather than failing the pass on a duplicate.
+met against a visit log that disagrees.
+
+**Nothing is automatic.** Selecting a different `model` migrates nothing; it only
+swaps which database is in use. The pass runs when, and only when, somebody calls
+`reembed_from`. So switching models back and forth as much as you like costs
+nothing — each model's roster simply sits where it was.
+
+**It blocks, and on a large roster for a noticeable time.** The action runs inside
+its own `tools/call` thread (ThreadingHTTPServer), so the rest of perception keeps
+serving, but the call does not return until the pass is done and there is no
+progress reporting. The cost is dominated by one decode-plus-embed per stored crop,
+measured at **6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
+
+| roster | crops | embedding time alone |
+|---|---|---|
+| 45 persons x 1 | 45 | ~0.3 s |
+| 100 persons x 4 | 400 | ~2.6 s |
+| 500 persons x 8 | 4000 | ~26 s |
+
+Add one `persons.json` + full-matrix rewrite per person on top. A maxed-out roster
+is therefore a **~30-60 s blocking call**, which is long enough to hit an HTTP
+client timeout — run it from a direct MCP call rather than expecting the card to
+sit through it, and treat `dry_run` as the cheap way to see the scale first.
+
+**Re-running is idempotent, including at sample level.** Crops this person already
+has here are skipped, keyed on content — the stored bytes are the source crop
+verbatim, so no provenance column is needed and the same face arriving by two
+routes collapses too. A person with nothing left to migrate comes back in
+`skipped` as `already migrated`, distinct from `unmigratable` which means it could
+not be done at all.
+
+That distinction is load-bearing and was a real defect first: without the content
+check a second pass re-embedded the same crops and *appended* them, taking one
+person from 5 samples to 8 with three duplicates. Once that fills
+`max_samples_per_person`, the oldest-first trim starts evicting the genuinely new
+captures made since the migration — the migration eating real data. The original
+test asserted only that the person *count* was unchanged, which it was, the whole
+time it was happening.
 
 What it cannot do is invent crops. Samples enrolled before `store_sample_crops`
 have nothing to re-embed and come back in `unmigratable` with a reason, alongside
