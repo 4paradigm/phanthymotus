@@ -1,5 +1,5 @@
 /** text.js — Renders streaming text output */
-import { decodeNestedJson, plainValue, escapeHtml } from './json-util.js';
+import { decodeNestedJson, plainValue, escapeHtml, directionDisplayValue } from './json-util.js';
 
 export const TextRenderer = {
   name: 'text',
@@ -93,7 +93,7 @@ function _formatJson(obj) {
   const decoded = decodeNestedJson(obj);
   const keys = Object.keys(decoded);
   const rows = keys.map(k => {
-    const full = plainValue(decoded[k]);
+    const full = plainValue(directionDisplayValue(k, decoded[k]));
     // These cards are one grid column wide. A single unbroken value used to wrap
     // into a ribbon of a few characters per line, which is not readable at any
     // length — clip it and keep the whole thing reachable on hover.

@@ -347,7 +347,8 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
         <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(_displayPath(topicPath))}</span>
       </div>
       ${modeHtml}
-      <span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>
+      ${format === 'sensor/sound-direction-v1' ? ''
+        : `<span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>`}
     </div>
     <div class="monitor-card-body"></div>
     <div class="monitor-card-empty">

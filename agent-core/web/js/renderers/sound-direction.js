@@ -8,7 +8,7 @@ export function directionDisplayData(message) {
     state: 'fresh', trigger: 'sound_activity',
     timestamp_ms: Math.floor(message.published_us / 1000),
     angle: message.angle_deg,
-    unit: 'deg', reference: 'robot_front_clockwise',
+    unit: 'deg',
     audio_window_start_us: message.window_start_us,
     audio_window_end_us: message.window_end_us,
   };
@@ -25,11 +25,8 @@ export const SoundDirectionRenderer = {
   },
   _display(message) {
     const data = directionDisplayData(message);
-    // Keep the latest observation like other JSON cards, but label it as
-    // historical once speech ends or updates stop. This is display-only.
-    if (this.mode === 'kv' && (data.state === 'fresh' || this._renderer._cells.angle)) {
-      data.angle_status = data.state === 'fresh' ? '实时' : '上次读数（非实时）';
-    }
+    // Latest mode retains the last angle and timestamp, while state changes
+    // to no_event/stale so it is not presented as a current valid event.
     this._renderer.onData(new TextEncoder().encode(JSON.stringify(data)));
   },
   onData(buffer) {
