@@ -71,16 +71,23 @@ log = logging.getLogger(__name__)
 
 DEFAULT_FACE_MODEL_DIR = "/models/face/buffalo_sc"
 
-# Which model pair to run. One entry today; the point of the registry is that adding a
-# second is a table row rather than a hunt through the file for hardcoded names, and
-# that the card can offer the choice.
+# Which model pair to run. The point of the registry is that adding one is a table row
+# rather than a hunt through the file for hardcoded names, and that the card can offer
+# the choice — `scrfd25g_edgeface_s` below was added that way and needed no code.
 #
 # What a new entry has to supply: the detector must emit **nine** outputs — score, bbox
 # and five keypoints per stride — because ArcFace alignment needs the landmarks and
 # `plugins/scrfd_decode.py` decodes exactly that shape. A detector without keypoints
 # cannot be used here at all, which is asserted at load time rather than discovered as
 # bad embeddings. The recogniser must take 112x112 and return 512 dimensions, since the
-# stored samples and every existing FaceDB row are that.
+# stored samples and every existing FaceDB row are that. Both are checked at load
+# time. Pre/post-processing is shared and must not be: a candidate recogniser whose
+# normalisation is not RGB `(x-127.5)/127.5` does not belong in this table, it belongs
+# behind a branch in `embed()`.
+#
+# It also has to supply a `match_threshold`, measured rather than guessed — cosine
+# thresholds are a property of the embedding space, and the two rows here differ by
+# 0.2. See each row for the numbers and how they were obtained.
 #
 # Changing the model invalidates the database: embeddings from different networks are
 # not comparable, and matching across them would silently confuse identities. The
@@ -99,9 +106,60 @@ FACE_MODELS = {
         # `buffalo_sc` is InsightFace's pack name and covers two networks; spelling
         # them out is what makes the card's dropdown readable.
         "description": "InsightFace buffalo_sc（SCRFD-500M 检测 + ArcFace MobileFaceNet，512 维）",
+        "match_threshold": 0.35,
+    },
+    # SCRFD-2.5G-BNKPS detection + EdgeFace-S-GAMMA-0.5 recognition. 3.3 MB +
+    # 14.8 MB. A bigger detector than buffalo_sc's (2.5G vs 500M FLOPs) and a
+    # stronger recogniser, for the same 9-output/112x112/512-d contract — which
+    # is the whole reason this is a row and not a second plugin.
+    #
+    # The detector is insightface's own scrfd_2.5g_bnkps, re-hosted from
+    # `hsuyabc/scrfd_2.5g_bnkps.onnx` on HuggingFace. The recogniser is exported
+    # from `anjith2006/edgeface` (Idiap EdgeFace, CVPR-W 2023) — upstream ships
+    # only PyTorch weights, so the ONNX is ours, exported at fp32 opset 17 and
+    # checked against the reference implementation (worst cosine 0.9999999).
+    #
+    # **Not** the INT8 export: measured on the same graph it was no faster at all
+    # (16.0 ms vs 15.7 ms p50, 2 threads) and moved the embedding by cosine 0.84,
+    # so it bought disk at the cost of an unvalidated recogniser.
+    "scrfd25g_edgeface_s": {
+        "dir": "/models/face/scrfd25g_edgeface_s",
+        "det": "scrfd_2.5g_bnkps.onnx",
+        "rec": "edgeface_s_gamma_05.onnx",
+        "bundle": "scrfd25g_edgeface_s",
+        "description": "SCRFD-2.5G 检测 + EdgeFace-S-GAMMA-0.5 识别（512 维，比 buffalo_sc 更准、模型更大）",
+        # Higher than buffalo_sc's, and that is a measurement, not a guess.
+        # Over the 100-image LFW sample (4849 impostor pairs, 2 genuine):
+        #
+        #   buffalo_sc           impostor p99 0.158  max 0.323   genuine 0.52 / 0.71
+        #   scrfd25g_edgeface_s  impostor p99 0.246  max 0.450   genuine 0.70 / 0.88
+        #
+        # EdgeFace separates identities better (margin +0.252 vs +0.199) but its
+        # whole similarity distribution sits higher, so reusing 0.35 would put
+        # four of those impostor pairs over the line. 0.55 clears the measured
+        # impostor maximum with room to spare and still sits well under the
+        # genuine pairs. Raise it if the robot confuses people, lower it if it
+        # fails to recognise them, and record what you saw.
+        "match_threshold": 0.55,
     },
 }
 DEFAULT_FACE_MODEL = "buffalo_sc"
+# Per-model, because a cosine threshold is a property of the embedding space and
+# not of the plugin: see the measurements on each row above. An explicit
+# `match_threshold` in config still wins, so a robot that was tuned by hand keeps
+# its number.
+DEFAULT_MATCH_THRESHOLD = FACE_MODELS[DEFAULT_FACE_MODEL]["match_threshold"]
+
+
+def default_match_threshold(model: str) -> float:
+    """The recommended cosine threshold for `model`'s embedding space.
+
+    Unknown names fall back to the default model's rather than raising: this is
+    only a default-picker, and the real validation of `model` happens in
+    FaceAnalyzer, which gives a far better message.
+    """
+    spec = FACE_MODELS.get(model) or FACE_MODELS[DEFAULT_FACE_MODEL]
+    return float(spec["match_threshold"])
 
 
 def face_bundle_for(model: str, model_dir: str) -> tuple[str, str]:
@@ -625,13 +683,18 @@ __all__ = [
     "DEFAULT_MAX_IMAGE_SIDE",
     "DEFAULT_DET_SIZE",
     "DEFAULT_DET_THRESH",
+    "DEFAULT_FACE_MODEL",
     "DEFAULT_FACE_MODEL_DIR",
+    "DEFAULT_MATCH_THRESHOLD",
     "DEFAULT_MIN_FACE_PX",
     "DEFAULT_NMS_THRESH",
     "DET_MODEL_FILE",
     "DEFAULT_DB_DIR",
     "EMBEDDING_DIM",
     "REC_MODEL_FILE",
+    "FACE_MODELS",
     "DetectedFace",
     "FaceAnalyzer",
+    "default_match_threshold",
+    "face_bundle_for",
 ]

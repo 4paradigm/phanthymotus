@@ -83,6 +83,7 @@ from plugins.face_proxy import FaceServiceProxy
 from plugins.face_runtime import (
     DEFAULT_DB_DIR,
     DEFAULT_FACE_MODEL,
+    DEFAULT_MATCH_THRESHOLD,
     EMBEDDING_DIM,
     FACE_MODELS,
     DEFAULT_BLUR_MIN,
@@ -95,6 +96,7 @@ from plugins.face_runtime import (
     DEFAULT_NMS_THRESH,
     DetectedFace,
     FaceAnalyzer,
+    default_match_threshold,
 )
 
 log = logging.getLogger(__name__)
@@ -102,7 +104,10 @@ log = logging.getLogger(__name__)
 _ERROR_LOG_INTERVAL_SECONDS = 10.0
 _SEEN_FLUSH_INTERVAL_SECONDS = 300.0
 
-DEFAULT_MATCH_THRESHOLD = 0.35
+# DEFAULT_MATCH_THRESHOLD is re-exported from plugins.face_runtime, where it is
+# derived from the default model's row: the right cosine threshold depends on which
+# embedding space is in use, so it cannot be a constant here. `_gates` resolves it
+# per configured model via `default_match_threshold`.
 DEFAULT_SUBJECT_DOMINANCE = 1.6
 DEFAULT_MAX_FACES = 8
 DEFAULT_DETECT_FPS = 1.0
@@ -276,7 +281,7 @@ TOOLS = [
                 "model":             {"type": "string", "enum": sorted(FACE_MODELS), "default": DEFAULT_FACE_MODEL, "description": "识别模型：" + "；".join(f"{name} = {spec['description']}" for name, spec in sorted(FACE_MODELS.items())) + "。切换模型会重新加载，并使已存样本失效——不同网络的 embedding 不可比较，已注册人员需重新录入"},
                 "device":            {"type": "string", "enum": ["auto", "cpu", "gpu"], "default": "auto", "description": "推理设备。auto=有 GPU 用 GPU，没有则用 CPU"},
                 "detect_fps":        {"type": "number", "minimum": 0, "default": DEFAULT_DETECT_FPS, "description": "检测频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都检测", "scope": "instance"},
-                "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）"},
+                "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）。留空时按所选模型取推荐值（" + "；".join(f"{name} = {spec['match_threshold']}" for name, spec in sorted(FACE_MODELS.items())) + "）——阈值属于 embedding 空间，换模型后不能照搬旧值"},
                 "min_face_px":       {"type": "integer", "minimum": 16, "default": DEFAULT_MIN_FACE_PX, "description": "最小人脸边长(px)，小于此值不做识别"},
                 "blur_min":          {"type": "number", "minimum": 0.0, "default": DEFAULT_BLUR_MIN, "description": "清晰度下限(拉普拉斯方差)，低于此值视为模糊人脸"},
                 "max_faces":         {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_FACES, "description": "单帧最多处理的人脸数"},
@@ -367,7 +372,14 @@ def _gates(cfg: dict) -> dict:
         "min_face_px": float(cfg.get("min_face_px", DEFAULT_MIN_FACE_PX)),
         "blur_min": float(cfg.get("blur_min", DEFAULT_BLUR_MIN)),
         "dominance": float(cfg.get("subject_dominance", DEFAULT_SUBJECT_DOMINANCE)),
-        "match_threshold": float(cfg.get("match_threshold", DEFAULT_MATCH_THRESHOLD)),
+        # Defaults to the configured model's own threshold rather than one number
+        # for the plugin: buffalo_sc wants 0.35 and scrfd25g_edgeface_s wants 0.55
+        # (see FACE_MODELS). An explicit value in config still wins, so a robot
+        # tuned by hand keeps its number across a model switch.
+        "match_threshold": float(cfg.get(
+            "match_threshold",
+            default_match_threshold(str(cfg.get("model", DEFAULT_FACE_MODEL))),
+        )),
         "max_faces": int(cfg.get("max_faces", DEFAULT_MAX_FACES)),
     }
 
@@ -1269,10 +1281,14 @@ class FaceRecognitionPlugin:
     # ── info / start / stop / config ──────────────────────────────────────
 
     def _do_info(self, instance_id: str, input_topic: str) -> dict:
-        base = {"name": "FaceRecognition", "manufacture": "Embodied",
-                "model": "scrfd+arcface"}
         with self._state_lock:
             engine = self._engine
+            # Reports the model pair actually configured, not a fixed string: with
+            # more than one row in FACE_MODELS a hardcoded "scrfd+arcface" would
+            # misreport whichever card is not buffalo_sc. Read under the lock
+            # because `config` replaces _plugin_cfg wholesale.
+            base = {"name": "FaceRecognition", "manufacture": "Embodied",
+                    "model": str(self._plugin_cfg.get("model", DEFAULT_FACE_MODEL))}
             if instance_id:
                 node = self._nodes.get(instance_id)
                 topic = (

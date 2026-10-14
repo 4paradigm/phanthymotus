@@ -2255,13 +2255,53 @@ enrols new people from a photo, the live stream, or a batch package.
 
 ### Models
 
-InsightFace **buffalo_sc**, the smallest pack that still ships landmarks (alignment
+Two detector+recogniser pairs, selected by `model` on the card (registry:
+`plugins/face_runtime.FACE_MODELS`). **`buffalo_sc` is the default.**
+
+`buffalo_sc` — InsightFace's smallest pack that still ships landmarks (alignment
 needs them):
 
 | File | Size | Role |
 |------|------|------|
 | `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
 | `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
+
+`scrfd25g_edgeface_s` — a bigger detector and a stronger recogniser, same contract:
+
+| File | Size | Role |
+|------|------|------|
+| `scrfd_2.5g_bnkps.onnx` | 3.3 MB | SCRFD-2.5G-BNKPS — detection + 5 keypoints |
+| `edgeface_s_gamma_05.onnx` | 15 MB | EdgeFace-S-GAMMA-0.5 — 512-d embedding |
+
+Measured over a 100-image LFW sample (4849 impostor pairs, 2 genuine pairs), both
+pairs detected 99 of the 100 faces:
+
+| | impostor p99 | impostor max | genuine | margin | `match_threshold` |
+|---|---|---|---|---|---|
+| `buffalo_sc` | 0.158 | 0.323 | 0.52 / 0.71 | +0.199 | 0.35 |
+| `scrfd25g_edgeface_s` | 0.246 | 0.450 | 0.70 / 0.88 | +0.252 | 0.55 |
+
+EdgeFace separates identities better, but its whole similarity distribution sits
+higher — which is why **`match_threshold` is per-model** and why reusing 0.35 on
+the second pair puts four of those impostor pairs over the line. Leave the key out
+of config to get the configured model's recommended value; an explicit value still
+wins, so a hand-tuned robot keeps its number.
+
+**Adding a third pair is a row in `FACE_MODELS`, not a plugin.** What a candidate
+has to satisfy: the detector emits **nine** outputs (score/bbox/kps for strides
+8/16/32, 2 anchors) because `plugins/scrfd_decode.py` decodes exactly that and
+alignment needs the landmarks; the recogniser takes 112x112 and returns 512-d,
+because every stored sample and FaceDB row is that. Pre/post-processing is
+*shared* — RGB `(x-127.5)/128` into the detector, RGB `(x-127.5)/127.5` into the
+recogniser — so a model with different normalisation does not belong in the table,
+it belongs behind a branch in `embed()`. All of this is asserted at load time
+rather than discovered as bad embeddings, and
+`tests/test_face_models_registry.py` pins the table-level invariants.
+
+**Switching `model` invalidates the identity database.** Embeddings from different
+networks are not comparable, so `IdentityDB._load` refuses a store written by
+another model rather than silently confusing people; already-stored samples are
+not re-embedded. Pick the pair on a fresh deploy, or accept re-enrolling everyone.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
@@ -2362,6 +2402,28 @@ be pinned, and the robots have no reliable route to GitHub. To refresh, download
 (`prisma/articles/upload-figs.js` cannot do it — it only accepts image extensions
 and forces its own key shape), then re-download from COS and paste the *verified*
 `size`/`sha256` into `FACE_MODEL_FILES`.
+
+`scrfd25g_edgeface_s` lives at `public/face/scrfd25g_edgeface_s/`
+(`FACE_SCRFD25G_BASE`, pins in `FACE_SCRFD25G_FILES`) and its two halves come from
+different places:
+
+- **The detector** is insightface's own `scrfd_2.5g_bnkps`, re-hosted from
+  `hsuyabc/scrfd_2.5g_bnkps.onnx` on HuggingFace. Its pinned size and SHA256 are
+  that repo's LFS oid, so the re-host is verifiable against upstream.
+- **The recogniser ONNX does not exist upstream.** Idiap publish EdgeFace as
+  PyTorch weights only, so this file is *our* export from `anjith2006/edgeface` —
+  fp32, opset 17, single-file (weights inlined, no `.onnx.data` companion), one
+  input `(batch,3,112,112)` and one output `(batch,512)`. It was checked against
+  the reference implementation before upload: worst cosine 0.9999999 over 8
+  inputs. Re-exporting is therefore the only way to refresh it, and a new export
+  means a new hash.
+- **Not the INT8 export.** On the same graph it measured no faster at all (16.0 ms
+  vs 15.7 ms p50, 2 threads) while moving the embedding by cosine 0.84 — it buys
+  disk in exchange for an unvalidated recogniser. If someone wants it, validate it
+  against a real face set first and give it its own row and threshold.
+
+Either way the rule is the same as everywhere else: **re-download from COS and pin
+the hash of what came back**, not of what you uploaded.
 
 ### The person record: `name` vs `profile`
 
@@ -2514,7 +2576,9 @@ is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
 smear that never matches anything again. Relax `min_face_px` / `blur_min` if you
 want identities at greater distance.
 
-`match_threshold` defaults to **0.35**. Measured separations on this model, same
+`match_threshold` defaults to the configured model's value — **0.35** for
+`buffalo_sc`, **0.55** for `scrfd25g_edgeface_s`; see § Models for how those were
+measured and why they differ. Measured separations on `buffalo_sc`, same
 photo transformed: same face at half resolution **0.983**, same face +35
 brightness **0.979**, a different person **-0.108**. Real same-person /
 different-photo scores sit well below the first two, so **tune this against your own

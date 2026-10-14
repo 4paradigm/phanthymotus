@@ -532,8 +532,28 @@ plugins:
 
   face_recognition:
     enabled: true
+    # Which detector+recogniser pair to run. The registry is
+    # plugins/face_runtime.FACE_MODELS and the card offers it as a dropdown:
+    #
+    #   buffalo_sc           SCRFD-500M + ArcFace MobileFaceNet   2.5 + 13 MB
+    #   scrfd25g_edgeface_s  SCRFD-2.5G  + EdgeFace-S-GAMMA-0.5   3.3 + 15 MB
+    #
+    # `scrfd25g_edgeface_s` is the more accurate pair — measured over a 100-image
+    # LFW sample it separates identities by +0.252 against buffalo_sc's +0.199,
+    # and both detectors found 99 of the 100 faces. It is **not** the default, and
+    # that is deliberate: switching recognisers invalidates every stored sample
+    # (embeddings from different networks are not comparable), so a robot with a
+    # populated roster would have to re-enrol everyone. Pick it on a fresh deploy,
+    # or accept re-enrolment.
+    #
+    # Leave `match_threshold` unset when changing this — the default follows the
+    # model (0.35 / 0.55). A threshold copied across models is wrong in whichever
+    # direction the embedding space moved.
+    model: buffalo_sc
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
     # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
+    # Left at the buffalo_sc path, which `model` overrides when it names another
+    # pair — set this only to point at a local copy of the weights.
     model_dir: /models/face/buffalo_sc
     # The only host-mounted writable path in this container is /models (see
     # perception/deploy/service.yml), so the identity database lives under it.
@@ -551,10 +571,15 @@ plugins:
     warmup: true
     det_size: [640, 640]
     det_thresh: 0.5
-    # Cosine similarity between L2-normalised ArcFace embeddings. 0.35 is a
-    # starting point for w600k_mbf, NOT a measured value — raise it if the
-    # robot confuses people, lower it if it fails to recognise them, and record
-    # what you saw. Editable from the card.
+    # Cosine similarity between L2-normalised embeddings. 0.35 is a starting
+    # point for w600k_mbf, NOT a measured value — raise it if the robot confuses
+    # people, lower it if it fails to recognise them, and record what you saw.
+    # Editable from the card.
+    #
+    # This is the **buffalo_sc** scale. It belongs to the embedding space, not to
+    # the plugin: scrfd25g_edgeface_s wants 0.55, and reusing 0.35 there put four
+    # impostor pairs out of 4849 over the line in the LFW sample. Delete this key
+    # to take whichever value the configured `model` recommends.
     match_threshold: 0.35
     # Quality gate. A face below either bound is reported with person_id: null
     # rather than matched or auto-enrolled: matching a blurred 30 px face is a
