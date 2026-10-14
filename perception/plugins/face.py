@@ -190,7 +190,7 @@ TOOLS = [
                         "recognize_by_photo", "recognize_by_url",
                         "recognize_by_stream",
                         "list_persons", "get_person", "update_person", "forget",
-                        "list_visits",
+                        "list_visits", "reembed_from",
                     ],
                     "description": "Action to perform",
                 },
@@ -213,6 +213,9 @@ TOOLS = [
                 "since":      {"type": "string", "description": "起始时间，epoch 秒或 ISO-8601，如 \"2026-09-07T15:00\" 或 1788780000。按时间重叠筛选：15:00 前到、15:20 走的人，查 15:00-15:05 也会返回"},
                 "until":      {"type": "string", "description": "结束时间，格式同 since。留空表示至今"},
                 "person_id":  {"type": "string", "description": "已存在的人员 id，形如 p-3"},
+                "source_model": {"type": "string", "enum": sorted(FACE_MODELS), "description": "迁移的来源模型（当前模型之外的那一个）。它的库只读不改"},
+                "dry_run": {"type": "boolean", "default": False, "description": "只统计能迁多少、哪些迁不了，不写入任何数据"},
+                "include_unknown": {"type": "boolean", "default": True, "description": "是否一并迁移未命名的人（p-N 但没名字）。迁移后仍受 unknown_capacity 淘汰约束"},
                 "person_ids": {"type": "array", "items": {"type": "string"}, "description": "批量删除的 id 列表，如 [\"p-1\",\"p-2\",\"p-7\"]；也接受逗号或空格分隔的字符串 \"p-1, p-7\"。一次提交完成，不是逐个删。返回 forgotten(已删数量+id列表) 与 missing(不存在的 id)，部分成功是正常结果"},
                 "window_s":   {"type": "number", "description": "回看最近多少秒的画面。register_by_stream 默认 3.0，recognize_by_stream 默认 1.0，上限为 enroll_window_s"},
                 "package":    {"type": "string", "description": "图片包：目录 / .zip / .tar.gz 的路径或 URL。包内可放 manifest.json 指定每张图的 name 与 profile，如 [{\"file\":\"alice.jpg\",\"name\":\"Alice\",\"person\":\"alice\"}]；没有 manifest 则用同名 .json/.txt 侧文件，再退回文件名"},
@@ -258,6 +261,7 @@ TOOLS = [
                 "list_persons":  {"params": ["named", "query", "limit", "offset"], "description": "List registered people with their name and profile"},
                 "get_person":    {"params": ["person_id"], "description": "Read one person's full record"},
                 "update_person": {"params": ["person_id", "name", "profile", "profile_delete", "merge"], "description": "Edit a person's name or profile; setting a name on an unnamed person (p-N with empty name) names that identity, keeping the id"},
+                "reembed_from":  {"params": ["source_model", "dry_run", "include_unknown"], "description": "把另一个模型的花名册迁移到当前模型：读取对方库里每个样本存下的人脸切图，用当前模型重新算 embedding，写入当前模型自己的库。不覆盖、不修改来源库，person_id/姓名/档案/首次登记时间都保留。没有切图的样本（本功能之前注册的）无法迁移，会在 unmigratable 里列出。先用 dry_run=true 看能迁多少"},
                 "forget":        {"params": ["person_id", "person_ids", "named"], "description": "删除人员：单个 person_id、批量 person_ids，或 named='unknown' 清空所有未命名人员。id 退役后永不复用"},
                 "list_visits":   {"params": ["person_id", "since", "until", "limit", "offset"], "description": "访问记录：查询某段时间内出现过的人。一次连续出现算一条记录，含首末时间与出现次数"},
             },
@@ -1307,7 +1311,171 @@ class FaceRecognitionPlugin:
             return self._do_forget(args)
         if action == "list_visits":
             return self._do_list_visits(args)
+        if action == "reembed_from":
+            return self._do_reembed_from(args)
         return None
+
+    # ── roster migration ──────────────────────────────────────────────────
+
+    def _do_reembed_from(self, args: dict) -> dict:
+        """Migrate another model's roster into the current model's database.
+
+        **Neither an overwrite nor an extra column.** Each model owns its own
+        database (`face_db_dir_for`), so this reads the source, re-embeds, and
+        writes into the *target's* store, leaving the source byte-for-byte intact.
+        That falls out of the per-model layout and is what makes the operation safe
+        to retry and trivial to abandon: if the migrated roster is worse, select the
+        old model again and the original is still there.
+
+        A shared database with one column per model was the alternative and is
+        worse here. `dim` is per-database and a future recogniser need not be
+        512-d; IdentityDB is deliberately modality-agnostic and shared with
+        voiceprints, so widening its schema for face-specific multi-model rows
+        taxes a module that has no stake in it; and every match would have to pick
+        a column, which is the "silently confuses identities" failure the model
+        check exists to prevent.
+
+        What is preserved: `person_id` (so visits.jsonl stays attributable), name,
+        profile, named/unnamed, and `registered_at`. What cannot be: samples
+        enrolled before crops were stored have nothing to re-embed and are reported
+        in `unmigratable` rather than quietly skipped.
+        """
+        engine = self._require_engine()
+        with self._state_lock:
+            target_model = str(self._plugin_cfg.get("model", DEFAULT_FACE_MODEL))
+        source_model = str(args.get("source_model") or "").strip()
+        if not source_model:
+            raise ValueError(
+                "source_model is required; it is the model whose roster you are "
+                f"migrating from, and must not be the current one ({target_model})")
+        if source_model not in FACE_MODELS:
+            raise ValueError(
+                f"unknown source_model {source_model!r}; this build has "
+                f"{sorted(FACE_MODELS)}")
+        if source_model == target_model:
+            raise ValueError(
+                f"source_model {source_model!r} is the model already running; "
+                "re-embedding a roster into itself would do nothing but reset "
+                "every sample. Select the other model first.")
+
+        dry_run = bool(args.get("dry_run", False))
+        include_unknown = bool(args.get("include_unknown", True))
+
+        cfg = dict(self._plugin_cfg)
+        source_dir = face_db_dir_for(source_model,
+                                     str(cfg.get("db_dir", DEFAULT_DB_DIR)))
+        if not os.path.exists(os.path.join(source_dir, "persons.json")):
+            return {"ok": False, "reason": REASON_BAD_INPUT,
+                    "detail": f"no {source_model} database at {source_dir}"}
+
+        # Opened with the source's own model string so IdentityDB's own check
+        # confirms we are reading what we think we are. Read-only by discipline:
+        # nothing below calls a mutating method on it.
+        source = IdentityDB(db_dir=source_dir, dim=EMBEDDING_DIM,
+                            model=source_model, label="face_db:source",
+                            artifact_suffix=".jpg")
+
+        by_person: dict[str, list[dict]] = {}
+        for item in source.sample_artifacts():
+            by_person.setdefault(item["person_id"], []).append(item)
+
+        migrated, unmigratable, skipped = [], [], []
+        samples_done = 0
+        for record in source.list_persons(limit=0)["persons"]:
+            person_id = record["id"]
+            if not record.get("named") and not include_unknown:
+                skipped.append({"person_id": person_id, "reason": "unnamed"})
+                continue
+            items = by_person.get(person_id) or []
+            if not items:
+                unmigratable.append({
+                    "person_id": person_id, "name": record.get("name", ""),
+                    "reason": "no stored crop — enrolled before store_sample_crops",
+                })
+                continue
+            if dry_run:
+                migrated.append({"person_id": person_id,
+                                 "name": record.get("name", ""),
+                                 "samples": len(items)})
+                samples_done += len(items)
+                continue
+
+            crops = []
+            for item in items:
+                try:
+                    with open(item["path"], "rb") as handle:
+                        crops.append(handle.read())
+                except OSError:
+                    crops.append(None)
+            usable = [crop for crop in crops if crop]
+            vectors = engine.analyzer.embed_aligned(usable) if usable else []
+            pairs = [(vec, crop) for vec, crop in zip(vectors, usable)
+                     if vec is not None]
+            if not pairs:
+                unmigratable.append({
+                    "person_id": person_id, "name": record.get("name", ""),
+                    "reason": "every stored crop failed to re-embed",
+                })
+                continue
+
+            embeddings = [pair[0] for pair in pairs]
+            artifacts = [pair[1] for pair in pairs]
+            try:
+                existing = None
+                try:
+                    existing = engine.db.get_person(person_id)
+                except KeyError:
+                    existing = None
+                if existing is not None:
+                    # Idempotent re-run: the person is already here, so add the
+                    # samples rather than failing the whole pass on a duplicate id.
+                    engine.db.add_samples(person_id, embeddings, artifacts)
+                else:
+                    engine.db.add(
+                        record.get("name", ""), embeddings,
+                        named=bool(record.get("named")),
+                        profile=record.get("profile"),
+                        person_id=person_id,
+                        artifacts=artifacts,
+                        registered_at=record.get("registered_at"),
+                    )
+            except Exception as error:  # noqa: BLE001 - one person must not
+                # abandon a 500-person migration half-done
+                log.error("[face] could not migrate %s: %s", person_id,
+                          escape_log_text(error))
+                unmigratable.append({"person_id": person_id,
+                                     "name": record.get("name", ""),
+                                     "reason": str(error)})
+                continue
+            migrated.append({"person_id": person_id,
+                             "name": record.get("name", ""),
+                             "samples": len(embeddings)})
+            samples_done += len(embeddings)
+
+        source_stats = source.stats()
+        result = {
+            "ok": True,
+            "dry_run": dry_run,
+            "source_model": source_model,
+            "source_db": source_dir,
+            "target_model": target_model,
+            "target_db": engine.db.path,
+            "persons_migrated": len(migrated),
+            "samples_reembedded": samples_done,
+            "migrated": migrated,
+            "unmigratable": unmigratable,
+            "skipped": skipped,
+            # The honest denominator: how much of the source could never move,
+            # because it was enrolled before its crops were being kept.
+            "source_samples": source_stats["samples"],
+            "source_samples_with_crop": source_stats["samples_with_artifact"],
+        }
+        log.info("[face] reembed %s -> %s: %d person(s), %d sample(s)%s; "
+                 "%d unmigratable (source has crops for %d of %d samples)",
+                 source_model, target_model, len(migrated), samples_done,
+                 " (dry run)" if dry_run else "", len(unmigratable),
+                 source_stats["samples_with_artifact"], source_stats["samples"])
+        return result
 
     _DESC = "Face recognition — identifies registered people in the camera feed"
 

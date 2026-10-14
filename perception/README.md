@@ -2392,10 +2392,49 @@ to date — there is still nothing to re-embed, so the cheap path applies:
 auto-enrolment re-learns people as they appear, and only **named** people need
 their name re-attached. On the Orin 5 rig that was 4 names out of 44 identities.
 
-What is **not** built yet is the re-embedding pass itself — the offline job that
-reads `sample_artifacts()`, runs each crop through the newly selected model and
-writes that model's database. The data it needs is now being kept; the job is not
-written.
+#### Migrating a roster: `reembed_from`
+
+The pass itself is the `reembed_from` action. Select the new model, then ask it to
+pull the old model's roster across:
+
+| | |
+|---|---|
+| `source_model` | the model to migrate *from*. Its database is opened read-only |
+| `dry_run` | count what would move and what cannot, write nothing, do not even run the model |
+| `include_unknown` | carry the unnamed `p-N` people too (default true) |
+
+**It is neither an overwrite nor an extra column.** Each model owns its own
+database, so this reads the source, re-embeds, and writes into the *target's*
+store, leaving the source byte-for-byte intact — which is what makes it safe to
+retry and trivial to abandon: if the migrated roster is worse, select the old model
+again and the original is still there, untouched.
+
+A single database with one embedding column per model was the alternative, and is
+worse here for three independent reasons. `dim` is a per-database property and a
+future recogniser need not be 512-d. `IdentityDB` is deliberately
+modality-agnostic and shared with voiceprints, so widening its schema for
+face-specific multi-model rows taxes a module with no stake in it. And every
+`match()` would then have to choose a column — which is exactly the "matching
+across two networks does not fail, it silently confuses identities" failure the
+model check exists to prevent.
+
+Carried across: `person_id` (so `visits.jsonl` stays attributable), name, profile,
+named/unnamed, and `registered_at` — resetting that would make everybody look newly
+met against a visit log that disagrees. Re-running is idempotent at person level: an
+id already present gets samples added rather than failing the pass on a duplicate.
+
+What it cannot do is invent crops. Samples enrolled before `store_sample_crops`
+have nothing to re-embed and come back in `unmigratable` with a reason, alongside
+`source_samples` and `source_samples_with_crop` so the shortfall is a number rather
+than a surprise. One corrupt crop or one failing person is reported and skipped,
+not allowed to abandon a 500-person pass.
+
+The embedding step deliberately **skips detection and alignment**
+(`FaceService.embed_aligned`). The stored crop is already aligned, so re-detecting
+would at best apply a second similarity transform on top of the first and at worst
+find no face at all — a 112x112 image letterboxed to 640x640 is not what SCRFD was
+trained on. Re-embedding has to put the new network on the *same pixels* the old one
+saw, or the migrated embedding is not comparable to a fresh capture of that person.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that

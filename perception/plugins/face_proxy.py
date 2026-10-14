@@ -127,6 +127,17 @@ class FaceServiceProxy:
             ))
         return (reply["height"], reply["width"]), faces
 
+    def embed_aligned(self, crops: list) -> list:
+        """Already-aligned crops -> embeddings in this model's space.
+
+        See `plugins/face_service.FaceService.embed_aligned` for why this does not
+        go through detection. Entries are `None` where a crop could not be used.
+        """
+        if not crops:
+            return []
+        reply = self._worker.call(SERVICE_KEY, "embed_aligned", {"crops": list(crops)})
+        return list(reply.get("embeddings") or [])
+
     def close(self) -> None:
         """Drop the service, releasing its models and its share of the GPU pool.
 

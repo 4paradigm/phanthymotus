@@ -763,6 +763,7 @@ class IdentityDB:
         profile: Any = None,
         person_id: str | None = None,
         artifacts: list | None = None,
+        registered_at: float | None = None,
     ) -> dict:
         """Enrol a new identity and return its record.
 
@@ -785,7 +786,12 @@ class IdentityDB:
                 "name": str(name or ""),
                 "profile": clean_profile,
                 "named": bool(named),
-                "registered_at": timestamp,
+                # Overridable so a roster migrated to another model keeps when each
+                # person was first enrolled. Resetting it to the migration time
+                # would make everybody look new and break "who have we known
+                # longest" against a visit log that disagrees.
+                "registered_at": (float(registered_at) if registered_at
+                                  else timestamp),
                 "updated_at": timestamp,
                 "last_seen_at": timestamp,
             }
