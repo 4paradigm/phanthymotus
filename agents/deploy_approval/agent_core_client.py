@@ -5,10 +5,10 @@ the core ``POST /api/system/update`` adapter. No sockets, no SSH, no shell.
 The runtime credential is a per-machine Agent Core Bearer token from
 ``secrets.yaml``.
 
-TLS verification is mandatory: the controller connects over HTTPS to each
-machine's Agent Core, verifying certificate identity via a per-machine CA PEM
-trust anchor from secrets.yaml. Every machine must have an explicit CA PEM
-configured; there is no system CA fallback.
+HTTPS is mandatory in both migration modes. Strict mode verifies certificate
+identity using a per-machine CA PEM and the target IPv4 SAN, with no system CA
+fallback. Explicit legacy mode supports unverified self-signed certificates only
+for configured RFC1918 machines with per-machine tokens. Strict is the default.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from .clients_common import (
     require_http_policy,
     stream_request,
 )
-from .config import Config
+from .config import Config, validate_agent_core_tls_mode, _load_ca_pem_config
 from .image_ref import validate_image_ref
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,11 @@ class AgentCoreClient:
         http: httpx.AsyncClient | None = None,
     ):
         self.config = config
+        try:
+            self.tls_mode = validate_agent_core_tls_mode(config.agent_core_tls_mode)
+        except ValueError as exc:
+            raise AgentCoreError(str(exc)) from exc
+        self.legacy_tls = self.tls_mode == "legacy"
         self._access_token = access_token
         if not base_url:
             raise AgentCoreError(
@@ -121,9 +126,13 @@ class AgentCoreClient:
                 f"Agent Core endpoint hostname must match node_host ({node_host}), "
                 f"got {parsed.hostname!r}"
             )
-        if parsed.port != 15678:
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise AgentCoreError("Agent Core endpoint has an invalid port") from exc
+        if port != 15678:
             raise AgentCoreError(
-                f"Agent Core endpoint port must be 15678, got {parsed.port}"
+                f"Agent Core endpoint port must be 15678, got {port}"
             )
         if parsed.username or parsed.password:
             raise AgentCoreError("Agent Core endpoint must not contain userinfo")
@@ -141,27 +150,60 @@ class AgentCoreClient:
         self.base_url = base_url.rstrip("/")
         self.node_host = node_host
         self._machine_alias = machine_alias
+        if self.legacy_tls:
+            if not any(parsed_ip in ipaddress.IPv4Network(network) for network in (
+                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            )):
+                raise AgentCoreError("legacy TLS requires an RFC1918 IPv4 node_host")
+            if not isinstance(machine_alias, str) or not machine_alias.strip():
+                raise AgentCoreError("machine_alias is required for legacy TLS")
+            configured_token = (config.agent_core_tokens.get(machine_alias)
+                                if isinstance(config.agent_core_tokens, dict) else None)
+            if (not isinstance(access_token, str) or not access_token.strip()
+                    or not isinstance(configured_token, str) or not configured_token.strip()
+                    or access_token != configured_token
+                    or any(char in _CONTROL_CHARS for char in access_token)):
+                raise AgentCoreError("legacy TLS requires the selected machine's configured token")
+            from .policy import load_machines, MachineLoadError
+            from yaml import YAMLError
+            try:
+                machines = load_machines(config.machine_owners_file)
+            except (MachineLoadError, OSError, ValueError, YAMLError) as exc:
+                raise AgentCoreError("legacy TLS requires a valid configured machine policy") from exc
+            machine = machines.get(machine_alias)
+            if machine is None or machine.node_host != node_host:
+                raise AgentCoreError("legacy TLS alias and node_host must match the machine policy")
+            try:
+                _load_ca_pem_config({"agent_core_ca_pem": config.agent_core_ca_pem})
+            except ValueError as exc:
+                raise AgentCoreError("legacy TLS supplied CA configuration is invalid") from exc
         self._owns_http = http is None
         if http is None:
             import ssl
 
             if not isinstance(machine_alias, str) or not machine_alias.strip():
                 raise AgentCoreError("machine_alias is required for Agent Core TLS")
-            ca_map = config.agent_core_ca_pem
-            ca_pem = ca_map.get(machine_alias) if isinstance(ca_map, dict) else None
-            if not isinstance(ca_pem, str) or not ca_pem.strip():
-                raise AgentCoreError(
-                    f"no valid agent_core_ca_pem configured for machine alias {machine_alias!r}"
-                )
-            try:
+            _ssl_ctx = None
+            if self.legacy_tls:
+                # The only unverified transport is this explicit, policy-bound mode.
+                verify = False
+            else:
                 _ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                _ssl_ctx.load_verify_locations(cadata=ca_pem)
-            except (ssl.SSLError, ValueError, TypeError) as exc:
-                raise AgentCoreError(
-                    f"per-machine CA PEM for alias {machine_alias!r} is invalid"
-                ) from exc
-            if not _ssl_ctx.check_hostname or _ssl_ctx.verify_mode != ssl.CERT_REQUIRED:
-                raise AgentCoreError("per-machine CA SSL context does not enforce peer identity")
+                ca_map = config.agent_core_ca_pem
+                ca_pem = ca_map.get(machine_alias) if isinstance(ca_map, dict) else None
+                if not isinstance(ca_pem, str) or not ca_pem.strip():
+                    raise AgentCoreError(
+                        f"no valid agent_core_ca_pem configured for machine alias {machine_alias!r}"
+                    )
+                try:
+                    _ssl_ctx.load_verify_locations(cadata=ca_pem)
+                except (ssl.SSLError, ValueError, TypeError) as exc:
+                    raise AgentCoreError(
+                        f"per-machine CA PEM for alias {machine_alias!r} is invalid"
+                    ) from exc
+                if not _ssl_ctx.check_hostname or _ssl_ctx.verify_mode != ssl.CERT_REQUIRED:
+                    raise AgentCoreError("per-machine CA SSL context does not enforce peer identity")
+                verify = _ssl_ctx
             self.http = httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     config.total_timeout,
@@ -171,13 +213,17 @@ class AgentCoreClient:
                     pool=config.connect_timeout,
                 ),
                 follow_redirects=False,
-                verify=_ssl_ctx,
+                verify=verify,
                 trust_env=False,
             )
             self._ssl_ctx = _ssl_ctx
         else:
             self.http = http
             self._ssl_ctx = None
+        if self.legacy_tls:
+            logger.warning("TLS_MODE=legacy LEGACY_TLS_UNVERIFIED=YES TLS_CERT_VERIFIED=NO")
+        else:
+            logger.info("TLS_MODE=strict")
 
     async def aclose(self) -> None:
         if self._owns_http:
@@ -226,6 +272,8 @@ class AgentCoreClient:
             )
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
+        if self.legacy_tls and method.upper() == "POST":
+            await self.verify()
         resp, data = await self._request_impl(method, path, json, url)
         self._check_code(data, method, path)
         return data
@@ -361,6 +409,8 @@ class AgentCoreClient:
             )
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
+        if self.legacy_tls:
+            await self.verify()
         try:
             resp = await stream_request(
                 self.http, "POST", url, self.config.max_response_bytes,
@@ -602,6 +652,8 @@ class AgentCoreClient:
             )
         except SecurityError as e:
             raise AgentCoreError(str(e)) from e
+        if self.legacy_tls:
+            await self.verify()
         try:
             resp = await stream_request(
                 self.http, "POST", url, self.config.max_response_bytes,

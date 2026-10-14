@@ -16,16 +16,18 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
-from ..agent_core_client import AgentCoreClient, AgentCoreError
+from ..agent_core_client import AgentCoreClient, AgentCoreError, AgentCoreDeployOutcomeUncertain
 from ..config import Config, _load_secrets_config
 
 
-def _config(cas: dict[str, str]) -> Config:
+def _config(cas: dict[str, str], mode: str = "strict") -> Config:
     return Config(
         allow_private_http=True,
         agent_core_tokens={"machine-a": "test-only-token"},
         agent_core_ca_pem=cas,
+        agent_core_tls_mode=mode,
     )
 
 
@@ -78,7 +80,7 @@ def test_ca(tmp_path):
 
 
 def _ephemeral_test_certificate(
-    directory: Path, ca_cert: Path, ip: str = "127.0.0.1", *, expired: bool = False,
+    directory: Path, ca_cert: Path, ip: str | None = "127.0.0.1", *, expired: bool = False,
 ) -> tuple[Path, Path]:
     directory.mkdir()
     (directory / "issued").mkdir()
@@ -97,7 +99,7 @@ def _ephemeral_test_certificate(
         "keyUsage = critical, digitalSignature, keyEncipherment\n"
         "extendedKeyUsage = serverAuth\n"
         "subjectKeyIdentifier = hash\nauthorityKeyIdentifier = keyid,issuer\n"
-        f"subjectAltName = IP:{ip}\n",
+        + (f"subjectAltName = IP:{ip}\n" if ip is not None else ""),
         encoding="ascii",
     )
     _openssl(
@@ -303,3 +305,414 @@ def test_secrets_loader_rejects_invalid_machine_alias(tmp_path, test_ca):
     )
     with pytest.raises(ValueError, match="machine aliases"):
         _load_secrets_config(str(secrets))
+
+
+@pytest.mark.asyncio
+async def test_tls_compatibility_mode_without_ca(tmp_path, caplog):
+    """Legacy compatibility now requires an explicit mode and policy binding."""
+    caplog.set_level("WARNING", logger="agents.deploy_approval.agent_core_client")
+    config = _migration_config(tmp_path)
+    seen = []
+
+    def respond(request):
+        seen.append(request)
+        return httpx.Response(200, json={"valid": True, "auth_required": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond), trust_env=False, follow_redirects=False) as http:
+        client = _migration_client(config, http=http)
+        assert client.legacy_tls is True
+        assert await client.verify() == {"valid": True, "auth_required": True}
+    assert len(seen) == 1
+    assert seen[0].headers["Authorization"] == "Bearer test-only-token"
+    assert "LEGACY_TLS_UNVERIFIED=YES" in caplog.text
+    assert "TLS_CERT_VERIFIED=NO" in caplog.text
+    assert "test-only-token" not in caplog.text
+
+
+@pytest.mark.parametrize("cas", [{}, {"machine-a": " "}, {"machine-b": "wrong-alias"}])
+def test_tls_strict_mode_requires_ca(cas):
+    with pytest.raises(AgentCoreError, match="no valid agent_core_ca_pem"):
+        _client(_config(cas, mode="strict"))
+
+
+@pytest.mark.asyncio
+async def test_tls_strict_mode_requires_ip_san(tmp_path, test_ca, caplog):
+    caplog.set_level("INFO", logger="agents.deploy_approval.agent_core_client")
+    # The CA is trusted and CN equals the IPv4, but SAN is absent.
+    cert, key = _ephemeral_test_certificate(tmp_path / "no-san", test_ca, ip=None)
+    client = _client(_config({"machine-a": test_ca.read_text(encoding="ascii")}, mode="strict"))
+    seen = []
+    try:
+        assert client.legacy_tls is False
+        assert client._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+        assert client._ssl_ctx.check_hostname is True
+        async with _tls_test_server(cert, key, seen) as port:
+            async with httpx.AsyncClient(
+                verify=client._ssl_ctx, trust_env=False, timeout=5,
+                headers=client._headers(), follow_redirects=False,
+            ) as probe:
+                with pytest.raises(httpx.ConnectError) as raised:
+                    await probe.get(f"https://127.0.0.1:{port}/tls-probe")
+            cause = raised.value
+            while cause is not None and not isinstance(cause, ssl.SSLCertVerificationError):
+                cause = cause.__cause__ or cause.__context__
+            assert isinstance(cause, ssl.SSLCertVerificationError)
+        assert seen == []
+        assert "TLS_MODE=strict" in caplog.text
+        assert "test-only-token" not in caplog.text
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tls_legacy_mode_keeps_https(tmp_path):
+    config = _migration_config(tmp_path)
+    for url, host, error in (
+        ("http://10.23.0.5:15678", "10.23.0.5", "scheme must be https"),
+        ("https://10.23.0.5:443", "10.23.0.5", "port must be 15678"),
+        ("https://10.23.0.6:15678", "10.23.0.5", "hostname must match node_host"),
+        ("https://user:secret@10.23.0.5:15678", "10.23.0.5", "userinfo"),
+    ):
+        with pytest.raises(AgentCoreError, match=error):
+            AgentCoreClient(config, url, node_host=host, machine_alias="machine-a")
+
+    seen = []
+    responses = [
+        httpx.Response(302, headers={"Location": "http://other-host/"}),
+        httpx.Response(200, json={"valid": False, "auth_required": True}),
+        httpx.Response(200, json={"valid": True, "auth_required": True}),
+    ]
+
+    def respond(request):
+        seen.append(request)
+        return responses.pop(0)
+
+    # Offline HTTP contract probe: no real Agent Core request or deployment.
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond), trust_env=False, follow_redirects=False) as http:
+        client = AgentCoreClient(
+            config, "https://10.23.0.5:15678", node_host="10.23.0.5",
+            machine_alias="machine-a", access_token="test-only-token", http=http,
+        )
+        with pytest.raises(AgentCoreError, match="302"):
+            await client.verify()
+        assert len(seen) == 1  # The redirect target received no token or request.
+        with pytest.raises(AgentCoreError, match="valid=true and auth_required=true"):
+            await client.verify()
+        assert await client.verify() == {"valid": True, "auth_required": True}
+    assert len(seen) == 3
+    for request in seen:
+        assert str(request.url) == "https://10.23.0.5:15678/api/auth/verify"
+        assert request.headers["Authorization"] == "Bearer test-only-token"
+
+
+def _migration_config(tmp_path, *, host="10.23.0.5", mode="legacy"):
+    """Explicitly controlled offline machine policy, never a production fallback."""
+    machines = tmp_path / "machines.yaml"
+    machines.write_text(yaml.safe_dump({"version": 1, "machines": {
+        "machine-a": {
+            "node_id": "offline-node", "node_host": host, "owners": ["offline-owner"],
+            "targets": ["core", "perception", "actucore"],
+            "platforms": ["linux/arm64"], "variants": ["5.11", "6.1"],
+        },
+    }}), encoding="utf-8")
+    return Config(
+        machine_owners_file=str(machines), agent_core_tls_mode=mode,
+        agent_core_tokens={"machine-a": "test-only-token"}, agent_core_ca_pem={},
+    )
+
+
+def _migration_client(config, **overrides):
+    arguments = dict(
+        base_url="https://10.23.0.5:15678", node_host="10.23.0.5",
+        machine_alias="machine-a", access_token="test-only-token",
+    )
+    arguments.update(overrides)
+    return AgentCoreClient(config, **arguments)
+
+
+def _owned_mock_transport(monkeypatch, handler):
+    """Keep real owned AsyncClient construction, replacing only the wire transport."""
+    original = httpx.AsyncClient
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs.copy())
+        return original(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", create)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_tls_legacy_no_ca_client_connects(tmp_path, monkeypatch, caplog):
+    caplog.set_level("WARNING", logger="agents.deploy_approval.agent_core_client")
+    config = _migration_config(tmp_path)
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/api/auth/verify":
+            return httpx.Response(200, json={"valid": True, "auth_required": True})
+        return httpx.Response(200, json={"code": 0, "data": {"status": "updating"}})
+
+    construction = _owned_mock_transport(monkeypatch, respond)
+    client = _migration_client(config)
+    try:
+        assert config.agent_core_ca_pem == {}
+        assert construction[0]["verify"] is False
+        assert await client.verify() == {"valid": True, "auth_required": True}
+        assert (await client.update_core("registry.example/core:v17"))["data"]["status"] == "updating"
+        assert [r.method for r in requests] == ["GET", "GET", "POST"]
+        assert all(r.headers["Authorization"] == "Bearer test-only-token" for r in requests)
+        assert all(str(r.url).startswith("https://10.23.0.5:15678/") for r in requests)
+        assert "LEGACY_TLS_UNVERIFIED=YES" in caplog.text
+        assert "TLS_CERT_VERIFIED=NO" in caplog.text
+        assert "test-only-token" not in caplog.text
+    finally:
+        await client.aclose()
+    assert client.http.is_closed
+
+
+@pytest.mark.asyncio
+async def test_tls_legacy_https_exact_ipv4_port_only(tmp_path):
+    config = _migration_config(tmp_path)
+    for url, host in (
+        ("http://10.23.0.5:15678", "10.23.0.5"),
+        ("https://10.23.0.5:443", "10.23.0.5"),
+        ("https://10.23.0.5", "10.23.0.5"),
+        ("https://10.23.0.5:bad", "10.23.0.5"),
+        ("https://10.23.0.6:15678", "10.23.0.5"),
+        ("https://device.local:15678", "device.local"),
+        ("https://user:secret@10.23.0.5:15678", "10.23.0.5"),
+        ("https://10.23.0.5:15678/api", "10.23.0.5"),
+        ("https://10.23.0.5:15678?token=secret", "10.23.0.5"),
+        ("https://10.23.0.5:15678#extra", "10.23.0.5"),
+    ):
+        with pytest.raises(AgentCoreError):
+            _migration_client(config, base_url=url, node_host=host)
+    for host in ("10.23.0.5", "172.20.0.5", "192.168.10.5"):
+        config = _migration_config(tmp_path, host=host)
+        client = _migration_client(config, base_url=f"https://{host}:15678", node_host=host)
+        await client.aclose()  # Construction only; no network request.
+
+
+def test_tls_legacy_rejects_non_rfc1918_hosts(tmp_path, monkeypatch):
+    construction = _owned_mock_transport(monkeypatch, lambda r: httpx.Response(200))
+    for host in ("8.8.8.8", "127.0.0.1", "169.254.10.5", "100.64.0.5",
+                 "192.0.2.1", "0.0.0.0", "224.0.0.1", "172.32.0.1", "192.169.0.1"):
+        config = _migration_config(tmp_path, host=host)
+        with pytest.raises(AgentCoreError, match="RFC1918"):
+            _migration_client(config, base_url=f"https://{host}:15678", node_host=host)
+    assert construction == []
+
+
+@pytest.mark.asyncio
+async def test_tls_legacy_disables_redirects_and_proxies(tmp_path, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://untrusted.invalid:9999")
+    monkeypatch.setenv("ALL_PROXY", "http://untrusted.invalid:9999")
+    requests = []
+
+    def redirect(request):
+        requests.append(request)
+        return httpx.Response(302, headers={"Location": "http://untrusted.invalid/"})
+
+    construction = _owned_mock_transport(monkeypatch, redirect)
+    client = _migration_client(_migration_config(tmp_path))
+    try:
+        assert construction[0]["trust_env"] is False
+        assert construction[0]["follow_redirects"] is False
+        assert construction[0]["verify"] is False
+        assert client.http.trust_env is False
+        assert client.http.follow_redirects is False
+        assert client.http.timeout.connect == client.config.connect_timeout
+        assert client.http.timeout.read == client.config.read_timeout
+        with pytest.raises(AgentCoreError, match="302"):
+            await client.update_core("registry.example/core:v17")
+        assert len(requests) == 1
+        assert requests[0].method == "GET" and requests[0].url.path == "/api/auth/verify"
+        assert requests[0].url.host == "10.23.0.5"
+    finally:
+        await client.aclose()
+
+
+def test_tls_legacy_missing_alias_or_token_denied(tmp_path, monkeypatch):
+    construction = _owned_mock_transport(monkeypatch, lambda r: httpx.Response(200))
+    for overrides in ({"machine_alias": ""}, {"machine_alias": "unknown"},
+                      {"access_token": ""}, {"access_token": "wrong-token"},
+                      {"base_url": "https://10.23.0.6:15678", "node_host": "10.23.0.6"}):
+        with pytest.raises(AgentCoreError):
+            _migration_client(_migration_config(tmp_path), **overrides)
+    config = _migration_config(tmp_path)
+    config.agent_core_tokens = {}
+    with pytest.raises(AgentCoreError, match="configured token"):
+        _migration_client(config)
+    config = _migration_config(tmp_path)
+    config.agent_core_tokens["unknown"] = "test-only-token"
+    with pytest.raises(AgentCoreError, match="match the machine policy"):
+        _migration_client(config, machine_alias="unknown")
+    config = _migration_config(tmp_path)
+    config.agent_core_ca_pem = {"machine-a": "invalid PEM"}
+    with pytest.raises(AgentCoreError, match="CA configuration is invalid"):
+        _migration_client(config)
+    config = _migration_config(tmp_path)
+    config.machine_owners_file = str(tmp_path / "missing.yaml")
+    with pytest.raises(AgentCoreError, match="machine policy"):
+        _migration_client(config)
+    assert construction == []
+
+
+@pytest.mark.asyncio
+async def test_tls_legacy_auth_invalid_rejected(tmp_path, caplog):
+    config = _migration_config(tmp_path)
+    failures = [
+        httpx.Response(401), httpx.Response(403),
+        httpx.Response(200, json={"valid": False, "auth_required": True}),
+        httpx.Response(200, json={"valid": True, "auth_required": False}),
+        httpx.Response(200, json={"valid": "true", "auth_required": True}),
+        httpx.Response(200, json={"code": 0, "data": {"valid": False, "auth_required": True}}),
+        httpx.Response(200, content=b"not-json"), httpx.Response(200, json=[]),
+        "timeout",
+    ]
+    for failure in failures:
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if failure == "timeout":
+                raise httpx.ReadTimeout("offline auth timeout", request=request)
+            return failure
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond), trust_env=False, follow_redirects=False) as http:
+            client = _migration_client(config, http=http)
+            for operation in (
+                lambda: client.update_core("registry.example/core:v17"),
+                lambda: client.deploy_driver("perception", "registry.example/perception:v17"),
+                lambda: client.request("POST", "/api/system/update", {"image": "registry.example/core:v17"}),
+            ):
+                with pytest.raises(AgentCoreError) as raised:
+                    await operation()
+                assert not isinstance(raised.value, AgentCoreDeployOutcomeUncertain)
+            assert requests and all(r.method == "GET" and r.url.path == "/api/auth/verify" for r in requests)
+            assert "test-only-token" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tls_legacy_post_uncertain_no_retry(tmp_path):
+    config = _migration_config(tmp_path)
+    for endpoint in ("core", "driver"):
+        for failure in ("timeout", "reset", "non-json", "bad-envelope"):
+            requests = []
+
+            def respond(request):
+                requests.append(request)
+                if request.method == "GET":
+                    return httpx.Response(200, json={"valid": True, "auth_required": True})
+                if failure == "timeout":
+                    raise httpx.ReadTimeout("offline POST timeout", request=request)
+                if failure == "reset":
+                    raise httpx.ReadError("offline connection reset", request=request)
+                if failure == "non-json":
+                    return httpx.Response(200, content=b"unknown outcome")
+                return httpx.Response(200, json={"code": True, "data": {}})
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond), trust_env=False, follow_redirects=False) as http:
+                client = _migration_client(config, http=http)
+                with pytest.raises(AgentCoreDeployOutcomeUncertain):
+                    if endpoint == "core":
+                        await client.update_core("registry.example/core:v17")
+                    else:
+                        await client.deploy_driver("perception", "registry.example/perception:v17")
+            assert [r.method for r in requests] == ["GET", "POST"]
+
+
+def test_tls_strict_no_ca_fails_closed(tmp_path, monkeypatch):
+    construction = _owned_mock_transport(monkeypatch, lambda r: httpx.Response(200))
+    for cas in ({}, {"machine-a": " "}, {"other-machine": "not-selected"}):
+        config = _migration_config(tmp_path, mode="strict")
+        config.agent_core_ca_pem = cas
+        with pytest.raises(AgentCoreError, match="no valid agent_core_ca_pem"):
+            _migration_client(config)
+    assert construction == []
+
+
+@pytest.mark.asyncio
+async def test_tls_strict_no_fallback(tmp_path, monkeypatch, offline_ca_pem, caplog):
+    config = _migration_config(tmp_path, mode="strict")
+    config.agent_core_ca_pem = {"machine-a": "invalid PEM"}
+    with pytest.raises(AgentCoreError, match="CA PEM.*invalid"):
+        _migration_client(config)
+    requests = []
+
+    def bad_certificate(request):
+        requests.append(request)
+        raise httpx.ConnectError("offline certificate verification failed", request=request)
+
+    construction = _owned_mock_transport(monkeypatch, bad_certificate)
+    config.agent_core_ca_pem = {"machine-a": offline_ca_pem}
+    client = _migration_client(config)
+    try:
+        with pytest.raises(AgentCoreError, match="certificate verification failed"):
+            await client.verify()
+        assert len(construction) == len(requests) == 1
+        assert isinstance(construction[0]["verify"], ssl.SSLContext)
+        assert construction[0]["verify"].verify_mode == ssl.CERT_REQUIRED
+        assert "LEGACY_TLS_UNVERIFIED" not in caplog.text
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tls_strict_verified_ssl_context(tmp_path, monkeypatch, offline_ca_pem):
+    config = _migration_config(tmp_path, mode="strict")
+    config.agent_core_ca_pem = {"machine-a": offline_ca_pem}
+    construction = _owned_mock_transport(monkeypatch, lambda r: httpx.Response(200))
+    client = _migration_client(config)
+    try:
+        assert client.legacy_tls is False
+        context = construction[0]["verify"]
+        assert context is client._ssl_ctx
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
+        assert context.get_ca_certs(binary_form=True) == [ssl.PEM_cert_to_DER_cert(offline_ca_pem)]
+        assert construction[0]["trust_env"] is False
+        assert construction[0]["follow_redirects"] is False
+    finally:
+        await client.aclose()
+
+
+def test_tls_mode_invalid_rejected(tmp_path, monkeypatch):
+    from .. import config as config_module
+
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text(yaml.safe_dump({
+        "version": 1, "agent_core_tokens": {"machine-a": "test-only-token"},
+        "cos": {"region": "ap-beijing", "bucket": "offline-bucket-123",
+                "secret_id": "OFFLINE_ID", "secret_key": "OFFLINE_KEY"},
+        "review_comment_trust": {"author_id": "123456", "author_login": "offline-review"},
+    }), encoding="utf-8")
+    loader = _load_secrets_config
+    monkeypatch.setattr(config_module, "_load_secrets_config", lambda path: loader(str(secrets)))
+    monkeypatch.setenv("GITHUB_REPOS", "example/main,example/drivers")
+    for mode in ("", "compatibility", "LEGACY", "strcit", " legacy", "legacy\n"):
+        monkeypatch.setenv("AGENT_CORE_TLS_MODE", mode)
+        with pytest.raises(ValueError, match="AGENT_CORE_TLS_MODE"):
+            config_module.load_config()
+        with pytest.raises(AgentCoreError, match="AGENT_CORE_TLS_MODE"):
+            _migration_client(_migration_config(tmp_path, mode=mode))
+    monkeypatch.delenv("AGENT_CORE_TLS_MODE")
+    assert Config().agent_core_tls_mode == "strict"
+    assert config_module.load_config().agent_core_tls_mode == "strict"
+    monkeypatch.setenv("AGENT_CORE_TLS_MODE", "legacy")
+    loaded = config_module.load_config()
+    assert loaded.agent_core_tls_mode == "legacy" and loaded.agent_core_ca_pem == {}
+    assert loaded.agent_core_tokens == {"machine-a": "test-only-token"}
+    assert loaded.cos_secret_id == "OFFLINE_ID" and loaded.cos_secret_key == "OFFLINE_KEY"
+    assert loaded.review_comment_author_id == "123456" and loaded.review_comment_author_login == "offline-review"
+    assert loaded.github_repos == ["example/main", "example/drivers"]
+    for mode in ("legacy", "strict"):
+        monkeypatch.setenv("AGENT_CORE_TLS_MODE", mode)
+        data = yaml.safe_load(secrets.read_text())
+        data["agent_core_ca_pem"] = {"machine-a": "invalid PEM"}
+        secrets.write_text(yaml.safe_dump(data), encoding="utf-8")
+        with pytest.raises(ValueError, match="agent_core_ca_pem"):
+            config_module.load_config()

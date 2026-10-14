@@ -100,6 +100,22 @@ block, providing verifiable evidence that can be validated independently.
 
 ### Running
 
+TLS defaults to strict. Existing robots without CA/IP SAN can use an explicit
+server deployment setting, without changing their certificates or tokens:
+
+```bash
+AGENT_CORE_TLS_MODE=legacy ./deploy.sh preflight
+AGENT_CORE_TLS_MODE=legacy ./deploy.sh restart
+```
+
+Keep the same mode for each deployment command. `build_env_file` passes it to
+Compose and the controller; empty or unknown values are rejected. Legacy permits
+only configured RFC1918 IPv4 machines over HTTPS:15678, checks the original
+per-machine token against `/api/auth/verify` before any deployment POST, and logs
+`LEGACY_TLS_UNVERIFIED=YES TLS_CERT_VERIFIED=NO`. It does not authenticate the
+server certificate. Strict requires the matching machine CA and IPv4 SAN and
+never falls back. No certificate reissue is needed for explicit legacy mode.
+
 ```bash
 # Pre-flight checks + start
 ./deploy.sh up

@@ -166,7 +166,7 @@ def test_agent_core_constructor_has_no_ca_file_parameter():
 def test_agent_core_self_created_client_disables_proxy_env(monkeypatch, offline_ca_pem):
     monkeypatch.setenv("HTTPS_PROXY", "http://bad proxy")
     client = AgentCoreClient(
-        make_config(agent_core_ca_pem={"test-machine": offline_ca_pem}),
+        make_config(agent_core_tls_mode="strict", agent_core_ca_pem={"test-machine": offline_ca_pem}),
         base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1",
         machine_alias="test-machine",
@@ -180,7 +180,7 @@ def test_agent_core_self_created_client_disables_proxy_env(monkeypatch, offline_
 
 
 def test_agent_core_aclose_owns_only_self_created_http(offline_ca_pem):
-    cfg = make_config(agent_core_ca_pem={"test-machine": offline_ca_pem})
+    cfg = make_config(agent_core_tls_mode="strict", agent_core_ca_pem={"test-machine": offline_ca_pem})
     owned = AgentCoreClient(
         cfg,
         base_url="https://192.0.2.1:15678",

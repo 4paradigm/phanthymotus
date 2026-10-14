@@ -179,6 +179,170 @@ def _extract_bodies(deploy_sh_text):
     return m1.group(1), m2.group(1)
 
 
+def test_preflight_compatibility_without_ca(tmp_path, offline_ca_pem, monkeypatch):
+    """Execute the actual preflight validators against local fixture files only."""
+    secrets_body, machine_body = _extract_bodies(_deploy_sh())
+    secrets = tmp_path / "secrets.yaml"
+    machines = tmp_path / "machines.yaml"
+    machines.write_text(_machines_yaml(), encoding="utf-8")
+    wrapper = tmp_path / "preflight.sh"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        'SECRETS_FILE="' + str(secrets) + '"\n'
+        'MACHINES_FILE="' + str(machines) + '"\n'
+        'die() { echo "ERROR: $*" >&2; exit 1; }\n'
+        "require_machine_policy() {\n" + machine_body + "\n}\n"
+        "require_secrets() {\n" + secrets_body + "\n}\n"
+        "require_machine_policy\nrequire_secrets\n", encoding="utf-8",
+    )
+    for mode, ca, expected in (
+        (None, {}, False),
+        ("legacy", {}, True),
+        ("strict", {}, False),
+        ("strict", {"test-machine": offline_ca_pem}, True),
+        ("strcit", {}, False),
+    ):
+        fixture = yaml.safe_load(_secrets_yaml(
+            offline_ca_pem, agent_core_ca_pem=ca,
+        ))
+        if mode is None:
+            monkeypatch.delenv("AGENT_CORE_TLS_MODE", raising=False)
+        else:
+            monkeypatch.setenv("AGENT_CORE_TLS_MODE", mode)
+        secrets.write_text(yaml.safe_dump(fixture), encoding="utf-8")
+        result = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True, timeout=30)
+        assert (result.returncode == 0) is expected
+        output = result.stdout + result.stderr
+        if expected:
+            assert "SECRETS_OK" in output
+            assert f"TLS_MODE={mode or 'strict'}" in output
+        elif mode in (None, "strict"):
+            assert "CA_NOT_PROVISIONED" in output
+        else:
+            assert "AGENT_CORE_TLS_MODE" in output
+        assert "test-token" not in output
+        assert "TEST_FAKE_SECRET_KEY_AAAA" not in output
+
+    monkeypatch.setenv("AGENT_CORE_TLS_MODE", "legacy")
+    for host, tokens, error in (
+        ("192.168.1.100", {"other-machine": "offline-other-token"}, "token required"),
+        ("http://192.168.1.100:15678", {"test-machine": "test-token"}, "literal IPv4"),
+    ):
+        policy = yaml.safe_load(_machines_yaml())
+        policy["machines"]["test-machine"]["node_host"] = host
+        machines.write_text(yaml.safe_dump(policy), encoding="utf-8")
+        secrets.write_text(_secrets_yaml(
+            offline_ca_pem,
+            agent_core_ca_pem={}, agent_core_tokens=tokens,
+        ), encoding="utf-8")
+        result = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0
+        assert error in result.stdout + result.stderr
+
+
+def _tls_preflight(tmp_path, mode):
+    secrets_body, machine_body = _extract_bodies(_deploy_sh())
+    secrets = tmp_path / "secrets.yaml"
+    machines = tmp_path / "machines.yaml"
+    # Deliberately omit the CA key entirely, matching the old server schema.
+    data = yaml.safe_load(_secrets_yaml(None, agent_core_ca_pem={}))
+    del data["agent_core_ca_pem"]
+    secrets.write_text(yaml.safe_dump(data), encoding="utf-8")
+    machines.write_text(_machines_yaml(), encoding="utf-8")
+    wrapper = tmp_path / "tls-preflight.sh"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        'SECRETS_FILE="' + str(secrets) + '"\n'
+        'MACHINES_FILE="' + str(machines) + '"\n'
+        'die() { echo "ERROR: $*" >&2; exit 1; }\n'
+        "require_machine_policy() {\n" + machine_body + "\n}\n"
+        "require_secrets() {\n" + secrets_body + "\n}\n"
+        "require_machine_policy\nrequire_secrets\n", encoding="utf-8",
+    )
+    env = os.environ.copy()
+    if mode is None:
+        env.pop("AGENT_CORE_TLS_MODE", None)
+    else:
+        env["AGENT_CORE_TLS_MODE"] = mode
+    return subprocess.run(["bash", str(wrapper)], env=env, capture_output=True, text=True, timeout=30)
+
+
+def test_preflight_legacy_no_ca_passes(tmp_path):
+    result = _tls_preflight(tmp_path, "legacy")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SECRETS_OK" in result.stdout and "MACHINE_POLICY_OK" in result.stdout
+    assert "TLS_MODE=legacy" in result.stdout
+    assert "LEGACY_TLS_UNVERIFIED=YES TLS_CERT_VERIFIED=NO" in result.stdout
+    assert "test-token" not in result.stdout + result.stderr
+
+
+def test_preflight_strict_no_ca_blocks(tmp_path):
+    for mode in (None, "strict"):
+        result = _tls_preflight(tmp_path, mode)
+        assert result.returncode != 0
+        assert "CA_NOT_PROVISIONED" in result.stdout + result.stderr
+        assert "SECRETS_OK" not in result.stdout
+        assert "LEGACY_TLS_UNVERIFIED" not in result.stdout
+        assert "test-token" not in result.stdout + result.stderr
+
+
+def test_compose_tls_mode_passthrough(tmp_path, monkeypatch):
+    """Execute the env-file generator and real Config loader across the Compose key."""
+    from .. import config as config_module
+
+    script = _deploy_sh()
+    functions = []
+    for name in ("require_github_repos", "build_env_file"):
+        match = re.search(rf"{name}\(\)\s*\{{(.*?)\n\}}", script, re.DOTALL)
+        assert match
+        functions.append(name + "() {\n" + match.group(1) + "\n}\n")
+    wrapper = tmp_path / "generate-env.sh"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\nRUNTIME_UID=65532\nRUNTIME_GID=65532\n"
+        'die() { echo "ERROR: $*" >&2; exit 1; }\n'
+        + "".join(functions) + "build_env_file\n", encoding="utf-8",
+    )
+    declared = _compose()["services"]["deploy-approval"]["environment"]["AGENT_CORE_TLS_MODE"]
+    # Resolve only this scalar, using the variable and default declared by Compose.
+    interpolation = re.fullmatch(r"\$\{([A-Z_]+)-([^}]+)\}", declared)
+    assert interpolation and interpolation.groups() == ("AGENT_CORE_TLS_MODE", "strict")
+    variable, default = interpolation.groups()
+    secrets = tmp_path / "secrets.yaml"
+    secrets.write_text(_secrets_yaml(None, agent_core_ca_pem={}), encoding="utf-8")
+    loader = config_module._load_secrets_config
+    monkeypatch.setattr(config_module, "_load_secrets_config", lambda path: loader(str(secrets)))
+    for supplied in (None, "legacy", "strict", "", "compatibility"):
+        env = os.environ.copy()
+        env["TMPDIR"] = str(tmp_path)
+        env["GITHUB_REPOS"] = "example/main,example/drivers"
+        if supplied is None:
+            env.pop(variable, None)
+        else:
+            env[variable] = supplied
+        result = subprocess.run(["bash", str(wrapper)], env=env, capture_output=True, text=True, timeout=30)
+        if supplied in ("", "compatibility"):
+            assert result.returncode != 0
+            assert "AGENT_CORE_TLS_MODE" in result.stderr
+            continue
+        assert result.returncode == 0, result.stderr
+        generated = Path(result.stdout.strip())
+        try:
+            assert stat.S_IMODE(generated.stat().st_mode) == 0o600
+            values = dict(line.split("=", 1) for line in generated.read_text().splitlines())
+            effective = values.get(variable, default)
+            assert effective == (supplied or "strict")
+            assert values["DEPLOY_APPROVAL_RUNTIME_UID"] == "65532"
+            monkeypatch.setenv(variable, effective)
+            monkeypatch.setenv("GITHUB_REPOS", values["GITHUB_REPOS"])
+            cfg = config_module.load_config()
+            assert cfg.agent_core_tls_mode == effective
+            assert cfg.agent_core_tokens == {"test-machine": "test-token"}
+            assert cfg.github_repos == ["example/main", "example/drivers"]
+            assert cfg.cos_secret_key == "TEST_FAKE_SECRET_KEY_AAAA"
+        finally:
+            generated.unlink()
+
+
 def test_missing_machines_file_rejected(tmp_path, offline_ca_pem):
     """Missing machines.yaml must cause deploy.sh validation to fail."""
     deploy_sh = _deploy_sh()

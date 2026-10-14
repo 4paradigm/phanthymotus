@@ -263,8 +263,8 @@ PY
 require_secrets() {
     [ -f "$SECRETS_FILE" ] && [ ! -L "$SECRETS_FILE" ] || die "COS secrets file must be a regular file: $SECRETS_FILE"
     [ -r "$SECRETS_FILE" ] || die "COS secrets file not readable: $SECRETS_FILE"
-    python3 - "$SECRETS_FILE" <<'PY'
-import sys, yaml, re, ssl
+    AGENT_CORE_TLS_MODE="${AGENT_CORE_TLS_MODE-strict}" python3 - "$SECRETS_FILE" <<'PY'
+import sys, yaml, re, ssl, ipaddress, os
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -339,29 +339,57 @@ if not re.fullmatch(r"[1-9][0-9]*", aid):
 if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?", al):
     raise SystemExit("review_comment_trust.author_login must be a valid GitHub login")
 
-# ── Mandatory per-machine Agent Core CA PEM ──────────────────────────
+# ── Agent Core TLS migration policy and per-machine credentials ──────
+mode = os.environ.get("AGENT_CORE_TLS_MODE", "strict")
+if mode not in ("legacy", "strict"):
+    raise SystemExit("AGENT_CORE_TLS_MODE must be legacy or strict")
+print(f"TLS_MODE={mode}", flush=True)
+if mode == "legacy":
+    print("LEGACY_TLS_UNVERIFIED=YES TLS_CERT_VERIFIED=NO", flush=True)
 machines_path = path.with_name("machines.yaml")
 try:
     with machines_path.open("r", encoding="utf-8") as fh:
         machine_data = yaml.safe_load(fh)
 except (OSError, yaml.YAMLError):
-    raise SystemExit("cannot read machines.yaml while validating Agent Core CAs")
+    raise SystemExit("cannot read machines.yaml while validating Agent Core endpoints")
 machines = machine_data.get("machines") if isinstance(machine_data, dict) else None
 if not isinstance(machines, dict) or not machines:
-    raise SystemExit("cannot validate Agent Core CAs without a non-empty machines mapping")
+    raise SystemExit("cannot validate Agent Core endpoints without a non-empty machines mapping")
 
-ca_pem = data.get("agent_core_ca_pem")
+for alias, machine in machines.items():
+    if not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", alias):
+        raise SystemExit("machines.yaml contains an invalid machine alias")
+    if not isinstance(machine, dict):
+        raise SystemExit(f"machine {alias!r} must be a mapping")
+    token = tokens.get(alias)
+    if not isinstance(token, str) or not token.strip():
+        raise SystemExit(f"Agent Core token required for machine {alias!r}")
+    host = machine.get("node_host")
+    try:
+        if not isinstance(host, str) or str(ipaddress.IPv4Address(host)) != host:
+            raise ValueError("non-canonical IPv4")
+    except ValueError:
+        raise SystemExit(f"Agent Core endpoint requires a literal IPv4 node_host for {alias!r}")
+    if mode == "legacy" and not any(ipaddress.IPv4Address(host) in ipaddress.IPv4Network(net)
+                                    for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
+        raise SystemExit(f"legacy TLS requires an RFC1918 IPv4 node_host for {alias!r}")
+    # Runtime uses https://<validated node_host>:15678; no endpoint override.
+
+ca_pem = data.get("agent_core_ca_pem", {})
 if not isinstance(ca_pem, dict):
-    raise SystemExit("CA_NOT_PROVISIONED: agent_core_ca_pem must explicitly cover every machine")
+    raise SystemExit("agent_core_ca_pem must be a mapping")
 machine_aliases = set(machines)
 ca_aliases = set(ca_pem)
-if ca_aliases != machine_aliases:
+if mode == "strict" and ca_aliases != machine_aliases:
     missing = [alias for alias in machines if alias not in ca_aliases]
     if missing:
         # Do not include secret values in diagnostics.
         raise SystemExit("CA_NOT_PROVISIONED: missing CA for machine alias(es): " + ", ".join(missing))
     raise SystemExit("agent_core_ca_pem aliases must exactly match machines.yaml aliases (unexpected alias)")
-for alias in machines:
+if ca_aliases - machine_aliases:
+    raise SystemExit("agent_core_ca_pem contains an unexpected machine alias")
+# Legacy permits an absent CA map, but supplied PEMs must still be valid.
+for alias in ca_pem:
     pem = ca_pem.get(alias)
     if not isinstance(alias, str) or not alias.strip():
         raise SystemExit("machines.yaml contains an invalid machine alias for CA provisioning")
@@ -391,10 +419,16 @@ require_runtime_inputs() {
 build_env_file() {
     local tmp
     require_github_repos
+    local tls_mode="${AGENT_CORE_TLS_MODE-strict}"
+    case "$tls_mode" in
+        legacy|strict) ;;
+        *) die "AGENT_CORE_TLS_MODE must be legacy or strict" ;;
+    esac
     tmp="$(mktemp)"
     chmod 600 "$tmp"
     {        printf 'DEPLOY_APPROVAL_RUNTIME_UID=%s\n' "$RUNTIME_UID"
         printf 'DEPLOY_APPROVAL_RUNTIME_GID=%s\n' "$RUNTIME_GID"
+        printf 'AGENT_CORE_TLS_MODE=%s\n' "$tls_mode"
         for key in GITHUB_REPOS POLL_ENABLED POLL_INTERVAL_SECONDS WEBHOOK_ENABLED GITHUB_WEBHOOK_SECRET DEPLOY_APPROVAL_BIND_IP; do
             value="${!key:-}"
             if [ -n "$value" ]; then

@@ -126,7 +126,10 @@ class Config:
         repr=False,
     )
 
-    # Per-machine CA PEM trust anchors keyed by machine alias
+    # Explicit deployment environment opt-in; strict never downgrades.
+    agent_core_tls_mode: str = "strict"
+
+    # Per-machine CA PEM trust anchors keyed by machine alias (strict mode)
     agent_core_ca_pem: dict[str, str] = field(
         default_factory=dict,
         repr=False,
@@ -224,6 +227,12 @@ def _load_yaml_mapping(path: str) -> dict:
     return data
 
 
+def validate_agent_core_tls_mode(value: str) -> str:
+    if not isinstance(value, str) or value not in ("legacy", "strict"):
+        raise ValueError("AGENT_CORE_TLS_MODE must be legacy or strict")
+    return value
+
+
 def _load_ca_pem_config(secrets: dict) -> dict[str, str]:
     """Load per-machine CA PEM trust anchors from secrets config."""
     ca_pem = secrets.get("agent_core_ca_pem", {})
@@ -289,7 +298,7 @@ def _load_secrets_config(path: str) -> dict:
         if not isinstance(value, str):
             raise ValueError(f"secrets.yaml review_comment_trust.{key} must be a string")
         result["review_comment_trust"][key] = value
-    # Agent Core CA PEM trust anchors
+    # Supplied CA material remains validated in either mode.
     result["agent_core_ca_pem"] = _load_ca_pem_config(data)
     # Agent Core tokens
     act = data.get("agent_core_tokens")
@@ -337,6 +346,7 @@ def load_config() -> Config:
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
+        agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),
         agent_core_ca_pem=secrets.get("agent_core_ca_pem", {}),
     )
     validate_config(cfg)
@@ -386,6 +396,7 @@ def validate_config(cfg: Config) -> None:
         val = getattr(cfg, name)
         if not isinstance(val, str):
             raise ValueError(f"{name} must be a string")
+    validate_agent_core_tls_mode(cfg.agent_core_tls_mode)
     # Validate agent_core_tokens
     act = cfg.agent_core_tokens
     if not isinstance(act, Mapping):
