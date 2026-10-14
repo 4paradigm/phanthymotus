@@ -24,7 +24,7 @@ function drop(tool, save = true) {
 }
 
 const direction = { name: 'sound_direction', type: 'sensor',
-  topic_out: [{ format: 'sensor/sound-direction-v1', topic: '/ubuntu/sound_direction' }] };
+  topic_out: [{ format: 'sensor/sound-direction', topic: '/ubuntu/sound_direction' }] };
 
 test('dropping a direction sensor starts it without starting the project', () => {
   const calls = drop(direction);

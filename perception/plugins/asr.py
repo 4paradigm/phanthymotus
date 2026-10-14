@@ -593,7 +593,7 @@ def _resolve_asr_inputs(args: dict) -> tuple[str, str]:
     bindings = args.get("input_bindings") or []
     if bindings:
         by_format = {item.get("format"): item.get("topic", "") for item in bindings}
-        return by_format.get(AUDIO_FORMAT, ""), by_format.get("sensor/sound-direction-v1", "")
+        return by_format.get(AUDIO_FORMAT, ""), by_format.get("sensor/sound-direction", "")
     topics = args.get("input_topics") or []
     if len(topics) > 1:
         log.warning("[asr] multiple input_topics without format bindings; assuming audio then direction")
@@ -602,7 +602,7 @@ def _resolve_asr_inputs(args: dict) -> tuple[str, str]:
 
 def _asr_topics_in(audio_topic: str = "", direction_topic: str = "") -> list[dict]:
     return [{"topic": audio_topic, "format": AUDIO_FORMAT, "desc": "mic audio input"},
-            {"topic": direction_topic, "format": "sensor/sound-direction-v1",
+            {"topic": direction_topic, "format": "sensor/sound-direction",
              "desc": "sound direction input"}]
 
 
@@ -693,7 +693,7 @@ TOOLS = [
             "required": []
         },
         "topic_in":  [{"format": AUDIO_FORMAT, "desc": "mic audio input"},
-                      {"format": "sensor/sound-direction-v1", "desc": "sound direction input"}],
+                      {"format": "sensor/sound-direction", "desc": "sound direction input"}],
         # 两条输出。第二条是未触发唤醒词的话语，带 priority 0 —— 它**不会自动流
         # 到 LLM**：agent-core 订阅的是画布上连进 decision_core 入口的 topic
         # （api/mcp_manage.py 的 all_topics 来自那次 start 调用的参数），不是这里

@@ -329,7 +329,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
   const fmtClass = _formatClass(format);
   const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
   const isJson = format === 'data/json' || format?.startsWith('text/')
-    || format === 'sensor/sound-direction-v1';
+    || format === 'sensor/sound-direction';
   const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
   const modeHtml = isJson
@@ -347,7 +347,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
         <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(_displayPath(topicPath))}</span>
       </div>
       ${modeHtml}
-      ${format === 'sensor/sound-direction-v1' ? ''
+      ${format === 'sensor/sound-direction' ? ''
         : `<span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>`}
     </div>
     <div class="monitor-card-body"></div>

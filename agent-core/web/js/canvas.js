@@ -896,7 +896,7 @@ function _addCard(data, save = true) {
   if (save) {
     _saveLayout();
     if (tool?.type === 'sensor' && tool.topic_out?.some(
-      port => port.format === 'sensor/sound-direction-v1')) {
+      port => port.format === 'sensor/sound-direction')) {
       _startDirectionSensor(mcpId, toolName, id);
     }
   }
@@ -1122,7 +1122,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     el.querySelector('.canvas-view-btn').addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (topicOut.some(port => port.format === 'sensor/sound-direction-v1')) {
+      if (topicOut.some(port => port.format === 'sensor/sound-direction')) {
         if (!(await _startDirectionSensor(mcpId, toolName, id))) return;
       }
       _openTopicDetailFor(el, mcpId, topicOut);

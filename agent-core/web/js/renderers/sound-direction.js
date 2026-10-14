@@ -16,7 +16,7 @@ export function directionDisplayData(message) {
 
 export const SoundDirectionRenderer = {
   name: 'sound-direction',
-  canRender: format => format === 'sensor/sound-direction-v1',
+  canRender: format => format === 'sensor/sound-direction',
   mode: 'log',
   mount(container) {
     this._renderer = Object.assign({}, this.mode === 'kv' ? KvLatestRenderer : TextRenderer);

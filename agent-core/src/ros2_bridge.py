@@ -143,7 +143,7 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
 
     def _on_msg(msg):
         try:
-            if fmt == 'sensor/sound-direction-v1':
+            if fmt == 'sensor/sound-direction':
                 data = json.dumps({key: getattr(msg, key) for key in (
                     'state', 'angle_deg', 'window_start_us', 'window_end_us',
                     'published_us')}).encode('utf-8')
@@ -219,7 +219,7 @@ def publish(topic: str, data: str) -> None:
 
 def _resolve_msg_type(fmt: str):
     """根据 data format 返回对应的 ROS2 消息类型，未知返回 None。"""
-    if fmt == 'sensor/sound-direction-v1':
+    if fmt == 'sensor/sound-direction':
         try:
             from audio_msgs.msg import SoundDirection
             return SoundDirection

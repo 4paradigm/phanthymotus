@@ -16,10 +16,10 @@ import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, inputBindingsOf, inp
 
 test('upgraded ASR keeps its audio topic and gains the direction input', () => {
   const saved = [{ topic: '/robot/mic/audio', format: 'audio/pcm-16k' }];
-  const declared = [{ format: 'audio/pcm-16k' }, { format: 'sensor/sound-direction-v1' }];
+  const declared = [{ format: 'audio/pcm-16k' }, { format: 'sensor/sound-direction' }];
   assert.deepEqual(mergeInputPorts(saved, declared), [
     { topic: '/robot/mic/audio', format: 'audio/pcm-16k' },
-    { format: 'sensor/sound-direction-v1' },
+    { format: 'sensor/sound-direction' },
   ]);
 });
 
@@ -37,16 +37,16 @@ const CONNS = [
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 test('direction and audio bindings retain their formats regardless of link order', () => {
-  const direction = { id: 'direction', topicOut: [{ topic: '/direction', format: 'sensor/sound-direction-v1' }] };
+  const direction = { id: 'direction', topicOut: [{ topic: '/direction', format: 'sensor/sound-direction' }] };
   const mic = { id: 'mic', topicOut: [{ topic: '/mic', format: 'audio/pcm-16k' }] };
-  const asr = { id: 'asr', topicIn: [{ format: 'audio/pcm-16k' }, { format: 'sensor/sound-direction-v1' }] };
+  const asr = { id: 'asr', topicIn: [{ format: 'audio/pcm-16k' }, { format: 'sensor/sound-direction' }] };
   const conns = [
     { fromCardId: 'direction', fromPortIdx: '0', toCardId: 'asr', toPortIdx: '1' },
     { fromCardId: 'mic', fromPortIdx: '0', toCardId: 'asr', toPortIdx: '0' },
   ];
   const bindings = inputBindingsOf(asr, [direction, mic, asr], conns);
   assert.deepEqual(bindings, [
-    { topic: '/direction', format: 'sensor/sound-direction-v1', port_index: 1 },
+    { topic: '/direction', format: 'sensor/sound-direction', port_index: 1 },
     { topic: '/mic', format: 'audio/pcm-16k', port_index: 0 },
   ]);
   assert.deepEqual(inputArgs(['/direction', '/mic'], bindings).input_bindings, bindings);

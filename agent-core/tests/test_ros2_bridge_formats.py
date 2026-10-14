@@ -63,7 +63,7 @@ def test_sound_direction_uses_structured_ros_message_and_delivers_json_bytes(mon
     audio.msg = audio_msg
     monkeypatch.setitem(sys.modules, "audio_msgs", audio)
     monkeypatch.setitem(sys.modules, "audio_msgs.msg", audio_msg)
-    assert ros2_bridge._resolve_msg_type("sensor/sound-direction-v1") is SoundDirection
+    assert ros2_bridge._resolve_msg_type("sensor/sound-direction") is SoundDirection
 
     callbacks = []
     received = []
@@ -81,14 +81,14 @@ def test_sound_direction_uses_structured_ros_message_and_delivers_json_bytes(mon
         received.append((json.loads(data), fmt, type(data)))
 
     ros2_bridge.subscribe("test-sound-direction", "/direction",
-                          "sensor/sound-direction-v1", None, receive)
+                          "sensor/sound-direction", None, receive)
     callbacks[0](SoundDirection())
     assert received == [({
         "state": 1, "angle_deg": -90.0,
         "window_start_us": 1700000000000000,
         "window_end_us": 1700000000020000,
         "published_us": 1700000000030000,
-    }, "sensor/sound-direction-v1", bytes)]
+    }, "sensor/sound-direction", bytes)]
 
     pending = []
 

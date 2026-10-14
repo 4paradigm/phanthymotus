@@ -186,7 +186,7 @@ def test_missing_input_or_untrusted_windows_never_use_last_angle():
 def test_input_bindings_identify_audio_and_direction_in_any_order():
     args = {"input_topic": "/direction", "input_topics": ["/direction", "/mic"],
             "input_bindings": [
-                {"topic": "/direction", "format": "sensor/sound-direction-v1", "port_index": 1},
+                {"topic": "/direction", "format": "sensor/sound-direction", "port_index": 1},
                 {"topic": "/mic", "format": "audio/pcm-16k", "port_index": 0}]}
     assert asr._resolve_asr_inputs(args) == ("/mic", "/direction")
     assert asr._resolve_asr_inputs({"input_topic": "/mic"}) == ("/mic", "")
@@ -355,7 +355,7 @@ def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):
     def start(direction):
         return plugin.dispatch('asr', {'action': 'start', 'instance_id': 'card-1',
             'input_bindings': [
-                {'topic': direction, 'format': 'sensor/sound-direction-v1', 'port_index': 1},
+                {'topic': direction, 'format': 'sensor/sound-direction', 'port_index': 1},
                 {'topic': '/mic', 'format': 'audio/pcm-16k', 'port_index': 0}]})
 
     assert start('/direction/old')['state'] == 'running'

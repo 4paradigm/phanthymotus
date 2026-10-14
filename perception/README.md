@@ -44,7 +44,7 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 
 ### Wake Direction Timing
 
-When ASR is connected to `sensor/sound-direction-v1`, `AudioChunk.header.stamp`
+When ASR is connected to `sensor/sound-direction`, `AudioChunk.header.stamp`
 must be the Unix capture time of the chunk's first sample. The direction
 message's `window_start_us` and `window_end_us` use the same clock in
 microseconds. ASR reports an unknown wake direction when the audio stamp is

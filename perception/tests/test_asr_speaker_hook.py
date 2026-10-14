@@ -451,7 +451,7 @@ def test_loading_without_an_input_topic_reports_none():
     info = plugin.dispatch("asr", {"action": "info"})
     assert info["topic_out"] == []
     assert [t["format"] for t in info["topic_in"]] == [
-        "audio/pcm-16k", "sensor/sound-direction-v1"]
+        "audio/pcm-16k", "sensor/sound-direction"]
 
 
 def test_every_info_return_carries_topic_out():
