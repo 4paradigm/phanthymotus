@@ -346,18 +346,39 @@ async def _heartbeat(model: str, url: str, t0: float, acc: _StreamAccumulator) -
 # 所以几种写法全带上：多出来的字段绝大多数网关直接忽略，而真有网关认了 400，
 # 下面 _create() 会按报错点名的字段逐个撤掉并记在这个 client 上，不让一次
 # 400 变成整次调用失败。
+#
+# 下面标的「实测」是 2026-10-14 在 Orin5 上对生产入口
+# router.phanthy.com + zhipu/glm-5.2 逐个字段单独发、同一个 prompt 各 5 次的
+# completion_tokens 中位数（2 = 只答数字，没思考；175 = 在想）：
+#
+#     不发任何字段                 175    3.09s
+#     chat_template_kwargs 单发      2    0.81s   ← 管用
+#     thinking.type 单发             2    0.71s   ← 管用
+#     enable_thinking 单发           2    0.88s   ← 管用
+#     thinking_budget 单发         207    3.66s   ← 这条线上无效
+#     reasoning.enabled 单发       197    2.81s   ← 这条线上无效
+#     reasoning_effort 单发          2    0.80s   ← 管用
+#     六个一起发                     3    0.72s
+#
+# 两点结论。一是「发了但没关掉」是真的：这个入口对 thinking_budget 和
+# reasoning.enabled 完全不响应，只发它们等于没发，而延迟差 4 倍。二是互不打架
+# ——六个一起发和最好的单发同档，没有哪个字段把别的顶掉。
+#
+# 无效的那两个仍然留着：它们是给别的供应商的（DashScope、OpenRouter），在这个
+# 入口只是被忽略，代价为零。别拿这张表当「哪些字段该删」的依据——它只测了一个
+# 入口一个模型，换一条线结论就不一样，这正是要全发的原因。
 THINKING_OFF_EXTRA = {
-    # vLLM / SGLang 托管的 Qwen3、GLM 系列（经 chat template 透传）
+    # vLLM / SGLang 托管的 Qwen3、GLM 系列（经 chat template 透传）。实测管用
     "chat_template_kwargs": {"enable_thinking": False},
-    # 智谱 GLM-4.5/4.6 的 OpenAI 接口、Anthropic 兼容网关
+    # 智谱 GLM-4.5/4.6 的 OpenAI 接口、Anthropic 兼容网关。实测管用
     "thinking": {"type": "disabled"},
-    # DashScope 及部分自建网关放在顶层的同名开关
+    # DashScope 及部分自建网关放在顶层的同名开关。实测管用
     "enable_thinking": False,
-    # budget 形式：0 等价于不思考
+    # budget 形式：0 等价于不思考。实测对 router.phanthy.com 无效，留给别的线
     "thinking_budget": 0,
-    # OpenRouter
+    # OpenRouter。同上，实测对 router.phanthy.com 无效
     "reasoning": {"enabled": False},
-    # OpenAI 风格的 reasoning_effort，部分网关用它关
+    # OpenAI 风格的 reasoning_effort，部分网关用它关。实测管用
     "reasoning_effort": "none",
 }
 
