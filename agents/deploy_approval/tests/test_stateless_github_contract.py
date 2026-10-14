@@ -443,6 +443,30 @@ def test_unrelated_machine_hidden(controller, policy):
     assert "unrelated" not in aliases
 
 
+def test_target_superset_does_not_add_or_misroute_pr_components(controller, policy):
+    """Declared target supersets only admit explicitly requested compatible components."""
+    from dataclasses import replace
+
+    policy.machines["test-machine"] = replace(
+        policy.machines["test-machine"],
+        targets=["core", "perception", "actucore", "driver"],
+        variants=["5.11"],
+    )
+    requested = [
+        _component(component_id="p511", target="perception", variant="5.11"),
+        _component(component_id="p61", target="perception", variant="6.1"),
+        _component(component_id="a511", target="actucore", variant="5.11"),
+        _component(component_id="core", target="core", variant=""),
+    ]
+
+    selected = controller._get_component_ids_for_machine("test-machine", requested)
+    groups = controller._get_machine_groups_for_components(requested)
+    machine_group = next(g for g in groups if g["alias"] == "test-machine")
+    assert selected == ["p511", "a511", "core"]
+    assert machine_group["component_ids"] == ["p511", "a511", "core"]
+    assert set(machine_group["component_ids"]) <= {c["component_id"] for c in requested}
+
+
 @pytest.mark.asyncio
 async def test_request_deploy_zero_registry_dependency(controller, proxy, mock_github):
     """A. /request_deploy uses exact Review Agent tag, ZERO registry calls.

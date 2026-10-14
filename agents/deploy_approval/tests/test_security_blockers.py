@@ -5,6 +5,7 @@ Fail-closed, legacy commands unknown, per-machine owners, no duplicate POST.
 from __future__ import annotations
 
 import asyncio
+import httpx
 import pytest
 import yaml
 
@@ -144,16 +145,21 @@ def test_deploy_sh_no_raw_compose_restart():
 class TestAgentCoreClientSecurity:
     """AgentCoreClient constructor defense-in-depth."""
 
-    def test_configured_private_agent_core_node_allowed_with_private_http_disabled(self, config):
+    def test_configured_private_agent_core_node_allowed_with_private_http_disabled(self, config, offline_ca_pem):
         """A node with a configured 10.x IP can be used even when allow_private_http is False."""
         config.allow_private_http = False
+        config.agent_core_ca_pem = {"test-machine": offline_ca_pem}
         client = AgentCoreClient(
             config,
             base_url="https://10.0.0.1:15678",
             node_host="10.0.0.1",
-)
-        assert client.base_url == "https://10.0.0.1:15678"
-        assert client.node_host == "10.0.0.1"
+            machine_alias="test-machine",
+        )
+        try:
+            assert client.base_url == "https://10.0.0.1:15678"
+            assert client.node_host == "10.0.0.1"
+        finally:
+            asyncio.run(client.aclose())
 
     def test_unconfigured_private_agent_core_node_rejected(self, config):
         """A private IP not matching the machine's node_host is rejected by the constructor."""
@@ -209,46 +215,64 @@ class TestAgentCoreClientSecurity:
                 node_host="10.0.0.1",
 )
 
-    def test_agent_core_bearer_token_is_sent(self, config):
-        """Per-machine token is used via config parameter, not ACCESS_TOKEN env."""
-        client = AgentCoreClient(
-            config,
-            base_url="https://10.0.0.1:15678",
-            node_host="10.0.0.1",
-            access_token="secret-token-123",
-        )
-        headers = client._headers()
-        assert headers.get("Authorization") == "Bearer secret-token-123"
-    def test_agent_core_token_never_persisted_or_rendered(self, config):
-            """The token is read from env at call time and never stored on the instance."""
-        # Per-machine token passed as parameter, not from env.
+    @pytest.mark.asyncio
+    async def test_agent_core_bearer_token_is_sent(self, config):
+        """Offline HTTP header verification with MockTransport; not TLS acceptance."""
+        config.agent_core_tokens = {"test-machine": "secret-token-123"}
+        seen = []
+
+        def handle(request):
+            seen.append(request)
+            return httpx.Response(200, json={"valid": True, "auth_required": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle), trust_env=False) as http:
             client = AgentCoreClient(
-                    config,
-                    base_url="https://10.0.0.1:15678",
-                    node_host="10.0.0.1",
-                    access_token="my-secret-token",
-    )
-            # The token is not stored directly on the instance
-            assert not hasattr(client, "token_value")
-            # The env var is not exposed in __dict__
-            inst_repr = repr(client)
-            assert "my-secret" not in inst_repr
-            # The token is only produced by _headers() at call time
-            headers = client._headers()
-            assert headers["Authorization"] == "Bearer my-secret-token"
+                config, base_url="https://10.0.0.1:15678", node_host="10.0.0.1",
+                machine_alias="test-machine",
+                access_token=config.agent_core_tokens["test-machine"], http=http,
+            )
+            assert await client.verify() == {"valid": True, "auth_required": True}
+            assert len(seen) == 1
+            assert seen[0].method == "GET"
+            assert seen[0].url.path == "/api/auth/verify"
+            assert seen[0].headers["Authorization"] == "Bearer secret-token-123"
+            await client.aclose()
 
-    def test_agent_core_verify_invalid_token_fails_closed(self, config):
-        """verify() raises AgentCoreError when the token is invalid (401)."""
+    def test_agent_core_token_never_persisted_or_rendered(self, config, offline_ca_pem):
+        """Client and config representations do not render the synthetic credential."""
+        config.agent_core_tokens = {"test-machine": "my-secret-token"}
+        config.agent_core_ca_pem = {"test-machine": offline_ca_pem}
         client = AgentCoreClient(
-            config,
-            base_url="https://10.0.0.1:15678",
-            node_host="10.0.0.1",
-)
-        # Replace verify with a mock that raises a SecurityError
-        async def _mock_verify():
-            from agents.deploy_approval.clients_common import SecurityError
-            raise SecurityError("unexpected status 401")
-        client.verify = _mock_verify
+            config, base_url="https://10.0.0.1:15678", node_host="10.0.0.1",
+            machine_alias="test-machine",
+            access_token=config.agent_core_tokens["test-machine"],
+        )
+        try:
+            assert not hasattr(client, "token_value")
+            assert "my-secret-token" not in repr(client)
+            assert "my-secret-token" not in repr(config)
+            assert client._headers()["Authorization"] == "Bearer my-secret-token"
+        finally:
+            asyncio.run(client.aclose())
 
-        with pytest.raises((AgentCoreError, Exception), match="401|unauthorized|unexpected status"):
-            asyncio.run(client.verify())
+    @pytest.mark.asyncio
+    async def test_agent_core_verify_invalid_token_fails_closed(self, config):
+        """Real verify() rejects offline HTTP 401; MockTransport does not test TLS."""
+        seen = []
+
+        def handle(request):
+            seen.append(request)
+            return httpx.Response(401, json={"valid": False, "auth_required": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle), trust_env=False) as http:
+            client = AgentCoreClient(
+                config, base_url="https://10.0.0.1:15678", node_host="10.0.0.1",
+                machine_alias="test-machine", access_token="invalid-test-token", http=http,
+            )
+            with pytest.raises(AgentCoreError, match="agent-core auth verify: unexpected status 401"):
+                await client.verify()
+            assert len(seen) == 1
+            assert seen[0].method == "GET"
+            assert seen[0].url.path == "/api/auth/verify"
+            assert seen[0].headers["Authorization"] == "Bearer invalid-test-token"
+            await client.aclose()

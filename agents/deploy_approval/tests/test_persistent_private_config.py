@@ -37,8 +37,8 @@ def _deploy_sh():
     return DEPLOY_SH_PATH.read_text(encoding="utf-8")
 
 
-def _secrets_yaml(**overrides):
-    """Return a minimal valid secrets.yaml with optional overrides."""
+def _secrets_yaml(ca_pem, **overrides):
+    """Return offline secrets with a test CA for each explicit token alias."""
     base = {
         "version": 1,
         "cos": {
@@ -56,6 +56,9 @@ def _secrets_yaml(**overrides):
         },
     }
     base.update(overrides)
+    base.setdefault("agent_core_ca_pem", {
+        alias: ca_pem for alias in base["agent_core_tokens"]
+    })
     return yaml.dump(base, default_flow_style=False)
 
 
@@ -176,13 +179,13 @@ def _extract_bodies(deploy_sh_text):
     return m1.group(1), m2.group(1)
 
 
-def test_missing_machines_file_rejected(tmp_path):
+def test_missing_machines_file_rejected(tmp_path, offline_ca_pem):
     """Missing machines.yaml must cause deploy.sh validation to fail."""
     deploy_sh = _deploy_sh()
     secrets_body, machine_body = _extract_bodies(deploy_sh)
 
     ok_secrets = tmp_path / "secrets.yaml"
-    ok_secrets.write_text(_secrets_yaml())
+    ok_secrets.write_text(_secrets_yaml(offline_ca_pem))
 
     wrapper = tmp_path / "test_missing.sh"
     wrapper.write_text(
@@ -196,14 +199,17 @@ def test_missing_machines_file_rejected(tmp_path):
         + secrets_body + "\n}\n"
         "require_machine_policy() {\n"
         + machine_body + "\n}\n"
-        "require_secrets\n"
         "require_machine_policy\n"
+        "require_secrets\n"
     )
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
     assert r.returncode != 0
     combined = (r.stdout + r.stderr).lower()
-    assert "missing" in combined or "not a regular file" in combined
+    expected = f"machine policy file must be a regular file: {tmp_path / 'nonexistent.yaml'}"
+    assert expected.lower() in combined
+    assert "ca_not_provisioned" not in combined
+    assert "SECRETS_OK" not in r.stdout
 
 
 def test_missing_secrets_file_rejected(tmp_path):
@@ -226,8 +232,8 @@ def test_missing_secrets_file_rejected(tmp_path):
         + secrets_body + "\n}\n"
         "require_machine_policy() {\n"
         + machine_body + "\n}\n"
-        "require_secrets\n"
         "require_machine_policy\n"
+        "require_secrets\n"
     )
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
@@ -238,7 +244,7 @@ def test_missing_secrets_file_rejected(tmp_path):
 
 # ── 4. Permission-denied rejection ──────────────────────────────────────
 
-def test_unreadable_file_rejected(tmp_path):
+def test_unreadable_file_rejected(tmp_path, offline_ca_pem):
     """Unreadable machines.yaml must be rejected."""
     deploy_sh = _deploy_sh()
     secrets_body, machine_body = _extract_bodies(deploy_sh)
@@ -248,7 +254,7 @@ def test_unreadable_file_rejected(tmp_path):
     bad.chmod(0o000)
 
     ok_secrets = tmp_path / "secrets.yaml"
-    ok_secrets.write_text(_secrets_yaml())
+    ok_secrets.write_text(_secrets_yaml(offline_ca_pem))
 
     wrapper = tmp_path / "test_perm.sh"
     wrapper.write_text(
@@ -262,8 +268,8 @@ def test_unreadable_file_rejected(tmp_path):
         + secrets_body + "\n}\n"
         "require_machine_policy() {\n"
         + machine_body + "\n}\n"
-        "require_secrets\n"
         "require_machine_policy\n"
+        "require_secrets\n"
     )
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
@@ -273,7 +279,7 @@ def test_unreadable_file_rejected(tmp_path):
 
 # ── 5. Placeholder value rejection ─────────────────────────────────────
 
-def test_placeholder_in_machines_node_id_rejected(tmp_path):
+def test_placeholder_in_machines_node_id_rejected(tmp_path, offline_ca_pem):
     """machines.yaml with <placeholder> in node_id must be rejected."""
     deploy_sh = _deploy_sh()
     secrets_body, machine_body = _extract_bodies(deploy_sh)
@@ -292,7 +298,7 @@ def test_placeholder_in_machines_node_id_rejected(tmp_path):
         "    driver_paths: []\n"
     )
     ok_secrets = tmp_path / "secrets.yaml"
-    ok_secrets.write_text(_secrets_yaml())
+    ok_secrets.write_text(_secrets_yaml(offline_ca_pem))
 
     wrapper = tmp_path / "test_placeholder.sh"
     wrapper.write_text(
@@ -306,13 +312,16 @@ def test_placeholder_in_machines_node_id_rejected(tmp_path):
         + secrets_body + "\n}\n"
         "require_machine_policy() {\n"
         + machine_body + "\n}\n"
-        "require_secrets\n"
         "require_machine_policy\n"
+        "require_secrets\n"
     )
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
     assert r.returncode != 0
-    assert "placeholder" in (r.stdout + r.stderr).lower()
+    combined = (r.stdout + r.stderr).lower()
+    assert "field 'node_id' contains an unreplaced placeholder" in combined
+    assert "ca_not_provisioned" not in combined
+    assert "SECRETS_OK" not in r.stdout
 
 
 def test_placeholder_in_secrets_secret_id_rejected(tmp_path):
@@ -350,8 +359,8 @@ def test_placeholder_in_secrets_secret_id_rejected(tmp_path):
         + secrets_body + "\n}\n"
         "require_machine_policy() {\n"
         + machine_body + "\n}\n"
-        "require_secrets\n"
         "require_machine_policy\n"
+        "require_secrets\n"
     )
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
@@ -540,7 +549,7 @@ def test_preflight_matches_compose_mount_paths():
 
 # ── 11. Symlink rejection ──────────────────────────────────────────────
 
-def test_symlink_machines_yaml_rejected(tmp_path):
+def test_symlink_machines_yaml_rejected(tmp_path, offline_ca_pem):
     """machines.yaml as symlink must be rejected."""
     deploy_sh = _deploy_sh()
     secrets_body, machine_body = _extract_bodies(deploy_sh)
@@ -551,7 +560,7 @@ def test_symlink_machines_yaml_rejected(tmp_path):
     link.symlink_to(real_file)
 
     ok_secrets = tmp_path / "secrets.yaml"
-    ok_secrets.write_text(_secrets_yaml())
+    ok_secrets.write_text(_secrets_yaml(offline_ca_pem))
 
     wrapper = tmp_path / "test_symlink.sh"
     wrapper.write_text(
@@ -565,13 +574,17 @@ def test_symlink_machines_yaml_rejected(tmp_path):
         + secrets_body + "\n}\n"
         "require_machine_policy() {\n"
         + machine_body + "\n}\n"
-        "require_secrets\n"
         "require_machine_policy\n"
+        "require_secrets\n"
     )
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
     assert r.returncode != 0
-    assert "symlink" in (r.stdout + r.stderr).lower()
+    assert link.is_symlink() and link.is_file()
+    combined = r.stdout + r.stderr
+    assert f"Machine policy file must be a regular file: {link}" in combined
+    assert "CA_NOT_PROVISIONED" not in combined
+    assert "SECRETS_OK" not in r.stdout
 
 
 # ── 12. New release SHA preservation ───────────────────────────────────
@@ -593,7 +606,7 @@ def test_config_paths_survive_release_directory_change():
 
 # ── 13. Different config directories ──────────────────────────────────
 
-def test_two_different_config_directories(tmp_path):
+def test_two_different_config_directories(tmp_path, offline_ca_pem):
     """Two different config directories can each hold valid independent YAML."""
     deploy_sh = _deploy_sh()
     secrets_body, machine_body = _extract_bodies(deploy_sh)
@@ -601,7 +614,7 @@ def test_two_different_config_directories(tmp_path):
     dir1 = tmp_path / "config_dir_1"
     dir1.mkdir()
     (dir1 / "machines.yaml").write_text(_machines_yaml())
-    (dir1 / "secrets.yaml").write_text(_secrets_yaml())
+    (dir1 / "secrets.yaml").write_text(_secrets_yaml(offline_ca_pem))
 
     dir2 = tmp_path / "config_dir_2"
     dir2.mkdir()
@@ -614,7 +627,7 @@ def test_two_different_config_directories(tmp_path):
         }})
     )
     (dir2 / "secrets.yaml").write_text(
-        _secrets_yaml(cos={
+        _secrets_yaml(offline_ca_pem, agent_core_tokens={"other-machine": "other-test-token"}, cos={
             "region": "ap-guangzhou",
             "bucket": "otherbucket456",
             "secret_id": "TEST_FAKE_SECRET_ID_BBBB",
@@ -632,7 +645,7 @@ def test_two_different_config_directories(tmp_path):
         'die() { echo "ERROR: $*" >&2; exit 1; }\n'
         "require_secrets() {\n" + secrets_body + "\n}\n"
         "require_machine_policy() {\n" + machine_body + "\n}\n"
-        "require_secrets\nrequire_machine_policy\n"
+        "require_machine_policy\nrequire_secrets\n"
     )
     wrapper1.chmod(0o755)
     r1 = subprocess.run(["bash", str(wrapper1)], capture_output=True, text=True)
@@ -648,7 +661,7 @@ def test_two_different_config_directories(tmp_path):
         'die() { echo "ERROR: $*" >&2; exit 1; }\n'
         "require_secrets() {\n" + secrets_body + "\n}\n"
         "require_machine_policy() {\n" + machine_body + "\n}\n"
-        "require_secrets\nrequire_machine_policy\n"
+        "require_machine_policy\nrequire_secrets\n"
     )
     wrapper2.chmod(0o755)
     r2 = subprocess.run(["bash", str(wrapper2)], capture_output=True, text=True)
@@ -699,14 +712,14 @@ def test_preflight_missing_env_var(tmp_path):
 
 # ── 15. Relative path rejects ────────────────────────────────────────
 
-def test_relative_config_dir_rejected_in_preflight(tmp_path):
+def test_relative_config_dir_rejected_in_preflight(tmp_path, offline_ca_pem):
     """preflight must reject relative DEPLOY_APPROVAL_CONFIG_DIR even if the directory exists."""
     # Create a real relative directory
     rel_dir = tmp_path / "relative_config"
     rel_dir.mkdir()
     (rel_dir / "machines.yaml").write_text(_machines_yaml())
     (rel_dir / "machines.yaml").chmod(0o600)
-    (rel_dir / "secrets.yaml").write_text(_secrets_yaml())
+    (rel_dir / "secrets.yaml").write_text(_secrets_yaml(offline_ca_pem))
     (rel_dir / "secrets.yaml").chmod(0o600)
 
     # Use a relative path (relative to tmp_path)
@@ -784,7 +797,7 @@ def test_preflight_failure_zero_docker_modifications(tmp_path):
 
 # ── 18. Dev/test/prod config isolation ───────────────────────────────
 
-def test_config_isolation_between_environments(tmp_path):
+def test_config_isolation_between_environments(tmp_path, offline_ca_pem):
     """Dev, test, and prod configs are independent and don't leak."""
     dev_dir = tmp_path / "dev"
     dev_dir.mkdir()
@@ -797,7 +810,8 @@ def test_config_isolation_between_environments(tmp_path):
         }})
     )
     (dev_dir / "secrets.yaml").write_text(
-        _secrets_yaml(cos={"region": "ap-beijing", "bucket": "dev-bucket-123",
+        _secrets_yaml(offline_ca_pem, agent_core_tokens={"dev-machine": "dev-test-token"},
+                      cos={"region": "ap-beijing", "bucket": "dev-bucket-123",
                            "secret_id": "TEST_FAKE_SECRET_ID_CCCC", "secret_key": "TEST_FAKE_SECRET_KEY_CCCC"})
     )
 
@@ -812,7 +826,8 @@ def test_config_isolation_between_environments(tmp_path):
         }})
     )
     (prod_dir / "secrets.yaml").write_text(
-        _secrets_yaml(cos={"region": "ap-shanghai", "bucket": "prod-bucket-456",
+        _secrets_yaml(offline_ca_pem, agent_core_tokens={"prod-machine": "prod-test-token"},
+                      cos={"region": "ap-shanghai", "bucket": "prod-bucket-456",
                            "secret_id": "TEST_FAKE_SECRET_ID_DDDD", "secret_key": "TEST_FAKE_SECRET_KEY_DDDD"})
     )
 
@@ -830,7 +845,7 @@ def test_config_isolation_between_environments(tmp_path):
             'die() { echo "ERROR: $*" >&2; exit 1; }\n'
             "require_secrets() {\n" + secrets_body + "\n}\n"
             "require_machine_policy() {\n" + machine_body + "\n}\n"
-            "require_secrets\nrequire_machine_policy\n"
+            "require_machine_policy\nrequire_secrets\n"
         )
         wrapper.chmod(0o755)
         r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
@@ -839,7 +854,7 @@ def test_config_isolation_between_environments(tmp_path):
 
 # ── 19. GitHub App key no leak ───────────────────────────────────────
 
-def test_github_app_key_not_leaked_in_preflight_output(tmp_path):
+def test_github_app_key_not_leaked_in_preflight_output(tmp_path, offline_ca_pem):
     """Preflight must not print GitHub App private key content."""
     wrapper = tmp_path / "test_key_leak.sh"
     key_file = tmp_path / "key.pem"
@@ -855,7 +870,7 @@ def test_github_app_key_not_leaked_in_preflight_output(tmp_path):
     dir_path.mkdir()
     (dir_path / "machines.yaml").write_text(_machines_yaml())
     (dir_path / "machines.yaml").chmod(0o600)
-    (dir_path / "secrets.yaml").write_text(_secrets_yaml())
+    (dir_path / "secrets.yaml").write_text(_secrets_yaml(offline_ca_pem))
     (dir_path / "secrets.yaml").chmod(0o600)
 
     wrapper.write_text(
@@ -871,13 +886,18 @@ def test_github_app_key_not_leaked_in_preflight_output(tmp_path):
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
     assert r.returncode == 0
-    # The actual key content should not appear in output
-    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw" not in (r.stdout + r.stderr)
+    assert "MACHINE_POLICY_OK" in r.stdout
+    assert "SECRETS_OK" in r.stdout
+    assert "Preflight PASSED" in r.stdout
+    # Neither part of the synthetic private-key payload may appear in output.
+    combined = r.stdout + r.stderr
+    assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw" not in combined
+    assert "fake-key-content-that-should-not-be-leaked" not in combined
 
 
 # ── 20. Agent Core Token no leak ─────────────────────────────────────
 
-def test_agent_core_token_not_leaked_in_output(tmp_path):
+def test_agent_core_token_not_leaked_in_output(tmp_path, offline_ca_pem):
     """Preflight and validation must not print Agent Core Token values."""
     dir_path = tmp_path / "config_token"
     dir_path.mkdir()
@@ -890,6 +910,7 @@ def test_agent_core_token_not_leaked_in_output(tmp_path):
     (dir_path / "machines.yaml").write_text(machines)
     (dir_path / "secrets.yaml").write_text(
         _secrets_yaml(
+            offline_ca_pem,
             cos={"region": "ap-beijing", "bucket": "tokentest123",
                  "secret_id": "TEST_FAKE_SECRET_ID_EEEE", "secret_key": "TEST_FAKE_SECRET_KEY_EEEE"},
             agent_core_tokens={"secret-machine": "SUPER-SECRET-TOKEN-VALUE-12345"},
@@ -897,7 +918,7 @@ def test_agent_core_token_not_leaked_in_output(tmp_path):
     )
 
     deploy_sh = _deploy_sh()
-    secrets_body, _ = _extract_bodies(deploy_sh)
+    secrets_body, machine_body = _extract_bodies(deploy_sh)
 
     wrapper = tmp_path / "test_token_leak.sh"
     wrapper.write_text(
@@ -907,13 +928,14 @@ def test_agent_core_token_not_leaked_in_output(tmp_path):
         'PERSISTENT_DIR="' + str(dir_path) + '"\n'
         'die() { echo "ERROR: $*" >&2; exit 1; }\n'
         "require_secrets() {\n" + secrets_body + "\n}\n"
-        "require_secrets\n"
+        "require_machine_policy() {\n" + machine_body + "\n}\n"
+        "require_machine_policy\nrequire_secrets\n"
     )
     wrapper.chmod(0o755)
     r = subprocess.run(["bash", str(wrapper)], capture_output=True, text=True)
     assert r.returncode == 0
     assert "SUPER-SECRET-TOKEN-VALUE-12345" not in (r.stdout + r.stderr)
-    # But SECRETS_OK should be present
+    assert "MACHINE_POLICY_OK" in r.stdout
     assert "SECRETS_OK" in r.stdout
 
 

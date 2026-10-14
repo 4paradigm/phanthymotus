@@ -245,7 +245,7 @@ require_secrets() {
     [ -f "$SECRETS_FILE" ] && [ ! -L "$SECRETS_FILE" ] || die "COS secrets file must be a regular file: $SECRETS_FILE"
     [ -r "$SECRETS_FILE" ] || die "COS secrets file not readable: $SECRETS_FILE"
     python3 - "$SECRETS_FILE" <<'PY'
-import sys, yaml, re
+import sys, yaml, re, ssl
 from pathlib import Path
 
 path = Path(sys.argv[1])
@@ -319,6 +319,42 @@ if aid != "7950763":
     raise SystemExit("review_comment_trust.author_id must be \"7950763\"")
 if al != "kentcyq":
     raise SystemExit("review_comment_trust.author_login must be \"kentcyq\"")
+
+# ── Mandatory per-machine Agent Core CA PEM ──────────────────────────
+machines_path = path.with_name("machines.yaml")
+try:
+    with machines_path.open("r", encoding="utf-8") as fh:
+        machine_data = yaml.safe_load(fh)
+except (OSError, yaml.YAMLError):
+    raise SystemExit("cannot read machines.yaml while validating Agent Core CAs")
+machines = machine_data.get("machines") if isinstance(machine_data, dict) else None
+if not isinstance(machines, dict) or not machines:
+    raise SystemExit("cannot validate Agent Core CAs without a non-empty machines mapping")
+
+ca_pem = data.get("agent_core_ca_pem")
+if not isinstance(ca_pem, dict):
+    raise SystemExit("CA_NOT_PROVISIONED: agent_core_ca_pem must explicitly cover every machine")
+machine_aliases = set(machines)
+ca_aliases = set(ca_pem)
+if ca_aliases != machine_aliases:
+    missing = [alias for alias in machines if alias not in ca_aliases]
+    if missing:
+        # Do not include secret values in diagnostics.
+        raise SystemExit("CA_NOT_PROVISIONED: missing CA for machine alias(es): " + ", ".join(missing))
+    raise SystemExit("agent_core_ca_pem aliases must exactly match machines.yaml aliases (unexpected alias)")
+for alias in machines:
+    pem = ca_pem.get(alias)
+    if not isinstance(alias, str) or not alias.strip():
+        raise SystemExit("machines.yaml contains an invalid machine alias for CA provisioning")
+    if not isinstance(pem, str) or not pem.strip():
+        raise SystemExit(f"CA_NOT_PROVISIONED: non-empty Agent Core CA required for machine {alias!r}")
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(cadata=pem)
+    except (ssl.SSLError, ValueError, TypeError):
+        raise SystemExit(f"invalid Agent Core CA certificate for machine {alias!r}")
+    if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
+        raise SystemExit(f"Agent Core CA verification must enforce certificate and hostname checks for {alias!r}")
 
 print("SECRETS_OK")
 PY

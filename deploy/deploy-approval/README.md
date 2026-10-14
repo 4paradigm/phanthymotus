@@ -150,9 +150,6 @@ export DEPLOY_APPROVAL_CONFIG_DIR="/path/to/your/config"
 Your machine configuration and COS secrets are preserved automatically because
 they live at the configured directory, not inside the Git repository.
 
-Your machine configuration and COS secrets are preserved automatically because
-they live at the configured directory, not inside the Git repository.
-
 ## Security
 
 - **No secrets in Git**: `machines.yaml` and `secrets.yaml` are in `.gitignore`.

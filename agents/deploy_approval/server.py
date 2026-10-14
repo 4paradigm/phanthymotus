@@ -22,6 +22,21 @@ from .policy import Policy
 from .router_webhook import router as webhook_router
 from .service import DeployController
 
+# Install logsafe before any logging to prevent control chars from corrupting container logs.
+# This must run before logging.basicConfig and uvicorn startup.
+try:
+    from agents.deploy_approval import logsafe
+except ImportError:
+    # logsafe.py is a required module for secure logging.
+    # Cannot start without it.
+    raise SystemExit(
+        "logsafe.py is required but not found in agents.deploy_approval. "
+        "Ensure logsafe.py is deployed alongside the server module."
+    )
+# Install logsafe before any logging to prevent control chars from corrupting container logs.
+# This must run before logging.basicConfig and uvicorn startup.
+logsafe.install()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

@@ -180,7 +180,12 @@ class ReviewBuild:
 
 @dataclass
 class ReviewCommentEvidence:
-    """Complete review evidence extracted from PR comments for one HEAD."""
+    """Review evidence for one HEAD; free-text code review needs human review.
+
+    Comment completeness is not a machine-readable code-quality approval.
+    The developer must review the findings before requesting deployment,
+    followed by the existing machine owner/collaborator approval gate.
+    """
     head_sha: str = ""
     commit_prefix: str = ""
     review_author_id: str = ""
@@ -199,6 +204,15 @@ class ReviewCommentEvidence:
     code_review_created_at: str = ""
     code_review_comment_updated_at: str = ""
     code_review_text: str = ""
+
+    @property
+    def test_results_block_deployment(self) -> bool:
+        """Structured failures cannot be waived by free-text review findings."""
+        return (
+            isinstance(self.test_failed, bool)
+            or not isinstance(self.test_failed, int)
+            or self.test_failed != 0
+        )
 
 
 # ------------------------------------------------------------------
@@ -518,7 +532,8 @@ def parse_code_review(
 ) -> str | None:
     """Parse Code Review comment body.
 
-    Returns the review text or None if not found/malformed.
+    Returns review text for manual inspection, not an approval verdict, or
+    None if not found/malformed. Free-text keywords never establish approval.
     """
     if not _has_marker(body) or CODE_REVIEW_HEADING not in body:
         return None

@@ -1431,20 +1431,8 @@ async def test_multi_machine_partial_coverage_is_variant_and_platform_generic(co
     assert controller._run_automated_case.call_count == 1
 
 
-@pytest.mark.asyncio
-async def test_case_fail_does_not_block_overall_manual_pass(controller, proxy, mock_github):
-    state = _state(status="testing", deployments=[{"machine": "test-machine", "component_ids": ["comp-001"], "phase": "deployed"}], case_results={"comp-001": "fail"})
-    proxy.read_hidden_state = AsyncMock(return_value=state)
-    proxy.write_hidden_state = AsyncMock()
-    proxy.project_status_label = AsyncMock()
-    mock_github.get_pr.return_value = {"state": "open", "merged": False, "head": {"sha": "a" * 40}}
-    mock_github.collaborator_permission = AsyncMock(return_value="admin")
-    cos_key = "phanthymotus_pr/phanthymotus/2026-10/2026-10-13/pr-1/evidence-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.log.gz"
-    controller._upload_evidence = AsyncMock(return_value={"object_key": cos_key, "sha256": "c" * 64, "size": 12})
-
-    await controller.handle_record_test("4paradigm/phanthymotus", 1, 501, "pass", "", "owner1", "")
-
-    assert proxy.write_hidden_state.call_args.args[3]["status"] == "succeeded"
+# Failed-case final acceptance coverage is consolidated in
+# test_pr314_case_regressions.test_record_test_pass_rejects_failed_case.
 
 
 @pytest.mark.asyncio

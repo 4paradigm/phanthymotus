@@ -6,6 +6,10 @@ machine ownership, Review Agent trust, Agent Core tokens, and COS secrets.
 
 Review Agent HTTP API is NOT a Deploy Approval dependency.
 Deploy Approval reads Review Agent output from GitHub PR comments.
+
+Per-machine Agent Core CA PEM trust anchors are strictly validated: keys must be
+non-empty machine-alias strings and values must be valid PEM certificate blobs.
+Invalid entries raise ValueError instead of being silently ignored.
 """
 
 from __future__ import annotations
@@ -101,6 +105,12 @@ class Config:
         repr=False,
     )
 
+    # Per-machine CA PEM trust anchors keyed by machine alias
+    agent_core_ca_pem: dict[str, str] = field(
+        default_factory=dict,
+        repr=False,
+    )
+
 
 def _env_int(name: str, default: int, *, min_val: int = 1, max_val: int | None = None) -> int:
     raw = os.getenv(name)
@@ -174,6 +184,32 @@ def _load_yaml_mapping(path: str) -> dict:
     return data
 
 
+def _load_ca_pem_config(secrets: dict) -> dict[str, str]:
+    """Load per-machine CA PEM trust anchors from secrets config."""
+    ca_pem = secrets.get("agent_core_ca_pem", {})
+    if not isinstance(ca_pem, dict):
+        raise ValueError("secrets.yaml agent_core_ca_pem must be a mapping")
+    result = {}
+    for alias, pem in ca_pem.items():
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError("agent_core_ca_pem machine aliases must be non-empty strings")
+        alias = alias.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", alias):
+            raise ValueError("agent_core_ca_pem contains an invalid machine alias")
+        if alias in result:
+            raise ValueError("agent_core_ca_pem contains duplicate normalized machine aliases")
+        if not isinstance(pem, str) or not pem.strip():
+            raise ValueError(f"agent_core_ca_pem for machine {alias!r} must be non-empty PEM")
+        try:
+            import ssl
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.load_verify_locations(cadata=pem.strip())
+        except (ssl.SSLError, ValueError, TypeError) as exc:
+            raise ValueError(f"agent_core_ca_pem for machine {alias!r} is invalid") from exc
+        result[alias] = pem.strip()
+    return result
+
+
 def _load_secrets_config(path: str) -> dict:
     data = _load_yaml_mapping(path)
     if not data:
@@ -213,6 +249,8 @@ def _load_secrets_config(path: str) -> dict:
         if not isinstance(value, str):
             raise ValueError(f"secrets.yaml review_comment_trust.{key} must be a string")
         result["review_comment_trust"][key] = value
+    # Agent Core CA PEM trust anchors
+    result["agent_core_ca_pem"] = _load_ca_pem_config(data)
     # Agent Core tokens
     act = data.get("agent_core_tokens")
     if act is not None:
@@ -258,6 +296,7 @@ def load_config() -> Config:
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
+        agent_core_ca_pem=secrets.get("agent_core_ca_pem", {}),
     )
     validate_config(cfg)
     return cfg
@@ -334,6 +373,14 @@ def validate_config(cfg: Config) -> None:
             raise ValueError("agent_core_tokens keys must be non-empty strings")
         if not isinstance(v, str) or not v.strip():
             raise ValueError("agent_core_tokens values must be non-empty strings")
+    ca_map = cfg.agent_core_ca_pem
+    if not isinstance(ca_map, Mapping):
+        raise ValueError("agent_core_ca_pem must be a mapping")
+    # Revalidate direct Config construction as well as secrets.yaml loading.
+    normalized_ca_map = _load_ca_pem_config({"agent_core_ca_pem": ca_map})
+    if len(normalized_ca_map) != len(ca_map):
+        raise ValueError("agent_core_ca_pem contains duplicate normalized machine aliases")
+    cfg.agent_core_ca_pem = normalized_ca_map
     # ── Production COS guard: reject invalid region, bucket, placeholders ──
     # This prevents the Controller from starting with obviously wrong or
     # unfilled-in COS configuration, even if someone bypasses deploy.sh.

@@ -5,8 +5,10 @@ the core ``POST /api/system/update`` adapter. No sockets, no SSH, no shell.
 The runtime credential is a per-machine Agent Core Bearer token from
 ``secrets.yaml``.
 
-TLS verification is disabled: the controller connects over HTTPS directly to
-each machine's Agent Core without certificate pinning.
+TLS verification is mandatory: the controller connects over HTTPS to each
+machine's Agent Core, verifying certificate identity via a per-machine CA PEM
+trust anchor from secrets.yaml. Every machine must have an explicit CA PEM
+configured; there is no system CA fallback.
 """
 
 from __future__ import annotations
@@ -79,6 +81,7 @@ class AgentCoreClient:
         base_url: str,
         *,
         node_host: str,
+        machine_alias: str = "",
         access_token: str = "",
         http: httpx.AsyncClient | None = None,
     ):
@@ -137,8 +140,28 @@ class AgentCoreClient:
             )
         self.base_url = base_url.rstrip("/")
         self.node_host = node_host
+        self._machine_alias = machine_alias
         self._owns_http = http is None
         if http is None:
+            import ssl
+
+            if not isinstance(machine_alias, str) or not machine_alias.strip():
+                raise AgentCoreError("machine_alias is required for Agent Core TLS")
+            ca_map = config.agent_core_ca_pem
+            ca_pem = ca_map.get(machine_alias) if isinstance(ca_map, dict) else None
+            if not isinstance(ca_pem, str) or not ca_pem.strip():
+                raise AgentCoreError(
+                    f"no valid agent_core_ca_pem configured for machine alias {machine_alias!r}"
+                )
+            try:
+                _ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                _ssl_ctx.load_verify_locations(cadata=ca_pem)
+            except (ssl.SSLError, ValueError, TypeError) as exc:
+                raise AgentCoreError(
+                    f"per-machine CA PEM for alias {machine_alias!r} is invalid"
+                ) from exc
+            if not _ssl_ctx.check_hostname or _ssl_ctx.verify_mode != ssl.CERT_REQUIRED:
+                raise AgentCoreError("per-machine CA SSL context does not enforce peer identity")
             self.http = httpx.AsyncClient(
                 timeout=httpx.Timeout(
                     config.total_timeout,
@@ -148,15 +171,19 @@ class AgentCoreClient:
                     pool=config.connect_timeout,
                 ),
                 follow_redirects=False,
-                verify=False,
+                verify=_ssl_ctx,
                 trust_env=False,
             )
+            self._ssl_ctx = _ssl_ctx
         else:
             self.http = http
+            self._ssl_ctx = None
 
     async def aclose(self) -> None:
         if self._owns_http:
             await self.http.aclose()
+        # Clear SSL context reference on close
+        self._ssl_ctx = None
 
     def _headers(self) -> dict:
         h = {}
@@ -548,7 +575,7 @@ class AgentCoreClient:
         """POST /api/system/update — trigger Agent Core self-update.
 
         Requires *exact* ``image`` (already validated by ``validate_image_ref``).
-        HTTP 200 => UPDATE_ACCEPTED, NOT deployed.
+        HTTP 2xx with an accepted business response => UPDATE_ACCEPTED, NOT deployed.
 
         Classification:
         * Validation / security errors BEFORE request is sent:
@@ -557,8 +584,8 @@ class AgentCoreClient:
           ``AgentCoreDeployOutcomeUncertain``
         * Response received but cannot safely prove update did NOT start:
          保守按 ``AgentCoreDeployOutcomeUncertain``
-        * Explicit application error (non-2xx, malformed envelope,
-          code!=0/200, data.status=="error"):
+        * Explicit application error (integer code!=0/200,
+          data.status in {"error", "failed"}, or non-empty string data.error):
           ``AgentCoreError``
 
         Never classify a possibly-executed self-update as "absolutely not run".
@@ -611,4 +638,12 @@ class AgentCoreClient:
                 f"agent-core update failed: code={code!r}, "
                 f"message={data.get('message')!r}"
             )
+        inner = data.get("data")
+        if isinstance(inner, dict):
+            error = inner.get("error")
+            if inner.get("status") in ("error", "failed") or (isinstance(error, str) and error):
+                # Explicit business failure is confirmed, unlike POST transport
+                # uncertainty. Never expose the server's potentially sensitive
+                # response details in the exception or controller logs.
+                raise AgentCoreError("agent-core update reported an explicit application failure")
         return data

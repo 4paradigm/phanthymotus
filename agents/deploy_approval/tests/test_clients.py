@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import ssl
 from unittest.mock import MagicMock
 
 import pytest
@@ -161,22 +162,29 @@ def test_agent_core_constructor_has_no_ca_file_parameter():
     assert "ca_file" not in sig.parameters
 
 
-def test_agent_core_self_created_client_disables_proxy_env(monkeypatch):
+def test_agent_core_self_created_client_disables_proxy_env(monkeypatch, offline_ca_pem):
     monkeypatch.setenv("HTTPS_PROXY", "http://bad proxy")
     client = AgentCoreClient(
-        _client(),
+        make_config(agent_core_ca_pem={"test-machine": offline_ca_pem}),
         base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1",
+        machine_alias="test-machine",
     )
-    assert client.http.trust_env is False
+    try:
+        assert client.http.trust_env is False
+        assert client._ssl_ctx.verify_mode == ssl.CERT_REQUIRED
+        assert client._ssl_ctx.check_hostname is True
+    finally:
+        asyncio.run(client.aclose())
 
 
-
-def test_agent_core_aclose_owns_only_self_created_http():
+def test_agent_core_aclose_owns_only_self_created_http(offline_ca_pem):
+    cfg = make_config(agent_core_ca_pem={"test-machine": offline_ca_pem})
     owned = AgentCoreClient(
-        _client(),
+        cfg,
         base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1",
+        machine_alias="test-machine",
     )
     asyncio.run(owned.aclose())
     asyncio.run(owned.aclose())
@@ -184,9 +192,10 @@ def test_agent_core_aclose_owns_only_self_created_http():
 
     external = httpx.AsyncClient(transport=_Transport({"code": 200, "data": {}}))
     injected = AgentCoreClient(
-        _client(),
+        cfg,
         base_url="https://192.0.2.1:15678",
         node_host="192.0.2.1",
+        machine_alias="test-machine",
         http=external,
     )
     asyncio.run(injected.aclose())
@@ -870,6 +879,58 @@ class TestValidateApiPathSegment:
             asyncio.run(c.deploy_driver("web", "registry/repo@sha256:" + "a" * 64))
         assert isinstance(excinfo.value, AgentCoreError)
         assert not isinstance(excinfo.value, AgentCoreDeployOutcomeUncertain)
+
+    @pytest.mark.asyncio
+    async def test_update_core_status_error_fails_closed(self, caplog, capsys):
+        """Offline Core response classification; MockTransport performs no deployment."""
+        import json
+
+        token = "offline-core-update-test-token"
+        response_detail = "offline-private-response-detail " + token
+        image = "registry.example/core:v12"
+        for code in (0, 200):
+            for inner, rejected in (
+                ({"status": "error", "error": response_detail}, True),
+                ({"status": "failed"}, True),
+                ({"status": "updating", "error": response_detail}, True),
+                ({"status": "updating"}, False),
+            ):
+                payload = {"code": code, "data": inner}
+                seen = []
+
+                def handle(request):
+                    seen.append(request)
+                    return httpx.Response(200, json=payload)
+
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(handle), trust_env=False,
+                    follow_redirects=False,
+                ) as http:
+                    client = AgentCoreClient(
+                        make_config(agent_core_tokens={"test-machine": token}),
+                        base_url="https://10.0.0.1:15678", node_host="10.0.0.1",
+                        machine_alias="test-machine", access_token=token, http=http,
+                    )
+                    if rejected:
+                        with pytest.raises(AgentCoreError, match="explicit application failure") as raised:
+                            await client.update_core(image)
+                        assert not isinstance(raised.value, AgentCoreDeployOutcomeUncertain)
+                        assert token not in str(raised.value)
+                        assert response_detail not in str(raised.value)
+                    else:
+                        assert await client.update_core(image) == payload
+                    await client.aclose()
+
+                assert len(seen) == 1
+                assert seen[0].method == "POST"
+                assert str(seen[0].url) == "https://10.0.0.1:15678/api/system/update"
+                assert json.loads(seen[0].content) == {"image": image}
+                assert seen[0].headers["Authorization"] == "Bearer " + token
+
+        captured = capsys.readouterr()
+        for output in (caplog.text, captured.out, captured.err):
+            assert token not in output
+            assert response_detail not in output
 
     def test_deploy_post_skipped_response_is_confirmed_failure(self):
         class Transport(httpx.AsyncBaseTransport):

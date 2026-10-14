@@ -325,10 +325,12 @@ def deploy_ready(
             f"{int(evidence.get('test_failed', 0))} failed"
         )
     lines.extend([
-        "- **Code Review:** completed",
+        "- **Code Review:** findings available — manual review required",
         "",
         "> Deploy Approval does not interpret Review Agent findings; "
-        "the developer/owner must read the Review Agent review comment.",
+        "the developer/owner must read the Review Agent review comment. "
+        "The developer's `/request_deploy` confirms this manual review; "
+        "machine owner/collaborator approval is still required before deployment.",
         "",
         "### Components",
         "",

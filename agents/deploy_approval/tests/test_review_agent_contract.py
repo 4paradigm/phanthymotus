@@ -1081,8 +1081,8 @@ async def test_existing_history_lifecycle_write_executes_without_nameerror():
 
 
 @pytest.mark.asyncio
-async def test_reconcile_pr279_evidence_transitions_review_required_to_deploy_ready():
-    """PR #279 comments must drive the complete production reconcile path."""
+async def test_reconcile_pr279_failed_tests_keep_review_required():
+    """Real parsed failed-test counts block readiness despite a completed review."""
     from agents.deploy_approval import comments as comments_mod
     from agents.deploy_approval.config import Config
     from agents.deploy_approval.github_state_proxy import (
@@ -1231,17 +1231,14 @@ No blocking findings.
 
     await controller.reconcile_pr(repo, pr_number)
 
-    assert initial_state["status"] == "deploy-ready"
-    evidence = initial_state["review_evidence"]
-    assert evidence
-    assert evidence["test_passed"] == 2960
-    assert evidence["test_failed"] == 13
-    assert evidence["test_skipped"] is False
+    assert initial_state["status"] == "review-required"
+    assert initial_state["review_evidence"] == {}
+    assert initial_state["deployments"] == []
     assert len(build_rows) == 5
     from agents.deploy_approval.github_state_proxy import _validate_hidden_state
     _validate_hidden_state(initial_state)
-    assert proxy.write_hidden_state.await_count == 1
-    proxy.project_status_label.assert_awaited_once_with(repo, pr_number, "deploy-ready")
+    proxy.write_hidden_state.assert_not_awaited()
+    proxy.project_status_label.assert_awaited_once_with(repo, pr_number, "review-required")
 
 
 # ------------------------------------------------------------------
@@ -1279,7 +1276,7 @@ def _core_contract_state(*, component=None, health=None, status="deploy-requeste
             "code_review_comment_updated_at": "2026-09-26T00:02:00Z",
             "review_author_id": TRUSTED_AUTHOR_ID,
             "test_passed": 2960,
-            "test_failed": 13,
+            "test_failed": 0,
             "test_skipped": False,
         },
         "components": [component or _core_contract_component()],
@@ -1417,7 +1414,8 @@ async def test_core_component_snapshot_binds_core_runtime_without_driver_resolut
 
 
 @pytest.mark.asyncio
-async def test_request_deploy_uses_canonical_review_snapshot_and_core_component():
+@pytest.mark.parametrize("test_failed", [0, 13], ids=["tests-pass", "tests-fail"])
+async def test_request_deploy_uses_canonical_review_snapshot_and_core_component(test_failed):
     from agents.deploy_approval.review_comment_parser import (
         ReviewBuild,
         ReviewCommentEvidence,
@@ -1438,6 +1436,7 @@ async def test_request_deploy_uses_canonical_review_snapshot_and_core_component(
     proxy.find_trusted_lifecycle_comment = AsyncMock(return_value=None)
     proxy.write_hidden_state = AsyncMock()
     proxy.project_status_label = AsyncMock()
+    proxy.post_issue_comment = AsyncMock()
     github.get_issue_comments = AsyncMock(return_value=[])
     github.resolve_commit_sha = AsyncMock(return_value=head)
     evidence = ReviewCommentEvidence(
@@ -1456,7 +1455,7 @@ async def test_request_deploy_uses_canonical_review_snapshot_and_core_component(
         test_comment_id=1002,
         test_comment_updated_at="2026-09-26T00:01:00Z",
         test_passed=2960,
-        test_failed=13,
+        test_failed=test_failed,
         test_skipped=False,
         code_review_comment_id=1003,
         code_review_comment_updated_at="2026-09-26T00:02:00Z",
@@ -1471,10 +1470,16 @@ async def test_request_deploy_uses_canonical_review_snapshot_and_core_component(
         )
 
     assert handled is True
+    if test_failed:
+        proxy.write_hidden_state.assert_not_awaited()
+        proxy.project_status_label.assert_not_awaited()
+        assert initial_state["status"] == "deploy-ready"
+        assert "failed or invalid structured test results" in proxy.post_issue_comment.call_args.args[2]
+        return
     written_state = proxy.write_hidden_state.call_args.args[3]
     assert written_state["status"] == "deploy-requested"
     assert written_state["review_evidence"]["test_passed"] == 2960
-    assert written_state["review_evidence"]["test_failed"] == 13
+    assert written_state["review_evidence"]["test_failed"] == 0
     assert written_state["review_evidence"]["test_skipped"] is False
     assert written_state["components"][0]["target"] == "core"
     assert written_state["components"][0]["runtime_id"] == "core"
@@ -1651,7 +1656,7 @@ def _recovery_evidence(*builds, build_comment_id=1):
         test_comment_id=2,
         test_comment_updated_at="2026-09-26T00:01:00Z",
         test_passed=2960,
-        test_failed=13,
+        test_failed=0,
         test_skipped=False,
         code_review_comment_id=3,
         code_review_comment_updated_at="2026-09-26T00:02:00Z",
@@ -1885,6 +1890,8 @@ def test_deploy_ready_components_and_review_evidence_are_unambiguous():
     assert "15 passed" not in body
     assert "12 passed / 3 failed" in body
     assert "does not interpret Review Agent findings" in body
+    assert "manual review required" in body
+    assert "`/request_deploy` confirms this manual review" in body
 
 
 def test_deploy_ready_renders_tests_not_run():

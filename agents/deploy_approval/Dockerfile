@@ -33,6 +33,6 @@ RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app \
 USER app
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fs http://127.0.0.1:25001/healthz || exit 1
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:25001/healthz')" || exit 1
 
 CMD ["python3", "-m", "agents.deploy_approval.server"]

@@ -259,6 +259,7 @@ class DeployController:
             self.config,
             base_url,
             node_host=machine.node_host,
+            machine_alias=machine.alias,
             access_token=token,
         )
         try:
@@ -858,6 +859,15 @@ class DeployController:
                     repo, pr_number,
                     "No completed review evidence found for this HEAD. "
                     "Wait for Review Agent to complete.",
+                )
+                return True
+
+            if evidence.test_results_block_deployment:
+                await self._post_error(
+                    repo, pr_number,
+                    "Review Agent reports failed or invalid structured test results. "
+                    "Resolve them before requesting deployment. Code review findings "
+                    "also require manual review by the developer and machine approver.",
                 )
                 return True
 
@@ -1650,6 +1660,80 @@ class DeployController:
             )
             raise
 
+    def _final_case_pass_is_ready(self, state: dict) -> bool:
+        """Require successful cases bound to real deployed components.
+
+        The trusted deployment record binds component_id to machine alias;
+        the component snapshot pins runtime_id and the exact deployed image.
+        Core has no fixed Case, but still needs its deployed record.
+        """
+        components = state.get("components")
+        deployments = state.get("deployments")
+        case_results = state.get("case_results")
+        if (not isinstance(components, list) or not components
+                or not isinstance(deployments, list)
+                or not isinstance(case_results, dict)):
+            return False
+        seen = set()
+        for component in components:
+            if not isinstance(component, dict):
+                return False
+            cid = component.get("component_id")
+            target = component.get("target")
+            runtime_id = component.get("runtime_id")
+            image_ref = component.get("image_ref")
+            if (not isinstance(cid, str) or not cid or cid in seen
+                    or not _is_supported_target(target)
+                    or not isinstance(runtime_id, str) or not runtime_id
+                    or not isinstance(image_ref, str) or not image_ref):
+                return False
+            seen.add(cid)
+            if target == "core" and runtime_id != "core":
+                return False
+            expected_case = "n/a" if target == "core" else "pass"
+            if case_results.get(cid) != expected_case:
+                return False
+            records = [dep for dep in deployments if isinstance(dep, dict)
+                       and dep.get("phase") == "deployed"
+                       and isinstance(dep.get("component_ids"), list)
+                       and cid in dep.get("component_ids", [])]
+            if len(records) != 1:
+                return False
+            alias = records[0].get("machine")
+            if not isinstance(alias, str) or not alias or self.policy.get_machine(alias) is None:
+                return False
+        return set(case_results) == seen
+
+    async def _revalidate_record_test_state(
+        self, repo: str, pr_number: int, original: dict, result: str,
+    ) -> dict | None:
+        """Fresh-read GitHub after awaits before publishing the result."""
+        pr_data = await self.proxy.get_pr(repo, pr_number)
+        if inspect.isawaitable(pr_data):
+            pr_data = await pr_data
+        fresh = await self.proxy.read_hidden_state(repo, pr_number)
+        if (not isinstance(pr_data, dict) or not isinstance(fresh, dict)
+                or pr_data.get("state") != "open" or pr_data.get("merged")):
+            return None
+        pr_head = pr_data.get("head", {}).get("sha", "")
+        if pr_head and pr_head != original.get("head_sha", ""):
+            return None
+        if (fresh.get("status") != "testing" or not isinstance(fresh.get("command"), dict)
+                or fresh.get("command") != original.get("command")):
+            return None
+        if int(fresh.get("last_processed_comment_id", 0) or 0) != original.get("last_processed_comment_id", 0):
+            return None
+        if result == "pass":
+            if pr_head != original.get("head_sha") or not self._final_case_pass_is_ready(fresh):
+                return None
+            for key in (
+                "head_sha", "components", "deployments", "case_results", "review_evidence",
+                "approve_attempts", "approve_attempts_total", "approve_attempts_truncated",
+            ):
+                if fresh.get(key) != original.get(key):
+                    return None
+        return copy.deepcopy(fresh)
+
     async def handle_record_test(
         self, repo: str, pr_number: int, comment_id: int,
         result: str, summary: str, actor: str, actor_id: str,
@@ -1662,6 +1746,9 @@ class DeployController:
                     "No active deployment found. Use `/request_deploy` first.",
                 )
                 return True
+
+            # Freeze the accepted bindings before permissions/logging awaits.
+            state = copy.deepcopy(state)
 
             _current_status = state.get("status", "")
             if _current_status == "testing":
@@ -1720,7 +1807,10 @@ class DeployController:
             bound_ids = [c.get("component_id", "") for c in components if isinstance(c, dict) and c.get("component_id")]
             case_results = state.get("case_results", {})
             terminal_values = {"pass", "fail", "n/a"}
-            if bound_ids and not all(case_results.get(cid) in terminal_values for cid in bound_ids):
+            if not isinstance(case_results, dict) or (bound_ids and not all(
+                isinstance(case_results.get(cid), str) and case_results.get(cid) in terminal_values
+                for cid in bound_ids
+            )):
                 await self._post_command_not_ready(
                     repo, pr_number, "testing",
                     "Not all Automated Cases have terminal results yet (pass/fail/n/a). "
@@ -1728,21 +1818,35 @@ class DeployController:
                 )
                 return True
 
+            if result == "pass" and not self._final_case_pass_is_ready(state):
+                await self._post_command_not_ready(
+                    repo, pr_number, "testing",
+                    "Final PASS requires a deployed record for every component, "
+                    "Core Case=n/a, and every non-Core Automated Case=pass. "
+                    "Failed Cases cannot be overridden by a manual PASS.",
+                )
+                return True
+
+            original_state = copy.deepcopy(state)
+
             # Authorize actor: collaborator OR owner of any deployed machine
             await self._check_record_test_permissions(
                 repo, actor, state,
             )
-
-            # Save original command deep copy, cursor, HEAD for concurrency checks
-            original_command = copy.deepcopy(state.get("command", {}))
-            original_cursor = state.get("last_processed_comment_id", comment_id)
-            original_head = state.get("head_sha", "")
 
             # Snapshot runtime logs BEFORE any state mutation
             runtime_logs = await self._snapshot_terminal_runtime_logs(
                 state.get("components", []),
                 state.get("deployments", []),
             )
+
+            if result == "pass":
+                fresh_before_upload = await self._revalidate_record_test_state(
+                    repo, pr_number, original_state, result,
+                )
+                if fresh_before_upload is None:
+                    return False
+                state = fresh_before_upload
 
             # Upload COS evidence FIRST — failure does not roll back (nothing written yet)
             state["cos"] = self._empty_cos()
@@ -1789,32 +1893,14 @@ class DeployController:
                 )
                 return False
 
-            # Concurrency check: re-read PR + Hidden State before writing terminal state
-            pr_data_check = await self.proxy.get_pr(repo, pr_number)
-            if inspect.isawaitable(pr_data_check):
-                pr_data_check = await pr_data_check
-            fresh_pr_state = pr_data_check.get("state", "")
-            fresh_pr_merged = pr_data_check.get("merged", False)
-            fresh_pr_head = pr_data_check.get("head", {}).get("sha", "")
-            fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+            # COS upload is asynchronous too: do not overwrite changed Cases,
+            # runtime/image bindings or deployment records after it completes.
+            fresh_state = await self._revalidate_record_test_state(
+                repo, pr_number, original_state, result,
+            )
             if fresh_state is None:
                 return False
-            if fresh_pr_state != "open" or fresh_pr_merged:
-                return False
-            if fresh_pr_head and fresh_pr_head != original_head:
-                return False
-            # T2: fresh_status must be strictly "testing" for both pass and fail
-            fresh_status = fresh_state.get("status", "")
-            if fresh_status != "testing":
-                return False
-            fresh_cmd = fresh_state.get("command", {})
-            if not isinstance(fresh_cmd, dict):
-                return False
-            if fresh_cmd != original_command:
-                return False
-            fresh_cursor = int(fresh_state.get("last_processed_comment_id", 0) or 0)
-            if fresh_cursor != original_cursor:
-                return False
+            state = fresh_state
 
             # All checks passed — write terminal state, lifecycle, and COS
             state["status"] = "succeeded" if result == "pass" else "failed"
@@ -1860,9 +1946,12 @@ class DeployController:
                     "timestamp": comments_mod.beijing_now_str(),
                 }
 
-            await self._write_lifecycle_with_history(
+            terminal_written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, terminal_markdown, event=event,
+                expected_record_test_state=original_state if result == "pass" else None,
             )
+            if terminal_written is False:
+                return False
             await self.proxy.project_status_label(repo, pr_number, state["status"])
 
             if cos_metadata.get("object_key"):
@@ -2944,13 +3033,26 @@ class DeployController:
         new_visible_markdown: str,
         event: dict | None = None,
         events: list[dict] | None = None,
-    ) -> None:
+        expected_record_test_state: dict | None = None,
+    ) -> bool:
         """Write lifecycle comment with automatic history management.
 
         If event is provided, it is appended to the visible History section.
         Legacy v1 migration is handled automatically on first meaningful event.
         Preserves existing History events across lifecycle rewrites.
         """
+        async def write_if_current(visible: str) -> bool:
+            # History/archive discovery also awaits GitHub. Recheck after all
+            # of those awaits, immediately before a final PASS state write.
+            if expected_record_test_state is not None:
+                fresh = await self._revalidate_record_test_state(
+                    repo, pr_number, expected_record_test_state, "pass",
+                )
+                if fresh is None:
+                    return False
+            await self.proxy.write_hidden_state(repo, pr_number, visible, state)
+            return True
+
         comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
         if comment is None:
             if events is not None:
@@ -2963,8 +3065,7 @@ class DeployController:
                 final_visible = _insert_history_into_visible(new_visible_markdown, event)
             else:
                 final_visible = new_visible_markdown
-            await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
-            return
+            return await write_if_current(final_visible)
 
         existing_body = comment.get("body", "")
         if not isinstance(existing_body, str):
@@ -2977,8 +3078,7 @@ class DeployController:
                 final_visible = _insert_history_into_visible(new_visible_markdown, event)
             else:
                 final_visible = new_visible_markdown
-            await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
-            return
+            return await write_if_current(final_visible)
 
         from .github_state_proxy import HIDDEN_STATE_MARKER
         idx = existing_body.find(HIDDEN_STATE_MARKER)
@@ -2992,8 +3092,7 @@ class DeployController:
                 final_visible = _insert_history_into_visible(new_visible_markdown, event)
             else:
                 final_visible = new_visible_markdown
-            await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
-            return
+            return await write_if_current(final_visible)
 
         existing_visible = existing_body[:idx].rstrip()
 
@@ -3100,7 +3199,7 @@ class DeployController:
             pass
 
         # 4. Write the final state
-        await self.proxy.write_hidden_state(repo, pr_number, final_visible, state)
+        return await write_if_current(final_visible)
 
     def _discover_trusted_archive_links(
         self, comments: list[dict], repo: str, pr_number: int,
@@ -3739,7 +3838,7 @@ class DeployController:
                         resolved_head_ev = await self._resolve_commit_prefix_for_head(
                             repo, current_head, evidence.commit_prefix,
                         )
-                        if resolved_head_ev != current_head:
+                        if resolved_head_ev != current_head or evidence.test_results_block_deployment:
                             desired_status = "review-required"
                             review_evidence_data = {}
                             build_infos = []
@@ -4314,6 +4413,8 @@ class DeployController:
         """
         from .review_comment_parser import ReviewCommentEvidence
         if not isinstance(evidence, ReviewCommentEvidence):
+            return None
+        if evidence.test_results_block_deployment:
             return None
         commit_prefix = evidence.commit_prefix
         if not isinstance(commit_prefix, str) or not re.fullmatch(r"[0-9a-f]{7,40}", commit_prefix):
