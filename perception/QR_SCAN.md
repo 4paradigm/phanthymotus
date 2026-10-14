@@ -13,6 +13,14 @@ qr_scan 是 perception 的 processor 卡片，multiInstance=true。
 输出为 /perception/qr_scan/instance_<实例哈希>/result 和同级 announce，info 可提前推导。
 只缓存最新帧；结果包含状态、码内容、JPEG像素角点、图像尺寸、帧接收时间、序号和新事件。
 
+优先直接解码整帧。发现二维码但解码失败时，裁出该区域并保留边缘，
+按0.75、1、2、1.5倍重试；单帧最多8次，重试图像最长边最多1600像素。
+部分码已解出时保留成功结果并重试剩余候选；重试结果不会把邻近码内容归到当前候选。
+输出角点始终使用原图坐标。没有找到二维码为no_qr；找到但均无法解码为
+detected_unreadable，undecoded_codes包含未解码候选的原图角点及图像尺寸。
+这种候选不产生新事件或播报文字。部分成功时仍为detected，同时保留undecoded_codes。
+断流清空两类结果。复杂图案的重试增加处理时间，需在实机检查延迟及stale状态。
+
 支持 start、stop、info、read、config。instance_id 优先定位实例，否则使用 input_topic。
 stop 不指定实例时停止全部。config 更新停止该实例，重新 start 生效。
 

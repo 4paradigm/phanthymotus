@@ -8,32 +8,82 @@ class QrDecoder:
         import cv2
         self.cv2 = cv2
         self.detector = cv2.QRCodeDetector()
+        self.undecoded = []
 
     def decode(self, jpeg: bytes) -> list[dict]:
         import numpy as np
+        self.undecoded = []
         if not jpeg or len(jpeg) > 5_000_000:
             raise ValueError("empty or oversized JPEG")
         image = self.cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), self.cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError("invalid JPEG")
-        ok, texts, points, _ = self.detector.detectAndDecodeMulti(image)
-        # The single-code path can succeed where multi-code detection fails.
-        if not ok or not any(texts):
-            text, corners, _ = self.detector.detectAndDecode(image)
-            texts, points = ([text], corners) if text else ([], None)
+        _, texts, points, _ = self.detector.detectAndDecodeMulti(image)
+        # Retain undecoded multi-code candidates, including partial successes.
+        if points is None or (len(points) == 1 and not any(texts)):
+            text, single, _ = self.detector.detectAndDecode(image)
+            if points is None or text:
+                points = single
+                texts = [text] if single is not None else []
         if points is None:
             return []
+        candidates = np.asarray(points).reshape(-1, 4, 2)
         codes = []
-        for text, corners in zip(texts, points):
-            if not text:
+        retry_budget = 8  # Across all candidates; blank frames do no retries.
+        for index, corners in enumerate(candidates):
+            if not np.isfinite(corners).all():
                 continue
-            codes.append({
-                "text": text,
+            text = texts[index] if index < len(texts) else ''
+            if not text and retry_budget:
+                text, used = self._retry_crop(image, corners, retry_budget)
+                retry_budget -= used
+            record = {
                 "corners_px": [[float(x), float(y)] for x, y in corners],
                 "image_width": int(image.shape[1]),
                 "image_height": int(image.shape[0]),
-            })
+            }
+            if text:
+                codes.append({"text": text, **record})
+            else:
+                self.undecoded.append(record)
         return codes
+
+    def _retry_crop(self, image, corners, budget):
+        """Re-detect at bounded scales, retaining coordinates in the source frame."""
+        import numpy as np
+        low, high = corners.min(axis=0), corners.max(axis=0)
+        margin = max(12, int(max(high - low) * 0.12))
+        height, width = image.shape[:2]
+        x0, y0 = np.maximum(0, np.floor(low - margin)).astype(int)
+        x1, y1 = np.minimum([width, height], np.ceil(high + margin)).astype(int)
+        crop = image[y0:y1, x0:x1]
+        if crop.size == 0:
+            return '', 0
+        used = 0
+        sizes = set()
+        for scale in (0.75, 1.0, 2.0, 1.5):
+            if used >= budget:
+                break
+            # Bound allocation even if the source is a high-resolution frame.
+            factor = min(scale, 1600 / max(crop.shape[:2]))
+            w, h = max(1, round(crop.shape[1] * factor)), max(1, round(crop.shape[0] * factor))
+            if (w, h) in sizes:
+                continue
+            sizes.add((w, h))
+            resized = self.cv2.resize(crop, (w, h), interpolation=self.cv2.INTER_CUBIC)
+            used += 1
+            text, found, _ = self.detector.detectAndDecode(resized)
+            if not text or found is None:
+                continue
+            # An adjacent QR may enter the padded crop. Only accept a decoded
+            # quadrangle overlapping this candidate, not its neighbour.
+            mapped = np.asarray(found).reshape(4, 2) / [w / crop.shape[1], h / crop.shape[0]] + [x0, y0]
+            rlow, rhigh = mapped.min(axis=0), mapped.max(axis=0)
+            intersection = np.maximum(0, np.minimum(high, rhigh) - np.maximum(low, rlow)).prod()
+            union = (high - low).prod() + (rhigh - rlow).prod() - intersection
+            if union > 0 and intersection / union >= 0.5:
+                return text, used
+        return '', used
 
 
 class QrTracker:

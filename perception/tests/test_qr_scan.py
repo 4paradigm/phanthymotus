@@ -42,6 +42,100 @@ def test_dedup():
     assert tracker.update([{'text': 'A'}], 5)
 
 
+def test_crop_retry_keeps_original_coordinates_and_recovers_partial_multi():
+    image = np.full((700, 1000, 3), 255, np.uint8)
+    qr = cv2.imdecode(np.frombuffer(jpeg('CROP-RETRY'), np.uint8), cv2.IMREAD_COLOR)
+    image[180:470, 300:590] = qr
+    real = cv2.QRCodeDetector()
+    found, corners = real.detect(image)
+    assert found
+    target = corners.reshape(4, 2)
+
+    class PartialDetector:
+        def detectAndDecodeMulti(self, frame):
+            # Preserve an already decoded neighbouring code and recover only
+            # this missing payload through real OpenCV on the cropped image.
+            neighbour = target + [500, 0]
+            return True, ['ALREADY-DECODED', ''], np.array([neighbour, target]), ()
+
+        def detectAndDecode(self, frame):
+            return real.detectAndDecode(frame)
+
+    decoder = QrDecoder()
+    decoder.detector = PartialDetector()
+    ok, data = cv2.imencode('.jpg', image)
+    assert ok
+    result = decoder.decode(data.tobytes())
+    assert [c['text'] for c in result] == ['ALREADY-DECODED', 'CROP-RETRY']
+    assert np.allclose(result[1]['corners_px'], target)
+    assert result[1]['image_width'] == 1000 and result[1]['image_height'] == 700
+    assert decoder.undecoded == []
+
+
+def test_unreadable_candidates_bound_retries_and_reject_neighbour_payload():
+    target = np.array([[100, 100], [200, 100], [200, 200], [100, 200]], np.float32)
+
+    class UnreadableDetector:
+        calls = 0
+
+        def detectAndDecodeMulti(self, image):
+            return False, [''] * 10, np.array([target] * 10), ()
+
+        def detectAndDecode(self, image):
+            self.calls += 1
+            assert max(image.shape[:2]) <= 1600
+            # A different code in the crop must not be attributed to target.
+            return 'NEIGHBOUR', np.array([[[0, 0], [8, 0], [8, 8], [0, 8]]]), None
+
+    decoder = QrDecoder()
+    detector = decoder.detector = UnreadableDetector()
+    assert decoder.decode(jpeg()) == []
+    assert detector.calls <= 8
+    assert len(decoder.undecoded) == 10
+    # Diagnostic state must not leak into a subsequent blank frame.
+    decoder.detector = cv2.QRCodeDetector()
+    assert decoder.decode(jpeg()) == [] and decoder.undecoded == []
+
+
+def test_stream_distinguishes_unreadable_from_blank_without_new_event():
+    from plugins.qr_scan import _QrStream
+    unresolved = [{'corners_px': [[1, 1], [9, 1], [9, 9], [1, 9]],
+                   'image_width': 10, 'image_height': 10}]
+    decoder = SimpleNamespace(decode=lambda data: [], undecoded=unresolved)
+    stream = _QrStream(None, '/camera', '/result', {'auto_announce': True}, decoder)
+    frame = {'data': b'test', 'received_monotonic': time.monotonic(),
+             'received_at': 'test', 'frame_sequence': 1}
+    result = stream.process_frame(frame)
+    assert result['status'] == 'detected_unreadable'
+    assert result['undecoded_codes'] == unresolved
+    assert result['codes'] == result['new_events'] == []
+    assert stream._announcement(result, time.monotonic()) is None
+    decoder.undecoded = []
+    assert stream.process_frame(frame)['status'] == 'no_qr'
+    frame['received_monotonic'] -= stream.stale_s + 1
+    stale = stream.process_frame(frame)
+    assert stale['status'] == 'stale' and stale['undecoded_codes'] == []
+
+
+def test_single_full_frame_fallback_does_not_require_crop_retry():
+    points = np.array([[[40, 40], [200, 40], [200, 200], [40, 200]]], np.float32)
+
+    class SingleDetector:
+        calls = 0
+
+        def detectAndDecodeMulti(self, image):
+            return False, [''], points, ()
+
+        def detectAndDecode(self, image):
+            self.calls += 1
+            return 'SINGLE-PATH', points, None
+
+    decoder = QrDecoder()
+    detector = decoder.detector = SingleDetector()
+    assert decoder.decode(jpeg())[0]['text'] == 'SINGLE-PATH'
+    assert detector.calls == 1 and decoder.undecoded == []
+
+
 def wait(plugin, key, status, sequence=None):
     until = time.monotonic() + 5
     while time.monotonic() < until:
@@ -194,7 +288,8 @@ def test_integrated_announcement_once_and_cooldown():
 
 def test_integrated_announcement_published_from_real_qr():
     executor = _FakeExecutor()
-    plugin = QrScanPlugin({'auto_announce': True, 'scan_hz': 10}, executor)
+    # Exercise event publication independently of decoding speed on ARM/QEMU.
+    plugin = QrScanPlugin({'auto_announce': True, 'scan_hz': 10, 'stale_after_s': 30}, executor)
     try:
         started = plugin.dispatch('qr_scan', {'action': 'start', 'input_topic': '/camera'})
         stream = plugin._streams['/camera']

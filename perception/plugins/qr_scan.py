@@ -57,7 +57,7 @@ class _QrStream:
 
     def _empty(self, status, message=""):
         return {"status": status, "message": message, "session_id": self._session,
-                "codes": [], "new_events": [], "frame_sequence": None,
+                "codes": [], "undecoded_codes": [], "new_events": [], "frame_sequence": None,
                 "frame_age_s": None, "frame_received_at": None,
                 "processed_at": datetime.now(timezone.utc).isoformat()}
 
@@ -154,8 +154,12 @@ class _QrStream:
             if result["frame_age_s"] > self.stale_s:
                 result["status"] = "stale"
                 return result
-            result.update(status="detected" if codes else "no_qr", codes=codes,
+            undecoded = getattr(self.decoder, 'undecoded', [])
+            status = 'detected' if codes else 'detected_unreadable' if undecoded else 'no_qr'
+            result.update(status=status, codes=codes, undecoded_codes=copy.deepcopy(undecoded),
                           new_events=self._tracker.update(codes, now))
+            if status == 'detected_unreadable':
+                result['message'] = 'QR detected but not decoded; improve size, focus or lighting'
         except Exception as exc:
             result.update(status="decode_error", message=f"{type(exc).__name__}: {str(exc)[:160]}")
         return result
