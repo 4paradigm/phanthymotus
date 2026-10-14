@@ -16,7 +16,14 @@ def test_core_build_context_contains_sound_direction_source(tmp_path):
     (bin_dir / "uname").write_text("#!/bin/sh\necho aarch64\n")
     (bin_dir / "docker").write_text(
         '#!/bin/sh\nprintf "%s\\n" "$@" > "$DOCKER_CAPTURE"\n')
-    for command in ("uname", "docker"):
+    # build_core.sh reads the commit it tags the image with *before* it reaches
+    # do_build(). The harness mounts this worktree detached, so its .git points
+    # at a path that only exists in the review container and real git exits 128
+    # there — killing the run before the docker invocation this test exists to
+    # check. Answer the tag lookup, the way uname and docker are answered above;
+    # build_core.sh runs nothing else against git.
+    (bin_dir / "git").write_text("#!/bin/sh\necho abcdef0\n")
+    for command in ("uname", "docker", "git"):
         (bin_dir / command).chmod(0o755)
     capture = tmp_path / "docker-args"
     env = os.environ.copy()
