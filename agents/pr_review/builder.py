@@ -521,9 +521,9 @@ def split_image_ref(ref: str) -> tuple[str, str]:
 def container_name_from_service_yaml(yaml_text: str) -> str:
     """Read the container_name a service fragment declares, or "".
 
-    Only the name is needed now: `deploy/run-pr-image.sh` does the rest by
-    reading the same fragment out of the image, so translating the whole
-    fragment into `docker run` here would duplicate what compose already does.
+    Only the name is needed now: run-pr-image.sh does the rest by reading the
+    same fragment out of the image, so translating the whole fragment into
+    `docker run` here would duplicate what compose already does.
     The name is used to tell the reviewer which container to expect.
     """
     try:

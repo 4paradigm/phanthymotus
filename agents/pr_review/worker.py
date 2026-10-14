@@ -639,9 +639,9 @@ async def _execute_builds(
         results.append(result)
 
         # Note which container the target declares, while the worktree still
-        # exists. Its presence is what tells the comment that
-        # deploy/run-pr-image.sh will work. Drivers and perception ship a
-        # fragment; core does not (it self-updates via the web console).
+        # exists. Its presence is what tells the comment that run-pr-image.sh
+        # will work. Drivers and perception ship a fragment; core does not
+        # (it self-updates via the web console).
         rel = service_yaml_path(target, driver_path)
         if result.success and result.image_tag and rel:
             svc = read_service_yaml(worktree, rel)
