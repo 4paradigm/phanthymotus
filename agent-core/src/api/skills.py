@@ -5,6 +5,9 @@ api/skills.py — 技能管理 API。
 """
 
 import fastapi
+import datetime
+import json
+import re
 
 import sys
 import config
@@ -145,6 +148,49 @@ async def install_skill(request: fastapi.Request, body: dict = fastapi.Body(...)
     if not result.get('ok'):
         return {'code': 404, 'error': result.get('error', '安装失败')}
     return {'code': 200, 'data': result['data']}
+
+
+@router.post('/import')
+async def import_local_skill(body: dict = fastapi.Body(...)):
+    """Import an unpublished skill into the existing local skill store.
+
+    No await between read and write: concurrent requests on the API loop cannot
+    overwrite one another. ConfigDB commits the whole value transactionally.
+    A retry is idempotent; a conflicting slug never overwrites an installed skill.
+    """
+    limits = {'slug': 100, 'name': 100, 'oneLiner': 300, 'description': 4000,
+              'instruction': 20000, 'category': 80, 'version': 40}
+    if len(json.dumps(body, ensure_ascii=False).encode()) > 32768:
+        raise fastapi.HTTPException(413, '技能定义超过 32 KiB')
+    if set(body) - (set(limits) | {'requiredTools'}):
+        raise fastapi.HTTPException(422, '技能定义含不支持的字段')
+    for key, limit in limits.items():
+        value = body.get(key, '')
+        if not isinstance(value, str) or len(value) > limit:
+            raise fastapi.HTTPException(422, f'无效的技能字段：{key}')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,99}', body.get('slug', '')):
+        raise fastapi.HTTPException(422, '无效的技能标识')
+    if any(not body.get(k, '').strip() for k in ('name', 'oneLiner', 'instruction')):
+        raise fastapi.HTTPException(422, '名称、简介和指令不能为空')
+    required = body.get('requiredTools', [])
+    if (not isinstance(required, list) or len(required) > 32 or
+            any(not isinstance(t, str) or not re.fullmatch(r'[\w:.-]{1,200}', t) for t in required)):
+        raise fastapi.HTTPException(422, '无效的工具依赖')
+    definition = {k: body.get(k, '') for k in limits}
+    definition['version'] = definition['version'] or '1.0.0'
+    definition['requiredTools'] = required
+    skills_cfg = config.main.get('skills', {})
+    installed = list(skills_cfg.get('installed', []))
+    previous = next((s for s in installed if s['slug'] == definition['slug']), None)
+    if previous is not None:
+        if any(previous.get(k, '' if k != 'requiredTools' else []) != v
+               for k, v in definition.items()):
+            raise fastapi.HTTPException(409, '相同标识的技能已存在，请使用新的标识')
+        return {'code': 200, 'data': {'slug': previous['slug'], 'already': True}}
+    installed.append({**definition, 'active': True,
+                      'installedAt': datetime.datetime.now().isoformat()})
+    config.main['skills'] = {**skills_cfg, 'installed': installed}
+    return {'code': 200, 'data': {'slug': definition['slug'], 'already': False}}
 
 
 @router.post('/uninstall')
