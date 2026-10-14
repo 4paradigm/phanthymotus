@@ -362,6 +362,18 @@ def test_reasoning_deltas_are_captured():
     assert msg['_reasoning']['truncated'] is False
 
 
+def test_heartbeat_counts_reasoning_as_progress():
+    """心跳的 chars 要算上思考，否则思考阶段打出 chars=0，看着像卡死。
+
+    真机实测：18.7s 的一次调用里有 15s 打的是 `chunks=1145 chars=0`。
+    """
+    acc = llm_mod._StreamAccumulator()
+    acc.feed(_chunk(reasoning='想了很多'))
+    assert acc.chars == 4
+    acc.feed(_chunk('答'))
+    assert acc.chars == 5
+
+
 def test_no_reasoning_field_when_thinking_is_off():
     """关掉 think 时不能留一个空壳字段——它会进历史、进 recent 文件。"""
     msg = _call(_FakeClient([_chunk('2'), _chunk(finish_reason='stop')]))

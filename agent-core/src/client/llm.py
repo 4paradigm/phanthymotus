@@ -203,8 +203,12 @@ class _StreamAccumulator:
 
     @property
     def chars(self) -> int:
-        return sum(len(p) for p in self.content_parts) + sum(
-            len(tc['function']['arguments']) for tc in self.tool_calls.values())
+        # 思考的字数也要算进来。它只进心跳行，不影响聚合结果——漏了的话，
+        # think_mode=True 下的思考阶段会打出 `chunks=1145 chars=0`，看着像
+        # 「流在动但一个字都没出」的卡死，实测 18.7s 里有 15s 长这样。
+        return (sum(len(p) for p in self.content_parts)
+                + sum(len(p) for p in self.reasoning_parts)
+                + sum(len(tc['function']['arguments']) for tc in self.tool_calls.values()))
 
     def feed(self, chunk) -> None:
         self.chunks += 1
