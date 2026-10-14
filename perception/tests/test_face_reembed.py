@@ -225,3 +225,18 @@ def test_a_missing_source_database_is_reported_not_raised(tmp_path, monkeypatch)
     result = plugin._do_reembed_from({"source_model": "buffalo_sc"})
     assert result["ok"] is False
     assert "no buffalo_sc database" in result["detail"]
+
+
+def test_a_pinned_db_dir_that_collides_is_refused_with_the_real_reason(
+        tmp_path, monkeypatch):
+    """An explicit db_dir pins the path for every model, so both can collide.
+
+    Without the guard the source is opened as the wrong model and IdentityDB
+    complains about a model mismatch on the database we are writing to — true, and
+    useless as a diagnosis.
+    """
+    plugin, engine = _plugin(tmp_path)
+    monkeypatch.setattr(face_plugin, "face_db_dir_for",
+                        lambda model, db_dir: engine.db.path)
+    with pytest.raises(ValueError, match="both resolve to"):
+        plugin._do_reembed_from({"source_model": "buffalo_sc"})

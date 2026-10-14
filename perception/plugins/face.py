@@ -1364,6 +1364,17 @@ class FaceRecognitionPlugin:
         cfg = dict(self._plugin_cfg)
         source_dir = face_db_dir_for(source_model,
                                      str(cfg.get("db_dir", DEFAULT_DB_DIR)))
+        # An explicit `db_dir` pins the path for *every* model (face_db_dir_for),
+        # so source and target can resolve to the same directory even though the
+        # model names differ. Without this the source would be opened as the wrong
+        # model and IdentityDB's own check would raise a mismatch about a database
+        # that is simply the one we are writing to — true, but useless as a
+        # diagnosis.
+        if os.path.abspath(source_dir) == os.path.abspath(engine.db.path):
+            raise ValueError(
+                f"{source_model} and {target_model} both resolve to {source_dir}, "
+                "because db_dir is pinned explicitly. Clear db_dir to give each "
+                "model its own store, or point the source at its own path.")
         if not os.path.exists(os.path.join(source_dir, "persons.json")):
             return {"ok": False, "reason": REASON_BAD_INPUT,
                     "detail": f"no {source_model} database at {source_dir}"}
