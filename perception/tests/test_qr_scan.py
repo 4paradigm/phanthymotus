@@ -267,7 +267,9 @@ def test_bundle_registers_qr_with_enabled_config():
         assert plugin.dispatch('qr_scan', {'action': 'info', 'input_topic': '/camera_a/image'})['state'] == 'idle'
     finally:
         for p in plugin._plugins:
-            p.stop()
+            stop = getattr(p, 'stop', None)
+            if callable(stop):
+                stop()
 
 
 def test_integrated_announcement_once_and_cooldown():

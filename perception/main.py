@@ -6,6 +6,7 @@ perception/main.py — Perception Stack bundle 统一入口。
 
   asr              语音识别（VAD + 唤醒词 + 多后端 ASR）
   tts              语音合成（VITS2 / Matcha / Kokoro，本地 TensorRT 或 ONNX）
+  phanthy_music    曲库检索、HTTPS 音乐播放与语音优先混音
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   ocr              文字识别（RapidOCR + TensorRT）
@@ -54,8 +55,12 @@ import rclpy.executors
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
-# suppress noisy third-party loggers
-for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
+# suppress noisy third-party loggers.
+# pyvips logs six INFO lines per decoded image ("thumbnailing N bytes",
+# "selected loader is ...", "converting to processing space srgb", ...). At a
+# camera's frame rate that is the only thing in the log: measured on Tianyi,
+# ~4 lines/second with every other perception message buried under it.
+for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'pyvips'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
 # Cap on how much of an MCP argument dict reaches the log. A tool call can carry
@@ -139,6 +144,7 @@ class PerceptionBundle:
             log.info("ASRPlugin loaded (speaker=%s)",
                      "yes" if speaker_plugin else "no")
 
+        tts_plugin = None
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin
             # Guarded: TTSPlugin validates its engine configuration in the
@@ -146,10 +152,47 @@ class PerceptionBundle:
             # config must not take ASR/VOP/OCR down with it — the tool simply
             # does not appear, which is visible in the dashboard.
             try:
-                self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
+                tts_plugin = TTSPlugin(plugins_cfg["tts"], executor)
+                self._plugins.append(tts_plugin)
                 log.info("TTSPlugin loaded")
             except Exception:
                 log.error("TTSPlugin failed to load; continuing without TTS",
+                          exc_info=True)
+
+        # Built after TTS and holding a handle to it, for the same reason ASR
+        # holds one to speaker_recognition: the echo cancellation's reference
+        # signal *is* the TTS card's audio output, and asking the plugin in this
+        # process is what lets `robot_voice_topic: auto` need no configuration
+        # at all. The handle is optional — without it `auto` resolves to
+        # nothing and the card says so on its face rather than muting at random.
+        if plugins_cfg.get("echo_cancellation", {}).get("enabled", True):
+            from plugins.echo_cancellation import EchoCancellationPlugin
+            self._plugins.append(EchoCancellationPlugin(
+                plugins_cfg.get("echo_cancellation", {}), executor, tts=tts_plugin))
+            log.info("EchoCancellationPlugin loaded (tts=%s)",
+                     "yes" if tts_plugin else "no")
+
+        # After TTS and holding its handle, for the same reason echo_cancellation
+        # does: `speech_topics: auto` means "ask the local TTS card what it
+        # publishes", and in-process is the only place that answer is free.
+        if plugins_cfg.get("audio_mixer", {}).get("enabled", True):
+            try:
+                from plugins.audio_mixer import AudioMixerPlugin
+                self._plugins.append(AudioMixerPlugin(
+                    plugins_cfg.get("audio_mixer", {}), executor, tts=tts_plugin))
+                log.info("AudioMixerPlugin loaded (tts=%s)",
+                         "yes" if tts_plugin else "no")
+            except Exception:
+                log.error("AudioMixerPlugin failed to load; continuing without it",
+                          exc_info=True)
+
+        if plugins_cfg.get("phanthy_music", {}).get("enabled", False):
+            try:
+                from plugins.phanthy_music import PhanthyMusicPlugin
+                self._plugins.append(PhanthyMusicPlugin(plugins_cfg["phanthy_music"], executor))
+                log.info("PhanthyMusicPlugin loaded")
+            except Exception:
+                log.error("PhanthyMusicPlugin failed to load; continuing without phanthy_music",
                           exc_info=True)
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
@@ -479,8 +522,13 @@ def make_handler():
                     args   = params.get("arguments") or {}
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
+                    music_call = (name == 'phanthy_music' or name.startswith('phanthy_music_')
+                  or name == 'audio_mixer' or name.startswith('audio_mixer_'))
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
+                        if music_call:
+                            log.info("[mcp] tools/call: phanthy_music (payload omitted)")
+                        else:
+                            log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         # `dispatch` returns None for two very different things:
@@ -499,7 +547,10 @@ def make_handler():
                             err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            if music_call:
+                                log.info("[mcp] phanthy_music result received (payload omitted)")
+                            else:
+                                log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")

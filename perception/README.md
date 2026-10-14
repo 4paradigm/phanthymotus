@@ -1,8 +1,9 @@
 # Perception Stack
 
-Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
-vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
-`face_recognition`, `pose` human keypoints + actions, `barcode` QR/条码扫码).
+Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`,
+`echo_cancellation` echo handling), vision (`vop` object detection, `visual_depth`
+monocular depth, `ocr`, `face_recognition`, `pose` human keypoints + actions,
+`barcode` QR/条码扫码).
 Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
@@ -77,6 +78,400 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 | `vad_threshold` | `0.5` | Speech probability threshold (0–1). Raise to `0.7`–`0.85` in noisy environments (e.g. robot motor noise). |
 | `vad_silence_ms` | `400` | Silence duration (ms) required before an utterance is considered complete. |
 | `vad_pre_roll_ms` | `500` | Audio retained from *before* the VAD tripped. Recovers clipped word onsets — without it the first syllable is often missing, which costs wake-word recall. |
+
+---
+
+## Echo Cancellation: keeping the robot's own voice out of its microphone
+
+The robot's TTS reaches its own microphone acoustically, and until this card
+existed nothing in perception removed it. The symptoms did not look like one
+problem: ASR transcribes the robot's own sentence and hands it to the LLM as if
+a person had said it, speaker recognition enrols that voice as a person (see
+`plugins/speaker.py`, which says so in a comment), and nobody can interrupt the
+robot mid-sentence.
+
+Wire it between the microphone card and everything that consumes microphone
+audio:
+
+```
+mic ──▶ echo_cancellation ──▶ asr
+                       └──▶ soundevent
+```
+
+### Why a card and not a switch inside ASR
+
+`soundevent` subscribes to the microphone topic itself, and speaker recognition
+runs off the segment ASR cut. Cleaning the signal inside ASR cleans it for ASR
+alone. As a card it is cleaned once for everything downstream, and the cleaned
+audio is a topic a human can listen to on the dashboard.
+
+Two costs, both real. One extra DDS hop, on loopback — one chunk of latency,
+32-100 ms depending on the mic driver. And the downstream topic names change:
+`/g1/mic/audio/asr` becomes `/g1/mic/audio/clean/asr`, so agent-core's
+`event.subscribe_topics` and any saved canvas have to be re-wired. Inserting
+this card into a working robot is not a no-op.
+
+### The reference signal is config, not a connection
+
+The card has to know what the robot is saying, which is the TTS card's audio
+output — the same PCM the speaker driver plays. That is a config field and not a
+second in-port, for three reasons:
+
+- the canvas matches connections by `format` alone, and a card-level drop takes
+  the first in-port of that format (`agent-core/web/js/canvas.js`), so two
+  `audio/pcm-16k` in-ports would be a coin flip;
+- what reaches a plugin is a role-less `input_topics` list ordered by click
+  order (`web/js/topic-derive.js`);
+- and the reference is not input data. It is "what another card on this machine
+  is publishing right now", and there is almost always exactly one right answer.
+
+So the default, `auto`, asks the TTS plugin in this same process — the way ASR
+is handed a handle to speaker recognition in `main.py`. Nobody fills anything
+in, and it follows the TTS card when that gets re-wired. The dropdown is filled
+per `tools/list` with the topics TTS is publishing at that moment; a topic set
+in `config.yaml` is honoured even when it is not in the list, which is the
+escape hatch for a TTS running in another container.
+
+`auto` can resolve to nothing — vendor TTS that never passes through Agent Core
+(Tianyi speaks over a ROS service), or a TTS in another container. That
+degrades the card to a passthrough, so `info()` always reports
+`robot_voice_topic`, `robot_voice_seen` and `last_robot_voice_s_ago`, and the
+card's own description says which of the two happened.
+
+### One setting
+
+| Field | Choices | Notes |
+|---|---|---|
+| `robot_voice_topic` | `auto` (default), or a live TTS topic | Above. The only thing on the card. |
+
+**There is no mode, and that is a decision.** The card cancels; it does not
+offer muting as an alternative. Half-duplex muting cannot do the job the card
+exists for — being interruptible — so offering it would be offering a setting
+that fails the requirement, and asking an operator to understand the trade in
+order to pick the only workable side of it.
+
+**There is no "how hard to scrub" and no "mute tail" either**, for the same
+reason in a weaker form: both have a defensible default, and neither is a
+question anybody can answer better from the dashboard than from the
+measurements below. They stay settable from `config.yaml` or an `action=config`
+call, which is how `gentle` would get tried on a real robot without a rebuild —
+what they are not is a question put to an operator.
+
+| Fixed at | Why that value |
+|---|---|
+| `removal_strength: normal` | An interrupting voice stays 12 dB above the residual, which is enough for ASR, while removing 5 dB more of the robot than `gentle` — and that 5 dB is the margin against the robot's own speech reaching ASR. The number that could overturn it is not in hand: whether the residual's *absolute* level still trips the VAD needs a real microphone, a real speaker and ASR in the loop. |
+| `mute_tail: auto` | Follows the delay the card measures for itself. Only applies during the warmup below, so there is nothing left to tune. |
+
+Also deliberately not offered: frame size, filter length, adaptation step size,
+double-talk thresholds, and the delay search range. They derive from the above
+or stay internal constants.
+
+**The "filter tail" knob was planned and then dropped**, which is worth stating
+because it was promised. Once the bulk delay is measured and compensated by
+shifting the reference, the filter only has to model the echo's *spread*, and a
+tail longer than the path actively costs cancellation: against a 60 ms
+synthetic room, 64 ms of tail gives 23 dB, 128 ms gives 20, 256 ms gives 18 and
+512 ms gives 14. So "raise it if echo remains" — the only advice an operator
+could act on — would have been wrong advice. It is a 128 ms constant, reported
+as `filter_tail_ms`. The delay *search range* went the same way: it is 1.5 s,
+the measurement costs ~6 ms per second of audio, and 1.5 s covers every robot
+measured.
+
+**`instance_id` is not declared in the `inputSchema`**, though every call
+carries one. The canvas renders each input property it does not recognise as a
+manual field on the card — it hides `input_topic` by name pattern, and an
+`action` whose values are all system actions — so declaring it put an
+`INSTANCE_ID` text box and an 执行 button on the card's face, asking an operator
+to type a canvas id the canvas fills in itself. No other plugin here declares
+it either.
+
+### The two places muting survives, neither of them a setting
+
+- **Warmup.** Before a delay has been measured there is nothing to align to, so
+  the microphone is held silent while the robot is audible — subtracting an
+  unaligned reference adds noise, and passing the audio through hands ASR the
+  robot's own sentence. It lasts about 3 s into the robot's first utterance,
+  once per session, and the card says what it is doing.
+- **Nothing else.** When the coupling disappears mid-session the card *passes
+  audio through* rather than muting: no measurable echo means there is nothing
+  to remove, and a permanent mute would be exactly the behaviour ruled out
+  above.
+
+### Why the mute needs a tail, and why `auto` is the default
+
+Publishing the last frame of an utterance is not the end of the sound. The
+speaker path buffers: the G1 driver prefills 9 600 bytes (~300 ms), merges into
+300 ms blocks and runs up to 240 ms ahead of the MCU's queue
+(`phanthymotus-driver` `unitree/g1/device.py`), and the measured gap between
+"TTS finished publishing" and "the robot stopped being audible" is 0.7-1.2 s on
+that robot. A mute that ended with the reference stream would therefore
+transcribe the last few words of the robot's own sentence — the exact failure
+this card exists to remove.
+
+That number is a property of the robot and its speaker, nobody knows it in
+advance, and it moves with bus load. Hence `auto`: the tail follows the delay
+the card measures for itself (`measured_echo_delay_ms` + 200 ms), falling back
+to 800 ms before the first measurement. The explicit values do exactly what
+they say, and when one of them is shorter than the measured delay the card says
+so on its face rather than only in a diagnostics field.
+
+TTS's 8-byte end-of-utterance marker is **not** used to open the gate: it marks
+the end of *publishing*, which is several hundred milliseconds before the end of
+the sound.
+
+### The delay measurement
+
+`_DelayTracker` cross-correlates the two signals' 100 Hz RMS envelopes over a
+0-1.5 s lag range, once a second, on a 3 s window. Envelope domain rather than
+waveform: what is being measured is a bulk transport delay, and an envelope
+carries that as well at 1/160th of the arithmetic. It runs in
+the warmup too, where only the mute tail needs it — so that an operator
+can read the robot's real delay off a running card before deciding anything.
+
+What the synthetic sweeps in `tests/test_echo_cancellation_plugin.py` establish:
+
+| Condition | Result |
+|---|---|
+| Delays 0-1.45 s, 5 seeds each | Exact, 0 ms error (the lag indexing has no off-by-one) |
+| Echo attenuated 20x | Still exact |
+| No echo at all, noisy room | Reports nothing — never a confident 0 ms |
+| Echo beyond the 1.5 s range | Mostly nothing; a peak pinned to the last lag is refused outright, because that is the signature of a delay *beyond* the range |
+| A person talking over the robot at the robot's own level | **A single window can be wrong by a second.** The median over up to 20 windows held at 420 ms with 80% of windows contaminated, while `echo_delay_spread_ms` grew to ~1 s |
+
+The last row is why `measured` is a median and not the latest value, and why the
+spread is reported at all: an operator needs to be able to tell "this robot's
+delay is 420 ms" from "this number is moving".
+
+Two things it does not and cannot cover, both needing a machine with a speaker
+and a microphone in one room: whether a given robot's speaker path is linear
+enough for *cancellation* to be worth building (the G1 plays through a vendor
+MCU, which may apply EQ, limiting and resampling we cannot see), and the sample
+clock drift between the microphone and the speaker.
+
+### Cancellation
+
+A partitioned-block frequency-domain NLMS filter, 16 ms blocks, 128 ms tail,
+followed by a soft gate on the residual. In numpy, not bound to speexdsp's MDF:
+that binding is a PyPI sdist needing swig and `libspeexdsp-dev` inside a 16 GB
+image built for two JetPack lines and cp38, it exposes `process(near, far)` and
+nothing else — no delay handling, no access to the preprocessor's residual
+stage — and it would have to be hand-fed lock-step frames anyway. This is ~40
+lines of arithmetic, runs on both lines with the numpy already in the image,
+can be tested against synthetic echo paths offline, and can be hot-copied onto
+a rig.
+
+**The delay is measured, not modelled.** The reference is fetched by time from
+`_RefBuffer` at `measured_delay - 32 ms`, so the filter spans the room and the
+alignment error rather than the speaker's several hundred milliseconds of
+buffering. Covering that with taps instead would need 5-75x the arithmetic to
+model what is mostly a constant offset — and, per the tail measurements above,
+would cancel *less*.
+
+Until a delay has been measured the card **mutes** instead: subtracting an
+unaligned reference adds noise rather than removing echo. The card says so on
+its face while that lasts, and it lasts about 3 s into the robot's first
+utterance.
+
+#### A second filter, because the guards cannot be relaxed
+
+The protection the published filter needs makes it unable to recover from
+anything. The skip guard refuses an update whenever the error exceeds the
+microphone — which is what double-talk looks like, and *also* what a changed
+echo path looks like. So when the robot turns its head mid-session the filter
+locks to the old path forever: measured at **-2.9 dB and still -2.9 dB six
+seconds later**, with 355 consecutive updates refused. Worse than passing the
+microphone through, because a stale filter adds a wrong estimate. The same run
+with the guards disabled recovered to 17.4 dB within six seconds.
+
+Double-talk and a changed path cannot be separated by powers — the third time
+that is true in this file. So a second filter adapts with none of the
+protection, its output is never published, and every ~1 s of far-end audio the
+two are compared on the error they produced. The shadow replaces the foreground
+when it is better by 2 dB over a whole window. During double-talk it adapts to a
+person and gets *worse*, so it is not promoted; after a path change it learns
+the new path and gets better, so it is.
+
+| | before | after |
+|---|---|---|
+| steady path | 26.8 dB | 26.8 dB, no promotions |
+| path changes at 9 s | 0.6 dB, never recovers | **20.2 dB**, one promotion |
+| the same on Orin 5, over real DDS | — | 20.2 dB before, 1.4 dB just after, **17.2 dB** six seconds later, two promotions |
+| 4 s of double-talk | 22.9 → 24.2 dB across it | unchanged, no promotions |
+| person preserved during double-talk | 17.0 dB | 17.0 dB |
+
+Recovery after a path change takes 4-6 s offline and 6-9 s on the rig, where
+the robot's speech is bursty and only far-end-active blocks count. The shadow
+costs 5.5 ms per second of audio, a fifth of the cancel path.
+
+Two further guards, both earning their place with a measured failure:
+
+- **Skip the update when the error is bigger than the microphone.** That is
+  either double-talk or divergence, and skipping is what keeps a bad second from
+  undoing a good minute. Measured: 19.8 dB before a 4 s double-talk stretch,
+  1.7 dB during it (the person is in the microphone and is *supposed* to
+  survive, so low ERLE there is correct), 22.1 dB after.
+- **Zero the filter when its output is measurably worse than its input**, over
+  a window of far-end-active blocks. Only that — the guard started out asking
+  the more useful question, "is this filter doing anything at all", at a +1 dB
+  threshold, and a rig showed why that cannot work: *in powers alone* a filter
+  converged to 20 dB and then talked over is indistinguishable from one that
+  has learned nothing, because the residual is dominated by the person either
+  way. On Orin 5 it zeroed a converged filter three times during one 4 s
+  double-talk stretch and put "this microphone barely hears the speaker" on the
+  card — reintroducing from inside the guard the failure the per-block skip
+  exists to prevent.
+
+**Whether there is coupling worth cancelling is decided by correlation, not by
+powers**, because correlation can tell those two cases apart. The delay tracker
+already measures it, so cancelling requires a *fresh* measurement: one
+accepted within the last 15 s **of the robot actually talking** (wall clock
+would be wrong — a delay measured an hour ago is still right if the robot has
+been silent since). Without one the card passes audio
+through, reports `coupling_lost`, and says to check the volume — muting there
+would be the permanent half-duplex microphone this card exists to avoid.
+
+That is also what protects against the no-coupling case, where a canceller makes
+a microphone *worse*: with the reference playing and no echo in the mic, the
+filter cannot explain a person with the reference, the gradient is pure noise
+and it injects that noise — measured at 4.5 dB below passthrough over 18 s. With
+no coupling the tracker accepts nothing, so cancellation never runs at all.
+
+Measured on synthetic rooms (12-18 s, 60 ms path):
+
+| | echo removed | a person talking over the robot, preserved |
+|---|---|---|
+| `gentle` (linear filter only) | 18.1 dB | 18.1 dB |
+| `normal` | 22.9 dB | 12.0 dB |
+| `aggressive` | 27.9 dB | 6.5 dB |
+
+The scale stops at `aggressive` because ERLE saturates there: suppression
+factors of 1.5 and 2.5 also give 27.9 dB and cost another 2-3 dB of the
+person's voice, so offering them would only let somebody pick a strictly worse
+point.
+
+The step size is 0.2, a factor of two below the measured stability edge: 0.3
+reaches 22-25 dB, 0.4 collapses to about 0 dB and 0.5 diverges. A diverged
+filter is worse than no filter, and these robots' speakers have not been
+characterised.
+
+Measured on Orin 5 over real DDS topics, with a 450 ms delay and a 60 ms room
+convolved in (`normal`, one 24 s session):
+
+| phase | microphone in | published out | change |
+|---|---|---|---|
+| person only, robot silent | 3649 | 3649 | **0.0 dB** — untouched |
+| robot only, before the delay was measured | 1659 | 0 | muted (the fallback) |
+| robot only, converging | 1750 | 453 | **11.7 dB** |
+| both talking | 3491 | 2714 | 2.2 dB — the person survives |
+| robot only, after the double-talk | 1704 | 242 | **17.0 dB** |
+| person only again | 3331 | 3331 | **0.0 dB** |
+
+The delay came back as 460 ms against the 450 injected, with a 10 ms spread.
+The reported `echo_removed_db` was 14.1 dB and no filter reset fired.
+
+`echo_removed_db` is an exponentially-weighted average over roughly the last
+1.5 s **of the robot talking**, and only over echo-dominant blocks. Both of
+those are rig findings rather than design: a lifetime average read 3.8 dB at the
+end of that same session, and including double-talk blocks read 4.3 dB — in a
+session whose settled phases removed 11.7 and 17.0. A card that says 4 while
+removing 17 is not a diagnostic.
+
+Cost on Orin 5, callback profiled in isolation:
+
+| | ms per second of audio |
+|---|---|
+| forwarding only (warmup, or a card with nothing to cancel) | 3.7 |
+| cancelling | **27.3** |
+| cancelling, with the shadow filter | **32.8** |
+
+This section said 3.8 ms for cancelling until the shadow filter was measured,
+and that figure was wrong by a factor of eight. The benchmark fed the whole
+reference signal in before the first microphone chunk, so by the time a block
+asked for its echo the audio had aged out of the 2.5 s reference ring: every
+block came back silent, nothing was far-end-active, and **neither filter ever
+ran**. The giveaway was in the output the whole time — `adapted 0 blocks`.
+
+The same trap had already been caught once in `tests/`, where the end-to-end
+test cancelled nothing for the same reason and was fixed by interleaving the
+two streams by stamp, which is what the executor does. Anything that drives
+this card has to interleave them. The live `callback_wall_ms_per_audio_s` reads ~91 ms/s, which is GIL
+contention in a process running nine other plugins, not CPU (see the cost note
+above). Caching the delay median mattered: it is read once per chunk, and
+`np.median` was a third of this path's cost before.
+
+Reframing into 16 ms blocks means published audio is up to one block older than
+the chunk that triggered it, so a cancelled chunk carries **its own** stamp
+rather than the input's — ASR reads that header as the capture time.
+
+### Where this breaks, measured
+
+Every number above comes from a synthetic echo path: linear, time-invariant,
+sample-clock-locked — the assumptions the algorithm itself makes. That makes
+them necessary but not sufficient, so the assumptions were broken one at a time
+to find out what the margin is:
+
+| | ERLE |
+|---|---|
+| baseline | 26.8 dB |
+| speaker clipping at 50% / 30% / 15% of peak | 24.6 / 18.0 / 12.6 dB |
+| sample clock drift 10 / 50 / 200 ppm | 15.0 / **3.0** / ~1 dB |
+| echo path changes mid-session | 20.2 dB (with the shadow filter; 0.6 without) |
+
+Nonlinearity degrades gracefully. A changed path is handled. **Drift is a wall**:
+50 ppm — well inside the spread of two ordinary crystals — leaves nothing. Over
+18 s, 50 ppm is a slide of only 14 samples, but at 8 kHz that is more than half
+a period, so the high band decorrelates completely.
+
+That makes one deployment condition non-negotiable and unverified here: **the
+microphone and the speaker must share a sample clock**, which they do when both
+sit on one codec and do not when the microphone is a USB device and the speaker
+is on-board. Which robots are which is a question only hardware can answer.
+
+Nor has any of this met a real speaker. On a box with no audio hardware the
+echo path is something this file computes, and a real one adds exactly the
+effects above in combinations nobody has measured here.
+
+### What is not here yet
+
+Noise reduction, which is a different thing from echo cancellation and cannot
+remove the robot's own voice (DeepFilterNet3 and GTCRN have no reference input).
+
+A per-bin spectral residual suppressor, which would improve double-talk quality
+rather than remove more echo — the current one is a broadband soft gate, ramped
+across the block so it cannot click, and a spectral one needs its own windowed
+overlap-add framing.
+
+And the two things no amount of code can settle from here: nonlinear echo (a
+speaker driven into its limiter, which is what a vendor MCU may well do) and
+sample clock drift between the microphone and the speaker. Both need a machine
+with a speaker and a microphone in one room.
+
+Processing currently happens in the microphone callback, with no worker thread:
+the work is a comparison and a memset, and the estimate is a 300x150 dot
+product once a second.
+
+Measured on Orin 5 (jp5.11), one stream, idle box, against an injected 450 ms
+echo on real DDS topics:
+
+| | ms per second of audio |
+|---|---|
+| callback profiled in isolation | 3.6 |
+| `callback_wall_ms_per_audio_s`, live, reference playing | 29.7 |
+| same, before the `array.array` fix below | 46.9 |
+| same, live, no reference at all (no correlation) | 40.7 → the correlation costs ~6 |
+
+The two columns differ because the reported figure is **wall** time inside the
+callback, not CPU time: nine other plugins' threads contend for the GIL in this
+process. Treat it as a headroom indicator and a regression tripwire, and
+profile in isolation before concluding anything about cost.
+
+The `array.array` fix is worth repeating elsewhere. Assigning a Python list to
+an `uint8[]` field makes the generated setter validate it element by element
+(`all(isinstance(v, int) and 0 <= v < 256 ...)`, 1024 iterations per chunk);
+assigning an `array.array('B')` takes a buffer fast path. Measured here: 0.226
+vs 0.021 ms per chunk, which was the single largest cost in this callback.
+`plugins/tts.py` and every mic driver in `phanthymotus-driver` still write
+`list(...)` and can have the same saving.
 
 ---
 
@@ -2100,6 +2495,19 @@ what an operator reasons about, and it stays meaningful when the camera's own ra
 changes. (`min_interval_ms`, the knob this replaced, is still honoured when
 `detect_fps` is absent, so a canvas saved by an earlier build keeps working.)
 
+**OCR has the same knob, `ocr_fps`**, with the same semantics, the same 1.0
+default and the same `min_interval_ms` fallback. It used to default to every
+frame, which on a 14fps 720p camera cost a full core: inference is TensorRT and
+sits on the GPU, but the JPEG decode in front of it does not — measured on Tianyi
+(Orin, 30W), **37.6 ms/frame** to decode 1280x720 plus 7.1 ms for the shape-
+preserving enhancement. Text in front of a robot does not change at frame rate, so
+once a second is the sensible default and the rest was heat.
+
+Note that lowering `max_side_len` is *not* a way to make the decode cheaper. The
+same measurement at 960 took **66.5 ms** — worse than 1600, because a bound below
+the source resolution turns a straight decode into a decode plus a resample. The
+frame rate is the knob that matters.
+
 A face that *fails* the gate is reported with `person_id: null`, `quality: "low"`
 and a `reason`, and is neither matched nor enrolled. Matching a blurred 30 px face
 is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
@@ -3645,6 +4053,7 @@ Three rules that follow, each with a reason:
 |-----------|--------------|--------|
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
+| Output (echo_cancellation) | `{input_topic}/clean` | `audio/pcm-16k` |
 | Output (vop) | `{input_topic}/objects` | `data/json` |
 | Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
 | Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |
