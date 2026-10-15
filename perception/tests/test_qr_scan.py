@@ -61,7 +61,8 @@ def test_crop_retry_keeps_original_coordinates_and_recovers_partial_multi():
         def detectAndDecode(self, frame):
             return real.detectAndDecode(frame)
 
-    decoder = QrDecoder()
+    # Exercise OpenCV crop recovery independently of the earlier ZXing path.
+    decoder = QrDecoder(use_zxing=False)
     decoder.detector = PartialDetector()
     ok, data = cv2.imencode('.jpg', image)
     assert ok
@@ -134,6 +135,127 @@ def test_single_full_frame_fallback_does_not_require_crop_retry():
     detector = decoder.detector = SingleDetector()
     assert decoder.decode(jpeg())[0]['text'] == 'SINGLE-PATH'
     assert detector.calls == 1 and decoder.undecoded == []
+
+
+class _NoQrDetector:
+    def detectAndDecodeMulti(self, image):
+        return False, (), None, ()
+
+    def detectAndDecode(self, image):
+        return '', None, None
+
+
+def test_zxing_real_fallback_when_opencv_misses_qr():
+    pytest.importorskip('zxingcpp')
+    decoder = QrDecoder()
+    decoder.detector = _NoQrDetector()
+    codes = decoder.decode(jpeg('ZXING-FALLBACK'))
+    assert len(codes) == 1 and codes[0]['text'] == 'ZXING-FALLBACK'
+    assert codes[0]['image_width'] == codes[0]['image_height'] == 290
+    assert len(codes[0]['corners_px']) == 4
+    assert decoder.undecoded == []
+
+
+def test_zxing_recovers_unreadable_before_crop_retries():
+    pytest.importorskip('zxingcpp')
+    data = jpeg('RECOVER-BEFORE-CROP')
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    found, points = cv2.QRCodeDetector().detect(image)
+    assert found
+
+    class UnreadableDetector(_NoQrDetector):
+        def detectAndDecodeMulti(self, image):
+            return True, [''], points, ()
+
+    def unexpected(*args):
+        pytest.fail('recovered candidate must not need OpenCV crop retries')
+
+    decoder = QrDecoder()
+    decoder.detector = UnreadableDetector()
+    decoder._retry_crop = unexpected
+    codes = decoder.decode(data)
+    assert len(codes) == 1 and codes[0]['text'] == 'RECOVER-BEFORE-CROP'
+    assert decoder.undecoded == []
+
+
+def _zxing_result(text, corners, valid=True):
+    return SimpleNamespace(valid=valid, text=text, position=SimpleNamespace(**{
+        name: SimpleNamespace(x=x, y=y) for name, (x, y) in zip(
+            ('top_left', 'top_right', 'bottom_right', 'bottom_left'), corners)}))
+
+
+def test_zxing_partial_recovery_merges_positions_not_payloads():
+    a = [[10, 10], [60, 10], [60, 60], [10, 60]]
+    b = [[150, 150], [230, 150], [230, 230], [150, 230]]
+    unreadable = [[80, 80], [120, 80], [120, 120], [80, 120]]
+    calls = []
+
+    class PartialDetector:
+        def detectAndDecodeMulti(self, image):
+            return True, ['SAME', '', ''], np.array([a, b, unreadable]), ()
+
+    def read(image, **kwargs):
+        calls.append(kwargs)
+        return [_zxing_result('SAME', a), _zxing_result('SAME', b),
+                _zxing_result('BAD-CHECKSUM', unreadable, valid=False)]
+
+    decoder = QrDecoder()
+    decoder.detector = PartialDetector()
+    decoder._retry_crop = lambda *args: ('', 0)
+    decoder._zxing = SimpleNamespace(read_barcodes=read,
+                                    BarcodeFormat=SimpleNamespace(QRCode='QR-only'))
+    codes = decoder.decode(jpeg())
+    assert [c['text'] for c in codes] == ['SAME', 'SAME']
+    assert codes[0]['corners_px'] == a and codes[1]['corners_px'] == b
+    assert len(decoder.undecoded) == 1
+    assert decoder.undecoded[0]['corners_px'] == unreadable
+    assert calls == [{'formats': 'QR-only', 'try_rotate': True, 'try_downscale': True}]
+    tracker = QrTracker(3)
+    assert len(tracker.update(codes, 0)) == 1
+    assert tracker.update(codes, 1) == []
+
+
+def test_zxing_failure_retains_opencv_success_and_unreadable_state(caplog):
+    points = np.array([[[20, 20], [70, 20], [70, 70], [20, 70]],
+                       [[150, 150], [230, 150], [230, 230], [150, 230]]])
+
+    class PartialDetector:
+        def detectAndDecodeMulti(self, image):
+            return True, ['OPENCV-OK', ''], points, ()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError('do not leak backend error or payload')
+
+    decoder = QrDecoder()
+    decoder.detector = PartialDetector()
+    decoder._retry_crop = lambda *args: ('', 0)
+    decoder._zxing = SimpleNamespace(read_barcodes=fail,
+                                    BarcodeFormat=SimpleNamespace(QRCode='QR-only'))
+    for _ in range(2):
+        assert [c['text'] for c in decoder.decode(jpeg())] == ['OPENCV-OK']
+        assert len(decoder.undecoded) == 1
+    assert caplog.text.count('QR ZXing fallback failed') == 1
+    assert 'do not leak' not in caplog.text
+
+
+def test_zxing_missing_dependency_falls_back_to_opencv(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, 'zxingcpp', None)
+    decoder = QrDecoder()
+    decoder.detector = _NoQrDetector()
+    assert decoder.decode(jpeg()) == []
+    assert decoder._zxing_unavailable
+    # Missing ZXing does not affect the normal OpenCV path.
+    decoder.detector = cv2.QRCodeDetector()
+    assert decoder.decode(jpeg('OPENCV-ONLY'))[0]['text'] == 'OPENCV-ONLY'
+
+
+def test_zxing_not_called_when_opencv_succeeds():
+    def unexpected(*args, **kwargs):
+        pytest.fail('ZXing must only run on the fallback path')
+    decoder = QrDecoder()
+    decoder._zxing = SimpleNamespace(read_barcodes=unexpected)
+    assert decoder.decode(jpeg('DIRECT'))[0]['text'] == 'DIRECT'
 
 
 def wait(plugin, key, status, sequence=None):

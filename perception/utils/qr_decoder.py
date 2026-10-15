@@ -1,14 +1,22 @@
 """Robot-independent JPEG QR decoding and bounded content deduplication."""
 from __future__ import annotations
 
+import logging
+
+log = logging.getLogger(__name__)
+
 class QrDecoder:
     """Decode JPEG frames. Pixel coordinates refer to the original image."""
 
-    def __init__(self):
+    def __init__(self, *, use_zxing=True):
         import cv2
         self.cv2 = cv2
         self.detector = cv2.QRCodeDetector()
         self.undecoded = []
+        self.use_zxing = use_zxing
+        self._zxing = None
+        self._zxing_unavailable = False
+        self._zxing_error_logged = False
 
     def decode(self, jpeg: bytes) -> list[dict]:
         import numpy as np
@@ -26,17 +34,13 @@ class QrDecoder:
                 points = single
                 texts = [text] if single is not None else []
         if points is None:
-            return []
+            return self._decode_zxing(image)
         candidates = np.asarray(points).reshape(-1, 4, 2)
         codes = []
-        retry_budget = 8  # Across all candidates; blank frames do no retries.
         for index, corners in enumerate(candidates):
             if not np.isfinite(corners).all():
                 continue
             text = texts[index] if index < len(texts) else ''
-            if not text and retry_budget:
-                text, used = self._retry_crop(image, corners, retry_budget)
-                retry_budget -= used
             record = {
                 "corners_px": [[float(x), float(y)] for x, y in corners],
                 "image_width": int(image.shape[1]),
@@ -46,7 +50,84 @@ class QrDecoder:
                 codes.append({"text": text, **record})
             else:
                 self.undecoded.append(record)
+        if not codes or self.undecoded:
+            recovered = self._decode_zxing(image)
+            for code in recovered:
+                # Keep one result per physical code, even when both readers
+                # return it. Equal payloads at distinct positions remain distinct.
+                if not any(self._overlaps(code, existing) for existing in codes):
+                    codes.append(code)
+            self.undecoded = [record for record in self.undecoded
+                              if not any(self._overlaps(record, code) for code in recovered)]
+        # Try the independent reader before repeated OpenCV crop attempts, so
+        # a styled QR recoverable by ZXing need not pay for all eight retries.
+        retry_budget = 8
+        unresolved = []
+        for record in self.undecoded:
+            text = ''
+            if retry_budget:
+                text, used = self._retry_crop(
+                    image, np.asarray(record['corners_px']), retry_budget)
+                retry_budget -= used
+            if text:
+                codes.append({'text': text, **record})
+            else:
+                unresolved.append(record)
+        self.undecoded = unresolved
         return codes
+
+    @staticmethod
+    def _overlaps(left, right):
+        """Match full-frame detections without attributing a neighbour's text."""
+        import numpy as np
+        a, b = np.asarray(left['corners_px']), np.asarray(right['corners_px'])
+        low_a, high_a = a.min(axis=0), a.max(axis=0)
+        low_b, high_b = b.min(axis=0), b.max(axis=0)
+        intersection = np.maximum(0, np.minimum(high_a, high_b) - np.maximum(low_a, low_b)).prod()
+        union = (high_a - low_a).prod() + (high_b - low_b).prod() - intersection
+        return union > 0 and intersection / union >= 0.5
+
+    def _decode_zxing(self, image):
+        """One full-frame QR-only fallback; reuse the image's existing ZXing.
+
+        Only arguments supported by both shipped versions (2.2.0 / 3.1.1)
+        are passed. Missing/failed ZXing must not discard OpenCV results.
+        """
+        if not self.use_zxing or self._zxing_unavailable:
+            return []
+        if self._zxing is None:
+            try:
+                import zxingcpp
+            except ImportError:
+                self._zxing_unavailable = True
+                log.warning('QR ZXing fallback unavailable; continuing with OpenCV')
+                return []
+            self._zxing = zxingcpp
+        try:
+            results = self._zxing.read_barcodes(
+                image, formats=self._zxing.BarcodeFormat.QRCode,
+                try_rotate=True, try_downscale=True)
+            codes = []
+            for result in results[:16]:
+                if not result.valid or not result.text:
+                    continue
+                position = result.position
+                corners = [[float(point.x), float(point.y)] for point in (
+                    position.top_left, position.top_right,
+                    position.bottom_right, position.bottom_left)]
+                if not all(0 <= x < image.shape[1] and 0 <= y < image.shape[0]
+                           for x, y in corners):
+                    continue
+                codes.append({'text': result.text, 'corners_px': corners,
+                              'image_width': int(image.shape[1]),
+                              'image_height': int(image.shape[0])})
+            return codes
+        except Exception:
+            # Do not log payloads or repeat a backend error on every frame.
+            if not self._zxing_error_logged:
+                log.warning('QR ZXing fallback failed; continuing with OpenCV')
+                self._zxing_error_logged = True
+            return []
 
     def _retry_crop(self, image, corners, budget):
         """Re-detect at bounded scales, retaining coordinates in the source frame."""
@@ -120,5 +201,5 @@ def self_check():
     image = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
     ok, jpeg = cv2.imencode('.jpg', image)
     assert ok, 'OpenCV JPEG encoding unavailable'
-    result = QrDecoder().decode(jpeg.tobytes())
+    result = QrDecoder(use_zxing=False).decode(jpeg.tobytes())
     assert [c['text'] for c in result] == ['QR-SELF-CHECK'], 'OpenCV QR decoding unavailable'
