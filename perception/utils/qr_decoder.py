@@ -66,6 +66,10 @@ class QrDecoder:
         for record in self.undecoded:
             text = ''
             if retry_budget:
+                text, used = self._retry_rectified(
+                    image, np.asarray(record['corners_px']), retry_budget)
+                retry_budget -= used
+            if not text and retry_budget:
                 text, used = self._retry_crop(
                     image, np.asarray(record['corners_px']), retry_budget)
                 retry_budget -= used
@@ -88,7 +92,7 @@ class QrDecoder:
         return union > 0 and intersection / union >= 0.5
 
     def _decode_zxing(self, image):
-        """One full-frame QR-only fallback; reuse the image's existing ZXing.
+        """Decode a frame or prepared ROI with the existing QR-only ZXing.
 
         Only arguments supported by both shipped versions (2.2.0 / 3.1.1)
         are passed. Missing/failed ZXing must not discard OpenCV results.
@@ -128,6 +132,63 @@ class QrDecoder:
                 log.warning('QR ZXing fallback failed; continuing with OpenCV')
                 self._zxing_error_logged = True
             return []
+
+    def _retry_rectified(self, image, corners, budget):
+        """Rectify a known quadrangle, then try bounded contrast variants.
+
+        This only resamples received pixels; it does not invent QR modules or
+        retrieve a higher-resolution frame from a device-specific camera API.
+        """
+        import numpy as np
+        cv2 = self.cv2
+        source = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+        if (budget <= 0 or not np.isfinite(source).all()
+                or not cv2.isContourConvex(source)
+                or abs(cv2.contourArea(source)) < 16):
+            return '', 0
+        # Fixed allocation, including a white quiet zone around the QR.
+        side, border = 640, 77
+        target = np.float32([[border, border], [side + border, border],
+                             [side + border, side + border], [border, side + border]])
+        transform = cv2.getPerspectiveTransform(source, target)
+        inverse = cv2.getPerspectiveTransform(target, source)
+        rectified = cv2.warpPerspective(
+            image, transform, (side + 2 * border, side + 2 * border),
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+        gray = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
+
+        def variants():
+            yield gray
+            yield cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+            yield cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            yield cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY, 41, 8)
+
+        candidate = {'corners_px': source}
+        used = 0
+        for variant in variants():
+            if used >= min(4, budget):
+                break
+            # One reader call per attempt, sharing the frame-wide retry budget.
+            # Older images without ZXing retain an OpenCV-only retry path.
+            if self.use_zxing and not self._zxing_unavailable:
+                decoded = self._decode_zxing(variant)
+                if self._zxing_unavailable:
+                    text, found, _ = self.detector.detectAndDecode(variant)
+                    decoded = ([{'text': text, 'corners_px': found.reshape(4, 2)}]
+                               if text and found is not None else [])
+            else:
+                text, found, _ = self.detector.detectAndDecode(variant)
+                decoded = ([{'text': text, 'corners_px': found.reshape(4, 2)}]
+                           if text and found is not None else [])
+            used += 1
+            for code in decoded:
+                points = np.asarray(code['corners_px'], dtype=np.float32).reshape(1, 4, 2)
+                mapped = cv2.perspectiveTransform(points, inverse).reshape(4, 2)
+                if np.isfinite(mapped).all() and self._overlaps(
+                        candidate, {'corners_px': mapped}):
+                    return code['text'], used
+        return '', used
 
     def _retry_crop(self, image, corners, budget):
         """Re-detect at bounded scales, retaining coordinates in the source frame."""

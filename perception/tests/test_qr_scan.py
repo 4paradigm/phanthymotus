@@ -64,6 +64,7 @@ def test_crop_retry_keeps_original_coordinates_and_recovers_partial_multi():
     # Exercise OpenCV crop recovery independently of the earlier ZXing path.
     decoder = QrDecoder(use_zxing=False)
     decoder.detector = PartialDetector()
+    decoder._retry_rectified = lambda *args: ('', 0)
     ok, data = cv2.imencode('.jpg', image)
     assert ok
     result = decoder.decode(data.tobytes())
@@ -201,6 +202,7 @@ def test_zxing_partial_recovery_merges_positions_not_payloads():
 
     decoder = QrDecoder()
     decoder.detector = PartialDetector()
+    decoder._retry_rectified = lambda *args: ('', 0)
     decoder._retry_crop = lambda *args: ('', 0)
     decoder._zxing = SimpleNamespace(read_barcodes=read,
                                     BarcodeFormat=SimpleNamespace(QRCode='QR-only'))
@@ -256,6 +258,99 @@ def test_zxing_not_called_when_opencv_succeeds():
     decoder = QrDecoder()
     decoder._zxing = SimpleNamespace(read_barcodes=unexpected)
     assert decoder.decode(jpeg('DIRECT'))[0]['text'] == 'DIRECT'
+
+
+@pytest.mark.parametrize('use_zxing', [True, False])
+def test_rectified_real_decode_keeps_original_frame_coordinates(use_zxing):
+    if use_zxing:
+        pytest.importorskip('zxingcpp')
+    qr = cv2.imdecode(np.frombuffer(jpeg('RECTIFIED-001'), np.uint8), cv2.IMREAD_COLOR)
+    _, qr_corners = cv2.QRCodeDetector().detect(qr)
+    transform = cv2.getPerspectiveTransform(
+        np.float32([[0, 0], [289, 0], [289, 289], [0, 289]]),
+        np.float32([[250, 110], [650, 180], [590, 610], [180, 480]]))
+    image = cv2.warpPerspective(qr, transform, (1000, 720), borderValue=(255, 255, 255))
+    corners = cv2.perspectiveTransform(qr_corners, transform)
+
+    class UnreadableDetector(_NoQrDetector):
+        def detectAndDecodeMulti(self, image):
+            return True, [''], corners, ()
+
+        def detectAndDecode(self, frame):
+            if frame.shape[:2] == (720, 1000):
+                return '', None, None
+            return cv2.QRCodeDetector().detectAndDecode(frame)
+
+    decoder = QrDecoder(use_zxing=use_zxing)
+    decoder.detector = UnreadableDetector()
+    real_zxing = decoder._decode_zxing
+    # Force the initial full-frame attempt to fail, then use the real reader
+    # on the perspective-corrected image instead of a fabricated payload.
+    decoder._decode_zxing = lambda frame: ([] if frame.shape[:2] == (720, 1000)
+                                           else real_zxing(frame))
+    decoder._retry_crop = lambda *args: pytest.fail('rectified QR must decode first')
+    ok, data = cv2.imencode('.jpg', image)
+    assert ok
+    result = decoder.decode(data.tobytes())
+    assert len(result) == 1 and result[0]['text'] == 'RECTIFIED-001'
+    assert np.allclose(result[0]['corners_px'], corners.reshape(4, 2))
+    assert result[0]['image_width'] == 1000 and result[0]['image_height'] == 720
+    assert decoder.undecoded == []
+
+
+def test_rectified_and_crop_retries_share_frame_budget():
+    target = np.float32([[50, 50], [230, 50], [230, 230], [50, 230]])
+    calls = []
+
+    class UnreadableDetector(_NoQrDetector):
+        def detectAndDecodeMulti(self, image):
+            return False, [''] * 10, np.array([target] * 10), ()
+
+        def detectAndDecode(self, image):
+            calls.append(('crop', image.shape[:2]))
+            return '', None, None
+
+    decoder = QrDecoder()
+    decoder.detector = UnreadableDetector()
+
+    def no_decode(frame):
+        calls.append(('zxing', frame.shape[:2]))
+        return []
+
+    decoder._decode_zxing = no_decode
+    assert decoder.decode(jpeg()) == []
+    assert calls[0] == ('zxing', (290, 290))  # Full-frame fallback is separate.
+    assert len(calls[1:]) == 8
+    assert sum(kind == 'zxing' for kind, _ in calls[1:]) == 4
+    assert all(shape == (794, 794) for kind, shape in calls[1:] if kind == 'zxing')
+    assert len(decoder.undecoded) == 10
+
+
+def test_rectified_retry_rejects_neighbour_outside_candidate():
+    decoder = QrDecoder()
+    calls = []
+
+    def neighbour(frame):
+        calls.append(frame.shape)
+        # A detection entirely in the padding maps outside the target QR.
+        return [{'text': 'NEIGHBOUR', 'corners_px': [[0, 0], [10, 0], [10, 10], [0, 10]]}]
+
+    decoder._decode_zxing = neighbour
+    frame = np.full((300, 300, 3), 255, np.uint8)
+    corners = np.float32([[40, 40], [250, 40], [250, 250], [40, 250]])
+    assert decoder._retry_rectified(frame, corners, 2) == ('', 2)
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize('corners', [
+    [[1, 1]] * 4,
+    [[0, 0], [30, 30], [0, 30], [30, 0]],
+    [[float('nan'), 0], [30, 0], [30, 30], [0, 30]],
+])
+def test_rectified_retry_skips_invalid_quadrangles(corners):
+    frame = np.full((40, 40, 3), 255, np.uint8)
+    decoder = QrDecoder()
+    assert decoder._retry_rectified(frame, np.asarray(corners), 8) == ('', 0)
 
 
 def wait(plugin, key, status, sequence=None):
