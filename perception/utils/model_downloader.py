@@ -1526,6 +1526,38 @@ def ensure_vop_model(model_dir: str, family: str | None = None,
                                  progress_cb=progress_cb)
 
 
+# Exported from the official OpenAI ViT-B/32 checkpoint with
+# tools/export_robot_model_clip.py. The bundle is installed locally under
+# /models/robot_model; no remote URL is configured for this opt-in prototype.
+ROBOT_MODEL_BUNDLES = {
+    "clip-vit-b32": {
+        "files": {
+            "clip_image.onnx": {
+                "size": 351783473,
+                "sha256": "118bd74305a817ef411e68e403cfc2ce902eba3019339f8ca8439587f1e4de9c",
+            },
+            "candidates.npz": {
+                "size": 28442,
+                "sha256": "c55a238018f6f83065e7225257a8c27c6082ca49c06e202f0e686332ca2ef568",
+            },
+        },
+    },
+}
+
+
+def ensure_robot_model_bundle(model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Use only the locally installed image encoder with published byte pins."""
+    model_dir = require_models_subpath(model_dir)
+    files = ROBOT_MODEL_BUNDLES["clip-vit-b32"]["files"]
+    paths = {name: os.path.join(model_dir, name) for name in files}
+    try:
+        for name, path in paths.items():
+            _verify_pinned_file(path, files[name])
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"robot model bundle verification failed: {error}") from error
+    return paths
+
+
 def ensure_depth_model(model_dir: str, family: str | None = None,
                        progress_cb=None) -> dict[str, str]:
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
