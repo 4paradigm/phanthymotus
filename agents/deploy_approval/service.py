@@ -2289,6 +2289,127 @@ class DeployController:
             )
             raise
 
+    async def handle_evidence_link(
+        self, repo: str, pr_number: int, comment_id: int, actor: str, actor_id: str,
+    ) -> bool:
+        """Issue one verified short-lived link in a separate Conversation reply."""
+        from .commands import parse_command
+        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+
+        def authorized_repo() -> bool:
+            return (self.config.auth_valid and repo in self.config.active_repos
+                    and repo in self.config.github_repos)
+
+        if (not authorized_repo() or type(pr_number) is not int or pr_number <= 0
+                or type(comment_id) is not int or comment_id <= 0):
+            return False
+        marker = f"<!-- deploy-approval-evidence-link:{repo}:{pr_number}:{comment_id} -->"
+
+        async def already_replied() -> bool:
+            # Durable deduplication also covers a successful POST whose response
+            # was lost. Only this App's replies may satisfy the marker.
+            existing = await self.proxy.get_issue_comments(repo, pr_number)
+            return any(self.proxy.is_bot_comment(c)
+                       and marker in (c.get("body", "") or "") for c in existing)
+
+        async def read_context() -> tuple:
+            if not authorized_repo():
+                raise PolicyError("Evidence request denied")
+            pr = await self.proxy.get_pr(repo, pr_number)
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            comment = await self.proxy.get_comment(repo, comment_id)
+            if not isinstance(comment, dict) or not isinstance(state, dict):
+                raise PolicyError("Evidence request denied")
+            user = comment.get("user", {})
+            app = comment.get("performed_via_github_app")
+            if (not isinstance(user, dict)
+                    or type(comment.get("id")) is not int or comment["id"] != comment_id
+                    or comment.get("url") != f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/comments/{comment_id}"
+                    or comment.get("issue_url") != f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
+                    or type(user.get("id")) is not int or user["id"] <= 0
+                    or str(user["id"]) != actor_id or not actor or user.get("login") != actor
+                    or user.get("type") != "User" or self.proxy.is_bot_comment(comment)
+                    or not isinstance(comment.get("body"), str)
+                    or parse_command(comment["body"]).kind != "evidence_link"
+                    or not isinstance(comment.get("created_at"), str) or not comment["created_at"]
+                    or comment.get("updated_at") != comment["created_at"]
+                    or (app is not None and (not isinstance(app, dict)
+                        or type(app.get("id")) is not int or app["id"] <= 0))
+                    or pr.get("number") != pr_number or pr.get("state") != "open" or pr.get("merged")):
+                raise PolicyError("Evidence request denied")
+            head = state.get("head_sha", "")
+            if (not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None
+                    or pr.get("head", {}).get("sha") != head):
+                raise PolicyError("Evidence request denied")
+            pr_author = pr.get("user", {})
+            if not (type(pr_author.get("id")) is int and pr_author["id"] == user["id"]
+                    and pr_author.get("login") == actor):
+                await self._check_record_test_permissions(repo, actor, state)
+            if not authorized_repo():
+                raise PolicyError("Evidence request denied")
+            # Ignore API display metadata; preserve exact command/provenance.
+            identity = (comment["id"], comment["url"], comment["issue_url"],
+                        comment["body"], user["id"], user["login"], user["type"],
+                        comment["created_at"], comment["updated_at"],
+                        app.get("id") if app else None, pr_author.get("id"), pr_author.get("login"))
+            return state, identity
+
+        async def reply(body: str, expected_context: tuple | None = None) -> bool:
+            if not authorized_repo():
+                return False
+            if await already_replied():
+                return True
+            if expected_context is not None and await read_context() != expected_context:
+                return False
+            if not authorized_repo():
+                return False
+            posted = await self.proxy.post_issue_comment(
+                repo, pr_number, f"{comments_mod.BOT_MARKER}\n{marker}\n\n{body}",
+            )
+            return isinstance(posted, dict) and type(posted.get("id")) is int and posted["id"] > 0
+
+        try:
+            original = await read_context()
+            if await already_replied():
+                return True
+            state = original[0]
+            if comment_id <= state.get("last_processed_comment_id", 0):
+                return True  # Never replay a consumed historical request.
+            metadata = state.get("cos", {}) or {}
+            if not self._valid_cos_metadata(repo, pr_number, state["head_sha"], metadata):
+                return await reply("No verified COS evidence is available for this PR HEAD.", original)
+            # verify_upload performs bounded HEAD/GET, SHA256, size, gzip and
+            # repo/PR/full-HEAD identity validation. This path never calls PUT.
+            if not await self.cos.verify_upload(metadata["object_key"], metadata["sha256"], metadata["size"]):
+                return False
+            if await read_context() != original:
+                return False
+            if await already_replied():
+                return True
+            url = comments_mod._safe_download_url(
+                self.cos.generate_evidence_download_url(metadata["object_key"]),
+            )
+            if not url or await read_context() != original:
+                return False
+            return await reply(
+                f"[Download COS evidence]({url})\n\n"
+                f"Expires in {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds from issuance. "
+                "Post a new `/evidence_link` after expiry. Open PRs only.",
+                original,
+            )
+        except PolicyError:
+            try:
+                return await reply("Evidence request denied.")
+            except Exception as exc:
+                logger.warning("evidence_link denial reply failed %s#%s cid=%s exception=%s",
+                               repo, pr_number, comment_id, type(exc).__name__)
+                return False
+        except Exception as exc:
+            # SDK/HTTP exceptions can contain signed URLs; never log their text.
+            logger.warning("evidence_link failed %s#%s cid=%s exception=%s",
+                           repo, pr_number, comment_id, type(exc).__name__)
+            return False
+
     async def handle_deploy_status(
         self, repo: str, pr_number: int, comment_id: int,
     ) -> bool:

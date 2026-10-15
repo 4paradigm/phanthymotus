@@ -8,6 +8,7 @@ No obsolete lifecycle states, no build_index, no dpl_x.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from zoneinfo import ZoneInfo
 
 import urllib.parse
@@ -134,16 +135,16 @@ def _cos_evidence_block(
     if not object_key:
         return []
     lines = [""]
-    if download_url:
-        safe_url = _safe_download_url(download_url)
-        if safe_url:
-            lines.append(f"[Download COS evidence]({safe_url})")
     text = f"COS: `{_escape(object_key)}`"
     if sha256:
-        text += f" \u00b7 `@sha256:{_escape(sha256[:12])}`"
+        text += f" \u00b7 `@sha256:{_escape(sha256)}`"
     if size:
         text += f" \u00b7 `{_human_size(size)}`"
     lines.append(text)
+    if (isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
+            and isinstance(size, int) and not isinstance(size, bool)
+            and 1 <= size <= 10 * 1024 * 1024):
+        lines.append("For a short-lived download link, post `/evidence_link` on this open PR.")
     return lines
 
 
@@ -815,6 +816,7 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/record_test result=pass|fail [summary=\"...\"]` \u2014 Record overall test result",
         "",
         "**Read-only commands:**",
+        "- `/evidence_link` \u2014 Request a short-lived evidence download link (open PRs only)",
         "- `/deploy_status` \u2014 Show deployment status",
         "- `/deploy_help [topic]` \u2014 Show this help",
         "",
