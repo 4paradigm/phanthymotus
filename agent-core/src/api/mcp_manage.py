@@ -1131,8 +1131,17 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                import ros2_bridge, start as _start_mod
+                import ros2_bridge, start as _start_mod, remote_camera as _remote_camera
                 visible = '/remote_control/camera' in ros2_bridge.get_dds_topics()
+                # `info` is in _SYSTEM_ACTIONS_NO_CONFIG, so the saved config is
+                # not replayed before it — read it here. Either row may hold the
+                # key: older UI builds saved without filtering by scope.
+                _inst = req.arguments.get('instance_id', '')
+                _cfg = {**(config.main.get(f'tool_config:{mcp_id}:remote_camera') or {}),
+                        **((config.main.get(
+                            f'tool_config:{mcp_id}:remote_camera:{_inst}') or {})
+                           if _inst else {})}
+                declaration = _remote_camera.declaration(_cfg)
                 recent = list(_start_mod._camera_recent)
                 achieved = 0.0
                 if len(recent) >= 2 and recent[-1] > recent[0]:
@@ -1153,6 +1162,12 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                                    'format': 'image/jpeg'}],
                     'topic_visible': visible,
                     'ws_connected': _start_mod._camera_ws_connected,
+                    # What the optics are, when anyone has said. Consumers read
+                    # this off `info()` — `api/config.py:_upstream_camera_info`
+                    # collects it from a card's sources and hands it to the
+                    # consumer's `start`. Empty unless a field of view has been
+                    # configured; see `start.remote_camera_declaration`.
+                    **({'camera_info': declaration} if declaration else {}),
                     'frames_received': _start_mod._camera_frame_count}}
             return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
