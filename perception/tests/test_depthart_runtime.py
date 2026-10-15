@@ -4,7 +4,7 @@ import pytest
 import vision_stubs
 from vision_stubs import _FakeExecutor
 from plugins import visual_depth as vd
-from plugins.depthart_runtime import camera_matrix, prepare_image
+from plugins.depthart_runtime import camera_matrix, prepare_image, fit_to_canvas, canvas_resize
 from plugins.vision_runtime import decode_depth
 
 
@@ -17,7 +17,7 @@ def camera(fx=900.):
 
 def test_preprocess_scales_intrinsics_and_normalizes_rgb():
     frame=np.zeros((900,1600,3),np.uint8); frame[:,:,2]=255
-    blob,k=prepare_image(frame,camera(),(864,480))
+    blob,k,crop=prepare_image(frame,camera(),(864,480))
     expected=np.array(camera()['K'],np.float32).reshape(3,3)
     expected[0]*=864/1600; expected[1]*=480/900
     assert blob.shape==(1,3,480,864)
@@ -31,9 +31,71 @@ def test_invalid_camera_rejected(bad):
     with pytest.raises(ValueError):camera_matrix(bad)
 
 
-def test_unsupported_aspect_rejected():
-    with pytest.raises(ValueError,match='aspect ratio'):
-        prepare_image(np.zeros((480,640,3),np.uint8),camera(),(864,480))
+@pytest.mark.parametrize('size', [(1280, 720), (864, 480), (640, 360), (1920, 1080),
+                                  (960, 540), (848, 480)])
+def test_no_crop_when_the_resize_already_lands_on_the_canvas(size):
+    # The rounding to multiples of 32 admits a band of ratios, not just the
+    # canvas's exact 1.8. 16:9 needs no crop; cropping it to 1.8 regardless
+    # would throw away rows for nothing.
+    assert fit_to_canvas(*size, (864, 480)) == (0, 0, *size)
+    assert canvas_resize(*size, (864, 480)) == (864, 480)
+
+
+@pytest.mark.parametrize('size,expected', [
+    ((640, 480), (0, 62, 640, 356)),      # 4:3 — trim top and bottom
+    ((800, 600), (0, 78, 800, 444)),
+    ((1280, 960), (0, 124, 1280, 711)),
+    ((1280, 800), (0, 44, 1280, 711)),    # 16:10 — a much smaller loss
+    ((1600, 480), (368, 0, 864, 480)),    # too wide — trim the sides
+])
+def test_centre_crop_fits_the_canvas_aspect(size, expected):
+    # A 4:3 source used to be refused outright. It is cropped now, because the
+    # alternative on a fixed engine canvas is a stretch, and a stretch hands
+    # the network a geometry its K does not describe.
+    assert fit_to_canvas(*size, (864, 480)) == expected
+    x0, y0, w, h = expected
+    # The point of the crop: what is left resizes onto the canvas exactly.
+    assert canvas_resize(w, h, (864, 480)) == (864, 480)
+    # Centred: equal margins on the axis that was trimmed.
+    assert (size[0] - w) // 2 == x0 and (size[1] - h) // 2 == y0
+
+
+@pytest.mark.parametrize('size', [(480, 854), (200, 1000), (720, 1280)])
+def test_a_crop_that_would_eat_half_the_frame_is_refused(size):
+    with pytest.raises(ValueError, match='crop away'):
+        fit_to_canvas(*size, (864, 480))
+
+
+def test_crop_moves_the_principal_point_and_leaves_focal_lengths_alone():
+    """The property that makes this cheap: a vertical crop costs no horizontal FOV."""
+    frame = np.zeros((480, 640, 3), np.uint8)
+    cam = {'schema': 'motus.camera/1', 'id': 'c', 'width': 640, 'height': 480,
+           'K': [502.3, 0., 319.5, 0., 502.3, 239.5, 0., 0., 1.]}
+    blob, k, crop = prepare_image(frame, cam, (864, 480))
+    assert blob.shape == (1, 3, 480, 864)
+    assert crop == (0, 62, 640, 356)
+    sx, sy = 864 / 640, 480 / 356
+    # fx scales with the horizontal resize only — the crop did not touch width.
+    assert k[0][0, 0] == pytest.approx(502.3 * sx, rel=1e-5)
+    assert k[0][0, 2] == pytest.approx(319.5 * sx, rel=1e-5)
+    # cy is the principal point in the cropped frame, then scaled.
+    assert k[0][1, 2] == pytest.approx((239.5 - 62) * sy, rel=1e-5)
+    assert k[0][1, 1] == pytest.approx(502.3 * sy, rel=1e-5)
+    # The horizontal half-FOV a consumer derives back is unchanged by the crop.
+    assert np.arctan((864 / 2) / k[0][0, 0]) == pytest.approx(
+        np.arctan((640 / 2) / 502.3), rel=1e-5)
+
+
+def test_declaration_at_a_higher_resolution_than_the_frame():
+    # The declaration may describe the same lens at a larger size; K must be
+    # brought to frame pixels before the crop offsets, not after.
+    frame = np.zeros((480, 640, 3), np.uint8)
+    cam = {'schema': 'motus.camera/1', 'id': 'c', 'width': 1280, 'height': 960,
+           'K': [1004.6, 0., 639., 0., 1004.6, 479., 0., 0., 1.]}
+    blob, k, crop = prepare_image(frame, cam, (864, 480))
+    assert crop == (0, 62, 640, 356)
+    assert k[0][0, 0] == pytest.approx(502.3 * 864 / 640, rel=1e-4)
+    assert k[0][1, 2] == pytest.approx((479. / 2 - 62) * 480 / 356, rel=1e-4)
 
 
 def make_plugin(cfg=None):

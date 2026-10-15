@@ -2141,9 +2141,40 @@ There is no startup compilation or fallback to another model on download failure
 Supply actual `motus.camera/1` intrinsics (`width`, `height`, row-major nine-value
 `K`) through the upstream camera declaration for streams, or explicitly for
 photos. Photos can inherit a running instance's bound declaration but cannot
-replace it. Unbound on-demand instances require K on every photo. The engine's
-fixed image canvas must support the image aspect ratio; runtime K does not make
-the canvas dynamic. Unsupported ratios fail rather than silently stretch.
+replace it. Unbound on-demand instances require K on every photo.
+
+#### The engine canvas is fixed, so an off-aspect source is centre-cropped
+
+The engine's input binding is static — `DepthARTSession.input_size` is read off
+the engine itself, 864x480 for the pinned bundle — so every frame has to become
+exactly that tensor. Runtime K does not make the canvas dynamic.
+
+Rounding the cover-resize to a multiple of 32 admits a **band** of ratios, not
+just 1.8: 16:9 and 16:10 sources go in untouched. Anything outside the band is
+**centre-cropped** to fit, and `prepare_image` folds the crop into K — the
+principal point moves, the focal lengths do not. A vertical crop therefore costs
+nothing on the horizontal axis, which is the axis a camera's `half_fov_rad`
+describes and the one an avoidance corridor is computed from. A 4:3 source gives
+up 26% of its height, 16:10 gives up 7%. `DepthARTSession.infer` logs the crop
+once per engine; past `MAX_CROP_FRACTION` (half the frame) it is refused
+instead, naming the ratio to feed it.
+
+**It is not stretched, and that is the whole point.** Resizing 640x480 into
+864x480 is one line and silently wrong: it squashes the world horizontally by
+1.35x while K still says the pixels are square, and DepthART derives its metric
+scale *from* K — so the card would publish confidently wrong numbers on a topic
+whose contract is metres. Letterboxing would keep the field of view instead, at
+the cost of feeding the network grey bars it never saw in training, whose depth
+would then have to be masked. Rebuilding the engine for another canvas is the
+only thing that removes the limit outright, and that is an artifact problem.
+
+**Known gap:** the declaration this card *publishes* (`camera_info.inherit`)
+rescales the upstream K as though the stage only resized, so after a crop its
+vertical terms (`fy`, `cy`) describe more of the scene than the depth map
+actually covers. The horizontal terms and `half_fov_rad` stay correct, and
+`half_fov_v_rad` is `null`, so nothing reads the wrong number today — but a
+consumer that starts using vertical geometry would be misled. Folding the crop
+through `inherit` is the fix.
 
 #### Calibration belongs to camera × model, and a mismatch is dropped, not refused
 
