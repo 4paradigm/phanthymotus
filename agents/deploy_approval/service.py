@@ -47,11 +47,13 @@ from .github_state_proxy import (
     _truncate_events_to_fit,
     _MAX_VISIBLE_LIFECYCLE_BYTES,
     HISTORY_ARCHIVE_MARKER_PREFIX,
+    HISTORY_EVENT_DELIMITER,
     _next_history_archive_page,
     _build_archive_body,
     _parse_visible_history,
     _build_history_block,
     VISIBLE_HISTORY_START_MARKER,
+    VISIBLE_HISTORY_END_MARKER,
 )
 from .models import BuildInfo
 from .policy import Policy, PolicyError
@@ -659,9 +661,12 @@ class DeployController:
         expected_test_result: str = "",
         cos_metadata: dict[str, Any] | None = None,
         markdown: str = "",
+        expected_state: dict | None = None,
     ) -> bool:
         fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
         if fresh_state is None:
+            return False
+        if expected_state is not None and fresh_state != expected_state:
             return False
         if fresh_state.get("head_sha", "") != expected_head:
             return False
@@ -737,6 +742,8 @@ class DeployController:
                     and existing_size == size_val):
                 return False
 
+        expected_terminal_state = copy.deepcopy(fresh_state)
+        fresh_state = copy.deepcopy(fresh_state)
         fresh_state["cos"] = {
             "object_key": object_key,
             "sha256": sha256_val,
@@ -748,10 +755,11 @@ class DeployController:
             # drop the existing visible History (Test recorded, deployments, ...).
             # event=None: refresh terminal rendering + state.cos only — the
             # history-preserving writer carries existing events over verbatim.
-            await self._write_lifecycle_with_history(
+            return await self._write_lifecycle_with_history(
                 repo, pr_number, fresh_state, markdown, event=None,
+                expected_terminal_state=expected_terminal_state,
             )
-        return True
+        return False  # No lifecycle write was performed.
 
     def _resolve_component_runtime(
         self,
@@ -1097,7 +1105,6 @@ class DeployController:
                 )
                 return True
 
-            self._check_independent_deploy_approver(pr_data, actor, actor_id)
             phase = state.get("command", {}).get("phase")
             if phase == "executing":
                 await self._handle_uncertain_if_needed(repo, pr_number, state)
@@ -1301,8 +1308,6 @@ class DeployController:
                     "HEAD drifted after approval re-validation.",
                 )
                 return True
-
-            self._check_independent_deploy_approver(final_pr, actor, actor_id)
 
             # Capture frozen component + deployment snapshots before hidden state validation
             expected_component_snapshot = self._canonical_component_snapshot(
@@ -1552,7 +1557,7 @@ class DeployController:
 
                 if cos_metadata.get("object_key"):
                     # Step 1: rebind terminal state with COS metadata FIRST
-                    await self._rebind_terminal_cos_if_current(
+                    rebound = await self._rebind_terminal_cos_if_current(
                         repo,
                         pr_number,
                         expected_head=pr_head,
@@ -1568,6 +1573,8 @@ class DeployController:
                             cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
                         ),
                     )
+                    if not rebound:
+                        return False
                     # Step 2: generate presigned URL AFTER successful rebind
                     cos_download_url = ""
                     try:
@@ -1580,7 +1587,7 @@ class DeployController:
                             repo, pr_number,
                         )
                     # Step 3: rebind final comment with download URL
-                    await self._rebind_terminal_cos_if_current(
+                    rebound = await self._rebind_terminal_cos_if_current(
                         repo,
                         pr_number,
                         expected_head=pr_head,
@@ -1597,6 +1604,8 @@ class DeployController:
                             cos_download_url=cos_download_url,
                         ),
                     )
+                    if not rebound:
+                        return False
                 return True
 
             # Merge into existing deployments
@@ -1809,6 +1818,9 @@ class DeployController:
             return None
         if int(fresh.get("last_processed_comment_id", 0) or 0) != original.get("last_processed_comment_id", 0):
             return None
+        if (fresh.get("head_sha") != original.get("head_sha")
+                or fresh.get("cos") != original.get("cos")):
+            return None
         if result == "pass":
             if pr_head != original.get("head_sha") or not self._final_case_pass_is_ready(fresh):
                 return None
@@ -1840,6 +1852,46 @@ class DeployController:
             if _current_status == "testing":
                 pass  # normal path continues below
             elif _current_status in ("succeeded", "failed"):
+                terminal_command = state.get("command", {})
+                if (terminal_command.get("kind") == "record_test"
+                        and terminal_command.get("comment_id") == comment_id
+                        and terminal_command.get("phase") == "completed"
+                        and _current_status == ("succeeded" if result == "pass" else "failed")
+                        and state.get("test_result") == result
+                        and terminal_command.get("args", {}).get("result") == result):
+                    if result == "pass" and not self._final_case_pass_is_ready(state):
+                        return False
+                    await self._check_record_test_permissions(repo, actor, state)
+                    # The terminal write may have succeeded before a URL refresh
+                    # failed. Retry that refresh without another upload/event.
+                    metadata = state.get("cos", {}) or {}
+                    download_url = ""
+                    if metadata.get("object_key"):
+                        try:
+                            download_url = self.cos.generate_evidence_download_url(metadata["object_key"])
+                        except Exception:
+                            logger.warning("COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s", repo, pr_number)
+                    render_kwargs = {
+                        "cos_object_key": metadata.get("object_key", ""),
+                        "cos_bundle_sha256": metadata.get("sha256", ""),
+                        "cos_bundle_size": metadata.get("size", 0),
+                        "cos_download_url": download_url,
+                    }
+                    if result == "pass":
+                        markdown = comments_mod.succeeded_comment(
+                            repo, pr_number, state["head_sha"],
+                            deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+                            components=state.get("components", []), **render_kwargs,
+                        )
+                    else:
+                        markdown = comments_mod.failed_comment(repo, pr_number, state["head_sha"], **render_kwargs)
+                    return await self._rebind_terminal_cos_if_current(
+                        repo, pr_number, expected_head=state["head_sha"],
+                        expected_terminal_status=_current_status,
+                        expected_comment_id=comment_id, expected_command_kind="record_test",
+                        expected_test_result=result, cos_metadata=metadata, markdown=markdown,
+                        expected_state=state,
+                    )
                 logger.warning(
                     "STALE_COMMAND_IGNORED kind=record_test comment_id=%s current_status=%s",
                     comment_id, _current_status,
@@ -1935,7 +1987,6 @@ class DeployController:
                 state = fresh_before_upload
 
             # Upload COS evidence FIRST — failure does not roll back (nothing written yet)
-            state["cos"] = self._empty_cos()
             cos_metadata = {"object_key": "", "sha256": "", "size": 0}
             try:
                 cos_metadata = await self._upload_evidence(
@@ -1987,6 +2038,10 @@ class DeployController:
             if fresh_state is None:
                 return False
             state = fresh_state
+            existing_cos = state.get("cos", {}) or {}
+            if cos_valid and existing_cos.get("object_key") and existing_cos != cos_metadata:
+                logger.warning("record_test COS metadata conflict %s#%s", repo, pr_number)
+                return False
 
             # All checks passed — write terminal state, lifecycle, and COS
             state["status"] = "succeeded" if result == "pass" else "failed"
@@ -1998,11 +2053,7 @@ class DeployController:
                 "args": {"result": result, "summary": summary, "actor": actor},
             }
             state["last_processed_comment_id"] = comment_id
-            state["cos"] = {
-                "object_key": str(cos_metadata.get("object_key", "") or ""),
-                "sha256": str(cos_metadata.get("sha256", "") or ""),
-                "size": int(cos_metadata.get("size", 0) or 0),
-            }
+            state["cos"] = dict(cos_metadata) if cos_valid else dict(existing_cos)
 
             # Write the terminal visible lifecycle comment
             if result == "pass":
@@ -2024,7 +2075,12 @@ class DeployController:
                     "timestamp": comments_mod.beijing_now_str(),
                 }
             else:
-                terminal_markdown = comments_mod.failed_comment(repo, pr_number, pr_head)
+                terminal_markdown = comments_mod.failed_comment(
+                    repo, pr_number, pr_head,
+                    cos_object_key=str(state["cos"].get("object_key", "") or ""),
+                    cos_bundle_sha256=str(state["cos"].get("sha256", "") or ""),
+                    cos_bundle_size=int(state["cos"].get("size", 0) or 0),
+                )
                 event = {
                     "event": "Test recorded",
                     "lifecycle": "`testing` \u2192 `failed`",
@@ -2034,13 +2090,13 @@ class DeployController:
 
             terminal_written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, terminal_markdown, event=event,
-                expected_record_test_state=original_state if result == "pass" else None,
+                expected_record_test_state=original_state,
             )
-            if terminal_written is False:
+            if not terminal_written:
                 return False
             await self.proxy.project_status_label(repo, pr_number, state["status"])
 
-            if cos_metadata.get("object_key"):
+            if cos_valid:
                 # Step 1: rebind terminal state with COS metadata FIRST
                 if result == "pass":
                     markdown_no_url = comments_mod.succeeded_comment(
@@ -2058,7 +2114,7 @@ class DeployController:
                         cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
                         cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
                     )
-                await self._rebind_terminal_cos_if_current(
+                rebound = await self._rebind_terminal_cos_if_current(
                     repo,
                     pr_number,
                     expected_head=pr_head,
@@ -2068,7 +2124,10 @@ class DeployController:
                     expected_test_result=result,
                     cos_metadata=cos_metadata,
                     markdown=markdown_no_url,
+                    expected_state=state,
                 )
+                if not rebound:
+                    return False
                 # Step 2: generate presigned URL AFTER successful rebind
                 cos_download_url = ""
                 try:
@@ -2099,7 +2158,7 @@ class DeployController:
                         cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
                         cos_download_url=cos_download_url,
                     )
-                await self._rebind_terminal_cos_if_current(
+                rebound = await self._rebind_terminal_cos_if_current(
                     repo,
                     pr_number,
                     expected_head=pr_head,
@@ -2109,7 +2168,10 @@ class DeployController:
                     expected_test_result=result,
                     cos_metadata=cos_metadata,
                     markdown=markdown_with_url,
+                    expected_state=state,
                 )
+                if not rebound:
+                    return False
             return True
 
 
@@ -2541,18 +2603,6 @@ class DeployController:
                     result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
         return result
 
-    @staticmethod
-    def _check_independent_deploy_approver(pr: dict, actor: str, actor_id: str) -> None:
-        author = pr.get("user", {})
-        author_id = str(author.get("id") or "") if isinstance(author, dict) else ""
-        author_login = str(author.get("login") or "") if isinstance(author, dict) else ""
-        if (not actor or not isinstance(actor_id, str)
-                or not re.fullmatch(r"[1-9][0-9]*", actor_id)
-                or not re.fullmatch(r"[1-9][0-9]*", author_id)
-                or actor_id == author_id
-                or actor.casefold() == author_login.casefold()):
-            raise PolicyError("Deployment approval requires a verified actor other than the PR author.")
-
     async def _check_approval_permissions(
         self, machine, actor: str, repo: str,
     ) -> None:
@@ -2928,9 +2978,12 @@ class DeployController:
         Failure does not raise.
         """
         try:
-            object_key = self.cos.build_object_key(
+            # Retries keep the originally published key, including its date.
+            # ensure_evidence_archive verifies/reuses it without replacing bytes.
+            object_key = (state.get("cos", {}) or {}).get("object_key") or self.cos.build_object_key(
                 repo, pr_number, head_sha,
             )
+            CosClient.validate_object_key(repo, pr_number, head_sha, object_key)
             archive_bytes = b""
             sha256 = ""
             size = 0
@@ -2968,6 +3021,28 @@ class DeployController:
                 "evidence upload %s#%s: %s", repo, pr_number, e,
             )
             return {"object_key": "", "sha256": "", "size": 0}
+
+    async def _ensure_history_archive(
+        self, repo: str, pr_number: int, existing_comments: list[dict],
+        *, extra_text: str,
+    ) -> dict:
+        """Reuse the identical trusted archive after an uncertain GitHub write."""
+        prefix = f"{HISTORY_ARCHIVE_MARKER_PREFIX}{repo}:{pr_number}:"
+        for comment in existing_comments:
+            body = comment.get("body", "")
+            if not isinstance(body, str) or prefix not in body or not self.proxy.is_bot_comment(comment):
+                continue
+            page = body.split(prefix, 1)[1].split(" -->", 1)[0]
+            if not re.fullmatch(r"[1-9][0-9]*", page):
+                continue
+            if body == _build_archive_body(repo, pr_number, int(page), [], extra_text=extra_text):
+                return {"page": int(page), "url": comment.get("html_url", "")}
+        page = _next_history_archive_page(existing_comments, repo, pr_number)
+        body = _build_archive_body(repo, pr_number, page, [], extra_text=extra_text)
+        comment = await self.proxy.post_issue_comment(repo, pr_number, body)
+        if not isinstance(comment, dict) or not comment.get("id"):
+            raise GitHubStateProxyError("History archive write was not confirmed")
+        return {"page": page, "url": comment.get("html_url", "")}
 
     async def _preflight_archive_for_event(
         self,
@@ -3030,39 +3105,63 @@ class DeployController:
                 "preflight archive: comment body is not a string"
             )
 
-        # 2. Parse existing visible history events
-        existing_visible, existing_events = _parse_visible_history(current_body)
-
-        # 3. Build the real prospective visible body
-        #    base renderer + existing history + new event
+        # Keep raw events: parsing/re-rendering would discard historical fields.
+        from .github_state_proxy import HIDDEN_STATE_MARKER
+        hidden_idx = current_body.find(HIDDEN_STATE_MARKER)
+        if hidden_idx < 0:
+            raise GitHubStateProxyError("preflight archive: cannot find hidden state marker")
+        existing_visible_part = current_body[:hidden_idx].rstrip()
+        h_start = existing_visible_part.find(VISIBLE_HISTORY_START_MARKER)
+        h_end = existing_visible_part.find(VISIBLE_HISTORY_END_MARKER)
+        raw_events = []
+        tail = ""
+        if h_start >= 0 or h_end >= 0:
+            if (h_start < 0 or h_end <= h_start
+                    or existing_visible_part.count(VISIBLE_HISTORY_START_MARKER) != 1
+                    or existing_visible_part.count(VISIBLE_HISTORY_END_MARKER) != 1):
+                raise GitHubStateProxyError("preflight archive: malformed History markers")
+            content = existing_visible_part[h_start + len(VISIBLE_HISTORY_START_MARKER):h_end]
+            parts = content.split(HISTORY_EVENT_DELIMITER)
+            raw_events = [part + HISTORY_EVENT_DELIMITER for part in parts[:-1]]
+            tail = parts[-1]
+            if tail.strip():
+                raw_events.append(tail)
+                tail = ""
+        old_archives = re.search(r"(?ms)^### Archived history[ \t]*\n.*?(?=^### |\Z)", existing_visible_part)
+        archive_links_text = old_archives.group(0) if old_archives else ""
+        reserved_inner = ""
         if reserved_event is not None:
-            # Merge existing events into prospective base, then prepend new event
-            if existing_events:
-                existing_block = _build_history_block(existing_events)
-                temp_base = prospective_visible.rstrip() + "\n\n" + existing_block + "\n"
-            else:
-                temp_base = prospective_visible
-            prospective_with_history = _insert_history_into_visible(temp_base, reserved_event)
-        else:
-            prospective_with_history = prospective_visible
+            reserved_inner = _build_history_block([reserved_event])[
+                len(VISIBLE_HISTORY_START_MARKER):-len(VISIBLE_HISTORY_END_MARKER)
+            ]
+
+        def prospective_size(kept_events: list[str]) -> int:
+            return _count_visible_bytes(
+                prospective_visible.rstrip() + "\n\n### History\n\n"
+                + VISIBLE_HISTORY_START_MARKER + reserved_inner
+                + "".join(kept_events) + tail + VISIBLE_HISTORY_END_MARKER
+                + "\n\n" + archive_links_text
+            )
 
         # 4. Count real prospective visible bytes
-        body_bytes = _count_visible_bytes(prospective_with_history)
+        body_bytes = prospective_size(raw_events)
         if body_bytes <= _MAX_VISIBLE_LIFECYCLE_BYTES:
             return
 
         # 5. Need to archive oldest events
-        if not existing_events:
+        if not raw_events:
             raise GitHubStateProxyError(
                 "preflight archive: visible lifecycle exceeds 48 KiB "
                 "soft limit and no history events available to archive"
             )
 
         # 6. Truncate oldest events to fit
-        kept, archived = _truncate_events_to_fit(
-            existing_events,
-            _MAX_VISIBLE_LIFECYCLE_BYTES - 2048,  # 2 KiB headroom
-        )
+        kept = list(raw_events)
+        archived = []
+        while kept and prospective_size(kept) > _MAX_VISIBLE_LIFECYCLE_BYTES - 2048:
+            archived.insert(0, kept.pop())
+        if prospective_size(kept) > _MAX_VISIBLE_LIFECYCLE_BYTES - 2048:
+            raise GitHubStateProxyError("preflight archive: prospective lifecycle cannot fit after archival")
 
         if not archived:
             raise GitHubStateProxyError(
@@ -3072,27 +3171,16 @@ class DeployController:
 
         # 7. Create archive comment
         existing_comments = await self.proxy.get_issue_comments(repo, pr_number)
-        page_num = _next_history_archive_page(existing_comments, repo, pr_number)
-
-        archive_body = _build_archive_body(
-            repo, pr_number, page_num, archived,
-            extra_text="Archived oldest history events to preserve main lifecycle capacity.",
+        archive = await self._ensure_history_archive(
+            repo, pr_number, existing_comments,
+            extra_text=("Archived oldest history events to preserve main lifecycle capacity.\n\n"
+                        + VISIBLE_HISTORY_START_MARKER + "".join(archived) + tail
+                        + VISIBLE_HISTORY_END_MARKER),
         )
 
-        await self.proxy.post_issue_comment(repo, pr_number, archive_body)
-
         # 8. Rewrite the SAME lifecycle comment to remove archived events
-        from .github_state_proxy import HIDDEN_STATE_MARKER
-        hidden_idx = current_body.find(HIDDEN_STATE_MARKER)
-        if hidden_idx < 0:
-            raise GitHubStateProxyError("preflight archive: cannot find hidden state marker")
-
-        existing_visible_part = current_body[:hidden_idx].rstrip()
-
-        final_events = kept if kept else []
-
-        # Build the new history block with kept events only
-        new_history_block = _build_history_block(final_events)
+        new_history_block = (VISIBLE_HISTORY_START_MARKER + "".join(kept) + tail
+                             + VISIBLE_HISTORY_END_MARKER)
 
         # Reconstruct visible with shrunk history
         h_start = existing_visible_part.find(VISIBLE_HISTORY_START_MARKER)
@@ -3103,6 +3191,16 @@ class DeployController:
             new_visible = before_hist + new_history_block + after_hist
         else:
             new_visible = existing_visible_part.rstrip() + "\n\n" + new_history_block + "\n"
+
+        # Publish the new archive reference atomically with removal from main.
+        archive_line = comments_mod._archives_link_block([archive]).split("\n", 2)[2]
+        old_links = re.search(r"(?ms)^### Archived history[ \t]*\n.*?(?=^### |\Z)", new_visible)
+        if old_links:
+            if str(archive["page"]) not in re.findall(r"History Archive Page ([0-9]+)", old_links.group(0)):
+                new_visible = (new_visible[:old_links.end()].rstrip() + "\n" + archive_line
+                               + "\n\n" + new_visible[old_links.end():])
+        else:
+            new_visible += "\n\n" + comments_mod._archives_link_block([archive])
 
         # 9. Verify the shrunk visible fits
         shrunk_bytes = _count_visible_bytes(new_visible)
@@ -3120,8 +3218,15 @@ class DeployController:
 
         final_body = _build_hidden_state_body(new_visible, fresh_state)
         comment_id = comment.get("id")
-        if isinstance(comment_id, int):
-            await self.proxy.update_comment(repo, comment_id, final_body)
+        fresh_comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+        if (fresh_comment is None or fresh_comment.get("body") != current_body
+                or fresh_comment.get("id") != comment_id):
+            raise GitHubStateProxyError("preflight archive: lifecycle changed during archival")
+        if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
+            raise GitHubStateProxyError("preflight archive: invalid lifecycle comment id")
+        written = await self.proxy.update_comment(repo, comment_id, final_body)
+        if not isinstance(written, dict):
+            raise GitHubStateProxyError("preflight archive: lifecycle write was not confirmed")
 
     async def _write_lifecycle_with_history(
         self,
@@ -3132,6 +3237,7 @@ class DeployController:
         event: dict | None = None,
         events: list[dict] | None = None,
         expected_record_test_state: dict | None = None,
+        expected_terminal_state: dict | None = None,
     ) -> bool:
         """Write lifecycle comment with automatic history management.
 
@@ -3141,14 +3247,30 @@ class DeployController:
         """
         async def write_if_current(visible: str) -> bool:
             # History/archive discovery also awaits GitHub. Recheck after all
-            # of those awaits, immediately before a final PASS state write.
+            # of those awaits, immediately before a terminal record_test write.
             if expected_record_test_state is not None:
                 fresh = await self._revalidate_record_test_state(
-                    repo, pr_number, expected_record_test_state, "pass",
+                    repo, pr_number, expected_record_test_state,
+                    "pass" if state.get("status") == "succeeded" else "fail",
                 )
                 if fresh is None:
                     return False
-            await self.proxy.write_hidden_state(repo, pr_number, visible, state)
+            if expected_terminal_state is not None:
+                pr = await self.proxy.get_pr(repo, pr_number)
+                fresh = await self.proxy.read_hidden_state(repo, pr_number)
+                if (fresh != expected_terminal_state
+                        or pr.get("head", {}).get("sha") != state.get("head_sha")
+                        or pr.get("state") != "open" or pr.get("merged")):
+                    return False
+            current_comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+            if ((comment is None) != (current_comment is None)
+                    or (comment is not None and (
+                        current_comment.get("id") != comment.get("id")
+                        or current_comment.get("body") != comment.get("body")))):
+                raise GitHubStateProxyError("Lifecycle History changed before write")
+            written = await self.proxy.write_hidden_state(repo, pr_number, visible, state)
+            if not isinstance(written, dict):
+                raise GitHubStateProxyError("Lifecycle state write was not confirmed")
             return True
 
         comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
@@ -3205,96 +3327,74 @@ class DeployController:
             and ("**Status:**" in existing_visible or "### Deploy Approval" in existing_visible)
         )
 
+        created_archives = []
         if is_legacy and (event is not None or events is not None):
             # First meaningful event on a legacy comment
             # 1. Preserve legacy visible markdown in an archive
             legacy_snapshot = existing_visible
 
             existing_comments = await self.proxy.get_issue_comments(repo, pr_number)
-            page_num = _next_history_archive_page(existing_comments, repo, pr_number)
-
-            archive_body = _build_archive_body(
-                repo, pr_number, page_num, [],
+            archive = await self._ensure_history_archive(
+                repo, pr_number, existing_comments,
                 extra_text=(
                     "Legacy lifecycle snapshot preserved before history-enabled renderer migration.\n\n"
                     + legacy_snapshot
                 ),
             )
-            await self.proxy.post_issue_comment(repo, pr_number, archive_body)
+            created_archives.append(archive)
 
-        # 2. Collect existing history events from the current lifecycle comment
-        existing_events: list[dict] = []
-        if not is_legacy:
-            _, existing_events = _parse_visible_history(existing_visible)
-
-        # 3. Build the prospective new visible markdown with event + existing events
-        #    _build_history_block emits only the marker-delimited event section;
-        #    the "### History" heading is not part of it, so it is carried here
-        #    to keep exactly one heading in every rendered lifecycle.
-        if events is not None:
-            # Multiple events: newest-first via repeated insertion.
-            # incoming events are already in newest-first order, so we
-            # insert them in reverse so the first (newest) ends up on top.
-            incoming = list(events)
-            if existing_events:
-                existing_history_block = _build_history_block(existing_events)
-                temp_visible = (
-                    new_visible_markdown.rstrip()
-                    + "\n\n### History\n\n" + existing_history_block + "\n"
-                )
+        # Preserve the original event bytes, including fields the legacy parser
+        # does not understand. Render only newly appended events.
+        h_start = existing_visible.find(VISIBLE_HISTORY_START_MARKER)
+        h_end = existing_visible.find(VISIBLE_HISTORY_END_MARKER)
+        history_block = ""
+        if h_start >= 0 or h_end >= 0:
+            if (h_start < 0 or h_end <= h_start
+                    or existing_visible.count(VISIBLE_HISTORY_START_MARKER) != 1
+                    or existing_visible.count(VISIBLE_HISTORY_END_MARKER) != 1):
+                raise GitHubStateProxyError("Cannot safely preserve malformed History markers")
+            history_block = existing_visible[h_start:h_end + len(VISIBLE_HISTORY_END_MARKER)]
+        incoming = list(events) if events is not None else ([event] if event is not None else [])
+        if incoming:
+            new_block = _build_history_block(incoming)
+            if history_block:
+                history_block = (new_block[:-len(VISIBLE_HISTORY_END_MARKER)]
+                                 + history_block[len(VISIBLE_HISTORY_START_MARKER):])
             else:
-                temp_visible = new_visible_markdown
-            final_visible = temp_visible
-            for evt in reversed(incoming):
-                final_visible = _insert_history_into_visible(final_visible, evt)
-        elif event is not None:
-            # _insert_history_into_visible reads existing events from visible markdown.
-            # new_visible_markdown is a fresh renderer output with no history section.
-            # So we inject existing events first via a temporary placeholder,
-            # then let _insert_history_into_visible prepend the new event on top.
-            if existing_events:
-                existing_history_block = _build_history_block(existing_events)
-                temp_visible = (
-                    new_visible_markdown.rstrip()
-                    + "\n\n### History\n\n" + existing_history_block + "\n"
-                )
-            else:
-                temp_visible = new_visible_markdown
-            final_visible = _insert_history_into_visible(temp_visible, event)
-        elif existing_events:
-            # event=None rewrite (e.g. terminal COS metadata/presigned-URL rebind):
-            # no new history event may be created, but the existing visible history
-            # events MUST be carried over into the fresh renderer output.
-            existing_history_block = _build_history_block(existing_events)
-            final_visible = (
-                new_visible_markdown.rstrip()
-                + "\n\n### History\n\n" + existing_history_block + "\n"
-            )
-        else:
-            final_visible = new_visible_markdown
+                history_block = new_block
+        final_visible = new_visible_markdown.rstrip()
+        if history_block:
+            final_visible += "\n\n### History\n\n" + history_block + "\n"
+        elif not incoming:
+            # Older terminal comments can have an unmarked History section.
+            old_history = re.search(r"(?ms)^### History[ \t]*\n.*?(?=^### |\Z)", existing_visible)
+            if old_history:
+                final_visible += "\n\n" + old_history.group(0)
 
-        # 3.5. Discover trusted archive comments and add archive links if any
+        # Keep published archive links even if fresh discovery is unavailable.
+        old_archives = re.search(r"(?ms)^### Archived history[ \t]*\n.*?(?=^### |\Z)", existing_visible)
+        archives_block = old_archives.group(0).rstrip() if old_archives else ""
+        archive_links = list(created_archives)
         try:
             existing_comments = await self.proxy.get_issue_comments(repo, pr_number)
-            archive_links = self._discover_trusted_archive_links(
+            archive_links += self._discover_trusted_archive_links(
                 existing_comments, repo, pr_number,
             )
-            if archive_links:
-                archives_block = comments_mod._archives_link_block(archive_links)
-                # Insert archive links before the History section
-                h_start = final_visible.find("### History")
-                if h_start >= 0:
-                    final_visible = (
-                        final_visible[:h_start]
-                        + archives_block
-                        + final_visible[h_start:]
-                    )
-                else:
-                    # No History section yet; append before hidden state marker
-                    final_visible = final_visible.rstrip() + "\n\n" + archives_block
         except Exception:
-            # Archive link discovery is best-effort
             pass
+        seen_pages = set(re.findall(r"History Archive Page ([0-9]+)", archives_block))
+        for archive in archive_links:
+            if str(archive["page"]) in seen_pages:
+                continue
+            rendered = comments_mod._archives_link_block([archive])
+            archives_block += ("\n" + rendered.split("\n", 2)[2]) if archives_block else rendered
+            seen_pages.add(str(archive["page"]))
+        if archives_block:
+            h_start = final_visible.find("### History")
+            if h_start >= 0:
+                final_visible = final_visible[:h_start] + archives_block.rstrip() + "\n\n" + final_visible[h_start:]
+            else:
+                final_visible += "\n\n" + archives_block
 
         # 4. Write the final state
         return await write_if_current(final_visible)
