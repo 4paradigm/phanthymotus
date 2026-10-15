@@ -60,6 +60,21 @@ _pending_background: dict[str, bool] = {}
 # 原先靠 collector 里 action_id 以 'speak-'/'tts-' 开头的字符串判断，驱动一改命名就失效。
 _pending_silent: dict[str, bool] = {}
 
+# A device can finish before its MCP response has reached the caller. Keep that
+# receipt until registration supplies the owner/resource/silent metadata. Unknown
+# IDs never set a barrier or wake the LLM. These are in-memory transport buffers,
+# not a durable task ledger: bound both their lifetime and their memory use.
+_EARLY_COMPLETION_CAP = 512
+_EARLY_COMPLETION_TTL_S = 120.0   # longer than the normal 60 s actuator RPC budget
+_EARLY_COMPLETION_MAX_BYTES = 4 * 1024 * 1024
+_EARLY_COMPLETION_MAX_ITEM_BYTES = 1024 * 1024
+_COMPLETION_RECEIPT_CAP = 2048
+_COMPLETION_RECEIPT_TTL_S = 300.0
+_early_completions: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+_completion_receipts: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+_completion_notification_tasks: dict[str, asyncio.Task] = {}
+_completion_clock = time.monotonic
+
 # 所有按 action_id 分表的 pending side table。_forget_pending 和测试夹具都遍历它，
 # 这样新增一张表不必在七个地方各补一行 —— 漏掉一处就泄漏到进程结束，而漏在测试夹具
 # 里则是上一个用例的值串到下一个用例。
@@ -149,10 +164,123 @@ def mark_action_complete(action_id: str, payload: dict) -> bool:
     """
     if action_id not in _pending_actions:
         return False
+    if action_id in _pending_results:
+        return False
     _pending_results[action_id] = payload
     _pending_actions[action_id].set()
+    _prune_completion_receipts()
+    _completion_receipts[action_id] = {'at': _completion_clock(), 'notification': None,
+                                      'notified': False}
+    while len(_completion_receipts) > _COMPLETION_RECEIPT_CAP:
+        _completion_receipts.popitem(last=False)
     _notify_settled(action_id)
     return True
+
+
+def _prune_completion_receipts() -> None:
+    now = _completion_clock()
+    for table, ttl in ((_early_completions, _EARLY_COMPLETION_TTL_S),
+                       (_completion_receipts, _COMPLETION_RECEIPT_TTL_S)):
+        for action_id, entry in list(table.items()):
+            if now - entry['at'] >= ttl:
+                table.pop(action_id, None)
+
+
+def _completion_notification(action_id: str, payload: dict, source: str) -> dict:
+    # Snapshot silent before setting the event: a concurrent waiter may reap all
+    # per-action metadata as soon as completion is marked.
+    nested = payload.get('payload')
+    nested = nested if isinstance(nested, dict) else {}
+    # SSE messages may carry declared priority/other event fields. Preserve them
+    # while making the envelope consistent with the existing HTTP receipt.
+    event = dict(payload) if source.startswith('mcp:') else {}
+    event.update({'type': 'action_complete', 'action_id': action_id,
+             'status': payload.get('status', nested.get('status', 'completed')),
+             'result': payload.get('result', nested.get('result', {})),
+             'silent': completion_is_silent(action_id)})
+    return {'source': source, 'text': json.dumps(event, ensure_ascii=False), 'payload': event}
+
+
+def _start_completion_notification(action_id: str, entry: dict) -> asyncio.Task | None:
+    """One in-flight enqueue per ID; a failed enqueue remains retryable."""
+    if entry['notified'] or entry['notification'] is None:
+        return None
+    task = _completion_notification_tasks.get(action_id)
+    if task is not None:
+        return task
+
+    async def enqueue():
+        await event_bus.enqueue(**entry['notification'])
+        entry['notified'] = True
+        entry['notification'] = None
+
+    task = asyncio.create_task(enqueue(), name=f'acp-notify:{action_id}')
+    _completion_notification_tasks[action_id] = task
+
+    def done(finished):
+        if _completion_notification_tasks.get(action_id) is finished:
+            _completion_notification_tasks.pop(action_id, None)
+        if not finished.cancelled() and finished.exception() is not None:
+            print(f'[acp] completion notification failed: {action_id}: {finished.exception()}')
+
+    task.add_done_callback(done)
+    return task
+
+
+def _accept_action_completion(action_id: str, payload: dict, source: str) -> str:
+    """Apply, cache or deduplicate one receipt without awaiting another request."""
+    _prune_completion_receipts()
+    if action_id in _pending_actions:
+        # An explicit new registration may reuse an old ID; its current result is
+        # authoritative. A duplicate must never replace that terminal payload.
+        if action_id in _pending_results:
+            return 'duplicate'
+        notification = _completion_notification(action_id, payload, source)
+        mark_action_complete(action_id, payload)
+        _completion_receipts[action_id]['notification'] = notification
+        return 'matched'
+    if action_id in _completion_receipts or action_id in _action_outcomes:
+        return 'duplicate'
+    if action_id in _early_completions:
+        return 'duplicate'
+    try:
+        encoded = json.dumps(payload, allow_nan=False).encode('utf-8')
+        size = len(encoded)
+    except (TypeError, ValueError):
+        return 'rejected'
+    if (size > _EARLY_COMPLETION_MAX_ITEM_BYTES
+            or len(_early_completions) >= _EARLY_COMPLETION_CAP
+            or sum(item['bytes'] for item in _early_completions.values()) + size > _EARLY_COMPLETION_MAX_BYTES):
+        # Do not evict another acknowledged early result to accept a new one.
+        return 'rejected'
+    _early_completions[action_id] = {'at': _completion_clock(), 'bytes': size,
+                                     'payload': json.loads(encoded), 'source': source}
+    return 'cached'
+
+
+async def receive_action_completion(action_id: str, payload: dict, *, source: str | None = None) -> dict:
+    """Shared HTTP/SSE receipt path. `ok` means matched, buffered or duplicate.
+
+    A buffered result is replayed only after the actual MCP task is registered.
+    Legacy drivers may keep checking ok/action_id; newer ones can inspect state.
+    """
+    if not isinstance(action_id, str) or not action_id or len(action_id) > 256 or not isinstance(payload, dict):
+        return {'ok': False, 'action_id': action_id if isinstance(action_id, str) else None,
+                'state': 'rejected', 'error': 'A non-empty action_id (max 256 characters) and object payload are required.'}
+    state = _accept_action_completion(action_id, payload, source or f'acp:{action_id}')
+    if state == 'rejected':
+        return {'ok': False, 'action_id': action_id, 'state': state,
+                'error': 'Early completion buffer is full or the result is too large or invalid; retry later.'}
+    entry = _completion_receipts.get(action_id)
+    if entry is not None:
+        task = _start_completion_notification(action_id, entry)
+        if task is not None:
+            try:
+                await asyncio.shield(task)
+            except Exception:
+                return {'ok': False, 'action_id': action_id, 'state': state,
+                        'error': 'Completion recorded; notification delivery failed. Retry the same action_id.'}
+    return {'ok': True, 'action_id': action_id, 'state': state}
 
 
 # ── 次序：谁发起的动作 ────────────────────────────────────────────────────────
@@ -643,15 +771,13 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                         # ACP: action_complete 事件 → 解锁 sync() 等待
                         msg_type = msg.get('type') if isinstance(msg, dict) else None
                         if msg_type == 'action_complete':
-                            action_id = msg.get('action_id') or payload.get('action_id')
-                            if action_id:
-                                # 和 /api/acp/complete 一样：先问静默，再标记完成。
-                                if completion_is_silent(action_id):
-                                    if isinstance(msg, dict):
-                                        msg['silent'] = True
-                                    if isinstance(payload, dict):
-                                        payload['silent'] = True
-                                mark_action_complete(action_id, msg)
+                            action_id = msg.get('action_id') or (
+                                payload.get('action_id') if isinstance(payload, dict) else None)
+                            ack = await receive_action_completion(
+                                action_id, msg, source=f'mcp:{mcp_id}')
+                            if not ack['ok']:
+                                print(f'[acp] SSE completion rejected: {action_id}: {ack.get("error")}')
+                            continue
 
                         await event_bus.enqueue(
                             source  = f'mcp:{mcp_id}',
@@ -1034,9 +1160,6 @@ async def call_tool(full_name: str, args: dict) -> str:
             if action_id:
                 _register_pending(action_id, tool_name=tool_name, meta=meta,
                                   args=args or {}, result=parsed_result)
-                # 通知订阅者。放在 try 里面、注册后面是有意的：这一段任何一步抛了，
-                # pending 就没建成，也就没有"动作开始了"这回事可通知。
-                _notify_registered(action_id, tool_name, args or {}, meta.get('resource'))
         except (json.JSONDecodeError, IndexError):
             pass
 
@@ -1218,6 +1341,11 @@ def _register_pending(action_id: str, *, tool_name: str, meta: dict,
     原先这段在 call_tool 和 call_tool_hook 里各写了一份，两份都要算 timeout、都要填
     六张表 —— 给 ACP 加一个字段就得改两处，漏一处就只在 hook 路径上不生效。
     """
+    if action_id in _pending_actions:
+        return  # response replay must not replace a completed event with a new one
+    _prune_completion_receipts()
+    _completion_receipts.pop(action_id, None)
+    _pending_results.pop(action_id, None)
     completion_spec = meta.get('completion') or {}
     resource = meta.get('resource')
     timeout = _pending_timeout(completion_spec, args or {}, result)
@@ -1240,6 +1368,13 @@ def _register_pending(action_id: str, *, tool_name: str, meta: dict,
     print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
           f'timeout={_timeout_txt}, resource={_res_txt}{_flags})'
           f'{" [via hook]" if via_hook else ""}')
+    # All entry points (LLM, hooks and manual canvas calls) must notify register
+    # before an early completion is allowed to notify settle.
+    _notify_registered(action_id, tool_name, args or {}, resource)
+    early = _early_completions.pop(action_id, None)
+    if early is not None:
+        _accept_action_completion(action_id, early['payload'], early['source'])
+        _start_completion_notification(action_id, _completion_receipts[action_id])
 
 
 def is_background(action_id: str) -> bool:

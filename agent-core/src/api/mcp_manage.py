@@ -19,6 +19,36 @@ router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
 
 
+def _register_canvas_completion(tool: dict | None, arguments: dict, result: dict) -> bool:
+    """Match manual card callbacks to the same ACP bookkeeping used by LLM calls.
+
+    The proxy bypasses call_tool, so it must register returned action IDs itself.
+    This also consumes a completion that arrived while the HTTP reply was in
+    flight, rather than leaving a valid manual callback in the early cache.
+    """
+    if not tool or result.get('isError'):
+        return False
+    schema = tool.get('inputSchema') or {}
+    completion = schema.get('x-completion')
+    if not completion or not mcp_client._should_await_completion(completion, arguments.get('action')):
+        return False
+    for item in result.get('content') or []:
+        if not isinstance(item, dict) or item.get('type') != 'text':
+            continue
+        try:
+            parsed = json.loads(item.get('text', ''))
+        except (TypeError, ValueError):
+            continue
+        action_id = parsed.get('action_id') if isinstance(parsed, dict) else None
+        if not isinstance(action_id, str) or not action_id:
+            continue
+        meta = {'completion': completion, 'resource': mcp_client.parse_resources(schema.get('x-resource'))}
+        mcp_client._register_pending(action_id, tool_name=tool['name'], meta=meta,
+                                     args=arguments, result=parsed)
+        return True
+    return False
+
+
 async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
     """Register topics with the embedded inspection module (process-internal call).
 
@@ -1387,6 +1417,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                _register_canvas_completion(tool_obj, final_args, result)
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):
