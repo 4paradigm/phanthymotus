@@ -10,16 +10,94 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+def _k_from_half_fov(camera, width, height):
+    """K from a declared half field of view, or None if none was declared.
+
+    **A declaration with no `K` is not an incomplete declaration.** The spec
+    (`phanthymotus-driver/README_dev.md` § Camera Parameters) carries
+    `half_fov_rad` precisely because "a tape measure produces one directly
+    while producing no K at all", and its reference declaration — R1's
+    `unitree/r1/camera_main` — is exactly that: `K: null`,
+    `half_fov_rad: 0.888`, `source: measured`. Reading only `K` rejected the
+    canonical camera of the robot this project is built around.
+
+    Only consulted when `K` is absent, which keeps the spec's own precedence:
+    when both are present K wins, because a calibration matrix is solved from
+    many observations and the angle beside it is usually a tape measure.
+
+    `fy` needs the vertical angle, which **cannot** be derived from the aspect
+    ratio — the spec is explicit, and a stage that resizes 1280x720 into
+    640x480 is why. So `half_fov_v_rad` is used when declared, and square
+    pixels assumed when it is not. That assumption holds at a camera, which is
+    where these declarations are born; it is the thing to suspect first if a
+    chain ever puts a non-uniform resize upstream of this card.
+
+    What it cannot fix: a pinhole K is an approximation on a wide lens. R1's is
+    ~102 degrees with `distortion_model: unknown` and `D: null`, and `tan`
+    overstates the lateral offset towards the edges. The depth will need site
+    calibration on that lens, as YOLO's does there.
+    """
+    half = camera.get("half_fov_rad")
+    if half in (None, ""):
+        return None
+    # Present but unusable is a different fault from absent, and saying
+    # "declares neither" about a declaration that declares one sends the reader
+    # to the wrong file.
+    try:
+        half = float(half)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"camera_info half_fov_rad is not a number ({camera.get('half_fov_rad')!r}); "
+            f"it is the horizontal half field of view in radians") from None
+    if not np.isfinite(half) or not 0.0 < half < np.pi / 2:
+        raise ValueError(
+            f"camera_info half_fov_rad={half!r} is out of range; it is the "
+            f"horizontal **half** field of view in radians, so a 102 degree "
+            f"lens declares about 0.89, not 102")
+    fx = (width / 2.0) / float(np.tan(half))
+    half_v = camera.get("half_fov_v_rad")
+    fy = fx
+    if half_v not in (None, ""):
+        try:
+            half_v = float(half_v)
+            if 0.0 < half_v < np.pi / 2 and np.isfinite(half_v):
+                fy = (height / 2.0) / float(np.tan(half_v))
+        except (TypeError, ValueError):
+            pass
+    return np.asarray([fx, 0.0, width / 2.0 - 0.5,
+                       0.0, fy, height / 2.0 - 0.5,
+                       0.0, 0.0, 1.0], dtype=np.float32)
+
+
 def camera_matrix(camera):
-    """Read a motus.camera/1 declaration; K is expressed at width × height."""
+    """Read a motus.camera/1 declaration; K is expressed at width × height.
+
+    `K` when it is there, otherwise derived from `half_fov_rad` — see
+    `_k_from_half_fov` for why the second case is a valid declaration and not a
+    missing one.
+    """
     if not isinstance(camera, dict):
         raise ValueError("DepthART requires camera_info with K, width and height")
     try:
-        matrix = np.asarray(camera["K"], dtype=np.float32)
         width, height = int(camera["width"]), int(camera["height"])
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("DepthART requires camera_info with a nine-value K, width and height") from exc
-    if matrix.shape != (9,) or width <= 0 or height <= 0:
+        raise ValueError("DepthART requires camera_info with width and height") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("camera_info must contain positive width/height")
+    declared = camera.get("K")
+    if declared in (None, "") or (isinstance(declared, (list, tuple)) and not declared):
+        matrix = _k_from_half_fov(camera, width, height)
+        if matrix is None:
+            raise ValueError(
+                "camera_info declares neither K nor half_fov_rad, so DepthART "
+                "has no focal length to work from. A camera that was measured "
+                "with a tape measure should declare half_fov_rad.")
+    else:
+        try:
+            matrix = np.asarray(declared, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("DepthART requires camera_info with a nine-value K, width and height") from exc
+    if matrix.shape != (9,):
         raise ValueError("camera_info must contain a nine-value K and positive width/height")
     matrix = matrix.reshape(3, 3).copy()
     if (not np.isfinite(matrix).all() or matrix[0, 0] <= 0 or matrix[1, 1] <= 0

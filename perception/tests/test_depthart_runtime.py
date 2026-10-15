@@ -665,3 +665,73 @@ def test_start_without_upstream_intrinsics_says_what_to_do(declaration):
     assert '/remote_control/camera' in result['message']
     assert 'yolo' in result['message']          # the way out
     assert not p._nodes
+
+
+# ── A declaration with no K is a valid declaration ───────────────────────────
+#
+# The spec carries `half_fov_rad` because a tape measure produces an angle and
+# no K at all, and its reference declaration — R1's main camera — is exactly
+# that. Reading only `K` rejected the canonical camera of the robot this
+# project is built around. Rows below are R1's real declaration, from
+# /ubuntu/camera/main on r1_bj.
+
+R1_MAIN = {'schema': 'motus.camera/1', 'topic': '/ubuntu/camera/main',
+           'id': 'unitree/r1/camera_main', 'format': 'image/jpeg',
+           'width': 1280, 'height': 720, 'distortion_model': 'unknown',
+           'D': None, 'K': None, 'half_fov_rad': 0.888, 'half_fov_v_rad': None,
+           'source': 'measured', 'measured_on': 'r1_sz, 2026-09-23',
+           'pipeline': ['unitree/r1/camera_main']}
+
+
+@pytest.mark.parametrize('absent', [None, '', []])
+def test_k_derived_from_declared_half_fov(absent):
+    matrix, w, h = camera_matrix(dict(R1_MAIN, K=absent))
+    assert (w, h) == (1280, 720)
+    fx = 640 / np.tan(0.888)
+    assert float(matrix[0, 0]) == pytest.approx(fx, rel=1e-5)
+    assert float(matrix[1, 1]) == pytest.approx(fx, rel=1e-5)   # square pixels
+    assert (float(matrix[0, 2]), float(matrix[1, 2])) == (639.5, 359.5)
+    # The angle a consumer derives back must be the one the camera measured.
+    assert float(np.arctan((w / 2) / matrix[0, 0])) == pytest.approx(0.888, rel=1e-6)
+
+
+def test_k_is_absent_entirely_rather_than_null():
+    stripped = {k: v for k, v in R1_MAIN.items() if k != 'K'}
+    assert float(camera_matrix(stripped)[0][0, 0]) == pytest.approx(640 / np.tan(0.888), rel=1e-5)
+
+
+def test_declared_k_wins_over_the_angle_beside_it():
+    """The spec's own precedence: K is solved from many observations."""
+    both = dict(R1_MAIN, K=[700., 0., 639.5, 0., 700., 359.5, 0., 0., 1.])
+    assert float(camera_matrix(both)[0][0, 0]) == 700.
+
+
+def test_vertical_angle_is_used_when_declared_and_not_guessed_from_aspect():
+    # half_fov_v_rad cannot be derived from the aspect ratio — the spec is
+    # explicit — so it is read when present and square pixels assumed when not.
+    matrix, _, _ = camera_matrix(dict(R1_MAIN, half_fov_v_rad=0.6))
+    assert float(matrix[1, 1]) == pytest.approx(360 / np.tan(0.6), rel=1e-5)
+    assert float(matrix[1, 1]) != pytest.approx(float(matrix[0, 0]), rel=1e-3)
+
+
+@pytest.mark.parametrize('bad,match', [
+    (102, 'half'),          # degrees typed where radians belong
+    (1.6, 'out of range'),   # beyond pi/2
+    (0, 'out of range'),
+    (-0.5, 'out of range'),
+    ('wide', 'not a number'),
+])
+def test_an_unusable_half_fov_says_so_rather_than_claiming_none_was_declared(bad, match):
+    with pytest.raises(ValueError, match=match):
+        camera_matrix(dict(R1_MAIN, half_fov_rad=bad))
+
+
+def test_neither_k_nor_half_fov_is_still_refused():
+    with pytest.raises(ValueError, match='neither K nor half_fov_rad'):
+        camera_matrix({'width': 1280, 'height': 720})
+
+
+def test_r1_main_needs_no_crop():
+    # 1280x720 lands on the 864x480 canvas untouched, so R1 loses no field of
+    # view to the canvas — only to the pinhole approximation on a 102 deg lens.
+    assert fit_to_canvas(1280, 720, (864, 480)) == (0, 0, 1280, 720)

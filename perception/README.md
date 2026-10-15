@@ -2987,10 +2987,29 @@ For custom provisioning, set both `depthart_engine_path` and
 A partial override fails explicitly. JP5/JP6 artifacts are not interchangeable.
 There is no startup compilation or fallback to another model on download failure.
 
-Supply actual `motus.camera/1` intrinsics (`width`, `height`, row-major nine-value
-`K`) through the upstream camera declaration for streams, or explicitly for
-photos. Photos can inherit a running instance's bound declaration but cannot
-replace it. Unbound on-demand instances require K on every photo.
+Supply actual `motus.camera/1` intrinsics through the upstream camera declaration
+for streams, or explicitly for photos. Photos can inherit a running instance's
+bound declaration but cannot replace it. Unbound on-demand instances require a
+declaration on every photo.
+
+**A declaration with no `K` is valid, and R1 is the case.** The spec carries
+`half_fov_rad` because a tape measure produces an angle directly and no `K` at
+all, and its reference declaration is exactly that — `/ubuntu/camera/main`
+declares `K: null`, `half_fov_rad: 0.888`, `source: measured`. So `K` is read
+when present and derived from `half_fov_rad` when not (`fx = (w/2)/tan(half)`,
+principal point at centre), which keeps the spec's precedence: when both are
+present `K` wins, because a matrix is solved from many observations while the
+angle beside it is usually a tape measure. `fy` comes from `half_fov_v_rad`
+when declared and assumes square pixels when it is not — it **cannot** be
+derived from the aspect ratio, which is why the declared field exists.
+
+Reading only `K` rejected the canonical camera of the robot this project is
+built around, with `camera_info must contain a nine-value K`.
+
+What this does not fix on that lens: a pinhole `K` is an approximation at ~102
+degrees with `distortion_model: unknown` and `D: null`, and `tan` overstates
+the lateral offset towards the edges. Expect DepthART to need site calibration
+there, as YOLO does (`cal_b: -0.9753`, a factor of 2.65).
 
 #### The engine canvas is fixed, so an off-aspect source is centre-cropped
 
