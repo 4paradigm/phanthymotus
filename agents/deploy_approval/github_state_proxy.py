@@ -1055,11 +1055,14 @@ class GitHubStateProxy:
         pr_number: int,
         visible_markdown: str,
         state: dict,
+        *, expected_comment: tuple[int | None, str | None] | None = None,
     ) -> dict | None:
         """Write hidden state to the trusted lifecycle comment.
 
         If no trusted comment exists, creates a new one.
-        Returns the comment dict, or None on failure.
+        Returns the comment dict, or None on failure. When expected_comment
+        is supplied, require the same ID/body at the final read before PATCH;
+        (None, None) requires that no lifecycle comment exists yet.
 
         Trust is established per-comment via lazy provenance in
         find_trusted_lifecycle_comment.  The installation token used
@@ -1078,6 +1081,11 @@ class GitHubStateProxy:
             raise GitHubStateProxyError("comment body exceeds max size")
 
         existing = await self.find_trusted_lifecycle_comment(repo, pr_number)
+        if expected_comment is not None:
+            observed = ((existing.get("id"), existing.get("body"))
+                        if existing is not None else (None, None))
+            if observed != expected_comment:
+                raise GitHubStateProxyError("Lifecycle comment changed before persistence")
         if existing is not None:
             comment_id = existing.get("id")
             if isinstance(comment_id, int):

@@ -1799,8 +1799,71 @@ class DeployController:
                 return False
         return set(case_results) == seen
 
+    async def _restart_record_test_comment_is_current(
+        self, repo: str, state: dict, expected_comment: dict,
+    ) -> bool:
+        """Recheck unedited comment provenance and current authority, fail closed."""
+        if (not self.config.auth_valid or repo not in self.config.active_repos
+                or repo not in self.config.github_repos):
+            return False
+        cid = expected_comment.get("id")
+        user = expected_comment.get("user", {})
+        uid, login = user.get("id"), user.get("login")
+        if (not isinstance(cid, int) or isinstance(cid, bool)
+                or cid <= state.get("last_processed_comment_id", 0)
+                or not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0
+                or not isinstance(login, str) or not login
+                or self.proxy.is_bot_comment(expected_comment)
+                or not expected_comment.get("created_at")
+                or expected_comment.get("updated_at") != expected_comment.get("created_at")):
+            return False
+        try:
+            await self._check_record_test_permissions(repo, login, state)
+        except PolicyError:
+            return False
+        fresh_comment = await self.proxy.get_comment(repo, cid)
+        return (fresh_comment == expected_comment and self.config.auth_valid
+                and repo in self.config.active_repos and repo in self.config.github_repos)
+
+    async def resume_record_test(
+        self, repo: str, pr_number: int, expected_state: dict, expected_comment: dict,
+    ) -> bool:
+        """Resume evidence finalization only; never dispatch deployment commands."""
+        from .commands import parse_command
+
+        cmd = parse_command(expected_comment.get("body", ""))
+        if (cmd.kind != "record_test" or cmd.result not in ("pass", "fail")
+                or expected_state.get("status") != "testing"
+                or not self._final_case_pass_is_ready(expected_state)
+                or not await self._restart_record_test_comment_is_current(
+                    repo, expected_state, expected_comment)):
+            return False
+        pr = await self.proxy.get_pr(repo, pr_number)
+        if (pr.get("state") != "open" or pr.get("merged")
+                or pr.get("head", {}).get("sha") != expected_state.get("head_sha")):
+            return False
+        user = expected_comment["user"]
+        handled = await self.handle_record_test(
+            repo, pr_number, expected_comment["id"], cmd.result, cmd.summary,
+            user["login"], str(user["id"]),
+            _recovery_state=expected_state, _recovery_comment=expected_comment,
+        )
+        if not handled:
+            return False
+        # Policy/not-ready responses are handled commands in normal operation,
+        # but never authorize advancing a startup baseline over unfinished work.
+        fresh = await self.proxy.read_hidden_state(repo, pr_number)
+        return (isinstance(fresh, dict)
+                and fresh.get("head_sha") == expected_state.get("head_sha")
+                and fresh.get("status") == ("succeeded" if cmd.result == "pass" else "failed")
+                and fresh.get("command", {}).get("kind") == "record_test"
+                and fresh.get("command", {}).get("comment_id") == expected_comment["id"]
+                and fresh.get("command", {}).get("phase") == "completed"
+                and fresh.get("last_processed_comment_id") == expected_comment["id"])
+
     async def _revalidate_record_test_state(
         self, repo: str, pr_number: int, original: dict, result: str,
+        expected_comment: dict | None = None,
     ) -> dict | None:
         """Fresh-read GitHub after awaits before publishing the result."""
         pr_data = await self.proxy.get_pr(repo, pr_number)
@@ -1830,14 +1893,24 @@ class DeployController:
             ):
                 if fresh.get(key) != original.get(key):
                     return None
+        if expected_comment is not None:
+            if (pr_head != original.get("head_sha")
+                    or not self._final_case_pass_is_ready(fresh)
+                    or fresh != original
+                    or not await self._restart_record_test_comment_is_current(
+                        repo, fresh, expected_comment)):
+                return None
         return copy.deepcopy(fresh)
 
     async def handle_record_test(
         self, repo: str, pr_number: int, comment_id: int,
         result: str, summary: str, actor: str, actor_id: str,
+        *, _recovery_state: dict | None = None, _recovery_comment: dict | None = None,
     ) -> bool:
         try:
             state = await self.proxy.read_hidden_state(repo, pr_number)
+            if _recovery_state is not None and state != _recovery_state:
+                return False
             if state is None:
                 await self._post_error(
                     repo, pr_number,
@@ -1918,6 +1991,8 @@ class DeployController:
                 return True
 
             # Check HEAD drift
+            if _recovery_comment is not None and pr_head != state.get("head_sha", ""):
+                return False
             if pr_head and pr_head != state.get("head_sha", ""):
                 await self._supersede_head_drift(
                     repo, pr_number, state, pr_head, comment_id,
@@ -1981,6 +2056,7 @@ class DeployController:
             if result == "pass":
                 fresh_before_upload = await self._revalidate_record_test_state(
                     repo, pr_number, original_state, result,
+                    expected_comment=_recovery_comment,
                 )
                 if fresh_before_upload is None:
                     return False
@@ -2001,7 +2077,7 @@ class DeployController:
                 )
                 return False
 
-            # Validate COS metadata — pass path REQUIRES valid COS; fail path is best-effort
+            # Finalizing either result requires verified COS metadata.
             cos_valid = False
             if cos_metadata.get("object_key"):
                 object_key = cos_metadata.get("object_key", "")
@@ -2023,10 +2099,10 @@ class DeployController:
                             and 1 <= size_val <= 10485760):
                         cos_valid = True
 
-            if result == "pass" and not cos_valid:
+            if not cos_valid:
                 logger.warning(
-                    "record_test pass but COS invalid %s#%s — keeping testing",
-                    repo, pr_number,
+                    "record_test %s but COS invalid %s#%s — keeping testing",
+                    result, repo, pr_number,
                 )
                 return False
 
@@ -2034,6 +2110,7 @@ class DeployController:
             # runtime/image bindings or deployment records after it completes.
             fresh_state = await self._revalidate_record_test_state(
                 repo, pr_number, original_state, result,
+                expected_comment=_recovery_comment,
             )
             if fresh_state is None:
                 return False
@@ -2091,6 +2168,7 @@ class DeployController:
             terminal_written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, terminal_markdown, event=event,
                 expected_record_test_state=original_state,
+                expected_record_test_comment=_recovery_comment,
             )
             if not terminal_written:
                 return False
@@ -3238,6 +3316,7 @@ class DeployController:
         events: list[dict] | None = None,
         expected_record_test_state: dict | None = None,
         expected_terminal_state: dict | None = None,
+        expected_record_test_comment: dict | None = None,
     ) -> bool:
         """Write lifecycle comment with automatic history management.
 
@@ -3252,6 +3331,7 @@ class DeployController:
                 fresh = await self._revalidate_record_test_state(
                     repo, pr_number, expected_record_test_state,
                     "pass" if state.get("status") == "succeeded" else "fail",
+                    expected_comment=expected_record_test_comment,
                 )
                 if fresh is None:
                     return False
@@ -3268,7 +3348,11 @@ class DeployController:
                         current_comment.get("id") != comment.get("id")
                         or current_comment.get("body") != comment.get("body")))):
                 raise GitHubStateProxyError("Lifecycle History changed before write")
-            written = await self.proxy.write_hidden_state(repo, pr_number, visible, state)
+            written = await self.proxy.write_hidden_state(
+                repo, pr_number, visible, state,
+                expected_comment=((comment.get("id"), comment.get("body"))
+                                  if comment is not None else (None, None)),
+            )
             if not isinstance(written, dict):
                 raise GitHubStateProxyError("Lifecycle state write was not confirmed")
             return True

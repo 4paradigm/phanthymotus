@@ -20,6 +20,7 @@ Safety rules:
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 import logging
 
@@ -102,6 +103,11 @@ class GitHubCommandWatcher:
         # pending-generation. Prevents rebaselining PRs that
         # already succeeded this generation.
         self._baseline_progress: dict[str, set[int]] = {}
+        # Startup alone may resume unfinished evidence finalization. Auth
+        # reactivation never grants replay authority to historical commands.
+        self._startup_recovery_repos: set[str] = set()
+        self._recovery_comments: dict[tuple[str, int], dict] = {}
+        self._recovery_states: dict[tuple[str, int], dict] = {}
 
     def start(self) -> None:
         if self._running:
@@ -109,7 +115,9 @@ class GitHubCommandWatcher:
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
 
-    def mark_repos_pending_baseline(self, repos: list[str]) -> None:
+    def mark_repos_pending_baseline(
+        self, repos: list[str], *, startup: bool = True,
+    ) -> None:
         """Seed the pending-baseline gate for externally resolved repos.
 
         Startup and authorization recovery both establish a new generation.
@@ -121,6 +129,10 @@ class GitHubCommandWatcher:
                 continue
             self._pending_baseline_repos.add(repo)
             self._baseline_progress[repo] = set()
+            if startup:
+                self._startup_recovery_repos.add(repo)
+            else:
+                self._startup_recovery_repos.discard(repo)
 
     async def stop(self) -> None:
         self._running = False
@@ -206,7 +218,7 @@ class GitHubCommandWatcher:
                 self._pending_baseline_repos.discard(repo)
                 self._baseline_progress.pop(repo, None)
             newly_active = new_active_set if not old_auth_valid else new_active_set - old_active_set
-            self.mark_repos_pending_baseline(sorted(newly_active))
+            self.mark_repos_pending_baseline(sorted(newly_active), startup=False)
         except Exception as e:
             logger.warning(
                 "auth refresh failed: %s \u2014 failing closed",
@@ -277,15 +289,18 @@ class GitHubCommandWatcher:
                 )
                 if all_baselined:
                     self._pending_baseline_repos.discard(repo)
+                    self._startup_recovery_repos.discard(repo)
 
     async def _baseline_pr(self, repo: str, pr_number: int) -> bool:
-        """Baseline one PR's command cursor without dispatching anything.
+        """Baseline old commands, allowing only guarded startup record_test recovery.
 
         Used on first observation AND when a repo is newly (re)activated by an
         authorization refresh: the cursor is advanced to the maximum comment
         id observed on GitHub so preexisting comments never execute as fresh
         approvals.  Commands posted AFTER the baseline persist are processed
-        normally by subsequent cycles.
+        normally by subsequent cycles. An unfinished record_test in testing is
+        resumed only at startup through the Controller's validation path; a
+        failed or ambiguous recovery blocks baseline cursor advancement.
 
         For PRs that already have a baselined cursor (existing lifecycle state
         from a previous authorized period), advance the cursor to the maximum
@@ -378,6 +393,46 @@ class GitHubCommandWatcher:
 
             old_cursor = initial_state.get("last_processed_comment_id", 0)
             baseline_id = max(old_cursor, max_cid)
+            key = (repo, pr_number)
+            if key in self._recovery_states and initial_state.get("status") == "testing":
+                if initial_state != self._recovery_states[key]:
+                    return False
+                # Deleted/edited-away commands cannot silently become consumed.
+                if self._recovery_comments[key] not in comments:
+                    return False
+            if initial_state.get("status") == "testing":
+                pending_commands = sorted(
+                    (c for c in comments
+                     if isinstance(c.get("id"), int) and not isinstance(c["id"], bool)
+                     and c["id"] > old_cursor
+                     and commands_mod.parse_command(c.get("body", "") or "").is_command),
+                    key=lambda c: c["id"],
+                )
+                pending_tests = [c for c in pending_commands
+                                 if commands_mod.parse_command(c.get("body", "")).kind == "record_test"]
+                if pending_tests:
+                    candidate = pending_tests[0]
+                    snapshot = self._recovery_comments.setdefault(key, copy.deepcopy(candidate))
+                    self._recovery_states.setdefault(key, copy.deepcopy(initial_state))
+                    # An intervening mutation, edit, HEAD drift, or auth outage
+                    # blocks recovery; never consume the unfinished test cursor.
+                    if (repo not in self._startup_recovery_repos
+                            or not self.config.auth_valid
+                            or repo not in self.config.active_repos
+                            or pr_info.get("merged")
+                            or pr_info.get("head", {}).get("sha") != initial_state.get("head_sha")
+                            or candidate != snapshot
+                            or not candidate.get("created_at")
+                            or candidate.get("updated_at") != candidate.get("created_at")
+                            or any(commands_mod.parse_command(c.get("body", "")).kind
+                                   in ("request_deploy", "approve_deploy")
+                                   for c in pending_commands if c["id"] < candidate["id"])):
+                        logger.warning("record_test restart recovery blocked %s#%s", repo, pr_number)
+                        return False
+                    if not await self.controller.resume_record_test(
+                        repo, pr_number, initial_state, snapshot,
+                    ):
+                        return False
 
         # Persist baseline cursor (shared by both paths).
         try:
@@ -624,9 +679,9 @@ class GitHubCommandWatcher:
                 )
                 if handled:
                     await self._consume_comment_cursor(repo, pr_number, comment_id)
-                    # After one command is dispatched, stop processing this PR
-                    # for this cycle. Next cycle starts with fresh GitHub state.
-                    return
+                # False means unfinished work (including COS failure). Never
+                # consume a later comment past it; retry from fresh state next poll.
+                return
             except DeployCommandError as e:
                 logger.warning(
                     "command %s comment %s in %s#%s: %s",

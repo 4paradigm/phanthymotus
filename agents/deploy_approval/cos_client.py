@@ -61,6 +61,25 @@ class CosClient:
         self._fake = _fake
         self._uploads: list[dict] = []
 
+    @staticmethod
+    def _log_operation_error(operation: str, exc: Exception) -> None:
+        """Classify failures without logging SDK messages containing URLs/secrets."""
+        from qcloud_cos import CosClientError, CosServiceError
+        from requests.exceptions import RequestException
+
+        category = "SDK_ERROR"
+        if isinstance(exc, CosServiceError):
+            status = exc.get_status_code()
+            category = ("FORBIDDEN" if status == 403 else
+                        "OBJECT_CONFLICT" if status in (409, 412) else "SERVICE_ERROR")
+        elif isinstance(exc, CosClientError):
+            category = ("SDK_PARAMETER_UNSUPPORTED"
+                        if str(exc).startswith("No Parameter Named ") else "NETWORK_ERROR")
+        elif isinstance(exc, (OSError, RequestException)):
+            category = "NETWORK_ERROR"
+        logger.warning("COS operation=%s category=%s exception=%s",
+                       operation, category, type(exc).__name__)
+
     def _has_credentials(self) -> bool:
         values = (
             self.config.cos_region,
@@ -238,8 +257,8 @@ class CosClient:
            - If identity wrong or corrupted -> return False (reject overwrite).
         4. HEAD error (403, timeout, network) -> UNKNOWN -> return False.
 
-        Uses Tencent COS ForbidOverwrite parameter ONLY when bucket
-        versioning is confirmed absent (empty/None response).
+        Uses the signed x-cos-forbid-overwrite header ONLY when bucket
+        versioning is confirmed absent (dict with missing/empty Status).
         Enabled, Suspended, or unknown versioning -> fail closed.
         """
         if not self._is_controlled_key(object_key):
@@ -343,7 +362,9 @@ class CosClient:
                 SecretKey=self.config.cos_secret_key,
                 Token=None,
             )
-            client = CosS3Client(config)
+            # An uncertain PUT must return to the HEAD/GET guard on the next
+            # bounded watcher poll, never be blindly replayed inside the SDK.
+            client = CosS3Client(config, retry=0)
 
 
             # Pre-validate local archive identity BEFORE any COS operation.
@@ -402,6 +423,7 @@ class CosClient:
                     return False
                 existing_length = cl_int
             except Exception as exc:
+                self._log_operation_error("head_object", exc)
                 # Use CosServiceError.get_status_code() for precise 404 detection ONLY.
                 try:
                     from qcloud_cos import CosServiceError  # type: ignore
@@ -474,7 +496,8 @@ class CosClient:
                             await asyncio.to_thread(close)
                 except CosError:
                     raise
-                except Exception:
+                except Exception as exc:
+                    self._log_operation_error("get_object", exc)
                     logger.warning(
                         "COS get_object failed for %s — "
                         "cannot verify existing object, rejecting PUT",
@@ -542,7 +565,7 @@ class CosClient:
                 )
                 if validation_err is not None:
                     logger.warning(
-                        "COS %s: existing identity invalid (%s) — "
+                        "COS category=OBJECT_CONFLICT %s: existing identity invalid (%s) — "
                         "rejecting overwrite",
                         object_key, validation_err,
                     )
@@ -616,6 +639,7 @@ class CosClient:
                             )
             except Exception as exc:
                 # Versioning query error -> fail closed, reject PUT entirely
+                self._log_operation_error("get_bucket_versioning", exc)
                 logger.warning(
                     "COS %s: versioning check failed (%s) — "
                     "refusing PUT to avoid overwrite",
@@ -625,7 +649,7 @@ class CosClient:
             # Only proceed with PUT when versioning is confirmed absent.
             if not versioning_ok:
                 logger.warning(
-                    "COS %s: cannot confirm bucket is non-versioned — "
+                    "COS category=BUCKET_VERSIONING_INCOMPATIBLE %s: cannot confirm bucket is non-versioned — "
                     "refusing PUT to avoid overwrite",
                     object_key,
                 )
@@ -637,14 +661,17 @@ class CosClient:
                     "Key": object_key,
                 }
                 if forbid_overwrite:
-                    kwargs["ForbidOverwrite"] = "true"
+                    # SDK 1.9.44 mapped() rejects top-level ForbidOverwrite.
+                    # Metadata is copied verbatim to request headers (no meta-
+                    # prefix), and CosS3Auth signs all x-cos-* headers.
+                    kwargs["Metadata"] = {"x-cos-forbid-overwrite": "true"}
                 await asyncio.to_thread(client.put_object, **kwargs)
                 return True
             except Exception as exc:
-                logger.error("COS upload failed: %s", type(exc).__name__)
+                self._log_operation_error("put_object", exc)
                 return False
         except Exception as exc:
-            logger.error("COS upload failed: %s", type(exc).__name__)
+            self._log_operation_error("upload_evidence_archive", exc)
             return False
 
     @staticmethod
@@ -1008,6 +1035,7 @@ class CosClient:
         except CosError:
             return False
         except Exception as exc:
+            self._log_operation_error("verify_upload", exc)
             logger.warning("COS verify failed for %s: %s", object_key, type(exc).__name__)
             return False
 
@@ -1110,6 +1138,7 @@ class CosClient:
         except CosError:
             raise
         except Exception as exc:
+            self._log_operation_error("download_evidence_archive", exc)
             logger.error("COS download failed: %s", type(exc).__name__)
             raise CosError("COS download failed") from exc
 
@@ -1182,22 +1211,26 @@ class CosClient:
                 )
                 if err is not None:
                     logger.warning(
-                        "ensure_evidence_archive %s: actual object invalid (%s)",
+                        "COS category=POST_UPLOAD_VERIFICATION_FAILED %s: actual object invalid (%s)",
                         object_key, err,
                     )
                     return {"object_key": "", "sha256": "", "size": 0}
 
+                if not await self.verify_upload(object_key, actual_sha, actual_size):
+                    logger.warning("COS category=POST_UPLOAD_VERIFICATION_FAILED %s", object_key)
+                    return {"object_key": "", "sha256": "", "size": 0}
                 return {
                     "object_key": object_key,
                     "sha256": actual_sha,
                     "size": actual_size,
                 }
             except CosError:
+                logger.warning("COS category=POST_UPLOAD_VERIFICATION_FAILED %s", object_key)
                 return {"object_key": "", "sha256": "", "size": 0}
             except Exception as e:
                 logger.warning(
-                    "ensure_evidence_archive %s: post-upload download failed (%s)",
-                    object_key, e,
+                    "COS category=POST_UPLOAD_VERIFICATION_FAILED %s exception=%s",
+                    object_key, type(e).__name__,
                 )
                 return {"object_key": "", "sha256": "", "size": 0}
         except Exception as e:
