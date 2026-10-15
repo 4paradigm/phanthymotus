@@ -237,6 +237,33 @@ class CompletionReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notice['payload']['result']['reason'], 'stopped')
         self.enqueue.assert_awaited_once()
 
+    async def test_rejected_sse_log_escapes_caps_and_rate_limits_untrusted_ids(self):
+        action_id = 'bad\nforged\r\x1b[31m' + 'x' * 300
+        payload = {'type': 'action_complete', 'action_id': action_id}
+        async def lines():
+            for _ in range(5):
+                yield ('data: ' + json.dumps(payload)).encode()
+            raise asyncio.CancelledError()
+        response = types.SimpleNamespace(status=200, content=lines())
+        class Context:
+            def __init__(self, result): self.result = result
+            async def __aenter__(self): return self.result
+            async def __aexit__(self, *args): pass
+        session = types.SimpleNamespace(get=lambda _: Context(response))
+        with patch.object(mcp_client.aiohttp, 'ClientSession', return_value=Context(session)), \
+                patch.object(mcp_client.time, 'monotonic', return_value=100), \
+                patch('builtins.print') as log:
+            await mcp_client._subscribe_sse('device', 'http://fake/mcp')
+        log.assert_called_once()
+        message = log.call_args.args[0]
+        self.assertNotIn(action_id, message)
+        self.assertNotIn('\n', message)
+        self.assertNotIn('\r', message)
+        self.assertNotIn('\x1b', message)
+        self.assertIn(repr(action_id)[:200], message)
+        self.assertLess(len(message), 350)
+        self.enqueue.assert_not_awaited()
+
 
 if __name__ == '__main__':
     unittest.main()

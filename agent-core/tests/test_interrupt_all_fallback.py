@@ -76,7 +76,9 @@ def bind_vla():
 
 def interrupt(reason=''):
     agent = DecisionLoop.__new__(DecisionLoop)
-    with mock.patch('event.llm._stop_countdown') as stop:
+    # event.llm is also a package-level Event instance; Python 3.10's string
+    # patch resolver follows that instance instead of the loaded module.
+    with mock.patch.object(sys.modules[DecisionLoop.__module__], '_stop_countdown') as stop:
         asyncio.run(DecisionLoop._interrupt_active_outputs(agent, reason=reason))
     return stop
 

@@ -727,6 +727,7 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
     #
     # 5xx 之类不在此列：那是「现在不行」，退避重试是对的。
     missing = 0
+    last_receipt_warning = -math.inf
 
     while True:
         try:
@@ -775,8 +776,13 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                                 payload.get('action_id') if isinstance(payload, dict) else None)
                             ack = await receive_action_completion(
                                 action_id, msg, source=f'mcp:{mcp_id}')
-                            if not ack['ok']:
-                                print(f'[acp] SSE completion rejected: {action_id}: {ack.get("error")}')
+                            now = time.monotonic()
+                            if not ack['ok'] and now - last_receipt_warning >= 5:
+                                # Untrusted IDs must not forge lines/control
+                                # sequences; repeated rejection is rate limited.
+                                last_receipt_warning = now
+                                safe_id = repr(action_id)[:200]
+                                print(f'[acp] SSE completion rejected: {safe_id}: {ack.get("error")}')
                             continue
 
                         await event_bus.enqueue(
