@@ -1,5 +1,70 @@
 # Perception Stack
 
+## Robot model recognition prototype
+
+The opt-in `robot_model` card identifies **robots visible in an image**, not the
+host robot's own Driver. It reuses VOP boxes, encodes each crop with local CLIP
+ViT-B/32 in the isolated ONNX Runtime worker, and ranks the Driver IDs in
+`plugins/robot_model_catalog.py`. It does not select a Driver or authorize
+movement. `recognize_by_photo` accepts an uploaded image path;
+`recognize_by_url` fetches an image and runs inference locally. `start` with an
+`image/jpeg` topic publishes `data/json` at `<input_topic>/robot_models`, at
+most `fps` results per second. `stop` disposes that stream.
+
+This prototype remains `enabled: false` in `config.yaml`. Both `min_score` and
+`min_margin` are `null`, so **every model result is `unknown`** until calibrated
+from real, independent photos. Ranked candidates, scores, and the reason are
+still returned for evaluation. VOP must also be enabled. Its frozen vocabulary
+can detect robot, humanoid robot, quadruped robot, and drone; it currently has
+no underwater-robot class, so Chasing ROV recognition is not reachable through
+this detector. A missing or corrupt bundle returns `engine_unavailable`.
+
+To build the immutable local bundle, use the official OpenAI CLIP ViT-B/32
+checkpoint (SHA256 `40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af`)
+in a build environment with `clip`, PyTorch, ONNX and ONNX Runtime:
+
+```bash
+python3 tools/export_robot_model_clip.py /path/to/ViT-B-32.pt /tmp/robot-model-bundle
+```
+
+The exporter verifies the checkpoint, ONNX parity, candidate order and hashes.
+Install `clip_image.onnx` and `candidates.npz` from the resulting directory at
+`/models/robot_model` on the robot. The runtime rechecks their pinned sizes and
+SHA256 hashes in `utils/model_downloader.py`. For this prototype the bundle is
+copied locally; no download URL is configured. The generated weights are not
+tracked in Git.
+
+Collect examples of each supported model, visually similar variants, and
+unlisted robots across viewpoints, occlusions and backgrounds. Record
+the physical robot's `unit_id`; assign whole units to either calibration or
+test, never both. For each image, save the ground truth boxes and the card's
+unthresholded result in a JSON list:
+
+```json
+[
+  {
+    "image": "photos/g1-front.jpg",
+    "split": "calibration",
+    "unit_id": "g1-serial-a",
+    "truth": [{"bbox": [10, 20, 180, 410], "model_id": "unitree/g1"}],
+    "result": {"objects": [{"bbox": [11, 21, 179, 409], "model_id": "unknown", "score": 0.31, "margin": 0.08, "candidates": [{"model_id": "unitree/g1", "score": 0.31}]}]}
+  }
+]
+```
+
+Use `model_id: "unknown"` for unlisted robots. Record `latency_ms` in each
+result if measured by the caller. Then run
+`python3 tools/eval_robot_model.py manifest.json` from `perception/`. The
+evaluator matches boxes at IoU ≥ 0.5, fits score and margin gates only on the
+calibration units while refusing false model IDs there, and reports recall per
+model and the false-identification rate for unknown robots on the disjoint test
+units. `null` recall means that model had no test examples; `null` thresholds
+mean no safe separating pair was found. Before changing the production gates or
+enabling the card by default, measure held-out errors, latency and memory on
+both JP5.11 and JP6.1 hardware. Those device and dataset measurements have not
+yet been performed.
+
+
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`,
 `echo_cancellation` echo handling), vision (`vop` object detection, `visual_depth`
 monocular depth, `ocr`, `face_recognition`, `pose` human keypoints + actions,
