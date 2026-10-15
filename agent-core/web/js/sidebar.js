@@ -649,6 +649,69 @@ function _readConfigValue(input, def) {
 }
 
 /** Check if a configSchema has any instance-scope fields. */
+/**
+ * A <select> listing the browser's media input devices of one kind.
+ *
+ * Shared by the `audio-input-device` and `video-input-device` config formats,
+ * and by both places that build a config form. It was already duplicated
+ * verbatim once before video needed it; a third and fourth copy is how the two
+ * drift apart.
+ *
+ * Labels are only exposed after permission is granted, so a stream is requested
+ * and released immediately just to read them — otherwise every device shows up
+ * as an opaque id.
+ */
+function _mediaDeviceInput(kind, key, saved) {
+  const constraint = kind === 'videoinput' ? { video: true } : { audio: true };
+  const noun = kind === 'videoinput' ? 'Camera' : 'Microphone';
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+    // Non-secure context (plain HTTP) — the API is unavailable, so offer a
+    // text field rather than an empty select the user cannot act on.
+    const input = document.createElement('input');
+    input.className = 'tool-config-input';
+    input.dataset.key = key;
+    input.type = 'text';
+    input.placeholder = 'Requires HTTPS or localhost';
+    input.value = saved;
+    return input;
+  }
+
+  const input = document.createElement('select');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  const loadingOpt = document.createElement('option');
+  loadingOpt.value = '';
+  loadingOpt.textContent = 'Loading devices...';
+  input.appendChild(loadingOpt);
+
+  navigator.mediaDevices.getUserMedia(constraint).then(stream => {
+    stream.getTracks().forEach(t => t.stop());   // release immediately
+    return navigator.mediaDevices.enumerateDevices();
+  }).then(devices => {
+    input.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = '-- Default --';
+    input.appendChild(defaultOpt);
+    for (const d of devices.filter(d => d.kind === kind)) {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `${noun} ${d.deviceId.slice(0, 8)}`;
+      if (saved === d.deviceId) opt.selected = true;
+      input.appendChild(opt);
+    }
+    if (saved) input.value = saved;
+  }).catch(() => {
+    input.innerHTML = '';
+    const errOpt = document.createElement('option');
+    errOpt.value = '';
+    errOpt.textContent = 'Permission denied';
+    input.appendChild(errOpt);
+  });
+  return input;
+}
+
 function _hasInstanceFields(configSchema) {
   if (!configSchema || !configSchema.properties) return false;
   return Object.values(configSchema.properties).some(def => def.scope === 'instance');
@@ -748,50 +811,11 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
-    } else if (def.format === 'audio-input-device') {
-      input = document.createElement('select');
-      input.className = 'tool-config-input';
-      input.dataset.key = key;
-      const saved = savedValues[key] || '';
-      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-        // Non-secure context (HTTP) — fall back to text input
-        input = document.createElement('input');
-        input.className = 'tool-config-input';
-        input.dataset.key = key;
-        input.type = 'text';
-        input.placeholder = 'Requires HTTPS or localhost';
-        input.value = saved;
-      } else {
-        const loadingOpt = document.createElement('option');
-        loadingOpt.value = '';
-        loadingOpt.textContent = 'Loading devices...';
-        input.appendChild(loadingOpt);
-        // Request mic permission first to get device labels, then enumerate
-        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-          stream.getTracks().forEach(t => t.stop()); // release immediately
-          return navigator.mediaDevices.enumerateDevices();
-        }).then(devices => {
-          input.innerHTML = '';
-          const defaultOpt = document.createElement('option');
-          defaultOpt.value = '';
-          defaultOpt.textContent = '-- Default --';
-          input.appendChild(defaultOpt);
-          for (const d of devices.filter(d => d.kind === 'audioinput')) {
-            const opt = document.createElement('option');
-            opt.value = d.deviceId;
-            opt.textContent = d.label || `Microphone ${d.deviceId.slice(0, 8)}`;
-            if (saved === d.deviceId) opt.selected = true;
-            input.appendChild(opt);
-          }
-          if (saved) input.value = saved;
-        }).catch(() => {
-          input.innerHTML = '';
-          const errOpt = document.createElement('option');
-          errOpt.value = '';
-          errOpt.textContent = 'Permission denied';
-          input.appendChild(errOpt);
-        });
-      }
+    } else if (def.format === 'audio-input-device'
+               || def.format === 'video-input-device') {
+      input = _mediaDeviceInput(
+        def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
+        key, savedValues[key] || '');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1049,6 +1073,25 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // Expert settings go in a fold. A card whose every tuning knob is laid out
+  // flat is a card nobody can configure: the pose card reached 26 fields, each
+  // labelled with its own paragraph of rationale, and finding `fps` in it meant
+  // reading all of them. A schema says which of its fields are everyday by
+  // leaving `advanced` unset; one that marks nothing keeps the flat layout it
+  // had, so this changes no card that has not opted in.
+  let advancedBox = null;
+  const advancedHost = () => {
+    if (advancedBox) return advancedBox;
+    const details = document.createElement('details');
+    details.className = 'tool-config-advanced';
+    const summary = document.createElement('summary');
+    summary.textContent = 'Advanced settings';
+    details.appendChild(summary);
+    bodyEl.appendChild(details);
+    advancedBox = details;
+    return details;
+  };
+
   let hasFields = false;
   for (const [key, def] of Object.entries(props)) {
     // Only show instance-scope fields
@@ -1057,6 +1100,10 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
+    // `title` is the name of the setting; `description` is what it does. They
+    // were one field, so a description written to explain a trade-off became
+    // the label and the form turned into an essay. A schema with no title
+    // still falls back to its description, as before.
     label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
 
     let input;
@@ -1106,50 +1153,11 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
-    } else if (def.format === 'audio-input-device') {
-      input = document.createElement('select');
-      input.className = 'tool-config-input';
-      input.dataset.key = key;
-      const saved = savedValues[key] || '';
-      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-        // Non-secure context (HTTP) — fall back to text input
-        input = document.createElement('input');
-        input.className = 'tool-config-input';
-        input.dataset.key = key;
-        input.type = 'text';
-        input.placeholder = 'Requires HTTPS or localhost';
-        input.value = saved;
-      } else {
-        const loadingOpt = document.createElement('option');
-        loadingOpt.value = '';
-        loadingOpt.textContent = 'Loading devices...';
-        input.appendChild(loadingOpt);
-        // Request mic permission first to get device labels, then enumerate
-        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-          stream.getTracks().forEach(t => t.stop()); // release immediately
-          return navigator.mediaDevices.enumerateDevices();
-        }).then(devices => {
-          input.innerHTML = '';
-          const defaultOpt = document.createElement('option');
-          defaultOpt.value = '';
-          defaultOpt.textContent = '-- Default --';
-          input.appendChild(defaultOpt);
-          for (const d of devices.filter(d => d.kind === 'audioinput')) {
-            const opt = document.createElement('option');
-            opt.value = d.deviceId;
-            opt.textContent = d.label || `Microphone ${d.deviceId.slice(0, 8)}`;
-            if (saved === d.deviceId) opt.selected = true;
-            input.appendChild(opt);
-          }
-          if (saved) input.value = saved;
-        }).catch(() => {
-          input.innerHTML = '';
-          const errOpt = document.createElement('option');
-          errOpt.value = '';
-          errOpt.textContent = 'Permission denied';
-          input.appendChild(errOpt);
-        });
-      }
+    } else if (def.format === 'audio-input-device'
+               || def.format === 'video-input-device') {
+      input = _mediaDeviceInput(
+        def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
+        key, savedValues[key] || '');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1204,8 +1212,19 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
-    bodyEl.appendChild(label);
-    bodyEl.appendChild(input);
+    // Help text, only when there is a separate title to help — otherwise the
+    // description is already serving as the label and repeating it is noise.
+    let help = null;
+    if (def.title && def.description) {
+      help = document.createElement('p');
+      help.className = 'tool-config-help';
+      help.textContent = def.description;
+    }
+
+    const host = def.advanced ? advancedHost() : bodyEl;
+    host.appendChild(label);
+    host.appendChild(input);
+    if (help) host.appendChild(help);
   }
 
   if (!hasFields) {

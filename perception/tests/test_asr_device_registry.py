@@ -531,7 +531,7 @@ def test_custom_hotwords_and_wake_word_changes_reload_and_can_be_cleared(monkeyp
     assert len(loads) == 4
 
 
-def test_xasr_factory_uses_enabled_defaults_and_merges_wake_word(monkeypatch):
+def test_xasr_factory_separates_wake_from_enhanced_hotwords(monkeypatch):
     calls = []
     monkeypatch.setattr(model_downloader, 'ensure_model', lambda *a, **kw: None)
     monkeypatch.setitem(asr.ASR_MODELS['x-asr-zh-en'], 'adapter',
@@ -540,14 +540,16 @@ def test_xasr_factory_uses_enabled_defaults_and_merges_wake_word(monkeypatch):
                                asr_prefix_lm_scale=0, asr_beam_paths=16,
                                asr_hotwords='星河展厅', kws={'asr_kws_keyword':'小星小星'}))
     assert calls[0]['prefix_lm_scale'] == .05
-    assert calls[0]['max_active_paths'] == 3
+    assert calls[0]['max_active_paths'] == 7
     assert calls[0]['tail_padding_seconds'] == .3
-    assert calls[0]['custom_hotwords'].splitlines() == ['星河展厅', '小星小星']
+    assert calls[0]['custom_hotwords'] == '星河展厅'
+    assert calls[0]['wake_word'] == '小星小星'
 
 
 def test_simple_card_hides_algorithm_controls():
     props = asr.TOOLS[0]['configSchema']['properties']
-    assert set(props) == {'asr_model', 'device', 'trigger_mode', 'asr_kws_keyword', 'asr_hotwords'}
+    assert set(props) == {'asr_model', 'device', 'trigger_mode', 'asr_kws_keyword',
+                         'asr_hotwords', 'publish_background', 'emit_audio_tags', 'emit_emotion'}
     assert props['asr_hotwords']['format'] == 'hotwords'
 
 

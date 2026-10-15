@@ -29,12 +29,17 @@ from vision_stubs import (  # noqa: F401
 )
 
 import plugins.face as face_plugin  # noqa: E402
-import plugins.face_db as face_db_module  # noqa: E402
+import plugins.identity_db as face_db_module  # noqa: E402
 # The image-source helpers moved to plugins/image_input.py, shared with vop
 # and ocr. Patching them on face_plugin no longer intercepts anything: the
 # call now resolves inside that module.
 import plugins.image_input as image_input  # noqa: E402
-from plugins.face_db import EMBEDDING_DIM, FaceDB  # noqa: E402
+import functools  # noqa: E402
+
+from plugins.face_runtime import EMBEDDING_DIM  # noqa: E402
+from plugins.identity_db import IdentityDB  # noqa: E402
+
+FaceDB = functools.partial(IdentityDB, dim=EMBEDDING_DIM, label="face_db")
 from plugins.face_runtime import DetectedFace  # noqa: E402
 
 

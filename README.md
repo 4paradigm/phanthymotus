@@ -412,6 +412,116 @@ Two rules follow, both of which were learned the hard way:
 
 Frontend tests: `node --test "agent-core/web/js/*.test.mjs"` (no dependencies).
 
+#### Stopping is two stages, and they have different guarantees
+
+「停止智能控制」 used to be one `await fetch` with **no UI feedback of any kind** —
+the button did not change, did not disable, showed no spinner — and the backend
+behind it walked the cards **serially** with `mcp_call_tool` and no timeout, whose
+default is no deadline at all. Measured on Orin 5:
+
+| | |
+|---|---|
+| 6 idle cards | 70 ms |
+| cards mid-model-load | 0.46 s |
+| one MCP that accepts but never answers, `timeout=None` | **still waiting at 25 s** (we cut it) |
+| the same MCP with a 5 s deadline | fails at 5.3 s |
+
+So the problem was never "slow", it was **unbounded** — and the ordering made it a
+safety problem rather than a cosmetic one: the cards were stopped *first* and
+`project_running` was flipped *last*, so throughout that unbounded wait **the agent
+loop was still live**, still able to call TTS and drive actuators. The operator
+pressing 停止 wants exactly that to end immediately, and saw nothing happen at all,
+so they pressed it again — which fired a second POST, because there was no
+in-flight guard either.
+
+It is now two stages:
+
+| stage | time | can fail | what |
+|---|---|---|---|
+| 1 | ≤100 ms | no | agent loop off (`project_running = False`, broadcast), browser mic/camera capture stopped |
+| 2 | seconds | yes, partially | per-card `stop` — **parallel**, each with a `STOP_CARD_TIMEOUT_S` deadline |
+
+`POST /api/config/stop-project` returns after stage 1 and runs stage 2 as a
+background task, so the button can honestly flip the moment the agent is off
+instead of waiting on a broken device. Stage 2 reports `project_stop_begin` →
+`project_stop_item`×N → `project_stop_done` on `/ws/motus`, which drives a
+dismissible chip beside the button (`web/js/teardown-chip.js`, state and HTML both
+pure so `node --test` covers them) and leaves a row per device in the activity log.
+
+Four things in there are deliberate and easy to undo by accident:
+
+- **The deadline is enforced twice** — `timeout_s` on the request *and*
+  `asyncio.wait_for` around the whole call. A stop must come back regardless of
+  *where* it hung, and the hang is not always the socket (registry lookup, a lock,
+  a thread holding the GIL).
+- **Parallel, so one dead device cannot hold the others.** Total time is `max()`,
+  not `sum()`. "One device broke, so none of the others could be stopped" is the
+  worst possible coupling direction for a stop path.
+- **Partial failure states the consequence, not the completion rate.** The chip
+  says 「1 台设备未停止」, not 「5/6 完成」, and it does not auto-hide — unlike the
+  all-clear, which disappears after a few seconds. A card that never answered is
+  counted as failed, because "no result" has the same consequence as an error here:
+  that device may still be running.
+- **A second click does not start a second teardown.** Stop is idempotent, but two
+  overlapping rounds make the per-item progress overwrite itself.
+
+Two conventions this toolbar has that break **silently, and only in the hand** — the
+teardown chip got both wrong first time round, and the desktop looked perfect:
+
+- **`pointer-events` is opt-in below 768px.** `.canvas-top-control` is
+  `pointer-events: none` there so touches fall through to the canvas, and every
+  interactive child declares `auto` for itself. The chip did not, so on a 390x844
+  phone `tap()` simply timed out — while the chip was the *only* thing on screen
+  saying a device had not stopped, because the activity log is a closed drawer at
+  that width. (Hence the extra toast on failure: a row written into a drawer nobody
+  opened is not a report.)
+- **Touch sizing is keyed on `pointer: coarse`, not on width** — a tablet is a wide
+  screen with a coarse pointer, and keying on 768px hands it desktop-sized targets.
+  Measured first cut: the 「重试」 button was **42x19 px**, under half the 44px floor
+  the rest of this stylesheet uses.
+
+Measured after fixing, on Orin 5 through Playwright:
+
+| | summary row | 重试 | dropdown |
+|---|---|---|---|
+| phone 390x844, coarse | 270x**44** | 63x**44** | within viewport, full container width |
+| tablet 1024x768, coarse | 123x**59** | 63x**44** | within viewport |
+| desktop 1440x900, mouse | 141x33 | 42x19 | within viewport |
+
+`tests/test_canvas_toolbar_touch.py` asserts both conventions against the stylesheet
+itself, so the next control added to that toolbar cannot quietly repeat it. Those
+assertions were mutation-checked: putting each of the three original mistakes back
+makes them fail.
+
+#### The activity log, and what the robot *overheard*
+
+The strip at the bottom subscribes to `/ws/motus` and renders one line per event.
+Each event type gets its own branch in `web/js/activity-summary.js` — a separate,
+import-free module purely so it can be covered by `node --test`; `activity-log.js`
+itself cannot be imported there, because it pulls in `mobile.js` and from there the
+whole renderer tree and three.js.
+
+Speech the robot was addressed with has always shown up (as a `trigger`). Speech it
+merely *overheard* — `<topic>/asr_background`, the utterances with no wake word —
+**had no trace in the log at all**. Those events go to the P=0 pipeline, where a
+background subagent may be collapsed by the 1-second throttle or judged
+substance-free and never spawned at all, so the sentence existed only on DDS. A
+`👂` row is now pushed from `collector._push_asr_background` before any of that is
+decided, carrying whatever the payload actually knows — speaker, language, emotion,
+audio event — and nothing it does not.
+
+Two things about it worth keeping:
+
+- **Only ASR background events go to the activity stream, not every P=0 event.**
+  Most of P=0 is battery, temperature and IMU readings arriving every second;
+  pushing those would flush the log, and being readable at a glance is the whole
+  point of it.
+- **Both the `background` flag and the `asr_background` topic name count as
+  evidence.** The flag is written into the JSON by perception, the topic name comes
+  from the canvas wiring; the two are independent, so recognising only one of them
+  means the rows silently stop appearing when the other end changes — and "a kind
+  of thing that stopped showing up in the log" is a failure nobody reports.
+
 ### Agent Definition
 
 Define the agent's identity, system prompt, and long-term memory directly from the UI.

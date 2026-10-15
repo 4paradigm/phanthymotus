@@ -30,9 +30,13 @@ def bundle(tmp_path):
 @pytest.fixture
 def runtime(monkeypatch):
     calls = []
+    def build(**kw):
+        calls.append(dict(kw, hotwords_content=Path(kw['hotwords_file']).read_text()))
+        return object()
     module = types.SimpleNamespace(
-        XASR_PREFIX_LM_VERSION=1, XASR_EARLY_HOTWORD_VERSION=1,
-        OfflineRecognizer=types.SimpleNamespace(from_transducer=lambda **kw: calls.append(kw) or object()))
+        XASR_PREFIX_LM_VERSION=1, XASR_EARLY_HOTWORD_VERSION=1, XASR_ENGLISH_DECODE_VERSION=1,
+        XASR_SELECTIVE_HOTWORD_VERSION=1,
+        OfflineRecognizer=types.SimpleNamespace(from_transducer=build))
     monkeypatch.setitem(sys.modules, 'sherpa_onnx', module)
     monkeypatch.setattr(onnx_provider, 'provider_for_device', lambda device, *a: 'cuda' if device == 'gpu' else 'cpu')
     monkeypatch.setenv('SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE', '3.9')
@@ -54,6 +58,31 @@ def test_stock_runtime_rejects_prefix_lm(bundle, runtime):
         XASRAdapter(str(bundle), prefix_lm_path=str(bundle/'lm.onnx'), prefix_lm_scale=.05)
 
 
+def test_prefix_runtime_without_english_fix_is_reported(bundle, runtime):
+    module, _ = runtime
+    module.XASR_ENGLISH_DECODE_VERSION = 0
+    with pytest.raises(RuntimeError, match='English-preserving'):
+        XASRAdapter(str(bundle), prefix_lm_path=str(bundle/'lm.onnx'), prefix_lm_scale=.05)
+
+
+def test_prefix_runtime_requires_corrected_selective_hotwords(bundle, runtime):
+    module, _ = runtime
+    module.XASR_SELECTIVE_HOTWORD_VERSION = 0
+    with pytest.raises(RuntimeError, match='selective-hotword'):
+        XASRAdapter(str(bundle), prefix_lm_path=str(bundle/'lm.onnx'), prefix_lm_scale=.05)
+
+
+@pytest.mark.parametrize('via_wrapper', [False, True])
+def test_default_beam_is_seven(bundle, runtime, via_wrapper):
+    _, calls = runtime
+    if via_wrapper:
+        from plugins.asr import SherpaOnnxXASRAdapter
+        SherpaOnnxXASRAdapter(str(bundle))
+    else:
+        XASRAdapter(str(bundle))
+    assert calls[0]['max_active_paths'] == 7
+
+
 def test_entity_boost_requires_prefix_lm(bundle, runtime):
     with pytest.raises(ValueError, match='requires prefix LM'):
         XASRAdapter(str(bundle), entity_boost={'语音':4.0})
@@ -73,11 +102,11 @@ def test_entity_setting_is_adapter_local_and_packaged_hotwords_are_restored(bund
     options = dict(prefix_lm_path=str(bundle/'lm.onnx'), prefix_lm_scale=.05)
     XASRAdapter(str(bundle), entity_boost={'语音':4.0}, **options)
     assert os.environ['SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE'] == '3.9'
-    assert '语 音 :4.0' in Path(calls[-1]['hotwords_file']).read_text()
+    assert '语 音 :4.0' in calls[-1]['hotwords_content']
     XASRAdapter(str(bundle), entity_boost={}, **options)
     assert os.environ['SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE'] == '3.9'
-    assert calls[-1]['hotwords_file'] == str(bundle/'hotwords.bpe.txt')
-    assert '语 音 :2.5' in Path(calls[-1]['hotwords_file']).read_text()
+    assert '语 音 :2.5' in calls[-1]['hotwords_content']
+    assert '语 音 :2.5' in (bundle/'hotwords.bpe.txt').read_text()
 
 
 def _wheel_download(monkeypatch, tmp_path, checksum):
@@ -154,6 +183,39 @@ def _wav_bytes():
     return data.getvalue()
 
 
+@pytest.mark.parametrize('lm', [False, True])
+@pytest.mark.parametrize('fails', [False, True])
+def test_english_decoder_options_are_scoped_and_restored(bundle, runtime, monkeypatch, lm, fails):
+    import os
+    module, _ = runtime
+    names = ['XASR_CANDIDATE_PROTECTION', 'XASR_CASE_DIVERSITY',
+             'XASR_SHARED_REWARD', 'XASR_ENGLISH_LM_SCALE', 'XASR_SELECTIVE_HOTWORDS']
+    for name in names:
+        monkeypatch.setenv(name, 'external')
+    seen = []
+
+    class Recognizer:
+        def create_stream(self):
+            return types.SimpleNamespace(accept_waveform=lambda *args: None,
+                                         result=types.SimpleNamespace(text='hello'))
+
+        def decode_streams(self, streams):
+            seen.append([os.environ.get(name) for name in names])
+            if fails:
+                raise RuntimeError('decode failed')
+
+    module.OfflineRecognizer.from_transducer = lambda **kwargs: Recognizer()
+    adapter = XASRAdapter(str(bundle), prefix_lm_path=str(bundle/'lm.onnx'),
+                         prefix_lm_scale=.05 if lm else 0)
+    if fails:
+        with pytest.raises(RuntimeError, match='decode failed'):
+            adapter.transcribe(_wav_bytes(), '')
+    else:
+        assert adapter.transcribe(_wav_bytes(), '') == 'hello'
+    assert seen == [['1', '1', '2', '0', '1'] if lm else ['0', '0', '0', '0', '0']]
+    assert [os.environ[name] for name in names] == ['external'] * 5
+
+
 @pytest.mark.parametrize('previous', [None, '7.1'])
 @pytest.mark.parametrize('fails', [False, True])
 def test_decode_scopes_and_restores_environment(bundle, runtime, monkeypatch, previous, fails):
@@ -228,3 +290,30 @@ def test_mixed_adapters_decode_concurrently_without_leaking_state(bundle, runtim
         assert other.result(timeout=3) == 'ok'
     assert sorted(observations) == [(False, None, None), (True, '3.9', '3.9')]
     assert os.environ.get(name) == '7.1'
+
+
+def test_automatic_wake_word_uses_normal_score_without_early_runtime(bundle, runtime):
+    module, calls = runtime
+    module.XASR_EARLY_HOTWORD_VERSION = 0
+    def build(**kwargs):
+        calls.append(kwargs)
+        assert 'little fancy :2.5' in Path(kwargs['hotwords_file']).read_text()
+        return object()
+    module.OfflineRecognizer.from_transducer = build
+    adapter = XASRAdapter(str(bundle), wake_word='little fancy')
+    assert adapter._early_hotword_min_score is None
+    assert not Path(calls[-1]['hotwords_file']).exists()
+
+
+def test_wake_and_explicit_custom_scores_are_independent(bundle, runtime):
+    module, _ = runtime
+    def build(**kwargs):
+        text = Path(kwargs['hotwords_file']).read_text()
+        assert '小 星 小 星 :2.5' in text
+        assert '星 河 展 厅 :4.0' in text
+        assert '语 音 :2.5' in text
+        return object()
+    module.OfflineRecognizer.from_transducer = build
+    adapter = XASRAdapter(str(bundle), wake_word='小星小星', custom_hotwords='星河展厅',
+                         prefix_lm_path=str(bundle/'lm.onnx'), prefix_lm_scale=.05)
+    assert adapter._early_hotword_min_score == '3.9'

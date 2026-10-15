@@ -2,7 +2,7 @@
 """
 plugins/asr.py — ASRPlugin: sherpa-onnx VAD + KWS + ASR pipeline.
 
-Pipeline: Audio → ONNX VAD → KWS (wake word gate) → ASR transcription
+Pipeline: Audio → ONNX VAD → ASR transcription → text wake gate → publication
 """
 
 from __future__ import annotations
@@ -10,7 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import multiprocessing
+import contextlib
+import ctypes.util
 import os
+import platform
+import re
 import struct
 import threading
 import time
@@ -31,6 +35,12 @@ SAMPLE_RATE    = 16000
 SPEECH_THRESH  = 0.5
 SILENCE_THRESH = 0.35
 SILENCE_FRAMES = 16
+_WAKE_FRAGMENT_GAP_S = 1.0
+_COMMAND_JOIN_GAP_S = 0.6
+_VAD_WINDOW_S = 512 / SAMPLE_RATE
+# Native onset requires 100 ms speech plus several 32 ms windows. Allow its
+# notification to reach the worker before declaring the short silence final.
+_VAD_ONSET_GRACE_S = 0.2
 
 # Documented AudioChunk contract — see perception/README.md ("Audio Requirements
 # for ASR"): 16 kHz mono PCM_S16_LE, at least 512 samples per chunk.
@@ -125,16 +135,149 @@ def _point_phonemizer_at_espeak() -> None:
                 ", ".join(_ESPEAK_LIB_CANDIDATES))
 
 
+# Libraries we resolve by path rather than by forking `ldconfig` — see
+# `_import_without_forking`. Keyed by the name the caller passes to
+# `ctypes.util.find_library`; anything not listed here falls through to the real
+# implementation, fork and all.
+#
+# `dl` is the one that matters: `dlinfo/_glibc.py` calls
+# `find_library('dl')` at **import** time, and `phonemizer` imports `dlinfo`.
+# `espeak-ng` is listed too, even though PHONEMIZER_ESPEAK_LIBRARY normally
+# makes phonemizer skip the lookup, so a deployment that unsets that variable
+# does not quietly get the fork back.
+_FORK_FREE_LIBRARIES = {
+    "dl": ("/lib/aarch64-linux-gnu/libdl.so.2",
+           "/lib/x86_64-linux-gnu/libdl.so.2",
+           "/usr/lib/aarch64-linux-gnu/libdl.so.2",
+           "/usr/lib/x86_64-linux-gnu/libdl.so.2",
+           "/lib/libdl.so.2",
+           "/usr/lib/libdl.so.2"),
+    "espeak-ng": _ESPEAK_LIB_CANDIDATES,
+}
+
+# One import at a time, so two worker threads cannot nest the patch below and
+# leave the replacement installed when the inner one restores.
+_PHONEMIZER_IMPORT_LOCK = threading.Lock()
+
+
+def _warm_platform_uname() -> None:
+    """Fill `platform`'s uname cache now, while this process is still small.
+
+    `platform.uname()` runs `uname -p` to fill its `processor` field, and caches
+    the result for the life of the process. Doing that once at import — perception
+    is loading plugins, nothing is inferring yet — means the later callers
+    (`joblib` during the phonemizer import, among others) are served from the
+    cache and never fork. See `_import_without_forking` for why a fork from the
+    loaded process is not survivable.
+
+    Never raises: a missing `uname` is not a reason for ASR to fail to load.
+    """
+    try:
+        platform.uname()
+    except Exception as error:  # noqa: BLE001 - informational only
+        log.debug("[asr] platform.uname() warm-up failed: %s", error)
+
+
+@contextlib.contextmanager
+def _import_without_forking():
+    """Stop the `phonemizer` import shelling out, for the duration of a block.
+
+    **`ctypes.util.find_library` forks.** On Linux it shells out to
+    `ldconfig -p` through `subprocess`, and `dlinfo` — which `phonemizer` imports
+    — calls it at import time. Forking a 2.4 GB process with dozens of threads,
+    one of which is running a TensorRT warmup, is how the ASR worker wedged
+    forever on Orin 5: the child never reached `exec` (it inherited a lock held
+    by another thread at fork time) and the parent sat in `_execute_child`
+    waiting on the error pipe. The import lock stayed held, the worker never
+    transcribed anything, and perception's whole MCP surface stopped answering —
+    with nothing in any log, because the last line written was the one before
+    the fork.
+
+    It is a race: the same card starts cleanly when nothing else is loading,
+    which is why this only ever showed up right after 「启动控制」 (TTS warmup and
+    the ASR card come up together). That is exactly the kind of bug that must be
+    removed rather than made less likely, so this does not retry or time-bound
+    the fork — it makes sure there is no fork.
+
+    Same family as the espeak lookup documented in perception/README.md
+    (「asr_kws and espeak」); that fix used PHONEMIZER_ESPEAK_LIBRARY to skip
+    phonemizer's *own* `find_library`, which an env var cannot do for an import
+    inside a third-party package.
+
+    Measured on Orin 5 — every fork during `from phonemizer.backend import
+    EspeakBackend`, with `subprocess.Popen` instrumented:
+
+        without this guard   4   uname -p
+                                 /sbin/ldconfig -p
+                                 /usr/bin/gcc -Wl,-t -o /tmp/… -ldl
+                                 /usr/bin/objdump -p -j .dynamic …/libdl.so
+        with it              0
+
+    The gcc/objdump pair is `ctypes.util`'s fallback: `ldconfig -p` finds
+    nothing, because `Dockerfile.jetson` replaces `ldconfig` with a no-op during
+    apt installs and the cache is never rebuilt — the same root cause as the
+    espeak lookup above. So what reads like one library lookup actually
+    *compiles a program* to find `libdl`: three forks, one of them a compiler,
+    in a process that must not fork at all.
+
+    `uname -p` is the fourth, and it is **not** `platform.processor()` — that was
+    the obvious guess and it was wrong. The caller is `platform.system()`, which
+    goes through `platform.uname()`, which fills its `processor` field by running
+    `uname -p` (`platform._syscmd_uname`). `joblib`, imported by
+    `phonemizer.backend.base`, calls `system()` at import time. Patching
+    `processor` therefore changed nothing — measured, still 1 fork.
+
+    `platform.uname()` caches, so `_warm_platform_uname()` at module import does
+    the real work: one fork while the process is small and quiet, and every later
+    caller is served from `_uname_cache`. The patch here is the belt to that
+    braces — if the warm-up ever fails, `_syscmd_uname` returns its `default`
+    instead of forking, which is exactly what `platform` itself does on a system
+    with no `uname` binary.
+
+    A tiny child is not a safer child, which is why `uname -p` is in scope at
+    all: the hang is *in* fork, before exec, so what would have been exec'd does
+    not matter.
+    """
+    original_find_library = ctypes.util.find_library
+    # Private, so do not assume it exists — a future CPython may drop it, and
+    # losing this guard must not break ASR.
+    original_syscmd_uname = getattr(platform, "_syscmd_uname", None)
+
+    def resolver(name):
+        for path in _FORK_FREE_LIBRARIES.get(name, ()):
+            if os.path.exists(path):
+                return path
+        # Unknown library: keep the stdlib behaviour rather than returning None,
+        # which the caller would read as "not installed".
+        return original_find_library(name)
+
+    ctypes.util.find_library = resolver
+    if original_syscmd_uname is not None:
+        platform._syscmd_uname = lambda option, default='': default
+    try:
+        yield
+    finally:
+        ctypes.util.find_library = original_find_library
+        if original_syscmd_uname is not None:
+            platform._syscmd_uname = original_syscmd_uname
+
+
+_warm_platform_uname()
+
+
 def _get_espeak_backend(lang):
     global _ESPEAK_SEP
-    if _ESPEAK_SEP is None:
-        _point_phonemizer_at_espeak()
-        from phonemizer.separator import Separator
-        _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
-    if lang not in _ESPEAK_BACKENDS:
-        from phonemizer.backend import EspeakBackend
-        _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
-    return _ESPEAK_BACKENDS[lang]
+    # The import is what forks, so the guard has to cover it. Everything else in
+    # here is cheap and holding the lock across it keeps the patch un-nested.
+    with _PHONEMIZER_IMPORT_LOCK, _import_without_forking():
+        if _ESPEAK_SEP is None:
+            _point_phonemizer_at_espeak()
+            from phonemizer.separator import Separator
+            _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
+        if lang not in _ESPEAK_BACKENDS:
+            from phonemizer.backend import EspeakBackend
+            _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
+        return _ESPEAK_BACKENDS[lang]
 
 
 def _phonemize_safe(text: str, lang: str) -> str:
@@ -296,7 +439,7 @@ _SIMILAR_GROUPS = [
     {'ou', 'uo'},         # vowel variants
     {'i', 'i.'},          # apical vowel variant
     # ── Chinese ASR common confusions ──
-    {'a', 'ɑ'},           # open vowels (same sound, different notation)
+    {'a', 'ɑ', 'aɜ'},           # open vowels (same sound, different notation)
     {'an', 'ɑn'},         # front nasal variants
     {'f', 'kh'},          # 范/康 confusion in noisy env
     {'f', 'x'},           # 范/欢 confusion
@@ -372,6 +515,132 @@ def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
     return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
 
+
+def _safe_match_wake(text, keyword_text, phones, char_ends, keyword_phones,
+                     threshold, prefix_only=False):
+    """Validate the first wake, then honor later explicit invocations.
+
+    Word/character removal uses the selected span, not a fixed keyword width.
+    A known literal prefix may finish inside a joined English word; unrelated
+    body letters must not be consumed merely to complete that whole word.
+    """
+    import math
+    size = len(keyword_phones)
+    if not size:
+        return False, -1, ''
+    separator = r'[\s，。！？、；：,.!?;:]*'
+    literal = separator + separator.join(_re.escape(c) for c in keyword_text
+                                           if not c.isspace())
+
+    def command_after(cut, end):
+        # A later exact invocation at a clause boundary replaces earlier chat.
+        # Searching arbitrary mentions would eat e.g. 介绍小范小范的功能.
+        repeated = _re.compile(literal, _re.IGNORECASE)
+        for match in repeated.finditer(text, cut):
+            # A bare wake at the end must not erase an earlier command.
+            if not text[match.end():].strip('，。！？、；：,.!?;: \t\r\n'):
+                continue
+            between = text[cut:match.start()]
+            separators = text[match.start():match.end()].lstrip('，。！？、；：,.!?;: \t\r\n')
+            start = match.end() - len(separators)
+            boundary = text[match.start():start]
+            if (not between.strip('，。！？、；：,.!?;: \t\r\n')
+                    or any(c in '，。！？；：,.!?;:\r\n' for c in boundary)
+                    or (match.start() > 0 and text[match.start() - 1] in '，。！？；：,.!?;:\r\n')):
+                cut = match.end()
+                end = sum(offset <= cut for offset in char_ends)
+        return True, end, text[cut:].lstrip('，。！？、；：,.!?;: ')
+
+    if prefix_only:
+        # Already awake: don't search or fuzzily delete a command prefix.
+        # Only an exact repeated invocation can be stripped here.
+        exact = _re.compile(literal, _re.IGNORECASE).match(text)
+        return (command_after(exact.end(), size)
+                if exact else (False, -1, text))
+    letters = [c for c in keyword_text if c.isalnum()]
+    cjk_keyword = bool(letters) and all('\u4e00' <= c <= '\u9fff' for c in letters)
+    unit_phones = [_text_to_ipa(c) for c in dict.fromkeys(letters)] if cjk_keyword else []
+    observed_units = {}
+    minimum = max(1, math.ceil(size * (1 - threshold)))
+    maximum = (len(phones) if threshold >= 1 else
+               min(len(phones), math.floor(size / (1 - threshold))))
+    starts = [0] if prefix_only else range(max(0, len(phones) - minimum + 1))
+    occurrence_end = None
+    best = None
+    for start in starts:
+        if occurrence_end is not None and start >= occurrence_end:
+            break
+        count = min(maximum, len(phones) - start)
+        if count < minimum:
+            continue
+        # One DP matrix computes all admissible end positions at this start.
+        previous = list(range(count + 1))
+        for i, wanted in enumerate(keyword_phones, 1):
+            current = [i]
+            for j in range(1, count + 1):
+                current.append(min(previous[j] + 1, current[j - 1] + 1,
+                                   previous[j - 1] +
+                                   _phoneme_sub_cost(wanted, phones[start + j - 1])))
+            previous = current
+        eligible = []
+        for n in range(minimum, count + 1):
+            if cjk_keyword:
+                last = text[char_ends[start + n - 1] - 1]
+                if not ('\u4e00' <= last <= '\u9fff'):
+                    continue
+                if last not in observed_units:
+                    observed_units[last] = _text_to_ipa(last)
+                # The whole final character must resemble a wake character.
+                # A cheap overall score must not borrow 停/你 from the body.
+                if min(_phoneme_edit_distance(observed_units[last], unit)
+                       for unit in unit_phones) > threshold:
+                    continue
+            eligible.append((previous[n] / max(size, n), n))
+        if not eligible:
+            continue
+        score, width = min(eligible)
+        if score > threshold:
+            continue
+        if occurrence_end is None:
+            occurrence_end = start + width
+        candidate = (score, start, width)
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return False, -1, ''
+    score, start, width = best
+    end = start + width
+    char_start = 0 if start == 0 else char_ends[start - 1]
+    cut = char_ends[end - 1]
+    exact = _re.compile(literal, _re.IGNORECASE).match(text, char_start)
+    if exact:
+        cut = exact.end()
+    elif (0 < cut < len(text) and text[cut].isascii() and text[cut].isalnum()
+          and text[cut - 1].isascii() and text[cut - 1].isalnum()):
+        word_end = cut
+        while (word_end < len(text) and text[word_end].isascii()
+               and text[word_end].isalnum()):
+            word_end += 1
+        completed_phones = _text_to_ipa(text[char_start:word_end])
+        # Preserve the existing fanscy→fancy cleanup when the completed
+        # word really matches; never advance through a joined command.
+        if _phoneme_edit_distance(completed_phones, keyword_phones) <= score + 1e-9:
+            cut = word_end
+    return command_after(cut, end)
+
+
+def _wake_prefix_tail(text, phones, char_ends, keyword_phones, threshold):
+    """Only retain a trailing, incomplete phonetic prefix of the wake word."""
+    for start in range(max(0, len(phones) - len(keyword_phones) + 1), len(phones)):
+        if start and char_ends[start - 1] == char_ends[start]:
+            continue  # A prefix must start at a character boundary.
+        tail = phones[start:]
+        if (len(tail) < len(keyword_phones) and
+                _phoneme_edit_distance(tail, keyword_phones[:len(tail)]) <= threshold):
+            offset = char_ends[start - 1] if start else 0
+            return text[offset:]
+    return ''
+
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -426,16 +695,66 @@ TOOLS = [
                 # removed; REMOVED_TRIGGER_MODES migrates cards still set to it.
                 "trigger_mode":  {"oneOf": [{"const": "vad", "title": "Continuous listening"}, {"const": "asr_kws", "title": "Wake-word activation"}], "type": "string", "enum": ["vad", "asr_kws"], "description": "Listening mode: Listen continuously (vad) or activate with a wake word (asr_kws).", "default": "asr_kws", "scope": "shared"},
                 "asr_kws_keyword": {"type": "string", "x-allow-empty": True, "description": "Wake word: Enter the phrase used to activate recognition, such as little fancy. X-ASR automatically includes it in the hotwords.", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
+                # 默认开，理由是两种失败的代价不对称：开着而操作员不想要，结果只是
+                # 一条没人读的 topic（loopback DDS，出不了这台机器，不连线就什么也
+                # 不会发生）；关着而操作员想要，结果是他在画布上连好了线、什么都看
+                # 不到、也不知道为什么 —— 而那正是这个开关被要求加上来的起因。
+                # trigger_mode=vad 时这条路径根本不会被走到。
+                "publish_background": {"type": "boolean", "description": "Background speech: Publish speech without a wake word to the background output. Connect that output to an agent to use it.", "default": True, "scope": "shared"},
+                # SenseVoice 的解码结果本来就带情绪 / 音频事件 / 语种（见
+                # SherpaOnnxSenseVoiceAdapter.transcribe_rich），以前整段丢掉只
+                # 留 text。打开它不加载模型、不多一次推理 —— 只是别再扔掉。
+                # 默认开，且无信息的取值（NEUTRAL / Speech / EMO_UNKNOWN）会被
+                # 压掉，所以普通一句话只多出一个 lang 字段。
+                # 只对 sensevoice-small 有意义：别的模型的结果里没有这些字段，
+                # 开着也只是调一个返回空 dict 的默认实现。
+                "emit_audio_tags": {"type": "boolean", "description": "Audio tags: Include the language and audio events already produced by SenseVoice. Emotion tags are controlled separately.", "default": True, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"]}},
+                # 默认 **关**，而上面那个默认开。不是保守，是实测：Orin 6 上 351
+                # 段真机语音里 340 段是 NEUTRAL/EMO_UNKNOWN，剩下 11 段基本是错的
+                # （「小范小范，你好呀。」→ SAD，出现三次；「我的断网了？」→ HAPPY）。
+                # 一个挂在愉快问候上的 "emotion": "SAD" 比没有这个字段更糟 —— LLM
+                # 会据此改口气。开关留着，因为换一批说话人/换个场景也许不一样，而
+                # 要量就得能打开；但默认值要对得起测出来的东西。见 README。
+                "emit_emotion": {"type": "boolean", "description": "Emotion tags: Include SenseVoice emotion labels. Disabled by default because they were unreliable in recorded speech tests.", "default": False, "scope": "shared", "x-show-when": {"asr_model": ["sensevoice-small"], "emit_audio_tags": [True]}},
             },
             "required": []
         },
         "topic_in":  [{"format": "audio/pcm-16k", "desc": "mic audio input"}],
-        "topic_out": [{"format": "data/json",     "desc": "ASR result event"}],
+        # 两条输出。第二条是未触发唤醒词的话语，带 priority 0 —— 它**不会自动流
+        # 到 LLM**：agent-core 订阅的是画布上连进 decision_core 入口的 topic
+        # （api/mcp_manage.py 的 all_topics 来自那次 start 调用的参数），不是这里
+        # 声明的 topic_out。要用它就得在画布上连一根线。
+        # desc 要能把两个口分开 —— 画布上未解析时显示的就是这里的文字，两条都写
+        # "data/json" 的话端口之间没有任何区别可言。
+        "topic_out": [
+            {"format": "data/json", "desc": "识别结果（被唤醒词触发的话）"},
+            {"format": "data/json", "desc": "未触发唤醒词的话语（priority 0，走后台 subagent）"},
+        ],
     }
 ]
 
 
 # ── WAV helper ────────────────────────────────────────────────────────────────
+
+def _asr_topics_out(input_topic: str, publish_background: bool = True) -> list[dict]:
+    """ASR 的两条输出 topic，一处构造。
+
+    之前 `info` 里手抄了四份，而 `_status_dict` 是第五份 —— 加第二条输出时只改了
+    `_status_dict`（info 根本不用它），于是卡片按静态声明画了两个输出口，运行时
+    只解析出一个，第二个永远显示「未解析」。这就是四份手抄的代价。
+
+    `desc` 不能留空：画布上解析后的端口显示的是这里的 desc，空字符串会让两个口
+    都只剩一个 `data/json`，看不出哪个是哪个。
+    """
+    if not input_topic:
+        return []
+    out = [{"topic": f"{input_topic}/asr", "format": "data/json",
+            "desc": "识别结果（被唤醒词触发的话）"}]
+    note = "" if publish_background else "（publish_background 已关，当前不发）"
+    out.append({"topic": f"{input_topic}/asr_background", "format": "data/json",
+                "desc": f"未触发唤醒词的话语，priority 0，走后台 subagent{note}"})
+    return out
+
 
 def _pcm16_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
     import io, wave
@@ -448,9 +767,76 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
 
 # ── ASR Adapters ──────────────────────────────────────────────────────────────
 
+# SenseVoice 的解码结果里那三个 tag 的「没说出什么」取值。
+#
+# 这些值要被压掉，而不是照发。payload 里每个 key 都要被塞进 L4 trigger 让 LLM 读
+# 一遍，而每一句都挂一个 `"emotion": "NEUTRAL"` 是让它为零信息付 token —— 更糟的
+# 是它会把「模型没判断出情绪」读成「这个人语气平淡」，那是两件不同的事。
+# 同理 `Speech`：说话这件事由 text 本身证明，不需要一个字段重复一遍。
+# `withitn` / `woitn` 是 ITN 开关的回显，连信息都不是。
+#
+# `lang` 不在这里：它每次都有值，而值本身就是信息（中/英/日/韩/粤），见
+# `_audio_tag_fields`。
+_UNINFORMATIVE_AUDIO_TAGS = frozenset({
+    "EMO_UNKNOWN", "UNKNOWN", "NEUTRAL",
+    "Speech", "Event_UNK", "withitn", "woitn",
+})
+
+_TAG_RE = re.compile(r"<\|(.*?)\|>")
+
+
+def _strip_tag(raw: str) -> str:
+    """`<|HAPPY|>` → `HAPPY`。不是 tag 形状的原样返回（去空白）。"""
+    text = (raw or "").strip()
+    match = _TAG_RE.fullmatch(text)
+    return (match.group(1) if match else text).strip()
+
+
+def _audio_tag_fields(lang: str = "", emotion: str = "",
+                      event: str = "", include_emotion: bool = False) -> dict:
+    """把 SenseVoice 的三个 tag 变成要合进 payload 的字段。
+
+    没信息的值不进 payload —— 理由见 `_UNINFORMATIVE_AUDIO_TAGS`。所以一句语气
+    平淡的普通话只多出 `{"lang": "zh"}`，笑了才会多出 `audio_event`。
+
+    `include_emotion` 默认 **False**，因为 351 段真机语音实测下来这一项是噪音而
+    不是稀疏信号 —— 见 README「语音情绪和音频事件」。打开它是操作员的选择。
+
+    `event` 叫 `audio_event` 而不是 `event`：agent-core 那边 `event` 是触发器/
+    事件总线的词（`src/event/llm.py`、`config['event']`），payload 里再出现一个
+    同名 key 只会让读日志的人以为是同一件事。
+    """
+    fields = {}
+    pairs = [("lang", lang), ("audio_event", event)]
+    if include_emotion:
+        pairs.insert(1, ("emotion", emotion))
+    for key, raw in pairs:
+        value = _strip_tag(raw)
+        if not value or value in _UNINFORMATIVE_AUDIO_TAGS:
+            continue
+        fields[key] = value
+    return fields
+
+
 class ASRAdapter(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, language: str) -> str: ...
+
+    def transcribe_rich(self, wav_bytes: bytes, language: str,
+                        include_emotion: bool = False) -> tuple[str, dict]:
+        """转写，外加这个模型顺带算出的非文字信息（情绪 / 音频事件 / 语种）。
+
+        返回 `(text, extras)`，`extras` 直接合进发布的 payload。默认是空 dict：
+        只有 SenseVoice 的解码结果带这些字段，别的适配器下这些 key 干脆不出现，
+        而不是出现一个空值让 LLM 以为「这句话判断过、没有情绪」。
+
+        为什么是返回值，而不是适配器上记一个 `self._last_emotion`：
+        `ASRPlugin._adapter` 是 **plugin 级的单个实例**，被所有 _ASRNode 共用
+        （见 `_apply_shared`），而每个 node 有自己的 worker 线程。挂在实例上的
+        状态在两个输入 topic 同时转写时会互相串，而串出来的结果是「情绪对了但
+        配到了另一句话上」—— 不会报错，也不会有任何日志。
+        """
+        return self.transcribe(wav_bytes, language), {}
 
 
 class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
@@ -487,6 +873,18 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
                  f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        return self.transcribe_rich(wav_bytes, language)[0]
+
+
+    def transcribe_rich(self, wav_bytes: bytes, language: str,
+                        include_emotion: bool = False) -> tuple[str, dict]:
+        """一次解码，文字和 tag 一起拿。
+
+        `emotion` / `event` / `lang` 是 SenseVoice 的前几个输出 token，sherpa 在
+        把它们从 text 里剥掉的同时填进了 result 的这三个字段。也就是说这些信息
+        **本来就已经算出来了**，以前只是被 `return text` 扔掉：这里不加载任何
+        模型、不多跑一次推理、不多占一字节显存。
+        """
         import io as _io, wave as _wave
         with _wave.open(_io.BytesIO(wav_bytes)) as wf:
             pcm = wf.readframes(wf.getnframes())
@@ -499,8 +897,15 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
         self._recognizer.decode_streams([stream])
-        text = stream.result.text
-        return text.strip()
+        result = stream.result
+        # getattr 而不是直接取：这三个字段是 sherpa 的 C++ binding 给的，换个
+        # 版本少一个就会让 ASR 整条路径抛异常。少一个 tag 不值得让机器人听不见。
+        tags = _audio_tag_fields(
+            lang=getattr(result, "lang", "") or "",
+            emotion=getattr(result, "emotion", "") or "",
+            event=getattr(result, "event", "") or "",
+            include_emotion=include_emotion)
+        return result.text.strip(), tags
 
 
 class SherpaOnnxNemoCtcAdapter(ASRAdapter):
@@ -564,16 +969,17 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
     def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2,
-                 max_active_paths: int = 3, tail_padding_seconds: float = 0.3,
+                 max_active_paths: int = 7, tail_padding_seconds: float = 0.3,
                  prefix_lm_path: str = "", prefix_lm_scale: float = 0.0,
-                 entity_boost: dict = None, custom_hotwords: str = ""):
+                 entity_boost: dict = None, custom_hotwords: str = "", wake_word: str = ""):
         from plugins.x_asr import XASRAdapter
 
         self._delegate = XASRAdapter(model_dir, device, num_threads,
                                      max_active_paths=max_active_paths,
                                      tail_padding_seconds=tail_padding_seconds,
                                      prefix_lm_path=prefix_lm_path, prefix_lm_scale=prefix_lm_scale,
-                                     entity_boost=entity_boost, custom_hotwords=custom_hotwords)
+                                     entity_boost=entity_boost, custom_hotwords=custom_hotwords,
+                                     wake_word=wake_word)
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
@@ -864,11 +1270,11 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
             ensure_model("asr_x_asr_prefix_lm", lm_dir, progress_cb=_on_progress)
         adapter = model_info["adapter"](
             model_dir, device, num_threads,
-            max_active_paths=3,
+            max_active_paths=7,
             tail_padding_seconds=0.3,
             prefix_lm_path=os.path.join(lm_dir, "model.onnx"), prefix_lm_scale=scale,
-            custom_hotwords='\n'.join((cfg.get('asr_hotwords', ''),
-                                      cfg.get('kws', {}).get('asr_kws_keyword', ''))))
+            custom_hotwords=cfg.get('asr_hotwords', ''),
+            wake_word=cfg.get('kws', {}).get('asr_kws_keyword', ''))
     else:
         adapter = model_info["adapter"](model_dir, device, num_threads)
     if cfg.get('warmup', True):
@@ -969,7 +1375,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # runs on the GPU: silero VAD infers one 512-sample window at a time, so
         # a CUDA session pays a kernel launch plus a H2D/D2H copy per 32 ms of
         # audio for a model small enough to finish on one core. It would also
-        # hold a second CUDA context in this child process. Only ASR, KWS and
         # hold a second CUDA context in this child process. Only ASR and the
         # sherpa TTS engine follow `device`.
         provider="cpu",
@@ -989,6 +1394,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     speech_buf = b''
     start_ts = None
     end_ts = None
+    utterance_pre_roll_bytes = 0
     _was_speaking = False  # Track speech onset for hook notification
 
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx)")
@@ -1058,33 +1464,57 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             wf.writeframes(pcm_bytes)
         _enforce_retention()
 
+    import queue as _queue
+    import struct as _struct
+    pending_audio = False
+    last_chunk_samples = 0
+    idle_timeout = max(0.4, silence_ms / 1000)
     while not stop_evt.is_set():
+        input_ended = False
+        speech_ended = False
         try:
-            pcm, ts = pcm_q.get(timeout=1)
+            pcm, ts = pcm_q.get(timeout=idle_timeout)
+        except _queue.Empty:
+            if stop_evt.is_set():
+                break
+            if not pending_audio:
+                continue
+            # A stopped microphone sends no more silence to close the last
+            # native segment. Flush existing audio once; never synthesize speech.
+            vad.flush()
+            pending_audio = False
+            speech_ended = _was_speaking
+            _was_speaking = False
+            input_ended = True
         except Exception:
             continue
 
-        audio_count += 1
-        if audio_count == 1:
-            _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
+        if not input_ended:
+            audio_count += 1
+            if audio_count == 1:
+                _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
 
-        # Convert PCM bytes to float samples
-        n = len(pcm) // 2
-        if n < 160:
-            continue
-        import struct as _struct
-        samples = _struct.unpack(f'<{n}h', pcm)
-        float_samples = [s / 32768.0 for s in samples]
+            # Convert PCM bytes to float samples
+            n = len(pcm) // 2
+            if n < 160:
+                continue
+            import struct as _struct
+            samples = _struct.unpack(f'<{n}h', pcm)
+            float_samples = [s / 32768.0 for s in samples]
 
-        # Feed VAD
-        pcm_history.append(pcm[:n * 2])
-        vad.accept_waveform(float_samples)
+            last_chunk_samples = n
+            pending_audio = True
+            # Feed VAD
+            pcm_history.append(pcm[:n * 2])
+            vad.accept_waveform(float_samples)
 
-        # Detect speech onset → notify main thread for on_hearing hook
-        _is_speaking = vad.is_speech_detected()
-        if _is_speaking and not _was_speaking:
-            result_q.put(("speech_start", ts, ts))
-        _was_speaking = _is_speaking
+            # Detect speech onset → notify main thread for on_hearing hook
+            _is_speaking = vad.is_speech_detected()
+            if _is_speaking and not _was_speaking:
+                result_q.put(("speech_start", ts, ts))
+            elif _was_speaking and not _is_speaking:
+                speech_ended = True
+            _was_speaking = _is_speaking
 
         # Collect completed VAD segments.
         # The VAD only reports a segment after min_silence_duration of
@@ -1096,6 +1526,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         seg_end_ts = ts - silence_samples / SAMPLE_RATE
         while not vad.empty():
             seg = vad.front
+            if input_ended:
+                segment_end = getattr(seg, 'start', 0) + len(seg.samples)
+                buffered_tail = max(0, pcm_history.total_samples - segment_end)
+                seg_end_ts = ts + (last_chunk_samples - buffered_tail) / SAMPLE_RATE
             seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                    *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
             # `is None`, not falsy: a legitimate start_ts of 0.0 would
@@ -1105,10 +1539,14 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     getattr(seg, 'start', None),
                     len(seg.samples),
                     pre_roll_samples,
-                    silence_samples,
+                    0 if input_ended else silence_samples,
                 )
                 start_ts = seg_end_ts - (len(pre_pcm) + len(seg_pcm)) / 2 / SAMPLE_RATE
                 speech_buf = pre_pcm + seg_pcm
+                # Per *utterance*, not per segment: pre-roll is only prepended to
+                # the first segment of an utterance, and the later ones append to
+                # the same buffer.
+                utterance_pre_roll_bytes = len(pre_pcm)
             else:
                 pre_pcm = b''
                 speech_buf += seg_pcm
@@ -1116,19 +1554,35 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             vad.pop()
 
             # Output the segment as an utterance
-            if len(speech_buf) > SAMPLE_RATE:  # >500ms
+            if speech_buf:  # Native VAD already accepted the speech duration.
                 _log.info(
                     f"[vad-worker] utterance complete, len={len(speech_buf)} bytes, "
                     f"pre_roll_bytes={len(pre_pcm)}"
                 )
                 if save_vad_segments:
                     _save_segment_pcm(speech_buf)
+                # 第四项是这一段开头有多少字节是 pre-roll。对 ASR 它是有益的
+                # （不吃字头），对声纹 embedding 它是污染：vad_pre_roll_ms 默认
+                # 500，而一个 1.5 秒的段里 500 毫秒是静音或别人的尾音，占三分之
+                # 一。消费侧用它把 pre-roll 剥掉再算 embedding，transcribe 仍然
+                # 吃完整的 buffer。
+                #
+                # 必须从这里传出去：speech_buf 是 pre_pcm + seg_pcm 拼好的，
+                # 父进程看不出边界在哪。不传的话，调 vad_pre_roll_ms 会改变声纹
+                # 识别率，而没有人会想到去那里找。
                 result_q.put((speech_buf,
                               seg_end_ts if start_ts is None else start_ts,
-                              seg_end_ts if end_ts is None else end_ts))
+                              seg_end_ts if end_ts is None else end_ts,
+                              utterance_pre_roll_bytes))
                 speech_buf = b''
                 start_ts = None
                 end_ts = None
+                utterance_pre_roll_bytes = 0
+
+        # Queue the completed segment first. Clearing speech before its payload
+        # could let the parent finalize a command while that payload is in flight.
+        if speech_ended:
+            result_q.put(("speech_end", ts, ts))
 
     _log.info("[vad-worker] process exiting")
 
@@ -1140,21 +1594,43 @@ class _ASRNode(Node):
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
                  kws_cfg: dict = None, node_suffix: str = '',
                  save_vad_segments: bool = False, max_saved_segments: int = 1000,
-                 vad_pre_roll_ms: int = 500):
+                 vad_pre_roll_ms: int = 500, speaker=None,
+                 publish_background: bool = True,
+                 emit_audio_tags: bool = True,
+                 emit_emotion: bool = False):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
         self._output_topic = f"{input_topic}/asr"
+        # 第二条输出：KWS 未触发的话语。独立 topic 而不是同一条带 priority 0，
+        # 这样它在 ring buffer / raw_input_info / 画布上有自己的 source 和自己的
+        # 节流桶，不和「对机器人说的话」混在一起。
+        self._background_topic = f"{input_topic}/asr_background"
         self._adapter  = adapter
         self._language = language
         self.state     = "idle"
         self._sub      = None
         self._pub      = self.create_publisher(String, self._output_topic, _ASR_PUB_QOS)
+        self._background_pub = self.create_publisher(
+            String, self._background_topic, _ASR_PUB_QOS)
         # VAD runs in a separate process to avoid GIL contention
         self._vad_backend = vad_backend
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
         self._vad_pre_roll_ms = vad_pre_roll_ms
+        # The SpeakerRecognitionPlugin, or None. Optional on purpose: an
+        # utterance with no identity is a complete, publishable result, and ASR
+        # must never fail or stall because voiceprints are unavailable.
+        self._speaker = speaker
+        # Whether to publish what the robot heard but was not addressed by.
+        # The publisher itself is always created: creating it lazily would mean
+        # a config flip could not take effect without restarting the node, and a
+        # ROS publisher with no subscriber costs nothing.
+        self._publish_background_enabled = bool(publish_background)
+        # 情绪 / 音频事件 / 语种是否进 payload。关掉就回到以前的行为：只发 text。
+        self._emit_audio_tags = bool(emit_audio_tags)
+        # 情绪单独一个开关，默认关 —— 实测它是噪音，见 configSchema 里的说明。
+        self._emit_emotion = bool(emit_emotion)
         self._kws_cfg = kws_cfg or {}
         self._save_vad_segments = save_vad_segments
         self._max_saved_segments = max_saved_segments
@@ -1172,6 +1648,8 @@ class _ASRNode(Node):
         # _teardown() while already holding it.
         self._lifecycle_lock = threading.RLock()
         self._audio_contract_warns: dict = {}
+        self._last_audio_ts = None
+        self._last_audio_arrival = None
 
     def start(self) -> dict:
         with self._lifecycle_lock:
@@ -1323,7 +1801,7 @@ class _ASRNode(Node):
         if not self._first_chunk_event.is_set():
             self._first_chunk_event.set()
         # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder
-        if self._vad_proc and not self._vad_proc.is_alive():
+        if self._vad_proc and self._vad_proc.exitcode is not None:
             log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
             self._stop_event.set()
             # Clean up queues to suppress feeder thread errors
@@ -1342,10 +1820,18 @@ class _ASRNode(Node):
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
+        self._last_audio_ts = ts
+        self._last_audio_arrival = time.monotonic()
         try:
             self._pcm_queue.put_nowait((pcm, ts))
         except Exception:
             pass  # drop if severely behind
+
+    def _audio_now(self):
+        """Advance the capture clock through silence or a stopped input."""
+        if self._last_audio_ts is None or self._last_audio_arrival is None:
+            return None
+        return self._last_audio_ts + time.monotonic() - self._last_audio_arrival
 
     def _warn_audio_contract(self, key: str, detail: str) -> None:
         """Warn on the first violation of a kind, then every 500th one.
@@ -1385,6 +1871,99 @@ class _ASRNode(Node):
 
         return pcm
 
+    # ── 声纹：并发计算，带 timeout 的收集 ────────────────────────────────
+
+    # 等声纹结果的上限。实测 p90 是 118-192 ms，所以 1 秒是 5-10 倍余量。
+    # **裸 join 是不行的**：ASR 的发布路径今天不可能被声纹拖死，加了 join 之后就
+    # 可能 —— 一次 compute() 卡住就等于 ASR 永久不再发任何东西。超时就不带身份
+    # 发出去、打日志，让那个孤儿线程自己跑完（结果丢弃，短命线程不漏）。
+    _IDENTIFY_TIMEOUT_S = 1.0
+
+    def _start_identify(self, utterance: bytes, pre_roll_bytes: int):
+        """在一个线程里开始算声纹，立刻返回句柄。拿不到 speaker 时返回 None。
+
+        剥掉 pre-roll 再算：那 500 ms 对 ASR 有益（不吃字头），对一个 1.5 秒的段
+        里的 embedding 是三分之一的污染。transcribe 仍然吃完整的 buffer。
+        """
+        speaker = self._speaker
+        if speaker is None:
+            return None
+        pcm = utterance
+        if 0 < pre_roll_bytes < len(utterance):
+            pcm = utterance[pre_roll_bytes:]
+        box: dict = {}
+
+        def run() -> None:
+            # 线程内兜底：异常不能让线程带着它死掉导致 box 永远空着而上面还在等
+            # —— identify_pcm 自己已经不抛了，这一层是防它以后变。
+            try:
+                box['fields'] = speaker.identify_pcm(
+                    pcm, source=self._input_topic)
+            except Exception as error:  # noqa: BLE001
+                log.debug(f"[asr] speaker identify raised: {error}")
+
+        thread = threading.Thread(target=run, name='asr-speaker', daemon=True)
+        thread.start()
+        return thread, box
+
+    def _collect_identity(self, handle) -> dict:
+        """等那个线程，最多 _IDENTIFY_TIMEOUT_S，返回要合并进 payload 的字段。"""
+        if handle is None:
+            return {}
+        thread, box = handle
+        thread.join(timeout=self._IDENTIFY_TIMEOUT_S)
+        if thread.is_alive():
+            log.warning(
+                f"[asr] speaker identify exceeded {self._IDENTIFY_TIMEOUT_S}s; "
+                f"publishing without an identity")
+            return {}
+        fields = box.get('fields') or {}
+        # speech_duration_s 是声纹侧的质量信息（够不够长、是不是多说话人都靠它
+        # 解释），但 audio_duration_ms 已经在 payload 里，两个表达同一件事只会
+        # 让 LLM 困惑。保留声纹自己的 key，丢掉重复的那个。
+        fields.pop('speech_duration_s', None)
+        return fields
+
+    def _publish_background(self, text: str, start_ts, end_ts,
+                           utterance: bytes, speaker_fields: dict,
+                           audio_tags: Optional[dict] = None) -> None:
+        """旁边听到、但没在跟机器人说的话。
+
+        `priority: 0` 是路由的全部机制：`collector._extract_priority` 读 JSON 里
+        的 priority **优先于**按 source 匹配，所以这条即使 source 里含 `asr`
+        也会落进 bg buffer 而不是打断主 agent。
+
+        `log_type: true` 是第二件必需的事。bg 管道原本只服务仪表读数，对它们
+        「最新值取代旧值」是对的；对话不是读数，丢一条就永久丢了。这个标记让
+        collector 对这条 source 改成追加并渲染全部条目，而不是 1 秒内替换、只给
+        最后一条。没有它的话这条 topic 能发出去、看起来工作，而一场 30 秒的旁人
+        对话到 subagent 面前只剩最后半句。
+
+        永不抛：这条路径是附带收益，不能让它影响 ASR 的主输出。
+        """
+        if not self._publish_background_enabled:
+            return
+        try:
+            payload = {
+                "text": text,
+                "background": True,
+                "priority": 0,
+                "log_type": True,
+                "audio_start_ts": start_ts,
+                "audio_end_ts": end_ts,
+                "audio_duration_ms": int(len(utterance) / 32),
+                **(speaker_fields or {}),
+                # 旁边那个人的情绪和笑声/哭声，对后台 subagent 和前台一样是信息
+                # —— 「谁在房间里、在干什么」这件事上甚至更是。
+                **(audio_tags or {}),
+            }
+            message = String()
+            message.data = json.dumps(payload, ensure_ascii=False)
+            self._background_pub.publish(message)
+            log.info(f"[asr] background {text!r}")
+        except Exception as error:  # noqa: BLE001
+            log.debug(f"[asr] publish background failed: {error}")
+
     def _worker(self):
         try:
             self._worker_inner()
@@ -1394,8 +1973,13 @@ class _ASRNode(Node):
             self._worker_ready.set()
 
     def _worker_inner(self):
+        import queue as _queue
         # Pre-compute keyword IPA if in asr_kws mode
-        _kws_triggered = False  # track whether current utterance was KWS-triggered
+        wake_deadline = None  # One command, measured by audio onset rather than ASR completion.
+        command = None
+        partial_wake = []
+        partial_text = ''
+        speech_active = False
         trigger_mode = resolve_trigger_mode(
             self._kws_cfg.get('trigger_mode', DEFAULT_TRIGGER_MODE), self._kws_cfg)
         keyword_ipa = None
@@ -1409,14 +1993,73 @@ class _ASRNode(Node):
                 log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
                 trigger_mode = 'vad'
 
+        def publish(result):
+            if self._stop_event.is_set():
+                return
+            self._kws_triggered = False
+            message = String()
+            message.data = json.dumps(result, ensure_ascii=False)
+            self._pub.publish(message)
+            log.info(f"[asr] {result['text']!r}")
+
+        def finish_command():
+            nonlocal command, wake_deadline
+            if command is not None:
+                publish(command)
+            command = None
+            wake_deadline = None
+
+        def release_partial():
+            nonlocal partial_wake, partial_text
+            for packet in partial_wake:
+                self._publish_background(*packet)
+            partial_wake = []
+            partial_text = ''
+
+        def settle_partial():
+            nonlocal wake_deadline, partial_wake, partial_text
+            phones, ends = _text_to_ipa(partial_text, with_positions=True)
+            matched, _, remaining = _safe_match_wake(
+                partial_text, kw_text, phones, ends, keyword_ipa, asr_kws_threshold)
+            if matched and not remaining.strip():
+                # A fuzzy complete wake (e.g. 小范小) retains the old 5 s
+                # command wait even when its fragment-assembly window expires.
+                wake_deadline = partial_wake[-1][2] + 5.0
+                partial_wake = []
+                partial_text = ''
+            else:
+                release_partial()
+
+        def poll_capture():
+            nonlocal wake_deadline, partial_wake, partial_text
+            now = self._audio_now()
+            if now is None or speech_active:
+                return
+            if command is not None and now >= command['audio_end_ts'] + _COMMAND_JOIN_GAP_S + _VAD_ONSET_GRACE_S:
+                finish_command()
+            if partial_wake and now >= partial_wake[-1][2] + _WAKE_FRAGMENT_GAP_S + _VAD_ONSET_GRACE_S:
+                settle_partial()
+            if wake_deadline is not None and now > wake_deadline + _VAD_ONSET_GRACE_S:
+                wake_deadline = None
+
         # Signal that worker init is complete
         self._worker_ready.set()
 
         while not self._stop_event.is_set():
             try:
-                item = self._utterance_queue.get(timeout=1)
+                item = self._utterance_queue.get(timeout=0.05 if command is not None or partial_wake else 1)
+                if len(item) >= 2 and item[0] == "speech_end":
+                    speech_active = False
+                    continue
                 # Handle speech onset signal from VAD worker
                 if len(item) >= 2 and item[0] == "speech_start":
+                    # The notification follows acoustic onset; final join
+                    # eligibility is checked against the segment's actual onset.
+                    if command is not None and item[1] > command['audio_end_ts'] + _COMMAND_JOIN_GAP_S + _VAD_ONSET_GRACE_S:
+                        finish_command()
+                    if partial_wake and item[1] > partial_wake[-1][2] + _WAKE_FRAGMENT_GAP_S + _VAD_ONSET_GRACE_S:
+                        settle_partial()
+                    speech_active = True
                     try:
                         import urllib.request as _urllib_req
                         import json as _json_hook
@@ -1435,6 +2078,16 @@ class _ASRNode(Node):
                         log.debug(f"[asr] fire on_hearing failed: {_he}")
                     continue
                 utterance, start_ts, end_ts = item[:3]
+                # Fourth element since speaker recognition: how many leading
+                # bytes are VAD pre-roll. Tolerate its absence so a mismatched
+                # pair of worker/parent (a hot-copied file, a rolling restart)
+                # degrades to "no pre-roll known" instead of raising.
+                pre_roll_bytes = int(item[3]) if len(item) > 3 else 0
+                voice_start_ts = start_ts + pre_roll_bytes / (2 * SAMPLE_RATE)
+            except _queue.Empty:
+                if not self._stop_event.is_set():
+                    poll_capture()
+                continue
             except Exception:
                 continue
             try:
@@ -1442,52 +2095,159 @@ class _ASRNode(Node):
 
                 # 性能 span 记录
                 _spans = []
+                # 声纹和 transcribe **并发**，不是串行相加。实测（25 段真实语音
+                # × 3 轮，串并交替以消掉负载漂移）：
+                #
+                #   ASR 单跑 p50   215 ms (jp5.11) / 232 ms (jp6.1)
+                #   声纹单跑 p50    86 ms          / 102 ms
+                #   串行           299 ms          / 334 ms
+                #   并行           218 ms          / 239 ms   ← 净增 2-7 ms
+                #
+                # 并行只比 max(两者) 高 2-7 ms，即几乎完全重叠：sherpa 在推理里
+                # 放了 GIL，6 核跑 2+2 线程在 vop/OCR/TTS 都在的情况下仍有余量。
+                _identity = self._start_identify(utterance, pre_roll_bytes)
                 _t0 = time.time()
-                text  = self._adapter.transcribe(wav, self._language)
+                if self._emit_audio_tags:
+                    text, _audio_tags = self._adapter.transcribe_rich(
+                        wav, self._language, self._emit_emotion)
+                else:
+                    text = self._adapter.transcribe(wav, self._language)
+                    _audio_tags = {}
                 _spans.append({"span": "asr_transcribe", "component": "perception",
                                "start_ts": _t0, "end_ts": time.time(),
                                "meta": {"audio_ms": int(len(utterance) / 32)}})
+                # 收声纹结果。**必须在 kws 门之前**，而且分成两件事：
+                #   - 记录在场（record_sighting，在 identify 内部做）：每段无条件；
+                #   - 身份进 payload：只有实际 publish 的那条才附加。
+                # trigger_mode 默认是 asr_kws，没有唤醒词的句子在下面直接
+                # continue 且永不 publish。只挂在 publish 路径上的话，出现记录里
+                # 就只有说过唤醒词的人，而「谁在房间里待过」这个能力基本是空的。
+                # 额外成本为零：transcribe 本来也在门前对每段都跑。
+                _speaker_fields = self._collect_identity(_identity)
                 if not text.strip(): continue
 
                 # ASR-based keyword spotting
                 if trigger_mode == 'asr_kws' and keyword_ipa:
+                    changed_speaker = (command is not None and command.get('speaker_id')
+                                       and _speaker_fields.get('speaker_id')
+                                       and command['speaker_id'] != _speaker_fields['speaker_id'])
+                    # Segment endpoints are quantized by a 32 ms VAD window.
+                    # This admission tolerance does not extend the idle timer.
+                    if command is not None and (voice_start_ts > command['audio_end_ts'] + _COMMAND_JOIN_GAP_S + _VAD_WINDOW_S or changed_speaker):
+                        finish_command()
+                    if partial_wake and (voice_start_ts > partial_wake[-1][2] + _WAKE_FRAGMENT_GAP_S or
+                            (partial_wake[-1][4].get('speaker_id') and _speaker_fields.get('speaker_id')
+                             and partial_wake[-1][4]['speaker_id'] != _speaker_fields['speaker_id'])):
+                        settle_partial()
+                    waiting_for_command = command is not None or wake_deadline is not None
+                    if command is None and wake_deadline is not None and voice_start_ts > wake_deadline:
+                        wake_deadline = None
+                        waiting_for_command = False
+                    match_text = ((partial_text + ' ' + text) if partial_wake else text)
                     _t1 = time.time()
                     text_ipa, text_char_ends = _text_to_ipa(
-                        text, with_positions=True)
+                        match_text, with_positions=True)
                     _spans.append({"span": "kws_phonemize", "component": "perception",
                                    "start_ts": _t1, "end_ts": time.time(),
                                    "meta": {"text": text[:20]}})
 
                     _t2 = time.time()
-                    matched, end_pos = _find_keyword_in_ipa(text_ipa, keyword_ipa, asr_kws_threshold)
+                    matched, end_pos, remaining = _safe_match_wake(
+                        match_text, kw_text, text_ipa, text_char_ends, keyword_ipa,
+                        asr_kws_threshold, prefix_only=waiting_for_command)
                     _spans.append({"span": "kws_match", "component": "perception",
                                    "start_ts": _t2, "end_ts": time.time(),
                                    "meta": {"matched": matched}})
 
-                    log.info(f"[asr] asr_kws: text='{text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
-                    if not matched:
+                    packet = (text, start_ts, end_ts, utterance, _speaker_fields, _audio_tags)
+                    # A short fuzzy match may still be an unfinished literal
+                    # wake (小/范/小/范). Keep collecting instead of publishing
+                    # its final character as a command on the next segment.
+                    prefix = ('' if waiting_for_command else _wake_prefix_tail(
+                        match_text, text_ipa, text_char_ends, keyword_ipa, asr_kws_threshold))
+                    if (prefix and (not partial_wake or prefix == match_text)
+                            and (not matched or (not remaining.strip() and len(text_ipa) < len(keyword_ipa)))):
+                        partial_wake.append(packet)
+                        partial_text = prefix
                         continue
-                    # Extract text after keyword
-                    remaining = _text_after_phoneme(text, text_char_ends, end_pos)
+                    if partial_wake:
+                        if matched:
+                            direct_ipa, direct_ends = _text_to_ipa(text, with_positions=True)
+                            direct, _, direct_body = _safe_match_wake(
+                                text, kw_text, direct_ipa, direct_ends, keyword_ipa,
+                                asr_kws_threshold)
+                            if direct and (direct_body.strip() or len(direct_ipa) >= len(keyword_ipa)):
+                                # The new segment has its own invocation; the
+                                # older unmatched prefix still belongs to BG.
+                                settle_partial()
+                                remaining = direct_body
+                            else:
+                                partial_wake = []
+                                partial_text = ''
+                        else:
+                            release_partial()
+                            match_text = text
+                            text_ipa, text_char_ends = _text_to_ipa(text, with_positions=True)
+                            matched, end_pos, remaining = _safe_match_wake(
+                                text, kw_text, text_ipa, text_char_ends, keyword_ipa,
+                                asr_kws_threshold, prefix_only=waiting_for_command)
+                            prefix = _wake_prefix_tail(text, text_ipa, text_char_ends,
+                                                       keyword_ipa, asr_kws_threshold)
+                            if prefix and not matched:
+                                partial_wake = [packet]
+                                partial_text = prefix
+                                continue
+
+                    log.info(f"[asr] asr_kws: text='{match_text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
+                    if not matched and not waiting_for_command:
+                        # 没有唤醒词 —— 不是对机器人说的，所以不进主 agent。但也
+                        # 不是没有用：旁边说的话里有间接指令、和当前任务相关的
+                        # 信息、值得记住的事实。发到独立 topic 上、标 priority 0，
+                        # agent-core 的 collector 据此送后台 subagent（priority
+                        # 字段优先于 source 匹配，见 collector._extract_priority）。
+                        self._publish_background(text, start_ts, end_ts,
+                                                utterance, _speaker_fields,
+                                                _audio_tags)
+                        continue
+                    if not matched:
+                        remaining = text  # The wake-only segment already opened this turn.
+                    elif command is not None:
+                        finish_command()  # A repeated invocation starts a new turn.
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
-                    _kws_triggered = True
                     if not remaining.strip():
+                        if wake_deadline is None:
+                            wake_deadline = end_ts + 5.0
                         continue
                     text = remaining
+                    wake_deadline = None
 
-                _kws_was_triggered = _kws_triggered
-                _kws_triggered = False
-                self._kws_triggered = False
                 result = {"text": text, "audio_start_ts": start_ts,
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time(),
                           "audio_duration_ms": int(len(utterance) / 32),
                           "text_length": len(text),
                           "priority": 1,
-                          "kws_triggered": _kws_was_triggered,
-                          "spans": _spans}
-                msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
-                self._pub.publish(msg)
-                log.info(f"[asr] {text!r}")
+                          "kws_triggered": trigger_mode == 'asr_kws' and bool(keyword_ipa),
+                          "spans": _spans,
+                          # 空值不进来：plugins/speaker.py 只返回带信息的 key，
+                          # 所以这里直接合并。`"speaker_profile": {}` 这种东西
+                          # LLM 要为它付 token 而拿不到信息，还会让它以为「这个
+                          # 人有 profile，只是空的」。
+                          **_speaker_fields,
+                          # 同一条规则：SenseVoice 判断不出情绪时这里什么都不加，
+                          # 而不是加一个 NEUTRAL —— 见 _UNINFORMATIVE_AUDIO_TAGS。
+                          **_audio_tags}
+                if result['kws_triggered']:
+                    if command is None:
+                        command = result
+                    else:
+                        command['text'] += ' ' + text
+                        command['audio_end_ts'] = end_ts
+                        command['audio_duration_ms'] = round((end_ts - command['audio_start_ts']) * 1000)
+                        command['asr_complete_ts'] = result['asr_complete_ts']
+                        command['text_length'] = len(command['text'])
+                        command['spans'].extend(_spans)
+                else:
+                    publish(result)
             except Exception as e:
                 log.error(f"[asr] transcribe error: {e}", exc_info=True)
 
@@ -1495,7 +2255,8 @@ class _ASRNode(Node):
         return {
             "state":     self.state,
             "topic_in":  [{"topic": self._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
-            "topic_out": [{"topic": self._output_topic, "format": "data/json",     "desc": "ASR result"}],
+            "topic_out": _asr_topics_out(
+                self._input_topic, self._publish_background_enabled),
         }
 
 
@@ -1504,7 +2265,7 @@ class _ASRNode(Node):
 class ASRPlugin:
     PREFIX = "asr"
 
-    def __init__(self, plugin_cfg: dict, executor):
+    def __init__(self, plugin_cfg: dict, executor, speaker=None):
         from utils.onnx_provider import normalize_device
         self._language     = plugin_cfg.get('language', 'zh-CN')
         self._asr_model    = plugin_cfg.get('asr_model', DEFAULT_ASR_MODEL)
@@ -1546,9 +2307,19 @@ class ASRPlugin:
         # actually handed the recogniser when a transcription looks wrong. Bounded
         # by _max_saved_segments — see _enforce_retention(), which unlike the
         # previous per-process counter actually prunes.
+        self._publish_background_enabled = bool(
+            plugin_cfg.get('publish_background', True))
+        self._emit_audio_tags = bool(plugin_cfg.get('emit_audio_tags', True))
+        self._emit_emotion = bool(plugin_cfg.get('emit_emotion', False))
         self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
         self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
         self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
+        # plugins/speaker.SpeakerRecognitionPlugin, or None. main.py builds it
+        # first and hands it over; see the comment there. Held as a plain
+        # attribute rather than looked up: the identity is computed on the PCM
+        # this plugin already has, which is below the ASR adapter, so it is
+        # independent of which ASR model is loaded and survives a model switch.
+        self._speaker = speaker
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         # main.py serves MCP over ThreadingHTTPServer, so start/stop/config can
         # run concurrently on this plugin. Guards read-modify-write of _nodes
@@ -1600,6 +2371,12 @@ class ASRPlugin:
         node._kws_cfg = self._kws_cfg
         node._save_vad_segments = self._save_vad_segments
         node._max_saved_segments = self._max_saved_segments
+        # Live, no restart: the publisher exists either way, so the flag is the
+        # only thing that has to change. `save_vad_segments` above is applied the
+        # same way and for the same reason.
+        node._publish_background_enabled = self._publish_background_enabled
+        node._emit_audio_tags = self._emit_audio_tags
+        node._emit_emotion = self._emit_emotion
 
     def _load_model_async(self, model_name: str):
         """Download and load ASR model in a background thread.
@@ -1683,23 +2460,41 @@ class ASRPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            input_topic = args.get("input_topic", "")
             # Report loading/error state at plugin level. A start that is still
             # queued behind the load counts as loading too: the caller polling
             # this reads anything else as final, and `idle` in that window would
             # be reported as a cancelled card moments before the node comes up.
+            #
+            # **These still report their topics.** The output topics are derived
+            # from `input_topic`, which the caller just handed us — a loading
+            # card knows perfectly well where it is going to publish. Returning
+            # nothing here failed the *wiring* check rather than the card:
+            # start-project resolves every connection from the upstream card's
+            # info(), so on a cold model `asr -> decision_core` came back
+            # 「连线缺少 topic」 and rolled the whole project back. Starting it a
+            # second time worked, because by then the model was warm — which is
+            # exactly the shape of bug that gets written off as a flake.
             if self._loading or self._pending_starts:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "loading",
+                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
+                                   "desc": ""}] if input_topic else []),
+                    "topic_out": _asr_topics_out(
+                        input_topic, self._publish_background_enabled),
                     "desc": self._load_status or f"正在加载模型 '{self._asr_model}' …",
                 }
             if self._load_error:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "error",
+                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
+                                   "desc": ""}] if input_topic else []),
+                    "topic_out": _asr_topics_out(
+                        input_topic, self._publish_background_enabled),
                     "desc": f"Model load failed: {self._load_error}",
                 }
-            input_topic = args.get("input_topic", "")
             # Snapshot under the lock: info is a heartbeat probe and iterating
             # the live dict can raise "dictionary changed size" mid-start.
             with self._nodes_lock:
@@ -1710,30 +2505,33 @@ class ASRPlugin:
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": node.state,
                     "topic_in":  [{"topic": node._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
-                    "topic_out": [{"topic": node._output_topic, "format": "data/json",     "desc": ""}],
+                    "topic_out": _asr_topics_out(
+                        node._input_topic, node._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             if instance_id:
                 # Instance requested but not running — return inferred topics for this instance only.
                 # Do NOT fall through to aggregate path (which would mix in other instances' topics).
-                inferred_out = f"{input_topic}/asr" if input_topic else ""
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": "idle",
                     "topic_in":  [{"topic": input_topic,   "format": "audio/pcm-16k", "desc": ""}] if input_topic else [],
-                    "topic_out": [{"topic": inferred_out,  "format": "data/json",     "desc": ""}] if inferred_out else [],
+                    "topic_out": _asr_topics_out(
+                        input_topic, self._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             # Aggregate info for all instances (no instance_id = ping/overview only)
             if nodes_snapshot:
                 topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in nodes_snapshot]
-                topics_out = [{"topic": n._output_topic, "format": "data/json", "desc": ""} for n in nodes_snapshot]
+                topics_out = [t for n in nodes_snapshot
+                              for t in _asr_topics_out(
+                                  n._input_topic, n._publish_background_enabled)]
                 states = list(set(n.state for n in nodes_snapshot))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                inferred_out = f"{input_topic}/asr" if input_topic else ""
                 topics_in = [{"topic": input_topic, "format": "audio/pcm-16k", "desc": ""}]
-                topics_out = [{"topic": inferred_out, "format": "data/json", "desc": ""}]
+                topics_out = _asr_topics_out(
+                    input_topic, self._publish_background_enabled)
                 state = "idle"
             return {
                 "name": "ASR", "manufacture": "Embodied", "model": "asr",
@@ -1793,7 +2591,11 @@ class ASRPlugin:
                                     node_suffix=node_key.replace('/', '_').replace('-', '_'),
                                     save_vad_segments=self._save_vad_segments,
                                     max_saved_segments=self._max_saved_segments,
-                                    vad_pre_roll_ms=self._vad_pre_roll_ms)
+                                    vad_pre_roll_ms=self._vad_pre_roll_ms,
+                                    speaker=self._speaker,
+                                    publish_background=self._publish_background_enabled,
+                                    emit_audio_tags=self._emit_audio_tags,
+                                    emit_emotion=self._emit_emotion)
                     try:
                         self._executor.add_node(node)
                     except Exception:
@@ -1860,6 +2662,12 @@ class ASRPlugin:
                 self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
             if 'asr_kws_threshold' in cfg:
                 self._kws_cfg['asr_kws_threshold'] = float(cfg['asr_kws_threshold'])
+            if 'publish_background' in cfg:
+                self._publish_background_enabled = bool(cfg['publish_background'])
+            if 'emit_audio_tags' in cfg:
+                self._emit_audio_tags = bool(cfg['emit_audio_tags'])
+            if 'emit_emotion' in cfg:
+                self._emit_emotion = bool(cfg['emit_emotion'])
             if 'save_vad_segments' in cfg:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:

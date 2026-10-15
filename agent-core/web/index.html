@@ -155,6 +155,17 @@
       </div>
       <div class="canvas-top-control" id="canvas-top-control">
         <button class="canvas-main-btn" id="canvas-project-toggle" title="开启智能控制">开启智能控制</button>
+        <!-- 设备收尾进度。停止是两段的：agent loop 立刻停（按钮马上翻转），各设备的
+             stop 在后台继续，结果报在这里。非阻塞是有意的 —— 按下停止的那一刻操作者
+             通常是要去干别的了，不该被一个弹窗挡住画布。 -->
+        <div class="teardown-chip hidden" id="teardown-chip">
+          <button class="teardown-summary" id="teardown-summary" title="设备收尾进度">
+            <span class="teardown-icon" id="teardown-icon">⏳</span>
+            <span class="teardown-text" id="teardown-text">设备收尾</span>
+            <span class="teardown-caret" id="teardown-caret">⌄</span>
+          </button>
+          <div class="teardown-detail hidden" id="teardown-detail"></div>
+        </div>
         <label class="auto-start-toggle" title="开机后自动开启智能控制">
           <input type="checkbox" id="auto-start-checkbox">
           <span class="auto-start-switch"></span>

@@ -108,6 +108,17 @@ class _FakeString:
         self.data = ""
 
 
+class _FakeHeader:
+    """`stamp` is the only field anything here sets, but the attribute has to
+    exist: a publisher that stamps its outgoing frames (pose's overlay) would
+    otherwise fail inside its own try/except and publish nothing, which looks
+    like a disabled feature rather than a missing stub."""
+
+    def __init__(self):
+        self.stamp = 0
+        self.frame_id = ""
+
+
 class _FakeCompressedImage:
     # Defaults so a plugin that *publishes* one can construct it the way ROS
     # does — `CompressedImage()` then assign — as well as tests that build an
@@ -115,6 +126,7 @@ class _FakeCompressedImage:
     def __init__(self, data: bytes = b"", fmt="jpeg"):
         self.data = data
         self.format = fmt
+        self.header = _FakeHeader()
 
 
 class _FakeAudioChunk:
@@ -197,6 +209,9 @@ def _install_fake_cv2():
     cv2.IMREAD_COLOR = 1
     cv2.INTER_NEAREST = 0
     cv2.INTER_LINEAR = 1
+    cv2.INTER_CUBIC = 2
+    cv2.INTER_AREA = 3
+    cv2.BORDER_REFLECT_101 = 4
 
     def imdecode(buf, flags):
         # Tests hand in a raw "WxH" marker rather than a real JPEG; anything
@@ -212,6 +227,23 @@ def _install_fake_cv2():
         rows = (_np.arange(height) * src.shape[0] // height).clip(0, src.shape[0] - 1)
         cols = (_np.arange(width) * src.shape[1] // width).clip(0, src.shape[1] - 1)
         return src[rows][:, cols]
+
+    def copyMakeBorder(src, top, bottom, left, right, borderType):
+        """Only BORDER_REFLECT_101, which is what the hand crop asks for.
+
+        numpy's `reflect` is exactly OpenCV's REFLECT_101 — it mirrors without
+        repeating the edge pixel. The other border modes raise rather than
+        falling back to this one: a stub that silently substituted a different
+        extension would change the pixels the hand engine sees at the frame
+        edge, which is precisely where a raised hand sits.
+        """
+        if borderType != cv2.BORDER_REFLECT_101:
+            raise NotImplementedError(
+                f"fake cv2.copyMakeBorder only implements BORDER_REFLECT_101, "
+                f"got {borderType}")
+        pad = [(int(top), int(bottom)), (int(left), int(right))]
+        pad += [(0, 0)] * (src.ndim - 2)
+        return _np.pad(src, pad, mode="reflect")
 
     def _bgr2hsv(src):
         """OpenCV's 8-bit HSV ranges, not the textbook ones.
@@ -297,9 +329,55 @@ def _install_fake_cv2():
         return nxt, labels
 
     cv2.COLOR_BGR2GRAY = 6
+    # ── drawing + encoding, for the pose overlay path ────────────────────
+    #
+    # Approximations, and deliberately so: their only job is to let a test
+    # assert that the drawing code ran and touched the canvas. Without them
+    # `draw_skeleton` raises AttributeError inside the plugin's own
+    # try/except, the overlay silently publishes nothing, and the test passes
+    # on a host with no OpenCV while the real path is never exercised — which
+    # is precisely the failure mode frame_bytes() exists to prevent.
+
+    def line(img, pt1, pt2, colour, thickness=1, lineType=0):
+        steps = max(abs(pt2[0] - pt1[0]), abs(pt2[1] - pt1[1]), 1) + 1
+        xs = _np.linspace(pt1[0], pt2[0], steps).round().astype(int)
+        ys = _np.linspace(pt1[1], pt2[1], steps).round().astype(int)
+        inside = ((xs >= 0) & (xs < img.shape[1]) & (ys >= 0) & (ys < img.shape[0]))
+        img[ys[inside], xs[inside]] = colour
+        return img
+
+    def circle(img, centre, radius, colour, thickness=1, lineType=0):
+        x, y = int(centre[0]), int(centre[1])
+        r = max(int(radius), 1)
+        y0, y1 = max(y - r, 0), min(y + r + 1, img.shape[0])
+        x0, x1 = max(x - r, 0), min(x + r + 1, img.shape[1])
+        img[y0:y1, x0:x1] = colour       # a square, not a disc
+        return img
+
+    def putText(img, text, org, fontFace, fontScale, colour, thickness=1,
+                lineType=0):
+        cv2.__text_calls__.append((text, tuple(org)))
+        return img
+
+    def imencode(ext, img, params=None):
+        # Returns the same b"WxH" marker frame_bytes() produces, so an encoded
+        # overlay can be handed straight back to imdecode in a test.
+        height, width = img.shape[:2]
+        return True, _np.frombuffer(f"{width}x{height}".encode(), dtype=_np.uint8)
+
+    cv2.LINE_AA = 16
+    cv2.FONT_HERSHEY_SIMPLEX = 0
+    cv2.IMWRITE_JPEG_QUALITY = 1
+    cv2.__text_calls__ = []
+    cv2.line = line
+    cv2.circle = circle
+    cv2.putText = putText
+    cv2.imencode = imencode
+
     cv2.COLOR_BGR2HSV = 40
     cv2.imdecode = imdecode
     cv2.resize = resize
+    cv2.copyMakeBorder = copyMakeBorder
     cv2.cvtColor = cvtColor
     cv2.connectedComponents = connectedComponents
     cv2.__motus_fake__ = True
