@@ -23,6 +23,7 @@ import asyncio
 import logging
 import time
 import copy
+from datetime import datetime
 from typing import Any
 
 from . import comments as comments_mod
@@ -209,7 +210,7 @@ class DeployController:
     """Stateless Deploy Controller.
 
     Reads/writes hidden state through GitHubStateProxy.
-    No SQLite, no DeploymentStore, no in-memory state.
+    No SQLite, no DeploymentStore, no in-memory lifecycle state.
     """
 
     def __init__(
@@ -228,6 +229,9 @@ class DeployController:
         self._core_clients: dict[str, AgentCoreClient] = {}
         self.cos = CosClient(config)
         self._case_runner: CaseRunner | None = None
+        # Retry scheduling only; durable terminal state identifies pending COS
+        # after restart. At most five attempts per binding per process.
+        self._cos_retries: dict[tuple[str, int, str, int], tuple[int, float]] = {}
 
     async def aclose(self) -> None:
         for core in self._core_clients.values():
@@ -690,9 +694,10 @@ class DeployController:
         if expected_comment_id <= 0:
             return False
 
-        # T4: cursor drift check — last_processed_comment_id must match expected_comment_id
+        # Read-only commands may have advanced the cursor after finalization.
+        # A full expected_state snapshot still guards every field during rebind.
         cursor_val = int(fresh_state.get("last_processed_comment_id", 0) or 0)
-        if cursor_val != expected_comment_id:
+        if cursor_val < expected_comment_id or (expected_state is None and cursor_val != expected_comment_id):
             return False
 
         # T4: command.args.result must match expected_test_result
@@ -755,6 +760,7 @@ class DeployController:
             # drop the existing visible History (Test recorded, deployments, ...).
             # event=None: refresh terminal rendering + state.cos only — the
             # history-preserving writer carries existing events over verbatim.
+            await self._preflight_archive_for_event(repo, pr_number, markdown)
             return await self._write_lifecycle_with_history(
                 repo, pr_number, fresh_state, markdown, event=None,
                 expected_terminal_state=expected_terminal_state,
@@ -1800,7 +1806,7 @@ class DeployController:
         return set(case_results) == seen
 
     async def _restart_record_test_comment_is_current(
-        self, repo: str, state: dict, expected_comment: dict,
+        self, repo: str, state: dict, expected_comment: dict, *, consumed: bool = False,
     ) -> bool:
         """Recheck unedited comment provenance and current authority, fail closed."""
         if (not self.config.auth_valid or repo not in self.config.active_repos
@@ -1810,7 +1816,9 @@ class DeployController:
         user = expected_comment.get("user", {})
         uid, login = user.get("id"), user.get("login")
         if (not isinstance(cid, int) or isinstance(cid, bool)
-                or cid <= state.get("last_processed_comment_id", 0)
+                or (not consumed and cid <= state.get("last_processed_comment_id", 0))
+                or (consumed and (cid != state.get("command", {}).get("comment_id")
+                                  or cid > state.get("last_processed_comment_id", 0)))
                 or not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0
                 or not isinstance(login, str) or not login
                 or self.proxy.is_bot_comment(expected_comment)
@@ -1828,13 +1836,13 @@ class DeployController:
     async def resume_record_test(
         self, repo: str, pr_number: int, expected_state: dict, expected_comment: dict,
     ) -> bool:
-        """Resume evidence finalization only; never dispatch deployment commands."""
+        """Resume the business verdict only; never dispatch deployment commands."""
         from .commands import parse_command
 
         cmd = parse_command(expected_comment.get("body", ""))
         if (cmd.kind != "record_test" or cmd.result not in ("pass", "fail")
                 or expected_state.get("status") != "testing"
-                or not self._final_case_pass_is_ready(expected_state)
+                or (cmd.result == "pass" and not self._final_case_pass_is_ready(expected_state))
                 or not await self._restart_record_test_comment_is_current(
                     repo, expected_state, expected_comment)):
             return False
@@ -1877,6 +1885,7 @@ class DeployController:
         if pr_head and pr_head != original.get("head_sha", ""):
             return None
         if (fresh.get("status") != "testing" or not isinstance(fresh.get("command"), dict)
+                or fresh.get("command", {}).get("phase") != "completed"
                 or fresh.get("command") != original.get("command")):
             return None
         if int(fresh.get("last_processed_comment_id", 0) or 0) != original.get("last_processed_comment_id", 0):
@@ -1895,12 +1904,146 @@ class DeployController:
                     return None
         if expected_comment is not None:
             if (pr_head != original.get("head_sha")
-                    or not self._final_case_pass_is_ready(fresh)
+                    or (result == "pass" and not self._final_case_pass_is_ready(fresh))
                     or fresh != original
                     or not await self._restart_record_test_comment_is_current(
                         repo, fresh, expected_comment)):
                 return None
         return copy.deepcopy(fresh)
+
+    @staticmethod
+    def _valid_cos_metadata(repo: str, pr_number: int, head_sha: str, metadata: dict) -> bool:
+        try:
+            CosClient.validate_object_key(repo, pr_number, head_sha, metadata.get("object_key", ""))
+            size = metadata.get("size")
+            return (isinstance(metadata.get("sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is not None
+                    and isinstance(size, int) and not isinstance(size, bool)
+                    and 1 <= size <= 10485760)
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    async def _terminal_cos_context_is_current(
+        self, repo: str, pr_number: int, state: dict, comment: dict,
+    ) -> bool:
+        if not await self._restart_record_test_comment_is_current(
+            repo, state, comment, consumed=True,
+        ):
+            return False
+        pr = await self.proxy.get_pr(repo, pr_number)
+        fresh = await self.proxy.read_hidden_state(repo, pr_number)
+        return (fresh == state and pr.get("state") == "open" and not pr.get("merged")
+                and pr.get("head", {}).get("sha") == state.get("head_sha")
+                and self.config.auth_valid and repo in self.config.active_repos
+                and repo in self.config.github_repos)
+
+    async def _retry_terminal_cos(
+        self, repo: str, pr_number: int, state: dict, *, refresh_url: bool = False,
+    ) -> None:
+        """Best-effort evidence maintenance in the existing serial watcher.
+
+        Missing metadata is the durable restart signal. Retry timing is local:
+        five attempts per command/process, 60s exponential backoff capped at
+        900s. No business fields/events/labels are changed by this path.
+        """
+        try:
+            state = copy.deepcopy(state)
+            status = state.get("status")
+            cmd = state.get("command", {})
+            result = state.get("test_result")
+            cid = cmd.get("comment_id")
+            head = state.get("head_sha", "")
+            if (status not in ("succeeded", "failed") or result not in ("pass", "fail")
+                    or status != ("succeeded" if result == "pass" else "failed")
+                    or cmd.get("kind") != "record_test" or cmd.get("phase") != "completed"
+                    or not isinstance(cid, int) or isinstance(cid, bool) or cid <= 0
+                    or state.get("last_processed_comment_id", 0) < cid):
+                return
+            metadata = state.get("cos", {}) or {}
+            if self._valid_cos_metadata(repo, pr_number, head, metadata) and not refresh_url:
+                return
+            key = (repo, pr_number, head, cid)
+            attempts, next_attempt = self._cos_retries.get(key, (0, 0.0))
+            now = time.monotonic()
+            if attempts >= 5 or now < next_attempt:
+                return
+            self._cos_retries[key] = (attempts + 1, now + min(60 * 2 ** attempts, 900))
+
+            # Old terminal states lacking the original command/deployment
+            # evidence remain readable; they never authorize invented evidence.
+            args = cmd.get("args", {})
+            if (args.get("result") != result or not args.get("actor")
+                    or not isinstance(args.get("summary"), str)
+                    or not state.get("components") or not state.get("deployments")
+                    or not state.get("review_evidence")
+                    or (result == "pass" and not self._final_case_pass_is_ready(state))):
+                logger.warning("COS retry lacks original evidence %s#%s", repo, pr_number)
+                return
+            comment = await self.proxy.get_comment(repo, cid)
+            if not isinstance(comment, dict):
+                return
+            from .commands import parse_command
+            parsed = parse_command(comment.get("body", ""))
+            if (parsed.kind != "record_test" or parsed.result != result
+                    or parsed.summary != args["summary"]
+                    or comment.get("user", {}).get("login") != args["actor"]
+                    or not await self._terminal_cos_context_is_current(repo, pr_number, state, comment)):
+                return
+
+            # A stable date keeps uncertain PUTs on the same key across retries
+            # and restarts. This candidate key is never published as metadata.
+            object_key = metadata.get("object_key") or self.cos.build_object_key(
+                repo, pr_number, head,
+                now=datetime.fromisoformat(comment["created_at"].replace("Z", "+00:00")),
+            )
+            runtime_logs = await self._snapshot_terminal_runtime_logs(
+                state.get("components", []), state.get("deployments", []),
+            )
+            if not await self._terminal_cos_context_is_current(repo, pr_number, state, comment):
+                return
+            uploaded = await self._upload_evidence(
+                repo, pr_number, head, state, result, args["summary"],
+                runtime_logs=runtime_logs, object_key=object_key,
+            )
+            if not self._valid_cos_metadata(repo, pr_number, head, uploaded):
+                logger.warning("COS retry not verified %s#%s attempt=%s", repo, pr_number, attempts + 1)
+                return
+            if not await self._terminal_cos_context_is_current(repo, pr_number, state, comment):
+                return
+            # Existing references are immutable even when they are incomplete.
+            if metadata.get("object_key") and metadata != uploaded:
+                logger.warning("COS retry metadata conflict %s#%s", repo, pr_number)
+                return
+            try:
+                download_url = self.cos.generate_evidence_download_url(uploaded["object_key"])
+            except Exception:
+                download_url = ""
+                logger.warning("COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s", repo, pr_number)
+            render_kwargs = {
+                "cos_object_key": uploaded["object_key"],
+                "cos_bundle_sha256": uploaded["sha256"],
+                "cos_bundle_size": uploaded["size"],
+                "cos_download_url": download_url,
+            }
+            if result == "pass":
+                markdown = comments_mod.succeeded_comment(
+                    repo, pr_number, head,
+                    deployments=self._enrich_deployments_for_render(state["deployments"]),
+                    components=state["components"], **render_kwargs,
+                )
+            else:
+                markdown = comments_mod.failed_comment(repo, pr_number, head, **render_kwargs)
+            if await self._rebind_terminal_cos_if_current(
+                repo, pr_number, expected_head=head, expected_terminal_status=status,
+                expected_comment_id=cid, expected_command_kind="record_test",
+                expected_test_result=result, cos_metadata=uploaded, markdown=markdown,
+                expected_state=state,
+            ):
+                self._cos_retries.pop(key, None)
+        except Exception as exc:
+            # No exception from optional persistence may strand a consumed
+            # record_test or prevent subsequent GitHub command processing.
+            logger.warning("COS retry failed %s#%s exception=%s", repo, pr_number, type(exc).__name__)
 
     async def handle_record_test(
         self, repo: str, pr_number: int, comment_id: int,
@@ -1935,36 +2078,8 @@ class DeployController:
                     if result == "pass" and not self._final_case_pass_is_ready(state):
                         return False
                     await self._check_record_test_permissions(repo, actor, state)
-                    # The terminal write may have succeeded before a URL refresh
-                    # failed. Retry that refresh without another upload/event.
-                    metadata = state.get("cos", {}) or {}
-                    download_url = ""
-                    if metadata.get("object_key"):
-                        try:
-                            download_url = self.cos.generate_evidence_download_url(metadata["object_key"])
-                        except Exception:
-                            logger.warning("COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s", repo, pr_number)
-                    render_kwargs = {
-                        "cos_object_key": metadata.get("object_key", ""),
-                        "cos_bundle_sha256": metadata.get("sha256", ""),
-                        "cos_bundle_size": metadata.get("size", 0),
-                        "cos_download_url": download_url,
-                    }
-                    if result == "pass":
-                        markdown = comments_mod.succeeded_comment(
-                            repo, pr_number, state["head_sha"],
-                            deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
-                            components=state.get("components", []), **render_kwargs,
-                        )
-                    else:
-                        markdown = comments_mod.failed_comment(repo, pr_number, state["head_sha"], **render_kwargs)
-                    return await self._rebind_terminal_cos_if_current(
-                        repo, pr_number, expected_head=state["head_sha"],
-                        expected_terminal_status=_current_status,
-                        expected_comment_id=comment_id, expected_command_kind="record_test",
-                        expected_test_result=result, cos_metadata=metadata, markdown=markdown,
-                        expected_state=state,
-                    )
+                    await self._retry_terminal_cos(repo, pr_number, state, refresh_url=True)
+                    return True
                 logger.warning(
                     "STALE_COMMAND_IGNORED kind=record_test comment_id=%s current_status=%s",
                     comment_id, _current_status,
@@ -2041,73 +2156,19 @@ class DeployController:
                 return True
 
             original_state = copy.deepcopy(state)
-
-            # Authorize actor: collaborator OR owner of any deployed machine
-            await self._check_record_test_permissions(
-                repo, actor, state,
-            )
-
-            # Snapshot runtime logs BEFORE any state mutation
-            runtime_logs = await self._snapshot_terminal_runtime_logs(
-                state.get("components", []),
-                state.get("deployments", []),
-            )
-
-            if result == "pass":
-                fresh_before_upload = await self._revalidate_record_test_state(
-                    repo, pr_number, original_state, result,
-                    expected_comment=_recovery_comment,
-                )
-                if fresh_before_upload is None:
-                    return False
-                state = fresh_before_upload
-
-            # Upload COS evidence FIRST — failure does not roll back (nothing written yet)
-            cos_metadata = {"object_key": "", "sha256": "", "size": 0}
-            try:
-                cos_metadata = await self._upload_evidence(
-                    repo, pr_number, pr_head, state, result, summary,
-                    deploy_error="",
-                    runtime_logs=runtime_logs,
-                )
-            except Exception as e:
-                logger.warning(
-                    "record_test evidence upload failed %s#%s: %s",
-                    repo, pr_number, e,
-                )
+            if _recovery_comment is None:
+                _recovery_comment = await self.proxy.get_comment(repo, comment_id)
+            if not isinstance(_recovery_comment, dict):
                 return False
-
-            # Finalizing either result requires verified COS metadata.
-            cos_valid = False
-            if cos_metadata.get("object_key"):
-                object_key = cos_metadata.get("object_key", "")
-                sha256_val = cos_metadata.get("sha256", "")
-                size_val = cos_metadata.get("size", 0)
-                try:
-                    CosClient.validate_object_key(
-                        repo, pr_number, pr_head, str(object_key),
-                    )
-                except Exception:
-                    logger.warning(
-                        "record_test COS object_key validation failed %s#%s: %s",
-                        repo, pr_number, object_key,
-                    )
-                else:
-                    if (sha256_val and isinstance(sha256_val, str)
-                            and re.fullmatch(r"[0-9a-f]{64}", sha256_val)
-                            and isinstance(size_val, int) and not isinstance(size_val, bool)
-                            and 1 <= size_val <= 10485760):
-                        cos_valid = True
-
-            if not cos_valid:
-                logger.warning(
-                    "record_test %s but COS invalid %s#%s — keeping testing",
-                    result, repo, pr_number,
-                )
+            from .commands import parse_command
+            accepted = parse_command(_recovery_comment.get("body", ""))
+            user = _recovery_comment.get("user", {})
+            if (accepted.kind != "record_test" or accepted.result != result
+                    or accepted.summary != summary or _recovery_comment.get("id") != comment_id
+                    or user.get("login") != actor or str(user.get("id")) != actor_id
+                    or not await self._restart_record_test_comment_is_current(
+                        repo, state, _recovery_comment)):
                 return False
-
-            # COS upload is asynchronous too: do not overwrite changed Cases,
-            # runtime/image bindings or deployment records after it completes.
             fresh_state = await self._revalidate_record_test_state(
                 repo, pr_number, original_state, result,
                 expected_comment=_recovery_comment,
@@ -2115,12 +2176,12 @@ class DeployController:
             if fresh_state is None:
                 return False
             state = fresh_state
-            existing_cos = state.get("cos", {}) or {}
-            if cos_valid and existing_cos.get("object_key") and existing_cos != cos_metadata:
-                logger.warning("record_test COS metadata conflict %s#%s", repo, pr_number)
-                return False
+            # COS is independent of the business verdict. Retain any published
+            # metadata, but expose it only when its existing binding is valid.
+            metadata = state.get("cos", {}) or {}
+            render_cos = metadata if self._valid_cos_metadata(repo, pr_number, pr_head, metadata) else {}
 
-            # All checks passed — write terminal state, lifecycle, and COS
+            # Persist the business verdict before any COS or runtime-log request.
             state["status"] = "succeeded" if result == "pass" else "failed"
             state["test_result"] = "pass" if result == "pass" else "fail"
             state["command"] = {
@@ -2130,7 +2191,6 @@ class DeployController:
                 "args": {"result": result, "summary": summary, "actor": actor},
             }
             state["last_processed_comment_id"] = comment_id
-            state["cos"] = dict(cos_metadata) if cos_valid else dict(existing_cos)
 
             # Write the terminal visible lifecycle comment
             if result == "pass":
@@ -2141,9 +2201,9 @@ class DeployController:
                     repo, pr_number, pr_head,
                     deployments=enriched,
                     components=state.get("components", []),
-                    cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                    cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                    cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
+                    cos_object_key=str(render_cos.get("object_key", "") or ""),
+                    cos_bundle_sha256=str(render_cos.get("sha256", "") or ""),
+                    cos_bundle_size=int(render_cos.get("size", 0) or 0),
                 )
                 event = {
                     "event": "Test recorded",
@@ -2154,9 +2214,9 @@ class DeployController:
             else:
                 terminal_markdown = comments_mod.failed_comment(
                     repo, pr_number, pr_head,
-                    cos_object_key=str(state["cos"].get("object_key", "") or ""),
-                    cos_bundle_sha256=str(state["cos"].get("sha256", "") or ""),
-                    cos_bundle_size=int(state["cos"].get("size", 0) or 0),
+                    cos_object_key=str(render_cos.get("object_key", "") or ""),
+                    cos_bundle_sha256=str(render_cos.get("sha256", "") or ""),
+                    cos_bundle_size=int(render_cos.get("size", 0) or 0),
                 )
                 event = {
                     "event": "Test recorded",
@@ -2165,6 +2225,9 @@ class DeployController:
                     "timestamp": comments_mod.beijing_now_str(),
                 }
 
+            await self._preflight_archive_for_event(
+                repo, pr_number, terminal_markdown, reserved_event=event,
+            )
             terminal_written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, terminal_markdown, event=event,
                 expected_record_test_state=original_state,
@@ -2172,84 +2235,14 @@ class DeployController:
             )
             if not terminal_written:
                 return False
-            await self.proxy.project_status_label(repo, pr_number, state["status"])
-
-            if cos_valid:
-                # Step 1: rebind terminal state with COS metadata FIRST
-                if result == "pass":
-                    markdown_no_url = comments_mod.succeeded_comment(
-                        repo, pr_number, pr_head,
-                        deployments=enriched,
-                        components=state.get("components", []),
-                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                    )
-                else:
-                    markdown_no_url = comments_mod.failed_comment(
-                        repo, pr_number, pr_head,
-                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                    )
-                rebound = await self._rebind_terminal_cos_if_current(
-                    repo,
-                    pr_number,
-                    expected_head=pr_head,
-                    expected_terminal_status=state["status"],
-                    expected_comment_id=comment_id,
-                    expected_command_kind="record_test",
-                    expected_test_result=result,
-                    cos_metadata=cos_metadata,
-                    markdown=markdown_no_url,
-                    expected_state=state,
-                )
-                if not rebound:
-                    return False
-                # Step 2: generate presigned URL AFTER successful rebind
-                cos_download_url = ""
-                try:
-                    cos_download_url = self.cos.generate_evidence_download_url(
-                        cos_metadata["object_key"],
-                    )
-                except Exception:
-                    logger.warning(
-                        "COS_EVIDENCE_PRESIGN=FAILED repo=%s pr=%s",
-                        repo, pr_number,
-                    )
-                # Step 3: rebind final comment with download URL
-                if result == "pass":
-                    markdown_with_url = comments_mod.succeeded_comment(
-                        repo, pr_number, pr_head,
-                        deployments=enriched,
-                        components=state.get("components", []),
-                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                        cos_download_url=cos_download_url,
-                    )
-                else:
-                    markdown_with_url = comments_mod.failed_comment(
-                        repo, pr_number, pr_head,
-                        cos_object_key=str(cos_metadata.get("object_key", "") or ""),
-                        cos_bundle_sha256=str(cos_metadata.get("sha256", "") or ""),
-                        cos_bundle_size=int(cos_metadata.get("size", 0) or 0),
-                        cos_download_url=cos_download_url,
-                    )
-                rebound = await self._rebind_terminal_cos_if_current(
-                    repo,
-                    pr_number,
-                    expected_head=pr_head,
-                    expected_terminal_status=state["status"],
-                    expected_comment_id=comment_id,
-                    expected_command_kind="record_test",
-                    expected_test_result=result,
-                    cos_metadata=cos_metadata,
-                    markdown=markdown_with_url,
-                    expected_state=state,
-                )
-                if not rebound:
-                    return False
+            try:
+                await self.proxy.project_status_label(repo, pr_number, state["status"])
+            except Exception as exc:
+                logger.warning("record_test label projection %s#%s exception=%s",
+                               repo, pr_number, type(exc).__name__)
+            # Failures are logged/backed off internally and cannot undo or block
+            # consumption of this durably completed business command.
+            await self._retry_terminal_cos(repo, pr_number, state)
             return True
 
 
@@ -3049,6 +3042,7 @@ class DeployController:
         state: dict, result: str, summary: str = "",
         deploy_error: str = "",
         runtime_logs: dict | None = None,
+        object_key: str = "",
     ) -> dict:
         """Upload COS evidence bundle. Returns metadata dict.
 
@@ -3058,7 +3052,7 @@ class DeployController:
         try:
             # Retries keep the originally published key, including its date.
             # ensure_evidence_archive verifies/reuses it without replacing bytes.
-            object_key = (state.get("cos", {}) or {}).get("object_key") or self.cos.build_object_key(
+            object_key = object_key or (state.get("cos", {}) or {}).get("object_key") or self.cos.build_object_key(
                 repo, pr_number, head_sha,
             )
             CosClient.validate_object_key(repo, pr_number, head_sha, object_key)
@@ -3205,6 +3199,11 @@ class DeployController:
             if tail.strip():
                 raw_events.append(tail)
                 tail = ""
+        legacy_history = None
+        if h_start < 0 and h_end < 0:
+            legacy_history = re.search(r"(?ms)^### History[ \t]*\n.*?(?=^### |\Z)", existing_visible_part)
+            if legacy_history:
+                raw_events = [legacy_history.group(0).partition("\n")[2]]
         old_archives = re.search(r"(?ms)^### Archived history[ \t]*\n.*?(?=^### |\Z)", existing_visible_part)
         archive_links_text = old_archives.group(0) if old_archives else ""
         reserved_inner = ""
@@ -3267,6 +3266,10 @@ class DeployController:
             before_hist = existing_visible_part[:h_start]
             after_hist = existing_visible_part[h_end + len(VISIBLE_HISTORY_END_MARKER):]
             new_visible = before_hist + new_history_block + after_hist
+        elif legacy_history is not None:
+            new_visible = (existing_visible_part[:legacy_history.start()]
+                           + "### History\n\n" + new_history_block + "\n\n"
+                           + existing_visible_part[legacy_history.end():])
         else:
             new_visible = existing_visible_part.rstrip() + "\n\n" + new_history_block + "\n"
 
@@ -3438,6 +3441,14 @@ class DeployController:
                     or existing_visible.count(VISIBLE_HISTORY_END_MARKER) != 1):
                 raise GitHubStateProxyError("Cannot safely preserve malformed History markers")
             history_block = existing_visible[h_start:h_end + len(VISIBLE_HISTORY_END_MARKER)]
+        elif event is not None or events:
+            # Only wrap unmarked legacy events when appending. COS-only refresh
+            # retains the original unmarked History section verbatim below.
+            old_history = re.search(r"(?ms)^### History[ \t]*\n.*?(?=^### |\Z)", existing_visible)
+            if old_history:
+                history_block = (VISIBLE_HISTORY_START_MARKER
+                                 + old_history.group(0).partition("\n")[2]
+                                 + VISIBLE_HISTORY_END_MARKER)
         incoming = list(events) if events is not None else ([event] if event is not None else [])
         if incoming:
             new_block = _build_history_block(incoming)
@@ -3702,252 +3713,13 @@ class DeployController:
                     )
                 return
 
-            if state.get("status") == "succeeded":
+            if state.get("status") in ("succeeded", "failed"):
                 try:
-                    await self.proxy.project_status_label(
-                        repo, pr_number, state.get("status", "review-required"),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "reconcile label projection %s#%s: %s", repo, pr_number, e,
-                    )
-                return
-
-            if state.get("status") == "failed":
-                # Check for missing COS evidence on record_test failures
-                cmd = state.get("command", {})
-                cos_state = state.get("cos", {}) or {}
-                is_missing_cos = (
-                    isinstance(cmd, dict)
-                    and cmd.get("kind") == "record_test"
-                    and cmd.get("phase") == "completed"
-                    and not cos_state.get("object_key")
-                )
-
-                if is_missing_cos:
-                    # Validate recovery eligibility
-                    args = cmd.get("args", {})
-                    if not isinstance(args, dict):
-                        args = {}
-                    if args.get("result") != "fail":
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    comment_id_val = cmd.get("comment_id", 0)
-                    if isinstance(comment_id_val, bool) or not isinstance(comment_id_val, int):
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-                    if comment_id_val <= 0:
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    cursor_val = int(state.get("last_processed_comment_id", 0) or 0)
-                    if cursor_val != comment_id_val:
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    test_result_val = state.get("test_result", "")
-                    if test_result_val != "fail":
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    # Verify PR still open/unmerged and HEAD matches
-                    if pr_state != "open" or pr_merged:
-                        return
-                    if current_head != state.get("head_sha", ""):
-                        return
-
-                    # Upload fail evidence
-                    pre_upload_cmd = copy.deepcopy(cmd)
-                    pre_upload_cursor = cursor_val
-                    pre_upload_head = state.get("head_sha", "")
-
-                    upload_state = dict(state)
-                    try:
-                        uploaded_meta = await self._upload_evidence(
-                            repo, pr_number, current_head, upload_state, "fail",
-                            summary=str(args.get("summary", "")),
-                            deploy_error=str(args.get("deploy_error", "") or ""),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "reconcile evidence upload %s#%s: %s",
-                            repo, pr_number, e,
-                        )
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    # Validate uploaded metadata
-                    if not (uploaded_meta and isinstance(uploaded_meta, dict)
-                            and uploaded_meta.get("object_key")):
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    upload_key = str(uploaded_meta.get("object_key", "") or "")
-                    upload_sha = str(uploaded_meta.get("sha256", "") or "")
-                    upload_size = uploaded_meta.get("size", 0)
-                    try:
-                        from .cos_client import CosClient
-                        CosClient.validate_object_key(
-                            repo, pr_number, current_head, upload_key,
-                        )
-                    except Exception:
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-                    if not (upload_sha and re.fullmatch(r"[0-9a-f]{64}", upload_sha)):
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-                    if not (isinstance(upload_size, int) and not isinstance(upload_size, bool)
-                            and 1 <= upload_size <= 10485760):
-                        try:
-                            await self.proxy.project_status_label(
-                                repo, pr_number, "failed",
-                            )
-                        except Exception:
-                            pass
-                        return
-
-                    # Post-upload concurrency re-check
-                    try:
-                        post_pr = await self.proxy.get_pr(repo, pr_number)
-                        if inspect.isawaitable(post_pr):
-                            post_pr = await post_pr
-                    except Exception:
-                        post_pr = {}
-                    post_state = await self.proxy.read_hidden_state(repo, pr_number)
-                    if post_state is None:
-                        return
-                    if post_pr.get("state", "") != "open" or post_pr.get("merged", False):
-                        return
-                    if post_pr.get("head", {}).get("sha", "") != pre_upload_head:
-                        return
-                    if post_state.get("status") != "failed":
-                        return
-                    if post_state.get("test_result") != "fail":
-                        return
-                    post_cmd = post_state.get("command", {})
-                    if not isinstance(post_cmd, dict):
-                        return
-                    if post_cmd != pre_upload_cmd:
-                        return
-                    post_cursor = int(post_state.get("last_processed_comment_id", 0) or 0)
-                    if post_cursor != pre_upload_cursor:
-                        return
-                    if post_cursor != comment_id_val:
-                        return
-
-                    # Idempotent reuse: check for existing COS in post_state
-                    post_cos = post_state.get("cos", {}) or {}
-                    post_cos_key = ""
-                    if post_cos.get("object_key"):
-                        post_cos_key = str(post_cos.get("object_key", "") or "")
-                        if post_cos_key != upload_key:
-                            # Conflict: different COS evidence — do not overwrite
-                            return
-                        if post_cos.get("sha256", "") != upload_sha:
-                            return
-                        post_size = post_cos.get("size", 0)
-                        if not (isinstance(post_size, int) and not isinstance(post_size, bool)
-                                and post_size == upload_size):
-                            return
-
-                    # Write COS metadata via history-aware writer, event=None
-                    # Generate full failed comment body with COS evidence (not empty markdown)
-                    failed_markdown = comments_mod.failed_comment(
-                        repo, pr_number, current_head,
-                        cos_object_key=upload_key,
-                        cos_bundle_sha256=upload_sha,
-                        cos_bundle_size=upload_size,
-                    )
-                    # Try to generate presigned URL; keep metadata even if signing fails
-                    cos_download_url = ""
-                    try:
-                        cos_download_url = self.cos.generate_evidence_download_url(
-                            upload_key,
-                        )
-                        if cos_download_url:
-                            failed_markdown = comments_mod.failed_comment(
-                                repo, pr_number, current_head,
-                                cos_object_key=upload_key,
-                                cos_bundle_sha256=upload_sha,
-                                cos_bundle_size=upload_size,
-                                cos_download_url=cos_download_url,
-                            )
-                    except Exception:
-                        logger.warning(
-                            "reconcile COS presign failed %s#%s, keeping metadata without URL",
-                            repo, pr_number,
-                        )
-                    post_state["cos"] = {
-                        "object_key": upload_key,
-                        "sha256": upload_sha,
-                        "size": upload_size,
-                    }
-                    await self._write_lifecycle_with_history(
-                        repo, pr_number, post_state, failed_markdown, event=None,
-                    )
-                    try:
-                        await self.proxy.project_status_label(
-                            repo, pr_number, "failed",
-                        )
-                    except Exception:
-                        pass
-                    return
-
-                # Normal failed path: project label
-                try:
-                    await self.proxy.project_status_label(
-                        repo, pr_number, state.get("status", "review-required"),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "reconcile label projection %s#%s: %s", repo, pr_number, e,
-                    )
+                    await self.proxy.project_status_label(repo, pr_number, state["status"])
+                except Exception as exc:
+                    logger.warning("reconcile label projection %s#%s exception=%s",
+                                   repo, pr_number, type(exc).__name__)
+                await self._retry_terminal_cos(repo, pr_number, state)
                 return
 
             if state.get("status") == "deploy-requested":
