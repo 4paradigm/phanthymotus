@@ -58,9 +58,14 @@ right negative), plus
 `audio_window_start_us` / `audio_window_end_us`. Driver publishes `no_event` after
 activity stops and `stale` if a valid observation expires. Neither state clears
 ASR's capture history: a transcription can finish after the event expires.
-ASR ignores a direction observation with a missing or different convention and
-includes `wake_direction_convention` alongside a valid `wake_direction_deg` in
-its existing recognition result for the agent.
+ASR ignores a direction observation with a missing or different convention.
+Its existing recognition result reports `speaker_direction_state` and, when
+valid, `speaker_direction` as a single string such as
+`"115°, robot_front_0_left_positive_ccw"`. The matched capture window is
+reported as `speaker_direction_window_start_us` /
+`speaker_direction_window_end_us`. The angle refers to the start of the wake
+word, not the full utterance. Unknown and disconnected directions report only
+`speaker_direction_state: "unknown"` or `"no_input"`.
 
 `AudioChunk.header.stamp` must be the Unix capture time of the chunk's first
 sample. Direction windows use the same clock in microseconds. ASR reports an

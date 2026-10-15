@@ -43,3 +43,22 @@ for (const base of [TextRenderer, KvLatestRenderer]) {
     }
   });
 }
+
+test('ASR shows speaker direction as one value', () => {
+  const oldDocument = globalThis.document;
+  const renderer = Object.assign({}, KvLatestRenderer);
+  try {
+    globalThis.document = { createElement: element };
+    renderer.mount(element());
+    renderer.onData(new TextEncoder().encode(JSON.stringify({
+      text: '过来', speaker_direction_state: 'valid',
+      speaker_direction: '115°, robot_front_0_left_positive_ccw',
+    })));
+    assert.equal(renderer._cells.speaker_direction.valueEl.textContent,
+      '115°, robot_front_0_left_positive_ccw');
+    assert.equal(renderer._cells.wake_direction_convention, undefined);
+  } finally {
+    renderer.unmount();
+    globalThis.document = oldDocument;
+  }
+});

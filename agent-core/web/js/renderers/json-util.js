@@ -79,7 +79,7 @@ export function escapeHtml(s) {
 
 /** Round direction fields for display without changing timestamps or payloads. */
 export function directionDisplayValue(key, value) {
-  if ((key === 'angle' || key === 'wake_direction_deg') && typeof value === 'number') {
+  if (key === 'angle' && typeof value === 'number') {
     const rounded = Math.round(value);
     return rounded === -180 ? 180 : rounded === 0 ? 0 : rounded;
   }

@@ -28,10 +28,10 @@ def test_leading_wake_matches_voice_onset_after_preroll():
         1700000000.0, 16000,
         [window(90, 1700000000500000, 1700000000600000)], True)
     assert fields == {
-        "wake_direction_state": "valid", "wake_direction_deg": 90,
-        "wake_direction_convention": "robot_front_0_left_positive_ccw",
-        "wake_direction_window_start_us": 1700000000500000,
-        "wake_direction_window_end_us": 1700000000600000,
+        "speaker_direction_state": "valid",
+        "speaker_direction": "90°, robot_front_0_left_positive_ccw",
+        "speaker_direction_window_start_us": 1700000000500000,
+        "speaker_direction_window_end_us": 1700000000600000,
     }
 
 
@@ -47,7 +47,7 @@ def test_prefix_without_audio_alignment_never_supplies_wake_direction(prefix, ca
     char_ends = list(range(1, len(prefix) + 1)) + list(range(len(prefix) + 2, len(text) + 1))
     assert asr._wake_direction_fields(text, char_ends, len(char_ends), 4,
                                       1700000000.0, 0, candidates, True) == {
-        'wake_direction_state': 'unknown'}
+        'speaker_direction_state': 'unknown'}
 
 
 @pytest.mark.parametrize('prefix', ['嗯', '那个', '先说别的'])
@@ -62,9 +62,9 @@ def test_aligned_wake_uses_keyword_time_instead_of_prefix_time(prefix):
         [window(-45, 1700000000500000, 1700000000600000),
          window(90, 1700000001000000, 1700000001100000)], True,
         alignment=alignment)
-    assert fields['wake_direction_state'] == 'valid'
-    assert fields['wake_direction_deg'] == 90
-    assert fields['wake_direction_window_start_us'] == 1700000001000000
+    assert fields['speaker_direction_state'] == 'valid'
+    assert fields['speaker_direction'] == '90°, robot_front_0_left_positive_ccw'
+    assert fields['speaker_direction_window_start_us'] == 1700000001000000
 
 
 @pytest.mark.parametrize('alignment', [
@@ -78,7 +78,7 @@ def test_aligned_wake_uses_keyword_time_instead_of_prefix_time(prefix):
 def test_unusable_alignment_does_not_guess_prefix_duration(alignment):
     assert asr._wake_direction_fields('嗯，小范', [1, 3, 4], 3, 2,
         1700000000.0, 0, [window(90, 1700000000000000, 1700000000020000)],
-        True, alignment=alignment) == {'wake_direction_state': 'unknown'}
+        True, alignment=alignment) == {'speaker_direction_state': 'unknown'}
 
 
 def test_english_token_boundaries_map_to_custom_wake_time():
@@ -138,10 +138,10 @@ def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, pr
     node._worker_inner()
     payload = json.loads(node._pub.messages[0])
     assert payload['text'] == '你好'
-    assert payload['wake_direction_state'] == 'valid'
-    assert payload['wake_direction_deg'] == 90
-    assert payload['wake_direction_convention'] == 'robot_front_0_left_positive_ccw'
-    assert payload['wake_direction_window_start_us'] == 1700000001000000
+    assert payload['speaker_direction_state'] == 'valid'
+    assert payload['speaker_direction'] == '90°, robot_front_0_left_positive_ccw'
+    assert payload['speaker_direction_window_start_us'] == 1700000001000000
+    assert not any(key.startswith('wake_direction') for key in payload)
     assert payload['audio_start_ts'] == 1700000000.0
     assert payload['asr_complete_ts'] == 1900000000.0
     assert ('lang' in payload) is emit_tags
@@ -160,8 +160,8 @@ def test_long_utterance_retains_leading_wake_window_despite_later_direction_samp
     fields = asr._wake_direction_fields('小范你好', [1, 2, 3, 4], 2, 2,
         base_us / 1000000, 0, list(node._direction_windows), True,
         alignment={'tokens': list('小范你好'), 'timestamps': [0.2, 0.4, 10, 25], 'duration_s': 30})
-    assert fields['wake_direction_state'] == 'valid'
-    assert fields['wake_direction_deg'] == 90
+    assert fields['speaker_direction_state'] == 'valid'
+    assert fields['speaker_direction'] == '90°, robot_front_0_left_positive_ccw'
 
 
 def test_circular_angles_and_conflicts():
@@ -169,12 +169,22 @@ def test_circular_angles_and_conflicts():
                  window(-179, 1700000000020000, 1700000000040000)]
     fields = asr._wake_direction_fields("小范", [1, 2], 2, 2,
                                         1700000000.0, 0, near_back, True)
-    assert fields["wake_direction_deg"] == 180
+    assert fields["speaker_direction"] == '180°, robot_front_0_left_positive_ccw'
     conflict = [window(0, 1700000000000000, 1700000000020000),
                 window(180, 1700000000020000, 1700000000040000)]
     assert asr._wake_direction_fields("小范", [1, 2], 2, 2,
                                       1700000000.0, 0, conflict, True) == {
-        "wake_direction_state": "unknown"}
+        "speaker_direction_state": "unknown"}
+
+
+@pytest.mark.parametrize('angle, expected', [
+    (115, '115°, robot_front_0_left_positive_ccw'),
+    (-0.004, '0°, robot_front_0_left_positive_ccw'),
+])
+def test_speaker_direction_formats_angle_and_convention(angle, expected):
+    fields = asr._wake_direction_fields('小范', [1, 2], 2, 2,
+        1700000000.0, 0, [window(angle, 1700000000000000, 1700000000020000)], True)
+    assert fields['speaker_direction'] == expected
 
 
 def test_missing_input_or_untrusted_windows_never_use_last_angle():
@@ -182,15 +192,15 @@ def test_missing_input_or_untrusted_windows_never_use_last_angle():
              window(180, 1700000001000000, 1700000001020000)]
     assert asr._wake_direction_fields("小范", [1, 2], 2, 2,
                                       1700000000.0, 0, stale, True) == {
-        "wake_direction_state": "unknown"}
+        "speaker_direction_state": "unknown"}
     assert asr._wake_direction_fields("小范", [1, 2], 2, 2,
                                       1700000000.0, 0, stale, False) == {
-        "wake_direction_state": "no_input"}
+        "speaker_direction_state": "no_input"}
     close = [window(90, 1700000000000000, 1700000000020000)]
     assert asr._wake_direction_fields("小范", [1, 2], 2, 2,
                                       1700000000.0, 0, close, True,
                                       trusted_audio=False) == {
-        "wake_direction_state": "unknown"}
+        "speaker_direction_state": "unknown"}
 
 
 def test_input_bindings_identify_audio_and_direction_in_any_order():
@@ -231,8 +241,8 @@ def test_json_direction_uses_precise_angle_for_wake_matching():
     assert len(node._direction_windows) == 1
     fields = asr._wake_direction_fields('小范', [1, 2], 2, 2,
         1700000000.0, 0, list(node._direction_windows), True)
-    assert fields['wake_direction_state'] == 'valid'
-    assert fields['wake_direction_deg'] == -29.68
+    assert fields['speaker_direction_state'] == 'valid'
+    assert fields['speaker_direction'] == '-29.68°, robot_front_0_left_positive_ccw'
 
 
 @pytest.mark.parametrize('convention', [None, 'robot_front_0_right_positive_cw'])
@@ -389,8 +399,8 @@ def test_vad_first_sample_stamps_align_utterance_and_wake_direction(monkeypatch,
             trusted_audio=utterance[4],
             alignment={'tokens': ['嗯', '小', '范'],
                        'timestamps': [0.05, 0.2, 0.25], 'duration_s': 0.64})
-        assert fields['wake_direction_deg'] == 90
-        assert fields['wake_direction_window_start_us'] == 1700000000200000
+        assert fields['speaker_direction'] == '90°, robot_front_0_left_positive_ccw'
+        assert fields['speaker_direction_window_start_us'] == 1700000000200000
 
 
 def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):
@@ -463,16 +473,16 @@ def test_direction_subscription_enforces_open_negative_endpoint(angle, accepted)
 
 
 @pytest.mark.parametrize('angle, expected', [
-    (-180, {'wake_direction_state': 'unknown'}),
-    (180.001, {'wake_direction_state': 'unknown'}),
-    (-179.999, {'wake_direction_state': 'valid', 'wake_direction_deg': 180,
-                'wake_direction_convention': 'robot_front_0_left_positive_ccw',
-                'wake_direction_window_start_us': 1700000000000000,
-                'wake_direction_window_end_us': 1700000000020000}),
-    (180, {'wake_direction_state': 'valid', 'wake_direction_deg': 180,
-           'wake_direction_convention': 'robot_front_0_left_positive_ccw',
-           'wake_direction_window_start_us': 1700000000000000,
-           'wake_direction_window_end_us': 1700000000020000}),
+    (-180, {'speaker_direction_state': 'unknown'}),
+    (180.001, {'speaker_direction_state': 'unknown'}),
+    (-179.999, {'speaker_direction_state': 'valid',
+                'speaker_direction': '180°, robot_front_0_left_positive_ccw',
+                'speaker_direction_window_start_us': 1700000000000000,
+                'speaker_direction_window_end_us': 1700000000020000}),
+    (180, {'speaker_direction_state': 'valid',
+           'speaker_direction': '180°, robot_front_0_left_positive_ccw',
+           'speaker_direction_window_start_us': 1700000000000000,
+           'speaker_direction_window_end_us': 1700000000020000}),
 ])
 def test_wake_direction_rejects_negative_endpoint_and_canonicalizes_rounding(angle, expected):
     assert asr._wake_direction_fields('小范', [1, 2], 2, 2,

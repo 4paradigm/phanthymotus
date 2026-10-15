@@ -94,15 +94,13 @@ test('escapeHtml neutralises publisher-controlled markup', () => {
 });
 
 // Direction precision is a presentation choice; other numbers keep precision.
-for (const key of ['angle', 'wake_direction_deg']) {
-  test(`${key} displays an integer with the agreed signed-angle boundary`, () => {
-    assert.equal(directionDisplayValue(key, 29.678), 30);
-    assert.equal(directionDisplayValue(key, -29.678), -30);
-    assert.equal(directionDisplayValue(key, -179.9), 180);
-    assert.equal(directionDisplayValue(key, 90), 90);
-    assert.equal(directionDisplayValue(key, null), null);
-  });
-}
+test('angle displays an integer with the agreed signed-angle boundary', () => {
+  assert.equal(directionDisplayValue('angle', 29.678), 30);
+  assert.equal(directionDisplayValue('angle', -29.678), -30);
+  assert.equal(directionDisplayValue('angle', -179.9), 180);
+  assert.equal(directionDisplayValue('angle', 90), 90);
+  assert.equal(directionDisplayValue('angle', null), null);
+});
 test('non-angle fields retain their original precision', () => {
   assert.equal(directionDisplayValue('audio_start_ts', 1700000000.123), 1700000000.123);
 });

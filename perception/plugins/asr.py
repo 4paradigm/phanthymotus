@@ -554,11 +554,11 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
                            alignment: dict | None = None) -> dict:
     """Match a timed wake word to direction windows on the capture clock.
 
-    `wake_direction_deg` uses the robot frame: front 0, left positive
+    `speaker_direction` uses the robot frame: front 0, left positive
     (counter-clockwise, REP-103) — the same sign as the locomotion `vyaw`
     command, so the angle can be passed to a turn without negation.
     """
-    state = {"wake_direction_state": "unknown" if has_input else "no_input"}
+    state = {"speaker_direction_state": "unknown" if has_input else "no_input"}
     if not has_input or not trusted_audio:
         return state
     kw_start = end_pos - keyword_phones
@@ -590,10 +590,12 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
     angle = round(angle, 2)
     if angle == -180:
         angle = 180
-    return {"wake_direction_state": "valid", "wake_direction_deg": angle,
-            "wake_direction_convention": DIRECTION_ANGLE_CONVENTION,
-            "wake_direction_window_start_us": min(begin for _, begin, _ in selected),
-            "wake_direction_window_end_us": max(end for _, _, end in selected)}
+    if angle == 0:
+        angle = 0
+    return {"speaker_direction_state": "valid",
+            "speaker_direction": f"{angle:g}°, {DIRECTION_ANGLE_CONVENTION}",
+            "speaker_direction_window_start_us": min(begin for _, begin, _ in selected),
+            "speaker_direction_window_end_us": max(end for _, _, end in selected)}
 
 
 def _resolve_asr_inputs(args: dict) -> tuple[str, str]:
