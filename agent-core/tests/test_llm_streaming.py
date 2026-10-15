@@ -30,6 +30,8 @@ import sys
 import tempfile
 import time
 
+import httpx
+import openai
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
@@ -46,11 +48,14 @@ from event.llm import RoundReconsider, TurnCancelled  # noqa: E402
 
 # ── 假的流式响应 ──────────────────────────────────────────────────────────────
 
-def _chunk(content=None, tool_calls=None, finish_reason=None, usage=None):
+def _chunk(content=None, tool_calls=None, finish_reason=None, usage=None,
+           reasoning=None):
     """OpenAI chunk 的最小 dict 形态；`_attr` 对 dict 和 pydantic 一视同仁。"""
     delta = {}
     if content is not None:
         delta['content'] = content
+    if reasoning is not None:
+        delta['reasoning_content'] = reasoning
     if tool_calls is not None:
         delta['tool_calls'] = tool_calls
     out = {'choices': [{'delta': delta, 'finish_reason': finish_reason}]}
@@ -232,7 +237,184 @@ def test_think_mode_off_still_sends_extra_body():
     """think_mode=False 的 extra_body 是生产在用的，流式不能把它弄丢。"""
     fake = _FakeClient([_chunk('hi')])
     _call(fake)
-    assert fake.kwargs['extra_body'] == {'chat_template_kwargs': {'enable_thinking': False}}
+    assert fake.kwargs['extra_body'] == llm_mod.THINKING_OFF_EXTRA
+
+
+def test_thinking_off_sends_every_known_spelling():
+    """同一个模型换个供应商就换一种关法，少发一种就有网关照样在想。
+
+    实测过只发 chat_template_kwargs 关不掉、补上 thinking.type 才关掉的情况——
+    所以这几个键是回归锁，不是可选项。
+    """
+    fake = _FakeClient([_chunk('hi')])
+    _call(fake)
+    extra = fake.kwargs['extra_body']
+    assert extra['chat_template_kwargs'] == {'enable_thinking': False}
+    assert extra['thinking'] == {'type': 'disabled'}
+    assert extra['enable_thinking'] is False
+    assert extra['thinking_budget'] == 0
+    assert extra['reasoning'] == {'enabled': False}
+    assert extra['reasoning_effort'] == 'none'
+
+
+def test_think_mode_on_sends_no_extra_body():
+    fake = _FakeClient([_chunk('hi')])
+    # ConfigDB.__getitem__ 每次反序列化一份新 dict，改嵌套键改的是副本——
+    # 必须整段回写才算数。
+    saved = config.main['client']
+    config.main['client'] = {'llm': [{**saved['llm'][0], 'think_mode': True}]}
+    try:
+        _call(fake)
+    finally:
+        config.main['client'] = saved
+    assert 'extra_body' not in fake.kwargs
+
+
+# ── 网关不认某个关闭参数时的降级 ──────────────────────────────────────────────
+
+class _RejectingCompletions(_FakeCompletions):
+    """前 N 次按 `reject` 里的字段名报 400，之后正常返回。"""
+
+    async def create(self, **kwargs):
+        o = self._outer
+        o.calls.append(dict(kwargs))
+        for field in list(o.reject):
+            if field in (kwargs.get('extra_body') or {}):
+                o.reject.remove(field)
+                raise openai.BadRequestError(
+                    f'unrecognized parameter: {field}',
+                    response=httpx.Response(400, request=httpx.Request('POST', o.base_url)),
+                    body=None)
+        return await super().create(**kwargs)
+
+
+class _RejectingClient(_FakeClient):
+    def __init__(self, script=(), reject=()):
+        super().__init__(script)
+        self.reject = list(reject)
+        self.calls = []
+        self.chat = type('C', (), {'completions': _RejectingCompletions(self)})()
+
+
+def test_rejected_thinking_field_is_dropped_and_remembered():
+    """一次 400 不该变成一次失败：撤掉被点名的字段重发，并记住别再发。"""
+    fake = _RejectingClient([_chunk('hi')], reject=['thinking_budget'])
+    msg = _call(fake)
+    assert msg['content'] == 'hi'
+    assert 'thinking_budget' in fake.calls[0]['extra_body']
+    assert 'thinking_budget' not in fake.calls[1]['extra_body']
+    # 仍然带着其余几种写法——不能因为一个字段被拒就整组放弃
+    assert fake.calls[1]['extra_body']['thinking'] == {'type': 'disabled'}
+    # `thinking` 是 `thinking_budget` 的前缀——按子串匹配会把它一起撤掉，
+    # 那正好撤掉最管用的那一种关法。
+    assert fake._thinking_rejected == {'thinking_budget'}
+
+    # 第二次调用直接就不发了，不再浪费一个往返
+    fake.script = [_chunk('hi')]
+    _call(fake)
+    assert 'thinking_budget' not in fake.calls[2]['extra_body']
+
+
+def test_unnamed_400_drops_the_whole_group_once():
+    """网关只回一句 invalid request 时，整组撤掉重试一次，但不永久记账。"""
+    fake = _RejectingClient([_chunk('hi')], reject=['thinking'])
+    fake.reject = ['*']
+
+    calls = fake.calls
+    orig = fake.chat.completions.create
+
+    async def create(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise openai.BadRequestError(
+                'invalid request',
+                response=httpx.Response(400, request=httpx.Request('POST', fake.base_url)),
+                body=None)
+        fake.stream = _FakeStream(fake.script)
+        fake.kwargs = kwargs
+        return fake.stream
+
+    fake.chat.completions.create = create
+    msg = _call(fake)
+    assert msg['content'] == 'hi'
+    assert 'extra_body' in calls[0]
+    assert 'extra_body' not in calls[1]
+    assert not getattr(fake, '_thinking_rejected', None)
+
+
+# ── 思考内容要能在日志里看见 ─────────────────────────────────────────────────
+
+def test_reasoning_deltas_are_captured():
+    """think_mode=True 时思考逐帧到达，累加器原先只取 content/tool_calls 就丢了它。
+
+    真机实测：一轮 126 帧 / 870 字，而整个容器日志和落盘请求文件里
+    `reasoning_content` 命中数都是 0——token 和首 token 延迟照付，内容无从复盘。
+    """
+    msg = _call(_FakeClient([
+        _chunk(reasoning='先想一下：'),
+        _chunk(reasoning='这首歌不适合小孩。'),
+        _chunk('换一首'),
+        _chunk(finish_reason='stop'),
+    ]))
+    assert msg['content'] == '换一首'
+    assert msg['_reasoning']['text'] == '先想一下：这首歌不适合小孩。'
+    assert msg['_reasoning']['chars'] == 14
+    assert msg['_reasoning']['truncated'] is False
+
+
+def test_heartbeat_counts_reasoning_as_progress():
+    """心跳的 chars 要算上思考，否则思考阶段打出 chars=0，看着像卡死。
+
+    真机实测：18.7s 的一次调用里有 15s 打的是 `chunks=1145 chars=0`。
+    """
+    acc = llm_mod._StreamAccumulator()
+    acc.feed(_chunk(reasoning='想了很多'))
+    assert acc.chars == 4
+    acc.feed(_chunk('答'))
+    assert acc.chars == 5
+
+
+def test_no_reasoning_field_when_thinking_is_off():
+    """关掉 think 时不能留一个空壳字段——它会进历史、进 recent 文件。"""
+    msg = _call(_FakeClient([_chunk('2'), _chunk(finish_reason='stop')]))
+    assert '_reasoning' not in msg
+
+
+def test_long_reasoning_is_truncated_but_length_is_honest():
+    """历史要落 data.db，长思考不能整条留；但长度必须记完整值。
+
+    否则「被截断」会被读成「模型只想了这么多」。
+    """
+    saved = llm_mod.REASONING_KEEP_CHARS
+    llm_mod.REASONING_KEEP_CHARS = 10
+    try:
+        msg = _call(_FakeClient([_chunk(reasoning='思' * 50), _chunk('ok')]))
+    finally:
+        llm_mod.REASONING_KEEP_CHARS = saved
+    assert msg['_reasoning']['chars'] == 50          # 完整长度
+    assert len(msg['_reasoning']['text']) == 10      # 只留一段
+    assert msg['_reasoning']['truncated'] is True
+
+
+def test_reasoning_is_an_internal_field_and_never_goes_back_out():
+    """`_` 前缀是本仓库的既有约定：出门前被 event/llm.py 摘掉。
+
+    钉住这一点，否则思考内容会随历史回到请求体，被严格的服务端按未知字段拒。
+    """
+    import sys as _sys, pathlib as _pl
+    _sys.path.insert(0, str(_pl.Path(__file__).resolve().parents[1] / 'src'))
+    from event.llm import _scrub as _san
+    msg = _call(_FakeClient([_chunk(reasoning='想'), _chunk('ok')]))
+    assert '_reasoning' in msg
+    out = _san([msg])
+    assert '_reasoning' not in out[0]
+    assert out[0]['content'] == 'ok'
+
+
+def test_reasoning_shows_up_in_the_log_line(capsys):
+    """日志行要带思考字数——这正是这次要解决的「看不见」。"""
+    _call(_FakeClient([_chunk(reasoning='想了想'), _chunk('ok')]))
+    assert 'reasoning=3字' in capsys.readouterr().out
 
 
 # ── 卡死必须被及时发现 ────────────────────────────────────────────────────────
@@ -396,6 +578,7 @@ def test_stream_can_be_turned_off():
     fake.chat.completions.create = create
     msg = _call(fake)
     assert fake.kwargs['stream'] is False
+    assert fake.kwargs['extra_body'] == llm_mod.THINKING_OFF_EXTRA
     assert msg == {'role': 'assistant', 'content': 'hi'}
 
 

@@ -863,8 +863,40 @@ FACE_MODEL_FILES = {
 }
 
 
+# SCRFD-2.5G-BNKPS + EdgeFace-S-GAMMA-0.5, the second `plugins/face_runtime.FACE_MODELS`
+# row. Re-hosted on COS for the same reason as buffalo_sc, and in one more case: the
+# EdgeFace ONNX does not exist upstream at all. Idiap publish PyTorch weights only, so
+# the ONNX here is our own export (`anjith2006/edgeface`, fp32, opset 17), which makes
+# COS the only place it can come from.
+FACE_SCRFD25G_BASE = os.environ.get(
+    "FACE_SCRFD25G_MODEL_BASE_URL", f"{COS_BASE}/face/scrfd25g_edgeface_s"
+)
+# Pinned against the **COS copies, re-downloaded and re-hashed after upload**, so these
+# are the bytes a robot will actually receive — not the bytes that were uploaded.
+FACE_SCRFD25G_FILES = {
+    # insightface scrfd_2.5g_bnkps, re-hosted from `hsuyabc/scrfd_2.5g_bnkps.onnx` on
+    # HuggingFace; this size/hash is also that repo's LFS oid, so the re-host is
+    # verifiable against upstream. 9 outputs, strides 8/16/32, 2 anchors, 5 keypoints —
+    # the same wire format det_500m has, checked against plugins/scrfd_decode.py.
+    "scrfd_2.5g_bnkps.onnx": {
+        "size": 3290207,
+        "sha256": "bc24bb349491481c3ca793cf89306723162c280cb284c5a5e49df3760bf5c2ce",
+    },
+    # EdgeFace-S-GAMMA-0.5 (Idiap, CVPR-W 2023), 3.65M params, 112x112 -> 512-d.
+    # Exported by us from the upstream PyTorch weights and checked against the
+    # reference implementation (worst cosine 0.9999999 over 8 inputs). Single-file:
+    # the weights are inlined rather than split into an `.onnx.data` companion, so
+    # there is one artifact to pin and one to fetch.
+    "edgeface_s_gamma_05.onnx": {
+        "size": 14811229,
+        "sha256": "10f2c9998879869a190b9bc3858ad59e9891ac1c79d4a8b4ffed866c06def2c0",
+    },
+}
+
+
 FACE_MODEL_BUNDLES = {
     "face": (FACE_MODEL_BASE, FACE_MODEL_FILES),
+    "scrfd25g_edgeface_s": (FACE_SCRFD25G_BASE, FACE_SCRFD25G_FILES),
 }
 
 
@@ -872,10 +904,10 @@ def ensure_face_model(model_dir: str, bundle: str = "face",
                       progress_cb=None) -> dict[str, str]:
     """Ensure a face detection + recognition ONNX pair is present.
 
-    `bundle` selects which pinned set to fetch, so a second model added to
+    `bundle` selects which pinned set to fetch, so each model added to
     `plugins/face_runtime.FACE_MODELS` brings its own sizes and hashes rather than
-    reusing these. One entry today; the parameter exists so adding the second does not
-    have to touch the call site.
+    reusing another's. The name comes from that row's `bundle` key, resolved by
+    `face_bundle_for`, so adding a model does not touch any call site.
     """
     spec = FACE_MODEL_BUNDLES.get(bundle)
     if spec is None:

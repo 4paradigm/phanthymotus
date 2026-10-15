@@ -16,6 +16,18 @@ except ImportError:  # pragma: no cover - 部署环境一定有 pyyaml
     yaml = None
 
 
+# 关 thinking 的几种写法——必须和 src/client/llm.py 的 THINKING_OFF_EXTRA 保持
+# 一致，否则评测出来的延迟不是生产会拿到的那个。
+THINKING_OFF_EXTRA = {
+    "chat_template_kwargs": {"enable_thinking": False},
+    "thinking": {"type": "disabled"},
+    "enable_thinking": False,
+    "thinking_budget": 0,
+    "reasoning": {"enabled": False},
+    "reasoning_effort": "none",
+}
+
+
 class ConfigError(Exception):
     pass
 
@@ -234,8 +246,11 @@ def build_groups(cfg: dict, db_path: str | None = None) -> list[Group]:
                 continue
             extra = dict(default_extra)
             if not item.get('think_mode', False):
-                # 与 src/client/llm.py:136-139 的生产行为一致
-                extra.setdefault('chat_template_kwargs', {'enable_thinking': False})
+                # 与生产一致：关 thinking 的几种写法全带上，见
+                # src/client/llm.py 的 THINKING_OFF_EXTRA（那边 import 了
+                # src/config.py，这里刻意不碰，所以照抄一份）
+                for k, v in THINKING_OFF_EXTRA.items():
+                    extra.setdefault(k, v)
             groups.append(Group(f'current/{model}', url, key, model, extra,
                                 source='configdb'))
 
