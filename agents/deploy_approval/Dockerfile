@@ -29,7 +29,8 @@ EXPOSE 25001
 
 # Non-root runtime user (no Docker socket / SSH mounted).
 RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app \
-    && chown -R app:app /app
+    && chown -R app:app /app \
+    && chmod -R a+rX /app/agents
 USER app
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
