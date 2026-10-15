@@ -488,6 +488,102 @@ def test_the_search_falls_back_to_a_timeout_without_odometry():
     assert "searched" in decision.reason
 
 
+def test_the_sweep_counts_radians_actually_turned_when_odometry_says_so():
+    """The point of the sweep: a full circle means a full circle.
+
+    Here the robot is commanded to turn and reports turning at half the
+    commanded rate — a gait still starting, a chassis clipping the command, a
+    robot leaning on something. Counting the command would declare a full sweep
+    on schedule and report `target lost` for a thing that was never passed.
+    """
+    config = _cfg(search_sweep_rad=1.0, search_rate=1.0, search_timeout_s=1e6)
+    state = _state(missing_frames=20)
+    for _ in range(12):
+        decision = _step(detections=_detections(), depth=_depth(),
+                         odom={"vx": 0.0, "vy": 0.0, "wz": -0.5},
+                         config=config, state=state, dt=0.1)
+    # Commanded would have reached 1.2 rad and failed; measured is at 0.6.
+    assert decision.publishes is True
+    assert state.searched_rad == pytest.approx(0.6, abs=0.01)
+
+
+def test_a_robot_that_does_not_turn_never_completes_a_sweep():
+    """The failure this is for: the sweep ending without the robot moving."""
+    config = _cfg(search_sweep_rad=1.0, search_rate=1.0, search_timeout_s=1e6)
+    state = _state(missing_frames=20)
+    for _ in range(50):
+        decision = _step(detections=_detections(), depth=_depth(),
+                         odom={"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                         config=config, state=state, dt=0.1)
+    assert state.searched_rad == 0.0
+    assert decision.status != P.FAILED or "searched" in decision.reason
+
+
+def test_yaw_noise_and_bias_do_not_accumulate_a_phantom_sweep():
+    """Why the accumulation is signed rather than `abs`.
+
+    `abs(measured)` rectifies noise, so a robot standing still banks sweep it
+    never performed — and R1's `yaw_speed` carries a small zero bias on top
+    (~0.12 deg/s measured while stationary), which `abs` cannot cancel either.
+    Every such error inflates the sweep, i.e. gives up early on a target that is
+    really there.
+    """
+    config = _cfg(search_sweep_rad=1.0, search_rate=1.0, search_timeout_s=1e6)
+    state = _state(missing_frames=20)
+    for tick in range(100):
+        _step(detections=_detections(), depth=_depth(),
+              odom={"vx": 0.0, "vy": 0.0, "wz": 0.3 * (-1) ** tick},
+              config=config, state=state, dt=0.1)
+    assert state.searched_rad < 0.05
+
+
+def test_turning_the_wrong_way_does_not_count_as_progress():
+    """Being shoved, or turned by hand, is not searching."""
+    config = _cfg(search_sweep_rad=1.0, search_rate=1.0, search_timeout_s=1e6)
+    state = _state(missing_frames=20, last_seen_side=1.0)
+    for _ in range(10):
+        _step(detections=_detections(), depth=_depth(),
+              # Commanded wz is negative here (towards the right); this is the
+              # opposite sign, so it must not bank credit — nor go negative.
+              odom={"vx": 0.0, "vy": 0.0, "wz": +1.0},
+              config=config, state=state, dt=0.1)
+    assert state.searched_rad == 0.0
+
+
+def test_the_failure_says_which_measure_ended_the_sweep():
+    """"Swept a full circle" and "was told to" are different claims."""
+    config = _cfg(search_sweep_rad=0.5, search_rate=1.0, search_timeout_s=1e6)
+    state = _state(missing_frames=20)
+    for _ in range(12):
+        decision = _step(detections=_detections(), depth=_depth(),
+                         odom={"vx": 0.0, "vy": 0.0, "wz": -1.0},
+                         config=config, state=state, dt=0.1)
+    assert "measured" in decision.reason
+
+    state = _state(missing_frames=20)
+    for _ in range(12):
+        decision = _step(detections=_detections(), depth=_depth(),
+                         config=config, state=state, dt=0.1)
+    assert "no odometry" in decision.reason
+
+
+def test_an_axis_the_robot_does_not_measure_falls_back_to_the_command():
+    """`None` is not `0.0`, here as everywhere.
+
+    A robot reporting forward speed but not yaw rate must keep the commanded
+    sweep, not freeze at zero radians for ever — which is what reading `wz` as
+    0.0 would do, turning "cannot answer" into "never turned".
+    """
+    config = _cfg(search_sweep_rad=1.0, search_rate=1.0, search_timeout_s=1e6)
+    state = _state(missing_frames=20)
+    for _ in range(12):
+        decision = _step(detections=_detections(), depth=_depth(),
+                         odom={"vx": 0.2, "vy": None, "wz": None},
+                         config=config, state=state, dt=0.1)
+    assert decision.publishes is False
+    assert "no odometry" in decision.reason
+
+
 def test_seeing_the_target_again_resets_the_search():
     state = _state(missing_frames=20, searching_for_s=5.0, searched_rad=3.0)
     seed(state, _detections(_obj(x=0.0)), _depth())

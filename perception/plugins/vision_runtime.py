@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 plugins/vision_runtime.py — letterbox preprocessing and output decoding for the
-YOLO-family TensorRT engines used by vop (detection) and visual_depth.
+YOLO-family TensorRT engines used by vop (detection), visual_depth (dense depth)
+and pose (COCO-17 keypoints).
 
 Everything CUDA/TensorRT-related lives in `utils.tensorrt_runtime.TensorRTEngine`;
 this module is the model-specific layer on top, exactly as
@@ -194,6 +195,164 @@ def decode_detections(outputs, meta: LetterboxMeta, conf: float) -> tuple[np.nda
         undo_letterbox(kept[:, :4], meta),
         kept[:, 4].astype(np.float32),
         kept[:, 5].astype(np.int32),
+    )
+
+
+# ── pose decoding ────────────────────────────────────────────────────────────
+#
+# COCO-17, the keypoint set every YOLO pose export uses. Order is part of the
+# weights, not a convention we get to pick — reindexing it silently swaps left
+# and right, which still produces a plausible-looking skeleton.
+COCO_KEYPOINTS = (
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle",
+)
+
+N_KEYPOINTS = len(COCO_KEYPOINTS)
+
+# Index of each name, so callers say COCO_INDEX["left_wrist"] rather than 9.
+COCO_INDEX = {name: i for i, name in enumerate(COCO_KEYPOINTS)}
+
+# The 19 bones drawn between those joints. Shared with the dashboard renderer
+# (web/js/renderers/pose2d.js keeps its own copy, since it cannot import this).
+COCO_SKELETON = (
+    (15, 13), (13, 11), (16, 14), (14, 12), (11, 12),      # legs + hips
+    (5, 11), (6, 12), (5, 6),                              # torso
+    (5, 7), (7, 9), (6, 8), (8, 10),                        # arms
+    (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6),  # head + neck
+)
+
+
+def _pose_layout(rows: np.ndarray, n_kpts: int) -> Optional[int]:
+    """Column offset at which the keypoint triples start, or None.
+
+    Two layouts exist in the wild and they differ by exactly one column:
+
+        [x1, y1, x2, y2, score, class, kx, ky, kv × K]   offset 6
+        [x1, y1, x2, y2, score,        kx, ky, kv × K]   offset 5
+
+    Pose is single-class, so the class column carries no information — but
+    whether it is *there* decides where the keypoints begin, and reading them
+    one column off shifts every joint by half a coordinate. For K=17 the two
+    widths are 57 and 56, so the width alone picks the layout unambiguously;
+    the content checks below are what reject a tensor that merely happens to
+    be that wide.
+    """
+    if rows.ndim != 2:
+        return None
+    for offset in (6, 5):
+        if rows.shape[1] != offset + 3 * n_kpts:
+            continue
+        if rows.shape[0] == 0:
+            # No detections is a valid answer; the width already settled the
+            # layout. Same rule as _looks_like_detection_rows.
+            return offset
+        scores = rows[:, 4]
+        if not np.all((scores >= -1e-3) & (scores <= 1.0 + 1e-3)):
+            continue
+        if offset == 6:
+            classes = rows[:, 5]
+            if not (np.all(classes >= -1e-3)
+                    and np.allclose(classes, np.round(classes), atol=1e-3)):
+                continue
+        # Per-keypoint visibility is also a probability. This is the check that
+        # actually discriminates: box coordinates and keypoint coordinates are
+        # both large positive numbers, so only the [0, 1] columns tell the
+        # orientation and the offset apart.
+        visibility = rows[:, offset + 2::3]
+        if not np.all((visibility >= -1e-3) & (visibility <= 1.0 + 1e-3)):
+            continue
+        return offset
+    return None
+
+
+def _find_pose_rows(outputs, n_kpts: int) -> tuple[Optional[np.ndarray], int]:
+    """Pick the output that reads as pose rows, in either orientation.
+
+    By content, never by index — the same export lists its tensors in opposite
+    order under TensorRT 10.4 and 8.5, which is recorded at length on
+    _find_detection_rows. Indexing here would have worked on one JetPack line
+    and quietly decoded garbage on the other.
+    """
+    for array in _as_candidates(outputs):
+        array = np.asarray(array, dtype=np.float32)
+        if array.ndim == 3 and array.shape[0] == 1:
+            array = array[0]
+        if array.ndim != 2:
+            continue
+        for candidate in (array, array.T):
+            offset = _pose_layout(candidate, n_kpts)
+            if offset is not None:
+                return candidate, offset
+    return None, 0
+
+
+def undo_letterbox_points(points: np.ndarray, meta: LetterboxMeta) -> np.ndarray:
+    """Map xy points from network input space back to original frame pixels.
+
+    Deliberately NOT clipped to the frame, unlike undo_letterbox. A box is a
+    region of the image and a region outside it is meaningless, but a wrist
+    *is* sometimes outside the frame, and pinning it to the border invents a
+    position on the edge — which then reads as a real joint to both the action
+    rules and the renderer. Out-of-frame stays out of frame; the caller decides
+    what to do with it.
+    """
+    if points.size == 0:
+        return points
+    out = points.astype(np.float32, copy=True)
+    out[..., 0] -= meta.pad_x
+    out[..., 1] -= meta.pad_y
+    out /= meta.scale
+    return out
+
+
+def decode_poses(outputs, meta: LetterboxMeta, conf: float,
+                 n_kpts: int = N_KEYPOINTS) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Decode a pose head into (boxes_xyxy, scores, keypoints).
+
+    `keypoints` is (N, n_kpts, 3) — x, y in original frame pixels and the
+    per-joint visibility the model emitted, left as it came. Boxes come back
+    through undo_letterbox (clipped), keypoints through
+    undo_letterbox_points (not clipped; see there).
+
+    decode_detections cannot be reused for this. It settles the orientation by
+    requiring column 5 to be integral class ids, and in a pose row column 5 is
+    either a class id or a keypoint x depending on the layout — so it would
+    accept the 6-column reading of a 57-wide tensor and treat 51 keypoint
+    numbers as mask coefficients to ignore.
+
+    An output that satisfies no layout raises rather than being interpreted:
+    every wrong reading of these numbers still draws a plausible skeleton.
+    """
+    rows, offset = _find_pose_rows(outputs, n_kpts)
+    if rows is None:
+        shapes = [tuple(np.asarray(a).shape) for a in _as_candidates(outputs)]
+        raise VisionDecodeError(
+            f"no engine output {shapes} reads as "
+            f"[x1,y1,x2,y2,score,(class,)kx,ky,kv × {n_kpts}] in either "
+            f"orientation — expected width {5 + 3 * n_kpts} or "
+            f"{6 + 3 * n_kpts}; was the engine exported from a *-pose model "
+            f"with nms=False?"
+        )
+
+    scores = rows[:, 4].astype(np.float32)
+    keep = scores >= conf
+    if not keep.any():
+        return (np.empty((0, 4), dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+                np.empty((0, n_kpts, 3), dtype=np.float32))
+
+    kept = rows[keep]
+    triples = kept[:, offset:offset + 3 * n_kpts].reshape(-1, n_kpts, 3)
+    keypoints = np.empty_like(triples, dtype=np.float32)
+    keypoints[:, :, :2] = undo_letterbox_points(triples[:, :, :2], meta)
+    keypoints[:, :, 2] = triples[:, :, 2]
+    return (
+        undo_letterbox(kept[:, :4], meta),
+        kept[:, 4].astype(np.float32),
+        keypoints,
     )
 
 

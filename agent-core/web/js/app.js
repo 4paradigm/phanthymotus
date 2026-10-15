@@ -3,7 +3,7 @@
  * Mounts canvas, sidebar, deploy panel, settings panel, and activity log.
  */
 
-import { getToken, setToken, verifyToken } from './auth.js';
+import { getToken, setToken, verifyToken, consumeTokenFromUrl } from './auth.js';
 import { initSidebar, renderSidebar } from './sidebar.js';
 import { initCanvas, updateCanvasMcps } from './canvas.js';
 import { initDeployPanel, showDeployConfirmModal } from './deploy-panel.js';
@@ -30,6 +30,10 @@ let _topicStatuses = {};
 const _pingedIds = new Set();
 
 async function main() {
+  // 扫码进来的那一次，token 在 URL 里 —— 必须先收下再走鉴权，否则扫了码
+  // 还是停在登录框上。收下后地址栏里那份会被抹掉。
+  consumeTokenFromUrl();
+
   // Auth gate: check if auth is required
   const token = getToken();
   const noTokenValid = await verifyToken('');  // If no-token passes, auth is disabled

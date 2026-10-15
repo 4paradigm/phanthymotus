@@ -143,6 +143,60 @@ def trt_dtype_to_numpy(trt_module, dtype) -> np.dtype:
 
 # ── engine file ──────────────────────────────────────────────────────────────
 
+# ── TensorRT's own logging ───────────────────────────────────────────────────
+
+# Messages TensorRT emits per *inference* and which say nothing an operator can
+# act on. The profile one is the loud case: an engine with several optimization
+# profiles — OCR's recognizer, whose input width varies — logs two to twelve
+# lines every time the input shape crosses a profile boundary, which on a
+# camera stream is several times a second:
+#
+#   [TRT] [W] ICudaEngine::getProfileDimensions: bindingIndex 0 is not in
+#             profile 1. Using bindingIndex = 2 instead.
+#
+# It is TensorRT translating a binding index through its own deprecated API and
+# then correcting itself. Nothing is wrong and nothing is dropped.
+#
+# Filtering has to happen *here* rather than through Python's logging config,
+# because these lines never go through Python logging at all: they are printed
+# by the C++ logger object we hand to the runtime. Raising the severity to
+# ERROR would also work and would also throw away the warnings that matter —
+# a deserialize failing on a version mismatch is a W.
+_TRT_SUPPRESSED = (
+    "is not in profile",
+)
+
+
+def _make_logger(trt):
+    """A TensorRT logger that drops known per-inference noise and routes the rest
+    into this module's logger, so it carries a timestamp like everything else."""
+    severities = {}
+    try:
+        base = trt.ILogger
+    except AttributeError:          # very old bindings: no interface to subclass
+        return trt.Logger(trt.Logger.WARNING)
+
+    class _FilteredLogger(base):
+        def __init__(self):
+            base.__init__(self)
+
+        def log(self, severity, msg):
+            text = str(msg)
+            if any(noise in text for noise in _TRT_SUPPRESSED):
+                return
+            level = severities.get(severity, logging.INFO)
+            log.log(level, "[TRT] %s", text)
+
+    severities.update({
+        trt.Logger.INTERNAL_ERROR: logging.ERROR,
+        trt.Logger.ERROR: logging.ERROR,
+        trt.Logger.WARNING: logging.WARNING,
+        trt.Logger.INFO: logging.DEBUG,      # TensorRT's INFO is our DEBUG
+        trt.Logger.VERBOSE: logging.DEBUG,
+    })
+    return _FilteredLogger()
+
+
 def read_engine_file(path: str | Path) -> tuple[dict, bytes]:
     """Read a serialized engine, stripping an optional JSON metadata header.
 
@@ -322,7 +376,11 @@ class TensorRTEngine:
         self.metadata, serialized = read_engine_file(self.path)
         try:
             self._cuda = CudaRuntime(device_id)
-            self._runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
+            # Kept on the instance, not passed inline: TensorRT holds a bare
+            # pointer to the logger, so letting a Python-side one be collected
+            # segfaults the process at a random later inference.
+            self._logger = _make_logger(trt)
+            self._runtime = trt.Runtime(self._logger)
             self._engine = self._runtime.deserialize_cuda_engine(serialized)
             del serialized
             if self._engine is None:

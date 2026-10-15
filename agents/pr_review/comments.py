@@ -420,13 +420,22 @@ def _log_details(name: str, log_tail: str, budget: int, kind: str = "build") -> 
 def _deploy_help(built: list[BuildResult]) -> str:
     """How to run a freshly built image.
 
-    Leads with the repo's own `deploy/run-pr-image.sh`, which pulls the image,
-    reads the compose service fragment out of `/deploy/service.yml`, and starts
-    it from a standalone compose file. That keeps the same tool production uses
-    (compose, at /opt/phanthy-motus/docker-compose.yml) instead of a
-    hand-written `docker run`, and means the flags each service declares —
-    privileged, host networking, device mounts — are used exactly as its author
-    wrote them.
+    Leads with run-pr-image.sh, which pulls the image, reads the compose
+    service fragment out of `/deploy/service.yml`, and starts it from a
+    standalone compose file. That keeps the same tool production uses (compose,
+    at /opt/phanthy-motus/docker-compose.yml) instead of a hand-written
+    `docker run`, and means the flags each service declares — privileged, host
+    networking, device mounts — are used exactly as its author wrote them.
+
+    Given as a curl one-liner against the hosted copy, not as
+    `./deploy/run-pr-image.sh`, which is what this used to print. The script
+    was committed to phanthymotus and phanthymotus-driver, one copy each, and
+    the machine the reviewer runs it on is a rig or a robot with a deployed
+    image and no checkout of either — so the path named a file that was not
+    there. The two copies had also drifted apart, and the comment described the
+    behaviour of whichever one happened to be fixed. There is now one copy, at
+    motus.phanthy.com, and install.sh also drops it at
+    /opt/phanthy-motus/run-pr-image.sh.
     """
     out = "\n### Try it\n"
 
@@ -437,11 +446,20 @@ def _deploy_help(built: list[BuildResult]) -> str:
 **{name}**
 
 ```bash
-./deploy/run-pr-image.sh {r.image_tag}
+curl -fsSL https://motus.phanthy.com/run-pr-image.sh | bash -s -- {r.image_tag}
 ```
 
-Then `--logs`, `--shell`, `--down`. Starts container `{r.container_name}`, and
-`--down` removes it and the generated compose file completely.
+Then `--logs {r.container_name}`, `--status`, `--down`, after the `--` the same
+way. Starts container `{r.container_name}`, and `--down` removes it and the
+generated compose file completely. Several images can be under test at once —
+each gets its own compose project, so starting one leaves the others alone;
+name the container to say which one a command applies to, or omit it while
+only one is running.
+
+`--shell` is the exception: it needs a terminal on stdin, which the pipe
+occupies. Use the copy `install.sh` leaves on the machine — `sudo bash
+/opt/phanthy-motus/run-pr-image.sh --shell {r.container_name}` — or just
+`docker exec -it {r.container_name} bash`.
 """
 
     # Targets with no service fragment — in practice just core, which is the

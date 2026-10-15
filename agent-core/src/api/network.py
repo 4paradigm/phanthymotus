@@ -1063,3 +1063,93 @@ async def set_policy_route(req: PolicyRouteRequest):
         return {'code': 200, 'data': {'success': True}}
     except Exception as e:
         return {'code': 500, 'data': {'error': str(e), 'success': False}}
+
+
+# ── 本机可达地址 ──────────────────────────────────────────────────────────────
+#
+# 给「扫码上手机」用：浏览器只知道自己是怎么连上来的，而那常常是
+# `localhost`——机器上本地开的浏览器、SSH 端口转发、反向代理，都会让
+# `location.host` 变成一个手机拨不通的地址。所以地址必须由服务端给。
+#
+# 刻意不走 NetworkManager：`/network/interfaces` 依赖 D-Bus，开发机上没有，
+# 而这个接口在开发机上也要能用。
+
+_VIRTUAL_IFACE_PREFIXES = ('lo', 'docker', 'br-', 'veth', 'virbr', 'tun', 'tap')
+
+# 网卡名到人话。Linux 的可预测命名里 en* 是以太网、wl* 是无线；
+# eth*/wlan* 是旧式名字，机器人上两种都见得到。
+_IFACE_KINDS = (
+    (('wl',), 'wifi'),
+    (('en', 'eth', 'end'), 'ethernet'),
+)
+
+
+def _iface_kind(name: str) -> str:
+    for prefixes, kind in _IFACE_KINDS:
+        if name.startswith(prefixes):
+            return kind
+    return 'other'
+
+
+def _primary_ipv4() -> str:
+    """默认路由会走的那个地址。UDP connect 不发包，只是让内核挑一次路由。
+
+    `gethostname()` 解析不能替代它：容器里通常解析成回环或容器内部地址，
+    那是个手机连不上的地址。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('8.8.8.8', 80))
+        return s.getsockname()[0]
+    except OSError:
+        return ''
+    finally:
+        s.close()
+
+
+def _ipv4_addresses() -> list[dict]:
+    """枚举各网卡的 IPv4 地址。
+
+    Linux 走 ioctl（容器是 host 网络，看到的就是宿主机的网卡）；其它平台
+    没有 SIOCGIFADDR，退回只报默认路由那一个地址。
+    """
+    found = []
+    try:
+        import fcntl
+        import struct
+        SIOCGIFADDR = 0x8915
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for _, name in socket.if_nameindex():
+                if name.startswith(_VIRTUAL_IFACE_PREFIXES):
+                    continue
+                try:
+                    packed = fcntl.ioctl(
+                        sock.fileno(), SIOCGIFADDR,
+                        struct.pack('256s', name[:15].encode()))
+                    ip = socket.inet_ntoa(packed[20:24])
+                except OSError:
+                    continue            # 网卡在但没拿到地址
+                found.append({'device': name, 'ip': ip, 'kind': _iface_kind(name)})
+        finally:
+            sock.close()
+    except (ImportError, AttributeError, OSError):
+        pass
+    return found
+
+
+@router.get('/reachable')
+async def reachable_addresses():
+    """手机能用来访问这台 Agent Core 的地址，默认路由那个排在最前。"""
+    primary = _primary_ipv4()
+    addresses = [
+        a for a in _ipv4_addresses()
+        # 169.254/16 是拿不到 DHCP 时自己编的地址，贴出来只会让人白扫一次
+        if not a['ip'].startswith(('127.', '169.254.'))
+    ]
+    if primary and not any(a['ip'] == primary for a in addresses):
+        addresses.append({'device': '', 'ip': primary, 'kind': 'other'})
+    for a in addresses:
+        a['primary'] = a['ip'] == primary
+    addresses.sort(key=lambda a: (not a['primary'], a['kind'] != 'wifi', a['device']))
+    return {'code': 200, 'data': {'addresses': addresses}}
