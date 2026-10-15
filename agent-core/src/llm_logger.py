@@ -174,6 +174,9 @@ class LLMLogger:
             'content': response.get('content'),
             'tool_calls': response.get('tool_calls'),
             'usage': response.get('_usage'),
+            # think_mode=True 时模型的思考内容。客户端已按 LLM_REASONING_KEEP_CHARS
+            # 截断，这里照记——没有它，开着 think 的那些 token 花在哪里无从复盘。
+            'reasoning': response.get('_reasoning'),
             'ts': time.time(),
         }
         line = json.dumps(record, ensure_ascii=False, separators=(',', ':'))

@@ -113,8 +113,8 @@ class JobStore:
             row[1]
             for row in conn.execute("PRAGMA table_info(build_results)").fetchall()
         }
-        # `run_command` is legacy: it held a generated `docker run`, replaced by
-        # deploy/run-pr-image.sh. Kept so existing databases are not rewritten;
+        # `run_command` is legacy: it held a generated `docker run`, replaced
+        # by run-pr-image.sh. Kept so existing databases are not rewritten;
         # nothing reads or writes it.
         for column, ddl in (
             ("run_command",

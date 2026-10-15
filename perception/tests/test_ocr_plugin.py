@@ -432,10 +432,78 @@ def test_ocr_config_schema_exposes_only_operator_fields():
     from plugins.ocr import TOOLS
 
     schema = TOOLS[0]["configSchema"]
-    assert set(schema["properties"]) == {"min_interval_ms"}
+    assert set(schema["properties"]) == {"ocr_fps"}
     for name, spec in schema["properties"].items():
         assert spec["type"] != "object", name
     assert "required" not in schema
+
+
+# ── recognition rate (ocr_fps) ──────────────────────────────────────
+
+def test_default_ocr_fps_is_once_per_second():
+    """The shipped default. Text in front of a robot does not change at frame
+    rate, and the old default (every frame) kept a core busy on JPEG decode."""
+    assert ocr_plugin.ocr_interval({}) == pytest.approx(1.0)
+    assert ocr_plugin.DEFAULT_OCR_FPS == 1.0
+
+
+def test_ocr_fps_accepts_fractions():
+    assert ocr_plugin.ocr_interval({"ocr_fps": 0.5}) == pytest.approx(2.0)
+    assert ocr_plugin.ocr_interval({"ocr_fps": 4}) == pytest.approx(0.25)
+
+
+def test_ocr_fps_zero_means_every_frame():
+    assert ocr_plugin.ocr_interval({"ocr_fps": 0}) == 0.0
+    assert ocr_plugin.ocr_interval({"ocr_fps": -3}) == 0.0
+
+
+def test_legacy_min_interval_ms_still_honoured():
+    """A canvas saved by the pre-ocr_fps build must keep working — including
+    the old `min_interval_ms: 0`, which meant "every frame"."""
+    assert ocr_plugin.ocr_interval({"min_interval_ms": 500}) == pytest.approx(0.5)
+    assert ocr_plugin.ocr_interval({"min_interval_ms": 0}) == 0.0
+    # ocr_fps wins when both are present.
+    assert ocr_plugin.ocr_interval(
+        {"ocr_fps": 4, "min_interval_ms": 500}) == pytest.approx(0.25)
+
+
+def test_instance_legacy_rate_beats_plugin_default():
+    """config.yaml now ships ocr_fps, so a plain dict merge would let the
+    plugin default override a card that had only stored min_interval_ms. The
+    instance is the more specific layer and must win."""
+    merged = ocr_plugin.merge_rate_cfg(
+        {"ocr_fps": 1.0}, {"min_interval_ms": 250})
+    assert ocr_plugin.ocr_interval(merged) == pytest.approx(0.25)
+
+
+def test_instance_ocr_fps_beats_plugin_ocr_fps():
+    merged = ocr_plugin.merge_rate_cfg({"ocr_fps": 1.0}, {"ocr_fps": 5})
+    assert ocr_plugin.ocr_interval(merged) == pytest.approx(0.2)
+
+
+def test_merge_rate_cfg_keeps_unrelated_keys():
+    merged = ocr_plugin.merge_rate_cfg(
+        {"ocr_fps": 1.0, "language": "zh"}, {"min_interval_ms": 250})
+    assert merged["language"] == "zh"
+
+
+def test_ocr_fps_is_not_an_adapter_setting():
+    """Changing the rate must not rebuild the TensorRT adapter — the live
+    nodes take it in place. If it leaked into the signature, every rate tweak
+    would reload three engines."""
+    base = {"provider": "rapidocr"}
+    assert (ocr_plugin._adapter_signature({**base, "ocr_fps": 1})
+            == ocr_plugin._adapter_signature({**base, "ocr_fps": 9}))
+
+
+def test_ocr_fps_is_instance_scoped():
+    """Two cards on different cameras may read at different rates, so the
+    rate is per-instance, not a shared inference setting."""
+    from plugins.ocr import TOOLS
+
+    spec = TOOLS[0]["configSchema"]["properties"]["ocr_fps"]
+    assert spec["scope"] == "instance"
+    assert spec["default"] == ocr_plugin.DEFAULT_OCR_FPS
 
 
 # ── node-level start/stop races (bot P1, 2026-08-22) ─────────────────────────
