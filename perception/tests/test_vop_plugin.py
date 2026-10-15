@@ -54,6 +54,26 @@ def _plugin(cfg=None, model=None):
     return plugin, executor
 
 
+def test_detect_frame_reuses_one_shot_boxes_without_publishing():
+    model = _FakeModel([
+        [10, 20, 50, 80, 0.9, 0],
+        [80, 20, 130, 100, 0.8, 1],
+        [150, 40, 220, 120, 0.7, 2],
+    ])
+    plugin, _ = _plugin(model=model)
+    plugin._vocabulary = ["person", "quadruped robot", "humanoid robot"]
+    frame = np.zeros((160, 240, 3), dtype=np.uint8)
+
+    objects = plugin.detect_frame(frame, confidence=0.5)
+
+    assert [obj["name"] for obj in objects] == [
+        "person", "quadruped robot", "humanoid robot"]
+    assert objects[1]["bbox"] == [80.0, 20.0, 130.0, 100.0]
+    assert objects[1]["confidence"] == 0.8
+    assert model.calls == 1
+    assert plugin._nodes == {}
+
+
 # ── model name aliasing ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("configured,expected", [

@@ -805,6 +805,29 @@ class VideoObjectPerceptionPlugin:
         self._ensure_model()
         return self._model
 
+    def detect_frame(self, frame: np.ndarray, confidence: float) -> list[dict]:
+        """Detect objects in an already decoded frame without publishing."""
+        from plugins.vision_runtime import decode_detections
+
+        outputs, meta = self._require_engine().infer(frame)
+        boxes, scores, classes = decode_detections(outputs, meta, confidence)
+        height, width = frame.shape[:2]
+        half_w, half_h = width / 2.0, height / 2.0
+        objects = []
+        for (x1, y1, x2, y2), score, cls_id in zip(boxes, scores, classes):
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            objects.append({
+                "name": self._class_name_from_vocab(int(cls_id)),
+                "position": [
+                    round(float((cx - half_w) / half_w), 3),
+                    round(float((cy - half_h) / half_h), 3),
+                ],
+                "confidence": round(float(score), 2),
+                "bbox": [round(float(v), 1) for v in (x1, y1, x2, y2)],
+                "color": color_stats(frame, (x1, y1, x2, y2)),
+            })
+        return objects
+
     def _recognize_image(self, args: dict, url_action: str) -> dict:
         """Decode one image and run the detector over it once."""
         cfg = dict(self._plugin_cfg)
@@ -823,38 +846,15 @@ class VideoObjectPerceptionPlugin:
                 "picture and not, say, HTML returned by a redirect", source,
             ).as_result()
 
-        try:
-            model = self._require_engine()
-        except Exception as error:  # noqa: BLE001 — surfaced to the caller
-            log.error(f"[vop] engine load failed during recognize: {error}", exc_info=True)
-            return {"ok": False, "reason": "engine_unavailable", "detail": str(error)}
-
         confidence = args.get("confidence")
         confidence = float(confidence) if confidence not in (None, "") else self._confidence
+        try:
+            objects = self.detect_frame(frame, confidence)
+        except Exception as error:  # noqa: BLE001 — surfaced to the caller
+            log.error(f"[vop] engine failed during recognize: {error}", exc_info=True)
+            return {"ok": False, "reason": "engine_unavailable", "detail": str(error)}
 
-        from plugins.vision_runtime import decode_detections
-
-        outputs, meta = model.infer(frame)
-        boxes, scores, classes = decode_detections(outputs, meta, confidence)
-
-        # Same shape the stream publishes, so a consumer written against
-        # {topic}/objects needs no second parser — plus the pixel box, which a
-        # caller who cannot see the frame has no other way to recover.
         height, width = frame.shape[:2]
-        half_w, half_h = width / 2.0, height / 2.0
-        objects = []
-        for (x1, y1, x2, y2), score, cls_id in zip(boxes, scores, classes):
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            objects.append({
-                "name": self._class_name_from_vocab(int(cls_id)),
-                "position": [
-                    round(float((cx - half_w) / half_w), 3),
-                    round(float((cy - half_h) / half_h), 3),
-                ],
-                "confidence": round(float(score), 2),
-                "bbox": [round(float(v), 1) for v in (x1, y1, x2, y2)],
-                "color": color_stats(frame, (x1, y1, x2, y2)),
-            })
 
         # Echo onto the card's output topic when one is running, so a topic-less
         # card wired into the canvas actually shows data flowing — which is the
