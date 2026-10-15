@@ -1,8 +1,11 @@
-"""One-shot robot model card contract."""
+"""Robot model card contract."""
 
+import json
+import threading
+import time
 import numpy as np
 
-from vision_stubs import _FakeExecutor, frame_bytes
+from vision_stubs import _FakeCompressedImage, _FakeExecutor, _wait_until, frame_bytes
 
 from plugins.robot_model_catalog import CANDIDATES
 from plugins.robot_model import RobotModelPlugin
@@ -108,3 +111,58 @@ def test_photo_and_url_use_shared_input_guard_and_recognition(monkeypatch, tmp_p
     assert card.dispatch("robot_model", {"action": "recognize_by_photo", "image_path": "/etc/passwd"})["reason"] == "bad_input"
     image.write_bytes(b"broken")
     assert card.dispatch("robot_model", {"action": "recognize_by_photo", "image_path": str(image)})["reason"] == "bad_input"
+
+
+def test_stream_publishes_and_stop_disposes_node():
+    card = plugin([box("robot", [0, 0, 20, 20])])
+    result = card.dispatch("robot_model", {"action": "start", "input_topic": "/camera"})
+    assert result["state"] == "running"
+    node = card._nodes["/camera"]
+    assert node in card._executor.nodes
+    assert node.publishers[0].topic == "/camera/robot_models"
+    node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(30, 30)))
+    assert _wait_until(lambda: len(node.publishers[0].messages) == 1)
+    assert json.loads(node.publishers[0].messages[0])["objects"][0]["model_id"] == CANDIDATES[0][0]
+    assert card.dispatch("robot_model", {"action": "info"})["instances"]["/camera"]["state"] == "running"
+    assert card.dispatch("robot_model", {"action": "stop", "input_topic": "/camera"})["state"] == "idle"
+    assert node.destroyed and node not in card._executor.nodes
+    assert node.subscriptions == []
+
+
+def test_stream_rate_limit_and_instance_isolation():
+    card = plugin([], {"fps": 1})
+    for topic in ("/one", "/two"):
+        card.dispatch("robot_model", {"action": "start", "input_topic": topic})
+    one, two = card._nodes["/one"], card._nodes["/two"]
+    one.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(30, 30)))
+    two.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(30, 30)))
+    assert _wait_until(lambda: len(one.publishers[0].messages) == len(two.publishers[0].messages) == 1)
+    one.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(30, 30)))
+    time.sleep(0.1)
+    assert len(one.publishers[0].messages) == 1
+    assert len(two.publishers[0].messages) == 1
+    card.dispatch("robot_model", {"action": "stop", "input_topic": "/one"})
+    assert "/two" in card._nodes
+    card.dispatch("robot_model", {"action": "stop", "input_topic": "/two"})
+
+
+def test_stop_during_inference_suppresses_late_publish():
+    card = plugin([])
+    started, release = threading.Event(), threading.Event()
+    def delayed(frame):
+        started.set()
+        release.wait(2)
+        return {"ok": True, "objects": []}
+    card.recognize_frame = delayed
+    card.dispatch("robot_model", {"action": "start", "input_topic": "/slow"})
+    node = card._nodes["/slow"]
+    node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(30, 30)))
+    assert started.wait(1)
+    stopped = threading.Thread(target=lambda: card.dispatch(
+        "robot_model", {"action": "stop", "input_topic": "/slow"}))
+    stopped.start()
+    assert _wait_until(lambda: node._stopped)
+    release.set()
+    stopped.join(2)
+    assert not stopped.is_alive()
+    assert node.publishers[0].messages == []
