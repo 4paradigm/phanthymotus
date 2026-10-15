@@ -412,6 +412,38 @@ def _missed_channel_reply_warning(trigger_event: dict, replied_message_ids: set[
             f'{json.dumps(missed, ensure_ascii=False)}')
 
 
+def _not_dispatched(name: str, acp_result: dict | None) -> dict:
+    """barrier 没放行时，这次调用的工具结果。
+
+    **这条调用没有发给设备** —— 没有发声、没有动作、设备侧什么都没发生。原先三种
+    状态共用一句 `barrier wait interrupted before dispatch (status=timeout)`，LLM 把
+    它读成了成功：天轶 2026-10-15 的导览里，结束语的 speak 在 barrier 超时后被丢掉，
+    下一轮模型的原话是「结束语已播放完毕」，然后 finish() 收工 —— 而那段话一个字都
+    没播出去。
+
+    所以这里按状态分开说，并且把 `error` 放在顶层：模型对 `status` 的语义不敏感，
+    对 `error` 敏感。timeout 还要显式要求重发，这是唯一一种「该做的事没做、而且没人
+    会替你做」的情况。
+    """
+    status = (acp_result or {}).get('status')
+    aids = (acp_result or {}).get('actions') or []
+    aid_txt = ','.join(str(a) for a in aids) or '(未知)'
+    base = {"status": "not_dispatched", "dispatched": False, "tool": name}
+    if status == 'timeout':
+        return {**base,
+                "error": f"未执行：等 {aid_txt} 超时，`{name}` 没有发给设备。"
+                         f"没有发声、没有动作，设备侧什么都没发生。前一个动作可能仍在"
+                         f"进行。确认仍然需要这一步时请重新调用一次。",
+                "retry": True}
+    if status == 'cancelled':
+        return {**base,
+                "error": f"未执行：等待期间被打断（通常是用户插话或 interrupt），"
+                         f"`{name}` 没有发给设备。请先按新的输入重新判断，不要默认重发。"}
+    return {**base,
+            "reason": f"barrier wait interrupted before dispatch (status={status})",
+            "error": f"未执行：`{name}` 没有发给设备（barrier status={status}）。"}
+
+
 def _acp_barrier_log(name: str, acp_result: dict | None) -> None:
     """记录 barrier 结果。timeout 与 completed 走同一条路（都清 pending 并放行），
     所以不打这一行的话，一次静默超时看起来跟成功完全一样 —— ACP 回调发不出去
@@ -2615,11 +2647,7 @@ class Event:
                                           "请结合新消息继续处理，不要重复已经说过的内容。",
                             }
                         else:
-                            result = {
-                                "status": "not_dispatched",
-                                "reason": f"barrier wait interrupted before dispatch "
-                                          f"(status={_barrier_result.get('status')})",
-                            }
+                            result = _not_dispatched(name, _barrier_result)
                     else:
                         result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
@@ -2642,8 +2670,7 @@ class Event:
                         # still legitimately in flight; the caller decides whether to
                         # void this whole round (reconsidering, nothing dispatched
                         # yet) or just record it as not-dispatched.
-                        result = {"status": "not_dispatched",
-                                  "reason": f"barrier wait interrupted before dispatch (status={_barrier_result.get('status')})"}
+                        result = _not_dispatched(name, _barrier_result)
                         _reconsidered = (_barrier_result.get('status') == 'reconsidering')
                     else:
                         args['_trace_id'] = _trace_id

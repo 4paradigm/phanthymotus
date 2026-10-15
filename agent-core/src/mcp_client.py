@@ -1294,6 +1294,49 @@ async def cancel_and_reap(tasks) -> None:
         await asyncio.gather(*live, return_exceptions=True)
 
 
+def _barrier_budget(aids: list[str], default: float) -> float:
+    """这个 barrier 最多等多久。
+
+    同一个资源上的动作是**串行**的 —— 一个嘴一次只能说一句，驱动侧按队列逐条播。
+    所以互相冲突的那些要把预算**相加**；资源不冲突的并行跑，取 max。
+
+    原先一律取 max。天轶 2026-10-15 的导览里，barrier 同时等一条自动播报和一条
+    487 字的讲解，预算取了后者的 172s；而两条在驱动的队列里是前后播的，真正播完
+    要 208s。barrier 在 13:21:50 放弃，9 秒之后那条才完成 —— 结束语于是一个字都
+    没播出去（见 event/llm.py 的 not_dispatched 分支）。
+
+    分组用并查集而不是「按 resource 集合相等分组」：`{mouth}` 和 `{mouth, speaker}`
+    不相等但互相冲突，必须算进同一条串行链。未声明资源的一侧按互斥处理（见
+    `resources_conflict`），于是它会把所有组并成一条链 —— 这正是保守的那一边。
+    """
+    if not aids:
+        return default
+    parent = list(range(len(aids)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a in range(len(aids)):
+        for b in range(a + 1, len(aids)):
+            if resources_conflict(_pending_resources.get(aids[a]),
+                                  _pending_resources.get(aids[b])):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+    sums: dict[int, float] = {}
+    for i, aid in enumerate(aids):
+        root = find(i)
+        t = _pending_timeouts.get(aid, default)
+        if t == float('inf'):
+            return float('inf')
+        sums[root] = sums.get(root, 0.0) + float(t)
+    return min(max(sums.values()), MAX_PENDING_TIMEOUT_S)
+
+
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
                         tool_name: str | None = None,
                         want: frozenset | None = None,
@@ -1335,8 +1378,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
     if not events:
         return {"status": "no_pending"}
 
-    # 只对实际要等的 action 取最大 timeout
-    effective_timeout = max(_pending_timeouts.get(aid, timeout) for aid in aids)
+    effective_timeout = _barrier_budget(aids, timeout)
     _scope_txt = ''
     if scoped:
         _want_txt = ','.join(sorted(want)) if want else 'undeclared/exclusive'
