@@ -301,7 +301,7 @@ TOOLS = [
                 # identity — i.e. trust the engine.
                 "cal_a": {"type": "number", "title": "Calibration a", "description": "Depth exponent; 1 means no exponent correction.", "default": 1.0, "scope": "instance"},
                 "cal_b": {"type": "number", "title": "Calibration b", "description": "Log scale offset; 0 means no scale correction.", "default": 0.0, "scope": "instance"},
-                "calibration_backend": {"type": "string", "title": "Calibration model", "description": "Select the model these measured coefficients belong to. Recalibrate before using a different model.", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "scope": "instance"},
+                "calibration_backend": {"type": "string", "title": "Calibration model", "description": "这对 cal_a / cal_b 是在哪个深度模型上量的。`calibrate` 会自己填好，手填只在从别处抄一组系数时需要。**留空＝YOLO26-N Depth**，因为这个字段出现之前只有这一个模型。和当前模型不符的系数会被忽略（不换算），深度回到模型自带的标定，`info()` 的 calibration_note 会说明。", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "scope": "instance"},
                 # Presets are for the common case (a known robot, a known
                 # camera); cal_a/cal_b above stay for anything else, and a
                 # non-identity value there wins — see _calibration_from_cfg.
@@ -1051,7 +1051,11 @@ class VideoDepthPerceptionPlugin:
             raise ValueError(f"unsupported visual_depth backend: {self._backend}")
         # Kept whole: image_input reads max_image_bytes and the path-confinement
         # settings straight from it (see plugins/image_input.py).
-        self._plugin_cfg = self._backend_calibration_cfg(plugin_cfg or {})
+        self._plugin_cfg, note = self._backend_calibration_cfg(plugin_cfg or {})
+        # Per instance ("" for the card's own config), because that is the
+        # scope a fit has. Surfaced on `info()` — a dropped coefficient that
+        # nothing says out loud is the failure this card keeps repeating.
+        self._cal_notes: dict[str, str] = {"": note} if note else {}
         # What cal_a/cal_b were before `calibrate` overwrote them, so
         # `reset_calibration` can put the dict back exactly as it found it.
         self._cal_cfg_backup = None
@@ -1089,20 +1093,60 @@ class VideoDepthPerceptionPlugin:
         # stop, or a model load.
         self._nodes_lock = threading.RLock()
 
+    # The backend a fit was measured against, when the row does not say.
+    #
+    # **Absent means `yolo`, and that is not a guess.** `calibration_backend`
+    # is new in this change; before it there was one depth model, so every
+    # coefficient already saved on every deployed card was measured against
+    # YOLO26-depth by construction. Reading absence as "unknown" and refusing
+    # the row instead rejected the config of every card that had ever been
+    # calibrated — and Agent Core replaces a rejected config's reason with its
+    # own generic text, so the robot came up with
+    # `配置无效（缺少 url/key）` on a card that has neither a url nor a key.
+    # See agent-core/src/api/mcp_manage.py and mcp_client.py.
+    LEGACY_CAL_BACKEND = "yolo"
+
     def _backend_calibration_cfg(self, cfg):
+        """Drop a fit that was not measured on the selected model, and say so.
+
+        A log-affine fit belongs to a **camera × model** pair, so coefficients
+        measured under one backend are not transferable to the other: on
+        r1_sz's ultra-wide lens YOLO's `cal_b: -0.9753` is a factor of 2.65,
+        and DepthART, which is handed the real `K`, needs nothing like it.
+
+        What this must *not* do is refuse the config. The canvas replays the
+        saved row on every project start, so a raise here does not read as
+        "check this coefficient" — it stops the depth card coming up at all,
+        under a message about credentials the card does not have. The card
+        already has a rule for a fit the selector is ignoring
+        (`calibration_conflict`): drop it, fall back to the model's own fit,
+        and state it out loud. Same rule here, and `_select_backend` already
+        strips the same keys when the switch happens while the plugin is live.
+        """
         cfg = dict(cfg)
         manual = cfg.get("calibration_preset") == CAL_MANUAL
         custom = any(float(cfg.get(key, default)) != default
                      for key, default in (("cal_a", 1.), ("cal_b", 0.), ("depth_scale", 1.)))
-        if (manual or custom) and cfg.get("calibration_backend") != self._backend:
-            raise ValueError("Calibration model is missing or differs from the selected depth model; review the coefficients and save their model, or choose no calibrate")
-        if self._backend == "depthart":
-            choice = cfg.get("calibration_preset")
-            if choice in CALIBRATION_PRESETS:
-                raise ValueError("YOLO calibration presets cannot be used with DepthART; use manual site calibration")
-            if choice == CAL_AUTO:
+        measured_on = cfg.get("calibration_backend") or self.LEGACY_CAL_BACKEND
+        note = ""
+        if (manual or custom) and measured_on != self._backend:
+            note = (f"标定系数是在 {measured_on!r} 上量的，当前深度模型是 "
+                    f"{self._backend!r} —— 这两个数**没有生效**，深度用的是模型"
+                    f"自带的标定。换模型后要重新 calibrate，再把新的 cal_a / "
+                    f"cal_b 和 Calibration model 存进卡片配置。")
+        if self._backend == "depthart" and cfg.get("calibration_preset") in CALIBRATION_PRESETS:
+            note = (f"{cfg['calibration_preset']!r} 是在 YOLO26-depth 上量的预设，"
+                    f"DepthART 用不了 —— 已按「{CAL_NONE}」处理。要标定请用 "
+                    f"calibrate 现场量。")
+        if note:
+            log.warning(f"[visual_depth] {note}")
+            for key in ("cal_a", "cal_b", "depth_scale", "calibration_backend"):
+                cfg.pop(key, None)
+            if cfg.get("calibration_preset") is not None:
                 cfg["calibration_preset"] = CAL_NONE
-        return cfg
+        if self._backend == "depthart" and cfg.get("calibration_preset") == CAL_AUTO:
+            cfg["calibration_preset"] = CAL_NONE
+        return cfg, note
 
     def _camera_declaration(self, key):
         with self._nodes_lock:
@@ -1575,6 +1619,7 @@ class VideoDepthPerceptionPlugin:
                         config.pop(key, None)
                 self._cal_a, self._cal_b = 1.0, 0.0
                 self._cal_samples = []
+                self._cal_notes.clear()
                 self._cal_cfg_backup = None
                 self._model_load_error = self._model_load_status = None
         finally:
@@ -1671,6 +1716,14 @@ class VideoDepthPerceptionPlugin:
                 info["camera_info"] = camera_out
             if camera_note:
                 info["camera_info_note"] = camera_note
+            # Why `calibration` reads `model-default` on a card whose config
+            # dialog visibly holds a cal_b. Without it the two cases — nobody
+            # ever measured, and somebody measured against the other model —
+            # are indistinguishable from outside.
+            with self._nodes_lock:
+                cal_note = self._cal_notes.get(cam_key) or self._cal_notes.get("")
+            if cal_note:
+                info["calibration_note"] = cal_note
             return info
 
         elif action == "start":
@@ -1773,16 +1826,26 @@ class VideoDepthPerceptionPlugin:
                 except ValueError as error:
                     return {"status": "error", "adapter_ok": False, "message": str(error)}
             try:
-                cfg = self._backend_calibration_cfg(cfg)
+                cfg, cal_note = self._backend_calibration_cfg(cfg)
             except (TypeError, ValueError) as error:
+                # A coefficient that is not a number at all. Unlike a fit from
+                # the other model, there is nothing to fall back *to* here —
+                # the value is garbage and the operator has to fix it.
                 return {"status": "error", "adapter_ok": False, "message": str(error)}
+            with self._nodes_lock:
+                if cal_note:
+                    self._cal_notes[instance_id] = cal_note
+                else:
+                    self._cal_notes.pop(instance_id, None)
+            note_field = {"calibration_note": cal_note} if cal_note else {}
             if instance_id:
                 with self._nodes_lock:
                     self._instance_configs[instance_id] = cfg
                     running = instance_id in self._nodes
                 if running:
                     self._retire_node(instance_id)
-                return {"status": "configured", "instance_id": instance_id, "config": cfg}
+                return {"status": "configured", "instance_id": instance_id,
+                        "config": cfg, **note_field}
             if "fps" in cfg:
                 self._fps = int(cfg["fps"])
             if any(k in cfg for k in ("cal_a", "cal_b", "depth_scale")):
@@ -1790,7 +1853,7 @@ class VideoDepthPerceptionPlugin:
                     cfg, (self._cal_a, self._cal_b))
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
-            return {"status": "configured", "config": cfg}
+            return {"status": "configured", "config": cfg, **note_field}
 
         elif action in ("calibrate", "reset_calibration"):
             if action == "reset_calibration" or args.get("reset"):
