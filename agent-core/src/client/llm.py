@@ -74,6 +74,11 @@ TOTAL_TIMEOUT_S = _env_float('LLM_TOTAL_TIMEOUT', 600.0)
 # 在飞请求的心跳日志间隔；0 关闭。事中可见，不必等失败后才蹦一行
 HEARTBEAT_S = _env_float('LLM_HEARTBEAT', 15.0)
 
+# 思考内容落盘时保留的字符数。整条留会把历史和 data.db 撑大（实测单轮 870 字，
+# 长的更多），全丢又等于看不见——所以留一段，长度照完整值记。设 0 关掉保留，
+# 只留长度。
+REASONING_KEEP_CHARS = int(_env_float('LLM_REASONING_KEEP_CHARS', 4000))
+
 
 async def _log_request(request: httpx.Request):
     """httpx event hook: dump the real HTTP request body to disk for debugging.
@@ -190,6 +195,7 @@ class _StreamAccumulator:
 
     def __init__(self):
         self.content_parts: list[str] = []
+        self.reasoning_parts: list[str] = []
         self.tool_calls: dict[int, dict] = {}
         self.finish_reason: str | None = None
         self.usage = None
@@ -197,8 +203,12 @@ class _StreamAccumulator:
 
     @property
     def chars(self) -> int:
-        return sum(len(p) for p in self.content_parts) + sum(
-            len(tc['function']['arguments']) for tc in self.tool_calls.values())
+        # 思考的字数也要算进来。它只进心跳行，不影响聚合结果——漏了的话，
+        # think_mode=True 下的思考阶段会打出 `chunks=1145 chars=0`，看着像
+        # 「流在动但一个字都没出」的卡死，实测 18.7s 里有 15s 长这样。
+        return (sum(len(p) for p in self.content_parts)
+                + sum(len(p) for p in self.reasoning_parts)
+                + sum(len(tc['function']['arguments']) for tc in self.tool_calls.values()))
 
     def feed(self, chunk) -> None:
         self.chunks += 1
@@ -223,6 +233,14 @@ class _StreamAccumulator:
         text = _attr(delta, 'content', '')
         if text:
             self.content_parts.append(text)
+
+        # think_mode=True 时模型的思考逐帧到达（实测 126 帧 / 870 字），而这里原先
+        # 只取 content 和 tool_calls，于是它在进入任何日志之前就被丢掉：整个容器
+        # 日志和落盘的请求文件里 `reasoning_content` 命中数都是 0。开着 think 的
+        # token 和首 token 延迟照付，内容却无从复盘。
+        reasoning = _attr(delta, 'reasoning_content', '')
+        if reasoning:
+            self.reasoning_parts.append(reasoning)
 
         for tcd in (_attr(delta, 'tool_calls') or []):
             idx = _attr(tcd, 'index', 0) or 0
@@ -250,11 +268,35 @@ class _StreamAccumulator:
             if args:
                 slot['function']['arguments'] += args
 
+    @property
+    def reasoning(self) -> str:
+        return ''.join(self.reasoning_parts)
+
     def message(self) -> dict:
         msg: dict = {'role': 'assistant', 'content': ''.join(self.content_parts)}
         if self.tool_calls:
             msg['tool_calls'] = [self.tool_calls[i] for i in sorted(self.tool_calls)]
+        _attach_reasoning(msg, self.reasoning)
         return msg
+
+
+def _attach_reasoning(msg: dict, text: str) -> dict:
+    """把思考内容挂成内部字段，让它在日志和落盘文件里可见。
+
+    下划线开头是本仓库既有的约定：`event/llm.py` 出门前会摘掉所有 `_` 字段，
+    所以它能进历史、进 recent 文件，却不会随历史回到请求体里被服务端拒。
+    （`_usage` 走的就是这条路。）
+
+    正文截断而不是整条丢弃：思考可以很长，而历史是要落 data.db 的；长度始终
+    按完整值记，截断了就说出来，免得把「被截断」读成「模型只想了这么多」。
+    """
+    if not text:
+        return msg
+    limit = REASONING_KEEP_CHARS
+    kept = text if len(text) <= limit else text[:limit]
+    msg['_reasoning'] = {'chars': len(text), 'text': kept,
+                         'truncated': len(text) > limit}
+    return msg
 
 
 def _finalize_message(msg: dict) -> dict:
@@ -336,6 +378,64 @@ async def _heartbeat(model: str, url: str, t0: float, acc: _StreamAccumulator) -
               f'(chunks={acc.chunks} chars={acc.chars})')
 
 
+# ── 关闭 thinking ─────────────────────────────────────────────────────────────
+#
+# 同一个模型换一个供应商就换一种关法：vLLM/SGLang 自建的走 chat template，
+# 智谱和 Anthropic 兼容层走 `thinking.type`，DashScope 把开关放在顶层，
+# OpenRouter 又是另一个名字。单带 chat_template_kwargs 时实测会遇到「参数发了
+# 但照样在想」——那不是模型不听话，是这个网关压根不看这个字段。
+#
+# 所以几种写法全带上：多出来的字段绝大多数网关直接忽略，而真有网关认了 400，
+# 下面 _create() 会按报错点名的字段逐个撤掉并记在这个 client 上，不让一次
+# 400 变成整次调用失败。
+#
+# 下面标的「实测」是 2026-10-14 在 Orin5 上对生产入口
+# router.phanthy.com + zhipu/glm-5.2 逐个字段单独发、同一个 prompt 各 5 次的
+# completion_tokens 中位数（2 = 只答数字，没思考；175 = 在想）：
+#
+#     不发任何字段                 175    3.09s
+#     chat_template_kwargs 单发      2    0.81s   ← 管用
+#     thinking.type 单发             2    0.71s   ← 管用
+#     enable_thinking 单发           2    0.88s   ← 管用
+#     thinking_budget 单发         207    3.66s   ← 这条线上无效
+#     reasoning.enabled 单发       197    2.81s   ← 这条线上无效
+#     reasoning_effort 单发          2    0.80s   ← 管用
+#     六个一起发                     3    0.72s
+#
+# 两点结论。一是「发了但没关掉」是真的：这个入口对 thinking_budget 和
+# reasoning.enabled 完全不响应，只发它们等于没发，而延迟差 4 倍。二是互不打架
+# ——六个一起发和最好的单发同档，没有哪个字段把别的顶掉。
+#
+# 无效的那两个仍然留着：它们是给别的供应商的（DashScope、OpenRouter），在这个
+# 入口只是被忽略，代价为零。别拿这张表当「哪些字段该删」的依据——它只测了一个
+# 入口一个模型，换一条线结论就不一样，这正是要全发的原因。
+THINKING_OFF_EXTRA = {
+    # vLLM / SGLang 托管的 Qwen3、GLM 系列（经 chat template 透传）。实测管用
+    "chat_template_kwargs": {"enable_thinking": False},
+    # 智谱 GLM-4.5/4.6 的 OpenAI 接口、Anthropic 兼容网关。实测管用
+    "thinking": {"type": "disabled"},
+    # DashScope 及部分自建网关放在顶层的同名开关。实测管用
+    "enable_thinking": False,
+    # budget 形式：0 等价于不思考。实测对 router.phanthy.com 无效，留给别的线
+    "thinking_budget": 0,
+    # OpenRouter。同上，实测对 router.phanthy.com 无效
+    "reasoning": {"enabled": False},
+    # OpenAI 风格的 reasoning_effort，部分网关用它关。实测管用
+    "reasoning_effort": "none",
+}
+
+
+def _looks_like_unknown_param(err: str) -> bool:
+    """400 的文案像不像「有个参数我不认识」。"""
+    low = err.lower()
+    if any(k in low for k in ('context length', 'context_length', 'maximum context',
+                             'token limit', 'too many tokens')):
+        return False
+    return any(k in low for k in ('parameter', 'argument', 'field', 'property',
+                                  'extra_body', 'unknown', 'unsupported',
+                                  'unrecognized', 'not allowed', 'invalid request'))
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class Client():
@@ -371,10 +471,58 @@ class Client():
         model_override: 'str | None' = None,
     ) -> dict:
 
-        def _extra(think_mode: bool) -> dict:
+        def _extra(client, think_mode: bool) -> dict:
             if think_mode:
                 return {}
-            return {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+            # 之前被这个 endpoint 400 掉的字段不再发
+            rejected = getattr(client, '_thinking_rejected', ())
+            extra = {k: v for k, v in THINKING_OFF_EXTRA.items() if k not in rejected}
+            return {"extra_body": extra} if extra else {}
+
+        async def _create(client, model, url, kwargs):
+            """发起 create()，并对「网关不认某个字段」逐级降级后重试。
+
+            每一轮都严格减少 kwargs，所以循环必然收敛。
+            """
+            while True:
+                try:
+                    return await client.chat.completions.create(**kwargs)
+                except openai.BadRequestError as e:
+                    err = str(e)
+                    if 'stream_options' in kwargs and 'stream_options' in err:
+                        print(f'[llm] {model} @ {url} rejects stream_options — '
+                              f'retrying without usage')
+                        client._no_stream_options = True
+                        kwargs.pop('stream_options')
+                        continue
+                    extra = kwargs.get('extra_body') or {}
+                    # 必须按词边界匹配：`thinking` 是 `thinking_budget` 的前缀，
+                    # 子串匹配会因为后者被拒而把前者一起撤掉——而前者正是对智谱
+                    # 那条线唯一管用的关法。
+                    named = [k for k in extra
+                             if re.search(rf'(?<![\w.]){re.escape(k)}(?![\w])', err)]
+                    if named:
+                        # 报错点了名：记在 client 上，这个 endpoint 以后都不发了
+                        client._thinking_rejected = set(
+                            getattr(client, '_thinking_rejected', ())) | set(named)
+                        drop = named
+                    elif extra and _looks_like_unknown_param(err):
+                        # 没点名（有些网关只回一句 unsupported parameter）：把整组
+                        # 关闭参数一起撤掉再试一次，但不记账——这个 400 也可能压根
+                        # 与 thinking 无关，不该让该 endpoint 永久退回带 thinking。
+                        #
+                        # 要先确认它真像「参数不认识」：context overflow 在一些网关
+                        # 上也是 400，无条件重发等于把一个 36k 的请求白发两遍。
+                        drop = list(extra)
+                    else:
+                        raise
+                    print(f'[llm] {model} @ {url} rejects {",".join(drop)} — retrying without')
+                    extra = {k: v for k, v in extra.items() if k not in drop}
+                    if extra:
+                        kwargs['extra_body'] = extra
+                    else:
+                        kwargs.pop('extra_body', None)
+                    continue
 
         async def _go_stream(client, model, think_mode: bool, attempt: int) -> dict:
             url = str(client.base_url)
@@ -387,7 +535,7 @@ class Client():
                 tools=tool_list,
                 max_tokens=10240,
                 stream=True,
-                **_extra(think_mode),
+                **_extra(client, think_mode),
             )
             # include_usage 让最后一帧带 usage。个别网关不认这个字段，认了 400
             # 就记住并降级——usage 没了只是统计缺一行，不该让整次调用失败。
@@ -401,16 +549,7 @@ class Client():
                 # httpx 的 120s read timeout 管着。不把它一起纳入首 token 预算，
                 # 卡在响应头上的请求照样能干等两分钟——那正是这次要修的故障。
                 async def _open():
-                    try:
-                        return await client.chat.completions.create(**kwargs)
-                    except openai.BadRequestError as e:
-                        if 'stream_options' not in kwargs or 'stream_options' not in str(e):
-                            raise
-                        print(f'[llm] {model} @ {url} rejects stream_options — '
-                              f'retrying without usage')
-                        client._no_stream_options = True
-                        kwargs.pop('stream_options')
-                        return await client.chat.completions.create(**kwargs)
+                    return await _create(client, model, url, kwargs)
 
                 try:
                     stream = await asyncio.wait_for(_open(), timeout=first_timeout)
@@ -432,15 +571,17 @@ class Client():
 
                 elapsed = time.perf_counter() - t0
                 usage = _usage_dict(acc.usage, elapsed)
+                think = f' | reasoning={len(acc.reasoning)}字' if acc.reasoning else ''
                 if usage:
                     print(
                         f'[llm] {model} ok {elapsed:.2f}s | '
                         f'prompt={usage["prompt_tokens"]} completion={usage["completion_tokens"]} '
                         f'total={usage["total_tokens"]} cached={usage["cached_tokens"]} '
-                        f'| stream chunks={acc.chunks}'
+                        f'| stream chunks={acc.chunks}{think}'
                     )
                 else:
-                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A | stream chunks={acc.chunks}')
+                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A '
+                          f'| stream chunks={acc.chunks}{think}')
 
                 msg = _finalize_message(acc.message())
                 if usage:
@@ -461,24 +602,26 @@ class Client():
             url = str(client.base_url)
             t0 = time.perf_counter()
             try:
-                response = await client.chat.completions.create(
+                response = await _create(client, model, url, dict(
                     model=model,
                     messages=message_list,
                     tools=tool_list,
                     max_tokens=10240,
                     stream=False,
-                    **_extra(think_mode),
-                )
+                    **_extra(client, think_mode),
+                ))
                 elapsed = time.perf_counter() - t0
                 usage = _usage_dict(response.usage, elapsed)
+                _r = _attr(response.choices[0].message, 'reasoning_content', '') or ''
+                think = f' | reasoning={len(_r)}字' if _r else ''
                 if usage:
                     print(
                         f'[llm] {model} ok {elapsed:.2f}s | '
                         f'prompt={usage["prompt_tokens"]} completion={usage["completion_tokens"]} '
-                        f'total={usage["total_tokens"]} cached={usage["cached_tokens"]}'
+                        f'total={usage["total_tokens"]} cached={usage["cached_tokens"]}{think}'
                     )
                 else:
-                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A')
+                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A{think}')
                 try:
                     msg = response.choices[0].message.to_dict()
                 except (KeyError, AttributeError, IndexError) as parse_err:
@@ -493,6 +636,8 @@ class Client():
                             pass
                     print(f'[llm] WARNING: message.to_dict() failed ({parse_err}), using fallback parse')
                 msg = _finalize_message(msg)
+                _attach_reasoning(msg, _attr(response.choices[0].message,
+                                             'reasoning_content', '') or '')
                 # 附加 token 用量信息（内部字段，下划线前缀）
                 if usage:
                     msg['_usage'] = usage

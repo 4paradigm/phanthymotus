@@ -38,6 +38,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_OCR_MODEL_DIR = "/models/ocr/ppocrv6-small-trt"
 
+# Once a second. Text in front of a robot does not change at frame rate, and
+# the previous default (every frame the camera delivers) meant a 14fps 720p
+# stream kept a whole CPU core busy on JPEG decode and enhancement whether or
+# not anything downstream consumed the result.
+DEFAULT_OCR_FPS = 1.0
+
 # Where a topic-less card publishes, mirroring tts's /perception/tts.
 DEFAULT_OUTPUT_TOPIC = "/perception/ocr"
 _DEFAULT_INSTANCE = "_default"
@@ -105,7 +111,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "instance"},
+                "ocr_fps": {"type": "number", "minimum": 0, "default": DEFAULT_OCR_FPS, "description": "识别频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都识别", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -115,6 +121,45 @@ TOOLS = [
 
 
 # ── OCR Adapters ──────────────────────────────────────────────────────────────
+
+def ocr_interval(cfg: dict) -> float:
+    """Seconds to leave between recognitions, from `ocr_fps`.
+
+    Expressed as a frequency because that is what an operator reasons about
+    ("read once a second"), and it stays meaningful when the camera's own rate
+    changes — a minimum interval in ms does not. Fractional values are the
+    point: 0.2 means once every five seconds.
+
+    `ocr_fps: 0` means "every frame the camera delivers". `min_interval_ms` is
+    still honoured when `ocr_fps` is absent, so a canvas saved by an earlier
+    build of this plugin keeps working (the same courtesy plugins/face.py
+    extends for its own `detect_fps` migration).
+    """
+    if cfg.get("ocr_fps") is None and cfg.get("min_interval_ms") is not None:
+        legacy = max(0.0, float(cfg["min_interval_ms"])) / 1000.0
+        log.info("[ocr] using legacy min_interval_ms=%s as %.3fs between "
+                 "recognitions; set ocr_fps instead",
+                 cfg["min_interval_ms"], legacy)
+        return legacy
+    fps = float(cfg.get("ocr_fps", DEFAULT_OCR_FPS))
+    if fps <= 0:
+        return 0.0
+    return 1.0 / fps
+
+
+def merge_rate_cfg(plugin_cfg: dict, instance_cfg: dict) -> dict:
+    """Merge plugin- and instance-level config, keeping the rate precedence.
+
+    A plain `{**plugin, **instance}` loses the legacy fallback: config.yaml now
+    ships `ocr_fps`, so a card that stored only `min_interval_ms` would see the
+    plugin's `ocr_fps` and have its own setting ignored. The instance is the
+    more specific layer, so whichever rate key *it* carries wins outright.
+    """
+    merged = {**plugin_cfg, **instance_cfg}
+    if "min_interval_ms" in instance_cfg and "ocr_fps" not in instance_cfg:
+        merged.pop("ocr_fps", None)
+    return merged
+
 
 def _ocr_output_topic(input_topic: str) -> str:
     """The one place the output topic is derived from the input.
@@ -527,13 +572,15 @@ class OCRPlugin:
                 node.stop()
 
     def _create_node(self, node_key: str, input_topic: str, adapter) -> "_OCRNode":
-        cfg = {**self._plugin_cfg, **self._instance_configs.get(node_key, {})}
+        cfg = merge_rate_cfg(
+            self._plugin_cfg, self._instance_configs.get(node_key, {})
+        )
         return _OCRNode(
             input_topic,
             adapter,
             cfg.get("language", self._language),
             node_suffix=node_key.replace('/', '_').replace('-', '_'),
-            min_interval=float(cfg.get('min_interval_ms', 0)) / 1000.0,
+            min_interval=ocr_interval(cfg),
         )
 
     def _dispose(self, node_key: str, node: "_OCRNode") -> None:
@@ -819,7 +866,7 @@ class OCRPlugin:
         }
 
         if instance_id:
-            shared = set(cfg) - {"language", "min_interval_ms"}
+            shared = set(cfg) - {"language", "ocr_fps", "min_interval_ms"}
             if shared:
                 raise ValueError(
                     "OCR inference settings are shared: " + ", ".join(sorted(shared))
@@ -847,11 +894,9 @@ class OCRPlugin:
                 # Lightweight fields only — apply to live nodes in place.
                 for node_key, node in self._nodes.items():
                     inst = self._instance_configs.get(node_key, {})
-                    merged = {**updated_cfg, **inst}
+                    merged = merge_rate_cfg(updated_cfg, inst)
                     node._language = merged.get("language", self._language)
-                    node._min_interval = max(
-                        0.0, float(merged.get("min_interval_ms", 0)) / 1000.0
-                    )
+                    node._min_interval = ocr_interval(merged)
                 return {"status": "configured", "adapter_loaded": self._adapter is not None, "reused": self._adapter is not None}
 
             # Model-affecting change: invalidate any in-flight load, drop the

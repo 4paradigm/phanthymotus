@@ -863,8 +863,40 @@ FACE_MODEL_FILES = {
 }
 
 
+# SCRFD-2.5G-BNKPS + EdgeFace-S-GAMMA-0.5, the second `plugins/face_runtime.FACE_MODELS`
+# row. Re-hosted on COS for the same reason as buffalo_sc, and in one more case: the
+# EdgeFace ONNX does not exist upstream at all. Idiap publish PyTorch weights only, so
+# the ONNX here is our own export (`anjith2006/edgeface`, fp32, opset 17), which makes
+# COS the only place it can come from.
+FACE_SCRFD25G_BASE = os.environ.get(
+    "FACE_SCRFD25G_MODEL_BASE_URL", f"{COS_BASE}/face/scrfd25g_edgeface_s"
+)
+# Pinned against the **COS copies, re-downloaded and re-hashed after upload**, so these
+# are the bytes a robot will actually receive — not the bytes that were uploaded.
+FACE_SCRFD25G_FILES = {
+    # insightface scrfd_2.5g_bnkps, re-hosted from `hsuyabc/scrfd_2.5g_bnkps.onnx` on
+    # HuggingFace; this size/hash is also that repo's LFS oid, so the re-host is
+    # verifiable against upstream. 9 outputs, strides 8/16/32, 2 anchors, 5 keypoints —
+    # the same wire format det_500m has, checked against plugins/scrfd_decode.py.
+    "scrfd_2.5g_bnkps.onnx": {
+        "size": 3290207,
+        "sha256": "bc24bb349491481c3ca793cf89306723162c280cb284c5a5e49df3760bf5c2ce",
+    },
+    # EdgeFace-S-GAMMA-0.5 (Idiap, CVPR-W 2023), 3.65M params, 112x112 -> 512-d.
+    # Exported by us from the upstream PyTorch weights and checked against the
+    # reference implementation (worst cosine 0.9999999 over 8 inputs). Single-file:
+    # the weights are inlined rather than split into an `.onnx.data` companion, so
+    # there is one artifact to pin and one to fetch.
+    "edgeface_s_gamma_05.onnx": {
+        "size": 14811229,
+        "sha256": "10f2c9998879869a190b9bc3858ad59e9891ac1c79d4a8b4ffed866c06def2c0",
+    },
+}
+
+
 FACE_MODEL_BUNDLES = {
     "face": (FACE_MODEL_BASE, FACE_MODEL_FILES),
+    "scrfd25g_edgeface_s": (FACE_SCRFD25G_BASE, FACE_SCRFD25G_FILES),
 }
 
 
@@ -872,16 +904,61 @@ def ensure_face_model(model_dir: str, bundle: str = "face",
                       progress_cb=None) -> dict[str, str]:
     """Ensure a face detection + recognition ONNX pair is present.
 
-    `bundle` selects which pinned set to fetch, so a second model added to
+    `bundle` selects which pinned set to fetch, so each model added to
     `plugins/face_runtime.FACE_MODELS` brings its own sizes and hashes rather than
-    reusing these. One entry today; the parameter exists so adding the second does not
-    have to touch the call site.
+    reusing another's. The name comes from that row's `bundle` key, resolved by
+    `face_bundle_for`, so adding a model does not touch any call site.
     """
     spec = FACE_MODEL_BUNDLES.get(bundle)
     if spec is None:
         raise ValueError(
             f"unknown face model bundle {bundle!r}; this build has "
             f"{sorted(FACE_MODEL_BUNDLES)}")
+    base, files = spec
+    model_dir = require_models_subpath(model_dir)
+    return ensure_verified_bundle(bundle, model_dir, base, files,
+                                  progress_cb=progress_cb)
+
+
+# ── Speaker embedding (voiceprint) ───────────────────────────────────────────
+# Re-hosted on COS for the same reason as the face models: the upstream GitHub
+# release redirects to a signed, expiring URL that cannot be pinned, and the
+# robots have no reliable route to GitHub.
+SPEAKER_MODEL_BASE = os.environ.get(
+    "SPEAKER_MODEL_BASE_URL", f"{COS_BASE}/speaker/campplus_zh_en"
+)
+# Pinned against the COS copy, **re-downloaded and re-hashed after upload**, so
+# this is the bytes a robot will actually receive. Verified 2026-10-09 to be
+# byte-identical to the `checksum.txt` entry in sherpa-onnx's
+# `speaker-recongition-models` release.
+SPEAKER_MODEL_FILES = {
+    # 3D-Speaker CAM++, 200k speakers, Chinese+English, 192-d, 16 kHz.
+    # Apache-2.0. ONNX metadata: output_dim=192, sample_rate=16000,
+    # normalize_samples=1, feature_normalize_type=global-mean.
+    "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": {
+        "size": 28281164,
+        "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+    },
+}
+
+SPEAKER_MODEL_BUNDLES = {
+    "campplus_zh_en": (SPEAKER_MODEL_BASE, SPEAKER_MODEL_FILES),
+}
+
+
+def ensure_speaker_model(model_dir: str, bundle: str = "campplus_zh_en",
+                         progress_cb=None) -> dict[str, str]:
+    """Ensure a speaker-embedding ONNX model is present.
+
+    `bundle` selects which pinned set to fetch, so a second model added to
+    `plugins.speaker_runtime.SPEAKER_MODELS` brings its own size and hash rather
+    than reusing these.
+    """
+    spec = SPEAKER_MODEL_BUNDLES.get(bundle)
+    if spec is None:
+        raise ValueError(
+            f"unknown speaker model bundle {bundle!r}; this build has "
+            f"{sorted(SPEAKER_MODEL_BUNDLES)}")
     base, files = spec
     model_dir = require_models_subpath(model_dir)
     return ensure_verified_bundle(bundle, model_dir, base, files,
@@ -1238,6 +1315,175 @@ DEPTH_MODEL_BUNDLES = {
 }
 
 
+POSE_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp61-trt10.4-orin-640",
+        "files": {
+            "yolo26s-pose.engine": {
+                "size": 24704612,
+                "sha256": "ec90f471e4b3fa793e567b14859ea23aa5ea36602e8a99d9632b05baa9681338",
+            },
+        },
+    },
+    # Built on Orin 5 in a container off the jp5.11 image (TensorRT 8.5.2.2),
+    # 634 s. Not interchangeable with the jp61 plan above and not a rebuild of
+    # the same bytes: a different TensorRT produces a different engine, which is
+    # the whole reason this table is keyed by JetPack family.
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yolo26s-pose.engine": {
+                "size": 23916308,
+                "sha256": "80473d875d6cbfec829a0572e51bdde7785b42b7542f3ae21a55c8f163ab376c",
+            },
+        },
+    },
+}
+
+
+# Hand keypoints for the pose card: RTMPose-m, hand5, 21 joints, 256x256.
+#
+# **This replaced a YOLO26-pose model fine-tuned on hand keypoints, and the
+# reason was accuracy, not speed.** On a real camera that model put the wrist
+# in the middle of the palm on an OK sign, returned an open hand as a clump,
+# and collapsed the joints under motion blur — while its detection score
+# stayed around 0.8, so nothing downstream could tell. Compared on the same
+# crops, RTMPose was right on every picture it was wrong on.
+#
+# It is also cheaper, which was not expected. Per hand, through the production
+# runtime:
+#
+#     engine                     Orin 6 @1020MHz   Orin 5 (jp5.11)
+#     yolo26s-hand21 @448            7.99 ms           8.19 ms
+#     rtmpose-m-hand5 @256           3.58 ms           4.33 ms
+#     rtmpose-m-hand5, batch 2       2.52 ms/hand      3.14 ms/hand
+#
+# Built from the ONNX in OpenMMLab's own deployment bundle
+# (rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320), with
+# trtexec --fp16 inside the target perception image. Dynamic batch, 1..4.
+#
+# Two things about this model that the YOLO one did not have:
+#
+# * **It is top-down.** There is no detector and no detection score; it
+#   assumes whatever is in the box is a hand. The box comes from the arm, and
+#   it has to be roughly right — measured, anywhere from 0.30 to 0.65 of the
+#   crop the YOLO model wanted produced a correct hand, which is a 2.2x range.
+# * **It normalises with ImageNet mean/std on RGB**, not /255. Feeding it the
+#   other one produces a confident hand in the wrong place.
+#
+# The two outputs are both (N, 21, 512) — identical shapes — so they can only
+# be told apart by name. plugins/hand_runtime indexes them by name for that
+# reason; this repository has already been bitten by TensorRT listing an
+# engine's outputs in a different order on the two JetPack lines.
+HAND_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/rtmpose-m-hand5/tensorrt-jp61-trt10.4-orin-256",
+        "files": {
+            "rtmpose-m-hand5.engine": {
+                "size": 30486172,
+                "sha256": "b1d182c7376a220153ffd6bdaadab7674c6f660a711086f1e5b92e399bde2a72",
+            },
+        },
+    },
+    # Same ONNX, different TensorRT (8.5.2.2), therefore different bytes —
+    # which is the whole reason this table is keyed by JetPack family.
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/rtmpose-m-hand5/tensorrt-jp511-trt8.5-orin-256",
+        "files": {
+            "rtmpose-m-hand5.engine": {
+                "size": 30313545,
+                "sha256": "c162de4333771769b50309db16b651f3ce40f627b3719dc3fbb75ef305a5b212",
+            },
+        },
+    },
+}
+
+
+# The ONNX both plans were built from, mirrored so an engine rebuild is
+# reproducible without re-downloading from openmmlab. **Build-time only; no
+# robot fetches this.**
+HAND_ONNX = {
+    "rtmpose-m-hand5-256.onnx": {
+        "size": 55080248,
+        "sha256": "39e858936bca0f94c09847d4e70b68a51d6c0adac61f36b457fcadb54621cd29",
+    },
+}
+
+HAND_ONNX_BASE = os.environ.get(
+    "HAND_ONNX_BASE_URL", f"{VISION_MODEL_BASE}/rtmpose-m-hand5/onnx")
+
+
+# Skeleton-action recognition for the pose card: ST-GCN++, joint stream,
+# NTU60-XSub, 2D 17-keypoint input. 1.39 M params and 1.95 GFLOPs at 100 frames,
+# top-1 89.3% — the smallest of the options with a published 2D-COCO17
+# checkpoint, and on that benchmark also the most accurate (ST-GCN 3.1 M/3.8 G,
+# AGCN 3.5 M/4.4 G). Single stream, not the four-stream ensemble: 4x the compute
+# for +3.9 points.
+#
+# jp61 is built and pinned: 4,384,468 bytes, 4.66 ms GPU latency on Orin 6,
+# T=100 as the checkpoint was trained. jp511 still has to come from Orin 5 and
+# stays unpinned, so ensure_action_model raises there with the build
+# instructions rather than fetching anything unverified, and the pose card falls
+# back to the `rules` backend with that message in `info` instead of failing.
+#
+# Built by tools/stgcn_export.py (checkpoint -> ONNX, validated against torch to
+# 2.9e-06) then trtexec --fp16 inside the jp6.1 image. The engine agrees with the
+# ONNX to three decimal places on the same inputs.
+# The ST-GCN++ *checkpoint*, mirrored onto COS so the engine build is
+# reproducible and does not depend on download.openmmlab.com being reachable
+# from wherever it runs. Not a runtime download — no robot ever fetches this; it
+# is an input to tools/export_vision_engines.py --model action.
+#
+# Upstream:
+#   http://download.openmmlab.com/mmaction/pyskl/ckpt/stgcnpp/
+#       stgcnpp_ntu60_xsub_hrnet/j.pth
+#   PYSKL's stgcn++_ntu60_xsub_hrnet joint config, 89.3 top-1.
+#
+# PYSKL's code is Apache-2.0. The weights are trained on NTU RGB+D, whose
+# dataset terms are academic-research; a model trained on it inherits that
+# question for a commercial deployment. Recorded here as a fact to check, not
+# settled by this file.
+ACTION_CHECKPOINT_BASE = os.environ.get(
+    "ACTION_CHECKPOINT_BASE_URL",
+    f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/checkpoint")
+
+ACTION_CHECKPOINT = {
+    "stgcnpp_ntu60_xsub_hrnet_j.pth": {
+        "size": 5854105,
+        "sha256": "b274888dd5b7bd8552ce4e3c3073973af84fa0fd18fd94363eac25457f225992",
+    },
+}
+
+
+ACTION_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp61-trt10.4-orin-t100",
+        "files": {
+            "stgcnpp-ntu60-2d.engine": {
+                "size": 4384468,
+                "sha256": "fea60df0ebfa190dd1483705d1e53bd3124480afd6612258c6545e919e6f74f6",
+            },
+        },
+    },
+    # Same checkpoint and the same ONNX graph as jp61 — only the TensorRT that
+    # built the plan differs (8.5.2.2), which is why the bytes and the size do.
+    # Measurably slower on the older line: 8.62 ms GPU latency against jp61's
+    # 4.66 ms for an identical (1, 2, 100, 17, 3) input, so a jp5.11 robot has
+    # roughly half the action-inference headroom. The ~3 Hz per-track throttle
+    # in plugins/pose.py was sized with margin and still holds, but anything
+    # that raises activity_interval_s should be checked here first.
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp511-trt8.5-orin-t100",
+        "files": {
+            "stgcnpp-ntu60-2d.engine": {
+                "size": 3842709,
+                "sha256": "8a627bf92d372ba87eaf81062051ff1da7e2e759543161eb8a5d66c84a871268",
+            },
+        },
+    },
+}
+
+
 def _ensure_vision_bundle(
     kind: str, bundles: dict, model_dir: str, family: str | None = None,
     progress_cb=None,
@@ -1260,9 +1506,11 @@ def _ensure_vision_bundle(
         raise RuntimeError(
             f"{kind.upper()}_MODEL_BUNDLES[{key!r}] has no pinned size/sha256 for "
             f"{sorted(unpinned)} — build the engine with "
-            "tools/export_vision_engines.py on a host of that JetPack line, "
-            "publish it to COS, and record the size and SHA256 of the *uploaded* "
-            "copy here"
+            "tools/export_vision_engines.py in a container built from the "
+            f"{key} perception image (NOT on the Jetson host: the image and the "
+            "host ship different TensorRT versions and an engine only loads on "
+            "the one that built it), publish it to COS, and record the size and "
+            "SHA256 of the *uploaded* copy here"
         )
     log.info(f"[model_downloader] {kind}: using {key} bundle")
     return ensure_verified_bundle(
@@ -1320,4 +1568,65 @@ def ensure_depth_model(model_dir: str, family: str | None = None,
                        progress_cb=None) -> dict[str, str]:
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_action_checkpoint(model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Fetch the pinned ST-GCN++ checkpoint for the engine build.
+
+    Build-time only; nothing on a robot calls this. Pinned by size+SHA256 like
+    every other artefact here, and the pin is the hash of the copy downloaded
+    back from COS — which for this one also matches the upstream openmmlab
+    download byte for byte, so the mirror is verifiably the same weights.
+    """
+    return ensure_verified_bundle("action/checkpoint", model_dir,
+                                  ACTION_CHECKPOINT_BASE, ACTION_CHECKPOINT,
+                                  progress_cb=progress_cb)
+
+
+def ensure_action_model(model_dir: str, family: str | None = None,
+                        progress_cb=None) -> dict[str, str]:
+    """Ensure the skeleton-action engine matching the runtime TensorRT is present."""
+    return _ensure_vision_bundle("action", ACTION_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_hand_model(model_dir: str, family: str | None = None,
+                      progress_cb=None) -> dict[str, str]:
+    """Ensure the 21-keypoint hand engine matching the runtime TensorRT is present.
+
+    Fetched lazily and only when the pose card's `hands` setting asks for it:
+    on an 8 GB Orin already running body pose, vop, depth, OCR, ASR and TTS,
+    memory rather than GPU time is the binding constraint, so a card whose hand
+    channel is off must cost nothing.
+    """
+    return _ensure_vision_bundle("hand", HAND_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_hand_onnx(model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Fetch the ONNX the hand engines are built from. Build-time only.
+
+    Nothing on a robot calls this; it is an input to
+    tools/export_vision_engines.py --model hand, and the reason an engine can be
+    rebuilt without re-exporting from the .pt (which would change the numbers if
+    the ultralytics version differs — see HAND_MODEL_BUNDLES).
+    """
+    return ensure_verified_bundle("hand/onnx", model_dir, HAND_ONNX_BASE,
+                                  HAND_ONNX, progress_cb=progress_cb)
+
+
+def ensure_pose_model(model_dir: str, family: str | None = None,
+                      progress_cb=None) -> dict[str, str]:
+    """Ensure the human-keypoint engine matching the runtime TensorRT is present.
+
+    The pins above are still zero, so this raises with the build instructions
+    until the engines have been exported inside the jp6.1 and jp5.11 perception
+    images and published. That is the intended behaviour, not a gap:
+    _ensure_vision_bundle refuses an unpinned entry rather than downloading it,
+    because size+SHA256 verification is what makes a multi-source fetch safe at
+    all. A pose card on a machine without the bundle reports `state: error` with
+    that message, and ASR/TTS/VOP/OCR are untouched.
+    """
+    return _ensure_vision_bundle("pose", POSE_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)

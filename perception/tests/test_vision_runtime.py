@@ -16,12 +16,17 @@ import pytest
 import vision_stubs  # noqa: F401  (installs the cv2 / ROS stubs)
 
 from plugins.vision_runtime import (  # noqa: E402
+    COCO_INDEX,
+    COCO_KEYPOINTS,
+    COCO_SKELETON,
+    N_KEYPOINTS,
     PAD_VALUE,
     LetterboxMeta,
     VisionDecodeError,
     VisionEngineSession,
     decode_depth,
     decode_detections,
+    decode_poses,
     letterbox,
     to_blob,
     undo_letterbox,
@@ -298,3 +303,215 @@ def test_an_empty_detection_output_decodes_to_no_boxes():
         np.zeros((1, 0, 6), dtype=np.float32), meta, conf=0.25)
     assert boxes.shape == (0, 4)
     assert scores.size == 0 and classes.size == 0
+
+
+# ── pose decoding ────────────────────────────────────────────────────────────
+
+def _pose_rows(entries, *, with_class: bool, n_kpts: int = 17) -> np.ndarray:
+    """Build an engine-shaped pose output from (box, score, keypoints) tuples.
+
+    `keypoints` is a list of (x, y, visibility) in *network input* space, which
+    is what an engine emits — the decoder's job is to get them back out.
+    """
+    offset = 6 if with_class else 5
+    rows = np.zeros((len(entries), offset + 3 * n_kpts), dtype=np.float32)
+    for i, (box, score, keypoints) in enumerate(entries):
+        rows[i, :4] = box
+        rows[i, 4] = score
+        if with_class:
+            rows[i, 5] = 0.0                      # pose is single-class
+        rows[i, offset:] = np.asarray(keypoints, dtype=np.float32).reshape(-1)
+    return rows
+
+
+def _uniform_keypoints(x: float, y: float, visibility: float = 0.9,
+                       n_kpts: int = 17) -> list:
+    return [(x, y, visibility)] * n_kpts
+
+
+# scale 0.5, pad_y 80: a 1280x960 frame letterboxed into 640x640.
+_POSE_META = LetterboxMeta(0.5, 0, 80, 1280, 960)
+
+
+@pytest.mark.parametrize("with_class", [True, False])
+def test_pose_round_trip_maps_box_and_keypoints_back(with_class):
+    """Both layouts must yield the same geometry — the class column carries no
+    information, it only moves where the keypoints begin."""
+    rows = _pose_rows(
+        [((50, 100, 250, 300), 0.9, _uniform_keypoints(100, 180))],
+        with_class=with_class,
+    )
+    boxes, scores, keypoints = decode_poses(rows[None], _POSE_META, conf=0.25)
+
+    assert boxes.shape == (1, 4)
+    assert boxes[0] == pytest.approx([100.0, 40.0, 500.0, 440.0])
+    assert scores == pytest.approx([0.9])
+    assert keypoints.shape == (1, 17, 3)
+    # (100 - 0) / 0.5 = 200 ; (180 - 80) / 0.5 = 200
+    assert keypoints[0, 0, :2] == pytest.approx([200.0, 200.0])
+    assert keypoints[0, :, 2] == pytest.approx([0.9] * 17)
+
+
+def test_pose_decodes_the_transposed_orientation():
+    """Output order and orientation are not stable across TensorRT majors."""
+    rows = _pose_rows(
+        [((50, 100, 250, 300), 0.8, _uniform_keypoints(100, 180))],
+        with_class=True,
+    )
+    straight = decode_poses(rows, _POSE_META, conf=0.25)
+    transposed = decode_poses(rows.T, _POSE_META, conf=0.25)
+    for a, b in zip(straight, transposed):
+        assert a == pytest.approx(b)
+
+
+def test_pose_picks_its_tensor_by_content_not_by_index():
+    """A pose engine emits more than one output; the pose rows may be second."""
+    rows = _pose_rows(
+        [((50, 100, 250, 300), 0.7, _uniform_keypoints(100, 180))],
+        with_class=True,
+    )
+    decoy = np.full((1, 32, 160, 160), 0.5, dtype=np.float32)   # mask prototypes
+    boxes, _, keypoints = decode_poses([decoy, rows], _POSE_META, conf=0.25)
+    assert boxes.shape == (1, 4)
+    assert keypoints[0, 0, :2] == pytest.approx([200.0, 200.0])
+
+
+def test_pose_filters_by_score():
+    rows = _pose_rows(
+        [
+            ((50, 100, 250, 300), 0.9, _uniform_keypoints(100, 180)),
+            ((60, 110, 260, 310), 0.1, _uniform_keypoints(120, 200)),
+        ],
+        with_class=True,
+    )
+    boxes, scores, keypoints = decode_poses(rows, _POSE_META, conf=0.5)
+    assert boxes.shape == (1, 4) and keypoints.shape == (1, 17, 3)
+    assert scores == pytest.approx([0.9])
+
+
+def test_pose_with_no_detections_decodes_to_empty_arrays():
+    """Finding nobody is an answer, with the keypoint axis still present —
+    a consumer that indexes [:, 0] must not get an IndexError on an empty frame."""
+    boxes, scores, keypoints = decode_poses(
+        np.zeros((1, 0, 57), dtype=np.float32), _POSE_META, conf=0.25)
+    assert boxes.shape == (0, 4)
+    assert scores.shape == (0,)
+    assert keypoints.shape == (0, 17, 3)
+
+
+def test_pose_below_threshold_keeps_the_keypoint_axis():
+    rows = _pose_rows(
+        [((50, 100, 250, 300), 0.1, _uniform_keypoints(100, 180))],
+        with_class=True,
+    )
+    _, _, keypoints = decode_poses(rows, _POSE_META, conf=0.5)
+    assert keypoints.shape == (0, 17, 3)
+
+
+def test_pose_keypoints_are_not_clipped_but_boxes_are():
+    """A wrist outside the frame is real information; a box outside it is not.
+
+    Pinning an off-frame joint to the border invents a position on the edge,
+    which then reads as a real joint to both the action rules and the renderer.
+    """
+    rows = _pose_rows(
+        # Keypoint at network (-50, 0) → original (-100, -160): the frame was
+        # padded on y only, so pad_y is what pushes y negative.
+        [((-100, -100, 250, 300), 0.9, _uniform_keypoints(-50, 0))],
+        with_class=True,
+    )
+    boxes, _, keypoints = decode_poses(rows, _POSE_META, conf=0.25)
+    assert boxes[0, 0] == pytest.approx(0.0)        # clipped into the frame
+    assert boxes[0, 1] == pytest.approx(0.0)
+    assert keypoints[0, 0, 0] == pytest.approx(-100.0)   # left as measured
+    assert keypoints[0, 0, 1] == pytest.approx(-160.0)
+
+
+def test_a_detection_only_output_is_refused_as_a_pose():
+    """vop's 6-wide rows are not a pose; reading them as one must raise."""
+    rows = np.zeros((4, 6), dtype=np.float32)
+    rows[:, 4] = 0.9
+    with pytest.raises(VisionDecodeError, match="pose"):
+        decode_poses(rows, _POSE_META, conf=0.25)
+
+
+def test_an_off_by_one_width_is_refused_rather_than_shifted():
+    """Reading the keypoints one column off shifts every joint by half a
+    coordinate and still draws a plausible skeleton — so it must not decode."""
+    rows = np.zeros((2, 58), dtype=np.float32)
+    rows[:, 4] = 0.9
+    with pytest.raises(VisionDecodeError):
+        decode_poses(rows, _POSE_META, conf=0.25)
+
+
+def test_visibility_outside_zero_one_is_refused():
+    """The visibility columns are the check that actually settles the layout:
+    box and keypoint coordinates are both large positive numbers."""
+    rows = _pose_rows(
+        [((50, 100, 250, 300), 0.9, _uniform_keypoints(100, 180, visibility=7.5))],
+        with_class=True,
+    )
+    with pytest.raises(VisionDecodeError):
+        decode_poses(rows, _POSE_META, conf=0.25)
+
+
+def test_a_dense_depth_output_is_not_mistaken_for_a_pose():
+    with pytest.raises(VisionDecodeError):
+        decode_poses(np.zeros((1, 1, 480, 640), dtype=np.float32),
+                     _POSE_META, conf=0.25)
+
+
+def test_skeleton_edges_reference_real_keypoints():
+    """A bad index here draws a bone to a joint that does not exist, or
+    silently to the wrong one."""
+    assert len(COCO_KEYPOINTS) == N_KEYPOINTS == 17
+    assert len(COCO_SKELETON) == 19
+    for a, b in COCO_SKELETON:
+        assert 0 <= a < N_KEYPOINTS and 0 <= b < N_KEYPOINTS
+        assert a != b
+    assert len(set(COCO_SKELETON)) == len(COCO_SKELETON)
+
+
+def test_keypoint_index_matches_the_name_order():
+    """COCO order is part of the weights; reindexing it swaps left and right."""
+    assert COCO_INDEX["nose"] == 0
+    assert COCO_INDEX["left_shoulder"] == 5 and COCO_INDEX["right_shoulder"] == 6
+    assert COCO_INDEX["left_wrist"] == 9 and COCO_INDEX["right_wrist"] == 10
+    assert COCO_INDEX["left_hip"] == 11 and COCO_INDEX["right_hip"] == 12
+    assert COCO_INDEX["left_ankle"] == 15 and COCO_INDEX["right_ankle"] == 16
+    assert all(COCO_INDEX[name] == i for i, name in enumerate(COCO_KEYPOINTS))
+
+
+def test_the_real_pose_engine_geometry_decodes():
+    """The shape the shipped engine actually declares.
+
+    Measured, not assumed: exporting yolo26s-pose inside the jp6.1 perception
+    image (TensorRT 10.4) reported
+
+        input  "images"  shape(1, 3, 640, 640)  FLOAT
+        output "output0" shape(1, 300, 57)      FLOAT
+
+    57 = 6 + 3x17, so the engine carries the class column and the keypoints
+    start at index 6; 300 rows is the NMS-free end-to-end head, the same fixed
+    row count yoloe-26s-seg's (1, 300, 38) has. One output tensor, so the
+    per-JetPack output *ordering* problem does not arise for pose — but the
+    decode still picks by content, because that was also true of vop's engine
+    on one of the two lines and not the other.
+
+    Pinning it here means a future re-export that changes the layout fails in a
+    test rather than on a robot.
+    """
+    rows = np.zeros((1, 300, 57), dtype=np.float32)
+    rows[0, 0, :4] = (10, 20, 110, 420)
+    rows[0, 0, 4] = 0.91
+    rows[0, 0, 5] = 0.0                       # the class column
+    rows[0, 0, 6:] = np.tile([55.0, 66.0, 0.8], 17)
+    meta = LetterboxMeta(1.0, 0, 0, 640, 640)
+
+    boxes, scores, keypoints = decode_poses(rows, meta, conf=0.5)
+    assert boxes.shape == (1, 4) and keypoints.shape == (1, 17, 3)
+    assert scores[0] == pytest.approx(0.91)
+    assert keypoints[0, 0].tolist() == pytest.approx([55.0, 66.0, 0.8])
+    # The other 299 rows are all-zero: score 0 is below any usable threshold,
+    # so a fixed-row head does not report 299 phantom people.
+    assert len(boxes) == 1

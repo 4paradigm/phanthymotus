@@ -186,7 +186,11 @@ TOOLS = [
             "required": ["action"],
             "x-completion": {
                 "actions": ["speak"],
-                "timeout": 60
+                "timeout": 60,
+                # 「说完了」是回执，不是新消息 —— 不该唤醒一个 turn。原先靠 collector
+                # 认 action_id 以 speak-/tts- 开头，也就是靠本文件给 id 的拼写；
+                # 申报出来才靠得住（换个前缀就失效的判断不算判断）。
+                "silent_completion": True
             },
             # The speaker is a single exclusive channel: two `speak` calls must
             # serialise, but speaking while the base drives or an arm moves is fine

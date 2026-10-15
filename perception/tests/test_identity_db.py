@@ -1,8 +1,15 @@
 """
-tests/test_face_db.py — FaceDB persistence, id allocation, capacity, profile CRUD.
+tests/test_identity_db.py — IdentityDB persistence, id allocation, capacity, profile CRUD.
 
 Pure host-side: no models, no ROS. Everything here is disk + numpy.
 Run: python -m pytest perception/tests -q
+
+Every test below predates the generalisation of `face_db.py` into
+`identity_db.py` and is unchanged apart from the import: the point of that commit
+was that face's behaviour does not move. `FaceDB` here is the 512-dim binding the
+face plugin now constructs explicitly, so these tests still exercise exactly what
+they did before. Dimension-specific behaviour is covered in
+test_identity_db_dim.py instead.
 """
 
 from __future__ import annotations
@@ -16,8 +23,14 @@ import pytest
 
 from vision_stubs import PERCEPTION_ROOT  # noqa: F401  (puts perception on sys.path)
 
-import plugins.face_db as face_db_module  # noqa: E402
-from plugins.face_db import EMBEDDING_DIM, FaceDB, FaceDBError, is_unknown_id  # noqa: E402
+import functools  # noqa: E402
+
+import plugins.identity_db as face_db_module  # noqa: E402
+from plugins.identity_db import IdentityDB, IdentityDBError, is_unknown_id  # noqa: E402
+
+EMBEDDING_DIM = 512
+FaceDB = functools.partial(IdentityDB, dim=EMBEDDING_DIM, label="face_db")
+FaceDBError = IdentityDBError
 
 
 @pytest.fixture(autouse=True)

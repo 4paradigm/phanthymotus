@@ -66,21 +66,15 @@ class TestResourcesConflict(unittest.TestCase):
 
 class _PendingFixture(unittest.TestCase):
     def setUp(self):
-        self._saved = (
-            dict(mcp_client._pending_actions), dict(mcp_client._pending_results),
-            dict(mcp_client._pending_timeouts), dict(mcp_client._pending_tools),
-            dict(mcp_client._pending_resources),
-        )
-        for d in (mcp_client._pending_actions, mcp_client._pending_results,
-                  mcp_client._pending_timeouts, mcp_client._pending_tools,
-                  mcp_client._pending_resources):
+        # 遍历 _PENDING_TABLES，不手写名单：按 action_id 分表的表有九张了，夹具漏掉
+        # 一张就是上一个用例的值串到下一个 —— 而 action_id 在这些用例里是复用的
+        # （'speak-1' 到处都是），串味会表现成一个莫名其妙失败的无关用例。
+        self._saved = tuple(dict(d) for d in mcp_client.pending_tables())
+        for d in mcp_client.pending_tables():
             d.clear()
 
     def tearDown(self):
-        targets = (mcp_client._pending_actions, mcp_client._pending_results,
-                   mcp_client._pending_timeouts, mcp_client._pending_tools,
-                   mcp_client._pending_resources)
-        for d, saved in zip(targets, self._saved):
+        for d, saved in zip(mcp_client.pending_tables(), self._saved):
             d.clear()
             d.update(saved)
 
@@ -124,9 +118,7 @@ class TestForgetPending(_PendingFixture):
         self._add('speak-1', frozenset({'mouth'}))
         mcp_client._pending_results['speak-1'] = {'status': 'completed'}
         mcp_client._forget_pending(['speak-1'])
-        for d in (mcp_client._pending_actions, mcp_client._pending_results,
-                  mcp_client._pending_timeouts, mcp_client._pending_tools,
-                  mcp_client._pending_resources):
+        for d in mcp_client.pending_tables():
             self.assertNotIn('speak-1', d)
 
     def test_leaves_others_alone(self):

@@ -159,13 +159,32 @@ are deployed differently:
 So drivers and perception get a one-line command in the comment:
 
 ```bash
-./deploy/run-pr-image.sh <image-ref>
+curl -fsSL https://motus.phanthy.com/run-pr-image.sh | bash -s -- <image-ref>
 ```
 
-`deploy/run-pr-image.sh` (committed in both repos) pulls the image, reads the
-compose fragment out of `/deploy/service.yml`, substitutes the real ref, and
-starts it from a standalone compose file under `PR_IMAGE_DIR`. Then `--logs`,
-`--shell`, `--status`, `--down`.
+run-pr-image.sh pulls the image, reads the compose fragment out of
+`/deploy/service.yml`, substitutes the real ref, and starts it from a
+standalone compose file under `PR_IMAGE_DIR`. Then `--logs`, `--shell`,
+`--status`, `--down`, passed after the `--` the same way.
+
+**It is hosted, not committed.** The script lives at
+`resource-center/public/run-pr-image.sh` and nowhere else. It used to be
+committed to `phanthymotus` and `phanthymotus-driver`, one copy each, and that
+was wrong twice over. The machine a reviewer runs it on is a rig or a robot —
+it has a deployed image and no checkout of either repo, so `./deploy/...`
+named a file that was not there. And two copies of a file that must agree
+drifted: the fix that gives each run its own compose project landed in the
+`phanthymotus` copy and never in the driver one, so for months testing a
+second driver on a machine went on removing the first, while this document and
+the PR comment both described the fixed behaviour.
+
+Nothing in the script is tied to a revision — it reads whatever
+`/deploy/service.yml` the image it is handed contains — so a PR has no reason
+to carry its own copy, and "always the published version" is the right
+semantics rather than a compromise. `install.sh` also drops it at
+`/opt/phanthy-motus/run-pr-image.sh`, which is the path to use when the site
+is unreachable, and the only one that can serve `--shell` (that needs a
+terminal on stdin, which a piped run does not have).
 
 Using compose rather than a generated `docker run` matters for three reasons:
 it is the same tool production uses, the flags each service declares
