@@ -2167,6 +2167,14 @@ calibrated — and because Agent Core replaces a rejected config's reason with i
 own generic text, the symptom was `配置无效（缺少 url/key）` at project start on a
 card that has neither a url nor a key (see `agent-core/src/api/mcp_manage.py`).
 
+There are **two** ways this rejected a card, and the second is the one seen on
+a real machine. Orin 5 held `{"backend": "depthart"}` shared plus
+`{"fps": 2, "cal_a": 1, "cal_b": 0, "calibration_preset": "Unitree R1"}` on the
+card: the coefficients are at their defaults, so the provenance check never
+runs — the raise came from the YOLO preset being unusable under DepthART. Note
+it needs no reconfiguring to trigger: a machine that ran that build once has the
+row, and a later build with the field reads it back.
+
 A genuine mismatch — a YOLO fit under DepthART, or a YOLO preset under DepthART
 — therefore **drops the coefficients and says so** rather than failing the
 config: depth falls back to the model's own fit, `info()` reports

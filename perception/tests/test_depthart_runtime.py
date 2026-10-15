@@ -566,3 +566,24 @@ def test_legacy_unmarked_calibration_in_startup_yaml_does_not_kill_the_plugin():
     p = vd.VideoDepthPerceptionPlugin({'cal_b': -0.9753}, 'test', _FakeExecutor())
     assert (p._cal_a, p._cal_b) == (1., -0.9753)
     assert p.dispatch('visual_depth', {'action': 'info'})['calibration'] == 'site:manual'
+
+
+def test_orin5_saved_rows_replay(monkeypatch):
+    """The two rows literally in Orin 5's agent-core DB on 2026-10-15.
+
+    This is the second, independent way #286 killed the card, and the one that
+    actually fired on a real machine: `cal_a`/`cal_b` are at their defaults so
+    the provenance check never runs, and the raise comes from the YOLO preset
+    being unusable under DepthART. Agent Core sends these as two calls —
+    shared without instance_id, then the card's own row with it — so they are
+    replayed that way here rather than merged.
+    """
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    monkeypatch.setattr(p, '_ensure_model', lambda: pytest.fail('config must not load an engine'))
+    assert p.dispatch('visual_depth', {'action': 'config', 'backend': 'depthart'})['status'] == 'configured'
+    row = {'action': 'config', 'instance_id': 'card-mv8w41sh6a45',
+           'fps': 2, 'cal_a': 1, 'cal_b': 0, 'calibration_preset': 'Unitree R1'}
+    result = p.dispatch('visual_depth', row)
+    assert result['status'] == 'configured' and result.get('adapter_ok', True) is True
+    assert result['config'] == {'fps': 2, 'calibration_preset': vd.CAL_NONE}
+    assert 'Unitree R1' in result['calibration_note']
