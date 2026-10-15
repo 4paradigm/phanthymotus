@@ -2149,8 +2149,12 @@ the canvas dynamic. Unsupported ratios fail rather than silently stretch.
 
 A log-affine fit corrects one camera's optics *as that model sees them*, so it
 is not transferable between the two backends: on r1_sz's ultra-wide lens YOLO
-needs `cal_b: -0.9753` — a factor of 2.65 — while DepthART, which is handed the
-real `K`, needs nothing like it. `calibration_backend` records which model a
+needs `cal_b: -0.9753` — a factor of 2.65 — and what it is correcting there is a
+fixed-K model's guess at a 102° lens, which is not the error DepthART makes,
+since DepthART is handed the real `K`. **DepthART's own residual on that lens
+has not been measured**, so "it should need less" is an expectation, not a
+result; measure it with `calibrate` before trusting either number.
+`calibration_backend` records which model a
 fit was measured against; `calibrate` stamps it, and it only has to be typed in
 when a fit is copied from somewhere else. DepthART does not use the YOLO camera
 presets either, for the same reason.

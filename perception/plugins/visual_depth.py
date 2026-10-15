@@ -1111,8 +1111,10 @@ class VideoDepthPerceptionPlugin:
 
         A log-affine fit belongs to a **camera × model** pair, so coefficients
         measured under one backend are not transferable to the other: on
-        r1_sz's ultra-wide lens YOLO's `cal_b: -0.9753` is a factor of 2.65,
-        and DepthART, which is handed the real `K`, needs nothing like it.
+        r1_sz's ultra-wide lens YOLO's `cal_b: -0.9753` is a factor of 2.65 —
+        it is correcting a fixed-K model's guess at a 102° lens, which is not
+        the error DepthART makes, since DepthART is handed the real `K`. What
+        DepthART's own residual on that lens *is* has not been measured.
 
         What this must *not* do is refuse the config. The canvas replays the
         saved row on every project start, so a raise here does not read as
