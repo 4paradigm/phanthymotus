@@ -22,7 +22,6 @@ cb 签名: async def cb(data: bytes, fmt: str) -> None
 """
 
 import asyncio
-import json
 import sys
 import threading
 
@@ -143,24 +142,14 @@ def subscribe(mcp_id: str, topic: str, fmt: str, loop: asyncio.AbstractEventLoop
 
     def _on_msg(msg):
         try:
-            if fmt == 'sensor/sound-direction':
-                data = json.dumps({key: getattr(msg, key) for key in (
-                    'state', 'angle_deg', 'window_start_us', 'window_end_us',
-                    'published_us')}).encode('utf-8')
-                msg_fmt = fmt
-            else:
-                raw = msg.data
-                data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
-                msg_fmt = getattr(msg, 'format', fmt)
+            raw = msg.data
+            data = raw if isinstance(raw, bytes) else (raw.encode('utf-8') if isinstance(raw, str) else bytes(raw))
+            msg_fmt = getattr(msg, 'format', fmt)
         except Exception as e:
             print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
             return
         _last_seen[topic] = _time.time()
-        coro = cb(data, msg_fmt)
-        try:
-            asyncio.run_coroutine_threadsafe(coro, _cb_loop)
-        except RuntimeError:  # loop closed during shutdown
-            coro.close()
+        asyncio.run_coroutine_threadsafe(cb(data, msg_fmt), _cb_loop)
 
     sub = _node_main.create_subscription(msg_type, topic, _on_msg, _low_lat_qos())
     with _lock:
@@ -219,12 +208,6 @@ def publish(topic: str, data: str) -> None:
 
 def _resolve_msg_type(fmt: str):
     """根据 data format 返回对应的 ROS2 消息类型，未知返回 None。"""
-    if fmt == 'sensor/sound-direction':
-        try:
-            from audio_msgs.msg import SoundDirection
-            return SoundDirection
-        except ImportError:
-            return None
     if fmt.startswith('audio/'):
         try:
             from audio_msgs.msg import AudioChunk

@@ -44,12 +44,33 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 
 ### Wake Direction Timing
 
-When ASR is connected to `sensor/sound-direction`, `AudioChunk.header.stamp`
-must be the Unix capture time of the chunk's first sample. The direction
-message's `window_start_us` and `window_end_us` use the same clock in
-microseconds. ASR reports an unknown wake direction when the audio stamp is
-missing or either capture window is untrusted. Confirm clock alignment on the
-robot before relying on direction results.
+Connect Bumi's `sensor/sound-direction` output
+(`/<namespace>/sound_direction/events`) to ASR's sound-direction input, and
+its microphone to the `audio/pcm-16k` input. The direction port remains a
+specific sensor type, not `data/json`: an ordinary JSON card cannot supply it.
+Like the existing `sensor/pose2d` card, its ROS transport is `std_msgs/String`
+with a structured payload. Core reuses its standard sensor transport and text
+viewer, without compiling a custom direction message or starting the sensor.
+
+The payload has `state: "fresh"`, the exact `angle_deg`, and
+`audio_window_start_us` / `audio_window_end_us`. The integer `angle` is for
+display only; ASR never uses it for matching. Driver publishes `no_event` after
+activity stops and `stale` if a valid observation expires. Neither state clears
+ASR's capture history: a transcription can finish after the event expires.
+
+`AudioChunk.header.stamp` must be the Unix capture time of the chunk's first
+sample. Direction windows use the same clock in microseconds. ASR reports an
+unknown wake direction when the audio stamp is missing or either capture
+window is untrusted. Confirm clock alignment on the robot before relying on
+direction results.
+
+For this migration, update Core once to remove its old custom ROS decoder,
+and upgrade Driver and Perception together. Remove/re-add the direction and ASR
+cards and reconnect them to replace cached topics from the earlier typed ROS
+transport. The canvas type remains `sensor/sound-direction`. Core retains
+its generic format-tagged input bindings and multi-instance port refresh, so
+connection order does not choose the audio source. Environment defaults use
+Core's generic schema-default handling.
 
 SenseVoice, Parakeet and X-ASR retain the recognizer's token timestamps from
 the same decode. ASR maps the matched wake word's text boundary to a timed

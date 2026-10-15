@@ -893,13 +893,7 @@ function _addCard(data, save = true) {
 
   _syncEmptyState();
 
-  if (save) {
-    _saveLayout();
-    if (tool?.type === 'sensor' && tool.topic_out?.some(
-      port => port.format === 'sensor/sound-direction')) {
-      _startDirectionSensor(mcpId, toolName, id);
-    }
-  }
+  if (save) _saveLayout();
 }
 
 async function _removeCard(id) {
@@ -1120,11 +1114,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       });
     }
 
-    el.querySelector('.canvas-view-btn').addEventListener('click', async (e) => {
+    el.querySelector('.canvas-view-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      if (topicOut.some(port => port.format === 'sensor/sound-direction')) {
-        if (!(await _startDirectionSensor(mcpId, toolName, id))) return;
-      }
       _openTopicDetailFor(el, mcpId, topicOut);
     });
 
@@ -2348,14 +2339,6 @@ function _initAutoStartToggle() {
       checkbox.checked = !checkbox.checked;
     }
   });
-}
-
-async function _startDirectionSensor(mcpId, toolName, id) {
-  const result = _parseMcpCallResult(await _triggerAction(
-    mcpId, toolName, 'start', { instance_id: id }));
-  if (result?.state === 'running') return true;
-  _showToast(result?.message || '声音方向启动失败，请检查驱动和标定配置');
-  return false;
 }
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {

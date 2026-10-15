@@ -1663,14 +1663,8 @@ class _ASRNode(Node):
         self._worker_ready = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
         if self._direction_topic:
-            try:
-                from audio_msgs.msg import SoundDirection
-            except ImportError:
-                log.warning("[asr] SoundDirection interface unavailable; continuing without direction input")
-                self._direction_topic = ''
-            else:
-                self._direction_sub = self.create_subscription(
-                    SoundDirection, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
+            self._direction_sub = self.create_subscription(
+                String, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
         # A fresh event, not .clear(): the previous worker thread and _audio_cb
         # closures still hold a reference to the old one.
         self._stop_event = threading.Event()
@@ -1786,10 +1780,16 @@ class _ASRNode(Node):
         self._vad_stop = None
 
     def _direction_cb(self, msg) -> None:
-        if msg.state != 1:
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
             return
-        begin, end, angle = msg.window_start_us, msg.window_end_us, msg.angle_deg
-        if (begin < 1_000_000_000_000_000 or end <= begin
+        if not isinstance(data, dict) or data.get('state') != 'fresh':
+            return
+        begin, end = data.get('audio_window_start_us'), data.get('audio_window_end_us')
+        angle = data.get('angle_deg')
+        if (type(angle) not in (int, float) or type(begin) is not int or type(end) is not int
+                or begin < 1_000_000_000_000_000 or end <= begin
                 or end - begin > 3_000_000 or not math.isfinite(angle)
                 or not -180 < angle <= 180):
             return

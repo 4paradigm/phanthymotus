@@ -3,7 +3,7 @@ import { decodeNestedJson, plainValue, escapeHtml, directionDisplayValue } from 
 
 export const TextRenderer = {
   name: 'text',
-  canRender: (hint) => hint && (hint.startsWith('text/') || hint === 'data/json'),
+  canRender: (hint) => hint && (hint.startsWith('text/') || hint === 'data/json' || hint === 'sensor/sound-direction'),
   _el: null,
   _textEl: null,
 

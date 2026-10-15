@@ -7,7 +7,6 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/AudioChunk.msg"
-  "msg/SoundDirection.msg"
   DEPENDENCIES std_msgs
 )
 

@@ -30,7 +30,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} uv
 
 WORKDIR /work
 
-COPY agent-core/pyproject.toml /work/
+COPY pyproject.toml /work/
 ENV UV_INDEX_URL=${PYPI_MIRROR}
 RUN uv lock && uv sync --no-dev --no-install-project
 
@@ -40,21 +40,14 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
     echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/usr/lib/python3/dist-packages" >> .venv/lib/python3.10/site-packages/system.pth
 
-COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
-RUN cd /ros_ws && \
-    . /opt/ros/humble/setup.sh && \
-    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release && \
-    . /ros_ws/install/setup.sh && \
-    /work/.venv/bin/python -c "from audio_msgs.msg import AudioChunk, SoundDirection"
-
-COPY agent-core/web/      /work/web/
-COPY agent-core/src/      /work/src/
-COPY agent-core/tools/    /work/tools/
-COPY agent-core/resource/ /work/resource/
-COPY agent-core/deploy/   /deploy/
+COPY web/      /work/web/
+COPY src/      /work/src/
+COPY tools/    /work/tools/
+COPY resource/ /work/resource/
+COPY deploy/   /deploy/
 
 # Bake defaults to a path immune to volume mounts (for cold-start init)
-COPY agent-core/resource/memory/defaults/ /opt/defaults/memory/
+COPY resource/memory/defaults/ /opt/defaults/memory/
 
 # `file` —— 模型拿它判断下载下来的东西到底是不是图片。Tianyi 实测：LLM 下了两张人物
 # 照片后连着两次 `file /tmp/x.png` 都撞上 `/bin/sh: 1: file: not found`，白烧两轮才改用

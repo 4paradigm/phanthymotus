@@ -3,6 +3,7 @@
 from vision_stubs import PERCEPTION_ROOT, _FakeExecutor  # noqa: F401
 
 from plugins import asr
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -12,6 +13,12 @@ import pytest
 
 def window(angle, start, end):
     return (angle, start, end)
+
+
+def direction_message(state, angle_deg, window_start_us, window_end_us):
+    return SimpleNamespace(data=json.dumps({
+        'state': 'fresh' if state == 1 else 'no_event', 'angle_deg': angle_deg,
+        'audio_window_start_us': window_start_us, 'audio_window_end_us': window_end_us}))
 
 
 def test_leading_wake_matches_voice_onset_after_preroll():
@@ -104,7 +111,7 @@ def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, pr
     def decode(streams):
         decoded.append(streams)
         if evict_during_decode:
-            node._direction_cb(SimpleNamespace(state=1, angle_deg=-90,
+            node._direction_cb(direction_message(state=1, angle_deg=-90,
                 window_start_us=1700000120000000, window_end_us=1700000120050000))
 
     adapter._recognizer.decode_streams = decode
@@ -145,7 +152,7 @@ def test_long_utterance_retains_leading_wake_window_despite_later_direction_samp
     # 32 seconds at Bumi's maximum 20 Hz, beyond one maximum-length VAD segment.
     for i in range(650):
         begin = base_us + i * 50000
-        node._direction_cb(SimpleNamespace(state=1, angle_deg=90 if i < 20 else -45,
+        node._direction_cb(direction_message(state=1, angle_deg=90 if i < 20 else -45,
             window_start_us=begin, window_end_us=begin + 50000))
     fields = asr._wake_direction_fields('小范你好', [1, 2, 3, 4], 2, 2,
         base_us / 1000000, 0, list(node._direction_windows), True,
@@ -194,15 +201,45 @@ def test_input_bindings_identify_audio_and_direction_in_any_order():
         "/mic", "/direction")
 
 
+def test_direction_input_rejects_generic_json_connections():
+    args = {'input_bindings': [
+        {'topic': '/unrelated', 'format': 'data/json', 'port_index': 1},
+        {'topic': '/mic', 'format': 'audio/pcm-16k', 'port_index': 0}]}
+    assert asr._resolve_asr_inputs(args) == ('/mic', '')
+    assert asr.TOOLS[0]['topic_in'][1]['format'] == 'sensor/sound-direction'
+
+
+def test_json_direction_uses_precise_angle_for_wake_matching():
+    node = asr._ASRNode.__new__(asr._ASRNode)
+    node._direction_windows = asr.deque(maxlen=50)
+    node._direction_lock = asr.threading.Lock()
+    payload = {'state': 'fresh', 'angle': -30, 'angle_deg': -29.678,
+               'audio_window_start_us': 1700000000000000,
+               'audio_window_end_us': 1700000000020000}
+    node._direction_cb(SimpleNamespace(data=json.dumps(payload)))
+    assert list(node._direction_windows) == [(-29.678, 1700000000000000, 1700000000020000)]
+    for invalid in ['not json', '[]', '{"state":"fresh"}',
+                    json.dumps({**payload, 'angle_deg': 'bad'}),
+                    json.dumps({**payload, 'audio_window_start_us': True}),
+                    json.dumps({**payload, 'state': 'stale'}),
+                    json.dumps({'state': 'no_event'})]:
+        node._direction_cb(SimpleNamespace(data=invalid))
+    assert len(node._direction_windows) == 1
+    fields = asr._wake_direction_fields('小范', [1, 2], 2, 2,
+        1700000000.0, 0, list(node._direction_windows), True)
+    assert fields['wake_direction_state'] == 'valid'
+    assert fields['wake_direction_deg'] == -29.68
+
+
 def test_direction_buffer_ignores_invalid_time_and_no_event_keeps_history():
     node = asr._ASRNode.__new__(asr._ASRNode)
     node._direction_windows = asr.deque(maxlen=50)
     node._direction_lock = asr.threading.Lock()
-    node._direction_cb(SimpleNamespace(state=1, angle_deg=90,
+    node._direction_cb(direction_message(state=1, angle_deg=90,
         window_start_us=1700000000000000, window_end_us=1700000000020000))
-    node._direction_cb(SimpleNamespace(state=0, angle_deg=0,
+    node._direction_cb(direction_message(state=0, angle_deg=0,
         window_start_us=0, window_end_us=0))
-    node._direction_cb(SimpleNamespace(state=1, angle_deg=180,
+    node._direction_cb(direction_message(state=1, angle_deg=180,
         window_start_us=0, window_end_us=0))
     assert list(node._direction_windows) == [(90, 1700000000000000, 1700000000020000)]
 
@@ -365,7 +402,7 @@ def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):
     assert [sub.topic for sub in node.subscriptions] == ['/mic', '/direction/new']
 
 
-def test_missing_optional_direction_interface_does_not_stop_asr(monkeypatch):
+def test_dedicated_direction_port_uses_standard_transport_without_custom_interface(monkeypatch):
     message_module = types.ModuleType('audio_msgs.msg')
     message_module.AudioChunk = object
     monkeypatch.setitem(sys.modules, 'audio_msgs.msg', message_module)
@@ -389,8 +426,9 @@ def test_missing_optional_direction_interface_does_not_stop_asr(monkeypatch):
 
     result = node._start_inner()
     assert result['state'] == 'running'
-    assert node._direction_topic == ''
-    assert [sub.topic for sub in node.subscriptions] == ['/mic']
+    assert node._direction_topic == '/direction'
+    assert [sub.topic for sub in node.subscriptions] == ['/mic', '/direction']
+    assert node.subscriptions[-1].callback == node._direction_cb
 
 
 @pytest.mark.parametrize('angle, accepted', [
@@ -401,7 +439,7 @@ def test_direction_subscription_enforces_open_negative_endpoint(angle, accepted)
     node = asr._ASRNode.__new__(asr._ASRNode)
     node._direction_windows = asr.deque(maxlen=50)
     node._direction_lock = asr.threading.Lock()
-    node._direction_cb(SimpleNamespace(state=1, angle_deg=angle,
+    node._direction_cb(direction_message(state=1, angle_deg=angle,
         window_start_us=1700000000000000, window_end_us=1700000000020000))
     assert bool(node._direction_windows) is accepted
 

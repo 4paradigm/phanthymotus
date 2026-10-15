@@ -16,11 +16,10 @@ import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
-import { SoundDirectionRenderer } from './renderers/sound-direction.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, SoundDirectionRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 // Column count by viewport width. Desktop used to be a flat 5 whatever the
 // window was, which is only right near 1080p: at 1280 a column is 237px and a
@@ -347,8 +346,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
         <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(_displayPath(topicPath))}</span>
       </div>
       ${modeHtml}
-      ${format === 'sensor/sound-direction' ? ''
-        : `<span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>`}
+      <span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>
     </div>
     <div class="monitor-card-body"></div>
     <div class="monitor-card-empty">
@@ -492,9 +490,6 @@ function _switchMode(topicPath, newMode, modeBtns) {
 }
 
 function _createRenderer(format, mode) {
-  if (SoundDirectionRenderer.canRender(format)) {
-    return Object.assign({}, SoundDirectionRenderer, { mode });
-  }
   if (mode === 'kv') {
     return Object.assign(Object.create(Object.getPrototypeOf(KvLatestRenderer)), KvLatestRenderer);
   }
