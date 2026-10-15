@@ -187,7 +187,6 @@ class PluginTests(unittest.TestCase):
         self.plugin.stop()
 
     def test_schema_declares_an_actuator_that_only_emits_music(self):
-        import jsonschema
         tool = self.plugin.get_tools()[0]
         self.assertEqual(tool['name'], 'phanthy_music')
         # An actuator with an output topic and no input: mixing is audio_mixer's
@@ -203,9 +202,18 @@ class PluginTests(unittest.TestCase):
                          {'list_genres', 'play', 'next', 'previous', 'pause',
                           'resume', 'stop_music', 'now_playing', 'set_volume',
                           'set_autoplay', 'search'})
-        jsonschema.validate({'action': 'play', 'genre': 'pop'}, schema)
-        jsonschema.validate({'action': 'next'}, schema)
-        jsonschema.validate({'action': 'list_genres'}, schema)
+        self.assertEqual(schema['type'], 'object')
+        self.assertEqual(schema['required'], ['action'])
+        properties = schema['properties']
+        self.assertEqual(properties['action']['type'], 'string')
+        self.assertEqual(set(properties['action']['enum']),
+                         set(schema['x-action-params']))
+        self.assertEqual(properties['genre']['type'], 'string')
+        self.assertIn('genre', schema['x-action-params']['play']['params'])
+        self.assertEqual(schema['x-action-params']['next']['params'], [])
+        self.assertEqual(schema['x-action-params']['list_genres']['params'], [])
+        for action in schema['x-action-params'].values():
+            self.assertTrue(set(action['params']) <= set(properties))
 
     def test_play_only_takes_what_a_person_actually_says(self):
         """Pins the param set against drift back toward the REST shape.

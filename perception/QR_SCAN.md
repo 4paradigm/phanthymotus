@@ -66,9 +66,12 @@ Dockerfile复用既有OpenCV，并进行JPEG二维码解码自检，避免基础
 ```bash
 python -m pytest perception/tests/test_qr_scan.py perception/tests/test_bundle_dispatch.py perception/tests/test_shared_utils.py -q
 source /opt/ros/humble/setup.bash
+ROS_DOMAIN_ID=42 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml \
 PYTHONPATH="$PWD/perception:$PYTHONPATH" python3 perception/tests/qr_scan_dds_check.py
 ```
 
 测试包含真实OpenCV解码、两个无机型关联的相机输入、多实例隔离、去重、断流、生命周期、播报文字和链接过滤。
-DDS脚本在隔离domain142验证两路模拟图像及输出，不代表硬件实测。
+DDS脚本使用平台domain42及现有loopback配置，使用每次运行唯一的测试话题和实例标识，
+避免与生产相机或其他检查串流。验证两路模拟图像及输出，不代表硬件实测。
 需要构建并部署新的perception镜像后再在画布选择本卡片；原生播报专属配置已删除，需要按标准端口连接下游。

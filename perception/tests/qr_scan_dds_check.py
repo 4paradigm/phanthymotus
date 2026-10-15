@@ -1,6 +1,9 @@
 """Hardware-free DDS smoke check for two generic QR perception instances."""
 import json
+import os
 import time
+from pathlib import Path
+from uuid import uuid4
 
 import cv2
 import rclpy
@@ -13,9 +16,15 @@ from utils.qos import CAMERA_QOS
 
 
 def main():
-    rclpy.init(domain_id=142)
+    profile = os.environ.get('FASTRTPS_DEFAULT_PROFILES_FILE', '')
+    if not profile or not Path(profile).is_file():
+        raise RuntimeError('Set FASTRTPS_DEFAULT_PROFILES_FILE to the deployed DDS loopback profile')
+    if os.environ.get('RMW_IMPLEMENTATION') != 'rmw_fastrtps_cpp':
+        raise RuntimeError('Run with the deployed RMW_IMPLEMENTATION=rmw_fastrtps_cpp')
+    rclpy.init(domain_id=42)
     executor = SingleThreadedExecutor()
-    peer = Node('qr_test_camera')
+    run_id = 'qr_check_' + uuid4().hex[:12]
+    peer = Node(run_id)
     executor.add_node(peer)
     plugin = QrScanPlugin({'scan_hz': 2, 'stale_after_s': 3, 'auto_announce': True}, executor)
     outputs = {'source_a': [], 'source_b': []}
@@ -23,8 +32,9 @@ def main():
     publishers = {}
     messages = {}
     try:
-        for key, topic in [('source_a', '/camera_a/image'), ('source_b', '/camera_b/image')]:
-            args = {'instance_id': key, 'input_topic': topic}
+        for key in outputs:
+            topic = f'/{run_id}/{key}/image'
+            args = {'instance_id': f'{run_id}_{key}', 'input_topic': topic}
             info = plugin.dispatch('qr_scan', {**args, 'action': 'info'})
             peer.create_subscription(String, info['topic_out'][0]['topic'],
                 lambda msg, key=key: outputs[key].append(json.loads(msg.data)), CAMERA_QOS)
@@ -64,7 +74,7 @@ def main():
         for values in outputs.values():
             stale = next((r for r in values if r['status'] == 'stale'), None)
             assert stale and stale['codes'] == []
-        print(json.dumps({'dds': 'passed', 'independent_inputs': 2,
+        print(json.dumps({'dds': 'passed', 'domain_id': 42, 'independent_inputs': 2,
                           'decoded': ['SOURCE_A-DDS', 'SOURCE_B-DDS'], 'stale': 'passed', 'announcement_per_input': 1}))
     finally:
         plugin.stop()
