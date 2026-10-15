@@ -18,7 +18,7 @@ ARG ENABLE_VITS2_TRT=1
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 
-# ── Everything that differs per JetPack line, resolved once ──────────────────
+# ── Stable JetPack platform facts, resolved once ──────────────────
 # These facts used to be restated at each point of use — the numpy pin appeared
 # twice in this file alone, and the two copies had to agree or the C-ABI those
 # wheels were built against breaks. Resolve them here and have each consumer
@@ -32,9 +32,6 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 #
 #   NUMPY_VERSION  matches the torch/cv2 stack each base ships, so nothing in
 #                  the base image is upgraded or downgraded under it.
-#   SHERPA_GPU_WHEEL  Fixed public URL or COS key (see the sherpa-onnx step).
-#                  Empty for a line we have not built a wheel for, which selects
-#                  the PyPI CPU wheel.
 #   PY_ABI         read from the interpreter, not from the base image's
 #                  PYTHON_VERSION env: jp5.11's base does not set that variable
 #                  at all (it happened to work only because the shell default
@@ -45,18 +42,14 @@ ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 #
 # It is also a record: `docker exec <c> cat /etc/jetpack.env` says what line an
 # image was built for, which is otherwise guesswork from the tag alone.
-ARG SHERPA_GPU_WHEEL_511=https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/550b9920d46f65dbe4b7350b2e1f83a63607d0aa/sherpa_onnx-1.13.6%2Bcuda.prefixfullselective1-cp38-cp38-linux_aarch64.whl
-ARG SHERPA_GPU_WHEEL_61=https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/550b9920d46f65dbe4b7350b2e1f83a63607d0aa/sherpa_onnx-1.13.6%2Bcuda.prefixfullselective1-cp310-cp310-linux_aarch64.whl
-ARG SHERPA_GPU_WHEEL_SHA256_511=2d76566d7daa59a7e055b5b13d9171525ab4a6c5b979eb518d61b42536aa60ef
-ARG SHERPA_GPU_WHEEL_SHA256_61=8fcb24aeffa4648910d71602c10d5837e981f3487a63014c7dd506895ccfb8fe
 ARG DLA_COMPILER_SO_61=jp61/libnvdla_compiler.so
 RUN case "${JP_VERSION}" in \
-        511) NUMPY=1.24.4; WHEEL="${SHERPA_GPU_WHEEL_511}"; WHEEL_SHA="${SHERPA_GPU_WHEEL_SHA256_511}"; DLA= ;; \
-        61)  NUMPY=1.26.4; WHEEL="${SHERPA_GPU_WHEEL_61}"; WHEEL_SHA="${SHERPA_GPU_WHEEL_SHA256_61}"; DLA="${DLA_COMPILER_SO_61}" ;; \
-        *)   NUMPY=1.24.4; WHEEL=; WHEEL_SHA=; DLA= ;; \
+        511) NUMPY=1.24.4; DLA= ;; \
+        61)  NUMPY=1.26.4; DLA="${DLA_COMPILER_SO_61}" ;; \
+        *)   NUMPY=1.24.4; DLA= ;; \
     esac; \
-    printf 'NUMPY_VERSION=%s\nSHERPA_GPU_WHEEL=%s\nSHERPA_GPU_WHEEL_SHA256=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\n' \
-        "${NUMPY}" "${WHEEL}" "${WHEEL_SHA}" \
+    printf 'NUMPY_VERSION=%s\nPY_ABI=%s\nDLA_COMPILER_SO=%s\n' \
+        "${NUMPY}" \
         "$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')" \
         "${DLA}" \
         > /etc/jetpack.env && \
@@ -184,78 +177,6 @@ RUN . /etc/jetpack.env; \
 # memory, and the build caught it at `import rapidocr`.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pillow>=7.1.2" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
-
-# ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
-# PyPI ships CPU-only sherpa-onnx, so each JetPack line installs a CUDA-enabled
-# wheel built in-house on an Orin with -DSHERPA_ONNX_ENABLE_GPU=ON.
-#
-# Installing it does NOT move anything to the GPU on its own: that is opt-in via
-# `device: gpu` in the ASR/TTS config, and only for the (model, device) pairs
-# ASR_MODELS lists. int8 weights are *slower* on CUDA — ONNX Runtime's CUDA
-# provider has no int8 kernels and falls back per node — so `device: gpu` loads
-# different, non-quantised weights. Measured on an Orin NX at matched num_threads:
-# SenseVoice fp16 5.8x faster, streaming paraformer fp32 1.8x faster, while the
-# same models' int8 weights were 0.4-0.7x, i.e. worse. The numbers, the thread
-# sweep and the reasoning are in perception/README.md § sherpa-onnx Device
-# Selection, along with how to rebuild these wheels.
-#
-# One wheel per JetPack line, not one wheel: the ONNX Runtime a wheel links is
-# what ties it to a CUDA/cuDNN pair, and the pybind extension is tagged with the
-# CPython ABI it was compiled against. Neither is portable.
-#
-#   jp5.11  onnxruntime-gpu 1.16.0  CUDA 11.4 / cuDNN 8  cp38   (focal)
-#   jp6.1   onnxruntime-gpu 1.18.1  CUDA 12.6 / cuDNN 9  cp310  (jammy)
-#
-# Verified rather than assumed for jp6.1: 1.18.1's aarch64 GPU package needs
-# libcudnn.so.9 / libcudart.so.12 / libcublas.so.12, and all of them resolve
-# inside this image (cuDNN 9.4.0, CUDA 12.6). 1.18.0 would not — it is built
-# against cuDNN 8.9.4. sherpa-onnx's own cmake pins 1.18.1 for L4T R36 + CUDA
-# 12.6, which is what this line targets.
-#
-# An unlisted JP_VERSION (and any non-Jetson build) falls back to the PyPI CPU
-# wheel, where `device: gpu` degrades to cpu with a warning rather than failing
-# to start. The gate is therefore on JP_VERSION, not on "is this a Jetson":
-# there is nothing sensible to guess for a line we have not built a wheel for.
-#
-# Fixed full selective-runtime wheel sizes (decimal MB): JP5 64.4 compressed /
-# 274.8 unpacked; JP6 83.7 / 379.5. Most bytes are the CUDA provider. Model
-# weights are separate; these are neither image sizes nor runtime memory.
-#
-# Legacy COS keys carry the JetPack; the default fixed public URLs select the
-# matching wheel explicitly. Upstream's setup.py
-# tags the wheel `1.13.6+cuda-cp<abi>`, so the only thing separating the two
-# builds in a flat directory would be `cp38` vs `cp310` — which is a *Python*
-# discriminator, not a CUDA one. It happens to select correctly today, since each
-# image ships exactly one Python, but a second cp310 build for another JetPack 6.x
-# on a different CUDA would collide. Renaming the file is not an option (pip parses
-# the version out of it and it must match the wheel metadata), so the directory
-# records what the name cannot.
-#
-# The URL needs %2B for the '+cuda' local version — `quote` leaves the '/' of the
-# key alone — while the file on disk must keep the literal '+' or pip refuses to
-# parse the version out of the filename.
-RUN . /etc/jetpack.env; \
-    if [ -n "${SHERPA_GPU_WHEEL}" ]; then \
-        FILE="$(python3 -c 'import os, sys, urllib.parse; key=sys.argv[1]; u=urllib.parse.urlsplit(key); print(os.path.basename(urllib.parse.unquote(u.path)) if u.scheme in ("http", "https") else os.path.basename(key))' "${SHERPA_GPU_WHEEL}")" && \
-        echo "[build] sherpa-onnx: GPU wheel for jp${JP_VERSION} — ${SHERPA_GPU_WHEEL}" && \
-        python3 -c "import urllib.request, urllib.parse, sys, hashlib, pathlib; \
-key, dest, expected = sys.argv[1:]; \
-assert expected, 'SHA256 is required for the selected runtime wheel'; \
-url = key if urllib.parse.urlsplit(key).scheme in ('http', 'https') else 'https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(key); \
-urllib.request.urlretrieve(url, dest); \
-assert hashlib.sha256(pathlib.Path(dest).read_bytes()).hexdigest() == expected, 'Runtime wheel checksum mismatch'" \
-            "${SHERPA_GPU_WHEEL}" "/tmp/${FILE}" "${SHERPA_GPU_WHEEL_SHA256}" && \
-        pip3 install --no-cache-dir "/tmp/${FILE}" && \
-        rm -f "/tmp/${FILE}" && \
-        python3 -c "import sherpa_onnx, pathlib; \
-lib = pathlib.Path(sherpa_onnx.__file__).parent / 'lib' / 'libonnxruntime_providers_cuda.so'; \
-assert lib.is_file(), 'CUDA provider missing from the installed wheel'; \
-assert hasattr(sherpa_onnx, 'OfflineTtsConfig'), 'ASR-only wheel cannot replace the full perception runtime'; \
-print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
-    else \
-        echo "[build] sherpa-onnx: no GPU wheel for jp${JP_VERSION} — CPU wheel from PyPI" && \
-        pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
-    fi
 
 # ── libnvdla_compiler.so fallback (jp6.1) ────────────────────────────────────
 # `import tensorrt` on JetPack 6 has libnvdla_compiler.so as a hard DT_NEEDED,
@@ -433,9 +354,8 @@ print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
 # our models on it. They coexist fine — measured on Orin6, both import orders
 # and both holding live sessions.
 #
-# Deliberately the last dependency layer. A step inserted higher up invalidates
-# the cache for every layer below, and several of those install *unpinned*
-# (ultralytics, phonemizer), so they silently re-resolve to whatever is newest.
+# Installed before the separately versioned speech runtime so changing its
+# wheel does not reinstall this runtime or the independent frontend packages.
 #
 # --no-deps: a resolved install also pulls protobuf, coloredlogs, humanfriendly
 # and flatbuffers, and protobuf was not in this image at all. None is needed for
@@ -476,45 +396,6 @@ RUN . /etc/jetpack.env && \
         *)   ORT_WHEEL="onnxruntime==1.18.1" ;; \
     esac && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} "${ORT_WHEEL}"
-
-# ── JP6.1: the second half of the GPU fix ────────────────────────────────────
-# The COS wheel installed above carries the provider bridge but was built against
-# cuDNN 8; JP6.1 ships 9, so its own provider fails to load with
-# "libcudnn.so.8: cannot open shared object file". sherpa-onnx 1.13.6+cuda bundles
-# the same provider built against cuDNN 9, so overwrite the wheel's copy with it.
-#
-# Neither half works alone — see the measurements on the wheel-selection step above.
-# Do not "simplify" this away and go back to the PyPI CPU wheel: that has no bridge
-# at all, and this copy then silently does nothing while the plugin logs
-# "device='gpu' ... falling back to cpu". Re-confirmed by running the same probe in
-# both images, with and without sherpa_onnx imported first — the import order makes
-# no difference, so this is not something symbol interposition can rescue:
-#
-#   release.260910.84b5450 (PyPI wheel + copy)  compiled-in ['Azure','CPU']  18.5 ms
-#   release.260910.10266c2 (COS wheel + copy)   compiled-in [...,'CUDA',...]  6.0 ms
-#
-# The price of the copy, and it is a real one: the standalone runtime (1.18.0) and
-# sherpa's (**1.18.1**, not 1.18.0 — check `sherpa_onnx/lib/`) now share a single
-# provider library, since the soname collides and the first dlopen wins. They
-# coexist fine for separate graphs — face keeps its 3x with a sherpa CUDA session
-# live — but a *second* CUDA session on the **Kokoro** graph fails in whichever
-# runtime did not load the provider, symmetrically:
-#
-#   sherpa's session first  -> the standalone one fails, naming /home/tian/Yxh/...
-#   the standalone first    -> sherpa's fails, naming /home/yifanl/...
-#   both: "Error mapping output names: Could not find OrtValue '/Squeeze_2_output_0'"
-#
-# That is why plugins/kokoro_direct.py is CPU-only by construction and takes no
-# device argument. Anything else that wants a standalone CUDA session on a graph
-# sherpa also loads has the same constraint.
-RUN . /etc/jetpack.env && \
-    if [ "${JP_VERSION}" = "61" ]; then \
-        SHERPA_LIB="/usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib" && \
-        ORT_CAPI="/usr/local/lib/python3.10/dist-packages/onnxruntime/capi" && \
-        cp "${SHERPA_LIB}/libonnxruntime_providers_cuda.so" "${ORT_CAPI}/" && \
-        cp "${SHERPA_LIB}/libonnxruntime_providers_shared.so" "${ORT_CAPI}/" && \
-        echo "[build] JP6.1: GPU enabled via sherpa-onnx's cuDNN-9 CUDA provider"; \
-    fi
 
 # ── Thai TTS frontend deps ────────────────────────────────────────
 # Three pure-Python wheels, no compiled extensions and no build-time model fetch,
@@ -582,38 +463,9 @@ assert not any(0x4E00 <= ord(c) <= 0x9FFF for c in out), out; \
 print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
-# ── Application code ───────────────────────────────────────────────
-WORKDIR /work
-COPY perception/main.py    /work/main.py
-COPY perception/plugins/   /work/plugins/
-COPY perception/utils/     /work/utils/
-COPY perception/resource/  /work/resource/
-COPY perception/config.yaml /work/config.yaml
-COPY perception/deploy/    /deploy/
-
-# ── Thai frontend self-check, on the real interpreter ──────────────────────────
-# Runs the frontend that was just copied in, on the Python this image actually
-# ships, and asserts the one invariant the Thai engine depends on: every character
-# it emits is in the model's 71-character table. Importing the dependencies (the
-# step above) is not the same test — pythainlp's and khanaa's APIs drift between
-# the versions cp38 and cp310 resolve to, and this is what catches that. It already
-# would have: khanaa 0.0.6 spells with SpellWord().spell_out() where 0.1.1 uses
-# Kham().form, and pythainlp 5.0.4's maiyamok takes a token list where 5.3.7's
-# takes a string — each a crash on one JetPack line only.
-#
-# The cases and assertions live in plugins/thai_frontend.py:self_check(), not
-# inline here: a Dockerfile RUN cannot contain a bare newline (every line needs a
-# trailing backslash, or the parser reports "unknown instruction"), and the
-# assertions are more use next to the code they guard.
-#
-# Cheap — no model, no ROS, no sherpa-onnx.
-RUN if [ "${ENABLE_THAI_TTS}" = "1" ]; then \
-      cd /work && python3 -m plugins.thai_frontend; \
-    fi
-
 # ── zxing-cpp (barcode / QR decoding for plugins/barcode.py) ─────
-# Deliberately the last dependency step in this file: a new ARG or layer near
-# the top rebuilds all ~16 GB from there down, and this one is ~2 MB.
+# Keep barcode dependencies before the speech runtime and application COPY,
+# so updating either does not reinstall the barcode decoder.
 #
 # Zero models, nothing to download at runtime — it is a decoder, not a network.
 # But it cannot be one `pip install` for both lines:
@@ -668,6 +520,162 @@ urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.my
 print('[build] zxing-cpp:', version('zxing-cpp'), 'ok,', \
       'try_invert' in zxingcpp.read_barcodes.__doc__.splitlines()[0] and 'with try_invert' or 'no try_invert')" \
       || echo "[build] zxing-cpp: NOT INSTALLED — the barcode card will report decoder_unavailable"
+
+# ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
+# PyPI ships CPU-only sherpa-onnx, so each JetPack line installs a CUDA-enabled
+# wheel built in-house on an Orin with -DSHERPA_ONNX_ENABLE_GPU=ON.
+#
+# Installing it does NOT move anything to the GPU on its own: that is opt-in via
+# `device: gpu` in the ASR/TTS config, and only for the (model, device) pairs
+# ASR_MODELS lists. int8 weights are *slower* on CUDA — ONNX Runtime's CUDA
+# provider has no int8 kernels and falls back per node — so `device: gpu` loads
+# different, non-quantised weights. Measured on an Orin NX at matched num_threads:
+# SenseVoice fp16 5.8x faster, streaming paraformer fp32 1.8x faster, while the
+# same models' int8 weights were 0.4-0.7x, i.e. worse. The numbers, the thread
+# sweep and the reasoning are in perception/README.md § sherpa-onnx Device
+# Selection, along with how to rebuild these wheels.
+#
+# One wheel per JetPack line, not one wheel: the ONNX Runtime a wheel links is
+# what ties it to a CUDA/cuDNN pair, and the pybind extension is tagged with the
+# CPython ABI it was compiled against. Neither is portable.
+#
+#   jp5.11  onnxruntime-gpu 1.16.0  CUDA 11.4 / cuDNN 8  cp38   (focal)
+#   jp6.1   onnxruntime-gpu 1.18.1  CUDA 12.6 / cuDNN 9  cp310  (jammy)
+#
+# Verified rather than assumed for jp6.1: 1.18.1's aarch64 GPU package needs
+# libcudnn.so.9 / libcudart.so.12 / libcublas.so.12, and all of them resolve
+# inside this image (cuDNN 9.4.0, CUDA 12.6). 1.18.0 would not — it is built
+# against cuDNN 8.9.4. sherpa-onnx's own cmake pins 1.18.1 for L4T R36 + CUDA
+# 12.6, which is what this line targets.
+#
+# An unlisted JP_VERSION (and any non-Jetson build) falls back to the PyPI CPU
+# wheel, where `device: gpu` degrades to cpu with a warning rather than failing
+# to start. The gate is therefore on JP_VERSION, not on "is this a Jetson":
+# there is nothing sensible to guess for a line we have not built a wheel for.
+#
+# Fixed full selective-runtime wheel sizes (decimal MB): JP5 64.4 compressed /
+# 274.8 unpacked; JP6 83.7 / 379.5. Most bytes are the CUDA provider. Model
+# weights are separate; these are neither image sizes nor runtime memory.
+#
+# Legacy COS keys carry the JetPack; the default fixed public URLs select the
+# matching wheel explicitly. Upstream's setup.py
+# tags the wheel `1.13.6+cuda-cp<abi>`, so the only thing separating the two
+# builds in a flat directory would be `cp38` vs `cp310` — which is a *Python*
+# discriminator, not a CUDA one. It happens to select correctly today, since each
+# image ships exactly one Python, but a second cp310 build for another JetPack 6.x
+# on a different CUDA would collide. Renaming the file is not an option (pip parses
+# the version out of it and it must match the wheel metadata), so the directory
+# records what the name cannot.
+#
+# The URL needs %2B for the '+cuda' local version — `quote` leaves the '/' of the
+# key alone — while the file on disk must keep the literal '+' or pip refuses to
+# parse the version out of the filename.
+# Speech-wheel versions are scoped here, after independent dependencies.
+# Updating the URL/SHA rebuilds this install and the dependent provider copy;
+# stable platform facts above remain cacheable. Keep the installed wheel in
+# /etc/jetpack.env alongside the ABI record used by existing consumers.
+ARG SHERPA_GPU_WHEEL_511=https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/550b9920d46f65dbe4b7350b2e1f83a63607d0aa/sherpa_onnx-1.13.6%2Bcuda.prefixfullselective1-cp38-cp38-linux_aarch64.whl
+ARG SHERPA_GPU_WHEEL_61=https://www.modelscope.cn/models/Flame4pd/x-asr-exhibition-prefix-lm/resolve/550b9920d46f65dbe4b7350b2e1f83a63607d0aa/sherpa_onnx-1.13.6%2Bcuda.prefixfullselective1-cp310-cp310-linux_aarch64.whl
+ARG SHERPA_GPU_WHEEL_SHA256_511=2d76566d7daa59a7e055b5b13d9171525ab4a6c5b979eb518d61b42536aa60ef
+ARG SHERPA_GPU_WHEEL_SHA256_61=8fcb24aeffa4648910d71602c10d5837e981f3487a63014c7dd506895ccfb8fe
+RUN case "${JP_VERSION}" in \
+        511) WHEEL="${SHERPA_GPU_WHEEL_511}"; WHEEL_SHA="${SHERPA_GPU_WHEEL_SHA256_511}" ;; \
+        61)  WHEEL="${SHERPA_GPU_WHEEL_61}"; WHEEL_SHA="${SHERPA_GPU_WHEEL_SHA256_61}" ;; \
+        *)   WHEEL=; WHEEL_SHA= ;; \
+    esac; \
+    printf 'SHERPA_GPU_WHEEL=%s\nSHERPA_GPU_WHEEL_SHA256=%s\n' \
+        "${WHEEL}" "${WHEEL_SHA}" >> /etc/jetpack.env
+
+RUN . /etc/jetpack.env; \
+    if [ -n "${SHERPA_GPU_WHEEL}" ]; then \
+        FILE="$(python3 -c 'import os, sys, urllib.parse; key=sys.argv[1]; u=urllib.parse.urlsplit(key); print(os.path.basename(urllib.parse.unquote(u.path)) if u.scheme in ("http", "https") else os.path.basename(key))' "${SHERPA_GPU_WHEEL}")" && \
+        echo "[build] sherpa-onnx: GPU wheel for jp${JP_VERSION} — ${SHERPA_GPU_WHEEL}" && \
+        python3 -c "import urllib.request, urllib.parse, sys, hashlib, pathlib; \
+key, dest, expected = sys.argv[1:]; \
+assert expected, 'SHA256 is required for the selected runtime wheel'; \
+url = key if urllib.parse.urlsplit(key).scheme in ('http', 'https') else 'https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(key); \
+urllib.request.urlretrieve(url, dest); \
+assert hashlib.sha256(pathlib.Path(dest).read_bytes()).hexdigest() == expected, 'Runtime wheel checksum mismatch'" \
+            "${SHERPA_GPU_WHEEL}" "/tmp/${FILE}" "${SHERPA_GPU_WHEEL_SHA256}" && \
+        pip3 install --no-cache-dir "/tmp/${FILE}" && \
+        rm -f "/tmp/${FILE}" && \
+        python3 -c "import sherpa_onnx, pathlib; \
+lib = pathlib.Path(sherpa_onnx.__file__).parent / 'lib' / 'libonnxruntime_providers_cuda.so'; \
+assert lib.is_file(), 'CUDA provider missing from the installed wheel'; \
+assert hasattr(sherpa_onnx, 'OfflineTtsConfig'), 'ASR-only wheel cannot replace the full perception runtime'; \
+print('sherpa-onnx', sherpa_onnx.__version__, 'with CUDA provider')"; \
+    else \
+        echo "[build] sherpa-onnx: no GPU wheel for jp${JP_VERSION} — CPU wheel from PyPI" && \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
+    fi
+
+# ── JP6.1: the second half of the GPU fix ────────────────────────────────────
+# The COS wheel installed above carries the provider bridge but was built against
+# cuDNN 8; JP6.1 ships 9, so its own provider fails to load with
+# "libcudnn.so.8: cannot open shared object file". sherpa-onnx 1.13.6+cuda bundles
+# the same provider built against cuDNN 9, so overwrite the wheel's copy with it.
+#
+# Neither half works alone — see the measurements on the wheel-selection step above.
+# Do not "simplify" this away and go back to the PyPI CPU wheel: that has no bridge
+# at all, and this copy then silently does nothing while the plugin logs
+# "device='gpu' ... falling back to cpu". Re-confirmed by running the same probe in
+# both images, with and without sherpa_onnx imported first — the import order makes
+# no difference, so this is not something symbol interposition can rescue:
+#
+#   release.260910.84b5450 (PyPI wheel + copy)  compiled-in ['Azure','CPU']  18.5 ms
+#   release.260910.10266c2 (COS wheel + copy)   compiled-in [...,'CUDA',...]  6.0 ms
+#
+# The price of the copy, and it is a real one: the standalone runtime (1.18.0) and
+# sherpa's (**1.18.1**, not 1.18.0 — check `sherpa_onnx/lib/`) now share a single
+# provider library, since the soname collides and the first dlopen wins. They
+# coexist fine for separate graphs — face keeps its 3x with a sherpa CUDA session
+# live — but a *second* CUDA session on the **Kokoro** graph fails in whichever
+# runtime did not load the provider, symmetrically:
+#
+#   sherpa's session first  -> the standalone one fails, naming /home/tian/Yxh/...
+#   the standalone first    -> sherpa's fails, naming /home/yifanl/...
+#   both: "Error mapping output names: Could not find OrtValue '/Squeeze_2_output_0'"
+#
+# That is why plugins/kokoro_direct.py is CPU-only by construction and takes no
+# device argument. Anything else that wants a standalone CUDA session on a graph
+# sherpa also loads has the same constraint.
+RUN . /etc/jetpack.env && \
+    if [ "${JP_VERSION}" = "61" ]; then \
+        SHERPA_LIB="/usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib" && \
+        ORT_CAPI="/usr/local/lib/python3.10/dist-packages/onnxruntime/capi" && \
+        cp "${SHERPA_LIB}/libonnxruntime_providers_cuda.so" "${ORT_CAPI}/" && \
+        cp "${SHERPA_LIB}/libonnxruntime_providers_shared.so" "${ORT_CAPI}/" && \
+        echo "[build] JP6.1: GPU enabled via sherpa-onnx's cuDNN-9 CUDA provider"; \
+    fi
+
+# ── Application code ───────────────────────────────────────────────
+WORKDIR /work
+COPY perception/main.py    /work/main.py
+COPY perception/plugins/   /work/plugins/
+COPY perception/utils/     /work/utils/
+COPY perception/resource/  /work/resource/
+COPY perception/config.yaml /work/config.yaml
+COPY perception/deploy/    /deploy/
+
+# ── Thai frontend self-check, on the real interpreter ──────────────────────────
+# Runs the frontend that was just copied in, on the Python this image actually
+# ships, and asserts the one invariant the Thai engine depends on: every character
+# it emits is in the model's 71-character table. Importing the dependencies (the
+# step above) is not the same test — pythainlp's and khanaa's APIs drift between
+# the versions cp38 and cp310 resolve to, and this is what catches that. It already
+# would have: khanaa 0.0.6 spells with SpellWord().spell_out() where 0.1.1 uses
+# Kham().form, and pythainlp 5.0.4's maiyamok takes a token list where 5.3.7's
+# takes a string — each a crash on one JetPack line only.
+#
+# The cases and assertions live in plugins/thai_frontend.py:self_check(), not
+# inline here: a Dockerfile RUN cannot contain a bare newline (every line needs a
+# trailing backslash, or the parser reports "unknown instruction"), and the
+# assertions are more use next to the code they guard.
+#
+# Cheap — no model, no ROS, no sherpa-onnx.
+RUN if [ "${ENABLE_THAI_TTS}" = "1" ]; then \
+      cd /work && python3 -m plugins.thai_frontend; \
+    fi
 
 EXPOSE 15720
 EXPOSE 15721
