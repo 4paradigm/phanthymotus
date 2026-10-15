@@ -909,14 +909,14 @@ function _displayPath(topicPath) {
 function _formatClass(format) {
   if (!format) return '';
   if (format.includes('audio') || format === 'audio/pcm') return 'fmt-audio';
-  if (format.includes('json') || format.startsWith('text/')) return 'fmt-json';
+  if (format.includes('json') || format.startsWith('text/') || format === 'sensor/sound-direction') return 'fmt-json';
   if (format.includes('video') || format.includes('image') || format.includes('visual')) return 'fmt-visual';
   return '';
 }
 
 function _formatLabel(format) {
   if (!format) return 'RAW';
-  if (format === 'data/json') return 'JSON';
+  if (format === 'data/json' || format === 'sensor/sound-direction') return 'JSON';
   if (format === 'audio/pcm') return 'AUDIO';
   if (format.includes('video')) return 'VIDEO';
   if (format.includes('image')) return 'IMAGE';
