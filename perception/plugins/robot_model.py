@@ -105,6 +105,8 @@ class _RobotModelNode(Node):
 
 
 class RobotModelPlugin:
+    PREFIX = "robot_model"
+
     def __init__(self, plugin_cfg: dict, detector, executor):
         self._cfg = dict(plugin_cfg)
         self._detector = detector

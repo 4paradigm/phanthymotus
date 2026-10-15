@@ -179,3 +179,14 @@ def test_get_all_tools_prefixes_sub_tools_only(bundle_cls):
     assert names == {"face_recognition", "asr", "asr_start"}
     for name in names:
         assert bundle.owns(name), name
+
+
+def test_robot_model_card_registers_without_breaking_other_tools(bundle_cls):
+    from plugins.robot_model import RobotModelPlugin
+    from vision_stubs import _FakeExecutor
+
+    bundle = _bundle(bundle_cls, _StubPlugin("ocr"),
+                     RobotModelPlugin({}, None, _FakeExecutor()))
+    assert {tool["name"] for tool in bundle.get_all_tools()} == {"ocr", "robot_model"}
+    assert bundle.dispatch("ocr", {"action": "info"})["plugin"] == "ocr"
+    assert bundle.dispatch("robot_model", {"action": "info"})["state"] == "unavailable"

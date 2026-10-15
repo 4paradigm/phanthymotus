@@ -46,3 +46,10 @@ def test_uncalibrated_when_no_clean_separation():
     report = evaluate(rows)
     assert report["thresholds"] == {"min_score": None, "min_margin": None}
     assert report["per_model_recall"]["unitree/g1"] == 0.0
+
+
+def test_crossed_wrong_scores_do_not_crash_calibration():
+    rows = [row("calibration", "a", "unknown", .8, .1, "unitree/g1"),
+            row("calibration", "b", "unknown", .7, .2, "unitree/g1"),
+            row("test", "c", "unknown", .9, .3, "unitree/g1")]
+    assert evaluate(rows)["thresholds"] == {"min_score": None, "min_margin": None}

@@ -67,7 +67,7 @@ def _calibrate(observations: list[dict]) -> dict:
     best = (0, None, None)
     for score, margin in itertools.product(scores, margins):
         accepted = [item for item in observations if _accepted(item, score, margin)]
-        if any(item["truth"] != item["top_id"] for item in accepted):
+        if not accepted or any(item["truth"] != item["top_id"] for item in accepted):
             continue
         candidate = (len(accepted), score, margin)
         if candidate > best:
