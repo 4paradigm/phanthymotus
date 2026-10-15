@@ -64,7 +64,7 @@ def test_dedicated_direction_delivers_standard_sensor_payload(monkeypatch):
     async def receive(data, fmt):
         received.append((json.loads(data), fmt))
 
-    ros2_bridge.subscribe('direction', '/robot/sound_direction/events',
+    ros2_bridge.subscribe('direction', '/robot/sound_direction',
                           'sensor/sound-direction', None, receive)
     assert callbacks[0][0] is _msg.String
     payload = {'state': 'fresh', 'angle': -30, 'angle_deg': -29.678,

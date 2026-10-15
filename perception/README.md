@@ -45,7 +45,7 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 ### Wake Direction Timing
 
 Connect Bumi's `sensor/sound-direction` output
-(`/<namespace>/sound_direction/events`) to ASR's sound-direction input, and
+(`/<namespace>/sound_direction`) to ASR's sound-direction input, and
 its microphone to the `audio/pcm-16k` input. The direction port remains a
 specific sensor type, not `data/json`: an ordinary JSON card cannot supply it.
 Like the existing `sensor/pose2d` card, its ROS transport is `std_msgs/String`

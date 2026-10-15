@@ -24,7 +24,7 @@ function drop(tool, save = true) {
 }
 
 const direction = { name: 'sound_direction', type: 'sensor',
-  topic_out: [{ format: 'sensor/sound-direction', topic: '/ubuntu/sound_direction/events' }] };
+  topic_out: [{ format: 'sensor/sound-direction', topic: '/ubuntu/sound_direction' }] };
 
 test('direction follows other boot-managed sensors without an extra start call', () => {
   assert.equal(drop(direction).length, 0);
