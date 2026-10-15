@@ -17,6 +17,8 @@ import event.skills
 _skills_mod = sys.modules['event.skills']
 
 router = fastapi.APIRouter(prefix='/skills', tags=['skills'])
+from api.skill_packages import router as package_router
+router.include_router(package_router)
 
 
 def _get_rc_url() -> str:
@@ -126,6 +128,8 @@ async def list_skills():
             'requiredTools': s.get('requiredTools', []),
             'active': s.get('active', False),
             'installedAt': s.get('installedAt', ''),
+            'compatibility': s.get('compatibility'),
+            'attachment': s.get('attachment'),
         })
     return {'code': 200, 'data': result}
 
@@ -150,19 +154,12 @@ async def install_skill(request: fastapi.Request, body: dict = fastapi.Body(...)
     return {'code': 200, 'data': result['data']}
 
 
-@router.post('/import')
-async def import_local_skill(body: dict = fastapi.Body(...)):
-    """Import an unpublished skill into the existing local skill store.
-
-    No await between read and write: concurrent requests on the API loop cannot
-    overwrite one another. ConfigDB commits the whole value transactionally.
-    A retry is idempotent; a conflicting slug never overwrites an installed skill.
-    """
+def validate_local_skill(body):
     limits = {'slug': 100, 'name': 100, 'oneLiner': 300, 'description': 4000,
               'instruction': 20000, 'category': 80, 'version': 40}
     if len(json.dumps(body, ensure_ascii=False).encode()) > 32768:
         raise fastapi.HTTPException(413, '技能定义超过 32 KiB')
-    if set(body) - (set(limits) | {'requiredTools'}):
+    if set(body) - (set(limits) | {'requiredTools', 'compatibility', 'attachment', 'origin'}):
         raise fastapi.HTTPException(422, '技能定义含不支持的字段')
     for key, limit in limits.items():
         value = body.get(key, '')
@@ -179,6 +176,33 @@ async def import_local_skill(body: dict = fastapi.Body(...)):
     definition = {k: body.get(k, '') for k in limits}
     definition['version'] = definition['version'] or '1.0.0'
     definition['requiredTools'] = required
+    for key in ('compatibility', 'attachment', 'origin'):
+        if key in body:
+            if not isinstance(body[key], dict) or len(json.dumps(body[key]).encode()) > 8192:
+                raise fastapi.HTTPException(422, f'无效的技能字段：{key}')
+            definition[key] = body[key]
+    attachment = definition.get('attachment')
+    if attachment and (set(attachment) != {'schema', 'tool', 'asset_id'} or
+            attachment.get('schema') != 'motus.teaching.package/1' or
+            attachment.get('tool') not in required or
+            not re.fullmatch(r'[a-f0-9]{32}', str(attachment.get('asset_id', '')))):
+        raise fastapi.HTTPException(422, '无效的动作附件声明')
+    origin = definition.get('origin')
+    if origin and (set(origin) != {'mcp_id', 'instance_id'} or
+                   any(not isinstance(v, str) or not v or len(v) > 200 for v in origin.values())):
+        raise fastapi.HTTPException(422, '无效的技能来源')
+    return definition
+
+
+@router.post('/import')
+async def import_local_skill(body: dict = fastapi.Body(...)):
+    """Import an unpublished skill into the existing local skill store.
+
+    No await between read and write: concurrent requests on the API loop cannot
+    overwrite one another. ConfigDB commits the whole value transactionally.
+    A retry is idempotent; a conflicting slug never overwrites an installed skill.
+    """
+    definition = validate_local_skill(body)
     skills_cfg = config.main.get('skills', {})
     installed = list(skills_cfg.get('installed', []))
     previous = next((s for s in installed if s['slug'] == definition['slug']), None)

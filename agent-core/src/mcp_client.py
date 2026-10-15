@@ -444,7 +444,10 @@ def _to_openai_schema(mcp_id: str, tool: dict) -> list[dict]:
 
         # 只保留该 action 对应的参数（不含 action 字段本身）
         props = {k: all_props[k] for k in param_keys if k in all_props}
-        required = [k for k in param_keys if k in all_required]
+        # An action can require parameters that sibling actions do not take.
+        # Keep the legacy tool-wide requirements when no override is declared.
+        action_required = action_def.get('required', all_required)
+        required = [k for k in param_keys if k in action_required]
 
         schemas.append({
             'name':        f'mcp__{mcp_id}__{tool["name"]}__{action_name}',

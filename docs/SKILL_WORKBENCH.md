@@ -1,6 +1,6 @@
 # 内嵌技能工作台
 
-在现有执行卡上选择「录制技能」并点击原有的「执行」，打开 Driver 提供的页面。没有专用全局按钮、额外的全局样式或机器人选择页。Core 复用已有 modal 样式，提供通用卡片页面容器、受限通信和本机技能导入；页面样式、示教状态、机器人适配和动作资产属于 Driver。既有 Agent Loop、技能激活、提示词与 ACP 不变。
+在现有执行卡上选择「录制技能」并点击原有的「执行」，打开 Driver 提供的页面。没有专用全局示教按钮或额外的全局样式。Core 复用已有 modal 样式，提供通用卡片页面容器、受限通信和本机技能导入；页面样式、示教状态、机器人适配和动作资产属于 Driver。既有 Agent Loop、技能激活、提示词与 ACP 不变。
 
 原有卡片只能显示参数表单和文本结果；现有技能安装接口从资源中心获取定义，不能安装本机生成的未发布定义。因此新增上述两项通用能力。若后续统一的卡片页面协议或本地安装接口覆盖它们，应迁移并移除重复实现；不在 Core 添加各机器人专用流程。
 
@@ -45,7 +45,7 @@ port.postMessage({id: 'request-1', method: 'call', args: {action: 'info'}});
 
 `POST /api/skills/import` 使用既有 Core API 鉴权，直接写入 ConfigDB 的 `skills.installed`。无需资源中心账号。
 
-必填：`slug`、`name`、`oneLiner`、`instruction`。可选：`description`、`category`、`version`、`requiredTools`。仅接收这些字段，限制大小和类型，不接受 HTML 图标、远程资源、任意配置或 active 覆盖。总定义不超过 32 KiB。
+必填：`slug`、`name`、`oneLiner`、`instruction`。可选：`description`、`category`、`version`、`requiredTools`、`compatibility`、`attachment`、`origin`。后三项为有界对象，attachment 校验协议、工具和资产 ID，origin 校验 MCP 与卡片实例；不接受任意外链附件。仅接收这些字段，限制大小和类型，不接受 HTML 图标、远程资源、任意配置或 active 覆盖。总定义不超过 32 KiB。
 
 新技能默认对 LLM 可见；仍沿用 `activate_skill` 的现有指令加载机制。相同定义重试幂等，不重置用户后来修改的可见性；同 slug 不同定义返回 HTTP 409。导入不是自动执行，也不会自动授权未连接的工具。
 
@@ -55,10 +55,37 @@ port.postMessage({id: 'request-1', method: 'call', args: {action: 'info'}});
 
 工作台中的操作绑定打开页面的 MCP 服务、工具和卡片实例。导入接口仅接收已有 Skill 格式，不会自动创建执行器连线、增加运行权限或给网页增加聊天框；自然语言入口仍由部署已有的语音或消息渠道提供。
 
-首个 Driver 生成的 Skill 目前只记录工具名与资产 ID，尚未固定来源 MCP 服务 / 卡片；多个同名工具服务同时接入时的选择仍待完善。卡片「运行技能」也仍是带资产 ID 的参数表单，尚无按保存名称选择并运行的界面。模拟浏览器验收覆盖单个绑定设备的发现、激活和 MCP 调用，未验证真实 LLM 决策或真机操作。这些限制不应被表述为已完成完整的多设备网页调用体验。
+支持动作包的 Driver 返回型号元数据和本地资产附件声明，宿主补入来源 MCP/卡片；导出及更新说明固定该来源。既有 Agent 路由仍按画布连接选择工具，多个同名服务同时接入时的自然语言选择未新增强制限制。卡片「运行技能」也仍是带资产 ID 的参数表单，尚无按保存名称选择并运行的界面。模拟浏览器验收覆盖单个绑定设备的发现、激活和 MCP 调用，未验证真实 LLM 决策或真机操作。这些限制不应被表述为已完成完整的多设备网页调用体验。
 
 ## 验证
 
 本仓：`python -m pytest -q tests/test_skill_import.py`（在 agent-core 目录，使用既有依赖及 pytest）。
 
 Driver 的 `tests/test_teaching_browser.py` 提供跨仓浏览器验收：真实 MCP 代理、SQLite 导入、现有技能列表、模拟机器人、起点拒绝、试运行和沙箱隔离；使用方式见 Driver 的 `common/teaching/README.md`。
+
+
+## 每动作必填参数
+
+`mcp_client._to_openai_schema` 支持 `x-action-params.<action>.required`，仅将声明的该动作参数列为必填；未声明时沿用工具级 required。解决兄弟动作参数不同、拆分后 run 的参数全为可选的问题。Driver 仍须自行执行参数和状态校验；此变更不修改 Agent Loop、提示词或执行许可。
+
+## 完整动作文件
+
+现有技能管理的「已安装」中可导入动作包；本机动作 Skill 详情可下载动作包或更新调用说明。导出与更新使用原来源 MCP/卡片，旧 taught UUID Skill 仅在可唯一确定原工具服务时兼容。Core 复用已有鉴权和 MCP 调用，传输不会自动连线或执行动作。
+
+新增 `src/api/skill_packages.py` 的 `/api/skills/package` 路由：
+
+| 接口 | 行为 |
+| --- | --- |
+| GET `/targets` | 当前画布中声明 `x-skill-package.schema=motus.teaching.package/1` 的 HTTP MCP 工具 |
+| POST `/inspect` | 有界读取上传文件，返回 manifest 与设备卡片；不接触机器人 |
+| POST `/install` | 按 card_id 发送有界分块，由 Driver 验证兼容并生成草稿；不安装/激活 Core Skill |
+| GET `/export/{slug}` | 从原卡读取完整包，验证长度与传输 SHA 后下载 |
+| POST `/refresh/{slug}` | 由原 Driver 校验资产并重新生成说明，校验相同 slug/资产后更新；保留可见性和安装时间，拒绝并发覆盖 |
+
+文件包含 `manifest.json` 和 `trajectory.jsonl`，最大 16 MiB，解压轨迹最大 64 MiB；Core 检查格式边界并负责传输，Driver 完成轨迹校验、型号/关节/模型匹配和重新绑定。导入创建的新草稿必须本机试运行并确认效果，随后走已有 save/import 才成为可调用 Skill。拒绝替换尚未保存的录制草稿。
+
+`web/index.html` / `web/js/skills.js` 复用现有技能弹窗和样式提供文件入口和型号详情，`workbench.js` 在保存时补入原 MCP/实例身份。没有机器人型号判断或运动算法放进 Core。
+
+完整附件的资源中心发布尚未实现。线上公开客户端当前只展示文本/配置发布流程；在拿到服务端附件实现前，本 PR 不能声称动作包已可上传、审核、下载并从技能广场安装。也不会将轨迹塞进 instruction 或 configSchema。
+
+本次验证：Skill 导入、文件路由、旧定义更新、action required，以及真实浏览器下的导出→更换模拟设备身份→导入→试运行→重新保存。硬件为模拟，未调用真实 LLM。上海此前部署的是早期三文件宿主版本，新增修复及文件能力尚未部署。

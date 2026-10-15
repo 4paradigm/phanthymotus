@@ -88,7 +88,9 @@ export async function openWorkbench(target, spec, ui) {
         let result = await invoke(target, {...args, action});
         if (request.method === 'save') {
           if (!result.skill) throw new Error('扩展未返回技能定义');
-          result = {...result, installed: await api('/api/skills/import', result.skill),
+          const definition = result.skill.attachment ? {...result.skill,
+            origin: {mcp_id: target.mcp, instance_id: target.instanceId}} : result.skill;
+          result = {...result, installed: await api('/api/skills/import', definition),
             context: await conversationContext(target).catch(() => ({conversation_ready: false, tool: target.tool}))};
         }
         reply.postMessage({id: request.id, result});

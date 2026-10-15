@@ -4,6 +4,7 @@
  */
 
 import { isRcLoggedIn as _isRcLoggedIn, rcHeaders as _rcHeaders, showAccount } from './account.js';
+import { openWorkbench } from './workbench.js';
 
 let _overlay, _closeBtn, _tabs, _panels;
 let _installedList, _installedEmpty, _browseList, _browseEmpty, _searchInput;
@@ -63,6 +64,7 @@ export function initSkills() {
     if (e.target.id === 'skill-form-overlay') _closeSkillForm();
   });
   document.getElementById('skill-form-el').addEventListener('submit', _handleSkillFormSubmit);
+  _initPackages();
 
 }
 
@@ -487,6 +489,7 @@ function _renderSkillDetail(skill, context) {
   const container = context === 'installed' ? _installedList : _browseList;
   const emptyEl = context === 'installed' ? _installedEmpty : _browseEmpty;
   emptyEl.classList.add('hidden');
+  const actionSkill = skill.attachment || /^taught-[a-f0-9]{32}$/.test(skill.slug);
 
   const requiredToolsHtml = (skill.requiredTools || []).length
     ? `<div class="skill-detail-section">
@@ -510,7 +513,9 @@ function _renderSkillDetail(skill, context) {
     <div class="skill-detail-actions">
       <button class="skill-btn skill-btn-primary" id="skill-detail-install">安装</button>
     </div>
-  ` : '';
+  ` : actionSkill ? `
+    <div class="skill-detail-actions"><button class="skill-btn" id="skill-package-refresh">更新调用说明</button><button class="skill-btn skill-btn-primary" id="skill-package-export">下载动作包</button></div>
+    <p class="skill-detail-text" id="skill-package-export-status" role="status"></p>` : '';
 
   container.innerHTML = `
     <button class="skill-detail-back" id="skill-detail-back">← 返回</button>
@@ -527,12 +532,16 @@ function _renderSkillDetail(skill, context) {
       </div>
     </div>
     ${skill.description ? `<div class="skill-detail-section"><div class="skill-detail-section-label">描述</div><div class="skill-detail-text">${_esc(skill.description)}</div></div>` : ''}
-    ${skill.instruction ? `<div class="skill-detail-section"><div class="skill-detail-section-label">指令内容</div><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></div>` : ''}
+    ${_compatibilityHtml(skill.compatibility)}
+    ${skill.instruction ? actionSkill
+      ? `<details class="skill-detail-section"><summary class="skill-detail-text">调用说明</summary><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></details>`
+      : `<div class="skill-detail-section"><div class="skill-detail-section-label">指令内容</div><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></div>` : ''}
     ${requiredToolsHtml}
     ${configSchemaHtml}
     ${installedAtHtml}
     ${actionsHtml}
   `;
+  _overlay.querySelector('.skill-modal-body').scrollTop = 0;
 
   // Back button
   container.querySelector('#skill-detail-back').addEventListener('click', () => {
@@ -541,6 +550,30 @@ function _renderSkillDetail(skill, context) {
   });
 
   // Action buttons
+  container.querySelector('#skill-package-refresh')?.addEventListener('click', async event => {
+    const button = event.currentTarget, status = container.querySelector('#skill-package-export-status');
+    button.disabled = true; status.textContent = '正在核对原动作并更新说明…';
+    try {
+      const response = await fetch(`/api/skills/package/refresh/${encodeURIComponent(skill.slug)}`, {method: 'POST'});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || '更新失败');
+      await _showSkillDetail(skill.slug);
+      container.querySelector('#skill-package-export-status').textContent = '调用说明与型号信息已更新。';
+    } catch (error) { status.textContent = error.message; button.disabled = false; }
+  });
+  container.querySelector('#skill-package-export')?.addEventListener('click', async event => {
+    const button = event.currentTarget, status = container.querySelector('#skill-package-export-status');
+    button.disabled = true; status.textContent = '正在读取完整录制…';
+    try {
+      const response = await fetch(`/api/skills/package/export/${encodeURIComponent(skill.slug)}`);
+      if (!response.ok) { const error = await response.json(); throw new Error(error.detail || '导出失败'); }
+      const url = URL.createObjectURL(await response.blob()), link = document.createElement('a');
+      link.href = url; link.download = `${skill.slug}.motus-skill`; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      status.textContent = '已下载完整动作包。导入其他设备后需重新试运行。';
+    } catch (error) { status.textContent = error.message; }
+    finally { button.disabled = false; }
+  });
   if (context === 'browse') {
     container.querySelector('#skill-detail-install').addEventListener('click', async () => {
       try {
@@ -559,6 +592,75 @@ function _renderSkillDetail(skill, context) {
       } catch (e) { alert('安装失败: ' + e.message); }
     });
   }
+}
+
+function _compatibilityHtml(value) {
+  if (!value || typeof value !== 'object') return '';
+  const labels = [value.manufacturer, value.variant || value.model,
+    value.scope === 'dual_arm' ? '双臂' : value.scope,
+    value.end_effectors === 'fixed_hand' ? '固定手' : value.end_effectors,
+    Array.isArray(value.joint_names) ? `${value.joint_names.length} 关节` : ''].filter(Boolean);
+  return `<div class="skill-detail-section"><div class="skill-detail-section-label">适用设备</div>
+    <div class="skill-detail-tools">${labels.map(v => `<span class="skill-detail-tool-pill">${_esc(String(v))}</span>`).join('')}</div>
+    <details><summary class="skill-detail-text">兼容信息</summary><pre class="skill-detail-schema">${_esc(JSON.stringify(value, null, 2))}</pre></details></div>`;
+}
+
+function _initPackages() {
+  const get = id => document.getElementById('skill-package-' + id);
+  let file, targets = [], busy = false, revision = 0;
+  const close = () => { if (!busy) get('overlay').classList.add('hidden'); };
+  get('close').onclick = close; get('cancel').onclick = close;
+  get('open').onclick = () => { get('overlay').classList.remove('hidden'); get('file').focus(); };
+  get('file').onchange = async () => {
+    const version = ++revision;
+    file = null; targets = []; get('install').disabled = true; get('target').disabled = true;
+    get('target').replaceChildren(); get('summary').replaceChildren(); get('error').textContent = '';
+    const selected = get('file').files[0];
+    if (!selected) return;
+    try {
+      if (selected.size > 16*1024*1024) throw new Error('动作包须小于 16 MiB');
+      const body = new FormData(); body.append('file', selected);
+      const response = await fetch('/api/skills/package/inspect', {method: 'POST', body});
+      const result = await response.json();
+      if (version !== revision) return;
+      if (!response.ok) throw new Error(result.detail || '无法读取动作包');
+      const value = result.data;
+      get('summary').innerHTML = `<h3 class="skill-detail-title">${_esc(value.manifest.skill?.name || '动作技能')}</h3>` + _compatibilityHtml(value.manifest.compatibility);
+      targets = value.targets;
+      const tool = value.manifest.compatibility?.tool;
+      targets = targets.filter(t => t.tool === tool && t.workbench);
+      get('target').replaceChildren(new Option('请选择目标设备…', ''), ...targets.map(t => new Option(t.label, t.instance_id)));
+      if (targets.length === 1) get('target').value = targets[0].instance_id;
+      get('target').disabled = !targets.length;
+      if (!targets.length) throw new Error('画布中没有支持此动作包的设备卡片，请先连接对应驱动。');
+      file = selected; get('install').disabled = !get('target').value;
+    } catch (error) { if (version === revision) get('error').textContent = error.message; }
+  };
+  get('target').onchange = () => { get('install').disabled = !file || !get('target').value; };
+  get('install').onclick = async () => {
+    if (busy || !file) return;
+    busy = true; get('install').disabled = true; get('file').disabled = true;
+    get('error').textContent = '正在校验并传入目标设备…';
+    try {
+      const body = new FormData(); body.append('file', file); body.append('card_id', get('target').value);
+      const response = await fetch('/api/skills/package/install', {method: 'POST', body});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || '导入失败');
+      const target = result.data.target;
+      const uiResponse = await fetch(`/api/mcp/${encodeURIComponent(target.mcp_id)}/call`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tool: target.tool, arguments: {action: 'ui', instance_id: target.instance_id}}),
+      });
+      const uiResult = await uiResponse.json();
+      if (!uiResponse.ok || uiResult.code !== 200) throw new Error('动作包已导入，请从目标卡片打开工作台继续检查。');
+      const content = uiResult.data;
+      const ui = Array.isArray(content) ? JSON.parse(content.find(c => c.type === 'text').text) : content;
+      await openWorkbench({mcp: target.mcp_id, tool: target.tool, instanceId: target.instance_id}, target.workbench, ui);
+      get('overlay').classList.add('hidden'); hide();
+      file = null; get('file').value = ''; get('summary').replaceChildren(); get('error').textContent = '';
+    } catch (error) { get('error').textContent = error.message; }
+    finally { busy = false; get('install').disabled = !file; get('file').disabled = false; }
+  };
 }
 
 // ── Legacy global handlers (kept for backward compat) ─────────────────────
