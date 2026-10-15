@@ -231,6 +231,25 @@ def _register_core_mcp(silent=False):
                                             'camera\'s own aspect ratio, never '
                                             'stretched.'),
                         },
+                        # No default, deliberately. See
+                        # `remote_camera_declaration`: a guessed focal length
+                        # does not break a metric-depth consumer, it makes it
+                        # publish wrong metres silently.
+                        'camera_fov_deg': {
+                            'type': 'number', 'minimum': 1, 'exclusiveMaximum': 180,
+                            'scope': 'instance',
+                            'title': 'Horizontal field of view (deg)',
+                            'description': (
+                                '镜头的水平视场角，整个视场不是一半。填了之后这张卡才会'
+                                '声明相机内参（motus.camera/1），需要内参的卡片（如 '
+                                'visual_depth 的 DepthART 模型）才能用它；留空就什么也'
+                                '不声明，那些卡片会拒绝启动并说明原因 —— 这是故意的，'
+                                '浏览器不提供焦距，猜一个会让深度静悄悄地错。\n\n'
+                                '从设备规格里查（常见 webcam 60–78 度，手机主摄约 '
+                                '65–75 度）。这是标称值不是标定：数字变焦、防抖裁切都会'
+                                '改变实际视场，所以接上之后用 visual_depth 的 calibrate '
+                                '量一次已知距离，把剩下的尺度误差去掉。'),
+                        },
                     },
                 },
                 'topic_out': [{'topic': '/remote_control/camera',
@@ -961,6 +980,9 @@ _camera_ws_connected = False
 # at all: at 1 fps a track expires between frames and the action model never
 # accumulates the seconds of history it needs.
 _camera_recent: "collections.deque" = __import__("collections").deque(maxlen=30)
+# The frame shape the browser actually settled on lives in remote_camera,
+# with the code that reads and uses it.
+import remote_camera
 
 
 def _ensure_camera_pub():
@@ -1010,6 +1032,11 @@ async def _ws_camera(ws: fastapi.WebSocket):
             msg.data = data
             _camera_pub.publish(msg)
             _camera_frame_count += 1
+            # Re-read periodically, not once: the operator can change the card's
+            # `width`, and a declaration describing the previous resolution is
+            # worse than none — K is in pixels.
+            if remote_camera.frame_size() is None or _camera_frame_count % 30 == 0:
+                remote_camera.note_frame(data)
             _camera_recent.append(time.time())
     except Exception:
         pass
