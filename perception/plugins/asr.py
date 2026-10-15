@@ -76,6 +76,7 @@ VAD_BUFFER_S     = 35
 # maximum direction rate. Snapshot at dequeue so transcription cannot evict it.
 DIRECTION_HISTORY_S = VAD_MAX_SPEECH_S + 30
 DIRECTION_HISTORY_MAX_EVENTS = DIRECTION_HISTORY_S * 20 + 1
+DIRECTION_ANGLE_CONVENTION = "robot_front_0_left_positive_ccw"
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -590,6 +591,7 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
     if angle == -180:
         angle = 180
     return {"wake_direction_state": "valid", "wake_direction_deg": angle,
+            "wake_direction_convention": DIRECTION_ANGLE_CONVENTION,
             "wake_direction_window_start_us": min(begin for _, begin, _ in selected),
             "wake_direction_window_end_us": max(end for _, _, end in selected)}
 
@@ -1784,7 +1786,8 @@ class _ASRNode(Node):
             data = json.loads(msg.data)
         except (ValueError, TypeError):
             return
-        if not isinstance(data, dict) or data.get('state') != 'fresh':
+        if (not isinstance(data, dict) or data.get('state') != 'fresh'
+                or data.get('angle_convention') != DIRECTION_ANGLE_CONVENTION):
             return
         begin, end = data.get('audio_window_start_us'), data.get('audio_window_end_us')
         angle = data.get('angle_deg')

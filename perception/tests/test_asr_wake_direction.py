@@ -18,6 +18,7 @@ def window(angle, start, end):
 def direction_message(state, angle_deg, window_start_us, window_end_us):
     return SimpleNamespace(data=json.dumps({
         'state': 'fresh' if state == 1 else 'no_event', 'angle_deg': angle_deg,
+        'angle_convention': 'robot_front_0_left_positive_ccw',
         'audio_window_start_us': window_start_us, 'audio_window_end_us': window_end_us}))
 
 
@@ -28,6 +29,7 @@ def test_leading_wake_matches_voice_onset_after_preroll():
         [window(90, 1700000000500000, 1700000000600000)], True)
     assert fields == {
         "wake_direction_state": "valid", "wake_direction_deg": 90,
+        "wake_direction_convention": "robot_front_0_left_positive_ccw",
         "wake_direction_window_start_us": 1700000000500000,
         "wake_direction_window_end_us": 1700000000600000,
     }
@@ -138,6 +140,7 @@ def test_worker_publishes_aligned_keyword_direction_after_prefix(monkeypatch, pr
     assert payload['text'] == '你好'
     assert payload['wake_direction_state'] == 'valid'
     assert payload['wake_direction_deg'] == 90
+    assert payload['wake_direction_convention'] == 'robot_front_0_left_positive_ccw'
     assert payload['wake_direction_window_start_us'] == 1700000001000000
     assert payload['audio_start_ts'] == 1700000000.0
     assert payload['asr_complete_ts'] == 1900000000.0
@@ -214,6 +217,7 @@ def test_json_direction_uses_precise_angle_for_wake_matching():
     node._direction_windows = asr.deque(maxlen=50)
     node._direction_lock = asr.threading.Lock()
     payload = {'state': 'fresh', 'angle': -30, 'angle_deg': -29.678,
+               'angle_convention': 'robot_front_0_left_positive_ccw',
                'audio_window_start_us': 1700000000000000,
                'audio_window_end_us': 1700000000020000}
     node._direction_cb(SimpleNamespace(data=json.dumps(payload)))
@@ -229,6 +233,20 @@ def test_json_direction_uses_precise_angle_for_wake_matching():
         1700000000.0, 0, list(node._direction_windows), True)
     assert fields['wake_direction_state'] == 'valid'
     assert fields['wake_direction_deg'] == -29.68
+
+
+@pytest.mark.parametrize('convention', [None, 'robot_front_0_right_positive_cw'])
+def test_direction_input_rejects_missing_or_wrong_angle_convention(convention):
+    node = asr._ASRNode.__new__(asr._ASRNode)
+    node._direction_windows = asr.deque(maxlen=50)
+    node._direction_lock = asr.threading.Lock()
+    payload = {'state': 'fresh', 'angle_deg': 90,
+               'audio_window_start_us': 1700000000000000,
+               'audio_window_end_us': 1700000000020000}
+    if convention is not None:
+        payload['angle_convention'] = convention
+    node._direction_cb(SimpleNamespace(data=json.dumps(payload)))
+    assert list(node._direction_windows) == []
 
 
 def test_direction_buffer_ignores_invalid_time_and_no_event_keeps_history():
@@ -448,9 +466,11 @@ def test_direction_subscription_enforces_open_negative_endpoint(angle, accepted)
     (-180, {'wake_direction_state': 'unknown'}),
     (180.001, {'wake_direction_state': 'unknown'}),
     (-179.999, {'wake_direction_state': 'valid', 'wake_direction_deg': 180,
+                'wake_direction_convention': 'robot_front_0_left_positive_ccw',
                 'wake_direction_window_start_us': 1700000000000000,
                 'wake_direction_window_end_us': 1700000000020000}),
     (180, {'wake_direction_state': 'valid', 'wake_direction_deg': 180,
+           'wake_direction_convention': 'robot_front_0_left_positive_ccw',
            'wake_direction_window_start_us': 1700000000000000,
            'wake_direction_window_end_us': 1700000000020000}),
 ])
