@@ -17,13 +17,15 @@ for (const base of [TextRenderer, KvLatestRenderer]) {
       assert.equal(TextRenderer.canRender('sensor/sound-direction'), true);
       globalThis.document = { createElement: element };
       renderer.mount(element());
-      send({ state: 'fresh', angle: -30, angle_deg: -29.678,
+      send({ state: 'fresh', angle_deg: -29.678,
+        angle_convention: 'robot_front_0_left_positive_ccw',
         timestamp_ms: 1700000000040, audio_window_start_us: 1700000000000000,
         audio_window_end_us: 1700000000020000 });
       send({ state: 'stale' });
       if (base === KvLatestRenderer) {
-        assert.equal(renderer._cells.angle.valueEl.textContent, '-30');
         assert.equal(renderer._cells.angle_deg.valueEl.textContent, '-29.678');
+        assert.equal(renderer._cells.angle, undefined);
+        assert.equal(renderer._cells.unit, undefined);
         assert.equal(renderer._cells.state.valueEl.textContent, 'stale');
       } else {
         assert.match(renderer._textEl.children[0].innerHTML, /-29.678/);

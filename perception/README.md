@@ -55,8 +55,7 @@ viewer, without compiling a custom direction message or starting the sensor.
 The payload has `state: "fresh"`, the exact `angle_deg`, and
 `angle_convention: "robot_front_0_left_positive_ccw"` (front 0°, left positive,
 right negative), plus
-`audio_window_start_us` / `audio_window_end_us`. The integer `angle` is for
-display only; ASR never uses it for matching. Driver publishes `no_event` after
+`audio_window_start_us` / `audio_window_end_us`. Driver publishes `no_event` after
 activity stops and `stale` if a valid observation expires. Neither state clears
 ASR's capture history: a transcription can finish after the event expires.
 ASR ignores a direction observation with a missing or different convention and
