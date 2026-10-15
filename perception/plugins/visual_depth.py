@@ -541,6 +541,33 @@ def calibration_origin(cfg: dict, camera_id: str = "") -> str:
     return "model-default"
 
 
+def _depthart_camera_error(error, input_topic, declaration) -> str:
+    """Why the card will not start, in terms the operator can act on.
+
+    `camera_matrix` says "DepthART requires camera_info with a nine-value K,
+    width and height", which is correct and useless from the canvas: nothing
+    there is called camera_info, and the operator did not leave a field blank —
+    the upstream card simply does not declare its optics, and most cards never
+    have. Measured on Orin 5: `remote_camera`'s `info()` has no `camera_info`
+    key at all, so Agent Core had nothing to pass on (see
+    `api/config.py:_upstream_camera_info`), and the card dead-ended on a
+    sentence naming a field that appears nowhere in the UI.
+
+    Refusing is still right. DepthART's metric scale comes *from* K; inventing
+    a focal length would publish confidently wrong metres on a topic whose
+    whole contract is that the number is in metres, and a browser or phone
+    camera has no calibrated K to declare in the first place.
+    """
+    if not declaration:
+        where = f"上游 {input_topic} " if input_topic else "这个输入 "
+        return (f"{where}没有声明相机内参（motus.camera/1）—— DepthART 的公制尺度"
+                f"是从 K 算出来的，没有 K 就只能瞎猜焦距，发出去的米数会是错的。"
+                f"两条路：把 Depth model 改回 yolo（它不需要内参），"
+                f"或者换一个会声明内参的相机。浏览器/手机远程摄像头不会有内参。")
+    return (f"{error}（上游 {input_topic or '输入'} 的声明读不出可用的 K）"
+            if input_topic else str(error))
+
+
 def calibration_conflict(cfg: dict) -> str:
     """A typed-in fit that the dropdown is ignoring, or "".
 
@@ -1752,7 +1779,8 @@ class VideoDepthPerceptionPlugin:
                 try:
                     camera_matrix(declaration)
                 except ValueError as error:
-                    return {"state": "error", "message": str(error)}
+                    return {"state": "error",
+                            "message": _depthart_camera_error(error, input_topic, declaration)}
 
             with self._nodes_lock:
                 running = self._nodes.get(node_key)

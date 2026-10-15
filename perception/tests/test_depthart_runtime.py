@@ -587,3 +587,19 @@ def test_orin5_saved_rows_replay(monkeypatch):
     assert result['status'] == 'configured' and result.get('adapter_ok', True) is True
     assert result['config'] == {'fps': 2, 'calibration_preset': vd.CAL_NONE}
     assert 'Unitree R1' in result['calibration_note']
+
+
+@pytest.mark.parametrize('declaration', [None, {}, {'schema': 'motus.camera/1'}])
+def test_start_without_upstream_intrinsics_says_what_to_do(declaration):
+    # Orin 5's wiring: the depth card is fed by agent-core's `remote_camera`,
+    # whose info() has no camera_info at all, so nothing reaches the start.
+    # The old message named a field that appears nowhere on the canvas.
+    p = make_plugin()
+    args = {'action': 'start', 'instance_id': 'a', 'input_topic': '/remote_control/camera'}
+    if declaration is not None:
+        args['camera_info'] = declaration
+    result = p.dispatch('visual_depth', args)
+    assert result['state'] == 'error'
+    assert '/remote_control/camera' in result['message']
+    assert 'yolo' in result['message']          # the way out
+    assert not p._nodes
