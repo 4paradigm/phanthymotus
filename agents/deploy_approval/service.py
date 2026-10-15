@@ -260,8 +260,11 @@ class DeployController:
                 f"no agent_core_token configured for machine {machine.alias!r}"
             )
         base_url = f"https://{machine.node_host}:15678"
+        # This deployment path keeps the policy-bound legacy HTTPS + token contract.
+        core_config = copy.copy(self.config)
+        core_config.agent_core_tls_mode = "legacy"
         core = AgentCoreClient(
-            self.config,
+            core_config,
             base_url,
             node_host=machine.node_host,
             machine_alias=machine.alias,
@@ -281,14 +284,69 @@ class DeployController:
             self._case_runner = CaseRunner(self.config)
         return self._case_runner
 
-    def _extract_trusted_review_evidence(self, comments: list[dict]):
+    def _extract_trusted_review_evidence(self, comments: list[dict], *, head_sha: str = ""):
         # Even an injected/incomplete Config must not turn exact login matching
         # into the parser's optional ID-only compatibility path.
         author_id = self.config.review_comment_author_id
         author_login = self.config.review_comment_author_login
         if not isinstance(author_id, str) or not author_id or not isinstance(author_login, str) or not author_login:
             return None
-        return extract_review_evidence(comments, author_id, author_login)
+        return extract_review_evidence(comments, author_id, author_login, head_sha=head_sha)
+
+    async def _review_evidence_from_comments(self, repo: str, pr_number: int, head_sha: str, comments: list[dict]):
+        """Authenticate the real triggering comment and recheck HEAD after awaits.
+
+        Parsed unbound evidence remains available for inspection, but its
+        blocking flag forbids readiness, requests and pre-POST revalidation.
+        """
+        evidence = self._extract_trusted_review_evidence(comments, head_sha=head_sha)
+        if evidence is not None and evidence.test_results_block_deployment:
+            logger.warning("REVIEW_EVIDENCE_BLOCKED TEST_RESULTS_STATE=%s TEST_FAILED=%s REQUEST_RUN_BOUND=%s",
+                           evidence.test_status, evidence.test_failed, evidence.run_binding_valid)
+        if evidence is None or evidence.request_comment is None or not evidence.run_binding_valid:
+            return evidence
+        request = evidence.request_comment
+        original_evidence = copy.deepcopy(evidence)
+        evidence.run_binding_valid = False
+        try:
+            fresh = await self.proxy.get_comment(repo, int(request["id"]))
+            for key in ("id", "body", "created_at", "updated_at", "user"):
+                if fresh.get(key) != request.get(key):
+                    return evidence
+            user = fresh["user"]
+            pr = await self.proxy.get_pr(repo, pr_number)
+            if (pr.get("head", {}).get("sha") != head_sha or pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft") is True):
+                return evidence
+            author = pr.get("user", {})
+            if (str(author.get("id", "")) != str(user["id"])
+                    or author.get("login", "").casefold() != user["login"].casefold()):
+                permission = await self.proxy.collaborator_permission(repo, user["login"])
+                if not Policy.collaborator_can_approve(permission):
+                    return evidence
+            if await self._resolve_commit_prefix_for_head(repo, head_sha, evidence.commit_prefix) != head_sha:
+                return evidence
+            # Permission/commit lookups await GitHub too. A newer run, deleted
+            # evidence or an edited result during those awaits must revoke this
+            # snapshot even when the PR HEAD itself has not changed.
+            latest_comments = await self.proxy.get_issue_comments(repo, pr_number)
+            if not isinstance(latest_comments, list):
+                return evidence
+            latest_evidence = self._extract_trusted_review_evidence(latest_comments, head_sha=head_sha)
+            if latest_evidence != original_evidence:
+                return evidence
+            final_pr = await self.proxy.get_pr(repo, pr_number)
+            if (final_pr.get("head", {}).get("sha") != head_sha
+                    or final_pr.get("state") != "open" or final_pr.get("merged")
+                    or final_pr.get("draft") is True):
+                return evidence
+        except Exception:
+            return evidence
+        evidence.head_sha = head_sha
+        evidence.run_binding_valid = True
+        if evidence.code_review_binding == "LEGACY_CONTIGUOUS_CHAIN_NO_DIRECT_SHA":
+            logger.info("CODE_REVIEW_HEAD_BINDING=INDIRECT_LEGACY_CHAIN DIRECT_SHA_PROOF=NO build_comment_id=%s", evidence.build_comment_id)
+        return evidence
 
     @staticmethod
     def _empty_cos() -> dict[str, Any]:
@@ -517,6 +575,20 @@ class DeployController:
             component.get("review_image_tag", ""),
         )
 
+    def _review_build_infos(self, repo: str, evidence: "ReviewCommentEvidence") -> list[BuildInfo]:
+        """Keep every parsed row; build validity is independent of project tests."""
+        return [
+            BuildInfo(
+                target=build.target,
+                driver_path=build.driver_path,
+                variant=build.variant,
+                success=build.success,
+                image_tag=build.image_tag,
+                deployable=_is_deployable_build(repo, build, self.config.github_repos),
+            )
+            for build in evidence.builds
+        ]
+
     async def _build_component_snapshot(
         self,
         repo: str,
@@ -529,11 +601,15 @@ class DeployController:
         No Registry access.  Image references come directly from the trusted
         GitHub comment.  Platform is policy-derived (linux/arm64).
         """
+        if not builds:
+            return None
         snapshot: list[dict] = []
         seen_semantic_keys: set[tuple] = set()
-        for build in builds or []:
-            if not build.success or not build.deployable:
-                continue
+        for build in builds:
+            # A requested matrix is indivisible: never deploy its successful subset.
+            if (not build.success or not build.deployable
+                    or not _is_deployable_build(repo, build, self.config.github_repos)):
+                return None
             review_image_tag = str(build.image_tag or "")
             if not review_image_tag:
                 return None
@@ -551,7 +627,6 @@ class DeployController:
                 build.target,
                 build.driver_path,
                 build.variant,
-                validated_tag,
             )
             if skey in seen_semantic_keys:
                 return None
@@ -856,7 +931,7 @@ class DeployController:
                 comments = await self.github.get_issue_comments(repo, pr_number)
                 if not isinstance(comments, list):
                     comments = []
-                evidence = self._extract_trusted_review_evidence(comments)
+                evidence = await self._review_evidence_from_comments(repo, pr_number, pr_head, comments)
             except Exception as e:
                 logger.warning(
                     "request_deploy comment evidence %s#%s: %s",
@@ -872,35 +947,25 @@ class DeployController:
                 )
                 return True
 
+            if not evidence.run_binding_valid:
+                await self._post_error(
+                    repo, pr_number,
+                    "Review request, required build matrix or run provenance is missing or ambiguous. "
+                    "No deployment can be requested from unbound review evidence.",
+                )
+                return True
             if evidence.test_results_block_deployment:
                 await self._post_error(
                     repo, pr_number,
-                    "Review Agent reports failed or invalid structured test results. "
-                    "Resolve them before requesting deployment. Code review findings "
-                    "also require manual review by the developer and machine approver.",
+                    "Review Agent test evidence is missing, malformed or unbound. "
+                    "Restore valid evidence before requesting deployment. "
+                    "Project test failures and code review findings remain available "
+                    "for manual review by the developer and machine approver.",
                 )
                 return True
 
             # Convert evidence builds to BuildInfo
-            builds = []
-            for eb in evidence.builds:
-                bi = BuildInfo(
-                    target=eb.target,
-                    driver_path=eb.driver_path,
-                    variant=eb.variant,
-                    success=eb.success,
-                    image_tag=eb.image_tag,
-                    deployable=_is_deployable_build(
-                        repo,
-                        type("_build", (), {
-                            "target": eb.target,
-                            "success": eb.success,
-                            "image_tag": eb.image_tag,
-                            "driver_path": eb.driver_path,
-                        })(), configured_repos=self.config.github_repos,
-                    ),
-                )
-                builds.append(bi)
+            builds = self._review_build_infos(repo, evidence)
 
             components = await self._build_component_snapshot(
                 repo, pr_number, pr_head, builds,
@@ -920,7 +985,7 @@ class DeployController:
 
             # Resolve evidence commit prefix to full SHA
             resolved_head = await self._resolve_review_evidence_for_head(
-                repo, pr_head, evidence,
+                repo, pr_head, evidence, pr_number=pr_number,
             )
             if resolved_head is None:
                 await self._post_error(
@@ -1032,17 +1097,16 @@ class DeployController:
                 )
                 return True
 
-            if state.get("command", {}).get("phase") == "uncertain":
-                refresh_result = await self._refresh_uncertain_state(
-                    repo, pr_number, state,
-                )
-                if refresh_result == "deploy-requested":
-                    refreshed_state = await self.proxy.read_hidden_state(repo, pr_number)
-                    if refreshed_state is None:
-                        return True
-                    state = refreshed_state
-                else:
-                    return True
+            self._check_independent_deploy_approver(pr_data, actor, actor_id)
+            phase = state.get("command", {}).get("phase")
+            if phase == "executing":
+                await self._handle_uncertain_if_needed(repo, pr_number, state)
+                return True
+            if phase == "uncertain":
+                await self._refresh_uncertain_state(repo, pr_number, state)
+                # Recovery is read-only with respect to Agent Core. A later
+                # approval may deploy only components proven never attempted.
+                return True
 
             # Resolve machine selector (alias or IPv4) to canonical MachineInfo
             try:
@@ -1238,6 +1302,8 @@ class DeployController:
                 )
                 return True
 
+            self._check_independent_deploy_approver(final_pr, actor, actor_id)
+
             # Capture frozen component + deployment snapshots before hidden state validation
             expected_component_snapshot = self._canonical_component_snapshot(
                 state.get("components", []),
@@ -1263,6 +1329,7 @@ class DeployController:
             if not await self._fresh_review_evidence_matches_state(
                 repo, pr_number, final_head,
                 state.get("review_evidence", {}),
+                expected_components=state.get("components", []),
             ):
                 await self._invalidate_review_required(
                     repo, pr_number, state, final_head, comment_id,
@@ -1278,7 +1345,12 @@ class DeployController:
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
                 "phase": "executing",
-                "args": {"machine": machine_alias, "actor": actor},
+                "args": {
+                    "machine": machine_alias,
+                    "actor": actor,
+                    # A restart cannot prove which selected POST was sent.
+                    "pending_component_ids": [c["component_id"] for c in selected_components],
+                },
             }
             await self._write_lifecycle_with_history(
                 repo, pr_number, state, "Deploying...", event=None,
@@ -1395,7 +1467,11 @@ class DeployController:
                     "comment_id": comment_id,
                     "kind": "approve_deploy",
                     "phase": "uncertain",
-                    "args": {"machine": machine_alias, "actor": actor},
+                    "args": {
+                        "machine": machine_alias,
+                        "actor": actor,
+                        "pending_component_ids": [component_id],
+                    },
                 }
                 state["last_processed_comment_id"] = comment_id
                 approve_attempt["outcome"] = "uncertain"
@@ -2464,6 +2540,18 @@ class DeployController:
                 except Exception:
                     result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
         return result
+
+    @staticmethod
+    def _check_independent_deploy_approver(pr: dict, actor: str, actor_id: str) -> None:
+        author = pr.get("user", {})
+        author_id = str(author.get("id") or "") if isinstance(author, dict) else ""
+        author_login = str(author.get("login") or "") if isinstance(author, dict) else ""
+        if (not actor or not isinstance(actor_id, str)
+                or not re.fullmatch(r"[1-9][0-9]*", actor_id)
+                or not re.fullmatch(r"[1-9][0-9]*", author_id)
+                or actor_id == author_id
+                or actor.casefold() == author_login.casefold()):
+            raise PolicyError("Deployment approval requires a verified actor other than the PR author.")
 
     async def _check_approval_permissions(
         self, machine, actor: str, repo: str,
@@ -3834,42 +3922,27 @@ class DeployController:
                     build_infos = []
                 elif latest_anchor.state == "build-succeeded":
                     # Build completed successfully — get full evidence for deploy-ready check
-                    evidence = self._extract_trusted_review_evidence(comments)
+                    evidence = await self._review_evidence_from_comments(repo, pr_number, current_head, comments)
                     if evidence is None:
                         # Build succeeded but Test/Code Review not yet complete
                         desired_status = "reviewing"
                         review_evidence_data = {}
                         build_infos = []
                     else:
-                        resolved_head_ev = await self._resolve_commit_prefix_for_head(
-                            repo, current_head, evidence.commit_prefix,
+                        resolved_head_ev = await self._resolve_review_evidence_for_head(
+                            repo, current_head, evidence, pr_number=pr_number,
                         )
-                        if resolved_head_ev != current_head or evidence.test_results_block_deployment:
+                        build_infos = self._review_build_infos(repo, evidence)
+                        components = await self._build_component_snapshot(
+                            repo, pr_number, current_head, build_infos,
+                        ) if resolved_head_ev == current_head else None
+                        if resolved_head_ev != current_head or not components:
                             desired_status = "review-required"
                             review_evidence_data = {}
                             build_infos = []
                         else:
                             desired_status = "deploy-ready"
                             review_evidence_data = self._review_evidence_snapshot(evidence, resolved_head_ev)
-                            build_infos = []
-                            for eb in evidence.builds:
-                                bi = BuildInfo(
-                                    target=eb.target,
-                                    driver_path=eb.driver_path,
-                                    variant=eb.variant,
-                                    success=eb.success,
-                                    image_tag=eb.image_tag,
-                                    deployable=_is_deployable_build(
-                                        repo,
-                                        type("_build", (), {
-                                            "target": eb.target,
-                                            "success": eb.success,
-                                            "image_tag": eb.image_tag,
-                                            "driver_path": eb.driver_path,
-                                        })(), configured_repos=self.config.github_repos,
-                                    ),
-                                )
-                                build_infos.append(bi)
                 else:
                     desired_status = "review-required"
                     review_evidence_data = {}
@@ -4016,6 +4089,75 @@ class DeployController:
             repo, pr_number, state.get("status", "review-required"),
         )
 
+    async def _recover_uncertain_deployments(self, old_state: dict, refreshed_state: dict) -> bool:
+        """Observe possibly attempted components; never repeat their deploy POSTs."""
+        args = old_state.get("command", {}).get("args", {})
+        machine_alias = args.get("machine", "")
+        machine = self.policy.get_machine(machine_alias)
+        if machine is None:
+            return False
+        old_components = old_state.get("components", [])
+        deployed = _component_id_set(old_state.get("deployments", []))
+        pending = args.get("pending_component_ids")
+        if pending is None:
+            # Older executing states have no per-component POST provenance.
+            # Conservatively observe every remaining component for this machine.
+            pending = self._get_component_ids_for_machine(machine_alias, old_components)
+        if (not isinstance(pending, list) or not pending
+                or any(not isinstance(cid, str) or not cid for cid in pending)
+                or not set(pending).issubset({c.get("component_id") for c in old_components})):
+            return False
+        fresh_by_key = {
+            self._component_semantic_key(c): c for c in refreshed_state.get("components", [])
+        }
+        recovered = []
+        try:
+            core = await self._core_for_node(machine.node_id)
+            for old in old_components:
+                if old["component_id"] not in pending or old["component_id"] in deployed:
+                    continue
+                component = fresh_by_key.get(self._component_semantic_key(old))
+                if component is None:
+                    # A genuinely different artifact is not a retry of this POST.
+                    continue
+                if component["component_id"] not in self._get_component_ids_for_machine(machine_alias, [component]):
+                    return False
+                runtime_id = str(old.get("runtime_id") or "")
+                if component.get("target") == "core":
+                    verified, _ = await self._verify_core_update(
+                        core, component["component_id"], old["image_ref"],
+                    )
+                    runtime_id = "core"
+                else:
+                    if not runtime_id:
+                        preflight = await self._preflight_running_images(core, [old])
+                        runtime_id = preflight[0]["runtime_id"]
+                    verified, _ = await self._verify_deployed_runtime(
+                        core, machine.node_id, component["component_id"], runtime_id, old["image_ref"],
+                    )
+                if not verified:
+                    return False
+                recovered.append((component, old["image_ref"], runtime_id))
+        except Exception as e:
+            logger.warning("uncertain deployment observation unavailable: %s", e)
+            return False
+        already_deployed = _component_id_set(refreshed_state.get("deployments", []))
+        refreshed_state["deployments"] = list(refreshed_state.get("deployments", []))
+        for component, image_ref, runtime_id in recovered:
+            if component["component_id"] in already_deployed:
+                continue
+            component["runtime_id"] = runtime_id
+            component["image_ref"] = image_ref
+            refreshed_state["deployments"].append({
+                "machine": machine_alias,
+                "component_ids": [component["component_id"]],
+                "phase": "deployed",
+            })
+        all_ids = {c["component_id"] for c in refreshed_state.get("components", [])}
+        if all_ids and all_ids == _component_id_set(refreshed_state.get("deployments", [])):
+            refreshed_state["status"] = "testing"
+        return True
+
     async def _refresh_uncertain_state(
         self, repo: str, pr_number: int, state: dict,
     ) -> str:
@@ -4023,7 +4165,8 @@ class DeployController:
 
         Returns:
         - "deploy-requested" when a fresh validation snapshot was rebuilt.
-        - "review-required" when the head drifted or no exact review job exists.
+        - "testing" when every deployment was observed successful without POST.
+        - "review-required" when the head drifted.
         - "uncertain" when the rebuild could not complete but must stay pending.
         - "noop" when the PR is no longer open/active.
         """
@@ -4077,7 +4220,7 @@ class DeployController:
             comments = await self.github.get_issue_comments(repo, pr_number)
             if not isinstance(comments, list):
                 comments = []
-            evidence = self._extract_trusted_review_evidence(comments)
+            evidence = await self._review_evidence_from_comments(repo, pr_number, current_head, comments)
         except Exception as e:
             logger.warning(
                 "refresh_uncertain comment evidence %s#%s: %s",
@@ -4086,90 +4229,16 @@ class DeployController:
             evidence = None
 
         if evidence is None:
-            state["status"] = "review-required"
-            state["review_evidence"] = {}
-            state["components"] = []
-            state["deployments"] = []
-            state["approve_attempts"] = []
-            state["approve_attempts_total"] = 0
-            state["approve_attempts_truncated"] = False
-            state["case_results"] = {}
-            state["test_result"] = ""
-            state["cos"] = {"object_key": "", "sha256": "", "size": 0}
-            state["command"] = {
-                "comment_id": comment_id,
-                "kind": "approve_deploy",
-                "phase": "completed",
-                "args": dict(cmd.get("args", {}) or {}),
-            }
-            state["last_processed_comment_id"] = max(old_cursor, comment_id)
-            markdown = comments_mod.review_required(
-                repo, pr_number, current_head,
-            )
-            event = {
-                "event": "Review evidence unavailable",
-                "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
-                "timestamp": comments_mod.beijing_now_str(),
-            }
-            await self._write_lifecycle_with_history(
-                repo, pr_number, state, markdown, event=event,
-            )
-            await self.proxy.project_status_label(repo, pr_number, "review-required")
-            return "review-required"
+            # Missing evidence cannot erase the fact that a POST may have run.
+            return "uncertain"
 
         # Convert evidence builds to BuildInfo
-        builds = []
-        resolved_head = await self._resolve_review_evidence_for_head(repo, current_head, evidence)
+        resolved_head = await self._resolve_review_evidence_for_head(
+            repo, current_head, evidence, pr_number=pr_number,
+        )
         if resolved_head is None:
-            # resolved_head is None => fail closed, cannot write None into canonical review_evidence
-            state["status"] = "review-required"
-            state["review_evidence"] = {}
-            state["components"] = []
-            state["deployments"] = []
-            state["approve_attempts"] = []
-            state["approve_attempts_total"] = 0
-            state["approve_attempts_truncated"] = False
-            state["case_results"] = {}
-            state["test_result"] = ""
-            state["cos"] = {"object_key": "", "sha256": "", "size": 0}
-            state["command"] = {
-                "comment_id": comment_id,
-                "kind": "approve_deploy",
-                "phase": "completed",
-                "args": dict(cmd.get("args", {}) or {}),
-            }
-            state["last_processed_comment_id"] = max(old_cursor, comment_id)
-            markdown = comments_mod.review_required(
-                repo, pr_number, current_head,
-            )
-            event = {
-                "event": "Review evidence unresolved",
-                "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
-                "timestamp": comments_mod.beijing_now_str(),
-            }
-            await self._write_lifecycle_with_history(
-                repo, pr_number, state, markdown, event=event,
-            )
-            await self.proxy.project_status_label(repo, pr_number, "review-required")
-            return "review-required"
-        for eb in evidence.builds:
-            bi = BuildInfo(
-                target=eb.target,
-                driver_path=eb.driver_path,
-                variant=eb.variant,
-                success=eb.success,
-                image_tag=eb.image_tag,
-                deployable=_is_deployable_build(
-                    repo,
-                    type("_build", (), {
-                        "target": eb.target,
-                        "success": eb.success,
-                        "image_tag": eb.image_tag,
-                        "driver_path": eb.driver_path,
-                    })(), configured_repos=self.config.github_repos,
-                ),
-            )
-            builds.append(bi)
+            return "uncertain"
+        builds = self._review_build_infos(repo, evidence)
 
         review_evidence_data = self._review_evidence_snapshot(evidence, resolved_head)
         fresh_components = await self._build_component_snapshot(
@@ -4376,6 +4445,15 @@ class DeployController:
                 updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
                 updated_state["components"] = migrated
 
+        if not await self._recover_uncertain_deployments(state, updated_state):
+            logger.warning("uncertain deployment remains pending; refusing repeated POST %s#%s", repo, pr_number)
+            return "uncertain"
+        if not await self._fresh_review_evidence_matches_state(
+            repo, pr_number, current_head, review_evidence_data,
+            expected_components=updated_state.get("components", []),
+        ):
+            return "uncertain"
+
         state.clear()
         state.update(updated_state)
 
@@ -4396,6 +4474,8 @@ class DeployController:
             gate_note=gate_note,
             deployments=state.get("deployments", []),
         )
+        if state["status"] == "testing":
+            markdown = comments_mod.testing(repo, pr_number, current_head, case_result="")
         event = {
             "event": "Restart recovery: evidence refreshed",
             "timestamp": comments_mod.beijing_now_str(),
@@ -4403,11 +4483,12 @@ class DeployController:
         await self._write_lifecycle_with_history(
             repo, pr_number, state, markdown, event=event,
         )
-        await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
-        return "deploy-requested"
+        await self.proxy.project_status_label(repo, pr_number, state["status"])
+        return state["status"]
 
     async def _resolve_review_evidence_for_head(
         self, repo: str, fresh_head: str, evidence: "ReviewCommentEvidence",
+        *, pr_number: int | None = None,
     ) -> str | None:
         """Resolve evidence.commit_prefix to full SHA and verify == fresh_head.
 
@@ -4417,6 +4498,11 @@ class DeployController:
         if not isinstance(evidence, ReviewCommentEvidence):
             return None
         if evidence.test_results_block_deployment:
+            return None
+        if evidence.head_sha and evidence.head_sha != fresh_head:
+            return None
+        builds = self._review_build_infos(repo, evidence)
+        if not builds or any(not build.success or not build.deployable for build in builds):
             return None
         commit_prefix = evidence.commit_prefix
         if not isinstance(commit_prefix, str) or not re.fullmatch(r"[0-9a-f]{7,40}", commit_prefix):
@@ -4441,6 +4527,17 @@ class DeployController:
                 "resolved sha %s != fresh_head %s", resolved, fresh_head
             )
             return None
+        if pr_number is not None:
+            # Commit resolution awaits GitHub after the run-binding HEAD check.
+            try:
+                final_pr = await self.proxy.get_pr(repo, pr_number)
+            except Exception:
+                return None
+            if (not isinstance(final_pr, dict)
+                    or final_pr.get("head", {}).get("sha") != fresh_head
+                    or final_pr.get("state") != "open" or final_pr.get("merged")
+                    or final_pr.get("draft") is True):
+                return None
         return resolved
 
         # ── Hidden state validation ──
@@ -4521,21 +4618,35 @@ class DeployController:
     async def _fresh_review_evidence_matches_state(
         self, repo: str, pr_number: int, fresh_head: str,
         persisted_review_evidence: dict,
+        *, expected_components: list[dict] | None = None,
     ):
         """Fresh-read PR Conversation and validate evidence matches persisted snapshot."""
-        from .review_comment_parser import extract_review_evidence
         try:
             comments = await self.proxy.get_issue_comments(repo, pr_number)
         except Exception:
             return False
-        evidence = self._extract_trusted_review_evidence(comments)
+        evidence = await self._review_evidence_from_comments(repo, pr_number, fresh_head, comments)
         if evidence is None:
             return False
         resolved_head = await self._resolve_review_evidence_for_head(
-            repo, fresh_head, evidence,
+            repo, fresh_head, evidence, pr_number=pr_number,
         )
         if resolved_head != fresh_head:
             return False
+        fresh_components = await self._build_component_snapshot(
+            repo, pr_number, fresh_head, self._review_build_infos(repo, evidence),
+        )
+        if not fresh_components:
+            return False
+        if expected_components is not None:
+            # Compare semantic identities so historical digest/runtime bindings
+            # survive, while a truncated or duplicated matrix cannot reach POST.
+            if sorted(self._component_semantic_key(c) for c in fresh_components) != sorted(
+                self._component_semantic_key(c) for c in expected_components
+            ):
+                return False
+            if any(c.get("resolved_platform") != get_deploy_platform() for c in expected_components):
+                return False
         fresh_snapshot = self._review_evidence_snapshot(evidence, resolved_head)
         return (
             self._review_evidence_identity(fresh_snapshot)

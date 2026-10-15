@@ -19,6 +19,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
+
+from .image_ref import validate_image_ref
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,9 @@ PR_REVIEW_MARKER = "<!-- pr-review-agent -->"
 BUILD_HEADING = "## PR Review Agent — Build Result"
 TEST_HEADING = "## PR Review Agent — Test Results"
 CODE_REVIEW_HEADING = "## PR Review Agent — Code Review"
+# Published by agents/pr_review/models.py DEFAULT_JP_VERSION. The isolated
+# Controller image does not ship that package; keep the protocol default here.
+_DEFAULT_REQUEST_VARIANT = "5.11"
 
 @dataclass
 class ReviewJobAnchor:
@@ -42,15 +48,32 @@ class ReviewJobAnchor:
 
 
 def _extract_review_job_commit_prefix(body: str) -> str:
-    """Extract commit prefix from 'Commit: <sha>' or '| Commit | <sha> |'."""
+    """Read one explicit Commit; malformed/duplicate metadata is not absence."""
+    prefixes = []
     for line in body.splitlines():
         m = _COMMIT_PREFIX_RE.match(line.strip())
-        if m:
-            return m.group(1).strip().strip("`")
         m2 = _TABLE_COMMIT_PREFIX_RE.match(line.strip())
-        if m2:
-            return m2.group(1).strip().strip("`")
-    return ""
+        if m or m2:
+            prefix = (m or m2).group(1).strip().strip("`")
+            if not _SHORT_SHA_RE.fullmatch(prefix):
+                return "!ambiguous"
+            prefixes.append(prefix)
+        elif re.match(r"^\|\s*Commit\s*\|", line.strip(), re.I):
+            return "!ambiguous"
+    if not prefixes:
+        return ""
+    return prefixes[0] if len(prefixes) == 1 else "!ambiguous"
+
+
+def _is_review_job_anchor_body(body: str) -> bool:
+    if not _has_marker(body):
+        return False
+    if BUILD_HEADING in body:
+        return True
+    if TEST_HEADING in body or CODE_REVIEW_HEADING in body:
+        return False
+    return bool(_extract_review_job_commit_prefix(body)
+                or re.search(r"(?m)^## PR Review Agent\s*$", body))
 
 
 def extract_latest_review_job_anchor(
@@ -60,8 +83,8 @@ def extract_latest_review_job_anchor(
 ) -> ReviewJobAnchor | None:
     """Scan ALL trusted comments with pr-review-agent marker.
 
-    Returns the latest ReviewJobAnchor by (created_at, comment_id) among
-    comments that contain a commit prefix.  Supports both
+    Returns the latest ReviewJobAnchor by (created_at, comment_id).
+    Malformed newer anchors still supersede older evidence. Supports both
     `Commit: sha` and `| Commit | sha |` formats.
 
     LATEST RUN ALWAYS WINS.  Never falls back to an older completed run.
@@ -85,20 +108,17 @@ def extract_latest_review_job_anchor(
     if not trusted:
         return None
 
-    # Build anchors from ALL trusted comments that have a marker and commit prefix.
+    # Build anchors from ALL trusted run comments, including malformed new runs.
     # Progress comments (Queued/Building) that lack a Build Result table still form anchors.
     # Test Results and Code Review are FOLLOW-UP evidence, NOT run anchors.
     anchors: list[ReviewJobAnchor] = []
     for c in trusted:
         body = str(c.get("body", "") or "")
-        if not _has_marker(body):
+        if not _is_review_job_anchor_body(body):
             continue
         commit_prefix = _extract_review_job_commit_prefix(body)
-        if not commit_prefix:
-            continue
-        # Exclude follow-up evidence comments from anchor candidates
-        if TEST_HEADING in body or CODE_REVIEW_HEADING in body:
-            continue
+        if _comment_position(c) is None:
+            return None  # Invalid run provenance must never fall back to an older run.
         # Determine anchor state based on comment content
         anchor_state = "reviewing"
         if BUILD_HEADING in body:
@@ -110,10 +130,7 @@ def extract_latest_review_job_anchor(
                 has_exact_image = True
                 for row in rows:
                     status_raw = row.get("status", "")
-                    is_success = (
-                        ":white_check_mark:" in status_raw
-                        or status_raw.lower() == "success"
-                    )
+                    is_success = _success_status(status_raw)
                     if not is_success:
                         all_success = False
                     target = row.get("target", "")
@@ -137,11 +154,11 @@ def extract_latest_review_job_anchor(
     if not anchors:
         return None
 
-    anchors.sort(key=lambda a: (a.created_at, a.comment_id))
+    anchors.sort(key=lambda a: (datetime.fromisoformat(a.created_at.replace("Z", "+00:00")), a.comment_id))
     return anchors[-1]
 
 
-_COMMIT_PREFIX_RE = re.compile(r"^Commit:\s*(.+)$")
+_COMMIT_PREFIX_RE = re.compile(r"^Commit:\s*(.*?)\s*$", re.I)
 _TABLE_ROW_RE = re.compile(r"^\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$")
 _TEST_TABLE_ROW_RE = re.compile(
     r"^\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$"
@@ -154,7 +171,7 @@ _IMAGE_REF_RE = re.compile(
     r"^([^\s:/]+(?:/[^\s:/]+)+)/([^:\s]+(?::(.+))?)$"
 )
 _VERSION_RE = re.compile(r"^`(.+?)`$")
-_TABLE_COMMIT_PREFIX_RE = re.compile(r'^\|\s*(?:Commit|commit)\s*\|\s*(.+?)\s*\|')
+_TABLE_COMMIT_PREFIX_RE = re.compile(r'^\|\s*Commit\s*\|\s*(.*?)\s*\|$', re.I)
 _SHORT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
@@ -204,14 +221,28 @@ class ReviewCommentEvidence:
     code_review_created_at: str = ""
     code_review_comment_updated_at: str = ""
     code_review_text: str = ""
+    # Parsed evidence always supplies these explicitly. Defaults retain the
+    # internal API for callers constructing already validated historical data.
+    test_status: str = "VALID"
+    skip_tests_requested: bool = False
+    run_binding_valid: bool = True
+    request_comment: dict | None = field(default=None, repr=False)
+    code_review_binding: str = ""
 
     @property
     def test_results_block_deployment(self) -> bool:
-        """Structured failures cannot be waived by free-text review findings."""
+        """Reject invalid review evidence, not reported project test failures.
+
+        Valid failure counts remain evidence for manual review. Deployment
+        success is gated separately by the Controller's Automated Cases.
+        """
         return (
-            isinstance(self.test_failed, bool)
-            or not isinstance(self.test_failed, int)
-            or self.test_failed != 0
+            not self.run_binding_valid
+            or self.test_status not in ("VALID", "SKIPPED")
+            or (self.test_status == "SKIPPED" and not self.skip_tests_requested)
+            or any(isinstance(count, bool) or not isinstance(count, int) or count < 0
+                   for count in (self.test_passed, self.test_failed))
+            or not isinstance(self.test_skipped, bool)
         )
 
 
@@ -230,6 +261,91 @@ def _normalize_variant(variant: str) -> str:
     if v in ("5.11", "6.1"):
         return v
     return variant.strip()
+
+
+def _comment_position(comment: dict) -> tuple[datetime, int] | None:
+    cid = comment.get("id")
+    if isinstance(cid, bool) or not str(cid).isdigit() or int(cid) <= 0:
+        return None
+    try:
+        created = datetime.fromisoformat(str(comment.get("created_at", "")).replace("Z", "+00:00"))
+        updated = datetime.fromisoformat(str(comment.get("updated_at", "")).replace("Z", "+00:00"))
+        if created.tzinfo is None or updated.tzinfo is None or updated < created:
+            return None
+    except ValueError:
+        return None
+    return created, int(cid)
+
+
+def _parse_review_request(body: str) -> dict | None:
+    """Read the actual command, never PR prose or the PR body.
+
+    Expanded matrix tokens express operator intent. In particular jp511/jp61
+    and actucore are NOT evidence that the unchanged upstream supports them.
+    """
+    lines = [line.strip().lstrip(">*- \t") for line in body.splitlines()]
+    commands = [line for line in lines if re.match(r"^/request_bot_review(?:\s|$)", line, re.I)]
+    if len(commands) != 1:
+        return None
+    targets, variants = [], []
+    skip_tests = False
+    unsupported = False
+    for raw in commands[0].split()[1:]:
+        token = raw.strip("`,").lower()
+        if token in ("force", "--force", "-f"):
+            continue
+        if token == "skip-tests":
+            skip_tests = True
+        elif token in ("core", "perception", "actucore"):
+            if token in targets:
+                return None
+            targets.append(token)
+        elif token in ("jp511", "jp61", "jp5.11", "jp6.1", "5.11", "6.1",
+                        "jetson-jp5.11", "jetson-jp6.1", "jetson-5.11", "jetson-6.1"):
+            variant = "5.11" if token in ("jp511", "jp5.11", "5.11", "jetson-jp5.11", "jetson-5.11") else "6.1"
+            if variant in variants:
+                return None
+            variants.append(variant)
+        elif re.fullmatch(r"[a-z0-9_.-]+(?:/[a-z0-9_.-]+)+", token) and all(
+            part not in (".", "..") for part in token.split("/")
+        ):
+            if token in targets:
+                return None
+            targets.append(token)
+        else:
+            unsupported = True  # Unknown flags/versions must never silently disappear.
+    if variants and not any(t in ("perception", "actucore") for t in targets):
+        targets.append("perception")
+    if any(t in ("perception", "actucore") for t in targets) and not variants:
+        # Reuse the producer's actual default instead of inventing a platform.
+        variants = [_DEFAULT_REQUEST_VARIANT]
+    expected = set()
+    for target in targets:
+        if target in ("perception", "actucore"):
+            expected.update((target, "", variant) for variant in variants)
+        elif target == "core":
+            expected.add(("core", "", ""))
+        else:
+            expected.add(("driver", target, ""))
+    return {"expected": expected or None, "skip_tests": skip_tests, "valid": not unsupported}
+
+
+def _same_commit(value: str, expected: str) -> bool:
+    return bool(_SHORT_SHA_RE.fullmatch(value) and _SHORT_SHA_RE.fullmatch(expected)
+                and (value.lower().startswith(expected.lower()) or expected.lower().startswith(value.lower())))
+
+
+def _run_id(body: str) -> str:
+    # Optional explicit Markdown metadata, not an invented GitHub API field.
+    lines = re.findall(r"^[ \t]*(?:Review )?Run(?: ID)?:[ \t]*([^\r\n]*)$", body, re.M | re.I)
+    if not lines:
+        return ""
+    value = lines[0].strip().strip("`")
+    return value if len(lines) == 1 and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value) else "!ambiguous"
+
+
+def _success_status(status: str) -> bool:
+    return bool(re.fullmatch(r"(?:success|:white_check_mark:(?:\s*success)?)", status.strip(), re.I))
 
 
 def _normalize_build_label(raw_label: str) -> dict | None:
@@ -284,15 +400,14 @@ def _has_marker(body: str) -> bool:
 
 
 def _find_section(body: str, heading: str) -> str | None:
-    """Find text between `heading` and the next heading (##) or end of body."""
+    """Read the whole result, including tables after Markdown subheadings."""
     idx = body.find(heading)
-    if idx < 0:
+    if idx < 0 or body.count(heading) != 1:
         return None
     rest = body[idx + len(heading):]
-    # Find next ## heading
-    next_idx = rest.find("\n## ")
-    if next_idx >= 0:
-        return rest[:next_idx].strip()
+    if any(other in rest for other in (BUILD_HEADING, TEST_HEADING, CODE_REVIEW_HEADING)
+           if other != heading):
+        return None
     return rest.strip()
 
 
@@ -317,27 +432,31 @@ def _parse_build_table(text: str) -> list[dict[str, str]]:
     """
 
     def _is_header_row(groups: re.Match) -> bool:
-        """Return True if the row is a table header (all cells alphabetic)."""
-        for g in (groups.group(1), groups.group(2), groups.group(3), groups.group(4)):
-            cell = g.strip()
-            if not cell or not cell.isalpha():
-                return False
-        return True
+        """Only the actual header is a header; alphabetic results are data."""
+        return tuple(groups.group(i).strip().lower() for i in range(1, 5)) == (
+            "target", "status", "version", "took",
+        )
 
     def _is_separator(target: str) -> bool:
         """Return True if *target* looks like a markdown table separator."""
         return bool(re.fullmatch(r"[- :	]+", target)) and len(target) > 2
 
     rows: list[dict[str, str]] = []
+    fenced = False
     for line in text.splitlines():
+        if line.strip().startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
         m = _TABLE_ROW_RE.match(line.strip())
         if m:
-            # Skip header rows (all cells purely alphabetic)
+            # Skip the exact protocol header.
             if _is_header_row(m):
                 continue
             target = m.group(1).strip()
             # Skip markdown table separator rows
-            if _is_separator(target):
+            if all(_is_separator(m.group(i).strip()) for i in range(1, 5)):
                 continue
             rows.append({
                 "target": target,
@@ -380,9 +499,28 @@ def parse_all_build_results(
     if section is None:
         return []
 
-    commit_prefix = _extract_commit_prefix(section)
-    if not commit_prefix:
+    commit_prefix = _extract_review_job_commit_prefix(section)
+    if not _SHORT_SHA_RE.fullmatch(commit_prefix):
         return []
+
+    # Malformed rows must not vanish before the requested-set comparison. Ignore
+    # fenced image/log payloads, which are not build-result table evidence.
+    fenced = False
+    for line in section.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        if not stripped.startswith("|"):
+            if "|" in stripped:
+                return []
+            continue
+        if _TABLE_COMMIT_PREFIX_RE.match(stripped):
+            continue
+        if not stripped.endswith("|") or len(stripped[1:-1].split("|")) != 4:
+            return []
 
     table_rows = _parse_build_table(section)
     if not table_rows:
@@ -409,10 +547,7 @@ def parse_all_build_results(
         seen_keys.add(dup_key)
 
         status_raw = row["status"]
-        is_success = (
-            ":white_check_mark:" in status_raw
-            or status_raw.lower() == "success"
-        )
+        is_success = _success_status(status_raw)
         is_failed = (
             ":x:" in status_raw
             or status_raw.lower() in ("failed", "failure")
@@ -432,6 +567,17 @@ def parse_all_build_results(
         if is_success and image_ref and images.get(raw_label, "") and images.get(raw_label, "") != image_ref:
             return []
 
+        if is_success:
+            try:
+                validate_image_ref(image_ref)
+            except ValueError:
+                return []
+            # Producer tags may explicitly attest a JetPack version. Never
+            # accept a contradictory tag; older refs without this suffix retain
+            # their trusted build-label binding instead of inventing metadata.
+            image_variant = re.search(r"-jetson-jp(\d+\.\d+)$", image_ref)
+            if image_variant and image_variant.group(1) != variant:
+                return []
         image_tag = image_ref  # full mutable ref: registry.example/path/image:tag
 
         build = ReviewBuild(
@@ -453,74 +599,98 @@ def parse_all_build_results(
 # Test Results parser
 # ------------------------------------------------------------------
 
-def parse_test_results(
-    body: str,
-) -> tuple[int, int, bool]:
-    """Parse Test Results comment.
+@dataclass
+class TestResultEvidence:
+    status: str
+    passed: int = 0
+    failed: int = 0
 
-    Returns (passed, failed, skipped).
+    def __iter__(self):
+        # Preserve historical tuple unpacking without hiding the explicit state.
+        yield self.passed
+        yield self.failed
+        yield self.status == "SKIPPED"
 
-    A real Test Results table takes precedence over any informational
-    ``skip-tests`` text in the comment footer.
 
-    Passed and failed counts are accumulated independently across every
-    concrete suite row because a failed suite can still contain many
-    passing tests.
-    """
-    if not _has_marker(body) or TEST_HEADING not in body:
-        return (0, 0, False)
-
+def parse_test_results(body: str) -> TestResultEvidence:
+    if TEST_HEADING not in body:
+        return TestResultEvidence("MISSING")
+    if not _has_marker(body):
+        return TestResultEvidence("MALFORMED")
+    if _extract_review_job_commit_prefix(body) == "!ambiguous":
+        return TestResultEvidence("MALFORMED")
     section = _find_section(body, TEST_HEADING)
     if section is None:
-        return (0, 0, False)
-
-    passed = 0
-    failed = 0
-    saw_result_row = False
-
+        return TestResultEvidence("MALFORMED")
+    # A footer instruction is not a verdict. A table inside a footer is invalid
+    # evidence, and must not disappear together with its reported failures.
+    malformed = any("|" in footer for footer in re.findall(
+        r"<sub>.*?</sub>", section, flags=re.DOTALL,
+    ))
+    section = re.sub(r"<sub>[^|]*?</sub>", "", section, flags=re.DOTALL)
+    suites = set()
+    passed = failed = 0
+    header_seen = False
+    separator_seen = False
     for line in section.splitlines():
-        m = _TEST_TABLE_ROW_RE.match(line.strip())
-        if not m:
+        if not line.strip().startswith("|"):
+            if "|" in line:
+                malformed = True
             continue
-
-        suite = m.group(1).strip()
-
-        if not suite:
+        if not line.strip().endswith("|"):
+            malformed = True
             continue
-
-        if suite.lower() == "suite":
+        cells = [cell.strip() for cell in line.strip()[1:-1].split("|")]
+        if cells and cells[0].lower() == "suite":
+            if (header_seen or len(cells) != 5 or [c.lower() for c in cells[2:4]] != ["passed", "failed"]
+                    or cells[1].lower() not in ("result", "status")):
+                malformed = True
+            header_seen = True
             continue
-
-        if re.fullmatch(r"[- :\t]+", suite) and len(suite) > 2:
+        if cells and all(re.fullmatch(r"[- :]+", cell) for cell in cells):
+            if separator_seen or suites or not header_seen:
+                malformed = True
+            separator_seen = len(cells) == 5
+            if not separator_seen:
+                malformed = True
             continue
-
-        try:
-            row_passed = int(m.group(3).strip())
-            row_failed = int(m.group(4).strip())
-        except (ValueError, IndexError):
+        if len(cells) == 2 and cells[0].lower() == "commit" and _SHORT_SHA_RE.fullmatch(cells[1].strip("`")):
             continue
-
-        saw_result_row = True
-        passed += row_passed
-        failed += row_failed
-
-    if saw_result_row:
-        return (passed, failed, False)
-
-    # Review Agent normally emits no Test Results comment at all when
-    # nothing ran. Preserve compatibility for an explicit skipped-only
-    # Test Results body, but never let the standard footer override a
-    # real table above.
-    lowered = section.lower()
-    if (
-        "tests skipped" in lowered
-        or "test skipped" in lowered
-        or "not run" in lowered
-        or "skip-tests" in lowered
-    ):
-        return (0, 0, True)
-
-    return (0, 0, False)
+        if len(cells) != 5 or not cells[0]:
+            malformed = True
+            continue
+        suite = cells[0].casefold()
+        if suite in suites:
+            malformed = True
+        suites.add(suite)
+        counts = []
+        for raw in cells[2:4]:
+            if not re.fullmatch(r"[0-9]{1,10}", raw) or int(raw) > 2147483647:
+                malformed = True
+                counts.append(None)
+            else:
+                counts.append(int(raw))
+        if counts[0] is not None:
+            passed += counts[0]
+        if counts[1] is not None:
+            failed += counts[1]
+        status = cells[1].lower()
+        is_failure = bool(re.fullmatch(r"(?::x:\s*)?(?:[0-9]+\s+)?(?:failed|failure)", status))
+        is_pass = bool(re.fullmatch(r"(?::white_check_mark:\s*)?(?:[0-9]+\s+)?(?:passed|pass|success)", status))
+        if not (is_failure or is_pass) or (is_failure and counts[1] == 0) or (is_pass and counts[1] not in (None, 0)):
+            malformed = True
+        if not cells[4] or passed > 2147483647 or failed > 2147483647:
+            malformed = True
+    if malformed or (suites and not (header_seen and separator_seen)):
+        return TestResultEvidence("MALFORMED", passed, failed)
+    if suites:
+        return TestResultEvidence("VALID", passed, failed)
+    prose = re.sub(r"(?m)^Commit:.*$", "", section).strip()
+    prose = re.sub(r"(?im)^(?:Review )?Run(?: ID)?:.*$", "", prose).strip()
+    prose = re.sub(r"(?m)^\s*---+\s*$", "", prose).strip()
+    if re.fullmatch(r"(?:tests? skipped|tests? not run)(?:[.!])?", prose, re.I):
+        return TestResultEvidence("SKIPPED")
+    return TestResultEvidence("MALFORMED")
 
 
 # ------------------------------------------------------------------
@@ -535,12 +705,12 @@ def parse_code_review(
     Returns review text for manual inspection, not an approval verdict, or
     None if not found/malformed. Free-text keywords never establish approval.
     """
-    if not _has_marker(body) or CODE_REVIEW_HEADING not in body:
+    if not _has_marker(body) or body.count(CODE_REVIEW_HEADING) != 1:
         return None
 
-    section = _find_section(body, CODE_REVIEW_HEADING)
-    if section is None:
-        return None
+    # format_review embeds arbitrary Markdown, including ## sections, in this
+    # one comment. Those headings belong to the review, not to another result.
+    section = body.split(CODE_REVIEW_HEADING, 1)[1].strip()
 
     # Remove footer
     section = re.sub(r"<sub>.*?</sub>", "", section, flags=re.DOTALL)
@@ -565,12 +735,16 @@ def extract_review_evidence(
     comments: list[dict],
     trusted_author_id: str,
     trusted_author_login: str = "",
+    *,
+    head_sha: str = "",
 ) -> ReviewCommentEvidence | None:
     """Extract the latest complete, unambiguous review evidence from PR comments.
 
     Latest review run wins: selects newest run by (created_at, comment_id).
     Does NOT fall back to older runs.
     """
+    if not trusted_author_id or not trusted_author_login:
+        return None
     # Filter comments by trusted author
     trusted_comments: list[dict] = []
     for c in comments:
@@ -630,20 +804,88 @@ def extract_review_evidence(
 
     # Build commit prefix must match fresh HEAD (checked later by caller)
     build_commit = anchor.commit_prefix
+    expected_commit = head_sha or build_commit
+    if not _same_commit(build_commit, expected_commit):
+        return None
+    anchor_comment = next(c for c in trusted_comments if int(c.get("id", 0) or 0) == anchor.comment_id)
+    anchor_position = _comment_position(anchor_comment)
+    if anchor_position is None:
+        return None
+
+    other_anchors = [c for c in trusted_comments if c is not anchor_comment
+                     and _is_review_job_anchor_body(str(c.get("body", "")))]
+    prior_positions = [_comment_position(c) for c in other_anchors]
+    if any(position is None or position >= anchor_position for position in prior_positions):
+        return None
+    previous_position = max(prior_positions) if prior_positions else None
+    request_candidates = []
+    request_positions = []
+    run_valid = True
+    for c in comments:
+        body = c.get("body", "")
+        if not isinstance(body, str) or not re.search(r"(?im)^\s*[>*-]*\s*/request_bot_review(?:\s|$)", body):
+            continue
+        position = _comment_position(c)
+        if position is None:
+            run_valid = False
+            continue
+        request_positions.append(position)
+        if previous_position is not None and position <= previous_position:
+            continue
+        if position >= anchor_position:
+            run_valid = False  # A newer request supersedes this chain; no fallback.
+            continue
+        request_candidates.append(c)
+    request = request_candidates[0] if len(request_candidates) == 1 else None
+    command = _parse_review_request(str(request.get("body", ""))) if request else None
+    if (request is None or command is None or not command["valid"]
+            or int(request.get("id", 0)) >= anchor.comment_id
+            or request.get("updated_at") != request.get("created_at")):
+        run_valid = False
+    request_commit = _extract_review_job_commit_prefix(str(request.get("body", ""))) if request else ""
+    if request_commit and not _same_commit(request_commit, expected_commit):
+        run_valid = False
+    user = request.get("user") if request else None
+    if (not isinstance(user, dict) or isinstance(user.get("id"), bool)
+            or not str(user.get("id", "")).isdigit() or int(user.get("id", 0)) <= 0
+            or not isinstance(user.get("login"), str) or not user.get("login")):
+        run_valid = False
+    keys = {(b.target, b.driver_path, b.variant) for b in build_builds}
+    if (not all(b.success for b in build_builds)
+            or len(keys) != len(build_builds)
+            or any(b.target in ("perception", "actucore") and b.variant not in ("5.11", "6.1")
+                   for b in build_builds)
+            or any(b.target == "core" and b.variant for b in build_builds)
+            or (command and command["expected"] is not None and keys != command["expected"])):
+        run_valid = False
+    skip_requested = bool(command and command["skip_tests"])
+    anchor_run = _run_id(anchor.body)
+    if anchor_run == "!ambiguous":
+        run_valid = False
 
     # Select Test Results: trusted test comments created after selected Build
     # Lower bound: selected Build Result anchor.updated_at
+    anchor_updated = datetime.fromisoformat(anchor.updated_at.replace("Z", "+00:00"))
     test_candidates: list[dict] = []
     for c in test_comments:
-        c_created = str(c.get("created_at", ""))
-        if c_created < anchor.updated_at:
+        position = _comment_position(c)
+        if position is None:
+            return None
+        if position[0] < anchor_updated:
+            if position > anchor_position:
+                return None  # A result inside an unfinished run is ambiguous.
             continue
         c_body = str(c.get("body", "") or "")
         test_commit = _extract_review_job_commit_prefix(c_body)
-        if test_commit and test_commit != build_commit:
+        if test_commit and not _same_commit(test_commit, expected_commit):
             return None  # commit mismatch => fail closed
         if not test_commit:
             return None  # commit missing => fail closed
+        if position[1] <= anchor.comment_id:
+            return None
+        explicit_run = _run_id(c_body)
+        if explicit_run and (not anchor_run or explicit_run != anchor_run):
+            return None
         test_candidates.append(c)
 
     test_comment_id = 0
@@ -660,15 +902,28 @@ def extract_review_evidence(
 
     # Select Code Review: trusted CR comments after the selected run
     # Lower bound: latest of selected Build Result updated_at, selected Test updated_at
-    lb = anchor.updated_at
+    lb = anchor_updated
     if test_comment_id > 0 and test_updated:
-        lb = test_updated
+        lb = datetime.fromisoformat(test_updated.replace("Z", "+00:00"))
 
     cr_candidates: list[dict] = []
     for c in code_review_comments:
-        c_created = str(c.get("created_at", ""))
-        if c_created < lb:
+        position = _comment_position(c)
+        if position is None:
+            return None
+        if position[0] < lb:
+            if position > anchor_position:
+                return None
             continue
+        if position[1] <= max(anchor.comment_id, test_comment_id):
+            return None
+        body = str(c.get("body", ""))
+        explicit_commit = _extract_review_job_commit_prefix(body)
+        if explicit_commit and not _same_commit(explicit_commit, expected_commit):
+            return None
+        explicit_run = _run_id(body)
+        if explicit_run and (not anchor_run or explicit_run != anchor_run):
+            return None
         cr_candidates.append(c)
 
     if len(cr_candidates) != 1:
@@ -684,16 +939,59 @@ def extract_review_evidence(
     code_review_created = str(cr_comment.get("created_at", ""))
     code_review_updated = str(cr_comment.get("updated_at", ""))
 
+    # Prior runs must be closed before this run starts. Without this, a delayed
+    # SHA-less review could belong to an older/overlapping worker.
+    for older in other_anchors:
+        old_builds = parse_all_build_results(str(older.get("body", "")))
+        old_position = _comment_position(older)
+        old_updated = datetime.fromisoformat(older["updated_at"].replace("Z", "+00:00"))
+        # Each prior run needs its own closure before the next request/anchor;
+        # one delayed review cannot close several overlapping runs.
+        boundary = min(position for position in
+                       [anchor_position, *prior_positions, *request_positions]
+                       if position > old_position)
+        # A failed build is a real terminal run; upstream emits no Code Review
+        # for it. It must have finished before the new request, not overlap it.
+        old_rows = _parse_build_table(str(older.get("body", "")))
+        terminal_status = lambda status: bool(re.fullmatch(
+            r"(?:(?::x:\s*)?(?:failed|failure)|(?::hourglass:\s*)?killed)", status.strip(), re.I))
+        if (old_builds and old_rows and any(terminal_status(row["status"]) for row in old_rows)
+                and all(_success_status(row["status"]) or terminal_status(row["status"]) for row in old_rows)
+                and old_updated < boundary[0]):
+            continue
+        closed = []
+        for c in code_review_comments:
+            position = _comment_position(c)
+            if position is None or position <= old_position or position >= boundary:
+                continue
+            if (position[0] < old_updated or position[1] <= old_position[1]
+                    or datetime.fromisoformat(c["updated_at"].replace("Z", "+00:00")) >= boundary[0]):
+                run_valid = False
+                continue
+            body = str(c.get("body", ""))
+            commit = _extract_review_job_commit_prefix(body)
+            if commit and not _same_commit(commit, _extract_review_job_commit_prefix(str(older.get("body", "")))):
+                run_valid = False
+                continue
+            run = _run_id(body)
+            if run and (run == "!ambiguous" or run != _run_id(str(older.get("body", "")))):
+                run_valid = False
+                continue
+            if parse_code_review(body) is not None:
+                closed.append(c)
+            else:
+                run_valid = False
+        if len(closed) != 1:
+            run_valid = False
+
     # Test results from the selected test comment
-    test_evidence = (0, 0, False)
+    test_evidence = TestResultEvidence("SKIPPED" if skip_requested else "MISSING")
     if test_comment_id > 0:
         test_body = str(test_candidates[0].get("body", "") or "")
         test_evidence = parse_test_results(test_body)
 
-    # Gather successful build info
-    successful_builds = [b for b in build_builds if b.success]
-    if not successful_builds:
-        return None
+    # Preserve the entire requested matrix; failed rows must never disappear.
+    successful_builds = build_builds
 
     # Derive review_author_login from the selected trusted comment's user.login
     selected_author_login = ""
@@ -717,9 +1015,15 @@ def extract_review_evidence(
         test_comment_id=test_comment_id,
         test_comment_created_at=test_created,
         test_comment_updated_at=test_updated,
-        test_passed=test_evidence[0],
-        test_failed=test_evidence[1],
-        test_skipped=test_evidence[2],
+        test_passed=test_evidence.passed,
+        test_failed=test_evidence.failed,
+        test_skipped=test_evidence.status == "SKIPPED",
+        test_status=test_evidence.status,
+        skip_tests_requested=skip_requested,
+        run_binding_valid=run_valid,
+        request_comment=request,
+        code_review_binding=("DIRECT_SHA" if _extract_review_job_commit_prefix(cr_body)
+                             else "LEGACY_CONTIGUOUS_CHAIN_NO_DIRECT_SHA"),
         code_review_comment_id=code_review_comment_id,
         code_review_created_at=code_review_created,
         code_review_comment_updated_at=code_review_updated,
