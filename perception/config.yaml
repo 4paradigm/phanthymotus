@@ -14,6 +14,15 @@ file_intake:
   retention_days: 7
 
 plugins:
+  qr_scan:
+    enabled: true
+    auto_announce: false
+    announce_cooldown_s: 10
+    announce_max_chars: 80
+    scan_hz: 2
+    stale_after_s: 3
+    rearm_after_s: 3
+
   # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
   phanthy_music:
     # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作

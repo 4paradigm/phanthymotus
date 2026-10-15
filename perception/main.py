@@ -246,6 +246,10 @@ class PerceptionBundle:
                 log.error("PosePerceptionPlugin failed to load; continuing without pose",
                           exc_info=True)
 
+        if plugins_cfg.get("qr_scan", {}).get("enabled", False):
+            from plugins.qr_scan import QrScanPlugin
+            self._plugins.append(QrScanPlugin(plugins_cfg["qr_scan"], executor))
+
         if plugins_cfg.get("ocr", {}).get("enabled", False):
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
