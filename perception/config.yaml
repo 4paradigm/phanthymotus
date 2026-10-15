@@ -194,6 +194,13 @@ plugins:
 
   # Was `vdp:` for one release; main.py still reads that spelling from a
   # config.yaml already on a machine, and the tool answers to `vdp_*` too.
+  robot_model:
+    enabled: false
+    model_dir: /models/robot_model
+    min_score: null
+    min_margin: null
+    fps: 1
+
   visual_depth:
     # Monocular depth. On by default, so the card is there to wire up without
     # editing a file on the robot first.

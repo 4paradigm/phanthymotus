@@ -195,6 +195,7 @@ class PerceptionBundle:
                 log.error("PhanthyMusicPlugin failed to load; continuing without phanthy_music",
                           exc_info=True)
 
+        vop_plugin = None
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["vop"].get("namespace", "").strip()
@@ -203,7 +204,14 @@ class PerceptionBundle:
             from plugins.vop import VideoObjectPerceptionPlugin
             plugin = VideoObjectPerceptionPlugin(plugins_cfg["vop"], namespace, executor)
             self._plugins.append(plugin)
+            vop_plugin = plugin
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+
+        if plugins_cfg.get("robot_model", {}).get("enabled", False):
+            from plugins.robot_model import RobotModelPlugin
+            self._plugins.append(RobotModelPlugin(
+                plugins_cfg["robot_model"], vop_plugin, executor))
+            log.info("RobotModelPlugin loaded")
 
         # `vdp:` is the pre-rename spelling of this section; a config.yaml a
         # machine already has on disk still uses it.
