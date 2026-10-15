@@ -217,10 +217,12 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pillow>=7.1.2" && \
 # to start. The gate is therefore on JP_VERSION, not on "is this a Jetson":
 # there is nothing sensible to guess for a line we have not built a wheel for.
 #
-# Cost: 74 MB compressed / ~250 MB unpacked, nearly all of it
-# libonnxruntime_providers_cuda.so, versus ~30 MB for the CPU wheel.
+# Fixed full selective-runtime wheel sizes (decimal MB): JP5 64.4 compressed /
+# 274.8 unpacked; JP6 83.7 / 379.5. Most bytes are the CUDA provider. Model
+# weights are separate; these are neither image sizes nor runtime memory.
 #
-# The COS key carries the JetPack, the filename does not. Upstream's setup.py
+# Legacy COS keys carry the JetPack; the default fixed public URLs select the
+# matching wheel explicitly. Upstream's setup.py
 # tags the wheel `1.13.6+cuda-cp<abi>`, so the only thing separating the two
 # builds in a flat directory would be `cp38` vs `cp310` — which is a *Python*
 # discriminator, not a CUDA one. It happens to select correctly today, since each
