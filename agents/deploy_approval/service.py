@@ -1814,14 +1814,18 @@ class DeployController:
             return False
         cid = expected_comment.get("id")
         user = expected_comment.get("user", {})
+        if not isinstance(user, dict):
+            return False
         uid, login = user.get("id"), user.get("login")
-        if (not isinstance(cid, int) or isinstance(cid, bool)
+        if (not isinstance(cid, int) or isinstance(cid, bool) or cid <= 0
                 or (not consumed and cid <= state.get("last_processed_comment_id", 0))
                 or (consumed and (cid != state.get("command", {}).get("comment_id")
                                   or cid > state.get("last_processed_comment_id", 0)))
                 or not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0
                 or not isinstance(login, str) or not login
                 or self.proxy.is_bot_comment(expected_comment)
+                or not isinstance(expected_comment.get("body"), str)
+                or not isinstance(expected_comment.get("created_at"), str)
                 or not expected_comment.get("created_at")
                 or expected_comment.get("updated_at") != expected_comment.get("created_at")):
             return False
@@ -1830,7 +1834,35 @@ class DeployController:
         except PolicyError:
             return False
         fresh_comment = await self.proxy.get_comment(repo, cid)
-        return (fresh_comment == expected_comment and self.config.auth_valid
+        if not isinstance(fresh_comment, dict):
+            return False
+        fresh_user = fresh_comment.get("user", {})
+        if not isinstance(fresh_user, dict):
+            return False
+        # Compare API identity, not response shape (pin/reactions may differ).
+        # Bind both snapshots to the explicitly requested repository and ID.
+        comment_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/comments/{cid}"
+        for comment in (expected_comment, fresh_comment):
+            app = comment.get("performed_via_github_app")
+            if app is not None and (
+                not isinstance(app, dict)
+                or not isinstance(app.get("id"), int) or isinstance(app.get("id"), bool)
+                or app["id"] <= 0
+            ):
+                return False
+        return (type(fresh_comment.get("id")) is int and fresh_comment["id"] == cid
+                and expected_comment.get("url") == comment_url
+                and fresh_comment.get("url") == comment_url
+                and fresh_comment.get("body") == expected_comment["body"]
+                and type(fresh_user.get("id")) is int and fresh_user["id"] == uid
+                and fresh_user.get("login") == login
+                and fresh_user.get("type") == user.get("type")
+                and fresh_comment.get("created_at") == expected_comment["created_at"]
+                and fresh_comment.get("updated_at") == expected_comment["updated_at"]
+                and (fresh_comment.get("performed_via_github_app") or {}).get("id")
+                == (expected_comment.get("performed_via_github_app") or {}).get("id")
+                and not self.proxy.is_bot_comment(fresh_comment)
+                and self.config.auth_valid
                 and repo in self.config.active_repos and repo in self.config.github_repos)
 
     async def resume_record_test(
