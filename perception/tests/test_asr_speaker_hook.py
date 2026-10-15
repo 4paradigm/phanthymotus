@@ -267,8 +267,8 @@ def test_background_is_published_from_the_unmatched_branch():
     都不会有任何异样。
     """
     source = (PERCEPTION_ROOT / "plugins" / "asr.py").read_text()
-    branch = source[source.index("if not matched:"):]
-    branch = branch[:branch.index("# Extract text after keyword")]
+    branch = source[source.index("if not matched and not waiting_for_command:"):]
+    branch = branch[:branch.index("\n                    if not matched:")]
     assert "_publish_background" in branch
     assert branch.index("_publish_background") < branch.index("continue")
 
@@ -462,6 +462,7 @@ def test_every_info_return_carries_topic_out():
     body = source[source.index('if action == "info":'):]
     body = body[:body.index('elif action == "start"')]
     returns = body.count("return {")
-    assert returns == body.count('"topic_out"'), (
-        f"info 有 {returns} 个 return，但只有 {body.count('\"topic_out\"')} 个带 topic_out"
+    outputs = body.count('"topic_out"')
+    assert returns == outputs, (
+        f"info 有 {returns} 个 return，但只有 {outputs} 个带 topic_out"
     )

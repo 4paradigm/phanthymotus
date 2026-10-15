@@ -1407,8 +1407,64 @@ just a different provider string.
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
 | `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
-| `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
+| `x-asr-zh-en` | int8 encoder/joiner + fp32 decoder | fp32 encoder/decoder/joiner | Measure on the target device and decoding configuration |
 | `parakeet-en` | int8, 104 MB | **fp32, 437 MB** | **4.9x** long / **2.0x** short |
+
+X-ASR GPU loads the separately published FP32 bundle; it does not run the mixed
+INT8 CPU bundle on CUDA. The earlier INT8-on-CUDA slowdown is not a measurement
+of this FP32 path. CPU remains the global default. GPU uses additional runtime
+and inference memory; weight-file size is not the process or unified-memory
+footprint, and multiple-instance headroom must be checked on the target.
+
+X-ASR's configuration card exposes an English-labelled `asr_hotwords` tag input:
+type a phrase and press Enter to add a removable tag, or paste multiple lines.
+Duplicates are removed and English phrase spaces are preserved. The stored value
+remains one phrase per line. The wake word
+is automatically merged into the hotwords. Clearing either field removes its
+contribution on the next adapter reload; packaged hotwords are never overwritten.
+Chinese characters and intact English words are passed to the runtime's BPE
+encoder. Explicit custom phrases use per-token score 4.0 with early ranking. Automatically
+added wake phrases use the normal 2.5 score without early ranking; packaged phrases
+also retain 2.5. If a wake phrase is explicitly listed as a custom hotword, that
+explicit custom score takes precedence. These biases do not force an output or guarantee a match.
+The supplementary vocabulary in `resource/asr/hotwords.txt` is also merged at the
+ordinary 2.5 score; it includes 范式智能. Explicit custom scores override it.
+
+The product recipe uses beam 7 and trailing silence 300 ms. The prefix LM has
+weight 0.05 for Chinese and zero weight within English spans; its state still
+updates across both languages. The matching English-preserving runtime also
+protects candidate diversity and removes shared completed-hotword rewards before
+length normalization. All scoring takes place in one ASR pass.
+Selective hotword scoring uses the full vocabulary for Chinese spans and the
+non-Chinese vocabulary for English spans. Explicit word scores are preserved
+when constructing that vocabulary, including shared prefixes. The matching
+full selective-hotword runtime is required.
+The INT8 encoder additionally receives 100 ms of leading silence in its inference
+copy. Recorded PCM, VAD boundaries and speaker audio remain unchanged; this adds
+no recording wait and does not switch CPU recognition to FP32.
+
+Wake-word activation matches the transcription after ASR without extending a
+shortened Chinese wake into an English command. Later explicit invocations at
+clause boundaries select the following command; a bare trailing wake does not
+erase an existing command. Split wake fragments can be assembled across VAD
+segments. A wake-only segment accepts a command beginning within five seconds
+of its end, using speech onset without pre-roll rather than ASR completion time.
+Command segments join within 0.6 seconds, with one 32 ms VAD frame of timestamp
+tolerance. This is a joining threshold, not a total response-time guarantee.
+Native VAD-accepted short segments are preserved. When audio input stops for at
+least the configured silence interval (minimum 400 ms), pending detected speech
+is flushed once; this does not raise the volume or detect speech the VAD missed.
+
+These controls and the former entity-score JSON are no longer exposed; saved
+legacy decoder settings do not override this recipe. The matching prefix/selective-hotword
+runtime is required. The LM is downloaded on X-ASR loading when missing. Other
+models do not acquire X-ASR hotword support by filling this field.
+Hotword thresholds belong to each adapter. Because the native runtime reads an
+environment variable during decoding, X-ASR decodes within one process are
+serialized while setting and restoring that adapter's threshold, including on
+errors. Constructing a recognizer does not modify the process environment.
+
+The main default model remains SenseVoice on CPU.
 
 ### Removed models
 
@@ -1717,11 +1773,16 @@ are converted from those with `tools/convert_onnx_fp16.py`.
 
 ### The CUDA wheels
 
-PyPI ships CPU-only `sherpa-onnx`, so `Dockerfile.jetson` downloads a wheel built
-in-house from COS under `public/sherpa-onnx/<jp>/`, one per JetPack line, and falls
-back to the PyPI CPU wheel for any `JP_VERSION` without one:
+PyPI ships CPU-only `sherpa-onnx`. `Dockerfile.jetson` defaults to fixed public
+ModelScope full CUDA prefix/selective-hotword wheels, one per JetPack line. The full build
+retains TTS, VAD and speaker-diarization APIs. A public URL or legacy COS key can
+still be supplied through `SHERPA_GPU_WHEEL_511` or `SHERPA_GPU_WHEEL_61`; provide
+its matching `SHERPA_GPU_WHEEL_SHA256_511` or `SHERPA_GPU_WHEEL_SHA256_61` when
+overriding it. Every selected wheel must pass that checksum, irrespective of its
+filename. An unsupported `JP_VERSION` without a GPU wheel keeps the PyPI CPU
+fallback. The underlying runtime/ABI pairings are:
 
-| | onnxruntime-gpu | CUDA / cuDNN | COS key |
+| | onnxruntime-gpu | CUDA / cuDNN | Legacy COS override key |
 |---|---|---|---|
 | jp5.11 (focal, L4T R35) | 1.16.0 | 11.4 / 8 | `jp511/sherpa_onnx-<ver>+cuda-cp38-cp38-linux_aarch64.whl` |
 | jp6.1 (jammy, L4T R36) | 1.18.1 | 12.6 / 9 | `jp61/sherpa_onnx-<ver>+cuda-cp310-cp310-linux_aarch64.whl` |
@@ -1731,7 +1792,7 @@ there are two wheels rather than one. `cmake/onnxruntime-linux-aarch64-gpu.cmake
 in sherpa-onnx pins the URL and SHA256 per version and names the target board for
 each; 1.18.1 is the one it lists for L4T R36 + CUDA 12.6.
 
-**The directory carries the JetPack, because the filename cannot.** Upstream's
+**For legacy COS keys, the directory carries the JetPack.** Upstream's
 `setup.py` tags the wheel `<ver>+cuda-cp<abi>`, so in a flat directory the only
 thing separating the two builds is `cp38` vs `cp310` — a *Python* discriminator,
 not a CUDA one. It selects correctly today, since each image ships exactly one

@@ -9,14 +9,21 @@ import os
 import struct
 import tempfile
 import threading
+import unicodedata
 import wave
 from pathlib import Path
 
 
 SAMPLE_RATE = 16000
-TAIL_PADDING_SECONDS = 0.5
-MAX_ACTIVE_PATHS = 10
+TAIL_PADDING_SECONDS = 0.3
+INT8_HEAD_PADDING_SECONDS = 0.1
+MAX_ACTIVE_PATHS = 7
 HOTWORDS_SCORE = 2.5
+_SUPPLEMENTARY_HOTWORDS = Path(__file__).resolve().parents[1] / "resource/asr/hotwords.txt"
+
+# The native decoder reads this process-wide option during Decode, not construction.
+_EARLY_HOTWORD_ENV = "SHERPA_ONNX_EARLY_HOTWORD_MIN_SCORE"
+_DECODE_LOCK = threading.Lock()
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +78,85 @@ def _prepare_hotwords_file(
     return output
 
 
+def _boost_hotwords(encoded: Path, boosts: dict) -> Path:
+    """Apply per-token scores to packaged CJK phrases without changing the source."""
+    scores = {"".join(str(key).split()): float(value) for key, value in boosts.items()}
+    source = encoded.read_bytes()
+    digest = hashlib.sha256(source + repr(sorted(scores.items())).encode()).hexdigest()[:16]
+    directory = Path('/tmp/asr_x_asr_hotwords')
+    directory.mkdir(parents=True, exist_ok=True)
+    output = directory / f'hotwords-boosted-{digest}.txt'
+    if output.is_file():
+        return output
+    found, lines = set(), []
+    for line in source.decode('utf-8').splitlines():
+        phrase, separator, _ = line.rpartition(' :')
+        compact = ''.join(phrase.split())
+        if separator and compact in scores:
+            line = f'{phrase} :{scores[compact]}'
+            found.add(compact)
+        lines.append(line+'\n')
+    missing = set(scores)-found
+    if missing:
+        raise ValueError('Boosted CJK phrases are not packaged hotwords: '+', '.join(sorted(missing)))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.writelines(lines)
+        os.replace(temporary, output)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return output
+
+
+def _hotword_phrases(words: str) -> list:
+    """Preserve English words while separating Chinese characters for BPE."""
+    phrases = []
+    for phrase in words.splitlines():
+        units, run = [], []
+        for char in phrase.strip():
+            cjk = '\u3400' <= char <= '\u4dbf' or '\u4e00' <= char <= '\u9fff'
+            if cjk or char.isspace() or unicodedata.category(char).startswith(('P', 'S')):
+                if run:
+                    units.append(''.join(run))
+                    run = []
+                if cjk:
+                    units.append(char)
+            else:
+                run.append(char)
+        if run:
+            units.append(''.join(run))
+        if units:
+            phrases.append(' '.join(units))
+    return phrases
+
+
+def _custom_hotwords_file(encoded: Path, words: str, wake_word: str = "",
+                         ordinary_hotwords: str = "") -> Path:
+    """Merge ordinary vocabulary/wake bias and custom scores without editing the bundle."""
+    additions = {phrase: HOTWORDS_SCORE for phrase in _hotword_phrases(wake_word)}
+    additions.update({phrase: 4.0 for phrase in _hotword_phrases(words)})
+    ordinary = _hotword_phrases(ordinary_hotwords)
+    if not additions and not ordinary:
+        return encoded
+    lines = {}
+    for line in encoded.read_text(encoding='utf-8').splitlines():
+        phrase, sep, score = line.rpartition(' :')
+        if sep:
+            lines[phrase] = float(score)
+    for phrase in ordinary:
+        # Supplement missing vocabulary without overriding an explicit score.
+        lines.setdefault(phrase, HOTWORDS_SCORE)
+    lines.update(additions)
+    # A task-local generated file; never change the packaged vocabulary.
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.txt',
+                                     prefix='asr-hotwords-', delete=False) as stream:
+        stream.writelines(f'{phrase} :{score}\n' for phrase, score in lines.items())
+    return Path(stream.name)
+
+
 class XASRAdapter:
     """Decode complete utterances with X-ASR and the packaged hotword list."""
 
@@ -79,13 +165,21 @@ class XASRAdapter:
         model_dir: str,
         device: str = "cpu",
         num_threads: int = 2,
+        max_active_paths: int = MAX_ACTIVE_PATHS,
+        tail_padding_seconds: float = TAIL_PADDING_SECONDS,
+        prefix_lm_path: str = "",
+        prefix_lm_scale: float = 0.0,
+        entity_boost: dict = None,
+        custom_hotwords: str = "",
+        wake_word: str = "",
     ):
         from utils.onnx_provider import provider_for_device
 
         root = Path(model_dir)
-        encoder = root / "encoder-epoch-99-avg-1.int8.onnx"
+        dtype = "" if device == "gpu" else ".int8"
+        encoder = root / f"encoder-epoch-99-avg-1{dtype}.onnx"
         decoder = root / "decoder-epoch-99-avg-1.onnx"
-        joiner = root / "joiner-epoch-99-avg-1.int8.onnx"
+        joiner = root / f"joiner-epoch-99-avg-1{dtype}.onnx"
         tokens = root / "tokens.txt"
         bpe_model = root / "bpe.model"
         bpe_vocab = root / "bpe.vocab"
@@ -107,37 +201,84 @@ class XASRAdapter:
 
         import sherpa_onnx
 
-        # This bundle only exists in mixed int8/fp32 form, so ASR_MODELS lists no
-        # gpu entry for it and device is effectively always cpu. The call stays so
-        # a forced device=gpu is reported rather than silently honoured.
+        self._max_active_paths = int(max_active_paths)
+        self._tail_padding_seconds = float(tail_padding_seconds)
+        self._head_padding_seconds = INT8_HEAD_PADDING_SECONDS if dtype else 0.0
+        scale = float(prefix_lm_scale)
+        if self._max_active_paths < 1 or self._tail_padding_seconds < 0 or not 0 <= scale <= 1:
+            raise ValueError("Invalid X-ASR beam, tail padding or prefix LM scale")
+        lm_options = {}
+        if scale:
+            if getattr(sherpa_onnx, "XASR_PREFIX_LM_VERSION", 0) != 1:
+                raise RuntimeError("X-ASR prefix LM requires a prefix-enabled sherpa-onnx runtime")
+            if not Path(prefix_lm_path).is_file():
+                raise FileNotFoundError("X-ASR prefix LM model is missing")
+            lm_options = {"lm": prefix_lm_path, "lm_scale": scale}
         provider = provider_for_device(device,
                                        (str(encoder), str(decoder), str(joiner)))
-        encoded_hotwords = _prepare_hotwords_file(hotwords)
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=str(encoder),
-            decoder=str(decoder),
-            joiner=str(joiner),
-            tokens=str(tokens),
-            num_threads=int(num_threads),
-            provider=provider,
-            sample_rate=SAMPLE_RATE,
-            feature_dim=80,
-            decoding_method="modified_beam_search",
-            max_active_paths=MAX_ACTIVE_PATHS,
-            hotwords_file=str(encoded_hotwords),
-            hotwords_score=HOTWORDS_SCORE,
-            modeling_unit="bpe",
-            bpe_vocab=str(bpe_vocab),
-        )
-        self._decode_lock = threading.Lock()
+        encoded_hotwords = root / "hotwords.bpe.txt"
+        if not encoded_hotwords.is_file():
+            encoded_hotwords = _prepare_hotwords_file(hotwords)
+        self._early_hotword_min_score = None
+        if scale and getattr(sherpa_onnx, 'XASR_ENGLISH_DECODE_VERSION', 0) != 1:
+            raise RuntimeError('Prefix LM requires the English-preserving X-ASR runtime')
+        if scale and getattr(sherpa_onnx, 'XASR_SELECTIVE_HOTWORD_VERSION', 0) != 1:
+            raise RuntimeError('Prefix LM requires the corrected selective-hotword X-ASR runtime')
+        self._decoder_options = {
+            'XASR_CANDIDATE_PROTECTION': '1' if scale else '0',
+            'XASR_CASE_DIVERSITY': '1' if scale else '0',
+            'XASR_SHARED_REWARD': '2' if scale else '0',
+            'XASR_ENGLISH_LM_SCALE': '0',
+            'XASR_SELECTIVE_HOTWORDS': '1' if scale else '0',
+        }
+        if entity_boost:
+            if not scale:
+                raise ValueError('Early entity boosting requires prefix LM scoring')
+            if getattr(sherpa_onnx, 'XASR_EARLY_HOTWORD_VERSION', 0) != 1:
+                raise RuntimeError('Early entity boosting requires the full entity-enabled runtime')
+            early_min = min(float(value) for value in entity_boost.values()) - 0.1
+            if early_min <= HOTWORDS_SCORE:
+                raise ValueError(f'Entity per-token scores must exceed {HOTWORDS_SCORE + 0.1}')
+            encoded_hotwords = _boost_hotwords(encoded_hotwords, entity_boost)
+            self._early_hotword_min_score = f'{early_min:g}'
+        custom_file = _custom_hotwords_file(encoded_hotwords, custom_hotwords, wake_word,
+                                           _SUPPLEMENTARY_HOTWORDS.read_text(encoding="utf-8"))
+        if _hotword_phrases(custom_hotwords):
+            if not scale or getattr(sherpa_onnx, "XASR_EARLY_HOTWORD_VERSION", 0) != 1:
+                custom_file.unlink()
+                raise RuntimeError('Custom hotwords require prefix LM and the entity-enabled runtime')
+            self._early_hotword_min_score = "3.9"
+        try:
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=str(encoder),
+                decoder=str(decoder),
+                joiner=str(joiner),
+                tokens=str(tokens),
+                num_threads=int(num_threads),
+                provider=provider,
+                sample_rate=SAMPLE_RATE,
+                feature_dim=80,
+                decoding_method="modified_beam_search",
+                max_active_paths=self._max_active_paths,
+                hotwords_file=str(custom_file),
+                hotwords_score=HOTWORDS_SCORE,
+                modeling_unit="bpe",
+                bpe_vocab=str(bpe_vocab),
+                **lm_options,
+            )
+        finally:
+            if custom_file != encoded_hotwords:
+                custom_file.unlink(missing_ok=True)
         log.info(
             "[asr] X-ASR adapter loaded: encoder=%s, device=%s, provider=%s, "
-            "max_active_paths=%d, hotwords_score=%.1f",
+            "max_active_paths=%d, hotwords_score=%.1f, tail_padding=%.2fs, prefix_lm_scale=%.3f",
             encoder,
             device,
             provider,
-            MAX_ACTIVE_PATHS,
+            self._max_active_paths,
             HOTWORDS_SCORE,
+            self._tail_padding_seconds,
+            scale,
         )
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
@@ -153,11 +294,31 @@ class XASRAdapter:
             sample / 32768.0
             for sample in struct.unpack(f"<{sample_count}h", pcm)
         ]
-        samples.extend([0.0] * int(sample_rate * TAIL_PADDING_SECONDS))
+        # Give the quantized encoder leading acoustic context on its inference
+        # copy. The source audio and VAD/speaker timestamps remain unchanged.
+        if self._head_padding_seconds:
+            samples[:0] = [0.0] * int(sample_rate * self._head_padding_seconds)
+        samples.extend([0.0] * int(sample_rate * self._tail_padding_seconds))
 
-        with self._decode_lock:
-            stream = self._recognizer.create_stream()
-            stream.accept_waveform(sample_rate, samples)
-            self._recognizer.decode_streams([stream])
-            result = stream.result
+        # Serialize all X-ASR adapters (plugin and WebSocket), not just this instance.
+        with _DECODE_LOCK:
+            options = dict(self._decoder_options)
+            options[_EARLY_HOTWORD_ENV] = self._early_hotword_min_score
+            previous = {name: os.environ.get(name) for name in options}
+            try:
+                for name, value in options.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+                stream = self._recognizer.create_stream()
+                stream.accept_waveform(sample_rate, samples)
+                self._recognizer.decode_streams([stream])
+                result = stream.result
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
         return str(getattr(result, "text", result or "")).strip()
