@@ -1586,6 +1586,10 @@ class Event:
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
+        self._personal_owner = None
+        self._personal_remember = False
+        self._transient_turns = []
+        self._personal_seen_at = 0.0
         self._subagent_mgr = None             # SubagentManager instance
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
 
@@ -1898,9 +1902,19 @@ class Event:
 
     def _prepare_personal_turn(self, trigger_event: dict):
         """Fresh identity per turn; never inherit a prior user's in-memory state."""
-        personal.bind_context(trigger_event.get('_personal_user_id'))
-        personal._turn.set(str(__import__('uuid').uuid4()))
-        self._turns = personal.load_turns()
+        from uuid import uuid4
+        user_id = trigger_event.get('_personal_user_id')
+        personal.bind_context(user_id)
+        personal._turn.set(str(uuid4()))
+        user = personal.get_user(user_id)
+        same_session = (user and not user['remember'] and self._personal_owner == user_id
+                        and time.time() - self._personal_seen_at <= 300)
+        if not same_session:
+            self._transient_turns = []
+        self._turns = list(self._transient_turns) if same_session else personal.load_turns()
+        self._personal_owner = user_id
+        self._personal_remember = bool(user and user['remember'])
+        self._personal_seen_at = time.time()
         self._summary = None
         self._session_id = None
 
@@ -2004,6 +2018,11 @@ class Event:
         self._turns.append(turn)
         if personal.enabled():
             personal.save_turn(personal._turn.get(), turn)
+            user = personal.get_user(personal.current_user())
+            if user and not user['remember']:
+                # Opt-out keeps only this active conversation in RAM; switching users clears it.
+                self._transient_turns = [turn] if self._personal_remember else self._turns[-18:]
+            self._personal_seen_at = time.time()
             return
         # 持久化（延迟创建 session）
         import chat_history
@@ -3010,7 +3029,8 @@ class Event:
             'source': trigger_event.get('source', ''),
             'ts': time.time(),
         }
-        ros2_bridge.publish('/decision_core', json.dumps(decision, ensure_ascii=False))
+        if not personal.enabled():
+            ros2_bridge.publish('/decision_core', json.dumps(decision, ensure_ascii=False))
 
         await push_event({'type': 'turn_end', 'payload': {
             'rounds': total_rounds + 1,

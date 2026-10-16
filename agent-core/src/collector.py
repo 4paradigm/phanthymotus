@@ -235,13 +235,17 @@ async def _push_asr_background(ev: dict) -> None:
         print(f'[collector] push asr_background failed: {error}')
 
 
-def _pending_has_same_asr_text(asr_text: str) -> bool:
+def _pending_has_same_asr_text(asr_text: str, identity=None) -> bool:
     """检查 steering_queue 或 priority_pending 中是否已有相同 ASR 文本。"""
+    if personal.enabled() and (not isinstance(identity, personal.IdentitySnapshot) or not identity.user_id):
+        return False
     for item in list(_steering_queue._queue):
-        if _extract_asr_text_field(item) == asr_text:
+        if (_extract_asr_text_field(item) == asr_text
+                and (not personal.enabled() or item.get('_personal_identity') == identity)):
             return True
     for item in _priority_pending:
-        if _extract_asr_text_field(item) == asr_text:
+        if (_extract_asr_text_field(item) == asr_text
+                and (not personal.enabled() or item.get('_personal_identity') == identity)):
             return True
     return False
 
@@ -464,6 +468,11 @@ def _chat_history_blocks(batch: list[dict]) -> str:
     return '\n'.join(blocks)
 
 
+def _capture_personal_identity(ev: dict) -> None:
+    """Freeze attribution at ingress, before queues can outlive the face evidence."""
+    ev['_personal_identity'] = personal.IdentitySnapshot(personal.resolver.resolve(ev))
+
+
 def _build_trigger(batch: list[dict], urgent: bool) -> dict:
     channel_ids = []
     for payload in _channel_payloads(batch):
@@ -493,7 +502,9 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }
     if personal.enabled():
-        trigger['_personal_user_id'] = personal.resolver.resolve(batch[0]) if len(batch) == 1 else None
+        snapshot = batch[0].get('_personal_identity') if len(batch) == 1 else None
+        trigger['_personal_user_id'] = (snapshot.user_id if isinstance(snapshot, personal.IdentitySnapshot)
+                                        else personal.resolver.resolve(batch[0]) if len(batch) == 1 else None)
     from channel.manager import manager as channel_manager
     for payload in trusted_payloads:
         channel_manager.consume_trusted_bot_message(payload.get('message_id', ''))
@@ -875,6 +886,8 @@ async def _drain_loop():
             personal.resolver.resolve(ev)
             continue  # Face evidence updates identity; a sighting is not a request.
 
+        if personal.enabled():
+            _capture_personal_identity(ev)
         _extract_perf_timestamps(ev)
         priority = _extract_priority(ev)
 
@@ -911,7 +924,7 @@ async def _drain_loop():
                 # ASR 去重：busy 时如果相同 text 已在排队中，丢弃重复
                 if 'asr' in source.lower():
                     _asr_text = _extract_asr_text_field(ev)
-                    if _asr_text and _pending_has_same_asr_text(_asr_text):
+                    if _asr_text and _pending_has_same_asr_text(_asr_text, ev.get('_personal_identity')):
                         print(f'[collector] dedup: ASR text "{_asr_text[:30]}" already pending, skip')
                         continue
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 import sqlite3
 import time
@@ -175,6 +176,11 @@ class IdentityResolver:
                 return None
             return voice
         return face
+
+
+@dataclass(frozen=True)
+class IdentitySnapshot:
+    user_id: str | None
 
 
 resolver = IdentityResolver()

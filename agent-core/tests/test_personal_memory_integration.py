@@ -196,3 +196,95 @@ def test_recall_paginates_without_revealing_another_user(store):
     result = json.loads(asyncio.run(_memory_recall('', limit=1, offset=1)))
     assert result['memories'][0]['content'] == 'first'
     assert 'Bob' not in json.dumps(result)
+
+
+def test_queued_speech_keeps_identity_from_arrival_not_later_face(store, monkeypatch):
+    a = pm.create_user('Alice', remember=True)
+    b = pm.create_user('Bob', remember=True)
+    pm.bind_identity(a['id'], 'face', 'alice-face')
+    pm.bind_identity(b['id'], 'face', 'bob-face')
+    pm.resolver.resolve(event('dds:/camera/face', faces=[{'person_id': 'alice-face', 'quality': 'ok'}]))
+    speech = event('dds:/mic/asr', text='Alice disclosure')
+    collector._capture_personal_identity(speech)
+    pm.resolver.resolve(event('dds:/camera/face', faces=[{'person_id': 'bob-face', 'quality': 'ok'}]))
+    monkeypatch.setattr(collector, '_priority_pending', [speech])
+    monkeypatch.setattr(collector, '_steering_queue', asyncio.Queue())
+    monkeypatch.setattr(collector, '_output', asyncio.Queue())
+    collector._flush_all_pending()
+    trigger = collector._output.get_nowait()
+    assert trigger['_personal_user_id'] == a['id']
+    assert trigger['_personal_user_id'] != b['id']
+
+
+def test_private_decision_is_not_broadcast_to_shared_dds(store, monkeypatch):
+    from types import SimpleNamespace
+    import client
+    llm = sys.modules['event.llm']
+    loop = Event()
+    loop._desktop_tools = SimpleNamespace(reset_python_namespace=lambda: None)
+
+    async def finish():
+        return 'done'
+
+    loop._sys_tools = llm._build_system_tools([('finish', finish)])
+
+    async def model(**kwargs):
+        return {'role': 'assistant', 'content': 'Alice private assessment',
+                'tool_calls': [{'id': 'end', 'type': 'function', 'function': {
+                    'name': 'finish', 'arguments': '{}'}}]}
+
+    published = []
+    monkeypatch.setattr(client, 'call', model)
+    monkeypatch.setitem(sys.modules, 'ros2_bridge', SimpleNamespace(publish=lambda *args: published.append(args)))
+    monkeypatch.setattr(collector, '_steering_queue', asyncio.Queue())
+    loop._prepare_personal_turn({})
+    asyncio.run(loop._one_turn({'source': 'collector', 'text': 'hello', 'ts': time.time()}))
+    assert not any(topic == '/decision_core' for topic, _ in published)
+
+
+def test_opt_out_retains_only_current_users_short_term_conversation(store):
+    a = pm.create_user('Alice', remember=False)
+    b = pm.create_user('Bob', remember=False)
+    loop = Event()
+    loop._prepare_personal_turn({'_personal_user_id': a['id']})
+    loop._current_turn = [{'role': 'user', 'content': 'just this conversation'}]
+    loop._save_current_turn({})
+    loop._prepare_personal_turn({'_personal_user_id': a['id']})
+    assert 'just this conversation' in json.dumps(loop._build_history())
+    assert pm.load_turns() == []
+    loop._prepare_personal_turn({'_personal_user_id': b['id']})
+    assert loop._build_history() == []
+    loop._prepare_personal_turn({'_personal_user_id': a['id']})
+    assert loop._build_history() == []
+
+
+def test_busy_ingress_keeps_identical_words_from_different_people(store, monkeypatch):
+    import event_bus
+    a = pm.create_user('Alice', remember=True)
+    b = pm.create_user('Bob', remember=True)
+    pm.bind_identity(a['id'], 'face', 'alice-face')
+    pm.bind_identity(b['id'], 'face', 'bob-face')
+    pending = []
+    monkeypatch.setattr(collector, '_priority_pending', pending)
+    monkeypatch.setattr(collector, '_steering_queue', asyncio.Queue())
+    monkeypatch.setattr(collector, '_busy', True)
+    monkeypatch.setattr(collector, '_cancel_event', asyncio.Event())
+    config.main['core'] = {'project_running': True}
+    events = iter([
+        event('dds:/camera/face', faces=[{'person_id': 'alice-face', 'quality': 'ok'}]),
+        event('dds:/mic/asr', text='我想聊聊', priority=2),
+        event('dds:/camera/face', faces=[{'person_id': 'bob-face', 'quality': 'ok'}]),
+        event('dds:/mic/asr', text='我想聊聊', priority=2),
+    ])
+
+    async def dequeue():
+        try:
+            return next(events)
+        except StopIteration:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(event_bus, 'dequeue', dequeue)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(collector._drain_loop())
+    assert len(pending) == 2
+    assert [ev['_personal_identity'].user_id for ev in pending] == [a['id'], b['id']]
