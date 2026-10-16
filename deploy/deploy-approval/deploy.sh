@@ -147,92 +147,6 @@ print("GITHUB_APP_PRIVATE_KEY_OK")
 PY
 }
 
-require_evidence_inputs() {
-    # Evidence upload is optional. Match config.py's accepted boolean values
-    # and leave the deployment path unchanged unless an operator opts in.
-    python3 - <<'PY'
-import base64
-import ipaddress
-import os
-import re
-from urllib.parse import urlsplit
-
-enabled = os.environ.get("DEPLOY_EVIDENCE_ENABLED", "false").strip().lower()
-true_values = {"1", "true", "yes", "on"}
-false_values = {"0", "false", "no", "off", ""}
-if enabled not in true_values | false_values:
-    raise SystemExit("DEPLOY_EVIDENCE_ENABLED must be a boolean")
-if enabled in false_values:
-    print("EVIDENCE_UPLOAD_DISABLED")
-    raise SystemExit(0)
-
-names = (
-    "DEPLOY_EVIDENCE_ENABLED", "EVIDENCE_PUBLIC_BASE_URL",
-    "EVIDENCE_OAUTH_CLIENT_ID", "EVIDENCE_OAUTH_CLIENT_SECRET",
-    "EVIDENCE_SESSION_KEY", "EVIDENCE_MAX_FILE_BYTES",
-    "EVIDENCE_MAX_VIDEO_BYTES", "EVIDENCE_PART_BYTES",
-)
-for name in names:
-    value = os.environ.get(name, "")
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        raise SystemExit(f"{name} contains a control character")
-
-base = os.environ.get("EVIDENCE_PUBLIC_BASE_URL", "")
-try:
-    parsed = urlsplit(base)
-    port = parsed.port
-except ValueError:
-    raise SystemExit("EVIDENCE_PUBLIC_BASE_URL must be a complete HTTPS origin") from None
-if (parsed.scheme.lower() != "https" or not parsed.hostname
-        or parsed.username is not None or parsed.password is not None
-        or parsed.path not in ("", "/") or parsed.query or parsed.fragment
-        or parsed.netloc.endswith(":")):
-    raise SystemExit("EVIDENCE_PUBLIC_BASE_URL must be a complete HTTPS origin")
-if port is not None and not 1 <= port <= 65535:
-    raise SystemExit("EVIDENCE_PUBLIC_BASE_URL has an invalid port")
-host = parsed.hostname
-try:
-    ipaddress.ip_address(host)
-except ValueError:
-    try:
-        ascii_host = host.encode("idna").decode("ascii")
-    except UnicodeError:
-        raise SystemExit("EVIDENCE_PUBLIC_BASE_URL has an invalid host") from None
-    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    if len(ascii_host) > 253 or any(not re.fullmatch(label, item) for item in ascii_host.split(".")):
-        raise SystemExit("EVIDENCE_PUBLIC_BASE_URL has an invalid host")
-
-for name in ("EVIDENCE_OAUTH_CLIENT_ID", "EVIDENCE_OAUTH_CLIENT_SECRET"):
-    if not os.environ.get(name, "").strip():
-        raise SystemExit(f"{name} is required when evidence upload is enabled")
-
-key = os.environ.get("EVIDENCE_SESSION_KEY", "")
-if not re.fullmatch(r"[A-Za-z0-9_-]{43}=", key):
-    raise SystemExit("EVIDENCE_SESSION_KEY must be a valid Fernet key")
-try:
-    decoded = base64.b64decode(key.encode("ascii"), altchars=b"-_", validate=True)
-except (UnicodeEncodeError, ValueError):
-    raise SystemExit("EVIDENCE_SESSION_KEY must be a valid Fernet key") from None
-if len(decoded) != 32 or base64.urlsafe_b64encode(decoded).decode("ascii") != key:
-    raise SystemExit("EVIDENCE_SESSION_KEY must be a valid Fernet key")
-
-limits = {
-    "EVIDENCE_MAX_FILE_BYTES": (1, 536870912, "536870912"),
-    "EVIDENCE_MAX_VIDEO_BYTES": (1, 536870912, "536870912"),
-    "EVIDENCE_PART_BYTES": (1048576, 536870912, "8388608"),
-}
-for name, (minimum, maximum, default) in limits.items():
-    value = os.environ.get(name, default)
-    if not re.fullmatch(r"[0-9]+", value):
-        raise SystemExit(f"{name} must be a positive integer")
-    number = int(value)
-    if not minimum <= number <= maximum:
-        raise SystemExit(f"{name} is outside the supported bounds")
-
-print("EVIDENCE_UPLOAD_INPUTS_OK")
-PY
-}
-
 require_private_local_inputs() {
     python3 - "$MACHINES_FILE" "$SECRETS_FILE" "$PERSISTENT_DIR" <<'PY'
 import os
@@ -541,10 +455,6 @@ cmd_preflight() {
     echo "Machines file        : $PREFLIGHT_MACHINES"
     echo "Secrets file         : $PREFLIGHT_SECRETS"
     echo ""
-
-    # 0. Optional browser evidence configuration. Secrets are read from the
-    # caller's exported environment and are never copied to an env file/log.
-    require_evidence_inputs
 
     # 1. Persistent directory check
     if [ ! -d "$PREFLIGHT_DIR" ]; then

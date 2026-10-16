@@ -284,6 +284,27 @@ def _load_secrets_config(path: str) -> dict:
         raise ValueError("secrets.yaml cos section must be a mapping")
     result = {"cos": {}, "review_comment_trust": {}}
 
+    # Browser evidence is optional. Malformed or incomplete evidence values
+    # disable that feature without making the Controller configuration fail.
+    evidence_fields = (
+        "public_base_url", "oauth_client_id", "oauth_client_secret", "session_key",
+    )
+    evidence = data.get("evidence", {})
+    evidence_values = {key: "" for key in evidence_fields}
+    evidence_enabled = isinstance(evidence, dict)
+    if evidence_enabled:
+        for key in evidence_fields:
+            value = evidence.get(key)
+            if (not isinstance(value, str) or not value.strip()
+                    or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                evidence_enabled = False
+                break
+            evidence_values[key] = value
+    if not evidence_enabled:
+        evidence_values = {key: "" for key in evidence_fields}
+    result["evidence"] = evidence_values
+    result["deploy_evidence_enabled"] = evidence_enabled
+
     def _coerce_string(key: str, *, required: bool = False, allow_empty: bool = True) -> str:
         if key not in cos:
             if required:
@@ -331,6 +352,7 @@ def _load_secrets_config(path: str) -> dict:
 def load_config() -> Config:
     secrets = _load_secrets_config("/run/deploy-approval/secrets.yaml")
     cos = secrets.get("cos", {})
+    evidence = secrets.get("evidence", {})
     review_trust = secrets.get("review_comment_trust", {})
     cfg = Config(
         github_api_url="https://api.github.com",
@@ -356,14 +378,11 @@ def load_config() -> Config:
         cos_bucket=cos.get("bucket", ""),
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
-        deploy_evidence_enabled=_env_bool("DEPLOY_EVIDENCE_ENABLED", False),
-        evidence_public_base_url=os.getenv("EVIDENCE_PUBLIC_BASE_URL", "").rstrip("/"),
-        evidence_oauth_client_id=os.getenv("EVIDENCE_OAUTH_CLIENT_ID", ""),
-        evidence_oauth_client_secret=os.getenv("EVIDENCE_OAUTH_CLIENT_SECRET", ""),
-        evidence_session_key=os.getenv("EVIDENCE_SESSION_KEY", ""),
-        evidence_max_file_bytes=_env_int("EVIDENCE_MAX_FILE_BYTES", 512 * 1024 * 1024, max_val=512 * 1024 * 1024),
-        evidence_max_video_bytes=_env_int("EVIDENCE_MAX_VIDEO_BYTES", 512 * 1024 * 1024, max_val=512 * 1024 * 1024),
-        evidence_part_bytes=_env_int("EVIDENCE_PART_BYTES", 8 * 1024 * 1024, min_val=1024 * 1024, max_val=512 * 1024 * 1024),
+        deploy_evidence_enabled=secrets.get("deploy_evidence_enabled", False),
+        evidence_public_base_url=evidence.get("public_base_url", "").rstrip("/"),
+        evidence_oauth_client_id=evidence.get("oauth_client_id", ""),
+        evidence_oauth_client_secret=evidence.get("oauth_client_secret", ""),
+        evidence_session_key=evidence.get("session_key", ""),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
         agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),
         agent_core_ca_pem=secrets.get("agent_core_ca_pem", {}),
