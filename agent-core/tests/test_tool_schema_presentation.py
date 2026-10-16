@@ -137,7 +137,7 @@ class TestBothPathsShareIt(unittest.TestCase):
 
 class TestActionRequirements(unittest.TestCase):
     def test_required_fields_survive_action_splitting(self):
-        tool = {'name': 'teaching', 'inputSchema': {
+        tool = {'name': 'recorder', 'inputSchema': {
             'properties': {'action': {'type': 'string'}, 'asset_id': {'type': 'string'},
                            'preview_id': {'type': 'string'}},
             'required': ['action'],

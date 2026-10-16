@@ -1,142 +1,263 @@
-# 内嵌技能工作台
+# 内嵌技能工作台与技能包
 
-在现有执行卡上选择「录制技能」并点击原有的「执行」，打开 Driver 提供的页面。没有专用全局示教按钮或额外的全局样式。Core 复用已有 modal 样式，提供通用卡片页面容器、受限通信和本机技能导入；页面样式、示教状态、机器人适配和动作资产属于 Driver。既有 Agent Loop、技能激活、提示词与 ACP 不变。
+一张执行卡可以附带一个由 Driver 提供的交互页面。Core 给它一个隔离容器、一条受限
+通道、一个本机技能导入接口和一个自动执行策略存储；页面内容、设备适配、资产校验和
+运动逻辑全部属于 Driver。既有 Agent Loop、`activate_skill`、提示词生成和 ACP 不变，
+没有新增全局按钮，也没有新增全局 CSS。
 
-原有卡片只能显示参数表单和文本结果；现有技能安装接口从资源中心获取定义，不能安装本机生成的未发布定义。因此新增上述两项通用能力。若后续统一的卡片页面协议或本地安装接口覆盖它们，应迁移并移除重复实现；不在 Core 添加各机器人专用流程。
+## Core 知道什么，不知道什么
 
-## 当前版本：持久自动执行设置（2026-10-16）
+这是本文档最重要的一节，因为前几个版本正是在这里出了问题。
 
-用户可在示教保存/导入启用时选择自动执行，也可在「我的 → 技能广场 → 已安装 → 技能 → 对话调用」勾选「允许自动执行」。卡片齿轮另提供「本设备所有已验证技能自动执行」，覆盖现有及以后验证通过的技能；关闭总开关后恢复单技能选择。默认关闭，正常停止、停止项目及容器重启后保留用户选择。每次调用仍由 Driver 检查资产、设备、起点和控制权，新导入仍须本机验证。
+**Core 不知道**：这是什么类型的设备、包里装的是什么、协议叫什么名字。具体地：
 
-只有声明 `x-skill-package.persistent_execution` 的工具使用此能力。Core 不判断型号或驱动机器人；这里的必要修改为：
-
-- `skill_packages.py` 在 ConfigDB 保存单技能设置，并读取现有 tool_config 的卡片设置；开启前读取 Driver 的设备/动作绑定，更新旧 Skill 的调用说明。旧 taught UUID 定义与新 attachment 定义均沿用严格来源解析。
-- `api/canvas.py` 保存该类卡片配置时，验证网页 token 并取得真实设备绑定，不接受调用方伪造的绑定；普通卡片沿用原流程。
-- `auth.py` 只允许同机 Driver 无 token 读取已保存策略，不能写入。持久设置和一次性授权创建都要求已登录网页；模型直接调用 MCP config 不授予权限。
-- `web/js/skills.js` 在原「对话调用」内提供复选框；`workbench.js` 在 save/import 成功后保存用户的单技能选择；`sidebar.js` 为配置 schema 的 `x-widget: checkbox` 渲染原生复选框，未新增全局按钮或 CSS。
-- `mcp_client.py` 沿用已有 `missing_required_config`，仅在真正缺必填配置时阻止 start；新增可选开关不能导致未配置过的卡片无法启动。没有修改 Agent Loop、技能激活或提示词生成代码。
-
-策略绑定 MCP/卡片、设备身份、模型/几何/标定摘要；单技能还绑定录制 SHA、录制绑定和元数据。策略只存本机，不包含在导出动作包中。改变绑定使原设置不匹配，Driver 的实时检查仍可拒绝执行。
-
-| 新增接口 | 行为 |
+| Core 不持有 | 由谁决定 |
 | --- | --- |
-| GET `/api/skills/package/execution/{slug}` | 读取实际绑定后的有效选择、是否继承卡片及绑定变化提示 |
-| POST `/api/skills/package/execution/{slug}` | 网页开启/关闭单技能自动执行，并撤销该技能旧临时授权 |
-| POST `/api/skills/package/execution/read` | 精确回环端点；Driver 每次 preview/run 只读策略，无授权写入能力 |
+| 协议标识符 | 卡片的 `x-skill-package.schema`，任意字符串 |
+| 包内文件名 | Driver。Core 只要求有 `manifest.json`，其余条目名不限 |
+| `compatibility` 的字段含义 | Driver。Core 只读其中的 `tool` 用于选路，其余原样转发/展示 |
+| 旧 slug 前缀 | 卡片的 `x-skill-package.legacy_slug_prefix` |
+| 资产 ID / 绑定标识的格式 | Driver。Core 只做长度与字符集边界检查 |
+| 「还在释放中」的状态词 | 工具的 `inputSchema['x-stop']`（见下） |
 
-上海已部署 `phanthymotus-core:auto-execution-20261016-r2`（`2eb5412a7bd4`），保留现场基线更新、原画布/数据及 DDS 环境变量。真实网页验证单技能设置、卡片总开关与继承展示；真实 Driver 预览验证作用范围、优先关系、关闭恢复、直接 MCP config 不授权；普通 stop 与 Core/G1 重启后设置保留。测试设置已恢复关闭，项目停止，浏览器无脚本错误。实际截图见 [Driver #412](https://github.com/4paradigm/phanthymotus-driver/pull/412) 的当前版本部分。
+早期版本把 `motus.teaching.package/1`、`trajectory.jsonl`、`taught-` 前缀、32 位
+十六进制资产 ID、64 字符绑定、以及一整套 `hold`/`handback`/`sdk_pending`/
+`ownership_held` 状态词硬编码在 Core 里。每一项都让「接入第二种设备」等于「改
+Core」，这与 `x-skill-package` 这个声明机制的目的正相反。前端一度还把
+`dual_arm` 映射成「双臂」、`fixed_hand` 映射成「固定手」—— 运动学词汇出现在宿主
+页面里，第二种形态只能靠继续编辑那个文件来支持。
 
-本轮没有执行新的 run/trial，未重做录制→试运行→保存的物理闭环；新增回归断言未执行模拟测试。Python AST/镜像 py_compile、Chromium 脚本编译和 diff 检查用于静态验证。下方五次动作和测试数量均为历史版本证据，不能表述为持久设置版本的完整 Agent/动作验收。
+`tests/test_skill_packages.py` 用一套故意与任何已发布 Driver 都不相同的标识
+（`example.device.package/1`、`recorded-` 前缀、非 16 进制资产 ID、非 64 字符绑定）
+守住这条边界：只要有任何一项需要和 Core 里写死的字符串对上，那组测试就会红。
+
+**Core 知道**：传输边界（大小、压缩方式、条目名不得逃出目录）、谁有权开启自动执行、
+包该送到哪张卡、以及本机技能库的读写。
 
 ## 扩展声明
 
-声明放在 `inputSchema` 内，避免被现有 MCP 注册字段白名单丢弃：
+声明放在 `inputSchema` 内，避免被现有 MCP 注册字段白名单丢弃。
+
+### `x-workbench` —— 页面容器
 
 ```json
 {
   "x-workbench": {
     "protocol": "motus.workbench/1",
     "kind": "skill-authoring",
-    "title": "机器人示教",
+    "title": "技能录制",
     "entry": "ui",
-    "actions": ["ui", "info", "new", "check", "begin", "record", "finish", "inspect", "trial", "save", "run", "stop"]
+    "actions": ["ui", "info", "new", "check", "begin", "record", "finish",
+                "inspect", "trial", "save", "run", "stop"]
   }
 }
 ```
 
-用户通过卡片原有执行按钮调用 `entry` 声明的动作，预期返回 `{protocol, html}`。HTML 最大 250,000 字符，需自包含。对声明工作台的卡片，动作菜单只显示页面入口和 `x-action-params` 中的公开动作，中文标签取自 action 的 `oneOf[].title`；内部编写动作只在工作台使用，`ui` 无需暴露给 LLM。`info` 必须无运动副作用，且提供 `busy`，用于关闭前检查。停止须可独立调用。只打开页面不触发运动。
+用户通过卡片原有执行按钮调用 `entry` 声明的动作，预期返回 `{protocol, html}`。
+HTML 最大 250,000 字符，需自包含。对声明工作台的卡片，动作菜单只显示页面入口和
+`x-action-params` 中的公开动作，标签取自 action 的 `oneOf[].title`；内部编写动作
+只在工作台使用。`info` 必须无运动副作用且提供 `busy`，用于关闭前检查。停止须可
+独立调用。只打开页面不触发运动。
 
-宿主 iframe 使用 `sandbox="allow-scripts"`，不授予同源、弹窗、表单或顶层导航权限。宿主前置 CSP 禁止联网和外部脚本。页面无法读取 Core 的 token 或父页面存储。
+iframe 使用 `sandbox="allow-scripts"`，不授予同源、弹窗、表单或顶层导航权限；宿主
+前置 CSP（`default-src 'none'; connect-src 'none'`）禁止联网和外部资源。页面读不到
+Core 的 token，也读不到父页面存储。
+
+关闭时宿主先问设备 `info`：`busy` 为真则拒绝关闭；设备**读不到**（不可达、超时）
+则说明原因并让操作者选择是否仍然关闭。两种情况都不会把页面锁死 —— 早期版本在关闭
+失败时留着模块级的 `opened` 标志，于是整页在刷新前再也打不开任何工作台。Esc 也能
+触发同一套关闭流程。
+
+### `x-skill-package` —— 技能包能力
+
+```json
+{
+  "x-skill-package": {
+    "schema": "example.device.package/1",
+    "pending": true,
+    "session_authorization": true,
+    "persistent_execution": true,
+    "legacy_slug_prefix": "recorded-"
+  }
+}
+```
+
+`schema` 是这张卡能收的包的协议标识，必须与包内 `manifest.schema` 一致，否则 Core
+在接触设备之前就以 409 拒绝。其余字段都是可选能力位；没有声明的能力，对应入口就
+不出现。
+
+### `x-stop` —— 释放协议（可选）
+
+```json
+{
+  "x-stop": {
+    "pending_states": ["handing_back"],
+    "pending_flags": {"authority_released": false},
+    "failed_states": ["refused"]
+  }
+}
+```
+
+Core 自己只认两个「还在停」的状态（`running`、`stopping`）和三个失败状态
+（`error`、`failed`、`fault`）。需要确认交权、等输出排空的设备自己声明补充规则。
+声明格式不合法时整条声明被忽略并回落到通用规则 —— 一个 Driver 不能靠发垃圾字段
+搞坏全机队每张卡的停止。
+
+两条有意为之的规则：
+
+- **`unknown` 不是失败。** 它是设备在遥测过期时的回答（engineai/t800），把它读成
+  「停止失败」会把一台已经停好的设备报成卡住。
+- **被拒绝的动作不是失败的动作。** 无生命周期的插件（手势、回桩、喇叭）回答
+  `{"error": "unknown action: stop"}`，意思是「我没有东西需要解除」。
+  phanthymotus-driver 的 30 个 bundle 里只有 6 个用 `common/lifecycle` 自行规范化
+  了这个回答，其余 24 个仍然原样返回；把它读成失败，正是那个仓库的
+  `common/lifecycle.py` 记录过的、曾经让一台机器人整个 start-project 因为一条回桩
+  命令而回滚的误读。
+- **`error` 只在没有 `state` 时才定胜负。** 这是同一文件里 `tool_state_of` 早已写明
+  的规则（`{"state": "running", "error": "last frame dropped"}` 是警告不是失败），
+  停止路径现在复用 `tool_state_of` 而不是自己再写一遍。
+
+另外，轮询间隔是 0.25s 且不超过每卡死线的 1/4。0.1s 会把 5 秒死线变成每张卡最多
+50 次 MCP 调用，还是所有卡片同时扇出。
 
 ## 通信
 
-iframe 加载后，父页面向其发送 `{protocol: "motus.workbench/1"}` 并转移一个 `MessagePort`。子页面须验证 `event.source === parent`。后续消息均走该端口：
+iframe 加载后，父页面向其发送 `{protocol: "motus.workbench/1"}` 并转移一个
+`MessagePort`。子页面须验证 `event.source === parent`。后续消息均走该端口：
 
 ```js
 port.postMessage({id: 'request-1', method: 'call', args: {action: 'info'}});
 // 返回 {id, result} 或 {id, error}
 ```
 
-- `call`：仅转发到当前卡片的 MCP/工具和固定 instance_id，action 必须在声明中。不能指定任意 MCP、工具或 URL，也不能直接调用 save。
-- `save`：仅向声明 `kind=skill-authoring` 的工具开放。调用该工具的 `save`，要求返回标准 `skill` 定义；宿主再调用本机导入 API，并返回 `installed` 与 `context`。字段验证和保存条件由 Driver 执行。打开既有技能列表时自动读取最新数据。
-- `context`：只读查询当前工具是否已通过画布执行器连线连接到决策核心，返回 `{conversation_ready, tool}`。不自动增加执行权限。
+- `call`：仅转发到当前卡片的 MCP/工具和固定 `instance_id`，action 必须在声明中。
+  不能指定任意 MCP、工具或 URL，也不能直接调用 save。
+- `save`：仅向声明 `kind=skill-authoring` 的工具开放。调用该工具的 `save`，要求
+  返回标准 `skill` 定义；宿主再调用本机导入 API，并返回 `installed` 与 `context`。
+  字段验证和保存条件由 Driver 执行。
+- `context`：只读查询当前工具是否已通过画布执行器连线连接到决策核心，返回
+  `{conversation_ready, tool}`。不自动增加执行权限。
 
-每条请求最多 40,000 字符；写操作串行，停止可以并行抵达。没有通用 fetch、任意父页面操作或 token 通道。关闭会撤销原端口。浏览器关闭不是机器人急停；驱动仍须提供独立的停止与输入看门狗。
-
-示教流程首个实现见 Driver 仓库 `common/teaching/` 和 `agilex/piper/teaching.py`。
+每条请求最多 40,000 字符；写操作串行，停止可以并行抵达。没有通用 fetch、任意父页面
+操作或 token 通道。导航和关闭都会撤销原端口。**浏览器关闭不是机器人急停**；驱动仍须
+提供独立的停止与输入看门狗。
 
 ## 本机技能导入
 
-`POST /api/skills/import` 使用既有 Core API 鉴权，直接写入 ConfigDB 的 `skills.installed`。无需资源中心账号。
+`POST /api/skills/import` 使用既有 Core API 鉴权，直接写入 ConfigDB 的
+`skills.installed`。无需资源中心账号。
 
-必填：`slug`、`name`、`oneLiner`、`instruction`。可选：`description`、`category`、`version`、`requiredTools`、`compatibility`、`attachment`、`origin`。后三项为有界对象，attachment 校验协议、工具和资产 ID，origin 校验 MCP 与卡片实例；不接受任意外链附件。仅接收这些字段，限制大小和类型，不接受 HTML 图标、远程资源、任意配置或 active 覆盖。总定义不超过 32 KiB。
+必填：`slug`、`name`、`oneLiner`、`instruction`。可选：`description`、`category`、
+`version`、`requiredTools`、`compatibility`、`attachment`、`origin`。后三项为有界
+对象：`attachment` 校验协议标识的**形状**（`<ns>/<ver>`）、所声明的 tool 必须出现在
+`requiredTools` 里、资产 ID 在长度与字符集范围内 —— 不校验具体是哪个协议或哪种 ID
+格式。`origin` 校验 MCP 与卡片实例。总定义不超过 32 KiB，不接受 HTML 图标、远程
+资源、任意配置或 `active` 覆盖。
 
-新技能默认对 LLM 可见；仍沿用 `activate_skill` 的现有指令加载机制。相同定义重试幂等，不重置用户后来修改的可见性；同 slug 不同定义返回 HTTP 409。导入不是自动执行，也不会自动授权未连接的工具。
+相同定义重试幂等；同 slug 不同定义返回 409。幂等判断按字段类型取缺省值：字符串和
+列表有归一化的空形式（缺失等价于空），字典没有 —— 早期版本对三个字典字段也用 `''`
+作缺省，于是「重新导入一个在这些字段出现之前就装好的技能」会撞上 409 并被要求改
+slug，而不是预期的幂等 200。
 
-用户需要把示教执行卡接到决策核心一次，之后同一机器人的新录制技能沿用该连接。工作台会显示这项状态，未连接时不会宣称保存后即可对话调用。
+导入不是自动执行，也不会自动授权未连接的工具。用户需要把该执行卡接到决策核心一次，
+之后同一设备的新技能沿用该连接；工作台会显示这项状态，未连接时不会宣称保存后即可
+对话调用。
 
-## 本次实现的调用边界
+## 技能包传输
 
-工作台中的操作绑定打开页面的 MCP 服务、工具和卡片实例。导入接口仅接收已有 Skill 格式，不会自动创建执行器连线、增加运行权限或给网页增加聊天框；自然语言入口仍由部署已有的语音或消息渠道提供。
-
-支持动作包的 Driver 返回型号元数据和本地资产附件声明，宿主补入来源 MCP/卡片；导出及更新说明固定该来源。既有 Agent 路由仍按画布连接选择工具，多个同名服务同时接入时的自然语言选择未新增强制限制。卡片「运行技能」也仍是带资产 ID 的参数表单，尚无按保存名称选择并运行的界面。模拟浏览器验收覆盖单个绑定设备的发现、激活和 MCP 调用，未验证真实 LLM 决策或真机操作。这些限制不应被表述为已完成完整的多设备网页调用体验。
-
-## 验证
-
-本仓：`python -m pytest -q tests/test_skill_import.py`（在 agent-core 目录，使用既有依赖及 pytest）。
-
-Driver 的 `tests/test_teaching_browser.py` 提供跨仓浏览器验收：真实 MCP 代理、SQLite 导入、现有技能列表、模拟机器人、起点拒绝、试运行和沙箱隔离；使用方式见 Driver 的 `common/teaching/README.md`。
-
-
-## 每动作必填参数
-
-`mcp_client._to_openai_schema` 支持 `x-action-params.<action>.required`，仅将声明的该动作参数列为必填；未声明时沿用工具级 required。解决兄弟动作参数不同、拆分后 run 的参数全为可选的问题。Driver 仍须自行执行参数和状态校验；此变更不修改 Agent Loop、提示词或执行许可。
-
-## 完整动作文件
-
-现有技能管理的「已安装」中可导入动作包；本机动作 Skill 详情可下载动作包或更新调用说明。导出与更新使用原来源 MCP/卡片，旧 taught UUID Skill 仅在可唯一确定原工具服务时兼容。Core 复用已有鉴权和 MCP 调用，传输不会自动连线或执行动作。
-
-新增 `src/api/skill_packages.py` 的 `/api/skills/package` 路由：
+`src/api/skill_packages.py` 挂在 `/api/skills/package`：
 
 | 接口 | 行为 |
 | --- | --- |
-| GET `/targets` | 当前画布中声明 `x-skill-package.schema=motus.teaching.package/1` 的 HTTP MCP 工具 |
-| POST `/inspect` | 有界读取上传文件，返回 manifest 与设备卡片；不接触机器人 |
-| POST `/install` | 按 card_id 发送有界分块，由 Driver 验证兼容并生成草稿；仅本机已有相同验证资产时可复用安装，保持原可见性 |
+| GET `/targets` | 画布中声明了 `x-skill-package.schema`（任意值）的 HTTP MCP 工具 |
+| POST `/inspect` | 有界读取上传文件，返回 manifest 与**已按协议和 tool 选路过**的卡片；不接触设备 |
+| POST `/install` | 按 `card_id` 发送有界分块；协议不符或 tool 不符在接触设备前拒绝 |
 | GET `/pending` / POST `/resume` | 聚合各卡片待验证导入；从技能列表恢复对应工作台 |
-| GET / POST `/session/{slug}` | 查询、设置或撤销本机此技能的限时调用授权；设置必须有网页 Bearer token 与显式条件确认 |
-| POST `/approval/consume` | 只允许回环来源消费 30 秒一次性凭据；不能创建授权 |
 | GET `/export/{slug}` | 从原卡读取完整包，验证长度与传输 SHA 后下载 |
-| POST `/refresh/{slug}` | 由原 Driver 校验资产并重新生成说明，校验相同 slug/资产后更新；保留可见性和安装时间，拒绝并发覆盖 |
+| POST `/refresh/{slug}` | 由原 Driver 校验资产并重新生成说明；保留可见性和安装时间，拒绝并发覆盖 |
+| GET / POST `/session/{slug}` | 查询、设置或撤销限时调用授权（未声明持久能力的旧适配器） |
+| POST `/approval/consume` | 只允许回环来源消费 30 秒一次性凭据；不能创建授权 |
+| GET `/execution/{slug}` | 读取实际绑定后的有效选择、是否继承卡片及绑定变化提示 |
+| POST `/execution/{slug}` | 网页开启/关闭单技能自动执行，并撤销该技能旧临时授权 |
+| POST `/execution/read` | 精确回环、只读；Driver 每次 preview/run 读取策略，无授权写入能力 |
 
-文件包含 `manifest.json` 和 `trajectory.jsonl`，最大 16 MiB，解压轨迹最大 64 MiB；Core 检查格式边界并负责传输，Driver 完成轨迹校验、型号/关节/模型匹配和重新绑定。导入创建的新草稿必须本机试运行并确认效果，随后走已有 save/import 才成为可调用 Skill。拒绝替换尚未保存的录制草稿。
+边界：整包 ≤ 16 MiB，`manifest.json` ≤ 16 KiB，单个条目解压 ≤ 64 MiB，全部条目合计
+≤ 128 MiB，拒绝加密与非 deflate/stored 压缩，拒绝绝对路径和 `..`。**整条传输有
+180 秒死线** —— 16 MiB 是最多 683 次分块调用，只给每块 30 秒超时的话一次上传能把
+请求挂住几小时，而这个仓库里其他每一条面向设备的路径都有死线。
 
-导入后直接打开自动检查页面，一次点击确认本次条件并试运行，完成后确认效果启用。关闭可从技能列表「待验证 → 继续验证」恢复。目标设备已有完全相同且验证成功的本机资产时复用原资产；不采信包内授权，不重复试运行，也不重置既有 Skill 可见性。
+导入创建的新草稿必须本机试运行并确认效果，随后走已有 save/import 才成为可调用
+Skill。不采信包内的验证声明。目标设备上已有完全相同且验证成功的本机资产时复用原
+资产，不重复试运行，也不重置既有 Skill 的可见性。关闭后可从技能列表「待验证 →
+继续验证」恢复。
 
-未声明持久能力的旧适配器，技能详情仍可「允许本次直接调用」，最长 30 分钟，Driver 继续执行每次新预览及运动检查。Core 的 `skill_packages.py` 负责已登录网页的一次性授权凭据，`auth.py` 对回环消费端点增加精确豁免，供同机 Driver 核验；创建权限仍必须验证 Bearer token。无需给 Driver 增加网页 token，也不把授权动作暴露给 Agent。授权成功自动刷新旧 Skill 调用说明。停止、驱动重启、反馈重连、模式/标定或动作变化及执行异常由 Driver 撤销；旧临时授权不导出、不持久化。此生命周期不适用于上面的持久设置。
+## 持久自动执行设置
 
-`web/index.html` / `web/js/skills.js` 复用现有技能弹窗和样式提供文件入口和型号详情，`workbench.js` 在保存时补入原 MCP/实例身份。没有机器人型号判断或运动算法放进 Core。
+用户可在保存/导入启用时选择，也可在「我的 → 技能广场 → 已安装 → 技能 → 对话调用」
+勾选「允许自动执行」。卡片齿轮另提供「本设备所有已验证技能自动执行」。默认关闭，
+正常停止、停止项目及容器重启后保留。
 
-完整附件的资源中心发布尚未实现。线上公开客户端当前只展示文本/配置发布流程；在拿到服务端附件实现前，本 PR 不能声称动作包已可上传、审核、下载并从技能广场安装。也不会将轨迹塞进 instruction 或 configSchema。
+**卡片总开关授权的是还不存在的技能。** 它覆盖该设备当前**以及以后**验证通过的技能，
+这比单技能授权宽得多，界面上据此明说，不要当成同一件事。
 
-本地验证：Skill 导入、文件路由、旧定义更新、action required，以及真实浏览器下的导出→更换模拟设备身份→导入→试运行→重新保存。该闭环硬件为模拟，未调用真实 LLM。
+只有声明 `x-skill-package.persistent_execution` 的工具使用此能力。三道闸：
 
-2026-10-16 已在上海部署：基于现场 `release.261015.0897a8d` 应用完整 PR 增量，保留基线 MCP 更新，构建 `phanthymotus-core:workbench318-20261016`（`0609067d81ce`）。候选镜像内 schema、Skill 导入、动作包、MCP 合并及错误处理五组测试 **52 passed**。真实网页已完成旧“抬手”说明更新、型号展示、完整动作包下载和上传文件检查，原 Skill 保持启用，页面无脚本错误；没有上传资源中心。
+1. **已登录网页。** `prepare_execution_config` 和 `POST /execution/{slug}` 都要求
+   Bearer token，模型直接调 MCP `config` 不授予权限。调用方送来的
+   `_execution_binding` 一律丢弃并由 Core 向设备重新取得。
+   部署若没有配置 `ACCESS_TOKEN`，这道闸永远打不开 —— 此时返回 403 并说明原因，
+   而不是让操作者去找一个那台机器上不存在的登录入口。
+2. **绑定匹配。** 策略记录设备绑定与资产绑定；换绑定后旧选择不匹配，按「manual」
+   处理并提示核对。设备返回的绑定里**只有三个字段被读取**，其余（型号、几何、标定
+   摘要等）原样忽略 —— 早期版本把设备回复直接 splat 进一个三参数函数，于是第一个
+   按自己协议多带一个字段的 Driver 就是一个 500。
+3. **画布绑定。** 工具必须接在本机的 `decision_core` 上。
 
-上述部署阶段，真实 Agent 已正确发现并调用 `g1_teaching.preview(asset_id)`，但一次物理回放遗留的 G1 交权超时导致 `motion_busy`。当时在 Driver #412 的 `arm_stream.py` / `teleop_control.py` 修复，现场完成停止交权并更新 Driver 后，多次预览成功、busy=false；未再次执行动作。该历史记录不代表下面新增候选的当前状态。
+关闭自动执行时**先撤销旧的限时授权，再落盘**。相反的顺序会在设备拒绝撤销时返回 409
+同时把设置写成「已关闭」而旧授权还活着 —— 正是这个调用存在的目的所要防止的事。
 
-## 前版停止修复与五次实机动作（2026-10-16）
+开启整张卡片会刷新该卡所拥有技能的调用说明，使旧定义学到自动执行规则。这个迁移
+**有上限**：最多 50 个技能、30 秒死线，单个技能失败不影响这次保存，未完成的数量
+打印在日志里。它也只在「从关到开」或「绑定变化」时才跑 —— 改同一张卡上别的配置字段
+不会再触发一轮设备调用。
 
-`src/api/config.py` 的停止收尾必须读取设备返回值：非 200、业务 error、unknown/failed/fault 及未确认的 release 都按失败报告。明确仍在释放或持有控制权时，在原有每卡 5 秒期限内轮询 info，不重复发送 stop；到期报告“停止未确认”。Agent 仍先停、设备仍并行收尾，沿用原进度事件和界面，没有修改 Agent Loop。
+每次执行仍由 Driver 预览、检查设备/起点/控制权并等待真实回执。策略只存本机，不包含
+在导出的技能包中。
 
-`src/api/mcp_manage.py` 同时保留 MCP `isError` 的失败含义，避免协议层成功包装掩盖工具失败。只修 Driver 无法解决 Core 不读取返回结果的问题，因此这两处属于必要的通用修改，无 G1 型号或动作判断。
+## 每动作必填参数
 
-限时授权、导入恢复及上述停止修复已部署至上海：`phanthymotus-core:session318-20261016-1af3e97` / `358b04072dd9`，保留现场基线增量、数据库、录制和 DDS 环境变量。现场自定义 desk_stretch 仅补 start/info/stop 生命周期入口，未并入 Core 或 Driver 仓库。
+`mcp_client._to_openai_schema` 支持 `x-action-params.<action>.required`，仅将声明的
+该动作参数列为必填；未声明时沿用工具级 required。解决兄弟动作参数不同、拆分后参数
+全为可选的问题。
 
-本轮实机共执行五次“抬手”：前两次分别经过 Core MCP 代理和真实 Agent，完成回放与交权，但发现 G1 正常子状态切换误撤销授权；Driver #412 将 801 下的 0/3 视为同一授权模式，其他模式变化和反馈间断仍撤销。第三次由网页恢复导入草稿并试运行成功，用户现场确认效果后启用为普通本机 Skill。用户另行授权后的第四/五次，由真实 Agent 在同一次网页授权下连续执行，两次 completed、busy=false、ownership_held=false、授权仍有效，未追问确认，并报告完成。
+同处的 start 前置检查改为复用既有的 `missing_required_config`：只在真正缺必填项时
+阻止启动（与 `api/mcp_manage.py` 早已采用的判断一致），并且**报出真正缺的字段名**。
+原来的文案是 `provider/url/key` —— 那是某个 LLM 适配器的字段表，把模型指向一张摄像头
+卡片上不存在的表单。
 
-真实 Agent 使用已有对话，不作为新会话 activate_skill 验收。复测准备时曾因授权失效拒绝发送动作，未留存足够诊断判断原因；重新网页授权后连续两次通过，长时间稳定性尚未验收。没有降低反馈新鲜度或运动阈值。
+## 验证
 
-真实浏览器验证同机相同包复用且保留可见性、新导入自动检查、试运行前禁止启用、关闭后恢复、试运行完成后确认效果并保存，页面无脚本错误。新增“抬手（导入验收）”（`taught-de9038f5d1174e30ace83e1c5a7b4af7`）已安装并对 Agent 可见，带 Unitree/G1/G1_23 元数据及 g1_teaching 工具要求。测试结束恢复原画布连线并保留示教卡，项目停止、8/8 卡片完成停止、会话授权撤销。
+```bash
+cd phanthymotus && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest agent-core/tests -q
+cd phanthymotus && node --test "agent-core/web/js/*.test.mjs"
+```
 
-截图与详细实机记录见 [Driver #412](https://github.com/4paradigm/phanthymotus-driver/pull/412)。本轮 Python/页面脚本语法及 diff 检查通过；停止错误、异步等待、超时回归断言已补，按用户要求没有执行模拟测试，也未在实机注入错误停止。正常项目启动/停止已验证；原厂 99 的 SDK 3104 根因仍未解决，五次轨迹回放使用零权重交权，不能视为该原厂 RPC 已恢复。完整动作附件的资源中心发布仍未接通。
+本轮状态（2026-10-16，`fix/skill-package-decoupling`）：
+
+- `agent-core/tests` **1595 passed, 1 skipped**；前端 **186 passed**；
+  `actucore/tests` + `agents/pr_review/tests` **484 passed, 21 skipped**。全部在本机
+  实测，不是推断。
+- 修掉了上一版带来的 3 个回归：`test_layout_stop_removed` 的替身返回值缺 `code`，于是
+  删卡清理把每张卡都报成停止失败。替身已改成 `mcp_call_tool` 真正返回的形状。
+- 修掉了一条**什么都没验证**的断言：`test_skill_packages` 里检查「伪造的
+  `_execution_binding` 打到通用 canvas 配置端点会被拒」的那条，用的 fixture 只挂了
+  `skills.router`，所以请求是 404 而不是 401。新增 `full_client` fixture 同时挂载
+  canvas 路由，并补上「伪造绑定被丢弃」「无关卡片保存不接触设备」两条。
+
+**尚未验收**：本轮没有在真机上跑过。上一版在上海 G1 上完成的五次「抬手」、限时授权
+与导入闭环是**那一版**的证据，不能作为本轮的实机验收 —— 本轮改动了停止路径的判定
+规则、技能包的协议解析和自动执行的落盘顺序，这三处都需要重新在真机上过一遍。资源
+中心的完整附件上传/审核/下载/广场安装仍未接通；本机技能不等于已发布到广场。
+
+历史实机记录、截图与动作 ID 见
+[Driver #412](https://github.com/4paradigm/phanthymotus-driver/pull/412)。

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 import config
 import aiohttp
+from tool_config import find_tool
 import openai as openai_lib
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
@@ -299,6 +300,79 @@ def tool_state_of(result) -> tuple[str | None, str]:
     if state is None and payload.get('error'):
         state = 'error'
     return state, message
+
+
+# How long to wait between two `info` reads while a device is still releasing.
+# 0.1s turned a 5s deadline into 50 MCP calls per card, fanned out across every
+# card at once; a release that needs confirming does not resolve in 100ms.
+_STOP_POLL_INTERVAL_S = 0.25
+
+# What Core knows on its own. `unknown` is deliberately **not** a failure: it is
+# what a tool answers when its telemetry is stale (engineai/t800), and reading
+# it as a failed stop reports a healthy device as stuck. A tool that cannot
+# confirm its own stop is not the same as one that refused to.
+_STOP_FAILED_STATES = frozenset({'error', 'failed', 'fault'})
+_STOP_PENDING_STATES = frozenset({'running', 'stopping'})
+
+
+def stop_rules(tool_obj: dict) -> dict:
+    """What counts as "still stopping" for this tool.
+
+    Core knows two generic pending states and no flags. Anything beyond that is
+    **declared by the tool** in `inputSchema['x-stop']`, because a release
+    protocol belongs to the device that has one:
+
+        "x-stop": {"pending_states": ["handing_back"],
+                   "pending_flags": {"authority_released": false},
+                   "failed_states": ["refused"]}
+
+    The alternative -- a hardcoded vocabulary -- was tried and does not work.
+    A list carrying `hold`, `handback`, `sdk_pending`, `ownership_held` and
+    `authority_released` was written against one driver's private words: not one
+    of those strings exists anywhere in phanthymotus-driver, while `active`
+    (19 occurrences) and `stopping` (10) do. So the guessed half applied to
+    nobody and the guessed-wrong half applied to every card on every robot.
+    `active` is still absent here on purpose: pndbotics/adam answers it from
+    `info` for an arm that is powered, which is not the same as a card that has
+    not stopped. A driver that does mean "still stopping" can say so.
+    """
+    declared = ((tool_obj or {}).get('inputSchema') or {}).get('x-stop') or {}
+    if not isinstance(declared, dict):
+        declared = {}
+
+    def names(key):
+        value = declared.get(key)
+        return {str(v) for v in value if isinstance(v, str)} if isinstance(value, list) else set()
+
+    flags = declared.get('pending_flags')
+    return {
+        'failed': _STOP_FAILED_STATES | names('failed_states'),
+        'pending': _STOP_PENDING_STATES | names('pending_states'),
+        'flags': {k: v for k, v in flags.items() if isinstance(k, str)} if isinstance(flags, dict) else {},
+    }
+
+
+def is_declined(payload: dict) -> bool:
+    """Did the plugin say it does not know the verb, rather than fail at it?
+
+    The mirror of phanthymotus-driver's `common/lifecycle.is_declined`, and
+    deliberately the same rule: only an `unknown action` error **with no
+    `state`** counts. Six of that repo's thirty bundles normalise the decline
+    themselves; the other twenty-four still answer it raw, and every one of
+    their stateless actuators -- a gesture, a dock command, a speaker -- would
+    otherwise report a failed stop for a card that had nothing to stop.
+    """
+    if not isinstance(payload, dict) or 'state' in payload:
+        return False
+    return str(payload.get('error', '')).strip().lower().startswith('unknown action')
+
+
+def is_pending(payload: dict, state, rules: dict) -> bool:
+    """Is this device still releasing, by its own declared rules?"""
+    for key, expected in rules['flags'].items():
+        if payload.get(key) == expected:
+            return True
+    return state in rules['pending']
 
 
 def _bound_inputs(info: dict) -> list:
@@ -1073,6 +1147,7 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
         tool_name = card.get('toolName', '')
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
                  'card_id': card.get('id', ''), 'ok': False, 'error': ''}
+        rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
         try:
             async def stop_and_confirm():
                 action = 'stop'
@@ -1083,24 +1158,24 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
                     if result.get('code') != 200:
                         raise RuntimeError(result.get('message') or '设备拒绝停止请求')
                     payload = payload_of(result)
-                    if isinstance(payload.get('result'), dict):
-                        payload = payload['result']
-                    state = payload.get('state') or payload.get('status') or payload.get('event')
-                    reason = payload.get('error') or payload.get('reason') or payload.get('message')
-                    if payload.get('error') or state in ('error', 'failed', 'fault', 'unknown'):
-                        raise RuntimeError(reason or '设备停止未确认')
-                    release = payload.get('release')
-                    if isinstance(release, dict) and release.get('state') in ('unknown', 'failed'):
-                        raise RuntimeError(release.get('reason') or '设备控制权释放未确认')
-                    pending = (payload.get('busy') is True or payload.get('ownership_held') is True
-                               or payload.get('output_active') is True or payload.get('authority_released') is False
-                               or state in ('running', 'active', 'loading', 'stopping', 'hold', 'holding',
-                                            'handback', 'confirming_handback', 'sdk_pending', 'awaiting_feedback'))
-                    if not pending:
+                    # A plugin with no lifecycle of its own declines the verb
+                    # outright. Nothing was armed, so nothing needs disarming --
+                    # and the driver's own common/lifecycle.py says exactly that.
+                    # Reading the decline as a failure is how start-project once
+                    # rolled an entire robot back over a dock command.
+                    if is_declined(payload):
                         return
-                    # Never resend stop while a device is handing control back.
-                    # Read its actual state within the existing per-card deadline.
-                    await _aio.sleep(.1)
+                    state, reason = tool_state_of(result)
+                    if state in rules['failed']:
+                        raise RuntimeError(reason or str(payload.get('reason') or '')[:200]
+                                           or '设备停止未确认')
+                    if not is_pending(payload, state, rules):
+                        return
+                    # Never resend stop while a device is still releasing. Read
+                    # its actual state within the existing per-card deadline --
+                    # and never spend the whole budget on one sleep, or a short
+                    # deadline gets no read at all.
+                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, STOP_CARD_TIMEOUT_S / 4))
                     action = 'info'
             # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
             # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把

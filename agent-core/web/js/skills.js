@@ -121,9 +121,9 @@ async function _loadPending() {
     }
     if (unavailable.length) {
       const note = document.createElement('p'); note.className = 'skill-detail-text';
-      note.textContent = '部分设备未连接，待验证动作将在连接后显示。'; list.append(note);
+      note.textContent = '部分设备未连接，待验证技能将在连接后显示。'; list.append(note);
     }
-  } catch { list.textContent = '暂时无法读取待验证动作，请重新打开重试。'; }
+  } catch { list.textContent = '暂时无法读取待验证技能，请重新打开重试。'; }
 }
 
 async function _openPackageWorkbench(target, ui) {
@@ -533,7 +533,10 @@ function _renderSkillDetail(skill, context) {
   const emptyEl = context === 'installed' ? _installedEmpty : _browseEmpty;
   emptyEl.classList.add('hidden');
   if (context === 'installed') document.getElementById('skill-pending-list').replaceChildren();
-  const actionSkill = skill.attachment || /^taught-[a-f0-9]{32}$/.test(skill.slug);
+  // `attachment` is the whole test. The page used to also sniff a
+  // `taught-<32 hex>` slug; the server resolves legacy slugs from the
+  // prefix each card declares, so the browser does not need the convention.
+  const packagedSkill = !!skill.attachment;
 
   const requiredToolsHtml = (skill.requiredTools || []).length
     ? `<div class="skill-detail-section">
@@ -557,8 +560,8 @@ function _renderSkillDetail(skill, context) {
     <div class="skill-detail-actions">
       <button class="skill-btn skill-btn-primary" id="skill-detail-install">安装</button>
     </div>
-  ` : actionSkill ? `
-    <div class="skill-detail-actions"><button class="skill-btn" id="skill-package-refresh">更新调用说明</button><button class="skill-btn skill-btn-primary" id="skill-package-export">下载动作包</button></div>
+  ` : packagedSkill ? `
+    <div class="skill-detail-actions"><button class="skill-btn" id="skill-package-refresh">更新调用说明</button><button class="skill-btn skill-btn-primary" id="skill-package-export">下载技能包</button></div>
     <p class="skill-detail-text" id="skill-package-export-status" role="status"></p>` : '';
 
   container.innerHTML = `
@@ -577,7 +580,7 @@ function _renderSkillDetail(skill, context) {
     </div>
     ${skill.description ? `<div class="skill-detail-section"><div class="skill-detail-section-label">描述</div><div class="skill-detail-text">${_esc(skill.description)}</div></div>` : ''}
     ${_compatibilityHtml(skill.compatibility)}
-    ${actionSkill && context === 'installed' ? '<div id="skill-session" class="skill-detail-section"></div>' : ''}
+    ${packagedSkill && context === 'installed' ? '<div id="skill-session" class="skill-detail-section"></div>' : ''}
     ${skill.instruction ? actionSkill
       ? `<details class="skill-detail-section"><summary class="skill-detail-text">调用说明</summary><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></details>`
       : `<div class="skill-detail-section"><div class="skill-detail-section-label">指令内容</div><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></div>` : ''}
@@ -587,7 +590,7 @@ function _renderSkillDetail(skill, context) {
     ${actionsHtml}
   `;
   _overlay.querySelector('.skill-modal-body').scrollTop = 0;
-  if (actionSkill && context === 'installed') _loadSession(skill.slug, container.querySelector('#skill-session'));
+  if (packagedSkill && context === 'installed') _loadSession(skill.slug, container.querySelector('#skill-session'));
 
   // Back button
   container.querySelector('#skill-detail-back').addEventListener('click', () => {
@@ -598,7 +601,7 @@ function _renderSkillDetail(skill, context) {
   // Action buttons
   container.querySelector('#skill-package-refresh')?.addEventListener('click', async event => {
     const button = event.currentTarget, status = container.querySelector('#skill-package-export-status');
-    button.disabled = true; status.textContent = '正在核对原动作并更新说明…';
+    button.disabled = true; status.textContent = '正在核对来源并更新说明…';
     try {
       const response = await fetch(`/api/skills/package/refresh/${encodeURIComponent(skill.slug)}`, {method: 'POST'});
       const result = await response.json();
@@ -609,14 +612,14 @@ function _renderSkillDetail(skill, context) {
   });
   container.querySelector('#skill-package-export')?.addEventListener('click', async event => {
     const button = event.currentTarget, status = container.querySelector('#skill-package-export-status');
-    button.disabled = true; status.textContent = '正在读取完整录制…';
+    button.disabled = true; status.textContent = '正在读取完整技能包…';
     try {
       const response = await fetch(`/api/skills/package/export/${encodeURIComponent(skill.slug)}`);
       if (!response.ok) { const error = await response.json(); throw new Error(error.detail || '导出失败'); }
       const url = URL.createObjectURL(await response.blob()), link = document.createElement('a');
       link.href = url; link.download = `${skill.slug}.motus-skill`; link.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      status.textContent = '已下载完整动作包。导入其他设备后需重新试运行。';
+      status.textContent = '已下载完整技能包。导入其他设备后需重新试运行。';
     } catch (error) { status.textContent = error.message; }
     finally { button.disabled = false; }
   });
@@ -651,7 +654,7 @@ async function _loadSession(slug, area) {
       <label class="skill-detail-text"><input type="checkbox" id="skill-auto-execute" ${current.enabled ? 'checked' : ''} ${current.device_enabled ? 'disabled' : ''}> 允许自动执行</label>
       <p class="skill-detail-text">${current.device_enabled ? '已按卡片设置允许本设备所有已验证技能自动执行。' : '开启后，直接说技能名称即可执行，无需逐次确认。'}</p>
       <p class="skill-detail-text">设置保存在本设备，停止项目或重启后保留；每次仍检查设备、起点及控制权。</p>
-      <p class="skill-detail-text" role="status" id="skill-auto-execute-status">${current.binding_changed ? '动作或设备绑定已变化，请核对后重新保存设置。' : ''}</p>`;
+      <p class="skill-detail-text" role="status" id="skill-auto-execute-status">${current.binding_changed ? '技能或设备绑定已变化，请核对后重新保存设置。' : ''}</p>`;
     const checkbox = area.querySelector('#skill-auto-execute');
     checkbox.onchange = async () => {
       checkbox.disabled = true;
@@ -698,15 +701,27 @@ async function _loadTemporarySession(slug, area) {
   } catch (error) { area.textContent = error.message; }
 }
 
+/** `compatibility` is opaque to Core. The device that wrote it knows what its
+ * fields mean, so it supplies the pills to show in `labels`; we render those
+ * and fall back to the raw scalars. An earlier version mapped `dual_arm` to
+ * 双臂 and `fixed_hand` to 固定手 right here — kinematics vocabulary in the
+ * host, for one robot shape, which a second shape could only extend by editing
+ * this file. */
 function _compatibilityHtml(value) {
   if (!value || typeof value !== 'object') return '';
-  const labels = [value.manufacturer, value.variant || value.model,
-    value.scope === 'dual_arm' ? '双臂' : value.scope,
-    value.end_effectors === 'fixed_hand' ? '固定手' : value.end_effectors,
-    Array.isArray(value.joint_names) ? `${value.joint_names.length} 关节` : ''].filter(Boolean);
+  const labels = (Array.isArray(value.labels) ? value.labels : _scalarLabels(value))
+    .filter(v => typeof v === 'string' && v.trim()).slice(0, 12);
+  if (!labels.length && !Object.keys(value).length) return '';
   return `<div class="skill-detail-section"><div class="skill-detail-section-label">适用设备</div>
-    <div class="skill-detail-tools">${labels.map(v => `<span class="skill-detail-tool-pill">${_esc(String(v))}</span>`).join('')}</div>
+    <div class="skill-detail-tools">${labels.map(v => `<span class="skill-detail-tool-pill">${_esc(v)}</span>`).join('')}</div>
     <details><summary class="skill-detail-text">兼容信息</summary><pre class="skill-detail-schema">${_esc(JSON.stringify(value, null, 2))}</pre></details></div>`;
+}
+
+/** Scalar fields, in declaration order, for a device that sends no `labels`. */
+function _scalarLabels(value) {
+  return Object.entries(value)
+    .filter(([key, v]) => key !== 'tool' && (typeof v === 'string' || typeof v === 'number'))
+    .map(([, v]) => String(v));
 }
 
 function _initPackages() {
@@ -722,21 +737,22 @@ function _initPackages() {
     const selected = get('file').files[0];
     if (!selected) return;
     try {
-      if (selected.size > 16*1024*1024) throw new Error('动作包须小于 16 MiB');
+      if (selected.size > 16*1024*1024) throw new Error('技能包须小于 16 MiB');
       const body = new FormData(); body.append('file', selected);
       const response = await fetch('/api/skills/package/inspect', {method: 'POST', body});
       const result = await response.json();
       if (version !== revision) return;
-      if (!response.ok) throw new Error(result.detail || '无法读取动作包');
+      if (!response.ok) throw new Error(result.detail || '无法读取技能包');
       const value = result.data;
-      get('summary').innerHTML = `<h3 class="skill-detail-title">${_esc(value.manifest.skill?.name || '动作技能')}</h3>` + _compatibilityHtml(value.manifest.compatibility);
-      targets = value.targets;
-      const tool = value.manifest.compatibility?.tool;
-      targets = targets.filter(t => t.tool === tool && t.workbench);
+      get('summary').innerHTML = `<h3 class="skill-detail-title">${_esc(value.manifest.skill?.name || '技能包')}</h3>` + _compatibilityHtml(value.manifest.compatibility);
+      // Already filtered server-side by declared protocol and tool: routing a
+      // package is a transport decision, not something the page should redo by
+      // reaching into the manifest.
+      targets = value.targets || [];
       get('target').replaceChildren(new Option('请选择目标设备…', ''), ...targets.map(t => new Option(t.label, t.instance_id)));
       if (targets.length === 1) get('target').value = targets[0].instance_id;
       get('target').disabled = !targets.length;
-      if (!targets.length) throw new Error('画布中没有支持此动作包的设备卡片，请先连接对应驱动。');
+      if (!targets.length) throw new Error('画布中没有支持此技能包的设备卡片，请先连接对应驱动。');
       file = selected; get('install').disabled = !get('target').value;
     } catch (error) { if (version === revision) get('error').textContent = error.message; }
   };
@@ -754,7 +770,7 @@ function _initPackages() {
         get('overlay').classList.add('hidden');
         file = null; get('file').value = '';
         await _showSkillDetail(result.data.slug);
-        document.getElementById('skill-package-export-status').textContent = '已复用本机相同动作的验证记录，无需重复试运行。';
+        document.getElementById('skill-package-export-status').textContent = '已复用本机相同技能包的验证记录，无需重复试运行。';
         return;
       }
       const target = result.data.target;
@@ -763,7 +779,7 @@ function _initPackages() {
         body: JSON.stringify({tool: target.tool, arguments: {action: 'ui', instance_id: target.instance_id}}),
       });
       const uiResult = await uiResponse.json();
-      if (!uiResponse.ok || uiResult.code !== 200) throw new Error('动作包已导入，请从目标卡片打开工作台继续检查。');
+      if (!uiResponse.ok || uiResult.code !== 200) throw new Error('技能包已导入，请从目标卡片打开工作台继续检查。');
       const content = uiResult.data;
       const ui = Array.isArray(content) ? JSON.parse(content.find(c => c.type === 'text').text) : content;
       await _openPackageWorkbench(target, ui);

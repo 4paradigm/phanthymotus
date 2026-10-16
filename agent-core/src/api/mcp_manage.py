@@ -1388,9 +1388,17 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
                 if result.get('isError'):
-                    message = '\n'.join(str(item.get('text', '')) for item in (result.get('content') or [])
+                    # An MCP-level error used to fall through and be returned as
+                    # an ordinary result, so a tool that said it had failed was
+                    # read as having succeeded. Surface it as one -- but keep the
+                    # content: limx/tron2 answers errors as structured JSON, and
+                    # a renderer or an ACP path that needs the detail would
+                    # otherwise be left with a truncated sentence.
+                    content = result.get('content') or []
+                    message = '\n'.join(str(item.get('text', '')) for item in content
                                         if isinstance(item, dict) and item.get('type') == 'text')
-                    return {'code': 500, 'message': message[:1000] or 'Tool call error', 'data': None}
+                    return {'code': 500, 'message': message[:1000] or 'Tool call error',
+                            'data': content or None}
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):

@@ -949,8 +949,14 @@ async def call_tool(full_name: str, args: dict) -> str:
                         return f'[{tool_name}] 配置无效（缺少 url/key），请在设备面板中检查配置后再启动。'
                 except (json.JSONDecodeError, IndexError, KeyError):
                     pass
-            elif missing_required_config(find_tool(mcp_id, tool_name), {}):
-                return f'[{tool_name}] 尚未配置，请先在设备面板中完成配置（provider/url/key）后再启动。'
+            else:
+                # Name the keys that are actually missing. `provider/url/key`
+                # is one LLM adapter's field list, and a model told to go fill
+                # those in on a camera card has been sent to the wrong form.
+                missing = missing_required_config(find_tool(mcp_id, tool_name), {})
+                if missing:
+                    return (f'[{tool_name}] 尚未配置：缺少 {"、".join(missing)}，'
+                            f'请先在设备面板中填写后再启动。')
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:

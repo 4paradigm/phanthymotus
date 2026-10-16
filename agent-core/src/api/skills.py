@@ -182,16 +182,41 @@ def validate_local_skill(body):
                 raise fastapi.HTTPException(422, f'无效的技能字段：{key}')
             definition[key] = body[key]
     attachment = definition.get('attachment')
+    # The protocol identifier and the asset id are the device's, not ours. An
+    # earlier version demanded the literal `motus.teaching.package/1` and a
+    # 32-hex asset id, which made a second kind of package an edit to Core.
+    # What Core does check is the shape, the bounds, and that the attachment
+    # names a tool the skill actually declares as a dependency.
     if attachment and (set(attachment) != {'schema', 'tool', 'asset_id'} or
-            attachment.get('schema') != 'motus.teaching.package/1' or
+            not isinstance(attachment.get('schema'), str) or
+            not re.fullmatch(r'[\w.+-]+/\w[\w.-]*', attachment.get('schema', '')) or
             attachment.get('tool') not in required or
-            not re.fullmatch(r'[a-f0-9]{32}', str(attachment.get('asset_id', '')))):
-        raise fastapi.HTTPException(422, '无效的动作附件声明')
+            not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', str(attachment.get('asset_id', '')))):
+        raise fastapi.HTTPException(422, '无效的技能附件声明')
     origin = definition.get('origin')
     if origin and (set(origin) != {'mcp_id', 'instance_id'} or
                    any(not isinstance(v, str) or not v or len(v) > 200 for v in origin.values())):
         raise fastapi.HTTPException(422, '无效的技能来源')
     return definition
+
+
+_ABSENT = object()
+
+
+def _same_field(previous: dict, key: str, value) -> bool:
+    """Does an installed skill already carry this field unchanged?
+
+    A string or a list has a normalised empty form (`validate_local_skill`
+    writes `''` and `[]`), so a missing one is equivalent to an empty one. A
+    dict does not: `compatibility`, `attachment` and `origin` are either
+    present or absent, and comparing an absent one against `''` is what turned
+    an idempotent re-import into a 409.
+    """
+    if isinstance(value, str):
+        return previous.get(key, '') == value
+    if isinstance(value, list):
+        return previous.get(key, []) == value
+    return previous.get(key, _ABSENT) == value
 
 
 @router.post('/import')
@@ -207,8 +232,13 @@ async def import_local_skill(body: dict = fastapi.Body(...)):
     installed = list(skills_cfg.get('installed', []))
     previous = next((s for s in installed if s['slug'] == definition['slug']), None)
     if previous is not None:
-        if any(previous.get(k, '' if k != 'requiredTools' else []) != v
-               for k, v in definition.items()):
+        # Compare against what is *absent*, not against one placeholder for
+        # every type. `previous.get(k, '')` yielded `''` for a missing
+        # `compatibility`/`attachment`/`origin`, which never equals a dict — so
+        # re-importing a skill installed before those fields existed hit a hard
+        # 409 telling the user to pick a new slug, instead of the documented
+        # idempotent 200.
+        if any(not _same_field(previous, k, v) for k, v in definition.items()):
             raise fastapi.HTTPException(409, '相同标识的技能已存在，请使用新的标识')
         return {'code': 200, 'data': {'slug': previous['slug'], 'already': True}}
     installed.append({**definition, 'active': True,

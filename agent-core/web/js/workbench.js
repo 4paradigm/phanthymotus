@@ -33,7 +33,7 @@ async function invoke(target, args) {
 }
 
 export async function openWorkbench(target, spec, ui, onClose) {
-  if (opened) throw new Error('请先关闭已打开的工作台，再继续验证。草稿已保留。');
+  if (opened) throw new Error('请先关闭已打开的工作台再继续。草稿已保留。');
   if (spec.protocol !== VERSION || !Array.isArray(spec.actions) ||
       !spec.actions.every(a => typeof a === 'string') || !spec.actions.includes('info') ||
       !spec.actions.includes('stop') || ui.protocol !== VERSION ||
@@ -54,14 +54,45 @@ export async function openWorkbench(target, spec, ui, onClose) {
   frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'">${ui.html}`;
   let port, busy = false, closed = false;
   const close = overlay.querySelector('button');
-  close.onclick = async () => {
-    try {
-      if (busy) throw new Error('请求处理中，请等待结果。');
-      if ((await invoke(target, {action: 'info'})).busy) throw new Error('请先停止动作，等待完成后再关闭。');
-      closed = true; port?.close(); overlay.remove(); opened = false; previousFocus?.focus();
-      onClose?.();
-    } catch (error) { alert(error.message); }
+
+  // Teardown is unconditional once we decide to go. `opened` is module-global,
+  // so leaving it true on a failed close locked the page out of every workbench
+  // for the rest of the session — and the only way out was a reload, because
+  // close was the sole place that cleared it and it threw into an `alert` the
+  // moment the device was unreachable.
+  const teardown = () => {
+    closed = true;
+    port?.close();
+    document.removeEventListener('keydown', onKeydown, true);
+    overlay.remove();
+    opened = false;
+    previousFocus?.focus();
+    onClose?.();
   };
+
+  /** Ask the device first; offer to leave anyway if it cannot answer. */
+  const requestClose = async () => {
+    if (closed) return;
+    if (busy) { alert('请求处理中，请等待结果。'); return; }
+    let running;
+    try {
+      running = (await invoke(target, {action: 'info'})).busy === true;
+    } catch (error) {
+      // Unreachable is not the same as busy. Say which one it is and let the
+      // operator decide, rather than trapping them in the dialog.
+      if (!confirm(`无法读取设备状态（${error.message}）。仍要关闭工作台吗？草稿已保留。`)) return;
+      teardown();
+      return;
+    }
+    if (running) { alert('请先停止当前操作，等待完成后再关闭。'); return; }
+    teardown();
+  };
+
+  function onKeydown(event) {
+    if (event.key === 'Escape' && !closed) { event.stopPropagation(); requestClose(); }
+  }
+  document.addEventListener('keydown', onKeydown, true);
+  close.onclick = requestClose;
   frame.onload = () => {
     if (closed) return;
     port?.close(); // Navigation revokes the previous document's capability.
@@ -110,5 +141,14 @@ export async function openWorkbench(target, spec, ui, onClose) {
     };
     frame.contentWindow.postMessage({protocol: VERSION}, '*', [channel.port2]);
   };
-  document.body.append(overlay); close.focus();
+  try {
+    document.body.append(overlay);
+    close.focus();
+  } catch (error) {
+    // Nothing is mounted yet, so release the latch rather than wedging it.
+    document.removeEventListener('keydown', onKeydown, true);
+    overlay.remove();
+    opened = false;
+    throw error;
+  }
 }

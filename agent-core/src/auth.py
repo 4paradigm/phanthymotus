@@ -59,6 +59,13 @@ def verify(token: str) -> bool:
 _LOOPBACK_HOSTS = frozenset({'127.0.0.1', '::1', 'localhost', '::ffff:127.0.0.1'})
 
 
+def from_loopback(request: Request) -> bool:
+    """Public alias. Three other modules reached for `_from_loopback`; a name
+    two packages depend on is part of the interface whatever the underscore
+    says."""
+    return _from_loopback(request)
+
+
 def _from_loopback(request: Request) -> bool:
     """Whether this request originated on this machine.
 
@@ -86,8 +93,11 @@ async def auth_middleware(request: Request, call_next):
     if path == '/api/auth/verify':
         return await call_next(request)
     # One-use UI approvals are created only by the authenticated skills route.
-    # The same-host Driver can consume an unguessable receipt, never create one.
-    if path in ('/api/skills/package/approval/consume', '/api/skills/package/execution/read') and request.method == 'POST' and _from_loopback(request):
+    # The same-host Driver can consume an unguessable receipt, never create one;
+    # the execution read is read-only and cannot grant anything.
+    if (path in ('/api/skills/package/approval/consume',
+                 '/api/skills/package/execution/read')
+            and request.method == 'POST' and _from_loopback(request)):
         return await call_next(request)
     if path.startswith('/api/channel/webhook/'):
         return await call_next(request)
