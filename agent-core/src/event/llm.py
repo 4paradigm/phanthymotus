@@ -1594,6 +1594,7 @@ class Event:
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
 
     async def __aenter__(self):
+        personal.pin_settings()
         if personal.enabled():
             import auth
             if not auth.is_enabled():

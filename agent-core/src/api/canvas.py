@@ -362,6 +362,9 @@ async def save_layout(layout: CanvasLayout):
 async def get_tool_config(mcp_id: str, tool_name: str):
     """Get saved config for a tool."""
     data = config.main.get(tool_config_key(mcp_id, tool_name), None)
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        from personal_memory_config import status
+        return {'code': 200, 'data': {**(data or {}), **status()}}
     return {'code': 200, 'data': data}
 
 
@@ -409,6 +412,16 @@ async def get_all_tool_configs():
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
+    if mcp_id == 'agentcore' and tool_name == 'decision_core':
+        from api.mcp_manage import _handle_agentcore_call, MCPCallRequest
+        from personal_memory_config import status
+        if not isinstance(body, dict):
+            raise fastapi.HTTPException(400, '配置必须是对象。')
+        result = await _handle_agentcore_call(MCPCallRequest(tool=tool_name, arguments={'action': 'config', **body}))
+        if result.get('code') != 200:
+            raise fastapi.HTTPException(result['code'], result.get('message', '配置保存失败'))
+        config.main[tool_config_key(mcp_id, tool_name)] = body
+        return {'code': 200, **status()}
     config.main[tool_config_key(mcp_id, tool_name)] = body
     apply_tool_config(mcp_id, tool_name, body)
     return {'code': 200}

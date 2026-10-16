@@ -12,6 +12,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(config, 'DB_PATH', str(tmp_path / 'personal.db'))
     monkeypatch.setattr(config, 'main', config.ConfigDB())
     monkeypatch.setattr(pm, 'resolver', pm.IdentityResolver())
+    monkeypatch.setattr(pm, '_runtime_settings', None)
     config.main['personal_memory'] = {
         'enabled': True, 'voice_sources': ['dds:/mic/asr'],
         'face_sources': ['dds:/camera/face'], 'face_max_age_s': 3,

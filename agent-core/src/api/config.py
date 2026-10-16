@@ -390,6 +390,16 @@ async def _do_start_project_impl():
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
     import asyncio as _asyncio
+    from personal_memory_config import start_error
+    problem = start_error()
+    if problem:
+        await push_event({'type': 'project_start_item', 'payload': {
+            'tool': 'decision_core', 'mcp_id': 'agentcore', 'status': 'error', 'message': problem,
+        }})
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True, 'errors': ['decision_core'],
+        }})
+        return False
 
     LOADING_POLL_S = 3
     LOADING_TIMEOUT_S = 900
@@ -1014,6 +1024,23 @@ async def _do_start_project_impl():
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
                                  camera_info=_upstream_camera_info(card.get('id', '')))
+
+    if not errors:
+        from personal_memory_config import apply_canvas_routes
+        import mcp_client
+        try:
+            problem = start_error()
+            if problem:
+                raise ValueError(problem)
+            apply_canvas_routes({**layout, 'connections': [
+                {**conn, 'resolvedTopic': _topic_of_connection(conn)} for conn in connections
+            ]}, mcp_client.registry)
+        except ValueError as error:
+            errors.append('decision_core')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': 'decision_core', 'mcp_id': 'agentcore',
+                'status': 'error', 'message': str(error),
+            }})
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:

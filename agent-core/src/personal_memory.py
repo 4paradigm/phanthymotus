@@ -17,10 +17,29 @@ import config
 
 _user = ContextVar('personal_memory_user', default=None)
 _turn = ContextVar('personal_memory_turn', default='')
+_runtime_settings: dict | None = None
+
+
+def configured_settings() -> dict:
+    return config.main.get('personal_memory', {})
 
 
 def settings() -> dict:
-    return config.main.get('personal_memory', {})
+    return _runtime_settings if _runtime_settings is not None else configured_settings()
+
+
+def pin_settings() -> None:
+    """Mode changes take effect at process startup, never halfway through a turn."""
+    global _runtime_settings
+    import copy
+    _runtime_settings = copy.deepcopy(configured_settings())
+
+
+def update_runtime_routes(routes: dict) -> None:
+    if _runtime_settings is not None:
+        _runtime_settings.update(routes)
+    global resolver
+    resolver = IdentityResolver()
 
 
 def enabled() -> bool:

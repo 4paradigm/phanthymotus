@@ -676,7 +676,25 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   const props = configSchema.properties || {};
   const required = configSchema.required || [];
   const configKey = `${mcpId}:${toolName}`;
-  const savedValues = _toolConfigs[configKey] || {};
+  let savedValues = _toolConfigs[configKey] || {};
+  if (mcpId === 'agentcore' && toolName === 'decision_core') {
+    const note = document.createElement('p');
+    note.className = 'tool-config-label';
+    try {
+      const response = await fetch('/api/canvas/tool-config/agentcore/decision_core');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const result = await response.json();
+      savedValues = { ...savedValues, ...(result.data || {}) };
+      const active = savedValues.personal_memory_active ? '开启' : '关闭';
+      note.textContent = `个人记忆当前${active}。ASR、人脸来源和本机 TTS 自动读取画布连线，无需重复填写。`
+        + (savedValues.personal_memory_restart_required
+          ? '已保存的开关尚未生效，请重启 AgentCore。'
+          : '修改开关后需重启 AgentCore；用户身份仍需首次登记和绑定。');
+    } catch (error) {
+      note.textContent = `未能读取个人记忆状态：${error.message}。修改开关后需重启 AgentCore。`;
+    }
+    bodyEl.appendChild(note);
+  }
 
   // If all fields are instance-scope, show them here too (as shared defaults)
   const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
@@ -865,9 +883,13 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
-      if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
+      const result = await resp.json().catch(() => ({}));
+      if (!resp.ok || (result.code && result.code !== 200)) {
+        alert(result.detail || result.message || `配置保存失败 (HTTP ${resp.status})`);
         return;
+      }
+      if (result.personal_memory_restart_required) {
+        alert('个人记忆设置已保存。请重启 AgentCore 后再开始智能控制，来源和语音输出将自动读取画布连线。');
       }
     } catch (err) {
       alert('配置保存失败: ' + err.message);
