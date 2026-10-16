@@ -88,4 +88,8 @@ Driver 的 `tests/test_teaching_browser.py` 提供跨仓浏览器验收：真实
 
 完整附件的资源中心发布尚未实现。线上公开客户端当前只展示文本/配置发布流程；在拿到服务端附件实现前，本 PR 不能声称动作包已可上传、审核、下载并从技能广场安装。也不会将轨迹塞进 instruction 或 configSchema。
 
-本次验证：Skill 导入、文件路由、旧定义更新、action required，以及真实浏览器下的导出→更换模拟设备身份→导入→试运行→重新保存。硬件为模拟，未调用真实 LLM。上海此前部署的是早期三文件宿主版本，新增修复及文件能力尚未部署。
+本地验证：Skill 导入、文件路由、旧定义更新、action required，以及真实浏览器下的导出→更换模拟设备身份→导入→试运行→重新保存。该闭环硬件为模拟，未调用真实 LLM。
+
+2026-10-16 已在上海部署：基于现场 `release.261015.0897a8d` 应用完整 PR 增量，保留基线 MCP 更新，构建 `phanthymotus-core:workbench318-20261016`（`0609067d81ce`）。候选镜像内 schema、Skill 导入、动作包、MCP 合并及错误处理五组测试 **52 passed**。真实网页已完成旧“抬手”说明更新、型号展示、完整动作包下载和上传文件检查，原 Skill 保持启用，页面无脚本错误；没有上传资源中心。
+
+真实 Agent 随后已正确发现并调用 `g1_teaching.preview(asset_id)`，但一次物理回放遗留的 G1 交权超时导致 `motion_busy`。该问题在 Driver #412 的 `arm_stream.py` / `teleop_control.py` 修复，无新增 Core 修改。现场完成停止交权并更新 Driver 后，多次预览成功、busy=false；未再次执行动作。真实 Agent 确认→执行→完成的整段流程仍待现场验证，不将这些只读检查表述为整次物理验收成功。
