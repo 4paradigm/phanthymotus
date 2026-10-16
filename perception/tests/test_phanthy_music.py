@@ -397,6 +397,25 @@ class AsmrCardTests(unittest.TestCase):
         self.assertEqual(track['title'], '睡前故事 第 1 期')
         self.assertEqual((track['genre'], track['artist'], track['vocal']), ('', '', None))
 
+    def test_a_category_on_the_song_action_routes_to_asmr(self):
+        """Measured on Orin5: `search(category='trigger')` returned songs.
+
+        Dropping an unknown field is right on the ASMR side — the user wanted
+        ASMR and gets ASMR, minus a filter that means nothing there. It is wrong
+        here, because `category` is the *only* signal of ASMR intent in a song
+        request, so discarding it answers 「想听咀嚼的声音」with a song. The
+        catalogue infers ASMR from a bare `category` too, so this keeps client
+        and server at the same conclusion.
+        """
+        result = self.call('search', category='trigger', top_k=2)
+        self.assertTrue(result['tracks'])
+        self.assertTrue(all(t['kind'] == 'asmr' for t in result['tracks']))
+        self.assertTrue(all(t['category'] == 'trigger' for t in result['tracks']))
+        self.assertIn('available_categories', result)
+        # And a song request that says nothing about ASMR stays a song request.
+        songs = self.call('search', genre='pop', top_k=2)
+        self.assertTrue(all(t['kind'] == 'song' for t in songs['tracks']))
+
     def test_list_genres_publishes_the_category_codes(self):
         vocabulary = self.call('list_genres')
         self.assertIn('bedtime_story',
@@ -414,6 +433,12 @@ class AsmrCardTests(unittest.TestCase):
         asmr_text = params['play_asmr']['description']
         for phrase in ('助眠', '哄睡', '睡前故事', '冥想', '白噪音', '咀嚼'):
             self.assertIn(phrase, asmr_text)
+        # ASMR is the umbrella; `bedtime_story` is one of its six categories,
+        # not a synonym and not a default. It is the most quotable of the six
+        # and so the easiest for a description to make the face of the whole
+        # feature — which would answer 「来点 ASMR」with a story every time.
+        self.assertIn('bedtime_story', asmr_text)
+        self.assertIn('统称', asmr_text)
         # And `play` must point sleep intent away from itself.
         self.assertIn('play_asmr', params['play']['description'])
         categories = schema['properties']['category']['description']

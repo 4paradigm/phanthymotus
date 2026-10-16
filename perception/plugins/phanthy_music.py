@@ -1,8 +1,16 @@
 """One phanthy_music card: browse a catalogue, play a station, emit music PCM.
 
 The catalogue holds **two kinds of content** behind one endpoint and one key —
-songs, and ASMR (trigger sounds plus softly-read bedtime stories, meditations,
-companionship, chat and poetry). They are separate *actions* here rather than a
+songs, and everything else, which the protocol labels `kind: 'asmr'`: trigger
+sounds plus softly-read bedtime stories, meditations, companionship, chat and
+poetry.
+
+**ASMR is the umbrella, and `bedtime_story` is one of its six categories — not
+a synonym for it and not a default.** "来点 ASMR" names no category and should
+return anything from any of the six; only "讲个睡前故事" asks for a bedtime
+story. Worth stating because a bedtime story is the most quotable of the six and
+so the easiest for a description to accidentally make the face of the whole
+feature. They are separate *actions* here rather than a
 `kind` parameter on `play`, for the same reason the catalogue returns 422 when
 the fields are crossed: an ASMR entry has no genre, no voice type and no
 artist, so an action that accepted those alongside `category` would be offering
@@ -133,17 +141,22 @@ ACTION_DESCRIPTIONS = {
             '什么都不给 = 随便放。返回即表示已开始取歌，不代表播完；'
             '换歌用 next，停歌用 stop_music。'
             '**用户要的是助眠、哄睡、白噪音、ASMR、睡前故事、冥想、轻声陪聊、'
-            '咀嚼/摩擦这类声音时，用 play_asmr，不要用 play。**',
-    'play_asmr': '播放**助眠／放松类音频（ASMR）**并开始播放。不是歌 —— 没有歌手、'
-                 '没有曲风，是触发音（咀嚼、摩擦、揉捏、撕拉、液体等纯声音）'
-                 '或轻声人声陪伴（睡前故事、冥想引导、情感陪伴、生活化闲聊、经典诗文朗读）。\n'
+            '咀嚼/摩擦这类声音时，用 play_asmr，不要用 play。'
+            '「放点睡前听的歌」要的还是歌，用 play 加 tags=睡前；'
+            '「哄我睡觉」要的不是歌，用 play_asmr。**',
+    'play_asmr': '播放**助眠／放松类音频**并开始播放。不是歌 —— 没有歌手、没有曲风。'
+                 '两大类：触发音（咀嚼、摩擦、揉捏、撕拉、液体等纯声音，没有人声）'
+                 '和轻声人声陪伴（睡前故事、冥想引导、情感陪伴、生活化闲聊、经典诗文朗读）。\n'
                  '用户说这些就用它：助眠、哄睡、哄我睡觉、睡不着、想睡了、睡前听点什么、'
-                 '放点 ASMR、白噪音、放松一下、帮我静一静、讲个睡前故事、带我做个冥想、'
+                 'ASMR、白噪音、放松一下、帮我静一静、讲个睡前故事、带我做个冥想、'
                  '我今天好累/陪我一会儿、随便陪我聊聊、给我读首诗、'
                  '想听咀嚼声/撕纸声/摸纸的声音。\n'
-                 '能判断出想听哪一类就填 category；只说「来点助眠的」「随便放点 ASMR」'
-                 '这种没指明类别的，**什么都不填**，曲库会从各类里随机挑一条。'
-                 '不要填 genre / artist / vocal / language —— ASMR 没有这些，填了会被拒绝。'
+                 '说出了具体想听什么就填对应的 category；只说「来点助眠的」'
+                 '「来点 ASMR」「哄我睡觉」这种没点名类别的，**什么都不填**，'
+                 '曲库会从六个类别里挑一条。'
+                 '**ASMR 是这一整类的统称，睡前故事只是其中一个类别 —— '
+                 '没点名类别时不要默认填 bedtime_story。**\n'
+                 '不要填 genre / artist / vocal / language —— 这些只属于歌曲，填了会被拒绝。'
                  '返回即表示已开始取音频，不代表播完；换一条用 next，停用 stop_music。',
     'next': '换下一首／下一条。不用传参数 —— 沿用上次 play 或 play_asmr 的条件'
             '（包括是歌还是 ASMR），并自动排除刚放过的那条。'
@@ -161,8 +174,10 @@ ACTION_DESCRIPTIONS = {
                     '用户说「一直放」「别停」时打开，说「放完这首就停」时关掉。',
     'search': '只回答「有没有/有哪些」**歌**，不播放。想听直接用 play。'
               '比 play 多 vocal 和 top_k，用于需要精确挑选的场合。',
-    'search_asmr': '只回答「有没有/有哪些」**ASMR**，不播放。想听直接用 play_asmr。'
-                   '比 play_asmr 多 top_k，用于需要先列几条给用户挑的场合。',
+    'search_asmr': '只回答「有没有/有哪些」**助眠／放松类音频**，不播放。'
+                   '想听直接用 play_asmr。比 play_asmr 多 top_k，'
+                   '用于需要先列几条给用户挑的场合。'
+                   'category 的取法和 play_asmr 完全一致 —— 没点名类别就留空。',
 }
 
 TOOLS = [{
@@ -485,6 +500,27 @@ class PhanthyMusicPlugin:
         return tuple(e.get('value') for e in entries
                      if isinstance(e, dict) and e.get('value'))
 
+    @staticmethod
+    def _kind_of(action, args):
+        """Which half of the protocol this call belongs to.
+
+        A `category` on `play`/`search` means the model reached for the song
+        action and then described ASMR, so route it rather than honour the
+        action name. The two directions are deliberately *not* symmetric:
+        dropping a `genre` from an ASMR call is harmless (the user wanted ASMR
+        and gets ASMR, minus a filter that means nothing there), but dropping a
+        `category` from a song call is not — `category` is the only signal of
+        ASMR intent in that request, so discarding it answers 「想听咀嚼的声音」
+        with a song. Measured on Orin5: it did exactly that.
+
+        This also matches what the catalogue itself does with a bare
+        `category`, so client and server reach the same conclusion.
+        """
+        if action in ('play_asmr', 'search_asmr'):
+            return 'asmr'
+        category = args.get('category')
+        return 'asmr' if isinstance(category, str) and category.strip() else ''
+
     def _coerce_filters(self, args, *, kind=''):
         """Keep a filter the catalogue knows; demote the rest to free text.
 
@@ -645,7 +681,7 @@ class PhanthyMusicPlugin:
             if action in ('search', 'search_asmr'):
                 # No ROS node and no Speaker needed, and no network under the
                 # state lock — "is there any jazz" must work with the card idle.
-                kind = 'asmr' if action == 'search_asmr' else ''
+                kind = self._kind_of(action, args)
                 with self._lock:
                     catalogue = self._catalogue
                 filters, demoted = self._coerce_filters(args, kind=kind)
@@ -659,7 +695,7 @@ class PhanthyMusicPlugin:
                         f'available_{"categories" if kind == "asmr" else "genres"}':
                             list(self._known_values(field))}
             if action in ('play', 'play_asmr'):
-                kind = 'asmr' if action == 'play_asmr' else ''
+                kind = self._kind_of(action, args)
                 track_id = args.get('track_id') if kind != 'asmr' else None
                 if isinstance(track_id, str) and track_id.strip():
                     with self._lock:

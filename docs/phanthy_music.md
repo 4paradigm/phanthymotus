@@ -42,9 +42,26 @@ reaches the network and never fails.
 `category` is one of `bedtime_story` 睡前故事, `meditation` 冥想引导,
 `companion` 情感陪伴, `chat` 生活化闲聊, `poetry` 经典诗文, `trigger` 触发音
 (no voice: chewing, friction, kneading, tearing, liquid). **Leaving it empty is
-the right answer when the user did not name a type** — 「来点助眠的」means any of
-them, and the catalogue picks. Looking for a specific object's sound is
+the right answer when the user did not name a type** — 「来点助眠的」and
+「来点 ASMR」both mean any of the six, and the catalogue picks.
+
+**ASMR is the umbrella; `bedtime_story` is one of the six, not a synonym for the
+whole thing and not a default.** It is the most quotable of the six, which makes
+it the easiest for a description or an example to turn into the face of the
+feature — and a model that reads it that way answers 「来点 ASMR」with a story
+every time. `play_asmr`'s description says so explicitly, and
+`test_the_declared_asmr_actions_describe_where_sleep_intent_goes` pins it. Looking for a specific object's sound is
 `category=trigger` plus the object in `query` (薯片, 纸).
+
+**A `category` on `play`/`search` routes to ASMR anyway.** The model reached for
+the song action and then described ASMR, so the description wins over the action
+name — which is also what the catalogue does with a bare `category`. Note this
+is deliberately *not* symmetric with the paragraph above: dropping a `genre`
+from an ASMR call is harmless, because the user wanted ASMR and gets ASMR minus
+a filter that means nothing there. Dropping a `category` from a song call is
+not, because `category` is the only signal of ASMR intent in that request — so
+discarding it answers 「想听咀嚼的声音」with a song. Measured on Orin5 doing
+exactly that before the routing was added.
 
 `language` is deliberately absent from the ASMR actions even though the protocol
 accepts it for both kinds: every ASMR entry in the catalogue is Chinese, so the
