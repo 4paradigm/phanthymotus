@@ -11,6 +11,7 @@ event/skills.py — 技能系统（混合模式）。
 import typing
 
 import config
+import personal_memory as personal
 
 
 # ── 运行时状态 ─────────────────────────────────────────────────────────────────
@@ -50,11 +51,15 @@ def installed_skills() -> list[dict]:
 
 def visible_skills() -> list[dict]:
     """获取对 LLM 可见的技能（UI 激活的）。"""
+    if personal.enabled():
+        return []
     return [s for s in installed_skills() if s.get('active', False)]
 
 
 def get_active_skills() -> list[dict]:
     """获取 LLM 已加载的技能（可见 + runtime activated，含完整 instruction）。"""
+    if personal.enabled():
+        return []
     return [s for s in installed_skills()
             if s.get('active', False) and s['slug'] in _runtime_activated]
 

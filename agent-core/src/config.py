@@ -76,6 +76,13 @@ _DB_DEFAULTS = {
         'subscribe_topics': [],  # DDS topics core subscribes to directly (e.g. ["/robot/mic/audio/asr_event"])
     },
     'scheduler': [],
+    'personal_memory': {
+        'enabled': False,
+        'voice_sources': [],  # Exact DDS source names; configure before enabling.
+        'face_sources': [],
+        'face_max_age_s': 3,
+        'output_tools': [],  # Explicit local output tools only; no delegation/filesystem.
+    },
     'skills': {'installed': []},
     'channel_configs': [],
     'channel_settings': {

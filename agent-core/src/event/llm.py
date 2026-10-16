@@ -21,6 +21,7 @@ import typing
 
 import log
 import config
+import personal_memory as personal
 import client
 import event
 import event_bus
@@ -656,6 +657,8 @@ def _notify_fire_spoke(results: list | None) -> bool:
 
 
 def _narration_enabled() -> bool:
+    if personal.enabled():
+        return False
     """自动播报（框架代为出声）的总开关。
 
     键名是 auto_narration 而不是旧的 auto_notify：旧键管的是"把 content 念出来"，那个
@@ -1405,8 +1408,12 @@ async def _memory_recall(
     source: typing.Annotated[str, "来源过滤: 'all'=全部, 'subagent'=子代理结论, 'conversation'=对话历史"] = 'all',
     limit: typing.Annotated[int, "返回最多 N 条结果，默认 5"] = 5,
     time_range: typing.Annotated[str, "时间范围: '1h'/'6h'/'1d'/'7d'/'' (不限)"] = '',
+    offset: typing.Annotated[int, '个人记忆分页偏移，默认0'] = 0,
 ) -> str:
     """从记忆库检索历史信息。包含过去的对话、subagent 分析结论等。当需要回顾历史状态、查找之前的任务结果时使用。"""
+    if personal.enabled():
+        return json.dumps({'memories': personal.recall(query, limit=limit, offset=offset),
+                           'conversations': personal.search_turns(query, limit=limit)}, ensure_ascii=False)
     import time as _time
     from config import _get_conn
 
@@ -1583,6 +1590,10 @@ class Event:
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
 
     async def __aenter__(self):
+        if personal.enabled():
+            import auth
+            if not auth.is_enabled():
+                raise RuntimeError('个人记忆模式需要 ACCESS_TOKEN；请配置后重启。')
         global _event_instance
         _event_instance = self
         # 初始化子代理管理器
@@ -1637,19 +1648,30 @@ class Event:
             ('WebFetch', self._desktop_tools.WebFetch),
             ('WebSearch', self._desktop_tools.WebSearch),
         ])
+        if personal.enabled():
+            from personal_memory_tools import Tools as PersonalTools
+            _personal_tools = PersonalTools()
+            self._sys_tools.update(_build_system_tools([
+                ('remember_personal', _personal_tools.remember_personal),
+                ('forget_personal', _personal_tools.forget_personal),
+                ('propose_public_memory', _personal_tools.propose_public_memory),
+                ('set_memory_preferences', _personal_tools.set_memory_preferences),
+            ]))
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
         # 恢复持久化的活跃任务及其定时检查
         import task_store
         from event.task import _register_check
-        task_store.load_all()
-        for task in task_store.active_tasks():
+        if not personal.enabled():
+            task_store.load_all()
+        for task in ([] if personal.enabled() else task_store.active_tasks()):
             _register_check(task)
         # 启动子代理调度器（restore + scheduler loop）
-        await self._subagent_mgr.start()
+        if not personal.enabled():
+            await self._subagent_mgr.start()
         # 重启续跑：加载上一个 session 的最近 turns
         import chat_history
-        last = chat_history.get_last_session_turns(limit=10)
+        last = None if personal.enabled() else chat_history.get_last_session_turns(limit=10)
         if last:
             # 落盘的历史可能是修复之前写的：那时 tool 消息的 content 会是 dict，
             # 读回来就等于把同一个 400 一起续跑回来。所以在 restore 这一侧也过一遍。
@@ -1874,10 +1896,20 @@ class Event:
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
 
+    def _prepare_personal_turn(self, trigger_event: dict):
+        """Fresh identity per turn; never inherit a prior user's in-memory state."""
+        personal.bind_context(trigger_event.get('_personal_user_id'))
+        personal._turn.set(str(__import__('uuid').uuid4()))
+        self._turns = personal.load_turns()
+        self._summary = None
+        self._session_id = None
+
     async def run_forever(self):
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
         while True:
             ev = await collector.next_trigger()
+            if personal.enabled():
+                self._prepare_personal_turn(ev)
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
@@ -1931,6 +1963,11 @@ class Event:
                 # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
                 if self._current_turn and not ev.get('_bot_channel_event'):
                     self._save_current_turn(ev)
+                if personal.enabled():
+                    personal.bind_context(None)
+                    self._turns = []
+                    self._summary = None
+                    self._current_turn = []
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
@@ -1940,6 +1977,9 @@ class Event:
         turn 结束时 `_save_current_turn` 再写同一个索引覆盖掉（那一份已 compact）。
         """
         if not self._current_turn:
+            return
+        if personal.enabled():
+            personal.save_turn(personal._turn.get(), _compact_turn(self._current_turn))
             return
         import chat_history
         try:
@@ -1962,6 +2002,9 @@ class Event:
         turn = _compact_turn(self._current_turn)
         self._current_turn[:] = turn
         self._turns.append(turn)
+        if personal.enabled():
+            personal.save_turn(personal._turn.get(), turn)
+            return
         # 持久化（延迟创建 session）
         import chat_history
         try:
@@ -2283,7 +2326,7 @@ class Event:
 
         # Log incoming event
         _urgent_tag = ' [URGENT]' if trigger_event.get('_urgent') else ''
-        print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:300]}')
+        print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={"[private]" if personal.enabled() else trigger_event.get("text", "")[:300]}')
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
@@ -2324,7 +2367,8 @@ class Event:
 
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
-        system_tools = list(self._sys_tools.values())
+        system_tools = [t for t in self._sys_tools.values() if personal.tool_allowed(t['schema']['name'])]
+        bound_schemas = [s for s in bound_schemas if personal.tool_allowed(s['name'])]
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools
@@ -2430,20 +2474,21 @@ class Event:
             await push_event({'type': 'llm_request', 'payload': {'round': round_idx}})
 
             # 保存请求日志
-            pathlib.Path('./resource/log').mkdir(parents=True, exist_ok=True)
-            pathlib.Path('./resource/log/llm.json').write_text(
-                json.dumps(messages, ensure_ascii=False)
-            )
-            pathlib.Path('./resource/log/llm_tools.json').write_text(
-                json.dumps(all_tool_list, ensure_ascii=False, indent=2)
-            )
+            if not personal.enabled():
+                pathlib.Path('./resource/log').mkdir(parents=True, exist_ok=True)
+                pathlib.Path('./resource/log/llm.json').write_text(
+                    json.dumps(messages, ensure_ascii=False)
+                )
+                pathlib.Path('./resource/log/llm_tools.json').write_text(
+                    json.dumps(all_tool_list, ensure_ascii=False, indent=2)
+                )
 
             # Log LLM request summary
             msg_count = len(messages)
             tool_count = len(all_tool_list)
             # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
             prompt_chars = sum(len(m.get('content') or '') for m in messages)
-            last_user = next((m.get('content', '')[:200] for m in reversed(messages) if m.get('role') == 'user'), '')
+            last_user = '[private]' if personal.enabled() else next((m.get('content', '')[:200] for m in reversed(messages) if m.get('role') == 'user'), '')
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────
@@ -2535,7 +2580,7 @@ class Event:
             _round_end_ts = time.time()
             _spans.append({'span': f'llm_round_{round_idx}', 'component': 'core',
                            'start_ts': _round_start_ts, 'end_ts': _round_end_ts})
-            resp_text = (response.get('content') or '')[:300]
+            resp_text = '[private]' if personal.enabled() else (response.get('content') or '')[:300]
             resp_tools = []
             for c in (response.get('tool_calls') or []):
                 name = c['function']['name']
@@ -2544,7 +2589,7 @@ class Event:
             print(f'[decision] llm response: round_time={_round_elapsed:.2f}s text={resp_text!r}')
             if resp_tools:
                 for t in resp_tools:
-                    print(f'[decision]   tool_call: {t}')
+                    print('[decision]   tool_call: [private]' if personal.enabled() else f'[decision]   tool_call: {t}')
 
             # ── 文字输出 ──────────────────────────────────────────────────
             # content 不再自动播报。它曾经被 hooks.fire('on_notify') 直接念出去，两个
@@ -2585,7 +2630,7 @@ class Event:
                     args = json.loads(call['function']['arguments'] or '{}')
                 except (json.JSONDecodeError, TypeError) as _ae:
                     raw = str(call['function'].get('arguments'))[:200]
-                    print(f'[decision] malformed arguments for {name}: {_ae}; raw={raw!r}')
+                    print('[decision] malformed private tool arguments' if personal.enabled() else f'[decision] malformed arguments for {name}: {_ae}; raw={raw!r}')
                     await push_event({'type': 'error', 'payload': {
                         'message': f'malformed tool arguments for {name}: {_ae}'}})
                     return {'id': call['id'], 'result':
@@ -2607,7 +2652,9 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
+                if not personal.tool_allowed(name):
+                    result = 'Error: tool unavailable in personal memory mode.'
+                elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '

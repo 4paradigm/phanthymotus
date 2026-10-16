@@ -40,6 +40,10 @@ def commit_spans(trace_id: str, spans: list[dict], source: str = '', trigger_tex
     """写入一组 spans 到 perf_spans 表，同时写/更新 perf_turns 索引。"""
     if not spans:
         return
+    import personal_memory
+    if personal_memory.enabled():
+        trigger_text = ''
+        spans = [{**s, 'meta': {}} for s in spans]
     now = time.time()
     conn = _get_conn()
 

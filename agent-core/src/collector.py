@@ -19,6 +19,7 @@ import time
 from collections import deque
 
 import config
+import personal_memory as personal
 import event_bus
 
 
@@ -419,6 +420,8 @@ def _bot_trust_class(events: list[dict]) -> int:
 
 def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
     """Keep trusted bots, other bots, and people in separate LLM turns."""
+    if personal.enabled():
+        return [[ev] for ev in events]
     batches = []
     for ev in events:
         if not batches or _bot_trust_class([batches[-1][0]]) != _bot_trust_class([ev]):
@@ -469,7 +472,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
             channel_ids.append(channel_id)
     bot_payloads = _bot_channel_payloads(batch)
     trusted_payloads = _trusted_bot_channel_payloads(batch)
-    history_text = _chat_history_blocks(batch)
+    history_text = '' if personal.enabled() else _chat_history_blocks(batch)
     formatted = _format_priority_batch(batch)
     trigger = {
         'source': 'collector',
@@ -489,6 +492,8 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }
+    if personal.enabled():
+        trigger['_personal_user_id'] = personal.resolver.resolve(batch[0]) if len(batch) == 1 else None
     from channel.manager import manager as channel_manager
     for payload in trusted_payloads:
         channel_manager.consume_trusted_bot_message(payload.get('message_id', ''))
@@ -695,6 +700,8 @@ def _format_bg_batch(events: list[dict]) -> str:
 
 async def _route_to_bg_subagent(batch: list[dict]) -> bool:
     """将 P=0 事件批次路由到 bg subagent。"""
+    if personal.enabled():
+        return True  # Never summarize private/overheard speech into the shared store.
     try:
         from subagent import _manager_instance
     except ImportError:
@@ -864,6 +871,10 @@ async def _drain_loop():
             continue
         _note_ungated()
 
+        if personal.enabled() and source in personal.settings().get('face_sources', []):
+            personal.resolver.resolve(ev)
+            continue  # Face evidence updates identity; a sighting is not a request.
+
         _extract_perf_timestamps(ev)
         priority = _extract_priority(ev)
 
@@ -881,9 +892,10 @@ async def _drain_loop():
                 asyncio.create_task(hooks.fire('on_kws_wakeup'))
 
         # Ring buffer 始终存储（所有事件，供 raw_input_info 查询）
-        if source not in _source_ring:
-            _source_ring[source] = deque(maxlen=ring_size)
-        _source_ring[source].append(ev)
+        if not personal.enabled():
+            if source not in _source_ring:
+                _source_ring[source] = deque(maxlen=ring_size)
+            _source_ring[source].append(ev)
 
         if priority > 0:
             # ── P>0: 送 main agent ──
@@ -904,7 +916,11 @@ async def _drain_loop():
                         continue
 
                 # 按模式处理
-                if _interrupt_mode == 'steer':
+                if personal.enabled():
+                    _priority_pending.append(ev)
+                    if _cancel_event:
+                        _cancel_event.set()
+                elif _interrupt_mode == 'steer':
                     if has_bot_channel_event([ev]):
                         _priority_pending.append(ev)
                         continue
@@ -942,6 +958,8 @@ async def _drain_loop():
                         _cancel_event.set()
         else:
             # ── P=0: 送 bg buffer ──
+            if personal.enabled():
+                continue
             _bg_buffer_add(ev)
             # 旁人说的话还要进活动流 —— 见 _push_asr_background 里为什么只有它进。
             await _push_asr_background(ev)

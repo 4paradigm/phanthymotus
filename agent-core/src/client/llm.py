@@ -88,6 +88,9 @@ async def _log_request(request: httpx.Request):
     「网络不通」并触发三次重试。所以这里既要保证文件名合法（模型名可能带厂商前缀
     的斜杠，如 zai-org/glm-5.2），也要整体吞掉异常——调试日志不该拖垮真实请求。
     """
+    import personal_memory
+    if personal_memory.enabled():
+        return
     try:
         if not request.content:
             return

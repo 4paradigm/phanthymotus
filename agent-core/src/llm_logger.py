@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import config
+import personal_memory as personal
 
 _TZ_CN = timezone(timedelta(hours=8))
 _SEPARATOR = '=' * 64
@@ -145,7 +146,7 @@ class LLMLogger:
     async def log_request(self, request_id: str, trace_id: str,
                           caller_info: dict | None, message_list: list[dict],
                           tool_list: list[dict], model: str):
-        if not self._cfg.get('enabled'):
+        if personal.enabled() or not self._cfg.get('enabled'):
             return
         record = {
             'request_id': request_id,
@@ -164,7 +165,7 @@ class LLMLogger:
 
     async def log_response(self, request_id: str, trace_id: str,
                            caller_info: dict | None, response: dict):
-        if not self._cfg.get('enabled'):
+        if personal.enabled() or not self._cfg.get('enabled'):
             return
         record = {
             'request_id': request_id,

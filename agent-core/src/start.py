@@ -642,6 +642,9 @@ app_api.include_router(api.solutions.router)
 import api.history
 app_api.include_router(api.history.router)
 
+import api.personal_memory
+app_api.include_router(api.personal_memory.router)
+
 import api.tasks
 app_api.include_router(api.tasks.router)
 

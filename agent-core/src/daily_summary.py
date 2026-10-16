@@ -67,6 +67,9 @@ async def run():
 
 async def _do_summary():
     """Spawn subagent 执行每日摘要。"""
+    import personal_memory
+    if personal_memory.enabled():
+        return
     try:
         from subagent import _manager_instance
         if not _manager_instance:

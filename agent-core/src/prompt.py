@@ -25,6 +25,7 @@ import datetime
 import pathlib
 
 import config
+import personal_memory as personal
 import event_bus
 
 # UTC+8 时区
@@ -61,6 +62,9 @@ _l1_cache: dict = {'mtime': 0.0, 'content': ''}
 
 def _system_definition() -> str:
     """读取 L1 base prompt（含 system prompt + 身份定义 + 长期记忆），带 mtime 缓存。"""
+    if personal.enabled():
+        from personal_memory_tools import system_content
+        return system_content()  # Never put personal content in the global L1 cache.
     system_path = pathlib.Path(config.main['event']['llm']['prompt_system'])
     identity_path = pathlib.Path('./resource/memory/identity.md')
     memory_path = pathlib.Path(config.main['event']['llm']['prompt_memory'])
@@ -112,7 +116,7 @@ def _registry_fingerprint(mcp_registry: dict, bound_tools: set | None) -> tuple:
         tuple(s['slug'] for s in _visible_skills()),
         frozenset(_rt_act),
     )
-    return (tuple(parts), frozenset(bound_tools) if bound_tools else None, skills_fp)
+    return (tuple(parts), frozenset(bound_tools) if bound_tools else None, skills_fp, personal.enabled())
 
 
 def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
@@ -207,6 +211,8 @@ def _env_dynamic() -> str:
     不影响 system message 的缓存命中。
     """
     now = format_ts(sep=' ')
+    if personal.enabled():
+        return f'<status time="{now}" />'
 
     # 活跃任务
     import task_store
