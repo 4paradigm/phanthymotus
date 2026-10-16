@@ -106,7 +106,8 @@ async function _loadPending() {
         <span class="skill-card-meta">待验证 · ${_esc(draft.target.label)}</span></div>
         <button class="skill-btn skill-btn-primary">继续验证</button></div>`;
       card.querySelector('button').onclick = async event => {
-        event.currentTarget.disabled = true;
+        const button = event.currentTarget;
+        button.disabled = true;
         try {
           const response = await fetch('/api/skills/package/resume', {method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -114,7 +115,7 @@ async function _loadPending() {
           const result = await response.json();
           if (!response.ok) throw new Error(result.detail || '无法继续验证');
           await _openPackageWorkbench(result.data.target, result.data.ui);
-        } catch (error) { alert(error.message); event.currentTarget.disabled = false; }
+        } catch (error) { alert(error.message); button.disabled = false; }
       };
       list.append(card);
     }
