@@ -17,8 +17,8 @@ import event.skills
 _skills_mod = sys.modules['event.skills']
 
 router = fastapi.APIRouter(prefix='/skills', tags=['skills'])
-from api.skill_packages import router as package_router
-router.include_router(package_router)
+from api.skill_execution import router as execution_router
+router.include_router(execution_router)
 
 
 def _get_rc_url() -> str:

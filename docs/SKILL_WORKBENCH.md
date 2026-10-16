@@ -160,31 +160,38 @@ slug，而不是预期的幂等 200。
 之后同一设备的新技能沿用该连接；工作台会显示这项状态，未连接时不会宣称保存后即可
 对话调用。
 
-## 技能包传输
+## 技能包怎么到设备上
 
-`src/api/skill_packages.py` 挂在 `/api/skills/package`：
+**走通用的 `format: file`，Core 不再有第二套传输。**
+
+工具在自己的 `inputSchema` 里把参数标成文件：
+
+```python
+"package": {"type": "string", "format": "file",
+            "accept": ".motus-skill,.zip", "uploadTo": "mcp"}
+```
+
+之后全部是既有机制：画布为这个参数渲染文件选择器，`mcp_client._transfer_file_args`
+在调用时发现参数是本地文件，就 POST 到那个服务的 `/file/upload`，拿回**该容器内的
+绝对路径**改写参数。调用方（人在画布上，或 LLM）调的那个工具**就是目的地** —— 不需要
+声明协议，不需要选卡片对话框。
+
+详见 `phanthymotus/README.md` § File Arguments，以及 driver 仓库 README_dev.md
+§ File Arguments（每份 bundle 的 glue 和三条顺序要求）。
+
+把技能包**带出**设备（换一台机器人用）走资源中心的附件与版本（resource-center!66），
+不再是「从网页下载一个文件、再上传到另一台」。
+
+`api/skill_execution.py` 剩下的职责只有三件：
 
 | 接口 | 行为 |
 | --- | --- |
-| GET `/targets` | 画布中声明了 `x-skill-package.schema`（任意值）的 HTTP MCP 工具 |
-| POST `/inspect` | 有界读取上传文件，返回 manifest 与**已按协议和 tool 选路过**的卡片；不接触设备 |
-| POST `/install` | 按 `card_id` 发送有界分块；协议不符或 tool 不符在接触设备前拒绝 |
-| GET `/pending` / POST `/resume` | 聚合各卡片待验证导入；从技能列表恢复对应工作台 |
-| GET `/export/{slug}` | 从原卡读取完整包，验证长度与传输 SHA 后下载 |
-| POST `/refresh/{slug}` | 由原 Driver 校验资产并重新生成说明；保留可见性和安装时间，拒绝并发覆盖 |
-| GET `/execution/{slug}` | 读取实际绑定后的有效选择、是否继承卡片及绑定变化提示 |
-| POST `/execution/{slug}` | 网页开启/关闭单技能自动执行，并撤销该技能旧临时授权 |
-| POST `/execution/read` | 精确回环、只读；Driver 每次 preview/run 读取策略，无授权写入能力 |
+| GET `/pending` · POST `/resume` | 聚合各卡片上待本机验证的草稿；从技能列表恢复对应工作台。由 Core 聚合而不是页面，因为找它们要拿画布布局去比对 MCP 注册表 —— 和选路不放在浏览器是同一个理由 |
+| POST `/refresh/{slug}` | 由原设备重新生成技能定义（临时，见「已移除与临时项」） |
+| GET · POST `/execution/{slug}`、POST `/execution/read` | 自动执行策略：网页读写，驱动回环只读 |
 
-边界：整包 ≤ 16 MiB，`manifest.json` ≤ 16 KiB，单个条目解压 ≤ 64 MiB，全部条目合计
-≤ 128 MiB，拒绝加密与非 deflate/stored 压缩，拒绝绝对路径和 `..`。**整条传输有
-180 秒死线** —— 16 MiB 是最多 683 次分块调用，只给每块 30 秒超时的话一次上传能把
-请求挂住几小时，而这个仓库里其他每一条面向设备的路径都有死线。
-
-导入创建的新草稿必须本机试运行并确认效果，随后走已有 save/import 才成为可调用
-Skill。不采信包内的验证声明。目标设备上已有完全相同且验证成功的本机资产时复用原
-资产，不重复试运行，也不重置既有 Skill 的可见性。关闭后可从技能列表「待验证 →
-继续验证」恢复。
+导入进来的草稿必须本机试运行并确认效果，随后走已有的 save/import 才成为可调用 Skill。
+不采信包内的验证声明。
 
 ## 持久自动执行设置
 
@@ -289,15 +296,12 @@ Skill。不采信包内的验证声明。目标设备上已有完全相同且验
 | --- | --- |
 | **30 分钟限时授权**（`session_challenge`/`authorize`/`revoke`、一次性凭据表、以及消费它所需的回环鉴权豁免） | 它被描述为「兼容早于持久设置的旧适配器」。没有这样的适配器 —— 唯一实现过这些 action 的驱动尚未合并，所以这是在跟一个从未发布的前任做兼容。顺带移除了 `/approval/consume` 那条豁免和那个带锁/过期/容量上限的内存凭据表。 |
 | **旧 slug 前缀解析器** | 用于把 `attachment` 字段出现之前安装的技能映射到设备。恰好一台测试机上有这样一行；一条 DB UPDATE 能替掉两条代码路径，而且 slug 命名约定本来就不是身份机制。 |
-| **整卡总开关** | 见上一节。 |
+| **整卡总开关** | 见「持久自动执行设置」一节。 |
+| **分块传输与导入弹窗**（`package_begin`/`write`/`finish`/`read`、zip 校验、`/inspect`、`/install`、`/export`、`/targets`、技能面板的导入弹窗） | 只因为当时没有任何 driver 实现 `POST /file/upload`。端点补上之后（phanthymotus-driver#417），通用的 `format: file` 就够了 —— 画布本来就为这类参数渲染文件选择器。**一件事两套传输是最不该留下的东西。** 删掉它也顺带去掉了「Core 原样转发整个归档」这个前提，于是归档条目名、路径穿越检查、解压大小这些 Core 本不该关心的事一并消失。模块改名 `api/skill_execution.py`，515 → 326 行。 |
 
-两项保留但**是临时的**，不要在它们之上再建东西：
-
-- **浏览器上传/下载**（`/inspect`、`/install`、`/export` 和导入弹窗）是人工搬文件 ——
-  在资源中心还存不了附件之前，这是技能跨设备移动的唯一手段。目标路径是
-  **RC → Core → 设备**，所以 RC 附件上线后这几条会移除。
-- **`refresh/{slug}`** 是「没有版本机制」的替代品。资源中心存上带版本的技能包之后，
-  重录一次产出的是新版本而不是改写当前这一份，这条路由随之消失。
+一项保留但**是临时的**：**`refresh/{slug}`** 是「没有版本机制」的替代品。资源中心
+存上带版本的技能包之后（resource-center!66），重录一次产出的是新版本而不是改写当前
+这一份，这条路由随之消失。
 
 ## 验证
 

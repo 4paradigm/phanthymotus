@@ -454,7 +454,6 @@
     </div>
     <div class="modal-body skill-modal-body">
       <div class="skill-panel active" data-panel="installed" id="skill-installed-panel">
-        <div class="skill-mine-toolbar"><button class="skill-btn" id="skill-package-open">导入技能包</button></div>
         <div class="skill-empty" id="skill-installed-empty">暂无已安装技能</div>
         <div class="skill-list" id="skill-installed-list"></div>
         <div class="skill-list" id="skill-pending-list"></div>
@@ -482,21 +481,6 @@
         <div class="skill-empty hidden" id="skill-browse-empty">未找到技能</div>
       </div>
     </div>
-  </div>
-</div>
-
-<!-- Skill packages are validated by the selected device before local trial. -->
-<div class="modal-overlay hidden" id="skill-package-overlay">
-  <div class="modal skill-form-modal" role="dialog" aria-modal="true" aria-labelledby="skill-package-title">
-    <div class="modal-header"><span class="modal-title" id="skill-package-title">导入技能包</span><button class="btn-icon" id="skill-package-close" aria-label="关闭导入">✕</button></div>
-    <div class="modal-body skill-form-body" style="display:flex;flex-direction:column;gap:18px">
-      <div class="skill-form-field"><label for="skill-package-file">技能包文件</label><input type="file" id="skill-package-file" accept=".motus-skill,.zip"><span class="skill-detail-text">包含技能说明、适用设备与完整内容，最大 16 MiB。</span></div>
-      <div id="skill-package-summary"></div>
-      <div class="skill-form-field"><label for="skill-package-target">目标设备卡片</label><select id="skill-package-target" disabled></select></div>
-      <p class="skill-detail-text">导入后先在目标设备上试运行，确认效果后保存为本机技能。</p>
-      <p class="skill-form-error" id="skill-package-error" role="status"></p>
-    </div>
-    <div class="modal-footer"><button class="btn-secondary" id="skill-package-cancel">取消</button><button class="btn-primary" id="skill-package-install" disabled>导入并检查</button></div>
   </div>
 </div>
 

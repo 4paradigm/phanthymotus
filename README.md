@@ -399,10 +399,13 @@ mechanism that already exists:
 |---|---|---|
 | how | `skill_file(slug, path)` → text, bounded, resumable by `offset` | `skill_file(…, as_path=true)` → a local path, passed to any `format: file` parameter |
 | who decides | the LLM, from the instruction | the LLM, **by which tool it calls** |
-| transport | `agent-core/src/skill_files.py` | the `format: file` path above — **no new transport** |
+| transport | `agent-core/src/skill_files.py` | the `format: file` path above — **the only transport** |
 
 The second row is the whole point: the tool the model called *is* the
-destination, so a skill never names a device, a protocol, or a tool. Earlier
+destination, so a skill never names a device, a protocol, or a tool. It is also
+why `agent-core/src/api/skill_execution.py` (once `skill_packages.py`) no longer
+carries a chunked transfer of its own — that existed only while no driver served
+`POST /file/upload`, and two transports for one job is the thing not to ship. Earlier
 drafts had each entry declare its consumer, a protocol `schema`, and the `tools`
 allowed to receive it; all three were wrong in the same direction — `tools`
 duplicated `schema` and forced a marketplace author to enumerate driver tool
