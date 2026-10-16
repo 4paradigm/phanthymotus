@@ -1205,6 +1205,27 @@ def test_search_is_disabled_when_the_chassis_has_no_yaw_axis():
     assert config.search_rate == 0.0
     assert any("搜索转身" in note for note in notes)
 
+
+@pytest.mark.parametrize("descriptor", [
+    {"limits": dict(_R1_DESC["limits"],
+                    lower=[-1, -1, 0, 0, 0, -0.2],
+                    upper=[1, 1, 0, 0, 0, 0.2],
+                    min_magnitude=[0, 0, 0, 0, 0, 0.33])},
+    {"limits": dict(_R1_DESC["limits"],
+                    lower=[-1, -1, 0, 0, 0, 0],
+                    upper=[1, 1, 0, 0, 0, 0])},
+])
+def test_a_disabled_search_fails_instead_of_publishing_zero_twists(descriptor):
+    config = _cfg(search_rate=1.0, search_timeout_s=1e6)
+    P.adopt_limits(config, descriptor)
+    assert config.search_rate == 0.0
+    state = _state(missing_frames=config.lost_frames)
+    decision = _step(detections=_detections(), depth=_depth(),
+                     config=config, state=state)
+    assert decision.status == P.FAILED
+    assert decision.publishes is False
+    assert "cannot search" in decision.reason
+
 def test_an_axis_the_chassis_does_not_have_is_switched_off():
     config = _cfg()
     pinned = {"limits": dict(_R1_DESC["limits"],

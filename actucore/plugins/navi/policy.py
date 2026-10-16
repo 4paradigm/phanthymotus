@@ -1382,6 +1382,18 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
         return Decision(None, SEARCHING,
                         f"target briefly out of sight ({state.missing_frames}/{config.lost_frames} frames)")
 
+    # ``adopt_limits`` has already established that no yaw command can clear
+    # this chassis's limits/deadband.  Publishing a zero twist here would keep
+    # its watchdog alive while claiming to search for up to the timeout, even
+    # though the required motion is impossible.  Fail immediately so the
+    # caller can select another strategy rather than waiting for a search that
+    # cannot start.
+    if config.search_rate <= 0.0:
+        state.failed_reason = (
+            f"cannot search for {state.target!r}: downstream chassis has no "
+            "executable yaw search rate")
+        return Decision(None, FAILED, state.failed_reason)
+
     state.searching_for_s += dt
     # Negated, for the same reason the main loop negates its bearing:
     # `last_seen_side` is +1 when the target was to the *right*, and turning
