@@ -503,6 +503,10 @@ _action_outcomes: "collections.OrderedDict[str, dict]" = collections.OrderedDict
 
 def _record_outcome(action_id: str, status: str) -> None:
     entry = {'status': status, 'tool': _pending_tools.get(action_id, '')}
+    # Preserve the driver's actual terminal payload after a barrier reaps its
+    # waiter. Barrier completion alone does not imply robot success.
+    if action_id in _pending_results:
+        entry['completion'] = _pending_results[action_id]
     _action_outcomes.pop(action_id, None)
     _action_outcomes[action_id] = entry
     while len(_action_outcomes) > _ACTION_OUTCOME_CAP:
@@ -1633,11 +1637,11 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         # 永久留在进程里；Phase 3 的 peer 回调正是走这条路，每次委派都会漏一份。
         results = {}
         for aid, _ in events:
-            results[aid] = _pending_results.pop(aid, {"status": "completed"})
+            results[aid] = _pending_results.get(aid, {"status": "completed"})
         _forget_pending((aid for aid, _ in events), 'completed')
         return {"status": "completed", "results": results}
     except asyncio.TimeoutError:
-        completed = {aid: _pending_results.pop(aid, {}) for aid, ev in events if ev.is_set()}
+        completed = {aid: _pending_results.get(aid, {}) for aid, ev in events if ev.is_set()}
         still_pending = [aid for aid, ev in events if not ev.is_set()]
         # 只清理已完成的；还在飞的留着，它们的 barrier 语义没变
         _forget_pending(completed, 'completed')

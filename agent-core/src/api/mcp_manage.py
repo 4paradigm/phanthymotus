@@ -352,6 +352,34 @@ async def hooks_status():
     return {'code': 200, 'data': hooks.get_status()}
 
 
+@router.get('/actions/{action_id}')
+async def canvas_action_status(action_id: str):
+    """Read ACP bookkeeping only; never dispatch, wait, cancel or reap a task."""
+    if not action_id or len(action_id) > 256:
+        raise fastapi.HTTPException(status_code=400, detail='Invalid action_id')
+    payload = mcp_client.pending_result(action_id)
+    outcome = mcp_client.action_outcome(action_id)
+    if payload is None and outcome:
+        payload = outcome.get('completion')
+    if payload is not None:
+        nested = payload.get('payload')
+        nested = nested if isinstance(nested, dict) else {}
+        data = {'action_id': action_id, 'state': 'settled',
+                'status': payload.get('status', nested.get('status', 'unknown')),
+                'result': payload.get('result', nested.get('result', {}))}
+    elif outcome:
+        # A harness timeout/interruption is not proof that the physical action
+        # stopped. Do not fabricate a successful controller completion.
+        data = {'action_id': action_id, 'state': 'unconfirmed',
+                'status': outcome.get('status', 'unknown'),
+                'message': 'No driver completion is available. Check actual device state.'}
+    else:
+        pending = action_id in mcp_client.get_pending_actions()
+        data = {'action_id': action_id, 'state': 'pending' if pending else 'unknown'}
+    return fastapi.responses.JSONResponse({'code': 200, 'data': data},
+                                         headers={'Cache-Control': 'no-store'})
+
+
 @router.get('')
 async def mcp_list():
     items = [

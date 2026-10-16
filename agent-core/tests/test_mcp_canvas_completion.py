@@ -119,3 +119,33 @@ def test_canvas_registration_replays_an_early_completion_in_listener_order(monke
         completed = await mcp_client.sync(['canvas-1'], timeout=.1)
         assert completed['results']['canvas-1']['status'] == 'completed'
     asyncio.run(scenario())
+
+@pytest.mark.parametrize('status', ['completed', 'error', 'cancelled'])
+def test_read_only_action_status_preserves_driver_result_after_barrier_cleanup(monkeypatch, status):
+    async def scenario():
+        async def enqueue(**kwargs): pass
+        monkeypatch.setattr(mcp_client.event_bus, 'enqueue', enqueue)
+        mcp_manage._register_canvas_completion(TOOL, {'action': 'move'}, result())
+        read = await mcp_manage.canvas_action_status('canvas-1')
+        assert json.loads(read.body)['data']['state'] == 'pending'
+        assert read.headers['cache-control'] == 'no-store'
+        payload = {'action_id': 'canvas-1', 'status': status, 'result': {'actual': [1, 2, 3], 'error': 'reason' if status == 'error' else None}}
+        await mcp_client.receive_action_completion('canvas-1', payload)
+        first = json.loads((await mcp_manage.canvas_action_status('canvas-1')).body)['data']
+        assert first == {'action_id': 'canvas-1', 'state': 'settled', 'status': status, 'result': payload['result']}
+        assert 'canvas-1' in mcp_client._pending_actions  # GET did not reap it.
+        await mcp_client.sync(['canvas-1'], timeout=.1)
+        assert 'canvas-1' not in mcp_client._pending_actions
+        assert json.loads((await mcp_manage.canvas_action_status('canvas-1')).body)['data'] == first
+    asyncio.run(scenario())
+
+
+def test_read_only_action_status_never_treats_timeout_or_missing_record_as_success():
+    async def scenario():
+        assert json.loads((await mcp_manage.canvas_action_status('unknown')).body)['data']['state'] == 'unknown'
+        mcp_manage._register_canvas_completion(TOOL, {'action': 'move'}, result())
+        mcp_client._forget_pending(['canvas-1'], outcome='timeout')
+        data = json.loads((await mcp_manage.canvas_action_status('canvas-1')).body)['data']
+        assert data['state'] == 'unconfirmed' and data['status'] == 'timeout'
+        assert 'result' not in data
+    asyncio.run(scenario())

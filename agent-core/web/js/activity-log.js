@@ -5,6 +5,7 @@
 
 import { onMotusEvent } from './motus-stream.js';
 import { summarizeEvent } from './activity-summary.js';
+import { activityCompletionId, claimCompletionActivity } from './completion-activity.js';
 import { toggleLog } from './mobile.js';
 
 export function initActivityLog() {
@@ -96,6 +97,8 @@ function _append(event) {
 
   const log = document.getElementById('activity-log');
   if (!log) return;
+  const completionId = activityCompletionId(event);
+  if (completionId && !claimCompletionActivity(completionId)) return;
 
   const atBottom = log.scrollHeight - log.scrollTop <= log.clientHeight + 40;
 
