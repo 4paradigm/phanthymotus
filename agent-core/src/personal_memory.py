@@ -18,6 +18,8 @@ import config
 _user = ContextVar('personal_memory_user', default=None)
 _turn = ContextVar('personal_memory_turn', default='')
 _runtime_settings: dict | None = None
+_revision = ContextVar('personal_memory_revision', default=None)
+_block_turn_save = ContextVar('personal_memory_block_save', default=False)
 
 
 def configured_settings() -> dict:
@@ -82,6 +84,10 @@ def _db():
                 id TEXT PRIMARY KEY, owner TEXT NOT NULL, content TEXT NOT NULL,
                 approved INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL);
         ''')
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(pm_users)')}
+        for column in ('paused', 'revision'):
+            if column not in columns:
+                conn.execute(f'ALTER TABLE pm_users ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0')
         yield conn
         conn.commit()
     finally:
@@ -97,7 +103,7 @@ def _text(value: str) -> str:
 def create_user(name: str, remember: bool = False, onboarding: bool = False) -> dict:
     user_id = str(uuid4())
     with _db() as conn:
-        conn.execute('INSERT INTO pm_users VALUES (?, ?, ?, ?)',
+        conn.execute('INSERT INTO pm_users (id, name, remember, onboarding) VALUES (?, ?, ?, ?)',
                      (user_id, _text(name), int(remember), int(onboarding)))
     return get_user(user_id)
 
@@ -119,8 +125,8 @@ def update_user(user_id: str, remember: bool, onboarding: bool) -> dict:
     with _db() as conn:
         if not conn.execute('SELECT 1 FROM pm_users WHERE id=?', (user_id,)).fetchone():
             raise ValueError('用户不存在。')
-        conn.execute('UPDATE pm_users SET remember=?, onboarding=? WHERE id=?',
-                     (int(remember), int(onboarding), user_id))
+        conn.execute('UPDATE pm_users SET remember=?, onboarding=?, paused=?, revision=revision+1 WHERE id=?',
+                     (int(remember), int(onboarding), int(not remember), user_id))
         if not remember:
             for table in ('pm_memories', 'pm_turns'):
                 conn.execute(f'DELETE FROM {table} WHERE owner=?', (user_id,))
@@ -212,14 +218,40 @@ def _remembering_user() -> dict:
     return user
 
 
-def save_memory(content: str, kind: str, source_turn: str) -> dict:
+def _identified_user() -> dict:
+    user = get_user(current_user())
+    if not user:
+        raise PermissionError('需要先识别并匹配本人，不能操作其他人的资料。')
+    return user
+
+
+def context_changed() -> bool:
+    if _revision.get() is None:
+        return False
+    user = get_user(current_user())
+    return not user or user['revision'] != _revision.get()
+
+
+def _writing_user() -> dict:
     user = _remembering_user()
+    if user['paused'] or _block_turn_save.get() or context_changed():
+        raise PermissionError('记录已暂停或本轮资料发生更改；本轮不再新增记忆。')
+    return user
+
+
+def save_memory(content: str, kind: str, source_turn: str) -> dict:
+    user = _writing_user()
     if kind not in ('fact', 'preference', 'event', 'analysis'):
         raise ValueError('记忆类型必须是 fact/preference/event/analysis；分析不是事实。')
     record = {'id': str(uuid4()), 'owner': user['id'], 'kind': kind,
               'content': _text(content), 'source_turn': source_turn, 'created_at': time.time()}
     with _db() as conn:
-        conn.execute('INSERT INTO pm_memories VALUES (:id, :owner, :kind, :content, :source_turn, :created_at)', record)
+        saved = conn.execute('INSERT INTO pm_memories (id, owner, kind, content, source_turn, created_at) '
+                             'SELECT :id, :owner, :kind, :content, :source_turn, :created_at FROM pm_users '
+                             'WHERE id=:owner AND remember=1 AND paused=0 AND revision=:expected_revision',
+                             {**record, 'expected_revision': user['revision']}).rowcount
+        if not saved:
+            raise PermissionError('保存前授权已变更，未写入记忆。')
     return record
 
 
@@ -237,18 +269,29 @@ def recall(query: str, limit: int = 20, offset: int = 0) -> list[dict]:
 
 
 def delete_memory(memory_id: str) -> bool:
-    user = _remembering_user()
+    user = _identified_user()
     with _db() as conn:
-        return conn.execute('DELETE FROM pm_memories WHERE id=? AND owner=?',
-                            (memory_id, user['id'])).rowcount > 0
+        deleted = conn.execute('DELETE FROM pm_memories WHERE id=? AND owner=?',
+                               (memory_id, user['id'])).rowcount > 0
+        if deleted:
+            # Raw history may repeat or paraphrase it; retain only other structured records.
+            conn.execute('DELETE FROM pm_turns WHERE owner=?', (user['id'],))
+            conn.execute('DELETE FROM pm_public WHERE owner=? AND approved=0', (user['id'],))
+            conn.execute('UPDATE pm_users SET revision=revision+1 WHERE id=?', (user['id'],))
+        return deleted
 
 
 def propose_public(content: str) -> dict:
-    user = _remembering_user()
+    user = _writing_user()
     record = {'id': str(uuid4()), 'owner': user['id'], 'content': _text(content),
               'approved': 0, 'created_at': time.time()}
     with _db() as conn:
-        conn.execute('INSERT INTO pm_public VALUES (:id, :owner, :content, :approved, :created_at)', record)
+        saved = conn.execute('INSERT INTO pm_public (id, owner, content, approved, created_at) '
+                             'SELECT :id, :owner, :content, :approved, :created_at FROM pm_users '
+                             'WHERE id=:owner AND remember=1 AND paused=0 AND revision=:expected_revision',
+                             {**record, 'expected_revision': user['revision']}).rowcount
+        if not saved:
+            raise PermissionError('保存前授权已变更，未提交公共候选。')
     return record
 
 
@@ -270,12 +313,13 @@ def delete_public(memory_id: str) -> None:
 
 def save_turn(turn_id: str, messages: list[dict]) -> None:
     user = get_user(current_user())
-    if not user or not user['remember']:
+    if not user or not user['remember'] or user['paused'] or _block_turn_save.get() or context_changed():
         return
     with _db() as conn:
-        conn.execute('INSERT INTO pm_turns VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET messages=excluded.messages '
-                     'WHERE pm_turns.owner=excluded.owner',
-                     (turn_id, user['id'], json.dumps(messages, ensure_ascii=False), time.time()))
+        conn.execute('INSERT INTO pm_turns (id, owner, messages, created_at) '
+                     'SELECT ?, ?, ?, ? FROM pm_users WHERE id=? AND remember=1 AND paused=0 AND revision=? '
+                     'ON CONFLICT(id) DO UPDATE SET messages=excluded.messages WHERE pm_turns.owner=excluded.owner',
+                     (turn_id, user['id'], json.dumps(messages, ensure_ascii=False), time.time(), user['id'], user['revision']))
 
 
 def load_turns(limit: int = 18) -> list[list[dict]]:
@@ -310,4 +354,74 @@ def tool_allowed(name: str) -> bool:
     if not enabled():
         return True
     return name in {'finish', 'memory_recall', 'remember_personal', 'forget_personal',
-                    'propose_public_memory', 'set_memory_preferences'} | set(settings().get('output_tools', []))
+                    'propose_public_memory', 'set_memory_preferences', 'set_memory_collection',
+                    'export_personal_data', 'correct_personal', 'withdraw_public_memory', 'delete_personal_data'} | set(settings().get('output_tools', []))
+
+
+def set_collection(enabled: bool) -> None:
+    user = _identified_user()
+    with _db() as conn:
+        conn.execute('UPDATE pm_users SET paused=?, remember=?, revision=revision+1 WHERE id=?',
+                     (int(not enabled), int(bool(enabled or user['remember'])), user['id']))
+        if not enabled:
+            conn.execute('DELETE FROM pm_turns WHERE id=? AND owner=?', (_turn.get(), user['id']))
+
+
+def correct_memory(memory_id: str, content: str, kind: str) -> dict:
+    user = _identified_user()
+    if kind not in ('fact', 'preference', 'event', 'analysis'):
+        raise ValueError('记忆类型必须是 fact/preference/event/analysis。')
+    with _db() as conn:
+        changed = conn.execute('UPDATE pm_memories SET content=?, kind=?, source_turn=?, created_at=? '
+                               'WHERE id=? AND owner=?',
+                               (_text(content), kind, _turn.get(), time.time(), memory_id, user['id'])).rowcount
+        if not changed:
+            raise PermissionError('未找到当前用户的这条记忆。')
+        conn.execute('DELETE FROM pm_turns WHERE owner=?', (user['id'],))
+        conn.execute('DELETE FROM pm_public WHERE owner=? AND approved=0', (user['id'],))
+        conn.execute('UPDATE pm_users SET revision=revision+1 WHERE id=?', (user['id'],))
+        return dict(conn.execute('SELECT * FROM pm_memories WHERE id=?', (memory_id,)).fetchone())
+
+
+def export_data(collection: str, limit: int = 20, offset: int = 0) -> dict:
+    user = _identified_user()
+    tables = {'memories': ('pm_memories', 'owner'), 'conversations': ('pm_turns', 'owner'),
+              'public_contributions': ('pm_public', 'owner'), 'bindings': ('pm_bindings', 'user_id')}
+    limit, offset = max(1, min(limit, 100)), max(0, offset)
+    if collection == 'profile':
+        rows, total = [user], 1
+        rows = rows[offset:offset + limit]
+    elif collection in tables:
+        table, owner_column = tables[collection]
+        with _db() as conn:
+            total = conn.execute(f'SELECT COUNT(*) FROM {table} WHERE {owner_column}=?', (user['id'],)).fetchone()[0]
+            rows = [dict(row) for row in conn.execute(
+                f'SELECT * FROM {table} WHERE {owner_column}=? ORDER BY rowid LIMIT ? OFFSET ?',
+                (user['id'], limit, offset))]
+        if collection == 'conversations':
+            for row in rows:
+                row['messages'] = json.loads(row['messages'])
+    else:
+        raise ValueError('collection 必须是 profile/memories/conversations/public_contributions/bindings。')
+    return {'collection': collection, 'items': rows, 'total': total,
+            'next_offset': offset + len(rows) if offset + len(rows) < total else None}
+
+
+def withdraw_public(memory_id: str) -> bool:
+    user = _identified_user()
+    with _db() as conn:
+        deleted = conn.execute('DELETE FROM pm_public WHERE id=? AND owner=?', (memory_id, user['id'])).rowcount > 0
+        if deleted:
+            conn.execute('UPDATE pm_users SET revision=revision+1 WHERE id=?', (user['id'],))
+        return deleted
+
+
+def clear_personal_data(delete_profile: bool = False) -> None:
+    user = _identified_user()
+    if delete_profile:
+        delete_user(user['id'])
+        return
+    with _db() as conn:
+        for table in ('pm_memories', 'pm_turns', 'pm_public'):
+            conn.execute(f'DELETE FROM {table} WHERE owner=?', (user['id'],))
+        conn.execute('UPDATE pm_users SET remember=0, paused=1, revision=revision+1 WHERE id=?', (user['id'],))

@@ -123,7 +123,7 @@ def test_scoped_tools_record_origin_and_distinguish_hypotheses(store):
     item = pm.recall('')[0]
     assert item['kind'] == 'analysis'
     assert item['source_turn'] == 'origin-turn'
-    asyncio.run(Tools().set_memory_preferences(False, False))
+    asyncio.run(Tools().set_memory_preferences(False, False, confirmed=True))
     assert pm.recall('') == []
 
 

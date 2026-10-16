@@ -20,7 +20,11 @@ def store(tmp_path, monkeypatch):
     }
     token = pm.bind_context(None)
     turn_token = pm._turn.set('')
+    revision_token = pm._revision.set(None)
+    block_token = pm._block_turn_save.set(False)
     yield
+    pm._revision.reset(revision_token)
+    pm._block_turn_save.reset(block_token)
     pm._turn.reset(turn_token)
     pm.reset_context(token)
 

@@ -1587,6 +1587,7 @@ class Event:
         self._session_id: str | None  = None  # chat history session
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
         self._personal_owner = None
+        self._personal_revision = None
         self._personal_remember = False
         self._transient_turns = []
         self._personal_seen_at = 0.0
@@ -1661,6 +1662,11 @@ class Event:
                 ('forget_personal', _personal_tools.forget_personal),
                 ('propose_public_memory', _personal_tools.propose_public_memory),
                 ('set_memory_preferences', _personal_tools.set_memory_preferences),
+                ('set_memory_collection', _personal_tools.set_memory_collection),
+                ('export_personal_data', _personal_tools.export_personal_data),
+                ('correct_personal', _personal_tools.correct_personal),
+                ('withdraw_public_memory', _personal_tools.withdraw_public_memory),
+                ('delete_personal_data', _personal_tools.delete_personal_data),
             ]))
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
@@ -1908,16 +1914,33 @@ class Event:
         personal.bind_context(user_id)
         personal._turn.set(str(uuid4()))
         user = personal.get_user(user_id)
-        same_session = (user and not user['remember'] and self._personal_owner == user_id
+        personal._revision.set(user['revision'] if user else None)
+        personal._block_turn_save.set(False)
+        same_session = (user and (not user['remember'] or user['paused']) and self._personal_owner == user_id
+                        and self._personal_revision == user['revision']
                         and time.time() - self._personal_seen_at <= 300)
         if not same_session:
             self._transient_turns = []
         self._turns = list(self._transient_turns) if same_session else personal.load_turns()
         self._personal_owner = user_id
-        self._personal_remember = bool(user and user['remember'])
+        self._personal_revision = user['revision'] if user else None
+        self._personal_remember = bool(user and user['remember'] and not user['paused'])
         self._personal_seen_at = time.time()
         self._summary = None
         self._session_id = None
+
+    def _refresh_personal_context(self, turn_messages: list[dict]):
+        user = personal.get_user(personal.current_user())
+        personal._revision.set(user['revision'] if user else None)
+        personal._block_turn_save.set(True)
+        self._personal_revision = user['revision'] if user else None
+        self._turns = personal.load_turns()
+        self._summary = None
+        self._transient_turns = []
+        turn_messages.clear()
+        turn_messages.append({'role': 'user', 'content':
+            '用户的个人资料管理操作已生效。旧对话上下文已清理，请依据当前授权状态和最新资料说明结果；'
+            '不得恢复、更改或重新保存已删除的信息。本轮不再保存对话。'})
 
     async def run_forever(self):
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
@@ -2013,6 +2036,11 @@ class Event:
 
     def _save_current_turn(self, trigger_event: dict):
         """保存 _current_turn 到内存历史 + SQLite。"""
+        if personal.enabled() and personal.context_changed():
+            self._transient_turns = []
+            self._turns = []
+            self._summary = None
+            return
         # 保存前 compact：截断大 tool results，减少 tier1 历史占用
         turn = _compact_turn(self._current_turn)
         self._current_turn[:] = turn
@@ -2020,7 +2048,7 @@ class Event:
         if personal.enabled():
             personal.save_turn(personal._turn.get(), turn)
             user = personal.get_user(personal.current_user())
-            if user and not user['remember']:
+            if user and (not user['remember'] or user['paused']):
                 # Opt-out keeps only this active conversation in RAM; switching users clears it.
                 self._transient_turns = [turn] if self._personal_remember else self._turns[-18:]
             self._personal_seen_at = time.time()
@@ -2448,6 +2476,10 @@ class Event:
             return True
 
         while True:
+            if personal.enabled() and personal.context_changed():
+                self._refresh_personal_context(turn_messages)
+                frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+                round_idx = max(1, round_idx + 1)
             # ── 绝对上限检查 ──────────────────────────────────────────────
             if total_rounds >= absolute_max:
                 print(f'[decision] absolute max {absolute_max} reached, forcing end')
@@ -2672,7 +2704,9 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if not personal.tool_allowed(name):
+                if personal.enabled() and personal.context_changed():
+                    result = '个人资料已更改，旧上下文已失效；本次调用未执行。'
+                elif not personal.tool_allowed(name):
                     result = 'Error: tool unavailable in personal memory mode.'
                 elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
@@ -2715,6 +2749,8 @@ class Event:
                             }
                         else:
                             result = _not_dispatched(name, _barrier_result)
+                    elif personal.enabled() and personal.context_changed():
+                        result = '个人资料在等待期间已更改，本次调用未执行。'
                     else:
                         result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
@@ -2739,6 +2775,8 @@ class Event:
                         # yet) or just record it as not-dispatched.
                         result = _not_dispatched(name, _barrier_result)
                         _reconsidered = (_barrier_result.get('status') == 'reconsidering')
+                    elif personal.enabled() and personal.context_changed():
+                        result = '个人资料在等待期间已更改，本次调用未执行。'
                     else:
                         args['_trace_id'] = _trace_id
                         args['_cancel_event'] = cancel_event
@@ -2925,6 +2963,9 @@ class Event:
             if _notified_by_tool or _channel_replied:
                 _turn_interacted = True
                 _on_speaking_started()
+
+            if personal.enabled() and personal.context_changed():
+                continue
 
             # ── finish 检测 ───────────────────────────────────────────────
             #

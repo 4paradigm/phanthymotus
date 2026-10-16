@@ -52,14 +52,16 @@ def installed_skills() -> list[dict]:
 def visible_skills() -> list[dict]:
     """获取对 LLM 可见的技能（UI 激活的）。"""
     if personal.enabled():
-        return []
+        from builtin_memory_skill import personal_memory_skill
+        return [personal_memory_skill()]
     return [s for s in installed_skills() if s.get('active', False)]
 
 
 def get_active_skills() -> list[dict]:
     """获取 LLM 已加载的技能（可见 + runtime activated，含完整 instruction）。"""
     if personal.enabled():
-        return []
+        from builtin_memory_skill import personal_memory_skill
+        return [personal_memory_skill()]
     return [s for s in installed_skills()
             if s.get('active', False) and s['slug'] in _runtime_activated]
 
