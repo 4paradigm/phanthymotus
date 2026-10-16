@@ -36,6 +36,7 @@ from .case_runner import CaseRunner
 from .config import Config, DEFAULT_GITHUB_REPOS, validate_repository_names
 from .cos_client import CosClient
 from .evidence_builder import EvidenceBuilder
+from .evidence_models import archive_snapshot, make_round_id, round_id_for_state, utc_now
 from .github_client import GitHubClient, GitHubError
 from .github_state_proxy import (
     GitHubStateProxy,
@@ -229,6 +230,8 @@ class DeployController:
         self._core_clients: dict[str, AgentCoreClient] = {}
         self.cos = CosClient(config)
         self._case_runner: CaseRunner | None = None
+        self._evidence_lock = asyncio.Lock()
+        self.evidence_service = None  # B attaches the shared EvidenceService instance.
         # Retry scheduling only; durable terminal state identifies pending COS
         # after restart. At most five attempts per binding per process.
         self._cos_retries: dict[tuple[str, int, str, int], tuple[int, float]] = {}
@@ -862,9 +865,10 @@ class DeployController:
                 )
                 return True
             _current_status = state.get("status", "")
-            if _current_status == "deploy-ready":
-                pass  # normal path continues below
-            elif _current_status in ("deploy-requested", "testing", "succeeded", "failed"):
+            if _current_status in ("deploy-ready", "succeeded", "failed"):
+                if comment_id <= state.get("last_processed_comment_id", 0):
+                    return True
+            elif _current_status in ("deploy-requested", "testing"):
                 logger.warning(
                     "STALE_COMMAND_IGNORED kind=request_deploy comment_id=%s current_status=%s",
                     comment_id, _current_status,
@@ -1016,12 +1020,18 @@ class DeployController:
             # Determine compatible machine groups
             machine_groups = self._get_machine_groups_for_components(components)
 
-            # Build hidden state
+            # Preserve the original round before replacing the active snapshot.
+            previous_state = copy.deepcopy(state)
             state = self._init_hidden_state(
                 head_sha=pr_head,
                 status="deploy-requested",
                 review_evidence=review_evidence_data,
                 components=components,
+            )
+            state["round_id"] = make_round_id(pr_head, comment_id)
+            state["round_started_at"] = utc_now()
+            state["round_archive"] = await self._archive_round(
+                repo, pr_number, previous_state, "New deployment request",
             )
             state["command"] = {
                 "comment_id": comment_id,
@@ -1181,14 +1191,14 @@ class DeployController:
                 state["last_processed_comment_id"] = comment_id
                 markdown = comments_mod.deploy_requested(
                     repo, pr_number, pr_head,
-                    undeployed_components,
+                    state["components"],
                     self._get_machine_groups_for_components(undeployed_components),
                     gate_note=[
                         f"Machine `{machine_alias}` does not cover any remaining component.",
                         "ZERO deploy POST.",
                         "Send a NEW `/approve_deploy machine=<alias-or-ip>` for a compatible machine.",
                     ],
-                    deployments=state.get("deployments", []),
+                    deployments=self._enrich_deployments_for_render(state["deployments"]),
                 )
                 event = {
                     "event": f"Machine `{machine_alias}` selected",
@@ -1202,13 +1212,37 @@ class DeployController:
                 return True
 
 
-            node_id = machine.node_id
-            core = await self._core_for_node(node_id)
-
-            # Preflight: read running_image for every SELECTED component before
-            # any deploy POST. running_image is evidence, not a block — Agent Core
-            # handles old-container replacement via its own deploy contract.
-            preflight = await self._preflight_running_images(core, selected_components)
+            try:
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state,
+                    self._deployment_progress_markdown(
+                        repo, pr_number, state, machine, selected_components, "Approval received; checking",
+                    ), event=None,
+                )
+                node_id = machine.node_id
+                core = await self._core_for_node(node_id)
+                preflight = await self._preflight_running_images(core, selected_components)
+            except (AgentCoreError, DeployControllerError, TimeoutError, OSError) as exc:
+                # This try block contains read-only preflight and no deploy POST.
+                fresh = await self.proxy.read_hidden_state(repo, pr_number)
+                if fresh != state:
+                    return False
+                state["command"] = {
+                    "comment_id": comment_id, "kind": "approve_deploy", "phase": "completed",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                markdown = self._deployment_progress_markdown(
+                    repo, pr_number, state, machine, selected_components,
+                    f"Preflight failed ({type(exc).__name__}); target machine/runtime unavailable or invalid. ZERO deploy POST. Send a NEW approval after recovery.",
+                )
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown,
+                    event={"event": "Preflight failed: ZERO deploy POST", "machine": machine_alias,
+                           "ip": machine.node_host, "reason": type(exc).__name__,
+                           "timestamp": comments_mod.beijing_now_str()},
+                )
+                return True
             for item in preflight:
                 item["component"]["runtime_id"] = item["runtime_id"]
             approve_attempt = {
@@ -1263,9 +1297,9 @@ class DeployController:
                 state["last_processed_comment_id"] = comment_id
                 approve_attempt["outcome"] = "approval_revoked"
                 self._record_approve_attempt(state, approve_attempt)
-                markdown = (
-                    "Approval comment was deleted, edited, or changed.\n"
-                    "A NEW approval comment is required."
+                markdown = self._deployment_progress_markdown(
+                    repo, pr_number, state, machine, selected_components,
+                    "Approval comment was deleted, edited, or changed; a NEW approval is required. ZERO deploy POST.",
                 )
                 event = {
                     "event": "Approval revoked",
@@ -1349,9 +1383,7 @@ class DeployController:
                 return True
 
             # Write executing state only after ALL gates pass.
-            # History-aware rewrite (event=None): "Deploying..." is a transient
-            # visible body, but existing visible History events MUST survive
-            # this durable persist that happens before the unsafe deploy POST.
+            # Persist the complete template before any deploy POST.
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
@@ -1364,7 +1396,10 @@ class DeployController:
                 },
             }
             await self._write_lifecycle_with_history(
-                repo, pr_number, state, "Deploying...", event=None,
+                repo, pr_number, state,
+                self._deployment_progress_markdown(
+                    repo, pr_number, state, machine, selected_components, "Deploying",
+                ), event=None,
             )
 
             new_deployments = []
@@ -1405,6 +1440,13 @@ class DeployController:
                     deploy_error = f"missing runtime id for {comp_target}"
                     break
 
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state,
+                    self._deployment_progress_markdown(
+                        repo, pr_number, state, machine, [comp],
+                        "Deploying and verifying Core" if comp_target == "core" else "Deploying component",
+                    ), event=None,
+                )
                 # Route core through self-update path; non-core via existing path
                 if comp_target == "core":
                     # Core has no automated case; runtime_id is always "core"
@@ -1451,6 +1493,12 @@ class DeployController:
                         deploy_error = str(e)
                         break
 
+                    await self._write_lifecycle_with_history(
+                        repo, pr_number, state,
+                        self._deployment_progress_markdown(
+                            repo, pr_number, state, machine, [comp], "Verifying target image",
+                        ), event=None,
+                    )
                     # Post-deploy verification: confirm target image is actually running
                     verified, health_evidence = await self._verify_deployed_runtime(
                         core, node_id, component_id, runtime_id, image_ref,
@@ -1492,7 +1540,10 @@ class DeployController:
                     pr_number,
                     pr_head,
                     state.get("components", []),
-                    self._get_machine_groups_for_components(state.get("components", [])),
+                    self._get_machine_groups_for_components([
+                        c for c in state.get("components", [])
+                        if c.get("component_id", "") not in _component_id_set(state["deployments"])
+                    ]),
                     gate_note=[
                         "### Restart Recovery",
                         "",
@@ -1500,6 +1551,7 @@ class DeployController:
                         f"Send a NEW `/approve_deploy machine={machine_alias}`.",
                         "No further deploy POSTs are allowed in this cycle.",
                     ],
+                    deployments=self._enrich_deployments_for_render(state["deployments"]),
                 )
                 event = {
                     "event": "Deploy outcome uncertain",
@@ -1644,7 +1696,7 @@ class DeployController:
                 ]
                 markdown = comments_mod.deploy_requested(
                     repo, pr_number, pr_head,
-                    remaining,
+                    state["components"],
                     self._get_machine_groups_for_components(remaining),
                     gate_note=[
                         "### Partial coverage completed",
@@ -1653,6 +1705,7 @@ class DeployController:
                         f"Remaining components need additional machine approval.",
                         "Send a NEW `/approve_deploy machine=<alias-or-ip>`.",
                     ],
+                    deployments=self._enrich_deployments_for_render(state["deployments"]),
                 )
                 machine_info = self.policy.get_machine(machine_alias)
                 deploy_event = {
@@ -3462,6 +3515,117 @@ class DeployController:
         if not isinstance(written, dict):
             raise GitHubStateProxyError("preflight archive: lifecycle write was not confirmed")
 
+    def _deployment_progress_markdown(self, repo, pr_number, state, machine, components, phase):
+        deployed = _component_id_set(state.get("deployments", []))
+        remaining = [c for c in state.get("components", []) if c.get("component_id") not in deployed]
+        targets = ", ".join(str(c.get("component_id", "")) for c in components)
+        return comments_mod.deploy_requested(
+            repo, pr_number, state["head_sha"], state.get("components", []),
+            self._get_machine_groups_for_components(remaining),
+            deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+            gate_note=[f"{phase}: `{machine.alias}` / `{machine.node_host}`; components: {targets}; "
+                       f"{comments_mod.beijing_now_str()}"],
+        )
+
+    async def _archive_round(self, repo, pr_number, state, reason):
+        async with self._evidence_lock:
+            return await self._archive_round_unlocked(repo, pr_number, state, reason)
+
+    async def _archive_round_unlocked(self, repo, pr_number, state, reason):
+        rid = round_id_for_state(state)
+        records = await self.proxy.read_evidence_records(repo, pr_number)
+        attachments = [r for r in records if r["kind"] in ("operation", "attachment")
+                       and r["data"].get("round_id") == rid]
+        snapshot = archive_snapshot(repo, pr_number, state, utc_now(), reason)
+        snapshot["attachment_records"] = attachments
+        content = {"snapshot": snapshot["snapshot"], "attachment_records": attachments}
+        import json
+        key = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        existing = next((r for r in records if r["kind"] == "round" and r["key"] == key), None)
+        record = existing or await self.proxy.write_evidence_record(repo, pr_number, "round", key, snapshot)
+        return {"round_id": rid, "comment_id": record["comment_id"],
+                "url": record["url"], "sha256": record["sha256"]}
+
+    async def _render_evidence_projection(self, repo, pr_number, state, visible):
+        renderer = getattr(comments_mod, "render_evidence_section", None)
+        if renderer is None:
+            return visible
+        records = await self.proxy.read_evidence_records(repo, pr_number)
+        archives = [dict(r["data"], url=r["url"], comment_id=r["comment_id"])
+                    for r in records if r["kind"] == "round"]
+        attachments = [r["data"] for r in records if r["kind"] == "attachment"]
+        latest = {r["attachment_id"]: r for r in attachments}
+        current_round = round_id_for_state(state)
+        current_rows = [r for r in latest.values() if r["round_id"] == current_round]
+        bundles = []
+        seen_rounds = set()
+        for archive in reversed(archives):
+            if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
+                continue
+            seen_rounds.add(archive["round_id"])
+            snapshot = copy.deepcopy(archive["snapshot"])
+            snapshot["deployments"] = self._enrich_deployments_for_render(snapshot.get("deployments", []))
+            snapshot["attachments"] = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
+            bundles.append({**archive, "snapshot": snapshot})
+            if len(bundles) == 3:
+                break
+        # Presentation flags are deliberately ephemeral. Hidden state has a
+        # strict schema and must never learn about browser feature config.
+        render_state = copy.deepcopy(state)
+        pr = {}
+        try:
+            from .evidence_auth import disabled_reason
+            pr = await self.proxy.get_pr(repo, pr_number)
+            store = getattr(self.evidence_service, "store", None)
+            evidence_enabled = (self.evidence_service is not None
+                                and callable(getattr(store, "dispatch", None))
+                                and not disabled_reason(self.config)
+                                and pr.get("state") == "open" and not pr.get("merged"))
+        except Exception:
+            evidence_enabled = False
+        render_state.update(
+            evidence_enabled=bool(evidence_enabled),
+            enabled=bool(evidence_enabled),
+            pr_state=(pr.get("state") if evidence_enabled else "closed"),
+            merged=(bool(pr.get("merged")) if evidence_enabled else False),
+        )
+        section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, archives[-4:],
+                           public_base_url=getattr(self.config, "evidence_public_base_url", ""))
+        if not isinstance(section, str):
+            raise GitHubStateProxyError("Evidence renderer must return markdown")
+        section += ("\n\nAttachment preview is bounded; complete records and archive chains remain in trusted GitHub "
+                    "comments and the authenticated evidence page.")
+        start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
+        if start in visible or end in visible:
+            if visible.count(start) != 1 or visible.count(end) != 1 or visible.index(start) >= visible.index(end):
+                raise GitHubStateProxyError("Malformed evidence projection")
+            before, rest = visible.split(start, 1)
+            _, after = rest.split(end, 1)
+            visible = before.rstrip() + after
+        return visible.rstrip() + "\n\n" + start + "\n" + section + "\n" + end
+
+    async def project_evidence(self, repo: str, pr_number: int) -> None:
+        """Watcher-only projection. HTTP handlers never call this writer."""
+        if self.evidence_service is None:
+            return
+        pr = await self.proxy.get_pr(repo, pr_number)
+        if pr.get("state") != "open" or pr.get("merged"):
+            return
+        comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+        if comment is None:
+            return
+        body = comment.get("body", "")
+        state = _extract_hidden_state(body)
+        if state is None:
+            raise GitHubStateProxyError("Evidence projection has no trusted state")
+        if pr.get("head", {}).get("sha") != state.get("head_sha"):
+            return
+        from .github_state_proxy import HIDDEN_STATE_MARKER
+        visible = body.split(HIDDEN_STATE_MARKER, 1)[0].rstrip()
+        await self._write_lifecycle_with_history(
+            repo, pr_number, state, visible, evidence_projection_only=True,
+        )
+
     async def _write_lifecycle_with_history(
         self,
         repo: str,
@@ -3473,6 +3637,7 @@ class DeployController:
         expected_record_test_state: dict | None = None,
         expected_terminal_state: dict | None = None,
         expected_record_test_comment: dict | None = None,
+        evidence_projection_only: bool = False,
     ) -> bool:
         """Write lifecycle comment with automatic history management.
 
@@ -3480,40 +3645,82 @@ class DeployController:
         Legacy v1 migration is handled automatically on first meaningful event.
         Preserves existing History events across lifecycle rewrites.
         """
+        archive_source = None
         async def write_if_current(visible: str) -> bool:
-            # History/archive discovery also awaits GitHub. Recheck after all
-            # of those awaits, immediately before a terminal record_test write.
-            if expected_record_test_state is not None:
-                fresh = await self._revalidate_record_test_state(
-                    repo, pr_number, expected_record_test_state,
-                    "pass" if state.get("status") == "succeeded" else "fail",
-                    expected_comment=expected_record_test_comment,
+            async with self._evidence_lock:
+                if archive_source is not None:
+                    # Final recapture includes any attachment committed while
+                    # the initial archive/projection was being assembled.
+                    state["round_archive"] = await self._archive_round_unlocked(
+                        repo, pr_number, archive_source, "Lifecycle snapshot replaced",
+                    )
+                # History/archive discovery also awaits GitHub. Recheck after all
+                # of those awaits, immediately before a terminal record_test write.
+                if expected_record_test_state is not None:
+                    fresh = await self._revalidate_record_test_state(
+                        repo, pr_number, expected_record_test_state,
+                        "pass" if state.get("status") == "succeeded" else "fail",
+                        expected_comment=expected_record_test_comment,
+                    )
+                    if fresh is None:
+                        return False
+                if expected_terminal_state is not None:
+                    pr = await self.proxy.get_pr(repo, pr_number)
+                    fresh = await self.proxy.read_hidden_state(repo, pr_number)
+                    if (fresh != expected_terminal_state
+                            or pr.get("head", {}).get("sha") != state.get("head_sha")
+                            or pr.get("state") != "open" or pr.get("merged")):
+                        return False
+                current_pr = await self.proxy.get_pr(repo, pr_number)
+                if (current_pr.get("state") != "open" or current_pr.get("merged")
+                        or current_pr.get("head", {}).get("sha") != state.get("head_sha")):
+                    raise GitHubStateProxyError("Lifecycle PR context changed before write")
+                current_comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+                if ((comment is None) != (current_comment is None)
+                        or (comment is not None and (
+                            current_comment.get("id") != comment.get("id")
+                            or current_comment.get("body") != comment.get("body")))):
+                    raise GitHubStateProxyError("Lifecycle History changed before write")
+                written = await self.proxy.write_hidden_state(
+                    repo, pr_number, visible, state,
+                    expected_comment=((comment.get("id"), comment.get("body"))
+                                      if comment is not None else (None, None)),
                 )
-                if fresh is None:
-                    return False
-            if expected_terminal_state is not None:
-                pr = await self.proxy.get_pr(repo, pr_number)
-                fresh = await self.proxy.read_hidden_state(repo, pr_number)
-                if (fresh != expected_terminal_state
-                        or pr.get("head", {}).get("sha") != state.get("head_sha")
-                        or pr.get("state") != "open" or pr.get("merged")):
-                    return False
-            current_comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
-            if ((comment is None) != (current_comment is None)
-                    or (comment is not None and (
-                        current_comment.get("id") != comment.get("id")
-                        or current_comment.get("body") != comment.get("body")))):
-                raise GitHubStateProxyError("Lifecycle History changed before write")
-            written = await self.proxy.write_hidden_state(
-                repo, pr_number, visible, state,
-                expected_comment=((comment.get("id"), comment.get("body"))
-                                  if comment is not None else (None, None)),
-            )
-            if not isinstance(written, dict):
-                raise GitHubStateProxyError("Lifecycle state write was not confirmed")
-            return True
+                if not isinstance(written, dict):
+                    raise GitHubStateProxyError("Lifecycle state write was not confirmed")
+                return True
 
         comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+        if comment is not None:
+            old = _extract_hidden_state(comment.get("body", ""))
+            if old is None:
+                raise GitHubStateProxyError("Cannot replace unreadable prior round")
+            old = _validate_hidden_state(old)
+            old_round = round_id_for_state(old)
+            head_changed = old.get("head_sha") != state.get("head_sha")
+            if "round_id" not in state and not head_changed:
+                state["round_id"] = old_round
+            round_changed = state.get("round_id") != old_round
+            lost_fields = any(old.get(k) and not state.get(k) for k in
+                              ("components", "deployments", "case_results", "review_evidence", "approve_attempts", "test_result"))
+            lost_attempt = any(a not in state.get("approve_attempts", []) for a in old.get("approve_attempts", []))
+            destructive = (head_changed or round_changed or lost_fields or lost_attempt
+                           or (old.get("cos", {}).get("object_key") and any(
+                               old["cos"].get(k) != state.get("cos", {}).get(k)
+                               for k in ("object_key", "sha256", "size"))))
+            if destructive:
+                archive_source = copy.deepcopy(old)
+                state["round_archive"] = await self._archive_round(repo, pr_number, old, "Lifecycle snapshot replaced")
+                if head_changed or (lost_fields and not round_changed):
+                    state["round_id"] = make_round_id(state["head_sha"], state.get("command", {}).get("comment_id", 0))
+                    state["round_started_at"] = utc_now()
+            if "round_started_at" not in state and old.get("round_started_at") and not head_changed and not round_changed:
+                state["round_started_at"] = old["round_started_at"]
+            if evidence_projection_only:
+                projected = await self._render_evidence_projection(repo, pr_number, state, new_visible_markdown)
+                if projected == new_visible_markdown:
+                    return True
+                return await write_if_current(projected)
         if comment is None:
             if events is not None:
                 # Multiple events: newest-first; then insert existing fresh markdown
@@ -3644,7 +3851,8 @@ class DeployController:
             else:
                 final_visible += "\n\n" + archives_block
 
-        # 4. Write the final state
+        # Projection is supplied only from trusted independent records.
+        final_visible = await self._render_evidence_projection(repo, pr_number, state, final_visible)
         return await write_if_current(final_visible)
 
     def _discover_trusted_archive_links(
@@ -3823,7 +4031,7 @@ class DeployController:
         pr_merged = pr_data.get("merged", False)
         current_head = str(pr_data.get("head", {}).get("sha", "") or "")
 
-        if state is None and (pr_state != "open" or pr_merged):
+        if pr_state != "open" or pr_merged:
             return
 
         if state is not None:
@@ -4415,7 +4623,8 @@ class DeployController:
         # Symmetric set comparison: detects added, removed, and changed components.
         semantic_changed = old_semantic_duplicate or old_semantic_keys != fresh_semantic_keys
 
-        if evidence_changed or semantic_changed:
+        snapshot_reset = evidence_changed or semantic_changed
+        if snapshot_reset:
             # Genuinely different build/evidence — reset to fresh snapshot.
             fresh_reset_components: list[dict] = []
             for component in fresh_components:
@@ -4471,6 +4680,7 @@ class DeployController:
                         break
 
             if not _migration_ok:
+                snapshot_reset = True
                 # Fall through to the reset branch below.
                 fresh_reset_components: list[dict] = []
                 for component in fresh_components:
@@ -4554,7 +4764,13 @@ class DeployController:
                 updated_state["last_processed_comment_id"] = max(old_cursor, comment_id)
                 updated_state["components"] = migrated
 
-        if not await self._recover_uncertain_deployments(state, updated_state):
+        if snapshot_reset:
+            # A fresh build must never adopt old runtime/image provenance as
+            # this round's deployment. Only a new approval may deploy it.
+            build_id = review_evidence_data.get("build_comment_id") or comment_id
+            updated_state["round_id"] = make_round_id(current_head, build_id)
+            updated_state["round_started_at"] = utc_now()
+        if not snapshot_reset and not await self._recover_uncertain_deployments(state, updated_state):
             logger.warning("uncertain deployment remains pending; refusing repeated POST %s#%s", repo, pr_number)
             return "uncertain"
         if not await self._fresh_review_evidence_matches_state(
@@ -4579,9 +4795,12 @@ class DeployController:
         markdown = comments_mod.deploy_requested(
             repo, pr_number, current_head,
             state.get("components", []),
-            self._get_machine_groups_for_components(state.get("components", [])),
+            self._get_machine_groups_for_components([
+                c for c in state.get("components", [])
+                if c.get("component_id", "") not in _component_id_set(state.get("deployments", []))
+            ]),
             gate_note=gate_note,
-            deployments=state.get("deployments", []),
+            deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
         )
         if state["status"] == "testing":
             markdown = comments_mod.testing(repo, pr_number, current_head, case_result="")

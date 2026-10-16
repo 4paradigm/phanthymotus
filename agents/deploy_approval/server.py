@@ -21,6 +21,9 @@ from .github_command_watcher import GitHubCommandWatcher
 from .policy import Policy
 from .router_webhook import router as webhook_router
 from .service import DeployController
+from .evidence_api import router as evidence_router
+from .evidence_auth import disabled_reason
+from .evidence_store import CosAttachmentStore
 
 # Install logsafe before any logging to prevent control chars from corrupting container logs.
 # This must run before logging.basicConfig and uvicorn startup.
@@ -293,6 +296,23 @@ def create_app(config: Config | None = None):
         agent_core_factory=None,
     )
 
+    store = CosAttachmentStore(config)
+    evidence_service = None
+    reason = disabled_reason(config)
+    if not reason:
+        from .evidence_service import EvidenceService
+        evidence_service = EvidenceService(
+            config=config, github=github, proxy=proxy, policy=policy,
+            controller=controller, store=store,
+        )
+        # A's existing serial watcher calls controller.project_evidence().
+        controller.evidence_service = evidence_service
+    else:
+        # C emits stable upload links only with a usable public base. Missing
+        # credentials must not advertise an upload feature that cannot work.
+        config.evidence_public_base_url = ""
+        logger.info("browser evidence disabled: %s", reason)
+
     # Single serial command watcher
     watcher = GitHubCommandWatcher(config, proxy, controller, github=github, github_auth=github_auth)
 
@@ -333,12 +353,15 @@ def create_app(config: Config | None = None):
     app.state.controller = controller
     app.state.proxy = proxy
     app.state.watcher = watcher
+    app.state.evidence_service = evidence_service
+    app.state.evidence_store = store
 
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok"}
 
     app.include_router(webhook_router)
+    app.include_router(evidence_router)
     return app
 
 

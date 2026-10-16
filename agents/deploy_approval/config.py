@@ -120,6 +120,17 @@ class Config:
 
 
 
+    # Missing browser credentials disables only the optional evidence feature.
+    deploy_evidence_enabled: bool = False
+    evidence_public_base_url: str = ""
+    evidence_oauth_client_id: str = ""
+    evidence_oauth_client_secret: str = field(default="", repr=False)
+    evidence_session_key: str = field(default="", repr=False)
+    evidence_max_file_bytes: int = 512 * 1024 * 1024
+    evidence_max_video_bytes: int = 512 * 1024 * 1024
+    evidence_part_bytes: int = 8 * 1024 * 1024
+    evidence_max_note_bytes: int = 64 * 1024
+
     # Agent Core access tokens keyed by machine alias
     agent_core_tokens: dict[str, str] = field(
         default_factory=dict,
@@ -345,6 +356,14 @@ def load_config() -> Config:
         cos_bucket=cos.get("bucket", ""),
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
+        deploy_evidence_enabled=_env_bool("DEPLOY_EVIDENCE_ENABLED", False),
+        evidence_public_base_url=os.getenv("EVIDENCE_PUBLIC_BASE_URL", "").rstrip("/"),
+        evidence_oauth_client_id=os.getenv("EVIDENCE_OAUTH_CLIENT_ID", ""),
+        evidence_oauth_client_secret=os.getenv("EVIDENCE_OAUTH_CLIENT_SECRET", ""),
+        evidence_session_key=os.getenv("EVIDENCE_SESSION_KEY", ""),
+        evidence_max_file_bytes=_env_int("EVIDENCE_MAX_FILE_BYTES", 512 * 1024 * 1024, max_val=512 * 1024 * 1024),
+        evidence_max_video_bytes=_env_int("EVIDENCE_MAX_VIDEO_BYTES", 512 * 1024 * 1024, max_val=512 * 1024 * 1024),
+        evidence_part_bytes=_env_int("EVIDENCE_PART_BYTES", 8 * 1024 * 1024, min_val=1024 * 1024, max_val=512 * 1024 * 1024),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
         agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),
         agent_core_ca_pem=secrets.get("agent_core_ca_pem", {}),
@@ -354,6 +373,13 @@ def load_config() -> Config:
 
 
 def validate_config(cfg: Config) -> None:
+    for name, lower, upper in (("evidence_max_file_bytes", 1, 512 * 1024 * 1024),
+                               ("evidence_max_video_bytes", 1, 512 * 1024 * 1024),
+                               ("evidence_part_bytes", 1024 * 1024, 512 * 1024 * 1024),
+                               ("evidence_max_note_bytes", 1, 64 * 1024)):
+        value = getattr(cfg, name)
+        if isinstance(value, bool) or not isinstance(value, int) or not lower <= value <= upper:
+            raise ValueError(f"{name} is outside the evidence size bounds")
     cfg.github_repos = validate_repository_names(cfg.github_repos)
     if not cfg.poll_enabled:
         raise ValueError(

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
+import html
+import json
 from zoneinfo import ZoneInfo
 
 import urllib.parse
@@ -75,7 +77,60 @@ def _compact_image_ref(image_ref: str) -> str:
 
 
 def _escape(text: str) -> str:
-    return (text or "").replace("`", "").replace("\r", " ").replace("\n", " ")[:500]
+    """Escape untrusted text for Markdown cells, inline code and HTML."""
+    value = str(text if text is not None else "")
+    value = html.escape(value, quote=True).replace("\r", " ").replace("\n", " ")
+    for char in "`|[]*_~\\":
+        value = value.replace(char, f"&#{ord(char)};")
+    return value
+
+
+def _lifecycle_body(lines: list[str]) -> str:
+    # The service owns the visible event block; this sentinel does not create a
+    # second visible-history block when that writer preserves existing events.
+    return "\n".join([*lines, "<!-- deploy-approval-history -->"])
+
+
+def _deployment_table(deployments=None, components=None, machine_groups=None) -> str:
+    snapshots = {c.get("component_id"): c for c in components or [] if isinstance(c, dict)}
+    machines = {m.get("alias"): m.get("ip", "") for m in machine_groups or [] if isinstance(m, dict)}
+    lines = ["| Machine | IP | Component | Variant/Path | Image | Result |",
+             "|---|---|---|---|---|---|"]
+    count = 0
+    for dep in deployments or []:
+        if not isinstance(dep, dict):
+            continue
+        local = dict(snapshots)
+        snapshot = dep.get("components", dep.get("component_snapshot", []))
+        if isinstance(snapshot, dict):
+            snapshot = ([snapshot] if "component_id" in snapshot else
+                        [dict(c, component_id=k) for k, c in snapshot.items() if isinstance(c, dict)])
+        snapshot_ids = []
+        for c in snapshot or []:
+            if isinstance(c, dict):
+                local[c.get("component_id")] = c
+                if c.get("component_id"):
+                    snapshot_ids.append(c["component_id"])
+        machine = dep.get("machine", dep.get("alias", "?"))
+        ip = dep.get("ip") or machines.get(machine) or "—"
+        phase = dep.get("phase") or dep.get("result") or dep.get("status") or "unknown"
+        result = str(phase)
+        if dep.get("error"):
+            result += ": " + str(dep["error"])
+        if dep.get("updated_at") or dep.get("timestamp"):
+            result += " · " + str(dep.get("updated_at") or dep.get("timestamp"))
+        ids = dep.get("component_ids") or ([dep["component_id"]] if dep.get("component_id") else snapshot_ids or ["unknown"])
+        for cid in ids:
+            c = local.get(cid, dep if dep.get("component_id") == cid else {})
+            values = (machine, ip, c.get("target") or cid,
+                      c.get("variant") or c.get("driver_path") or "—",
+                      c.get("image_ref") or dep.get("image_ref") or "—", result)
+            lines.append("| " + " | ".join(_escape(v) for v in values) + " |")
+            count += 1
+    if count:
+        return "\n".join(lines)
+    return ("Deployment records exist; details unavailable." if deployments else
+            "No deployment has been performed yet.")
 
 
 def _safe_download_url(url: str) -> str:
@@ -141,10 +196,9 @@ def _cos_evidence_block(
     if size:
         text += f" \u00b7 `{_human_size(size)}`"
     lines.append(text)
-    safe_url = _safe_download_url(download_url)
-    if safe_url:
-        lines.append(f"[Download COS evidence]({safe_url})")
-    elif (isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
+    # Keep the argument for existing callers, but never persist expiring COS
+    # URLs in the lifecycle summary. render_evidence_section owns stable links.
+    if (isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
             and isinstance(size, int) and not isinstance(size, bool)
             and 1 <= size <= 10 * 1024 * 1024):
         lines.append("For a short-lived download link, post `/evidence_link` on this open PR.")
@@ -237,7 +291,7 @@ def review_required(
     repo: str, pr_number: int, head_sha: str, last_lifecycle_event: str = "",
 ) -> str:
     """status: review-required \u2014 initial comment with full 8-step workflow."""
-    return "\n".join([
+    return _lifecycle_body([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
@@ -267,7 +321,7 @@ def review_required(
 def reviewing(
     repo: str, pr_number: int, head_sha: str, last_lifecycle_event: str = "",
 ) -> str:
-    return "\n".join([
+    return _lifecycle_body([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
@@ -342,7 +396,7 @@ def deploy_ready(
         "",
         last_lifecycle_event_line(last_lifecycle_event),
     ])
-    return "\n".join(lines)
+    return _lifecycle_body(lines)
 
 
 def deploy_requested(
@@ -352,6 +406,9 @@ def deploy_requested(
     gate_note: list[str] | None = None,
     deployments: list[dict] | None = None,
     last_lifecycle_event: str = "",
+    all_components: list[dict] | None = None,
+    component_snapshot: list[dict] | None = None,
+    attempt: dict | None = None,
 ) -> str:
     """status: deploy-requested with IP table, workflow, deployment, history."""
     # Build component labels
@@ -383,7 +440,10 @@ def deploy_requested(
             continue
         alias = mg.get("alias", "?")
         ip = mg.get("ip", "")
-        cids = mg.get("component_ids", [])
+        remaining_ids = {c.get("component_id") for c in components if isinstance(c, dict)}
+        cids = [cid for cid in mg.get("component_ids", []) if cid in remaining_ids]
+        if not cids:
+            continue
         comp_labels = []
         for cid in cids:
             for c in components if isinstance(components, list) else []:
@@ -403,7 +463,7 @@ def deploy_requested(
                 for c in (components or [])
             ):
                 comp_labels.append(cid)
-        ip_str = f"`{ip}`" if ip else "`\u2014`"
+        ip_str = f"`{_escape(ip)}`" if ip else "`\u2014`"
         comps_str = (
             ", ".join(f"`{_escape(l)}`" for l in comp_labels) if comp_labels else "`none`"
         )
@@ -438,7 +498,7 @@ def deploy_requested(
         "",
     ])
 
-    if table_lines:
+    if len(table_lines) > 2:
         lines.extend(table_lines)
     else:
         lines.extend(["No compatible machines found.", ""])
@@ -448,57 +508,27 @@ def deploy_requested(
 
     # Current Deployment section
     lines.extend(["", "### Current Deployment", ""])
-    if deployments:
-        dep_lines = [
-            "| Machine | IP | Component | Variant/Path | Image | Result |",
-            "|---|---|---|---|---|---|",
-        ]
-        for dep in deployments:
-            if not isinstance(dep, dict):
-                continue
-            machine = dep.get("machine", "?")
-            # Prefer enriched IP from deployment row (resolved from policy),
-            # fallback to remaining machine_groups lookup.
-            dep_ip = dep.get("ip", "")
-            if not dep_ip:
-                for mg in machine_groups:
-                    if isinstance(mg, dict) and mg.get("alias") == machine:
-                        dep_ip = mg.get("ip", "")
-                        break
-            for cid in dep.get("component_ids", []):
-                comp_target = cid
-                comp_variant = ""
-                comp_driver = ""
-                comp_image = ""
-                for c in components if isinstance(components, list) else []:
-                    if isinstance(c, dict) and c.get("component_id") == cid:
-                        comp_target = c.get("target", cid)
-                        comp_variant = c.get("variant", "") or ""
-                        comp_driver = c.get("driver_path", "") or ""
-                        comp_image = c.get("image_ref", "") or ""
-                        break
-                vpath = comp_variant if comp_variant else (comp_driver if comp_driver else "\u2014")
-                img_display = _compact_image_ref(comp_image) if comp_image else "\u2014"
-                dep_lines.append(
-                    f"| `{_escape(machine)}` | `{dep_ip}` | `{_escape(comp_target)}` "
-                    f"| `{_escape(vpath)}` | `{img_display}` | `deployed` |"
-                )
-        lines.extend(dep_lines)
-    else:
-        lines.append("No deployment has been performed yet.")
+    lines.append(_deployment_table(
+        deployments, all_components or component_snapshot or components, machine_groups,
+    ))
+    lines.extend(_attempt_lines(attempt))
 
     lines.extend([
         "",
         last_lifecycle_event_line(last_lifecycle_event),
     ])
 
-    return "\n".join(lines)
+    return _lifecycle_body(lines)
 
 
 def testing(
     repo: str, pr_number: int, head_sha: str,
     deployment_id: str = "", case_result: str = "",
     last_lifecycle_event: str = "",
+    deployments: list[dict] | None = None,
+    components: list[dict] | None = None,
+    machine_groups: list[dict] | None = None,
+    attempt: dict | None = None,
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -521,7 +551,7 @@ def testing(
         "",
         "### Current Deployment",
         "",
-        "All required components have been deployed.",
+        "Deployment validation is in progress; see recorded deployment results below.",
     ]
     if case_result:
         lines.extend([
@@ -533,7 +563,10 @@ def testing(
         "",
         last_lifecycle_event_line(last_lifecycle_event),
     ])
-    return "\n".join(lines)
+    lines.extend(_attempt_lines(attempt))
+    if deployments:
+        lines.extend(["### Deployment records", _deployment_table(deployments, components, machine_groups)])
+    return _lifecycle_body(lines)
 
 
 def succeeded_comment(
@@ -565,51 +598,15 @@ def succeeded_comment(
         "### Current Deployment",
         "",
     ]
-    if deployments and components:
-        dep_lines = [
-            "| Machine | IP | Component | Variant/Path | Image | Result |",
-            "|---|---|---|---|---|---|",
-        ]
-        for dep in deployments:
-            if not isinstance(dep, dict):
-                continue
-            machine = dep.get("machine", "?")
-            # Prefer enriched IP from deployment row (resolved from policy),
-            # fallback to machine_groups lookup if not enriched.
-            dep_ip = dep.get("ip", "")
-            if not dep_ip and machine_groups:
-                for mg in machine_groups:
-                    if isinstance(mg, dict) and mg.get("alias") == machine:
-                        dep_ip = mg.get("ip", "")
-                        break
-            for cid in dep.get("component_ids", []):
-                comp_target = cid
-                comp_variant = ""
-                comp_driver = ""
-                comp_image = ""
-                for c in components:
-                    if isinstance(c, dict) and c.get("component_id") == cid:
-                        comp_target = c.get("target", cid)
-                        comp_variant = c.get("variant", "") or ""
-                        comp_driver = c.get("driver_path", "") or ""
-                        comp_image = c.get("image_ref", "") or ""
-                        break
-                vpath = comp_variant if comp_variant else (comp_driver if comp_driver else "\u2014")
-                img_display = _compact_image_ref(comp_image) if comp_image else "\u2014"
-                dep_lines.append(
-                    f"| `{_escape(machine)}` | `{dep_ip}` | `{_escape(comp_target)}` "
-                    f"| `{_escape(vpath)}` | `{img_display}` | `deployed` |"
-                )
-        lines.extend(dep_lines)
-    else:
-        lines.append("Deployment completed.")
+    lines.append(_deployment_table(deployments, components, machine_groups)
+                 if deployments else "Deployment completed; deployment records unavailable.")
 
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
     lines.extend([
         "",
         last_lifecycle_event_line(last_lifecycle_event),
     ])
-    return "\n".join(lines)
+    return _lifecycle_body(lines)
 
 
 def failed_comment(
@@ -617,6 +614,10 @@ def failed_comment(
     error: str = "", cos_object_key: str = "", cos_bundle_sha256: str = "",
     cos_bundle_size: int = 0, cos_download_url: str = "",
     last_lifecycle_event: str = "",
+    deployments: list[dict] | None = None,
+    components: list[dict] | None = None,
+    machine_groups: list[dict] | None = None,
+    attempt: dict | None = None,
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -644,14 +645,17 @@ def failed_comment(
         "",
         last_lifecycle_event_line(last_lifecycle_event),
     ])
-    return "\n".join(lines)
+    lines.extend(_attempt_lines(attempt))
+    if deployments:
+        lines.extend(["### Deployment records", _deployment_table(deployments, components, machine_groups)])
+    return _lifecycle_body(lines)
 
 
 def superseded_comment(
     repo: str, pr_number: int, old_head: str, new_head: str,
     last_lifecycle_event: str = "",
 ) -> str:
-    return "\n".join([
+    return _lifecycle_body([
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
@@ -680,8 +684,12 @@ def superseded_comment(
 def uncertain_comment(
     repo: str, pr_number: int, head_sha: str,
     last_lifecycle_event: str = "",
+    deployments: list[dict] | None = None,
+    components: list[dict] | None = None,
+    machine_groups: list[dict] | None = None,
+    attempt: dict | None = None,
 ) -> str:
-    return "\n".join([
+    lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
@@ -704,7 +712,11 @@ def uncertain_comment(
         "Only a NEW `/approve_deploy` starts recovery validation.",
         "",
         last_lifecycle_event_line(last_lifecycle_event),
-    ])
+    ]
+    lines.extend(_attempt_lines(attempt))
+    if deployments:
+        lines.extend(["### Current Deployment", _deployment_table(deployments, components, machine_groups)])
+    return _lifecycle_body(lines)
 
 
 def deploy_status_comment(
@@ -714,6 +726,8 @@ def deploy_status_comment(
     cos_object_key: str = "", cos_bundle_sha256: str = "",
     cos_bundle_size: int = 0, cos_download_url: str = "",
     last_lifecycle_event: str = "",
+    machine_groups: list[dict] | None = None,
+    attempt: dict | None = None,
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -735,14 +749,8 @@ def deploy_status_comment(
             target = c.get("target", "")
             lines.append(f"- {_escape(target)}")
         lines.append("")
-    if deployments:
-        lines.append("Deployments:")
-        for d in deployments:
-            machine = d.get("machine", "")
-            comps = ", ".join(d.get("component_ids", []))
-            lines.append(f"- {_escape(machine)}: {comps}")
-        lines.append("")
-        lines.append("")
+    lines.extend(["### Current Deployment", "", _deployment_table(deployments, components, machine_groups), ""])
+    lines.extend(_attempt_lines(attempt))
     lines.extend(_cos_evidence_block(
         cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url,
     ))
@@ -750,7 +758,26 @@ def deploy_status_comment(
         "",
         last_lifecycle_event_line(last_lifecycle_event),
     ])
-    return "\n".join(lines)
+    return _lifecycle_body(lines)
+
+
+def deploying_comment(
+    repo: str, pr_number: int, head_sha: str,
+    deployments: list[dict] | None = None,
+    components: list[dict] | None = None,
+    machine_groups: list[dict] | None = None,
+    attempt: dict | None = None,
+    last_lifecycle_event: str = "",
+) -> str:
+    """Full lifecycle body for the service's transient executing phase."""
+    details = dict(attempt or {})
+    details.setdefault("phase", "executing")
+    return deploy_status_comment(
+        "deploy-requested", head_sha, repo, pr_number,
+        components=components, deployments=deployments,
+        machine_groups=machine_groups, attempt=details,
+        last_lifecycle_event=last_lifecycle_event,
+    )
 
 
 def deploy_help_text(topic: str = "") -> str:
@@ -828,3 +855,190 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/deploy_help approve_deploy`",
         "- `/deploy_help record_test`",
     ])
+
+
+def _attempt_lines(attempt: dict | None) -> list[str]:
+    if not attempt:
+        return []
+    values = {
+        "Machine": attempt.get("machine") or attempt.get("alias") or "unknown",
+        "IP": attempt.get("ip") or "unknown",
+        "Components": attempt.get("component_ids") or attempt.get("components") or attempt.get("args", {}).get("pending_component_ids") or "unknown",
+        "Phase": attempt.get("phase") or "unknown",
+        "Time": attempt.get("timestamp") or attempt.get("updated_at") or attempt.get("started_at") or "unknown",
+        "Error": attempt.get("error") or "—",
+    }
+    return ["", "### Deployment attempt", "", *[
+        f"- **{label}:** {_escape(value)}" for label, value in values.items()
+    ]]
+
+
+def _public_base(value: str) -> str:
+    """Only an explicitly configured HTTP(S) origin/path can enable links."""
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme not in {"https", "http"} or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or any(c in value for c in '<>"\\')):
+            return ""
+        return value.rstrip("/")
+    except ValueError:
+        return ""
+
+
+def _evidence_path(repo: str, pr_number: int) -> str:
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) and p not in {'.', '..'} for p in parts):
+        return ""
+    if type(pr_number) is not int or pr_number <= 0:
+        return ""
+    return f"/api/evidence/{parts[0]}/{parts[1]}/pulls/{pr_number}"
+
+
+def _trusted_archive_url(url: str, repo: str, pr_number: int, base: str) -> str:
+    """Archive input is from trusted discovery, never arbitrary record URLs."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username or parsed.password or any(c in url for c in '\r\n<>"\\'):
+            return ""
+        prefix = f"/{repo}/"
+        if (parsed.scheme == 'https' and parsed.netloc == 'github.com'
+                and parsed.path in {prefix + f'issues/{pr_number}', prefix + f'pull/{pr_number}'}
+                and re.fullmatch(r'issuecomment-[0-9]+', parsed.fragment) and not parsed.query):
+            return url
+        if base and url.startswith(base + _evidence_path(repo, pr_number) + '/'):
+            return url if not parsed.query and not parsed.fragment else ""
+    except (ValueError, TypeError):
+        pass
+    return ""
+
+
+def render_evidence_section(repo, pr_number, state, records, archive_links, *, public_base_url="") -> str:
+    """Render current evidence and three archived rounds without mutating history.
+
+    Records may be attachment rows, round bundles, or archive_snapshot entries.
+    Archive links must come from trusted server-side discovery. Signed COS URLs
+    and user-supplied URLs are deliberately not used as download destinations.
+    The caller supplies evidence_enabled=True in the render state only when
+    the configured feature is enabled; absent flags fail closed for API links.
+    """
+    from .evidence_models import round_id_for_state
+
+    state = state or {}
+    head = state.get("head_sha", "")
+    try:
+        current_round = round_id_for_state(state)
+    except ValueError:
+        current_round = state.get("round_id", "")
+    base = _public_base(public_base_url)
+    enabled = (state.get("evidence_enabled", state.get("enabled", False)) is True
+               and state.get("enabled", True) is not False)
+    api = _evidence_path(repo, pr_number)
+    if not enabled or not api:
+        base = ""
+    groups = {(head, current_round): dict(state, attachments=list(state.get("attachments") or []))}
+    if isinstance(records, dict):
+        records = records.get("rounds", records.get("records", records.get("attachments", [])))
+    archive_links = list(archive_links or [])
+    entries = list(records or []) + [a for a in archive_links if isinstance(a, dict) and "snapshot" in a]
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        if isinstance(row.get("data"), dict):
+            row = row["data"]
+        snapshot = row.get("snapshot", row)
+        h = row.get("head_sha") or snapshot.get("head_sha") or "unknown"
+        r = row.get("round_id") or snapshot.get("round_id") or "unknown"
+        key = (h, r)
+        group = groups.setdefault(key, {"attachments": []})
+        if "snapshot" in row or "attachments" in row or "deployments" in row:
+            attachments = list(group.get("attachments") or [])
+            if key != (head, current_round):
+                group.update(snapshot)
+                group.update({k: v for k, v in row.items() if k != "snapshot"})
+            group["attachments"] = attachments + list(snapshot.get("attachments") or [])
+            if row is not snapshot:
+                group["attachments"].extend(row.get("attachments") or [])
+            for record in row.get("attachment_records", []):
+                if isinstance(record, dict) and isinstance(record.get("data"), dict):
+                    group["attachments"].append(record["data"])
+        else:
+            group.setdefault("attachments", []).append(row)
+
+    def download(identifier, suffix):
+        identifier = str(identifier or "")
+        if not base or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
+            return ""
+        return base + api + suffix.format(id=identifier)
+
+    def render_round(key, group):
+        h, r = key
+        lines = [f"**HEAD:** `{_escape(h)}` · **round:** `{_escape(r)}`",
+                 f"**Submitter:** {_escape(group.get('actor') or group.get('actor_login') or group.get('submitted_by') or group.get('requested_by') or group.get('command', {}).get('args', {}).get('actor') or 'unknown')}",
+                 f"**Time:** {_escape(group.get('created_at') or group.get('started_at') or group.get('round_started_at') or 'unknown')}",
+                 f"**Status:** {_escape(group.get('status') or 'unknown')}", "",
+                 "| Attachment | Size | Submitter | Time | Note | Status | Download |",
+                 "|---|---|---|---|---|---|---|"]
+        latest_items = {}
+        for offset, item in enumerate(group.get("attachments", [])):
+            if not isinstance(item, dict):
+                continue
+            identity = item.get("attachment_id") or item.get("id") or f"record-{offset}"
+            previous = latest_items.get(identity)
+            # Immutable archives may contain earlier revisions after the live
+            # tombstone. Deletion always wins over an old ready revision.
+            rank = lambda row: 4 if row.get("deleted_at") or row.get("status") == "deleted" else 3 if row.get("status") == "ready" else 1
+            if previous is None or rank(item) >= rank(previous):
+                latest_items[identity] = item
+        for item in latest_items.values():
+            if not isinstance(item, dict):
+                continue
+            deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
+            status = "deleted" if deleted else item.get("status", "pending")
+            link = download(item.get("attachment_id") or item.get("id"), "/attachments/{id}/download")
+            cells = [item.get("filename") or item.get("text") or "Note", item.get("size", "—"),
+                     item.get("actor") or item.get("actor_login") or item.get("submitted_by") or "unknown",
+                     item.get("created_at") or "unknown", item.get("note", ""), status]
+            if item.get("replaces_id"):
+                cells[4] = str(cells[4]) + " · replaces " + str(item["replaces_id"])
+            if deleted:
+                cells[4] = str(cells[4]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
+            lines.append("| " + " | ".join(_escape(v) for v in cells) + " | " +
+                         (f"[Download]({link})" if link and not deleted and status == "ready" else "Unavailable") + " |")
+        if group.get("deployments"):
+            lines.extend(["", _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
+        for field in ("case_results", "test_result", "summary", "cos_object_key", "cos_bundle_sha256", "cos"):
+            if group.get(field):
+                lines.extend(["", f"**{_escape(field)}:** {_escape(json.dumps(group[field], ensure_ascii=False) if isinstance(group[field], (list, dict)) else group[field])}"])
+        log = download(r, "/rounds/{id}/log/download")
+        if log and (group.get("cos_object_key") or group.get("cos", {}).get("object_key") or group.get("log_available") or group.get("log_ready")):
+            lines.extend(["", f"[Download round COS log]({log})"])
+        return lines
+
+    lines = ["<!-- deploy-approval-evidence:start -->", "### Current round evidence", ""]
+    lines.extend(render_round((head, current_round), groups[(head, current_round)]))
+    if (base and state.get("evidence_enabled") is True and state.get("status") == "testing"
+            and state.get("pr_state", "open") == "open" and not state.get("merged")):
+        # Authentication's return_to uses this stable route. The server binds
+        # its rendered page to the latest trusted HEAD/round, never query input.
+        lines.extend(["", f"[Upload evidence]({base}/evidence/{repo}/pulls/{pr_number})"])
+    old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
+    old.sort(key=lambda pair: str(pair[1].get("archived_at") or pair[1].get("ended_at") or pair[1].get("created_at") or ""), reverse=True)
+    lines.extend(["", "### Previous rounds", ""])
+    for key, group in old[:3]:
+        lines.extend(["<details>", f"<summary>HEAD {_escape(key[0])} · round {_escape(key[1])} · {_escape(group.get('status', 'unknown'))}</summary>", "", *render_round(key, group), "", "</details>", ""])
+    linked_index = False
+    for link in archive_links or []:
+        if isinstance(link, dict):
+            url = _trusted_archive_url(link.get("url", ""), repo, pr_number, base)
+            if url:
+                lines.append(f"[History index {_escape(link.get('page', ''))}]({url})")
+                linked_index = True
+    if len(old) > 3:
+        lines.append(f"{len(old) - 3} additional rounds retained. " +
+                     ("Use the trusted history index above." if linked_index else
+                      "History index unavailable; history has not been deleted."))
+    lines.append("<!-- deploy-approval-evidence:end -->")
+    return "\n".join(lines)

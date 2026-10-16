@@ -262,6 +262,7 @@ class GitHubCommandWatcher:
                         # would advance their cursor past legitimate new
                         # comments posted while a sibling PR keeps failing.
                         if pr_number in self._baseline_progress.get(repo, set()):
+                            await self.controller.project_evidence(repo, pr_number)
                             continue
                         success = await self._baseline_pr(repo, pr_number)
                         if success:
@@ -269,6 +270,9 @@ class GitHubCommandWatcher:
                             self._baseline_progress[repo].add(pr_number)
                     else:
                         await self._process_pr(repo, pr_number)
+                    # The existing serial watcher projects durable attachment
+                    # events after the normal command slot; never a second writer.
+                    await self.controller.project_evidence(repo, pr_number)
                 except Exception as e:
                     logger.error(
                         "watcher process %s#%s: %s", repo, pr_number, e
