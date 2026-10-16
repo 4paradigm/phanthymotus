@@ -994,6 +994,22 @@ def test_start_rejects_more_than_two_input_topics():
     assert executor.nodes == []
 
 
+@pytest.mark.parametrize("mode", ["depth", "mono"])
+def test_start_rejects_explicit_mode_without_any_input(mode):
+    """review 第 8 轮：缺输入的检查以前只盖 mode == "auto"。
+
+    显式 mode="depth"/"mono" 不带 input_topic 会一路走到 _start_node ——
+    start() 一条订阅都不建却把自己标成 running，从此卡片报 running 却
+    永远 idle，且没有任何报错可查。stereo 已有自己的双路检查；这里把
+    其余模式也钉死。
+    """
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {"action": "start", "mode": mode})
+    assert reply["state"] == "error"
+    assert "input_topic" in reply["message"]
+    assert executor.nodes == []
+
+
 # ── review 第 6 轮：start 预检 raw blob，坏配置当场报错 ─────────────────────
 
 def test_start_rejects_raw_blob_with_missing_K2():

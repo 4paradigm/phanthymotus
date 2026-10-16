@@ -1195,7 +1195,12 @@ class PointCloudPerceptionPlugin:
                     except ValueError as error:
                         return {"state": "error",
                                 "message": f"raw 标定无法使用：{error}"}
-            elif mode == "auto" and not input_topic:
+            elif not input_topic:
+                # review 第 8 轮：这条检查以前只挡 mode == "auto"。显式
+                # mode="depth"/"mono" 不带 input_topic 会一路走到
+                # _start_node —— start() 不建任何订阅却把自己标成 running，
+                # 从此卡片永远 idle 却报 running，且没有任何报错可查。
+                # stereo 已在上面要求双路，这里覆盖其余全部模式。
                 return {"state": "error",
                         "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
