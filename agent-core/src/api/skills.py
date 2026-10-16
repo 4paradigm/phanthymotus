@@ -159,7 +159,8 @@ def validate_local_skill(body):
               'instruction': 20000, 'category': 80, 'version': 40}
     if len(json.dumps(body, ensure_ascii=False).encode()) > 32768:
         raise fastapi.HTTPException(413, '技能定义超过 32 KiB')
-    if set(body) - (set(limits) | {'requiredTools', 'compatibility', 'attachment', 'origin'}):
+    if set(body) - (set(limits) | {'requiredTools', 'compatibility', 'attachment',
+                                   'origin', 'files'}):
         raise fastapi.HTTPException(422, '技能定义含不支持的字段')
     for key, limit in limits.items():
         value = body.get(key, '')
@@ -197,6 +198,16 @@ def validate_local_skill(body):
     if origin and (set(origin) != {'mcp_id', 'instance_id'} or
                    any(not isinstance(v, str) or not v or len(v) > 200 for v in origin.values())):
         raise fastapi.HTTPException(422, '无效的技能来源')
+    # A manifest of what the skill ships: `{path, bytes, sha256}` and nothing
+    # about who reads it. `attachment` stays as one device protocol's own
+    # addressing (a handle that device minted). See skill_files for why the
+    # declaration names no consumer, protocol or tool.
+    if 'files' in body:
+        import skill_files
+        try:
+            definition['files'] = skill_files.validate_files(body['files'])
+        except ValueError as error:
+            raise fastapi.HTTPException(422, str(error))
     return definition
 
 
@@ -245,6 +256,48 @@ async def import_local_skill(body: dict = fastapi.Body(...)):
                       'installedAt': datetime.datetime.now().isoformat()})
     config.main['skills'] = {**skills_cfg, 'installed': installed}
     return {'code': 200, 'data': {'slug': definition['slug'], 'already': False}}
+
+
+@router.put('/files/{slug}/{path:path}')
+async def put_skill_file(slug: str, path: str, request: fastapi.Request):
+    """Store the content of a file the skill already declared.
+
+    Declaration first, content second: the body must match the declared length
+    and SHA256, so nothing can write a file the definition did not announce, nor
+    quietly substitute different content for one it did. Used by both authoring
+    paths -- a marketplace install fetching from the resource centre, and a
+    local save from the workbench.
+    """
+    import skill_files
+    skill = next((s for s in config.main.get('skills', {}).get('installed', [])
+                  if s['slug'] == slug), None)
+    if not skill:
+        raise fastapi.HTTPException(404, '技能未安装')
+    data = await request.body()
+    if len(data) > skill_files.MAX_FILE_BYTES:
+        raise fastapi.HTTPException(413, f'文件超过 {skill_files.MAX_FILE_BYTES} 字节')
+    try:
+        return {'code': 200, 'data': skill_files.write(slug, skill, path, data)}
+    except ValueError as error:
+        raise fastapi.HTTPException(422, str(error))
+
+
+@router.get('/files/{slug}')
+async def list_skill_files(slug: str):
+    """What this skill declares it carries. Metadata only -- no content."""
+    skill = next((s for s in config.main.get('skills', {}).get('installed', [])
+                  if s['slug'] == slug), None)
+    if not skill:
+        raise fastapi.HTTPException(404, '技能未安装')
+    import skill_files
+    present = []
+    for entry in skill.get('files') or []:
+        try:
+            stored = skill_files.resolve(slug, entry['path']).is_file()
+        except ValueError:
+            stored = False
+        present.append({**entry, 'stored': stored})
+    return {'code': 200, 'data': present}
 
 
 @router.post('/uninstall')

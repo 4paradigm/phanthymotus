@@ -1604,6 +1604,7 @@ class Event:
             ('update_memory', event.memory.update),
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
+            ('skill_file', event.skills.skill_file),
             ('set_auto_narration', event.skills.set_auto_narration),
             ('set_progress_report', event.skills.set_progress_report),
             ('task_create', event.task.task_create),
@@ -2880,6 +2881,10 @@ class Event:
                       'turn continues (audio keeps playing)')
 
             # ── Rebuild frozen_system if skill state changed (activate/deactivate) ─
+            # `skill_file` is deliberately absent: it returns content as a tool
+            # result, it does not change what is *in* the system prompt. Listing
+            # it here would rebuild the frozen system prompt on every file read
+            # and throw away the prompt cache for nothing.
             skill_tools = {'activate_skill', 'deactivate_skill'}
             if any(c['function']['name'] in skill_tools for c in tool_calls):
                 frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
