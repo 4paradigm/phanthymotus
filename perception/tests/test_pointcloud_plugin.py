@@ -125,6 +125,27 @@ def test_auto_mode_depth_zlib_compressed_image_publishes():
     assert summary["nearest"] == pytest.approx(2.5, abs=1e-3)
 
 
+def test_auto_mode_recognizes_visual_depth_producer_format():
+    """review 第 9 轮：栈内生产者 visual_depth 发的格式串是
+    "16UC1; compressedDepth zlib"（visual_depth.py _publish），不含小写
+    "depth" —— 旧实现按 `"depth" in fmt` 匹配把它判成 JPEG：触发 TRT
+    引擎下载、JPEG 解码失败、一帧云都不出。小写归一化后必须出云。
+    """
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/depth_raw"})
+    node = executor.nodes[0]
+
+    raw = np.full((480, 640), 3000, dtype="<u2").tobytes()
+    msg = _FakeCompressedImage(zlib.compress(raw), fmt="16UC1; compressedDepth zlib")
+    comp_cb = next(s.callback for s in node.subscriptions
+                   if s.callback.__name__ == "_auto_comp_cb")
+    comp_cb(msg)
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["mode"] == "depth"
+    assert summary["nearest"] == pytest.approx(3.0, abs=1e-3)
+
+
 def test_auto_mode_jpeg_frame_routes_to_mono():
     class _FakeModel:
         def __init__(self):

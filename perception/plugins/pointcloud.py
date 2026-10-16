@@ -412,7 +412,11 @@ class _PointCloudNode(Node):
     def _auto_comp_cb(self, msg: CompressedImage):
         if self._throttled():
             return
-        fmt = str(getattr(msg, "format", "") or "")
+        # review 第 9 轮：小写归一化后再匹配。栈内 visual_depth 发的格式串
+        # 是 "16UC1; compressedDepth zlib"（visual_depth.py），不含小写
+        # "depth" —— 旧实现把它判成 JPEG，触发 TRT 引擎下载，再在 JPEG
+        # 解码上失败，一帧云都不出。
+        fmt = str(getattr(msg, "format", "") or "").lower()
         if "depth" in fmt:
             self._drop_stale(self._frame_queue, ("depth_zlib", msg))
         else:
