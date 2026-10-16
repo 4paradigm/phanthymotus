@@ -167,6 +167,7 @@ class PreflightAggregateTest(unittest.TestCase):
         client.containers.get.side_effect = docker_sdk.errors.NotFound('missing')
         with mock.patch('api.preflight.docker_sdk.from_env', return_value=client), \
                 mock.patch('api.preflight.shutil.disk_usage', return_value=_disk(free, 400.0)), \
+                mock.patch('api.preflight.time.time', side_effect=[100.0, 100.01]), \
                 mock.patch('socket.create_connection'):
             return run_preflight_checks(PERCEPTION_IMAGE, 'embodied-perception')
 
