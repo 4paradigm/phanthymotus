@@ -161,10 +161,10 @@ def test_cos_download_head_before_get_and_hard_bound(monkeypatch):
 
 # ── presigned URL contract tests ─────────────────────────────────────────
 
-def test_cos_presign_ttl_is_120():
-    """EVIDENCE_PRESIGNED_URL_TTL_SECONDS must be exactly 120."""
+def test_cos_presign_ttl_is_365_days():
+    """EVIDENCE_PRESIGNED_URL_TTL_SECONDS must be exactly 365 days."""
     from ..cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
-    assert EVIDENCE_PRESIGNED_URL_TTL_SECONDS == 120
+    assert EVIDENCE_PRESIGNED_URL_TTL_SECONDS == 31536000
 
 
 @pytest.mark.asyncio

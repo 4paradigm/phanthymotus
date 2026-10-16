@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 COS_ROOT = "phanthymotus_pr/"
 EVIDENCE_MAX_ARCHIVE_BYTES = 10 * 1024 * 1024
 
-EVIDENCE_PRESIGNED_URL_TTL_SECONDS = 120
+EVIDENCE_PRESIGNED_URL_TTL_SECONDS = 31536000
 
 
 
@@ -146,6 +146,10 @@ class CosClient:
                 Bucket=self.config.cos_bucket,
                 Key=object_key,
                 Expired=EVIDENCE_PRESIGNED_URL_TTL_SECONDS,
+                Params={
+                    "response-content-disposition":
+                        f'attachment; filename="{object_key.rsplit("/", 1)[-1]}"'
+                },
             )
             if not url:
                 logger.warning(

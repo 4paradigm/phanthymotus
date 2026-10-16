@@ -141,7 +141,10 @@ def _cos_evidence_block(
     if size:
         text += f" \u00b7 `{_human_size(size)}`"
     lines.append(text)
-    if (isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
+    safe_url = _safe_download_url(download_url)
+    if safe_url:
+        lines.append(f"[Download COS evidence]({safe_url})")
+    elif (isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
             and isinstance(size, int) and not isinstance(size, bool)
             and 1 <= size <= 10 * 1024 * 1024):
         lines.append("For a short-lived download link, post `/evidence_link` on this open PR.")
