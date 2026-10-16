@@ -1158,12 +1158,32 @@ class PointCloudPerceptionPlugin:
                                           "format": "image/depth-z16" if node._mode == "depth" else "image/jpeg"})
                     if node._input_topic_right and all(t["topic"] != node._input_topic_right for t in topics_in):
                         topics_in.append({"topic": node._input_topic_right, "format": "image/jpeg"})
-            cloud_topic, summary_topic = output_topics_for(
-                next(iter(nodes.values()))._input_topic if len(nodes) == 1 else None)
-            topics_out = ([
-                {"topic": cloud_topic, "format": "sensor/pointcloud"},
-                {"topic": summary_topic, "format": "data/json"},
-            ] if topics_in or nodes else [])
+            # 每实例一对输出话题；多实例时不再用 output_topics_for(None)
+            # 的默认 /perception/... 话题把下游引向不存在的话题。
+            if instance_id and instance_id in nodes:
+                node = nodes[instance_id]
+                topics_out = [
+                    {"topic": node._cloud_topic, "format": "sensor/pointcloud"},
+                    {"topic": node._summary_topic, "format": "data/json"},
+                ]
+            else:
+                seen: set[str] = set()
+                topics_out: list[dict[str, str]] = []
+                for node in nodes.values():
+                    for topic, fmt in ((node._cloud_topic, "sensor/pointcloud"),
+                                       (node._summary_topic, "data/json")):
+                        if topic and topic not in seen:
+                            seen.add(topic)
+                            topics_out.append({"topic": topic, "format": fmt})
+            topics_out = topics_out if topics_in or nodes else []
+            # 供 _camera_info 的光学参数继承：有实例就用该实例的话题，
+            # 没有就用第一个节点的话题，绝不回退到默认话题。
+            if instance_id and instance_id in nodes:
+                sample = nodes[instance_id]
+            else:
+                sample = next(iter(nodes.values())) if nodes else None
+            cloud_topic = sample._cloud_topic if sample else DEFAULT_CLOUD_TOPIC
+            summary_topic = sample._summary_topic if sample else DEFAULT_SUMMARY_TOPIC
             info = {
                 "name": "PointCloudPerception", "manufacture": "Embodied",
                 "model": "depth|stereo",
@@ -1176,8 +1196,8 @@ class PointCloudPerceptionPlugin:
             # 光学参数往下传（同 visual_depth 的契约）：声明了才带
             # camera_info，没声明就带 note 说明是谁的问题。
             camera_out, camera_note = self._camera_info(
-                instance_id, (args.get("input_topic") or
-                              (args.get("input_topics") or [""])[0] or ""),
+                instance_id,
+                args.get("input_topic") or (args.get("input_topics") or [""])[0] or "",
                 nodes, cloud_topic, summary_topic)
             if camera_out:
                 info["camera_info"] = camera_out

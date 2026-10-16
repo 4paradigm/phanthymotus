@@ -1530,3 +1530,31 @@ def test_output_topics_follow_input():
     node = executor.nodes[0]
     assert node._cloud_topic == "/cam/depth/pointcloud"
     assert node._summary_topic == "/cam/depth/pointcloud_summary"
+
+
+def test_multi_instance_info_never_reports_default_topics():
+    """review 第 12 轮：多实例时 info() 不再把默认话题 /perception/...
+    塞进 topic_out —— 每个节点只发自己的 {input}/... 对，Agent Core 按
+    topic_out 接线，默认话题会把第二张卡之后的下游引向不存在的话题。"""
+    plugin, executor = _plugin()
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/a",
+                                    "mode": "depth"})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/b",
+                                    "mode": "depth"})
+    assert len(executor.nodes) == 2
+
+    # 不指定实例：全部实例的成对输出，且不含任何默认话题
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    out = [t["topic"] for t in info["topic_out"]]
+    assert "/cam/a/pointcloud" in out
+    assert "/cam/a/pointcloud_summary" in out
+    assert "/cam/b/pointcloud" in out
+    assert "/cam/b/pointcloud_summary" in out
+    assert "/perception/pointcloud" not in out
+    assert "/perception/pointcloud_summary" not in out
+
+    # 指定实例：只有该实例的一对，没有杂音
+    info_a = plugin.dispatch("pointcloud",
+                             {"action": "info", "instance_id": "/cam/a"})
+    assert [t["topic"] for t in info_a["topic_out"]] == [
+        "/cam/a/pointcloud", "/cam/a/pointcloud_summary"]
