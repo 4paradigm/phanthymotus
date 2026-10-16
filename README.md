@@ -373,6 +373,84 @@ Its behaviour, each point with a test:
 | pruned after `retention_days` (7) | uploads are a transfer buffer; enrolment keeps the *embedding*, never the photo |
 | `ACCESS_TOKEN` honoured when set | today perception is not given one, and the same port already serves `tools/call` — so this is reachability-gated, and the check is ready for when a token is wired in |
 
+## Capability Declarations (`x-*`)
+
+A driver's tool says what it can do; agent-core never infers it from the tool's
+name or the robot's model. The declarations live **inside `inputSchema`**, not
+at the top level of the tool object — MCP registration whitelists top-level
+fields, so an unknown key there is silently dropped.
+
+| Declaration | What the driver is telling Core |
+|---|---|
+| `x-action-params` | each action takes its own parameters — split this tool per action, and `<action>.required` is that action's required set |
+| `x-completion` | this action is asynchronous; here is how its completion receipt arrives (ACP) |
+| `x-resource` | this tool can serve a resource, e.g. the URDF a skeleton renderer needs |
+| `format: file` / `uploadTo` | this parameter is a file, and which service should receive the upload |
+| `x-hooks`, `x-show-when`, `x-sensitive` | how to render this field in the config form |
+| `x-skill-package` | this card can receive and emit skill packages — see below |
+| `x-workbench` | this card provides an interactive page to host in an iframe |
+| `x-stop` | this card has a release protocol; here is what "still stopping" looks like |
+
+The pattern is the same one used for LLMs: `config.main['client']['llm']` is
+`{url, key, model}` and there is not a line of inference about which model is
+behind it. A keyword guess is the failure mode this exists to avoid — the peer
+tool classifier once sorted tools by name and matched none of `loco`, `led`,
+`speaker` or `switch_mode`, which let a `viewer` drive locomotion.
+
+### `x-skill-package`
+
+A **skill package** is a portable archive a device produces and consumes: a
+manifest plus whatever payload that device's own protocol calls for. Core
+transfers it between one card and the browser, and stores whether the resulting
+skill may run without asking. It does not open the payload.
+
+```json
+{
+  "x-skill-package": {
+    "schema": "example.device.package/1",
+    "pending": true,
+    "session_authorization": true,
+    "persistent_execution": true,
+    "legacy_slug_prefix": "recorded-"
+  }
+}
+```
+
+One identity field and a set of capability bits:
+
+| Field | Effect |
+|---|---|
+| `schema` | the protocol this card speaks. A package is routed here only if its `manifest.schema` is the same string, and refused with 409 before the device is contacted if not. **Required** — a tool without it is not a package card. |
+| `pending` | the card can list unvalidated drafts, so "待验证 → 继续验证" appears in the skill list |
+| `session_authorization` | the card supports a time-boxed grant (the pre-`persistent_execution` path) |
+| `persistent_execution` | the card supports an auto-execution setting that survives a stop and a restart |
+| `legacy_slug_prefix` | how to resolve skills installed before packages carried `attachment` |
+
+A capability that is not declared has no UI entry and no code path. What Core
+reads out of a package is the `schema` and, for routing, `tool`; everything
+else — including all of `compatibility` — is forwarded to the device to judge
+and to the page to display.
+
+Two things to get right, both of which have already gone wrong once:
+
+- **A declaration is not an authorization.** `persistent_execution: true` means
+  the card *supports* the feature. It grants nothing: a skill runs
+  unattended only if a logged-in browser enabled it, the stored device binding
+  still matches, and the tool is wired to `decision_core` on this canvas. The
+  declaration comes from the driver, so it decides visibility and code paths —
+  never permission.
+- **A declaration only decouples if Core reads nothing else.** The mechanism can
+  be present and bypassed: a first cut of this declared `persistent_execution`
+  properly while also hardcoding one application's protocol id, archive entry
+  name, slug prefix and id formats. A correctly-declaring new card still could
+  not work, and the interface looked generic the whole time, which is worse
+  than having no declaration at all. `agent-core/tests/test_skill_packages.py`
+  runs the whole suite on identifiers no shipped driver uses, so a hardcoded
+  string turns it red.
+
+Full protocol, transfer boundaries, the `motus.workbench/1` message channel and
+the auto-execution gates: [`docs/SKILL_WORKBENCH.md`](docs/SKILL_WORKBENCH.md).
+
 ## Web Dashboard
 
 The dashboard at `http://<device-ip>:15678` provides:
