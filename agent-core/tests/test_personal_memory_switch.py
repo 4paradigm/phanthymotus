@@ -30,6 +30,8 @@ def runtime(store, monkeypatch):
     for name in ('_output', '_steering_queue'):
         monkeypatch.setattr(collector, name, asyncio.Queue())
     monkeypatch.setattr(collector, '_busy', False)
+    import scheduler
+    monkeypatch.setattr(scheduler, '_dynamic_tasks', {})
     collector._priority_pending.clear()
     collector._bg_buffer.clear()
     config.main['personal_memory'] = {'enabled': False}

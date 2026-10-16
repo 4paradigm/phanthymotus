@@ -45,7 +45,7 @@ def test_prompt_does_not_read_legacy_shared_memory_or_other_users(store, tmp_pat
     second = prompt.build_system({}, set())['content']
     assert 'Alice secret' not in second
     assert 'legacy secret' not in second
-    assert '心理' in second
+    assert '个人记忆' in second
 
 
 def test_switch_resets_history_and_summaries_and_guest_cannot_resume(store):
@@ -345,3 +345,28 @@ def test_personal_tools_keep_loop_responsive_during_database_work(store, monkeyp
 
     asyncio.run(run())
     assert observations == [(True, user['id'], 'worker-turn', user['revision'], False)]
+
+
+def test_personal_memory_preserves_robot_role_without_loading_legacy_memory(store, tmp_path, monkeypatch):
+    system = tmp_path / 'system.md'
+    system.write_text('BASE_SYSTEM: help with the current task.')
+    memory = tmp_path / 'shared.md'
+    memory.write_text('LEGACY_SHARED_SECRET')
+    identity = tmp_path / 'resource' / 'memory' / 'identity.md'
+    identity.parent.mkdir(parents=True)
+    identity.write_text('ROBOT_IDENTITY: museum guide.')
+    monkeypatch.chdir(tmp_path)
+    event_cfg = config.main.get('event', {})
+    event_cfg['llm'] = {**event_cfg.get('llm', {}), 'prompt_system': str(system), 'prompt_memory': str(memory)}
+    config.main['event'] = event_cfg
+    user = pm.create_user('Alice', remember=True, onboarding=True)
+    pm.bind_context(user['id'])
+    pm.save_memory('USER_PREFERENCE: concise explanations', 'preference', 'seed')
+    result = prompt._system_definition()
+    assert 'BASE_SYSTEM' in result and 'ROBOT_IDENTITY' in result
+    assert 'USER_PREFERENCE' in result
+    assert 'LEGACY_SHARED_SECRET' not in result
+    assert '你是心理支持与自我探索助手' not in result
+    assert '首次交流询问用户想自由聊天' not in result
+    assert '不自动发起问卷' in result
+    assert 'USER_PREFERENCE' not in prompt._l1_cache['content']

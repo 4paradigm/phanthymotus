@@ -62,11 +62,15 @@ _l1_cache: dict = {'mtime': 0.0, 'content': ''}
 
 def _system_definition() -> str:
     """读取 L1 base prompt（含 system prompt + 身份定义 + 长期记忆），带 mtime 缓存。"""
-    if personal.enabled():
-        from personal_memory_tools import system_content
-        return system_content()  # Never put personal content in the global L1 cache.
     system_path = pathlib.Path(config.main['event']['llm']['prompt_system'])
     identity_path = pathlib.Path('./resource/memory/identity.md')
+    if personal.enabled():
+        from personal_memory_tools import system_content
+        parts = [system_path.read_text()]
+        if identity_path.exists():
+            parts.append("\n\n---以下是你的身份定义（不可修改）---\n\n" + identity_path.read_text())
+        parts.append("\n\n---个人记忆管理规则与当前授权资料---\n\n" + system_content())
+        return ''.join(parts)  # Never cache private content or load legacy shared memory.
     memory_path = pathlib.Path(config.main['event']['llm']['prompt_memory'])
 
     # 检查文件修改时间

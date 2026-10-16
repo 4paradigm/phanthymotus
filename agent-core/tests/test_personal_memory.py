@@ -1,5 +1,6 @@
 """Biometric OR routing and owner checks, using real SQLite storage."""
 import json
+from pathlib import Path
 import time
 
 import pytest
@@ -18,6 +19,8 @@ def store(tmp_path, monkeypatch):
         'face_sources': ['dds:/camera/face'], 'face_max_age_s': 3,
         'output_tools': [],
     }
+    config.main['event'] = {'llm': {'prompt_system': str(
+        Path(__file__).resolve().parents[1] / 'resource/memory/prompt_system.md')}}
     token = pm.bind_context(None)
     turn_token = pm._turn.set('')
     revision_token = pm._revision.set(None)

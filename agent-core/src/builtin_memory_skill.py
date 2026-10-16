@@ -8,4 +8,4 @@ def personal_memory_skill() -> dict:
     instruction = (Path(__file__).parent / 'builtin_skills' / 'personal-memory' / 'SKILL.md').read_text()
     return {'slug': 'personal-memory', 'name': '个人记忆管理',
             'oneLiner': '按本人授权分类、记忆和管理个人资料', 'active': True,
-            'instruction': instruction, 'version': '1.0.0'}
+            'instruction': instruction, 'version': '1.1.0'}
