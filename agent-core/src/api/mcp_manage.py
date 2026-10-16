@@ -40,7 +40,9 @@ def _register_canvas_completion(tool: dict | None, arguments: dict, result: dict
         except (TypeError, ValueError):
             continue
         action_id = parsed.get('action_id') if isinstance(parsed, dict) else None
-        if not isinstance(action_id, str) or not action_id:
+        # The status endpoint and browser use the same limit: do not retain an
+        # action that the manual card cannot subsequently query.
+        if not isinstance(action_id, str) or not action_id or len(action_id) > 256:
             continue
         meta = {'completion': completion, 'resource': mcp_client.parse_resources(schema.get('x-resource'))}
         mcp_client._register_pending(action_id, tool_name=tool['name'], meta=meta,

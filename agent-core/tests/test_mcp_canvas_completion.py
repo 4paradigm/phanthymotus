@@ -67,6 +67,8 @@ def test_declared_canvas_action_registers_real_pending_metadata():
     ({}, {'action': 'move'}, {'content': [{'type': 'text', 'text': '{"state":"completed"}'}]}),
     ({}, {'action': 'move'}, {'isError': True, **result()}),
     ({}, {'action': 'move'}, result(17)),
+    ({}, {'action': 'move'}, result('')),
+    ({}, {'action': 'move'}, result('x' * 257)),
     ({'inputSchema': {}}, {'action': 'move'}, result()),
     ({}, {'action': 'move'}, {'content': [{'type': 'text', 'text': 'not json'}]}),
 ])
@@ -74,6 +76,27 @@ def test_passive_terminal_invalid_or_undeclared_calls_create_no_waiter(change, a
     async def scenario():
         assert not mcp_manage._register_canvas_completion({**TOOL, **change}, args, response)
         assert not mcp_client._pending_actions
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('length', [1, 255, 256])
+def test_canvas_action_id_boundary_can_be_registered_and_queried(length):
+    async def scenario():
+        action_id = 'x' * length
+        assert mcp_manage._register_canvas_completion(TOOL, {'action': 'move'}, result(action_id))
+        response = await mcp_manage.canvas_action_status(action_id)
+        assert json.loads(response.body)['data'] == {'action_id': action_id, 'state': 'pending'}
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('action_id', ['', 'x' * 257])
+def test_invalid_action_id_is_rejected_by_registration_and_query(action_id):
+    async def scenario():
+        assert not mcp_manage._register_canvas_completion(TOOL, {'action': 'move'}, result(action_id))
+        assert not mcp_client._pending_actions
+        with pytest.raises(mcp_manage.fastapi.HTTPException) as error:
+            await mcp_manage.canvas_action_status(action_id)
+        assert error.value.status_code == 400
     asyncio.run(scenario())
 
 

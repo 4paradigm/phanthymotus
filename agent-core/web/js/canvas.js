@@ -2772,8 +2772,9 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
       }
       const completion = completionRequest(json.data, _toolObj?.inputSchema, args.action);
       if (completion) {
-        // A later call must not lose this action's activity entry, but only the
-        // current call may update the card's result box. Stop stays usable.
+        // Watch while the card exists, including after Get status or Stop.
+        // isCurrent() below guards only the result box: replacing this watch's
+        // lifetime with it would drop the previous action's completion trigger.
         void watchCompletion({ ...completion, isCurrent: () => el.isConnected, onResult: (result, isError) => {
           if (isCurrent()) _showResult(el, JSON.stringify(result, null, 2), isError);
           const message = `${toolName} [${result.action_id}] → ${result.state}: ${_truncate(JSON.stringify(result), 400)}`;

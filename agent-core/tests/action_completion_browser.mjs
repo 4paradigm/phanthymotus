@@ -35,7 +35,7 @@ window.run=(action='move',el=document.querySelector('#arm'))=>{
 };
 window.ready=true;
 `;
-let kind='completed', serial=0;
+let kind='completed', serial=0, receiptGate;
 const receipts=new Map(),requests=[];
 const server=createServer(async(req,res)=>{
  try{
@@ -48,7 +48,7 @@ const server=createServer(async(req,res)=>{
   if(req.url==='/api/mcp/sim-arm/call'){
    let raw='';for await(const chunk of req)raw+=chunk;
    const body=JSON.parse(raw);requests.push(body);
-   if(body.arguments.action==='get_status')data={code:200,data:[{type:'text',text:'{"state":"idle","fresh":true}'}]};
+   if(body.arguments.action==='get_status')data={code:200,data:[{type:'text',text:'{"state":"idle","snapshot":{"fresh":true},"task":{"state":"idle"}}'}]};
    else{
     const action_id=`sim-${++serial}`;
     receipts.set(action_id,{action_id,state:'settled',status:kind,result:{actual:[1,2,3],error:kind==='error'?'<b>Rejected</b>':undefined}});
@@ -56,7 +56,9 @@ const server=createServer(async(req,res)=>{
    }
   }else if(req.url.startsWith('/api/mcp/actions/')){
    const id=decodeURIComponent(req.url.split('/').at(-1));
-   await new Promise(r=>setTimeout(r,120));
+   const gate=receiptGate;
+   if(gate){gate.seen(id);await gate.promise;}
+   else await new Promise(r=>setTimeout(r,120));
    data={code:200,data:receipts.get(id)};
   }
   if(data){res.setHeader('Content-Type','application/json');res.end(JSON.stringify(data));return;}
@@ -84,12 +86,28 @@ try{
   assert.equal(await page.locator('#arm pre b').count(),0);
   passed.push(`running changes to ${state} with safely rendered actual result`);
  }
- kind='completed';await page.evaluate(()=>window.run());await page.evaluate(()=>window.run('get_status'));
- await page.waitForTimeout(250);
- assert.equal(JSON.parse(await page.locator('#arm pre').innerText()).state,'idle');
- passed.push('Old callback cannot overwrite a later manual result');
+ for(const [status,state] of [['completed','completed'],['error','failed'],['cancelled','cancelled']]){
+  kind=status;
+  let release,seen;
+  const received=new Promise(resolve=>{seen=resolve;});
+  receiptGate={seen,promise:new Promise(resolve=>{release=resolve;})};
+  await page.evaluate(()=>window.run());
+  const actionId=JSON.parse(await page.locator('#arm pre').innerText()).action_id;
+  assert.equal(await received,actionId); // Hold the actual fetch callback until the next call finishes.
+  await page.evaluate(()=>window.run('get_status'));
+  const statusText=await page.locator('#arm pre').innerText();
+  assert.equal(JSON.parse(statusText).state,'idle');
+  receiptGate=null;release();
+  await page.waitForFunction(({id,state})=>window.logs.some(log=>
+   log.type==='trigger' && log.text.includes(`[${id}] → ${state}:`)),{id:actionId,state});
+  assert.equal(await page.locator('#arm pre').innerText(),statusText);
+  const completionLogs=await page.evaluate(id=>window.logs.filter(log=>
+   log.type==='trigger' && log.text.includes(`[${id}]`)),actionId);
+  assert.equal(completionLogs.length,1);
+  passed.push(`Late ${state} preserves the newer Get status result and still emits one trigger`);
+ }
  await page.screenshot({path:path.join(out,'three-card-completion.png'),fullPage:true});
- assert.deepEqual(errors,[]);assert.equal(requests.length,5);
+ assert.deepEqual(errors,[]);assert.equal(requests.length,9);
  await writeFile(path.join(out,'browser-result.json'),JSON.stringify({passed,requests,errors},null,2));
  console.log(JSON.stringify({passed:passed.length,errors}));
 }finally{await browser.close();await new Promise(r=>server.close(r));}
