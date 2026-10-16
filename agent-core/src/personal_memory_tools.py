@@ -1,4 +1,5 @@
 """Scoped tools and the built-in psychological support skill."""
+import asyncio
 import json
 import typing
 
@@ -30,7 +31,7 @@ class Tools:
     ):
         """保存当前已识别用户的个人记忆；用户归属由服务端决定。"""
         try:
-            return json.dumps(pm.save_memory(content, kind, pm._turn.get()), ensure_ascii=False)
+            return json.dumps(await asyncio.to_thread(pm.save_memory, content, kind, pm._turn.get()), ensure_ascii=False)
         except (ValueError, PermissionError) as error:
             return str(error)
 
@@ -42,7 +43,7 @@ class Tools:
         if not confirmed:
             return '删除该条目会同时清空你的全部原始对话历史和未公开公共候选，保留其他结构化记忆。请先确认这个范围。'
         try:
-            return '已删除该记忆，并清理原始对话历史和未公开候选。' if pm.delete_memory(memory_id) else '未找到当前用户的这条记忆。'
+            return '已删除该记忆，并清理原始对话历史和未公开候选。' if await asyncio.to_thread(pm.delete_memory, memory_id) else '未找到当前用户的这条记忆。'
         except PermissionError as error:
             return str(error)
 
@@ -51,7 +52,7 @@ class Tools:
     ):
         """提交公共知识候选；审核前不会向其他用户开放。"""
         try:
-            item = pm.propose_public(content)
+            item = await asyncio.to_thread(pm.propose_public, content)
             return f'已提交候选 {item["id"]}，审核前不会公开。'
         except (ValueError, PermissionError) as error:
             return str(error)
@@ -67,7 +68,7 @@ class Tools:
         if not remember and not confirmed:
             return '关闭此偏好会清除已有私有记忆、历史和未公开候选，请先确认。仅暂停记录请使用 set_memory_collection(false)。'
         try:
-            pm.update_user(pm.current_user(), remember, onboarding)
+            await asyncio.to_thread(pm.update_user, pm.current_user(), remember, onboarding)
             return '已更新。' if remember else '已关闭长期记忆并清除个人记忆、历史和未公开候选。'
         except ValueError as error:
             return str(error)
@@ -77,7 +78,7 @@ class Tools:
     ):
         """暂停或恢复个人信息收集；暂停不删除既有资料。"""
         try:
-            pm.set_collection(enabled)
+            await asyncio.to_thread(pm.set_collection, enabled)
             return '已恢复记录。' if enabled else '已暂停本轮及后续记录，既有资料保留且仍可查看、导出和删除。'
         except PermissionError as error:
             return str(error)
@@ -89,7 +90,7 @@ class Tools:
     ):
         """查看并分页导出本人资料为结构化JSON，暂停记录时仍可使用。"""
         try:
-            return json.dumps(pm.export_data(collection, limit, offset), ensure_ascii=False)
+            return json.dumps(await asyncio.to_thread(pm.export_data, collection, limit, offset), ensure_ascii=False)
         except (ValueError, PermissionError) as error:
             return str(error)
 
@@ -103,7 +104,7 @@ class Tools:
         if not confirmed:
             return '更正会同时清空你的全部原始对话历史和未公开公共候选，保留其他结构化记忆。请先确认这个范围。'
         try:
-            pm.correct_memory(memory_id, content, kind)
+            await asyncio.to_thread(pm.correct_memory, memory_id, content, kind)
             return '已更正该记忆，并清理旧对话历史和未公开候选。'
         except (ValueError, PermissionError) as error:
             return str(error)
@@ -113,7 +114,7 @@ class Tools:
     ):
         """撤回本人的公共贡献，不能删除他人的公共知识。"""
         try:
-            return '已撤回，不再作为公共知识检索。' if pm.withdraw_public(memory_id) else '未找到本人的这条公共贡献。'
+            return '已撤回，不再作为公共知识检索。' if await asyncio.to_thread(pm.withdraw_public, memory_id) else '未找到本人的这条公共贡献。'
         except PermissionError as error:
             return str(error)
 
@@ -125,7 +126,7 @@ class Tools:
         if not confirmed:
             return '请先确认删除范围：清空记忆、历史和本人公共贡献；注销还会解除身份关联。感知模板、录音和离线备份需另行处理。'
         try:
-            pm.clear_personal_data(delete_profile)
+            await asyncio.to_thread(pm.clear_personal_data, delete_profile)
             return '已删除本人资料和身份关联。' if delete_profile else '已清空本人数据并停止保存，身份关联保留。'
         except PermissionError as error:
             return str(error)

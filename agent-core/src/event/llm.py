@@ -1412,8 +1412,8 @@ async def _memory_recall(
 ) -> str:
     """从记忆库检索历史信息。包含过去的对话、subagent 分析结论等。当需要回顾历史状态、查找之前的任务结果时使用。"""
     if personal.enabled():
-        return json.dumps({'memories': personal.recall(query, limit=limit, offset=offset),
-                           'conversations': personal.search_turns(query, limit=limit)}, ensure_ascii=False)
+        return json.dumps({'memories': await asyncio.to_thread(personal.recall, query, limit=limit, offset=offset),
+                           'conversations': await asyncio.to_thread(personal.search_turns, query, limit=limit)}, ensure_ascii=False)
     import time as _time
     from config import _get_conn
 

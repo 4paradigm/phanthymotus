@@ -288,3 +288,60 @@ def test_busy_ingress_keeps_identical_words_from_different_people(store, monkeyp
         asyncio.run(collector._drain_loop())
     assert len(pending) == 2
     assert [ev['_personal_identity'].user_id for ev in pending] == [a['id'], b['id']]
+
+
+@pytest.mark.parametrize('tool,operation,args', [
+    ('remember_personal', 'save_memory', ('new fact', 'fact')),
+    ('forget_personal', 'delete_memory', ('memory', True)),
+    ('propose_public_memory', 'propose_public', ('general knowledge',)),
+    ('set_memory_preferences', 'update_user', (True, False)),
+    ('set_memory_collection', 'set_collection', (False,)),
+    ('export_personal_data', 'export_data', ('memories',)),
+    ('correct_personal', 'correct_memory', ('memory', 'corrected', 'fact', True)),
+    ('withdraw_public_memory', 'withdraw_public', ('public',)),
+    ('delete_personal_data', 'clear_personal_data', (False, True)),
+    ('memory_recall', 'recall', ('fact',)),
+    ('memory_recall', 'search_turns', ('fact',)),
+])
+def test_personal_tools_keep_loop_responsive_during_database_work(store, monkeypatch, tool, operation, args):
+    import threading
+    from personal_memory_tools import Tools
+
+    user = pm.create_user('Alice', remember=True)
+    pm.bind_context(user['id'])
+    pm._turn.set('worker-turn')
+    pm._revision.set(user['revision'])
+    pm._block_turn_save.set(False)
+    memory = pm.save_memory('old fact', 'fact', 'seed')
+    public = pm.propose_public('public knowledge')
+    args = tuple(memory['id'] if arg == 'memory' else public['id'] if arg == 'public' else arg for arg in args)
+    original = getattr(pm, operation)
+    started, release = threading.Event(), threading.Event()
+    observations = []
+
+    def delayed(*call_args, **kwargs):
+        started.set()
+        responsive = release.wait(5)
+        observations.append((responsive, pm.current_user(), pm._turn.get(),
+                             pm._revision.get(), pm._block_turn_save.get()))
+        return original(*call_args, **kwargs)
+
+    monkeypatch.setattr(pm, operation, delayed)
+
+    async def run():
+        handler = _memory_recall if tool == 'memory_recall' else getattr(Tools(), tool)
+        task = asyncio.create_task(handler(*args))
+        try:
+            while not started.is_set():
+                if task.done():
+                    await task
+                    pytest.fail('database operation was not invoked')
+                await asyncio.sleep(0)
+            # This independent coroutine must run while the DB call is waiting.
+            release.set()
+            await task
+        finally:
+            release.set()
+
+    asyncio.run(run())
+    assert observations == [(True, user['id'], 'worker-turn', user['revision'], False)]
