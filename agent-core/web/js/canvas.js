@@ -12,6 +12,10 @@
  */
 
 import { showToast } from './toast.js';
+import { completionRequest, watchCompletion } from './action-completion.js';
+import { claimCompletionActivity, preferManualCompletionActivity } from './completion-activity.js';
+
+const _cardExecutions = new WeakMap();
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -2563,7 +2567,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
       const parsed = _parseMcpCallResult(await resp.json());
       const liveTopic = parsed?.topic_out?.find(t => t && t.topic);
       if (liveTopic) {
-        showTopicDetail(liveTopic.topic, liveTopic.format || '');
+        showTopicDetail(liveTopic.topic, liveTopic.format || '', mcpId);
         return;
       }
     } catch (e) {
@@ -2579,7 +2583,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
     _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
     return;
   }
-  showTopicDetail(candidate.topic, candidate.format || '');
+  showTopicDetail(candidate.topic, candidate.format || '', mcpId);
 }
 
 /**
@@ -2700,6 +2704,9 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 // ── Execute ───────────────────────────────────────────────────────────────────
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
+  const execution = {};
+  _cardExecutions.set(el, execution);
+  const isCurrent = () => el.isConnected && _cardExecutions.get(el) === execution;
   const btn = el.querySelector('.canvas-exec-btn');
   btn.disabled = true;
   btn.textContent = '执行中…';
@@ -2752,6 +2759,50 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
       _showResult(el, resultText, false);
       // The panel can afford a 144-entry list; one log line cannot.
       _logActivity('mcp_result', `${toolName} → ${_truncate(resultText, 400)}`);
+      // Get status is a synchronous read, not an ACP movement task. Its
+      // top-level state describes the PREVIOUS task (which may have failed).
+      // Only a returned status snapshot confirms this query completed.
+      if (toolName === 'arm_control' && args.action === 'get_status') {
+        let status;
+        try { status = JSON.parse(resultText); } catch { /* No confirmed snapshot. */ }
+        if (status?.snapshot && typeof status.snapshot === 'object' && !Array.isArray(status.snapshot)
+            && status?.task && typeof status.task === 'object' && !json.data?.isError) {
+          _logActivity('trigger', `${toolName} get_status → completed: Status read successfully. This does not change the previous action result.`);
+        }
+      }
+      const completion = completionRequest(json.data, _toolObj?.inputSchema, args.action);
+      if (completion) {
+        // The detailed card result owns the manual action's activity entry.
+        // If an early collector receipt was already displayed, remove that
+        // provisional row so arrival order cannot select the abbreviated form.
+        if (preferManualCompletionActivity(completion.actionId)) {
+          for (const row of document.querySelectorAll('#activity-log [data-completion-action-id]')) {
+            if (row.dataset.completionActionId === completion.actionId) row.remove();
+          }
+          const latest = document.getElementById('activity-latest');
+          if (latest?.dataset.completionActionId === completion.actionId) latest.textContent = '';
+        }
+        // Watch while the card exists, including after Get status or Stop.
+        // isCurrent() below guards only the result box: replacing this watch's
+        // lifetime with it would drop the previous action's completion trigger.
+        void watchCompletion({ ...completion, isCurrent: () => el.isConnected, onResult: (result, isError) => {
+          if (isCurrent()) _showResult(el, JSON.stringify(result, null, 2), isError);
+          const message = `${toolName} [${result.action_id}] → ${result.state}: ${_truncate(JSON.stringify(result), 400)}`;
+          if (result.state === 'unconfirmed') {
+            _logActivity('warn', message);
+          } else if (document.getElementById('activity-log') && claimCompletionActivity(result.action_id)) {
+            _logActivity('trigger', message);
+          }
+        }});
+      } else if (toolName === 'arm_control' && args.action !== 'get_status') {
+        // Fast/synchronous actions have no ACP ID. Report their actual state,
+        // especially stopping, without pretending the arm has already stopped.
+        let result;
+        try { result = JSON.parse(resultText); } catch { /* Unconfirmed response. */ }
+        if (['completed', 'failed', 'cancelled', 'stopped', 'stopping', 'ready'].includes(result?.state)) {
+          _logActivity('trigger', `${toolName} ${args.action} → ${result.state}: ${_truncate(resultText, 400)}`);
+        }
+      }
     } else {
       const errText = json.message || '执行失败';
       _showResult(el, errText, true);
@@ -2876,6 +2927,14 @@ function _logActivity(type, msg) {
   `;
   logEl.appendChild(entry);
   logEl.scrollTop = logEl.scrollHeight;
+  if (type === 'trigger') {
+    const latest = document.getElementById('activity-latest');
+    if (latest) {
+      latest.dataset.completionActionId = '';
+      latest.innerHTML = `<span class="log-time">${_esc(time)}</span><span>${_esc(msg)}</span>`;
+      document.getElementById('activity-strip')?.classList.add('has-latest');
+    }
+  }
 }
 
 // ── Card drag (world-space pointer capture) ───────────────────────────────────

@@ -5,6 +5,7 @@
 
 import { onMotusEvent } from './motus-stream.js';
 import { summarizeEvent } from './activity-summary.js';
+import { activityCompletionId, claimCompletionActivity } from './completion-activity.js';
 import { toggleLog } from './mobile.js';
 
 export function initActivityLog() {
@@ -96,11 +97,14 @@ function _append(event) {
 
   const log = document.getElementById('activity-log');
   if (!log) return;
+  const completionId = activityCompletionId(event);
+  if (completionId && !claimCompletionActivity(completionId, 'collector')) return;
 
   const atBottom = log.scrollHeight - log.scrollTop <= log.clientHeight + 40;
 
   const row = document.createElement('div');
   row.className = 'log-entry';
+  if (completionId) row.dataset.completionActionId = completionId;
 
   const t        = new Date(event.ts * 1000).toLocaleTimeString();
   const mcpTag   = event.mcp_id ? `<span style="color:var(--accent);margin-right:4px">[${event.mcp_id}]</span>` : '';
@@ -118,6 +122,7 @@ function _append(event) {
   // would dominate a single line, and the message usually names the tool anyway.
   const latest = document.getElementById('activity-latest');
   if (latest) {
+    latest.dataset.completionActionId = completionId || '';
     latest.innerHTML = `<span class="log-time">${t}</span><span>${mcpTag}${msg}</span>`;
     document.getElementById('activity-strip')?.classList.add('has-latest');
   }

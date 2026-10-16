@@ -1,5 +1,5 @@
 /**
- * skeleton.js — 3D skeleton renderer for Unitree G1 humanoid robot.
+ * skeleton.js — 3D skeleton renderer using the selected device's model.
  * Fetches URDF model from driver via MCP tool, parses kinematic chain,
  * and renders a real-time 3D skeleton driven by joint state data.
  */
@@ -49,6 +49,9 @@ export const SkeletonRenderer = {
   _pelvisGroup: null, // IMU orientation applied here
   _loaded: false,
   _mcpId: null,
+  _modelGeneration: 0,
+  _modelRequest: null,
+  _modelNotice: null,
 
   mount(container, mcpId) {
     this._mcpId = mcpId;
@@ -57,6 +60,7 @@ export const SkeletonRenderer = {
     this._loaded = false;
     this._el = document.createElement('div');
     this._el.className = 'renderer-skeleton';
+    this._el.style.position = 'relative';
     container.appendChild(this._el);
 
     this._initThree();
@@ -102,41 +106,85 @@ export const SkeletonRenderer = {
   },
 
   async _loadModel(mcpId) {
-    if (!mcpId || mcpId === 'dashboard') {
-      this._buildFallbackSkeleton();
+    const generation = ++this._modelGeneration;
+    this._modelRequest?.abort();
+    this._modelRequest = new AbortController();
+    this._clearModel();
+    this._modelStatus('正在加载机器人模型…');
+    if (!mcpId || mcpId === 'dashboard' || mcpId === 'detail') {
+      this._modelStatus('无法确定设备，不能加载机器人模型。请启动卡片后重试。');
       return;
     }
     try {
       const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
         method: 'POST',
+        signal: this._modelRequest.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tool: 'model', arguments: {} }),
       });
+      if (!res.ok) throw new Error('Model request failed');
       const json = await res.json();
+      if (generation !== this._modelGeneration || !this._el) return;
       // API returns { code, data } where data is the content array
       const content = json.data?.[0]?.text ?? json.result?.content?.[0]?.text;
-      if (!content) { this._buildFallbackSkeleton(); return; }
+      if (!content) throw new Error('Model response is empty');
       const data = JSON.parse(content);
       if (data.urdf) {
         this._parseAndBuild(data.urdf);
       } else if (data.type === 'quadruped') {
         this._buildQuadrupedSkeleton(data);
       } else {
-        this._buildFallbackSkeleton();
+        throw new Error('Unsupported robot model');
       }
+      this._modelStatus(null);
     } catch (e) {
+      if (generation !== this._modelGeneration || !this._el) return;
       console.warn('[skeleton] Failed to load URDF model:', e);
-      this._buildFallbackSkeleton();
+      this._clearModel();
+      this._modelStatus('机器人模型加载失败。请检查驱动连接和模型资源，然后重新打开。');
     }
+  },
+
+  _clearModel() {
+    this._loaded = false;
+    if (this._rootGroup) {
+      this._scene?.remove(this._rootGroup);
+      this._rootGroup.traverse(obj => {
+        obj.geometry?.dispose();
+        if (Array.isArray(obj.material)) obj.material.forEach(material => material.dispose());
+        else obj.material?.dispose();
+      });
+    }
+    this._rootGroup = null;
+    this._pelvisGroup = null;
+    this._joints = {};
+    this._links = {};
+  },
+
+  _modelStatus(message) {
+    if (!this._el) return;
+    if (!this._modelNotice) {
+      this._modelNotice = document.createElement('div');
+      this._modelNotice.className = 'skeleton-model-status';
+      this._modelNotice.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;' +
+        'justify-content:center;padding:20px;text-align:center;color:var(--orange, #d77757);pointer-events:none';
+      this._el.appendChild(this._modelNotice);
+    }
+    this._modelNotice.textContent = message || '';
+    this._modelNotice.style.display = message ? 'flex' : 'none';
   },
 
   _parseAndBuild(urdfXml) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(urdfXml, 'text/xml');
+    if (doc.querySelector('parsererror') || doc.documentElement?.tagName !== 'robot') {
+      throw new Error('Invalid robot URDF');
+    }
 
     // Parse links and joints
     const linkNodes = doc.querySelectorAll('link');
     const jointNodes = doc.querySelectorAll('joint');
+    if (!linkNodes.length || !jointNodes.length) throw new Error('Robot motion chain is empty');
 
     // Build link map
     const linkMap = {};
@@ -301,6 +349,7 @@ export const SkeletonRenderer = {
 
     const root = new THREE.Group();
     this._scene.add(root);
+    this._rootGroup = root;
 
     const addJoint = (name, pos, r = 0.012) => {
       const s = new THREE.Mesh(new THREE.SphereGeometry(r, 8, 8), jointMat);
@@ -551,6 +600,10 @@ export const SkeletonRenderer = {
   },
 
   unmount() {
+    this._modelGeneration += 1;
+    this._modelRequest?.abort();
+    this._modelRequest = null;
+    this._modelNotice = null;
     if (this._raf) cancelAnimationFrame(this._raf);
     this._ro?.disconnect();
     this._controls?.dispose();
@@ -569,6 +622,8 @@ export const SkeletonRenderer = {
     }
     this._el?.remove();
     this._scene = null;
+    this._rootGroup = null;
+    this._pelvisGroup = null;
     this._camera = null;
     this._threeRenderer = null;
     this._controls = null;

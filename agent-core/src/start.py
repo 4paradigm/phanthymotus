@@ -692,37 +692,23 @@ app.include_router(api.inspection.ws_router)
 async def acp_complete(request: fastapi.Request):
     """Driver 动作完成后回调此接口，通知 Agent Core 解锁 sync() 并注入 steering。"""
     body = await request.json()
+    if not isinstance(body, dict):
+        return {'ok': False, 'action_id': None, 'state': 'rejected', 'error': 'Object payload required'}
     action_id = body.get('action_id')
-    status = body.get('status', 'completed')
-    result = body.get('result', {})
 
     if not action_id:
-        return {'ok': False, 'error': 'action_id required'}
+        return {'ok': False, 'action_id': action_id, 'state': 'rejected', 'error': 'action_id required'}
+    if not isinstance(action_id, str) or len(action_id) > 256:
+        return await mcp_client.receive_action_completion(action_id, body)
 
     # 基准测试的事实记录器要原样的这一份。顺序不重要 —— 记录器自己不依赖它，因为
     # `mark_action_complete` 还有 SSE 那条调用路径根本不经过这个端点。
     import benchmark_facts
     benchmark_facts.note_acp_post(body)
 
-    # **必须在 mark_action_complete 之前问**：一个并发的 barrier 随时可能把这一项
-    # 回收掉，回收之后 _pending_silent 里就查不到了，于是一句「播完了」的回执会被
-    # 当成新消息唤醒一个 turn。
-    silent = mcp_client.completion_is_silent(action_id)
-
-    # 通道1: 解锁 sync() 等待
-    mcp_client.mark_action_complete(action_id, body)
-
-    # 通道2: 进 event_bus → steering 注入 LLM
-    import event_bus
-    _event = {'type': 'action_complete', 'action_id': action_id,
-              'status': status, 'result': result, 'silent': silent}
-    await event_bus.enqueue(
-        source=f'acp:{action_id}',
-        text=json.dumps(_event, ensure_ascii=False),
-        payload=dict(_event),
-    )
-
-    return {'ok': True, 'action_id': action_id}
+    # HTTP and SSE share cache/replay/deduplication and capture silent before
+    # unblocking waiters. An unknown ID is buffered, never a global LLM message.
+    return await mcp_client.receive_action_completion(action_id, body)
 
 
 # ── System Hooks API ─────────────────────────────────────────────────────────

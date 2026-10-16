@@ -19,6 +19,38 @@ router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
 
 
+def _register_canvas_completion(tool: dict | None, arguments: dict, result: dict) -> bool:
+    """Match manual card callbacks to the same ACP bookkeeping used by LLM calls.
+
+    The proxy bypasses call_tool, so it must register returned action IDs itself.
+    This also consumes a completion that arrived while the HTTP reply was in
+    flight, rather than leaving a valid manual callback in the early cache.
+    """
+    if not tool or result.get('isError'):
+        return False
+    schema = tool.get('inputSchema') or {}
+    completion = schema.get('x-completion')
+    if not completion or not mcp_client._should_await_completion(completion, arguments.get('action')):
+        return False
+    for item in result.get('content') or []:
+        if not isinstance(item, dict) or item.get('type') != 'text':
+            continue
+        try:
+            parsed = json.loads(item.get('text', ''))
+        except (TypeError, ValueError):
+            continue
+        action_id = parsed.get('action_id') if isinstance(parsed, dict) else None
+        # The status endpoint and browser use the same limit: do not retain an
+        # action that the manual card cannot subsequently query.
+        if not isinstance(action_id, str) or not action_id or len(action_id) > 256:
+            continue
+        meta = {'completion': completion, 'resource': mcp_client.parse_resources(schema.get('x-resource'))}
+        mcp_client._register_pending(action_id, tool_name=tool['name'], meta=meta,
+                                     args=arguments, result=parsed)
+        return True
+    return False
+
+
 async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
     """Register topics with the embedded inspection module (process-internal call).
 
@@ -320,6 +352,34 @@ async def hooks_status():
     """Return hook registry and recent fire log for diagnostics."""
     import hooks
     return {'code': 200, 'data': hooks.get_status()}
+
+
+@router.get('/actions/{action_id}')
+async def canvas_action_status(action_id: str):
+    """Read ACP bookkeeping only; never dispatch, wait, cancel or reap a task."""
+    if not action_id or len(action_id) > 256:
+        raise fastapi.HTTPException(status_code=400, detail='Invalid action_id')
+    payload = mcp_client.pending_result(action_id)
+    outcome = mcp_client.action_outcome(action_id)
+    if payload is None and outcome:
+        payload = outcome.get('completion')
+    if payload is not None:
+        nested = payload.get('payload')
+        nested = nested if isinstance(nested, dict) else {}
+        data = {'action_id': action_id, 'state': 'settled',
+                'status': payload.get('status', nested.get('status', 'unknown')),
+                'result': payload.get('result', nested.get('result', {}))}
+    elif outcome:
+        # A harness timeout/interruption is not proof that the physical action
+        # stopped. Do not fabricate a successful controller completion.
+        data = {'action_id': action_id, 'state': 'unconfirmed',
+                'status': outcome.get('status', 'unknown'),
+                'message': 'No driver completion is available. Check actual device state.'}
+    else:
+        pending = action_id in mcp_client.get_pending_actions()
+        data = {'action_id': action_id, 'state': 'pending' if pending else 'unknown'}
+    return fastapi.responses.JSONResponse({'code': 200, 'data': data},
+                                         headers={'Cache-Control': 'no-store'})
 
 
 @router.get('')
@@ -1387,6 +1447,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                _register_canvas_completion(tool_obj, final_args, result)
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):
