@@ -4,6 +4,30 @@
 
 原有卡片只能显示参数表单和文本结果；现有技能安装接口从资源中心获取定义，不能安装本机生成的未发布定义。因此新增上述两项通用能力。若后续统一的卡片页面协议或本地安装接口覆盖它们，应迁移并移除重复实现；不在 Core 添加各机器人专用流程。
 
+## 当前版本：持久自动执行设置（2026-10-16）
+
+用户可在示教保存/导入启用时选择自动执行，也可在「我的 → 技能广场 → 已安装 → 技能 → 对话调用」勾选「允许自动执行」。卡片齿轮另提供「本设备所有已验证技能自动执行」，覆盖现有及以后验证通过的技能；关闭总开关后恢复单技能选择。默认关闭，正常停止、停止项目及容器重启后保留用户选择。每次调用仍由 Driver 检查资产、设备、起点和控制权，新导入仍须本机验证。
+
+只有声明 `x-skill-package.persistent_execution` 的工具使用此能力。Core 不判断型号或驱动机器人；这里的必要修改为：
+
+- `skill_packages.py` 在 ConfigDB 保存单技能设置，并读取现有 tool_config 的卡片设置；开启前读取 Driver 的设备/动作绑定，更新旧 Skill 的调用说明。旧 taught UUID 定义与新 attachment 定义均沿用严格来源解析。
+- `api/canvas.py` 保存该类卡片配置时，验证网页 token 并取得真实设备绑定，不接受调用方伪造的绑定；普通卡片沿用原流程。
+- `auth.py` 只允许同机 Driver 无 token 读取已保存策略，不能写入。持久设置和一次性授权创建都要求已登录网页；模型直接调用 MCP config 不授予权限。
+- `web/js/skills.js` 在原「对话调用」内提供复选框；`workbench.js` 在 save/import 成功后保存用户的单技能选择；`sidebar.js` 为配置 schema 的 `x-widget: checkbox` 渲染原生复选框，未新增全局按钮或 CSS。
+- `mcp_client.py` 沿用已有 `missing_required_config`，仅在真正缺必填配置时阻止 start；新增可选开关不能导致未配置过的卡片无法启动。没有修改 Agent Loop、技能激活或提示词生成代码。
+
+策略绑定 MCP/卡片、设备身份、模型/几何/标定摘要；单技能还绑定录制 SHA、录制绑定和元数据。策略只存本机，不包含在导出动作包中。改变绑定使原设置不匹配，Driver 的实时检查仍可拒绝执行。
+
+| 新增接口 | 行为 |
+| --- | --- |
+| GET `/api/skills/package/execution/{slug}` | 读取实际绑定后的有效选择、是否继承卡片及绑定变化提示 |
+| POST `/api/skills/package/execution/{slug}` | 网页开启/关闭单技能自动执行，并撤销该技能旧临时授权 |
+| POST `/api/skills/package/execution/read` | 精确回环端点；Driver 每次 preview/run 只读策略，无授权写入能力 |
+
+上海已部署 `phanthymotus-core:auto-execution-20261016-r2`（`2eb5412a7bd4`），保留现场基线更新、原画布/数据及 DDS 环境变量。真实网页验证单技能设置、卡片总开关与继承展示；真实 Driver 预览验证作用范围、优先关系、关闭恢复、直接 MCP config 不授权；普通 stop 与 Core/G1 重启后设置保留。测试设置已恢复关闭，项目停止，浏览器无脚本错误。实际截图见 [Driver #412](https://github.com/4paradigm/phanthymotus-driver/pull/412) 的当前版本部分。
+
+本轮没有执行新的 run/trial，未重做录制→试运行→保存的物理闭环；新增回归断言未执行模拟测试。Python AST/镜像 py_compile、Chromium 脚本编译和 diff 检查用于静态验证。下方五次动作和测试数量均为历史版本证据，不能表述为持久设置版本的完整 Agent/动作验收。
+
 ## 扩展声明
 
 声明放在 `inputSchema` 内，避免被现有 MCP 注册字段白名单丢弃：
@@ -89,7 +113,7 @@ Driver 的 `tests/test_teaching_browser.py` 提供跨仓浏览器验收：真实
 
 导入后直接打开自动检查页面，一次点击确认本次条件并试运行，完成后确认效果启用。关闭可从技能列表「待验证 → 继续验证」恢复。目标设备已有完全相同且验证成功的本机资产时复用原资产；不采信包内授权，不重复试运行，也不重置既有 Skill 可见性。
 
-技能详情可「允许本次直接调用」，最长 30 分钟，Driver 继续执行每次新预览及运动检查。Core 的 `skill_packages.py` 负责已登录网页的一次性授权凭据，`auth.py` 仅对回环消费端点增加精确豁免，供同机 Driver 核验；创建权限仍必须验证 Bearer token。无需给 Driver 增加网页 token，也不把授权动作暴露给 Agent。授权成功自动刷新旧 Skill 调用说明。停止、驱动重启、反馈重连、模式/标定或动作变化及执行异常由 Driver 撤销；授权不导出，不持久化。该轮没有修改 Agent Loop。
+未声明持久能力的旧适配器，技能详情仍可「允许本次直接调用」，最长 30 分钟，Driver 继续执行每次新预览及运动检查。Core 的 `skill_packages.py` 负责已登录网页的一次性授权凭据，`auth.py` 对回环消费端点增加精确豁免，供同机 Driver 核验；创建权限仍必须验证 Bearer token。无需给 Driver 增加网页 token，也不把授权动作暴露给 Agent。授权成功自动刷新旧 Skill 调用说明。停止、驱动重启、反馈重连、模式/标定或动作变化及执行异常由 Driver 撤销；旧临时授权不导出、不持久化。此生命周期不适用于上面的持久设置。
 
 `web/index.html` / `web/js/skills.js` 复用现有技能弹窗和样式提供文件入口和型号详情，`workbench.js` 在保存时补入原 MCP/实例身份。没有机器人型号判断或运动算法放进 Core。
 
@@ -101,7 +125,7 @@ Driver 的 `tests/test_teaching_browser.py` 提供跨仓浏览器验收：真实
 
 上述部署阶段，真实 Agent 已正确发现并调用 `g1_teaching.preview(asset_id)`，但一次物理回放遗留的 G1 交权超时导致 `motion_busy`。当时在 Driver #412 的 `arm_stream.py` / `teleop_control.py` 修复，现场完成停止交权并更新 Driver 后，多次预览成功、busy=false；未再次执行动作。该历史记录不代表下面新增候选的当前状态。
 
-## 停止结果与最新候选（2026-10-16）
+## 前版停止修复与五次实机动作（2026-10-16）
 
 `src/api/config.py` 的停止收尾必须读取设备返回值：非 200、业务 error、unknown/failed/fault 及未确认的 release 都按失败报告。明确仍在释放或持有控制权时，在原有每卡 5 秒期限内轮询 info，不重复发送 stop；到期报告“停止未确认”。Agent 仍先停、设备仍并行收尾，沿用原进度事件和界面，没有修改 Agent Loop。
 

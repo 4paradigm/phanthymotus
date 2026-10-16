@@ -86,13 +86,23 @@ export async function openWorkbench(target, spec, ui, onClose) {
         if (isMutation && busy) throw new Error('上一项操作尚未完成');
         mutation = isMutation;
         if (mutation) busy = true;
-        let result = await invoke(target, {...args, action});
+        const driverArgs = {...args, action};
+        const autoExecute = driverArgs.auto_execute;
+        if (autoExecute !== undefined) {
+          if (request.method !== 'save' || typeof autoExecute !== 'boolean' || !spec.actions.includes('execution_binding'))
+            throw new Error('此工作台不支持自动执行设置');
+          delete driverArgs.auto_execute;
+        }
+        let result = await invoke(target, driverArgs);
         if (request.method === 'save') {
           if (!result.skill) throw new Error('扩展未返回技能定义');
           const definition = result.skill.attachment ? {...result.skill,
             origin: {mcp_id: target.mcp, instance_id: target.instanceId}} : result.skill;
           result = {...result, installed: await api('/api/skills/import', definition),
             context: await conversationContext(target).catch(() => ({conversation_ready: false, tool: target.tool}))};
+          if (autoExecute !== undefined) {
+            result.execution_policy = await api(`/api/skills/package/execution/${encodeURIComponent(definition.slug)}`, {enabled: autoExecute});
+          }
         }
         reply.postMessage({id: request.id, result});
       } catch (error) { reply.postMessage({id: request.id, error: error.message}); }

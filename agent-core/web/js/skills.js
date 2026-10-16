@@ -642,6 +642,35 @@ function _renderSkillDetail(skill, context) {
 
 async function _loadSession(slug, area) {
   try {
+    const response = await fetch(`/api/skills/package/execution/${encodeURIComponent(slug)}`);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || '无法读取自动执行设置');
+    if (!result.data.supported) return _loadTemporarySession(slug, area);
+    const current = result.data;
+    area.innerHTML = `<div class="skill-detail-section-label">对话调用</div>
+      <label class="skill-detail-text"><input type="checkbox" id="skill-auto-execute" ${current.enabled ? 'checked' : ''} ${current.device_enabled ? 'disabled' : ''}> 允许自动执行</label>
+      <p class="skill-detail-text">${current.device_enabled ? '已按卡片设置允许本设备所有已验证技能自动执行。' : '开启后，直接说技能名称即可执行，无需逐次确认。'}</p>
+      <p class="skill-detail-text">设置保存在本设备，停止项目或重启后保留；每次仍检查设备、起点及控制权。</p>
+      <p class="skill-detail-text" role="status" id="skill-auto-execute-status">${current.binding_changed ? '动作或设备绑定已变化，请核对后重新保存设置。' : ''}</p>`;
+    const checkbox = area.querySelector('#skill-auto-execute');
+    checkbox.onchange = async () => {
+      checkbox.disabled = true;
+      try {
+        const response = await fetch(`/api/skills/package/execution/${encodeURIComponent(slug)}`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled: checkbox.checked})});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || '设置失败');
+        await _loadSession(slug, area);
+      } catch (error) {
+        area.querySelector('#skill-auto-execute-status').textContent = error.message;
+        checkbox.checked = current.enabled; checkbox.disabled = false;
+      }
+    };
+  } catch (error) { area.textContent = error.message; }
+}
+
+async function _loadTemporarySession(slug, area) {
+  try {
     const response = await fetch(`/api/skills/package/session/${encodeURIComponent(slug)}`);
     const result = await response.json();
     if (!response.ok) throw new Error(result.detail || '无法读取会话授权');

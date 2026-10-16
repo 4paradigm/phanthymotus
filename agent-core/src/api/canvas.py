@@ -407,8 +407,10 @@ async def get_all_tool_configs():
 
 
 @router.put('/tool-config/{mcp_id}/{tool_name}')
-async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
+async def save_tool_config(mcp_id: str, tool_name: str, request: fastapi.Request, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
+    from api.skill_packages import prepare_execution_config
+    body = await prepare_execution_config(mcp_id, tool_name, body, '', request)
     config.main[tool_config_key(mcp_id, tool_name)] = body
     apply_tool_config(mcp_id, tool_name, body)
     return {'code': 200}
@@ -437,8 +439,10 @@ async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
 
 
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
-async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
+async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, request: fastapi.Request, body: Any = fastapi.Body(...)):
     """Save config for a specific tool instance and apply it."""
+    from api.skill_packages import prepare_execution_config
+    body = await prepare_execution_config(mcp_id, tool_name, body, instance_id, request)
     config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
     apply_tool_config(mcp_id, tool_name, body, instance_id)
     return {'code': 200}

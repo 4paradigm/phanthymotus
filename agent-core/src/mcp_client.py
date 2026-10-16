@@ -927,6 +927,7 @@ async def call_tool(full_name: str, args: dict) -> str:
     if action == 'start':
         meta = info.get('tool_meta', {}).get(full_name, {})
         if meta.get('has_config_schema'):
+            from tool_config import find_tool, missing_required_config
             saved_cfg = _get_tool_config(mcp_id, tool_name)
             if saved_cfg:
                 # Drop keys the current schema no longer advertises; a stale row
@@ -948,7 +949,7 @@ async def call_tool(full_name: str, args: dict) -> str:
                         return f'[{tool_name}] 配置无效（缺少 url/key），请在设备面板中检查配置后再启动。'
                 except (json.JSONDecodeError, IndexError, KeyError):
                     pass
-            else:
+            elif missing_required_config(find_tool(mcp_id, tool_name), {}):
                 return f'[{tool_name}] 尚未配置，请先在设备面板中完成配置（provider/url/key）后再启动。'
 
     try:

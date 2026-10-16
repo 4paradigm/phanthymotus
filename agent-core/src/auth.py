@@ -87,7 +87,7 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     # One-use UI approvals are created only by the authenticated skills route.
     # The same-host Driver can consume an unguessable receipt, never create one.
-    if path == '/api/skills/package/approval/consume' and request.method == 'POST' and _from_loopback(request):
+    if path in ('/api/skills/package/approval/consume', '/api/skills/package/execution/read') and request.method == 'POST' and _from_loopback(request):
         return await call_next(request)
     if path.startswith('/api/channel/webhook/'):
         return await call_next(request)

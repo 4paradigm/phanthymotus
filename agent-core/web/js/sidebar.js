@@ -576,7 +576,7 @@ function _readConfigValue(input, def) {
   }
   if (def?.type === 'integer') return parseInt(raw, 10);
   if (def?.type === 'number')  return parseFloat(raw);
-  if (def?.type === 'boolean') return raw === 'true';
+  if (def?.type === 'boolean') return input.type === 'checkbox' ? input.checked : raw === 'true';
   return raw;
 }
 
@@ -729,6 +729,10 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         input.appendChild(option);
       }
       input.value = effectiveValue;
+    } else if (def.type === 'boolean' && def['x-widget'] === 'checkbox') {
+      input = document.createElement('input');
+      input.type = 'checkbox'; input.dataset.key = key;
+      input.checked = savedValues[key] ?? def.default ?? false;
     } else if (def.type === 'boolean') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1060,6 +1064,10 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         input.appendChild(option);
       }
       input.value = effectiveValue;
+    } else if (def.type === 'boolean' && def['x-widget'] === 'checkbox') {
+      input = document.createElement('input');
+      input.type = 'checkbox'; input.dataset.key = key;
+      input.checked = savedValues[key] ?? def.default ?? false;
     } else if (def.type === 'boolean') {
       input = document.createElement('select');
       input.className = 'tool-config-input';

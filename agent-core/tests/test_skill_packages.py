@@ -31,6 +31,33 @@ def package():
     return out.getvalue()
 
 
+def test_execution_policy_is_local_bound_and_card_overrides_skill(client, target):
+    from api.skill_packages import execution_key, execution_setting
+    device, asset, recording = 'd'*64, 'a'*32, 'b'*64
+    config.main['teaching_execution_policies'] = {execution_key(target)+':'+asset: {
+        'enabled': True, 'device_binding': device, 'asset_binding': recording}}
+    assert execution_setting(target, device, asset, recording)['source'] == 'skill'
+    assert not execution_setting(target, device, asset, 'changed')['enabled']
+    assert not execution_setting(target, 'other-device', asset, recording)['enabled']
+    key = 'tool_config:'+execution_key(target)
+    config.main[key] = {'auto_execute_verified': True, '_execution_binding': device}
+    assert execution_setting(target, device, 'new-validated-asset', 'new')['source'] == 'card'
+    config.main[key] = {'auto_execute_verified': False}
+    assert execution_setting(target, device, asset, recording)['source'] == 'skill'
+    assert not execution_setting(target, device, 'new-validated-asset', 'new')['enabled']
+
+
+def test_execution_settings_require_browser_and_driver_reads_are_loopback_only(client, target, monkeypatch):
+    import auth
+    monkeypatch.setattr(auth, '_token', 'browser-only-token')
+    assert client.post('/api/skills/package/execution/taught-'+'a'*32,
+                       json={'enabled': True}).status_code == 401
+    assert client.post('/api/skills/package/execution/read', json={}).status_code == 403
+    config.main['services']['mcp'][0]['tools'][0]['inputSchema']['x-skill-package']['persistent_execution'] = True
+    url = '/api/canvas/tool-config/robot-a/g1_teaching/teach-a'
+    assert client.put(url, json={'auto_execute_verified': True, '_execution_binding': 'forged'}).status_code == 401
+
+
 def test_import_uses_canvas_target_and_does_not_activate(client, target, monkeypatch):
     data = package()
     calls, received = [], bytearray()

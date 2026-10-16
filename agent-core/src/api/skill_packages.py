@@ -21,6 +21,118 @@ _approvals = {}
 _approval_lock = threading.Lock()
 
 
+def require_browser(request):
+    import auth
+    supplied = request.headers.get('Authorization', '').removeprefix('Bearer ')
+    if not auth.get_token() or not secrets.compare_digest(supplied, auth.get_token()):
+        raise fastapi.HTTPException(401, '请登录网页后设置自动执行')
+
+
+def execution_key(target):
+    return f"{target['mcp_id']}:{target['tool']}:{target['instance_id']}"
+
+
+def execution_setting(target, device_binding, asset_id='', asset_binding=''):
+    # This is the sole authority. Driver reads it before every preview/run;
+    # config MCP arguments and imported Skill metadata cannot grant permission.
+    shared = config.main.get(f"tool_config:{target['mcp_id']}:{target['tool']}", {}) or {}
+    own = config.main.get(f"tool_config:{execution_key(target)}", {}) or {}
+    settings = {**shared, **own}
+    requested = settings.get('auto_execute_verified') is True
+    device_enabled = requested and settings.get('_execution_binding') == device_binding
+    policies = config.main.get('teaching_execution_policies', {})
+    policy = policies.get(execution_key(target)+':'+asset_id, {}) if asset_id else {}
+    skill_enabled = (policy.get('enabled') is True and policy.get('device_binding') == device_binding
+                     and policy.get('asset_binding') == asset_binding)
+    return {'enabled': device_enabled or skill_enabled, 'device_enabled': device_enabled,
+            'skill_enabled': skill_enabled, 'source': 'card' if device_enabled else 'skill' if skill_enabled else 'manual',
+            'binding_changed': (requested and not device_enabled) or (policy.get('enabled') is True and not skill_enabled)}
+
+
+async def prepare_execution_config(mcp_id, tool_name, body, instance_id, request):
+    from tool_config import find_tool
+    tool = find_tool(mcp_id, tool_name)
+    if not tool.get('inputSchema', {}).get('x-skill-package', {}).get('persistent_execution'):
+        return body
+    require_browser(request)
+    if not isinstance(body, dict) or type(body.get('auto_execute_verified', False)) is not bool:
+        raise fastapi.HTTPException(422, '自动执行设置必须为布尔值')
+    candidates = [t for t in targets() if t['mcp_id'] == mcp_id and t['tool'] == tool_name
+                  and (not instance_id or t['instance_id'] == instance_id)]
+    if len(candidates) != 1:
+        raise fastapi.HTTPException(409, '请在对应示教卡片的配置中设置自动执行')
+    target = candidates[0]
+    clean = {k: v for k, v in body.items() if k != '_execution_binding'}
+    if clean.get('auto_execute_verified'):
+        binding = await call(target, 'execution_binding')
+        clean['_execution_binding'] = binding['device_binding']
+        # Old generated instructions must learn the automatic-execution rule
+        # before enabling a whole card. Keep user metadata and visibility.
+        for skill in list(config.main.get('skills', {}).get('installed', [])):
+            attachment = skill.get('attachment') or {}
+            legacy = not attachment and skill.get('slug', '').startswith('taught-') and skill.get('requiredTools') == [tool_name]
+            if attachment.get('tool') != tool_name and not legacy:
+                continue
+            try:
+                _, owner, _ = resolve_skill(skill['slug'])
+            except fastapi.HTTPException:
+                continue
+            if owner == target:
+                await refresh_definition(skill['slug'])
+    return clean
+
+
+@router.post('/execution/read')
+async def read_execution(request: fastapi.Request, body: dict = fastapi.Body(...)):
+    import auth
+    if not auth._from_loopback(request):
+        raise fastapi.HTTPException(403, '仅同机 Driver 可读取执行配置')
+    candidates = [t for t in targets() if t['tool'] == body.get('tool')
+                  and t.get('capabilities', {}).get('persistent_execution')
+                  and (not body.get('instance_id') or t['instance_id'] == body['instance_id'])]
+    if body.get('asset_id'):
+        try:
+            _, owner, _ = resolve_skill('taught-'+body['asset_id'])
+            candidates = [t for t in candidates if t == owner]
+        except fastapi.HTTPException:
+            return {'code': 200, 'data': {'enabled': False, 'device_enabled': False, 'skill_enabled': False, 'source': 'manual'}}
+    if len(candidates) != 1:
+        return {'code': 200, 'data': {'enabled': False, 'device_enabled': False, 'skill_enabled': False, 'source': 'manual'}}
+    if not isinstance(body.get('device_binding'), str) or len(body['device_binding']) != 64:
+        raise fastapi.HTTPException(422, '设备绑定无效')
+    return {'code': 200, 'data': execution_setting(candidates[0], body['device_binding'],
+        body.get('asset_id', ''), body.get('asset_binding', ''))}
+
+
+@router.get('/execution/{slug}')
+async def get_execution(slug: str):
+    _, target, asset_id = resolve_skill(slug)
+    if not target['capabilities'].get('persistent_execution'):
+        return {'code': 200, 'data': {'supported': False}}
+    binding = await call(target, 'execution_binding', asset_id=asset_id)
+    return {'code': 200, 'data': {'supported': True, **execution_setting(target, **binding)}}
+
+
+@router.post('/execution/{slug}')
+async def set_execution(slug: str, request: fastapi.Request, body: dict = fastapi.Body(...)):
+    require_browser(request)
+    if type(body.get('enabled')) is not bool:
+        raise fastapi.HTTPException(422, '请选择是否允许自动执行')
+    _, target, asset_id = resolve_skill(slug)
+    if not target['capabilities'].get('persistent_execution'):
+        raise fastapi.HTTPException(409, '请更新示教 Driver')
+    key = execution_key(target)+':'+asset_id
+    binding = await call(target, 'execution_binding', asset_id=asset_id)
+    if body['enabled']:
+        await refresh_definition(slug)
+    policies = dict(config.main.get('teaching_execution_policies', {}))
+    policies[key] = {**binding, 'enabled': body['enabled']}
+    config.main['teaching_execution_policies'] = policies
+    # Disabling permanent permission must not leave an old temporary grant.
+    await call(target, 'session_revoke', asset_id=asset_id)
+    return {'code': 200, 'data': {'supported': True, **execution_setting(target, **binding)}}
+
+
 def targets():
     services = config.main.get('services', {}).get('mcp', [])
     cards = config.main.get('canvas_layout', {}).get('cards', [])
