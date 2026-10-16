@@ -484,6 +484,93 @@ def test_max_points_cap_is_honoured():
     assert summary["points"] == 100
 
 
+def test_stereo_cap_is_honoured_on_the_flattened_cloud():
+    """review 第 11 轮：stereo 抽稀以前把 2-D 图像步长
+    ceil(sqrt(w*h/max_points)) 用在已展平的 (N,3) 云上 —— 步长差 sqrt(N)
+    倍，密集 640x480 云实际发 ~76800 点（max_points=20000），超渲染器
+    40000 上限。抽稀必须按点数本身：ceil(N/max_points)。
+
+    SGBM 反投影路径用假 cv2 走通：均匀视差 → 全帧有效 → 密集云。"""
+    plugin, executor = _plugin(cfg={"fps": 1000,
+                                    "max_points": 200,
+                                    "calibration": json.dumps(RECTIFIED_BLOB)})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    import cv2
+    if not getattr(cv2, "__motus_fake__", False):
+        pytest.skip("SGBM/reprojectImageTo3D stubs only exist on the fake cv2")
+
+    def sgbm_compute(_self, left_u, right_u):
+        # 均匀视差 1.0 → 每个像素的深度都在 [min, max] 内 → 全帧有效
+        return np.full(left_u.shape, 16, dtype=np.int16)
+
+    fake_sgbm = type("FakeSGBM", (), {"compute": sgbm_compute})
+    real_create = getattr(cv2, "StereoSGBM_create", None)
+    real_reproject = getattr(cv2, "reprojectImageTo3D", None)
+    real_mode = getattr(cv2, "STEREO_SGBM_MODE_SGBM_3WAY", None)
+
+    def fake_create(**kwargs):
+        return fake_sgbm()
+
+    def fake_reproject(disp, Q, handleMissingValues=False):
+        # Q[2,3]=fx, Q[3,2]=-1/Tx：Z = fx·Tx/d，均匀视差 → 恒定正深度
+        h, w = disp.shape
+        pts = np.zeros((h, w, 3), dtype=np.float32)
+        pts[..., 0] = np.arange(w, dtype=np.float32)[None, :] - Q[0, 3]
+        pts[..., 1] = np.arange(h, dtype=np.float32)[:, None] - Q[1, 3]
+        pts[..., 2] = Q[2, 3] * Q[3, 2] * -1.0  # fx · (1/Tx) · 常数视差
+        return pts * 0 + 2.0  # 深度恒 2.0 m，落在 [min, max] 内
+
+    cv2.StereoSGBM_create = fake_create
+    cv2.reprojectImageTo3D = fake_reproject
+    cv2.STEREO_SGBM_MODE_SGBM_3WAY = 1
+    try:
+        # 40x40 = 1600 点 >> max_points=200，逼出真实抽稀
+        left = np.full((40, 40, 3), 128, dtype=np.uint8)
+        right = np.full((40, 40, 3), 128, dtype=np.uint8)
+        node._emit_stereo(left, right)
+    finally:
+        if real_create is not None:
+            cv2.StereoSGBM_create = real_create
+        elif hasattr(cv2, "StereoSGBM_create"):
+            del cv2.StereoSGBM_create
+        if real_reproject is not None:
+            cv2.reprojectImageTo3D = real_reproject
+        elif hasattr(cv2, "reprojectImageTo3D"):
+            del cv2.reprojectImageTo3D
+        if real_mode is not None:
+            cv2.STEREO_SGBM_MODE_SGBM_3WAY = real_mode
+        elif hasattr(cv2, "STEREO_SGBM_MODE_SGBM_3WAY"):
+            del cv2.STEREO_SGBM_MODE_SGBM_3WAY
+
+    _, summary = _wait_cloud_and_summary(node)
+    # 1600 点 > max_points=200 → ceil(1600/200)=8 → 200 点
+    assert summary["points"] == 200
+    assert summary["mode"] == "stereo"
+
+
+def test_decimation_stride_on_flattened_cloud_matches_ceil_n_over_max():
+    """review 第 11 轮：decimation_stride(1, N, max_points) 必须退化为
+    ceil(N/max_points)，不是 sqrt(N/max_points)（2-D 网格用的 sqrt 形式）。
+
+    注意：插件把 max_points 下限clamp到 100（pointcloud.py:740），
+    所以端到端测试无法透传 16 这种小值，直接单元测试抽稀步长公式。"""
+    from plugins.pointcloud_math import decimation_stride
+
+    # 2-D 图像网格：60x60，max_points=100 → ceil(sqrt(3600/100)) = 6
+    assert decimation_stride(60, 60, 100) == 6
+    # 1-D 已展平云：48 点，max_points=16 → ceil(48/16) = 3
+    assert decimation_stride(1, 48, 16) == 3
+    # 1-D 整除边界
+    assert decimation_stride(1, 32, 16) == 2
+    # 1-D 不足整除进一
+    assert decimation_stride(1, 33, 16) == 3
+    # 1-D 点数不足 max_points → stride 1，不抽稀
+    assert decimation_stride(1, 48, 100) == 1
+
+
 # ── stereo 生命周期与 info 契约 ───────────────────────────────────────────────
 
 def test_stereo_start_without_calibration_runs_capture_only():

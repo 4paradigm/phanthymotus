@@ -572,7 +572,6 @@ class _PointCloudNode(Node):
             return
         fx, cx, cy, Tx, left_u, right_u = _rectify_pair(
             left, right, blob, getattr(self, "_rectify_cache", None))
-        h, w = left_u.shape[:2]
         # SGBM 参数照 Go1 经验取：块匹配对小基线更稳，但 SGBM 质量更好。
         block = 5
         sgbm = cv2.StereoSGBM_create(
@@ -594,8 +593,11 @@ class _PointCloudNode(Node):
         Q = Q_from_baseline(fx, cx, cy, Tx)
         xyz = cv2.reprojectImageTo3D(disp, Q, True).reshape(-1, 3).astype(np.float32)
         xyz = filter_cloud(xyz, self._min_depth_m, self._max_depth_m)
-        stride = decimation_stride(w, h, self._max_points)
-        xyz = decimate_cloud(xyz, stride)
+        # review 第 11 轮：这里以前用 2-D 的 decimation_stride(w, h)（图像
+        # 网格步长，sqrt(w*h/max_points)）去抽已展平的 (N,3) 云 —— 步长
+        # 差 sqrt(N) 倍，640x480 密集云实际发出 ~76800 点，是 max_points
+        # 的近 4 倍，还超渲染器 40000 上限。抽稀必须按点数本身算。
+        xyz = decimate_cloud(xyz, decimation_stride(1, len(xyz), self._max_points))
         self._publish(xyz)
 
     def _publish(self, xyz: np.ndarray):

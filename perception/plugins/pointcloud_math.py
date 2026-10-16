@@ -28,8 +28,16 @@ CALIB_DIR = "/models/stereo_calib"
 
 
 def decimation_stride(w: int, h: int, max_points: int) -> int:
-    """q5 参照：stride = ceil(sqrt(w*h/max_points))，至少 1。"""
-    return max(1, int(((w * h) / max(max_points, 1)) ** 0.5 + 0.999))
+    """q5 参照：stride = ceil(sqrt(w*h/max_points))，至少 1。
+
+    2-D 图像网格（backproject_depth 抽深度图）用 sqrt 形式；传 w=1 时退
+    化为 1-D：ceil(N/max_points）—— 供已展平的 (N,3) 点云（stereo 反投影
+    路径）按点数抽稀用。2-D 步长抽 1-D 云差 sqrt(N) 倍，密集 640x480 云
+    实际发 ~76800 点（review 第 11 轮）。"""
+    n = w * h
+    if w == 1:  # 1-D：按点数抽稀，不是 sqrt；ceil(N/max(max_points,1))
+        return max(1, -((-n) // max(max_points, 1)))
+    return max(1, int((n / max(max_points, 1)) ** 0.5 + 0.999))
 
 
 def backproject_depth(depth_m: np.ndarray, fx: float, fy: float,
