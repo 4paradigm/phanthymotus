@@ -92,11 +92,11 @@ async def auth_middleware(request: Request, call_next):
     # Exempt paths
     if path == '/api/auth/verify':
         return await call_next(request)
-    # One-use UI approvals are created only by the authenticated skills route.
-    # The same-host Driver can consume an unguessable receipt, never create one;
-    # the execution read is read-only and cannot grant anything.
-    if (path in ('/api/skills/package/approval/consume',
-                 '/api/skills/package/execution/read')
+    # The same-host driver reads whether a skill may run unattended before every
+    # preview. Read-only: it cannot create a permission, only observe one, which
+    # is why loopback alone is enough. (A companion exemption for a one-use
+    # session receipt was removed with the session-grant feature itself.)
+    if (path == '/api/skills/package/execution/read'
             and request.method == 'POST' and _from_loopback(request)):
         return await call_next(request)
     if path.startswith('/api/channel/webhook/'):

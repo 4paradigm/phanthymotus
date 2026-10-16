@@ -1,4 +1,4 @@
-"""Skill-package transfer through one selected card.
+"""Skill-package transfer through one selected card, plus the local auto-execution policy.
 
 Core is a transport and a policy store, nothing else. It does not know what is
 inside a package, what the device does with it, or what kind of device it is:
@@ -12,14 +12,31 @@ inside a package, what the device does with it, or what kind of device it is:
 - **`compatibility`** is opaque. Core reads exactly one field out of it --
   `tool`, to route the package to the right card -- and forwards the rest for
   the device to judge and the page to display.
-- the **legacy slug prefix** for skills installed before packages carried
-  `attachment` is declared per card, not spelled here.
 
 Every earlier version of this file hardcoded one application's vocabulary --
 a `motus.teaching.package/1` identifier, a `trajectory.jsonl` entry, a
 `taught-` slug prefix, a 32-hex asset id, a 64-char binding. Each of those
 made a second kind of device an edit to Core, which is the opposite of what
 `x-skill-package` is for.
+
+Three capabilities were built here and then removed before merge, because each
+was scaffolding for something that does not exist:
+
+- **A 30-minute session grant** (`session_challenge`/`authorize`/`revoke`, a
+  one-use receipt store, and a loopback auth exemption to consume it) was
+  described as backward compatibility for adapters predating the persistent
+  setting. There are none: the only driver that ever implemented those actions
+  is unmerged, so it was compatibility with a predecessor that never shipped.
+- **A legacy slug-prefix resolver** mapped pre-`attachment` skills to their
+  device. Exactly one test rig had such a row; a single DB update replaces two
+  code paths, and a slug convention is not an identity mechanism anyway.
+- **A whole-card override** granted auto-execution to every skill the card
+  would *later* verify -- the widest grant in the feature -- and to do it, it
+  intercepted the generic `PUT /api/canvas/tool-config` endpoint, did device
+  I/O inside a config save, and stored a private field inside the user's own
+  config blob. Per-skill consent covers the real need.
+
+See docs/SKILL_WORKBENCH.md for what replaced them.
 """
 import asyncio
 import base64
@@ -29,7 +46,6 @@ import io
 import json
 import re
 import secrets
-import threading
 import time
 import zipfile
 
@@ -37,7 +53,6 @@ import fastapi
 from fastapi.responses import Response
 
 import config
-from api.canvas import tool_config_key
 
 router = fastapi.APIRouter(prefix='/package')
 
@@ -53,21 +68,11 @@ CHUNK_BYTES = 24576
 # codebase carries one.
 TRANSFER_DEADLINE_S = 180.0
 
-# `prepare_execution_config` refreshes the generated instructions of every
-# skill the card owns. That is one device call each, so it needs a ceiling on
-# both counts -- a card with a hundred skills must not turn a config save into
-# a hundred serial round trips.
-REFRESH_DEADLINE_S = 30.0
-REFRESH_MAX_SKILLS = 50
-
 # Opaque device-side identifiers. Core compares and forwards them; it does not
 # know whether they are hashes, UUIDs or row ids, so it bounds the length and
 # the alphabet and stops there.
 _OPAQUE = re.compile(r'[A-Za-z0-9_.:-]{1,128}')
 _POLICY_KEY = 'skill_execution_policies'
-
-_approvals = {}
-_approval_lock = threading.Lock()
 
 
 # ── authentication ───────────────────────────────────────────────────────────
@@ -116,24 +121,22 @@ def read_binding(data, *, asset_id=''):
 
 
 def execution_setting(target, device_binding, asset_id='', asset_binding=''):
-    # This is the sole authority. The device reads it before every preview/run;
-    # config MCP arguments and imported Skill metadata cannot grant permission.
-    shared = config.main.get(tool_config_key(target['mcp_id'], target['tool']), {}) or {}
-    own = config.main.get(tool_config_key(target['mcp_id'], target['tool'],
-                                          target['instance_id']), {}) or {}
-    settings = {**shared, **own}
-    requested = settings.get('auto_execute_verified') is True
-    device_enabled = requested and settings.get('_execution_binding') == device_binding
+    """Whether this one skill may run on this one card without asking.
+
+    Per skill, per card, per recording -- there is deliberately no card-wide
+    form. The device reads this before every preview/run; MCP config arguments
+    and imported Skill metadata cannot grant it.
+    """
     policies = config.main.get(_POLICY_KEY, {})
     policy = policies.get(execution_key(target) + ':' + asset_id, {}) if asset_id else {}
-    skill_enabled = (policy.get('enabled') is True
-                     and policy.get('device_binding') == device_binding
-                     and policy.get('asset_binding') == asset_binding)
-    return {'enabled': device_enabled or skill_enabled, 'device_enabled': device_enabled,
-            'skill_enabled': skill_enabled,
-            'source': 'card' if device_enabled else 'skill' if skill_enabled else 'manual',
-            'binding_changed': ((requested and not device_enabled)
-                                or (policy.get('enabled') is True and not skill_enabled))}
+    requested = policy.get('enabled') is True
+    enabled = (requested and policy.get('device_binding') == device_binding
+               and policy.get('asset_binding') == asset_binding)
+    return {'enabled': enabled, 'source': 'skill' if enabled else 'manual',
+            'binding_changed': requested and not enabled}
+
+
+MANUAL = {'enabled': False, 'source': 'manual', 'binding_changed': False}
 
 
 async def binding_of(target, asset_id=''):
@@ -141,83 +144,9 @@ async def binding_of(target, asset_id=''):
     return read_binding(await call(target, 'execution_binding', **args), asset_id=asset_id)
 
 
-async def prepare_execution_config(mcp_id, tool_name, body, instance_id, request):
-    """Gate and bind `auto_execute_verified` on the ordinary config-save path.
-
-    Returns `body` untouched for every tool that does not declare the
-    capability, which is all of them but one kind of card.
-    """
-    from tool_config import find_tool
-    tool = find_tool(mcp_id, tool_name)
-    if not tool.get('inputSchema', {}).get('x-skill-package', {}).get('persistent_execution'):
-        return body
-    require_browser(request)
-    if not isinstance(body, dict) or type(body.get('auto_execute_verified', False)) is not bool:
-        raise fastapi.HTTPException(422, '自动执行设置必须为布尔值')
-    known = targets()
-    candidates = [t for t in known if t['mcp_id'] == mcp_id and t['tool'] == tool_name
-                  and (not instance_id or t['instance_id'] == instance_id)]
-    if len(candidates) != 1:
-        raise fastapi.HTTPException(409, '请在对应卡片的配置中设置自动执行')
-    target = candidates[0]
-    # `_execution_binding` is derived here and nowhere else. A caller that sends
-    # one is either an old page replaying what it read back or someone trying to
-    # pin a stale device; either way its value is discarded.
-    clean = {k: v for k, v in body.items() if k != '_execution_binding'}
-    if not clean.get('auto_execute_verified'):
-        return clean
-    previous = config.main.get(tool_config_key(mcp_id, tool_name, instance_id), {}) or {}
-    clean['_execution_binding'] = (await binding_of(target))['device_binding']
-    if (previous.get('auto_execute_verified') is True
-            and previous.get('_execution_binding') == clean['_execution_binding']):
-        return clean      # already on and still bound: nothing to migrate
-    # Old generated instructions must learn the automatic-execution rule before
-    # a whole card is enabled, so the user is not sent looking for a second
-    # migration button. Bounded in both count and time: this runs inside a
-    # config save, and one unreachable skill must not hold that save open.
-    await _refresh_owned_definitions(target, known)
-    return clean
-
-
-async def _refresh_owned_definitions(target, known):
-    legacy_prefix = target['capabilities'].get('legacy_slug_prefix') or ''
-    pending, skipped = [], 0
-    for skill in list(config.main.get('skills', {}).get('installed', [])):
-        attachment = skill.get('attachment') or {}
-        legacy = (not attachment and legacy_prefix
-                  and skill.get('slug', '').startswith(legacy_prefix)
-                  and skill.get('requiredTools') == [target['tool']])
-        if attachment.get('tool') != target['tool'] and not legacy:
-            continue
-        try:
-            if resolve_skill(skill['slug'], known=known)[1] != target:
-                continue
-        except fastapi.HTTPException:
-            continue
-        if len(pending) >= REFRESH_MAX_SKILLS:
-            skipped += 1
-            continue
-        pending.append(skill['slug'])
-    deadline = time.monotonic() + REFRESH_DEADLINE_S
-    failed = []
-    for slug in pending:
-        if time.monotonic() >= deadline:
-            skipped += len(pending) - pending.index(slug)
-            break
-        try:
-            await refresh_definition(slug)
-        except Exception:     # noqa: BLE001 - one bad skill must not block the save
-            failed.append(slug)
-    if failed or skipped:
-        # Loud rather than silent: a skill whose instructions were not refreshed
-        # still runs, it just does not mention the new rule yet.
-        print(f'[skill-package] auto-execution enabled on {target["label"]}; '
-              f'{len(pending) - len(failed)} definition(s) refreshed, '
-              f'{len(failed)} failed, {skipped} not attempted')
-
-
 @router.post('/execution/read')
 async def read_execution(request: fastapi.Request, body: dict = fastapi.Body(...)):
+    """What the device asks before every preview/run. Read-only, loopback only."""
     import auth
     if not auth.from_loopback(request):
         raise fastapi.HTTPException(403, '仅同机驱动可读取执行配置')
@@ -225,16 +154,14 @@ async def read_execution(request: fastapi.Request, body: dict = fastapi.Body(...
     candidates = [t for t in known if t['tool'] == body.get('tool')
                   and t['capabilities'].get('persistent_execution')
                   and (not body.get('instance_id') or t['instance_id'] == body['instance_id'])]
-    manual = {'code': 200, 'data': {'enabled': False, 'device_enabled': False,
-                                    'skill_enabled': False, 'source': 'manual'}}
     asset_id = body.get('asset_id') or ''
     if asset_id:
         owner = _owner_of_asset(asset_id, candidates, known)
         if owner is None:
-            return manual
+            return {'code': 200, 'data': dict(MANUAL)}
         candidates = [owner]
     if len(candidates) != 1:
-        return manual
+        return {'code': 200, 'data': dict(MANUAL)}
     device = body.get('device_binding')
     if not isinstance(device, str) or not _OPAQUE.fullmatch(device):
         raise fastapi.HTTPException(422, '设备绑定无效')
@@ -252,16 +179,6 @@ def _owner_of_asset(asset_id, candidates, known):
         except fastapi.HTTPException:
             return None
         return owner if owner in candidates else None
-    for target in candidates:
-        prefix = target['capabilities'].get('legacy_slug_prefix')
-        if not prefix:
-            continue
-        try:
-            owner = resolve_skill(prefix + asset_id, known=known)[1]
-        except fastapi.HTTPException:
-            continue
-        if owner in candidates:
-            return owner
     return None
 
 
@@ -284,14 +201,9 @@ async def set_execution(slug: str, request: fastapi.Request, body: dict = fastap
         raise fastapi.HTTPException(409, '该设备驱动不支持持久的自动执行设置，请先升级驱动')
     binding = await binding_of(target, asset_id)
     if body['enabled']:
+        # The generated instructions must learn the automatic-execution rule
+        # before the skill is allowed to run unattended.
         await refresh_definition(slug)
-    # Revoke **before** persisting, in both directions. The other order wrote
-    # the policy first and then called a device that can refuse: turning the
-    # setting off then reported a 409 while leaving the old temporary grant
-    # alive -- the exact thing this call exists to prevent. Writing last means a
-    # refusal leaves the stored setting untouched and the client correctly told
-    # nothing changed.
-    await call(target, 'session_revoke', asset_id=asset_id)
     policies = dict(config.main.get(_POLICY_KEY, {}))
     policies[execution_key(target) + ':' + asset_id] = {**binding, 'enabled': body['enabled']}
     config.main[_POLICY_KEY] = policies
@@ -411,7 +323,7 @@ def manifest_tool(manifest):
     return None
 
 
-# ── listing, drafts, approvals ───────────────────────────────────────────────
+# ── listing and drafts ───────────────────────────────────────────────────────
 
 @router.get('/targets')
 async def list_targets():
@@ -440,66 +352,6 @@ async def resume_package(body: dict = fastapi.Body(...)):
     return {'code': 200, 'data': {'target': target, 'ui': await call(target, 'ui')}}
 
 
-@router.post('/approval/consume')
-async def consume_approval(request: fastapi.Request, body: dict = fastapi.Body(...)):
-    import auth
-    if not auth.from_loopback(request):
-        raise fastapi.HTTPException(403, '仅本机驱动可核验授权')
-    ident = body.get('approval_id')
-    if not isinstance(ident, str) or len(ident) != 64:
-        raise fastapi.HTTPException(422, '无效的授权凭据')
-    with _approval_lock:
-        approval = _approvals.pop(ident, None)
-    if not approval or time.monotonic() >= approval['expires']:
-        raise fastapi.HTTPException(409, '授权凭据无效或已过期')
-    return {'code': 200, 'data': approval['receipt']}
-
-
-@router.get('/session/{slug}')
-async def session_status(slug: str):
-    _, target, asset_id = resolve_skill(slug)
-    if not target['capabilities'].get('session_authorization'):
-        return {'code': 200, 'data': {'supported': False, 'active': False}}
-    return {'code': 200, 'data': {'supported': True,
-                                  **await call(target, 'session_status', asset_id=asset_id)}}
-
-
-@router.post('/session/{slug}')
-async def authorize_session(slug: str, request: fastapi.Request, body: dict = fastapi.Body(...)):
-    # This route is never a model tool. Require browser token authentication
-    # even when a development server has its ordinary middleware disabled.
-    require_browser(request)
-    _, target, asset_id = resolve_skill(slug)
-    if body.get('enabled') is False:
-        return {'code': 200, 'data': await call(target, 'session_revoke', asset_id=asset_id)}
-    if (body.get('enabled') is not True or body.get('workspace_clear') is not True
-            or body.get('take_control') is not True):
-        raise fastapi.HTTPException(422, '请确认本次路径、活动空间与控制权接管')
-    challenge = await call(target, 'session_challenge', asset_id=asset_id)
-    ident = secrets.token_hex(32)
-    receipt = {'nonce': challenge['nonce'], 'asset_id': asset_id, 'tool': target['tool'],
-               'instance_id': target['instance_id'], 'seconds': 1800}
-    with _approval_lock:
-        for key, value in list(_approvals.items()):
-            if time.monotonic() >= value['expires']:
-                _approvals.pop(key)
-        if len(_approvals) >= 64:
-            raise fastapi.HTTPException(429, '请稍后重试')
-        _approvals[ident] = {'receipt': receipt, 'expires': time.monotonic() + 30}
-    try:
-        result = await call(target, 'session_authorize', asset_id=asset_id, approval_id=ident)
-        # Existing installed definitions must learn the session-aware calling
-        # contract too; do not make the user find another migration button.
-        await refresh_definition(slug)
-        return {'code': 200, 'data': result}
-    except Exception:
-        await call(target, 'session_revoke', asset_id=asset_id)
-        raise
-    finally:
-        with _approval_lock:
-            _approvals.pop(ident, None)
-
-
 # ── skill identity ───────────────────────────────────────────────────────────
 
 @router.post('/inspect')
@@ -516,28 +368,20 @@ async def inspect_package(file: fastapi.UploadFile = fastapi.File()):
 
 
 def resolve_skill(slug, card_id='', known=None):
+    """The (skill, card, asset) a packaged skill belongs to.
+
+    Identity comes from `attachment` and nothing else. A slug-prefix fallback
+    for skills installed before that field existed lived here briefly; one test
+    rig had such a row, and a slug naming convention is not an identity
+    mechanism -- fix the row, not the resolver.
+    """
     skill = next((s for s in config.main.get('skills', {}).get('installed', [])
                   if s['slug'] == slug), None)
     if not skill:
         raise fastapi.HTTPException(404, '技能未安装')
-    known = targets() if known is None else known
     attachment = skill.get('attachment') or {}
-    tool = attachment.get('tool')
-    asset_id = attachment.get('asset_id')
-    if not attachment:
-        # Skills installed before packages carried `attachment`. The prefix is
-        # whichever one the card declares -- Core spells no application's
-        # convention -- and only an exact prefix match on a uniquely connected
-        # card resolves.
-        deps = skill.get('requiredTools', [])
-        tool = deps[0] if len(deps) == 1 else None
-        prefixes = {t['capabilities'].get('legacy_slug_prefix') for t in known
-                    if t['tool'] == tool}
-        for prefix in sorted((p for p in prefixes if p), key=len, reverse=True):
-            if slug.startswith(prefix) and len(slug) > len(prefix):
-                asset_id = slug[len(prefix):]
-                break
-    candidates = [t for t in known if t['tool'] == tool]
+    tool, asset_id = attachment.get('tool'), attachment.get('asset_id')
+    candidates = [t for t in (targets() if known is None else known) if t['tool'] == tool]
     origin = skill.get('origin') or {}
     if origin:
         candidates = [t for t in candidates if t['mcp_id'] == origin.get('mcp_id')
@@ -551,6 +395,12 @@ def resolve_skill(slug, card_id='', known=None):
 
 @router.post('/refresh/{slug}')
 async def refresh_definition(slug: str):
+    """Regenerate a skill's definition from its source device.
+
+    Transitional: this exists because a skill has one mutable definition. Once
+    the resource centre stores versioned packages, re-recording produces a new
+    version instead of rewriting this one, and this route goes away.
+    """
     skill, target, asset_id = resolve_skill(slug)
     original = copy.deepcopy(skill)
     result = await call(target, 'package_definition', asset_id=asset_id)
@@ -570,6 +420,11 @@ async def refresh_definition(slug: str):
 
 
 # ── transfer ─────────────────────────────────────────────────────────────────
+#
+# Browser-side upload and download are a stopgap: they are how a skill moves
+# between two devices while the resource centre cannot store an attachment.
+# The destination is RC -> Core -> device, so nothing new should be built on
+# `/export` or `/inspect`.
 
 @router.get('/export/{slug}')
 async def export_package(slug: str, card_id: str = ''):

@@ -648,11 +648,11 @@ async function _loadSession(slug, area) {
     const response = await fetch(`/api/skills/package/execution/${encodeURIComponent(slug)}`);
     const result = await response.json();
     if (!response.ok) throw new Error(result.detail || '无法读取自动执行设置');
-    if (!result.data.supported) return _loadTemporarySession(slug, area);
+    if (!result.data.supported) return;
     const current = result.data;
     area.innerHTML = `<div class="skill-detail-section-label">对话调用</div>
-      <label class="skill-detail-text"><input type="checkbox" id="skill-auto-execute" ${current.enabled ? 'checked' : ''} ${current.device_enabled ? 'disabled' : ''}> 允许自动执行</label>
-      <p class="skill-detail-text">${current.device_enabled ? '已按卡片设置允许本设备所有已验证技能自动执行。' : '开启后，直接说技能名称即可执行，无需逐次确认。'}</p>
+      <label class="skill-detail-text"><input type="checkbox" id="skill-auto-execute" ${current.enabled ? 'checked' : ''}> 允许自动执行</label>
+      <p class="skill-detail-text">开启后，直接说技能名称即可执行，无需逐次确认。</p>
       <p class="skill-detail-text">设置保存在本设备，停止项目或重启后保留；每次仍检查设备、起点及控制权。</p>
       <p class="skill-detail-text" role="status" id="skill-auto-execute-status">${current.binding_changed ? '技能或设备绑定已变化，请核对后重新保存设置。' : ''}</p>`;
     const checkbox = area.querySelector('#skill-auto-execute');
@@ -672,34 +672,6 @@ async function _loadSession(slug, area) {
   } catch (error) { area.textContent = error.message; }
 }
 
-async function _loadTemporarySession(slug, area) {
-  try {
-    const response = await fetch(`/api/skills/package/session/${encodeURIComponent(slug)}`);
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail || '无法读取会话授权');
-    if (!result.data.supported) return;
-    const current = result.data;
-    area.innerHTML = `<div class="skill-detail-section-label">对话调用</div>
-      <p class="skill-detail-text">${current.active ? `本次已允许直接执行 · 剩余 ${Math.ceil(current.remaining_seconds/60)} 分钟` : '默认每次确认。可为本机此技能授权一次，后续直接说技能名称。'}</p>
-      <p class="skill-detail-text">使用条件：${_esc(current.conditions)}</p>
-      ${current.active ? '' : '<label class="skill-detail-text"><input type="checkbox" id="skill-session-confirm"> 已确认移动路径、活动空间及接管，允许本次直接调用（最长 30 分钟）。</label>'}
-      <div class="skill-detail-actions"><button class="skill-btn" id="skill-session-toggle" ${current.active ? '' : 'disabled'}>${current.active ? '结束本次授权' : '允许本次直接调用'}</button></div>
-      <p class="skill-detail-text">停止、设备重连或动作与标定变化后需重新授权。</p><p role="status" id="skill-session-status" class="skill-detail-text"></p>`;
-    const button = area.querySelector('#skill-session-toggle');
-    area.querySelector('#skill-session-confirm')?.addEventListener('change', event => {button.disabled = !event.target.checked;});
-    button.onclick = async () => {
-      button.disabled = true;
-      try {
-        const response = await fetch(`/api/skills/package/session/${encodeURIComponent(slug)}`, {method: 'POST',
-          headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled: !current.active,
-            workspace_clear: !current.active, take_control: !current.active})});
-        const result = await response.json();
-        if (!response.ok) throw new Error(result.detail || '设置失败');
-        await _loadSession(slug, area);
-      } catch (error) {area.querySelector('#skill-session-status').textContent = error.message; button.disabled = false;}
-    };
-  } catch (error) { area.textContent = error.message; }
-}
 
 /** `compatibility` is opaque to Core. The device that wrote it knows what its
  * fields mean, so it supplies the pills to show in `labels`; we render those
