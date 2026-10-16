@@ -308,10 +308,15 @@ def _get_conn() -> sqlite3.Connection:
     ROS2 bridge and in-flight MCP calls. One `/execution/read` touches
     `config.main` ten times: ~2.9 ms of blocking became ~0.2 ms.
 
-    It also leaked. `with _get_conn() as conn` reads like a resource guard, but
-    sqlite3's context manager is a **transaction**, not a close -- so every
-    access left a connection for the garbage collector. Nothing in the tree ever
-    called `.close()` on one.
+    Note it was churn, not an accumulating leak -- an earlier version of this
+    comment claimed otherwise. `with _get_conn() as conn` reads like a resource
+    guard, and sqlite3's context manager is in fact a **transaction** rather
+    than a close, so nothing in the tree ever called `.close()` on one. But
+    CPython's refcounting closes the connection as soon as `conn` leaves scope:
+    measured, 500 accesses moved the process's descriptor count by zero either
+    way. What the old shape cost was opening and closing a file 500 times, and
+    re-declaring 17 tables each time -- which is the 0.264 ms above, not a
+    descriptor to go hunting for.
 
     Thread-local rather than one shared connection: sqlite3 rejects cross-thread
     use by default, and the ROS2 bridge, the MCP heartbeat and the request
