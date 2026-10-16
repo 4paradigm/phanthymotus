@@ -299,6 +299,41 @@ def test_concurrent_mono_starts_launch_both_instances(monkeypatch):
         assert node._mode == "mono"
 
 
+def test_stop_cancels_pending_mono_start(monkeypatch):
+    """review 第 14 轮：冷启动的 mono 只把参数登记进 _model_pending_starts，
+    加载落地后 _bg_start 仍会把**已停掉**的卡片按旧 topic 重新拉起
+    （订阅+发布都恢复）。stop 必须把该卡片的 pending 条目清走——loader 落
+    完加载后队列里不再有它，也不会再被落成节点。"""
+    import threading
+
+    plugin, executor = _plugin()
+
+    block = threading.Event()
+
+    def _blocked_ensure_model():
+        block.wait()  # 永远阻塞，直到测试放行
+
+    plugin._ensure_model = _blocked_ensure_model
+
+    r1 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c1", "mode": "mono"})
+    assert r1["state"] == "loading"
+    assert _wait_until(
+        lambda: any(e[0] == "/cam/c1"
+                    for e in plugin._model_pending_starts), timeout=2.0)
+
+    stop = plugin.dispatch("pointcloud",
+                           {"action": "stop", "instance_id": "/cam/c1"})
+    assert stop["state"] == "idle"
+    assert "/cam/c1" not in plugin._nodes
+    # pending 条目（及任何已落地的节点）都不再存在：loader 落完加载也
+    # 不会把已停掉的卡片重新拉起。
+    assert not any(e[0] == "/cam/c1" for e in plugin._model_pending_starts)
+
+    block.set()  # loader 走完最后一步，队列已空，不会 resurrect 任何节点
+    assert _wait_until(lambda: len(executor.nodes) == 0, timeout=2.0)
+
+
 def test_info_reports_error_when_engine_load_fails():
     plugin, _ = _plugin()
 

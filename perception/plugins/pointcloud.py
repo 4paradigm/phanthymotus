@@ -821,18 +821,29 @@ class PointCloudPerceptionPlugin:
         return True
 
     def _bg_start(self):
-        """共享加载 + 启动全部登记过的 start 请求（review 第 13 轮）。
+        """共享加载 + 启动全部登记过的 start 请求（review 第 13/14 轮）。
 
         赢下 `_load_model_sync()` 的线程承担两件事：落地加载，然后把
-        `_model_pending_starts` 里登记的全部（含自己）用 _start_node 补齐；
-        重复 node_key 被 _start_node 去重，双实例并发 start 因此不会丢一条。
-        只有赢家的 `_bg_start` 会 drain+清队——输家在加载还在跑或已失败时
-        不能清队，否则赢家的收获被自己的早退掏空。"""
-        if not self._load_model_sync():
-            return  # 输家：不碰队列，等赢家来收
+        `_model_pending_starts` 里**还活着**的登记（含自己）用 _start_node
+        补齐；重复 node_key 被 _start_node 去重，双实例并发 start 因此不会
+        丢一条。输家在加载还在跑或已失败时不能清队，否则赢家的收获被自己的
+        早退掏空；stop 时清走的条目活着进不了 _nodes，也就不会再被启动。
+
+        任何线程只要看到加载已落地（本线程 _load_model_sync 成功，或本线程
+        之外 _model is not None 且无 error），就清走队列——清队幂等，落节点
+        靠 node_key 去重，不会重复。队列由 _bg_start 独占 drained（stop 摘
+        走条目与 _bg_start 读队列互斥——pending_lock 串行，strip 进不了
+        drain，drain 也看不到 strip），drained 条目一律落成节点。"""
+        loaded = self._load_model_sync() or (
+            self._model is not None and not self._model_load_error)
+        if not loaded:
+            return  # 输家：加载失败或还在跑（本线程没赢）
         with self._pending_lock:
             starts = self._model_pending_starts
             self._model_pending_starts = []
+        # 队列由 _bg_start 独占 drained（stop 先摘条目再让 _bg_start 看到
+        # 空队——pending_lock 串行，不会漏也不会重放），drained 条目必然
+        # 活着：stop 过的卡片条目已被摘走，不存在"被停掉的条目落节点"。
         for entry in starts:
             self._start_node(*entry)
 
@@ -1332,6 +1343,20 @@ class PointCloudPerceptionPlugin:
         elif action == "stop":
             if instance_id:
                 result = self._retire_node(instance_id)
+                if result is not None:
+                    # review 第 14 轮：stop 必须取消该卡片 pending 的 mono
+                    # 启动——它可能还在等共享模型下载，否则 _bg_start 落完
+                    # 加载后会把已停掉卡片按旧 topic 重新拉起。
+                    with self._pending_lock:
+                        self._model_pending_starts = [
+                            e for e in self._model_pending_starts
+                            if e[0] != instance_id]
+                # 节点尚未落地（还在 pending）时 retire_node 返回 None，
+                # pending 条目仍在——loader 落完加载后仍会把它重新拉起。
+                with self._pending_lock:
+                    self._model_pending_starts = [
+                        e for e in self._model_pending_starts
+                        if e[0] != instance_id]
                 return result if result is not None else {"state": "idle"}
             with self._nodes_lock:
                 keys = list(self._nodes.keys())
