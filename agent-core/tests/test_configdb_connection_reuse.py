@@ -119,18 +119,92 @@ def test_no_module_closes_the_shared_connection():
     assert not offenders, f'这些地方关了共享连接：{offenders}'
 
 
-def test_an_access_is_cheap_enough_for_the_event_loop(fresh):
-    """Not a microbenchmark for its own sake -- the number is why this exists.
+def test_two_hundred_reads_open_one_connection(fresh, monkeypatch):
+    """The property, counted rather than timed.
 
-    Generous bound: this runs on CI and on laptops. Before the change a read was
-    ~0.29 ms here; the point is that it is now dominated by the query rather
-    than by opening a file and re-declaring 17 tables.
+    This replaced an absolute wall-clock bound (`per_read_ms < 0.12`) that was
+    green on a laptop and red in the shipped image: the same code measures
+    0.015 ms here and 0.217 ms in the container, a 14x environment difference
+    that no fixed threshold survives. It was the same mistake as the
+    `mock.patch` target in `test_interrupt_all_fallback` -- a test that only
+    holds on the machine it was written on.
     """
+    opened = []
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(sqlite3, 'connect',
+                        lambda *a, **k: (opened.append(a[0]), real_connect(*a, **k))[1])
     config.main['canvas_layout'] = {'cards': [{'id': f'c{i}'} for i in range(40)]}
-    for _ in range(5):
-        config.main.get('canvas_layout')          # warm
-    started = time.perf_counter()
     for _ in range(200):
         config.main.get('canvas_layout')
-    per_read_ms = (time.perf_counter() - started) / 200 * 1000
-    assert per_read_ms < 0.12, f'一次读 {per_read_ms:.3f} ms，连接复用没生效？'
+    assert len(opened) == 1, f'200 次读开了 {len(opened)} 个连接'
+
+
+def test_reuse_is_measurably_cheaper_than_reopening(fresh):
+    """A *ratio* on one machine, so the hardware cancels out.
+
+    Measured 18.7x on a laptop (0.015 ms vs 0.274 ms). The bound is 2x because
+    this also runs in a container on shared CPU -- the point is to catch "reuse
+    stopped happening", not to pin a number.
+    """
+    config.main['canvas_layout'] = {'cards': [{'id': f'c{i}'} for i in range(40)]}
+
+    def timed(read, rounds=120):
+        for _ in range(5):
+            read()                                  # warm
+        started = time.perf_counter()
+        for _ in range(rounds):
+            read()
+        return (time.perf_counter() - started) / rounds
+
+    def reopen_every_time():
+        config._conn_local = threading.local()      # the old behaviour, forced
+        return config.main.get('canvas_layout')
+
+    reused = timed(lambda: config.main.get('canvas_layout'))
+    reopened = timed(reopen_every_time)
+    assert reopened / reused > 2, (
+        f'复用 {reused * 1000:.3f} ms vs 重开 {reopened * 1000:.3f} ms —— '
+        f'只快 {reopened / reused:.1f}x，复用没生效？')
+
+
+def test_connection_level_state_does_not_leak_between_consumers(fresh):
+    """The half of reuse that is easy to miss, and the PR bot caught.
+
+    A fresh connection per access meant connection-level state was discarded,
+    so callers set it and never restored it: `perf_log` sets
+    `row_factory = sqlite3.Row` at four sites; `chat_history` sets it back to
+    `None` at two (dead code back then -- which is why it exists at all). Shared,
+    whichever ran last on this thread would decide what the *next* reader's rows
+    look like.
+
+    The failure would also not have surfaced near the cause:
+    `ConfigDB.__getitem__` reads `row[0]`, which `sqlite3.Row` supports, so
+    config keeps working and something further away breaks instead.
+    """
+    config.main['k'] = {'v': 1}
+
+    # A perf_log-style consumer, on the real shared connection.
+    borrowed = config._get_conn()
+    borrowed.row_factory = sqlite3.Row
+    row = borrowed.execute('SELECT key, value FROM config WHERE key = ?', ('k',)).fetchone()
+    assert row['key'] == 'k', '这个消费者自己要的 Row 行为得生效'
+
+    # Every later handout is back to the default a fresh connection would have.
+    assert config._get_conn().row_factory is None
+    assert config.main.get('k') == {'v': 1}
+
+    # And a plain tuple-positional reader -- the shape most of this tree uses --
+    # still gets a tuple, not a Row.
+    fetched = config._get_conn().execute(
+        'SELECT COUNT(*) FROM config').fetchone()
+    assert type(fetched) is tuple, f'拿到 {type(fetched).__name__}，row_factory 泄漏了'
+
+
+def test_the_real_perf_log_consumer_does_not_poison_configdb(fresh):
+    """Same property, driven through the actual module rather than a stand-in."""
+    import perf_log
+
+    config.main['canvas_layout'] = {'cards': []}
+    perf_log.query_latest(1)          # sets row_factory = sqlite3.Row inside
+    assert config.main.get('canvas_layout') == {'cards': []}
+    assert config._get_conn().row_factory is None

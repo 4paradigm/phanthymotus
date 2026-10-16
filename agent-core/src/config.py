@@ -268,6 +268,31 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _default_state(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Hand the connection out in the state a freshly opened one would be in.
+
+    This is the half of connection reuse that is easy to miss. Callers across
+    this tree were written against "every `_get_conn()` gives me a new
+    connection", so they set connection-level state and never restore it:
+    `perf_log` sets `row_factory = sqlite3.Row` at four sites, and
+    `chat_history` sets it back to `None` at two (dead code while connections
+    were fresh -- which is why it is there at all).
+
+    Shared, that becomes a cross-module leak: whichever of them ran last on this
+    thread decides what the *next* reader's rows look like. And the first
+    symptom would not have been near the cause -- `ConfigDB.__getitem__` reads
+    `row[0]`, which `sqlite3.Row` happens to support, so config keeps working
+    and something further away breaks instead.
+
+    Only `row_factory` is normalised, because it is the only connection-level
+    attribute anything in the tree actually assigns on this handle. Resetting
+    `text_factory` or `isolation_level` as well would be guarding against
+    nothing, and would hide it if somebody started relying on one.
+    """
+    conn.row_factory = None
+    return conn
+
+
 def _get_conn() -> sqlite3.Connection:
     """This thread's connection to the config DB, created on first use.
 
@@ -303,7 +328,7 @@ def _get_conn() -> sqlite3.Connection:
     if existing is not None and getattr(_conn_local, 'path', None) == resolved:
         try:
             existing.execute('SELECT 1')
-            return existing
+            return _default_state(existing)
         except sqlite3.ProgrammingError:
             # Someone closed it. Three modules used to -- they took this
             # connection and called `.close()` on it, which was correct when
@@ -323,7 +348,7 @@ def _get_conn() -> sqlite3.Connection:
     _ensure_schema(conn)
     _conn_local.conn = conn
     _conn_local.path = resolved
-    return conn
+    return _default_state(conn)
 def _seed_defaults():
     with _get_conn() as conn:
         for k, v in _DB_DEFAULTS.items():
