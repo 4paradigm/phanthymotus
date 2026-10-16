@@ -334,6 +334,18 @@ async def next_trigger() -> dict:
     return await _output.get()
 
 
+def reset_context() -> None:
+    """Discard all in-memory input when crossing memory-mode boundaries."""
+    _priority_pending.clear()
+    _bg_buffer.clear()
+    _bg_last_accepted.clear()
+    _source_ring.clear()
+    event_bus.reset_context()
+    for queue in (_output, _steering_queue):
+        while not queue.empty():
+            queue.get_nowait()
+
+
 def get_source_detail(source: str, limit: int = 20) -> list[dict]:
     """获取指定 source 的原始事件详情（从 ring buffer）。"""
     ring = _source_ring.get(source)
@@ -485,6 +497,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
     formatted = _format_priority_batch(batch)
     trigger = {
         'source': 'collector',
+        '_context_generation': batch[0].get('_context_generation', event_bus._context_generation),
         'text': f'{history_text}\n{formatted}' if history_text else formatted,
         'payload': {
             'event_count': len(batch),
@@ -866,6 +879,8 @@ async def _drain_loop():
     while True:
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
+        if personal.enabled() and source.startswith(('scheduler:', 'subagent:')):
+            continue
 
         # 没启动就什么都不该跑。
         #

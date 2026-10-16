@@ -126,7 +126,7 @@ def _register_core_mcp(silent=False):
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
                         'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
-                        'personal_memory_enabled': {'type': 'boolean', 'title': '个人记忆（人脸或声纹自动识别）', 'description': '来源和语音输出自动读取画布连线；修改后重启 AgentCore 生效', 'default': False},
+                        'personal_memory_enabled': {'type': 'boolean', 'title': '个人记忆（人脸或声纹自动识别）', 'description': '来源和语音输出自动读取画布连线；停止智能控制后修改，下次启动生效，无需重启 Core', 'default': False},
                         'auto_narration': {'type': 'boolean', 'description': '自动播报：模型长时间不出声时，由系统自动生成一句进展汇报并通过已注册的语音/灯效等输出播报给用户', 'default': True},
                         'narration_silence_seconds': {'type': 'integer', 'description': '主动播报：距上次对用户说话多少秒后自动汇报一次进展（0 = 关闭）', 'default': 15, 'x-show-when': {'auto_narration': 'true'}},
                         'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},

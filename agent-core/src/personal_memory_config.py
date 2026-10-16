@@ -8,13 +8,17 @@ def status() -> dict:
     desired = memory.configured_settings().get('enabled', False) is True
     return {'personal_memory_enabled': desired,
             'personal_memory_active': memory.enabled(),
-            'personal_memory_restart_required': desired != memory.enabled()}
+            'personal_memory_restart_required': False,
+            'personal_memory_pending_start': desired != memory.enabled()}
 
 
 def save_enabled(value: bool) -> None:
     if type(value) is not bool:
         raise ValueError('个人记忆开关必须是布尔值。')
-    if config.main.get('core', {}).get('project_running', False):
+    from api.config import _start_project_task
+    changing = value != memory.configured_settings().get('enabled', False)
+    starting = _start_project_task is not None and not _start_project_task.done()
+    if changing and (config.main.get('core', {}).get('project_running', False) or starting):
         raise ValueError('请先停止智能控制，再修改个人记忆设置。')
     if value and not auth.is_enabled():
         raise ValueError('请先配置 ACCESS_TOKEN 并重启 AgentCore，再开启个人记忆。')
@@ -24,8 +28,8 @@ def save_enabled(value: bool) -> None:
 
 
 def start_error() -> str:
-    if status()['personal_memory_restart_required']:
-        return '个人记忆模式已更改，请重启 AgentCore 后再开始智能控制。'
+    if memory.configured_settings().get('enabled', False) and not auth.is_enabled():
+        return '请先配置 ACCESS_TOKEN 并重启 AgentCore，再开启个人记忆。'
     return ''
 
 
@@ -75,9 +79,18 @@ def canvas_routes(layout: dict, registry: dict) -> dict:
 
 def apply_canvas_routes(layout: dict, registry: dict) -> None:
     desired = memory.configured_settings()
-    if not memory.enabled() or not desired.get('use_canvas_routes', False):
+    if not desired.get('enabled', False) or not desired.get('use_canvas_routes', False):
         return
     routes = canvas_routes(layout, registry)
     desired.update(routes)
     config.main['personal_memory'] = desired
-    memory.update_runtime_routes(routes)
+    if memory.enabled():
+        memory.update_runtime_routes(routes)
+
+
+async def apply_runtime_mode() -> None:
+    from event.llm import _event_instance
+    if status()['personal_memory_pending_start'] and not _event_instance:
+        raise ValueError('决策核心尚未就绪，请稍后重新启动智能控制。')
+    if _event_instance and (status()['personal_memory_pending_start'] or not _event_instance._mode_ready):
+        await _event_instance.apply_memory_mode()

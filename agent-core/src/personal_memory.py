@@ -31,7 +31,7 @@ def settings() -> dict:
 
 
 def pin_settings() -> None:
-    """Mode changes take effect at process startup, never halfway through a turn."""
+    """Snapshot mode settings at initialization or a stopped project startup boundary."""
     global _runtime_settings
     import copy
     _runtime_settings = copy.deepcopy(configured_settings())

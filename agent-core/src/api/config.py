@@ -1026,7 +1026,7 @@ async def _do_start_project_impl():
                                  camera_info=_upstream_camera_info(card.get('id', '')))
 
     if not errors:
-        from personal_memory_config import apply_canvas_routes
+        from personal_memory_config import apply_canvas_routes, apply_runtime_mode
         import mcp_client
         try:
             problem = start_error()
@@ -1035,7 +1035,8 @@ async def _do_start_project_impl():
             apply_canvas_routes({**layout, 'connections': [
                 {**conn, 'resolvedTopic': _topic_of_connection(conn)} for conn in connections
             ]}, mcp_client.registry)
-        except ValueError as error:
+            await apply_runtime_mode()
+        except (ValueError, RuntimeError) as error:
             errors.append('decision_core')
             await push_event({'type': 'project_start_item', 'payload': {
                 'tool': 'decision_core', 'mcp_id': 'agentcore',

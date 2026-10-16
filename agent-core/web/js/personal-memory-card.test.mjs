@@ -26,14 +26,16 @@ async function open(mcpId, toolName, data = {}) {
     return { savedValues, notes: bodyEl.children.map(n => n.textContent) }; })()`, context);
 }
 
-test('decision_core loads canonical memory switch and pending restart notice', async () => {
+test('decision_core loads canonical memory switch and pending start notice', async () => {
   const result = await open('agentcore', 'decision_core', {
-    personal_memory_enabled: true, personal_memory_active: false, personal_memory_restart_required: true,
+    personal_memory_enabled: true, personal_memory_active: false, personal_memory_pending_start: true,
   });
   assert.equal(result.savedValues.personal_memory_enabled, true);
   assert.equal(result.savedValues.llm_model, 'saved-model');
   assert.match(result.notes[0], /自动读取画布连线/);
   assert.match(result.notes[0], /尚未生效/);
+  assert.match(result.notes[0], /下次启动智能控制时生效/);
+  assert.match(result.notes[0], /无需重启 Core/);
 });
 
 test('other card modals do not gain the memory notice or request', async () => {

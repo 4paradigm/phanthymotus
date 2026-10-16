@@ -18,6 +18,7 @@ import time
 
 _queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
 _recent: list[dict]   = []    # 最近 N 条事件，用于 L2 环境快照
+_context_generation = 0
 
 
 async def enqueue(source: str, text: str, payload: dict | None = None) -> None:
@@ -26,15 +27,30 @@ async def enqueue(source: str, text: str, payload: dict | None = None) -> None:
         'text':    text,
         'payload': payload or {},
         'ts':      time.time(),
+        '_context_generation': _context_generation,
     }
     await _queue.put(event)
+    if event['_context_generation'] != _context_generation:
+        return
     _recent.append(event)
     if len(_recent) > 100:
         _recent.pop(0)
 
 
 async def dequeue() -> dict:
-    return await _queue.get()
+    while True:
+        event = await _queue.get()
+        if event.get('_context_generation', _context_generation) == _context_generation:
+            return event
+
+
+def reset_context() -> None:
+    """Invalidate queued events and producers still blocked on the old context."""
+    global _context_generation
+    _context_generation += 1
+    _recent.clear()
+    while not _queue.empty():
+        _queue.get_nowait()
 
 
 def recent(n: int = 10) -> list[dict]:

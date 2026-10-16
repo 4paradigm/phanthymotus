@@ -687,11 +687,11 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       savedValues = { ...savedValues, ...(result.data || {}) };
       const active = savedValues.personal_memory_active ? '开启' : '关闭';
       note.textContent = `个人记忆当前${active}。ASR、人脸来源和本机 TTS 自动读取画布连线，无需重复填写。`
-        + (savedValues.personal_memory_restart_required
-          ? '已保存的开关尚未生效，请重启 AgentCore。'
-          : '修改开关后需重启 AgentCore；用户身份仍需首次登记和绑定。');
+        + (savedValues.personal_memory_pending_start
+          ? '已保存的开关尚未生效，下次启动智能控制时生效，无需重启 Core。'
+          : '停止智能控制后修改开关，再启动即可生效；用户身份仍需首次登记和绑定。');
     } catch (error) {
-      note.textContent = `未能读取个人记忆状态：${error.message}。修改开关后需重启 AgentCore。`;
+      note.textContent = `未能读取个人记忆状态：${error.message}。停止智能控制后修改开关，再启动即可生效。`;
     }
     bodyEl.appendChild(note);
   }
@@ -888,8 +888,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         alert(result.detail || result.message || `配置保存失败 (HTTP ${resp.status})`);
         return;
       }
-      if (result.personal_memory_restart_required) {
-        alert('个人记忆设置已保存。请重启 AgentCore 后再开始智能控制，来源和语音输出将自动读取画布连线。');
+      if (result.personal_memory_pending_start) {
+        alert('个人记忆设置已保存。下次启动智能控制时生效，无需重启 Core；来源和语音输出将自动读取画布连线。');
       }
     } catch (err) {
       alert('配置保存失败: ' + err.message);

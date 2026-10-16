@@ -10,14 +10,15 @@ import personal_memory_config as card_config
 from test_personal_memory import store
 
 
-def test_card_save_is_pending_until_runtime_restart(store, monkeypatch):
+def test_card_save_is_pending_until_next_project_start(store, monkeypatch):
     monkeypatch.setattr(auth, '_auth_enabled', True)
     monkeypatch.setattr(pm, '_runtime_settings', None)
     config.main['personal_memory'] = {'enabled': False}
     pm.pin_settings()
     result = asyncio.run(canvas.save_tool_config('agentcore', 'decision_core', {'personal_memory_enabled': True}))
     assert result['code'] == 200
-    assert result['personal_memory_restart_required'] is True
+    assert result['personal_memory_pending_start'] is True
+    assert result['personal_memory_restart_required'] is False
     assert config.main['personal_memory']['enabled'] is True
     assert pm.enabled() is False
     pm.pin_settings()
@@ -85,9 +86,10 @@ def test_routes_come_only_from_real_inbound_and_executor_connections(store):
         card_config.canvas_routes(broken, registry())
 
 
-def test_pending_mode_cannot_start_with_wrong_runtime(store, monkeypatch):
+def test_pending_mode_requires_auth_before_start(store, monkeypatch):
     monkeypatch.setattr(pm, '_runtime_settings', {'enabled': False})
-    assert '重启' in card_config.start_error()
+    monkeypatch.setattr(auth, '_auth_enabled', False)
+    assert 'ACCESS_TOKEN' in card_config.start_error()
 
 
 def test_enabled_switch_cannot_change_during_running_project(store, monkeypatch):
@@ -103,6 +105,7 @@ from test_start_project_resolution import driver, R1_LAYOUT, CORE, _start
 def test_real_project_start_derives_live_routes_from_wires(store, driver, monkeypatch):
     import copy
     import mcp_client
+    monkeypatch.setattr(auth, '_auth_enabled', True)
     graph = copy.deepcopy(R1_LAYOUT)
     next(c for c in graph['cards'] if c['id'] == CORE)['mcpId'] = 'agentcore'
     graph['cards'].append({'id': 'tts', 'mcpId': 'mcp-perception', 'toolName': 'tts'})
@@ -125,8 +128,9 @@ def test_real_project_start_derives_live_routes_from_wires(store, driver, monkey
     assert '/stale/asr' not in str(pm.settings())
 
 
-def test_pending_mode_refuses_start_before_starting_any_device(store, driver, monkeypatch):
+def test_pending_mode_without_auth_refuses_start_before_any_device(store, driver, monkeypatch):
     monkeypatch.setattr(pm, '_runtime_settings', {'enabled': False})
+    monkeypatch.setattr(auth, '_auth_enabled', False)
     assert _start(R1_LAYOUT) is False
     assert driver.starts == {}
-    assert any('重启' in e.get('payload', {}).get('message', '') for e in driver.events)
+    assert any('ACCESS_TOKEN' in e.get('payload', {}).get('message', '') for e in driver.events)

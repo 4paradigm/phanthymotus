@@ -1593,8 +1593,15 @@ class Event:
         self._personal_seen_at = 0.0
         self._subagent_mgr = None             # SubagentManager instance
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
+        self._turn_idle = asyncio.Event()
+        self._turn_idle.set()
+        self._mode_switching = False
+        self._mode_ready = False
 
     async def __aenter__(self):
+        return await self._initialize_mode(connect=True)
+
+    async def _initialize_mode(self, connect=False):
         personal.pin_settings()
         if personal.enabled():
             import auth
@@ -1669,7 +1676,8 @@ class Event:
                 ('delete_personal_data', _personal_tools.delete_personal_data),
             ]))
         # 连接并注册所有 MCP 工具
-        await mcp_client.init_all()
+        if connect:
+            await mcp_client.init_all()
         # 恢复持久化的活跃任务及其定时检查
         import task_store
         from event.task import _register_check
@@ -1691,6 +1699,7 @@ class Event:
             print(f'[startup] resumed session {last["session_id"][:8]}... ({len(last["turns"])} turns)')
         else:
             self._session_id = None
+        self._mode_ready = True
         return self
 
     async def __aexit__(self, *args):
@@ -1698,6 +1707,61 @@ class Event:
         if self._subagent_mgr:
             await self._subagent_mgr.shutdown()
         return False
+
+    async def apply_memory_mode(self):
+        """Rebuild mode state only while project input is gated and the old turn is idle."""
+        if config.main.get('core', {}).get('project_running', False):
+            raise ValueError('请先停止智能控制，再切换个人记忆模式。')
+        desired = personal.configured_settings().get('enabled', False) is True
+        if desired == personal.enabled() and self._mode_ready:
+            return
+        self._mode_switching = True
+        try:
+            if collector._cancel_event:
+                collector._cancel_event.set()
+            try:
+                await asyncio.wait_for(self._turn_idle.wait(), timeout=15)
+            except asyncio.TimeoutError as error:
+                raise ValueError('上一轮仍在结束中，请稍后重新启动智能控制。') from error
+            self._mode_ready = False
+            from subagent import _set_manager
+            _set_manager(None)
+            await self.__aexit__()
+            import scheduler
+            checks = [(name, task) for name, task in scheduler._dynamic_tasks.items()
+                      if name.startswith('task:')]
+            for name, _ in checks:
+                scheduler.remove_job(name)
+            if checks:
+                await asyncio.gather(*(task for _, task in checks), return_exceptions=True)
+            countdown = _silence_countdown
+            _stop_countdown()
+            if countdown:
+                await asyncio.gather(countdown, return_exceptions=True)
+            self._turns = []
+            self._summary = None
+            self._session_id = None
+            self._current_turn = []
+            self._personal_owner = None
+            self._personal_revision = None
+            self._personal_remember = False
+            self._personal_seen_at = 0.0
+            self._transient_turns = []
+            self._bound_instance_ids = {}
+            personal.bind_context(None)
+            personal._turn.set('')
+            personal._revision.set(None)
+            personal._block_turn_save.set(False)
+            personal.resolver = personal.IdentityResolver()
+            collector.reset_context()
+            import prompt
+            prompt._l1_cache.update(mtime=0.0, content='')
+            prompt._l2_static_cache.update(fingerprint=None, content='')
+            _pending_narration_feedback.clear()
+            _reported_rounds.clear()
+            await self._initialize_mode()
+        finally:
+            self._mode_switching = False
 
     def _get_bound_tool_schemas(self) -> list[dict]:
         """从画布 executor connections 获取绑定到 decision_core 的工具 schemas。"""
@@ -1946,6 +2010,11 @@ class Event:
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
         while True:
             ev = await collector.next_trigger()
+            if self._mode_switching or not self._mode_ready:
+                continue
+            if ev.get('_context_generation', event_bus._context_generation) != event_bus._context_generation:
+                continue
+            self._turn_idle.clear()
             if personal.enabled():
                 self._prepare_personal_turn(ev)
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
@@ -2006,6 +2075,7 @@ class Event:
                     self._turns = []
                     self._summary = None
                     self._current_turn = []
+                self._turn_idle.set()
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
