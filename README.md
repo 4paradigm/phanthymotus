@@ -359,8 +359,11 @@ invisible path.
 `perception/utils/file_intake.py` implements `POST /file/upload` and is
 deliberately **stdlib-only**, because the drivers run a bare
 `ThreadingHTTPServer` rather than FastAPI and can adopt the identical endpoint in
-about five lines. Only perception has it today; the contract is fixed for the
-rest.
+about five lines. All 15 HTTP driver bundles now do, via a copy of this module at
+`phanthymotus-driver/common/file_intake.py` — the same two-implementations-one-
+document rule as `motus.vla/1`, since the whole surface is four lines of wire
+format. See that repo's README_dev.md § File Arguments for the per-bundle glue
+and the three ordering requirements it has to satisfy.
 
 Its behaviour, each point with a test:
 
@@ -372,6 +375,67 @@ Its behaviour, each point with a test:
 | `subdir` refused, not sanitised | `../escape` became `.._escape` — a valid name, so the write succeeded somewhere unasked-for, silently |
 | pruned after `retention_days` (7) | uploads are a transfer buffer; enrolment keeps the *embedding*, never the photo |
 | `ACCESS_TOKEN` honoured when set | today perception is not given one, and the same port already serves `tools/call` — so this is reachability-gated, and the check is ready for when a token is wired in |
+
+## Skill Files
+
+A skill can ship files alongside its instruction. The definition declares a
+manifest — each entry just `{path, bytes, sha256}` — and **says nothing about
+who reads them**:
+
+```json
+"files": [
+  {"path": "reference/etiquette.md", "bytes": 1840,   "sha256": "…"},
+  {"path": "trajectory.jsonl",       "bytes": 482301, "sha256": "…"}
+]
+```
+
+That omission is the design. Every other tool-to-skill relationship here is
+descriptive: `requiredTools` is enforced nowhere (one display label in the skill
+panel is its only reader), a skill says in prose "use tool X", and the LLM
+routes the call. A file is the same, and it reaches either reader through a
+mechanism that already exists:
+
+| | the model reads it | a tool consumes it |
+|---|---|---|
+| how | `skill_file(slug, path)` → text, bounded, resumable by `offset` | `skill_file(…, as_path=true)` → a local path, passed to any `format: file` parameter |
+| who decides | the LLM, from the instruction | the LLM, **by which tool it calls** |
+| transport | `agent-core/src/skill_files.py` | the `format: file` path above — **no new transport** |
+
+The second row is the whole point: the tool the model called *is* the
+destination, so a skill never names a device, a protocol, or a tool. Earlier
+drafts had each entry declare its consumer, a protocol `schema`, and the `tools`
+allowed to receive it; all three were wrong in the same direction — `tools`
+duplicated `schema` and forced a marketplace author to enumerate driver tool
+names they cannot know, and `schema`/`consumer` froze a per-call routing
+decision at authoring time.
+
+Progressive disclosure follows from it: the `description` is always in context,
+an activated skill's `instruction` is injected whole, and files are read only
+when the instruction points at one. Before this, `instruction` was the only
+place to put content.
+
+### What Core enforces
+
+This is an **LLM-facing read primitive on a robot** whose path argument
+ultimately comes from text in a prompt, so confinement carries the weight:
+
+| | |
+|---|---|
+| a declared path cannot leave the skill's directory | `resolve()` then verify via `parents` — **not** a string prefix, which accepts a sibling directory whose name merely starts the same way (`<slug>-evil/x`) |
+| declaration first, content second | a write must match the declared length and SHA256; a file the skill never declared has no storage and no reader |
+| `O_NOFOLLOW` + regular-file check | this process can write the directory, so a planted symlink must not redirect the read |
+| bounded reads | 64 KiB per read, 1 MiB per text read, 16 MiB per file, 32 MiB per skill |
+| **activation is the gate** | only an activated skill's files are readable — this cannot browse what is merely installed |
+
+`skill_file` needs no canvas card, unlike every device tool. The canvas is an
+authorization surface (`agent-core/src/canvas_binding.py`), but skill *text* has
+never been gated by it: `prompt._env_static` injects an activated skill's
+`instruction` with no card involved. A skill file is the same operator-installed
+content, read on demand rather than always. **The tool does not widen what the
+LLM can read; it narrows when.**
+
+Full protocol, the storage layout, and the authoring paths:
+[`docs/SKILL_WORKBENCH.md`](docs/SKILL_WORKBENCH.md).
 
 ## Capability Declarations (`x-*`)
 
@@ -390,6 +454,9 @@ fields, so an unknown key there is silently dropped.
 | `x-skill-package` | this card can receive and emit skill packages — see below |
 | `x-workbench` | this card provides an interactive page to host in an iframe |
 | `x-stop` | this card has a release protocol; here is what "still stopping" looks like |
+
+A skill's own `files` manifest is **not** in this family — it is not a tool
+declaration. See [Skill Files](#skill-files) above.
 
 The pattern is the same one used for LLMs: `config.main['client']['llm']` is
 `{url, key, model}` and there is not a line of inference about which model is
