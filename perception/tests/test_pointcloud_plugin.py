@@ -993,6 +993,52 @@ def test_start_rejects_rectified_calibration_with_nonfinite_tx():
     assert "Tx" in reply["message"]
 
 
+@pytest.mark.parametrize("fx,why", [
+    (0, "fx=0 → 反投影深度恒 0"),
+    (float("nan"), "fx=NaN"),
+    ("abc", "fx 非数值"),
+    (None, "fx 缺失"),
+])
+def test_start_rejects_rectified_calibration_with_unusable_fx(fx, why):
+    """review 第 10 轮 Medium：rectified 预检以前只查 Tx。
+
+    fx=0 的 blob start 照收，Q[2,3]=fx=0 → Z=fx·Tx/w 恒 0，云被
+    filter_cloud 全剔光 —— 卡片 running 却一帧不出，无任何报错。fx
+    缺失/非数值则在 _rectify_pair 里每帧抛异常，外部同样静默。
+    JSON 不能表达 NaN/None，走 start 参数传入标定 blob。
+    """
+    import math
+    blob = {"fx": fx, "cx": 160.0, "cy": 120.0, "Tx": 0.05}
+    if fx is None:
+        del blob["fx"]
+    if isinstance(fx, float) and math.isnan(fx):
+        # json.dumps 会把 NaN 写成 NaN（非严格 JSON），load_calibration_blob
+        # 用的是宽容解析，直接喂 float 也一样；这里经 start 参数绕开 JSON。
+        plugin, executor = _plugin()
+        reply = plugin.dispatch("pointcloud", {
+            "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+            "calibration": blob})
+    else:
+        plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+        reply = plugin.dispatch("pointcloud", {
+            "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error", why
+    assert "fx" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_rectified_calibration_with_nonfinite_principal_point():
+    """cx/cy 非有限 → 反投影坐标全 NaN，云被剔光，同样要当场拒绝。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": {"fx": 300.0, "cx": float("inf"), "cy": 120.0,
+                        "Tx": 0.05}})
+    assert reply["state"] == "error"
+    assert "主点" in reply["message"]
+    assert executor.nodes == []
+
+
 # ── review 建议：mode / input_topics 数量校验 ─────────────────────────────────
 
 def test_start_rejects_unknown_mode():
@@ -1068,6 +1114,26 @@ def test_start_rejects_raw_blob_with_zero_baseline():
         "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
     assert reply["state"] == "error"
     assert "基线" in reply["message"]
+    assert executor.nodes == []
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("D1", [0, float("inf"), 0, 0]),
+    ("R", [[float("nan"), 0, 0], [0, 1, 0], [0, 0, 1]]),
+])
+def test_start_rejects_raw_blob_with_nonfinite_extrinsics(field, bad):
+    """review 第 10 轮建议：K 以前已查有限值，D/R 没查 —— 一个 NaN 让
+    stereoRectify 输出全 NaN，映射全废，云一帧不出且无报错。
+
+    inf/nan 过不了 JSON，走 start 参数直接传 dict。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob[field] = bad
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": blob})
+    assert reply["state"] == "error"
+    assert field in reply["message"]
     assert executor.nodes == []
 
 

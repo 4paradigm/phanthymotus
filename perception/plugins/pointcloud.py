@@ -636,7 +636,42 @@ def _raw_stereo_params(blob: dict) -> tuple:
     if R.size != 9:
         raise ValueError(f"raw 标定的 R 不是 3x3（{R.size} 个元素）")
     R = R.reshape(3, 3)
+    # review 第 10 轮建议：K 已查有限值，D/R 没查 —— 畸变系数/旋转矩阵
+    # 里一个 NaN 就让 stereoRectify 的输出全 NaN，映射全废，云一帧不出
+    # 且无任何报错。start 预检与 worker 共用这里，当场报清楚。
+    for name, arr in (("K1", K1), ("K2", K2), ("D1", D1), ("D2", D2),
+                      ("R", R), ("T", T)):
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"raw 标定的 {name} 含非有限值（NaN/inf）")
     return K1, D1, K2, D2, R, T
+
+
+def _rectified_params(blob: dict) -> tuple:
+    """解析 rectified 档 blob → (fx, cx, cy, Tx)，全部有限、fx>0、Tx≠0。
+
+    start 的预检与 _rectify_pair 共用这一份（同 _raw_stereo_params 的道理：
+    两处各写一遍必然漂移）。Q 反投影要四个数都能用：fx=0 → 深度恒 0，
+    云被 filter_cloud 剔光；Tx=0 → Q[3,2] 除零；cx/cy 非有限 → 点云坐标
+    全 NaN。缺省规则与 _rectify_pair 一致：cx/cy 缺省取 fx。"""
+    try:
+        fx = float(blob["fx"])
+        cx = float(blob.get("cx", blob["fx"]))
+        cy = float(blob.get("cy", blob["fx"]))
+        tx = float(blob["Tx"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"rectified 标定数值异常（需要有限的 fx/cx/cy/Tx）：{error}")
+    if not np.isfinite(fx) or fx <= 0:
+        raise ValueError(
+            f"rectified 标定的焦距无效（fx={blob.get('fx')!r}）："
+            "需要正的有限值（像素），否则反投影深度恒 0、一帧云不出")
+    if not (np.isfinite(cx) and np.isfinite(cy)):
+        raise ValueError(f"rectified 标定的主点无效（cx={cx!r}, cy={cy!r}）")
+    if not np.isfinite(tx) or abs(tx) < 1e-6:
+        raise ValueError(
+            f"rectified 标定的基线 Tx 无效（Tx={blob.get('Tx')!r}）："
+            "需要非零有限值（米），否则 Q 反投影每帧除零")
+    return fx, cx, cy, tx
 
 
 def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict,
@@ -653,19 +688,12 @@ def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict,
 
     tier = calibration_tier(blob)
     if tier == "rectified":
-        try:
-            tx = float(blob["Tx"])
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"stereo 标定基线异常（Tx={blob.get('Tx')!r}）：{error}")
-        if not np.isfinite(tx) or abs(tx) < 1e-6:
-            # 与 raw 档同一契约：Q_from_baseline 里 -1/Tx，Tx=0 每帧除零
-            # （review 指出 start 只查档位不查数值）。start 会提前拒绝，
-            # 这里是 worker 侧的兜底。
-            raise ValueError(f"stereo 标定基线异常（Tx={tx}）：rectified 档的 Tx 必须非零")
+        # 与 start 预检共用 _rectified_params（review 第 10 轮：以前这里
+        # 只查 Tx，fx=0/缺失的 blob start 照收、worker 里静默不出云）。
+        fx, cx, cy, tx = _rectified_params(blob)
         L = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
         R = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
-        return float(blob["fx"]), float(blob.get("cx", blob["fx"])), \
-            float(blob.get("cy", blob["fx"])), -abs(tx), L, R
+        return fx, cx, cy, -abs(tx), L, R
 
     if left.shape[:2] != right.shape[:2]:
         right = cv2.resize(right, (left.shape[1], left.shape[0]))
@@ -1172,17 +1200,15 @@ class PointCloudPerceptionPlugin:
                     # unknown 档不出云），calibrate 采完把 blob 填回配置重启。
                     log.info("[pointcloud] stereo start without calibration: capture-only")
                 elif calibration_tier(calibration) == "rectified":
-                    # review 指出：rectified 档 Tx=0 以前 start 照收，worker
-                    # 里 Q_from_baseline 的 -1/Tx 每帧除零。启动时就拒绝。
-                    tx = calibration.get("Tx")
+                    # review 第 6/10 轮：以前只查 Tx（Tx=0 → Q[3,2] 每帧除零）。
+                    # 但 Q 的其余输入同样致命：fx=0 → Z=fx·Tx/w 恒 0，云被
+                    # filter_cloud 全剔光，卡片 running 却一帧不出；fx 缺失/
+                    # 非数值则在 _rectify_pair 里每帧抛异常，同样静默。启动时
+                    # 用与 _rectify_pair 同一份解析器全量预检。
                     try:
-                        tx = float(tx)
-                    except (TypeError, ValueError):
-                        tx = None
-                    if tx is None or not np.isfinite(tx) or abs(tx) < 1e-6:
-                        return {"state": "error",
-                                "message": f"rectified 标定的基线 Tx 无效（Tx={calibration.get('Tx')!r}）："
-                                           "需要非零有限值（米），否则 Q 反投影每帧除零"}
+                        fx, cx, cy, tx = _rectified_params(calibration)
+                    except ValueError as error:
+                        return {"state": "error", "message": str(error)}
                 else:
                     # review 第 6 轮：raw 档以前 start 只查档位不查内容，
                     # K 缺失/畸形拖到首帧才在 worker 里炸 —— 卡片显示
