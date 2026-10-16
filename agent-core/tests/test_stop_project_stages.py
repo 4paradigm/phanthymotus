@@ -162,6 +162,137 @@ def test_a_failing_card_is_reported_not_swallowed(rig):
     assert bad[0]['error'], '错误信息不能是空的 —— 界面要显示它'
 
 
+@pytest.mark.parametrize('reply', [
+    {'code': 500, 'message': 'release_result_unknown'},
+    {'code': 200, 'data': {'error': 'release_result_unknown'}},
+    {'code': 200, 'data': {'state': 'failed', 'reason': 'release_result_unknown'}},
+    {'code': 200, 'data': [{'type': 'text', 'text':
+        '{"state":"error","error":"release_result_unknown"}'}]},
+])
+def test_unsuccessful_device_receipt_is_not_counted_as_stopped(rig, monkeypatch, reply):
+    async def call(*args, **kwargs):
+        return reply
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    results = run(api_config._stop_cards(CARDS[:1], progress=True))
+    assert results[0]['ok'] is False
+    assert 'release_result_unknown' in results[0]['error']
+    assert rig.events[-1]['payload']['status'] == 'error'
+
+
+def test_a_declined_stop_is_not_a_failed_stop(rig, monkeypatch):
+    """A stateless actuator answers the verb it does not know, and that is fine.
+
+    Twenty-four of phanthymotus-driver's thirty bundles still answer `stop`
+    raw, so their gestures, dock commands and speakers reply
+    `{"error": "unknown action: stop"}`. Nothing was armed. Reading that as a
+    failed stop is the same misreading that once rolled an entire robot's
+    start-project back over a dock command — see that repo's common/lifecycle.py.
+    """
+    async def call(*args, **kwargs):
+        return {'code': 200, 'data': {'error': 'unknown action: stop'}}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    assert run(api_config._stop_cards(CARDS[:1]))[0]['ok'] is True
+
+
+def test_a_stale_telemetry_read_is_not_a_failed_stop(rig, monkeypatch):
+    """`unknown` means "I cannot tell", not "I refused".
+
+    engineai/t800 answers `state: "unknown"` when its telemetry has gone stale.
+    Counting that as a failed stop reports a device that stopped fine as stuck.
+    """
+    async def call(*args, **kwargs):
+        return {'code': 200, 'data': {'state': 'unknown'}}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    assert run(api_config._stop_cards(CARDS[:1]))[0]['ok'] is True
+
+
+def test_core_does_not_invent_a_release_vocabulary(rig, monkeypatch):
+    """Undeclared device-specific fields must not decide a generic stop.
+
+    `ownership_held`, `authority_released`, `hold`, `handback`, `sdk_pending`
+    and `awaiting_feedback` were once hardcoded as "still stopping". Not one of
+    those strings exists anywhere in phanthymotus-driver — so the guess applied
+    to nobody, while `active` (19 occurrences, what pndbotics/adam answers for a
+    powered arm) was hardcoded too and applied to every card on every robot.
+    """
+    async def call(*args, **kwargs):
+        return {'code': 200, 'data': {'state': 'active', 'ownership_held': True,
+                                      'authority_released': False}}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    assert run(api_config._stop_cards(CARDS[:1]))[0]['ok'] is True
+
+
+def _declare_stop_rules(declaration):
+    """Put an `x-stop` declaration on the card CARDS[:1] points at."""
+    config_mod.main['services'] = {'mcp': [{'id': 'agentcore', 'transport': 'http', 'tools': [
+        {'name': 'remote_mic', 'inputSchema': {'x-stop': declaration}}]}]}
+
+
+@pytest.mark.parametrize('complete', [True, False])
+def test_a_declared_pending_flag_polls_info_without_reissuing_stop(rig, monkeypatch, complete):
+    """A device with a release protocol says so, and then Core waits for it."""
+    _declare_stop_rules({'pending_flags': {'ownership_held': True}})
+    calls = []
+
+    async def call(mcp_id, req, timeout_s=None):
+        action = req.arguments['action']
+        calls.append(action)
+        held = not (action == 'info' and complete)
+        return {'code': 200, 'data': {'state': 'idle', 'ownership_held': held}}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    result = run(api_config._stop_cards(CARDS[:1]))[0]
+    assert result['ok'] is complete
+    assert calls[0] == 'stop' and calls.count('stop') == 1 and 'info' in calls
+    if not complete:
+        assert '停止未确认' in result['error']
+
+
+def test_a_declared_pending_state_is_honoured(rig, monkeypatch):
+    _declare_stop_rules({'pending_states': ['handing_back']})
+    seen = []
+
+    async def call(mcp_id, req, timeout_s=None):
+        seen.append(req.arguments['action'])
+        state = 'handing_back' if req.arguments['action'] == 'stop' else 'idle'
+        return {'code': 200, 'data': {'state': state}}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    assert run(api_config._stop_cards(CARDS[:1]))[0]['ok'] is True
+    assert seen == ['stop', 'info']
+
+
+def test_a_declared_failed_state_fails_the_stop(rig, monkeypatch):
+    _declare_stop_rules({'failed_states': ['refused']})
+
+    async def call(*args, **kwargs):
+        return {'code': 200, 'data': {'state': 'refused', 'error': 'operator override'}}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    result = run(api_config._stop_cards(CARDS[:1]))[0]
+    assert result['ok'] is False and 'operator override' in result['error']
+
+
+@pytest.mark.parametrize('declaration', ['nonsense', None, {'pending_states': 'running'},
+                                         {'pending_flags': ['busy']}, {}])
+def test_a_malformed_declaration_falls_back_to_the_generic_rules(declaration):
+    """A driver cannot break every card's stop by sending junk in `x-stop`."""
+    rules = api_config.stop_rules({'inputSchema': {'x-stop': declaration}})
+    assert rules == {'failed': api_config._STOP_FAILED_STATES,
+                     'pending': api_config._STOP_PENDING_STATES, 'flags': {}}
+
+
+def test_a_warning_alongside_a_live_state_is_not_a_failure(rig, monkeypatch):
+    """`error` decides only when `state` is absent — the rule tool_state_of
+    already documents a few hundred lines up, and which an earlier version of
+    the stop path contradicted by raising on any `error` key at all."""
+    _declare_stop_rules({'pending_states': ['winding_down']})
+    replies = iter([{'state': 'winding_down', 'error': 'last frame dropped'},
+                    {'state': 'idle'}])
+
+    async def call(*args, **kwargs):
+        return {'code': 200, 'data': next(replies)}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    assert run(api_config._stop_cards(CARDS[:1]))[0]['ok'] is True
+
+
 def test_cards_without_an_mcp_are_skipped(rig):
     results = run(api_config._stop_cards(
         CARDS + [{'id': 'note', 'mcpId': '', 'toolName': ''}]))

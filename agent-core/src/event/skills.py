@@ -5,7 +5,8 @@ event/skills.py — 技能系统（混合模式）。
   1. DB `active` 字段 — UI 控制技能对 LLM 的可见性（出现在 <skills> 列表中）
   2. 内存 `_runtime_activated` — LLM 调用 activate_skill 后才注入完整 instruction
 
-提供 activate_skill / deactivate_skill / set_auto_narration / set_progress_report 系统工具。
+提供 activate_skill / deactivate_skill / skill_file / set_auto_narration /
+set_progress_report 系统工具。
 """
 
 import typing
@@ -107,6 +108,36 @@ class Tools:
             return f'技能 "{slug}" 未处于激活状态。'
         _runtime_activated.discard(slug)
         return f'已停用技能「{slug}」，其指令已从上下文移除。'
+
+    async def skill_file(self,
+        slug: typing.Annotated[str, '技能 slug（必须是已激活的技能）'],
+        path: typing.Annotated[str, '技能声明的文件路径，例如 reference/etiquette.md'],
+        as_path: typing.Annotated[bool, '不读内容，只要本地路径 —— 用于把文件交给接受文件参数的工具'] = False,
+        offset: typing.Annotated[int, '从第几个字节开始读，续读时用上次返回的 next_offset'] = 0,
+    ):
+        """读取已激活技能随附的文件。技能指令提到某个文件时调用，按需读取而不是一次性塞进上下文。
+
+        文本（说明、参考表、示例）用默认方式读。需要把文件**交给某个工具**时传
+        as_path=true 拿到本地路径，再把它填进那个工具的文件参数 —— 系统会自动把文件
+        送到该工具所在的服务。轨迹一类的二进制文件只能这样用，读不出有意义的文本。
+        """
+        import skill_files
+        skill = next((s for s in get_active_skills() if s['slug'] == slug), None)
+        if not skill:
+            # Activation is the gate: this cannot browse installed skills, nor
+            # read one the LLM has not been told to use.
+            active = ', '.join(s['slug'] for s in get_active_skills()) or '（无）'
+            return f'技能 "{slug}" 未激活。已激活的技能：{active}。先调用 activate_skill。'
+        try:
+            if as_path:
+                return skill_files.local_path(slug, skill, path)
+            text, info = skill_files.read_text(slug, skill, path, offset)
+        except ValueError as error:
+            return str(error)
+        if info['truncated']:
+            text += (f'\n\n[已读到 {info["next_offset"]}/{info["bytes"]} 字节，'
+                     f'续读请用 offset={info["next_offset"]}]')
+        return text
 
     async def set_auto_narration(self,
         enabled: typing.Annotated[bool, '是否允许系统在你长时间不出声时自动替你播报进展'],

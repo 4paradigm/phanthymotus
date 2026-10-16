@@ -21,7 +21,10 @@ import config
 
 def find_tool(mcp_id: str, tool_name: str) -> dict:
     """The tool object for mcp_id:tool_name, or {} (tools may be bare strings)."""
-    mcps = config.main.get('services', {}).get('mcp', []) or []
+    # `or {}` on both hops, not just the inner one: a config row can hold a
+    # literal null, and `.get(key, {})` does not apply its default to a stored
+    # None. Reached from the stop path now, which must never raise.
+    mcps = (config.main.get('services') or {}).get('mcp') or []
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
     for tool in (target or {}).get('tools', []) or []:
         if isinstance(tool, dict) and tool.get('name') == tool_name:

@@ -444,7 +444,10 @@ def _to_openai_schema(mcp_id: str, tool: dict) -> list[dict]:
 
         # 只保留该 action 对应的参数（不含 action 字段本身）
         props = {k: all_props[k] for k in param_keys if k in all_props}
-        required = [k for k in param_keys if k in all_required]
+        # An action can require parameters that sibling actions do not take.
+        # Keep the legacy tool-wide requirements when no override is declared.
+        action_required = action_def.get('required', all_required)
+        required = [k for k in param_keys if k in action_required]
 
         schemas.append({
             'name':        f'mcp__{mcp_id}__{tool["name"]}__{action_name}',
@@ -924,6 +927,7 @@ async def call_tool(full_name: str, args: dict) -> str:
     if action == 'start':
         meta = info.get('tool_meta', {}).get(full_name, {})
         if meta.get('has_config_schema'):
+            from tool_config import find_tool, missing_required_config
             saved_cfg = _get_tool_config(mcp_id, tool_name)
             if saved_cfg:
                 # Drop keys the current schema no longer advertises; a stale row
@@ -946,7 +950,13 @@ async def call_tool(full_name: str, args: dict) -> str:
                 except (json.JSONDecodeError, IndexError, KeyError):
                     pass
             else:
-                return f'[{tool_name}] 尚未配置，请先在设备面板中完成配置（provider/url/key）后再启动。'
+                # Name the keys that are actually missing. `provider/url/key`
+                # is one LLM adapter's field list, and a model told to go fill
+                # those in on a camera card has been sent to the wrong form.
+                missing = missing_required_config(find_tool(mcp_id, tool_name), {})
+                if missing:
+                    return (f'[{tool_name}] 尚未配置：缺少 {"、".join(missing)}，'
+                            f'请先在设备面板中填写后再启动。')
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
