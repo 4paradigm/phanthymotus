@@ -86,7 +86,49 @@ async function _loadInstalled() {
     const json = await res.json();
     const skills = json.data || [];
     _renderInstalled(skills);
+    await _loadPending();
   } catch { _renderInstalled([]); }
+}
+
+async function _loadPending() {
+  const list = document.getElementById('skill-pending-list');
+  try {
+    const response = await fetch('/api/skills/package/pending');
+    if (!response.ok) throw new Error();
+    const {drafts = [], unavailable = []} = (await response.json()).data;
+    list.replaceChildren();
+    if (drafts.length) _installedEmpty.classList.add('hidden');
+    for (const draft of drafts) {
+      const card = document.createElement('div'); card.className = 'skill-card';
+      card.dataset.draftId = draft.id;
+      card.innerHTML = `<div class="skill-card-header"><span class="skill-card-icon">◇</span>
+        <div class="skill-card-info"><span class="skill-card-name">${_esc(draft.name)}</span>
+        <span class="skill-card-meta">待验证 · ${_esc(draft.target.label)}</span></div>
+        <button class="skill-btn skill-btn-primary">继续验证</button></div>`;
+      card.querySelector('button').onclick = async event => {
+        event.currentTarget.disabled = true;
+        try {
+          const response = await fetch('/api/skills/package/resume', {method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({card_id: draft.target.instance_id, draft_id: draft.id})});
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.detail || '无法继续验证');
+          await _openPackageWorkbench(result.data.target, result.data.ui);
+        } catch (error) { alert(error.message); event.currentTarget.disabled = false; }
+      };
+      list.append(card);
+    }
+    if (unavailable.length) {
+      const note = document.createElement('p'); note.className = 'skill-detail-text';
+      note.textContent = '部分设备未连接，待验证动作将在连接后显示。'; list.append(note);
+    }
+  } catch { list.textContent = '暂时无法读取待验证动作，请重新打开重试。'; }
+}
+
+async function _openPackageWorkbench(target, ui) {
+  await openWorkbench({mcp: target.mcp_id, tool: target.tool, instanceId: target.instance_id},
+    target.workbench, ui, () => show());
+  hide();
 }
 
 function _renderInstalled(skills) {
@@ -489,6 +531,7 @@ function _renderSkillDetail(skill, context) {
   const container = context === 'installed' ? _installedList : _browseList;
   const emptyEl = context === 'installed' ? _installedEmpty : _browseEmpty;
   emptyEl.classList.add('hidden');
+  if (context === 'installed') document.getElementById('skill-pending-list').replaceChildren();
   const actionSkill = skill.attachment || /^taught-[a-f0-9]{32}$/.test(skill.slug);
 
   const requiredToolsHtml = (skill.requiredTools || []).length
@@ -533,6 +576,7 @@ function _renderSkillDetail(skill, context) {
     </div>
     ${skill.description ? `<div class="skill-detail-section"><div class="skill-detail-section-label">描述</div><div class="skill-detail-text">${_esc(skill.description)}</div></div>` : ''}
     ${_compatibilityHtml(skill.compatibility)}
+    ${actionSkill && context === 'installed' ? '<div id="skill-session" class="skill-detail-section"></div>' : ''}
     ${skill.instruction ? actionSkill
       ? `<details class="skill-detail-section"><summary class="skill-detail-text">调用说明</summary><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></details>`
       : `<div class="skill-detail-section"><div class="skill-detail-section-label">指令内容</div><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></div>` : ''}
@@ -542,6 +586,7 @@ function _renderSkillDetail(skill, context) {
     ${actionsHtml}
   `;
   _overlay.querySelector('.skill-modal-body').scrollTop = 0;
+  if (actionSkill && context === 'installed') _loadSession(skill.slug, container.querySelector('#skill-session'));
 
   // Back button
   container.querySelector('#skill-detail-back').addEventListener('click', () => {
@@ -592,6 +637,35 @@ function _renderSkillDetail(skill, context) {
       } catch (e) { alert('安装失败: ' + e.message); }
     });
   }
+}
+
+async function _loadSession(slug, area) {
+  try {
+    const response = await fetch(`/api/skills/package/session/${encodeURIComponent(slug)}`);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || '无法读取会话授权');
+    if (!result.data.supported) return;
+    const current = result.data;
+    area.innerHTML = `<div class="skill-detail-section-label">对话调用</div>
+      <p class="skill-detail-text">${current.active ? `本次已允许直接执行 · 剩余 ${Math.ceil(current.remaining_seconds/60)} 分钟` : '默认每次确认。可为本机此技能授权一次，后续直接说技能名称。'}</p>
+      <p class="skill-detail-text">使用条件：${_esc(current.conditions)}</p>
+      ${current.active ? '' : '<label class="skill-detail-text"><input type="checkbox" id="skill-session-confirm"> 已确认移动路径、活动空间及接管，允许本次直接调用（最长 30 分钟）。</label>'}
+      <div class="skill-detail-actions"><button class="skill-btn" id="skill-session-toggle" ${current.active ? '' : 'disabled'}>${current.active ? '结束本次授权' : '允许本次直接调用'}</button></div>
+      <p class="skill-detail-text">停止、设备重连或动作与标定变化后需重新授权。</p><p role="status" id="skill-session-status" class="skill-detail-text"></p>`;
+    const button = area.querySelector('#skill-session-toggle');
+    area.querySelector('#skill-session-confirm')?.addEventListener('change', event => {button.disabled = !event.target.checked;});
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/skills/package/session/${encodeURIComponent(slug)}`, {method: 'POST',
+          headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled: !current.active,
+            workspace_clear: !current.active, take_control: !current.active})});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || '设置失败');
+        await _loadSession(slug, area);
+      } catch (error) {area.querySelector('#skill-session-status').textContent = error.message; button.disabled = false;}
+    };
+  } catch (error) { area.textContent = error.message; }
 }
 
 function _compatibilityHtml(value) {
@@ -646,6 +720,13 @@ function _initPackages() {
       const response = await fetch('/api/skills/package/install', {method: 'POST', body});
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || '导入失败');
+      if (result.data.reused) {
+        get('overlay').classList.add('hidden');
+        file = null; get('file').value = '';
+        await _showSkillDetail(result.data.slug);
+        document.getElementById('skill-package-export-status').textContent = '已复用本机相同动作的验证记录，无需重复试运行。';
+        return;
+      }
       const target = result.data.target;
       const uiResponse = await fetch(`/api/mcp/${encodeURIComponent(target.mcp_id)}/call`, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -655,7 +736,7 @@ function _initPackages() {
       if (!uiResponse.ok || uiResult.code !== 200) throw new Error('动作包已导入，请从目标卡片打开工作台继续检查。');
       const content = uiResult.data;
       const ui = Array.isArray(content) ? JSON.parse(content.find(c => c.type === 'text').text) : content;
-      await openWorkbench({mcp: target.mcp_id, tool: target.tool, instanceId: target.instance_id}, target.workbench, ui);
+      await _openPackageWorkbench(target, ui);
       get('overlay').classList.add('hidden'); hide();
       file = null; get('file').value = ''; get('summary').replaceChildren(); get('error').textContent = '';
     } catch (error) { get('error').textContent = error.message; }

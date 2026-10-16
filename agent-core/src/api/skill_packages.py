@@ -5,6 +5,10 @@ import hashlib
 import io
 import json
 import zipfile
+import asyncio
+import secrets
+import threading
+import time
 
 import fastapi
 from fastapi.responses import Response
@@ -13,6 +17,8 @@ import config
 router = fastapi.APIRouter(prefix='/package')
 SCHEMA = 'motus.teaching.package/1'
 MAX_BYTES = 16 * 1024 * 1024
+_approvals = {}
+_approval_lock = threading.Lock()
 
 
 def targets():
@@ -28,6 +34,7 @@ def targets():
         if tool and tool.get('inputSchema', {}).get('x-skill-package', {}).get('schema') == SCHEMA:
             result.append({'mcp_id': service['id'], 'tool': tool['name'], 'instance_id': card['id'],
                            'label': f"{service.get('name', service['id'])} / {tool['name']}",
+                           'capabilities': tool['inputSchema']['x-skill-package'],
                            'workbench': tool.get('inputSchema', {}).get('x-workbench')})
     return result
 
@@ -85,6 +92,87 @@ def manifest_from(data):
 @router.get('/targets')
 async def list_targets():
     return {'code': 200, 'data': targets()}
+
+
+@router.get('/pending')
+async def pending_packages():
+    async def read(target):
+        if not target.get('capabilities', {}).get('pending'):
+            return [], None
+        try:
+            result = await asyncio.wait_for(call(target, 'draft_list'), 5)
+            return [{**d, 'target': target} for d in result['drafts']], None
+        except Exception:
+            return [], target['label']
+    result = await asyncio.gather(*(read(t) for t in targets()))
+    return {'code': 200, 'data': {'drafts': [d for rows, _ in result for d in rows],
+                                'unavailable': [error for _, error in result if error]}}
+
+
+@router.post('/resume')
+async def resume_package(body: dict = fastapi.Body(...)):
+    target = target_for(body.get('card_id'))
+    await call(target, 'draft_open', draft_id=body.get('draft_id'))
+    return {'code': 200, 'data': {'target': target, 'ui': await call(target, 'ui')}}
+
+
+@router.post('/approval/consume')
+async def consume_approval(request: fastapi.Request, body: dict = fastapi.Body(...)):
+    import auth
+    if not auth._from_loopback(request):
+        raise fastapi.HTTPException(403, '仅本机驱动可核验授权')
+    ident = body.get('approval_id')
+    if not isinstance(ident, str) or len(ident) != 64:
+        raise fastapi.HTTPException(422, '无效的授权凭据')
+    with _approval_lock:
+        approval = _approvals.pop(ident, None)
+    if not approval or time.monotonic() >= approval['expires']:
+        raise fastapi.HTTPException(409, '授权凭据无效或已过期')
+    return {'code': 200, 'data': approval['receipt']}
+
+
+@router.get('/session/{slug}')
+async def session_status(slug: str):
+    _, target, asset_id = resolve_skill(slug)
+    if not target.get('capabilities', {}).get('session_authorization'):
+        return {'code': 200, 'data': {'supported': False, 'active': False}}
+    return {'code': 200, 'data': {'supported': True, **await call(target, 'session_status', asset_id=asset_id)}}
+
+
+@router.post('/session/{slug}')
+async def authorize_session(slug: str, request: fastapi.Request, body: dict = fastapi.Body(...)):
+    import auth
+    # This route is never a model tool. Require browser token authentication
+    # even when a development server has its ordinary middleware disabled.
+    supplied = request.headers.get('Authorization', '').removeprefix('Bearer ')
+    if not auth.get_token() or not secrets.compare_digest(supplied, auth.get_token()):
+        raise fastapi.HTTPException(401, '请登录网页后设置会话授权')
+    _, target, asset_id = resolve_skill(slug)
+    if body.get('enabled') is False:
+        return {'code': 200, 'data': await call(target, 'session_revoke', asset_id=asset_id)}
+    if body.get('enabled') is not True or body.get('workspace_clear') is not True or body.get('take_control') is not True:
+        raise fastapi.HTTPException(422, '请确认本次路径、活动空间与控制权接管')
+    challenge = await call(target, 'session_challenge', asset_id=asset_id)
+    ident = secrets.token_hex(32)
+    receipt = {'nonce': challenge['nonce'], 'asset_id': asset_id, 'tool': target['tool'],
+               'instance_id': target['instance_id'], 'seconds': 1800}
+    with _approval_lock:
+        for key, value in list(_approvals.items()):
+            if time.monotonic() >= value['expires']: _approvals.pop(key)
+        if len(_approvals) >= 64:
+            raise fastapi.HTTPException(429, '请稍后重试')
+        _approvals[ident] = {'receipt': receipt, 'expires': time.monotonic()+30}
+    try:
+        result = await call(target, 'session_authorize', asset_id=asset_id, approval_id=ident)
+        # Existing installed definitions must learn the session-aware calling
+        # contract too; do not make the user find another migration button.
+        await refresh_definition(slug)
+        return {'code': 200, 'data': result}
+    except Exception:
+        await call(target, 'session_revoke', asset_id=asset_id)
+        raise
+    finally:
+        with _approval_lock: _approvals.pop(ident, None)
 
 
 @router.post('/inspect')
@@ -171,6 +259,18 @@ async def install_package(file: fastapi.UploadFile = fastapi.File(), card_id: st
         await call(target, 'package_write', transfer_id=start['transfer_id'], offset=offset,
                    data=base64.b64encode(data[offset:offset+24576]).decode())
     result = await call(target, 'package_finish', transfer_id=start['transfer_id'])
+    if result.get('reused'):
+        from api.skills import import_local_skill
+        definition = {**result['skill'], 'origin': {'mcp_id': target['mcp_id'], 'instance_id': target['instance_id']}}
+        existing = next((s for s in config.main.get('skills', {}).get('installed', []) if s['slug'] == definition['slug']), None)
+        if existing:
+            # Re-import must not reset visibility or overwrite edited metadata.
+            _, original_target, original_asset = resolve_skill(existing['slug'])
+            if original_target != target or original_asset != result['asset_id']:
+                raise fastapi.HTTPException(409, '现有技能来源不匹配')
+        else:
+            await import_local_skill(definition)
+        return {'code': 200, 'data': {'reused': True, 'installed': True, 'slug': definition['slug'], 'target': target}}
     # No installed Skill is created here. Driver's normal trial/save workflow
     # issues a new local asset and uses the ordinary skill import endpoint.
     return {'code': 200, 'data': {**result, 'target': target}}

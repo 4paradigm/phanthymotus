@@ -32,8 +32,8 @@ async function invoke(target, args) {
   return parsed;
 }
 
-export async function openWorkbench(target, spec, ui) {
-  if (opened) return;
+export async function openWorkbench(target, spec, ui, onClose) {
+  if (opened) throw new Error('请先关闭已打开的工作台，再继续验证。草稿已保留。');
   if (spec.protocol !== VERSION || !Array.isArray(spec.actions) ||
       !spec.actions.every(a => typeof a === 'string') || !spec.actions.includes('info') ||
       !spec.actions.includes('stop') || ui.protocol !== VERSION ||
@@ -59,6 +59,7 @@ export async function openWorkbench(target, spec, ui) {
       if (busy) throw new Error('请求处理中，请等待结果。');
       if ((await invoke(target, {action: 'info'})).busy) throw new Error('请先停止动作，等待完成后再关闭。');
       closed = true; port?.close(); overlay.remove(); opened = false; previousFocus?.focus();
+      onClose?.();
     } catch (error) { alert(error.message); }
   };
   frame.onload = () => {

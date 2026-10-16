@@ -78,11 +78,18 @@ Driver 的 `tests/test_teaching_browser.py` 提供跨仓浏览器验收：真实
 | --- | --- |
 | GET `/targets` | 当前画布中声明 `x-skill-package.schema=motus.teaching.package/1` 的 HTTP MCP 工具 |
 | POST `/inspect` | 有界读取上传文件，返回 manifest 与设备卡片；不接触机器人 |
-| POST `/install` | 按 card_id 发送有界分块，由 Driver 验证兼容并生成草稿；不安装/激活 Core Skill |
+| POST `/install` | 按 card_id 发送有界分块，由 Driver 验证兼容并生成草稿；仅本机已有相同验证资产时可复用安装，保持原可见性 |
+| GET `/pending` / POST `/resume` | 聚合各卡片待验证导入；从技能列表恢复对应工作台 |
+| GET / POST `/session/{slug}` | 查询、设置或撤销本机此技能的限时调用授权；设置必须有网页 Bearer token 与显式条件确认 |
+| POST `/approval/consume` | 只允许回环来源消费 30 秒一次性凭据；不能创建授权 |
 | GET `/export/{slug}` | 从原卡读取完整包，验证长度与传输 SHA 后下载 |
 | POST `/refresh/{slug}` | 由原 Driver 校验资产并重新生成说明，校验相同 slug/资产后更新；保留可见性和安装时间，拒绝并发覆盖 |
 
 文件包含 `manifest.json` 和 `trajectory.jsonl`，最大 16 MiB，解压轨迹最大 64 MiB；Core 检查格式边界并负责传输，Driver 完成轨迹校验、型号/关节/模型匹配和重新绑定。导入创建的新草稿必须本机试运行并确认效果，随后走已有 save/import 才成为可调用 Skill。拒绝替换尚未保存的录制草稿。
+
+导入后直接打开自动检查页面，一次点击确认本次条件并试运行，完成后确认效果启用。关闭可从技能列表「待验证 → 继续验证」恢复。目标设备已有完全相同且验证成功的本机资产时复用原资产；不采信包内授权，不重复试运行，也不重置既有 Skill 可见性。
+
+技能详情可「允许本次直接调用」，最长 30 分钟，Driver 继续执行每次新预览及运动检查。Core 的 `skill_packages.py` 负责已登录网页的一次性授权凭据，`auth.py` 仅对回环消费端点增加精确豁免，供同机 Driver 核验；创建权限仍必须验证 Bearer token。无需给 Driver 增加网页 token，也不把授权动作暴露给 Agent。授权成功自动刷新旧 Skill 调用说明。停止、驱动重启、反馈重连、模式/标定或动作变化及执行异常由 Driver 撤销；授权不导出，不持久化。该轮没有修改 Agent Loop。
 
 `web/index.html` / `web/js/skills.js` 复用现有技能弹窗和样式提供文件入口和型号详情，`workbench.js` 在保存时补入原 MCP/实例身份。没有机器人型号判断或运动算法放进 Core。
 
