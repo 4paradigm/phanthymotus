@@ -843,6 +843,11 @@ class DeployController:
         self, repo: str, pr_number: int, comment_id: int,
     ) -> bool:
         try:
+            pr_data = await self.proxy.get_pr(repo, pr_number)
+            pr_state = pr_data.get("state", "")
+            pr_merged = pr_data.get("merged", False)
+            if pr_state != "open" or pr_merged or pr_data.get("draft"):
+                return True
             state = await self.proxy.read_hidden_state(repo, pr_number)
             comment_author_id, comment_author_login = await self.proxy.comment_identity(
                 repo, comment_id
@@ -854,14 +859,17 @@ class DeployController:
                 )
                 return True
 
-            pr_data = await self.proxy.get_pr(repo, pr_number)
-            pr_state = pr_data.get("state", "")
-            pr_merged = pr_data.get("merged", False)
             pr_head = pr_data.get("head", {}).get("sha", "")
             if state is None:
                 await self._post_error(
                     repo, pr_number,
                     "No deploy approval lifecycle found. Wait for review lifecycle reconciliation first.",
+                )
+                return True
+            if pr_head and pr_head != state.get("head_sha", ""):
+                await self._supersede_head_drift(
+                    repo, pr_number, state, pr_head, comment_id,
+                    command_kind="request_deploy",
                 )
                 return True
             _current_status = state.get("status", "")
@@ -881,41 +889,6 @@ class DeployController:
                     "Wait for the PR to reach `deploy-ready` status before requesting deployment.",
                 )
                 return True
-            if pr_head != state.get("head_sha", ""):
-                # HEAD drift: zero deploy, clear old validation snapshot, reset to review-required
-                old_head = state.get("head_sha", "")
-                old_status = state.get("status", "review-required")
-                state["status"] = "review-required"
-                state["head_sha"] = pr_head
-                state["review_evidence"] = {}
-                state["components"] = []
-                state["deployments"] = []
-                state["approve_attempts"] = []
-                state["approve_attempts_total"] = 0
-                state["approve_attempts_truncated"] = False
-                state["case_results"] = {}
-                state["test_result"] = ""
-                state["cos"] = {"object_key": "", "sha256": "", "size": 0}
-                state["command"] = {
-                    "comment_id": comment_id,
-                    "kind": "request_deploy",
-                    "phase": "completed",
-                    "args": {},
-                }
-                state["last_processed_comment_id"] = comment_id
-                markdown = comments_mod.superseded_comment(
-                    repo, pr_number, old_head, pr_head,
-                )
-                event = {
-                    "event": "HEAD drift detected",
-                    "lifecycle": f"`{old_status}` \u2192 `review-required`",
-                    "timestamp": comments_mod.beijing_now_str(),
-                }
-                await self._write_lifecycle_with_history(
-                    repo, pr_number, state, markdown, event=event,
-                )
-                await self.proxy.project_status_label(repo, pr_number, "review-required")
-                return True
             pr_user = pr_data.get("user", {})
             pr_author_id = str(pr_user.get("id") or "") if isinstance(pr_user, dict) else ""
             if not pr_author_id:
@@ -928,19 +901,6 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Only the PR author can use `/request_deploy`.",
-                )
-                return True
-
-            if pr_state != "open" or pr_merged:
-                await self._post_error(
-                    repo, pr_number,
-                    "PR is not open. Deploy only when PR is open and unmerged.",
-                )
-                return True
-            if pr_data.get("draft") is True:
-                await self._post_error(
-                    repo, pr_number,
-                    "Deployment requires PR ready-for-review / non-draft.",
                 )
                 return True
 
@@ -1069,6 +1029,9 @@ class DeployController:
         machine_alias: str, actor: str, actor_id: str,
     ) -> bool:
         try:
+            pr_data = await self.proxy.get_pr(repo, pr_number)
+            if pr_data.get("state") != "open" or pr_data.get("merged") or pr_data.get("draft"):
+                return True
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if state is None:
                 await self._post_error(
@@ -1095,7 +1058,6 @@ class DeployController:
                 return True
 
             # Check PR is still valid
-            pr_data = await self.proxy.get_pr(repo, pr_number)
             pr_state = pr_data.get("state", "")
             pr_merged = pr_data.get("merged", False)
             pr_head = pr_data.get("head", {}).get("sha", "")
@@ -2136,6 +2098,9 @@ class DeployController:
         *, _recovery_state: dict | None = None, _recovery_comment: dict | None = None,
     ) -> bool:
         try:
+            pr_data = await self.proxy.get_pr(repo, pr_number)
+            if pr_data.get("state") != "open" or pr_data.get("merged") or pr_data.get("draft"):
+                return True
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if _recovery_state is not None and state != _recovery_state:
                 return False
@@ -2179,7 +2144,6 @@ class DeployController:
                 return True
 
             # Check PR is still valid
-            pr_data = await self.proxy.get_pr(repo, pr_number)
             pr_state = pr_data.get("state", "")
             pr_merged = pr_data.get("merged", False)
             pr_head = pr_data.get("head", {}).get("sha", "")
@@ -3557,18 +3521,6 @@ class DeployController:
         latest = {r["attachment_id"]: r for r in attachments}
         current_round = round_id_for_state(state)
         current_rows = [r for r in latest.values() if r["round_id"] == current_round]
-        bundles = []
-        seen_rounds = set()
-        for archive in reversed(archives):
-            if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
-                continue
-            seen_rounds.add(archive["round_id"])
-            snapshot = copy.deepcopy(archive["snapshot"])
-            snapshot["deployments"] = self._enrich_deployments_for_render(snapshot.get("deployments", []))
-            snapshot["attachments"] = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
-            bundles.append({**archive, "snapshot": snapshot})
-            if len(bundles) == 3:
-                break
         # Presentation flags are deliberately ephemeral. Hidden state has a
         # strict schema and must never learn about browser feature config.
         render_state = copy.deepcopy(state)
@@ -3580,7 +3532,9 @@ class DeployController:
             evidence_enabled = (self.evidence_service is not None
                                 and callable(getattr(store, "dispatch", None))
                                 and not disabled_reason(self.config)
-                                and pr.get("state") == "open" and not pr.get("merged"))
+                                and pr.get("state") == "open" and not pr.get("merged")
+                                and not pr.get("draft")
+                                and pr.get("head", {}).get("sha") == state.get("head_sha"))
         except Exception:
             evidence_enabled = False
         render_state.update(
@@ -3589,12 +3543,33 @@ class DeployController:
             pr_state=(pr.get("state") if evidence_enabled else "closed"),
             merged=(bool(pr.get("merged")) if evidence_enabled else False),
         )
+        bundles = []
+        seen_rounds = set()
+        from .evidence_auth import issue_capability
+        if evidence_enabled:
+            render_state["capability"] = issue_capability(
+                self.config, repo, pr_number, state["head_sha"], current_round,
+            )
+        for archive in reversed(archives):
+            if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
+                continue
+            seen_rounds.add(archive["round_id"])
+            snapshot = copy.deepcopy(archive["snapshot"])
+            if evidence_enabled:
+                snapshot["capability"] = issue_capability(
+                    self.config, repo, pr_number, snapshot["head_sha"], archive["round_id"],
+                )
+            snapshot["deployments"] = self._enrich_deployments_for_render(snapshot.get("deployments", []))
+            snapshot["attachments"] = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
+            bundles.append({**archive, "snapshot": snapshot})
+            if len(bundles) == 3:
+                break
         section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, archives[-4:],
                            public_base_url=getattr(self.config, "evidence_public_base_url", ""))
         if not isinstance(section, str):
             raise GitHubStateProxyError("Evidence renderer must return markdown")
         section += ("\n\nAttachment preview is bounded; complete records and archive chains remain in trusted GitHub "
-                    "comments and the authenticated evidence page.")
+                    "comments and the capability-protected evidence page.")
         start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
         if start in visible or end in visible:
             if visible.count(start) != 1 or visible.count(end) != 1 or visible.index(start) >= visible.index(end):
@@ -3609,7 +3584,7 @@ class DeployController:
         if self.evidence_service is None:
             return
         pr = await self.proxy.get_pr(repo, pr_number)
-        if pr.get("state") != "open" or pr.get("merged"):
+        if pr.get("state") != "open" or pr.get("merged") or pr.get("draft"):
             return
         comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
         if comment is None:
@@ -3669,10 +3644,11 @@ class DeployController:
                     fresh = await self.proxy.read_hidden_state(repo, pr_number)
                     if (fresh != expected_terminal_state
                             or pr.get("head", {}).get("sha") != state.get("head_sha")
-                            or pr.get("state") != "open" or pr.get("merged")):
+                            or pr.get("state") != "open" or pr.get("merged") or pr.get("draft")):
                         return False
                 current_pr = await self.proxy.get_pr(repo, pr_number)
                 if (current_pr.get("state") != "open" or current_pr.get("merged")
+                        or current_pr.get("draft")
                         or current_pr.get("head", {}).get("sha") != state.get("head_sha")):
                     raise GitHubStateProxyError("Lifecycle PR context changed before write")
                 current_comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
@@ -3903,11 +3879,14 @@ class DeployController:
 
     async def _supersede_head_drift(
         self, repo: str, pr_number: int, state: dict,
-        new_head: str, comment_id: int,
+        new_head: str, comment_id: int, command_kind: str = "approve_deploy",
     ) -> None:
         """Handle HEAD drift by superseding the current deployment."""
         old_head = state.get("head_sha", "")
         old_status = state.get("status", "review-required")
+        archived = await self._archive_round(
+            repo, pr_number, copy.deepcopy(state), "HEAD changed",
+        )
         state["status"] = "review-required"
         state["head_sha"] = new_head
         state["review_evidence"] = {}
@@ -3919,9 +3898,10 @@ class DeployController:
         state["case_results"] = {}
         state["test_result"] = ""
         state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+        state["round_archive"] = archived
         state["command"] = {
             "comment_id": comment_id,
-            "kind": "approve_deploy",
+            "kind": command_kind,
             "phase": "completed",
             "args": {"superseded": True},
         }
@@ -4031,7 +4011,7 @@ class DeployController:
         pr_merged = pr_data.get("merged", False)
         current_head = str(pr_data.get("head", {}).get("sha", "") or "")
 
-        if pr_state != "open" or pr_merged:
+        if pr_state != "open" or pr_merged or pr_data.get("draft"):
             return
 
         if state is not None:
@@ -4045,12 +4025,16 @@ class DeployController:
 
             if current_head and current_head != state.get("head_sha", ""):
                 old_status = state.get("status", "review-required")
+                archived = await self._archive_round(
+                    repo, pr_number, copy.deepcopy(state), "HEAD changed",
+                )
                 self._reset_review_lifecycle_state(
                     state,
                     head_sha=current_head,
                     status="review-required",
                     review_evidence={},
                 )
+                state["round_archive"] = archived
                 state["command"] = {
                     "comment_id": int(state.get("last_processed_comment_id", 0) or 0),
                     "kind": "",
@@ -4497,10 +4481,16 @@ class DeployController:
         pr_merged = pr_data.get("merged", False)
         current_head = pr_data.get("head", {}).get("sha", "")
 
-        if pr_state != "open" or pr_merged:
+        if pr_state != "open" or pr_merged or pr_data.get("draft"):
             return "noop"
 
-        if not current_head or current_head != state.get("head_sha", ""):
+        if not current_head:
+            return "uncertain"
+        if current_head != state.get("head_sha", ""):
+            archived = await self._archive_round(
+                repo, pr_number, copy.deepcopy(state), "HEAD changed",
+            )
+            old_status = state.get("status", "review-required")
             state["status"] = "review-required"
             state["review_evidence"] = {}
             state["components"] = []
@@ -4511,6 +4501,7 @@ class DeployController:
             state["case_results"] = {}
             state["test_result"] = ""
             state["cos"] = {"object_key": "", "sha256": "", "size": 0}
+            state["round_archive"] = archived
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "approve_deploy",
@@ -4523,7 +4514,7 @@ class DeployController:
             )
             event = {
                 "event": "HEAD drift detected",
-                "lifecycle": f"`{state.get('status', 'review-required')}` \u2192 `review-required`",
+                "lifecycle": f"`{old_status}` \u2192 `review-required`",
                 "timestamp": comments_mod.beijing_now_str(),
             }
             await self._write_lifecycle_with_history(

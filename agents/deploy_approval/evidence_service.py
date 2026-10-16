@@ -24,41 +24,21 @@ class EvidenceService:
         self.policy, self.controller, self.store = policy, controller, store
         controller.evidence_service = self
 
-    async def _authorize(self, repo, principal, state, *, check_machine=True):
+    async def _authorize(self, repo, principal, state, *, check_machine=True, pr=None):
         if (not self.config.auth_valid or repo not in self.config.github_repos
                 or repo not in self.config.active_repos):
             raise EvidenceError('repository_not_authorized', 403)
         authorized = await self.github.list_installation_repositories()
         if repo not in authorized:
             raise EvidenceError('app_access_revoked', 403)
-        uid, login, token = (principal.get(k) for k in ('id', 'login', 'user_access_token'))
-        if type(uid) is not int or uid <= 0 or not isinstance(login, str) or not login or not isinstance(token, str) or not token:
+        uid, login = principal.get('id'), principal.get('login')
+        if type(uid) is not int or uid <= 0 or not isinstance(login, str) or not login:
             raise EvidenceError('identity_required', 401)
-        # Principal is an internal authenticated value, but every operation also
-        # checks current GitHub identity and current repository access.
-        for path in ('/user', f'/repos/{repo}'):
-            response = await self.github.http.get(
-                self.config.github_api_url.rstrip('/') + path,
-                headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json'},
-                timeout=self.config.total_timeout, follow_redirects=False,
-            )
-            if response.status_code != 200 or len(response.content) > self.config.max_response_bytes:
-                raise EvidenceError('github_access_unavailable', 403 if response.status_code in (401, 403, 404) else 503)
-            data = response.json()
-            if path == '/user':
-                if type(data.get('id')) is not int or data['id'] != uid or data.get('login') != login:
-                    raise EvidenceError('identity_changed', 401)
-            elif data.get('full_name', '').lower() != repo.lower() or data.get('permissions', {}).get('pull') is not True:
-                raise EvidenceError('repository_access_denied', 403)
-        if check_machine:
-            try:
-                await self.controller._check_record_test_permissions(repo, login, state)
-            except Exception:
-                raise EvidenceError('actor_not_authorized', 403) from None
         if not self.config.auth_valid or repo not in self.config.active_repos:
             raise EvidenceError('app_access_revoked', 403)
 
     async def _save(self, repo, pr_number, kind, operation, phase):
+        operation['updated_at'] = utc_now()
         key = operation['operation_id'] + ':' + phase
         record = await self.proxy.write_evidence_record(repo, pr_number, kind, key, operation)
         canonical = copy.deepcopy(record['data'])
@@ -90,7 +70,7 @@ class EvidenceService:
             if not isinstance(state, dict):
                 raise EvidenceError('state_unavailable', 409)
             await self._authorize(repo, principal, state, check_machine=False)
-            if pr.get('state') != 'open' or pr.get('merged'):
+            if pr.get('state') != 'open' or pr.get('merged') or pr.get('draft'):
                 raise EvidenceError('pr_closed', 409)
             records = await self.proxy.read_evidence_records(repo, pr_number)
             active_round = round_id_for_state(state)
@@ -130,12 +110,18 @@ class EvidenceService:
                 if not archives:
                     raise EvidenceError('round_not_found', 404)
                 selected = archives[-1]['snapshot']
-            await self._authorize(repo, principal, selected)
+            await self._authorize(repo, principal, selected, pr=pr)
             write = action in {'init', 'resume', 'sign_part', 'complete', 'note', 'delete'}
             expected_head = payload.get('head_sha', selected.get('head_sha'))
             validate_context(pr, selected, expected_head, round_id, write=write)
             if write and round_id != active_round:
                 raise EvidenceError('round_changed', 409)
+            capability = principal.get('capability', {})
+            if (capability.get('repo') != repo or capability.get('pr') != pr_number
+                    or capability.get('head') != expected_head
+                    or capability.get('round') != round_id
+                    or capability.get('purpose') != 'deploy-evidence'):
+                raise EvidenceError('capability_context_mismatch', 403)
             latest = {}
             operations = {}
             for record in records:
@@ -229,7 +215,7 @@ class EvidenceService:
                 result = await self._store(action, operation, {})
                 fresh = await self.proxy.get_pr(repo, pr_number)
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
-                await self._authorize(repo, principal, selected)
+                await self._authorize(repo, principal, selected, pr=fresh)
                 validate_context(fresh, selected, expected_head, round_id, write=False)
                 if action == 'download':
                     revisions = await self.proxy.read_evidence_records(repo, pr_number)
@@ -262,7 +248,7 @@ class EvidenceService:
                 fresh_pr = await self.proxy.get_pr(repo, pr_number)
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
                 validate_context(fresh_pr, fresh_state, expected_head, round_id, write=True)
-                await self._authorize(repo, principal, fresh_state)
+                await self._authorize(repo, principal, fresh_state, pr=fresh_pr)
 
             if action == 'resume':
                 if source.get('actor_id') != principal['id']:
@@ -278,6 +264,7 @@ class EvidenceService:
                     await current()
                     await self._save(repo, pr_number, 'attachment', source, 'ready')
                     return public(source)
+                await current()
                 result = await self._store('resume', source, {})
                 try:
                     await current()
@@ -345,11 +332,12 @@ class EvidenceService:
                 note = payload.get('note', '')
                 if not isinstance(note, str):
                     raise EvidenceError('invalid_note', 400)
+                submitter = payload.get('submitter') or principal['login']
                 operation = existing or {
                     'operation_id': opid, 'upload_ref': opid, 'attachment_id': opid, 'repo': repo, 'pr_number': pr_number,
                     'head_sha': expected_head, 'round_id': round_id, 'actor_id': principal['id'],
-                    'actor_login': principal['login'], 'actor': principal['login'],
-                    'created_at': utc_now(), 'filename': filename, 'size': size, 'sha256': sha,
+                    'actor_login': submitter, 'actor': submitter, 'submitter': submitter,
+                    'created_at': utc_now(), 'updated_at': utc_now(), 'filename': filename, 'size': size, 'sha256': sha,
                     'note': _redact_secrets(text if action == 'note' else note)[:256],
                     'replaces_id': replaces, 'status': 'initializing', 'request_sha256': request_hash,
                     'part_bytes': self.config.evidence_part_bytes,
@@ -381,7 +369,8 @@ class EvidenceService:
                 operation = existing or {**source, 'operation_id': opid,
                                          'source_operation_id': source['operation_id'], 'request_sha256': request_hash}
                 if action == 'delete':
-                    operation.update(status='deleted', deleted_at=utc_now(), deleted_by=principal['id'], deleted_by_login=principal['login'])
+                    operation.update(status='deleted', deleted_at=utc_now(), deleted_by=principal['login'],
+                                     deleted_by_login=principal['login'], updated_at=utc_now())
                     await current()
                     await self._save(repo, pr_number, 'operation', operation, 'deleted')
                     await self._save(repo, pr_number, 'attachment', operation, 'deleted')
@@ -390,6 +379,7 @@ class EvidenceService:
                     part = payload.get('part_number')
                     if type(part) is not int or not 1 <= part <= 10000 or source.get('status') != 'uploading':
                         raise EvidenceError('invalid_part_request', 409)
+                    await current()
                     result = await self._store(action, source, {'part_number': part})
                     try:
                         await current()
@@ -414,6 +404,7 @@ class EvidenceService:
                         await self._save(repo, pr_number, 'operation', operation, 'completing')
                 store_action = 'resume' if existing or action == 'resume' else 'complete'
                 store_payload = {}
+            await current()
             result = await self._store(store_action, operation, store_payload)
             try:
                 await current()

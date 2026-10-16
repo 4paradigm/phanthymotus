@@ -123,8 +123,6 @@ class Config:
     # Missing browser credentials disables only the optional evidence feature.
     deploy_evidence_enabled: bool = False
     evidence_public_base_url: str = ""
-    evidence_oauth_client_id: str = ""
-    evidence_oauth_client_secret: str = field(default="", repr=False)
     evidence_session_key: str = field(default="", repr=False)
     evidence_max_file_bytes: int = 512 * 1024 * 1024
     evidence_max_video_bytes: int = 512 * 1024 * 1024
@@ -286,9 +284,7 @@ def _load_secrets_config(path: str) -> dict:
 
     # Browser evidence is optional. Malformed or incomplete evidence values
     # disable that feature without making the Controller configuration fail.
-    evidence_fields = (
-        "public_base_url", "oauth_client_id", "oauth_client_secret", "session_key",
-    )
+    evidence_fields = ("public_base_url", "session_key")
     evidence = data.get("evidence", {})
     evidence_values = {key: "" for key in evidence_fields}
     evidence_enabled = isinstance(evidence, dict)
@@ -380,8 +376,6 @@ def load_config() -> Config:
         cos_secret_key=cos.get("secret_key", ""),
         deploy_evidence_enabled=secrets.get("deploy_evidence_enabled", False),
         evidence_public_base_url=evidence.get("public_base_url", "").rstrip("/"),
-        evidence_oauth_client_id=evidence.get("oauth_client_id", ""),
-        evidence_oauth_client_secret=evidence.get("oauth_client_secret", ""),
         evidence_session_key=evidence.get("session_key", ""),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
         agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),

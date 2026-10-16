@@ -30,10 +30,11 @@ pre,code{{overflow-wrap:anywhere;white-space:pre-wrap}}li{{padding:.6rem 0;borde
 <body><h1>部署验证附件</h1>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}">
 <p>项目 <strong>{esc(repo)}</strong> · PR #{esc(pr_number)}<br>HEAD <code>{esc(head_sha)}</code><br>round <code>{esc(round_id)}</code></p>
-<p id="auth">正在检查登录状态。上传需要登录并获得当前轮写入权限。</p><a id="login" hidden>登录</a>
+<p id="auth">正在检查当前 PR/HEAD/round capability。</p>
 <p id="message" role="status" aria-live="polite"></p><button id="refresh" type="button">刷新状态</button>
 <section><h2>当前轮</h2><p id="summary">等待服务端状态</p>
 <fieldset id="writes" disabled><legend>上传与备注</legend>
+<label>提交者<input id="submitter" value="browser tester" maxlength="100"></label>
 <label>文件（支持视频和普通文件）<input id="file" type="file"></label>
 <label>备注<textarea id="note" maxlength="10000"></textarea></label>
 <label>替换当前轮附件<select id="replace"><option value="">新增附件</option></select></label>
@@ -59,8 +60,6 @@ _JAVASCRIPT = r'''"use strict";
   const api = app.dataset.api;
   const bound = {head_sha: app.dataset.head, round_id: app.dataset.round};
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
-  const pagePath = "/evidence/" + app.dataset.repo + "/pulls/" + app.dataset.pr;
-  const loginPath = "/evidence/auth/login?return_to=" + encodeURIComponent(pagePath);
   const active = new Set();
   let context = null, stopped = false, paused = true, busy = false;
   let session = null, chosen = null, fingerprint = "", completeUnknown = false, pollGeneration = 0;
@@ -107,8 +106,9 @@ _JAVASCRIPT = r'''"use strict";
       const headers = {Accept: "application/json"};
       if (write) {
         headers["Content-Type"] = "application/json";
-        if (!context.csrf_token) throw new Error("缺少 CSRF token，请重新登录。");
+        if (!context.csrf_token) throw new Error("缺少 CSRF token，请从 Summary capability 链接重新打开。");
         headers["X-CSRF-Token"] = context.csrf_token;
+        headers["X-Evidence-Submitter"] = $("submitter").value || "browser tester";
       }
       const response = await fetch(api + path, {
         method, headers, credentials: "same-origin", redirect: "error", cache: "no-store", signal: controller.signal,
@@ -119,9 +119,8 @@ _JAVASCRIPT = r'''"use strict";
       if (!response.ok) {
         const detail = typeof value.detail === "string" ? value.detail : typeof value.error === "string" ? value.error : "";
         if (response.status === 401) {
-          halt("登录已过期，请重新登录后刷新状态。");
-          $("auth").textContent = "需要重新登录";
-          loginLink(loginPath);
+          halt("Capability 不可用，请从 PR Summary 的 Evidence 链接重新打开页面。");
+          $("auth").textContent = "Capability 不可用，请从 PR Summary 的 Evidence 链接重新打开页面。";
         }
         if (response.status === 409) halt("HEAD/round 或上传状态已变化，已停止所有写入。请刷新当前轮。 " + detail);
         if (response.status === 413) throw new ApiError(413, "超过服务端大小限制。" + detail);
@@ -129,13 +128,6 @@ _JAVASCRIPT = r'''"use strict";
       }
       return value;
     } finally { clearTimeout(timeout); active.delete(controller); }
-  }
-  function loginLink(value) {
-    $("login").hidden = true; $("login").removeAttribute("href");
-    if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//")) return;
-    const url = new URL(value, location.origin);
-    if (url.origin !== location.origin || url.username || url.password) return;
-    $("login").href = url.href; $("login").hidden = false;
   }
   function anchor(label, path) {
     const a = document.createElement("a"); a.textContent = label; a.href = api + path;
@@ -153,7 +145,8 @@ _JAVASCRIPT = r'''"use strict";
         item.replaces_id ? `替换 ${item.replaces_id}` : ""].filter(Boolean).join(" · ");
       li.append(description);
       if (!deleted && item.status === "ready" && attachmentId) {
-        li.append(" ", anchor("下载", "/attachments/" + id(attachmentId) + "/download"));
+        const capability = item.download_capability ? "?cap=" + encodeURIComponent(item.download_capability) : "";
+        li.append(" ", anchor("下载", "/attachments/" + id(attachmentId) + "/download" + capability));
       }
       const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&
         (!item.round_id || item.round_id === bound.round_id);
@@ -170,8 +163,7 @@ _JAVASCRIPT = r'''"use strict";
     }
   }
   function render() {
-    $("auth").textContent = context.authenticated ? (writable() ? "已登录，可以向当前测试轮提交证据。" : "已登录，本轮只读或无写入权限。") : "请先登录。";
-    loginLink(context.enabled === false || context.evidence_enabled === false ? null : context.login_url || loginPath);
+    $("auth").textContent = context.authenticated ? (writable() ? "Capability 有效，可以向当前测试轮提交证据。" : "当前轮只读或不处于 testing。") : "Capability 无效。请从当前 PR Summary 重新打开。";
     $("summary").textContent = typeof context.summary === "string" ? context.summary : JSON.stringify(context.summary || {status: context.status});
     $("attachments").replaceChildren(); $("history").replaceChildren();
     const replacement = $("replace").value;
@@ -183,7 +175,7 @@ _JAVASCRIPT = r'''"use strict";
       summary.textContent = `HEAD ${round.head_sha || "unknown"} · round ${round.round_id || "unknown"} · ${round.status || "unknown"}`;
       details.append(summary);
       const ul = document.createElement("ul"); attachmentList(round.attachments || [], ul, false); details.append(ul);
-      if (round.round_id && (round.cos_object_key || round.cos?.object_key || round.log_available || round.log_ready) && context.enabled !== false && context.evidence_enabled !== false) details.append(anchor("下载本轮日志", "/rounds/" + id(round.round_id) + "/log/download"));
+      if (round.round_id && (round.cos_object_key || round.cos?.object_key || round.log_available || round.log_ready) && context.enabled !== false && context.evidence_enabled !== false) details.append(anchor("下载本轮日志", "/rounds/" + id(round.round_id) + "/log/download?cap=" + encodeURIComponent(round.capability || "")));
       $("history").append(details);
     }
     for (const archive of context.archive_links || []) {
@@ -247,7 +239,7 @@ _JAVASCRIPT = r'''"use strict";
     return Object.entries(rows).map(([number, row]) => ({...(typeof row === "object" ? row : {etag: row}), part_number: Number(number)}));
   }
   async function uploadState() {
-    const value = await request("/uploads/" + id(session.upload_id) + "/status");
+    const value = await request("/uploads/" + id(session.upload_id));
     if ((value.head_sha && value.head_sha !== bound.head_sha) || (value.round_id && value.round_id !== bound.round_id)) {
       halt("上传属于其他 HEAD/round，已停止。"); throw new Error("轮次不匹配");
     }
@@ -381,8 +373,8 @@ _JAVASCRIPT = r'''"use strict";
       fingerprint = selectedFingerprint;
       if (!session) {
         await refresh();
-        const result = await request("/uploads", {method: "POST", key: bound.round_id + ":" + fingerprint + ":" + ($("replace").value || "new"),
-          body: {filename: chosen.name, size: chosen.size, content_type: chosen.type || "application/octet-stream", note: $("note").value, replaces_id: $("replace").value || null}});
+        const result = await request("/uploads", {method: "POST", key: bound.round_id + ":" + fingerprint + ":" + ($("replace").value || "new") + ":" + uid(),
+          body: {filename: chosen.name, size: chosen.size, content_type: chosen.type || "application/octet-stream", note: $("note").value, submitter: $("submitter").value || "browser tester", replaces_id: $("replace").value || null}});
         id(result.upload_id); session = {...result, parts: partsOf(result)}; persist();
       }
       let state = await uploadState();
@@ -464,7 +456,7 @@ _JAVASCRIPT = r'''"use strict";
   });
   $("save-note").addEventListener("click", async () => {
     if (busy || !writable()) return;
-    const body = {text: $("text").value, note: $("note").value};
+    const body = {text: $("text").value, note: $("note").value, submitter: $("submitter").value || "browser tester"};
     if (!body.text.trim() && !body.note.trim()) { message("请输入文本或备注。"); return; }
     const content = JSON.stringify(body);
     if (!noteOperation || noteOperation.content !== content) noteOperation = {content, key: uid()};

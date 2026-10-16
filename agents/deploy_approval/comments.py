@@ -11,6 +11,7 @@ import datetime as _dt
 import re
 import html
 import json
+import ipaddress
 from zoneinfo import ZoneInfo
 
 import urllib.parse
@@ -874,17 +875,31 @@ def _attempt_lines(attempt: dict | None) -> list[str]:
 
 
 def _public_base(value: str) -> str:
-    """Only an explicitly configured HTTP(S) origin/path can enable links."""
-    if not isinstance(value, str) or any(c.isspace() for c in value):
+    """Accept HTTPS origins and HTTP origins on internal hosts only."""
+    if not isinstance(value, str) or any(ord(c) < 33 for c in value):
         return ""
     try:
         parsed = urllib.parse.urlsplit(value)
         if (parsed.scheme not in {"https", "http"} or not parsed.hostname
                 or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or parsed.path not in ("", "/") or parsed.netloc.endswith(":")
+                or any(c.isspace() or ord(c) < 33 or ord(c) == 127 for c in parsed.netloc)
                 or any(c in value for c in '<>"\\')):
             return ""
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            return ""
+        if parsed.scheme == "http":
+            host = parsed.hostname.lower()
+            if host != "localhost" and not host.endswith(".localhost"):
+                try:
+                    address = ipaddress.ip_address(host)
+                except ValueError:
+                    return ""
+                if (address.is_unspecified or address.is_multicast or not
+                        (address.is_private or address.is_loopback or address.is_link_local)):
+                    return ""
         return value.rstrip("/")
-    except ValueError:
+    except (TypeError, ValueError):
         return ""
 
 
@@ -956,8 +971,11 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         if "snapshot" in row or "attachments" in row or "deployments" in row:
             attachments = list(group.get("attachments") or [])
             if key != (head, current_round):
+                capability = group.get("capability")
                 group.update(snapshot)
                 group.update({k: v for k, v in row.items() if k != "snapshot"})
+                if not group.get("capability") and capability:
+                    group["capability"] = capability
             group["attachments"] = attachments + list(snapshot.get("attachments") or [])
             if row is not snapshot:
                 group["attachments"].extend(row.get("attachments") or [])
@@ -967,11 +985,14 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         else:
             group.setdefault("attachments", []).append(row)
 
-    def download(identifier, suffix):
+    def download(identifier, suffix, group):
         identifier = str(identifier or "")
         if not base or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
             return ""
-        return base + api + suffix.format(id=identifier)
+        capability = group.get("capability", "")
+        if not capability:
+            return ""
+        return base + api + suffix.format(id=identifier) + "?cap=" + urllib.parse.quote(capability, safe="")
 
     def render_round(key, group):
         h, r = key
@@ -997,7 +1018,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 continue
             deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
             status = "deleted" if deleted else item.get("status", "pending")
-            link = download(item.get("attachment_id") or item.get("id"), "/attachments/{id}/download")
+            link = download(item.get("attachment_id") or item.get("id"), "/attachments/{id}/download", group)
             cells = [item.get("filename") or item.get("text") or "Note", item.get("size", "—"),
                      item.get("actor") or item.get("actor_login") or item.get("submitted_by") or "unknown",
                      item.get("created_at") or "unknown", item.get("note", ""), status]
@@ -1012,7 +1033,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         for field in ("case_results", "test_result", "summary", "cos_object_key", "cos_bundle_sha256", "cos"):
             if group.get(field):
                 lines.extend(["", f"**{_escape(field)}:** {_escape(json.dumps(group[field], ensure_ascii=False) if isinstance(group[field], (list, dict)) else group[field])}"])
-        log = download(r, "/rounds/{id}/log/download")
+        log = download(r, "/rounds/{id}/log/download", group)
         if log and (group.get("cos_object_key") or group.get("cos", {}).get("object_key") or group.get("log_available") or group.get("log_ready")):
             lines.extend(["", f"[Download round COS log]({log})"])
         return lines
@@ -1021,9 +1042,10 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     lines.extend(render_round((head, current_round), groups[(head, current_round)]))
     if (base and state.get("evidence_enabled") is True and state.get("status") == "testing"
             and state.get("pr_state", "open") == "open" and not state.get("merged")):
-        # Authentication's return_to uses this stable route. The server binds
-        # its rendered page to the latest trusted HEAD/round, never query input.
-        lines.extend(["", f"[Upload evidence]({base}/evidence/{repo}/pulls/{pr_number})"])
+        # The signed Summary capability is bound to this trusted HEAD/round.
+        capability = state.get("capability", "")
+        if capability:
+            lines.extend(["", f"[Upload evidence]({base}/evidence/{repo}/pulls/{pr_number}?cap={urllib.parse.quote(capability, safe='')})"])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: str(pair[1].get("archived_at") or pair[1].get("ended_at") or pair[1].get("created_at") or ""), reverse=True)
     lines.extend(["", "### Previous rounds", ""])
