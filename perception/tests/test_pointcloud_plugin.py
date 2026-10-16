@@ -1050,6 +1050,62 @@ def test_start_accepts_a_good_raw_blob():
     assert len(executor.nodes) == 1
 
 
+# ── review 第 7 轮：标定优先级 start 参数 > 实例 config > 全局 ────────────────
+
+def test_instance_calibration_beats_global_calibration():
+    """全局 plugins.pointcloud.calibration 配了标定时，卡片经 action=config
+    配的实例标定必须赢 —— 以前 _resolve_mode 先取全局，实例档只有全局为
+    空才轮得到，双目会拿错内参/基线出歪云。"""
+    global_blob = json.loads(json.dumps(RAW_BLOB))
+    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]  # 标记值
+    instance_blob = json.loads(json.dumps(RAW_BLOB))
+    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
+    plugin, executor = _plugin(
+        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left",
+        "calibration": json.dumps(instance_blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 222  # 实例档胜出
+
+
+def test_start_param_beats_instance_and_global_calibration():
+    """start 参数直接带标定时最高优先：现场换标定不用先改配置。"""
+    global_blob = json.loads(json.dumps(RAW_BLOB))
+    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]
+    instance_blob = json.loads(json.dumps(RAW_BLOB))
+    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
+    inline_blob = json.loads(json.dumps(RAW_BLOB))
+    inline_blob["K1"] = [[333, 0, 160], [0, 333, 120], [0, 0, 1]]
+    plugin, executor = _plugin(
+        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left",
+        "calibration": json.dumps(instance_blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": json.dumps(inline_blob)})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 333
+
+
+def test_global_calibration_still_applies_without_instance_one():
+    """没有实例标定时全局档照常兜底 —— 修优先级不能把全局配置弄丢。"""
+    global_blob = json.loads(json.dumps(RAW_BLOB))
+    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]
+    plugin, executor = _plugin(
+        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 111
+
+
 # ── review 第 6 轮：每帧日志节流，坏流不淹容器日志 ───────────────────────────
 
 def test_zlib_decode_failure_logs_once_then_samples(caplog):

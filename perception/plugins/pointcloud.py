@@ -784,7 +784,8 @@ class PointCloudPerceptionPlugin:
 
     # ── node 生命周期 ──────────────────────────────────────────────────────
 
-    def _resolve_mode(self, args: dict) -> tuple[str, Optional[str], Optional[str], Optional[dict]]:
+    def _resolve_mode(self, args: dict,
+                      instance_id: str = "") -> tuple[str, Optional[str], Optional[str], Optional[dict]]:
         """→ (mode, left_topic, right_topic, calibration)。auto 按输入判定。
 
         单话题 auto 不猜话题名（"/camera/image_raw" 也可能载着 z16 深度）：
@@ -804,7 +805,17 @@ class PointCloudPerceptionPlugin:
             raise ValueError(f"不支持的 mode：{mode!r}（可选 auto / depth / mono / stereo）")
         if len(topics_list) > 2:
             raise ValueError(f"input_topics 最多 2 路（左、右），收到 {len(topics_list)} 路")
-        calibration = load_calibration_blob(args.get("calibration")) or self._calibration
+        # 标定优先级（review 第 7 轮）：start 参数 > 实例 config > 全局
+        # plugins.pointcloud.calibration。实例档在 configSchema 里声明为
+        # scope: instance，全局 blob 是兜底不是覆盖 —— 以前全局配了标定，
+        # 卡片自己的实例标定就永远拿不到（falsy 才轮到它），双目会拿错
+        # 内参/基线出歪云。
+        node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+        with self._nodes_lock:
+            icalib = load_calibration_blob(
+                (self._instance_configs.get(node_key) or {}).get("calibration"))
+        calibration = (load_calibration_blob(args.get("calibration"))
+                       or icalib or self._calibration)
         if mode == "auto":
             mode = "stereo" if right_topic else "auto"
         return mode, input_topic or None, right_topic, calibration
@@ -856,6 +867,8 @@ class PointCloudPerceptionPlugin:
             max_points = max(100, min(MAX_POINTS, int(icfg.get("max_points", self._max_points))))
             node = _PointCloudNode(
                 mode, input_topic, right_topic,
+                # 实例 config 的标定已由 _resolve_mode 按优先级挑好
+                # （start 参数 > 实例 > 全局），这里只兜 None。
                 calibration or load_calibration_blob(icfg.get("calibration")),
                 fps=int(icfg.get("fps", self._fps)),
                 max_points=max_points,
@@ -1140,7 +1153,8 @@ class PointCloudPerceptionPlugin:
 
         elif action == "start":
             try:
-                mode, input_topic, right_topic, calibration = self._resolve_mode(args)
+                mode, input_topic, right_topic, calibration = self._resolve_mode(
+                    args, instance_id)
             except ValueError as error:
                 return {"state": "error", "message": str(error)}
             if mode == "stereo":
