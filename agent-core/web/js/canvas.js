@@ -13,7 +13,7 @@
 
 import { showToast } from './toast.js';
 import { completionRequest, watchCompletion } from './action-completion.js';
-import { claimCompletionActivity } from './completion-activity.js';
+import { claimCompletionActivity, preferManualCompletionActivity } from './completion-activity.js';
 
 const _cardExecutions = new WeakMap();
 
@@ -2772,6 +2772,16 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
       }
       const completion = completionRequest(json.data, _toolObj?.inputSchema, args.action);
       if (completion) {
+        // The detailed card result owns the manual action's activity entry.
+        // If an early collector receipt was already displayed, remove that
+        // provisional row so arrival order cannot select the abbreviated form.
+        if (preferManualCompletionActivity(completion.actionId)) {
+          for (const row of document.querySelectorAll('#activity-log [data-completion-action-id]')) {
+            if (row.dataset.completionActionId === completion.actionId) row.remove();
+          }
+          const latest = document.getElementById('activity-latest');
+          if (latest?.dataset.completionActionId === completion.actionId) latest.textContent = '';
+        }
         // Watch while the card exists, including after Get status or Stop.
         // isCurrent() below guards only the result box: replacing this watch's
         // lifetime with it would drop the previous action's completion trigger.
@@ -2917,6 +2927,14 @@ function _logActivity(type, msg) {
   `;
   logEl.appendChild(entry);
   logEl.scrollTop = logEl.scrollHeight;
+  if (type === 'trigger') {
+    const latest = document.getElementById('activity-latest');
+    if (latest) {
+      latest.dataset.completionActionId = '';
+      latest.innerHTML = `<span class="log-time">${_esc(time)}</span><span>${_esc(msg)}</span>`;
+      document.getElementById('activity-strip')?.classList.add('has-latest');
+    }
+  }
 }
 
 // ── Card drag (world-space pointer capture) ───────────────────────────────────

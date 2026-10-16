@@ -17,7 +17,7 @@ function fn(name){
 }
 const entry=`
 import {completionRequest,watchCompletion} from '/action-completion.js';
-import {claimCompletionActivity} from '/completion-activity.js';
+import {claimCompletionActivity,preferManualCompletionActivity} from '/completion-activity.js';
 const _cardExecutions=new WeakMap();
 const _allMcps=[{id:'sim-arm',tools:${JSON.stringify(tools)}}];
 const _cards=[];
