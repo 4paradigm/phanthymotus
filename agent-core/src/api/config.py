@@ -1074,21 +1074,43 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
                  'card_id': card.get('id', ''), 'ok': False, 'error': ''}
         try:
-            req = MCPCallRequest(tool=tool_name,
-                                 arguments={'action': 'stop',
-                                            'instance_id': card.get('id', '')})
+            async def stop_and_confirm():
+                action = 'stop'
+                while True:
+                    result = await mcp_call_tool(card.get('mcpId', ''), MCPCallRequest(
+                        tool=tool_name, arguments={'action': action, 'instance_id': card.get('id', '')}),
+                        timeout_s=STOP_CARD_TIMEOUT_S)
+                    if result.get('code') != 200:
+                        raise RuntimeError(result.get('message') or '设备拒绝停止请求')
+                    payload = payload_of(result)
+                    if isinstance(payload.get('result'), dict):
+                        payload = payload['result']
+                    state = payload.get('state') or payload.get('status') or payload.get('event')
+                    reason = payload.get('error') or payload.get('reason') or payload.get('message')
+                    if payload.get('error') or state in ('error', 'failed', 'fault', 'unknown'):
+                        raise RuntimeError(reason or '设备停止未确认')
+                    release = payload.get('release')
+                    if isinstance(release, dict) and release.get('state') in ('unknown', 'failed'):
+                        raise RuntimeError(release.get('reason') or '设备控制权释放未确认')
+                    pending = (payload.get('busy') is True or payload.get('ownership_held') is True
+                               or payload.get('output_active') is True or payload.get('authority_released') is False
+                               or state in ('running', 'active', 'loading', 'stopping', 'hold', 'holding',
+                                            'handback', 'confirming_handback', 'sdk_pending', 'awaiting_feedback'))
+                    if not pending:
+                        return
+                    # Never resend stop while a device is handing control back.
+                    # Read its actual state within the existing per-card deadline.
+                    await _aio.sleep(.1)
+                    action = 'info'
             # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
             # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
             # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
-            await _aio.wait_for(
-                mcp_call_tool(card.get('mcpId', ''), req,
-                              timeout_s=STOP_CARD_TIMEOUT_S),
-                STOP_CARD_TIMEOUT_S)
+            await _aio.wait_for(stop_and_confirm(), STOP_CARD_TIMEOUT_S)
             entry['ok'] = True
         except _aio.TimeoutError:
             # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
             # 下来的卡片意味着那台设备可能还在跑。
-            entry['error'] = f'无响应（{STOP_CARD_TIMEOUT_S:g}s 死线）'
+            entry['error'] = f'停止未确认（{STOP_CARD_TIMEOUT_S:g}s 死线）；请检查设备状态'
         except Exception as error:  # noqa: BLE001
             entry['error'] = str(error) or type(error).__name__
         if progress:

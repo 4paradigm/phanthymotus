@@ -99,4 +99,12 @@ Driver 的 `tests/test_teaching_browser.py` 提供跨仓浏览器验收：真实
 
 2026-10-16 已在上海部署：基于现场 `release.261015.0897a8d` 应用完整 PR 增量，保留基线 MCP 更新，构建 `phanthymotus-core:workbench318-20261016`（`0609067d81ce`）。候选镜像内 schema、Skill 导入、动作包、MCP 合并及错误处理五组测试 **52 passed**。真实网页已完成旧“抬手”说明更新、型号展示、完整动作包下载和上传文件检查，原 Skill 保持启用，页面无脚本错误；没有上传资源中心。
 
-真实 Agent 随后已正确发现并调用 `g1_teaching.preview(asset_id)`，但一次物理回放遗留的 G1 交权超时导致 `motion_busy`。该问题在 Driver #412 的 `arm_stream.py` / `teleop_control.py` 修复，无新增 Core 修改。现场完成停止交权并更新 Driver 后，多次预览成功、busy=false；未再次执行动作。真实 Agent 确认→执行→完成的整段流程仍待现场验证，不将这些只读检查表述为整次物理验收成功。
+上述部署阶段，真实 Agent 已正确发现并调用 `g1_teaching.preview(asset_id)`，但一次物理回放遗留的 G1 交权超时导致 `motion_busy`。当时在 Driver #412 的 `arm_stream.py` / `teleop_control.py` 修复，现场完成停止交权并更新 Driver 后，多次预览成功、busy=false；未再次执行动作。该历史记录不代表下面新增候选的当前状态。
+
+## 停止结果与最新候选（2026-10-16）
+
+`src/api/config.py` 的停止收尾必须读取设备返回值：非 200、业务 error、unknown/failed/fault 及未确认的 release 都按失败报告。明确仍在释放或持有控制权时，在原有每卡 5 秒期限内轮询 info，不重复发送 stop；到期报告“停止未确认”。Agent 仍先停、设备仍并行收尾，沿用原进度事件和界面，没有修改 Agent Loop。
+
+`src/api/mcp_manage.py` 同时保留 MCP `isError` 的失败含义，避免协议层成功包装掩盖工具失败。只修 Driver 无法解决 Core 不读取返回结果的问题，因此这两处属于必要的通用修改，无 G1 型号或动作判断。
+
+限时授权、导入恢复及上述停止修复尚未部署。最新只读检查仍见现场项目运行、G1 持有控制权，没有强制切换版本。G1 的 DDS 环境变量已修复并收到实际数据，但不代表回放验收成功。本轮 Python/页面脚本语法和 diff 检查通过；已补停止错误、异步等待和超时的回归断言，按用户要求未继续运行模拟测试。连续调用两次和导入后一次试运行仍待现场验收，既有测试数量和截图均不是最新候选的验收证据。

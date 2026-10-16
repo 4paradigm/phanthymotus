@@ -162,6 +162,41 @@ def test_a_failing_card_is_reported_not_swallowed(rig):
     assert bad[0]['error'], '错误信息不能是空的 —— 界面要显示它'
 
 
+@pytest.mark.parametrize('reply', [
+    {'code': 500, 'message': 'release_result_unknown'},
+    {'code': 200, 'data': {'error': 'release_result_unknown'}},
+    {'code': 200, 'data': {'state': 'idle', 'ownership_held': True,
+        'release': {'state': 'unknown', 'reason': 'release_result_unknown'}}},
+    {'code': 200, 'data': [{'type': 'text', 'text':
+        '{"state":"unknown","reason":"release_result_unknown"}'}]},
+])
+def test_unsuccessful_device_receipt_is_not_counted_as_stopped(rig, monkeypatch, reply):
+    async def call(*args, **kwargs):
+        return reply
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    results = run(api_config._stop_cards(CARDS[:1], progress=True))
+    assert results[0]['ok'] is False
+    assert 'release_result_unknown' in results[0]['error']
+    assert rig.events[-1]['payload']['status'] == 'error'
+
+
+@pytest.mark.parametrize('complete', [True, False])
+def test_pending_stop_polls_info_without_reissuing_stop(rig, monkeypatch, complete):
+    calls = []
+    async def call(mcp_id, req, timeout_s=None):
+        action = req.arguments['action']
+        calls.append(action)
+        payload = ({'state': 'idle', 'ownership_held': False} if action == 'info' and complete
+                   else {'state': 'idle', 'ownership_held': True})
+        return {'code': 200, 'data': payload}
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', call)
+    result = run(api_config._stop_cards(CARDS[:1]))[0]
+    assert result['ok'] is complete
+    assert calls[0] == 'stop' and calls.count('stop') == 1 and 'info' in calls
+    if not complete:
+        assert '停止未确认' in result['error']
+
+
 def test_cards_without_an_mcp_are_skipped(rig):
     results = run(api_config._stop_cards(
         CARDS + [{'id': 'note', 'mcpId': '', 'toolName': ''}]))

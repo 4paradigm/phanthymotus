@@ -1372,6 +1372,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                if result.get('isError'):
+                    message = '\n'.join(str(item.get('text', '')) for item in (result.get('content') or [])
+                                        if isinstance(item, dict) and item.get('type') == 'text')
+                    return {'code': 500, 'message': message[:1000] or 'Tool call error', 'data': None}
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):
