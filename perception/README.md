@@ -42,6 +42,63 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 
 > **Why 512 samples?** The Silero VAD model requires at least one 512-sample window to compute a speech probability. WebRTC VAD requires 480-sample (30 ms) frames. Both backends use 512 samples as the minimum chunk size.
 
+### Wake Direction Timing
+
+Connect Bumi's `sensor/sound-direction` output
+(`/<namespace>/sound_direction`) to ASR's sound-direction input, and
+its microphone to the `audio/pcm-16k` input. The direction port remains a
+specific sensor type, not `data/json`: an ordinary JSON card cannot supply it.
+Like the existing `sensor/pose2d` card, its ROS transport is `std_msgs/String`
+with a structured payload. Core needs no change: its generic `sensor/*`
+transport already carries the message, without compiling a custom direction
+interface or starting the sensor.
+
+The payload has `state: "fresh"`, the exact `angle_deg`, and
+`angle_convention: "robot_front_0_left_positive_ccw"` (front 0°, left positive,
+right negative), plus
+`audio_window_start_us` / `audio_window_end_us`. Driver publishes `no_event` after
+activity stops and `stale` if a valid observation expires. Neither state clears
+ASR's capture history: a transcription can finish after the event expires.
+ASR ignores a direction observation with a missing or different convention.
+Its existing recognition result reports `speaker_direction_state` and, when
+valid, `speaker_direction` as a single string such as
+`"115°, robot_front_0_left_positive_ccw"`. The matched capture window is
+reported as `speaker_direction_window_start_us` /
+`speaker_direction_window_end_us`. The angle refers to the start of the wake
+word, not the full utterance. Unknown and disconnected directions report only
+`speaker_direction_state: "unknown"` or `"no_input"`.
+
+`AudioChunk.header.stamp` must be the Unix capture time of the chunk's first
+sample. Direction windows use the same clock in microseconds. ASR reports an
+unknown wake direction when the audio stamp is missing or either capture
+window is untrusted. Confirm clock alignment on the robot before relying on
+direction results.
+
+For this migration, upgrade Driver and Perception together. Remove/re/add the
+direction and ASR cards and reconnect them — a saved card keeps its old
+`topicIn` list and never gains the second input. The canvas type remains
+`sensor/sound-direction`. ASR picks its direction input by topic name: the
+connection whose topic has a `sound_direction` segment is the direction source,
+every other input is audio, so connection order does not choose the audio
+source. Keep that name — renaming the driver output breaks the binding.
+Direction payloads appear in the monitor as plain data; they are not rendered
+as JSON.
+
+SenseVoice, Parakeet and X-ASR retain the recognizer's token timestamps from
+the same decode. ASR maps the matched wake word's text boundary to a timed
+token and adds its offset to the utterance's capture start before selecting
+direction windows. This supports filler and other speech before a custom wake
+word. Token timing must be finite, ordered, inside the original audio, and
+consistent with the recognized text; a wake boundary inside an indivisible
+token is unavailable. If timing is unavailable, a wake word at the utterance
+start can use the VAD onset; a spoken prefix returns `unknown`. Recognition
+and wake triggering continue normally. Check token timing accuracy on the
+robot; the timestamps do not establish the physical alignment error by themselves.
+Direction history keeps up to 60 seconds / 1201 events, covering a 30-second
+VAD segment plus queueing margin at Bumi's maximum 20 Hz publication rate.
+The worker snapshots history before transcription, so later direction events
+cannot evict a wake window while that utterance is being decoded.
+
 ### Common Pitfalls
 
 #### External USB mic (ALSA, 48 kHz native rate)

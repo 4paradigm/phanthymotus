@@ -188,6 +188,29 @@ def test_sensevoice_survives_a_binding_without_those_fields():
     assert tags == {}
 
 
+@pytest.mark.parametrize('model', ['sensevoice', 'parakeet', 'x-asr'])
+def test_adapters_return_alignment_from_the_same_decode(model):
+    result = _FakeResult('你好', tokens=['你', '好'], timestamps=[0.02, 0.06])
+    recognizer = _FakeRecognizer(result)
+    if model == 'sensevoice':
+        adapter = asr_module.SherpaOnnxSenseVoiceAdapter.__new__(asr_module.SherpaOnnxSenseVoiceAdapter)
+    elif model == 'parakeet':
+        adapter = asr_module.SherpaOnnxNemoCtcAdapter.__new__(asr_module.SherpaOnnxNemoCtcAdapter)
+    else:
+        from plugins.x_asr import XASRAdapter
+        delegate = XASRAdapter.__new__(XASRAdapter)
+        delegate._recognizer = recognizer
+        delegate._decode_lock = threading.Lock()
+        adapter = asr_module.SherpaOnnxXASRAdapter.__new__(asr_module.SherpaOnnxXASRAdapter)
+        adapter._delegate = delegate
+    adapter._recognizer = recognizer
+    text, tags, alignment = adapter.transcribe_aligned(_wav(), 'zh-CN')
+    assert text == '你好'
+    assert tags == {}
+    assert alignment == {'tokens': ['你', '好'], 'timestamps': [0.02, 0.06], 'duration_s': 0.1}
+    assert recognizer.decoded == 1
+
+
 def test_sensevoice_pads_tail_silence():
     """tag 这条改动不能动到原本的尾部补零（否则末字被截）。"""
     result = _FakeResult("你好", lang="<|zh|>")
