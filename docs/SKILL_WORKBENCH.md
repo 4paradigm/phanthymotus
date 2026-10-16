@@ -73,7 +73,6 @@ Core 的 token，也读不到父页面存储。
 {
   "x-skill-package": {
     "schema": "example.device.package/1",
-    "pending": true,
     "persistent_execution": true
   }
 }
@@ -182,11 +181,10 @@ slug，而不是预期的幂等 200。
 把技能包**带出**设备（换一台机器人用）走资源中心的附件与版本（resource-center!66），
 不再是「从网页下载一个文件、再上传到另一台」。
 
-`api/skill_execution.py` 剩下的职责只有三件：
+`api/skill_execution.py` 剩下的职责只有两件：
 
 | 接口 | 行为 |
 | --- | --- |
-| GET `/pending` · POST `/resume` | 聚合各卡片上待本机验证的草稿；从技能列表恢复对应工作台。由 Core 聚合而不是页面，因为找它们要拿画布布局去比对 MCP 注册表 —— 和选路不放在浏览器是同一个理由 |
 | POST `/refresh/{slug}` | 由原设备重新生成技能定义（临时，见「已移除与临时项」） |
 | GET · POST `/execution/{slug}`、POST `/execution/read` | 自动执行策略：网页读写，驱动回环只读 |
 
@@ -298,6 +296,8 @@ slug，而不是预期的幂等 200。
 | **旧 slug 前缀解析器** | 用于把 `attachment` 字段出现之前安装的技能映射到设备。恰好一台测试机上有这样一行；一条 DB UPDATE 能替掉两条代码路径，而且 slug 命名约定本来就不是身份机制。 |
 | **整卡总开关** | 见「持久自动执行设置」一节。 |
 | **分块传输与导入弹窗**（`package_begin`/`write`/`finish`/`read`、zip 校验、`/inspect`、`/install`、`/export`、`/targets`、技能面板的导入弹窗） | 只因为当时没有任何 driver 实现 `POST /file/upload`。端点补上之后（phanthymotus-driver#417），通用的 `format: file` 就够了 —— 画布本来就为这类参数渲染文件选择器。**一件事两套传输是最不该留下的东西。** 删掉它也顺带去掉了「Core 原样转发整个归档」这个前提，于是归档条目名、路径穿越检查、解压大小这些 Core 本不该关心的事一并消失。模块改名 `api/skill_execution.py`，515 → 326 行。 |
+
+| **`/pending` + `/resume` 草稿代理** | 它聚合各卡片上未验证的草稿，给技能面板列出来。给的理由是「找它们要拿画布布局比对 MCP 注册表，只有 Core 有」—— 这是**错的**：`GET /api/mcp` 返回每个工具完整的 `inputSchema`（`sidebar.js` 和 `canvas.js` 都从那里读），页面本来就在取 `/api/canvas/layout`，而工作台本来就在经 `/api/mcp/{id}/call` 直接调驱动 action。Core 聚合 `draft_list` 买不到任何页面做不到的东西，所以想要这个列表就由页面自己做。通过卡片自己的 entry action 重开草稿不受影响 —— 那一直是驱动的事。 |
 
 一项保留但**是临时的**：**`refresh/{slug}`** 是「没有版本机制」的替代品。资源中心
 存上带版本的技能包之后（resource-center!66），重录一次产出的是新版本而不是改写当前

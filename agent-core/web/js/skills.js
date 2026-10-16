@@ -85,50 +85,7 @@ async function _loadInstalled() {
     const json = await res.json();
     const skills = json.data || [];
     _renderInstalled(skills);
-    await _loadPending();
   } catch { _renderInstalled([]); }
-}
-
-async function _loadPending() {
-  const list = document.getElementById('skill-pending-list');
-  try {
-    const response = await fetch('/api/skills/package/pending');
-    if (!response.ok) throw new Error();
-    const {drafts = [], unavailable = []} = (await response.json()).data;
-    list.replaceChildren();
-    if (drafts.length) _installedEmpty.classList.add('hidden');
-    for (const draft of drafts) {
-      const card = document.createElement('div'); card.className = 'skill-card';
-      card.dataset.draftId = draft.id;
-      card.innerHTML = `<div class="skill-card-header"><span class="skill-card-icon">◇</span>
-        <div class="skill-card-info"><span class="skill-card-name">${_esc(draft.name)}</span>
-        <span class="skill-card-meta">待验证 · ${_esc(draft.target.label)}</span></div>
-        <button class="skill-btn skill-btn-primary">继续验证</button></div>`;
-      card.querySelector('button').onclick = async event => {
-        const button = event.currentTarget;
-        button.disabled = true;
-        try {
-          const response = await fetch('/api/skills/package/resume', {method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({card_id: draft.target.instance_id, draft_id: draft.id})});
-          const result = await response.json();
-          if (!response.ok) throw new Error(result.detail || '无法继续验证');
-          await _openPackageWorkbench(result.data.target, result.data.ui);
-        } catch (error) { alert(error.message); button.disabled = false; }
-      };
-      list.append(card);
-    }
-    if (unavailable.length) {
-      const note = document.createElement('p'); note.className = 'skill-detail-text';
-      note.textContent = '部分设备未连接，待验证技能将在连接后显示。'; list.append(note);
-    }
-  } catch { list.textContent = '暂时无法读取待验证技能，请重新打开重试。'; }
-}
-
-async function _openPackageWorkbench(target, ui) {
-  await openWorkbench({mcp: target.mcp_id, tool: target.tool, instanceId: target.instance_id},
-    target.workbench, ui, () => show());
-  hide();
 }
 
 function _renderInstalled(skills) {
@@ -531,7 +488,6 @@ function _renderSkillDetail(skill, context) {
   const container = context === 'installed' ? _installedList : _browseList;
   const emptyEl = context === 'installed' ? _installedEmpty : _browseEmpty;
   emptyEl.classList.add('hidden');
-  if (context === 'installed') document.getElementById('skill-pending-list').replaceChildren();
   // `attachment` is the whole test. The page used to also sniff a
   // `taught-<32 hex>` slug; the server resolves legacy slugs from the
   // prefix each card declares, so the browser does not need the convention.

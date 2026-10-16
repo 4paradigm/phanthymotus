@@ -5,8 +5,7 @@ this skill to run without being asked each time? The device reads it over a
 loopback-only, read-only endpoint before every preview and run; nothing else can
 grant it -- not an MCP `config` argument, not metadata inside an imported skill.
 
-It also resolves a skill's identity (slug -> which card, which asset) and lists
-drafts that are installed but not yet verified on this machine.
+It also resolves a skill's identity: slug -> which card, which asset.
 
 **What used to live here and no longer does.** This file was `api/skill_packages`
 and carried a second file transport: `package_begin` / `package_write` /
@@ -26,12 +25,22 @@ dialog, no second transport.
 Two transports for one job is the thing worth not shipping. See
 `phanthymotus/README.md` § File Arguments and § Skill Files, and that repo's
 README_dev.md § File Arguments for the per-bundle glue.
+
+A `/pending` + `/resume` pair also lived here, aggregating each card's
+unverified drafts so the skill panel could list them. The justification given
+was that finding them needs the canvas layout checked against the MCP registry,
+which only Core has -- and that was simply wrong. `GET /api/mcp` returns each
+tool's full `inputSchema` (both `sidebar.js` and `canvas.js` read it from
+there), the page already fetches `/api/canvas/layout`, and the workbench already
+calls driver actions directly through `/api/mcp/{id}/call`. Core aggregating
+`draft_list` bought nothing the page could not do itself, so it is the page's
+job if the list is wanted back. Reopening a draft through the card's own entry
+action is unaffected -- that was always the driver's business.
 """
 import copy
 import re
 import secrets
 
-import asyncio
 import fastapi
 
 import config
@@ -214,14 +223,6 @@ def targets():
     return result
 
 
-def target_for(card_id, known=None):
-    target = next((t for t in (known if known is not None else targets())
-                   if t['instance_id'] == card_id), None)
-    if not target:
-        raise fastapi.HTTPException(409, '请选择画布中支持技能包的设备卡片')
-    return target
-
-
 async def call(target, action, **args):
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     response = await mcp_call_tool(target['mcp_id'], MCPCallRequest(
@@ -240,36 +241,6 @@ async def call(target, action, **args):
         raise fastapi.HTTPException(409, data.get('error') if isinstance(data, dict)
                                    else '设备返回无效结果')
     return data
-
-
-# ── drafts awaiting local verification ───────────────────────────────────────
-
-@router.get('/pending')
-async def pending_packages():
-    """Drafts installed on a card but not yet verified here.
-
-    Aggregated by Core rather than the page: finding them means walking the
-    canvas layout against the MCP registry, which is the same reason routing
-    does not live in the browser.
-    """
-    async def read(target):
-        if not target['capabilities'].get('pending'):
-            return [], None
-        try:
-            result = await asyncio.wait_for(call(target, 'draft_list'), 5)
-            return [{**d, 'target': target} for d in result['drafts']], None
-        except Exception:     # noqa: BLE001 - an offline card is not an error here
-            return [], target['label']
-    result = await asyncio.gather(*(read(t) for t in targets()))
-    return {'code': 200, 'data': {'drafts': [d for rows, _ in result for d in rows],
-                                  'unavailable': [error for _, error in result if error]}}
-
-
-@router.post('/resume')
-async def resume_package(body: dict = fastapi.Body(...)):
-    target = target_for(body.get('card_id'))
-    await call(target, 'draft_open', draft_id=body.get('draft_id'))
-    return {'code': 200, 'data': {'target': target, 'ui': await call(target, 'ui')}}
 
 
 # ── identity ─────────────────────────────────────────────────────────────────

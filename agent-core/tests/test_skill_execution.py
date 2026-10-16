@@ -28,7 +28,7 @@ BINDING = 'device-binding-v3'         # not 64 chars, on purpose
 SLUG = PREFIX + ASSET
 TOOL = 'example_recorder'
 
-CAPABILITIES = {'schema': SCHEMA, 'pending': True}
+CAPABILITIES = {'schema': SCHEMA}
 
 
 def _services(**extra):
@@ -158,30 +158,6 @@ def test_a_skill_without_an_attachment_cannot_be_resolved(client, target):
     with pytest.raises(fastapi.HTTPException) as caught:
         packages.resolve_skill(SLUG)
     assert caught.value.status_code == 409
-
-
-def test_pending_resume_uses_original_card_without_installing(client, target, monkeypatch):
-    seen = []
-
-    async def call(actual, action, **args):
-        assert actual == target
-        seen.append(action)
-        if action == 'draft_list':
-            return {'drafts': [{'id': 'draft-1', 'name': '待验证技能'}]}
-        if action == 'draft_open':
-            assert args == {'draft_id': 'draft-1'}
-            return {'draft': {'id': 'draft-1'}}
-        if action == 'ui':
-            return {'protocol': 'motus.workbench/1', 'html': '<p>检查</p>'}
-        pytest.fail(action)
-    monkeypatch.setattr(packages, 'call', call)
-    result = client.get('/api/skills/package/pending').json()['data']
-    assert result['drafts'][0]['target'] == target
-    response = client.post('/api/skills/package/resume',
-                           json={'card_id': 'card-a', 'draft_id': 'draft-1'})
-    assert response.json()['data']['ui']['html'] == '<p>检查</p>'
-    assert seen == ['draft_list', 'draft_open', 'ui']
-    assert config.main['skills']['installed'] == []
 
 
 def test_the_loopback_read_resolves_an_asset_to_its_owning_card(client, target, monkeypatch):
