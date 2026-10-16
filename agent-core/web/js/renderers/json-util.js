@@ -76,12 +76,3 @@ export function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
-
-/** Round direction fields for display without changing timestamps or payloads. */
-export function directionDisplayValue(key, value) {
-  if (key === 'angle' && typeof value === 'number') {
-    const rounded = Math.round(value);
-    return rounded === -180 ? 180 : rounded === 0 ? 0 : rounded;
-  }
-  return value;
-}

@@ -14,15 +14,6 @@
  *   node --test "agent-core/web/js/*.test.mjs"
  */
 
-/** Refresh declared input ports while retaining resolved topics for unchanged ports. */
-export function mergeInputPorts(saved = [], declared = []) {
-  if (!declared?.length) return saved || [];
-  return declared.map((port, index) => {
-    const old = saved?.[index];
-    return old?.format === port.format && old.topic ? { ...port, topic: old.topic } : port;
-  });
-}
-
 /**
  * The topic a card publishes on `portIdx`, or '' if not known yet.
  *
@@ -116,21 +107,6 @@ export function inputTopicsOf(card, cards, connections, allowStale = false) {
   return topics;
 }
 
-export function inputBindingsOf(card, cards, connections, allowStale = false) {
-  const bindings = [];
-  for (const conn of connections.filter(c => c.toCardId === card.id)) {
-    const topic = topicOfConnection(conn, cards, allowStale);
-    if (!topic) return [];
-    const source = cards.find(c => c.id === conn.fromCardId);
-    const sourceIndex = parseInt(conn.fromPortIdx, 10) || 0;
-    const portIndex = parseInt(conn.toPortIdx, 10) || 0;
-    const format = conn.format || source?.topicOut?.[sourceIndex]?.format ||
-                   card.topicIn?.[portIndex]?.format || '';
-    if (format) bindings.push({ topic, format, port_index: portIndex });
-  }
-  return bindings;
-}
-
 /**
  * The arguments that tell a tool what to consume.
  *
@@ -138,12 +114,9 @@ export function inputBindingsOf(card, cards, connections, allowStale = false) {
  * more than one, and the singular alongside it because no driver reads the
  * plural — sending only `input_topics` reaches them as no input at all.
  */
-export function inputArgs(topics, bindings = []) {
-  const args = topics.length > 1
-    ? { input_topics: topics, input_topic: topics[0] }
-    : { input_topic: topics[0] || '' };
-  if (bindings.length) args.input_bindings = bindings;
-  return args;
+export function inputArgs(topics) {
+  if (topics.length > 1) return { input_topics: topics, input_topic: topics[0] };
+  return { input_topic: topics[0] || '' };
 }
 
 /** A stable cache key for a set of input topics. */
@@ -179,8 +152,7 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tool: card.toolName,
-          arguments: { action: 'info', instance_id: card.id,
-                       ...inputArgs(inputTopics, inputBindingsOf(card, cards, connections)) },
+          arguments: { action: 'info', instance_id: card.id, ...inputArgs(inputTopics) },
         }),
       });
       const json = await res.json();

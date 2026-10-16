@@ -586,7 +586,6 @@ async def _do_start_project_impl():
             return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
-                                 input_bindings: list = None,
                                  control_interface: dict = None,
                                  camera_info: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
@@ -627,9 +626,6 @@ async def _do_start_project_impl():
             wanted = [input_topic]
             args['input_topic'] = input_topic
             info_args['input_topic'] = input_topic
-        if input_bindings:
-            args['input_bindings'] = input_bindings
-            info_args['input_bindings'] = input_bindings
 
         if control_interface:
             # The action space of the card this one drives. Sent on `start` so a
@@ -850,31 +846,6 @@ async def _do_start_project_impl():
             return topics[0], [], unresolved
         return '', [], unresolved
 
-    def _resolve_input_bindings(card_id: str) -> list[dict]:
-        bindings = []
-        card = next((c for c in cards if c.get('id') == card_id), {})
-        for conn in (c for c in connections if c.get('toCardId') == card_id):
-            topic = _topic_of_connection(conn)
-            if not topic:
-                continue
-            try:
-                port_index = int(conn.get('toPortIdx') or 0)
-            except (TypeError, ValueError):
-                port_index = 0
-            source = next((c for c in cards if c.get('id') == conn.get('fromCardId')), {})
-            source_ports = source.get('topicOut') or []
-            destination_ports = card.get('topicIn') or []
-            try:
-                source_index = int(conn.get('fromPortIdx') or 0)
-            except (TypeError, ValueError):
-                source_index = 0
-            fmt = (conn.get('format') or
-                   (source_ports[source_index].get('format') if 0 <= source_index < len(source_ports) else '') or
-                   (destination_ports[port_index].get('format') if 0 <= port_index < len(destination_ports) else ''))
-            if fmt:
-                bindings.append({'topic': topic, 'format': fmt, 'port_index': port_index})
-        return bindings
-
     def _upstream_camera_info(card_id: str) -> dict:
         """What this card's sources say about the optics behind each input.
 
@@ -1041,7 +1012,6 @@ async def _do_start_project_impl():
             continue
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
-                                 input_bindings=_resolve_input_bindings(card.get('id', '')),
                                  control_interface=descriptor,
                                  camera_info=_upstream_camera_info(card.get('id', '')))
 
@@ -1825,4 +1795,5 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
+
 

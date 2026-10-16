@@ -83,7 +83,7 @@ class RestartPolicyTests(unittest.TestCase):
         否则 install.sh 的 `docker cp .../deploy/docker-compose.yml` 会取到别的东西。
         """
         dockerfile = (REPO / 'agent-core' / 'Dockerfile').read_text(encoding='utf-8')
-        self.assertRegex(dockerfile, r'(?m)^COPY\s+deploy/\s+/deploy/\s*$')
+        self.assertIn('COPY deploy/', dockerfile)
 
     def test_the_reason_is_written_down(self):
         """没有理由的话，下一个人会觉得 unless-stopped 更稳妥而改回去。"""

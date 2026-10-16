@@ -17,7 +17,7 @@ import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
-import { inputBindingsOf, resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
+import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
@@ -181,7 +181,6 @@ async function _fetchAndBuild() {
   const canvasCards = layout.cards || [];
   const connections = layout.connections || [];
   const canvasTools = new Set(canvasCards.map(c => `${c.mcpId}:${c.toolName}`));
-  _refreshStaticTopics(canvasCards, mcps);
 
   // The layout is not a reliable record of derived topics — see topic-derive.js.
   // multiInstance marks the tools whose topic is derived rather than declared,
@@ -197,7 +196,6 @@ async function _fetchAndBuild() {
   // A connection's fromTopic is read below as a topic to subscribe to, and it is
   // just as stale as the card topic it was copied from — sync it before use.
   syncConnectionTopics(canvasCards, connections);
-  _refreshInputTopics(canvasCards, connections);
 
   const topicSet = new Set();
   _topicMcpMap = {};  // reset
@@ -309,28 +307,6 @@ async function _fetchAndBuild() {
   if (rearranged) _saveLayout();
 }
 
-function _refreshStaticTopics(cards, mcps) {
-  for (const card of cards) {
-    const mcp = mcps.find(m => m.id === card.mcpId);
-    const tool = (mcp?.tools || []).find(t => t.name === card.toolName);
-    if (tool && !tool.multiInstance && tool.topic_out?.some(port => port.topic)) {
-      card.topicOut = tool.topic_out.map(port => ({ ...port }));
-    }
-  }
-}
-
-function _refreshInputTopics(cards, connections) {
-  // A saved input can still name the source's old topic after a driver upgrade.
-  for (const card of cards) {
-    const bindings = inputBindingsOf(card, cards, connections);
-    if (!bindings.length || !card.topicIn?.length) continue;
-    card.topicIn = card.topicIn.map((port, index) => {
-      const binding = bindings.find(b => b.port_index === index && b.format === port.format);
-      return binding ? { ...port, topic: binding.topic } : port;
-    });
-  }
-}
-
 function _clampSpan(span) {
   return Math.max(1, Math.min(_totalCols, span));
 }
@@ -350,9 +326,8 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
   _applyPlacement(el, col, row, colSpan, rowSpan);
 
   const fmtClass = _formatClass(format);
-  const shortName = _cardShortName(topicPath);
-  const isJson = format === 'data/json' || format?.startsWith('text/')
-    || format === 'sensor/sound-direction';
+  const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
+  const isJson = format === 'data/json' || format?.startsWith('text/');
   const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
   const modeHtml = isJson
@@ -886,20 +861,6 @@ function _esc(s) {
  * `/remote_control/image/depth_summary` both displayed as `/remote_control/…`.
  * Keeping the tail keeps the distinction; the full path stays in the tooltip.
  */
-/**
- * The window name: the topic's last segment, except a trailing `events` —
- * that suffix names the transport, not the sensor. `/x/sound_direction/events`
- * and `/x/sound_direction` both read `sound_direction`, so a monitor upgrade
- * never flips the window between "sound_direction" and "event".
- */
-function _cardShortName(topicPath) {
-  const segs = String(topicPath || '').split('/').filter(Boolean);
-  if (segs.length >= 2 && segs[segs.length - 1] === 'events') {
-    return segs[segs.length - 2];
-  }
-  return segs[segs.length - 1] || topicPath;
-}
-
 function _displayPath(topicPath) {
   const segs = String(topicPath || '').split('/').filter(Boolean);
   if (segs.length <= 2) return '/' + segs.join('/');
@@ -909,14 +870,14 @@ function _displayPath(topicPath) {
 function _formatClass(format) {
   if (!format) return '';
   if (format.includes('audio') || format === 'audio/pcm') return 'fmt-audio';
-  if (format.includes('json') || format.startsWith('text/') || format === 'sensor/sound-direction') return 'fmt-json';
+  if (format.includes('json') || format.startsWith('text/')) return 'fmt-json';
   if (format.includes('video') || format.includes('image') || format.includes('visual')) return 'fmt-visual';
   return '';
 }
 
 function _formatLabel(format) {
   if (!format) return 'RAW';
-  if (format === 'data/json' || format === 'sensor/sound-direction') return 'JSON';
+  if (format === 'data/json') return 'JSON';
   if (format === 'audio/pcm') return 'AUDIO';
   if (format.includes('video')) return 'VIDEO';
   if (format.includes('image')) return 'IMAGE';

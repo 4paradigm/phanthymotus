@@ -12,16 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, inputBindingsOf, inputArgs, topicOfPort, mergeInputPorts } from './topic-derive.js';
-
-test('upgraded ASR keeps its audio topic and gains the direction input', () => {
-  const saved = [{ topic: '/robot/mic/audio', format: 'audio/pcm-16k' }];
-  const declared = [{ format: 'audio/pcm-16k' }, { format: 'sensor/sound-direction' }];
-  assert.deepEqual(mergeInputPorts(saved, declared), [
-    { topic: '/robot/mic/audio', format: 'audio/pcm-16k' },
-    { format: 'sensor/sound-direction' },
-  ]);
-});
+import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, topicOfPort } from './topic-derive.js';
 
 // The layout that produced the report: mic → asr → tts, both derived cards saved
 // with no topic because nothing had asked the driver yet.
@@ -35,30 +26,6 @@ const CONNS = [
 ];
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
-
-test('direction and audio bindings retain their formats regardless of link order', () => {
-  const direction = { id: 'direction', topicOut: [{ topic: '/direction', format: 'sensor/sound-direction' }] };
-  const mic = { id: 'mic', topicOut: [{ topic: '/mic', format: 'audio/pcm-16k' }] };
-  const asr = { id: 'asr', topicIn: [{ format: 'audio/pcm-16k' }, { format: 'sensor/sound-direction' }] };
-  const conns = [
-    { fromCardId: 'direction', fromPortIdx: '0', toCardId: 'asr', toPortIdx: '1' },
-    { fromCardId: 'mic', fromPortIdx: '0', toCardId: 'asr', toPortIdx: '0' },
-  ];
-  const bindings = inputBindingsOf(asr, [direction, mic, asr], conns);
-  assert.deepEqual(bindings, [
-    { topic: '/direction', format: 'sensor/sound-direction', port_index: 1 },
-    { topic: '/mic', format: 'audio/pcm-16k', port_index: 0 },
-  ]);
-  assert.deepEqual(inputArgs(['/direction', '/mic'], bindings).input_bindings, bindings);
-});
-
-test('a connection with no declared format has no input binding', () => {
-  const mic = { id: 'mic', topicOut: [{ topic: '/mic' }] };
-  const asr = { id: 'asr' };
-  const conns = [{ fromCardId: 'mic', fromPortIdx: '0',
-                   toCardId: 'asr', toPortIdx: '0', fromTopic: '/mic' }];
-  assert.deepEqual(inputBindingsOf(asr, [mic, asr], conns), []);
-});
 
 /** A driver that infers `input + '/' + tool`, like the real topic inference. */
 function driver(log = []) {

@@ -205,50 +205,6 @@ def test_asr_is_started_with_the_mic_topic(driver):
     assert driver.starts[ASR]['input_topic'] == '/ubuntu/mic/audio'
 
 
-def test_asr_bindings_identify_ports_when_direction_connects_first(driver):
-    layout = {
-        'cards': [
-            _card('direction', 'sound_direction', [
-                {'topic': '/robot/direction', 'format': 'sensor/sound-direction'}]),
-            _card(MIC, 'mic', [
-                {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k'}]),
-            _card(ASR, 'asr')],
-        'connections': [
-            {**_conn('direction', ASR, '/robot/direction'),
-             'toPortIdx': '1', 'format': 'sensor/sound-direction'},
-            {**_conn(MIC, ASR, '/ubuntu/mic/audio'),
-             'format': 'audio/pcm-16k'}],
-    }
-    _start(layout)
-    assert driver.starts[ASR]['input_bindings'] == [
-        {'topic': '/robot/direction', 'format': 'sensor/sound-direction', 'port_index': 1},
-        {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k', 'port_index': 0},
-    ]
-
-
-def test_malformed_saved_port_index_falls_back_to_first_port(driver):
-    layout = {
-        'cards': [_card(MIC, 'mic', [
-            {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k'}]),
-            {**_card(ASR, 'asr'), 'topicIn': [{'format': 'audio/pcm-16k'}]}],
-        'connections': [{**_conn(MIC, ASR, '/ubuntu/mic/audio'),
-                         'fromPortIdx': 'bad', 'toPortIdx': 'bad'}],
-    }
-    assert _start(layout) is True
-    assert driver.starts[ASR]['input_bindings'] == [
-        {'topic': '/ubuntu/mic/audio', 'format': 'audio/pcm-16k', 'port_index': 0}]
-
-
-def test_formatless_connection_does_not_create_a_binding(driver):
-    layout = {
-        'cards': [_card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio'}]),
-                  _card(ASR, 'asr')],
-        'connections': [_conn(MIC, ASR, '/ubuntu/mic/audio')],
-    }
-    assert _start(layout) is True
-    assert 'input_bindings' not in driver.starts[ASR]
-
-
 def test_a_derived_topic_reaches_the_bus(driver):
     """The dashboard subscribes to what start-project registers."""
     _start(R1_LAYOUT)

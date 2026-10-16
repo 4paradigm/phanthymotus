@@ -695,9 +695,6 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
-      const savedValue = savedValues[key] ?? def.default;
-      const effectiveValue = def.oneOf.some(item => String(item.const) === String(savedValue))
-        ? savedValue : (def.default ?? '');
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
@@ -709,10 +706,10 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         const option = document.createElement('option');
         option.value = item.const ?? '';
         option.textContent = item.title || String(item.const);
-        if (String(effectiveValue) === String(item.const)) option.selected = true;
+        if (String(savedValues[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      input.value = effectiveValue;
+      if (savedValues[key] != null) input.value = savedValues[key];
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1029,9 +1026,6 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
-      const savedValue = savedValues[key] ?? def.default;
-      const effectiveValue = def.oneOf.some(item => String(item.const) === String(savedValue))
-        ? savedValue : (def.default ?? '');
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
@@ -1043,10 +1037,10 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         const option = document.createElement('option');
         option.value = item.const ?? '';
         option.textContent = item.title || String(item.const);
-        if (String(effectiveValue) === String(item.const)) option.selected = true;
+        if (String(savedValues[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      input.value = effectiveValue;
+      if (savedValues[key] != null) input.value = savedValues[key];
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';

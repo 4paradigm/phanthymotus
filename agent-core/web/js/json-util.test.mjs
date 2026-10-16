@@ -15,7 +15,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { decodeNestedJson, plainValue, escapeHtml, directionDisplayValue } from './renderers/json-util.js';
+import { decodeNestedJson, plainValue, escapeHtml } from './renderers/json-util.js';
 
 test('a field holding a JSON string is decoded into the value it encodes', () => {
   // exactly what a tool call puts on the bus: arguments as an escaped string
@@ -91,16 +91,4 @@ test('escapeHtml neutralises publisher-controlled markup', () => {
   assert.equal(escapeHtml('<img src=x onerror=alert(1)>'),
                '&lt;img src=x onerror=alert(1)&gt;');
   assert.equal(escapeHtml('a"b\'c&d'), 'a&quot;b&#39;c&amp;d');
-});
-
-// Direction precision is a presentation choice; other numbers keep precision.
-test('angle displays an integer with the agreed signed-angle boundary', () => {
-  assert.equal(directionDisplayValue('angle', 29.678), 30);
-  assert.equal(directionDisplayValue('angle', -29.678), -30);
-  assert.equal(directionDisplayValue('angle', -179.9), 180);
-  assert.equal(directionDisplayValue('angle', 90), 90);
-  assert.equal(directionDisplayValue('angle', null), null);
-});
-test('non-angle fields retain their original precision', () => {
-  assert.equal(directionDisplayValue('audio_start_ts', 1700000000.123), 1700000000.123);
 });

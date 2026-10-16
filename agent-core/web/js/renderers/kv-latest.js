@@ -2,7 +2,7 @@
  * kv-latest.js — "最新模式" renderer for JSON topics.
  * Shows each top-level key as a cell with live-updating value.
  */
-import { decodeNestedJson, directionDisplayValue } from './json-util.js';
+import { decodeNestedJson } from './json-util.js';
 
 export const KvLatestRenderer = {
   name: 'kv-latest',
@@ -55,7 +55,7 @@ export const KvLatestRenderer = {
       this._cells[key] = cell;
     }
 
-    const formatted = _formatValue(directionDisplayValue(key, value));
+    const formatted = _formatValue(value);
     if (formatted !== cell.lastValue) {
       cell.valueEl.textContent = formatted;
       cell.lastValue = formatted;
