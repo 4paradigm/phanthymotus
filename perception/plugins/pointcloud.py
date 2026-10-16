@@ -749,6 +749,10 @@ class PointCloudPerceptionPlugin:
         self._model_load_error = None
         self._model_load_status = None
         self._model_lock = threading.Lock()
+        # mono 共享加载的并发 start 登记（review 第 13 轮）：加载在跑时
+        # 后续 start 登记到这里，加载落地后由共享线程统一补齐节点。
+        self._model_pending_starts: list[tuple] = []
+        self._pending_lock = threading.Lock()
         self._nodes: dict[str, _PointCloudNode] = {}
         self._instance_configs: dict[str, dict] = {}
         self._nodes_lock = threading.RLock()
@@ -815,6 +819,22 @@ class PointCloudPerceptionPlugin:
             self._model_loading = False
             self._model_load_status = None
         return True
+
+    def _bg_start(self):
+        """共享加载 + 启动全部登记过的 start 请求（review 第 13 轮）。
+
+        赢下 `_load_model_sync()` 的线程承担两件事：落地加载，然后把
+        `_model_pending_starts` 里登记的全部（含自己）用 _start_node 补齐；
+        重复 node_key 被 _start_node 去重，双实例并发 start 因此不会丢一条。
+        只有赢家的 `_bg_start` 会 drain+清队——输家在加载还在跑或已失败时
+        不能清队，否则赢家的收获被自己的早退掏空。"""
+        if not self._load_model_sync():
+            return  # 输家：不碰队列，等赢家来收
+        with self._pending_lock:
+            starts = self._model_pending_starts
+            self._model_pending_starts = []
+        for entry in starts:
+            self._start_node(*entry)
 
     # ── node 生命周期 ──────────────────────────────────────────────────────
 
@@ -979,6 +999,14 @@ class PointCloudPerceptionPlugin:
         board_h = int(args.get("board_h", 6))
         square = float(args.get("square_m", 0.025))
         target = int(args.get("pairs", _CALIB_PAIRS_TARGET))
+        # review 第 13 轮：0/负数会一路走到 OpenCV（square=0 时物方点全为零
+        # 的退化标定、board_w=0 时 pattern_size 非法），先于任何 cv2 调用
+        # 用 bad_input 拒绝，而不是让请求在库层以 cryptic 错误收场。
+        if board_w < 1 or board_h < 1 or square <= 0.0 or target < 1:
+            return {"ok": False, "reason": "bad_input",
+                    "detail": f"board_w/board_h/pairs 须 >= 1、square_m 须 > 0，收到: "
+                              f"board_w={board_w} board_h={board_h} square_m={square} "
+                              f"pairs={target}"}
         name = args.get("name") or default_calib_name()
         name, name_error = sanitize_calib_name(name)
         if name is None:
@@ -1273,18 +1301,25 @@ class PointCloudPerceptionPlugin:
                 needs_model = (mode == "mono" and self._model is None)
                 if needs_model:
                     if self._model_loading:
+                        # 加载在跑时先登记（含本条），落地后由赢下的
+                        # _bg_start 统一启动：双实例并发 start 才不会有一条
+                        # 停在"加载完成但只有 winner 启动 node"。
+                        with self._pending_lock:
+                            self._model_pending_starts.append(
+                                (node_key, mode, input_topic, right_topic, calibration))
                         return {"state": "loading",
-                                "message": (self._model_load_status or "Engine is still loading, please wait...")}
+                                "message": (self._model_load_status or
+                                            "Engine is still loading, please wait...")}
                     if self._model_load_error:
-                        return {"state": "error", "message": f"Engine failed to load: {self._model_load_error}"}
-
-                    def _bg_start():
-                        if not self._load_model_sync():
-                            return  # 已有加载在跑或已失败，等它 / 由它报
-                        if self._model_load_error is None:
-                            self._start_node(node_key, mode, input_topic, right_topic, calibration)
-
-                    threading.Thread(target=_bg_start, daemon=True, name="pointcloud_model_load").start()
+                        return {"state": "error",
+                                "message": f"Engine failed to load: {self._model_load_error}"}
+                    # 还没有加载在跑：先登记（含本条）再启动后台线程——顺序不能
+                    # 反，否则线程可能在本条登记前就完成加载并清走队列。
+                    with self._pending_lock:
+                        self._model_pending_starts.append(
+                            (node_key, mode, input_topic, right_topic, calibration))
+                    threading.Thread(target=self._bg_start, daemon=True,
+                                     name="pointcloud_model_load").start()
                     return {"state": "loading", "mode": mode, "input": input_topic,
                             "message": "Engine loading in background, will start automatically"}
                 self._start_node(node_key, mode, input_topic, right_topic, calibration)

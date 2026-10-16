@@ -248,6 +248,57 @@ def test_info_reports_loading_while_explicit_mono_engine_loads():
     assert len(executor.nodes) == 1
 
 
+def test_concurrent_mono_starts_launch_both_instances(monkeypatch):
+    """review 第 13 轮的双 mono 并发竞争：冷启动时两个 start 都看到
+    _model is None and not _model_loading，各 spawn 一个 _bg_start，
+    只有赢下 _load_model_sync 的线程会起 node——另一实例永远停在
+    'loading'、不订阅不发布。加载改成秒成功（不碰 GPU）后，两条路都必须
+    有 node（并各有一对订阅 + 一对输出）。"""
+    import utils.model_downloader as downloader
+    import plugins.vision_runtime as runtime
+
+    class _FakeSession:
+        def __init__(self, engine_path, **kw):
+            self.path = engine_path
+
+        @property
+        def input_size(self):
+            return (4, 4)
+
+    plugin, executor = _plugin()
+
+    def _fake_ensure_model():
+        # 与 test_real_path_mono_load_does_not_deadlock 同款桩：真下载路径
+        # 在主机上会走 tensorrt_family → TensorRTError，直接接管实例方法。
+        plugin._model = _FakeSession("/models/depth/fake.engine")
+
+    monkeypatch.setattr(downloader, "ensure_depth_model",
+                        lambda dir_, **kw: {"yolo26n-depth.engine": "/models/depth/fake.engine"})
+    monkeypatch.setattr(runtime, "VisionEngineSession", _FakeSession)
+    plugin._ensure_model = _fake_ensure_model
+
+    r1 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c1", "mode": "mono"})
+    r2 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c2", "mode": "mono"})
+    # 冷启动时两条路都走了后台加载：赢家的 _bg_start 必须把两条登记都
+    # 落成 node（加载慢时它们都停在 loading 回复，加载快时后一条直接起
+    # 节点——两种情况最后都要有双节点）。
+    assert _wait_until(lambda: len(executor.nodes) == 2)
+
+    def nodes_for(topic):
+        return [n for n in executor.nodes if any(
+            s.topic == topic for s in n.subscriptions)]
+
+    # mono 节点的订阅只有 jpeg_cb 一路（auto 才是双路回调）。
+    assert len(nodes_for("/cam/c1")) == 1
+    assert len(nodes_for("/cam/c2")) == 1
+    for node in executor.nodes:
+        kinds = {s.callback.__name__ for s in node.subscriptions}
+        assert kinds == {"_jpeg_cb"}, kinds
+        assert node._mode == "mono"
+
+
 def test_info_reports_error_when_engine_load_fails():
     plugin, _ = _plugin()
 
@@ -902,6 +953,22 @@ def test_calibrate_rejects_cv2_error_as_no_checkerboard(monkeypatch):
     assert reply["reason"] == "no_checkerboard"
 
 
+def test_calibrate_rejects_degenerate_parameters():
+    """review 第 13 轮：board_w=0 / board_h<0 / square_m=0 / pairs=0 等
+    退化参数不得到达 OpenCV（square=0 时物方点全为零、pattern_size
+    非法），必须在任何 cv2 调用前按 bad_input 契约回复。"""
+    plugin, _ = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    for bad in ({"board_w": 0}, {"board_h": -1}, {"square_m": 0.0}, {"pairs": 0}):
+        reply = plugin.dispatch("pointcloud", {"action": "calibrate", **bad})
+        if reply.get("reason") == "cv2_unavailable":
+            pytest.skip("fake cv2 has no chessboard API")
+        assert reply["ok"] is False
+        assert reply["reason"] == "bad_input"
+        assert "board_w" in str(reply["detail"])
+
+
 def test_calibrate_same_pair_is_not_a_new_pose():
     """review 指出的重复采样：连打 15 次 calibrate 不挪棋盘，会采到 15 份
     相同观测，stereoCalibrate 拟合出貌似成功的退化标定。同一对帧（seq
@@ -1361,7 +1428,9 @@ def test_worker_error_logs_full_trace_once_then_samples(caplog):
                               encoding="16UC1", width=4, height=4, step=8)
             node._frame_queue.put(("depth_z16", good))
             assert _wait_until(lambda: bool(_cloud_pub(node).messages), timeout=2.0)
-            assert node._worker_error_count == 0
+            # worker 先 publish 后才复位计数，主线程必须等 reset 可见，
+            # 否则微秒级的竞争窗口会让这条好帧断言失败。
+            assert _wait_until(lambda: node._worker_error_count == 0, timeout=2.0)
             pc._PointCloudNode._emit_depth = _boom
             node._frame_queue.put(("depth_z16", "fake"))
             assert _wait_until(lambda: node._worker_error_count == 1, timeout=2.0)
