@@ -203,22 +203,27 @@ def test_missing_input_or_untrusted_windows_never_use_last_angle():
         "speaker_direction_state": "unknown"}
 
 
-def test_input_bindings_identify_audio_and_direction_in_any_order():
-    args = {"input_topic": "/direction", "input_topics": ["/direction", "/mic"],
-            "input_bindings": [
-                {"topic": "/direction", "format": "sensor/sound-direction", "port_index": 1},
-                {"topic": "/mic", "format": "audio/pcm-16k", "port_index": 0}]}
-    assert asr._resolve_asr_inputs(args) == ("/mic", "/direction")
+def test_topic_names_identify_audio_and_direction_in_any_order():
+    """The direction input is the topic named `sound_direction`, not the
+    second connection: a canvas wired direction-first must still work."""
+    assert asr._resolve_asr_inputs(
+        {"input_topic": "/bumi/sound_direction",
+         "input_topics": ["/bumi/sound_direction", "/mic"]}) == (
+        "/mic", "/bumi/sound_direction")
+    assert asr._resolve_asr_inputs(
+        {"input_topics": ["/mic", "/bumi/sound_direction"]}) == (
+        "/mic", "/bumi/sound_direction")
     assert asr._resolve_asr_inputs({"input_topic": "/mic"}) == ("/mic", "")
-    assert asr._resolve_asr_inputs({"input_topics": ["/mic", "/direction"]}) == (
-        "/mic", "/direction")
 
 
-def test_direction_input_rejects_generic_json_connections():
-    args = {'input_bindings': [
-        {'topic': '/unrelated', 'format': 'data/json', 'port_index': 1},
-        {'topic': '/mic', 'format': 'audio/pcm-16k', 'port_index': 0}]}
-    assert asr._resolve_asr_inputs(args) == ('/mic', '')
+def test_only_a_sound_direction_topic_is_taken_as_direction():
+    """Anything else on a spare input is ignored — never guessed as the
+    direction source, so a mis-wired canvas reports no_input instead of a
+    confidently wrong angle."""
+    assert asr._resolve_asr_inputs(
+        {"input_topics": ["/mic", "/unrelated"]}) == ("/mic", "")
+    assert asr._resolve_asr_inputs(
+        {"input_topics": ["/mic", "/other/sound_direction_noise"]}) == ("/mic", "")
     assert asr.TOOLS[0]['topic_in'][1]['format'] == 'sensor/sound-direction'
 
 
@@ -418,16 +423,15 @@ def test_rewiring_a_running_asr_resubscribes_to_the_new_direction(monkeypatch):
     plugin = asr.ASRPlugin({}, _FakeExecutor())
 
     def start(direction):
+        # Direction first: only the topic name may pick it out.
         return plugin.dispatch('asr', {'action': 'start', 'instance_id': 'card-1',
-            'input_bindings': [
-                {'topic': direction, 'format': 'sensor/sound-direction', 'port_index': 1},
-                {'topic': '/mic', 'format': 'audio/pcm-16k', 'port_index': 0}]})
+            'input_topics': [direction, '/mic']})
 
-    assert start('/direction/old')['state'] == 'running'
+    assert start('/old/sound_direction')['state'] == 'running'
     node = plugin._nodes['card-1']
-    assert start('/direction/new')['state'] == 'running'
+    assert start('/new/sound_direction')['state'] == 'running'
     assert node.state == 'running'
-    assert [sub.topic for sub in node.subscriptions] == ['/mic', '/direction/new']
+    assert [sub.topic for sub in node.subscriptions] == ['/mic', '/new/sound_direction']
 
 
 def test_dedicated_direction_port_uses_standard_transport_without_custom_interface(monkeypatch):

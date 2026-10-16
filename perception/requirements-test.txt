@@ -1,6 +1,0 @@
-# Test-only dependencies; do not install into the production image.
-# These versions support both JP5.1.1 (Python 3.8) and JP6.1 (Python 3.10).
-pytest==8.3.4
-pytest-asyncio==0.24.0
-pytest-mock==3.14.0
-jsonschema==4.19.2

@@ -49,8 +49,9 @@ Connect Bumi's `sensor/sound-direction` output
 its microphone to the `audio/pcm-16k` input. The direction port remains a
 specific sensor type, not `data/json`: an ordinary JSON card cannot supply it.
 Like the existing `sensor/pose2d` card, its ROS transport is `std_msgs/String`
-with a structured payload. Core reuses its standard sensor transport and text
-viewer, without compiling a custom direction message or starting the sensor.
+with a structured payload. Core needs no change: its generic `sensor/*`
+transport already carries the message, without compiling a custom direction
+interface or starting the sensor.
 
 The payload has `state: "fresh"`, the exact `angle_deg`, and
 `angle_convention: "robot_front_0_left_positive_ccw"` (front 0°, left positive,
@@ -73,13 +74,15 @@ unknown wake direction when the audio stamp is missing or either capture
 window is untrusted. Confirm clock alignment on the robot before relying on
 direction results.
 
-For this migration, update Core once to remove its old custom ROS decoder,
-and upgrade Driver and Perception together. Remove/re-add the direction and ASR
-cards and reconnect them to replace cached topics from the earlier typed ROS
-transport. The canvas type remains `sensor/sound-direction`. Core retains
-its generic format-tagged input bindings and multi-instance port refresh, so
-connection order does not choose the audio source. Environment defaults use
-Core's generic schema-default handling.
+For this migration, upgrade Driver and Perception together. Remove/re/add the
+direction and ASR cards and reconnect them — a saved card keeps its old
+`topicIn` list and never gains the second input. The canvas type remains
+`sensor/sound-direction`. ASR picks its direction input by topic name: the
+connection whose topic has a `sound_direction` segment is the direction source,
+every other input is audio, so connection order does not choose the audio
+source. Keep that name — renaming the driver output breaks the binding.
+Direction payloads appear in the monitor as plain data; they are not rendered
+as JSON.
 
 SenseVoice, Parakeet and X-ASR retain the recognizer's token timestamps from
 the same decode. ASR maps the matched wake word's text boundary to a timed
@@ -4171,28 +4174,14 @@ downloads the solution. Full spec: `phanthymotus-driver/README_dev.md`
 
 ## Running the tests inside a perception image
 
-From the `perception` checkout, install the maintained test-only dependencies
-into your test environment before running pytest:
-
-```bash
-python3 -m pip install -r requirements-test.txt
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q -p pytest_mock
-```
-
-This includes `jsonschema`, used to validate the music tool schema. The pinned
-versions support both Python 3.8 (JP5.1.1) and Python 3.10 (JP6.1); they are not
-production-image dependencies. The application dependencies are still required.
-
-Running the same suite **inside a perception container** confirms behavior on
-the Python the device actually ships. Copy both the tests and their dependency
-file, then install them in the test container:
+`python3 -m pytest tests -q` from a checkout works anywhere. Running the same
+suite **inside a perception container** — which is how you confirm a fix behaves on
+the Python the device actually ships — needs one flag:
 
 ```bash
 docker cp tests <container>:/work/
-docker cp requirements-test.txt <container>:/work/requirements-test.txt
 docker exec <container> bash -c 'source /opt/ros/humble/install/setup.bash && \
   source /ros_ws/install/setup.bash && cd /work && \
-  python3 -m pip install -r requirements-test.txt && \
   PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q -p pytest_mock'
 ```
 

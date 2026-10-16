@@ -599,14 +599,23 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
 
 
 def _resolve_asr_inputs(args: dict) -> tuple[str, str]:
-    bindings = args.get("input_bindings") or []
-    if bindings:
-        by_format = {item.get("format"): item.get("topic", "") for item in bindings}
-        return by_format.get(AUDIO_FORMAT, ""), by_format.get("sensor/sound-direction", "")
+    """Pick the audio and direction inputs by topic name.
+
+    The direction input is the topic whose path has a `sound_direction`
+    segment — the name Bumi's card publishes on. Everything else is a
+    candidate for audio. Connection order never decides: a canvas wired
+    direction-first must resolve the same as audio-first.
+    """
     topics = args.get("input_topics") or []
-    if len(topics) > 1:
-        log.warning("[asr] multiple input_topics without format bindings; assuming audio then direction")
-    return (topics[0] if topics else args.get("input_topic", "")), (topics[1] if len(topics) > 1 else "")
+    if not topics and args.get("input_topic"):
+        topics = [args["input_topic"]]
+
+    def _is_direction(topic: str) -> bool:
+        return "sound_direction" in [seg for seg in str(topic).split("/") if seg]
+
+    audio = next((t for t in topics if not _is_direction(t)), "")
+    direction = next((t for t in topics if _is_direction(t)), "")
+    return audio, direction
 
 
 def _asr_topics_in(audio_topic: str = "", direction_topic: str = "") -> list[dict]:
