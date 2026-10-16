@@ -95,9 +95,21 @@ def test_a_package_for_another_protocol_is_refused_at_the_card(client, target, m
                        files={'file': ('p.motus-skill', wrong)}).json()['data']['targets'] == []
 
 
+@pytest.mark.parametrize('name', [
+    '../escape.bin', 'a/../../escape.bin', '/abs.bin',
+    # Both separators, because the extractor may be on either platform. A
+    # `'..' in name.split('/')` check lets this one straight through -- found by
+    # feeding the resource centre's TypeScript validator a zip built with
+    # Python's zipfile, which does not normalise entry names on write.
+    '..\\escape.bin', 'C:\\x.bin', '\\\\unc\\x',
+])
+def test_an_entry_that_escapes_its_directory_is_refused(name):
+    with pytest.raises(fastapi.HTTPException) as caught:
+        packages.manifest_from(package(entries=((name, b'x'),)))
+    assert caught.value.status_code == 422
+
+
 @pytest.mark.parametrize('entries', [
-    (('../escape.bin', b'x'),),                       # path traversal
-    (('/abs.bin', b'x'),),
     (('big.bin', b'0' * (packages.MAX_ENTRY_BYTES + 1)),),
 ])
 def test_archive_boundaries_are_enforced(entries):

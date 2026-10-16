@@ -270,6 +270,19 @@ async def read_upload(file):
     return data
 
 
+def _unsafe_entry_name(name: str) -> bool:
+    """Can this archive entry escape the directory it is extracted into?
+
+    Both separators count, because the extractor may be on either platform. A
+    `'..' in name.split('/')` check misses `..\\escape.bin` entirely -- found by
+    feeding the resource centre's validator a zip built with Python's zipfile,
+    which (unlike JSZip) does not normalise entry names on write.
+    """
+    if name.startswith('/') or name.startswith('\\') or re.match(r'^[A-Za-z]:', name):
+        return True
+    return '..' in re.split(r'[/\\]', name)
+
+
 def manifest_from(data, schema=None):
     """Transport-level validation of a package, and its manifest.
 
@@ -286,7 +299,7 @@ def manifest_from(data, schema=None):
             total = 0
             for item in archive.infolist():
                 name = item.filename
-                if (name.startswith('/') or '..' in name.split('/')
+                if (_unsafe_entry_name(name)
                         or item.flag_bits & 1 or item.compress_type not in (0, 8)):
                     raise ValueError()
                 limit = MAX_MANIFEST_BYTES if name == 'manifest.json' else MAX_ENTRY_BYTES
