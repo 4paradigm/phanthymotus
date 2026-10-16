@@ -532,11 +532,46 @@ plugins:
 
   face_recognition:
     enabled: true
+    # Which detector+recogniser pair to run. The registry is
+    # plugins/face_runtime.FACE_MODELS and the card offers it as a dropdown:
+    #
+    #   buffalo_sc           SCRFD-500M + ArcFace MobileFaceNet   2.5 + 13 MB
+    #   scrfd25g_edgeface_s  SCRFD-2.5G  + EdgeFace-S-GAMMA-0.5   3.3 + 15 MB
+    #
+    # `scrfd25g_edgeface_s` is the more accurate pair — measured over a 100-image
+    # LFW sample it separates identities by +0.252 against buffalo_sc's +0.199,
+    # and both detectors found 99 of the 100 faces. It is **not** the default, and
+    # that is deliberate: embeddings from different networks are not comparable, so
+    # every already-registered person has to be re-enrolled under the new model.
+    #
+    # Each model keeps its **own roster** (see `db_dir`), so switching is not
+    # destructive and switching back restores the old one intact — but the new
+    # model starts empty and recognises nobody until people are re-enrolled. Check
+    # `database.persons` in the card's info to see which roster is loaded.
+    #
+    # Leave `match_threshold` unset when changing this — the default follows the
+    # model (0.35 / 0.55). A threshold copied across models is wrong in whichever
+    # direction the embedding space moved.
+    #
+    # **Changing this on a robot that already has a roster is a one-way door for
+    # that roster**: the default db_dir moves with the model, so the robot comes up
+    # recognising nobody until its people are re-enrolled. The old roster is not
+    # destroyed — selecting buffalo_sc again restores it intact.
+    model: scrfd25g_edgeface_s
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
     # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
+    # Left at the buffalo_sc path, which `model` overrides when it names another
+    # pair — set this only to point at a local copy of the weights.
     model_dir: /models/face/buffalo_sc
     # The only host-mounted writable path in this container is /models (see
     # perception/deploy/service.yml), so the identity database lives under it.
+    # The identity store. Per **model**, not per plugin: this value is the one
+    # `buffalo_sc` uses, and any other model gets `/models/face_db-<model>` so that
+    # selecting it starts its own roster instead of being refused against this one
+    # (IdentityDB refuses a store written by another model — that stays, as a
+    # backstop). Setting this to anything other than the value below pins it
+    # explicitly and disables the per-model suffix. See
+    # plugins/face_runtime.face_db_dir_for.
     db_dir: /models/face_db
     # auto | cpu | gpu. auto (the default) uses the GPU when the installed
     # onnxruntime offers a CUDA/TensorRT provider and falls back to cpu when it
@@ -551,11 +586,17 @@ plugins:
     warmup: true
     det_size: [640, 640]
     det_thresh: 0.5
-    # Cosine similarity between L2-normalised ArcFace embeddings. 0.35 is a
-    # starting point for w600k_mbf, NOT a measured value — raise it if the
-    # robot confuses people, lower it if it fails to recognise them, and record
-    # what you saw. Editable from the card.
-    match_threshold: 0.35
+    # Cosine similarity between L2-normalised embeddings. Raise it if the robot
+    # confuses people, lower it if it fails to recognise them, and record what you
+    # saw. Editable from the card.
+    #
+    # 0.55 is the **scrfd25g_edgeface_s** scale, matching the `model` above. A
+    # threshold belongs to the embedding space, not to the plugin: buffalo_sc wants
+    # 0.35, and carrying 0.55 over to it would only ever fail to recognise people
+    # (the safe direction), while carrying 0.35 the other way put four impostor
+    # pairs out of 4849 over the line in the LFW sample. Delete this key to take
+    # whichever value the configured `model` recommends.
+    match_threshold: 0.55
     # Quality gate. A face below either bound is reported with person_id: null
     # rather than matched or auto-enrolled: matching a blurred 30 px face is a
     # coin flip, and enrolling one wastes an unknown-N slot forever.
@@ -574,6 +615,31 @@ plugins:
     # people are never evicted. Editable from the card.
     unknown_capacity: 500
     max_samples_per_person: 8
+    # Keep the aligned 112x112 crop each sample was embedded from, under
+    # `<db_dir>/samples/`. This is **the only thing that makes a model switch
+    # migratable**: an embedding means nothing outside the network that produced
+    # it, so without the crop a new model can only be populated by re-enrolling
+    # everyone by hand (see README § "Why there is no migration").
+    #
+    # It is face imagery on disk, which the rest of this system deliberately avoids
+    # keeping — `image_input` above discards registration photos after
+    # retention_days. The difference is that this is bounded: at most
+    # max_samples_per_person x (unknown_capacity + named) crops at ~6 KB, so ~24 MB
+    # at the defaults, and crops are deleted with their sample. Set false for a
+    # deployment that must not retain any face image; the cost is that the next
+    # model change starts from an empty roster.
+    store_sample_crops: true
+    # 引擎加载后在后台把另一个模型的花名册迁移过来：读它存的人脸切图，用当前模型重算
+    # embedding，写进当前模型自己的库。**不阻塞**——引擎先发布并开始识别，花名册边
+    # 跑边补，认得出的人越来越多；进度看 info 的 migration 字段。
+    #
+    # 每个 (切图, 模型) 只算一次并永久存在该模型自己的库里，所以来回切模型不会重算。
+    #
+    # **这是唯一的迁移入口。** 曾经还有一个 `reembed_from` 动作可以手动触发，已删除：
+    # 没有人需要手动迁移，而它的代价是被无条件拆成一个 LLM 可调用的工具（agent-core
+    # 对 x-action-params 里每一项都这么做），于是一个会阻塞几十秒的运维操作进了机器人
+    # 的工具箱。关掉这个开关就等于不迁移，换模型后需要重新录入每个人。
+    auto_migrate_roster: true
     # Visit log (visits.jsonl): one continuous appearance is one record, not
     # one per frame. A visit is closed and written only after the person has
     # been absent for visit_gap_s; 10 minutes stops somebody turning their head
