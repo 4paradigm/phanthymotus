@@ -200,10 +200,11 @@ class PluginTests(unittest.TestCase):
         # and must not make each other wait.
         self.assertEqual(schema['x-resource'], 'music')
         self.assertEqual(set(schema['x-action-params']),
-                         {'list_genres', 'play', 'next', 'previous', 'pause',
-                          'resume', 'stop_music', 'now_playing', 'set_volume',
-                          'set_autoplay', 'search'})
+                         {'list_genres', 'play', 'play_asmr', 'next', 'previous',
+                          'pause', 'resume', 'stop_music', 'now_playing',
+                          'set_volume', 'set_autoplay', 'search', 'search_asmr'})
         jsonschema.validate({'action': 'play', 'genre': 'pop'}, schema)
+        jsonschema.validate({'action': 'play_asmr', 'category': 'bedtime_story'}, schema)
         jsonschema.validate({'action': 'next'}, schema)
         jsonschema.validate({'action': 'list_genres'}, schema)
 
@@ -295,7 +296,10 @@ class PluginTests(unittest.TestCase):
         or suppress anything — and its end is a receipt, not a message.
         """
         completion = self.plugin.get_tools()[0]['inputSchema']['x-completion']
-        self.assertEqual(completion['actions'], ['play'])
+        # Both play actions open a session. A two-minute bedtime story needs a
+        # pending exactly as a song does; omitting `play_asmr` would let
+        # `finish` land mid-story.
+        self.assertEqual(completion['actions'], ['play', 'play_asmr'])
         self.assertTrue(completion['background'])
         self.assertTrue(completion['silent_completion'])
         # 0 = no deadline: a track has no `text` to estimate from, and a static

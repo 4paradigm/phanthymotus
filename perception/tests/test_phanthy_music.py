@@ -273,6 +273,155 @@ class CardTests(unittest.TestCase):
             interrupt.assert_not_called()
 
 
+class AsmrCardTests(unittest.TestCase):
+    """The ASMR half of the card: separate actions, one shared station."""
+
+    def setUp(self):
+        fixed = patch.multiple('plugins.phanthy_music',
+                               CATALOGUE_ENDPOINT='https://catalogue.example',
+                               CATALOGUE_API_KEY='fake-internal-key')
+        fixed.start()
+        self.addCleanup(fixed.stop)
+        self.plugin = PhanthyMusicPlugin({'catalogue_type': 'mock'}, _FakeExecutor())
+
+    def tearDown(self):
+        self.plugin.stop()
+
+    def call(self, action, **args):
+        return self.plugin.dispatch('phanthy_music', {'action': action, **args})
+
+    def found(self, **overrides):
+        track = {'id': 'fictional-asmr-1', 'kind': 'asmr', 'category': 'bedtime_story',
+                 'title': '睡前故事 第 1 期', 'genre': 'other', 'language': 'zh',
+                 'vocal': None, 'artist': {'id': None, 'name': ''}, 'duration_s': 150,
+                 'audio': {'url': 'https://audio.example/story.wav', 'format': 'wav',
+                           'expires_at': None},
+                 'usage': {'scope': 'personal_playback', 'attribution': '虚构样例'},
+                 **overrides}
+        return {'schema': SCHEMA, 'tracks': [track], 'relaxed': []}
+
+    def test_search_asmr_asks_the_catalogue_for_asmr_only(self):
+        result = self.call('search_asmr', category='bedtime_story')
+        self.assertTrue(result['tracks'])
+        self.assertTrue(all(t['kind'] == 'asmr' for t in result['tracks']))
+        self.assertTrue(all(t['category'] == 'bedtime_story' for t in result['tracks']))
+        self.assertIn('bedtime_story', result['available_categories'])
+        self.assertIsNone(self.plugin._node)
+
+    def test_play_asmr_forwards_the_wav_and_opens_a_session(self):
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play') as play:
+            result = self.call('play_asmr', category='bedtime_story', query='星空')
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+        self.assertEqual(query.call_args.kwargs['category'], 'bedtime_story')
+        self.assertEqual(play.call_args.args[:3],
+                         ('https://audio.example/story.wav', 'wav', 'fictional-asmr-1'))
+        # ASMR is as much a playback session as a song is: a two-minute story
+        # left without a pending would have `finish` land in the middle of it.
+        self.assertTrue(result['action_id'].startswith('music-'))
+        self.assertEqual(result['expected_duration_s'], 150)
+
+    def test_the_asmr_actions_cannot_express_a_song_filter(self):
+        """The parameter set comes from the action, not from `args`. That is
+        what stops a `genre` the model volunteered from reaching the catalogue
+        and returning 422 — the failure mode the split exists to remove.
+        """
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            self.call('play_asmr', category='meditation', genre='pop',
+                      vocal='female', artist='史叶茜', language='zh')
+        for field in ('genre', 'vocal', 'artist', 'language'):
+            self.assertNotIn(field, query.call_args.kwargs)
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+
+    def test_next_stays_on_the_side_the_user_asked_for(self):
+        """A station remembers `kind`, so "换一个" after an ASMR request does
+        not drift into songs."""
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()), \
+             patch.object(self.plugin._node.player, 'play'):
+            first = self.call('play_asmr', category='chat')['action_id']
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found(id='fictional-asmr-2')) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            following = self.call('next')
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+        self.assertEqual(query.call_args.kwargs['category'], 'chat')
+        self.assertIn('fictional-asmr-1', query.call_args.kwargs['exclude_ids'])
+        # One session across the skip, exactly as for songs.
+        self.assertEqual(following['action_id'], first)
+
+    def test_no_category_is_a_valid_request(self):
+        """「来点助眠的」names no category, and the catalogue picks from all of
+        them. The model must not have to guess one."""
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            self.assertFalse(self.call('play_asmr').get('error'))
+        # `kind` and nothing else: no category guessed on the model's behalf.
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+        for field in ('category', 'query', 'tags'):
+            self.assertNotIn(field, query.call_args.kwargs)
+
+    def test_an_unknown_category_becomes_free_text_rather_than_an_error(self):
+        """Same rule as `genre`: 「想听嚼冰块的声音」should get an answer, not a
+        vocabulary error."""
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            result = self.call('play_asmr', category='ice_chewing')
+        self.assertNotIn('category', query.call_args.kwargs)
+        self.assertIn('ice_chewing', query.call_args.kwargs['query'])
+        self.assertEqual(result['category_as_query'], ['ice_chewing'])
+
+    def test_now_playing_does_not_describe_an_asmr_entry_as_a_song(self):
+        """The protocol shares one track shape, so an ASMR entry arrives with
+        `genre: 'other'` and an empty artist. Reported verbatim that is what
+        makes a robot announce 「为你播放 other 曲风的歌」over a bedtime story.
+        """
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()), \
+             patch.object(self.plugin._node.player, 'play'):
+            self.call('play_asmr', category='bedtime_story')
+        track = self.call('now_playing')['track']
+        self.assertEqual(track['kind'], 'asmr')
+        self.assertEqual(track['category'], 'bedtime_story')
+        self.assertEqual(track['title'], '睡前故事 第 1 期')
+        self.assertEqual((track['genre'], track['artist'], track['vocal']), ('', '', None))
+
+    def test_list_genres_publishes_the_category_codes(self):
+        vocabulary = self.call('list_genres')
+        self.assertIn('bedtime_story',
+                      [x['value'] for x in vocabulary['asmr_categories']])
+        self.assertEqual([x['value'] for x in vocabulary['kinds']], ['song', 'asmr'])
+
+    def test_the_declared_asmr_actions_describe_where_sleep_intent_goes(self):
+        """The routing lives in the descriptions, so pin the words that carry
+        it: a model only reaches `play_asmr` if the card says so.
+        """
+        schema = self.plugin.get_tools()[0]['inputSchema']
+        params = schema['x-action-params']
+        self.assertEqual(set(params['play_asmr']['params']),
+                         {'query', 'category', 'tags'})
+        asmr_text = params['play_asmr']['description']
+        for phrase in ('助眠', '哄睡', '睡前故事', '冥想', '白噪音', '咀嚼'):
+            self.assertIn(phrase, asmr_text)
+        # And `play` must point sleep intent away from itself.
+        self.assertIn('play_asmr', params['play']['description'])
+        categories = schema['properties']['category']['description']
+        for code in ('bedtime_story', 'meditation', 'companion', 'chat',
+                     'poetry', 'trigger'):
+            self.assertIn(code, categories)
+
+
 class MCPTests(unittest.TestCase):
     def test_real_http_tools_list_dispatch_and_log_redaction(self):
         import main

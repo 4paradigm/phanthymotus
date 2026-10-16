@@ -8,11 +8,26 @@ SCHEMA = 'motus.music/1'
 GENRES = ('pop', 'rnb', 'electronic', 'gufeng', 'rock', 'folk', 'rap', 'jazz', 'country')
 LANGUAGES = ('zh', 'en', 'ja', 'ko', 'th', 'pt', 'fr')
 VOCALS = ('male', 'female', 'mixed', 'instrumental')
+# The catalogue holds two kinds of content behind one endpoint and one key.
+# `kind` is never relaxed: an ASMR request that finds nothing comes back empty
+# rather than quietly becoming a song.
+KINDS = ('song', 'asmr')
+# ASMR categories. One per entry, and — unlike `genre` — the whole vocabulary is
+# specified, so this fallback is complete rather than a subset.
+CATEGORIES = ('trigger', 'bedtime_story', 'meditation', 'companion', 'chat',
+              'poetry', 'other')
+# Which filters belong to which kind. The catalogue returns 422 for a field used
+# on the wrong kind, so these are also what the client checks locally — a
+# round trip to learn `genre` means nothing to an ASMR entry is a wasted 3 s.
+SONG_ONLY_FILTERS = ('genre', 'vocal', 'artist')
+ASMR_ONLY_FILTERS = ('category',)
 FALLBACK = {
     'schema': SCHEMA, 'provider': 'unavailable', 'limits': {'max_top_k': 10},
     'audio': {'url_ttl_s': None}, 'features': [],
     'filters': {name: [{'value': v, 'label': v} for v in values]
-                for name, values in (('genre', GENRES), ('language', LANGUAGES), ('vocal', VOCALS))},
+                for name, values in (('kind', KINDS), ('category', CATEGORIES),
+                                     ('genre', GENRES), ('language', LANGUAGES),
+                                     ('vocal', VOCALS))},
 }
 FALLBACK['filters']['tags'] = {}
 
@@ -66,7 +81,9 @@ def capabilities(data):
         raise MusicError('invalid_response', '曲库 max_top_k 无效。')
     out.update({k: data[k] for k in ('provider', 'audio', 'features') if k in data})
     out['limits']['max_top_k'] = maximum
-    for name in ('genre', 'language', 'vocal'):
+    # kind/category included: a provider without ASMR simply omits them and
+    # keeps the built-in fallback, exactly as it may for genre.
+    for name in ('kind', 'category', 'genre', 'language', 'vocal'):
         options = data['filters'].get(name, out['filters'][name])
         if (not isinstance(options, list) or not options or len(options) > 100
                 or any(not isinstance(x, dict) or not isinstance(x.get('value'), str)
@@ -82,9 +99,11 @@ def capabilities(data):
 
 
 def search_request(query='', genre='', language='', vocal='', tags='', artist='',
-                   top_k=3, exclude_ids='', duration_min_s=0, duration_max_s=0, caps=None):
+                   top_k=3, exclude_ids='', duration_min_s=0, duration_max_s=0,
+                   kind='', category='', caps=None):
     caps = caps or FALLBACK
-    for value in (query, genre, language, vocal, tags, artist, exclude_ids):
+    for value in (query, genre, language, vocal, tags, artist, exclude_ids,
+                  kind, category):
         if not isinstance(value, str):
             raise MusicError('invalid_argument', '检索文本和逗号分隔列表必须是字符串。')
     if len(query) > 200 or len(artist) > 200 or len(tags) > 2000:
@@ -102,6 +121,30 @@ def search_request(query='', genre='', language='', vocal='', tags='', artist=''
     if len(excluded) > 50 or any(len(x) > 200 for x in excluded):
         raise MusicError('invalid_argument', 'exclude_ids 最多 50 个，每个 ID 最长 200 字。')
     filters = {}
+    categories = split(category)
+    # `category` alone means ASMR — the server infers it, and so do we, so that
+    # the cross-kind check below reads the same conclusion the server will.
+    kind = kind.strip() or ('asmr' if categories else '')
+    for field, values in (('kind', [kind] if kind else []), ('category', categories)):
+        allowed = [x['value'] for x in caps['filters'].get(field, [])]
+        if any(x not in allowed for x in values):
+            raise MusicError('invalid_filter', f'{field} 的取值不合法。', allowed=allowed)
+    # Checked here rather than at the server: a 422 that tells the caller
+    # `genre` means nothing to an ASMR entry costs a round trip to learn
+    # something that is static.
+    song_only = {'genre': genre, 'vocal': vocal, 'artist': artist}
+    misused = ([f for f in SONG_ONLY_FILTERS if song_only[f].strip()] if kind == 'asmr'
+               else (list(ASMR_ONLY_FILTERS) if categories else []))
+    if misused:
+        raise MusicError(
+            'invalid_filter',
+            f"{'、'.join(misused)} 不适用于" + (
+                'ASMR：ASMR 没有曲风、人声和歌手。' if kind == 'asmr'
+                else '歌曲：category 只用于 ASMR。'))
+    if kind:
+        filters['kind'] = kind
+    if categories:
+        filters['category'] = categories
     for field, value in (('genre', genre), ('language', language), ('vocal', vocal)):
         values = split(value)
         allowed = [x['value'] for x in caps['filters'][field]]
@@ -129,7 +172,8 @@ def search_result(data, request, *, mock=False):
     tracks, relaxed = data.get('tracks'), data.get('relaxed', [])
     if (not isinstance(tracks, list) or len(tracks) > request['top_k']
             or not isinstance(relaxed, list)
-            or any(x not in ('query', 'duration_s', 'vocal', 'genre', 'artist') for x in relaxed)):
+            or any(x not in ('query', 'duration_s', 'vocal', 'genre', 'category',
+                             'artist') for x in relaxed)):
         raise MusicError('invalid_response', '曲库返回了无效的结果数量或放宽条件。')
     seen = set()
     for track in tracks:
@@ -153,7 +197,14 @@ def search_result(data, request, *, mock=False):
         if language and track.get('language') not in language:
             raise MusicError('invalid_response', '曲库违反了不可放宽的语种条件。')
         filters = request['filters']
-        for field in ('genre', 'vocal'):
+        # `kind` is absent from the relaxable list on purpose: asking for ASMR
+        # and getting a song back is not a loosened filter, it is the wrong
+        # content. A provider predating the split omits the field, which means
+        # song. Checked before `category`, whose absence on a song is correct.
+        wanted_kind = filters.get('kind')
+        if wanted_kind and (track.get('kind') or 'song') != wanted_kind:
+            raise MusicError('invalid_response', '曲库返回了另一类内容（kind 不可放宽）。')
+        for field in ('genre', 'vocal', 'category'):
             wanted = filters.get(field)
             if wanted and field not in relaxed:
                 if track.get(field) not in (wanted if isinstance(wanted, list) else [wanted]):
