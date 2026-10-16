@@ -17,6 +17,10 @@ from typing import Optional
 
 import config
 
+# `config._get_conn()` now returns this thread's **reused** connection, so
+# closing it here would pull it out from under every other reader. It was
+# correct while each call returned a fresh connection; it is not now.
+
 
 def _get_conn():
     conn = config._get_conn()
@@ -89,7 +93,6 @@ def commit_spans(trace_id: str, spans: list[dict], source: str = '', trigger_tex
     )
 
     conn.commit()
-    conn.close()
 
 
 def query_latest(n: int = 20) -> list:
@@ -119,7 +122,6 @@ def query_latest(n: int = 20) -> list:
             td['spans'].append(sd)
         result.append(td)
 
-    conn.close()
     return result
 
 
@@ -141,7 +143,6 @@ def turns_between(start: float, end: float) -> list:
             'SELECT span, component, start_ts, end_ts, duration_ms FROM perf_spans '
             'WHERE trace_id=? ORDER BY start_ts', (td['turn_id'],)).fetchall()]
         result.append(td)
-    conn.close()
     return result
 
 
@@ -160,7 +161,6 @@ def spans_between(start: float, end: float) -> list:
         'SELECT span, component, start_ts, end_ts, duration_ms FROM perf_spans '
         'WHERE start_ts BETWEEN ? AND ? ORDER BY start_ts',
         (float(start), float(end))).fetchall()
-    conn.close()
     return [dict(r) for r in rows]
 
 
@@ -179,7 +179,6 @@ def query_spans(trace_id: str) -> list:
         except (json.JSONDecodeError, TypeError):
             sd['meta'] = {}
         result.append(sd)
-    conn.close()
     return result
 
 
@@ -236,7 +235,6 @@ def aggregate(start: float = 0, end: float = 0) -> dict:
 
         by_span[span_name] = {'avg_ms': avg_ms, 'p95_ms': p95_ms, 'count': cnt, 'avg_offset_ms': avg_offset_ms}
 
-    conn.close()
     return {'count': turn_count, 'by_span': by_span}
 
 
@@ -248,7 +246,6 @@ def prune(days: int = 90):
     conn.execute('DELETE FROM perf_turns WHERE created_at < ?', (cutoff,))
     conn.execute('DELETE FROM token_usage WHERE created_at < ?', (cutoff,))
     conn.commit()
-    conn.close()
 
 
 # ── Token Usage ───────────────────────────────────────────────────────────────
@@ -271,7 +268,6 @@ def record_usage(trace_id: str, usage: dict):
         ),
     )
     conn.commit()
-    conn.close()
 
 
 def query_usage_summary(start: float = 0, end: float = 0) -> dict:
@@ -293,7 +289,6 @@ def query_usage_summary(start: float = 0, end: float = 0) -> dict:
             FROM token_usage {where}''',
         params,
     ).fetchone()
-    conn.close()
     return {
         'prompt_tokens': row[0],
         'completion_tokens': row[1],
@@ -324,7 +319,6 @@ def query_usage_daily(start: float = 0, end: float = 0) -> list:
             GROUP BY day ORDER BY day DESC''',
         params,
     ).fetchall()
-    conn.close()
     return [
         {
             'date': row[0],
@@ -358,7 +352,6 @@ def query_usage_hourly(start: float = 0, end: float = 0) -> list:
             GROUP BY hour ORDER BY hour DESC''',
         params,
     ).fetchall()
-    conn.close()
     return [
         {
             'date': row[0],  # "2026-07-29 14"

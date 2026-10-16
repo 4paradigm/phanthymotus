@@ -62,10 +62,10 @@ async def get_usage(range: str = Query('7d')):
 @router.delete('/clear')
 async def clear_data():
     import config
+    # 不 close：这个连接是本线程共享的（见 config._get_conn）。
     conn = config._get_conn()
     conn.execute('DELETE FROM perf_spans')
     conn.execute('DELETE FROM perf_turns')
     conn.execute('DELETE FROM token_usage')
     conn.commit()
-    conn.close()
     return {'code': 200, 'message': 'cleared'}
