@@ -18,6 +18,7 @@ import { Pose2dRenderer }   from './renderers/pose2d.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
+import { monitorTopicLabel } from './monitor-labels.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
@@ -37,6 +38,7 @@ const MAX_COLS = 10;    // above the last band
 const EDGE = 48;        // px from a grid edge where a drag starts auto-scrolling
 const EDGE_SPEED = 14;  // px per frame of auto-scroll
 let _topicMcpMap = {};  // topic → mcpId, populated on fetch
+let _mcpsById = new Map();
 
 let _grid = null;
 let _cards = new Map(); // topicPath → { el, renderer, ws, format, mode, col, row, colSpan, rowSpan }
@@ -179,6 +181,7 @@ async function _fetchAndBuild() {
   } catch { /* silent */ }
 
   const canvasCards = layout.cards || [];
+  _mcpsById = new Map(mcps.map(mcp => [mcp.id, mcp]));
   const connections = layout.connections || [];
   const canvasTools = new Set(canvasCards.map(c => `${c.mcpId}:${c.toolName}`));
 
@@ -326,7 +329,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
   _applyPlacement(el, col, row, colSpan, rowSpan);
 
   const fmtClass = _formatClass(format);
-  const shortName = topicPath.split('/').filter(Boolean).pop() || topicPath;
+  const shortName = monitorTopicLabel(topicPath, _mcpsById.get(_topicMcpMap[topicPath]));
   const isJson = format === 'data/json' || format?.startsWith('text/');
   const defaultMode = (isJson && savedMode) ? savedMode : 'log';
 
@@ -342,7 +345,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
       <div class="monitor-card-dot ${_esc(status)}"></div>
       <div class="monitor-card-names">
         <span class="monitor-card-topic">${_esc(shortName)}</span>
-        <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(_displayPath(topicPath))}</span>
+        <span class="monitor-card-path" title="${_esc(topicPath)}">${_esc(shortName.endsWith('｜相机画面') ? topicPath : _displayPath(topicPath))}</span>
       </div>
       ${modeHtml}
       <span class="monitor-card-format ${fmtClass}">${_esc(_formatLabel(format))}</span>

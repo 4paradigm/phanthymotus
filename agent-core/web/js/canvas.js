@@ -12,6 +12,8 @@
  */
 
 import { showToast } from './toast.js';
+import { fieldOptions, confirmedAction } from './card-controls.js';
+import { piperDevices, switchPiperDevice } from './piper-selector.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -42,6 +44,92 @@ let _zoomLabel  = null;
 let _connSvg    = null;
 let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
+let _piperTarget = null;
+let _piperSwitching = false;
+let _piperCalls = 0;
+let _piperKnownDevices = [];
+
+function _piperDevice(mcpId) {
+  return _piperKnownDevices.find(d => d.id === mcpId);
+}
+
+function _syncPiperSelector() {
+  if (!_canvasEl) return;
+  const detected = piperDevices(_allMcps);
+  if (detected.length) _piperKnownDevices = detected;
+  const devices = _piperKnownDevices;
+  let panel = _canvasEl.querySelector('.piper-target-card');
+  if (!devices.length) {
+    panel?.remove();
+    for (const card of _cards) card.el.classList.remove('piper-unselected');
+    return;
+  }
+  if (_piperTarget === null) _piperTarget = devices[0].id;
+  if (!panel) {
+    panel = document.createElement('section');
+    panel.className = 'piper-target-card';
+    panel.innerHTML = '<strong>选择控制的机械臂</strong><select aria-label="选择机械臂"></select><p>切换关闭两边许可；确认后请重新开启本次许可。</p><button type="button">切换操作对象</button><div class="piper-target-message" role="status"></div>';
+    _canvasEl.appendChild(panel);
+    panel.addEventListener('pointerdown', e => e.stopPropagation());
+    panel.addEventListener('wheel', e => e.stopPropagation());
+    panel.querySelector('button').addEventListener('click', async () => {
+      const message = panel.querySelector('.piper-target-message');
+      if (_piperCalls || _piperSwitching) { message.textContent = '正在提交操作，请稍后切换'; return; }
+      _piperSwitching = true;
+      const button = panel.querySelector('button');
+      button.disabled = true;
+      message.textContent = '检查两台状态并关闭许可…';
+      try {
+        const target = await switchPiperDevice(piperDevices(_allMcps), panel.querySelector('select').value, {
+          projectStopped: async () => {
+            const response = await fetch('/api/config/project-running');
+            if (!response.ok) throw new Error('无法确认智能控制状态');
+            const state = await response.json();
+            return state.running === false;
+          },
+          call: async (id, tool, args) => {
+            const response = await fetch(`/api/mcp/${encodeURIComponent(id)}/call`, {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({tool, arguments: args}),
+            });
+            const payload = await response.json();
+            if (!response.ok || payload.code !== 200) throw new Error(payload.message || '设备不可达');
+            return _parseMcpCallResult(payload) ?? payload.data;
+          },
+        });
+        _piperTarget = target;
+        _syncPiperSelector();
+        _fitToViewport();
+        _scheduleRedraw();
+        message.textContent = `已选择 ${_piperDevice(target)?.label}；许可已关闭，请重新开启。`;
+      } catch (error) {
+        message.textContent = `未切换：${error.message}`;
+      } finally {
+        _piperSwitching = false;
+        button.disabled = false;
+      }
+    });
+  }
+  const select = panel.querySelector('select');
+  const selected = select.value;
+  if ([...select.options].map(o => o.value).join(',') !== devices.map(d => d.id).join(',')) {
+    select.replaceChildren(...devices.map(d => {
+      const option = document.createElement('option');
+      option.value = d.id; option.textContent = d.label; return option;
+    }));
+    select.value = devices.some(d => d.id === selected) ? selected : _piperTarget;
+  }
+  if (!_piperSwitching) panel.querySelector('button').disabled = !detected.length;
+  if (!detected.length) panel.querySelector('.piper-target-message').textContent = '设备信息不完整，请刷新或检查连接；保留当前操作对象。';
+  for (const card of _cards) {
+    const device = devices.find(d => d.id === card.mcpId);
+    card.el.classList.toggle('piper-unselected', !!device && device.id !== _piperTarget);
+    if (device) {
+      const name = card.el.querySelector('.canvas-card-driver');
+      if (name) name.textContent = device.label;
+    }
+  }
+}
 
 // ── Editor Lock ──────────────────────────────────────────────────────────────
 // The session id comes from session.js (per-tab, see the rationale there) and is
@@ -250,7 +338,7 @@ function _applyProjectState(running) {
   _projectStateKnown = true;
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-    btn.classList.toggle('locked', !_projectRunning);
+    btn.classList.toggle('locked', !_projectRunning && btn.dataset.manualExecution !== 'true');
   });
   // Idempotent: both helpers no-op when their stream is already active, so the
   // start-project path and the cross-tab project_state event cannot double-start.
@@ -424,6 +512,7 @@ export async function initCanvas(initialMcps) {
 
   // Show editor status bar
   _updateEditorUI();
+  _syncPiperSelector();
 
   // Restore project running state from backend. Editing stays refused until
   // this answers, so a failure must not leave the canvas locked for good —
@@ -554,6 +643,7 @@ export function updateCanvasMcps(mcps) {
     _scheduleRedraw();
     _debouncedSave();
   }
+  _syncPiperSelector();
 }
 
 // ── Zoom / Pan ────────────────────────────────────────────────────────────────
@@ -564,13 +654,14 @@ function _applyTransform() {
 }
 
 function _fitToViewport() {
-  if (!_cards.length) return;
+  const visibleCards = _cards.filter(c => !c.el.classList.contains('piper-unselected'));
+  if (!visibleCards.length) return;
   const rect = _canvasEl.getBoundingClientRect();
   const padding = 30;
   // Find bounding box of all cards in world coords (with port margins)
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   const cardW = window.innerWidth <= 768 ? 220 : 260;
-  for (const c of _cards) {
+  for (const c of visibleCards) {
     minX = Math.min(minX, c.x - 20); // port extends left
     minY = Math.min(minY, c.y);
     maxX = Math.max(maxX, c.x + cardW + 20); // port extends right
@@ -934,6 +1025,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const tools   = mcp?.tools || [];
   const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
   const schema  = typeof toolObj === 'object' ? toolObj.inputSchema : null;
+  const displayName = (typeof toolObj === 'object' && toolObj.title) || toolName;
   const toolType = (typeof toolObj === 'object' ? toolObj.type : '') || '';
   const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
   const hasInstanceFields = configSchema && Object.values(configSchema.properties || {}).some(d => d.scope === 'instance');
@@ -976,7 +1068,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
           <div class="canvas-card-info">
-            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
+            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(displayName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
           <button class="tool-card-info-btn canvas-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
@@ -1023,7 +1115,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (hasSensorActions) {
       sensorFieldsHtml = Object.entries(sensorProps).map(([key, def]) => {
         const isReq = sensorRequired.includes(key);
-        const label = key + (isReq ? ' *' : '');
+        const label = (def.title || key) + (isReq ? ' *' : '');
         let inputHtml;
         const rawVals = _actionVals(def);
         if (rawVals.length || def.enum || def.oneOf) {
@@ -1043,7 +1135,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
-          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" value="${_esc(def.default ?? '')}"${def.minimum != null ? ` min="${_esc(def.minimum)}"` : ''}${def.maximum != null ? ` max="${_esc(def.maximum)}"` : ''}${type === 'number' ? ` step="${def.type === 'integer' ? '1' : 'any'}"` : ''} placeholder="${_esc(desc.slice(0, 40))}">`;
         }
         return `
           <div class="canvas-field">
@@ -1057,7 +1149,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
           <div class="canvas-card-info">
-            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
+            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(displayName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
           ${sensorInstanceCfgBtn}
@@ -1066,7 +1158,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         </div>
         ${sensorFieldsHtml ? `<div class="canvas-card-body">${sensorFieldsHtml}</div>` : ''}
         <div class="canvas-card-footer" style="padding:8px 10px">
-          ${hasSensorActions ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
+          ${hasSensorActions ? `<button class="canvas-exec-btn${_projectRunning || schema?.['x-manual-execution'] === true ? '' : ' locked'}" data-manual-execution="${schema?.['x-manual-execution'] === true}">▶ 执行</button>` : ''}
           ${hasSensorActions ? '<hr class="canvas-footer-divider">' : ''}
           <button class="canvas-view-btn">📡 查看数据流</button>
         </div>
@@ -1191,19 +1283,20 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const _SYSTEM_ACTIONS = new Set(['start', 'stop', 'info', 'config']);
     const _TOPIC_KEY_RE = /input.*topic|topic.*in|output.*topic|topic.*out/i;
     const fieldsHtml = Object.entries(props).map(([key, def]) => {
+      if (def['x-ui-hidden']) return '';
       // Hide auto-populated topic fields for processor cards
       if ((effectiveType === 'processor' || effectiveType === 'actuator') && _TOPIC_KEY_RE.test(key)) return '';
       const isReq = required.includes(key);
-      const label = key + (isReq ? ' *' : '');
+      const label = (def.title || key) + (isReq ? ' *' : '');
       let inputHtml;
-      if (def.enum) {
-        // Filter system actions from processor cards
-        let enumVals = def.enum;
-        if (key === 'action') {
-          enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v));
+      if (def.enum || def.oneOf) {
+        let options = fieldOptions(def);
+        if (key === 'action') options = options.filter(o => !_SYSTEM_ACTIONS.has(o.value));
+        if (!options.length) return '';
+        if (key === 'action' && options.length === 1 && schema?.['x-confirmation']) {
+          return `<input type="hidden" class="canvas-field-input" data-key="action" value="${_esc(options[0].value)}">`;
         }
-        if (!enumVals.length) return '';  // hide field entirely if no options left
-        const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(v)}</option>`).join('');
+        const opts = options.map(o => `<option value="${_esc(o.value)}"${o.value === def.default ? ' selected' : ''}>${_esc(o.label)}</option>`).join('');
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
       } else if (def.format === 'file') {
         const accept = def.accept || '*/*';
@@ -1246,16 +1339,16 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       <div class="canvas-card-body-wrap">
         <div class="canvas-card-header">
           <div class="canvas-card-info">
-            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(toolName)}</div>
+            <div class="canvas-card-tool" title="${_esc(toolName)}">${typeBadge} ${_esc(displayName)}</div>
             <div class="canvas-card-driver" title="${_esc(driverName)}">${_esc(driverName)}</div>
           </div>
           ${instanceCfgBtn}
           <button class="tool-card-info-btn canvas-card-info-btn" title="详情"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button>
           <button class="canvas-card-close" title="从画布移除">✕</button>
         </div>
-        ${fieldsHtml ? `<div class="canvas-card-body">${fieldsHtml}</div>` : ''}
+        ${fieldsHtml ? `<div class="canvas-card-body">${toolObj?.title && toolObj?.description ? `<p class="canvas-card-guidance">${_esc(toolObj.description)}</p>` : ''}${fieldsHtml}</div>` : ''}
         <div class="canvas-card-footer"${!fieldsHtml ? ' style="padding:8px 10px"' : ''}>
-          ${hasUsableFields ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
+          ${hasUsableFields ? `<button class="canvas-exec-btn${_projectRunning || schema?.['x-manual-execution'] === true ? '' : ' locked'}" data-manual-execution="${schema?.['x-manual-execution'] === true}">▶ 执行</button>` : ''}
           ${hasUsableFields && showViewBtn ? '<hr class="canvas-footer-divider">' : ''}
           ${showViewBtn ? '<button class="canvas-view-btn">📡 查看数据流</button>' : ''}
         </div>
@@ -1281,7 +1374,10 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           el.querySelectorAll('.canvas-field').forEach(field => {
             const key = field.querySelector('.canvas-field-input')?.dataset?.key;
             if (!key || key === 'action') return;
-            field.style.display = paramKeys.includes(key) ? '' : 'none';
+            const conditions = schema.properties[key]?.['x-visible-when'];
+            const matches = !conditions || Object.entries(conditions).every(([other, expected]) =>
+              el.querySelector(`.canvas-field-input[data-key="${other}"]`)?.value === String(expected));
+            field.style.display = paramKeys.includes(key) && matches ? '' : 'none';
           });
           // Showing/hiding fields changes the card's height, which moves every
           // port on it. The card ResizeObserver (_syncGeometryObservers) now
@@ -1295,6 +1391,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             return;
           }
           _applyActionParams();
+        });
+        el.querySelectorAll('.canvas-field-input').forEach(input => {
+          if (input !== actionSelect) input.addEventListener('change', _applyActionParams);
         });
         _applyActionParams();  // 初始应用
       }
@@ -1844,7 +1943,7 @@ function _redrawConnections() {
   for (const conn of _connections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
-    if (!fromCard || !toCard) continue;
+    if (!fromCard || !toCard || fromCard.el.classList.contains('piper-unselected') || toCard.el.classList.contains('piper-unselected')) continue;
 
     const fromPort = _findPort(fromCard.el, 'out', conn.fromPortIdx, conn.format);
     const toPort = _findPort(toCard.el, 'in', conn.toPortIdx, conn.format);
@@ -1879,7 +1978,7 @@ function _redrawConnections() {
   for (const conn of _execConnections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
-    if (!fromCard || !toCard) continue;
+    if (!fromCard || !toCard || fromCard.el.classList.contains('piper-unselected') || toCard.el.classList.contains('piper-unselected')) continue;
 
     const execPort = fromCard.el.querySelector('.canvas-port.executor');
     if (!execPort) { _warnUnresolved(conn, '执行器端口已消失'); continue; }
@@ -2700,12 +2799,19 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 // ── Execute ───────────────────────────────────────────────────────────────────
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
+  const device = _piperDevice(mcpId);
+  if (device && (_piperSwitching || mcpId !== _piperTarget)) {
+    _showToast('请先选择这台机械臂，等待切换完成');
+    return;
+  }
+  if (device) _piperCalls++;
   const btn = el.querySelector('.canvas-exec-btn');
   btn.disabled = true;
   btn.textContent = '执行中…';
 
   const args = {};
   el.querySelectorAll('.canvas-field-input').forEach(input => {
+    if (input.closest('.canvas-field')?.style.display === 'none') return;
     const key = input.dataset.key;
     const val = input.value.trim();
     if (val !== '') {
@@ -2740,6 +2846,34 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   _logActivity('mcp_call', `${toolName} @ ${mcpId}`);
 
   try {
+    const liveSchema = (typeof _toolObj === 'object' ? _toolObj.inputSchema : null);
+    if (!_projectRunning && liveSchema?.['x-manual-execution'] === true) {
+      const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool: toolName, arguments: { action: 'start', ...(instanceId ? {instance_id: instanceId} : {}) } }),
+      });
+      const result = await response.json();
+      if (result.code !== 200) throw new Error(result.message || '手动卡片启动失败');
+    }
+    if (liveSchema?.['x-confirmation']?.[args.action]) {
+      const call = async arguments_ => {
+        const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tool: toolName, arguments: arguments_ }),
+        });
+        const payload = await response.json();
+        if (payload.code !== 200) throw new Error(payload.message || '操作失败');
+        return _parseMcpCallResult(payload) ?? payload.data;
+      };
+      const value = await confirmedAction(liveSchema, args, {
+        call, confirm: message => window.confirm(device ? `${device.label}\n\n${message}` : message),
+        showPreview: value => _showResult(el, JSON.stringify(value, null, 2), false),
+      });
+      const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+      _showResult(el, text, false);
+      _logActivity('mcp_result', `${toolName} → ${_truncate(text, 400)}`);
+      return;
+    }
     const res  = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2761,6 +2895,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     _showResult(el, String(err), true);
     _logActivity('mcp_error', `${toolName} error: ${err}`);
   } finally {
+    if (device) _piperCalls--;
     btn.disabled = false;
     btn.textContent = '▶ 执行';
   }
@@ -3161,6 +3296,7 @@ async function _reloadLayout() {
     _resolveAllTopics();
     _scheduleRedraw();
     _syncEmptyState();
+    _syncPiperSelector();
     // Update editor info
     _currentEditor = layoutJson.editor || null;
     _isEditor = _currentEditor === _sessionId;
