@@ -76,7 +76,15 @@ def bind_vla():
 
 def interrupt(reason=''):
     agent = DecisionLoop.__new__(DecisionLoop)
-    with mock.patch('event.llm._stop_countdown') as stop:
+    # `patch.object(sys.modules['event.llm'], ...)` rather than the dotted
+    # string: `event/__init__.py` binds `llm = event.llm.Event()`, so the
+    # package attribute `event.llm` is that **instance**, not the module. On
+    # Python 3.12 mock resolves the dotted target via `sys.modules` and happens
+    # to find the module; on 3.10 — which the shipped image runs — it walks
+    # getattr and lands on the instance, and all 12 tests here die with
+    # "Event object has no attribute '_stop_countdown'" before the code under
+    # test ever runs. Green on a laptop, red in the image.
+    with mock.patch.object(sys.modules['event.llm'], '_stop_countdown') as stop:
         asyncio.run(DecisionLoop._interrupt_active_outputs(agent, reason=reason))
     return stop
 

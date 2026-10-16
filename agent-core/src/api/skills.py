@@ -319,6 +319,13 @@ async def uninstall_skill(body: dict = fastapi.Body(...)):
     # 同时停用
     _skills_mod.active_skills.discard(slug)
 
+    # 随附文件跟着技能走。留下来的话，下一个占用这个 slug 的技能会继承它们 ——
+    # 声明里写的是新 sha256，磁盘上躺着旧内容，而激活后读到的是后者。
+    import skill_files
+    removed = skill_files.remove_all(slug)
+    if removed:
+        print(f'[skills] uninstall {slug}: removed {removed} skill file(s)')
+
     return {'code': 200, 'data': {'slug': slug}}
 
 

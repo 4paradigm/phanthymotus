@@ -279,3 +279,75 @@ def test_the_tool_does_not_rebuild_the_system_prompt(store):
     line = next(l for l in body.splitlines() if 'skill_tools = {' in l)
     assert 'skill_file' not in line
     assert "('skill_file', event.skills.skill_file)" in body, '但它必须注册为系统工具'
+
+
+def test_uninstall_removes_the_files_so_a_new_skill_cannot_inherit_them(store, monkeypatch):
+    """The hole this closes, end to end.
+
+    Uninstall used to remove only the skill row. Import a *different* skill at
+    the same slug and path -- different content, so a different declared
+    digest -- and activation handed the tool the **previous** skill's bytes,
+    because nothing re-checked what was on disk against the new manifest.
+    """
+    import asyncio
+    import event.skills                                   # noqa: F401
+    from api import skills as skills_api
+    skills_mod = sys.modules['event.skills']
+
+    old_body = b'OLD content from the skill that was uninstalled'
+    old_entry = {'path': 'reference/notes.md', 'bytes': len(old_body), 'sha256': sha(old_body)}
+    first = validate_local_skill(definition([old_entry]))
+    config.main['skills'] = {'installed': [{**first, 'active': True}]}
+    skill_files.write(SLUG, first, old_entry['path'], old_body)
+    assert skill_files.resolve(SLUG, old_entry['path']).is_file()
+
+    asyncio.run(skills_api.uninstall_skill({'slug': SLUG}))
+    assert not skill_files.resolve(SLUG, old_entry['path']).exists(), '卸载后文件还在'
+    assert not skill_files.root().joinpath(SLUG).exists(), '卸载后目录还在'
+
+    # 同一个 slug、同一个路径，但声明的是另一份内容
+    new_body = b'NEW content the second skill actually declares'
+    new_entry = {'path': 'reference/notes.md', 'bytes': len(new_body), 'sha256': sha(new_body)}
+    second = validate_local_skill(definition([new_entry]))
+    config.main['skills'] = {'installed': [{**second, 'active': True}]}
+    skills_mod._runtime_activated.add(SLUG)
+    try:
+        answer = asyncio.run(skills_mod.Tools().skill_file(SLUG, new_entry['path']))
+        assert 'OLD content' not in answer, '读到了上一个技能的内容'
+        assert '尚未写入内容' in answer, answer
+    finally:
+        skills_mod._runtime_activated.discard(SLUG)
+
+
+def test_content_that_does_not_match_the_declaration_is_refused_on_read(store):
+    """Write-side verification alone is not enough.
+
+    A file can arrive on disk without going through `write()` -- placed by hand,
+    a partial write, a restored backup, or left over from a previous skill at
+    the same slug. Reading verifies the digest too.
+    """
+    skill = validate_local_skill(definition([TEXT_FILE]))
+    skill_files.write(SLUG, skill, TEXT_FILE['path'], REFERENCE)
+    target = skill_files.resolve(SLUG, TEXT_FILE['path'])
+
+    # 同样长度、不同内容 —— 只看大小的检查会放过它
+    target.write_bytes(bytes(len(REFERENCE)))
+    for reader in (skill_files.read_text, skill_files.local_path):
+        with pytest.raises(ValueError, match='校验和'):
+            reader(SLUG, skill, TEXT_FILE['path'])
+
+    # 长度也不同
+    target.write_bytes(b'short')
+    for reader in (skill_files.read_text, skill_files.local_path):
+        with pytest.raises(ValueError, match='长度'):
+            reader(SLUG, skill, TEXT_FILE['path'])
+
+
+def test_remove_all_cannot_be_talked_into_deleting_anything_else(store):
+    """`slug` reaches this from an uninstall request body."""
+    outside = store.parent / 'not-a-skill'
+    outside.mkdir()
+    (outside / 'keep.txt').write_text('keep me')
+    for slug in ['../not-a-skill', '/', '', 'a/b', '..', 'UPPER']:
+        assert skill_files.remove_all(slug) == 0
+    assert (outside / 'keep.txt').is_file(), '删到了技能目录之外'

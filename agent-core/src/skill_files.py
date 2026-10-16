@@ -192,34 +192,81 @@ def _open_regular(target: pathlib.Path, path: str):
     return stream
 
 
+def _verified_bytes(slug: str, skill: dict, path: str, cap: int) -> tuple[bytes, dict]:
+    """The stored content of a declared file, checked against its declaration.
+
+    **Read-side verification, not just write-side.** `write()` checks the digest
+    before storing, which is not enough on its own: uninstalling a skill removes
+    its row but used to leave this directory behind, so importing a *different*
+    skill at the same slug and path -- with a different declared digest -- would
+    read the previous skill's bytes. Activation then handed a tool content the
+    current manifest never described. Uninstall now deletes the directory
+    (`remove_all`), and this check closes the same hole for a file that arrives
+    any other way: a hand-placed file, a partial write, a restored backup.
+
+    A digest is the whole file, so this reads the whole file. The caps keep that
+    bounded (1 MiB for a text read, 16 MiB for a hand-over), and it runs once
+    per tool call rather than per byte. For `local_path` there is still a window
+    between this check and whatever opens the path afterwards -- deleting on
+    uninstall is the fix for the realistic case; this is defence in depth.
+    """
+    entry = declared(skill, path)
+    target = resolve(slug, path)
+    with _open_regular(target, path) as stream:
+        size = os.stat(stream.fileno()).st_size
+        if size > cap:
+            raise ValueError(f'{path} 有 {size} 字节，超过 {cap}')
+        data = stream.read(cap + 1)
+    if len(data) != entry['bytes']:
+        raise ValueError(f'{path} 的长度与声明不符：声明 {entry["bytes"]}，'
+                         f'实际 {len(data)} —— 内容不是这个技能声明的那一份')
+    if hashlib.sha256(data).hexdigest() != entry['sha256']:
+        raise ValueError(f'{path} 的校验和与声明不符 —— 内容不是这个技能声明的那一份')
+    return data, entry
+
+
 def local_path(slug: str, skill: dict, path: str) -> str:
-    """The absolute local path of a declared, stored file.
+    """The absolute local path of a declared, stored, verified file.
 
     This is what the LLM hands to a tool's `format: file` parameter;
     `mcp_client._transfer_file_args` then pushes it to whichever service that
     tool belongs to and rewrites the argument. No skill-side declaration of the
     destination is involved -- the tool the model called *is* the destination.
     """
-    declared(skill, path)
-    target = resolve(slug, path)
-    with _open_regular(target, path):
-        pass
-    return str(target)
+    _verified_bytes(slug, skill, path, MAX_FILE_BYTES)
+    return str(resolve(slug, path))
 
 
 def read_text(slug: str, skill: dict, path: str, offset: int = 0) -> tuple[str, dict]:
-    """Read a declared file as text, bounded. Returns `(text, info)`."""
-    entry = declared(skill, path)
-    target = resolve(slug, path)
+    """Read a declared, verified file as text, bounded. Returns `(text, info)`."""
     if not isinstance(offset, int) or offset < 0:
         raise ValueError('offset 不能为负')
-    with _open_regular(target, path) as stream:
-        size = os.stat(stream.fileno()).st_size
-        if size > MAX_TEXT_BYTES:
-            raise ValueError(f'{path} 有 {size} 字节，过大无法按文本读取；'
-                             f'改用 as_path=true 把它交给接受文件参数的工具')
-        stream.seek(min(offset, size))
-        chunk = stream.read(MAX_READ_BYTES)
+    target = resolve(slug, path)
+    size = os.stat(target).st_size if target.is_file() else -1
+    if size > MAX_TEXT_BYTES:
+        raise ValueError(f'{path} 有 {size} 字节，过大无法按文本读取；'
+                         f'改用 as_path=true 把它交给接受文件参数的工具')
+    data, entry = _verified_bytes(slug, skill, path, MAX_TEXT_BYTES)
+    chunk = data[offset:offset + MAX_READ_BYTES]
     return chunk.decode('utf-8', errors='replace'), {
-        'bytes': size, 'offset': offset, 'next_offset': offset + len(chunk),
-        'truncated': offset + len(chunk) < size, 'declared_sha256': entry['sha256']}
+        'bytes': len(data), 'offset': offset, 'next_offset': offset + len(chunk),
+        'truncated': offset + len(chunk) < len(data), 'declared_sha256': entry['sha256']}
+
+
+def remove_all(slug: str) -> int:
+    """Delete every stored file for a skill. Returns how many were removed.
+
+    Called on uninstall. Without it the directory outlives the skill, and the
+    next skill to take that slug inherits its files -- see `_verified_bytes`.
+    """
+    import shutil
+    try:
+        directory = _slug_dir(slug).resolve()
+    except ValueError:
+        return 0
+    base = root().resolve()
+    if directory == base or base not in directory.parents or not directory.is_dir():
+        return 0
+    count = sum(1 for _ in directory.rglob('*') if _.is_file())
+    shutil.rmtree(directory, ignore_errors=True)
+    return count
