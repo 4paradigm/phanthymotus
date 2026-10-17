@@ -1157,6 +1157,75 @@ def test_ceilings_are_also_pulled_down_into_the_descriptor():
     assert any("超过下游允许" in note for note in notes)
 
 
+def test_search_rate_is_also_clamped_to_the_yaw_limit():
+    """Searching is a twist too; it cannot bypass the descriptor's yaw cap."""
+    config = _cfg(search_rate=1.0)
+    bumi = {"limits": dict(_R1_DESC["limits"],
+                             lower=[-0.55, -0.2, 0, 0, 0, -0.83],
+                             upper=[0.55, 0.2, 0, 0, 0, 0.83],
+                             min_magnitude=[0.25, 0.12, 0, 0, 0, 0.33])}
+    notes = P.adopt_limits(config, bumi)
+    assert config.search_rate == 0.83
+    assert config.search_rate <= bumi["limits"]["upper"][5]
+    assert config.search_rate >= bumi["limits"]["min_magnitude"][5]
+    assert any("search_rate" in note for note in notes)
+
+
+
+def test_search_rate_uses_the_tighter_signed_yaw_limit():
+    """A search sweeps both signs, so the smaller side is the safe rate."""
+    config = _cfg(search_rate=1.0)
+    asymmetric = {"limits": dict(_R1_DESC["limits"],
+                                  lower=[-1, -1, 0, 0, 0, -0.55],
+                                  upper=[1, 1, 0, 0, 0, 0.83],
+                                  min_magnitude=[0.4, 0.4, 0, 0, 0, 0.33])}
+    P.adopt_limits(config, asymmetric)
+    assert config.search_rate == 0.55
+
+
+
+def test_search_is_disabled_when_yaw_ceiling_is_below_its_deadband():
+    """A capped rate below the declared floor would be zeroed downstream."""
+    config = _cfg(search_rate=1.0)
+    impossible = {"limits": dict(_R1_DESC["limits"],
+                                  lower=[-1, -1, 0, 0, 0, -0.2],
+                                  upper=[1, 1, 0, 0, 0, 0.2],
+                                  min_magnitude=[0, 0, 0, 0, 0, 0.33])}
+    notes = P.adopt_limits(config, impossible)
+    assert config.search_rate == 0.0
+    assert any("最小可执行量" in note for note in notes)
+
+def test_search_is_disabled_when_the_chassis_has_no_yaw_axis():
+    config = _cfg(search_rate=1.0)
+    no_yaw = {"limits": dict(_R1_DESC["limits"],
+                               lower=[-1, -1, 0, 0, 0, 0],
+                               upper=[1, 1, 0, 0, 0, 0])}
+    notes = P.adopt_limits(config, no_yaw)
+    assert config.wz_max == 0.0
+    assert config.search_rate == 0.0
+    assert any("搜索转身" in note for note in notes)
+
+
+@pytest.mark.parametrize("descriptor", [
+    {"limits": dict(_R1_DESC["limits"],
+                    lower=[-1, -1, 0, 0, 0, -0.2],
+                    upper=[1, 1, 0, 0, 0, 0.2],
+                    min_magnitude=[0, 0, 0, 0, 0, 0.33])},
+    {"limits": dict(_R1_DESC["limits"],
+                    lower=[-1, -1, 0, 0, 0, 0],
+                    upper=[1, 1, 0, 0, 0, 0])},
+])
+def test_a_disabled_search_fails_instead_of_publishing_zero_twists(descriptor):
+    config = _cfg(search_rate=1.0, search_timeout_s=1e6)
+    P.adopt_limits(config, descriptor)
+    assert config.search_rate == 0.0
+    state = _state(missing_frames=config.lost_frames)
+    decision = _step(detections=_detections(), depth=_depth(),
+                     config=config, state=state)
+    assert decision.status == P.FAILED
+    assert decision.publishes is False
+    assert "cannot search" in decision.reason
+
 def test_an_axis_the_chassis_does_not_have_is_switched_off():
     config = _cfg()
     pinned = {"limits": dict(_R1_DESC["limits"],

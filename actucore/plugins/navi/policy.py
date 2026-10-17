@@ -589,6 +589,12 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         except (IndexError, TypeError, ValueError):
             return None
 
+    def signed_at(row, index):
+        try:
+            return float(row[index])
+        except (IndexError, TypeError, ValueError):
+            return None
+
     # The three twist axes this policy drives, by their index in the six-wide
     # vector. vz/wx/wy are not here because nothing here produces them.
     for index, name, ceiling_attr, floor_attr in (
@@ -617,6 +623,9 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             if getattr(config, ceiling_attr) > 0:
                 notes.append(f"下游底盘没有 {name} 这个自由度，已停用该轴")
             setattr(config, ceiling_attr, 0.0)
+            if index == 5 and config.search_rate != 0.0:
+                config.search_rate = 0.0
+                notes.append("下游底盘没有 wz 这个自由度，已停用搜索转身")
             continue
 
         ceiling = float(getattr(config, ceiling_attr))
@@ -633,6 +642,38 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         if bound is not None and float(getattr(config, ceiling_attr)) > bound:
             notes.append(f"{name}_max 超过下游允许的 {bound:g}，已压回")
             setattr(config, ceiling_attr, bound)
+
+        # Searching is a yaw-only motion, but it does not go through
+        # ``wz_max``: it deliberately uses a fixed rate so a lost target does
+        # not make the robot creep around its own deadband.  It is still a
+        # chassis command and alternates signs while sweeping, so its usable
+        # magnitude is the smaller of the positive and negative yaw bounds.
+        # Bumi exposed this gap: its 0.83 rad/s yaw limit accepted normal
+        # steering after negotiation while the default 1.0 rad/s search was
+        # rejected at every tick.
+        if index == 5:
+            yaw_lower = signed_at(lower, index)
+            yaw_upper = signed_at(upper, index)
+            if yaw_lower is not None and yaw_upper is not None:
+                search_cap = max(0.0, min(yaw_upper, -yaw_lower))
+            elif yaw_upper is not None:
+                search_cap = max(0.0, yaw_upper)
+            elif yaw_lower is not None:
+                search_cap = max(0.0, -yaw_lower)
+            else:
+                search_cap = None
+            candidate = config.search_rate
+            if search_cap is not None:
+                candidate = min(candidate, search_cap)
+            if floor and candidate < floor:
+                if config.search_rate != 0.0:
+                    notes.append(
+                        f"search_rate 的可用上限 {candidate:g} 低于偏航最小可执行量 "
+                        f"{floor:g}，已停用搜索转身")
+                config.search_rate = 0.0
+            elif candidate < config.search_rate:
+                notes.append(f"search_rate 超过下游双向允许的 {candidate:g}，已压回")
+                config.search_rate = candidate
 
     return notes
 
@@ -1340,6 +1381,18 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
         # something that has not actually gone.
         return Decision(None, SEARCHING,
                         f"target briefly out of sight ({state.missing_frames}/{config.lost_frames} frames)")
+
+    # ``adopt_limits`` has already established that no yaw command can clear
+    # this chassis's limits/deadband.  Publishing a zero twist here would keep
+    # its watchdog alive while claiming to search for up to the timeout, even
+    # though the required motion is impossible.  Fail immediately so the
+    # caller can select another strategy rather than waiting for a search that
+    # cannot start.
+    if config.search_rate <= 0.0:
+        state.failed_reason = (
+            f"cannot search for {state.target!r}: downstream chassis has no "
+            "executable yaw search rate")
+        return Decision(None, FAILED, state.failed_reason)
 
     state.searching_for_s += dt
     # Negated, for the same reason the main loop negates its bearing:
