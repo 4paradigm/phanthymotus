@@ -4,19 +4,22 @@ Commands must start a line. Only the PR's main-conversation comments are read.
 Parsing is strict: unknown flags, a duplicated required arg or a stray argument
 are rejected as ``unknown``.
 
-Six commands are public:
+Eight commands are public:
   - ``/request_deploy`` — PR Author requests a deployment (ZERO parameters)
   - ``/approve_deploy`` — Machine Owner approves a deployment
   - ``/record_test`` — Machine Owner records test result (no machine=)
   - ``/evidence_link`` — Read-only short-lived evidence download link (no parameters)
   - ``/deploy_status`` — Read-only status query
   - ``/deploy_help`` — Help for commands
+  - ``/submit_evidence`` — Persist native PR attachments and notes
+  - ``/remove_evidence`` — Add a logical deletion record for an attachment
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import shlex
+import re
 from typing import Literal
 
 
@@ -27,6 +30,8 @@ CommandKind = Literal[
     "evidence_link",
     "deploy_status",
     "deploy_help",
+    "submit_evidence",
+    "remove_evidence",
     "unknown",
 ]
 
@@ -40,6 +45,7 @@ class ParsedCommand:
     help_topic: str = ""
     raw: str = ""
     comment_id: int = 0
+    evidence_args: dict[str, str] | None = None
 
     @property
     def is_command(self) -> bool:
@@ -53,6 +59,8 @@ _KNOWN = {
     "evidence_link",
     "deploy_status",
     "deploy_help",
+    "submit_evidence",
+    "remove_evidence",
 }
 
 
@@ -85,6 +93,8 @@ _ALLOWED_KV = {
     "evidence_link": frozenset(),
     "deploy_status": frozenset(),
     "deploy_help": frozenset(),
+    "submit_evidence": frozenset({"head", "round", "machine", "note", "replaces"}),
+    "remove_evidence": frozenset({"id", "head", "round"}),
 }
 
 
@@ -282,6 +292,27 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
         return ParsedCommand(
             kind="deploy_help", help_topic=topic, raw=raw
         )
+    if name in {"submit_evidence", "remove_evidence"}:
+        if positional:
+            return ParsedCommand(kind="unknown", raw="")
+        head = kv.get("head", "")
+        round_id = kv.get("round", "")
+        if (not re.fullmatch(r"[0-9a-fA-F]{40}", head)
+                or not re.fullmatch(r"[0-9a-fA-F]{40}-[0-9]+", round_id)
+                or not round_id.lower().startswith(head.lower() + "-")):
+            return ParsedCommand(kind="unknown", raw="")
+        if name == "submit_evidence":
+            return ParsedCommand(kind=name, evidence_args={
+                "head": head.lower(), "round": round_id.lower(),
+                "machine": kv.get("machine", ""),
+                "note": kv.get("note", ""), "replaces": kv.get("replaces", ""),
+            }, raw=raw)
+        attachment_id = kv.get("id", "")
+        if not attachment_id or any(k in kv for k in ("machine", "note", "replaces")):
+            return ParsedCommand(kind="unknown", raw="")
+        return ParsedCommand(kind=name, evidence_args={
+            "head": head.lower(), "round": round_id.lower(), "id": attachment_id,
+        }, raw=raw)
     return ParsedCommand(kind="unknown", raw="")
 
 

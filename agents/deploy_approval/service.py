@@ -4969,6 +4969,32 @@ class DeployController:
                 topic=cmd.help_topic,
             )
 
+        if cmd.kind in {"submit_evidence", "remove_evidence"}:
+            evidence = self.evidence_service
+            if evidence is None:
+                await self._post_error(
+                    repo, pr_number,
+                    "Evidence storage is unavailable; the comment was not accepted.",
+                )
+                return True
+            try:
+                await evidence.handle_native_comment(
+                    repo=repo, pr_number=pr_number, comment_id=comment_id,
+                    actor_id=int(author_id), actor_login=author_login,
+                    action=cmd.kind, arguments=cmd.evidence_args or {},
+                )
+            except Exception as exc:
+                # Business rejections are terminal comments; network/API/COS
+                # exceptions escape so the watcher retries this exact comment.
+                if getattr(exc, "status_code", None) in {400, 403, 404, 409, 410, 413}:
+                    await self._post_error(
+                        repo, pr_number,
+                        f"Evidence comment rejected: {getattr(exc, 'code', 'invalid_request')}.",
+                    )
+                    return True
+                raise
+            return True
+
         logger.warning("on_command: unknown kind %s", cmd.kind)
         return True
 

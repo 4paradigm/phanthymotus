@@ -208,6 +208,33 @@ class CosAttachmentStore:
     async def verify_object(self, *, key, size, metadata, sha256=None):
         return await self._io(self._verify, key=key, size=size, metadata=metadata, sha256=sha256)
 
+    async def put_native_file(self, *, key, metadata, size, sha256, body):
+        """Create a deterministic native-attachment object, then read-back verify it.
+
+        A retry first observes the exact key. Conditional creation prevents a
+        duplicate comment retry from replacing an existing audit object.
+        """
+        key = self._key(key)
+        self._metadata(metadata)
+        if (isinstance(size, bool) or not isinstance(size, int)
+                or not 1 <= size <= min(self.config.evidence_max_file_bytes, 100 * 1024 * 1024)
+                or not isinstance(sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', sha256)):
+            raise ValueError('invalid native attachment identity')
+        try:
+            return await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha256)
+        except EvidenceStoreError:
+            pass
+        body.seek(0)
+        try:
+            await self._io(self._sdk().put_object, Bucket=self.config.cos_bucket,
+                Key=key, Body=body, ContentLength=size, ContentType='application/octet-stream',
+                Metadata=self._metadata(metadata), IfNoneMatch='*')
+        except EvidenceStoreError:
+            # The PUT response may be lost after COS committed the object.
+            # Only an exact read-back is considered success.
+            return await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha256)
+        return await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha256)
+
     def _verify(self, *, key, size, metadata, sha256=None, gzip_required=False, log_identity=None):
         cap = 10 * 1024 * 1024 if gzip_required else self.config.evidence_max_file_bytes
         if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= cap:

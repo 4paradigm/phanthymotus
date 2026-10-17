@@ -10,11 +10,17 @@ are never accepted into durable records. C renders references via the watcher.
 from __future__ import annotations
 
 import copy
+import asyncio
 import hashlib
+import ipaddress
 import json
 import re
+import socket
+import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
+from urllib.parse import unquote, urljoin, urlsplit
 
 from .evidence_auth import DOWNLOAD_PURPOSE, PURPOSE
 from .evidence_models import EvidenceError, round_id_for_state, utc_now, validate_context
@@ -111,6 +117,398 @@ class EvidenceService:
         if not isinstance(result, dict):
             raise EvidenceError('store_result_invalid', 502)
         return result
+
+    @staticmethod
+    def _native_asset_id(source_url):
+        """Accept only GitHub's native PR attachment URL shapes."""
+        parsed = urlsplit(source_url)
+        if (parsed.scheme != 'https' or parsed.hostname != 'github.com'
+                or parsed.port not in (None, 443) or parsed.username or parsed.password
+                or parsed.query or parsed.fragment):
+            raise EvidenceError('attachment_url_not_allowed', 400)
+        if not parsed.path.startswith('/user-attachments/'):
+            raise EvidenceError('attachment_url_not_allowed', 400)
+        parts = [unquote(part) for part in parsed.path.split('/') if part]
+        if len(parts) < 3 or parts[0] != 'user-attachments':
+            raise EvidenceError('attachment_url_not_allowed', 400)
+        kind = parts[1]
+        if kind == 'assets' and len(parts) == 3 and re.fullmatch(r'[A-Fa-f0-9-]{16,}', parts[2]):
+            asset_id = parts[2]
+        elif (kind == 'files' and len(parts) == 4
+              and re.fullmatch(r'[1-9][0-9]*', parts[2])
+              and re.fullmatch(r'[A-Za-z0-9._~-]+', parts[3])):
+            asset_id = parts[2]
+        else:
+            raise EvidenceError('attachment_url_not_allowed', 400)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', asset_id):
+            raise EvidenceError('attachment_url_not_allowed', 400)
+        return asset_id
+
+    @staticmethod
+    def _attachment_urls(body):
+        found = []
+        for value in re.findall(r'https://github\.com/user-attachments/(?:assets|files)/[^\s<>\])]+', body):
+            value = value.rstrip('.,;')
+            try:
+                EvidenceService._native_asset_id(value)
+            except EvidenceError:
+                continue
+            if value not in found:
+                found.append(value)
+        return found
+
+    @staticmethod
+    def _safe_download_host(host):
+        if host == 'github.com':
+            return True
+        if host == 'githubusercontent.com' or host.endswith('.githubusercontent.com'):
+            return True
+        return bool(re.fullmatch(
+            r'github-production-user-asset-[0-9a-f]{6}\.s3\.amazonaws\.com', host))
+
+    @classmethod
+    def _download_native_asset(cls, source_url, target, limit):
+        """Stream a public GitHub attachment without forwarding credentials."""
+        import requests
+
+        current = source_url
+        session = requests.Session()
+        session.trust_env = False
+        total = 0
+        digest = hashlib.sha256()
+        filename = ''
+        started = time.monotonic()
+        try:
+            for redirect_count in range(4):
+                parsed = urlsplit(current)
+                host = (parsed.hostname or '').lower()
+                if (parsed.scheme != 'https' or not cls._safe_download_host(host)
+                        or parsed.port not in (None, 443) or parsed.username or parsed.password):
+                    raise EvidenceError('attachment_redirect_not_allowed', 400)
+                try:
+                    addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+                except OSError:
+                    raise EvidenceError('attachment_download_unavailable', 502) from None
+                if (not addresses or any(not ipaddress.ip_address(item[4][0]).is_global
+                                         for item in addresses)):
+                    raise EvidenceError('attachment_redirect_not_allowed', 400)
+                response = session.get(current, stream=True, allow_redirects=False,
+                                       timeout=(10, 30), headers={'User-Agent': 'Deploy-Approval-Evidence/1.0',
+                                                                  'Accept': 'application/octet-stream'})
+                if response.is_redirect or response.is_permanent_redirect:
+                    location = response.headers.get('Location', '')
+                    response.close()
+                    if redirect_count >= 3 or not location:
+                        raise EvidenceError('attachment_redirect_not_allowed', 400)
+                    current = urljoin(current, location)
+                    continue
+                if response.status_code != 200:
+                    response.close()
+                    raise EvidenceError('attachment_download_unavailable', 502)
+                length = response.headers.get('Content-Length')
+                if length:
+                    try:
+                        declared_size = int(length)
+                    except ValueError:
+                        response.close()
+                        raise EvidenceError('attachment_download_invalid', 502) from None
+                    if declared_size > limit:
+                        response.close()
+                        raise EvidenceError('attachment_too_large', 413)
+                disposition = response.headers.get('Content-Disposition', '')
+                try:
+                    from email.message import Message
+                    header = Message()
+                    header['Content-Disposition'] = disposition
+                    filename = header.get_filename() or ''
+                except (TypeError, ValueError):
+                    filename = ''
+                if not filename:
+                    filename = unquote(urlsplit(source_url).path.rsplit('/', 1)[-1])
+                try:
+                    from .evidence_store import safe_filename
+                    filename = safe_filename(filename)
+                except (ValueError, TypeError):
+                    filename = 'attachment-' + hashlib.sha256(source_url.encode()).hexdigest()[:12]
+                try:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > limit:
+                            raise EvidenceError('attachment_too_large', 413)
+                        if time.monotonic() - started > 300:
+                            raise EvidenceError('attachment_download_timeout', 502)
+                        target.write(chunk)
+                        digest.update(chunk)
+                finally:
+                    response.close()
+                if total < 1:
+                    raise EvidenceError('attachment_empty', 400)
+                target.flush()
+                target.seek(0)
+                return {'filename': filename, 'size': total, 'sha256': digest.hexdigest()}
+            raise EvidenceError('attachment_redirect_not_allowed', 400)
+        finally:
+            session.close()
+
+    async def _native_identity(self, repo, pr_number, comment_id, expected_id, expected_login,
+                               expected_body_hash=''):
+        comment = await self.proxy.get_comment(repo, comment_id)
+        issue_url = comment.get('issue_url', '') if isinstance(comment, dict) else ''
+        body = comment.get('body', '') if isinstance(comment, dict) else ''
+        if (not isinstance(comment, dict) or comment.get('id') != comment_id
+                or not isinstance(issue_url, str)
+                or issue_url.rstrip('/').split('/')[-1] != str(pr_number)
+                or not isinstance(body, str)
+                or (expected_body_hash and hashlib.sha256(body.encode()).hexdigest() != expected_body_hash)):
+            raise EvidenceError('comment_unavailable', 409)
+        actor_id, actor_login = await self.proxy.comment_identity(repo, comment_id)
+        if (not actor_id or not actor_login or str(actor_id) != str(expected_id)
+                or actor_login.casefold() != expected_login.casefold()):
+            raise EvidenceError('comment_identity_changed', 403)
+        return comment, int(actor_id), actor_login
+
+    async def _native_authorization(self, repo, pr_number, actor_id, actor_login):
+        if (not self.config.auth_valid or repo not in self.config.github_repos
+                or repo not in self.config.active_repos):
+            raise EvidenceError('repository_not_authorized', 403)
+        if repo not in await self.github.list_installation_repositories():
+            raise EvidenceError('app_access_revoked', 403)
+        pr = await self.proxy.get_pr(repo, pr_number)
+        state = await self.proxy.read_hidden_state(repo, pr_number)
+        if (not isinstance(pr, dict) or pr.get('state') != 'open' or pr.get('merged')
+                or pr.get('draft') or not isinstance(state, dict)):
+            raise EvidenceError('pr_closed', 409)
+        author = pr.get('user', {})
+        if isinstance(author, dict) and str(author.get('id', '')) == str(actor_id):
+            return pr, state, 'pr_author', ''
+        deployed = {row.get('machine') for row in state.get('deployments', [])
+                    if isinstance(row, dict) and row.get('phase') == 'deployed'}
+        for alias in deployed:
+            machine = self.policy.get_machine(alias) if isinstance(alias, str) else None
+            if machine and any(isinstance(owner, str) and owner.casefold() == actor_login.casefold()
+                               for owner in (machine.owners or [])):
+                return pr, state, 'machine_owner', alias
+        permission = await self.proxy.collaborator_permission(repo, actor_login)
+        if self.policy.collaborator_can_approve(permission):
+            return pr, state, 'collaborator', permission
+        raise EvidenceError('evidence_write_permission_required', 403)
+
+    @staticmethod
+    def _comment_created_at(comment):
+        value = comment.get('created_at')
+        if not isinstance(value, str):
+            raise EvidenceError('comment_time_invalid', 409)
+        try:
+            stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if stamp.tzinfo is None:
+                raise ValueError
+            return stamp.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+        except ValueError:
+            raise EvidenceError('comment_time_invalid', 409) from None
+
+    async def handle_native_comment(self, **kwargs):
+        """Serialize native comment writes with the existing Evidence writer."""
+        async with self.controller._evidence_lock:
+            return await self._handle_native_comment_locked(**kwargs)
+
+    async def _handle_native_comment_locked(self, *, repo, pr_number, comment_id, actor_id,
+                                            actor_login, action, arguments):
+        """Transfer native PR attachments and append immutable evidence documents."""
+        if action not in {'submit_evidence', 'remove_evidence'}:
+            raise EvidenceError('unknown_action', 400)
+        if repo not in {'4paradigm/phanthymotus', '4paradigm/phanthymotus-driver'}:
+            raise EvidenceError('repository_not_authorized', 403)
+        comment, actor_id, actor_login = await self._native_identity(
+            repo, pr_number, comment_id, actor_id, actor_login)
+        pr, state, role, role_value = await self._native_authorization(
+            repo, pr_number, actor_id, actor_login)
+        body = comment.get('body', '')
+        if not isinstance(body, str):
+            raise EvidenceError('comment_unavailable', 409)
+        from .commands import parse_command
+        parsed = parse_command(body)
+        if parsed.kind != action or parsed.evidence_args != arguments:
+            raise EvidenceError('comment_command_changed', 409)
+        body_hash = hashlib.sha256(body.encode()).hexdigest()
+        head_sha = arguments.get('head', '')
+        round_id = arguments.get('round', '')
+        if (not re.fullmatch(r'[0-9a-f]{40}', head_sha)
+                or state.get('head_sha') != head_sha or pr.get('head', {}).get('sha') != head_sha
+                or round_id_for_state(state) != round_id):
+            raise EvidenceError('round_changed', 409)
+        if state.get('status') != 'testing':
+            raise EvidenceError('context_not_writable', 409)
+        created_at = self._comment_created_at(comment)
+        async def recheck_current():
+            _, fresh_id, fresh_login = await self._native_identity(
+                repo, pr_number, comment_id, actor_id, actor_login, body_hash)
+            fresh_pr, fresh_state, _, _ = await self._native_authorization(
+                repo, pr_number, fresh_id, fresh_login)
+            if (fresh_pr.get('head', {}).get('sha') != head_sha
+                    or fresh_state.get('head_sha') != head_sha
+                    or round_id_for_state(fresh_state) != round_id
+                    or fresh_state.get('status') != 'testing'):
+                raise EvidenceError('round_changed', 409)
+            return fresh_pr, fresh_state
+
+        records = await self.proxy.read_evidence_records(repo, pr_number)
+        latest = {}
+        prepared_operations = {}
+        for record in records:
+            if record['kind'] == 'attachment':
+                latest[record['data'].get('attachment_id')] = record['data']
+            elif record['kind'] == 'operation':
+                data = record['data']
+                if data.get('native_attachment') is True:
+                    prepared_operations[data.get('attachment_id')] = data
+        if action == 'remove_evidence':
+            target_id = arguments.get('id', '')
+            target = latest.get(target_id)
+            if (not target or target.get('round_id') != round_id or target.get('head_sha') != head_sha
+                    or target.get('status') == 'deleted'):
+                raise EvidenceError('attachment_not_found', 404)
+            uploader = str(target.get('actor_id')) == str(actor_id)
+            await recheck_current()
+            if not uploader:
+                permission = await self.proxy.collaborator_permission(repo, actor_login)
+                if permission not in {'maintain', 'admin'}:
+                    raise EvidenceError('evidence_delete_permission_required', 403)
+            tombstone = {**target, 'status': 'deleted', 'deleted_at': created_at,
+                         'deleted_by': actor_login, 'deleted_by_id': actor_id,
+                         'deletion_comment_id': comment_id, 'updated_at': created_at}
+            await self.proxy.write_evidence_record(
+                repo, pr_number, 'attachment', 'native-delete:' + str(comment_id) + ':' + target_id,
+                tombstone)
+            return tombstone
+
+        urls = self._attachment_urls(body)
+        if len(urls) > 10:
+            raise EvidenceError('too_many_attachments', 413)
+        replaces = arguments.get('replaces', '')
+        if replaces and (len(urls) != 1 or replaces not in latest
+                         or latest[replaces].get('round_id') != round_id):
+            raise EvidenceError('replacement_not_found', 404)
+        if arguments.get('machine'):
+            alias = arguments['machine']
+            deployed = {row.get('machine') for row in state.get('deployments', [])
+                        if isinstance(row, dict) and row.get('phase') == 'deployed'}
+            if alias not in deployed or self.policy.get_machine(alias) is None:
+                raise EvidenceError('machine_not_deployed', 409)
+            machine = self.policy.get_machine(alias)
+            if (role == 'machine_owner' and role_value != alias
+                    and not any(owner.casefold() == actor_login.casefold()
+                                for owner in machine.owners or [])):
+                raise EvidenceError('machine_owner_mismatch', 403)
+        note = arguments.get('note', '').strip()
+        if not note:
+            remaining = body.split('\n', 1)[1] if '\n' in body else ''
+            remaining = re.sub(
+                r'!?\[[^\]]*\]\(\s*https://github\.com/user-attachments/(?:assets|files)/[^)]*\)',
+                '', remaining)
+            remaining = re.sub(r'https://github\.com/user-attachments/(?:assets|files)/[^\s<>\])]+', '', remaining)
+            note = remaining.strip()
+        if len(note.encode('utf-8')) > self.config.evidence_max_note_bytes:
+            raise EvidenceError('note_too_large', 413)
+        if not urls:
+            if not note:
+                raise EvidenceError('evidence_content_required', 400)
+            attachment_id = 'note-' + hashlib.sha256(
+                f'{repo}:{pr_number}:{comment_id}'.encode()).hexdigest()[:48]
+            data = {'repo': repo, 'pr_number': pr_number, 'source_comment_id': comment_id,
+                    'source_url': '', 'attachment_id': attachment_id, 'filename': 'note.txt',
+                    'size': len(note.encode('utf-8')), 'sha256': hashlib.sha256(note.encode('utf-8')).hexdigest(),
+                    'object_key': '', 'head_sha': head_sha, 'round_id': round_id,
+                    'actor_id': actor_id, 'actor_login': actor_login, 'actor_verified': True,
+                    'machine': arguments.get('machine', ''), 'note': note,
+                    'created_at': created_at, 'updated_at': created_at, 'status': 'text'}
+            await recheck_current()
+            await self.proxy.write_evidence_record(
+                repo, pr_number, 'attachment', 'native:' + attachment_id, data)
+            return data
+
+        limit = min(int(getattr(self.config, 'evidence_max_file_bytes', 100 * 1024 * 1024)),
+                    100 * 1024 * 1024)
+        completed = []
+        for source_url in urls:
+            asset_id = self._native_asset_id(source_url)
+            attachment_id = 'native-' + hashlib.sha256(
+                f'{repo}:{pr_number}:{comment_id}:{asset_id}'.encode()).hexdigest()[:48]
+            existing = latest.get(attachment_id)
+            if existing:
+                if (existing.get('source_comment_id') != comment_id
+                        or existing.get('source_url') != source_url
+                        or existing.get('head_sha') != head_sha or existing.get('round_id') != round_id):
+                    raise EvidenceError('attachment_identity_conflict', 409)
+                if existing.get('status') == 'ready':
+                    completed.append(existing)
+                    continue
+            prepared = prepared_operations.get(attachment_id)
+            metadata = {'repo': repo, 'pr_number': pr_number, 'head_sha': head_sha,
+                        'round_id': round_id, 'attachment_id': attachment_id}
+            if prepared and (prepared.get('source_url') != source_url
+                             or prepared.get('source_comment_id') != comment_id
+                             or prepared.get('actor_id') != actor_id
+                             or prepared.get('head_sha') != head_sha
+                             or prepared.get('round_id') != round_id
+                             or prepared.get('machine', '') != arguments.get('machine', '')
+                             or prepared.get('note', '') != note
+                             or prepared.get('replaces_id', '') != replaces):
+                raise EvidenceError('attachment_identity_conflict', 409)
+            if prepared:
+                record = {k: v for k, v in prepared.items() if k not in {'native_attachment', 'operation_id'}}
+                key, size, sha = record['object_key'], record['size'], record['sha256']
+                try:
+                    result = await self.store.verify_object(
+                        key=key, size=size, metadata=metadata, sha256=sha)
+                except Exception:
+                    result = None
+            else:
+                record = None
+                result = None
+            if result is None:
+                if not callable(getattr(self.store, 'put_native_file', None)):
+                    raise EvidenceError('store_adapter_unavailable', 503)
+                with tempfile.TemporaryFile() as temp:
+                    facts = await asyncio.to_thread(
+                        self._download_native_asset, source_url, temp, limit)
+                    from .evidence_store import build_attachment_key
+                    key = build_attachment_key(repo, pr_number, head_sha, round_id,
+                                               attachment_id, created_at, facts['filename'])
+                    record = {'repo': repo, 'pr_number': pr_number, 'source_comment_id': comment_id,
+                              'source_url': source_url, 'attachment_id': attachment_id,
+                              'filename': facts['filename'], 'size': facts['size'], 'sha256': facts['sha256'],
+                              'object_key': key, 'head_sha': head_sha, 'round_id': round_id,
+                              'actor_id': actor_id, 'actor_login': actor_login, 'actor_verified': True,
+                              'machine': arguments.get('machine', ''), 'note': note,
+                              'created_at': created_at, 'updated_at': created_at, 'status': 'prepared'}
+                    if replaces:
+                        record['replaces_id'] = replaces
+                    if prepared and any(record.get(k) != prepared.get(k)
+                                        for k in ('filename', 'size', 'sha256', 'object_key')):
+                        raise EvidenceError('attachment_retry_conflict', 409)
+                    if not prepared:
+                        await recheck_current()
+                        prepared_data = {**record, 'native_attachment': True,
+                                         'operation_id': attachment_id}
+                        await self.proxy.write_evidence_record(
+                            repo, pr_number, 'operation', 'native:' + attachment_id + ':prepared',
+                            prepared_data)
+                    await recheck_current()
+                    result = await self.store.put_native_file(
+                        key=key, metadata=metadata, size=facts['size'],
+                        sha256=facts['sha256'], body=temp)
+            if (not isinstance(result, dict) or result.get('verified') is not True
+                    or result.get('size') != record['size'] or result.get('sha256') != record['sha256']
+                    or result.get('object_key') != record['object_key']):
+                raise EvidenceError('object_not_verified', 409)
+            await recheck_current()
+            record.update(status='ready', updated_at=created_at)
+            await self.proxy.write_evidence_record(
+                repo, pr_number, 'attachment', 'native:' + attachment_id, record)
+            completed.append(record)
+        return {'attachments': completed}
 
     async def dispatch(self, action: str, *, repo: str, pr_number: int, principal: dict, payload: dict) -> dict:
         if action not in {'context', 'status', 'init', 'resume', 'sign_part', 'complete', 'note', 'delete', 'download', 'log_download'}:
@@ -229,6 +627,7 @@ class EvidenceService:
                                    for r in records if r['kind'] == 'round'],
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
                                        for r in operations.values() if not r.get('auth_nonce_marker')
+                                       and not r.get('native_attachment')
                                        and r.get('round_id') == round_id
                                        and r.get('actor_id') == principal['id']], 'records': [r for r in latest.values() if r['round_id'] == round_id],
                         'archive_links': [{'round_id': r['data']['round_id'], 'url': r['url']} for r in records if r['kind'] == 'round']}
