@@ -8,8 +8,9 @@ editable UI settings. Real catalogue records, audio assets and the remote search
 implementation are not included. The REST contract remains provider-independent.
 
 The client belongs to the [phanthy_music card](phanthy_music.md). A model extracts
-intent into `search` arguments, then calls `play_by_id(track_id)` on that same card.
-`play_by_genre(genre)` combines search and playback within the card.
+intent into `search_music` / `search_sleep_audio` arguments, or plays directly
+with `play_music` / `play_sleep_audio` on that same card. (`search`, `play`,
+`play_by_id` and `play_by_genre` are the older spellings and still dispatch.)
 There is no server-side LLM and no independent MusicSearch built-in. Local MCP
 connects Agent Core to the Perception card; the card uses authenticated REST to
 the catalogue. No change to MCP authentication or external MCP service is needed.
@@ -96,7 +97,7 @@ or unknown non-null codes are invalid. Request vocal values remain
 
 Tracks contain an ID, title, artist, metadata, HTTPS audio URL/format/expiry,
 lyrics excerpt, matching information and usage. An `expires_at` or URL TTL of
-null means no stated expiry. `play_by_id(track_id)` looks up fresh details and forwards
+null means no stated expiry. Playing by id looks up fresh details and forwards
 the returned format, expiry, attribution and usage into the player. A removed
 track returns `not_found`; a mock track returns `not_playable`.
 
@@ -145,7 +146,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_music_catalog.py t
 
 Mocks and tests contain only fictional metadata and placeholder credentials.
 For deployment acceptance, exercise real capabilities, filtered search, next
-song, condition relaxation and `play_by_id(track_id)` through the registered card;
+song, condition relaxation and playing a known id through the registered card;
 then check actual PCM output and interruption. Do not count mock success as
 remote compatibility or local audio output as robot acceptance.
 

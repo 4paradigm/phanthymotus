@@ -19,24 +19,24 @@ publishing into nothing.
 
 ## Two kinds of content, two sets of actions
 
-The catalogue holds songs *and* ASMR behind one endpoint and one key (the
-protocol side is in [`music-catalog.md`](music-catalog.md)). Here that is two
-pairs of actions, not a `kind` parameter:
+The catalogue holds songs *and* soothing / sleep audio behind one endpoint and
+one key (the protocol side is in [`music-catalog.md`](music-catalog.md)). Here
+that is two pairs of actions, not a `kind` parameter:
 
-| | Songs | ASMR |
+| | Songs | Sleep audio |
 |---|---|---|
-| Play | `play` | `play_asmr` |
-| Look without playing | `search` | `search_asmr` |
-| Filters | `query`, `genre`, `language`, `artist`, `tags` (+`vocal` on `search`) | `query`, `category`, `tags` |
+| Play | `play_music` | `play_sleep_audio` |
+| Look without playing | `search_music` | `search_sleep_audio` |
+| Filters | `query`, `genre`, `language`, `artist`, `tags` (+`vocal` on `search_music`) | `query`, `category`, `tags` |
 | Shared | `next`, `previous`, `pause`/`resume`, `stop_music`, `now_playing`, `set_volume`, `set_autoplay`, `list_genres` | same |
 
 **Why separate actions rather than `play(kind=…)`.** An ASMR entry has no genre,
 no voice type and no artist, and the catalogue returns 422 when those are sent
-with it. A single `play` carrying all eight filters would therefore be offering
+with it. A single `play_music` carrying all eight filters would therefore be offering
 the model five distinct ways to earn a 422 — and the one thing it cannot do is
 learn the rule from the parameter list. Because `_coerce_filters` reads the
 parameter set from the *action* rather than from `args`, a `genre` the model
-volunteers on `play_asmr` is dropped before the request is built; it never
+volunteers on `play_sleep_audio` is dropped before the request is built; it never
 reaches the network and never fails.
 
 `category` is one of `bedtime_story` 睡前故事, `meditation` 冥想引导,
@@ -45,15 +45,37 @@ reaches the network and never fails.
 the right answer when the user did not name a type** — 「来点助眠的」and
 「来点 ASMR」both mean any of the six, and the catalogue picks.
 
-**ASMR is the umbrella; `bedtime_story` is one of the six, not a synonym for the
-whole thing and not a default.** It is the most quotable of the six, which makes
-it the easiest for a description or an example to turn into the face of the
-feature — and a model that reads it that way answers 「来点 ASMR」with a story
-every time. `play_asmr`'s description says so explicitly, and
-`test_the_declared_asmr_actions_describe_where_sleep_intent_goes` pins it. Looking for a specific object's sound is
+### Why the action is not called `play_asmr`
+
+It shipped as `play_asmr` for one day, and that name was wrong. **"ASMR" in
+ordinary speech means the trigger sounds — and those are one of the six
+categories.** A bedtime story, a meditation or a read poem is not ASMR, so
+naming the whole set after one of its members is the same conflation this
+section exists to prevent, placed in the one string the model reads first.
+
+The protocol *does* label the kind `asmr`, and that cannot change: it is the
+server's vocabulary, so it stays in the wire format, in `filters.kind` and in
+`track.kind` comparisons. What changed is only the action names the model sees.
+`play`/`search` became `play_music`/`search_music` at the same time, because
+once the card plays two things "play" no longer says which.
+
+**No one category is the face of the set either.** `bedtime_story` is the most
+quotable of the six and `trigger` is what the protocol's own label points at —
+two separate ways for a description to drift into answering everything with one
+category — so `play_sleep_audio`'s description refuses both by name, and
+`test_the_declared_asmr_actions_describe_where_sleep_intent_goes` pins that.
+
+### Every category code is on the action, not only on the parameter
+
+`play_sleep_audio`'s description carries all six codes with a one-line gloss, a
+typical duration and the utterances that select them. The `category` parameter
+repeats them, and `list_genres` returns them from the catalogue — but a model
+that has to make a round trip to learn the six values will either make it or
+guess, and a guess is an `invalid_filter`. The description says
+「不用先调 list_genres」for that reason. Looking for a specific object's sound is
 `category=trigger` plus the object in `query` (薯片, 纸).
 
-**A `category` on `play`/`search` routes to ASMR anyway.** The model reached for
+**A `category` on `play_music`/`search_music` routes to ASMR anyway.** The model reached for
 the song action and then described ASMR, so the description wins over the action
 name — which is also what the catalogue does with a bare `category`. Note this
 is deliberately *not* symmetric with the paragraph above: dropping a `genre`
@@ -71,12 +93,12 @@ attention.
 ### `next` stays on the side the user asked for
 
 The station records `kind` along with the other criteria, so 「换一个」after
-`play_asmr` fetches another ASMR entry rather than drifting into songs. Crossing
-over is an explicit `play` or `play_asmr`.
+`play_sleep_audio` fetches another ASMR entry rather than drifting into songs. Crossing
+over is an explicit `play_music` or `play_sleep_audio`.
 
 ### ASMR is a playback session like any other
 
-`play_asmr` is in `x-completion.actions` beside `play`. A two-minute bedtime
+`play_sleep_audio` is in `x-completion.actions` beside `play_music`. A two-minute bedtime
 story needs a pending exactly as a song does — without one, `finish` lands in
 the middle of it.
 
@@ -131,17 +153,17 @@ them — but that is about not *leaking them further*, not about keeping them.
 | Action | Takes | Does |
 |---|---|---|
 | `list_genres` | — | The catalogue's own genre / language / vocal / tag vocabularies **and the ASMR categories**. **Call this before guessing a code.** Says whether the values came from the catalogue or from the built-in fallback. |
-| `play` | `query`, `genre`, `language`, `artist`, `tags` | Picks one **song** and starts playing. No criteria at all is valid — "放点歌" means anything. Returns as soon as fetching starts, not when the song ends. |
-| `play_asmr` | `query`, `category`, `tags` | Picks one **ASMR** entry and starts playing. Where 助眠／哄睡／睡不着／白噪音／放松／睡前故事／冥想／陪我聊聊／读首诗／咀嚼声 go. No criteria at all is valid, and is the right call when no type was named. |
-| `next` | — | Next track or entry. Takes no arguments: it reuses the last `play`/`play_asmr` criteria — **including which kind** — and excludes what already played. |
+| `play_music` | `query`, `genre`, `language`, `artist`, `tags` | Picks one **song** and starts playing. No criteria at all is valid — "放点歌" means anything. Returns as soon as fetching starts, not when the song ends. |
+| `play_sleep_audio` | `query`, `category`, `tags` | Picks one **sleep-audio** entry and starts playing. Where 助眠／哄睡／睡不着／白噪音／放松／睡前故事／冥想／陪我聊聊／读首诗／咀嚼声 go. No criteria at all is valid, and is the right call when no type was named. |
+| `next` | — | Next track or entry. Takes no arguments: it reuses the last `play_music`/`play_sleep_audio` criteria — **including which kind** — and excludes what already played. |
 | `previous` | — | Back one track, from the beginning. Costs one catalogue call, because signed audio URLs expire. |
 | `pause` / `resume` | — | Pause keeps the decoded buffer, so resuming continues rather than skipping. |
 | `stop_music` | — | Stops the music. Does not affect speech. |
 | `now_playing` | — | Title, artist, genre, `kind`, `category`, position, remaining, volume, station criteria. Call this before telling a user what is on. For `kind: 'asmr'` there is no artist and no genre — say the category instead. |
 | `set_volume` | `volume` | 0–100。只管音乐。 |
 | `set_autoplay` | `autoplay` | 一首放完要不要自动接下一首。**默认关**：放完就停。只接受 true/false —— 一个说不清要开还是要关的调用，猜错的后果是歌自己一直放下去。 |
-| `search` | `query`, `genre`, `language`, `vocal`, `tags`, `artist`, `top_k` | Answers "is there any **song**…" without playing. Keeps the filters `play` drops. Works with the card idle. |
-| `search_asmr` | `query`, `category`, `tags`, `top_k` | Answers "is there any **ASMR**…" without playing, for when a few options should be offered before one is picked. |
+| `search_music` | `query`, `genre`, `language`, `vocal`, `tags`, `artist`, `top_k` | Answers "is there any **song**…" without playing. Keeps the filters `play_music` drops. Works with the card idle. |
+| `search_sleep_audio` | `query`, `category`, `tags`, `top_k` | Answers "is there any **sleep audio**…" without playing, for when a few options should be offered before one is picked. |
 
 `start`, `stop`, `info` and `config` are dispatchable but are **not** in the
 declared action enum, so the model never sees them. `present_to_llm` only
@@ -151,12 +173,21 @@ next to the `stop_music` it means. That confusion was measured on a rig with
 `tts(action="stop")`.
 
 Old spellings still dispatch, undeclared: `interrupt` → `stop_music`, `status` →
-`now_playing`, `play_by_id` / `play_by_genre` → `play`.
+`now_playing`, `play_by_id` / `play_by_genre` → `play_music`, `play` →
+`play_music`, `search` → `search_music`, `play_asmr` → `play_sleep_audio`,
+`search_asmr` → `search_sleep_audio`.
 
-### Why `play` takes five filters and not nine
+**Every play alias is also listed in `x-completion.actions`, and that is
+load-bearing.** agent-core matches the literal action string the caller used
+against that list (`_should_await_completion`, `mcp_client.py:1278`) and knows
+nothing about `ALIAS_ACTIONS`. An alias missing from it dispatches perfectly and
+registers **no pending** — the track plays with no ACP session, `finish` can
+land mid-track, and nothing is logged.
 
-`play` is the voice path; `search` is the precision path. A filter earns a place
-on `play` only if it is reachable from something a person says:
+### Why `play_music` takes five filters and not nine
+
+`play_music` is the voice path; `search_music` is the precision path. A filter earns a place
+on `play_music` only if it is reachable from something a person says:
 
 | | |
 |---|---|
@@ -171,14 +202,14 @@ on `play` only if it is reachable from something a person says:
 驾驶/通勤/工作/夜晚/旅行/下雨天, filtering on 驾驶 returns tracks that genuinely
 carry that tag, and — unlike `query` — **tags are never relaxed**.
 
-Dropped from `play`, measured against the live catalogue rather than assumed:
+Dropped from `play_music`, measured against the live catalogue rather than assumed:
 
 - **`duration_min_s` / `duration_max_s`** — the index is real and precise
   (`>=240` returned 241–480 s, `<=120` returned 61–115 s). Nobody says it. They
-  were here because `SearchRequest` has them. Gone from `search` too.
+  were here because `SearchRequest` has them. Gone from `search_music` too.
 - **`vocal`** — works for `male`/`female`, but the one value a driver would ask
   for, 纯音乐 → `instrumental`, is relaxed by the catalogue: the reply comes back
-  `relaxed: ['vocal']` with vocal tracks in it. Kept on `search`, where a caller
+  `relaxed: ['vocal']` with vocal tracks in it. Kept on `search_music`, where a caller
   can see the relaxation and decide.
 - **`track_id`** — by voice, nobody searches and then plays a result by id; a
   named song reaches the same place through `query`. The *dispatch* path is
@@ -191,7 +222,7 @@ as free text and reported back in `genre_as_query`. So "city pop" returns music
 rather than `invalid_filter`. The catalogue protocol's strict validation is
 unchanged; the demotion happens in the card, above it.
 
-Every `search` / `play` reply also carries `available_genres`, so a caller that
+Every `search_music` / `play_music` reply also carries `available_genres`, so a caller that
 used a wrong code can see the right ones without a second call.
 
 ## Errors
@@ -204,7 +235,7 @@ is already in flight — retry), `invalid_filter` (call `list_genres`),
 
 ## Playback completion
 
-`play` returns an `action_id` and, when the catalogue reports a duration, an
+`play_music` returns an `action_id` and, when the catalogue reports a duration, an
 `expected_duration_s`. The session is declared `background`, so nothing waits on
 it: a four-minute track does not block `finish`, nor the agent's next tool call.
 Its completion is declared `silent_completion`, so the end of a song is a
@@ -268,5 +299,5 @@ against mock entries shaped like the real ones (no artist, null vocal,
 `genre: other`, empty trigger script). The routing itself lives in the action
 and parameter descriptions, so
 `test_the_declared_asmr_actions_describe_where_sleep_intent_goes` pins the words
-that carry it — a model reaches `play_asmr` only if the card says so, and a
+that carry it — a model reaches `play_sleep_audio` only if the card says so, and a
 silent edit to those strings is a behaviour change.

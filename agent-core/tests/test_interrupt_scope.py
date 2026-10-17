@@ -131,7 +131,7 @@ class TestScopeComesFromBindings(unittest.TestCase):
         self.assertTrue(self.hooks.is_interrupt_binding(
             'mcp-music', 'phanthy_music', 'stop_music'))
         self.assertFalse(self.hooks.is_interrupt_binding(
-            'mcp-music', 'phanthy_music', 'play'))
+            'mcp-music', 'phanthy_music', 'play_music'))
 
 
 if __name__ == '__main__':
