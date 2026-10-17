@@ -8,7 +8,9 @@ from copy import deepcopy
 from unittest.mock import Mock, patch
 import urllib.error
 
-from plugins.music_catalog.contracts import FALLBACK, MusicError, SCHEMA, capabilities, search_request, search_result
+from plugins.music_catalog.contracts import (
+    CATEGORIES, FALLBACK, MusicError, SCHEMA, capabilities, search_request,
+    search_result)
 from plugins.music_catalog.providers import discover
 from plugins.music_catalog.providers.motus_music import MotusMusicProvider, retry_seconds, _NoRedirect
 from plugins.music_catalog.service import MusicService
@@ -17,6 +19,115 @@ def track(**overrides):
     return {'id': 'fictional-1', 'title': 'Fictional', 'language': 'zh', 'genre': 'pop',
             'vocal': 'female', 'artist': {'id': 'artist-1', 'name': 'Fictional artist'},
             'duration_s': 120, 'audio': {'url': 'https://audio.example/test.mp3'}, **overrides}
+
+
+def asmr(**overrides):
+    """An ASMR entry in the shape the catalogue actually returns it.
+
+    Not a song with a field renamed: no artist name, no voice type, `genre`
+    pinned to `other`, and a wav. Those are the three fields whose handling the
+    card has to get right, so a fixture that filled them in would hide the bug.
+    """
+    return {'id': 'fictional-asmr-1', 'kind': 'asmr', 'category': 'bedtime_story',
+            'title': '睡前故事 第 1 期', 'language': 'zh', 'genre': 'other',
+            'vocal': None, 'artist': {'id': None, 'name': ''}, 'duration_s': 150,
+            'audio': {'url': 'https://audio.example/test.wav', 'format': 'wav'},
+            'lyrics_excerpt': '嘘……', **overrides}
+
+
+class AsmrContractTests(unittest.TestCase):
+    """motus.music/1's second kind of content, over the same endpoint and key."""
+
+    def test_kind_and_category_reach_the_request(self):
+        request = search_request('星空', kind='asmr', category='bedtime_story,chat',
+                                 tags='睡前')
+        self.assertEqual(request['filters']['kind'], 'asmr')
+        self.assertEqual(request['filters']['category'], ['bedtime_story', 'chat'])
+        self.assertEqual(request['filters']['tags'], ['睡前'])
+
+    def test_a_category_alone_means_asmr(self):
+        """The server infers it; inferring it here too is what keeps the local
+        cross-kind check reading the same conclusion the server will."""
+        self.assertEqual(search_request(category='meditation')['filters']['kind'], 'asmr')
+
+    def test_a_song_request_is_unchanged_by_the_split(self):
+        """A caller that only ever wanted songs sends exactly what it used to —
+        no `kind`, so no behaviour change and nothing to migrate."""
+        self.assertNotIn('kind', search_request('下雨天', genre='pop')['filters'])
+        self.assertNotIn('category', search_request('下雨天', genre='pop')['filters'])
+
+    def test_crossed_fields_fail_here_rather_than_as_a_422(self):
+        for kwargs in ({'kind': 'asmr', 'genre': 'pop'},
+                       {'kind': 'asmr', 'vocal': 'female'},
+                       {'kind': 'asmr', 'artist': '史叶茜'},
+                       {'kind': 'song', 'category': 'trigger'}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(MusicError) as ctx:
+                search_request(**kwargs)
+            self.assertEqual(ctx.exception.code, 'invalid_filter')
+
+    def test_unknown_kind_or_category_lists_what_is_allowed(self):
+        for kwargs, expected in (({'kind': 'podcast'}, ['song', 'asmr']),
+                                 ({'category': 'xyz'}, list(CATEGORIES))):
+            with self.subTest(kwargs=kwargs), self.assertRaises(MusicError) as ctx:
+                search_request(**kwargs)
+            self.assertEqual(ctx.exception.allowed, expected)
+
+    def test_capabilities_carry_both_vocabularies_and_tolerate_their_absence(self):
+        caps = capabilities({**deepcopy(FALLBACK),
+                             'features': ['query', 'asmr'],
+                             'filters': {**deepcopy(FALLBACK['filters']),
+                                         'category': [{'value': 'bedtime_story',
+                                                       'label': '睡前故事'}]}})
+        self.assertEqual([x['value'] for x in caps['filters']['category']],
+                         ['bedtime_story'])
+        # A provider with no ASMR simply omits both, and keeps the built-in
+        # fallback — the same tolerance `genre` already had.
+        without = {k: v for k, v in FALLBACK['filters'].items()
+                   if k not in ('kind', 'category')}
+        caps = capabilities({**deepcopy(FALLBACK), 'filters': without})
+        self.assertEqual([x['value'] for x in caps['filters']['kind']], ['song', 'asmr'])
+
+    def test_kind_is_never_relaxed_so_asmr_cannot_come_back_as_a_song(self):
+        """Asking for ASMR and getting a song is not a loosened filter, it is
+        the wrong content — so there is no `relaxed` value that excuses it."""
+        request = search_request(kind='asmr')
+        self.assertEqual(search_result({'schema': SCHEMA, 'tracks': [asmr()],
+                                        'relaxed': []}, request)['tracks'][0]['kind'], 'asmr')
+        for relaxed in ([], ['query'], ['category']):
+            with self.subTest(relaxed=relaxed), self.assertRaises(MusicError):
+                search_result({'schema': SCHEMA, 'tracks': [track()],
+                               'relaxed': relaxed}, request)
+
+    def test_a_missing_kind_reads_as_song(self):
+        """A provider predating the split labels nothing, and everything it has
+        is a song. That must satisfy a song request and fail an ASMR one."""
+        bare = track()
+        self.assertNotIn('kind', bare)
+        search_result({'schema': SCHEMA, 'tracks': [bare], 'relaxed': []},
+                      search_request(kind='song'))
+        with self.assertRaises(MusicError):
+            search_result({'schema': SCHEMA, 'tracks': [bare], 'relaxed': []},
+                          search_request(kind='asmr'))
+
+    def test_category_is_hard_unless_the_catalogue_says_it_relaxed_it(self):
+        request = search_request(kind='asmr', category='trigger')
+        wrong = {'schema': SCHEMA, 'tracks': [asmr(category='chat')], 'relaxed': []}
+        with self.assertRaises(MusicError):
+            search_result(wrong, request)
+        self.assertEqual(search_result({**wrong, 'relaxed': ['category']},
+                                       request)['relaxed'], ['category'])
+
+    def test_a_trigger_entry_without_a_script_is_valid(self):
+        """Trigger sounds have no voice and no transcript. An empty
+        `lyrics_excerpt` and a null `vocal` are the correct shape, not missing
+        data to reject."""
+        result = search_result(
+            {'schema': SCHEMA, 'relaxed': [],
+             'tracks': [asmr(category='trigger', title='咬/咀嚼·薯片',
+                             duration_s=22, lyrics_excerpt='')]},
+            search_request(kind='asmr', category='trigger'))
+        self.assertEqual(result['tracks'][0]['lyrics_excerpt'], '')
+        self.assertIsNone(result['tracks'][0]['vocal'])
 
 
 class ContractTests(unittest.TestCase):
@@ -215,6 +326,48 @@ class ServiceTests(unittest.TestCase):
             result = service.execute(track_id='fictional-1')
         self.assertIsNone(result['track']['vocal'])
         self.assertIn('人声未知', result['reply_notice'])
+
+    def test_asmr_lookups_offer_the_vocabulary_that_applies_to_them(self):
+        """An ASMR reply must not carry a genre list. Offering one is how a
+        model learns to put `genre` on the next ASMR call — which is a 422."""
+        service = MusicService({'catalogue_type': 'mock'})
+        songs = service.execute(genre='pop')
+        self.assertIn('available_genres', songs)
+        self.assertNotIn('available_categories', songs)
+        entries = service.execute(kind='asmr')
+        self.assertTrue(entries['tracks'])
+        self.assertTrue(all(t['kind'] == 'asmr' for t in entries['tracks']))
+        self.assertIn('bedtime_story', entries['available_categories'])
+        self.assertNotIn('available_genres', entries)
+        self.assertIn('ASMR 没有歌手和曲风', entries['reply_notice'])
+
+    def test_an_asmr_detail_lookup_is_recognised_from_the_result(self):
+        """`previous` refreshes by id and sends no filters at all, so the kind
+        can only be read off what came back."""
+        service = MusicService({'catalogue_type': 'mock'})
+        found = service.execute(kind='asmr', category='bedtime_story')
+        detail = service.execute(track_id=found['tracks'][0]['id'])
+        self.assertEqual(detail['track']['kind'], 'asmr')
+        self.assertIn('available_categories', detail)
+        self.assertNotIn('available_genres', detail)
+
+    def test_vocabulary_publishes_the_asmr_categories(self):
+        """Before this, the only way to learn a category code was to send a
+        wrong one and read `allowed` off the 422."""
+        vocabulary = MusicService({'catalogue_type': 'mock'}).vocabulary()
+        self.assertEqual([x['value'] for x in vocabulary['kinds']], ['song', 'asmr'])
+        self.assertIn('bedtime_story',
+                      [x['value'] for x in vocabulary['asmr_categories']])
+        self.assertTrue(vocabulary['asmr_supported'])
+        self.assertEqual(vocabulary['source'], 'catalogue')
+
+    def test_a_filter_from_the_wrong_kind_never_reaches_the_network(self):
+        service = MusicService({'catalogue_type': 'mock'})
+        service.execute()  # warm the capability cache
+        with patch.object(service._provider, 'search') as search:
+            self.assertEqual(service.execute(kind='asmr', genre='pop')['error']['code'],
+                             'invalid_filter')
+        search.assert_not_called()
 
     def test_concurrent_catalogue_call_is_bounded_not_queued(self):
         service = MusicService({'catalogue_type': 'mock'})

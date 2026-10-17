@@ -1,5 +1,33 @@
 """One phanthy_music card: browse a catalogue, play a station, emit music PCM.
 
+The catalogue holds **two kinds of content** behind one endpoint and one key:
+songs, and soothing / sleep audio — trigger sounds plus softly-read bedtime
+stories, meditations, companionship, chat and poetry.
+
+**The protocol labels that second half `kind: 'asmr'`, and that label is wrong
+as a name for the set.** "ASMR" in ordinary speech means the trigger sounds,
+and those are *one* of the six categories; a bedtime story, a meditation or a
+read poem is not ASMR. The protocol value is the server's vocabulary and cannot
+be changed, so it stays in the wire format and in `kind` comparisons — but the
+actions the model reads are named for what the set actually is:
+`play_sleep_audio` / `search_sleep_audio`. This card shipped briefly as
+`play_asmr`; the old spellings remain as aliases.
+
+Nor is any one category the face of the set. "来点助眠的" and "来点 ASMR" both
+name no category and should return anything from the six; only "讲个睡前故事"
+asks for a bedtime story. Worth stating twice over, because bedtime story is
+the most quotable of the six and trigger is what the protocol's own label points
+at — two separate ways for a description to drift into answering every request
+with one category.
+
+The two halves are separate *actions* rather than a `kind` parameter on one
+`play`, for the same reason the catalogue returns 422 when the fields are
+crossed: a sleep-audio entry has no genre, no voice type and no artist, so an
+action accepting those alongside `category` would be offering the model five
+ways to get a 422 back. `play_music`/`search_music` are songs;
+`play_sleep_audio`/`search_sleep_audio` are sleep audio; neither can express the
+other's filters.
+
 A pure actuator. It used to be the mixer as well — it took TTS in on its own
 `topic_in`, ducked the song under it and published the combined stream, which is
 why the wiring read `TTS → phanthy_music → Speaker`. Speech now belongs to
@@ -63,6 +91,15 @@ QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
 # They were here because the REST SearchRequest has them, which is not a reason.
 FILTER_PARAMS = ['query', 'genre', 'language', 'vocal', 'tags', 'artist']
 
+# The sleep-audio side. `language` is deliberately absent even though the
+# protocol accepts it for both kinds: every such entry in the catalogue is zh, so
+# the parameter has no reachable effect and its only cost is a slot in the
+# model's attention. `genre`/`vocal`/`artist` are absent because they do not
+# exist here — passing them is a 422, which is why these are separate
+# actions rather than one `play` with a `kind`.
+SLEEP_FILTER_PARAMS = ['query', 'category', 'tags']
+SLEEP_PLAY_PARAMS = ['query', 'category', 'tags']
+
 # What `play` accepts, which is deliberately narrower than what the catalogue
 # can filter on. Each one has to be reachable from something a person says:
 #   query  放点伤感的 / 放那首下雨天的歌      genre  放点爵士
@@ -80,7 +117,8 @@ HISTORY_LIMIT = 50
 
 ACTIONS = {
     'list_genres': [],
-    'play': PLAY_PARAMS,
+    'play_music': PLAY_PARAMS,
+    'play_sleep_audio': SLEEP_PLAY_PARAMS,
     'next': [],
     'previous': [],
     'pause': [],
@@ -89,7 +127,8 @@ ACTIONS = {
     'now_playing': [],
     'set_volume': ['volume'],
     'set_autoplay': ['autoplay'],
-    'search': FILTER_PARAMS + ['top_k'],
+    'search_music': FILTER_PARAMS + ['top_k'],
+    'search_sleep_audio': SLEEP_FILTER_PARAMS + ['top_k'],
 }
 # Not in the declared enum, so they never reach the model. `present_to_llm`
 # filters these four only for `type: 'processor'` cards, and this card is an
@@ -101,32 +140,95 @@ SYSTEM_ACTIONS = ['start', 'stop', 'info', 'config']
 # case or an x-hooks binding written against them must not break. Undeclared, so
 # the model is only ever offered the new names.
 ALIAS_ACTIONS = {'interrupt': 'stop_music', 'status': 'now_playing',
-                 'play_by_id': 'play', 'play_by_genre': 'play'}
+                 'play_by_id': 'play_music', 'play_by_genre': 'play_music',
+                 # `play`/`search` were the names before the catalogue grew a
+                 # second kind of content, when "this card plays music" was the
+                 # whole story. They are kept dispatching for stored canvas exec
+                 # args, saved benchmark cases and x-hooks bindings — and are
+                 # also listed in `x-completion.actions` below, which is not
+                 # optional. See the comment there.
+                 'play': 'play_music', 'search': 'search_music',
+                 # Shipped briefly under the protocol's own word for the kind.
+                 # `asmr` names one of the six categories (trigger sounds), so
+                 # using it for the set that also holds bedtime stories,
+                 # meditation and poetry was simply wrong.
+                 'play_asmr': 'play_sleep_audio',
+                 'search_asmr': 'search_sleep_audio'}
 
 ACTION_DESCRIPTIONS = {
-    'list_genres': '先查可用的曲风/语种/人声代码，再 play。代码来自曲库，不要凭译名猜。',
-    'play': '点歌并开始播放。按用户怎么说选参数：说曲风用 genre（取值见 list_genres），'
+    'list_genres': '先查可用的曲风/语种/人声代码和助眠音频的类别代码，'
+                   '再 play_music / play_sleep_audio。代码来自曲库，不要凭译名猜。',
+    'play_music': '点歌并开始播放（**歌曲**，有歌手、曲风、歌词）。'
+            '按用户怎么说选参数：说曲风用 genre（取值见 list_genres），'
             '说场景/心情（开车、睡前、下雨天、治愈）用 tags，说歌手用 artist，'
             '说语种用 language，其余（歌名、歌词、随口描述）都放 query。'
             '什么都不给 = 随便放。返回即表示已开始取歌，不代表播完；'
-            '换歌用 next，停歌用 stop_music。',
-    'next': '换下一首。不用传参数 —— 沿用上次 play 的条件，并自动排除刚放过的歌。',
+            '换歌用 next，停歌用 stop_music。'
+            '**用户要的是助眠、哄睡、白噪音、ASMR、睡前故事、冥想、轻声陪聊、'
+            '咀嚼/摩擦这类声音时，用 play_sleep_audio，不要用 play_music。'
+            '「放点睡前听的歌」要的还是歌，用 play_music 加 tags=睡前；'
+            '「哄我睡觉」要的不是歌，用 play_sleep_audio。**',
+    'play_sleep_audio': '播放**助眠／放松类音频**并开始播放。不是歌 —— '
+                 '没有歌手、没有曲风、全是中文。\n'
+                 '六个 category（下面就是全部取值，**不用先调 list_genres**）：\n'
+                 '· bedtime_story 睡前故事 —— 轻声讲一个哄睡的小故事（星空小岛、'
+                 '月光小船），约 2–3 分钟；「讲个睡前故事」「哄我睡觉」\n'
+                 '· meditation 冥想引导 —— 引导闭眼、放松身体、调整呼吸，约 2–3 分钟；'
+                 '「带我做个冥想」「帮我放松一下」「帮我静一静」\n'
+                 '· companion 情感陪伴 —— 轻声安慰和陪伴、倾诉式，约 1.5–3 分钟；'
+                 '「我今天好累」「陪我一会儿」「我心情不好」\n'
+                 '· chat 生活化闲聊 —— 像朋友一样轻声聊日常（窗外的风、小时候的夏天），'
+                 '约 2–3 分钟；「随便陪我聊聊」「说点轻松的」\n'
+                 '· poetry 经典诗文 —— 在轻柔氛围里朗读、讲解古诗文，约 2–4 分钟；'
+                 '「给我读首诗」「来段古文」\n'
+                 '· trigger 触发音 —— 也就是通常说的 ASMR：没有人声，只有声音本身'
+                 '（咀嚼、摩擦、揉捏、撕拉、切割、液体），每条 20–30 秒；'
+                 '「想听咀嚼的声音」「来点撕纸声」。找具体物品的声音时填 '
+                 'category=trigger 再把物品写进 query（薯片、纸、苹果、碳酸饮料）\n'
+                 '说出了具体想听什么就填对应的 category；只说「助眠」「哄我睡觉」'
+                 '「睡不着」「来点 ASMR」「白噪音」这种没点名类别的，**什么都不填**，'
+                 '曲库会从六个类别里挑一条。'
+                 '**六个类别谁也不是这一类的代名词 —— 没点名类别时不要默认填'
+                 ' bedtime_story，也不要默认填 trigger。**\n'
+                 '不要填 genre / artist / vocal / language —— 这些只属于歌曲，填了会被拒绝。'
+                 '返回即表示已开始取音频，不代表播完；换一条用 next，停用 stop_music。',
+    'next': '换下一首／下一条。不用传参数 —— 沿用上次 play_music 或 '
+            'play_sleep_audio 的条件（包括是歌还是助眠音频），'
+            '并自动排除刚放过的那条。'
+            '从助眠音频切回听歌，或反过来，要重新调 play_music / play_sleep_audio。',
     'previous': '回到上一首，从头开始播（记不住上一首播到哪儿了）。',
     'pause': '暂停当前这首，位置保留，resume 继续。',
     'resume': '继续播放暂停的那首。',
     'stop_music': '停止音乐。不影响说话。',
-    'now_playing': '现在放的是什么：歌名、歌手、曲风、进度、音量。要向用户报歌名时先调它。',
+    'now_playing': '现在放的是什么：歌名/标题、歌手、曲风、进度、音量，以及 kind'
+                   '（song 是歌，asmr 是助眠音频）和助眠音频的 category。'
+                   '要向用户报在放什么时先调它。'
+                   'kind=asmr 时没有歌手也没有曲风，按类别说（「一段睡前故事」'
+                   '「一段冥想引导」「一段咀嚼声」），不要说成「某某的歌」。',
     'set_volume': '音乐音量 0–100。不改变说话的音量。',
     'set_autoplay': '一首放完要不要自动接下一首（电台模式）。默认关：放完就停。'
                     '用户说「一直放」「别停」时打开，说「放完这首就停」时关掉。',
-    'search': '只回答「有没有/有哪些」，不播放。想听直接用 play。'
-              '比 play 多 vocal 和 top_k，用于需要精确挑选的场合。',
+    'search_music': '只回答「有没有/有哪些」**歌**，不播放。想听直接用 play_music。'
+                    '比 play_music 多 vocal 和 top_k，用于需要精确挑选的场合。',
+    'search_sleep_audio': '只回答「有没有/有哪些」**助眠／放松类音频**，不播放。'
+                   '想听直接用 play_sleep_audio。比 play_sleep_audio 多 top_k，'
+                   '用于需要先列几条给用户挑的场合。'
+                   'category 的取法和 play_sleep_audio 完全一致 —— 没点名类别就留空。',
 }
 
 TOOLS = [{
     'name': 'phanthy_music', 'type': 'actuator', 'multiInstance': False,
-    'description': '音乐播放器：play 点歌（曲风或自由描述）、next 换歌、list_genres 查可用曲风、'
-                   'now_playing 查当前曲目，另有 pause/resume/stop_music/set_volume。'
+    'description': '音乐与助眠音频播放器，两类内容：\n'
+                   '· **歌曲** —— play_music 点歌（曲风、歌手或自由描述）、'
+                   'search_music 查有没有；\n'
+                   '· **助眠／放松音频** —— play_sleep_audio 播放，'
+                   'search_sleep_audio 查有没有。六个类别：睡前故事、冥想引导、'
+                   '情感陪伴、生活化闲聊、经典诗文，以及触发音（通常说的 ASMR：'
+                   '咀嚼/摩擦/撕拉等纯声音）。用户说助眠、哄睡、睡不着、想睡觉、'
+                   '白噪音、放松一下、讲个睡前故事、带我冥想、陪我聊聊、读首诗、'
+                   '想听咀嚼声，走这一类。\n'
+                   '两类共用 next 换下一条、now_playing 查当前在放什么、list_genres 查可用代码，'
+                   '另有 pause/resume/stop_music/set_volume。'
                    '只输出音乐音频到自己的话题；混音和「说话时压低音乐」由 audio_mixer 卡负责：'
                    'phanthy_music → audio_mixer → Speaker。'
                    'personal_playback 只允许当次播放，不得保存或上传聊天附件。',
@@ -135,13 +237,34 @@ TOOLS = [{
         'properties': {
             'action': {'type': 'string', 'enum': list(ACTIONS)},
             **{key: {'type': 'string', 'description': description} for key, description in {
-                'query': '情绪、场景、歌名或歌词片段，最多 200 字',
+                'query': '情绪、场景、歌名或歌词片段，最多 200 字。'
+                         '助眠音频（play_sleep_audio/search_sleep_audio）里'
+                         '写想听的物品或主题，如 薯片、纸、星空、月光',
                 'genre': '曲风代码，逗号分隔。取值先用 list_genres；'
                          '不在表里的词会被当作自由描述处理，并在回包的 genre_as_query 里说明',
                 'language': '语种代码，逗号分隔；取值见 list_genres',
                 'vocal': 'male/female/mixed/instrumental；不确定就留空',
                 'tags': '标签，逗号分隔；可用词表见 list_genres',
                 'artist': '歌手名或歌手 ID',
+                'category': '助眠音频的类别，'
+                            '**只用于 play_sleep_audio / search_sleep_audio**，'
+                            '单个或逗号分隔多个（满足任一即可）：\n'
+                            '· bedtime_story 睡前故事 —— 轻声讲一个哄睡的小故事；'
+                            '「讲个睡前故事」「哄我睡觉」\n'
+                            '· meditation 冥想引导 —— 引导闭眼、放松身体、调整呼吸；'
+                            '「带我做个冥想」「帮我放松一下」\n'
+                            '· companion 情感陪伴 —— 轻声安慰和陪伴；'
+                            '「我今天好累」「陪我一会儿」\n'
+                            '· chat 生活化闲聊 —— 像朋友一样轻声聊日常；'
+                            '「随便陪我聊聊」「说点轻松的」\n'
+                            '· poetry 经典诗文 —— 朗读讲解古诗文；'
+                            '「给我读首诗」「来段古文」\n'
+                            '· trigger 触发音（通常说的 ASMR）—— 没有人声，只有声音本身'
+                            '（咀嚼、摩擦、揉捏、撕拉、切割、液体）；'
+                            '「想听咀嚼的声音」「来点撕纸声」。'
+                            '找具体物品的声音时用 category=trigger 再把物品写进 query。\n'
+                            '用户没指明类别（「来点助眠的」）就留空，不要猜 —— '
+                            '留空会从各类里随机挑',
             }.items()},
             'top_k': {'type': 'integer', 'minimum': 1, 'maximum': 10, 'default': 3},
             # `track_id` is no longer declared: by voice nobody searches and then
@@ -159,9 +282,21 @@ TOOLS = [{
         # they do not contend — a song must not make `speak` wait, nor vice versa.
         'x-resource': 'music',
         'x-completion': {
-            # Only `play` opens a session. next/previous continue the same one,
-            # so they must not register a second pending.
-            'actions': ['play'],
+            # Only the two play actions open a session. next/previous continue
+            # the same one, so they must not register a second pending. A
+            # two-minute bedtime story needs this exactly as a song does —
+            # omitting the sleep-audio action here would leave it with no
+            # pending at all, so `finish` would land mid-story.
+            #
+            # **The old spellings are listed too, and that is load-bearing.**
+            # agent-core matches the literal action string the caller used
+            # against this list (`_should_await_completion`,
+            # mcp_client.py:1278) and knows nothing about ALIAS_ACTIONS. So a
+            # stored canvas call still saying `play` would dispatch fine via the
+            # alias and register **no pending** — the track plays with no ACP
+            # session, `finish` can land mid-track, and nothing is logged.
+            'actions': ['play_music', 'play_sleep_audio',
+                        'play', 'play_asmr', 'play_by_id', 'play_by_genre'],
             # Holds the `music` channel for "is it playing", but nobody waits on
             # it: a four-minute track must not block `finish`, nor the agent's
             # next call of any kind (pendings_to_wait_for's own-ordering branch).
@@ -257,14 +392,25 @@ class PhanthyMusicPlugin:
         artist = track.get('artist') or {}
         duration = track.get('duration_s') or 0
         position = status.get('position_s', 0.0)
+        # Sleep-audio entries carry `genre: 'other'` and an empty artist, as the
+        # protocol shares one track shape between the two kinds. Reported
+        # verbatim, that is what makes a robot announce "为你播放 other 曲风的
+        # 歌" over a bedtime story, so those three fields are blanked here and
+        # `kind`/`category` are what the model is given to speak from instead.
+        asmr = track.get('kind') == 'asmr'
         return {
             'state': 'running' if node else 'idle',
             'playback_state': status.get('playback_state', 'idle'),
             'track': {
                 'id': track.get('id', ''), 'title': track.get('title', ''),
-                'artist': artist.get('name', '') if isinstance(artist, dict) else str(artist),
-                'genre': track.get('genre', ''), 'language': track.get('language', ''),
-                'vocal': track.get('vocal'), 'tags': track.get('tags') or [],
+                'kind': track.get('kind') or 'song',
+                'category': track.get('category') or '',
+                'artist': '' if asmr else (artist.get('name', '')
+                                           if isinstance(artist, dict) else str(artist)),
+                'genre': '' if asmr else track.get('genre', ''),
+                'language': track.get('language', ''),
+                'vocal': None if asmr else track.get('vocal'),
+                'tags': track.get('tags') or [],
                 'duration_s': duration, 'cover_url': track.get('cover_url', ''),
                 'lyrics_excerpt': track.get('lyrics_excerpt', ''),
                 'match_reason': track.get('match_reason', ''),
@@ -403,7 +549,28 @@ class PhanthyMusicPlugin:
         return tuple(e.get('value') for e in entries
                      if isinstance(e, dict) and e.get('value'))
 
-    def _coerce_filters(self, args):
+    @staticmethod
+    def _kind_of(action, args):
+        """Which half of the protocol this call belongs to.
+
+        A `category` on `play_music`/`search_music` means the model reached for
+        the song action and then described sleep audio, so route it rather than
+        honour the action name. The two directions are deliberately *not* symmetric:
+        dropping a `genre` from an ASMR call is harmless (the user wanted ASMR
+        and gets ASMR, minus a filter that means nothing there), but dropping a
+        `category` from a song call is not — `category` is the only signal of
+        sleep-audio intent in that request, so discarding it answers
+        「想听咀嚼的声音」with a song. Measured on Orin5: it did exactly that.
+
+        This also matches what the catalogue itself does with a bare
+        `category`, so client and server reach the same conclusion.
+        """
+        if action in ('play_sleep_audio', 'search_sleep_audio'):
+            return 'asmr'
+        category = args.get('category')
+        return 'asmr' if isinstance(category, str) and category.strip() else ''
+
+    def _coerce_filters(self, args, *, kind=''):
         """Keep a filter the catalogue knows; demote the rest to free text.
 
         An unrecognised `genre` used to be a hard `invalid_filter` error, so a
@@ -411,10 +578,20 @@ class PhanthyMusicPlugin:
         codes except by failing. The strict validation in `contracts` is
         deliberately untouched — the demotion happens here, above it — because a
         *declared* vocabulary violation is still a bug worth reporting.
+
+        `kind` selects which half of the protocol this call lives in, and the
+        parameter set is read from it rather than from `args`: that is what
+        stops a `genre` the model volunteered on an ASMR call from reaching the
+        catalogue and coming back 422. An unknown `category` is demoted the same
+        way an unknown `genre` is — "想听嚼冰块的声音" should get an answer, not
+        a vocabulary error.
         """
-        filters = {k: args[k] for k in FILTER_PARAMS if args.get(k) not in (None, '')}
+        params = SLEEP_FILTER_PARAMS if kind == 'asmr' else FILTER_PARAMS
+        filters = {k: args[k] for k in params if args.get(k) not in (None, '')}
+        if kind:
+            filters['kind'] = kind
         demoted = []
-        for field in ('genre', 'language', 'vocal'):
+        for field in (('category',) if kind == 'asmr' else ('genre', 'language', 'vocal')):
             raw = filters.get(field)
             if not isinstance(raw, str) or not raw.strip():
                 continue
@@ -550,29 +727,40 @@ class PhanthyMusicPlugin:
         try:
             if action == 'list_genres':
                 return self._vocabulary()
-            if action == 'search':
+            if action in ('search_music', 'search_sleep_audio'):
                 # No ROS node and no Speaker needed, and no network under the
                 # state lock — "is there any jazz" must work with the card idle.
+                kind = self._kind_of(action, args)
                 with self._lock:
                     catalogue = self._catalogue
-                filters, demoted = self._coerce_filters(args)
+                filters, demoted = self._coerce_filters(args, kind=kind)
                 reply = self._query(catalogue, **filters,
                                     **({'top_k': args['top_k']} if args.get('top_k') else {}))
-                return {**reply, **({'genre_as_query': demoted} if demoted else {}),
-                        'available_genres': list(self._known_values('genre'))}
-            if action == 'play':
-                track_id = args.get('track_id')
+                # Each reply names the vocabulary that applies to the kind it
+                # was asked about. Handing an ASMR reply a genre list is how a
+                # model learns to put `genre` on the next ASMR call.
+                field = 'category' if kind == 'asmr' else 'genre'
+                return {**reply, **({f'{field}_as_query': demoted} if demoted else {}),
+                        f'available_{"categories" if kind == "asmr" else "genres"}':
+                            list(self._known_values(field))}
+            if action in ('play_music', 'play_sleep_audio'):
+                kind = self._kind_of(action, args)
+                track_id = args.get('track_id') if kind != 'asmr' else None
                 if isinstance(track_id, str) and track_id.strip():
                     with self._lock:
                         self._station = {'criteria': {}}
                     return self._fetch_and_play(track_id=track_id.strip())
-                filters, demoted = self._coerce_filters(args)
+                filters, demoted = self._coerce_filters(args, kind=kind)
                 with self._lock:
                     # No criteria at all is a valid station: "放点歌" means
-                    # anything, and the catalogue picks.
+                    # anything, and the catalogue picks. The same is true of
+                    # "来点助眠的" — but the station still records `kind`, so a
+                    # later `next` stays on the side the user asked for instead
+                    # of drifting into songs.
                     self._station = {'criteria': filters}
                 reply = self._fetch_and_play(filters=filters)
-                return {**reply, **({'genre_as_query': demoted} if demoted else {})}
+                field = 'category' if kind == 'asmr' else 'genre'
+                return {**reply, **({f'{field}_as_query': demoted} if demoted else {})}
             if action == 'next':
                 with self._lock:
                     filters = dict(self._station.get('criteria') or {})

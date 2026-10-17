@@ -112,6 +112,69 @@ def test_ambiguous_short_name_is_refused_with_the_options(monkeypatch):
     assert f'mcp__{MCP_ID}__loco__stop' in out and f'mcp__{MCP_ID}__arm__stop' in out
 
 
+def test_a_stale_action_name_is_passed_to_the_card_to_resolve(monkeypatch):
+    """A **renamed** action, seen from here.
+
+    A card's declaration is re-read only when a browser pings
+    `/api/mcp/{id}/ping` — there is no backend timer — so after a card is
+    redeployed the model can hold the previous action names for an arbitrarily
+    long time. Every call it then makes keeps the tool segment but names an
+    action that is no longer in `split_map`, so nothing injected `action` and the
+    literal `<tool>__<old_action>` went out as the tool name.
+
+    Measured on Orin5 2026-10-17: `phanthy_music__play` after `play` became
+    `play_music`, answered `-32603 Tool phanthy_music__play does not handle
+    action None`. The card's own `ALIAS_ACTIONS` could have resolved `play`, but
+    it never saw it — aliases are undeclared, so they are absent from
+    `x-action-params` and therefore from `split_map`.
+
+    Splitting on the last `__` hands the decision to the card, the only party
+    that knows its own aliases.
+    """
+    reg = {MCP_ID: {
+        'url': 'http://x', 'tools': ['phanthy_music'],
+        'split_map': {
+            f'mcp__{MCP_ID}__phanthy_music__play_music':
+                {'tool': 'phanthy_music', 'action': 'play_music'},
+        },
+        'tool_meta': {}, 'schemas': {}, 'input_schemas': {}, 'tool_groups': {},
+    }}
+    monkeypatch.setattr(mcp_client, 'registry', reg)
+    seen = []
+    _stub_jrpc(monkeypatch, {'content': [{'type': 'text', 'text': '{"ok": 1}'}]}, seen)
+
+    out = asyncio.run(mcp_client.call_tool(
+        f'mcp__{MCP_ID}__phanthy_music__play', {'query': 'ASMR'}))
+
+    assert seen, 'the call must actually be dispatched'
+    assert seen[0]['name'] == 'phanthy_music', \
+        'previously sent name="phanthy_music__play", which no card has'
+    assert seen[0]['arguments']['action'] == 'play', \
+        'the old action must reach the card so its alias table can resolve it'
+    assert seen[0]['arguments']['query'] == 'ASMR'
+    assert '{"ok": 1}' in out
+
+
+def test_a_stale_name_for_an_unknown_tool_is_still_refused(monkeypatch):
+    """The recovery must not invent a tool. Only the *action* is in doubt."""
+    reg = {MCP_ID: {
+        'url': 'http://x', 'tools': ['phanthy_music'],
+        'split_map': {}, 'tool_meta': {}, 'schemas': {},
+        'input_schemas': {}, 'tool_groups': {},
+    }}
+    monkeypatch.setattr(mcp_client, 'registry', reg)
+    seen = []
+    _stub_jrpc(monkeypatch, {mcp_client.JRPC_ERROR_KEY:
+                             {'code': -32601, 'message': 'Unknown tool'}}, seen)
+
+    out = asyncio.run(mcp_client.call_tool(f'mcp__{MCP_ID}__no_such_card__play', {}))
+
+    # Dispatched unchanged — the card does not exist, so there is nothing to
+    # resolve and the driver's own "Unknown tool" is the honest answer.
+    assert seen[0]['name'] == 'no_such_card__play'
+    assert '-32601' in out
+
+
 def test_successful_call_is_unchanged(r1_registry, monkeypatch):
     seen = []
     _stub_jrpc(monkeypatch, {'content': [{'type': 'text',

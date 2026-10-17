@@ -8,7 +8,7 @@ import urllib.request
 from unittest.mock import Mock, patch
 
 from vision_stubs import _FakeExecutor
-from plugins.phanthy_music import PhanthyMusicPlugin, TOOLS
+from plugins.phanthy_music import ALIAS_ACTIONS, PhanthyMusicPlugin, TOOLS
 from plugins.music_catalog.contracts import SCHEMA
 
 
@@ -33,7 +33,7 @@ class CardTests(unittest.TestCase):
         return self.plugin.dispatch('phanthy_music', {'action': action, **args})
 
     def test_search_works_idle_and_never_starts_audio(self):
-        result = self.call('search', language='zh', vocal='female')
+        result = self.call('search_music', language='zh', vocal='female')
         self.assertTrue(result['tracks'])
         self.assertTrue(all(t['vocal'] == 'female' for t in result['tracks']))
         self.assertIsNone(self.plugin._node)
@@ -67,7 +67,7 @@ class CardTests(unittest.TestCase):
                  'reply_notice': 'Tell the user which conditions were relaxed.'}
         with patch.object(self.plugin._catalogue, 'execute', return_value=found) as query, \
              patch.object(self.plugin._node.player, 'play') as play:
-            result = self.call('play', genre='pop', language='zh',
+            result = self.call('play_music', genre='pop', language='zh',
                                artist='Fictional artist')
         self.assertEqual(query.call_args.kwargs['top_k'], 1)
         self.assertEqual(query.call_args.kwargs['genre'], 'pop')
@@ -93,7 +93,7 @@ class CardTests(unittest.TestCase):
         found = {'schema': SCHEMA, 'tracks': [track], 'relaxed': []}
         with patch.object(self.plugin._catalogue, 'execute', return_value=found), \
              patch.object(self.plugin._node.player, 'play'):
-            result = self.call('play', genre='pop')
+            result = self.call('play_music', genre='pop')
         self.assertEqual(result['expected_duration_s'], 214)
 
     def test_next_continues_the_same_session_rather_than_opening_another(self):
@@ -104,7 +104,7 @@ class CardTests(unittest.TestCase):
         found = {'schema': SCHEMA, 'tracks': [detail()['track']], 'relaxed': []}
         with patch.object(self.plugin._catalogue, 'execute', return_value=found), \
              patch.object(self.plugin._node.player, 'play'):
-            first = self.call('play', genre='pop')['action_id']
+            first = self.call('play_music', genre='pop')['action_id']
             second = self.call('next')
         self.assertEqual(second.get('action_id'), first)
 
@@ -114,7 +114,7 @@ class CardTests(unittest.TestCase):
         found = {'schema': SCHEMA, 'tracks': [detail()['track']], 'relaxed': []}
         with patch.object(self.plugin._catalogue, 'execute', return_value=found), \
              patch.object(self.plugin._node.player, 'play'):
-            self.call('play', genre='pop')
+            self.call('play_music', genre='pop')
         with patch.object(self.plugin._catalogue, 'execute',
                           return_value=found) as query, \
              patch.object(self.plugin._node.player, 'play'):
@@ -137,7 +137,7 @@ class CardTests(unittest.TestCase):
              patch.object(self.plugin._catalogue, 'execute',
                           return_value=found) as query, \
              patch.object(self.plugin._node.player, 'play'):
-            result = self.call('play', genre='city pop')
+            result = self.call('play_music', genre='city pop')
         self.assertNotIn('genre', query.call_args.kwargs)
         self.assertIn('city pop', query.call_args.kwargs['query'])
         self.assertEqual(result['genre_as_query'], ['city pop'])
@@ -156,7 +156,7 @@ class CardTests(unittest.TestCase):
                               return_value=result) as query, \
                  patch.object(self.plugin._node.player, 'play') as play, \
                  patch.object(self.plugin._node.player, 'interrupt') as interrupt:
-                reply = self.call('play', genre='jazz')
+                reply = self.call('play_music', genre='jazz')
                 self.assertIn('error', reply)
                 self.assertIsInstance(reply['error'], dict)
                 query.assert_called()
@@ -166,8 +166,8 @@ class CardTests(unittest.TestCase):
                 play.assert_not_called(); interrupt.assert_not_called()
 
     def test_network_request_never_blocks_controls_or_resurrects_cancelled_play(self):
-        for action, arguments in [('play', {'track_id': 'fictional-1'}),
-                                  ('play', {'genre': 'pop'})]:
+        for action, arguments in [('play_music', {'track_id': 'fictional-1'}),
+                                  ('play_music', {'genre': 'pop'})]:
             for control in ('stop_music', 'stop', 'config', 'replacement'):
                 with self.subTest(action=action, control=control):
                     self.call('start')
@@ -189,7 +189,7 @@ class CardTests(unittest.TestCase):
                             # audio_mixer，这里改用同样不碰网络的只读动作。
                             self.call('now_playing'); self.call('list_genres')
                             if control == 'replacement':
-                                replacement = self.call('play', track_id='fictional-2')
+                                replacement = self.call('play_music', track_id='fictional-2')
                                 self.assertEqual(replacement['error']['code'], 'busy')
                             elif control == 'config':
                                 # timeout_ms 不再是设置项；换曲库才是会让在途请求作废的
@@ -268,9 +268,221 @@ class CardTests(unittest.TestCase):
         self.call('start')
         with patch.object(self.plugin._catalogue, 'execute', return_value={'error': {'code': 'unavailable'}}), \
              patch.object(self.plugin._node.player, 'interrupt') as interrupt:
-            self.assertEqual(self.call('search')['error']['code'], 'unavailable')
+            self.assertEqual(self.call('search_music')['error']['code'], 'unavailable')
             self.assertEqual(self.call('status')['state'], 'running')
             interrupt.assert_not_called()
+
+
+class AsmrCardTests(unittest.TestCase):
+    """The ASMR half of the card: separate actions, one shared station."""
+
+    def setUp(self):
+        fixed = patch.multiple('plugins.phanthy_music',
+                               CATALOGUE_ENDPOINT='https://catalogue.example',
+                               CATALOGUE_API_KEY='fake-internal-key')
+        fixed.start()
+        self.addCleanup(fixed.stop)
+        self.plugin = PhanthyMusicPlugin({'catalogue_type': 'mock'}, _FakeExecutor())
+
+    def tearDown(self):
+        self.plugin.stop()
+
+    def call(self, action, **args):
+        return self.plugin.dispatch('phanthy_music', {'action': action, **args})
+
+    def found(self, **overrides):
+        track = {'id': 'fictional-asmr-1', 'kind': 'asmr', 'category': 'bedtime_story',
+                 'title': '睡前故事 第 1 期', 'genre': 'other', 'language': 'zh',
+                 'vocal': None, 'artist': {'id': None, 'name': ''}, 'duration_s': 150,
+                 'audio': {'url': 'https://audio.example/story.wav', 'format': 'wav',
+                           'expires_at': None},
+                 'usage': {'scope': 'personal_playback', 'attribution': '虚构样例'},
+                 **overrides}
+        return {'schema': SCHEMA, 'tracks': [track], 'relaxed': []}
+
+    def test_search_asmr_asks_the_catalogue_for_asmr_only(self):
+        result = self.call('search_sleep_audio', category='bedtime_story')
+        self.assertTrue(result['tracks'])
+        self.assertTrue(all(t['kind'] == 'asmr' for t in result['tracks']))
+        self.assertTrue(all(t['category'] == 'bedtime_story' for t in result['tracks']))
+        self.assertIn('bedtime_story', result['available_categories'])
+        self.assertIsNone(self.plugin._node)
+
+    def test_play_asmr_forwards_the_wav_and_opens_a_session(self):
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play') as play:
+            result = self.call('play_sleep_audio', category='bedtime_story', query='星空')
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+        self.assertEqual(query.call_args.kwargs['category'], 'bedtime_story')
+        self.assertEqual(play.call_args.args[:3],
+                         ('https://audio.example/story.wav', 'wav', 'fictional-asmr-1'))
+        # ASMR is as much a playback session as a song is: a two-minute story
+        # left without a pending would have `finish` land in the middle of it.
+        self.assertTrue(result['action_id'].startswith('music-'))
+        self.assertEqual(result['expected_duration_s'], 150)
+
+    def test_the_asmr_actions_cannot_express_a_song_filter(self):
+        """The parameter set comes from the action, not from `args`. That is
+        what stops a `genre` the model volunteered from reaching the catalogue
+        and returning 422 — the failure mode the split exists to remove.
+        """
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            self.call('play_sleep_audio', category='meditation', genre='pop',
+                      vocal='female', artist='史叶茜', language='zh')
+        for field in ('genre', 'vocal', 'artist', 'language'):
+            self.assertNotIn(field, query.call_args.kwargs)
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+
+    def test_next_stays_on_the_side_the_user_asked_for(self):
+        """A station remembers `kind`, so "换一个" after an ASMR request does
+        not drift into songs."""
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()), \
+             patch.object(self.plugin._node.player, 'play'):
+            first = self.call('play_sleep_audio', category='chat')['action_id']
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found(id='fictional-asmr-2')) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            following = self.call('next')
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+        self.assertEqual(query.call_args.kwargs['category'], 'chat')
+        self.assertIn('fictional-asmr-1', query.call_args.kwargs['exclude_ids'])
+        # One session across the skip, exactly as for songs.
+        self.assertEqual(following['action_id'], first)
+
+    def test_no_category_is_a_valid_request(self):
+        """「来点助眠的」names no category, and the catalogue picks from all of
+        them. The model must not have to guess one."""
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            self.assertFalse(self.call('play_sleep_audio').get('error'))
+        # `kind` and nothing else: no category guessed on the model's behalf.
+        self.assertEqual(query.call_args.kwargs['kind'], 'asmr')
+        for field in ('category', 'query', 'tags'):
+            self.assertNotIn(field, query.call_args.kwargs)
+
+    def test_an_unknown_category_becomes_free_text_rather_than_an_error(self):
+        """Same rule as `genre`: 「想听嚼冰块的声音」should get an answer, not a
+        vocabulary error."""
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()) as query, \
+             patch.object(self.plugin._node.player, 'play'):
+            result = self.call('play_sleep_audio', category='ice_chewing')
+        self.assertNotIn('category', query.call_args.kwargs)
+        self.assertIn('ice_chewing', query.call_args.kwargs['query'])
+        self.assertEqual(result['category_as_query'], ['ice_chewing'])
+
+    def test_now_playing_does_not_describe_an_asmr_entry_as_a_song(self):
+        """The protocol shares one track shape, so an ASMR entry arrives with
+        `genre: 'other'` and an empty artist. Reported verbatim that is what
+        makes a robot announce 「为你播放 other 曲风的歌」over a bedtime story.
+        """
+        self.call('start')
+        with patch.object(self.plugin._catalogue, 'execute',
+                          return_value=self.found()), \
+             patch.object(self.plugin._node.player, 'play'):
+            self.call('play_sleep_audio', category='bedtime_story')
+        track = self.call('now_playing')['track']
+        self.assertEqual(track['kind'], 'asmr')
+        self.assertEqual(track['category'], 'bedtime_story')
+        self.assertEqual(track['title'], '睡前故事 第 1 期')
+        self.assertEqual((track['genre'], track['artist'], track['vocal']), ('', '', None))
+
+    def test_a_category_on_the_song_action_routes_to_asmr(self):
+        """Measured on Orin5: `search(category='trigger')` returned songs.
+
+        Dropping an unknown field is right on the ASMR side — the user wanted
+        ASMR and gets ASMR, minus a filter that means nothing there. It is wrong
+        here, because `category` is the *only* signal of ASMR intent in a song
+        request, so discarding it answers 「想听咀嚼的声音」with a song. The
+        catalogue infers ASMR from a bare `category` too, so this keeps client
+        and server at the same conclusion.
+        """
+        result = self.call('search_music', category='trigger', top_k=2)
+        self.assertTrue(result['tracks'])
+        self.assertTrue(all(t['kind'] == 'asmr' for t in result['tracks']))
+        self.assertTrue(all(t['category'] == 'trigger' for t in result['tracks']))
+        self.assertIn('available_categories', result)
+        # And a song request that says nothing about ASMR stays a song request.
+        songs = self.call('search_music', genre='pop', top_k=2)
+        self.assertTrue(all(t['kind'] == 'song' for t in songs['tracks']))
+
+    def test_the_old_action_names_still_dispatch(self):
+        """`play`/`search` are what this card was called before the catalogue
+        grew a second kind of content, and `play_asmr`/`search_asmr` shipped
+        briefly under the protocol's own word for that kind. Stored canvas exec
+        args, saved benchmark cases and x-hooks bindings written against any of
+        them must keep working — and they are undeclared, so the model is only
+        ever offered the current names.
+        """
+        declared = self.plugin.get_tools()[0]['inputSchema']['properties']['action']['enum']
+        for old_name, new_name in (('play_asmr', 'play_sleep_audio'),
+                                   ('search_asmr', 'search_sleep_audio'),
+                                   ('search', 'search_music')):
+            with self.subTest(old=old_name):
+                self.assertNotIn(old_name, declared)
+                self.assertEqual(ALIAS_ACTIONS[old_name], new_name)
+        # Dispatch, not just the table: `search_asmr` must still reach the ASMR
+        # half rather than falling through to "Unknown action".
+        result = self.call('search_asmr', category='bedtime_story', top_k=1)
+        self.assertTrue(all(t['kind'] == 'asmr' for t in result['tracks']))
+        self.assertTrue(self.call('search', genre='pop', top_k=1)['tracks'])
+
+    def test_every_renamed_play_alias_still_registers_a_pending(self):
+        """agent-core matches the literal action string against
+        `x-completion.actions` and knows nothing about ALIAS_ACTIONS, so an
+        alias missing from that list dispatches fine and registers **no**
+        pending — the track plays with no ACP session and nothing is logged.
+        """
+        completion = self.plugin.get_tools()[0]['inputSchema']['x-completion']
+        for old_name, new_name in ALIAS_ACTIONS.items():
+            if new_name in ('play_music', 'play_sleep_audio'):
+                with self.subTest(alias=old_name):
+                    self.assertIn(old_name, completion['actions'])
+
+    def test_list_genres_publishes_the_category_codes(self):
+        vocabulary = self.call('list_genres')
+        self.assertIn('bedtime_story',
+                      [x['value'] for x in vocabulary['asmr_categories']])
+        self.assertEqual([x['value'] for x in vocabulary['kinds']], ['song', 'asmr'])
+
+    def test_the_declared_asmr_actions_describe_where_sleep_intent_goes(self):
+        """The routing lives in the descriptions, so pin the words that carry
+        it: a model only reaches `play_asmr` if the card says so.
+        """
+        schema = self.plugin.get_tools()[0]['inputSchema']
+        params = schema['x-action-params']
+        self.assertEqual(set(params['play_sleep_audio']['params']),
+                         {'query', 'category', 'tags'})
+        text = params['play_sleep_audio']['description']
+        for phrase in ('助眠', '哄睡', '睡前故事', '冥想', '白噪音', '咀嚼'):
+            self.assertIn(phrase, text)
+        # Every category code, with its gloss, on the *action* — not only on the
+        # `category` parameter and not only in `list_genres`. A model that has
+        # to make a round trip to learn the six values will either make it or
+        # guess, and guessing is an `invalid_filter`.
+        for code in ('bedtime_story', 'meditation', 'companion', 'chat',
+                     'poetry', 'trigger'):
+            self.assertIn(code, text)
+            self.assertIn(code, schema['properties']['category']['description'])
+        self.assertIn('不用先调 list_genres', text)
+        # No category is the face of the set. Bedtime story is the most quotable
+        # of the six and trigger is what the protocol's own `kind: 'asmr'` label
+        # points at, so there are two ways to drift into answering everything
+        # with one category — the description has to refuse both by name.
+        self.assertIn('不要默认填 bedtime_story', text)
+        self.assertIn('不要默认填 trigger', text)
+        # And `play_music` must point sleep intent away from itself.
+        self.assertIn('play_sleep_audio', params['play_music']['description'])
 
 
 class MCPTests(unittest.TestCase):
@@ -301,7 +513,7 @@ class MCPTests(unittest.TestCase):
                 self.assertEqual([t['name'] for t in rpc('tools/list', {})['tools']], ['phanthy_music'])
                 self.assertIsNone(bundle.dispatch('phanthy_music_config', {'volume': 10}))
                 self.assertIsNone(bundle.dispatch('phanthy_music_start', {}))
-                result = rpc('tools/call', {'name': 'phanthy_music', 'arguments': {'action': 'search', 'query': 'fake-private-value'}})
+                result = rpc('tools/call', {'name': 'phanthy_music', 'arguments': {'action': 'search_music', 'query': 'fake-private-value'}})
                 self.assertTrue(json.loads(result['content'][0]['text'])['tracks'])
                 result = rpc('tools/call', {'name': 'phanthy_music', 'arguments': {'action': 'config', 'api_key': 'fake-private-value'}})
                 self.assertIn('error', json.loads(result['content'][0]['text']))

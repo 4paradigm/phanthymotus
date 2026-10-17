@@ -91,12 +91,20 @@ class MusicService:
                 'genres': deepcopy(filters.get('genre') or []),
                 'languages': deepcopy(filters.get('language') or []),
                 'vocals': deepcopy(filters.get('vocal') or []),
+                # The two content kinds and the ASMR categories, from the same
+                # cached capabilities call. Without these the only way to learn
+                # a category code was to fail a search and read `allowed`.
+                'kinds': deepcopy(filters.get('kind') or []),
+                'asmr_categories': deepcopy(filters.get('category') or []),
                 'tag_groups': deepcopy(filters.get('tags') or {}),
                 'max_top_k': (caps.get('limits') or {}).get('max_top_k', 10),
                 'provider': caps.get('provider', ''),
+                'asmr_supported': 'asmr' in (caps.get('features') or []),
                 'source': 'fallback' if fallback else 'catalogue',
-                'reply_notice': '曲风/语种/人声只能用这里列出的 value；'
-                                '用户说的词不在表里时，放进 query 当自由描述。',
+                'reply_notice': '曲风/语种/人声/ASMR 类别只能用这里列出的 value；'
+                                '用户说的词不在表里时，放进 query 当自由描述。'
+                                'asmr_categories 只用于 ASMR，曲风/人声/歌手只用于歌曲，'
+                                '混用会被拒绝。',
             }
         finally:
             self._gate.release()
@@ -126,14 +134,27 @@ class MusicService:
                 request = search_request(caps=caps, **kwargs)
                 data = search_result(provider.search(request, **context), request, mock=self.kind == 'mock')
             check_cancel(cancel)
+            def values(field):
+                # Values only, no labels: cheap, and enough for a model to
+                # notice it used a code the catalogue does not have.
+                return [e.get('value') for e in (caps['filters'].get(field) or [])
+                        if isinstance(e, dict) and e.get('value')]
+            # One vocabulary per request, not both: the codes that matter to an
+            # ASMR lookup are the categories, and offering a genre list beside
+            # them is what invites the 422 this split exists to avoid.
+            # Read off the result as well as the request: a `track_id` lookup
+            # (which is how `previous` works) carries no filters at all, and an
+            # ASMR entry fetched that way must still not be described as a song.
+            found = [data['track']] if isinstance(data.get('track'), dict) else data.get('tracks') or []
+            asmr = (kwargs.get('kind') == 'asmr' or bool(kwargs.get('category'))
+                    or any(t.get('kind') == 'asmr' for t in found if isinstance(t, dict)))
             return {**data, 'available_tags': deepcopy(caps['filters'].get('tags', {})),
-                    # Values only, no labels: cheap, and enough for a model to
-                    # notice it used a code the catalogue does not have.
-                    'available_genres': [e.get('value') for e
-                                         in (caps['filters'].get('genre') or [])
-                                         if isinstance(e, dict) and e.get('value')],
+                    **({'available_categories': values('category')} if asmr
+                       else {'available_genres': values('genre')}),
                     'usage_notice': 'personal_playback 仅限当次播放；不得保存音频、上传聊天附件或二次分发。',
-                    'reply_notice': 'relaxed 非空须如实说明放宽条件；空结果不能编造歌曲；vocal 为 null 表示人声未知。'}
+                    'reply_notice': 'relaxed 非空须如实说明放宽条件；空结果不能编造歌曲或 ASMR；'
+                                    + ('ASMR 没有歌手和曲风，不要说成「某某的歌」。' if asmr
+                                       else 'vocal 为 null 表示人声未知。')}
         except MusicError as exc:
             return exc.result()
         finally:

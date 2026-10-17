@@ -200,10 +200,11 @@ class PluginTests(unittest.TestCase):
         # and must not make each other wait.
         self.assertEqual(schema['x-resource'], 'music')
         self.assertEqual(set(schema['x-action-params']),
-                         {'list_genres', 'play', 'next', 'previous', 'pause',
-                          'resume', 'stop_music', 'now_playing', 'set_volume',
-                          'set_autoplay', 'search'})
-        jsonschema.validate({'action': 'play', 'genre': 'pop'}, schema)
+                         {'list_genres', 'play_music', 'play_sleep_audio', 'next', 'previous',
+                          'pause', 'resume', 'stop_music', 'now_playing',
+                          'set_volume', 'set_autoplay', 'search_music', 'search_sleep_audio'})
+        jsonschema.validate({'action': 'play_music', 'genre': 'pop'}, schema)
+        jsonschema.validate({'action': 'play_sleep_audio', 'category': 'bedtime_story'}, schema)
         jsonschema.validate({'action': 'next'}, schema)
         jsonschema.validate({'action': 'list_genres'}, schema)
 
@@ -217,18 +218,18 @@ class PluginTests(unittest.TestCase):
         model can get wrong for no benefit.
         """
         params = self.plugin.get_tools()[0]['inputSchema']['x-action-params']
-        self.assertEqual(set(params['play']['params']),
+        self.assertEqual(set(params['play_music']['params']),
                          {'query', 'genre', 'language', 'artist', 'tags'})
         # `tags` in particular: the catalogue's scene vocabulary is
         # 驾驶/通勤/工作/夜晚, so "放点适合开车的歌" has somewhere to land. query
         # cannot substitute for it — query is relaxable, tags are not.
-        self.assertIn('tags', params['play']['params'])
+        self.assertIn('tags', params['play_music']['params'])
 
     def test_search_keeps_the_precision_filters_play_dropped(self):
         """Nothing is lost, it just moves: search stays the precise path."""
         params = self.plugin.get_tools()[0]['inputSchema']['x-action-params']
-        self.assertIn('vocal', params['search']['params'])
-        self.assertIn('top_k', params['search']['params'])
+        self.assertIn('vocal', params['search_music']['params'])
+        self.assertIn('top_k', params['search_music']['params'])
 
     def test_the_dropped_filters_are_gone_from_the_schema_entirely(self):
         """Declared nowhere means the model never sees them, not even as a
@@ -295,7 +296,23 @@ class PluginTests(unittest.TestCase):
         or suppress anything — and its end is a receipt, not a message.
         """
         completion = self.plugin.get_tools()[0]['inputSchema']['x-completion']
-        self.assertEqual(completion['actions'], ['play'])
+        # Both play actions open a session. A two-minute bedtime story needs a
+        # pending exactly as a song does; omitting `play_sleep_audio` would let
+        # `finish` land mid-story.
+        #
+        # The aliases are listed too, and that is load-bearing rather than
+        # tidiness: agent-core matches the literal action string the caller used
+        # against this list (`_should_await_completion`) and knows nothing about
+        # ALIAS_ACTIONS. A stored canvas call still saying `play` would dispatch
+        # via the alias and register **no pending** — the track plays with no
+        # ACP session, `finish` can land mid-track, and nothing is logged.
+        self.assertEqual(completion['actions'],
+                         ['play_music', 'play_sleep_audio',
+                          'play', 'play_asmr', 'play_by_id', 'play_by_genre'])
+        from plugins.phanthy_music import ALIAS_ACTIONS
+        for old_name, new_name in ALIAS_ACTIONS.items():
+            if new_name in ('play_music', 'play_sleep_audio'):
+                self.assertIn(old_name, completion['actions'])
         self.assertTrue(completion['background'])
         self.assertTrue(completion['silent_completion'])
         # 0 = no deadline: a track has no `text` to estimate from, and a static
@@ -363,7 +380,7 @@ class PluginTests(unittest.TestCase):
         caller could not read `error.code` without checking the type first.
         """
         reply = self.plugin.dispatch('phanthy_music',
-                                     {'action': 'play', 'track_id': 'fictional-1'})
+                                     {'action': 'play_music', 'track_id': 'fictional-1'})
         self.assertIsInstance(reply['error'], dict)
         self.assertIn('code', reply['error'])
         self.plugin.dispatch('phanthy_music', {'action': 'start'})
