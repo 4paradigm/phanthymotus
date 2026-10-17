@@ -1768,6 +1768,7 @@ async def config_test_vad_audio(
 class ResetRequest(BaseModel):
     restart_services: bool = False
     chat_history: bool = False
+    tasks: bool = False
     system_prompt: bool = False
     identity: bool = False
     memory: bool = False
@@ -1792,6 +1793,31 @@ async def reset_config(req: ResetRequest):
         event.llm._session_id = None
         event.llm._current_turn = []
         reset_items.append('chat_history')
+
+    if req.tasks:
+        # A task outlives a conversation on purpose: `load_all()` restores every
+        # active one at startup and `__aenter__` re-registers its cron check. So
+        # clearing history alone leaves the agent still working an agenda from a
+        # conversation the operator deleted — it will keep announcing progress on
+        # a goal with no visible origin.
+        #
+        # Order matters: cancel the cron jobs *first*. `task_store.clear_all()`
+        # cannot do it (it does not import `scheduler`, and the `task:<id>` job
+        # name is `event/task.py`'s convention), and a job left behind keeps
+        # firing 「任务定时检查 [id]」for a task that no longer exists — which
+        # would wake the agent with a goal it can no longer look up.
+        import sys
+        import task_store
+        import event.task  # ensure it is imported/registered in sys.modules
+        # `event.task` the *attribute* is a Tools() instance, rebound by
+        # event/__init__.py, which shadows the submodule where
+        # `_unregister_check` lives — same trap as `event.skills` below.
+        task_mod = sys.modules['event.task']
+        for task in task_store.active_tasks():
+            task_mod._unregister_check(task.id)
+        cleared = task_store.clear_all()
+        print(f'[reset] cleared {cleared} task(s) and their scheduled checks')
+        reset_items.append('tasks')
 
     if req.system_prompt:
         src = defaults_dir / 'prompt_system.md'
