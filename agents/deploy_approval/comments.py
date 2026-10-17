@@ -551,9 +551,11 @@ def testing(
         '`/record_test result=pass|fail [summary="..."]`',
         "",
         "### Current Deployment",
-        "",
-        "Deployment validation is in progress; see recorded deployment results below.",
     ]
+    if deployments:
+        lines.extend(["", _deployment_table(deployments, components, machine_groups)])
+    else:
+        lines.extend(["", "No deployment record is available for this round yet."])
     if case_result:
         lines.extend([
             "",
@@ -565,8 +567,6 @@ def testing(
         last_lifecycle_event_line(last_lifecycle_event),
     ])
     lines.extend(_attempt_lines(attempt))
-    if deployments:
-        lines.extend(["### Deployment records", _deployment_table(deployments, components, machine_groups)])
     return _lifecycle_body(lines)
 
 
@@ -1042,6 +1042,10 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
 
     lines = ["<!-- deploy-approval-evidence:start -->", "### Current round evidence", ""]
     lines.extend(render_round((head, current_round), groups[(head, current_round)]))
+    if state.get("evidence_enabled") is True and state.get("browser_upload_ready") is not True:
+        readiness = (state.get("evidence_readiness") or {}).get("status")
+        if readiness == "PUBLIC_INGRESS_PENDING":
+            lines.extend(["", "**Evidence upload:** `PUBLIC_INGRESS_PENDING` — waiting for a trusted HTTPS entry point."])
     if (base and state.get("evidence_enabled") is True and state.get("status") == "testing"
             and state.get("pr_state", "open") == "open" and not state.get("merged")):
         # The signed Summary capability is bound to this trusted HEAD/round.

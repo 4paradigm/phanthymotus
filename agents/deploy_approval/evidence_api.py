@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -135,7 +134,7 @@ async def _payload(request, action, **path):
 def _public_attachment(row):
     allowed = {'attachment_id', 'filename', 'size', 'sha256', 'note', 'round_id', 'head_sha',
                'status', 'created_at', 'updated_at', 'completed_at', 'deleted_at', 'replaces_id',
-               'actor', 'actor_login', 'submitter', 'download_capability'}
+               'actor', 'actor_login', 'actor_verified', 'submitter', 'download_capability'}
     result = {k: v for k, v in row.items() if k in allowed}
     if row.get('upload_ref'):
         result['upload_id'] = row['upload_ref']
@@ -170,7 +169,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         resource = 'attachment:' + path.get('attachment_id', '')
     elif action == 'log_download':
         resource = 'log:' + path.get('round_id', '')
-    principal, csrf = await evidence_auth.verified_principal(
+    principal, _ = await evidence_auth.verified_principal(
         request, canonical, pr, write=request.method in ('POST', 'DELETE'),
         purpose=purpose, resource=resource)
     # This read is deliberately before dispatch, including historic downloads;
@@ -274,9 +273,12 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         result['summary_updated'] = await _summary_updated(request, canonical, pr, result)
         result = {**result, 'authenticated': True, 'enabled': True,
                   'github_user_authenticated': bool(principal.get('github_user_authenticated')),
+                  'actor_verified': principal.get('actor_verified') is True,
+                  'readiness': evidence_auth.readiness(
+                      request.app.state.config, request.app.state.evidence_service),
                   'attachments': attachments, 'repo': canonical, 'pr_number': pr,
                   'max_file_bytes': request.app.state.config.evidence_max_file_bytes,
-                  'part_bytes': request.app.state.config.evidence_part_bytes, 'csrf_token': csrf}
+                  'part_bytes': request.app.state.config.evidence_part_bytes}
         if not {'head_sha', 'round_id', 'status', 'can_write', 'attachments', 'archive_links'} <= result.keys():
             raise HTTPException(503, detail='incomplete_evidence_context')
     for name in ('object_key', 'actor_id', 'actor_login', 'deleted_by', 'records', 'request_sha256'):
@@ -359,31 +361,9 @@ async def page(request: Request, owner: str, repo: str, pr: int):
     from . import evidence_ui
     page_html = evidence_ui.render_upload_page(
         result['repo'], pr, result['head_sha'], result['round_id'])
-    if (not result.get('github_user_authenticated')
-            and evidence_auth.oauth_enabled(request.app.state.config)):
-        page_owner, page_repo = canonical.split('/', 1)
-        return_to = f'/evidence/{page_owner}/{page_repo}/pulls/{pr}'
-        login_url = '/evidence/auth/login?' + urlencode({
-            'repo': canonical, 'pr': pr, 'return_to': return_to})
-        page_html = page_html.replace('</body>',
-            '<p><a id="evidence-github-login" href="' + login_url + '">Connect GitHub to upload or manage evidence</a></p></body>')
     return HTMLResponse(page_html,
         headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
                  'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY'})
-
-
-@router.get('/evidence/auth/login')
-async def evidence_oauth_login(request: Request, repo: str, pr: int, return_to: str):
-    parts = repo.split('/', 1)
-    if len(parts) != 2:
-        raise HTTPException(400, detail='invalid_repository')
-    canonical = _repo(parts[0], parts[1], pr)
-    return evidence_auth.oauth_login(request, canonical, pr, return_to)
-
-
-@router.get('/evidence/auth/callback')
-async def evidence_oauth_callback(request: Request):
-    return await evidence_auth.oauth_callback(request)
 
 
 @router.get('/evidence/assets/app.js')

@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import re
+import time
 from pathlib import PurePosixPath
 
 from .evidence_auth import DOWNLOAD_PURPOSE, PURPOSE
@@ -23,6 +24,7 @@ class EvidenceService:
     def __init__(self, *, config, github, proxy, policy, controller, store):
         self.config, self.github, self.proxy = config, github, proxy
         self.policy, self.controller, self.store = policy, controller, store
+        self._used_auth_nonces = {}
         controller.evidence_service = self
 
     async def _authorize(self, repo, principal, state, *, check_machine=True, pr=None):
@@ -37,16 +39,15 @@ class EvidenceService:
             raise EvidenceError('identity_required', 401)
         if not self.config.auth_valid or repo not in self.config.active_repos:
             raise EvidenceError('app_access_revoked', 403)
-        if not principal.get('github_user_authenticated'):
+        if not (principal.get('actor_verified') is True
+                and principal.get('github_user_authenticated') is True):
             return False
         # Browser write identity is accepted only after the HTTP layer has
         # revalidated GitHub /user for this request. Authorization remains
         # tied to the live PR author, deployed machine owners, or repo ACL.
         author = (pr or {}).get('user', {})
         if (isinstance(author, dict) and
-                ((type(author.get('id')) is int and author.get('id') == uid)
-                 or (isinstance(author.get('login'), str)
-                     and author['login'].lower() == login.lower()))):
+                type(author.get('id')) is int and author.get('id') == uid):
             return True
         deployed = {d.get('machine') for d in state.get('deployments', [])
                     if isinstance(d, dict) and d.get('phase') == 'deployed'}
@@ -60,6 +61,39 @@ class EvidenceService:
         except Exception:
             permission = ''
         return self.policy.collaborator_can_approve(permission)
+
+    @staticmethod
+    def _validate_proof_context(principal, repo, pr_number, head_sha, round_id):
+        """Require the HTTP layer's comment-proof identity to match this write."""
+        proof = principal.get('evidence_auth')
+        if (principal.get('actor_verified') is not True or not isinstance(proof, dict)
+                or proof.get('repo') != repo or proof.get('pr_number') != pr_number
+                or type(proof.get('comment_id')) is not int or proof['comment_id'] <= 0
+                or proof.get('head_sha') != head_sha or proof.get('round_id') != round_id
+                or not re.fullmatch(r'[0-9a-f]{64}', str(proof.get('proof', '')))
+                or not re.fullmatch(r'[0-9a-f]{64}', str(proof.get('nonce', '')))):
+            raise EvidenceError('evidence_authorization_invalid', 403)
+
+    async def _consume_auth_nonce(self, principal):
+        """Consume request replay protection in process memory, not GitHub comments.
+
+        Business mutations remain idempotent through their durable operation IDs;
+        short-lived per-request nonces must not create permanent records for every
+        signed multipart part URL.
+        """
+        proof = principal['evidence_auth']
+        nonce_key = hashlib.sha256(
+            f"{principal['id']}:{proof['nonce']}".encode('utf-8')
+        ).hexdigest()
+        now = time.monotonic()
+        for key, expires in list(self._used_auth_nonces.items()):
+            if expires <= now:
+                self._used_auth_nonces.pop(key, None)
+        if nonce_key in self._used_auth_nonces:
+            raise EvidenceError('evidence_request_replayed', 409)
+        if len(self._used_auth_nonces) >= 100_000:
+            raise EvidenceError('evidence_request_replay_cache_full', 503)
+        self._used_auth_nonces[nonce_key] = now + 24 * 60 * 60
 
     async def _save(self, repo, pr_number, kind, operation, phase):
         operation['updated_at'] = utc_now()
@@ -93,7 +127,6 @@ class EvidenceService:
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
                 raise EvidenceError('state_unavailable', 409)
-            initially_authorized = await self._authorize(repo, principal, state, check_machine=False, pr=pr)
             if pr.get('state') != 'open' or pr.get('merged') or pr.get('draft'):
                 raise EvidenceError('pr_closed', 409)
             records = await self.proxy.read_evidence_records(repo, pr_number)
@@ -134,15 +167,18 @@ class EvidenceService:
                 if not archives:
                     raise EvidenceError('round_not_found', 404)
                 selected = archives[-1]['snapshot']
-            await self._authorize(repo, principal, selected, pr=pr)
-            write = action in {'init', 'resume', 'sign_part', 'complete', 'note', 'delete'}
             authorized_writer = await self._authorize(repo, principal, selected, pr=pr)
+            write = action in {'init', 'resume', 'sign_part', 'complete', 'note', 'delete'}
             if write and not authorized_writer:
                 raise EvidenceError('evidence_write_permission_required', 403)
             expected_head = payload.get('head_sha', selected.get('head_sha'))
             validate_context(pr, selected, expected_head, round_id, write=write)
             if write and round_id != active_round:
                 raise EvidenceError('round_changed', 409)
+            if write:
+                self._validate_proof_context(
+                    principal, repo, pr_number, expected_head, round_id,
+                )
             capability = principal.get('capability', {})
             resource = (('attachment:' + str(payload.get('attachment_id', '')))
                         if action == 'download' else ('log:' + round_id)
@@ -182,16 +218,19 @@ class EvidenceService:
             if action == 'context':
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'status': selected['status'], 'authenticated': True, 'enabled': True,
-                        'github_user_authenticated': bool(principal.get('github_user_authenticated')),
-                        'can_write': bool(initially_authorized and selected.get('status') == 'testing'
+                        'github_user_authenticated': bool(
+                            principal.get('actor_verified') is True
+                            and principal.get('github_user_authenticated') is True),
+                        'can_write': bool(authorized_writer and selected.get('status') == 'testing'
                                           and selected.get('head_sha') == pr.get('head', {}).get('sha')),
                         'attachments': [r for r in latest.values() if r['round_id'] == round_id],
                         'rounds': [{**r['data']['snapshot'], 'round_id': r['data']['round_id'],
                                     'attachments': [a for a in latest.values() if a['round_id'] == r['data']['round_id']]}
                                    for r in records if r['kind'] == 'round'],
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
-                                       for r in operations.values() if r['round_id'] == round_id
-                                       and r['actor_id'] == principal['id']], 'records': [r for r in latest.values() if r['round_id'] == round_id],
+                                       for r in operations.values() if not r.get('auth_nonce_marker')
+                                       and r.get('round_id') == round_id
+                                       and r.get('actor_id') == principal['id']], 'records': [r for r in latest.values() if r['round_id'] == round_id],
                         'archive_links': [{'round_id': r['data']['round_id'], 'url': r['url']} for r in records if r['kind'] == 'round']}
             if action == 'status':
                 if source.get('head_sha') != expected_head or source.get('round_id') != round_id:
@@ -295,11 +334,18 @@ class EvidenceService:
                 value['parts'] = value['uploaded_parts']
                 return value
 
+            nonce_consumed = False
+
             async def current():
+                nonlocal nonce_consumed
                 fresh_pr = await self.proxy.get_pr(repo, pr_number)
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
                 validate_context(fresh_pr, fresh_state, expected_head, round_id, write=True)
-                await self._authorize(repo, principal, fresh_state, pr=fresh_pr)
+                if not await self._authorize(repo, principal, fresh_state, pr=fresh_pr):
+                    raise EvidenceError('evidence_write_permission_required', 403)
+                if not nonce_consumed:
+                    await self._consume_auth_nonce(principal)
+                    nonce_consumed = True
 
             if action == 'resume':
                 if source.get('actor_id') != principal['id']:
@@ -319,7 +365,9 @@ class EvidenceService:
                 result = await self._store('resume', source, {})
                 try:
                     await current()
-                except ValueError:
+                except ValueError as exc:
+                    if isinstance(exc, EvidenceError) and exc.code not in {'round_changed', 'context_not_writable'}:
+                        raise
                     fresh_pr = await self.proxy.get_pr(repo, pr_number)
                     if fresh_pr.get('state') == 'open' and not fresh_pr.get('merged'):
                         await self._save(repo, pr_number, 'operation',
@@ -388,6 +436,7 @@ class EvidenceService:
                     'operation_id': opid, 'upload_ref': opid, 'attachment_id': opid, 'repo': repo, 'pr_number': pr_number,
                     'head_sha': expected_head, 'round_id': round_id, 'actor_id': principal['id'],
                     'actor_login': submitter, 'actor': submitter, 'submitter': submitter,
+                    'actor_verified': True, 'created_by': submitter,
                     'created_at': utc_now(), 'updated_at': utc_now(), 'filename': filename, 'size': size, 'sha256': sha,
                     'note': _redact_secrets(text if action == 'note' else note)[:256],
                     'replaces_id': replaces, 'status': 'initializing', 'request_sha256': request_hash,
@@ -421,7 +470,8 @@ class EvidenceService:
                                          'source_operation_id': source['operation_id'], 'request_sha256': request_hash}
                 if action == 'delete':
                     operation.update(status='deleted', deleted_at=utc_now(), deleted_by=principal['login'],
-                                     deleted_by_login=principal['login'], updated_at=utc_now())
+                                     deleted_by_login=principal['login'], deleted_by_id=principal['id'],
+                                     actor_verified=True, updated_at=utc_now())
                     await current()
                     await self._save(repo, pr_number, 'operation', operation, 'deleted')
                     await self._save(repo, pr_number, 'attachment', operation, 'deleted')
@@ -434,7 +484,9 @@ class EvidenceService:
                     result = await self._store(action, source, {'part_number': part})
                     try:
                         await current()
-                    except ValueError:
+                    except ValueError as exc:
+                        if isinstance(exc, EvidenceError) and exc.code not in {'round_changed', 'context_not_writable'}:
+                            raise
                         fresh_pr = await self.proxy.get_pr(repo, pr_number)
                         if fresh_pr.get('state') == 'open' and not fresh_pr.get('merged'):
                             await self._save(repo, pr_number, 'operation',
@@ -459,7 +511,9 @@ class EvidenceService:
             result = await self._store(store_action, operation, store_payload)
             try:
                 await current()
-            except ValueError:
+            except ValueError as exc:
+                if isinstance(exc, EvidenceError) and exc.code not in {'round_changed', 'context_not_writable'}:
+                    raise
                 fresh_pr = await self.proxy.get_pr(repo, pr_number)
                 invalid = {**operation, 'status': 'invalid', 'invalidated_at': utc_now()}
                 if fresh_pr.get('state') == 'open' and not fresh_pr.get('merged'):

@@ -1686,6 +1686,8 @@ class DeployController:
             # Build testing markdown WITHOUT advisory case result
             testing_markdown = comments_mod.testing(
                 repo, pr_number, pr_head, case_result="",
+                deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+                components=state.get("components", []),
             )
             # The LAST machine also gets its own per-machine history event,
             # mirroring the partial-coverage path, so every successful machine
@@ -3454,22 +3456,28 @@ class DeployController:
         render_state = copy.deepcopy(state)
         pr = {}
         try:
-            from .evidence_auth import disabled_reason
+            from .evidence_auth import readiness
             pr = await self.proxy.get_pr(repo, pr_number)
             store = getattr(self.evidence_service, "store", None)
-            evidence_enabled = (self.evidence_service is not None
-                                and callable(getattr(store, "dispatch", None))
-                                and not disabled_reason(self.config)
-                                and pr.get("state") == "open" and not pr.get("merged")
-                                and not pr.get("draft")
-                                and pr.get("head", {}).get("sha") == state.get("head_sha"))
+            status = readiness(self.config, self.evidence_service)
+            backend_ready = (status["EVIDENCE_BACKEND_READY"]
+                             and callable(getattr(store, "dispatch", None))
+                             and pr.get("state") == "open" and not pr.get("merged")
+                             and not pr.get("draft")
+                             and pr.get("head", {}).get("sha") == state.get("head_sha"))
+            browser_upload_ready = backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
         except Exception:
-            evidence_enabled = False
+            status = {"status": "EVIDENCE_BACKEND_PENDING",
+                      "PUBLIC_HTTPS_INGRESS_READY": False}
+            backend_ready = False
+            browser_upload_ready = False
         render_state.update(
-            evidence_enabled=bool(evidence_enabled),
-            enabled=bool(evidence_enabled),
-            pr_state=(pr.get("state") if evidence_enabled else "closed"),
-            merged=(bool(pr.get("merged")) if evidence_enabled else False),
+            evidence_enabled=bool(backend_ready),
+            browser_upload_ready=bool(browser_upload_ready),
+            evidence_readiness=status,
+            enabled=bool(backend_ready),
+            pr_state=(pr.get("state") if backend_ready else "closed"),
+            merged=(bool(pr.get("merged")) if backend_ready else False),
         )
         bundles = []
         seen_rounds = set()
@@ -3488,7 +3496,7 @@ class DeployController:
                 bound.append(item)
             return bound
 
-        if evidence_enabled:
+        if browser_upload_ready:
             render_state["capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="page",
@@ -3497,14 +3505,14 @@ class DeployController:
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
             )
-        if evidence_enabled:
+        if browser_upload_ready:
             current_rows = bind_download_capabilities(current_rows, state["head_sha"], current_round)
         for archive in reversed(archives):
             if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
                 continue
             seen_rounds.add(archive["round_id"])
             snapshot = copy.deepcopy(archive["snapshot"])
-            if evidence_enabled:
+            if browser_upload_ready:
                 snapshot["log_capability"] = issue_capability(
                     self.config, repo, pr_number, snapshot["head_sha"], archive["round_id"],
                     purpose=DOWNLOAD_PURPOSE, resource="log:" + archive["round_id"],
@@ -3513,12 +3521,14 @@ class DeployController:
             snapshot_attachments = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
             snapshot["attachments"] = (bind_download_capabilities(
                 snapshot_attachments, snapshot["head_sha"], archive["round_id"],
-            ) if evidence_enabled else snapshot_attachments)
+            ) if browser_upload_ready else snapshot_attachments)
             bundles.append({**archive, "snapshot": snapshot})
             if len(bundles) == 3:
                 break
+        public_base_url = (getattr(self.config, "evidence_public_base_url", "")
+                           if browser_upload_ready else "")
         section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, archives[-4:],
-                           public_base_url=getattr(self.config, "evidence_public_base_url", ""))
+                           public_base_url=public_base_url)
         if not isinstance(section, str):
             raise GitHubStateProxyError("Evidence renderer must return markdown")
         section += ("\n\nAttachment preview is bounded; complete records and archive chains remain in trusted GitHub "
@@ -4708,7 +4718,11 @@ class DeployController:
             deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
         )
         if state["status"] == "testing":
-            markdown = comments_mod.testing(repo, pr_number, current_head, case_result="")
+            markdown = comments_mod.testing(
+                repo, pr_number, current_head, case_result="",
+                deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+                components=state.get("components", []),
+            )
         event = {
             "event": "Restart recovery: evidence refreshed",
             "timestamp": comments_mod.beijing_now_str(),

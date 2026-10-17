@@ -120,12 +120,11 @@ class Config:
 
 
 
-    # Missing browser credentials disables only the optional evidence feature.
+    # COS readiness gates the optional backend; browser upload also needs a
+    # separately trusted HTTPS ingress, reported by evidence_auth.readiness().
     deploy_evidence_enabled: bool = False
     evidence_public_base_url: str = ""
     evidence_session_key: str = field(default="", repr=False)
-    evidence_oauth_client_id: str = field(default="", repr=False)
-    evidence_oauth_client_secret: str = field(default="", repr=False)
     evidence_max_file_bytes: int = 512 * 1024 * 1024
     evidence_max_video_bytes: int = 512 * 1024 * 1024
     evidence_part_bytes: int = 8 * 1024 * 1024
@@ -284,31 +283,17 @@ def _load_secrets_config(path: str) -> dict:
         raise ValueError("secrets.yaml cos section must be a mapping")
     result = {"cos": {}, "review_comment_trust": {}}
 
-    # Browser evidence is optional. Malformed or incomplete evidence values
-    # disable that feature without making the Controller configuration fail.
-    evidence_fields = ("public_base_url", "session_key")
+    # The public URL is optional and trusted configuration, never inferred from
+    # request Host headers. Capability keys are derived from existing COS auth.
     evidence = data.get("evidence", {})
-    evidence_values = {key: "" for key in evidence_fields}
-    evidence_values.update(oauth_client_id="", oauth_client_secret="")
-    evidence_enabled = isinstance(evidence, dict)
-    if evidence_enabled:
-        for key in evidence_fields:
-            value = evidence.get(key)
-            if (not isinstance(value, str) or not value.strip()
-                    or any(ord(char) < 32 or ord(char) == 127 for char in value)):
-                evidence_enabled = False
-                break
-            evidence_values[key] = value
-        for key in ("oauth_client_id", "oauth_client_secret"):
+    evidence_values = {"public_base_url": "", "session_key": ""}
+    if isinstance(evidence, dict):
+        for key in evidence_values:
             value = evidence.get(key, "")
             if (isinstance(value, str)
                     and not any(ord(char) < 32 or ord(char) == 127 for char in value)):
                 evidence_values[key] = value.strip()
-    if not evidence_enabled:
-        evidence_values = {key: "" for key in evidence_fields}
-        evidence_values.update(oauth_client_id="", oauth_client_secret="")
     result["evidence"] = evidence_values
-    result["deploy_evidence_enabled"] = evidence_enabled
 
     def _coerce_string(key: str, *, required: bool = False, allow_empty: bool = True) -> str:
         if key not in cos:
@@ -383,11 +368,14 @@ def load_config() -> Config:
         cos_bucket=cos.get("bucket", ""),
         cos_secret_id=cos.get("secret_id", ""),
         cos_secret_key=cos.get("secret_key", ""),
-        deploy_evidence_enabled=secrets.get("deploy_evidence_enabled", False),
+        # Evidence uses the Controller's existing COS credentials and GitHub
+        # App installation; no separate Evidence secret section gates it.
+        deploy_evidence_enabled=all(
+            isinstance(cos.get(name), str) and bool(cos.get(name).strip())
+            for name in ("region", "bucket", "secret_id", "secret_key")
+        ),
         evidence_public_base_url=evidence.get("public_base_url", "").rstrip("/"),
         evidence_session_key=evidence.get("session_key", ""),
-        evidence_oauth_client_id=evidence.get("oauth_client_id", ""),
-        evidence_oauth_client_secret=evidence.get("oauth_client_secret", ""),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
         agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),
         agent_core_ca_pem=secrets.get("agent_core_ca_pem", {}),

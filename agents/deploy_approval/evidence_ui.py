@@ -30,6 +30,12 @@ pre,code{{overflow-wrap:anywhere;white-space:pre-wrap}}li{{padding:.6rem 0;borde
 <body><h1>部署验证附件</h1>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}">
 <p>项目 <strong>{esc(repo)}</strong> · PR #{esc(pr_number)}<br>HEAD <code>{esc(head_sha)}</code><br>round <code>{esc(round_id)}</code></p>
+<section id="authorization"><h2>授权上传</h2>
+<p>浏览器生成一次性随机密钥并只保存在当前标签页会话中。将显示的命令作为独立评论亲自发送到当前 PR Conversation；评论会公开 proof，但不会公开密钥。</p>
+<button id="make-proof" type="button">生成授权命令</button>
+<button id="verify-proof" type="button" disabled>验证我已发送的评论</button>
+<pre id="proof-command" aria-live="polite"></pre>
+<p>请不要转发或公开浏览器密钥。HEAD 或 round 改变后必须重新授权。</p></section>
 <p id="auth">正在检查当前 PR/HEAD/round capability。</p>
 <p id="message" role="status" aria-live="polite"></p><button id="refresh" type="button">刷新状态</button>
 <section><h2>当前轮</h2><p id="summary">等待服务端状态</p>
@@ -59,9 +65,11 @@ _JAVASCRIPT = r'''"use strict";
   const api = app.dataset.api;
   const bound = {head_sha: app.dataset.head, round_id: app.dataset.round};
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
+  const proofKey = "evidence-proof:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const active = new Set();
   let context = null, stopped = false, paused = true, busy = false;
   let session = null, chosen = null, fingerprint = "", completeUnknown = false, pollGeneration = 0;
+  let proofSecret = "";
   let noteOperation = null;
   const message = text => { $("message").textContent = String(text); };
   const id = value => {
@@ -69,20 +77,28 @@ _JAVASCRIPT = r'''"use strict";
     return encodeURIComponent(value);
   };
   const uid = () => crypto.randomUUID();
+  const randomHex = (size = 32) => {
+    const bytes = crypto.getRandomValues(new Uint8Array(size));
+    return [...bytes].map(value => value.toString(16).padStart(2, "0")).join("");
+  };
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const roundMatches = value => value && value.head_sha === bound.head_sha && value.round_id === bound.round_id;
   function writable() {
     return context && roundMatches(context) && context.enabled !== false && context.evidence_enabled !== false &&
       context.authenticated === true && context.can_write === true && context.status === "testing" &&
+      context.actor_verified === true && context.github_user_authenticated === true && !!proofSecret &&
+      context.readiness && context.readiness.BROWSER_UPLOAD_READY === true &&
       (context.pr_state === undefined || context.pr_state === "open") && !context.merged && !stopped;
   }
   function permissionMessage() {
     if (!context.authenticated) return "Evidence capability 无效或已过期；请从当前 PR Summary 的 View Evidence 链接重新打开。";
     if (context.enabled === false || context.evidence_enabled === false) return "Evidence 功能当前未启用。";
+    if (context.readiness && context.readiness.status === "PUBLIC_INGRESS_PENDING") return "PUBLIC_INGRESS_PENDING：等待可信 HTTPS 入口配置；不会通过 HTTP 发送授权密钥。";
+    if (context.readiness && context.readiness.BROWSER_UPLOAD_READY !== true) return "Evidence 后端尚未就绪，当前只读。";
     if (context.pr_state && context.pr_state !== "open" || context.merged) return "PR 已关闭或已合并，当前证据只读。";
     if (context.head_sha !== bound.head_sha || context.round_id !== bound.round_id) return "HEAD 或 round 已变化；本页面绑定历史轮次，只读。";
     if (context.status !== "testing") return `当前状态为 ${context.status || "unknown"}；仅 testing 阶段允许写入。`;
-    if (context.github_user_authenticated === false) return "请先完成 GitHub 用户认证；公开读者仅可查看和下载。";
+    if (context.github_user_authenticated !== true || context.actor_verified !== true) return "请先在当前 PR Conversation 发送页面生成的授权命令，再验证评论。";
     if (context.can_write !== true) return "当前 capability 没有本轮写入权限。";
     return "当前轮可写。";
   }
@@ -114,10 +130,14 @@ _JAVASCRIPT = r'''"use strict";
     const timeout = setTimeout(() => controller.abort(), 30000);
     try {
       const headers = {Accept: "application/json"};
+      if (proofSecret) {
+        if (window.location.protocol !== "https:") throw new Error("授权密钥只会通过 HTTPS 发送；当前页面没有可信 HTTPS 入口。");
+        headers["X-Evidence-Secret"] = proofSecret;
+        headers["X-Evidence-Nonce"] = randomHex();
+      }
       if (write) {
         headers["Content-Type"] = "application/json";
-        if (!context.csrf_token) throw new Error("缺少 CSRF token，请从 Summary capability 链接重新打开。");
-        headers["X-CSRF-Token"] = context.csrf_token;
+        if (!proofSecret) throw new Error("请先完成当前 HEAD/round 的评论 proof 授权。");
       }
       const response = await fetch(api + path, {
         method, headers, credentials: "same-origin", redirect: "error", cache: "no-store", signal: controller.signal,
@@ -297,7 +317,7 @@ _JAVASCRIPT = r'''"use strict";
       xhr.open("PUT", target.href); xhr.withCredentials = false; xhr.timeout = 120000;
       // Only storage headers returned by the authenticated API go to COS.
       for (const [name, value] of Object.entries(signed.headers || {})) {
-        if (/^(cookie|authorization|x-csrf-token)$/i.test(name)) { cleanup(); return reject(new Error("拒绝向存储地址发送认证头")); }
+        if (/^(cookie|authorization|x-csrf-token|x-evidence-secret|x-evidence-nonce)$/i.test(name)) { cleanup(); return reject(new Error("拒绝向存储地址发送认证头")); }
         xhr.setRequestHeader(name, value);
       }
       xhr.upload.onprogress = event => { inflight.set(number, event.loaded); update(); };
@@ -456,6 +476,41 @@ _JAVASCRIPT = r'''"use strict";
     finally { busy = false; controls(); }
   }
   $("upload").addEventListener("click", runUpload);
+  function loadProof() {
+    try {
+      const value = sessionStorage.getItem(proofKey) || "";
+      if (/^[0-9a-f]{64}$/.test(value)) proofSecret = value;
+    } catch (_) { proofSecret = ""; }
+    $("verify-proof").disabled = !proofSecret;
+  }
+  $("make-proof").addEventListener("click", async () => {
+    try {
+      const bytes = crypto.getRandomValues(new Uint8Array(32));
+      proofSecret = [...bytes].map(value => value.toString(16).padStart(2, "0")).join("");
+      sessionStorage.setItem(proofKey, proofSecret);
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      const proof = [...digest].map(value => value.toString(16).padStart(2, "0")).join("");
+      $("proof-command").textContent = `/authorize_evidence head=${bound.head_sha} round=${bound.round_id} proof=${proof}`;
+      $("verify-proof").disabled = false;
+      context = null; controls();
+      message("授权命令已生成。请在当前 PR Conversation 亲自发送，然后点击“验证我已发送的评论”。密钥只保存在本标签页会话中。");
+    } catch (_) {
+      proofSecret = ""; message("无法安全生成或保存授权密钥；请使用安全上下文打开页面。");
+    }
+  });
+  $("verify-proof").addEventListener("click", async () => {
+    if (!proofSecret) return;
+    try {
+      const next = await refresh();
+      if (next.actor_verified === true && next.github_user_authenticated === true) {
+        message("GitHub 评论身份已验证；服务端将对每次写入重新检查 PR 与权限。");
+      } else {
+        message("尚未找到与本密钥匹配的当前 PR 评论。请确认命令完整、评论已发布且 HEAD/round 未变化。");
+      }
+    } catch (error) {
+      message(error.message || String(error));
+    }
+  });
   $("retry").addEventListener("click", runUpload);
   $("pause").addEventListener("click", () => {
     paused = true; pollGeneration++;
@@ -491,6 +546,6 @@ _JAVASCRIPT = r'''"use strict";
       // Refresh is read-only. Resume and completion require an explicit button action.
     } catch (error) { message(error.message); }
   });
-  restore(); refresh().catch(error => message(error.message));
+  loadProof(); restore(); refresh().catch(error => message(error.message));
 })();
 '''
