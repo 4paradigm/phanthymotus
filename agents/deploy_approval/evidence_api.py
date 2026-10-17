@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -84,10 +85,6 @@ def _validate(payload, action, config):
         if field in payload and (not isinstance(payload[field], str) or
                                _byte_length(payload[field]) > config.evidence_max_note_bytes):
             raise HTTPException(413, detail='invalid_note_size')
-    if 'submitter' in payload and (not isinstance(payload['submitter'], str)
-            or not payload['submitter'].strip() or len(payload['submitter']) > 100
-            or any(ord(c) < 32 or ord(c) == 127 for c in payload['submitter'])):
-        raise HTTPException(400, detail='invalid_submitter')
     if action == 'note' and not (payload.get('text') or payload.get('note')):
         raise HTTPException(400, detail='note_required')
     for field in ('upload_id', 'attachment_id', 'replaces_id'):
@@ -126,6 +123,9 @@ async def _payload(request, action, **path):
         payload.pop('cap', None)
     if not isinstance(payload, dict) or any(field in payload for field in path):
         raise HTTPException(400, detail='invalid_evidence_payload')
+    # Older browser JS sends this display-only value. It is discarded before
+    # validation/dispatch and can never become a persisted actor identity.
+    payload.pop('submitter', None)
     if request.method in ('POST', 'DELETE') and not _BASE <= payload.keys():
         raise HTTPException(400, detail='evidence_context_required')
     payload.update(path)
@@ -163,19 +163,28 @@ async def _summary_updated(request, repo, pr, result):
 
 async def _dispatch(request, owner, repo, pr, action, **path):
     canonical = _repo(owner, repo, pr)
+    purpose = (evidence_auth.DOWNLOAD_PURPOSE if action in {'download', 'log_download'}
+               else evidence_auth.PURPOSE)
+    resource = None
+    if action == 'download':
+        resource = 'attachment:' + path.get('attachment_id', '')
+    elif action == 'log_download':
+        resource = 'log:' + path.get('round_id', '')
     principal, csrf = await evidence_auth.verified_principal(
-        request, canonical, pr, write=request.method in ('POST', 'DELETE'))
+        request, canonical, pr, write=request.method in ('POST', 'DELETE'),
+        purpose=purpose, resource=resource)
     # This read is deliberately before dispatch, including historic downloads;
     # a closed PR must never trigger a lifecycle write or a comment reply.
     try:
         snapshot = await request.app.state.github.get_pr(canonical, pr)
     except Exception:
         raise HTTPException(503, detail='evidence_pr_unavailable') from None
-    if (snapshot.get('state') != 'open' or snapshot.get('merged') or snapshot.get('draft') or
-            snapshot.get('base', {}).get('repo', {}).get('full_name', '').lower() != canonical):
+    if (snapshot.get('state') != 'open' or snapshot.get('merged') or snapshot.get('draft')
+            or snapshot.get('base', {}).get('repo', {}).get('full_name', '').lower() != canonical):
         raise HTTPException(409, detail='pr_closed_or_mismatched')
     payload = await _payload(request, action, **path)
-    claims = principal['capability']
+    claims = principal.get('capability') or {
+        'head': payload.get('head_sha'), 'round': payload.get('round_id')}
     if 'upload_id' in payload:
         # The public upload handle is A's durable operation identity, rather
         # than an unauthenticated client-selected COS UploadId.
@@ -193,6 +202,9 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     if action in {'init', 'resume', 'sign_part', 'complete', 'note', 'delete'}:
         payload.setdefault('head_sha', claims['head'])
         payload.setdefault('round_id', claims['round'])
+        # Compatibility with the current browser UI: a display name is not
+        # an identity source. The service records only the verified /user login.
+        payload.pop('submitter', None)
     if action in {'download', 'log_download'}:
         payload.setdefault('idempotency_key', hashlib.sha256(
             json.dumps([action, path], sort_keys=True).encode()).hexdigest())
@@ -230,9 +242,13 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                 head = item.get('head_sha')
                 round_value = item.get('round_id')
                 if (isinstance(head, str) and isinstance(round_value, str)
-                        and head == round_value.rsplit('-', 1)[0]):
+                        and head == round_value.rsplit('-', 1)[0]
+                        and isinstance(item.get('attachment_id'), str)
+                        and _ID.fullmatch(item['attachment_id'])):
                     item['download_capability'] = issue_capability(
                         request.app.state.config, canonical, pr, head, round_value,
+                        purpose=evidence_auth.DOWNLOAD_PURPOSE,
+                        resource='attachment:' + item['attachment_id'],
                     )
                 output.append(_public_attachment(item))
             return output
@@ -247,14 +263,17 @@ async def _dispatch(request, owner, repo, pr, action, **path):
             head, round_id = round_value.get('head_sha'), round_value.get('round_id')
             if isinstance(head, str) and isinstance(round_id, str) and head == round_id.rsplit('-', 1)[0]:
                 from .evidence_auth import issue_capability
-                round_value['capability'] = issue_capability(request.app.state.config, canonical, pr, head, round_id)
+                round_value['capability'] = issue_capability(
+                    request.app.state.config, canonical, pr, head, round_id,
+                    purpose=evidence_auth.DOWNLOAD_PURPOSE,
+                    resource='log:' + round_id,
+                )
             rounds.append(round_value)
         result['rounds'] = rounds
         result['operations'] = [_public_attachment(row) for row in result.get('operations', [])]
         result['summary_updated'] = await _summary_updated(request, canonical, pr, result)
         result = {**result, 'authenticated': True, 'enabled': True,
-                  'can_write': result.get('can_write', False) and result['status'] == 'testing'
-                               and result['head_sha'] == snapshot.get('head', {}).get('sha'),
+                  'github_user_authenticated': bool(principal.get('github_user_authenticated')),
                   'attachments': attachments, 'repo': canonical, 'pr_number': pr,
                   'max_file_bytes': request.app.state.config.evidence_max_file_bytes,
                   'part_bytes': request.app.state.config.evidence_part_bytes, 'csrf_token': csrf}
@@ -338,10 +357,33 @@ async def page(request: Request, owner: str, repo: str, pr: int):
         return redirect
     result = await _dispatch(request, owner, repo, pr, 'context')
     from . import evidence_ui
-    return HTMLResponse(evidence_ui.render_upload_page(
-        result['repo'], pr, result['head_sha'], result['round_id']),
+    page_html = evidence_ui.render_upload_page(
+        result['repo'], pr, result['head_sha'], result['round_id'])
+    if (not result.get('github_user_authenticated')
+            and evidence_auth.oauth_enabled(request.app.state.config)):
+        page_owner, page_repo = canonical.split('/', 1)
+        return_to = f'/evidence/{page_owner}/{page_repo}/pulls/{pr}'
+        login_url = '/evidence/auth/login?' + urlencode({
+            'repo': canonical, 'pr': pr, 'return_to': return_to})
+        page_html = page_html.replace('</body>',
+            '<p><a id="evidence-github-login" href="' + login_url + '">Connect GitHub to upload or manage evidence</a></p></body>')
+    return HTMLResponse(page_html,
         headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
                  'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY'})
+
+
+@router.get('/evidence/auth/login')
+async def evidence_oauth_login(request: Request, repo: str, pr: int, return_to: str):
+    parts = repo.split('/', 1)
+    if len(parts) != 2:
+        raise HTTPException(400, detail='invalid_repository')
+    canonical = _repo(parts[0], parts[1], pr)
+    return evidence_auth.oauth_login(request, canonical, pr, return_to)
+
+
+@router.get('/evidence/auth/callback')
+async def evidence_oauth_callback(request: Request):
+    return await evidence_auth.oauth_callback(request)
 
 
 @router.get('/evidence/assets/app.js')

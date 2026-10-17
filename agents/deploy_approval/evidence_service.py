@@ -36,6 +36,29 @@ class EvidenceService:
             raise EvidenceError('identity_required', 401)
         if not self.config.auth_valid or repo not in self.config.active_repos:
             raise EvidenceError('app_access_revoked', 403)
+        if not principal.get('github_user_authenticated'):
+            return False
+        # Browser write identity is accepted only after the HTTP layer has
+        # revalidated GitHub /user for this request. Authorization remains
+        # tied to the live PR author, deployed machine owners, or repo ACL.
+        author = (pr or {}).get('user', {})
+        if (isinstance(author, dict) and
+                ((type(author.get('id')) is int and author.get('id') == uid)
+                 or (isinstance(author.get('login'), str)
+                     and author['login'].lower() == login.lower()))):
+            return True
+        deployed = {d.get('machine') for d in state.get('deployments', [])
+                    if isinstance(d, dict) and d.get('phase') == 'deployed'}
+        for alias in deployed:
+            machine = self.policy.get_machine(alias) if isinstance(alias, str) else None
+            if machine and any(isinstance(owner, str) and owner.lower() == login.lower()
+                               for owner in (machine.owners or [])):
+                return True
+        try:
+            permission = await self.proxy.collaborator_permission(repo, login)
+        except Exception:
+            permission = ''
+        return self.policy.collaborator_can_approve(permission)
 
     async def _save(self, repo, pr_number, kind, operation, phase):
         operation['updated_at'] = utc_now()
@@ -69,7 +92,7 @@ class EvidenceService:
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
                 raise EvidenceError('state_unavailable', 409)
-            await self._authorize(repo, principal, state, check_machine=False)
+            initially_authorized = await self._authorize(repo, principal, state, check_machine=False, pr=pr)
             if pr.get('state') != 'open' or pr.get('merged') or pr.get('draft'):
                 raise EvidenceError('pr_closed', 409)
             records = await self.proxy.read_evidence_records(repo, pr_number)
@@ -112,15 +135,29 @@ class EvidenceService:
                 selected = archives[-1]['snapshot']
             await self._authorize(repo, principal, selected, pr=pr)
             write = action in {'init', 'resume', 'sign_part', 'complete', 'note', 'delete'}
+            authorized_writer = await self._authorize(repo, principal, selected, pr=pr)
+            if write and not authorized_writer:
+                raise EvidenceError('evidence_write_permission_required', 403)
             expected_head = payload.get('head_sha', selected.get('head_sha'))
             validate_context(pr, selected, expected_head, round_id, write=write)
             if write and round_id != active_round:
                 raise EvidenceError('round_changed', 409)
             capability = principal.get('capability', {})
-            if (capability.get('repo') != repo or capability.get('pr') != pr_number
+            resource = (('attachment:' + str(payload.get('attachment_id', '')))
+                        if action == 'download' else ('log:' + round_id)
+                        if action == 'log_download' else None)
+            if (not principal.get('github_user_authenticated') and
+                    (capability.get('repo') != repo or capability.get('pr') != pr_number
                     or capability.get('head') != expected_head
                     or capability.get('round') != round_id
-                    or capability.get('purpose') != 'deploy-evidence'):
+                    or capability.get('purpose') not in (
+                        {'deploy-evidence-download', 'deploy-evidence-upload'}
+                        if action in {'download', 'log_download'}
+                        else {'deploy-evidence-upload'})
+                    or (action in {'download', 'log_download'}
+                        and capability.get('purpose') == 'deploy-evidence-download'
+                        and capability.get('resource') != resource)
+                    or (action not in {'download', 'log_download'} and 'resource' in capability))):
                 raise EvidenceError('capability_context_mismatch', 403)
             latest = {}
             operations = {}
@@ -133,8 +170,9 @@ class EvidenceService:
             if action == 'context':
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'status': selected['status'], 'authenticated': True, 'enabled': True,
-                        'can_write': selected['status'] == 'testing' and round_id == active_round
-                                     and pr.get('head', {}).get('sha') == selected['head_sha'],
+                        'github_user_authenticated': bool(principal.get('github_user_authenticated')),
+                        'can_write': bool(initially_authorized and selected.get('status') == 'testing'
+                                          and selected.get('head_sha') == pr.get('head', {}).get('sha')),
                         'attachments': [r for r in latest.values() if r['round_id'] == round_id],
                         'rounds': [{**r['data']['snapshot'], 'round_id': r['data']['round_id'],
                                     'attachments': [a for a in latest.values() if a['round_id'] == r['data']['round_id']]}
@@ -196,6 +234,7 @@ class EvidenceService:
                 if result.get('verified') is True:
                     value['status'] = 'ready'
                     value['sha256'] = result.get('sha256', value.get('sha256', ''))
+                    value['verified'] = True
                 return value
             if action in {'download', 'log_download'}:
                 if action == 'log_download':
@@ -332,7 +371,7 @@ class EvidenceService:
                 note = payload.get('note', '')
                 if not isinstance(note, str):
                     raise EvidenceError('invalid_note', 400)
-                submitter = payload.get('submitter') or principal['login']
+                submitter = principal['login']
                 operation = existing or {
                     'operation_id': opid, 'upload_ref': opid, 'attachment_id': opid, 'repo': repo, 'pr_number': pr_number,
                     'head_sha': expected_head, 'round_id': round_id, 'actor_id': principal['id'],
@@ -347,8 +386,8 @@ class EvidenceService:
                     await self._save(repo, pr_number, 'operation', operation, 'initializing')
                 elif operation['status'] == 'uploading':
                     return public(operation)
-                store_action = 'resume' if existing else action
-                store_payload = {'text': text} if action == 'note' and not existing else {}
+                store_action = 'note' if action == 'note' else ('resume' if existing else action)
+                store_payload = {'text': text} if action == 'note' else {}
             else:
                 ref = payload.get('operation_id') or payload.get('upload_id')
                 source = next((r['data'] for r in reversed(records) if r['kind'] == 'operation'

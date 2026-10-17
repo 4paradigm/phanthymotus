@@ -471,6 +471,10 @@ class DeployController:
         review_evidence: dict | None = None,
     ) -> None:
         state["head_sha"] = head_sha
+        state["round_id"] = make_round_id(
+            head_sha, int(state.get("last_processed_comment_id", 0) or 0),
+        )
+        state["round_started_at"] = utc_now()
         state["status"] = status
         state["review_evidence"] = dict(review_evidence or {})
         state["components"] = []
@@ -859,14 +863,17 @@ class DeployController:
                 )
                 return True
 
-            pr_head = pr_data.get("head", {}).get("sha", "")
             if state is None:
                 await self._post_error(
                     repo, pr_number,
                     "No deploy approval lifecycle found. Wait for review lifecycle reconciliation first.",
                 )
                 return True
-            if pr_head and pr_head != state.get("head_sha", ""):
+            pr_head = pr_data.get("head", {}).get("sha", "")
+            if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
+                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.")
+                return True
+            if pr_head != state.get("head_sha", ""):
                 await self._supersede_head_drift(
                     repo, pr_number, state, pr_head, comment_id,
                     command_kind="request_deploy",
@@ -932,16 +939,6 @@ class DeployController:
                     "No deployment can be requested from unbound review evidence.",
                 )
                 return True
-            if evidence.test_results_block_deployment:
-                await self._post_error(
-                    repo, pr_number,
-                    "Review Agent test evidence is missing, malformed or unbound. "
-                    "Restore valid evidence before requesting deployment. "
-                    "Project test failures and code review findings remain available "
-                    "for manual review by the developer and machine approver.",
-                )
-                return True
-
             # Convert evidence builds to BuildInfo
             builds = self._review_build_infos(repo, evidence)
 
@@ -1040,6 +1037,16 @@ class DeployController:
                 )
                 return True
 
+            pr_head = pr_data.get("head", {}).get("sha", "")
+            if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
+                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.")
+                return True
+            if pr_head != state.get("head_sha", ""):
+                await self._supersede_head_drift(
+                    repo, pr_number, state, pr_head, comment_id,
+                )
+                return True
+
             _current_status = state.get("status", "")
             if _current_status == "deploy-requested":
                 pass  # normal path continues below
@@ -1060,8 +1067,6 @@ class DeployController:
             # Check PR is still valid
             pr_state = pr_data.get("state", "")
             pr_merged = pr_data.get("merged", False)
-            pr_head = pr_data.get("head", {}).get("sha", "")
-
             if pr_state != "open" or pr_merged:
                 await self._post_error(
                     repo, pr_number,
@@ -1073,13 +1078,6 @@ class DeployController:
                 await self._post_error(
                     repo, pr_number,
                     "Deployment requires PR ready-for-review / non-draft.",
-                )
-                return True
-
-            # Check HEAD drift
-            if pr_head and pr_head != state.get("head_sha", ""):
-                await self._supersede_head_drift(
-                    repo, pr_number, state, pr_head, comment_id,
                 )
                 return True
 
@@ -1714,56 +1712,6 @@ class DeployController:
             # Project status label "testing" SECOND
             await self.proxy.project_status_label(repo, pr_number, "testing")
 
-            # NOW run advisory Case only after durable testing state exists
-            case_results = await self._run_automated_case(
-                repo, pr_number, pr_head, components,
-                state.get("deployments", []),
-            )
-
-            # Case is advisory only; always re-read fresh state before merging
-            fresh = await self.proxy.read_hidden_state(repo, pr_number)
-            fresh_command = (
-                fresh.get("command", {})
-                if isinstance(fresh, dict)
-                else {}
-            )
-            if not isinstance(fresh_command, dict):
-                fresh_command = {}
-            fresh_args = fresh_command.get("args", {})
-            if not isinstance(fresh_args, dict):
-                fresh_args = {}
-            fresh_ok = (
-                isinstance(fresh, dict)
-                and fresh.get("head_sha") == pr_head
-                and fresh.get("status") == "testing"
-                and fresh_command.get("comment_id") == comment_id
-                and fresh_command.get("kind") == "approve_deploy"
-                and fresh_command.get("phase") == "completed"
-                and fresh_args.get("machine") == machine_alias
-                and fresh_args.get("actor") == actor
-            )
-            if case_results and fresh_ok:
-                fresh["case_results"] = fresh.get("case_results", {})
-                fresh["case_results"].update(case_results)
-                case_result_str = ", ".join(
-                    f"{k}={v}" for k, v in case_results.items()
-                )
-                case_markdown = comments_mod.testing(
-                    repo, pr_number, pr_head, case_result=case_result_str,
-                )
-                # History-aware refresh (event=None): the fresh renderer output
-                # must carry over the existing visible History events; no new
-                # event is created by an advisory case result refresh.
-                await self._write_lifecycle_with_history(
-                    repo, pr_number, fresh, case_markdown, event=None,
-                )
-            elif case_results:
-                logger.warning(
-                    "CASE_RESULT_DROPPED repo=%s pr=%s: fresh state mismatch, "
-                    "not overwriting newer GitHub state",
-                    repo, pr_number,
-                )
-
             return True
 
         except PolicyError as e:
@@ -1776,19 +1724,12 @@ class DeployController:
             )
             raise
 
-    def _final_case_pass_is_ready(self, state: dict) -> bool:
-        """Require successful cases bound to real deployed components.
-
-        The trusted deployment record binds component_id to machine alias;
-        the component snapshot pins runtime_id and the exact deployed image.
-        Core has no fixed Case, but still needs its deployed record.
-        """
+    def _all_required_components_deployed(self, state: dict) -> bool:
+        """Validate every required component has a trusted deployment record."""
         components = state.get("components")
         deployments = state.get("deployments")
-        case_results = state.get("case_results")
         if (not isinstance(components, list) or not components
-                or not isinstance(deployments, list)
-                or not isinstance(case_results, dict)):
+                or not isinstance(deployments, list)):
             return False
         seen = set()
         for component in components:
@@ -1806,9 +1747,6 @@ class DeployController:
             seen.add(cid)
             if target == "core" and runtime_id != "core":
                 return False
-            expected_case = "n/a" if target == "core" else "pass"
-            if case_results.get(cid) != expected_case:
-                return False
             records = [dep for dep in deployments if isinstance(dep, dict)
                        and dep.get("phase") == "deployed"
                        and isinstance(dep.get("component_ids"), list)
@@ -1818,7 +1756,7 @@ class DeployController:
             alias = records[0].get("machine")
             if not isinstance(alias, str) or not alias or self.policy.get_machine(alias) is None:
                 return False
-        return set(case_results) == seen
+        return True
 
     async def _restart_record_test_comment_is_current(
         self, repo: str, state: dict, expected_comment: dict, *, consumed: bool = False,
@@ -1889,12 +1827,12 @@ class DeployController:
         cmd = parse_command(expected_comment.get("body", ""))
         if (cmd.kind != "record_test" or cmd.result not in ("pass", "fail")
                 or expected_state.get("status") != "testing"
-                or (cmd.result == "pass" and not self._final_case_pass_is_ready(expected_state))
+                or not self._all_required_components_deployed(expected_state)
                 or not await self._restart_record_test_comment_is_current(
                     repo, expected_state, expected_comment)):
             return False
         pr = await self.proxy.get_pr(repo, pr_number)
-        if (pr.get("state") != "open" or pr.get("merged")
+        if (pr.get("state") != "open" or pr.get("merged") or pr.get("draft")
                 or pr.get("head", {}).get("sha") != expected_state.get("head_sha")):
             return False
         user = expected_comment["user"]
@@ -1926,10 +1864,12 @@ class DeployController:
             pr_data = await pr_data
         fresh = await self.proxy.read_hidden_state(repo, pr_number)
         if (not isinstance(pr_data, dict) or not isinstance(fresh, dict)
-                or pr_data.get("state") != "open" or pr_data.get("merged")):
+                or pr_data.get("state") != "open" or pr_data.get("merged")
+                or pr_data.get("draft")):
             return None
         pr_head = pr_data.get("head", {}).get("sha", "")
-        if pr_head and pr_head != original.get("head_sha", ""):
+        if (not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head)
+                or pr_head != original.get("head_sha", "")):
             return None
         if (fresh.get("status") != "testing" or not isinstance(fresh.get("command"), dict)
                 or fresh.get("command", {}).get("phase") != "completed"
@@ -1940,9 +1880,9 @@ class DeployController:
         if (fresh.get("head_sha") != original.get("head_sha")
                 or fresh.get("cos") != original.get("cos")):
             return None
+        if not self._all_required_components_deployed(fresh):
+            return None
         if result == "pass":
-            if pr_head != original.get("head_sha") or not self._final_case_pass_is_ready(fresh):
-                return None
             for key in (
                 "head_sha", "components", "deployments", "case_results", "review_evidence",
                 "approve_attempts", "approve_attempts_total", "approve_attempts_truncated",
@@ -1951,7 +1891,6 @@ class DeployController:
                     return None
         if expected_comment is not None:
             if (pr_head != original.get("head_sha")
-                    or (result == "pass" and not self._final_case_pass_is_ready(fresh))
                     or fresh != original
                     or not await self._restart_record_test_comment_is_current(
                         repo, fresh, expected_comment)):
@@ -1980,6 +1919,7 @@ class DeployController:
         pr = await self.proxy.get_pr(repo, pr_number)
         fresh = await self.proxy.read_hidden_state(repo, pr_number)
         return (fresh == state and pr.get("state") == "open" and not pr.get("merged")
+                and not pr.get("draft")
                 and pr.get("head", {}).get("sha") == state.get("head_sha")
                 and self.config.auth_valid and repo in self.config.active_repos
                 and repo in self.config.github_repos)
@@ -2023,7 +1963,7 @@ class DeployController:
                     or not isinstance(args.get("summary"), str)
                     or not state.get("components") or not state.get("deployments")
                     or not state.get("review_evidence")
-                    or (result == "pass" and not self._final_case_pass_is_ready(state))):
+                    or not self._all_required_components_deployed(state)):
                 logger.warning("COS retry lacks original evidence %s#%s", repo, pr_number)
                 return
             comment = await self.proxy.get_comment(repo, cid)
@@ -2113,6 +2053,18 @@ class DeployController:
 
             # Freeze the accepted bindings before permissions/logging awaits.
             state = copy.deepcopy(state)
+            pr_head = pr_data.get("head", {}).get("sha", "")
+            if not isinstance(pr_head, str) or not re.fullmatch(r"[0-9a-f]{40}", pr_head):
+                await self._post_error(repo, pr_number, "Cannot verify the current PR HEAD.")
+                return True
+            if pr_head != state.get("head_sha", ""):
+                if _recovery_comment is not None:
+                    return False
+                await self._supersede_head_drift(
+                    repo, pr_number, state, pr_head, comment_id,
+                    command_kind="record_test",
+                )
+                return True
 
             _current_status = state.get("status", "")
             if _current_status == "testing":
@@ -2125,7 +2077,7 @@ class DeployController:
                         and _current_status == ("succeeded" if result == "pass" else "failed")
                         and state.get("test_result") == result
                         and terminal_command.get("args", {}).get("result") == result):
-                    if result == "pass" and not self._final_case_pass_is_ready(state):
+                    if not self._all_required_components_deployed(state):
                         return False
                     await self._check_record_test_permissions(repo, actor, state)
                     await self._retry_terminal_cos(repo, pr_number, state, refresh_url=True)
@@ -2146,20 +2098,10 @@ class DeployController:
             # Check PR is still valid
             pr_state = pr_data.get("state", "")
             pr_merged = pr_data.get("merged", False)
-            pr_head = pr_data.get("head", {}).get("sha", "")
-            if pr_state != "open" or pr_merged:
+            if pr_state != "open" or pr_merged or pr_data.get("draft"):
                 await self._post_error(
                     repo, pr_number,
                     "PR is not open. Record test only when PR is open and unmerged.",
-                )
-                return True
-
-            # Check HEAD drift
-            if _recovery_comment is not None and pr_head != state.get("head_sha", ""):
-                return False
-            if pr_head and pr_head != state.get("head_sha", ""):
-                await self._supersede_head_drift(
-                    repo, pr_number, state, pr_head, comment_id,
                 )
                 return True
 
@@ -2171,36 +2113,12 @@ class DeployController:
                     for cid in dep.get("component_ids", []):
                         deployed_component_ids.add(cid)
             all_component_ids = {c.get("component_id", "") for c in components}
-            if all_component_ids and not all_component_ids.issubset(deployed_component_ids):
+            if (not all_component_ids or not all_component_ids.issubset(deployed_component_ids)
+                    or not self._all_required_components_deployed(state)):
                 await self._post_error(
                     repo, pr_number,
                     "Not all components are deployed yet. "
                     "Complete all machine approvals before recording test result.",
-                )
-                return True
-
-            # A4: All bound component IDs must have terminal case results
-            # before the test can be finalized. Missing or "running" blocks.
-            bound_ids = [c.get("component_id", "") for c in components if isinstance(c, dict) and c.get("component_id")]
-            case_results = state.get("case_results", {})
-            terminal_values = {"pass", "fail", "n/a"}
-            if not isinstance(case_results, dict) or (bound_ids and not all(
-                isinstance(case_results.get(cid), str) and case_results.get(cid) in terminal_values
-                for cid in bound_ids
-            )):
-                await self._post_command_not_ready(
-                    repo, pr_number, "testing",
-                    "Not all Automated Cases have terminal results yet (pass/fail/n/a). "
-                    "Await completion before finalizing record_test.",
-                )
-                return True
-
-            if result == "pass" and not self._final_case_pass_is_ready(state):
-                await self._post_command_not_ready(
-                    repo, pr_number, "testing",
-                    "Final PASS requires a deployed record for every component, "
-                    "Core Case=n/a, and every non-Core Automated Case=pass. "
-                    "Failed Cases cannot be overridden by a manual PASS.",
                 )
                 return True
 
@@ -3483,10 +3401,20 @@ class DeployController:
         deployed = _component_id_set(state.get("deployments", []))
         remaining = [c for c in state.get("components", []) if c.get("component_id") not in deployed]
         targets = ", ".join(str(c.get("component_id", "")) for c in components)
+        # Progress is presentation-only: hidden deployment rows retain their
+        # canonical deployed schema until a POST has been verified.
+        display_deployments = list(state.get("deployments", [])) + [{
+            "machine": machine.alias,
+            "ip": machine.node_host,
+            "component_ids": [c.get("component_id", "") for c in components],
+            "phase": ("preflight" if str(phase).lower().startswith(
+                ("approval received", "preflight failed")) else "deploying"),
+            "timestamp": comments_mod.beijing_now_str(),
+        }]
         return comments_mod.deploy_requested(
             repo, pr_number, state["head_sha"], state.get("components", []),
             self._get_machine_groups_for_components(remaining),
-            deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+            deployments=self._enrich_deployments_for_render(display_deployments),
             gate_note=[f"{phase}: `{machine.alias}` / `{machine.node_host}`; components: {targets}; "
                        f"{comments_mod.beijing_now_str()}"],
         )
@@ -3545,22 +3473,47 @@ class DeployController:
         )
         bundles = []
         seen_rounds = set()
-        from .evidence_auth import issue_capability
+        from .evidence_auth import DOWNLOAD_PURPOSE, issue_capability
+
+        def bind_download_capabilities(rows, head_sha, round_id):
+            bound = []
+            for row in rows:
+                item = copy.deepcopy(row)
+                attachment_id = item.get("attachment_id")
+                if isinstance(attachment_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id):
+                    item["download_capability"] = issue_capability(
+                        self.config, repo, pr_number, head_sha, round_id,
+                        purpose=DOWNLOAD_PURPOSE, resource="attachment:" + attachment_id,
+                    )
+                bound.append(item)
+            return bound
+
         if evidence_enabled:
             render_state["capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
+                purpose=DOWNLOAD_PURPOSE, resource="page",
             )
+            render_state["log_capability"] = issue_capability(
+                self.config, repo, pr_number, state["head_sha"], current_round,
+                purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
+            )
+        if evidence_enabled:
+            current_rows = bind_download_capabilities(current_rows, state["head_sha"], current_round)
         for archive in reversed(archives):
             if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
                 continue
             seen_rounds.add(archive["round_id"])
             snapshot = copy.deepcopy(archive["snapshot"])
             if evidence_enabled:
-                snapshot["capability"] = issue_capability(
+                snapshot["log_capability"] = issue_capability(
                     self.config, repo, pr_number, snapshot["head_sha"], archive["round_id"],
+                    purpose=DOWNLOAD_PURPOSE, resource="log:" + archive["round_id"],
                 )
             snapshot["deployments"] = self._enrich_deployments_for_render(snapshot.get("deployments", []))
-            snapshot["attachments"] = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
+            snapshot_attachments = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
+            snapshot["attachments"] = (bind_download_capabilities(
+                snapshot_attachments, snapshot["head_sha"], archive["round_id"],
+            ) if evidence_enabled else snapshot_attachments)
             bundles.append({**archive, "snapshot": snapshot})
             if len(bundles) == 3:
                 break
@@ -3882,13 +3835,26 @@ class DeployController:
         new_head: str, comment_id: int, command_kind: str = "approve_deploy",
     ) -> None:
         """Handle HEAD drift by superseding the current deployment."""
+        pr = await self.proxy.get_pr(repo, pr_number)
+        if (pr.get("state") != "open" or pr.get("merged") or pr.get("draft")
+                or not re.fullmatch(r"[0-9a-f]{40}", str(new_head))
+                or pr.get("head", {}).get("sha") != new_head):
+            return
         old_head = state.get("head_sha", "")
         old_status = state.get("status", "review-required")
         archived = await self._archive_round(
             repo, pr_number, copy.deepcopy(state), "HEAD changed",
         )
+        pr = await self.proxy.get_pr(repo, pr_number)
+        if (pr.get("state") != "open" or pr.get("merged") or pr.get("draft")
+                or pr.get("head", {}).get("sha") != new_head):
+            return
         state["status"] = "review-required"
         state["head_sha"] = new_head
+        state["round_id"] = make_round_id(
+            new_head, comment_id,
+        )
+        state["round_started_at"] = utc_now()
         state["review_evidence"] = {}
         state["components"] = []
         state["deployments"] = []
@@ -3930,7 +3896,28 @@ class DeployController:
         reason: str,
     ) -> None:
         """Invalidate the current validation snapshot and return to review-required."""
+        pr = await self.proxy.get_pr(repo, pr_number)
+        if (pr.get("state") != "open" or pr.get("merged") or pr.get("draft")
+                or not re.fullmatch(r"[0-9a-f]{40}", str(head_sha))
+                or pr.get("head", {}).get("sha") != head_sha):
+            return
+        head_changed = state.get("head_sha") != head_sha
+        archived = None
+        if head_changed:
+            archived = await self._archive_round(
+                repo, pr_number, copy.deepcopy(state), "HEAD changed",
+            )
+            pr = await self.proxy.get_pr(repo, pr_number)
+            if (pr.get("state") != "open" or pr.get("merged") or pr.get("draft")
+                    or not re.fullmatch(r"[0-9a-f]{40}", str(head_sha))
+                    or pr.get("head", {}).get("sha") != head_sha):
+                return
         state["status"] = "review-required"
+        if head_changed:
+            state["head_sha"] = head_sha
+            state["round_id"] = make_round_id(head_sha, comment_id)
+            state["round_started_at"] = utc_now()
+            state["round_archive"] = archived
         state["review_evidence"] = {}
         state["components"] = []
         state["deployments"] = []
@@ -4013,6 +4000,8 @@ class DeployController:
 
         if pr_state != "open" or pr_merged or pr_data.get("draft"):
             return
+        if not re.fullmatch(r"[0-9a-f]{40}", current_head):
+            return
 
         if state is not None:
             cmd = state.get("command", {})
@@ -4078,94 +4067,15 @@ class DeployController:
                     )
                 return
 
-            # ── testing status: reconcile missing/running case results ──
-            # A persisted "running" case must NOT strand the lifecycle in testing.
-            # Compute exact BOUND component DICTS from the authoritative components snapshot.
+            # Deployment and manual testing are decoupled. Preserve any legacy
+            # case_results as history, but never launch automated Cases here.
             if state.get("status") == "testing":
-                bound_components = [
-                    c for c in state.get("components", [])
-                    if isinstance(c, dict) and c.get("component_id")
-                ]
-                bound_ids = [c.get("component_id", "") for c in bound_components]
-                case_results = state.get("case_results", {})
-                # Terminal values: pass, fail, n/a. NOT "running", NOT missing.
-                case_complete = all(
-                    case_results.get(cid) in ("pass", "fail", "n/a")
-                    for cid in bound_ids
-                ) if bound_ids else False
-
-                if not case_complete:
-                    # Recovery of absent or running case results — advisory only, ZERO deploy POST.
-                    # Preserve already terminal results when merging fresh case results.
-                    fresh_re = {}
-                    for cid in bound_ids:
-                        cr = case_results.get(cid)
-                        if cr is None or cr not in ("pass", "fail", "n/a"):
-                            fresh_re[cid] = None  # placeholder: rerun advisory
-
-                    if fresh_re:
-                        # Validate bound component and deployment snapshots
-                        deployments = state.get("deployments", [])
-                        bound_deploy_ids = set()
-                        for d in deployments:
-                            if d.get("phase") == "deployed":
-                                bound_deploy_ids.update(d.get("component_ids", []))
-                        if not all(cid in bound_deploy_ids for cid in bound_ids):
-                            logger.warning(
-                                "reconcile testing: bound components not all deployed, skipping recovery %s#%s",
-                                repo, pr_number,
-                            )
-                        else:
-                            try:
-                                bound_head = state.get("head_sha", "")
-                                case_results_merged = await self._run_automated_case(
-                                    repo, pr_number, bound_head, bound_components, deployments,
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    "reconcile testing case recovery %s#%s: %s",
-                                    repo, pr_number, e,
-                                )
-                                case_results_merged = {}
-
-                            if case_results_merged:
-                                # Post-await stale-snapshot protection
-                                try:
-                                    post_head = (await self.proxy.get_pr(repo, pr_number)).get("head", {}).get("sha", "")
-                                except Exception:
-                                    post_head = None
-                                post_state = await self.proxy.read_hidden_state(repo, pr_number)
-                                stale = (
-                                    post_head != bound_head
-                                    or post_state is None
-                                    or post_state.get("head_sha") != bound_head
-                                    or post_state.get("status") != "testing"
-                                )
-                                if not stale:
-                                    # Merge only non-terminal results onto FRESH post_state
-                                    fresh_case_results = dict(post_state.get("case_results", {}))
-                                    for cid in bound_ids:
-                                        if fresh_case_results.get(cid) in ("pass", "fail", "n/a"):
-                                            continue
-                                        fresh_case_results[cid] = case_results_merged.get(cid, fresh_case_results.get(cid))
-                                    post_state["case_results"] = fresh_case_results
-                                    testing_markdown = comments_mod.testing(
-                                        repo, pr_number,
-                                        post_state.get("head_sha", ""),
-                                        case_result=", ".join(
-                                            f"{k}={v}" for k, v in fresh_case_results.items()
-                                        ),
-                                    )
-                                    await self._write_lifecycle_with_history(
-                                        repo, pr_number, post_state, testing_markdown, event=None,
-                                    )
-                                    try:
-                                        await self.proxy.project_status_label(repo, pr_number, "testing")
-                                    except Exception as e:
-                                        logger.warning(
-                                            "reconcile label projection %s#%s: %s", repo, pr_number, e,
-                                        )
-
+                try:
+                    await self.proxy.project_status_label(repo, pr_number, "testing")
+                except Exception as e:
+                    logger.warning(
+                        "reconcile label projection %s#%s: %s", repo, pr_number, e,
+                    )
                 return
 
         if pr_state != "open" or pr_merged:
@@ -4486,12 +4396,16 @@ class DeployController:
 
         if not current_head:
             return "uncertain"
+        if not re.fullmatch(r"[0-9a-f]{40}", str(current_head)):
+            return "uncertain"
         if current_head != state.get("head_sha", ""):
             archived = await self._archive_round(
                 repo, pr_number, copy.deepcopy(state), "HEAD changed",
             )
             old_status = state.get("status", "review-required")
             state["status"] = "review-required"
+            state["round_id"] = make_round_id(current_head, comment_id)
+            state["round_started_at"] = utc_now()
             state["review_evidence"] = {}
             state["components"] = []
             state["deployments"] = []
@@ -4815,8 +4729,6 @@ class DeployController:
         """
         from .review_comment_parser import ReviewCommentEvidence
         if not isinstance(evidence, ReviewCommentEvidence):
-            return None
-        if evidence.test_results_block_deployment:
             return None
         if evidence.head_sha and evidence.head_sha != fresh_head:
             return None

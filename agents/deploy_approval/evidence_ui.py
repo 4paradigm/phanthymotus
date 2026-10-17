@@ -33,8 +33,7 @@ pre,code{{overflow-wrap:anywhere;white-space:pre-wrap}}li{{padding:.6rem 0;borde
 <p id="auth">正在检查当前 PR/HEAD/round capability。</p>
 <p id="message" role="status" aria-live="polite"></p><button id="refresh" type="button">刷新状态</button>
 <section><h2>当前轮</h2><p id="summary">等待服务端状态</p>
-<fieldset id="writes" disabled><legend>上传与备注</legend>
-<label>提交者<input id="submitter" value="browser tester" maxlength="100"></label>
+<fieldset id="writes" disabled hidden><legend>上传与备注</legend>
 <label>文件（支持视频和普通文件）<input id="file" type="file"></label>
 <label>备注<textarea id="note" maxlength="10000"></textarea></label>
 <label>替换当前轮附件<select id="replace"><option value="">新增附件</option></select></label>
@@ -77,7 +76,18 @@ _JAVASCRIPT = r'''"use strict";
       context.authenticated === true && context.can_write === true && context.status === "testing" &&
       (context.pr_state === undefined || context.pr_state === "open") && !context.merged && !stopped;
   }
+  function permissionMessage() {
+    if (!context.authenticated) return "Evidence capability 无效或已过期；请从当前 PR Summary 的 View Evidence 链接重新打开。";
+    if (context.enabled === false || context.evidence_enabled === false) return "Evidence 功能当前未启用。";
+    if (context.pr_state && context.pr_state !== "open" || context.merged) return "PR 已关闭或已合并，当前证据只读。";
+    if (context.head_sha !== bound.head_sha || context.round_id !== bound.round_id) return "HEAD 或 round 已变化；本页面绑定历史轮次，只读。";
+    if (context.status !== "testing") return `当前状态为 ${context.status || "unknown"}；仅 testing 阶段允许写入。`;
+    if (context.github_user_authenticated === false) return "请先完成 GitHub 用户认证；公开读者仅可查看和下载。";
+    if (context.can_write !== true) return "当前 capability 没有本轮写入权限。";
+    return "当前轮可写。";
+  }
   function controls() {
+    $("writes").hidden = !writable();
     $("writes").disabled = !writable();
     $("upload").disabled = busy;
     $("file").disabled = busy;
@@ -108,7 +118,6 @@ _JAVASCRIPT = r'''"use strict";
         headers["Content-Type"] = "application/json";
         if (!context.csrf_token) throw new Error("缺少 CSRF token，请从 Summary capability 链接重新打开。");
         headers["X-CSRF-Token"] = context.csrf_token;
-        headers["X-Evidence-Submitter"] = $("submitter").value || "browser tester";
       }
       const response = await fetch(api + path, {
         method, headers, credentials: "same-origin", redirect: "error", cache: "no-store", signal: controller.signal,
@@ -140,7 +149,9 @@ _JAVASCRIPT = r'''"use strict";
       const attachmentId = item.attachment_id || item.id;
       const description = document.createElement("span");
       description.textContent = [item.filename || item.text || "文本证据", item.size === undefined ? "" : `${item.size} B`,
-        item.actor || item.submitted_by || "", item.created_at || "", item.note || "",
+        item.actor_verified === true ? (item.actor_login || item.actor || "") : "未验证身份",
+        item.created_at || "",
+        item.head_sha || "", item.round_id || "", item.note || "",
         deleted ? `已删除 ${item.deleted_at || ""} ${item.deleted_by || ""}` : item.status || "pending",
         item.replaces_id ? `替换 ${item.replaces_id}` : ""].filter(Boolean).join(" · ");
       li.append(description);
@@ -163,7 +174,7 @@ _JAVASCRIPT = r'''"use strict";
     }
   }
   function render() {
-    $("auth").textContent = context.authenticated ? (writable() ? "Capability 有效，可以向当前测试轮提交证据。" : "当前轮只读或不处于 testing。") : "Capability 无效。请从当前 PR Summary 重新打开。";
+    $("auth").textContent = permissionMessage();
     $("summary").textContent = typeof context.summary === "string" ? context.summary : JSON.stringify(context.summary || {status: context.status});
     $("attachments").replaceChildren(); $("history").replaceChildren();
     const replacement = $("replace").value;
@@ -248,7 +259,9 @@ _JAVASCRIPT = r'''"use strict";
   }
   const terminalReady = value => value.status === "ready" && value.verified === true;
   async function resumeIfRequired(state) {
-    if (state.resume_required !== true) return state;
+    // GET status is read-only. An initializing record means the prior init
+    // response was lost, so an explicit Upload / Continue can recover it.
+    if (state.status !== "initializing" && state.initialization_pending !== true) return state;
     if (!chosen || !fingerprint) throw new Error("恢复上传前请重新选择原文件并完成指纹核对。");
     const resumed = await request("/uploads/" + id(session.upload_id) + "/resume", {
       method: "POST", key: session.upload_id + ":resume", body: {}
@@ -373,14 +386,14 @@ _JAVASCRIPT = r'''"use strict";
       fingerprint = selectedFingerprint;
       if (!session) {
         await refresh();
-        const result = await request("/uploads", {method: "POST", key: bound.round_id + ":" + fingerprint + ":" + ($("replace").value || "new") + ":" + uid(),
-          body: {filename: chosen.name, size: chosen.size, content_type: chosen.type || "application/octet-stream", note: $("note").value, submitter: $("submitter").value || "browser tester", replaces_id: $("replace").value || null}});
+      const result = await request("/uploads", {method: "POST", key: bound.round_id + ":" + fingerprint + ":" + ($("replace").value || "new") + ":" + uid(),
+          body: {filename: chosen.name, size: chosen.size, content_type: chosen.type || "application/octet-stream", note: $("note").value, replaces_id: $("replace").value || null}});
         id(result.upload_id); session = {...result, parts: partsOf(result)}; persist();
       }
       let state = await uploadState();
       state = await resumeIfRequired(state);
       if (terminalReady(state) || ["completing", "verifying", "processing"].includes(state.status) || completeUnknown) { await complete(); return; }
-      const partBytes = Number(state.part_bytes);
+      const partBytes = Number(state.part_bytes || context.part_bytes);
       if (!Number.isSafeInteger(partBytes) || partBytes <= 0) throw new Error("服务端未提供有效的 part_bytes，无法安全分块。");
       if (state.filename && state.filename !== chosen.name || state.size !== undefined && Number(state.size) !== chosen.size) throw new Error("服务端上传文件元数据不匹配");
       const count = Math.ceil(chosen.size / partBytes);
@@ -456,7 +469,7 @@ _JAVASCRIPT = r'''"use strict";
   });
   $("save-note").addEventListener("click", async () => {
     if (busy || !writable()) return;
-    const body = {text: $("text").value, note: $("note").value, submitter: $("submitter").value || "browser tester"};
+    const body = {text: $("text").value, note: $("note").value};
     if (!body.text.trim() && !body.note.trim()) { message("请输入文本或备注。"); return; }
     const content = JSON.stringify(body);
     if (!noteOperation || noteOperation.content !== content) noteOperation = {content, key: uid()};

@@ -231,7 +231,7 @@ def _workflow_lines(status: str) -> str:
         ("3. Request deployment", 2),
         ("4. Machine Owner approval(s)", 3),
         ("5. All required components deployed", 4),
-        ("6. Automated Cases", 4),
+        ("6. Machine Owner uploads evidence", 4),
         ("7. Record validation result", 5),
         ("8. Deployment accepted", 6),
     ]
@@ -985,11 +985,10 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         else:
             group.setdefault("attachments", []).append(row)
 
-    def download(identifier, suffix, group):
+    def download(identifier, suffix, capability):
         identifier = str(identifier or "")
         if not base or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
             return ""
-        capability = group.get("capability", "")
         if not capability:
             return ""
         return base + api + suffix.format(id=identifier) + "?cap=" + urllib.parse.quote(capability, safe="")
@@ -1000,8 +999,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                  f"**Submitter:** {_escape(group.get('actor') or group.get('actor_login') or group.get('submitted_by') or group.get('requested_by') or group.get('command', {}).get('args', {}).get('actor') or 'unknown')}",
                  f"**Time:** {_escape(group.get('created_at') or group.get('started_at') or group.get('round_started_at') or 'unknown')}",
                  f"**Status:** {_escape(group.get('status') or 'unknown')}", "",
-                 "| Attachment | Size | Submitter | Time | Note | Status | Download |",
-                 "|---|---|---|---|---|---|---|"]
+                 "| Attachment | Size | Submitter | Time | HEAD | Round | Note | Status | Download |",
+                 "|---|---|---|---|---|---|---|---|---|"]
         latest_items = {}
         for offset, item in enumerate(group.get("attachments", [])):
             if not isinstance(item, dict):
@@ -1018,22 +1017,25 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 continue
             deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
             status = "deleted" if deleted else item.get("status", "pending")
-            link = download(item.get("attachment_id") or item.get("id"), "/attachments/{id}/download", group)
+            link = download(item.get("attachment_id") or item.get("id"),
+                            "/attachments/{id}/download", item.get("download_capability", ""))
             cells = [item.get("filename") or item.get("text") or "Note", item.get("size", "—"),
-                     item.get("actor") or item.get("actor_login") or item.get("submitted_by") or "unknown",
-                     item.get("created_at") or "unknown", item.get("note", ""), status]
+                     ((item.get("actor_login") or item.get("actor"))
+                      if item.get("actor_verified") is True else "unverified"),
+                     item.get("created_at") or "unknown", item.get("head_sha") or h,
+                     item.get("round_id") or r, item.get("note", ""), status]
             if item.get("replaces_id"):
-                cells[4] = str(cells[4]) + " · replaces " + str(item["replaces_id"])
+                cells[6] = str(cells[6]) + " · replaces " + str(item["replaces_id"])
             if deleted:
-                cells[4] = str(cells[4]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
+                cells[6] = str(cells[6]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
             lines.append("| " + " | ".join(_escape(v) for v in cells) + " | " +
                          (f"[Download]({link})" if link and not deleted and status == "ready" else "Unavailable") + " |")
         if group.get("deployments"):
             lines.extend(["", _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
-        for field in ("case_results", "test_result", "summary", "cos_object_key", "cos_bundle_sha256", "cos"):
+        for field in ("case_results", "test_result", "summary", "history", "cos_object_key", "cos_bundle_sha256", "cos"):
             if group.get(field):
                 lines.extend(["", f"**{_escape(field)}:** {_escape(json.dumps(group[field], ensure_ascii=False) if isinstance(group[field], (list, dict)) else group[field])}"])
-        log = download(r, "/rounds/{id}/log/download", group)
+        log = download(r, "/rounds/{id}/log/download", group.get("log_capability", ""))
         if log and (group.get("cos_object_key") or group.get("cos", {}).get("object_key") or group.get("log_available") or group.get("log_ready")):
             lines.extend(["", f"[Download round COS log]({log})"])
         return lines
@@ -1045,7 +1047,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         # The signed Summary capability is bound to this trusted HEAD/round.
         capability = state.get("capability", "")
         if capability:
-            lines.extend(["", f"[Upload evidence]({base}/evidence/{repo}/pulls/{pr_number}?cap={urllib.parse.quote(capability, safe='')})"])
+            evidence_url = f"{base}/evidence/{repo}/pulls/{pr_number}?cap={urllib.parse.quote(capability, safe='')}"
+            lines.extend(["", f"[View Evidence]({evidence_url})"])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: str(pair[1].get("archived_at") or pair[1].get("ended_at") or pair[1].get("created_at") or ""), reverse=True)
     lines.extend(["", "### Previous rounds", ""])
