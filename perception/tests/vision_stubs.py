@@ -219,6 +219,11 @@ def _install_fake_cv2():
     cv2.IMREAD_COLOR = 1
     cv2.INTER_NEAREST = 0
     cv2.INTER_LINEAR = 1
+    # The stub's `resize` ignores the mode, but a missing *constant* is an
+    # AttributeError at the call site — so a plugin that asks for a better
+    # filter fails here and nowhere else. Same trap as `frame_bytes`: a test
+    # that is green only on a host with real OpenCV is green exactly where the
+    # code does not run.
     cv2.INTER_CUBIC = 2
     cv2.INTER_AREA = 3
     cv2.BORDER_REFLECT_101 = 4

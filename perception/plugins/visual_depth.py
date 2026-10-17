@@ -2,7 +2,8 @@
 """
 plugins/visual_depth.py — VideoDepthPerceptionPlugin: monocular depth from a plain RGB camera.
 
-Subscribes to image/jpeg topics, runs a prebuilt YOLO26-depth TensorRT engine,
+Subscribes to image/jpeg topics, runs a prebuilt metric-depth TensorRT engine
+(YOLO26-depth by default, optionally K-aware DepthART),
 and publishes two things per frame:
 
     {input}/visual_depth          image/depth-zlib   for the dashboard's renderer
@@ -28,6 +29,10 @@ Two constraints worth knowing before changing anything here:
   `model.calibrate()` — and labelled every payload `"scale": "relative"`. That
   was wrong, and it is the more dangerous direction of wrong: an agent told the
   distances are meaningless will not use them.
+
+  The exporter details below describe the default YOLO backend. DepthART uses
+  its own metric head and a runtime camera matrix; YOLO camera presets do not
+  transfer to it.
 
   The head predicts a relative log-depth field, but the metric transform is
   applied *inside* `Depth.forward` (`depth.pow(cal_a) * cal_b.exp()`, ultralytics
@@ -251,6 +256,7 @@ TOOLS = [
                 # path perception can open, with no shared mount.
                 "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/scene.jpg）。常见格式都支持，过大的图会本地缩放"},
                 "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/scene.jpg。下载后本地解码，格式限制同 image_path"},
+                "camera_info": {"anyOf": [{"type": "object"}, {"type": "array", "items": {"type": "object"}}], "description": "DepthART 相机内参：流式 start 接收按 topic 组织的 motus.camera/1 声明或声明列表；按需 start 或单图可直接传含 width、height、九个行优先 K 数值的声明。start 绑定的相机不能被单图覆盖；未绑定的按需实例每张图必须传声明，不猜测焦距。"},
                 "distance_m": {"type": "number", "description": "标定用：镜头到那面墙/平面的真实距离（米），用卷尺量。墙要正对镜头、填满取样区域"},
                 "region": {"type": "string", "enum": list(CALIBRATION_REGIONS), "description": "标定用：在画面的哪一块取样。默认 center（画面正中 20% 的方框）；墙占满整个画面时可以用 full，取样像素更多"},
                 "reset": {"type": "boolean", "description": "标定用：等同于 reset_calibration，保留给已有调用方"},
@@ -286,19 +292,22 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "fps":          {"type": "integer", "description": "Max inference frames per second", "default": 2, "scope": "instance"},
+                "backend": {"type": "string", "title": "Depth model", "description": "Shared by all cameras. Stop all depth instances before switching. Missing model files download on first use; DepthART requires camera intrinsics.", "enum": ["yolo", "depthart"], "default": "yolo", "scope": "shared"},
+                "fps":          {"type": "integer", "title": "Inference FPS", "description": "Maximum inference frames per second", "default": 2, "scope": "instance"},
                 # Log-affine site calibration, applied on top of the one baked
                 # into the engine: metres_out = metres_in**cal_a * exp(cal_b).
                 # Same two parameters ultralytics' model.calibrate() fits, so a
                 # result from there pastes in here unchanged. 1.0 / 0.0 is
                 # identity — i.e. trust the engine.
-                "cal_a": {"type": "number", "description": "站点标定指数 a（d^a）。默认 1.0 = 不额外修正，直接用 engine 自带的标定", "default": 1.0, "scope": "instance"},
-                "cal_b": {"type": "number", "description": "站点标定偏移 b（乘 e^b）。默认 0.0 = 不额外修正。与 ultralytics model.calibrate() 的 cal_b 同一参数", "default": 0.0, "scope": "instance"},
+                "cal_a": {"type": "number", "title": "Calibration a", "description": "Depth exponent; 1 means no exponent correction.", "default": 1.0, "scope": "instance"},
+                "cal_b": {"type": "number", "title": "Calibration b", "description": "Log scale offset; 0 means no scale correction.", "default": 0.0, "scope": "instance"},
+                "calibration_backend": {"type": "string", "title": "Calibration model", "description": "这对 cal_a / cal_b 是在哪个深度模型上量的。`calibrate` 会自己填好，手填只在从别处抄一组系数时需要。**留空＝YOLO26-N Depth**，因为这个字段出现之前只有这一个模型。和当前模型不符的系数会被忽略（不换算），深度回到模型自带的标定，`info()` 的 calibration_note 会说明。", "oneOf": [{"const": "yolo", "title": "YOLO26-N Depth"}, {"const": "depthart", "title": "DepthART Metric-S"}], "scope": "instance"},
                 # Presets are for the common case (a known robot, a known
                 # camera); cal_a/cal_b above stay for anything else, and a
                 # non-identity value there wins — see _calibration_from_cfg.
                 "calibration_preset": {
                     "type": "string",
+                    "title": "Calibration",
                     "enum": [CAL_AUTO, CAL_NONE, CAL_MANUAL]
                             + sorted(CALIBRATION_PRESETS),
                     "description": "深度标定从哪来。"
@@ -307,7 +316,7 @@ TOOLS = [
                                    f"{CAL_NONE!r} = 一律不额外修正；"
                                    f"{CAL_MANUAL!r} = 用上面填的 cal_a / cal_b；"
                                    "其余是手动指定某台机器人的预设。"
-                                   "**标定是相机的属性** —— 同型号换了镜头必须重标，"
+                                   "**标定属于相机与深度模型的组合** —— 换镜头或切换模型必须重新确认标定，"
                                    "选错和不标定一样危险，只是更不容易发现。",
                     "default": CAL_AUTO,
                     "scope": "instance",
@@ -530,6 +539,33 @@ def calibration_origin(cfg: dict, camera_id: str = "") -> str:
     if cfg.get("depth_scale") not in (None, "") and "cal_b" not in cfg:
         return "legacy-depth_scale"
     return "model-default"
+
+
+def _depthart_camera_error(error, input_topic, declaration) -> str:
+    """Why the card will not start, in terms the operator can act on.
+
+    `camera_matrix` says "DepthART requires camera_info with a nine-value K,
+    width and height", which is correct and useless from the canvas: nothing
+    there is called camera_info, and the operator did not leave a field blank —
+    the upstream card simply does not declare its optics, and most cards never
+    have. Measured on Orin 5: `remote_camera`'s `info()` has no `camera_info`
+    key at all, so Agent Core had nothing to pass on (see
+    `api/config.py:_upstream_camera_info`), and the card dead-ended on a
+    sentence naming a field that appears nowhere in the UI.
+
+    Refusing is still right. DepthART's metric scale comes *from* K; inventing
+    a focal length would publish confidently wrong metres on a topic whose
+    whole contract is that the number is in metres, and a browser or phone
+    camera has no calibrated K to declare in the first place.
+    """
+    if not declaration:
+        where = f"上游 {input_topic} " if input_topic else "这个输入 "
+        return (f"{where}没有声明相机内参（motus.camera/1）—— DepthART 的公制尺度"
+                f"是从 K 算出来的，没有 K 就只能瞎猜焦距，发出去的米数会是错的。"
+                f"两条路：把 Depth model 改回 yolo（它不需要内参），"
+                f"或者换一个会声明内参的相机。浏览器/手机远程摄像头不会有内参。")
+    return (f"{error}（上游 {input_topic or '输入'} 的声明读不出可用的 K）"
+            if input_topic else str(error))
 
 
 def calibration_conflict(cfg: dict) -> str:
@@ -1036,9 +1072,17 @@ class VideoDepthPerceptionPlugin:
     def __init__(self, plugin_cfg: dict, namespace: str, executor):
         self._namespace = namespace
         self._executor = executor
+        self._closing = False
+        self._backend = str(plugin_cfg.get("backend", "yolo"))
+        if self._backend not in ("yolo", "depthart"):
+            raise ValueError(f"unsupported visual_depth backend: {self._backend}")
         # Kept whole: image_input reads max_image_bytes and the path-confinement
         # settings straight from it (see plugins/image_input.py).
-        self._plugin_cfg = dict(plugin_cfg or {})
+        self._plugin_cfg, note = self._backend_calibration_cfg(plugin_cfg or {})
+        # Per instance ("" for the card's own config), because that is the
+        # scope a fit has. Surfaced on `info()` — a dropped coefficient that
+        # nothing says out loud is the failure this card keeps repeating.
+        self._cal_notes: dict[str, str] = {"": note} if note else {}
         # What cal_a/cal_b were before `calibrate` overwrote them, so
         # `reset_calibration` can put the dict back exactly as it found it.
         self._cal_cfg_backup = None
@@ -1052,7 +1096,7 @@ class VideoDepthPerceptionPlugin:
         self._barrel_max_fraction = float(
             plugin_cfg.get("lens_barrel_max_fraction", 0.6))
         self._barrel_scale = int(plugin_cfg.get("lens_barrel_scale", 4))
-        self._cal_a, self._cal_b = _calibration_from_cfg(plugin_cfg)
+        self._cal_a, self._cal_b = _calibration_from_cfg(self._plugin_cfg)
         # (measured_m, predicted_m) reference readings from the `calibrate`
         # action, in call order. Refit from scratch on every addition, so a
         # bad sample can be undone with reset rather than compounding.
@@ -1076,11 +1120,134 @@ class VideoDepthPerceptionPlugin:
         # stop, or a model load.
         self._nodes_lock = threading.RLock()
 
+    # The backend a fit was measured against, when the row does not say.
+    #
+    # **Absent means `yolo`, and that is not a guess.** `calibration_backend`
+    # is new in this change; before it there was one depth model, so every
+    # coefficient already saved on every deployed card was measured against
+    # YOLO26-depth by construction. Reading absence as "unknown" and refusing
+    # the row instead rejected the config of every card that had ever been
+    # calibrated — and Agent Core replaces a rejected config's reason with its
+    # own generic text, so the robot came up with
+    # `配置无效（缺少 url/key）` on a card that has neither a url nor a key.
+    # See agent-core/src/api/mcp_manage.py and mcp_client.py.
+    LEGACY_CAL_BACKEND = "yolo"
+
+    def _backend_calibration_cfg(self, cfg):
+        """Drop a fit that was not measured on the selected model, and say so.
+
+        A log-affine fit belongs to a **camera × model** pair, so coefficients
+        measured under one backend are not transferable to the other: on
+        r1_sz's ultra-wide lens YOLO's `cal_b: -0.9753` is a factor of 2.65 —
+        it is correcting a fixed-K model's guess at a 102° lens, which is not
+        the error DepthART makes, since DepthART is handed the real `K`. What
+        DepthART's own residual on that lens *is* has not been measured.
+
+        What this must *not* do is refuse the config. The canvas replays the
+        saved row on every project start, so a raise here does not read as
+        "check this coefficient" — it stops the depth card coming up at all,
+        under a message about credentials the card does not have. The card
+        already has a rule for a fit the selector is ignoring
+        (`calibration_conflict`): drop it, fall back to the model's own fit,
+        and state it out loud. Same rule here, and `_select_backend` already
+        strips the same keys when the switch happens while the plugin is live.
+        """
+        cfg = dict(cfg)
+        manual = cfg.get("calibration_preset") == CAL_MANUAL
+        custom = any(float(cfg.get(key, default)) != default
+                     for key, default in (("cal_a", 1.), ("cal_b", 0.), ("depth_scale", 1.)))
+        measured_on = cfg.get("calibration_backend") or self.LEGACY_CAL_BACKEND
+        note = ""
+        if (manual or custom) and measured_on != self._backend:
+            note = (f"标定系数是在 {measured_on!r} 上量的，当前深度模型是 "
+                    f"{self._backend!r} —— 这两个数**没有生效**，深度用的是模型"
+                    f"自带的标定。换模型后要重新 calibrate，再把新的 cal_a / "
+                    f"cal_b 和 Calibration model 存进卡片配置。")
+        if self._backend == "depthart" and cfg.get("calibration_preset") in CALIBRATION_PRESETS:
+            note = (f"{cfg['calibration_preset']!r} 是在 YOLO26-depth 上量的预设，"
+                    f"DepthART 用不了 —— 已按「{CAL_NONE}」处理。要标定请用 "
+                    f"calibrate 现场量。")
+        if note:
+            log.warning(f"[visual_depth] {note}")
+            for key in ("cal_a", "cal_b", "depth_scale", "calibration_backend"):
+                cfg.pop(key, None)
+            if cfg.get("calibration_preset") is not None:
+                cfg["calibration_preset"] = CAL_NONE
+        if self._backend == "depthart" and cfg.get("calibration_preset") == CAL_AUTO:
+            cfg["calibration_preset"] = CAL_NONE
+        return cfg, note
+
+    def _camera_declaration(self, key):
+        with self._nodes_lock:
+            return dict(self._upstream_camera.get(key) or {})
+
+    def _request_camera(self, args, instance_id):
+        from plugins.depthart_runtime import camera_matrix
+
+        key = self._request_instance_key(args, instance_id)
+        with self._nodes_lock:
+            inherited = dict(self._upstream_camera.get(key) or {})
+            node = self._nodes.get(key)
+        explicit = args.get("camera_info")
+        if explicit is not None:
+            matrix, width, height = camera_matrix(explicit)
+            if node is not None and inherited:
+                original, ow, oh = camera_matrix(inherited)
+                matrix[0] /= width
+                matrix[1] /= height
+                original[0] /= ow
+                original[1] /= oh
+                if (not np.allclose(matrix, original, rtol=1e-5, atol=1e-6)
+                        or (explicit.get("id") and inherited.get("id")
+                            and explicit["id"] != inherited["id"])):
+                    raise ValueError("photo camera_info differs from this running camera instance")
+            return dict(explicit)
+        if node is None:
+            raise ValueError("DepthART requires camera_info for this photo or a running camera instance")
+        camera_matrix(inherited)
+        return inherited
+
+    def _request_instance_key(self, args, instance_id):
+        if instance_id or args.get("input_topic"):
+            return instance_id or args["input_topic"]
+        with self._nodes_lock:
+            if _DEFAULT_INSTANCE in self._nodes or _DEFAULT_INSTANCE in self._upstream_camera:
+                return _DEFAULT_INSTANCE
+            if len(self._nodes) == 1:
+                return next(iter(self._nodes))
+            if len(self._upstream_camera) == 1:
+                return next(iter(self._upstream_camera))
+        return None
+
+    def _camera_model(self, model, camera):
+        return model.for_camera(camera) if self._backend == "depthart" else model
+
     def _ensure_model(self):
+        if self._closing:
+            raise RuntimeError("visual_depth is shutting down")
         if self._model is not None:
             return
         with self._model_lock:
+            if self._closing:
+                raise RuntimeError("visual_depth is shutting down")
             if self._model is not None:
+                return
+            if self._backend == "depthart":
+                from plugins.depthart_runtime import DepthARTSession
+                engine = os.environ.get("DEPTHART_ENGINE_PATH") or self._plugin_cfg.get("depthart_engine_path")
+                plugin = os.environ.get("DEPTHART_PLUGIN_PATH") or self._plugin_cfg.get("depthart_plugin_path")
+                if bool(engine) != bool(plugin):
+                    raise ValueError("Provide both DepthART engine and plugin overrides, or leave both empty for automatic download")
+                if not engine:
+                    from utils.model_downloader import ensure_depthart_model
+                    from utils.model_progress import fetch_status
+                    progress_cb, _ = fetch_status(
+                        lambda text: setattr(self, "_model_load_status", text), "DepthART Metric-S")
+                    paths = ensure_depthart_model(os.environ.get("DEPTHART_MODEL_DIR", "/models/depthart"),
+                                                  progress_cb=progress_cb)
+                    engine, plugin = paths["depthart.engine"], paths["libdepthart_selective_scan_trt.so"]
+                self._model_load_status = "Loading DepthART Metric-S engine"
+                self._model = DepthARTSession(engine, plugin)
                 return
             from plugins.vision_runtime import VisionEngineSession
             from utils.model_downloader import ensure_depth_model
@@ -1158,11 +1325,14 @@ class VideoDepthPerceptionPlugin:
     def _start_node(self, node_key: str, input_topic: Optional[str]):
         """Register before starting, so a concurrent stop can always cancel it."""
         with self._nodes_lock:
+            if self._closing:
+                return
             if node_key in self._nodes:
                 return
             icfg = self._instance_configs.get(node_key, {})
             node = _DepthNode(
-                input_topic or None, self._model,
+                input_topic or None, self._camera_model(
+                    self._model, lambda: self._camera_declaration(node_key)),
                 fps=int(icfg.get("fps", self._fps)),
                 **dict(zip(("cal_a", "cal_b"),
                            _calibration_from_cfg(
@@ -1204,6 +1374,23 @@ class VideoDepthPerceptionPlugin:
         dispose_node(self._executor, node, label=f"visual_depth/{node_key}")
         return result
 
+    def shutdown(self) -> None:
+        """Release nodes and GPU resources before ROS/interpreter teardown."""
+        if self._backend != "depthart":
+            return
+        with self._nodes_lock:
+            self._closing = True
+        # A loader already holding this lock finishes before its model is closed.
+        # _start_node refuses the loader's subsequent node creation while closing.
+        with self._model_lock:
+            with self._nodes_lock:
+                keys = list(self._nodes)
+            for key in keys:
+                self._retire_node(key)
+            if self._model is not None:
+                model, self._model = self._model, None
+                model.close()
+
     # ── one-shot depth measurement ───────────────────────────────────────────
 
     # ── site calibration from known distances ────────────────────────────────
@@ -1225,7 +1412,8 @@ class VideoDepthPerceptionPlugin:
             if frame is None:
                 raise BadInput("could not decode that file as an image", source)
             from plugins.vision_runtime import decode_depth
-            outputs, meta = self._require_engine().infer(frame)
+            camera = self._request_camera(args, instance_id) if self._backend == "depthart" else None
+            outputs, meta = self._camera_model(self._require_engine(), camera).infer(frame)
             return [decode_depth(outputs, meta)], source
 
         with self._nodes_lock:
@@ -1315,7 +1503,7 @@ class VideoDepthPerceptionPlugin:
         self._ensure_model()
         return self._model
 
-    def _recognize_image(self, args: dict, url_action: str) -> dict:
+    def _recognize_image(self, args: dict, url_action: str, instance_id: str = "") -> dict:
         """Estimate depth for one image and return the measurements.
 
         No prose summary. There was one, and it only restated `nearest` /
@@ -1340,6 +1528,11 @@ class VideoDepthPerceptionPlugin:
             ).as_result()
 
         try:
+            camera = self._request_camera(args, instance_id) if self._backend == "depthart" else None
+        except ValueError as error:
+            return BadInput(str(error), source).as_result()
+
+        try:
             model = self._require_engine()
         except Exception as error:  # noqa: BLE001 — surfaced to the caller
             log.error(f"[visual_depth] engine load failed during recognize: {error}",
@@ -1348,8 +1541,21 @@ class VideoDepthPerceptionPlugin:
 
         from plugins.vision_runtime import decode_depth
 
-        outputs, meta = model.infer(frame)
-        depth_m = apply_site_calibration(decode_depth(outputs, meta), self._cal_a, self._cal_b)
+        try:
+            outputs, meta = self._camera_model(model, camera).infer(frame)
+        except ValueError as error:
+            if self._backend != "depthart":
+                raise
+            return BadInput(str(error), source).as_result()
+        cal_a, cal_b, calibration = self._cal_a, self._cal_b, self._calibration_label()
+        node_key = None
+        if self._backend == "depthart":
+            node_key = self._request_instance_key(args, instance_id)
+            with self._nodes_lock:
+                live = self._nodes.get(node_key)
+                if live is not None:
+                    cal_a, cal_b, calibration = live._cal_a, live._cal_b, live.calibration_label
+        depth_m = apply_site_calibration(decode_depth(outputs, meta), cal_a, cal_b)
         scale_label = "metric"
 
         # Measured at the model's own resolution, not the renderer's 640x480:
@@ -1365,7 +1571,7 @@ class VideoDepthPerceptionPlugin:
             "latency_ms": int((time.time() - started) * 1000),
             **stats,
         }
-        result["calibration"] = self._calibration_label()
+        result["calibration"] = calibration
 
         # Echo onto the card's output topics when an instance is running, so a
         # topic-less card wired into the canvas actually shows data flowing —
@@ -1373,7 +1579,10 @@ class VideoDepthPerceptionPlugin:
         # additive, and deliberately not reported back: which topics this went
         # out on is not something the caller asked about, and every field here
         # is re-read by the model on every turn.
-        self._publish_one_shot(args.get("instance_id", ""), depth_m, stats)
+        if self._backend != "depthart":
+            self._publish_one_shot(args.get("instance_id", ""), depth_m, stats)
+        elif node_key is not None:
+            self._publish_one_shot(node_key, depth_m, stats)
         return result
 
     def _publish_one_shot(self, instance_id: str, depth_m: np.ndarray,
@@ -1381,6 +1590,9 @@ class VideoDepthPerceptionPlugin:
         """Publish a one-shot result on the named instance, or the default one."""
         with self._nodes_lock:
             node = self._nodes.get(instance_id) if instance_id else None
+            if node is None and self._backend == "depthart":
+                # A calibrated photo must not be rerouted to a different camera.
+                return None
             if node is None:
                 node = self._nodes.get(_DEFAULT_INSTANCE)
             if node is None and len(self._nodes) == 1:
@@ -1400,7 +1612,47 @@ class VideoDepthPerceptionPlugin:
             return None
 
     def get_tools(self) -> list:
-        return TOOLS
+        import copy
+        tools = copy.deepcopy(TOOLS)
+        props = tools[0]["configSchema"]["properties"]
+        props["backend"]["default"] = self._backend
+        tools[0]["configSchema"]["properties"] = {
+            key: props[key] for key in ("backend", "fps", "calibration_preset", "calibration_backend", "cal_a", "cal_b")
+        }
+        if self._backend == "depthart":
+            preset = tools[0]["configSchema"]["properties"]["calibration_preset"]
+            preset["enum"] = [CAL_NONE, CAL_MANUAL]
+            preset["default"] = CAL_NONE
+            preset["description"] = "Use metric output as-is, or apply manual site calibration. YOLO presets do not apply to DepthART."
+        return tools
+
+    def _select_backend(self, backend):
+        """Switch only an idle plugin; loading stays lazy and files stay external."""
+        if backend not in ("yolo", "depthart"):
+            raise ValueError(f"Unsupported depth model: {backend}")
+        if backend == self._backend:
+            return
+        if not self._model_lock.acquire(blocking=False):
+            raise ValueError("Depth model is busy; wait until loading finishes")
+        try:
+            with self._nodes_lock:
+                if self._nodes or self._model_loading or self._closing:
+                    raise ValueError("Stop all depth instances and wait for loading to finish before switching models")
+                if self._model is not None:
+                    self._model.close()
+                    self._model = None
+                self._backend = backend
+                self._plugin_cfg["backend"] = backend
+                for config in [self._plugin_cfg, *self._instance_configs.values()]:
+                    for key in ("cal_a", "cal_b", "depth_scale", "calibration_preset", "calibration_backend"):
+                        config.pop(key, None)
+                self._cal_a, self._cal_b = 1.0, 0.0
+                self._cal_samples = []
+                self._cal_notes.clear()
+                self._cal_cfg_backup = None
+                self._model_load_error = self._model_load_status = None
+        finally:
+            self._model_lock.release()
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action", name)
@@ -1411,12 +1663,12 @@ class VideoDepthPerceptionPlugin:
                 # The declaration does not wait for the engine — see the same
                 # spot in plugins/vop.py for what dropping it cost.
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26n-depth", "state": "loading",
-                        "desc": "Loading depth engine...",
+                        "model": "depthart-metric-s" if self._backend == "depthart" else "yolo26n-depth", "state": "loading",
+                        "desc": self._model_load_status or "Loading depth engine...",
                         **self._loading_camera_info(args, instance_id)}
             if self._model_load_error:
                 return {"name": "VideoDepthPerception", "manufacture": "Embodied",
-                        "model": "yolo26n-depth", "state": "error",
+                        "model": "depthart-metric-s" if self._backend == "depthart" else "yolo26n-depth", "state": "error",
                         "desc": f"Engine load failed: {self._model_load_error}"}
 
             with self._nodes_lock:
@@ -1467,13 +1719,13 @@ class VideoDepthPerceptionPlugin:
             scale = "metric"
             info = {
                 "name": "VideoDepthPerception", "manufacture": "Embodied",
-                "model": "yolo26n-depth",
+                "model": "depthart-metric-s" if self._backend == "depthart" else "yolo26n-depth",
                 "state": "running" if instances else "idle",
                 "scale": scale,
                 "instances": instances,
                 "topic_in": topics_in,
                 "topic_out": topics_out,
-                "desc": "Monocular depth estimation (YOLO26-depth, TensorRT)",
+                "desc": f"Monocular depth estimation ({'DepthART' if self._backend == 'depthart' else 'YOLO26-depth'}, TensorRT)",
             }
             info["unit"] = "m"
             cam_key = instance_id if instance_id in nodes else (
@@ -1493,9 +1745,19 @@ class VideoDepthPerceptionPlugin:
                 info["camera_info"] = camera_out
             if camera_note:
                 info["camera_info_note"] = camera_note
+            # Why `calibration` reads `model-default` on a card whose config
+            # dialog visibly holds a cal_b. Without it the two cases — nobody
+            # ever measured, and somebody measured against the other model —
+            # are indistinguishable from outside.
+            with self._nodes_lock:
+                cal_note = self._cal_notes.get(cam_key) or self._cal_notes.get("")
+            if cal_note:
+                info["calibration_note"] = cal_note
             return info
 
         elif action == "start":
+            if self._closing:
+                return {"state": "error", "message": "visual_depth is shutting down"}
             input_topic = args.get("input_topic")
             upstream_camera = args.get("camera_info")
             if not input_topic:
@@ -1508,19 +1770,37 @@ class VideoDepthPerceptionPlugin:
             # recognize_by_url. It just has nothing to subscribe to.
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
 
-            # Recorded before the node starts, so `info()` can answer with it
-            # even while the engine is still loading — and recorded even when it
-            # is empty, so a restart that no longer carries a declaration
-            # replaces the old one rather than leaving a stale entry claiming a
-            # lens that is no longer wired.
+            declaration = upstream_camera
             if input_topic:
                 from plugins.camera_info import for_topic as _camera_for_topic
-                with self._nodes_lock:
-                    self._upstream_camera[node_key] = _camera_for_topic(
-                        upstream_camera, input_topic)
+                declaration = _camera_for_topic(upstream_camera, input_topic)
+            if self._backend == "depthart" and (input_topic or declaration is not None):
+                from plugins.depthart_runtime import camera_matrix
+                try:
+                    camera_matrix(declaration)
+                except ValueError as error:
+                    return {"state": "error",
+                            "message": _depthart_camera_error(error, input_topic, declaration)}
 
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
+                if self._backend == "depthart" and running is not None:
+                    if (running._input_topic or None) != (input_topic or None):
+                        return {"state": "error", "message": "Input topic differs from the running instance; stop before rebinding"}
+                    if declaration is not None:
+                        if not self._upstream_camera.get(node_key):
+                            return {"state": "error", "message": "Instance is unbound; stop before binding a camera"}
+                        try:
+                            self._request_camera({"camera_info": declaration}, node_key)
+                        except ValueError as error:
+                            return {"state": "error", "message": str(error)}
+                    return running.start()
+                # Only a new/stopped DepthART instance establishes a binding.
+                # Preserve YOLO's existing declaration-update behavior.
+                if input_topic or (self._backend == "depthart" and declaration is not None):
+                    self._upstream_camera[node_key] = dict(declaration)
+                elif self._backend == "depthart":
+                    self._upstream_camera.pop(node_key, None)
             if running is None:
                 if self._model is None:
                     if self._model_loading:
@@ -1530,19 +1810,19 @@ class VideoDepthPerceptionPlugin:
                     if self._model_load_error:
                         return {"state": "error", "message": f"Engine failed to load: {self._model_load_error}"}
 
+                    self._model_loading = True
                     def _bg_start():
-                        self._model_loading = True
                         self._model_load_error = None
                         self._model_load_status = None
                         try:
                             self._ensure_model()
-                            self._model_loading = False
                             self._model_load_status = None
                             self._start_node(node_key, input_topic)
                         except Exception as e:
-                            self._model_loading = False
                             self._model_load_error = str(e)
                             log.error(f"[visual_depth] engine load failed: {e}", exc_info=True)
+                        finally:
+                            self._model_loading = False
 
                     threading.Thread(target=_bg_start, daemon=True, name="visual_depth_model_load").start()
                     return {"state": "loading", "input": input_topic,
@@ -1566,13 +1846,36 @@ class VideoDepthPerceptionPlugin:
         elif action == "config":
             cfg = {k: v for k, v in args.items()
                    if k not in ("action", "instance_id") and v is not None and v != ""}
+            if any(k in cfg for k in ("depthart_engine_path", "depthart_plugin_path")):
+                return {"status": "error", "message": "Artifact paths are startup settings; update the service configuration and restart"}
+            if "backend" in cfg:
+                if instance_id:
+                    return {"status": "error", "adapter_ok": False, "message": "Depth model is shared; use the tool configuration, not instance configuration"}
+                try:
+                    self._select_backend(cfg.pop("backend"))
+                except ValueError as error:
+                    return {"status": "error", "adapter_ok": False, "message": str(error)}
+            try:
+                cfg, cal_note = self._backend_calibration_cfg(cfg)
+            except (TypeError, ValueError) as error:
+                # A coefficient that is not a number at all. Unlike a fit from
+                # the other model, there is nothing to fall back *to* here —
+                # the value is garbage and the operator has to fix it.
+                return {"status": "error", "adapter_ok": False, "message": str(error)}
+            with self._nodes_lock:
+                if cal_note:
+                    self._cal_notes[instance_id] = cal_note
+                else:
+                    self._cal_notes.pop(instance_id, None)
+            note_field = {"calibration_note": cal_note} if cal_note else {}
             if instance_id:
                 with self._nodes_lock:
                     self._instance_configs[instance_id] = cfg
                     running = instance_id in self._nodes
                 if running:
                     self._retire_node(instance_id)
-                return {"status": "configured", "instance_id": instance_id, "config": cfg}
+                return {"status": "configured", "instance_id": instance_id,
+                        "config": cfg, **note_field}
             if "fps" in cfg:
                 self._fps = int(cfg["fps"])
             if any(k in cfg for k in ("cal_a", "cal_b", "depth_scale")):
@@ -1580,7 +1883,7 @@ class VideoDepthPerceptionPlugin:
                     cfg, (self._cal_a, self._cal_b))
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
-            return {"status": "configured", "config": cfg}
+            return {"status": "configured", "config": cfg, **note_field}
 
         elif action in ("calibrate", "reset_calibration"):
             if action == "reset_calibration" or args.get("reset"):
@@ -1591,7 +1894,7 @@ class VideoDepthPerceptionPlugin:
                 # engine's own fit.
                 if self._cal_cfg_backup is not None:
                     for key, value in zip(
-                            ("cal_a", "cal_b", "calibration_preset"),
+                            ("cal_a", "cal_b", "calibration_preset", "calibration_backend"),
                             self._cal_cfg_backup):
                         if value is _ABSENT:
                             self._plugin_cfg.pop(key, None)
@@ -1661,13 +1964,15 @@ class VideoDepthPerceptionPlugin:
                 self._cal_cfg_backup = (
                     self._plugin_cfg.get("cal_a", _ABSENT),
                     self._plugin_cfg.get("cal_b", _ABSENT),
-                    self._plugin_cfg.get("calibration_preset", _ABSENT))
+                    self._plugin_cfg.get("calibration_preset", _ABSENT),
+                    self._plugin_cfg.get("calibration_backend", _ABSENT))
             self._plugin_cfg["cal_a"] = 1.0
             self._plugin_cfg["cal_b"] = round(cal_b, 6)
             # ...and switch the selector, or the rule above would ignore the fit
             # that was just measured — writing two numbers nothing reads is
             # worse than not writing them.
             self._plugin_cfg["calibration_preset"] = CAL_MANUAL
+            self._plugin_cfg["calibration_backend"] = self._backend
             log.info(f"[visual_depth] calibrated: {len(self._cal_samples)} sample(s) "
                      f"→ cal_a=1.0 cal_b={cal_b:.4f}")
 
@@ -1678,6 +1983,7 @@ class VideoDepthPerceptionPlugin:
                 # thing that has to survive a restart, and prose does not get
                 # copied accurately.
                 "save_to_config": {"calibration_preset": CAL_MANUAL,
+                                   "calibration_backend": self._backend,
                                    "cal_a": 1.0, "cal_b": round(cal_b, 6)},
                 "message": _calibration_message(self._cal_samples),
             }
@@ -1715,9 +2021,9 @@ class VideoDepthPerceptionPlugin:
             return report
 
         elif action == "recognize_by_photo":
-            return self._recognize_image(args, url_action="recognize_by_url")
+            return self._recognize_image(args, url_action="recognize_by_url", instance_id=instance_id)
 
         elif action == "recognize_by_url":
-            return self._recognize_image(args, url_action="recognize_by_url")
+            return self._recognize_image(args, url_action="recognize_by_url", instance_id=instance_id)
 
         return None

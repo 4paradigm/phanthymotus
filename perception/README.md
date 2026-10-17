@@ -3014,10 +3014,133 @@ transcribed and TTS still speaks with the card running.
 
 ## Vision: `vop` (detection) and `visual_depth` (depth)
 
-Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
+By default, both run a **prebuilt TensorRT engine** fetched as a pinned bundle
 (`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
 same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
 falls back to PyTorch if the bundle is missing — it fails loudly instead.
+
+### Optional DepthART backend
+
+`visual_depth` also supports DepthART Metric-S. Select **Depth model** in the
+shared tool configuration after stopping all depth instances; loading remains
+lazy. The default is still YOLO26-N Depth. Frame rate and calibration remain
+per-camera settings. This integration uses the existing Agent Core form without
+Core changes: the model selector shows `yolo` / `depthart`, and calibration fields
+remain visible rather than conditionally hidden. Leave a/b at 1/0 when not using
+manual calibration.
+
+DepthART downloads a pinned engine and SelectiveScan plugin on first use,
+selected from the runtime TensorRT family. Files are size/SHA256 verified and
+cached under `/models/depthart/jp511` or `/models/depthart/jp61`; concurrent
+processes reuse the shared downloader lock. Download progress is exposed through
+the loading status. Selecting the model or calling info/config does not download.
+The fixed release is the `dynamic-k-v1` directory of
+`Flame4pd/depthart-metric-s-jp61-trt`, revision
+`ce158696ba8a5a6cee919b851a879825ea700eea`; despite the repository name it includes
+both JP5/TRT8.5.2.2 and JP6/TRT10.4 Orin artifacts.
+
+For custom provisioning, set both `depthart_engine_path` and
+`depthart_plugin_path` (or `DEPTHART_ENGINE_PATH` and `DEPTHART_PLUGIN_PATH`).
+A partial override fails explicitly. JP5/JP6 artifacts are not interchangeable.
+There is no startup compilation or fallback to another model on download failure.
+
+Supply actual `motus.camera/1` intrinsics through the upstream camera declaration
+for streams, or explicitly for photos. Photos can inherit a running instance's
+bound declaration but cannot replace it. Unbound on-demand instances require a
+declaration on every photo.
+
+**A declaration with no `K` is valid, and R1 is the case.** The spec carries
+`half_fov_rad` because a tape measure produces an angle directly and no `K` at
+all, and its reference declaration is exactly that — `/ubuntu/camera/main`
+declares `K: null`, `half_fov_rad: 0.888`, `source: measured`. So `K` is read
+when present and derived from `half_fov_rad` when not (`fx = (w/2)/tan(half)`,
+principal point at centre), which keeps the spec's precedence: when both are
+present `K` wins, because a matrix is solved from many observations while the
+angle beside it is usually a tape measure. `fy` comes from `half_fov_v_rad`
+when declared and assumes square pixels when it is not — it **cannot** be
+derived from the aspect ratio, which is why the declared field exists.
+
+Reading only `K` rejected the canonical camera of the robot this project is
+built around, with `camera_info must contain a nine-value K`.
+
+What this does not fix on that lens: a pinhole `K` is an approximation at ~102
+degrees with `distortion_model: unknown` and `D: null`, and `tan` overstates
+the lateral offset towards the edges. Expect DepthART to need site calibration
+there, as YOLO does (`cal_b: -0.9753`, a factor of 2.65).
+
+#### The engine canvas is fixed, so an off-aspect source is centre-cropped
+
+The engine's input binding is static — `DepthARTSession.input_size` is read off
+the engine itself, 864x480 for the pinned bundle — so every frame has to become
+exactly that tensor. Runtime K does not make the canvas dynamic.
+
+Rounding the cover-resize to a multiple of 32 admits a **band** of ratios, not
+just 1.8: 16:9 and 16:10 sources go in untouched. Anything outside the band is
+**centre-cropped** to fit, and `prepare_image` folds the crop into K — the
+principal point moves, the focal lengths do not. A vertical crop therefore costs
+nothing on the horizontal axis, which is the axis a camera's `half_fov_rad`
+describes and the one an avoidance corridor is computed from. A 4:3 source gives
+up 26% of its height, 16:10 gives up 7%. `DepthARTSession.infer` logs the crop
+once per engine; past `MAX_CROP_FRACTION` (half the frame) it is refused
+instead, naming the ratio to feed it.
+
+**It is not stretched, and that is the whole point.** Resizing 640x480 into
+864x480 is one line and silently wrong: it squashes the world horizontally by
+1.35x while K still says the pixels are square, and DepthART derives its metric
+scale *from* K — so the card would publish confidently wrong numbers on a topic
+whose contract is metres. Letterboxing would keep the field of view instead, at
+the cost of feeding the network grey bars it never saw in training, whose depth
+would then have to be masked. Rebuilding the engine for another canvas is the
+only thing that removes the limit outright, and that is an artifact problem.
+
+**Known gap:** the declaration this card *publishes* (`camera_info.inherit`)
+rescales the upstream K as though the stage only resized, so after a crop its
+vertical terms (`fy`, `cy`) describe more of the scene than the depth map
+actually covers. The horizontal terms and `half_fov_rad` stay correct, and
+`half_fov_v_rad` is `null`, so nothing reads the wrong number today — but a
+consumer that starts using vertical geometry would be misled. Folding the crop
+through `inherit` is the fix.
+
+#### Calibration belongs to camera × model, and a mismatch is dropped, not refused
+
+A log-affine fit corrects one camera's optics *as that model sees them*, so it
+is not transferable between the two backends: on r1_sz's ultra-wide lens YOLO
+needs `cal_b: -0.9753` — a factor of 2.65 — and what it is correcting there is a
+fixed-K model's guess at a 102° lens, which is not the error DepthART makes,
+since DepthART is handed the real `K`. **DepthART's own residual on that lens
+has not been measured**, so "it should need less" is an expectation, not a
+result; measure it with `calibrate` before trusting either number.
+`calibration_backend` records which model a
+fit was measured against; `calibrate` stamps it, and it only has to be typed in
+when a fit is copied from somewhere else. DepthART does not use the YOLO camera
+presets either, for the same reason.
+
+**An absent marker means `yolo`.** The field is new; before it there was one
+depth model, so every coefficient already saved on a deployed card was measured
+against YOLO26-depth by construction. Reading absence as "unknown" and refusing
+the config instead rejected the saved row of every card that had ever been
+calibrated — and because Agent Core replaces a rejected config's reason with its
+own generic text, the symptom was `配置无效（缺少 url/key）` at project start on a
+card that has neither a url nor a key (see `agent-core/src/api/mcp_manage.py`).
+
+There are **two** ways this rejected a card, and the second is the one seen on
+a real machine. Orin 5 held `{"backend": "depthart"}` shared plus
+`{"fps": 2, "cal_a": 1, "cal_b": 0, "calibration_preset": "Unitree R1"}` on the
+card: the coefficients are at their defaults, so the provenance check never
+runs — the raise came from the YOLO preset being unusable under DepthART. Note
+it needs no reconfiguring to trigger: a machine that ran that build once has the
+row, and a later build with the field reads it back.
+
+A genuine mismatch — a YOLO fit under DepthART, or a YOLO preset under DepthART
+— therefore **drops the coefficients and says so** rather than failing the
+config: depth falls back to the model's own fit, `info()` reports
+`calibration: model-default` plus a `calibration_note` saying which model the
+numbers were measured on, the `config` response carries the same note, and it is
+logged. This is the rule the card already had for a typed-in fit the selector is
+ignoring (`calibration_conflict`), and the one `_select_backend` already applied
+when the switch happens on a live plugin — it strips the same keys silently.
+Refusing instead meant one path dropped quietly and the other stopped the robot.
+Recalibrate after changing models; do not relabel an old fit.
 
 ### Why TensorRT *directly*, and not through ultralytics
 
