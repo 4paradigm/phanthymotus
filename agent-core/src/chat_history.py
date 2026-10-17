@@ -181,12 +181,41 @@ def delete_sessions(session_ids: list[str]):
 
 
 def clear_all():
-    """Delete all sessions and messages."""
+    """Delete all sessions and messages, and the conclusions drawn from them.
+
+    `subagent_conclusions` is written by `subagent/agent.py` and
+    `subagent/manager.py` and read back by `memory_recall`
+    (`event/llm.py`, `source in ('all', 'subagent')`). It therefore holds the
+    *same* memory as the chat tables, one abstraction layer up — a background
+    monitor's summary of what was said, a daily digest of it.
+
+    Clearing the chat tables alone left that behind, so after "清除历史" the
+    agent could still recall conversations the operator had deleted and answer
+    out of them. Measured on Orin5 2026-10-17: `chat_messages` started at
+    17:13 while `subagent_conclusions` still held 1048 rows going back to
+    09-04 — six weeks of conclusions about deleted conversations. The symptom
+    is not a visible row anywhere; it is the agent simply still knowing
+    something, which is why it took a report of "感觉清除不干净" rather than a
+    bug to find.
+
+    **Only the wholesale clear can do this.** A conclusion carries `agent_id`,
+    `goal` and `created_at` but no `session_id` (see `config.py`'s DDL), so
+    `delete_session` / `delete_sessions` have nothing to join on and leave
+    conclusions behind. That gap is real and deliberate rather than
+    overlooked: guessing by timestamp would delete another session's
+    conclusions.
+    """
     with _get_conn() as conn:
         conn.execute('DELETE FROM chat_messages')
         conn.execute('DELETE FROM chat_sessions')
         try:
             conn.execute('DELETE FROM chat_messages_fts')
+        except Exception:
+            pass
+        # Separate try: a deployment predating the conclusions table must still
+        # get its chat tables cleared rather than failing the whole reset.
+        try:
+            conn.execute('DELETE FROM subagent_conclusions')
         except Exception:
             pass
         conn.commit()

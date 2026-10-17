@@ -861,6 +861,32 @@ async def call_tool(full_name: str, args: dict) -> str:
                 opts = ', '.join(sorted(f'mcp__{mcp_id}__{t}__{a}' for t, a in matches))
                 return (f'工具名 {full_name} 不明确：{len(matches)} 个工具都有 '
                         f'{tool_name} 动作。请使用完整名称之一：{opts}')
+            elif '__' in tool_name:
+                # The opposite failure: the model kept the tool segment but used
+                # an action the card no longer declares, so `split_map` had no
+                # entry and nothing injected `action`.
+                #
+                # This is what a **rename** looks like from here. The card's
+                # declaration is re-read only when a browser pings
+                # `/api/mcp/{id}/ping`, so after a card is redeployed the model
+                # can hold the previous action names for an arbitrarily long
+                # time — and every call it makes with them arrives as a literal
+                # `<tool>__<old_action>` with no action at all. Measured on
+                # Orin5: `phanthy_music__play` after `play` became `play_music`,
+                # answered by perception with `does not handle action None`.
+                #
+                # Splitting on the **last** `__` and passing the remainder as
+                # `action` hands the decision to the card, which is the only
+                # party that knows its own aliases (`ALIAS_ACTIONS`). A card
+                # with no alias for it still declines — the same outcome as
+                # today, minus the misleading `action None`.
+                candidate_tool, _, candidate_action = tool_name.rpartition('__')
+                if candidate_tool in (info_probe.get('tools') or []):
+                    print(f'[mcp] {full_name} names no declared action — passing '
+                          f'{candidate_tool}(action={candidate_action}) for the card '
+                          f'to resolve; its declaration has probably been renamed')
+                    tool_name = candidate_tool
+                    args = {**args, 'action': candidate_action}
 
     info = registry.get(mcp_id)
     if not info:
