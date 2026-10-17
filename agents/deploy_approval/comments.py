@@ -930,6 +930,33 @@ def _trusted_archive_url(url: str, repo: str, pr_number: int, base: str) -> str:
     return ""
 
 
+def _trusted_github_attachment_url(item: dict) -> str:
+    """Return only persisted GitHub-native attachment URLs with trusted provenance."""
+    comment_id = item.get("source_comment_id")
+    if (type(comment_id) is int and comment_id > 0):
+        valid_comment = True
+    elif isinstance(comment_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", comment_id):
+        valid_comment = True
+    else:
+        valid_comment = False
+    if not valid_comment or item.get("actor_verified") is not True or item.get("status") != "ready":
+        return ""
+    value = item.get("source_url")
+    if not isinstance(value, str) or len(value) > 2048 or any(c in value for c in '\r\n<>"\\'):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except (TypeError, ValueError):
+        return ""
+    if (parsed.scheme != "https" or parsed.netloc != "github.com"
+            or parsed.query or parsed.fragment
+            or not re.fullmatch(
+                r"/user-attachments/(?:assets/[A-Za-z0-9_-]{1,128}|files/[A-Za-z0-9_-]{1,128}/[A-Za-z0-9._~-]+)",
+                parsed.path)):
+        return ""
+    return value
+
+
 def render_evidence_section(repo, pr_number, state, records, archive_links, *, public_base_url="") -> str:
     """Render current evidence and three archived rounds without mutating history.
 
@@ -999,8 +1026,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                  f"**Submitter:** {_escape(group.get('actor') or group.get('actor_login') or group.get('submitted_by') or group.get('requested_by') or group.get('command', {}).get('args', {}).get('actor') or 'unknown')}",
                  f"**Time:** {_escape(group.get('created_at') or group.get('started_at') or group.get('round_started_at') or 'unknown')}",
                  f"**Status:** {_escape(group.get('status') or 'unknown')}", "",
-                 "| Attachment | Size | Submitter | Time | HEAD | Round | Note | Status | Download |",
-                 "|---|---|---|---|---|---|---|---|---|"]
+                 "| Attachment | Size | GitHub uploader | Machine | Time | HEAD | Round | Note | COS | Download |",
+                 "|---|---|---|---|---|---|---|---|---|---|"]
         latest_items = {}
         for offset, item in enumerate(group.get("attachments", [])):
             if not isinstance(item, dict):
@@ -1017,19 +1044,21 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 continue
             deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
             status = "deleted" if deleted else item.get("status", "pending")
-            link = download(item.get("attachment_id") or item.get("id"),
-                            "/attachments/{id}/download", item.get("download_capability", ""))
+            native_url = _trusted_github_attachment_url(item) if not deleted else ""
             cells = [item.get("filename") or item.get("text") or "Note", item.get("size", "—"),
                      ((item.get("actor_login") or item.get("actor"))
                       if item.get("actor_verified") is True else "unverified"),
+                     item.get("machine") or item.get("machine_alias") or "—",
                      item.get("created_at") or "unknown", item.get("head_sha") or h,
-                     item.get("round_id") or r, item.get("note", ""), status]
+                     item.get("round_id") or r, item.get("note", ""),
+                     ("Deleted" if deleted else "Persisted" if item.get("object_key") else
+                      "Pending" if status != "ready" else "Unavailable")]
             if item.get("replaces_id"):
-                cells[6] = str(cells[6]) + " · replaces " + str(item["replaces_id"])
+                cells[7] = str(cells[7]) + " · replaces " + str(item["replaces_id"])
             if deleted:
-                cells[6] = str(cells[6]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
-            lines.append("| " + " | ".join(_escape(v) for v in cells) + " | " +
-                         (f"[Download]({link})" if link and not deleted and status == "ready" else "Unavailable") + " |")
+                cells[7] = str(cells[7]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
+            download_cell = f"[GitHub attachment](<{native_url}>)" if native_url else "Source unavailable"
+            lines.append("| " + " | ".join(_escape(v) for v in cells) + " | " + download_cell + " |")
         if group.get("deployments"):
             lines.extend(["", _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
         for field in ("case_results", "test_result", "summary", "history", "cos_object_key", "cos_bundle_sha256", "cos"):
@@ -1042,6 +1071,20 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
 
     lines = ["<!-- deploy-approval-evidence:start -->", "### Current round evidence", ""]
     lines.extend(render_round((head, current_round), groups[(head, current_round)]))
+    round_pattern = re.escape(str(head)) + r"-[0-9]+"
+    if (state.get("status") == "testing" and state.get("pr_state", "open") == "open"
+            and not state.get("merged") and re.fullmatch(r"[0-9a-f]{40}", str(head))
+            and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)):
+        lines.extend([
+            "", "### Upload Test Evidence", "",
+            "1. In this PR's **Conversation**, click GitHub's native attachment button.",
+            "2. Attach a video, file, or image.",
+            "3. In the same comment, include this command:",
+            "", f"   `/submit_evidence head={head} round={current_round}`", "",
+            "4. Add a text note if useful, then publish the comment.",
+            "5. The Controller copies the attachment to COS; the Summary records the COS persistence result.",
+            "",
+        ])
     if state.get("evidence_enabled") is True and state.get("browser_upload_ready") is not True:
         readiness = (state.get("evidence_readiness") or {}).get("status")
         if readiness == "PUBLIC_INGRESS_PENDING":
