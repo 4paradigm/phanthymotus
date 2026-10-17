@@ -1802,19 +1802,20 @@ async def reset_config(req: ResetRequest):
         # a goal with no visible origin.
         #
         # Order matters: cancel the cron jobs *first*. `task_store.clear_all()`
-        # cannot do it (it does not import `scheduler`, and the `task:<id>` job
-        # name is `event/task.py`'s convention), and a job left behind keeps
-        # firing 「任务定时检查 [id]」for a task that no longer exists — which
-        # would wake the agent with a goal it can no longer look up.
-        import sys
+        # cannot do it — it does not import `scheduler`, and the `task:<id>` job
+        # name is the event/API layer's convention, not storage's. A job left
+        # behind keeps firing 「任务定时检查 [id]」for a task that no longer
+        # exists, waking the agent with a goal it can no longer look up.
+        #
+        # `scheduler.remove_job` directly, matching `api/tasks.py`, rather than
+        # `event.task._unregister_check`: that submodule is shadowed by the
+        # Tools() instance `event/__init__.py` rebinds onto `event.task` (the
+        # trap the skills branch below has to work around), and reaching it
+        # through sys.modules to wrap a one-line call is not worth it.
+        import scheduler
         import task_store
-        import event.task  # ensure it is imported/registered in sys.modules
-        # `event.task` the *attribute* is a Tools() instance, rebound by
-        # event/__init__.py, which shadows the submodule where
-        # `_unregister_check` lives — same trap as `event.skills` below.
-        task_mod = sys.modules['event.task']
         for task in task_store.active_tasks():
-            task_mod._unregister_check(task.id)
+            scheduler.remove_job(f'task:{task.id}')
         cleared = task_store.clear_all()
         print(f'[reset] cleared {cleared} task(s) and their scheduled checks')
         reset_items.append('tasks')
