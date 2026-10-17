@@ -172,6 +172,15 @@ def verify_capability(config, token, repo, pr_number, *, purpose=None, resource=
         raise HTTPException(403, detail='invalid_evidence_capability') from None
 
 
+def _verify_page_capability(config, token, repo, pr_number):
+    """Accept legacy page caps or the current page-scoped download cap only."""
+    try:
+        return verify_capability(config, token, repo, pr_number, purpose=PURPOSE)
+    except HTTPException:
+        return verify_capability(config, token, repo, pr_number,
+                                 purpose=DOWNLOAD_PURPOSE, resource='page')
+
+
 def csrf_token(config, token):
     return _b64(hmac.new(_key(config), b'evidence-csrf:' + token.encode('ascii'), hashlib.sha256).digest())
 
@@ -190,14 +199,14 @@ def bind_page_capability(request, repo, pr_number):
     require_enabled(request)
     token = request.query_params.get('cap')
     if token:
-        verify_capability(request.app.state.config, token, repo, pr_number)
+        _verify_page_capability(request.app.state.config, token, repo, pr_number)
         response = RedirectResponse(request.url.path, status_code=303,
                                     headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
         _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
         return response
     token = request.cookies.get(CAPABILITY_COOKIE, '')
     if token:
-        verify_capability(request.app.state.config, token, repo, pr_number)
+        _verify_page_capability(request.app.state.config, token, repo, pr_number)
     elif not _read_user_session(request.app.state.config, request.cookies.get(USER_COOKIE, ''), repo, pr_number):
         raise HTTPException(403, detail='invalid_evidence_capability')
     return None
@@ -264,7 +273,10 @@ async def verified_principal(request: Request, repo: str, pr_number: int, *, wri
         return principal, session['csrf']
     token = request.query_params.get('cap') or request.cookies.get(CAPABILITY_COOKIE, '')
     claims = None
-    if purpose == DOWNLOAD_PURPOSE:
+    if (purpose == PURPOSE and request.method == 'GET'
+            and request.url.path.endswith('/context')):
+        claims = _verify_page_capability(config, token, repo, pr_number)
+    elif purpose == DOWNLOAD_PURPOSE:
         try:
             claims = verify_capability(config, token, repo, pr_number, purpose=DOWNLOAD_PURPOSE, resource=resource)
         except HTTPException:
@@ -287,7 +299,7 @@ def oauth_callback_url(config):
 def oauth_login(request, repo, pr_number, return_to):
     require_oauth(request)
     cap = request.cookies.get(CAPABILITY_COOKIE, '')
-    verify_capability(request.app.state.config, cap, repo, pr_number, purpose=PURPOSE)
+    _verify_page_capability(request.app.state.config, cap, repo, pr_number)
     if not isinstance(return_to, str) or not re.fullmatch(r'/evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pulls/[1-9][0-9]*', return_to):
         raise HTTPException(400, detail='invalid_return_path')
     if return_to.lower() != f'/evidence/{repo}/pulls/{pr_number}'.lower():

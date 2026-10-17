@@ -15,6 +15,7 @@ import json
 import re
 from pathlib import PurePosixPath
 
+from .evidence_auth import DOWNLOAD_PURPOSE, PURPOSE
 from .evidence_models import EvidenceError, round_id_for_state, utc_now, validate_context
 
 
@@ -146,19 +147,30 @@ class EvidenceService:
             resource = (('attachment:' + str(payload.get('attachment_id', '')))
                         if action == 'download' else ('log:' + round_id)
                         if action == 'log_download' else None)
-            if (not principal.get('github_user_authenticated') and
-                    (capability.get('repo') != repo or capability.get('pr') != pr_number
-                    or capability.get('head') != expected_head
-                    or capability.get('round') != round_id
-                    or capability.get('purpose') not in (
-                        {'deploy-evidence-download', 'deploy-evidence-upload'}
-                        if action in {'download', 'log_download'}
-                        else {'deploy-evidence-upload'})
-                    or (action in {'download', 'log_download'}
-                        and capability.get('purpose') == 'deploy-evidence-download'
-                        and capability.get('resource') != resource)
-                    or (action not in {'download', 'log_download'} and 'resource' in capability))):
-                raise EvidenceError('capability_context_mismatch', 403)
+            if not principal.get('github_user_authenticated'):
+                purpose = capability.get('purpose')
+                context_capability = (
+                    action == 'context'
+                    and (purpose == PURPOSE and 'resource' not in capability
+                         or purpose == DOWNLOAD_PURPOSE
+                         and capability.get('resource') == 'page')
+                )
+                scoped_read_capability = (
+                    action in {'download', 'log_download'}
+                    and ((purpose == PURPOSE and 'resource' not in capability)
+                         or (purpose == DOWNLOAD_PURPOSE
+                             and capability.get('resource') == resource))
+                )
+                legacy_read_capability = (
+                    action == 'status' and purpose == PURPOSE
+                    and 'resource' not in capability
+                )
+                if (capability.get('repo') != repo or capability.get('pr') != pr_number
+                        or capability.get('head') != expected_head
+                        or capability.get('round') != round_id
+                        or not (context_capability or scoped_read_capability
+                                or legacy_read_capability)):
+                    raise EvidenceError('capability_context_mismatch', 403)
             latest = {}
             operations = {}
             for record in records:
