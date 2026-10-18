@@ -211,7 +211,7 @@ class CosAttachmentStore:
     async def put_native_file(self, *, key, metadata, size, sha256, body):
         """Create a deterministic native-attachment object, then read-back verify it.
 
-        A retry first observes the exact key. Conditional creation prevents a
+        A retry first observes the exact key. COS's no-overwrite header prevents a
         duplicate comment retry from replacing an existing audit object.
         """
         key = self._key(key)
@@ -227,8 +227,8 @@ class CosAttachmentStore:
         body.seek(0)
         try:
             await self._io(self._sdk().put_object, Bucket=self.config.cos_bucket,
-                Key=key, Body=body, ContentLength=size, ContentType='application/octet-stream',
-                Metadata=self._metadata(metadata), IfNoneMatch='*')
+                Key=key, Body=body, ContentLength=str(size), ContentType='application/octet-stream',
+                Metadata={**self._metadata(metadata), 'x-cos-forbid-overwrite': 'true'})
         except EvidenceStoreError:
             # The PUT response may be lost after COS committed the object.
             # Only an exact read-back is considered success.
