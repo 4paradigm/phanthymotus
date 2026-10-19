@@ -42,8 +42,12 @@ def calls(monkeypatch):
     async def _fake_call(mcp_id, req, timeout_s=None):
         # `timeout_s` 不是可选的摆设：`_stop_cards` 现在每张卡片都带死线，而这个
         # 替身不接受它的话，TypeError 会被那边的 except 吞成「这张卡片没停下来」。
+        #
+        # 返回值也不是：`stop_one` 现在**读结果**，所以替身必须长得像
+        # `mcp_call_tool` 真正返回的东西 —— `{'code': 200, 'data': ...}`。
+        # 少一个 `code` 就被判成「设备拒绝停止请求」，于是每张卡片都报失败。
         seen.append((mcp_id, req.tool, dict(req.arguments), timeout_s))
-        return {'state': 'idle'}
+        return {'code': 200, 'data': {'state': 'idle'}}
 
     class _Req:
         def __init__(self, tool, arguments):
@@ -114,7 +118,7 @@ def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
         seen.append(req.arguments['instance_id'])
         if req.arguments['instance_id'] == 'card_mt4rkb752py8':
             raise RuntimeError('connection refused')
-        return {'state': 'idle'}
+        return {'code': 200, 'data': {'state': 'idle'}}
 
     sys.modules['api.mcp_manage'].mcp_call_tool = _flaky
     assert _run([TTS_OLD, ASR], []) == 1          # one of two succeeded

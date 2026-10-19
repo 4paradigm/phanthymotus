@@ -295,8 +295,15 @@ def test_a_tracked_range_that_disagrees_with_the_measurement_is_flagged():
     drifted = _render(box=(0.3, 0.3, 0.6, 0.8), measured=2.22,
                       track={"state": "confirmed", "range_m": 0.55})
 
-    warn = lambda f: (f == np.array(V._WARN)).all(axis=2).sum()
-    assert warn(drifted) > warn(agreeing), "两个数差一倍也没有任何提示"
+    # ``cv2.LINE_AA`` blends every text pixel with the depth image below it, so
+    # counting pixels exactly equal to ``_WARN`` is renderer-version dependent.
+    # Keep the assertion about the visible warning, but accept the small BGR
+    # error introduced by anti-aliasing.
+    def warn_pixels(frame):
+        delta = frame.astype(np.int16) - np.array(V._WARN, dtype=np.int16)
+        return (np.abs(delta) <= 32).all(axis=2).sum()
+
+    assert warn_pixels(drifted) > warn_pixels(agreeing), "两个数差一倍也没有任何提示"
 
 
 @needs_cv2

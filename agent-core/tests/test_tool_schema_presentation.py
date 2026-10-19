@@ -135,5 +135,28 @@ class TestBothPathsShareIt(unittest.TestCase):
         self.assertNotIn('_SYSTEM_ACTIONS', self._src('event/llm.py'))
 
 
+class TestActionRequirements(unittest.TestCase):
+    def test_required_fields_survive_action_splitting(self):
+        tool = {'name': 'recorder', 'inputSchema': {
+            'properties': {'action': {'type': 'string'}, 'asset_id': {'type': 'string'},
+                           'preview_id': {'type': 'string'}},
+            'required': ['action'],
+            'x-action-params': {
+                'info': {'params': []},
+                'preview': {'params': ['asset_id'], 'required': ['asset_id']},
+                'run': {'params': ['asset_id', 'preview_id'], 'required': ['asset_id', 'preview_id']},
+            }}}
+        schemas = mcp_client._to_openai_schema('g1', tool)
+        self.assertEqual([s['parameters']['required'] for s in schemas],
+                         [[], ['asset_id'], ['asset_id', 'preview_id']])
+        self.assertEqual(tool['inputSchema']['required'], ['action'])
+
+    def test_legacy_tool_wide_requirements_are_preserved(self):
+        schemas = mcp_client._to_openai_schema('g1', {'name': 'legacy', 'inputSchema': {
+            'properties': {'action': {'type': 'string'}, 'text': {'type': 'string'}},
+            'required': ['action', 'text'], 'x-action-params': {'speak': {'params': ['text']}}}})
+        self.assertEqual(schemas[0]['parameters']['required'], ['text'])
+
+
 if __name__ == '__main__':
     unittest.main()

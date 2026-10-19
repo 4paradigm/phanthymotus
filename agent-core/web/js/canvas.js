@@ -1201,9 +1201,14 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         let enumVals = def.enum;
         if (key === 'action') {
           enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v));
+          // The page owns internal actions; the card exposes its entry and public actions.
+          if (schema['x-workbench'] && schema['x-action-params']) {
+            enumVals = enumVals.filter(v => v === schema['x-workbench'].entry || v in schema['x-action-params']);
+          }
         }
         if (!enumVals.length) return '';  // hide field entirely if no options left
-        const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(v)}</option>`).join('');
+        const titles = Object.fromEntries((def.oneOf || []).map(o => [o.const, o.title || o.const]));
+        const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(titles[v] || v)}</option>`).join('');
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
       } else if (def.format === 'file') {
         const accept = def.accept || '*/*';
@@ -2748,6 +2753,13 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     const json = await res.json();
 
     if (json.code === 200) {
+      const spec = _toolObj?.inputSchema?.['x-workbench'];
+      if (spec?.protocol === 'motus.workbench/1' && args.action === spec.entry) {
+        const { openWorkbench } = await import('./workbench.js');
+        await openWorkbench({mcp: mcpId, tool: toolName, instanceId: instanceId || el.dataset.cardId},
+          spec, JSON.parse(_formatCallResult(json.data)));
+        return;
+      }
       const resultText = _formatCallResult(json.data);
       _showResult(el, resultText, false);
       // The panel can afford a 144-entry list; one log line cannot.

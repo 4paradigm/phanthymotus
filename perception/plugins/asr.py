@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import multiprocessing
 import contextlib
 import ctypes.util
@@ -19,6 +20,7 @@ import struct
 import threading
 import time
 import wave
+from collections import deque
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -70,6 +72,11 @@ MODEL_LOAD_GRACE_S = 3.0
 # buffer drains — a spurious 1.1 s fragment cut immediately after it.
 VAD_MAX_SPEECH_S = 30
 VAD_BUFFER_S     = 35
+# Retain a maximum VAD segment plus 30 s of queueing margin, at Bumi's 20 Hz
+# maximum direction rate. Snapshot at dequeue so transcription cannot evict it.
+DIRECTION_HISTORY_S = VAD_MAX_SPEECH_S + 30
+DIRECTION_HISTORY_MAX_EVENTS = DIRECTION_HISTORY_S * 20 + 1
+DIRECTION_ANGLE_CONVENTION = "robot_front_0_left_positive_ccw"
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -509,6 +516,114 @@ def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
     return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
 
+def _aligned_wake_offset(text: str, prefix_end: int, alignment: dict | None) -> float | None:
+    """Locate the keyword's text boundary in the model's timed audio tokens."""
+    if not alignment:
+        return None
+    tokens = alignment.get('tokens', [])
+    times = alignment.get('timestamps', [])
+    duration = alignment.get('duration_s', 0)
+    if (not tokens or len(tokens) != len(times)
+            or not all(isinstance(token, str) for token in tokens)
+            or not all(type(t) in (int, float) and math.isfinite(t) and t >= 0 for t in times)
+            or any(a > b for a, b in zip(times, times[1:]))):
+        return None
+
+    def compact(value):
+        return re.sub(r'[\W_]+', '', value.replace('▁', ' ')).lower()
+
+    # ITN or other text rewriting can invalidate token-to-text correspondence.
+    pieces = [compact(token) for token in tokens]
+    if ''.join(pieces) != compact(text):
+        return None
+    target = len(compact(text[:prefix_end]))
+    position = 0
+    for piece, timestamp in zip(pieces, times):
+        if not piece:
+            continue
+        if position == target:
+            return timestamp if timestamp < duration else None
+        position += len(piece)
+    return None
+
+
+def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
+                           keyword_phones: int, start_ts: float,
+                           pre_roll_bytes: int, windows: list,
+                           has_input: bool, trusted_audio: bool = True,
+                           alignment: dict | None = None) -> dict:
+    """Match a timed wake word to direction windows on the capture clock.
+
+    `speaker_direction` uses the robot frame: front 0, left positive
+    (counter-clockwise, REP-103) — the same sign as the locomotion `vyaw`
+    command, so the angle can be passed to a turn without negation.
+    """
+    state = {"speaker_direction_state": "unknown" if has_input else "no_input"}
+    if not has_input or not trusted_audio:
+        return state
+    kw_start = end_pos - keyword_phones
+    if kw_start < 0 or kw_start > len(char_ends):
+        return state
+    prefix_end = char_ends[kw_start - 1] if kw_start else 0
+    prefix = re.sub(r'[\W_]+', '', text[:prefix_end])
+    offset = _aligned_wake_offset(text, prefix_end, alignment)
+    if offset is None:
+        # Without token timing, utterance onset is usable only for a leading wake.
+        if prefix:
+            return state
+        offset = pre_roll_bytes / 2 / SAMPLE_RATE
+    onset_us = int((start_ts + offset) * 1_000_000)
+    selected = [(angle, begin, end) for angle, begin, end in windows
+                if (begin >= 1_000_000_000_000_000 and begin < end
+                    and end - begin <= 3_000_000
+                    and begin < onset_us + 500_000 and end > onset_us
+                    and math.isfinite(angle) and -180 < angle <= 180)]
+    if not selected:
+        return state
+    x = sum(math.cos(math.radians(angle)) for angle, _, _ in selected) / len(selected)
+    y = sum(math.sin(math.radians(angle)) for angle, _, _ in selected) / len(selected)
+    if math.hypot(x, y) < 0.5:
+        return state
+    angle = math.degrees(math.atan2(y, x))
+    if abs(angle + 180) < 1e-6 or abs(angle - 180) < 1e-6:
+        angle = 180
+    angle = round(angle, 2)
+    if angle == -180:
+        angle = 180
+    if angle == 0:
+        angle = 0
+    return {"speaker_direction_state": "valid",
+            "speaker_direction": f"{angle:g}°, {DIRECTION_ANGLE_CONVENTION}",
+            "speaker_direction_window_start_us": min(begin for _, begin, _ in selected),
+            "speaker_direction_window_end_us": max(end for _, _, end in selected)}
+
+
+def _resolve_asr_inputs(args: dict) -> tuple[str, str]:
+    """Pick the audio and direction inputs by topic name.
+
+    The direction input is the topic whose path has a `sound_direction`
+    segment — the name Bumi's card publishes on. Everything else is a
+    candidate for audio. Connection order never decides: a canvas wired
+    direction-first must resolve the same as audio-first.
+    """
+    topics = args.get("input_topics") or []
+    if not topics and args.get("input_topic"):
+        topics = [args["input_topic"]]
+
+    def _is_direction(topic: str) -> bool:
+        return "sound_direction" in [seg for seg in str(topic).split("/") if seg]
+
+    audio = next((t for t in topics if not _is_direction(t)), "")
+    direction = next((t for t in topics if _is_direction(t)), "")
+    return audio, direction
+
+
+def _asr_topics_in(audio_topic: str = "", direction_topic: str = "") -> list[dict]:
+    return [{"topic": audio_topic, "format": AUDIO_FORMAT, "desc": "mic audio input"},
+            {"topic": direction_topic, "format": "sensor/sound-direction",
+             "desc": "sound direction input"}]
+
+
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -595,7 +710,8 @@ TOOLS = [
             },
             "required": []
         },
-        "topic_in":  [{"format": "audio/pcm-16k", "desc": "mic audio input"}],
+        "topic_in":  [{"format": AUDIO_FORMAT, "desc": "mic audio input"},
+                      {"format": "sensor/sound-direction", "desc": "sound direction input"}],
         # 两条输出。第二条是未触发唤醒词的话语，带 priority 0 —— 它**不会自动流
         # 到 LLM**：agent-core 订阅的是画布上连进 decision_core 入口的 topic
         # （api/mcp_manage.py 的 all_topics 来自那次 start 调用的参数），不是这里
@@ -698,6 +814,11 @@ class ASRAdapter(ABC):
     @abstractmethod
     def transcribe(self, wav_bytes: bytes, language: str) -> str: ...
 
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict | None]:
+        text, tags = self.transcribe_rich(wav_bytes, language, include_emotion)
+        return text, tags, None
+
     def transcribe_rich(self, wav_bytes: bytes, language: str,
                         include_emotion: bool = False) -> tuple[str, dict]:
         """转写，外加这个模型顺带算出的非文字信息（情绪 / 音频事件 / 语种）。
@@ -761,6 +882,11 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         **本来就已经算出来了**，以前只是被 `return text` 扔掉：这里不加载任何
         模型、不多跑一次推理、不多占一字节显存。
         """
+        text, tags, _ = self.transcribe_aligned(wav_bytes, language, include_emotion)
+        return text, tags
+
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict]:
         import io as _io, wave as _wave
         with _wave.open(_io.BytesIO(wav_bytes)) as wf:
             pcm = wf.readframes(wf.getnframes())
@@ -781,7 +907,10 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
             emotion=getattr(result, "emotion", "") or "",
             event=getattr(result, "event", "") or "",
             include_emotion=include_emotion)
-        return result.text.strip(), tags
+        alignment = {'tokens': list(getattr(result, 'tokens', ()) or ()),
+                     'timestamps': list(getattr(result, 'timestamps', ()) or ()),
+                     'duration_s': n / SAMPLE_RATE}
+        return result.text.strip(), tags, alignment
 
 
 class SherpaOnnxNemoCtcAdapter(ASRAdapter):
@@ -827,6 +956,10 @@ class SherpaOnnxNemoCtcAdapter(ASRAdapter):
                  f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        return self.transcribe_aligned(wav_bytes, language)[0]
+
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict]:
         import io as _io, wave as _wave
         with _wave.open(_io.BytesIO(wav_bytes)) as wf:
             pcm = wf.readframes(wf.getnframes())
@@ -837,8 +970,11 @@ class SherpaOnnxNemoCtcAdapter(ASRAdapter):
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
         self._recognizer.decode_streams([stream])
-        text = stream.result.text
-        return text.strip()
+        result = stream.result
+        alignment = {'tokens': list(getattr(result, 'tokens', ()) or ()),
+                     'timestamps': list(getattr(result, 'timestamps', ()) or ()),
+                     'duration_s': n / SAMPLE_RATE}
+        return result.text.strip(), {}, alignment
 
 
 class SherpaOnnxXASRAdapter(ASRAdapter):
@@ -851,6 +987,11 @@ class SherpaOnnxXASRAdapter(ASRAdapter):
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
+
+    def transcribe_aligned(self, wav_bytes: bytes, language: str,
+                           include_emotion: bool = False) -> tuple[str, dict, dict]:
+        text, alignment = self._delegate.transcribe_aligned(wav_bytes, language)
+        return text, {}, alignment
 
 
 # ASR model registry.
@@ -1241,6 +1382,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # One second past the longest segment the VAD can hand us, so pre_roll()
     # can still address the samples just before a maximum-length segment.
     pcm_history = PcmHistory(SAMPLE_RATE * (VAD_BUFFER_S + 1))
+    capture_history = deque()
     _log.info(
         f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, "
         f"silence_ms={silence_ms}, pre_roll_ms={pre_roll_ms})"
@@ -1250,6 +1392,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     start_ts = None
     end_ts = None
     utterance_pre_roll_bytes = 0
+    utterance_capture_trusted = True
     _was_speaking = False  # Track speech onset for hook notification
 
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx)")
@@ -1321,7 +1464,9 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
     while not stop_evt.is_set():
         try:
-            pcm, ts = pcm_q.get(timeout=1)
+            audio_item = pcm_q.get(timeout=1)
+            pcm, ts = audio_item[:2]
+            capture_trusted = len(audio_item) <= 2 or bool(audio_item[2])
         except Exception:
             continue
 
@@ -1338,7 +1483,11 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         float_samples = [s / 32768.0 for s in samples]
 
         # Feed VAD
+        chunk_start = pcm_history.total_samples
         pcm_history.append(pcm[:n * 2])
+        capture_history.append((chunk_start, pcm_history.total_samples, capture_trusted))
+        while capture_history and capture_history[0][1] <= pcm_history.start_sample:
+            capture_history.popleft()
         vad.accept_waveform(float_samples)
 
         # Detect speech onset → notify main thread for on_hearing hook
@@ -1350,15 +1499,30 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # Collect completed VAD segments.
         # The VAD only reports a segment after min_silence_duration of
         # trailing silence has elapsed, and that silence is not part of
-        # seg.samples — so the current chunk timestamp sits one silence
-        # window past the real end of speech. Rewind it, the same way
+        # seg.samples. A trusted capture stamp marks the first sample;
+        # advance to the chunk end before rewinding the trailing silence.
+        # Arrival-time fallback and legacy queue items retain their old anchor.
+        # Rewind it, the same way
         # PcmHistory.pre_roll() rewinds by silence_samples to locate the
         # segment start in the sample domain.
-        seg_end_ts = ts - silence_samples / SAMPLE_RATE
+        chunk_end_ts = ts + n / SAMPLE_RATE if len(audio_item) > 2 and capture_trusted else ts
+        seg_end_ts = chunk_end_ts - silence_samples / SAMPLE_RATE
         while not vad.empty():
             seg = vad.front
             seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                    *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+            segment_start = getattr(seg, 'start', None)
+            if segment_start is None:
+                segment_start = max(0, pcm_history.total_samples - len(seg.samples) - silence_samples)
+            segment_end = segment_start + len(seg.samples)
+            # VAD reports speech after it has heard enough samples. Use the
+            # completed segment's range so early speech counts too. The current
+            # chunk anchors seg_end_ts, so its timestamp must also be trusted.
+            utterance_capture_trusted &= capture_trusted and bool(capture_history) and (
+                capture_history[0][0] <= segment_start and
+                capture_history[-1][1] >= segment_end and
+                all(trusted for begin, end, trusted in capture_history
+                    if begin < segment_end and end > segment_start))
             # `is None`, not falsy: a legitimate start_ts of 0.0 would
             # otherwise be re-stamped.
             if start_ts is None:
@@ -1400,11 +1564,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 result_q.put((speech_buf,
                               seg_end_ts if start_ts is None else start_ts,
                               seg_end_ts if end_ts is None else end_ts,
-                              utterance_pre_roll_bytes))
+                              utterance_pre_roll_bytes,
+                              utterance_capture_trusted))
                 speech_buf = b''
                 start_ts = None
                 end_ts = None
                 utterance_pre_roll_bytes = 0
+                utterance_capture_trusted = True
 
     _log.info("[vad-worker] process exiting")
 
@@ -1419,10 +1585,14 @@ class _ASRNode(Node):
                  vad_pre_roll_ms: int = 500, speaker=None,
                  publish_background: bool = True,
                  emit_audio_tags: bool = True,
-                 emit_emotion: bool = False):
+                 emit_emotion: bool = False, direction_topic: str = ''):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
+        self._direction_topic = direction_topic
+        self._direction_sub = None
+        self._direction_windows = deque(maxlen=DIRECTION_HISTORY_MAX_EVENTS)
+        self._direction_lock = threading.Lock()
         self._output_topic = f"{input_topic}/asr"
         # 第二条输出：KWS 未触发的话语。独立 topic 而不是同一条带 priority 0，
         # 这样它在 ring buffer / raw_input_info / 画布上有自己的 source 和自己的
@@ -1505,6 +1675,9 @@ class _ASRNode(Node):
         self._first_chunk_event = threading.Event()
         self._worker_ready = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
+        if self._direction_topic:
+            self._direction_sub = self.create_subscription(
+                String, self._direction_topic, self._direction_cb, _LOW_LAT_QOS)
         # A fresh event, not .clear(): the previous worker thread and _audio_cb
         # closures still hold a reference to the old one.
         self._stop_event = threading.Event()
@@ -1578,6 +1751,11 @@ class _ASRNode(Node):
             except Exception:
                 pass  # may already be invalid
             self._sub = None
+        if self._direction_sub:
+            self.destroy_subscription(self._direction_sub)
+            self._direction_sub = None
+        with self._direction_lock:
+            self._direction_windows.clear()
         self.request_stop()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
         for q in (self._pcm_queue, self._utterance_queue):
@@ -1614,6 +1792,27 @@ class _ASRNode(Node):
         self._utterance_queue = None
         self._vad_stop = None
 
+    def _direction_cb(self, msg) -> None:
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if (not isinstance(data, dict) or data.get('state') != 'fresh'
+                or data.get('angle_convention') != DIRECTION_ANGLE_CONVENTION):
+            return
+        begin, end = data.get('audio_window_start_us'), data.get('audio_window_end_us')
+        angle = data.get('angle_deg')
+        if (type(angle) not in (int, float) or type(begin) is not int or type(end) is not int
+                or begin < 1_000_000_000_000_000 or end <= begin
+                or end - begin > 3_000_000 or not math.isfinite(angle)
+                or not -180 < angle <= 180):
+            return
+        with self._direction_lock:
+            self._direction_windows.append((angle, begin, end))
+            while (self._direction_windows
+                   and self._direction_windows[0][2] < end - DIRECTION_HISTORY_S * 1_000_000):
+                self._direction_windows.popleft()
+
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
             return
@@ -1641,7 +1840,7 @@ class _ASRNode(Node):
         if ts < 1e9:  # header.stamp not set by publisher
             ts = time.time()
         try:
-            self._pcm_queue.put_nowait((pcm, ts))
+            self._pcm_queue.put_nowait((pcm, ts, msg.header.stamp.sec >= 1_000_000_000))
         except Exception:
             pass  # drop if severely behind
 
@@ -1831,6 +2030,9 @@ class _ASRNode(Node):
                 # pair of worker/parent (a hot-copied file, a rolling restart)
                 # degrades to "no pre-roll known" instead of raising.
                 pre_roll_bytes = int(item[3]) if len(item) > 3 else 0
+                trusted_audio = bool(item[4]) if len(item) > 4 else False
+                with self._direction_lock:
+                    windows = list(self._direction_windows)
             except Exception:
                 continue
             try:
@@ -1850,7 +2052,14 @@ class _ASRNode(Node):
                 # 放了 GIL，6 核跑 2+2 线程在 vop/OCR/TTS 都在的情况下仍有余量。
                 _identity = self._start_identify(utterance, pre_roll_bytes)
                 _t0 = time.time()
-                if self._emit_audio_tags:
+                alignment = None
+                aligned_transcribe = getattr(self._adapter, 'transcribe_aligned', None)
+                if self._direction_topic and callable(aligned_transcribe):
+                    text, _audio_tags, alignment = aligned_transcribe(
+                        wav, self._language, self._emit_emotion)
+                    if not self._emit_audio_tags:
+                        _audio_tags = {}
+                elif self._emit_audio_tags:
                     text, _audio_tags = self._adapter.transcribe_rich(
                         wav, self._language, self._emit_emotion)
                 else:
@@ -1869,6 +2078,7 @@ class _ASRNode(Node):
                 _speaker_fields = self._collect_identity(_identity)
                 if not text.strip(): continue
 
+                direction_fields = {}
                 # ASR-based keyword spotting
                 if trigger_mode == 'asr_kws' and keyword_ipa:
                     _t1 = time.time()
@@ -1895,6 +2105,10 @@ class _ASRNode(Node):
                                                 utterance, _speaker_fields,
                                                 _audio_tags)
                         continue
+                    direction_fields = _wake_direction_fields(
+                        text, text_char_ends, end_pos, len(keyword_ipa),
+                        start_ts, pre_roll_bytes, windows,
+                        bool(self._direction_topic), trusted_audio, alignment)
                     # Extract text after keyword
                     remaining = _text_after_phoneme(text, text_char_ends, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
@@ -1913,6 +2127,7 @@ class _ASRNode(Node):
                           "priority": 1,
                           "kws_triggered": _kws_was_triggered,
                           "spans": _spans,
+                          **direction_fields,
                           # 空值不进来：plugins/speaker.py 只返回带信息的 key，
                           # 所以这里直接合并。`"speaker_profile": {}` 这种东西
                           # LLM 要为它付 token 而拿不到信息，还会让它以为「这个
@@ -1930,7 +2145,7 @@ class _ASRNode(Node):
     def _status_dict(self) -> dict:
         return {
             "state":     self.state,
-            "topic_in":  [{"topic": self._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
+            "topic_in": _asr_topics_in(self._input_topic, self._direction_topic),
             "topic_out": _asr_topics_out(
                 self._input_topic, self._publish_background_enabled),
         }
@@ -2131,7 +2346,7 @@ class ASRPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
-            input_topic = args.get("input_topic", "")
+            input_topic, direction_topic = _resolve_asr_inputs(args)
             # Report loading/error state at plugin level. A start that is still
             # queued behind the load counts as loading too: the caller polling
             # this reads anything else as final, and `idle` in that window would
@@ -2150,8 +2365,7 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "loading",
-                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
-                                   "desc": ""}] if input_topic else []),
+                    "topic_in": _asr_topics_in(input_topic, direction_topic),
                     "topic_out": _asr_topics_out(
                         input_topic, self._publish_background_enabled),
                     "desc": self._load_status or f"正在加载模型 '{self._asr_model}' …",
@@ -2160,8 +2374,7 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
                     "state": "error",
-                    "topic_in": ([{"topic": input_topic, "format": "audio/pcm-16k",
-                                   "desc": ""}] if input_topic else []),
+                    "topic_in": _asr_topics_in(input_topic, direction_topic),
                     "topic_out": _asr_topics_out(
                         input_topic, self._publish_background_enabled),
                     "desc": f"Model load failed: {self._load_error}",
@@ -2175,7 +2388,7 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": node.state,
-                    "topic_in":  [{"topic": node._input_topic,  "format": "audio/pcm-16k", "desc": ""}],
+                    "topic_in": _asr_topics_in(node._input_topic, node._direction_topic),
                     "topic_out": _asr_topics_out(
                         node._input_topic, node._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
@@ -2186,21 +2399,22 @@ class ASRPlugin:
                 return {
                     "name": "ASR", "manufacture": "Embodied", "model": "asr",
                     "state": "idle",
-                    "topic_in":  [{"topic": input_topic,   "format": "audio/pcm-16k", "desc": ""}] if input_topic else [],
+                    "topic_in": _asr_topics_in(input_topic, direction_topic),
                     "topic_out": _asr_topics_out(
                         input_topic, self._publish_background_enabled),
                     "desc": "ASR service — converts audio/pcm-16k to text",
                 }
             # Aggregate info for all instances (no instance_id = ping/overview only)
             if nodes_snapshot:
-                topics_in = [{"topic": n._input_topic, "format": "audio/pcm-16k", "desc": ""} for n in nodes_snapshot]
+                topics_in = [port for n in nodes_snapshot
+                             for port in _asr_topics_in(n._input_topic, n._direction_topic)]
                 topics_out = [t for n in nodes_snapshot
                               for t in _asr_topics_out(
                                   n._input_topic, n._publish_background_enabled)]
                 states = list(set(n.state for n in nodes_snapshot))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                topics_in = [{"topic": input_topic, "format": "audio/pcm-16k", "desc": ""}]
+                topics_in = _asr_topics_in(input_topic, direction_topic)
                 topics_out = _asr_topics_out(
                     input_topic, self._publish_background_enabled)
                 state = "idle"
@@ -2240,12 +2454,7 @@ class ASRPlugin:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
                 return {"state": "error", "message": "ASR model not loaded"}
-            input_topic = args.get("input_topic")
-            # Also accept input_topics list (sent by canvas when multiple connections exist)
-            if not input_topic:
-                topics_list = args.get("input_topics") or []
-                if topics_list:
-                    input_topic = topics_list[0]
+            input_topic, direction_topic = _resolve_asr_inputs(args)
             if not input_topic:
                 raise ValueError("input_topic is required")
             node_key = instance_id or input_topic
@@ -2266,7 +2475,8 @@ class ASRPlugin:
                                     speaker=self._speaker,
                                     publish_background=self._publish_background_enabled,
                                     emit_audio_tags=self._emit_audio_tags,
-                                    emit_emotion=self._emit_emotion)
+                                    emit_emotion=self._emit_emotion,
+                                    direction_topic=direction_topic)
                     try:
                         self._executor.add_node(node)
                     except Exception:
@@ -2276,6 +2486,9 @@ class ASRPlugin:
                 else:
                     # Sync latest config into existing node before restart
                     self._sync_cfg(node)
+                    if node._direction_topic != direction_topic:
+                        node.stop()
+                        node._direction_topic = direction_topic
             # Outside the lock on purpose: node.start() blocks up to 15s, and the
             # node is already registered, so a concurrent stop can find it, set
             # its _stop_event, and have start() roll itself back to idle.

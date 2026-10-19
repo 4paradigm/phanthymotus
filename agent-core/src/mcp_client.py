@@ -444,7 +444,10 @@ def _to_openai_schema(mcp_id: str, tool: dict) -> list[dict]:
 
         # 只保留该 action 对应的参数（不含 action 字段本身）
         props = {k: all_props[k] for k in param_keys if k in all_props}
-        required = [k for k in param_keys if k in all_required]
+        # An action can require parameters that sibling actions do not take.
+        # Keep the legacy tool-wide requirements when no override is declared.
+        action_required = action_def.get('required', all_required)
+        required = [k for k in param_keys if k in action_required]
 
         schemas.append({
             'name':        f'mcp__{mcp_id}__{tool["name"]}__{action_name}',
@@ -858,6 +861,32 @@ async def call_tool(full_name: str, args: dict) -> str:
                 opts = ', '.join(sorted(f'mcp__{mcp_id}__{t}__{a}' for t, a in matches))
                 return (f'工具名 {full_name} 不明确：{len(matches)} 个工具都有 '
                         f'{tool_name} 动作。请使用完整名称之一：{opts}')
+            elif '__' in tool_name:
+                # The opposite failure: the model kept the tool segment but used
+                # an action the card no longer declares, so `split_map` had no
+                # entry and nothing injected `action`.
+                #
+                # This is what a **rename** looks like from here. The card's
+                # declaration is re-read only when a browser pings
+                # `/api/mcp/{id}/ping`, so after a card is redeployed the model
+                # can hold the previous action names for an arbitrarily long
+                # time — and every call it makes with them arrives as a literal
+                # `<tool>__<old_action>` with no action at all. Measured on
+                # Orin5: `phanthy_music__play` after `play` became `play_music`,
+                # answered by perception with `does not handle action None`.
+                #
+                # Splitting on the **last** `__` and passing the remainder as
+                # `action` hands the decision to the card, which is the only
+                # party that knows its own aliases (`ALIAS_ACTIONS`). A card
+                # with no alias for it still declines — the same outcome as
+                # today, minus the misleading `action None`.
+                candidate_tool, _, candidate_action = tool_name.rpartition('__')
+                if candidate_tool in (info_probe.get('tools') or []):
+                    print(f'[mcp] {full_name} names no declared action — passing '
+                          f'{candidate_tool}(action={candidate_action}) for the card '
+                          f'to resolve; its declaration has probably been renamed')
+                    tool_name = candidate_tool
+                    args = {**args, 'action': candidate_action}
 
     info = registry.get(mcp_id)
     if not info:
@@ -924,6 +953,7 @@ async def call_tool(full_name: str, args: dict) -> str:
     if action == 'start':
         meta = info.get('tool_meta', {}).get(full_name, {})
         if meta.get('has_config_schema'):
+            from tool_config import find_tool, missing_required_config
             saved_cfg = _get_tool_config(mcp_id, tool_name)
             if saved_cfg:
                 # Drop keys the current schema no longer advertises; a stale row
@@ -946,7 +976,13 @@ async def call_tool(full_name: str, args: dict) -> str:
                 except (json.JSONDecodeError, IndexError, KeyError):
                     pass
             else:
-                return f'[{tool_name}] 尚未配置，请先在设备面板中完成配置（provider/url/key）后再启动。'
+                # Name the keys that are actually missing. `provider/url/key`
+                # is one LLM adapter's field list, and a model told to go fill
+                # those in on a camera card has been sent to the wrong form.
+                missing = missing_required_config(find_tool(mcp_id, tool_name), {})
+                if missing:
+                    return (f'[{tool_name}] 尚未配置：缺少 {"、".join(missing)}，'
+                            f'请先在设备面板中填写后再启动。')
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:

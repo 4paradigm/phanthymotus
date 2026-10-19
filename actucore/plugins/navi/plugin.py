@@ -57,6 +57,11 @@ TOPIC_FORMAT = "control/velocity"
 # How often the descriptor is echoed back into the stream. See next_command.
 _DESCRIPTOR_EVERY = 50
 
+# A direct hardware depth topic is allowed to come up after Navi.  Do not wait
+# in ``start`` (that would turn an upstream loading delay into a canvas-wide
+# timeout), but do not leave an untyped input retrying forever either.
+_DEPTH_TYPE_WAIT_S = 5.0
+
 # The six twist axes. **The order is fixed by the protocol** — motus.control/1's
 # MODES comment, loco_servo's AXIS_NAMES on the driver side and motus.odom/1's
 # AXES are all this same list — so a twist producer knows what its six numbers
@@ -172,6 +177,12 @@ class NaviPlugin:
         # `_limit_notes` only because they are populated at different points in
         # `_start`; both end up in `degraded`.
         self._camera_notes: list = []
+        # A depth input whose producer has not appeared yet.  Kept separately
+        # from the policy timer so stop/unwind can cancel it explicitly instead
+        # of relying on node destruction happening at the right instant.
+        self._depth_bind_timer = None
+        self._depth_bind_deadline = 0.0
+        self._depth_bind_topic = ""
 
     # ── tool ─────────────────────────────────────────────────────────────────
 
@@ -298,7 +309,7 @@ class NaviPlugin:
                          "「机器人是否在对这里做反应」做透明度，压在真实画面上，"
                          "于是一眼能同时看到它看见了什么和它在反应什么"},
                 {"format": "image/depth-zlib",
-                 "desc": "深度图 640x480 uint16 mm（与深度摘要二选一）"},
+                 "desc": "zlib 压缩深度图 640x480 uint16 mm（与深度摘要二选一）"},
                 {"format": "state/odom",
                  "desc": "motus.odom/1（可选，接上才有卡死检测）"},
             ],
@@ -373,6 +384,13 @@ class NaviPlugin:
         # command snaps to all-or-nothing, and nothing anywhere says so. The
         # notes go into `degraded` so the adjustment is visible rather than
         # merely correct.
+        # Rebuild the effective policy configuration for every start.
+        # adopt_limits mutates its input; reusing the previous Config would
+        # preserve the former chassis's yaw and velocity restrictions.
+        self._config = policy_mod.Config(**{
+            k: v for k, v in self._cfg.items()
+            if k in policy_mod.Config.__dataclass_fields__
+        })
         self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
 
         rate = negotiate.effective_rate(capabilities, descriptor,
@@ -398,7 +416,10 @@ class NaviPlugin:
 
         try:
             self._open_publisher()
-            binding, problem = self._bind_inputs(self._node, inputs)
+            binding, problem = self._bind_inputs(
+                self._node, inputs, args.get("camera_info"),
+                args.get("input_bindings"),
+            )
         except Exception as error:                            # noqa: BLE001
             self._unwind()
             return self._error(f"启动失败：{error}")
@@ -633,6 +654,7 @@ class NaviPlugin:
             timer, self._timer = self._timer, None
             self._publisher = None
 
+        self._cancel_pending_depth_bind(node)
         if timer is not None and node is not None:
             try:
                 node.destroy_timer(timer)
@@ -640,15 +662,17 @@ class NaviPlugin:
                 pass
         if node is not None:
             try:
-                self._executor.remove_node(node)
+                if self._executor is not None:
+                    self._executor.remove_node(node)
+            except Exception:                                 # noqa: BLE001
+                pass
+            try:
                 node.destroy_node()
             except Exception:                                 # noqa: BLE001
                 pass
         return {"state": "stopped"}
 
     def _unwind(self):
-        with self._lock:
-            self._running = False
         self._stop_view_thread()
         self._stop()
 
@@ -672,6 +696,8 @@ class NaviPlugin:
                     else int if field.type in ("int", int) else float)
             setattr(self._config, key, cast(value))
             changed[key] = getattr(self._config, key)
+            # Preserve user-configured values across subsequent starts.
+            self._cfg[key] = changed[key]
         return {"status": "configured", "config": changed}
 
     def _info(self):
@@ -795,11 +821,52 @@ class NaviPlugin:
     _ROLE_SUFFIXES = (
         ("/visual_depth_summary", "depth_summary"),
         ("/visual_depth", "depth_map"),
+
+        # Hardware drivers may publish metric depth directly. Support both
+        # normal camera/depth paths and namespaced head cameras (Tianyi).
+        ("/camera/head/depth", "depth_map"),
+        ("/camera/depth", "depth_map"),
+        ("/depth", "depth_map"),
+
         ("/objects", "objects"),
         ("/state/odom", "odom"),
     )
 
-    def _bind_inputs(self, node, topics):
+    @staticmethod
+    def _declared_format(bindings, topic: str) -> str:
+        """Return the explicit format for one bound topic, if one was sent.
+
+        Agent Core may carry bindings as a topic-keyed mapping or as entries
+        containing ``topic``, ``format`` and ``port_index``.  Port index is not
+        used to infer a type: the resolved topic is the stable identity once
+        the canvas is started.  Accepting both shapes keeps this reader
+        compatible with existing callers while avoiding a positional guess.
+        """
+        if isinstance(bindings, dict):
+            entry = bindings.get(topic)
+            if isinstance(entry, str):
+                return entry
+            if isinstance(entry, dict):
+                return str(entry.get("format") or "")
+            entries = bindings.get("bindings") or bindings.get("inputs") or ()
+        else:
+            entries = bindings or ()
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("topic") == topic:
+                return str(entry.get("format") or "")
+        return ""
+
+    def _cancel_pending_depth_bind(self, node=None):
+        timer, self._depth_bind_timer = self._depth_bind_timer, None
+        self._depth_bind_deadline = 0.0
+        self._depth_bind_topic = ""
+        if timer is not None and node is not None:
+            try:
+                node.destroy_timer(timer)
+            except Exception:                                 # noqa: BLE001
+                pass
+
+    def _bind_inputs(self, node, topics, declarations=None, input_bindings=None):
         """把连上来的话题分派到角色。
 
         **上游此刻有没有在发布，不参与这个判断。** 这一条是真机上换来的：
@@ -858,8 +925,89 @@ class NaviPlugin:
 
         qos = _sensor_qos()
         if bound["depth_map"]:
-            node.create_subscription(CompressedImage, bound["depth_map"],
-                                     self._on_depth_map, qos)
+            topic = bound["depth_map"]
+            # ``camera_info`` is optical metadata, not a wire-format registry.
+            # Prefer the canvas binding when supplied; keep the declaration
+            # fallback for callers that already attach format to it.
+            fmt = self._declared_format(input_bindings, topic)
+            if not fmt:
+                fmt = self._declared_format(declarations, topic)
+            declared = {"image/depth-zlib": CompressedImage}.get(fmt)
+            if fmt and declared is None:
+                # `image/depth-z16` used to be accepted here. It is retired:
+                # every driver that published it was already producing exactly
+                # 640x480 little-endian 16UC1 — the zlib form's contract — and
+                # the raw form costs ~614 KB/frame, which saturates ARM64 CPU
+                # on DDS serialization. The sources were converted in
+                # phanthymotus-driver#419. Named explicitly rather than lumped
+                # in with "incompatible", because a robot still running a
+                # pre-#419 driver image hits exactly this and the fix is to
+                # update that image, not to rewire the canvas.
+                if fmt == "image/depth-z16":
+                    return bound, (
+                        f"深度输入是 image/depth-z16：{topic}。该格式已停用 —— "
+                        f"请把这台机器的驱动镜像更新到含 phanthymotus-driver#419 "
+                        f"的版本，它会改发 image/depth-zlib（同样是 640x480 "
+                        f"uint16 毫米，只是压缩过）。")
+                return bound, f"深度输入格式不兼容：{fmt}（JPEG预览不能作米制深度）"
+
+            def bind_depth():
+                types = set(dict(node.get_topic_names_and_types()).get(topic) or [])
+                # Only CompressedImage now. A raw `sensor_msgs/msg/Image` on a
+                # depth topic lands in the `types and not observed` branch
+                # below and is refused by type rather than bound to a decoder
+                # that no longer exists.
+                supported = {"sensor_msgs/msg/CompressedImage": CompressedImage}
+                observed = [supported[t] for t in types if t in supported]
+                if len(types) > 1 or (types and not observed):
+                    raise ValueError(f"深度话题类型冲突：{topic}: {sorted(types)}")
+                if declared and observed and observed[0] is not declared:
+                    raise ValueError(f"深度声明与ROS类型不一致：{topic}")
+                selected = declared or (observed[0] if observed else None)
+                if selected is None and topic.endswith("/visual_depth"):
+                    selected = CompressedImage
+                if selected is None:
+                    return False
+                callback = self._on_depth_map
+                node.create_subscription(selected, topic, callback, qos)
+                self._cancel_pending_depth_bind(node)
+                with self._lock:
+                    if self._last_error.startswith(f"深度话题 {topic} 等待超过"):
+                        self._last_error = ""
+                return True
+
+            try:
+                ready = bind_depth()
+            except ValueError as error:
+                return bound, str(error)
+            if not ready:
+                def retry_depth():
+                    # A stopped/restarted card must never let a timer from its
+                    # previous node create a late duplicate subscription.
+                    if not self._running or self._node is not node:
+                        self._cancel_pending_depth_bind(node)
+                        return
+                    try:
+                        if bind_depth():
+                            return
+                    except Exception as error:
+                        with self._lock:
+                            self._last_error = f"深度订阅失败：{error}"
+                        self._cancel_pending_depth_bind(node)
+                        return
+                    if time.monotonic() >= self._depth_bind_deadline:
+                        with self._lock:
+                            self._last_error = (
+                                f"深度话题 {topic} 等待超过 {_DEPTH_TYPE_WAIT_S:g}s，"
+                                "尚未发现可识别的 ROS 消息类型；持续等待发布者"
+                            )
+                        # Keep retrying while Navi is running. A late driver
+                        # must not leave depth permanently unsubscribed.
+                        self._depth_bind_deadline = float("inf")
+
+                self._depth_bind_topic = topic
+                self._depth_bind_deadline = time.monotonic() + _DEPTH_TYPE_WAIT_S
+                self._depth_bind_timer = node.create_timer(0.1, retry_depth)
         if bound["image"]:
             # Kept as bytes and decoded only when a frame is drawn: the camera
             # runs at 15 fps and the overlay at 5, so decoding on arrival would
@@ -886,6 +1034,20 @@ class NaviPlugin:
         到这里才看发布者是合理的 —— 名字已经没能给出答案，图是仅剩的线索。
         """
         types = dict(node.get_topic_names_and_types()).get(topic) or []
+
+        # Hardware depth topics do not always follow perception's
+        # `/visual_depth` naming convention. If ROS tells us this is an Image
+        # stream and the topic itself is clearly depth, bind it as metric depth
+        # instead of treating it as a camera preview.
+        # Only accept real depth endpoints. Avoid turning topics such as
+        # `/camera/depth_preview` (JPEG preview) into metric depth.
+        topic_lower = topic.lower()
+        if topic_lower.endswith("/depth"):
+            if any(n.endswith("Image") for n in types):
+                return "depth_map", "raw depth Image"
+            if any(n.endswith("CompressedImage") for n in types):
+                return "depth_map", "compressed depth"
+
         if any(n.endswith(("CompressedImage", "Image")) for n in types):
             # **The camera, not the depth map.** perception derives its depth
             # topic from the camera's (`<camera>/visual_depth`), so a
@@ -974,6 +1136,12 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
+    def _set_depth_map(self, depth):
+        with self._obs_lock:
+            self._depth_map = depth
+            self._depth_bands = depth_mod.nearest_by_band(depth)
+            self._depth_ms = int(time.time() * 1000)
+
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")
         if not data:
@@ -984,10 +1152,7 @@ class NaviPlugin:
             with self._lock:
                 self._last_error = f"深度图解码失败：{error}"
             return
-        with self._obs_lock:
-            self._depth_map = depth
-            self._depth_bands = depth_mod.nearest_by_band(depth)
-            self._depth_ms = int(time.time() * 1000)
+        self._set_depth_map(depth)
 
     def _open_publisher(self):
         from rclpy.node import Node

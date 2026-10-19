@@ -127,6 +127,34 @@ def fail(task_id: str, reason: str = '') -> Task | None:
     return task
 
 
+def clear_all() -> int:
+    """Delete every task, from memory and from the DB. Returns how many.
+
+    Deliberately **not** built out of `done()`, which the `task_force_clear`
+    tool uses. `done()` persists `status='done'` and only drops the task from
+    memory, so the row survives — `load_all()` is what finally deletes it, at
+    the *next* startup. That is right for a task that finished (the record
+    outlives the run) and wrong for a reset: a task's `goal` and `progress` are
+    text the model or the operator wrote, so leaving them is the same kind of
+    leftover as keeping `subagent_conclusions` after clearing the chat.
+
+    `DELETE FROM tasks` rather than deleting the ids in `_tasks`: the table can
+    also hold done/failed rows that no longer have a memory entry, and a reset
+    should take those too.
+
+    Scheduler jobs are the caller's to cancel — `task_store` does not import
+    `scheduler`, and the `task:<id>` job names are `event/task.py`'s
+    convention, not this module's. Clearing here without unregistering there
+    leaves a cron firing 「任务定时检查 [id]」for a task that no longer exists.
+    """
+    count = len(_tasks)
+    _tasks.clear()
+    with _get_conn() as conn:
+        conn.execute('DELETE FROM tasks')
+        conn.commit()
+    return count
+
+
 def get(task_id: str) -> Task | None:
     return _tasks.get(task_id)
 

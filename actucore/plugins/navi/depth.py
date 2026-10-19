@@ -88,6 +88,7 @@ def decode(payload: bytes) -> np.ndarray:
     return metres
 
 
+
 def _valid(patch: np.ndarray) -> np.ndarray:
     return patch[np.isfinite(patch) & (patch > 0)]
 
@@ -97,14 +98,16 @@ def sample_box(depth_m: np.ndarray, bbox_norm) -> float | None:
 
     `bbox_norm` is `(x1, y1, x2, y2)` in 0..1 of the frame. Normalised rather
     than pixels because vop's box is in *its* camera's resolution and this map
-    has been resampled to 640x480 — passing pixels across that boundary is an
+    may have a different native resolution — passing pixels across that boundary is an
     error that produces plausible numbers for the wrong part of the image.
     """
+    height, width = depth_m.shape
+
     x1, y1, x2, y2 = bbox_norm
-    left = max(0, min(WIDTH - 1, int(x1 * WIDTH)))
-    right = max(left + 1, min(WIDTH, int(x2 * WIDTH)))
-    top = max(0, min(HEIGHT - 1, int(y1 * HEIGHT)))
-    bottom = max(top + 1, min(HEIGHT, int(y2 * HEIGHT)))
+    left = max(0, min(width - 1, int(x1 * width)))
+    right = max(left + 1, min(width, int(x2 * width)))
+    top = max(0, min(height - 1, int(y1 * height)))
+    bottom = max(top + 1, min(height, int(y2 * height)))
 
     valid = _valid(depth_m[top:bottom, left:right])
     if valid.size == 0:
@@ -119,8 +122,10 @@ def sample_point(depth_m: np.ndarray, position, window: float = 0.05) -> float |
     is vop's centre-relative pair in -1..1. A window rather than one pixel
     because a single sample of a monocular depth map is noise.
     """
+    height, width = depth_m.shape
+
     x, y = position
-    half_w, half_h = window, window * WIDTH / HEIGHT
+    half_w, half_h = window, window * width / height
     return sample_box(depth_m, (
         (x + 1) / 2 - half_w, (y + 1) / 2 - half_h,
         (x + 1) / 2 + half_w, (y + 1) / 2 + half_h,
@@ -134,12 +139,14 @@ def nearest_by_band(depth_m: np.ndarray) -> dict:
     always the closest thing in the frame and is never what it should turn to
     avoid.
     """
-    top = int(HEIGHT * OBSTACLE_ROW_SPAN[0])
-    bottom = int(HEIGHT * OBSTACLE_ROW_SPAN[1])
+    height, width = depth_m.shape
+
+    top = int(height * OBSTACLE_ROW_SPAN[0])
+    bottom = int(height * OBSTACLE_ROW_SPAN[1])
     rows = depth_m[top:bottom, :]
 
     out = {}
-    edges = [round(i * WIDTH / len(BANDS)) for i in range(len(BANDS) + 1)]
+    edges = [round(i * width / len(BANDS)) for i in range(len(BANDS) + 1)]
     for i, name in enumerate(BANDS):
         valid = _valid(rows[:, edges[i]:edges[i + 1]])
         out[name] = (round(float(np.percentile(valid, OBSTACLE_PERCENTILE)), 3)
@@ -208,16 +215,18 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     not whether the way ahead is clear but whether the way the robot is about to
     move into is.
     """
-    top = int(HEIGHT * OBSTACLE_ROW_SPAN[0])
-    bottom = int(HEIGHT * OBSTACLE_ROW_SPAN[1])
+    height, width = depth_m.shape
+
+    top = int(height * OBSTACLE_ROW_SPAN[0])
+    bottom = int(height * OBSTACLE_ROW_SPAN[1])
     rows = depth_m[top:bottom, :]
 
     # Tangent of the horizontal angle for each column, right-positive. Derived
     # from the half-FOV rather than from intrinsics because **nothing in this
     # project publishes intrinsics** — see the card's degradations. It is the
     # one number here that is a configuration rather than a measurement.
-    tangent = ((np.arange(WIDTH) - (WIDTH - 1) / 2.0)
-               * (2.0 * np.tan(half_fov_rad) / WIDTH))
+    tangent = ((np.arange(width) - (width - 1) / 2.0)
+               * (2.0 * np.tan(half_fov_rad) / width))
 
     lateral = tangent[None, :] * rows
     inside = np.abs(lateral - lateral_offset_m) <= half_width_m
@@ -238,7 +247,7 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     reference = max(1e-6, reference_m)
     low = (lateral_offset_m - half_width_m) / reference
     high = (lateral_offset_m + half_width_m) / reference
-    step = 2.0 * np.tan(half_fov_rad) / WIDTH
+    step = 2.0 * np.tan(half_fov_rad) / width
     wanted = max(1e-9, (high - low) / step)
 
     window = (tangent >= low) & (tangent <= high)

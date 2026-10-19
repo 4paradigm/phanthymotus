@@ -101,16 +101,13 @@ def _commit_perf_span(span_data: dict) -> None:
         return
     # 兼容旧版本 perception: fallback 到时间窗口匹配
     span_start = span_data.get('start_ts', 0)
-    conn = config._get_conn()
-    try:
-        row = conn.execute(
-            '''SELECT trace_id FROM perf_spans
-               WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
-               ORDER BY start_ts DESC LIMIT 1''',
-            (span_start, span_start)
-        ).fetchone()
-    finally:
-        conn.close()
+    # 这个连接是本线程共享的（见 config._get_conn），关掉会连带断了别人的读。
+    row = config._get_conn().execute(
+        '''SELECT trace_id FROM perf_spans
+           WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
+           ORDER BY start_ts DESC LIMIT 1''',
+        (span_start, span_start)
+    ).fetchone()
     if row:
         perf_log.commit_spans(row[0], [span_data], source='perception')
 

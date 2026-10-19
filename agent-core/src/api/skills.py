@@ -5,6 +5,9 @@ api/skills.py — 技能管理 API。
 """
 
 import fastapi
+import datetime
+import json
+import re
 
 import sys
 import config
@@ -14,6 +17,8 @@ import event.skills
 _skills_mod = sys.modules['event.skills']
 
 router = fastapi.APIRouter(prefix='/skills', tags=['skills'])
+from api.skill_execution import router as execution_router
+router.include_router(execution_router)
 
 
 def _get_rc_url() -> str:
@@ -123,6 +128,8 @@ async def list_skills():
             'requiredTools': s.get('requiredTools', []),
             'active': s.get('active', False),
             'installedAt': s.get('installedAt', ''),
+            'compatibility': s.get('compatibility'),
+            'attachment': s.get('attachment'),
         })
     return {'code': 200, 'data': result}
 
@@ -147,6 +154,152 @@ async def install_skill(request: fastapi.Request, body: dict = fastapi.Body(...)
     return {'code': 200, 'data': result['data']}
 
 
+def validate_local_skill(body):
+    limits = {'slug': 100, 'name': 100, 'oneLiner': 300, 'description': 4000,
+              'instruction': 20000, 'category': 80, 'version': 40}
+    if len(json.dumps(body, ensure_ascii=False).encode()) > 32768:
+        raise fastapi.HTTPException(413, '技能定义超过 32 KiB')
+    if set(body) - (set(limits) | {'requiredTools', 'compatibility', 'attachment',
+                                   'origin', 'files'}):
+        raise fastapi.HTTPException(422, '技能定义含不支持的字段')
+    for key, limit in limits.items():
+        value = body.get(key, '')
+        if not isinstance(value, str) or len(value) > limit:
+            raise fastapi.HTTPException(422, f'无效的技能字段：{key}')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,99}', body.get('slug', '')):
+        raise fastapi.HTTPException(422, '无效的技能标识')
+    if any(not body.get(k, '').strip() for k in ('name', 'oneLiner', 'instruction')):
+        raise fastapi.HTTPException(422, '名称、简介和指令不能为空')
+    required = body.get('requiredTools', [])
+    if (not isinstance(required, list) or len(required) > 32 or
+            any(not isinstance(t, str) or not re.fullmatch(r'[\w:.-]{1,200}', t) for t in required)):
+        raise fastapi.HTTPException(422, '无效的工具依赖')
+    definition = {k: body.get(k, '') for k in limits}
+    definition['version'] = definition['version'] or '1.0.0'
+    definition['requiredTools'] = required
+    for key in ('compatibility', 'attachment', 'origin'):
+        if key in body:
+            if not isinstance(body[key], dict) or len(json.dumps(body[key]).encode()) > 8192:
+                raise fastapi.HTTPException(422, f'无效的技能字段：{key}')
+            definition[key] = body[key]
+    attachment = definition.get('attachment')
+    # The protocol identifier and the asset id are the device's, not ours. An
+    # earlier version demanded the literal `motus.teaching.package/1` and a
+    # 32-hex asset id, which made a second kind of package an edit to Core.
+    # What Core does check is the shape, the bounds, and that the attachment
+    # names a tool the skill actually declares as a dependency.
+    if attachment and (set(attachment) != {'schema', 'tool', 'asset_id'} or
+            not isinstance(attachment.get('schema'), str) or
+            not re.fullmatch(r'[\w.+-]+/\w[\w.-]*', attachment.get('schema', '')) or
+            attachment.get('tool') not in required or
+            not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', str(attachment.get('asset_id', '')))):
+        raise fastapi.HTTPException(422, '无效的技能附件声明')
+    origin = definition.get('origin')
+    if origin and (set(origin) != {'mcp_id', 'instance_id'} or
+                   any(not isinstance(v, str) or not v or len(v) > 200 for v in origin.values())):
+        raise fastapi.HTTPException(422, '无效的技能来源')
+    # A manifest of what the skill ships: `{path, bytes, sha256}` and nothing
+    # about who reads it. `attachment` stays as one device protocol's own
+    # addressing (a handle that device minted). See skill_files for why the
+    # declaration names no consumer, protocol or tool.
+    if 'files' in body:
+        import skill_files
+        try:
+            definition['files'] = skill_files.validate_files(body['files'])
+        except ValueError as error:
+            raise fastapi.HTTPException(422, str(error))
+    return definition
+
+
+_ABSENT = object()
+
+
+def _same_field(previous: dict, key: str, value) -> bool:
+    """Does an installed skill already carry this field unchanged?
+
+    A string or a list has a normalised empty form (`validate_local_skill`
+    writes `''` and `[]`), so a missing one is equivalent to an empty one. A
+    dict does not: `compatibility`, `attachment` and `origin` are either
+    present or absent, and comparing an absent one against `''` is what turned
+    an idempotent re-import into a 409.
+    """
+    if isinstance(value, str):
+        return previous.get(key, '') == value
+    if isinstance(value, list):
+        return previous.get(key, []) == value
+    return previous.get(key, _ABSENT) == value
+
+
+@router.post('/import')
+async def import_local_skill(body: dict = fastapi.Body(...)):
+    """Import an unpublished skill into the existing local skill store.
+
+    No await between read and write: concurrent requests on the API loop cannot
+    overwrite one another. ConfigDB commits the whole value transactionally.
+    A retry is idempotent; a conflicting slug never overwrites an installed skill.
+    """
+    definition = validate_local_skill(body)
+    skills_cfg = config.main.get('skills', {})
+    installed = list(skills_cfg.get('installed', []))
+    previous = next((s for s in installed if s['slug'] == definition['slug']), None)
+    if previous is not None:
+        # Compare against what is *absent*, not against one placeholder for
+        # every type. `previous.get(k, '')` yielded `''` for a missing
+        # `compatibility`/`attachment`/`origin`, which never equals a dict — so
+        # re-importing a skill installed before those fields existed hit a hard
+        # 409 telling the user to pick a new slug, instead of the documented
+        # idempotent 200.
+        if any(not _same_field(previous, k, v) for k, v in definition.items()):
+            raise fastapi.HTTPException(409, '相同标识的技能已存在，请使用新的标识')
+        return {'code': 200, 'data': {'slug': previous['slug'], 'already': True}}
+    installed.append({**definition, 'active': True,
+                      'installedAt': datetime.datetime.now().isoformat()})
+    config.main['skills'] = {**skills_cfg, 'installed': installed}
+    return {'code': 200, 'data': {'slug': definition['slug'], 'already': False}}
+
+
+@router.put('/files/{slug}/{path:path}')
+async def put_skill_file(slug: str, path: str, request: fastapi.Request):
+    """Store the content of a file the skill already declared.
+
+    Declaration first, content second: the body must match the declared length
+    and SHA256, so nothing can write a file the definition did not announce, nor
+    quietly substitute different content for one it did. Used by both authoring
+    paths -- a marketplace install fetching from the resource centre, and a
+    local save from the workbench.
+    """
+    import skill_files
+    skill = next((s for s in config.main.get('skills', {}).get('installed', [])
+                  if s['slug'] == slug), None)
+    if not skill:
+        raise fastapi.HTTPException(404, '技能未安装')
+    data = await request.body()
+    if len(data) > skill_files.MAX_FILE_BYTES:
+        raise fastapi.HTTPException(413, f'文件超过 {skill_files.MAX_FILE_BYTES} 字节')
+    try:
+        return {'code': 200, 'data': skill_files.write(slug, skill, path, data)}
+    except ValueError as error:
+        raise fastapi.HTTPException(422, str(error))
+
+
+@router.get('/files/{slug}')
+async def list_skill_files(slug: str):
+    """What this skill declares it carries. Metadata only -- no content."""
+    skill = next((s for s in config.main.get('skills', {}).get('installed', [])
+                  if s['slug'] == slug), None)
+    if not skill:
+        raise fastapi.HTTPException(404, '技能未安装')
+    import skill_files
+    present = []
+    for entry in skill.get('files') or []:
+        try:
+            stored = skill_files.resolve(slug, entry['path']).is_file()
+        except ValueError:
+            stored = False
+        present.append({**entry, 'stored': stored})
+    return {'code': 200, 'data': present}
+
+
 @router.post('/uninstall')
 async def uninstall_skill(body: dict = fastapi.Body(...)):
     """卸载已安装的技能。"""
@@ -165,6 +318,13 @@ async def uninstall_skill(body: dict = fastapi.Body(...)):
 
     # 同时停用
     _skills_mod.active_skills.discard(slug)
+
+    # 随附文件跟着技能走。留下来的话，下一个占用这个 slug 的技能会继承它们 ——
+    # 声明里写的是新 sha256，磁盘上躺着旧内容，而激活后读到的是后者。
+    import skill_files
+    removed = skill_files.remove_all(slug)
+    if removed:
+        print(f'[skills] uninstall {slug}: removed {removed} skill file(s)')
 
     return {'code': 200, 'data': {'slug': slug}}
 

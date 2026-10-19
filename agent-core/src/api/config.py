@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 import config
 import aiohttp
+from tool_config import find_tool
 import openai as openai_lib
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
@@ -299,6 +300,79 @@ def tool_state_of(result) -> tuple[str | None, str]:
     if state is None and payload.get('error'):
         state = 'error'
     return state, message
+
+
+# How long to wait between two `info` reads while a device is still releasing.
+# 0.1s turned a 5s deadline into 50 MCP calls per card, fanned out across every
+# card at once; a release that needs confirming does not resolve in 100ms.
+_STOP_POLL_INTERVAL_S = 0.25
+
+# What Core knows on its own. `unknown` is deliberately **not** a failure: it is
+# what a tool answers when its telemetry is stale (engineai/t800), and reading
+# it as a failed stop reports a healthy device as stuck. A tool that cannot
+# confirm its own stop is not the same as one that refused to.
+_STOP_FAILED_STATES = frozenset({'error', 'failed', 'fault'})
+_STOP_PENDING_STATES = frozenset({'running', 'stopping'})
+
+
+def stop_rules(tool_obj: dict) -> dict:
+    """What counts as "still stopping" for this tool.
+
+    Core knows two generic pending states and no flags. Anything beyond that is
+    **declared by the tool** in `inputSchema['x-stop']`, because a release
+    protocol belongs to the device that has one:
+
+        "x-stop": {"pending_states": ["handing_back"],
+                   "pending_flags": {"authority_released": false},
+                   "failed_states": ["refused"]}
+
+    The alternative -- a hardcoded vocabulary -- was tried and does not work.
+    A list carrying `hold`, `handback`, `sdk_pending`, `ownership_held` and
+    `authority_released` was written against one driver's private words: not one
+    of those strings exists anywhere in phanthymotus-driver, while `active`
+    (19 occurrences) and `stopping` (10) do. So the guessed half applied to
+    nobody and the guessed-wrong half applied to every card on every robot.
+    `active` is still absent here on purpose: pndbotics/adam answers it from
+    `info` for an arm that is powered, which is not the same as a card that has
+    not stopped. A driver that does mean "still stopping" can say so.
+    """
+    declared = ((tool_obj or {}).get('inputSchema') or {}).get('x-stop') or {}
+    if not isinstance(declared, dict):
+        declared = {}
+
+    def names(key):
+        value = declared.get(key)
+        return {str(v) for v in value if isinstance(v, str)} if isinstance(value, list) else set()
+
+    flags = declared.get('pending_flags')
+    return {
+        'failed': _STOP_FAILED_STATES | names('failed_states'),
+        'pending': _STOP_PENDING_STATES | names('pending_states'),
+        'flags': {k: v for k, v in flags.items() if isinstance(k, str)} if isinstance(flags, dict) else {},
+    }
+
+
+def is_declined(payload: dict) -> bool:
+    """Did the plugin say it does not know the verb, rather than fail at it?
+
+    The mirror of phanthymotus-driver's `common/lifecycle.is_declined`, and
+    deliberately the same rule: only an `unknown action` error **with no
+    `state`** counts. Six of that repo's thirty bundles normalise the decline
+    themselves; the other twenty-four still answer it raw, and every one of
+    their stateless actuators -- a gesture, a dock command, a speaker -- would
+    otherwise report a failed stop for a card that had nothing to stop.
+    """
+    if not isinstance(payload, dict) or 'state' in payload:
+        return False
+    return str(payload.get('error', '')).strip().lower().startswith('unknown action')
+
+
+def is_pending(payload: dict, state, rules: dict) -> bool:
+    """Is this device still releasing, by its own declared rules?"""
+    for key, expected in rules['flags'].items():
+        if payload.get(key) == expected:
+            return True
+    return state in rules['pending']
 
 
 def _bound_inputs(info: dict) -> list:
@@ -1073,22 +1147,45 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
         tool_name = card.get('toolName', '')
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
                  'card_id': card.get('id', ''), 'ok': False, 'error': ''}
+        rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
         try:
-            req = MCPCallRequest(tool=tool_name,
-                                 arguments={'action': 'stop',
-                                            'instance_id': card.get('id', '')})
+            async def stop_and_confirm():
+                action = 'stop'
+                while True:
+                    result = await mcp_call_tool(card.get('mcpId', ''), MCPCallRequest(
+                        tool=tool_name, arguments={'action': action, 'instance_id': card.get('id', '')}),
+                        timeout_s=STOP_CARD_TIMEOUT_S)
+                    if result.get('code') != 200:
+                        raise RuntimeError(result.get('message') or '设备拒绝停止请求')
+                    payload = payload_of(result)
+                    # A plugin with no lifecycle of its own declines the verb
+                    # outright. Nothing was armed, so nothing needs disarming --
+                    # and the driver's own common/lifecycle.py says exactly that.
+                    # Reading the decline as a failure is how start-project once
+                    # rolled an entire robot back over a dock command.
+                    if is_declined(payload):
+                        return
+                    state, reason = tool_state_of(result)
+                    if state in rules['failed']:
+                        raise RuntimeError(reason or str(payload.get('reason') or '')[:200]
+                                           or '设备停止未确认')
+                    if not is_pending(payload, state, rules):
+                        return
+                    # Never resend stop while a device is still releasing. Read
+                    # its actual state within the existing per-card deadline --
+                    # and never spend the whole budget on one sleep, or a short
+                    # deadline gets no read at all.
+                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, STOP_CARD_TIMEOUT_S / 4))
+                    action = 'info'
             # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
             # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
             # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
-            await _aio.wait_for(
-                mcp_call_tool(card.get('mcpId', ''), req,
-                              timeout_s=STOP_CARD_TIMEOUT_S),
-                STOP_CARD_TIMEOUT_S)
+            await _aio.wait_for(stop_and_confirm(), STOP_CARD_TIMEOUT_S)
             entry['ok'] = True
         except _aio.TimeoutError:
             # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
             # 下来的卡片意味着那台设备可能还在跑。
-            entry['error'] = f'无响应（{STOP_CARD_TIMEOUT_S:g}s 死线）'
+            entry['error'] = f'停止未确认（{STOP_CARD_TIMEOUT_S:g}s 死线）；请检查设备状态'
         except Exception as error:  # noqa: BLE001
             entry['error'] = str(error) or type(error).__name__
         if progress:
@@ -1671,6 +1768,7 @@ async def config_test_vad_audio(
 class ResetRequest(BaseModel):
     restart_services: bool = False
     chat_history: bool = False
+    tasks: bool = False
     system_prompt: bool = False
     identity: bool = False
     memory: bool = False
@@ -1695,6 +1793,32 @@ async def reset_config(req: ResetRequest):
         event.llm._session_id = None
         event.llm._current_turn = []
         reset_items.append('chat_history')
+
+    if req.tasks:
+        # A task outlives a conversation on purpose: `load_all()` restores every
+        # active one at startup and `__aenter__` re-registers its cron check. So
+        # clearing history alone leaves the agent still working an agenda from a
+        # conversation the operator deleted — it will keep announcing progress on
+        # a goal with no visible origin.
+        #
+        # Order matters: cancel the cron jobs *first*. `task_store.clear_all()`
+        # cannot do it — it does not import `scheduler`, and the `task:<id>` job
+        # name is the event/API layer's convention, not storage's. A job left
+        # behind keeps firing 「任务定时检查 [id]」for a task that no longer
+        # exists, waking the agent with a goal it can no longer look up.
+        #
+        # `scheduler.remove_job` directly, matching `api/tasks.py`, rather than
+        # `event.task._unregister_check`: that submodule is shadowed by the
+        # Tools() instance `event/__init__.py` rebinds onto `event.task` (the
+        # trap the skills branch below has to work around), and reaching it
+        # through sys.modules to wrap a one-line call is not worth it.
+        import scheduler
+        import task_store
+        for task in task_store.active_tasks():
+            scheduler.remove_job(f'task:{task.id}')
+        cleared = task_store.clear_all()
+        print(f'[reset] cleared {cleared} task(s) and their scheduled checks')
+        reset_items.append('tasks')
 
     if req.system_prompt:
         src = defaults_dir / 'prompt_system.md'

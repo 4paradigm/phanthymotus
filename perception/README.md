@@ -42,6 +42,63 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 
 > **Why 512 samples?** The Silero VAD model requires at least one 512-sample window to compute a speech probability. WebRTC VAD requires 480-sample (30 ms) frames. Both backends use 512 samples as the minimum chunk size.
 
+### Wake Direction Timing
+
+Connect Bumi's `sensor/sound-direction` output
+(`/<namespace>/sound_direction`) to ASR's sound-direction input, and
+its microphone to the `audio/pcm-16k` input. The direction port remains a
+specific sensor type, not `data/json`: an ordinary JSON card cannot supply it.
+Like the existing `sensor/pose2d` card, its ROS transport is `std_msgs/String`
+with a structured payload. Core needs no change: its generic `sensor/*`
+transport already carries the message, without compiling a custom direction
+interface or starting the sensor.
+
+The payload has `state: "fresh"`, the exact `angle_deg`, and
+`angle_convention: "robot_front_0_left_positive_ccw"` (front 0°, left positive,
+right negative), plus
+`audio_window_start_us` / `audio_window_end_us`. Driver publishes `no_event` after
+activity stops and `stale` if a valid observation expires. Neither state clears
+ASR's capture history: a transcription can finish after the event expires.
+ASR ignores a direction observation with a missing or different convention.
+Its existing recognition result reports `speaker_direction_state` and, when
+valid, `speaker_direction` as a single string such as
+`"115°, robot_front_0_left_positive_ccw"`. The matched capture window is
+reported as `speaker_direction_window_start_us` /
+`speaker_direction_window_end_us`. The angle refers to the start of the wake
+word, not the full utterance. Unknown and disconnected directions report only
+`speaker_direction_state: "unknown"` or `"no_input"`.
+
+`AudioChunk.header.stamp` must be the Unix capture time of the chunk's first
+sample. Direction windows use the same clock in microseconds. ASR reports an
+unknown wake direction when the audio stamp is missing or either capture
+window is untrusted. Confirm clock alignment on the robot before relying on
+direction results.
+
+For this migration, upgrade Driver and Perception together. Remove/re/add the
+direction and ASR cards and reconnect them — a saved card keeps its old
+`topicIn` list and never gains the second input. The canvas type remains
+`sensor/sound-direction`. ASR picks its direction input by topic name: the
+connection whose topic has a `sound_direction` segment is the direction source,
+every other input is audio, so connection order does not choose the audio
+source. Keep that name — renaming the driver output breaks the binding.
+Direction payloads appear in the monitor as plain data; they are not rendered
+as JSON.
+
+SenseVoice, Parakeet and X-ASR retain the recognizer's token timestamps from
+the same decode. ASR maps the matched wake word's text boundary to a timed
+token and adds its offset to the utterance's capture start before selecting
+direction windows. This supports filler and other speech before a custom wake
+word. Token timing must be finite, ordered, inside the original audio, and
+consistent with the recognized text; a wake boundary inside an indivisible
+token is unavailable. If timing is unavailable, a wake word at the utterance
+start can use the VAD onset; a spoken prefix returns `unknown`. Recognition
+and wake triggering continue normally. Check token timing accuracy on the
+robot; the timestamps do not establish the physical alignment error by themselves.
+Direction history keeps up to 60 seconds / 1201 events, covering a 30-second
+VAD segment plus queueing margin at Bumi's maximum 20 Hz publication rate.
+The worker snapshots history before transcription, so later direction events
+cannot evict a wake window while that utterance is being decoded.
+
 ### Common Pitfalls
 
 #### External USB mic (ALSA, 48 kHz native rate)
@@ -3011,10 +3068,130 @@ transcribed and TTS still speaks with the card running.
 
 ## Vision: `vop` (detection) and `visual_depth` (depth)
 
-Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
+By default, both run a **prebuilt TensorRT engine** fetched as a pinned bundle
 (`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
 same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
 falls back to PyTorch if the bundle is missing — it fails loudly instead.
+
+### Optional DepthART backend
+
+`visual_depth` also supports DepthART Metric-S. Select **Depth model** in the
+shared tool configuration after stopping all depth instances; loading remains
+lazy. The default is still YOLO26-N Depth. Frame rate and calibration remain
+per-camera settings. This integration uses the existing Agent Core form without
+Core changes: the model selector shows `yolo` / `depthart`, and calibration fields
+remain visible rather than conditionally hidden. Leave a/b at 1/0 when not using
+manual calibration.
+
+DepthART downloads a pinned engine and SelectiveScan plugin on first use,
+selected from the runtime TensorRT family. Files are size/SHA256 verified and
+cached under `/models/depthart/jp511` or `/models/depthart/jp61`; concurrent
+processes reuse the shared downloader lock. Download progress is exposed through
+the loading status. Selecting the model or calling info/config does not download.
+The fixed release is the `dynamic-k-v1` directory of
+`Flame4pd/depthart-metric-s-jp61-trt`, revision
+`ce158696ba8a5a6cee919b851a879825ea700eea`; despite the repository name it includes
+both JP5/TRT8.5.2.2 and JP6/TRT10.4 Orin artifacts.
+
+For custom provisioning, set both `depthart_engine_path` and
+`depthart_plugin_path` (or `DEPTHART_ENGINE_PATH` and `DEPTHART_PLUGIN_PATH`).
+A partial override fails explicitly. JP5/JP6 artifacts are not interchangeable.
+There is no startup compilation or fallback to another model on download failure.
+
+Supply actual `motus.camera/1` intrinsics through the upstream camera declaration
+for streams, or explicitly for photos. Photos can inherit a running instance's
+bound declaration but cannot replace it. Unbound on-demand instances require a
+declaration on every photo.
+
+**A declaration with no `K` is valid, and R1 is the case.** The spec carries
+`half_fov_rad` because a tape measure produces an angle directly and no `K` at
+all, and its reference declaration is exactly that — `/ubuntu/camera/main`
+declares `K: null`, `half_fov_rad: 0.888`, `source: measured`. So `K` is read
+when present and derived from `half_fov_rad` when not (`fx = (w/2)/tan(half)`,
+principal point at centre), which keeps the spec's precedence: when both are
+present `K` wins, because a matrix is solved from many observations while the
+angle beside it is usually a tape measure. `fy` comes from `half_fov_v_rad`
+when declared and assumes square pixels when it is not — it **cannot** be
+derived from the aspect ratio, which is why the declared field exists.
+
+Reading only `K` rejected the canonical camera of the robot this project is
+built around, with `camera_info must contain a nine-value K`.
+
+What this does not fix on that lens: a pinhole `K` is an approximation at ~102
+degrees with `distortion_model: unknown` and `D: null`, and `tan` overstates
+the lateral offset towards the edges. Expect DepthART to need site calibration
+there, as YOLO does (`cal_b: -0.9753`, a factor of 2.65).
+
+#### The engine canvas is fixed, so an off-aspect source is centre-cropped
+
+The engine's input binding is static — `DepthARTSession.input_size` is read off
+the engine itself, 864x480 for the pinned bundle — so every frame has to become
+exactly that tensor. Runtime K does not make the canvas dynamic.
+
+Rounding the cover-resize to a multiple of 32 admits a **band** of ratios, not
+just 1.8: 16:9 and 16:10 sources go in untouched. Anything outside the band is
+**centre-cropped** to fit, and `prepare_image` folds the crop into K — the
+principal point moves, the focal lengths do not. A vertical crop therefore costs
+nothing on the horizontal axis, which is the axis a camera's `half_fov_rad`
+describes and the one an avoidance corridor is computed from. A 4:3 source gives
+up 26% of its height, 16:10 gives up 7%. `DepthARTSession.infer` logs the crop
+once per engine; past `MAX_CROP_FRACTION` (half the frame) it is refused
+instead, naming the ratio to feed it.
+
+**It is not stretched, and that is the whole point.** Resizing 640x480 into
+864x480 is one line and silently wrong: it squashes the world horizontally by
+1.35x while K still says the pixels are square, and DepthART derives its metric
+scale *from* K — so the card would publish confidently wrong numbers on a topic
+whose contract is metres. Letterboxing would keep the field of view instead, at
+the cost of feeding the network grey bars it never saw in training, whose depth
+would then have to be masked. Rebuilding the engine for another canvas is the
+only thing that removes the limit outright, and that is an artifact problem.
+
+**Known gap:** the declaration this card *publishes* (`camera_info.inherit`)
+rescales the upstream K as though the stage only resized, so after a crop its
+vertical terms (`fy`, `cy`) describe more of the scene than the depth map
+actually covers. The horizontal terms and `half_fov_rad` stay correct, and
+`half_fov_v_rad` is `null`, so nothing reads the wrong number today — but a
+consumer that starts using vertical geometry would be misled. Folding the crop
+through `inherit` is the fix.
+
+#### Calibration belongs to camera × model, so each model keeps its own pair
+
+A log-affine fit corrects one camera's optics *as that model sees them*, so it
+is not transferable between backends: on r1_sz's ultra-wide lens YOLO needs
+`cal_b: -0.9753` — a factor of 2.65 — and what it corrects there is a fixed-K
+model's guess at a 102° lens, which is not the error DepthART makes, since
+DepthART is handed the real `K`. **DepthART's own residual on that lens has not
+been measured**, so "it should need less" is an expectation, not a result;
+measure it with `calibrate` before trusting either number.
+
+So the coefficients are **keyed by model**: `cal_a`/`cal_b` are YOLO's pair and
+`cal_a_depthart`/`cal_b_depthart` are DepthART's. Switching models swaps which
+pair is read and changes nothing else — both survive in the saved row, and
+switching back restores the earlier fit rather than nothing.
+
+**There is deliberately no marker saying which model a fit belongs to.** An
+earlier cut of this carried `calibration_backend` alongside a single pair and
+compared it against the active model. Two fields that must agree eventually did
+not, and the failure was expensive: on r1_bj the mismatch dropped the card's
+only calibration to `no calibrate`, **the canvas persisted the dropped row**,
+and every distance was then uncalibrated on a 102° lens — with a
+`calibration_note` as the only trace. Keyed storage cannot contradict itself,
+and `_select_backend` no longer strips calibration keys, which was the step
+that did the erasing.
+
+No migration is needed: `cal_a`/`cal_b` keep their names and meaning, and every
+row already saved holds a YOLO fit by construction — it was the only model
+there was when those rows were written.
+
+The one cross-model rule that survives is the **preset table**, which is
+measured against YOLO26-depth. A preset selected under DepthART is dropped back
+to `no calibrate` — never silently: the note is on the `config` response, on
+`info()`, and in the log.
+
+What this does not fix on R1: a pinhole `K` is an approximation at ~102° with
+`distortion_model: unknown` and `D: null`, and `tan` overstates the lateral
+offset towards the edges. Expect DepthART to need site calibration there too.
 
 ### Why TensorRT *directly*, and not through ultralytics
 

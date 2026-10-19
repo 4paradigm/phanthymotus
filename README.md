@@ -359,8 +359,11 @@ invisible path.
 `perception/utils/file_intake.py` implements `POST /file/upload` and is
 deliberately **stdlib-only**, because the drivers run a bare
 `ThreadingHTTPServer` rather than FastAPI and can adopt the identical endpoint in
-about five lines. Only perception has it today; the contract is fixed for the
-rest.
+about five lines. All 15 HTTP driver bundles now do, via a copy of this module at
+`phanthymotus-driver/common/file_intake.py` — the same two-implementations-one-
+document rule as `motus.vla/1`, since the whole surface is four lines of wire
+format. See that repo's README_dev.md § File Arguments for the per-bundle glue
+and the three ordering requirements it has to satisfy.
 
 Its behaviour, each point with a test:
 
@@ -372,6 +375,151 @@ Its behaviour, each point with a test:
 | `subdir` refused, not sanitised | `../escape` became `.._escape` — a valid name, so the write succeeded somewhere unasked-for, silently |
 | pruned after `retention_days` (7) | uploads are a transfer buffer; enrolment keeps the *embedding*, never the photo |
 | `ACCESS_TOKEN` honoured when set | today perception is not given one, and the same port already serves `tools/call` — so this is reachability-gated, and the check is ready for when a token is wired in |
+
+## Skill Files
+
+A skill can ship files alongside its instruction. The definition declares a
+manifest — each entry just `{path, bytes, sha256}` — and **says nothing about
+who reads them**:
+
+```json
+"files": [
+  {"path": "reference/etiquette.md", "bytes": 1840,   "sha256": "…"},
+  {"path": "trajectory.jsonl",       "bytes": 482301, "sha256": "…"}
+]
+```
+
+That omission is the design. Every other tool-to-skill relationship here is
+descriptive: `requiredTools` is enforced nowhere (one display label in the skill
+panel is its only reader), a skill says in prose "use tool X", and the LLM
+routes the call. A file is the same, and it reaches either reader through a
+mechanism that already exists:
+
+| | the model reads it | a tool consumes it |
+|---|---|---|
+| how | `skill_file(slug, path)` → text, bounded, resumable by `offset` | `skill_file(…, as_path=true)` → a local path, passed to any `format: file` parameter |
+| who decides | the LLM, from the instruction | the LLM, **by which tool it calls** |
+| transport | `agent-core/src/skill_files.py` | the `format: file` path above — **the only transport** |
+
+The second row is the whole point: the tool the model called *is* the
+destination, so a skill never names a device, a protocol, or a tool. It is also
+why `agent-core/src/api/skill_execution.py` (once `skill_packages.py`) no longer
+carries a chunked transfer of its own — that existed only while no driver served
+`POST /file/upload`, and two transports for one job is the thing not to ship. Earlier
+drafts had each entry declare its consumer, a protocol `schema`, and the `tools`
+allowed to receive it; all three were wrong in the same direction — `tools`
+duplicated `schema` and forced a marketplace author to enumerate driver tool
+names they cannot know, and `schema`/`consumer` froze a per-call routing
+decision at authoring time.
+
+Progressive disclosure follows from it: the `description` is always in context,
+an activated skill's `instruction` is injected whole, and files are read only
+when the instruction points at one. Before this, `instruction` was the only
+place to put content.
+
+### What Core enforces
+
+This is an **LLM-facing read primitive on a robot** whose path argument
+ultimately comes from text in a prompt, so confinement carries the weight:
+
+| | |
+|---|---|
+| a declared path cannot leave the skill's directory | `resolve()` then verify via `parents` — **not** a string prefix, which accepts a sibling directory whose name merely starts the same way (`<slug>-evil/x`) |
+| declaration first, content second | a write must match the declared length and SHA256; a file the skill never declared has no storage and no reader |
+| `O_NOFOLLOW` + regular-file check | this process can write the directory, so a planted symlink must not redirect the read |
+| bounded reads | 64 KiB per read, 1 MiB per text read, 16 MiB per file, 32 MiB per skill |
+| **activation is the gate** | only an activated skill's files are readable — this cannot browse what is merely installed |
+
+`skill_file` needs no canvas card, unlike every device tool. The canvas is an
+authorization surface (`agent-core/src/canvas_binding.py`), but skill *text* has
+never been gated by it: `prompt._env_static` injects an activated skill's
+`instruction` with no card involved. A skill file is the same operator-installed
+content, read on demand rather than always. **The tool does not widen what the
+LLM can read; it narrows when.**
+
+Full protocol, the storage layout, and the authoring paths:
+[`docs/SKILL_WORKBENCH.md`](docs/SKILL_WORKBENCH.md).
+
+## Capability Declarations (`x-*`)
+
+A driver's tool says what it can do; agent-core never infers it from the tool's
+name or the robot's model. The declarations live **inside `inputSchema`**, not
+at the top level of the tool object — MCP registration whitelists top-level
+fields, so an unknown key there is silently dropped.
+
+| Declaration | What the driver is telling Core |
+|---|---|
+| `x-action-params` | each action takes its own parameters — split this tool per action, and `<action>.required` is that action's required set |
+| `x-completion` | this action is asynchronous; here is how its completion receipt arrives (ACP) |
+| `x-resource` | this tool can serve a resource, e.g. the URDF a skeleton renderer needs |
+| `format: file` / `uploadTo` | this parameter is a file, and which service should receive the upload |
+| `x-hooks`, `x-show-when`, `x-sensitive` | how to render this field in the config form |
+| `x-skill-package` | this card can receive and emit skill packages — see below |
+| `x-workbench` | this card provides an interactive page to host in an iframe |
+| `x-stop` | this card has a release protocol; here is what "still stopping" looks like |
+
+A skill's own `files` manifest is **not** in this family — it is not a tool
+declaration. See [Skill Files](#skill-files) above.
+
+The pattern is the same one used for LLMs: `config.main['client']['llm']` is
+`{url, key, model}` and there is not a line of inference about which model is
+behind it. A keyword guess is the failure mode this exists to avoid — the peer
+tool classifier once sorted tools by name and matched none of `loco`, `led`,
+`speaker` or `switch_mode`, which let a `viewer` drive locomotion.
+
+### `x-skill-package`
+
+A **skill package** is a portable archive a device produces and consumes: a
+manifest plus whatever payload that device's own protocol calls for. Core
+transfers it between one card and the browser, and stores whether the resulting
+skill may run without asking. It does not open the payload.
+
+```json
+{
+  "x-skill-package": {
+    "schema": "example.device.package/1",
+    "pending": true,
+    "session_authorization": true,
+    "persistent_execution": true,
+    "legacy_slug_prefix": "recorded-"
+  }
+}
+```
+
+One identity field and a set of capability bits:
+
+| Field | Effect |
+|---|---|
+| `schema` | the protocol this card speaks. A package is routed here only if its `manifest.schema` is the same string, and refused with 409 before the device is contacted if not. **Required** — a tool without it is not a package card. |
+| `pending` | the card can list unvalidated drafts, so "待验证 → 继续验证" appears in the skill list |
+| `session_authorization` | the card supports a time-boxed grant (the pre-`persistent_execution` path) |
+| `persistent_execution` | the card supports an auto-execution setting that survives a stop and a restart |
+| `legacy_slug_prefix` | how to resolve skills installed before packages carried `attachment` |
+
+A capability that is not declared has no UI entry and no code path. What Core
+reads out of a package is the `schema` and, for routing, `tool`; everything
+else — including all of `compatibility` — is forwarded to the device to judge
+and to the page to display.
+
+Two things to get right, both of which have already gone wrong once:
+
+- **A declaration is not an authorization.** `persistent_execution: true` means
+  the card *supports* the feature. It grants nothing: a skill runs
+  unattended only if a logged-in browser enabled it, the stored device binding
+  still matches, and the tool is wired to `decision_core` on this canvas. The
+  declaration comes from the driver, so it decides visibility and code paths —
+  never permission.
+- **A declaration only decouples if Core reads nothing else.** The mechanism can
+  be present and bypassed: a first cut of this declared `persistent_execution`
+  properly while also hardcoding one application's protocol id, archive entry
+  name, slug prefix and id formats. A correctly-declaring new card still could
+  not work, and the interface looked generic the whole time, which is worse
+  than having no declaration at all. `agent-core/tests/test_skill_packages.py`
+  runs the whole suite on identifiers no shipped driver uses, so a hardcoded
+  string turns it red.
+
+Full protocol, transfer boundaries, the `motus.workbench/1` message channel and
+the auto-execution gates: [`docs/SKILL_WORKBENCH.md`](docs/SKILL_WORKBENCH.md).
 
 ## Web Dashboard
 

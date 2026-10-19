@@ -6,7 +6,7 @@ perception/main.py — Perception Stack bundle 统一入口。
 
   asr              语音识别（VAD + 唤醒词 + 多后端 ASR）
   tts              语音合成（VITS2 / Matcha / Kokoro，本地 TensorRT 或 ONNX）
-  phanthy_music    曲库检索、HTTPS 音乐播放与语音优先混音
+  phanthy_music    曲库检索与 HTTPS 播放（歌曲 + ASMR 助眠音频）
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   pointcloud       点云（深度图反投影 / 单目深度估计 / 双目立体匹配）
@@ -354,6 +354,16 @@ class PerceptionBundle:
             if getattr(p, 'PREFIX', None) == 'tts':
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
+
+    def shutdown(self) -> None:
+        """Let resource-owning plugins finish before ROS and Python shut down."""
+        for plugin in self._plugins:
+            shutdown = getattr(plugin, "shutdown", None)
+            if shutdown is not None:
+                try:
+                    shutdown()
+                except Exception:
+                    log.exception("plugin shutdown failed: %s", plugin.PREFIX)
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -795,6 +805,7 @@ def main():
     try:
         server.serve_forever()
     finally:
+        _bundle.shutdown()
         executor.shutdown()
         rclpy.shutdown()
 

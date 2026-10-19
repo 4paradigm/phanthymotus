@@ -425,7 +425,7 @@ def test_a_loading_card_still_reports_its_topics():
     assert info["state"] == "loading"
     assert [t["topic"] for t in info["topic_out"]] == [
         "/mic/audio/asr", "/mic/audio/asr_background"]
-    assert [t["topic"] for t in info["topic_in"]] == ["/mic/audio"]
+    assert [t["topic"] for t in info["topic_in"]] == ["/mic/audio", ""]
 
 
 def test_a_card_with_a_deferred_start_also_reports_topics():
@@ -450,7 +450,8 @@ def test_loading_without_an_input_topic_reports_none():
     plugin = make_plugin(_loading=True)
     info = plugin.dispatch("asr", {"action": "info"})
     assert info["topic_out"] == []
-    assert info["topic_in"] == []
+    assert [t["format"] for t in info["topic_in"]] == [
+        "audio/pcm-16k", "sensor/sound-direction"]
 
 
 def test_every_info_return_carries_topic_out():
@@ -462,7 +463,7 @@ def test_every_info_return_carries_topic_out():
     body = source[source.index('if action == "info":'):]
     body = body[:body.index('elif action == "start"')]
     returns = body.count("return {")
-    with_topic_out = body.count('"topic_out"')
-    assert returns == with_topic_out, (
-        f"info 有 {returns} 个 return，但只有 {with_topic_out} 个带 topic_out"
+    topic_out_count = body.count('"topic_out"')
+    assert returns == topic_out_count, (
+        f"info 有 {returns} 个 return，但只有 {topic_out_count} 个带 topic_out"
     )

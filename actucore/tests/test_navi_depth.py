@@ -272,3 +272,5 @@ def test_the_offset_corridor_is_the_space_a_sidestep_moves_into():
     depth_map = _with_patch(5.0, lateral_m=0.35, distance_m=1.0, width_m=0.2)
     assert _corridor(depth_map, lateral_offset_m=0.33)[0] == pytest.approx(1.0)
     assert _corridor(depth_map, lateral_offset_m=-0.33)[0] == pytest.approx(5.0)
+
+
