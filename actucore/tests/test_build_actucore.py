@@ -87,3 +87,23 @@ def test_final_native_check_fails_closed(tmp_path, output, status, success):
                             env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
                             capture_output=True, text=True, timeout=5)
     assert (result.returncode == 0) is success, result.stdout + result.stderr
+
+
+def test_jp61_copied_plugins_can_import_without_source_tree(tmp_path):
+    final = (ROOT / 'actucore/Dockerfile.vla').read_text()
+    for line in final.splitlines():
+        if not line.startswith('COPY actucore/plugins/'):
+            continue
+        _, source, destination = line.split()
+        target = tmp_path / Path(destination).relative_to('/work')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if (ROOT / source).is_dir():
+            shutil.copytree(ROOT / source, target)
+        else:
+            shutil.copyfile(ROOT / source, target)
+    result = subprocess.run(
+        [sys.executable, '-c', 'from plugins.vla import VLAPlugin'],
+        cwd=tmp_path, env={'PYTHONPATH': str(tmp_path)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr

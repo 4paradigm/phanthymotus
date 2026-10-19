@@ -42,6 +42,7 @@ WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/__init__.py /work/plugins/__init__.py
 COPY actucore/plugins/vla/ /work/plugins/vla/
+COPY actucore/plugins/control_stream/ /work/plugins/control_stream/
 COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
 # JP6.1 has no published navigation base; never advertise an unusable card.
