@@ -11,6 +11,7 @@ from .contract import (
     CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
     NAVIGATION_ACTIONS,
     NAVIGATION_CONFIG_SCHEMA,
+    SEMANTIC_ACTIONS,
     navigation_tool_definition,
 )
 from .mapping.contract import FAST_LIVO2_ACTIONS
@@ -124,6 +125,12 @@ class NavigationPlugin:
                     "canvas_not_started",
                     "connect LiDAR and IMU, then start the "
                     "ControlledSemanticSpatial card",
+                )
+            if action in SEMANTIC_ACTIONS and not self._external_wiring.get("rgb"):
+                return self._error(
+                    "rgb_not_connected",
+                    "stop the card, connect the RGB input, then restart before "
+                    "using capture or navigate",
                 )
         if not self._runtime.info().get("running", False):
             return self._error(

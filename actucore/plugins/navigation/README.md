@@ -150,7 +150,9 @@ frame、QoS、freshness、数采和速度约束见内部实现说明：
 - [semantic/README.md](semantic/README.md)
 
 RGB 和 depth 均为可选端口：只连 LiDAR + IMU 即可启动建图、定位与
-Nav2 规划控制；连接 RGB 后才启动语义导航。Canvas 的静态卡片规格无法随
+Nav2 规划控制；连接 RGB 后才启动语义导航。未连 RGB 时，`capture` 和
+`navigate` 返回 `rgb_not_connected`，不会自动订阅默认相机。先停卡、连接 RGB，
+再启动卡片后重试。Canvas 的静态卡片规格无法随
 `collection_enabled` 动态改变端口外观，因此统一卡片在启动时执行条件
 校验：启用数采时 RGB 和 depth 都必须连接，否则返回明确的
 `invalid_canvas_wiring`，而不是启动一份不完整的数据集。
@@ -269,6 +271,9 @@ deadline 内只做原子状态切换，并在控制回执之后发布大栅格�
 `navigate_to_pose` 与语义 `navigate` 都在 `inputSchema.x-completion` 中声明为
 长时动作，接受目标后返回相同值的 `nav_id`/`action_id`。Nav2 上报终态时，ActuCore 通过 SSE 发布
 匹配的 `action_complete`，Agent Core 因而不会把“已开始导航”误当成“已到达”。
+该完成回执确认 Nav2 任务终态；它不包含 Driver 物理停稳 ACK。
+`terminal_confirmed` 同样指 Nav2 终态确认。现场必须另行核验实际停车，
+不能用 SSE 事件替代停车验收。
 ACP barrier 沿用上游的物理资源与调用顺序规则；本卡片尚未声明跨本体
 `x-resource`，因此按未声明资源保守互斥，不承诺与 TTS 并发。本卡片的
 `wait_navigation_done`、`pause_nav`、`resume_nav`、`stop_nav` 是明确的控制旁路，

@@ -684,6 +684,34 @@ class NavigationPluginTest(unittest.TestCase):
                 self.assertFalse(runtime.started)
                 self.assertIsNone(runtime.start_kwargs)
 
+    def test_lidar_imu_only_cannot_auto_start_real_semantic_processor(self):
+        from plugins.navigation.semantic.plugin import VisionAndLanguageNavigationPlugin
+
+        for action in ("capture", "navigate"):
+            with self.subTest(action=action):
+                client = mock.Mock(configured=True, timeout_sec=1.0)
+                bridge_factory = mock.Mock(side_effect=AssertionError("unexpected RGB subscription"))
+                semantic = VisionAndLanguageNavigationPlugin(
+                    {"auto_start_on_action": True}, "ubuntu", None,
+                    client=client, bridge_factory=bridge_factory,
+                )
+                planning = FakeComponent("planning")
+                plugin = self.make_plugin(semantic=semantic, planning=planning)
+                started = plugin.dispatch("ControlledSemanticSpatial", {
+                    "action": "start", "input_bindings": _external_bindings(),
+                })
+                self.assertEqual(started["state"], "ready")
+                result = plugin.dispatch("ControlledSemanticSpatial", {
+                    "action": action, "query": "desk",
+                })
+                self.assertEqual(result["error_code"], "rgb_not_connected")
+                bridge_factory.assert_not_called()
+                client.complete_json.assert_not_called()
+                coordinate = plugin.dispatch("ControlledSemanticSpatial", {
+                    "action": "navigate_to_pose", "x": 1, "y": 2, "yaw": 0,
+                })
+                self.assertEqual(coordinate["component"], "planning")
+
     def test_only_ControlledSemanticSpatial_is_a_public_dispatch_name(self):
         plugin = self.make_plugin()
 
@@ -914,7 +942,9 @@ class NavigationPluginTest(unittest.TestCase):
         )
         plugin.dispatch(
             "ControlledSemanticSpatial",
-            {"action": "start", "input_bindings": _external_bindings()},
+            {"action": "start", "input_bindings": _external_bindings() + [
+                {"port": "rgb", "topic": "/robot/camera/rgb"}
+            ]},
         )
         self.assertEqual(
             plugin.dispatch(
