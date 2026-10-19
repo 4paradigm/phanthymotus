@@ -314,9 +314,11 @@ class EvidenceService:
             return await self._handle_native_comment_locked(**kwargs)
 
     async def _handle_native_comment_locked(self, *, repo, pr_number, comment_id, actor_id,
-                                            actor_login, action, arguments):
+                                            actor_login, action, arguments, automatic=False):
         """Transfer native PR attachments and append immutable evidence documents."""
         if action not in {'submit_evidence', 'remove_evidence'}:
+            raise EvidenceError('unknown_action', 400)
+        if automatic and action != 'submit_evidence':
             raise EvidenceError('unknown_action', 400)
         if repo not in {'4paradigm/phanthymotus', '4paradigm/phanthymotus-driver'}:
             raise EvidenceError('repository_not_authorized', 403)
@@ -327,13 +329,28 @@ class EvidenceService:
         body = comment.get('body', '')
         if not isinstance(body, str):
             raise EvidenceError('comment_unavailable', 409)
-        from .commands import parse_command
-        parsed = parse_command(body)
-        if parsed.kind != action or parsed.evidence_args != arguments:
-            raise EvidenceError('comment_command_changed', 409)
+        if automatic:
+            from .commands import command_starts_line_any
+            if command_starts_line_any(body):
+                raise EvidenceError('comment_command_changed', 409)
+            arguments = {}
+        else:
+            from .commands import parse_command
+            parsed = parse_command(body)
+            if parsed.kind != action or parsed.evidence_args != arguments:
+                raise EvidenceError('comment_command_changed', 409)
         body_hash = hashlib.sha256(body.encode()).hexdigest()
-        head_sha = arguments.get('head', '')
-        round_id = arguments.get('round', '')
+        if automatic:
+            head_sha = state.get('head_sha', '')
+            round_id = round_id_for_state(state)
+            arguments = {
+                'head': head_sha, 'round': round_id,
+                'machine': role_value if role == 'machine_owner' else '',
+                'note': '', 'replaces': '',
+            }
+        else:
+            head_sha = arguments.get('head', '')
+            round_id = arguments.get('round', '')
         if (not re.fullmatch(r'[0-9a-f]{40}', head_sha)
                 or state.get('head_sha') != head_sha or pr.get('head', {}).get('sha') != head_sha
                 or round_id_for_state(state) != round_id):
@@ -341,9 +358,26 @@ class EvidenceService:
         if state.get('status') != 'testing':
             raise EvidenceError('context_not_writable', 409)
         created_at = self._comment_created_at(comment)
+
+        def require_current_round_comment(current_state):
+            if not automatic:
+                return
+            try:
+                started_at = current_state.get('round_started_at')
+                started = datetime.fromisoformat(str(started_at).replace('Z', '+00:00'))
+                created = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                if started.tzinfo is None or created.tzinfo is None or created <= started:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise EvidenceError('comment_before_round', 409) from None
+
+        require_current_round_comment(state)
+
         async def recheck_current():
-            _, fresh_id, fresh_login = await self._native_identity(
+            fresh_comment, fresh_id, fresh_login = await self._native_identity(
                 repo, pr_number, comment_id, actor_id, actor_login, body_hash)
+            if automatic and fresh_comment.get('created_at') != comment.get('created_at'):
+                raise EvidenceError('comment_time_invalid', 409)
             fresh_pr, fresh_state, _, _ = await self._native_authorization(
                 repo, pr_number, fresh_id, fresh_login)
             if (fresh_pr.get('head', {}).get('sha') != head_sha
@@ -351,6 +385,7 @@ class EvidenceService:
                     or round_id_for_state(fresh_state) != round_id
                     or fresh_state.get('status') != 'testing'):
                 raise EvidenceError('round_changed', 409)
+            require_current_round_comment(fresh_state)
             return fresh_pr, fresh_state
 
         records = await self.proxy.read_evidence_records(repo, pr_number)
@@ -401,8 +436,17 @@ class EvidenceService:
                     and not any(owner.casefold() == actor_login.casefold()
                                 for owner in machine.owners or [])):
                 raise EvidenceError('machine_owner_mismatch', 403)
-        note = arguments.get('note', '').strip()
-        if not note:
+        if automatic:
+            note = re.sub(
+                r'!?\[[^\]]*\]\(\s*https://github\.com/user-attachments/(?:assets|files)/[^)]*\)',
+                '', body)
+            note = re.sub(
+                r'https://github\.com/user-attachments/(?:assets|files)/[^\s<>\])]+',
+                '', note,
+            ).strip()
+        else:
+            note = arguments.get('note', '').strip()
+        if not note and not automatic:
             remaining = body.split('\n', 1)[1] if '\n' in body else ''
             remaining = re.sub(
                 r'!?\[[^\]]*\]\(\s*https://github\.com/user-attachments/(?:assets|files)/[^)]*\)',
@@ -423,6 +467,15 @@ class EvidenceService:
                     'actor_id': actor_id, 'actor_login': actor_login, 'actor_verified': True,
                     'machine': arguments.get('machine', ''), 'note': note,
                     'created_at': created_at, 'updated_at': created_at, 'status': 'text'}
+            existing = latest.get(attachment_id)
+            if existing:
+                if (existing.get('source_comment_id') != comment_id
+                        or existing.get('head_sha') != head_sha or existing.get('round_id') != round_id
+                        or existing.get('actor_id') != actor_id or existing.get('note') != note
+                        or existing.get('status') != 'text'):
+                    raise EvidenceError('attachment_identity_conflict', 409)
+                await recheck_current()
+                return existing
             await recheck_current()
             await self.proxy.write_evidence_record(
                 repo, pr_number, 'attachment', 'native:' + attachment_id, data)

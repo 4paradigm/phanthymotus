@@ -560,6 +560,8 @@ class GitHubCommandWatcher:
         historical commands from being replayed after a transient
         persist_cursor failure.
         """
+        from .evidence_models import EvidenceError
+
         initial_state = await self.proxy.read_hidden_state(repo, pr_number)
 
         if _needs_initial_comment_baseline(initial_state):
@@ -722,6 +724,72 @@ class GitHubCommandWatcher:
                 continue
 
             if not commands_mod.command_starts_line_any(fresh_body):
+                if state.get("status") == "testing":
+                    if (not self.config.auth_valid or repo not in self.config.active_repos
+                            or repo not in self.config.github_repos):
+                        return
+                    try:
+                        pr_info = await self.proxy.get_pr(repo, pr_number)
+                    except Exception as e:
+                        logger.warning(
+                            "watcher native evidence PR read %s#%s: %s",
+                            repo, pr_number, type(e).__name__,
+                        )
+                        return
+                    if (isinstance(pr_info, dict) and pr_info.get("state") == "open"
+                            and not pr_info.get("merged") and not pr_info.get("draft")):
+                        pr_head = (pr_info.get("head") or {}).get("sha")
+                        if pr_head != state.get("head_sha"):
+                            return
+                        evidence_service = getattr(self.controller, "evidence_service", None)
+                        user = fresh_comment_obj.get("user", {})
+                        actor_id = user.get("id") if isinstance(user, dict) else None
+                        actor_login = user.get("login") if isinstance(user, dict) else None
+                        if (isinstance(actor_id, bool)
+                                or not str(actor_id or "").isdigit()
+                                or not isinstance(actor_login, str) or not actor_login.strip()):
+                            logger.info(
+                                "watcher native evidence skipped %s#%s comment=%s reason=identity_missing",
+                                repo, pr_number, comment_id,
+                            )
+                            if state.get("head_sha"):
+                                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                            return
+                        if evidence_service is not None:
+                            try:
+                                await evidence_service.handle_native_comment(
+                                    repo=repo, pr_number=pr_number, comment_id=comment_id,
+                                    actor_id=int(actor_id), actor_login=actor_login,
+                                    action="submit_evidence", arguments={}, automatic=True,
+                                )
+                            except EvidenceError as e:
+                                terminal_skip = (
+                                    e.status_code in {400, 401, 403, 404, 409, 410, 413}
+                                    and e.code not in {
+                                        "attachment_retry_conflict", "comment_unavailable",
+                                        "object_not_verified",
+                                    }
+                                )
+                                if terminal_skip:
+                                    logger.info(
+                                        "watcher native evidence skipped %s#%s comment=%s reason=%s",
+                                        repo, pr_number, comment_id, e.code,
+                                    )
+                                    await self._consume_comment_cursor(repo, pr_number, comment_id)
+                                    return
+                                logger.warning(
+                                    "watcher native evidence retry %s#%s comment=%s reason=%s",
+                                    repo, pr_number, comment_id, e.code,
+                                )
+                                return
+                            except Exception as e:
+                                logger.warning(
+                                    "watcher native evidence retry %s#%s comment=%s error=%s",
+                                    repo, pr_number, comment_id, type(e).__name__,
+                                )
+                                return
+                            await self._consume_comment_cursor(repo, pr_number, comment_id)
+                            return
                 # Non-command comment — use cursor-only persistence
                 if state.get("head_sha"):
                     state = await self.proxy.persist_cursor(

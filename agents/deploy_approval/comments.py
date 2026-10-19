@@ -1051,13 +1051,18 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                      item.get("machine") or item.get("machine_alias") or "—",
                      item.get("created_at") or "unknown", item.get("head_sha") or h,
                      item.get("round_id") or r, item.get("note", ""),
-                     ("Deleted" if deleted else "Persisted" if item.get("object_key") else
+                     ("Deleted" if deleted else
+                      "Text note" if status == "text" else
+                      "COS verified" if status == "ready" and item.get("object_key") else
                       "Pending" if status != "ready" else "Unavailable")]
             if item.get("replaces_id"):
                 cells[7] = str(cells[7]) + " · replaces " + str(item["replaces_id"])
             if deleted:
                 cells[7] = str(cells[7]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
-            download_cell = f"[GitHub attachment](<{native_url}>)" if native_url else "Source unavailable"
+            download_cell = (
+                f"[GitHub attachment](<{native_url}>)" if native_url else
+                "Text note (no file)" if status == "text" else "Source unavailable"
+            )
             lines.append("| " + " | ".join(_escape(v) for v in cells) + " | " + download_cell + " |")
         if group.get("deployments"):
             lines.extend(["", _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
@@ -1072,23 +1077,43 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     lines = ["<!-- deploy-approval-evidence:start -->", "### Current round evidence", ""]
     lines.extend(render_round((head, current_round), groups[(head, current_round)]))
     round_pattern = re.escape(str(head)) + r"-[0-9]+"
-    if (state.get("status") == "testing" and state.get("pr_state", "open") == "open"
+    if (state.get("status") == "testing" and state.get("pr_state") == "open"
             and not state.get("merged") and re.fullmatch(r"[0-9a-f]{40}", str(head))
-            and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)):
+            and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
+            and state.get("evidence_enabled") is True and api):
         lines.extend([
-            "", "### Upload Test Evidence", "",
-            "1. In this PR's **Conversation**, click GitHub's native attachment button.",
-            "2. Attach a video, file, or image.",
-            "3. In the same comment, include this command:",
-            "", f"   `/submit_evidence head={head} round={current_round}`", "",
-            "4. Add a text note if useful, then publish the comment.",
-            "5. The Controller copies the attachment to COS; the Summary records the COS persistence result.",
+            "", "### 上传测试证据", "",
+            f"[上传视频 / 文件 / 图片（GitHub）](https://github.com/{repo}/pull/{pr_number})", "",
+            "**适用人员**",
+            "开发者、已部署机器的 Machine Owner，以及现有权限策略允许的协作者。",
+            "",
+            "**操作说明**",
+            "1. 点击上面的上传入口，打开当前 PR。",
+            "2. 在 GitHub 评论框点击 **Attach files**。",
+            "3. 选择视频、图片或文件，可同时填写测试说明。",
+            "4. 点击 **Comment** 提交。",
+            "5. Controller 自动下载 GitHub 附件、保存到 COS，并校验 SHA256。",
+            "6. COS 验证成功后，Summary 展示附件记录和下载链接。",
+            "无需输入 `/submit_evidence`。",
+            "",
+            "**文件大小**",
+            "- 免费组织仓库：视频上限 10 MB。",
+            "- 付费组织仓库且上传者符合 GitHub 资格时：视频最高 100 MB。",
+            "- 图片/GIF：10 MB。",
+            "- 其他支持的文件：25 MB。",
+            "- 超过 GitHub 限制的文件不能通过此入口上传。",
+            "",
+            "**重新上传**",
+            "可直接再次上传并发布新评论；新附件会保留为独立历史记录。",
+            "",
+            "**下载**",
+            "Summary 中的 GitHub attachment 链接下载 GitHub 原始附件。COS 是另外保存的、经过 SHA256 校验的私有副本；GitHub 原始链接不是 COS 下载地址。",
             "",
         ])
     if state.get("evidence_enabled") is True and state.get("browser_upload_ready") is not True:
         readiness = (state.get("evidence_readiness") or {}).get("status")
         if readiness == "PUBLIC_INGRESS_PENDING":
-            lines.extend(["", "**Evidence upload:** `PUBLIC_INGRESS_PENDING` — waiting for a trusted HTTPS entry point."])
+            lines.extend(["", "**自建网页上传：** `PUBLIC_INGRESS_PENDING` 仅表示自建网页上传入口暂不可用，不影响上方的 GitHub 原生附件上传入口。"])
     if (base and state.get("evidence_enabled") is True and state.get("status") == "testing"
             and state.get("pr_state", "open") == "open" and not state.get("merged")):
         # The signed Summary capability is bound to this trusted HEAD/round.
