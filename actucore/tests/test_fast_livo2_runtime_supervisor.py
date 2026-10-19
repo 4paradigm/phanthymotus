@@ -28,12 +28,12 @@ sys.path.insert(
 
 
 def _import_ros_runtime_modules():
-    inserted: list[str] = []
+    previous = {}
 
     def module(name: str):
         value = types.ModuleType(name)
+        previous[name] = sys.modules.get(name)
         sys.modules[name] = value
-        inserted.append(name)
         return value
 
     class Message:
@@ -103,8 +103,11 @@ def _import_ros_runtime_modules():
     try:
         from fast_livo2 import adapter_node, runtime_supervisor
     finally:
-        for name in reversed(inserted):
-            sys.modules.pop(name, None)
+        for name, value in previous.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
     return adapter_node, runtime_supervisor
 
 

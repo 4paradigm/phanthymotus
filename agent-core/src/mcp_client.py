@@ -25,6 +25,7 @@ from collections import OrderedDict
 import collections
 import contextvars
 import json
+import math
 import time
 import uuid
 
@@ -51,6 +52,33 @@ _pending_tools: dict[str, str] = {}               # action_id → tool_name (资
 _MAX_EARLY_COMPLETIONS = 1024
 _pending_resources: dict[str, frozenset | None] = {}  # action_id → 占用的物理通道
 _pending_owner: dict[str, str] = {}               # action_id → 发起它的 agent 上下文
+
+# action_id → 这个动作是不是「后台的」。后台动作仍然**占用**它申报的通道（
+# resource_actually_busy 照样算它忙），但任何人都不**等**它：一首四分钟的歌不该把
+# finish、把同一个 agent 的下一次调用、把 peer_call 全堵住四分钟。
+# 见 pendings_to_wait_for / await_pending。
+_pending_background: dict[str, bool] = {}
+# action_id → 完成通知要不要进 LLM。播放类动作的「播完了」是个回执，不是新消息；
+# 原先靠 collector 里 action_id 以 'speak-'/'tts-' 开头的字符串判断，驱动一改命名就失效。
+_pending_silent: dict[str, bool] = {}
+
+# 所有按 action_id 分表的 pending side table。_forget_pending 和测试夹具都遍历它，
+# 这样新增一张表不必在七个地方各补一行 —— 漏掉一处就泄漏到进程结束，而漏在测试夹具
+# 里则是上一个用例的值串到下一个用例。
+# 存名字而不是存 dict 对象，并在调用时解析：测试会 monkeypatch 掉其中某一张表
+# （`monkeypatch.setattr(mcp_client, '_pending_actions', {})`），而一个在 import 时
+# 就抓住了原对象的元组会继续清理那个**没人再看**的旧 dict —— 清理看起来跑了，实际
+# 一条也没清掉。
+_PENDING_TABLE_NAMES: tuple[str, ...] = (
+    '_pending_actions', '_pending_started', '_pending_results', '_pending_timeouts',
+    '_pending_tools', '_pending_resources', '_pending_owner',
+    '_pending_background', '_pending_silent',
+)
+
+
+def pending_tables() -> tuple[dict, ...]:
+    """当前所有按 action_id 分表的 pending side table。"""
+    return tuple(globals()[name] for name in _PENDING_TABLE_NAMES)
 
 # 动作"有结局了"的订阅者。原本没有单一观察点：完成回调分散在 start.py 的
 # /api/acp/complete 和下面 WS 分支两处，各自直接 .set() 那个 Event；而超时/取消走的是
@@ -246,6 +274,32 @@ def resource_actually_busy(want: frozenset | None) -> bool:
     return False
 
 
+def cancellable_by(scope: frozenset | None) -> list[str]:
+    """一次打断**有权**取消哪些 pending。
+
+    原先打断根本没有范围：两处都是 `for aid in list(_pending_actions.keys())` 全杀。
+    于是「别说了」会把正在播的音乐的 pending 也标成 cancelled —— 播放器还在放，而
+    agent-core 已经认为这条通道空了，后面没有任何东西知道音乐还在响。
+
+    * `scope=None`（整体打断 / 急停）→ 除后台动作外的全部。后台动作不是执行危险，
+      急停不该连歌一起掐；要停歌有 on_interrupt_music。
+    * 否则 → 资源与 scope 有交集的，**加上**没申报资源的那些。后者是为了让没申报
+      `x-resource` 的驱动保持今天的行为：它们本来就被当作与一切互斥，如果打断反而
+      碰不到它们，就会留下一个谁也清不掉的 pending。
+    """
+    out = []
+    for aid in _pending_actions:
+        if _pending_background.get(aid):
+            continue
+        if scope is None:
+            out.append(aid)
+            continue
+        held = _pending_resources.get(aid)
+        if held is None or (held & scope):
+            out.append(aid)
+    return out
+
+
 def pendings_to_wait_for(want: frozenset | None, *, owner: str,
                          concurrent: bool) -> list[str]:
     """Everything a call must wait for, in registration order.
@@ -262,6 +316,12 @@ def pendings_to_wait_for(want: frozenset | None, *, owner: str,
     """
     out = []
     for aid in _pending_actions:
+        # 后台动作在**两条**理由之前就被放过。资源那条好理解；真正要紧的是下面
+        # 「自己的顺序」那条 —— 它跟通道无关，只看是不是同一个 agent 起的，所以一首
+        # 在播的歌会把主 agent 的**下一次任意调用**（说话、移动、什么都算）堵到歌放完。
+        # 这比堵住 finish 严重得多，也是 background 这个标志存在的真正原因。
+        if _pending_background.get(aid):
+            continue
         if resources_conflict(want, _pending_resources.get(aid)):
             out.append(aid)
         elif not concurrent and _pending_owner.get(aid, CONTEXT_MAIN) == owner:
@@ -300,12 +360,8 @@ def _forget_pending(aids, outcome: str | None = None) -> None:
         if outcome:
             _record_outcome(aid, outcome)
         settled.append((aid, _pending_resources.get(aid)))
-        _pending_actions.pop(aid, None)
-        _pending_results.pop(aid, None)
-        _pending_timeouts.pop(aid, None)
-        _pending_tools.pop(aid, None)
-        _pending_resources.pop(aid, None)
-        _pending_owner.pop(aid, None)
+        for table in pending_tables():
+            table.pop(aid, None)
 
     # 超时 / 取消也是"这个动作有结局了" —— 不在这里通知的话，一次超时的播报之后再没有
     # 任何事件会让沉默计时重新开始，播报就永久静音了。
@@ -395,7 +451,10 @@ def _to_openai_schema(mcp_id: str, tool: dict) -> list[dict]:
 
         # 只保留该 action 对应的参数（不含 action 字段本身）
         props = {k: all_props[k] for k in param_keys if k in all_props}
-        required = [k for k in param_keys if k in all_required]
+        # An action can require parameters that sibling actions do not take.
+        # Keep the legacy tool-wide requirements when no override is declared.
+        action_required = action_def.get('required', all_required)
+        required = [k for k in param_keys if k in action_required]
 
         schemas.append({
             'name':        f'mcp__{mcp_id}__{tool["name"]}__{action_name}',
@@ -599,6 +658,12 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                         if msg_type == 'action_complete':
                             action_id = msg.get('action_id') or payload.get('action_id')
                             if action_id:
+                                # 和 /api/acp/complete 一样：先问静默，再标记完成。
+                                if completion_is_silent(action_id):
+                                    if isinstance(msg, dict):
+                                        msg['silent'] = True
+                                    if isinstance(payload, dict):
+                                        payload['silent'] = True
                                 mark_action_complete(action_id, msg)
 
                         await event_bus.enqueue(
@@ -807,6 +872,32 @@ async def call_tool(full_name: str, args: dict) -> str:
                 opts = ', '.join(sorted(f'mcp__{mcp_id}__{t}__{a}' for t, a in matches))
                 return (f'工具名 {full_name} 不明确：{len(matches)} 个工具都有 '
                         f'{tool_name} 动作。请使用完整名称之一：{opts}')
+            elif '__' in tool_name:
+                # The opposite failure: the model kept the tool segment but used
+                # an action the card no longer declares, so `split_map` had no
+                # entry and nothing injected `action`.
+                #
+                # This is what a **rename** looks like from here. The card's
+                # declaration is re-read only when a browser pings
+                # `/api/mcp/{id}/ping`, so after a card is redeployed the model
+                # can hold the previous action names for an arbitrarily long
+                # time — and every call it makes with them arrives as a literal
+                # `<tool>__<old_action>` with no action at all. Measured on
+                # Orin5: `phanthy_music__play` after `play` became `play_music`,
+                # answered by perception with `does not handle action None`.
+                #
+                # Splitting on the **last** `__` and passing the remainder as
+                # `action` hands the decision to the card, which is the only
+                # party that knows its own aliases (`ALIAS_ACTIONS`). A card
+                # with no alias for it still declines — the same outcome as
+                # today, minus the misleading `action None`.
+                candidate_tool, _, candidate_action = tool_name.rpartition('__')
+                if candidate_tool in (info_probe.get('tools') or []):
+                    print(f'[mcp] {full_name} names no declared action — passing '
+                          f'{candidate_tool}(action={candidate_action}) for the card '
+                          f'to resolve; its declaration has probably been renamed')
+                    tool_name = candidate_tool
+                    args = {**args, 'action': candidate_action}
 
     info = registry.get(mcp_id)
     if not info:
@@ -873,6 +964,7 @@ async def call_tool(full_name: str, args: dict) -> str:
     if action == 'start':
         meta = info.get('tool_meta', {}).get(full_name, {})
         if meta.get('has_config_schema'):
+            from tool_config import find_tool, missing_required_config
             saved_cfg = _get_tool_config(mcp_id, tool_name)
             if saved_cfg:
                 # Drop keys the current schema no longer advertises; a stale row
@@ -895,7 +987,13 @@ async def call_tool(full_name: str, args: dict) -> str:
                 except (json.JSONDecodeError, IndexError, KeyError):
                     pass
             else:
-                return f'[{tool_name}] 尚未配置，请先在设备面板中完成配置（provider/url/key）后再启动。'
+                # Name the keys that are actually missing. `provider/url/key`
+                # is one LLM adapter's field list, and a model told to go fill
+                # those in on a camera card has been sent to the wrong form.
+                missing = missing_required_config(find_tool(mcp_id, tool_name), {})
+                if missing:
+                    return (f'[{tool_name}] 尚未配置：缺少 {"、".join(missing)}，'
+                            f'请先在设备面板中填写后再启动。')
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -981,27 +1079,9 @@ async def call_tool(full_name: str, args: dict) -> str:
             parsed_result = json.loads(texts[0]) if texts else {}
             action_id = parsed_result.get('action_id')
             if action_id:
-                _pending_actions[action_id] = asyncio.Event()
-                # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
-                _pending_tools[action_id] = tool_name
-                _pending_resources[action_id] = meta.get('resource')
-                _pending_started[action_id] = time.time()
-                _pending_owner[action_id] = current_agent_context.get()
-                # 动态 timeout：有 text 参数时按字数算（合成+播放: 字数/3 + 10s余量），否则用 schema 默认值
-                text_arg = args.get('text', '')
-                default_timeout = completion_spec.get('timeout', 120)
-                if text_arg:
-                    dynamic_timeout = len(text_arg) / 3 + 10
-                else:
-                    dynamic_timeout = default_timeout
-                _pending_timeouts[action_id] = dynamic_timeout
-                if action_id in _pending_results:
-                    mark_action_complete(action_id, _pending_results[action_id])
-                _res = _pending_resources.get(action_id)
-                _res_txt = ','.join(sorted(_res)) if _res else 'undeclared/exclusive'
-                print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
-                      f'timeout={dynamic_timeout:.0f}s, resource={_res_txt})')
-                # 通知订阅者。放在 try 里面、print 后面是有意的：这一段任何一步抛了，
+                _register_pending(action_id, tool_name=tool_name, meta=meta,
+                                  args=args or {}, result=parsed_result)
+                # 通知订阅者。放在 try 里面、注册后面是有意的：这一段任何一步抛了，
                 # pending 就没建成，也就没有"动作开始了"这回事可通知。
                 _notify_registered(action_id, tool_name, args or {}, meta.get('resource'))
         except (json.JSONDecodeError, IndexError):
@@ -1137,6 +1217,103 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
 
 # ── ACP: 异步动作完成协议 ─────────────────────────────────────────────────────
 
+# 一个 pending 的 timeout 上限。驱动申报的时长会被夹到这里：
+# await_pending 用 max(每个要等的 action 的 timeout)，所以一条畸形的曲库响应
+# （duration_s = 1e9）会把一个毫不相关的 finish 拖上几十年。
+MAX_PENDING_TIMEOUT_S = 3600.0
+
+
+def _pending_timeout(completion_spec: dict, args: dict, result: dict | None) -> float:
+    """这个动作最多等多久。
+
+    四级优先，从最可信到最兜底：
+
+    1. **驱动自己量出来的** `expected_duration_s`（一首歌的 duration_s、一条路径的
+       长度）。原先没有这条路：时长只能来自 `len(text)/3`，而一首歌没有 text，于是
+       每首歌共用一个静态上限 —— 超了就在播放中途被静默回收，之后 barrier 认为通道
+       空着，下一句话直接压着音乐说。
+    2. **text 参数**：合成+播放 ≈ 字数/3 + 10s 余量。原样保留。
+    3. schema 里的静态 `timeout`。原样保留。
+    4. `background` 且 `timeout` 为 0/缺省 → 不设限，只有驱动回调能结束它。
+
+    非有限、非正、bool 一律不采信（`True` 是 int 的子类，`isinstance(x, int)` 会放它
+    过去）—— 一个永远回收不掉的 pending 比一个过短的坏得多。
+    """
+    declared = result.get('expected_duration_s') if isinstance(result, dict) else None
+    if (isinstance(declared, (int, float)) and not isinstance(declared, bool)
+            and math.isfinite(declared) and declared > 0):
+        grace = completion_spec.get('grace', 10)
+        if not (isinstance(grace, (int, float)) and not isinstance(grace, bool)
+                and math.isfinite(grace) and grace >= 0):
+            grace = 10
+        return min(float(declared) + float(grace), MAX_PENDING_TIMEOUT_S)
+
+    text_arg = args.get('text', '') if isinstance(args, dict) else ''
+    if text_arg:
+        return len(text_arg) / 3 + 10
+
+    declared_default = completion_spec.get('timeout', 120)
+    if completion_spec.get('background') and not declared_default:
+        return float('inf')
+    return declared_default
+
+
+def _register_pending(action_id: str, *, tool_name: str, meta: dict,
+                      args: dict, result: dict | None, via_hook: bool = False) -> None:
+    """建立一个 pending 的全部分表记账。
+
+    原先这段在 call_tool 和 call_tool_hook 里各写了一份，两份都要算 timeout、都要填
+    六张表 —— 给 ACP 加一个字段就得改两处，漏一处就只在 hook 路径上不生效。
+    """
+    completion_spec = meta.get('completion') or {}
+    resource = meta.get('resource')
+    timeout = _pending_timeout(completion_spec, args or {}, result)
+
+    _pending_actions[action_id] = asyncio.Event()
+    _pending_tools[action_id] = tool_name
+    _pending_resources[action_id] = resource
+    _pending_started[action_id] = time.time()
+    _pending_owner[action_id] = current_agent_context.get()
+    _pending_timeouts[action_id] = timeout
+    # 显式写入而不是「只有 True 才写」：这两张表按 action_id 分表，而 action_id 会被
+    # 复用（测试夹具里尤其如此），留着上一轮的值就是串味。
+    _pending_background[action_id] = bool(completion_spec.get('background'))
+    _pending_silent[action_id] = bool(completion_spec.get('silent_completion'))
+    if action_id in _pending_results:
+        mark_action_complete(action_id, _pending_results[action_id])
+
+    _res_txt = ','.join(sorted(resource)) if resource else 'undeclared/exclusive'
+    _timeout_txt = 'none' if timeout == float('inf') else f'{timeout:.0f}s'
+    _flags = ''.join((' background' if _pending_background[action_id] else '',
+                      ' silent' if _pending_silent[action_id] else ''))
+    print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
+          f'timeout={_timeout_txt}, resource={_res_txt}{_flags})'
+          f'{" [via hook]" if via_hook else ""}')
+
+
+def is_background(action_id: str) -> bool:
+    """这个动作是不是后台动作（占用通道但没人等它）。"""
+    return bool(_pending_background.get(action_id))
+
+
+def completion_is_silent(action_id: str) -> bool:
+    """这个动作的完成回执要不要瞒着 LLM。
+
+    必须在 mark_action_complete **之前**问：一个并发的 barrier 随时可能把这一项
+    回收掉，回收之后就查不到了，于是回执会按「不静默」处理并唤醒一个 turn。
+    """
+    return bool(_pending_silent.get(action_id))
+
+
+def has_blocking_pendings() -> bool:
+    """有没有「会挡住别人」的 pending。
+
+    和 get_pending_actions() 的区别就是后台动作：只有音乐在播的时候，不该因为「有
+    pending」就在每个用户 turn 上跑一遍打断清扫。
+    """
+    return any(not _pending_background.get(aid) for aid in _pending_actions)
+
+
 def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
     """判断当前 action 是否为异步动作（需要注册 pending）。"""
     actions_list = completion_spec.get('actions', [])
@@ -1164,6 +1341,49 @@ async def cancel_and_reap(tasks) -> None:
         task.cancel()
     if live:
         await asyncio.gather(*live, return_exceptions=True)
+
+
+def _barrier_budget(aids: list[str], default: float) -> float:
+    """这个 barrier 最多等多久。
+
+    同一个资源上的动作是**串行**的 —— 一个嘴一次只能说一句，驱动侧按队列逐条播。
+    所以互相冲突的那些要把预算**相加**；资源不冲突的并行跑，取 max。
+
+    原先一律取 max。天轶 2026-10-15 的导览里，barrier 同时等一条自动播报和一条
+    487 字的讲解，预算取了后者的 172s；而两条在驱动的队列里是前后播的，真正播完
+    要 208s。barrier 在 13:21:50 放弃，9 秒之后那条才完成 —— 结束语于是一个字都
+    没播出去（见 event/llm.py 的 not_dispatched 分支）。
+
+    分组用并查集而不是「按 resource 集合相等分组」：`{mouth}` 和 `{mouth, speaker}`
+    不相等但互相冲突，必须算进同一条串行链。未声明资源的一侧按互斥处理（见
+    `resources_conflict`），于是它会把所有组并成一条链 —— 这正是保守的那一边。
+    """
+    if not aids:
+        return default
+    parent = list(range(len(aids)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a in range(len(aids)):
+        for b in range(a + 1, len(aids)):
+            if resources_conflict(_pending_resources.get(aids[a]),
+                                  _pending_resources.get(aids[b])):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+    sums: dict[int, float] = {}
+    for i, aid in enumerate(aids):
+        root = find(i)
+        t = _pending_timeouts.get(aid, default)
+        if t == float('inf'):
+            return float('inf')
+        sums[root] = sums.get(root, 0.0) + float(t)
+    return min(max(sums.values()), MAX_PENDING_TIMEOUT_S)
 
 
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
@@ -1196,7 +1416,10 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             want, owner=owner if owner is not None else current_agent_context.get(),
             concurrent=concurrent)
     else:
-        aids = list(_pending_actions.keys())
+        # 全局等待（finish / peer_call / subagent_spawn）同样放过后台动作：在这里挡一次
+        # 比给每个系统工具开一个例外好 —— 后者要在 _ACP_BARRIER_SYSTEM_TOOLS 旁边再维护
+        # 一张名单，而新加的系统工具会默默回到「等四分钟」。
+        aids = [aid for aid in _pending_actions if not _pending_background.get(aid)]
     if not aids:
         return {"status": "no_pending"}
 
@@ -1204,8 +1427,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
     if not events:
         return {"status": "no_pending"}
 
-    # 只对实际要等的 action 取最大 timeout
-    effective_timeout = max(_pending_timeouts.get(aid, timeout) for aid in aids)
+    effective_timeout = _barrier_budget(aids, timeout)
     _scope_txt = ''
     if scoped:
         _want_txt = ','.join(sorted(want)) if want else 'undeclared/exclusive'
@@ -1490,21 +1712,8 @@ async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
         if completion_spec and _should_await_completion(completion_spec, action):
             action_id = result.get('action_id')
             if action_id:
-                resource = meta.get('resource')
-                _pending_actions[action_id] = asyncio.Event()
-                _pending_started[action_id] = time.time()
-                _pending_tools[action_id] = tool_name
-                _pending_resources[action_id] = resource
-                _pending_owner[action_id] = current_agent_context.get()
-                text_arg = args.get('text', '')
-                default_timeout = completion_spec.get('timeout', 120)
-                dynamic_timeout = len(text_arg) / 3 + 10 if text_arg else default_timeout
-                _pending_timeouts[action_id] = dynamic_timeout
-                if action_id in _pending_results:
-                    mark_action_complete(action_id, _pending_results[action_id])
-                _res_txt = ','.join(sorted(resource)) if resource else 'undeclared/exclusive'
-                print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
-                      f'timeout={dynamic_timeout:.0f}s, resource={_res_txt}) [via hook]')
+                _register_pending(action_id, tool_name=tool_name, meta=meta,
+                                  args=args or {}, result=result, via_hook=True)
 
     return result
 

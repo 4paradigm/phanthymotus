@@ -147,6 +147,38 @@ class FaceService:
         return {"width": int(width), "height": int(height), "faces": out,
                 "decoded": True}
 
+    def embed_aligned(self, crops: list) -> dict:
+        """Already-aligned 112x112 crops -> embeddings, one per crop.
+
+        **Detection and alignment are deliberately skipped.** The crops are the
+        aligned output of a previous enrolment, so running the detector over them
+        again would at best re-align an already-aligned face — a second similarity
+        transform on top of the first — and at worst find nothing, since a 112x112
+        image letterboxed to 640x640 is not what SCRFD was trained on. Re-embedding
+        has to apply the new network to the *same pixels* the old one saw, or the
+        migrated embedding is not comparable to a fresh capture of the same person.
+
+        This exists for the roster migration in `plugins/face.py`: it is the step
+        that turns a stored crop into an embedding in this model's space. Returns
+        `None` in place of any crop that could not be decoded or embedded, so one
+        corrupt file cannot abandon the rest of a 4 000-sample pass.
+        """
+        out = []
+        for payload in crops or []:
+            try:
+                image = self._analyzer.decode_image(payload)
+                if image is None:
+                    out.append(None)
+                    continue
+                vector = self._analyzer.embed(image)
+                out.append(np.ascontiguousarray(
+                    np.asarray(vector, dtype=np.float32)))
+            except Exception:  # noqa: BLE001 - one bad crop must not stop the pass
+                log.warning("face: a stored crop could not be re-embedded",
+                            exc_info=True)
+                out.append(None)
+        return {"embeddings": out}
+
     def close(self) -> None:
         self._analyzer.close()
 

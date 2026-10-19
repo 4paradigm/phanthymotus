@@ -155,6 +155,17 @@
       </div>
       <div class="canvas-top-control" id="canvas-top-control">
         <button class="canvas-main-btn" id="canvas-project-toggle" title="开启智能控制">开启智能控制</button>
+        <!-- 设备收尾进度。停止是两段的：agent loop 立刻停（按钮马上翻转），各设备的
+             stop 在后台继续，结果报在这里。非阻塞是有意的 —— 按下停止的那一刻操作者
+             通常是要去干别的了，不该被一个弹窗挡住画布。 -->
+        <div class="teardown-chip hidden" id="teardown-chip">
+          <button class="teardown-summary" id="teardown-summary" title="设备收尾进度">
+            <span class="teardown-icon" id="teardown-icon">⏳</span>
+            <span class="teardown-text" id="teardown-text">设备收尾</span>
+            <span class="teardown-caret" id="teardown-caret">⌄</span>
+          </button>
+          <div class="teardown-detail hidden" id="teardown-detail"></div>
+        </div>
         <label class="auto-start-toggle" title="开机后自动开启智能控制">
           <input type="checkbox" id="auto-start-checkbox">
           <span class="auto-start-switch"></span>
@@ -338,7 +349,8 @@
       <div class="reset-section-label">服务</div>
       <label class="reset-item"><input type="checkbox" id="reset-restart-services"><div class="reset-item-text"><span>重启所有服务</span><small>重启 Agent Core、Driver、Perception 等</small></div></label>
       <div class="reset-section-label">记忆</div>
-      <label class="reset-item"><input type="checkbox" id="reset-chat-history"><div class="reset-item-text"><span>历史对话</span><small>清空所有聊天记录与上下文</small></div></label>
+      <label class="reset-item"><input type="checkbox" id="reset-chat-history"><div class="reset-item-text"><span>历史对话</span><small>清空所有聊天记录、上下文，以及子代理从中得出的结论</small></div></label>
+      <label class="reset-item"><input type="checkbox" id="reset-tasks"><div class="reset-item-text"><span>任务</span><small>清除所有任务及其定时检查（任务会跨重启继续执行，不随历史对话一起清）</small></div></label>
       <label class="reset-item"><input type="checkbox" id="reset-system-prompt"><div class="reset-item-text"><span>系统提示词</span><small>恢复出厂系统规则</small></div></label>
       <label class="reset-item"><input type="checkbox" id="reset-identity"><div class="reset-item-text"><span>身份设定</span><small>恢复默认身份与性格</small></div></label>
       <label class="reset-item"><input type="checkbox" id="reset-memory"><div class="reset-item-text"><span>长期记忆</span><small>清除智能体积累的记忆</small></div></label>
@@ -665,6 +677,9 @@
     <div class="modal-header">
       <span class="modal-title">基准测试</span>
       <div class="bm-header-meta" id="bm-env"></div>
+      <!-- 用例库和历史只在打开面板、以及跑动起止时重读。别处起的跑动、刚跑完的
+           那一条，不刷新就看不见 —— 而「关掉再打开」不该是刷新的办法。 -->
+      <button class="btn-icon" id="bm-refresh" title="刷新用例库与历史">&#8635;</button>
       <button class="btn-icon" id="benchmark-close">&#10005;</button>
     </div>
 
@@ -691,7 +706,7 @@
         <div class="bm-launch">
           <label class="bm-repeats-row" for="bm-repeats">
             <span>重复</span>
-            <input type="number" id="bm-repeats" value="3" min="1" max="20">
+            <input type="number" id="bm-repeats" value="1" min="1" max="20">
             <span>次</span>
           </label>
           <p class="bm-note" id="bm-repeats-note"></p>
@@ -725,6 +740,9 @@
   <div class="modal bm-timeline-modal">
     <div class="modal-header">
       <span class="modal-title">运行详情</span>
+      <!-- 详情是打开时取一次的静态快照。跑动还在进行时打开，看到的就是那一刻的
+           样子，后面再没有更新。 -->
+      <button class="btn-icon" id="bm-timeline-refresh" title="重新读取这次运行">&#8635;</button>
       <button class="btn-icon" id="bm-timeline-close">&#10005;</button>
     </div>
     <div class="modal-body bm-timeline-body" id="bm-timeline-body"></div>

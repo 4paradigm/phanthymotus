@@ -39,11 +39,59 @@ log = logging.getLogger(__name__)
 DEFAULT_TOPIC = "/actucore/vla/cmd"
 # Which topic format to publish. Only the ones a driver can consume today; the
 # card refuses anything else rather than publishing into a void.
+# **这些串必须和驱动卡片 `topic_in[].format` 里写的**逐字相同**。** 画布连线按
+# 严格字符串相等匹配端口（`agent-core/web/js/canvas.js`：
+# `inPort.dataset.format === _draggingConn.format`），不相等时拖放被**静默拒绝**
+# —— 没有提示、没有日志，看起来就像画布坏了。真机上就是这么发现的：`vla` 的输出
+# 口怎么都连不到 `servo_eef` 的输入口。
 FORMATS = {"joint_position": "control/joint",
            "joint_velocity": "control/joint-velocity",
            "joint_torque": "control/joint-torque",
            "twist": "control/velocity",
-           "eef_pose": "control/waypoint"}
+           # **不是 `control/waypoint`。** 那个在 agent-core 的格式表里是**导航**
+           # 语义（`waypoint` / `navigate_to` / `goto`，见 `api/mcp_manage.py`）
+           # —— 「去那个地方」，不是「把手放到这个位姿」。用它会让一张导航卡片
+           # 和一张手臂卡片在画布上可以互换着连，而那两件事没有任何共同点。
+           #
+           # `control/eef` 是驱动侧一直在用的那个（`unitree/g1/servo_eef.py`），
+           # 这里此前和它对不上，于是这条链路在画布上根本连不起来。
+           "eef_pose": "control/eef"}
+
+
+def _sensor_qos():
+    """订阅观测用的 QoS。**必须是 BEST_EFFORT。**
+
+    这个项目里每一个传感器发布者都是 BEST_EFFORT（驱动的相机、状态、雷达，以及这
+    张卡片自己的指令发布器 —— 见 `_open_publisher`，那里还写了注释说明为什么）。
+    而 rclpy 的默认 profile 是 **RELIABLE**，一个 RELIABLE 的订阅者**收不到**
+    BEST_EFFORT 的发布者：DDS 认定 QoS 不兼容，直接不建立匹配。
+
+    真机实测（G1，2026-09-21）这条路此前是断的，而且断得完全静默：
+
+        [WARN] [actucore_vla]: New publisher discovered on topic
+        '/ubuntu/camera/rgb', offering incompatible QoS. No messages will be
+        received from it. Last incompatible policy: RELIABILITY
+
+    那条警告只到 ROS 的 stderr，卡片自己报 `state: running`、`error: ""`、
+    `published: 0`。也就是说 **`vla_cloud` 与 `smolvla` 两个 provider 在任何一台
+    真机上都从来拿不到观测** —— 协商通过、模型加载、定时器在跑，一条指令都不发。
+
+    测试没抓到它，是因为 `_bind_inputs` 的用例用的是假 node（没有真的 QoS 匹配），
+    而 `mock` provider 根本不需要输入 —— 两条路都绕开了唯一会暴露它的地方。
+
+    反方向是安全的：BEST_EFFORT 的订阅者可以收 RELIABLE 的发布者。所以这里取
+    BEST_EFFORT 不是"迁就传感器"，它在两种发布者下都成立。
+    """
+    from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                           ReliabilityPolicy)
+
+    return QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        # 深度 1：排队的观测就是过期的观测，策略要的是"此刻"。
+        depth=1,
+        durability=DurabilityPolicy.VOLATILE,
+    )
 
 
 def _model_label(provider_name: str, capabilities: dict) -> str:
@@ -110,6 +158,9 @@ class VLAPlugin:
         self._executor = executor
         self._namespace = (namespace or "").strip("/")
         self._topic = self._cfg.get("topic") or DEFAULT_TOPIC
+        # 见 configSchema 里的 `action_space`。协商之后 `_format()` 改看
+        # descriptor，这个值只决定**连线时**那个端口长什么样。
+        self._out_mode = str(self._cfg.get("action_space") or "joint_position")
 
         # start/stop/config arrive on separate threads (ThreadingHTTPServer).
         # The lock guards bookkeeping only — never a provider construction, an
@@ -151,6 +202,8 @@ class VLAPlugin:
         self._chunk_index = 0
         self._chunk_obs_ms = 0
         self._last_error = ""
+        # 观测从哪一刻开始一直不来。0 表示不饿着。见 _report_starvation。
+        self._starved_since = 0.0
         self._published = 0
 
     # ── tools ────────────────────────────────────────────────────────────────
@@ -240,6 +293,21 @@ class VLAPlugin:
                                  "default": "mock" if "mock" in available else
                                  (available[0] if available else ""),
                                  "scope": "shared"},
+                    # **连线之前，这张卡片不知道它会发什么空间的指令。**
+                    #
+                    # 画布按严格字符串相等匹配端口，而连线发生在 start 之前 ——
+                    # 那时还没有 descriptor，`_format()` 只能退到默认的
+                    # `control/joint`。于是一张末端位姿的驱动卡片（`control/eef`）
+                    # **永远连不上**：要拿到 descriptor 得先连，要连得先有
+                    # descriptor。真机实测就卡在这儿，而且是静默的——拖放没反应，
+                    # 没提示也没日志。
+                    #
+                    # 解法和 `_resources()` 那条一样：配置先顶上，协商之后被真值
+                    # 替换。填错不会静默——`negotiate.check` 比 `control_mode` 和
+                    # descriptor 的 `mode`，对不上就拒绝启动并报出是哪两个。
+                    "action_space": {"type": "string", "enum": sorted(FORMATS),
+                                     "default": "joint_position",
+                                     "scope": "shared"},
                     # Which checkpoint. For a local provider this selects one
                     # of the staged models under `models:`; for vla_cloud it is
                     # the name the server knows it by. One field either way —
@@ -445,6 +513,7 @@ class VLAPlugin:
             self._paused = False
             self._published = 0
             self._last_error = ""
+            self._starved_since = 0.0
             self._running = True
 
         # 连上来的观测源。单数形式是 agent-core 对单连接的写法，复数是多连接；
@@ -476,6 +545,8 @@ class VLAPlugin:
             # info().error 里，而画布上那张卡看着是 running 的。
             return self._error(problem)
         self._binding = binding
+        # 实体都建完了，现在才开始转。
+        self._attach_node()
 
         log.info("vla started: provider=%s topic=%s %.1f Hz ttl=%d ms task=%r",
                  provider_name, self._topic, rate, self._ttl_ms, self._task)
@@ -615,6 +686,34 @@ class VLAPlugin:
 
     # ── 观测输入 ─────────────────────────────────────────────────────────────
 
+    # DDS 发现要多久。一个刚建好的 node 对 ROS 图一无所知，而发现是异步的 ——
+    # 同一个域里已经有几十个端点时，第一次查到齐通常在一秒上下。
+    GRAPH_DISCOVERY_S = 5.0
+
+    def _await_graph(self, node, topics):
+        """等 ROS 图发现完这些话题，再回答它们是什么类型。
+
+        **不等的话这张卡片能不能启动取决于 DDS 发现快不快。** 真机实测
+        （G1，2026-09-21）：进程刚起来时第一次 start 报「/ubuntu/camera/rgb(无发布
+        者)」而拒绝，隔几秒再 start 同一条参数就成功了 —— 话题一直在以 12 Hz 发，
+        变的只是 node 有没有来得及发现它。
+
+        拒绝本身是对的（连错了就该在启动时说），错的是把「还没发现」和「真的没有」
+        当成同一件事。等待把前者排除掉，于是报出来的「无发布者」才真的是无发布者。
+        """
+        import time as _time
+
+        wanted = set(topics)
+        deadline = _time.monotonic() + self.GRAPH_DISCOVERY_S
+        by_type: dict = {}
+        while True:
+            by_type = dict(node.get_topic_names_and_types())
+            if wanted.issubset(by_type):
+                return by_type
+            if _time.monotonic() >= deadline:
+                return by_type
+            _time.sleep(0.1)
+
     def _bind_inputs(self, node, topics, capabilities):
         """把连上来的话题按**消息类型**分派到角色，并对账 provider 的需求。
 
@@ -629,7 +728,7 @@ class VLAPlugin:
         """
         # ROS 的 import 留到真要建订阅时 —— 角色判断只看类型名的字符串，而
         # "什么都没连所以拒绝"这条路不该需要一个 ROS 环境才能走到。
-        by_type = dict(node.get_topic_names_and_types())
+        by_type = self._await_graph(node, topics)
         bound, unknown = {"images": {}, "state": None}, []
         for topic in topics:
             types = by_type.get(topic) or []
@@ -660,6 +759,7 @@ class VLAPlugin:
 
         # 每种消息类型只在真的要订它时才 import：开环的 provider（mock）不连
         # 任何东西也能跑，不该因为进程里没有 sensor_msgs 就起不来。
+        qos = _sensor_qos()
         if bound["images"]:
             from sensor_msgs.msg import CompressedImage, Image
 
@@ -669,12 +769,12 @@ class VLAPlugin:
                     n.endswith("CompressedImage") for n in types) else Image
                 node.create_subscription(
                     message_type, topic,
-                    lambda message, key=name: self._on_image(key, message), 1)
+                    lambda message, key=name: self._on_image(key, message), qos)
         if bound["state"]:
             from std_msgs.msg import String
 
             node.create_subscription(
-                String, bound["state"], self._on_state, 1)
+                String, bound["state"], self._on_state, qos)
         return bound, ""
 
     def _on_image(self, name, message):
@@ -710,6 +810,53 @@ class VLAPlugin:
         if stamp is None:
             return int(time.time() * 1000)
         return int(stamp.sec * 1000 + stamp.nanosec // 1_000_000)
+
+    # 订阅建上了却一直收不到，要多久才算"不对劲"。给到几秒是因为相机启动、DDS
+    # 发现、模型加载都会让头几拍空手 —— 那是正常的，不该在启动瞬间就报错。
+    STARVED_AFTER_S = 3.0
+
+    def _report_starvation(self, capabilities: dict):
+        """观测一直不来，就把它写进 `error`，而不是静默地不发。
+
+        这是 QoS 那个 bug 教出来的一条：`_bind_inputs` 只能核对"话题连上了没"，
+        核对不了"消息收到了没"。订阅建立成功而一条消息都不来，在 DDS 里是常态
+        （QoS 不兼容、发布者其实没在发、域不同），而卡片此前对这三种情况的表现
+        完全一样 —— `state: running`、`error: ""`、`published: 0`。
+
+        不改成拒绝启动：启动那一刻本来就还没有消息，拒了会把所有正常启动也拒掉。
+        能做的是**在持续缺失的时候说出缺的是什么**。
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        if not self._starved_since:
+            self._starved_since = now
+            return
+        if now - self._starved_since < self.STARVED_AFTER_S:
+            return
+
+        with self._obs_lock:
+            have_images = len(self._images)
+            have_state = self._proprio is not None
+            have_eef = self._eef is not None
+        want_images = int(capabilities.get("n_cameras") or 0)
+        missing = []
+        if want_images > have_images:
+            missing.append(f"图像 {have_images}/{want_images} 路")
+        if capabilities.get("needs_state") and not have_state:
+            missing.append("本体状态")
+        if capabilities.get("needs_eef_state") and not have_eef:
+            missing.append("末端位姿")
+        if not missing:
+            return
+        text = (f"订阅建立了但 {now - self._starved_since:.0f} 秒没收到："
+                f"{'、'.join(missing)}。话题名对得上而消息不来，最常见的是 QoS 不"
+                "兼容（发布者 BEST_EFFORT、订阅者 RELIABLE，DDS 直接不匹配，"
+                "只在 ROS 日志里留一行 warning），其次是发布者其实没在发")
+        with self._lock:
+            if self._last_error != text:
+                log.warning("vla %s", text)
+            self._last_error = text
 
     def observation(self):
         """当前观测，或 None —— provider 要而没有的东西缺一样就返回 None。
@@ -775,10 +922,21 @@ class VLAPlugin:
         node = Node("actucore_vla")
         publisher = node.create_publisher(String, self._topic, qos)
         timer = node.create_timer(1.0 / self._rate_hz, self._tick)
-        if self._executor is not None:
-            self._executor.add_node(node)
+        # **不在这里 add_node。** 订阅要在 `_bind_inputs` 里建，而在一个已经交给
+        # executor 的 node 上新建 subscription，回调可能永久不触发 —— 这个仓库已经
+        # 记录过一次（perception 的 stop/start 循环），而表现是最难查的那种：ROS 图
+        # 里订阅在、QoS 匹配、executor 在转、timer 回调照常跑，只有 subscription 的
+        # 回调一次都不来。真机实测 2026-09-21 的 G1 上就是这样。
+        #
+        # 所以顺序是：建 node → 建完所有实体 → 再 `_attach_node()` 交给 executor。
         with self._lock:
             self._node, self._publisher, self._timer = node, publisher, timer
+
+    def _attach_node(self):
+        """实体都建完了，才把 node 交给 executor。见 `_open_publisher` 的注释。"""
+        node = self._node
+        if node is not None and self._executor is not None:
+            self._executor.add_node(node)
 
     def _tick(self):
         publisher = self._publisher
@@ -799,7 +957,9 @@ class VLAPlugin:
         capabilities = self._capabilities or {}
         if (int(capabilities.get("n_cameras") or 0) or capabilities.get("needs_state")) \
                 and self.observation() is None:
+            self._report_starvation(capabilities)
             return
+        self._starved_since = 0.0
         try:
             message = self.next_command()
         except Exception as error:      # noqa: BLE001
@@ -889,7 +1049,14 @@ class VLAPlugin:
         return "running"
 
     def _format(self) -> str:
-        return FORMATS.get(self._descriptor.get("mode"), "control/joint")
+        """输出口的格式串。协商之后由 descriptor 决定，之前由配置决定。
+
+        两段式和 `_resources()` 同一条理由：画布连线在 start 之前，而 descriptor
+        要 start 之后才有。默认 `joint_position` 是今天所有卡片的行为，所以这个
+        字段不填的机器人一切照旧。
+        """
+        mode = self._descriptor.get("mode") or self._out_mode
+        return FORMATS.get(mode, "control/joint")
 
     def _resources(self) -> list:
         """Physical channels this card occupies, for the ACP barrier.

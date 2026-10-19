@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 """
-plugins/face_db.py — 人脸身份持久化存储。
+plugins/identity_db.py — 身份与 embedding 的持久化存储（模态无关）。
 
-Holds every enrolled identity (both named and unnamed) plus their face embeddings,
-on disk under a `/models` subdirectory — the only host-mounted writable path the
+Holds every enrolled identity (both named and unnamed) plus their embeddings, on
+disk under a `/models` subdirectory — the only host-mounted writable path the
 perception container has (see `perception/deploy/service.yml`).
+
+**Nothing here knows what the embeddings are of.** It grew as `face_db.py` and was
+generalised when speaker recognition needed the same thing for voiceprints: the only
+face-specific part was a hardcoded 512 dimensions. Everything else — the p-N id
+allocation, per-sample row ownership, the `matrix @ embedding` cosine match, the
+atomic commit, the visit log, the unknown-capacity eviction — is identity management.
+So `dim` is a constructor argument and `label` only decides what the log lines say.
+
+`model` and `dim` are recorded in `persons.json` and **checked on load**. Embeddings
+from different networks are not comparable, so a database written by one model must
+not be silently read by another: matching across them does not fail, it quietly
+confuses identities. A mismatch raises instead, naming both sides, because the only
+correct recovery is to re-enrol.
 
 Three files, and **`persons.json` is the commit point**:
 
@@ -85,8 +98,6 @@ except ImportError:  # pragma: no cover - Windows/macOS dev hosts
 
 log = logging.getLogger(__name__)
 
-DEFAULT_DB_DIR = "/models/face_db"
-EMBEDDING_DIM = 512
 
 DEFAULT_UNKNOWN_CAPACITY = 500
 DEFAULT_MAX_SAMPLES_PER_PERSON = 8
@@ -95,9 +106,11 @@ DEFAULT_VISIT_LOG_MAX = 20000
 DEFAULT_VISIT_CHECKPOINT_S = 60.0
 
 _PERSONS_FILE = "persons.json"
+# Per-sample source artifacts (face crops), one file per sample id.
+_SAMPLES_DIR = "samples"
 _VISITS_FILE = "visits.jsonl"
 _OPEN_VISITS_FILE = "visits-open.json"
-_LOCK_FILE = ".face_db.lock"
+_LOCK_FILE = ".identity_db.lock"
 _EMBEDDINGS_PREFIX = "embeddings-"
 _EMBEDDINGS_SUFFIX = ".npy"
 
@@ -107,7 +120,34 @@ _EMBEDDINGS_SUFFIX = ".npy"
 PERSON_PREFIX = "p-"
 
 
-class FaceDBError(RuntimeError):
+def dim_on_disk(db_dir: str) -> int | None:
+    """The embedding width a database on disk was written with, without opening it.
+
+    `IdentityDB` needs `dim` up front, and the only honest source is normally the
+    model. But a caller that has deliberately **not** loaded a model still has a
+    roster to show and delete — somebody who switched speaker recognition off for
+    privacy reasons wants to clear what it collected, and making them switch it
+    back on first is backwards.
+
+    Returns None for a directory with no database, or one written before the
+    field existed (every face_db deployed so far). A caller that gets None has
+    nothing it can safely open and should say the database is unavailable rather
+    than guess a width.
+    """
+    path = os.path.join(str(db_dir), _PERSONS_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle).get("dim")
+    except (OSError, ValueError):
+        return None
+    try:
+        value = int(stored)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+class IdentityDBError(RuntimeError):
     """The database on disk exists but cannot be used as-is."""
 
 
@@ -121,12 +161,12 @@ def _now() -> float:
     return time.time()
 
 
-def _normalize(vector: np.ndarray) -> np.ndarray:
+def _normalize(vector: np.ndarray, dim: int) -> np.ndarray:
     """Return a float32 unit vector, so a dot product is a cosine."""
     array = np.asarray(vector, dtype=np.float32).reshape(-1)
-    if array.size != EMBEDDING_DIM:
+    if array.size != dim:
         raise ValueError(
-            f"embedding must have {EMBEDDING_DIM} dims, got {array.size}"
+            f"embedding must have {dim} dims, got {array.size}"
         )
     norm = float(np.linalg.norm(array))
     if norm <= 1e-8:
@@ -190,30 +230,67 @@ def parse_time(value: Any) -> float | None:
     return moment.timestamp()
 
 
-class FaceDB:
-    """Persistent store of enrolled identities and their face embeddings."""
+class IdentityDB:
+    """Persistent store of enrolled identities and their embeddings."""
 
     def __init__(
         self,
-        db_dir: str = DEFAULT_DB_DIR,
+        db_dir: str,
+        dim: int,
         unknown_capacity: int = DEFAULT_UNKNOWN_CAPACITY,
         max_samples_per_person: int = DEFAULT_MAX_SAMPLES_PER_PERSON,
         visit_gap_s: float = DEFAULT_VISIT_GAP_S,
         visit_log_max: int = DEFAULT_VISIT_LOG_MAX,
         visit_checkpoint_s: float = DEFAULT_VISIT_CHECKPOINT_S,
+        model: str = "",
+        label: str = "identity_db",
+        on_evict=None,
+        artifact_suffix: str = "",
     ):
         # db_dir arrives over MCP config and this process runs as root in the
         # container; the same validation model_downloader applies to model_dir.
         self._dir = require_models_subpath(db_dir)
+        self._dim = int(dim)
+        if self._dim <= 0:
+            raise ValueError(f"dim must be positive, got {dim!r}")
+        # Recorded in persons.json and compared on load. Empty means "whatever is
+        # on disk" — a caller that does not track its model cannot be protected
+        # from swapping it, and refusing to open an unlabelled database would
+        # break every face_db written before this field existed.
+        self._model = str(model or "")
+        self._tag = f"[{label}]"
+        # Called with the list of ids dropped by `unknown_capacity` eviction.
+        # See `_evict_unknowns_locked` for why a count is not enough.
+        self._on_evict = on_evict
         self._unknown_capacity = max(0, int(unknown_capacity))
         self._max_samples = max(1, int(max_samples_per_person))
+
+        # When set (e.g. ".jpg"), each sample may carry the source artifact it was
+        # embedded from, stored under `samples/<sample_id><suffix>`. Empty disables
+        # the whole mechanism, which is the default — voiceprints do not use it and
+        # must not pay for it.
+        #
+        # The point is re-embedding: an embedding is only meaningful inside the
+        # network that produced it, so without the artifact a model switch can
+        # never be migrated, only re-enrolled by hand. See `sample_artifacts`.
+        self._artifact_suffix = str(artifact_suffix or "")
 
         self._lock = threading.RLock()
         self._persons: dict[str, dict] = {}
         self._row_owners: list[str] = []
-        self._matrix = np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
+        # Parallel to `_row_owners`: the stable id of the artifact backing each row,
+        # or "" for a row that has none (every row written before this existed).
+        #
+        # Keyed by id and NOT by row index, which is the whole design: rows are
+        # reindexed by the max-samples trim, by `forget`, by capacity eviction and by
+        # the orphan filter in `_load`. An artifact filed under a row index would,
+        # after any of those, be served up as a different person's face. Ids are
+        # allocated from a counter that only ever increases, so a retired id is never
+        # handed to a new sample and a stale file can never be adopted.
+        self._row_samples: list[str] = []
+        self._matrix = np.zeros((0, self._dim), dtype=np.float32)
         # Single counter for all person IDs (p-N format)
-        self._next_ids = {"named": 1}
+        self._next_ids = {"named": 1, "sample": 1}
         self._generation = 0
 
         self._visit_gap = max(0.0, float(visit_gap_s))
@@ -240,22 +317,62 @@ class FaceDB:
     def _embeddings_name(self, generation: int) -> str:
         return f"{_EMBEDDINGS_PREFIX}{generation}{_EMBEDDINGS_SUFFIX}"
 
+    @property
+    def artifacts_enabled(self) -> bool:
+        return bool(self._artifact_suffix)
+
+    def _samples_dir(self) -> str:
+        return os.path.join(self._dir, _SAMPLES_DIR)
+
+    def _artifact_path(self, sample_id: str) -> str:
+        """Where `sample_id`'s artifact lives. Ids are generated here, never
+        caller-supplied, so they cannot traverse out of the directory."""
+        return os.path.join(self._samples_dir(),
+                            f"{sample_id}{self._artifact_suffix}")
+
+    def _allocate_sample_id_locked(self) -> str:
+        index = max(1, int(self._next_ids.get("sample", 1)))
+        self._next_ids["sample"] = index + 1
+        return f"s-{index}"
+
     def _load(self) -> None:
         persons_path = self._persons_path()
         if not os.path.exists(persons_path):
-            log.info("[face_db] no database at %s; starting empty", self._dir)
+            log.info("%s no database at %s; starting empty", self._tag, self._dir)
             return
         try:
             with open(persons_path, encoding="utf-8") as handle:
                 state = json.load(handle)
         except (OSError, ValueError) as error:
-            raise FaceDBError(
+            raise IdentityDBError(
                 f"{persons_path} is unreadable: {escape_log_text(error)}"
             ) from error
 
+        # Written since version 3. Absent in a database produced before this
+        # field existed (every deployed face_db), so absence is not an error —
+        # a disagreement is. Checked before anything is read: a dimension
+        # mismatch would otherwise surface as the generic "inconsistent"
+        # message below, which sends the reader looking for a corrupt file.
+        stored_dim = state.get("dim")
+        if stored_dim is not None and int(stored_dim) != self._dim:
+            raise IdentityDBError(
+                f"database at {self._dir} holds {int(stored_dim)}-dim embeddings "
+                f"but this instance expects {self._dim}. Embeddings from different "
+                f"networks are not comparable, so this database cannot be reused — "
+                f"point db_dir somewhere else, or delete it and re-enrol."
+            )
+        stored_model = str(state.get("model") or "")
+        if stored_model and self._model and stored_model != self._model:
+            raise IdentityDBError(
+                f"database at {self._dir} was written by model {stored_model!r} "
+                f"but this instance runs {self._model!r}. Matching across two "
+                f"networks does not fail, it silently confuses identities — "
+                f"re-enrol under the new model instead."
+            )
+
         embeddings_file = state.get("embeddings_file")
         rows = list(state.get("rows") or [])
-        matrix = np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
+        matrix = np.zeros((0, self._dim), dtype=np.float32)
         if embeddings_file:
             matrix_path = os.path.join(self._dir, os.path.basename(embeddings_file))
             try:
@@ -265,14 +382,14 @@ class FaceDB:
                 # silently continue with no embeddings: recognition would report
                 # every enrolled person as unknown while the dashboard showed a
                 # populated database. Surfaced as the plugin's error state.
-                raise FaceDBError(
+                raise IdentityDBError(
                     f"embeddings file {matrix_path} named by {_PERSONS_FILE} is "
                     f"unusable: {escape_log_text(error)}"
                 ) from error
         if matrix.ndim != 2 or matrix.shape[0] != len(rows) or (
-            matrix.size and matrix.shape[1] != EMBEDDING_DIM
+            matrix.size and matrix.shape[1] != self._dim
         ):
-            raise FaceDBError(
+            raise IdentityDBError(
                 f"database at {self._dir} is inconsistent: {len(rows)} row owners "
                 f"but embeddings shape {matrix.shape}"
             )
@@ -307,28 +424,48 @@ class FaceDB:
         # A row owned by a person that is not in the table would make
         # `_person_scores` attribute a sample to nobody; drop those rows rather
         # than carry a matrix the metadata cannot explain.
+        # Sample ids run parallel to `rows`. Absent (every database written before
+        # artifacts existed) or the wrong length (a hand-edited persons.json) means
+        # "no artifacts here" rather than a guess: a wrong id would attach one
+        # person's face to another's embedding, which is the one outcome worse than
+        # having no artifact at all.
+        sample_rows = state.get("sample_rows") or []
+        if len(sample_rows) != len(rows):
+            if sample_rows:
+                log.warning("%s sample_rows is %d long for %d row(s); ignoring it",
+                            self._tag, len(sample_rows), len(rows))
+            sample_rows = [""] * len(rows)
+        sample_rows = [str(item or "") for item in sample_rows]
+
         keep = [index for index, owner in enumerate(rows) if owner in persons]
         if len(keep) != len(rows):
-            log.warning("[face_db] dropping %d orphaned embedding row(s)",
+            log.warning("%s dropping %d orphaned embedding row(s)", self._tag,
                         len(rows) - len(keep))
             rows = [rows[index] for index in keep]
+            sample_rows = [sample_rows[index] for index in keep]
             matrix = matrix[keep] if matrix.size else matrix
 
         next_ids = state.get("next_ids") or {}
         self._persons = persons
         self._row_owners = [str(owner) for owner in rows]
+        self._row_samples = sample_rows
         self._matrix = matrix if matrix.size else np.zeros(
-            (0, EMBEDDING_DIM), dtype=np.float32
+            (0, self._dim), dtype=np.float32
         )
         # Migrate from old dual-counter format to single counter
         # Take the max of both counters to ensure no ID collisions
         old_named = max(1, int(next_ids.get("named", 1)))
         old_unknown = max(1, int(next_ids.get("unknown", 1)))
+        # Never below the highest id already on disk: a reused id would adopt the
+        # retired sample's artifact file and serve the wrong face.
+        used = [int(item[2:]) for item in sample_rows
+                if item.startswith("s-") and item[2:].isdigit()]
         self._next_ids = {
             "named": max(old_named, old_unknown),
+            "sample": max([int(next_ids.get("sample", 1) or 1), 1] + [n + 1 for n in used]),
         }
         self._generation = max(0, int(state.get("generation") or 0))
-        log.info("[face_db] loaded %d person(s), %d sample(s) from %s",
+        log.info("%s loaded %d person(s), %d sample(s) from %s", self._tag,
                  len(self._persons), len(self._row_owners), self._dir)
 
     def _save_locked(self) -> None:
@@ -364,11 +501,17 @@ class FaceDB:
                         os.unlink(tmp_matrix)
 
                 state = {
-                    "version": 2,
+                    "version": 3,
                     "generation": generation,
+                    # Checked by _load. Without them a model swap is silent:
+                    # the row count and the metadata still agree, every
+                    # similarity is garbage, and nothing says why.
+                    "dim": self._dim,
+                    "model": self._model,
                     "embeddings_file": matrix_name,
                     "next_ids": dict(self._next_ids),
                     "rows": list(self._row_owners),
+                    "sample_rows": list(self._row_samples),
                     "persons": [
                         dict(person) for person in self._persons.values()
                     ],
@@ -393,6 +536,13 @@ class FaceDB:
                             os.unlink(os.path.join(self._dir, name))
                         except OSError:  # noqa: PERF203 - best-effort cleanup
                             pass
+
+                # Same discipline for sample artifacts, and only after the commit:
+                # until persons.json lands, the ids it still names must keep their
+                # files. This also sweeps what a crashed earlier write left behind,
+                # since anything not named by the committed state is unreachable —
+                # ids are never reused, so an unreferenced file is always garbage.
+                self._sweep_artifacts_locked()
             finally:
                 if fcntl is not None:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -440,7 +590,7 @@ class FaceDB:
         caller can log how close it came — the number an operator needs when
         tuning `match_threshold`. `best_score` is `-1.0` on an empty database.
         """
-        vector = _normalize(embedding)
+        vector = _normalize(embedding, self._dim)
         with self._lock:
             scores = self._person_scores_locked(vector)
             if not scores:
@@ -453,12 +603,21 @@ class FaceDB:
 
     # ── writes ────────────────────────────────────────────────────────────
 
-    def _add_rows_locked(self, person_id: str, vectors: list[np.ndarray]) -> None:
+    def _add_rows_locked(self, person_id: str, vectors: list[np.ndarray],
+                         artifacts: list | None = None) -> None:
         """Append samples for one person, capped at `max_samples_per_person`.
 
         Oldest-first eviction: rows are appended in enrolment order, so keeping
         the tail keeps the most recent captures — the ones most likely to match
         how the person looks now.
+
+        `artifacts` is parallel to `vectors` and may hold the encoded bytes each
+        embedding was produced from, or None for an embedding whose source was not
+        kept. Ignored entirely unless this database was opened with an
+        `artifact_suffix`. Files are written *before* `persons.json` commits, which
+        is the same ordering the embeddings file uses and for the same reason: a
+        crash then leaves an unreferenced file, which the next commit sweeps, rather
+        than a referenced id with no file behind it.
         """
         if not vectors:
             return
@@ -470,12 +629,91 @@ class FaceDB:
         )
         self._row_owners.extend([person_id] * len(vectors))
 
+        payloads = list(artifacts or [])
+        payloads += [None] * (len(vectors) - len(payloads))
+        for payload in payloads[: len(vectors)]:
+            self._row_samples.append(
+                self._write_artifact_locked(payload) if self._artifact_suffix else "")
+
         owned = [i for i, owner in enumerate(self._row_owners) if owner == person_id]
         if len(owned) > self._max_samples:
             drop = set(owned[: len(owned) - self._max_samples])
             keep = [i for i in range(len(self._row_owners)) if i not in drop]
             self._row_owners = [self._row_owners[i] for i in keep]
+            self._row_samples = [self._row_samples[i] for i in keep]
             self._matrix = self._matrix[keep]
+
+    def _sweep_artifacts_locked(self) -> int:
+        """Delete artifact files no committed sample id names. Best-effort."""
+        if not self._artifact_suffix:
+            return 0
+        directory = self._samples_dir()
+        if not os.path.isdir(directory):
+            return 0
+        live = {item for item in self._row_samples if item}
+        removed = 0
+        for name in os.listdir(directory):
+            if not name.endswith(self._artifact_suffix):
+                continue
+            if name[: -len(self._artifact_suffix)] in live:
+                continue
+            try:
+                os.unlink(os.path.join(directory, name))
+                removed += 1
+            except OSError:  # noqa: PERF203 - best-effort cleanup
+                pass
+        return removed
+
+    def sample_artifacts(self) -> list[dict]:
+        """Every sample that still has its source artifact on disk.
+
+        This is the backfill surface: re-embedding a roster under another model
+        means reading these, running them through the new network, and writing a
+        fresh database — which is the only migration possible, because embeddings
+        cannot be converted between networks and nothing else here retains the face.
+
+        Rows whose artifact is missing are omitted rather than reported as empty:
+        every row enrolled before artifacts existed is in that state, and a caller
+        re-embedding needs the list it can actually act on. Compare the length
+        against `stats()["samples"]` to see the shortfall.
+        """
+        with self._lock:
+            out = []
+            for index, (owner, sample_id) in enumerate(
+                    zip(self._row_owners, self._row_samples)):
+                if not sample_id:
+                    continue
+                path = self._artifact_path(sample_id)
+                if not os.path.exists(path):
+                    continue
+                out.append({"row": index, "person_id": owner,
+                            "sample_id": sample_id, "path": path})
+            return out
+
+    def _write_artifact_locked(self, payload) -> str:
+        """Persist one sample artifact and return its id, or "" if there is none.
+
+        Best-effort: a full or read-only /models must not take enrolment down, so a
+        write failure costs the artifact (and with it the ability to re-embed that
+        one sample) and nothing else.
+        """
+        if not payload:
+            return ""
+        sample_id = self._allocate_sample_id_locked()
+        path = self._artifact_path(sample_id)
+        try:
+            os.makedirs(self._samples_dir(), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            log.warning("%s could not store the sample artifact for %s",
+                        self._tag, sample_id, exc_info=True)
+            return ""
+        return sample_id
 
     def _samples_locked(self, person_id: str) -> int:
         """Sample count, always derived from the row owners rather than stored.
@@ -485,6 +723,24 @@ class FaceDB:
         strings and runs only on the reporting paths, not per frame.
         """
         return sum(1 for owner in self._row_owners if owner == person_id)
+
+    def samples_of(self, person_id: str) -> int:
+        """How many samples this person has. 0 for an id that is not there.
+
+        Public because a caller that accumulates samples opportunistically needs
+        to know when it would be a no-op — `add_samples` on a full person silently
+        evicts the oldest row, which is correct but not free (every call rewrites
+        the whole matrix), so the cheap check belongs here rather than in a
+        caller reaching into `_samples_locked`.
+        """
+        with self._lock:
+            if person_id not in self._persons:
+                return 0
+            return self._samples_locked(person_id)
+
+    @property
+    def max_samples(self) -> int:
+        return self._max_samples
 
     def _record_locked(self, person_id: str) -> dict:
         person = self._persons[person_id]
@@ -506,9 +762,14 @@ class FaceDB:
         named: bool = True,
         profile: Any = None,
         person_id: str | None = None,
+        artifacts: list | None = None,
+        registered_at: float | None = None,
     ) -> dict:
-        """Enrol a new identity and return its record."""
-        vectors = [_normalize(item) for item in embeddings]
+        """Enrol a new identity and return its record.
+
+        `artifacts` is parallel to `embeddings`; see `_add_rows_locked`.
+        """
+        vectors = [_normalize(item, self._dim) for item in embeddings]
         if not vectors:
             raise ValueError("at least one embedding is required")
         clean_profile = _clean_profile(profile)
@@ -525,44 +786,53 @@ class FaceDB:
                 "name": str(name or ""),
                 "profile": clean_profile,
                 "named": bool(named),
-                "registered_at": timestamp,
+                # Overridable so a roster migrated to another model keeps when each
+                # person was first enrolled. Resetting it to the migration time
+                # would make everybody look new and break "who have we known
+                # longest" against a visit log that disagrees.
+                "registered_at": (float(registered_at) if registered_at
+                                  else timestamp),
                 "updated_at": timestamp,
                 "last_seen_at": timestamp,
             }
-            self._add_rows_locked(new_id, vectors)
+            self._add_rows_locked(new_id, vectors, artifacts)
+            evicted: list[str] = []
             if not named:
-                self._evict_unknowns_locked()
+                evicted = self._evict_unknowns_locked()
             record = self._record_locked(new_id) if new_id in self._persons else None
             self._save_locked()
         if record is None:
             # Capacity 0: the entry was evicted by the same call that made it.
-            raise FaceDBError("unknown_capacity is 0; cannot enrol unknown faces")
-        log.info("[face_db] enrolled %s (named=%s, samples=%d): %s",
+            raise IdentityDBError(
+                "unknown_capacity is 0; cannot enrol unnamed identities")
+        self._fire_evicted(evicted)
+        log.info("%s enrolled %s (named=%s, samples=%d): %s", self._tag,
                  new_id, named, record["samples"],
                  escape_log_text(record["name"]))
         return record
 
-    def add_samples(self, person_id: str, embeddings: Iterable[np.ndarray]) -> dict:
-        """Attach more face samples to an existing person."""
-        vectors = [_normalize(item) for item in embeddings]
+    def add_samples(self, person_id: str, embeddings: Iterable[np.ndarray],
+                    artifacts: list | None = None) -> dict:
+        """Attach more samples to an existing person."""
+        vectors = [_normalize(item, self._dim) for item in embeddings]
         if not vectors:
             raise ValueError("at least one embedding is required")
         with self._lock:
             if person_id not in self._persons:
                 raise KeyError(person_id)
-            self._add_rows_locked(person_id, vectors)
+            self._add_rows_locked(person_id, vectors, artifacts)
             self._persons[person_id]["updated_at"] = _now()
             record = self._record_locked(person_id)
             self._save_locked()
         return record
 
-    def enroll_unknown(self, embedding: np.ndarray) -> dict:
-        """Create an anonymous entry for a face nobody has named.
+    def enroll_unknown(self, embedding: np.ndarray, artifact=None) -> dict:
+        """Create an anonymous entry for somebody nobody has named.
 
         It gets an ordinary `p-N` id like everyone else — `named=False` is what
         marks it anonymous, not the id format.
         """
-        return self.add("", [embedding], named=False)
+        return self.add("", [embedding], named=False, artifacts=[artifact])
 
     def promote(
         self, person_id: str, name: str, profile: Any = None, merge: bool = True
@@ -598,7 +868,7 @@ class FaceDB:
                 # an unknown promotes it in place, keeping the id.
                 if str(name).strip() and not person["named"]:
                     person["named"] = True
-                    log.info("[face_db] %s promoted to a named person", person_id)
+                    log.info("%s %s promoted to a named person", self._tag, person_id)
                 changed = True
             if clean_profile is not None:
                 person["profile"] = (
@@ -662,9 +932,10 @@ class FaceDB:
         keep = [i for i, owner in enumerate(self._row_owners) if owner not in doomed]
         if len(keep) != len(self._row_owners):
             self._row_owners = [self._row_owners[i] for i in keep]
+            self._row_samples = [self._row_samples[i] for i in keep]
             self._matrix = (
                 self._matrix[keep] if keep
-                else np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
+                else np.zeros((0, self._dim), dtype=np.float32)
             )
         return removed
 
@@ -674,7 +945,7 @@ class FaceDB:
             if not self._drop_locked([person_id]):
                 return False
             self._save_locked()
-        log.info("[face_db] forgot %s", person_id)
+        log.info("%s forgot %s", self._tag, person_id)
         return True
 
     def forget_many(self, person_ids) -> dict:
@@ -696,7 +967,7 @@ class FaceDB:
         removed_set = set(removed)
         missing = [pid for pid in unique if pid not in removed_set]
         if removed:
-            log.info("[face_db] forgot %d person(s) in one commit", len(removed))
+            log.info("%s forgot %d person(s) in one commit", self._tag, len(removed))
         return {"forgotten": removed, "missing": missing}
 
     def forget_unknowns(self) -> int:
@@ -715,18 +986,24 @@ class FaceDB:
 
     # ── capacity ──────────────────────────────────────────────────────────
 
-    def _evict_unknowns_locked(self) -> int:
+    def _evict_unknowns_locked(self) -> list[str]:
         """Trim anonymous entries to `unknown_capacity`, oldest sighting first.
 
         Named people are never candidates: the cap exists to bound automatic
         enrolment, not to expire people somebody deliberately registered.
+
+        Returns the evicted **ids**, not a count. A caller that keeps anything
+        else keyed by person id — `plugins/speaker.py` keeps one playable wav per
+        voiceprint — has to be told *which* ones went, or those files accumulate
+        forever: `forget` deletes them, eviction silently would not. The ids go
+        to `on_evict`, fired by the public callers once they are out of the lock.
         """
         unknowns = [
             person for person in self._persons.values() if not person["named"]
         ]
         excess = len(unknowns) - self._unknown_capacity
         if excess <= 0:
-            return 0
+            return []
         unknowns.sort(key=lambda person: (person["last_seen_at"], person["registered_at"]))
         doomed = {person["id"] for person in unknowns[:excess]}
         for person_id in doomed:
@@ -736,13 +1013,31 @@ class FaceDB:
             if owner not in doomed
         ]
         self._row_owners = [self._row_owners[i] for i in keep]
+        self._row_samples = [self._row_samples[i] for i in keep]
         self._matrix = (
             self._matrix[keep] if keep
-            else np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
+            else np.zeros((0, self._dim), dtype=np.float32)
         )
-        log.info("[face_db] evicted %d unknown entr(ies) over capacity %d",
+        log.info("%s evicted %d unknown entr(ies) over capacity %d", self._tag,
                  len(doomed), self._unknown_capacity)
-        return len(doomed)
+        return sorted(doomed)
+
+    def _fire_evicted(self, evicted: list[str]) -> None:
+        """Hand evicted ids to the owner, **outside** the lock.
+
+        Outside on purpose: the callback belongs to the caller and may do
+        anything, including calling back into this database. Firing it while
+        holding `self._lock` would make that a deadlock, and a re-entrant
+        `forget` from an eviction handler is an entirely reasonable thing to
+        write.
+        """
+        if not evicted or self._on_evict is None:
+            return
+        try:
+            self._on_evict(list(evicted))
+        except Exception:  # noqa: BLE001 - eviction already happened
+            log.warning("%s on_evict callback failed for %s", self._tag,
+                        evicted, exc_info=True)
 
     def set_unknown_capacity(self, capacity: int) -> int:
         """Change the ceiling and apply it now. Returns how many were evicted."""
@@ -751,7 +1046,8 @@ class FaceDB:
             evicted = self._evict_unknowns_locked()
             if evicted:
                 self._save_locked()
-        return evicted
+        self._fire_evicted(evicted)
+        return len(evicted)
 
     @property
     def unknown_capacity(self) -> int:
@@ -771,8 +1067,27 @@ class FaceDB:
         query: str = "",
         limit: int = 100,
         offset: int = 0,
+        order: str = "updated",
     ) -> dict:
-        """Page through the roster. Never returns embeddings."""
+        """Page through the roster. Never returns embeddings.
+
+        `order` picks both the grouping and the tiebreak, because the two
+        callers want opposite things:
+
+        * `updated` (default, and what face has always done) — **named people
+          first**, then most recently *modified*. Right when the roster is a
+          list of known people and the anonymous entries are noise at the end.
+        * `recent` — **unnamed first**, then most recently *seen or heard*.
+          Right for the voiceprint review flow, which is the inverse: the useful
+          work is turning anonymous entries into names, so burying them under
+          everyone already named defeats it. And an auto-enrolled voice is never
+          edited, so its `updated_at` is frozen at creation and ordering by it
+          is arbitrary.
+
+        Neither is "most often heard". That number is not stored — deriving it
+        means scanning the visit log, which `list_visits` already does properly.
+        Do not let a sort option imply a frequency it does not measure.
+        """
         wanted = str(named or "all").lower()
         needle = str(query or "").strip().lower()
         with self._lock:
@@ -791,7 +1106,11 @@ class FaceDB:
                 ]).lower()
                 return needle in haystack
             records = [r for r in records if matches(r)]
-        records.sort(key=lambda record: (not record["named"], -record["updated_at"]))
+        if str(order or "updated").lower() == "recent":
+            records.sort(key=lambda r: (r["named"], -r["last_seen_at"],
+                                        -r["updated_at"]))
+        else:
+            records.sort(key=lambda r: (not r["named"], -r["updated_at"]))
         total = len(records)
         start = max(0, int(offset))
         end = start + max(0, int(limit)) if limit else total
@@ -881,7 +1200,7 @@ class FaceDB:
             os.replace(tmp, path)
             return True
         except OSError:
-            log.warning("[face_db] could not checkpoint open visits",
+            log.warning("%s could not checkpoint open visits", self._tag,
                         exc_info=True)
             return False
 
@@ -915,7 +1234,7 @@ class FaceDB:
             with self._lock:
                 self._append_visits_locked(closed)
         if resumed or closed:
-            log.info("[face_db] recovered open visits: %d resumed, %d closed",
+            log.info("%s recovered open visits: %d resumed, %d closed", self._tag,
                      resumed, len(closed))
         try:
             if not self._open_visits and os.path.exists(path):
@@ -977,7 +1296,7 @@ class FaceDB:
         except OSError:
             # A full or read-only /models must not take recognition down; the
             # identities still work, only the history is lost.
-            log.warning("[face_db] could not append to the visit log",
+            log.warning("%s could not append to the visit log", self._tag,
                         exc_info=True)
 
     def _trim_visits_locked(self) -> None:
@@ -997,7 +1316,7 @@ class FaceDB:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-        log.info("[face_db] visit log trimmed to the newest %d entries",
+        log.info("%s visit log trimmed to the newest %d entries", self._tag,
                  self._visit_log_max)
 
     def list_visits(
@@ -1082,19 +1401,23 @@ class FaceDB:
                 "unknown_capacity": self._unknown_capacity,
                 "open_visits": len(self._open_visits),
                 "db_dir": self._dir,
+                # How much of this roster could survive a model switch. Equal to
+                # `samples` once every row carries its source; lower on any database
+                # that predates artifacts, and 0 when they are disabled.
+                "samples_with_artifact": sum(1 for item in self._row_samples if item),
+                "artifacts_enabled": bool(self._artifact_suffix),
             }
 
 
 __all__ = [
-    "DEFAULT_DB_DIR",
     "DEFAULT_VISIT_CHECKPOINT_S",
     "DEFAULT_VISIT_GAP_S",
     "DEFAULT_VISIT_LOG_MAX",
     "parse_time",
     "DEFAULT_MAX_SAMPLES_PER_PERSON",
     "DEFAULT_UNKNOWN_CAPACITY",
-    "EMBEDDING_DIM",
-    "FaceDB",
-    "FaceDBError",
+    "IdentityDB",
+    "IdentityDBError",
+    "dim_on_disk",
     "is_unknown_id",
 ]

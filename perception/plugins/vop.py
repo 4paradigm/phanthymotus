@@ -88,6 +88,197 @@ _MODEL_ALIASES = {
 }
 
 
+_HUE_NAMES = (
+    # OpenCV hue is 0-179 (degrees / 2). Twelve bins around the colour wheel.
+    (8, "red"), (18, "orange"), (30, "yellow"), (42, "lime"), (70, "green"),
+    (85, "teal"), (97, "cyan"), (110, "azure"), (128, "blue"), (140, "violet"),
+    (155, "magenta"), (170, "pink"), (180, "red"),
+)
+_BRIGHTNESS_NAMES = (
+    (30, "black"), (70, "dark"), (110, "dim"), (150, "medium"), (200, "bright"),
+    (256, "white"),
+)
+_SATURATION_NAMES = ((25, "gray"), (80, "muted"), (256, "vivid"))
+
+
+def _bucket(value: float, table) -> str:
+    for upper, name in table:
+        if value < upper:
+            return name
+    return table[-1][1]
+
+
+def dominant_hue(h_mean: float, s_mean: float, v_mean: float = 0.0) -> str:
+    """Name the hue a mean HSV triple lands on; "neutral" when saturation is
+    too low for the hue to mean anything (a white wall, a black chair)."""
+    if s_mean < _SATURATION_NAMES[0][0]:
+        return "neutral"
+    return _bucket(h_mean, _HUE_NAMES)
+
+
+def dominant_brightness(v_mean: float) -> str:
+    return _bucket(v_mean, _BRIGHTNESS_NAMES)
+
+
+def dominant_saturation(s_mean: float) -> str:
+    return _bucket(s_mean, _SATURATION_NAMES)
+
+
+def color_name(h_mean: float, s_mean: float, v_mean: float) -> str:
+    """One phrase an LLM can repeat verbatim: "dark red", "bright cyan",
+    "light gray". Neutral colours are named by brightness alone."""
+    brightness = dominant_brightness(v_mean)
+    hue = dominant_hue(h_mean, s_mean, v_mean)
+    if hue == "neutral":
+        return {"black": "black", "dark": "dark gray", "dim": "gray",
+                "medium": "gray", "bright": "light gray", "white": "white"}[brightness]
+    if brightness in ("black", "dark"):
+        return f"dark {hue}"
+    if brightness in ("bright", "white"):
+        return f"bright {hue}"
+    return hue
+
+
+def _region(frame_bgr, bbox=None):
+    """The pixels a box selects, clamped to the frame. None if it selects none.
+
+    Shared by `color_stats` and `color_block` so the clamping exists once — the
+    box comes from a detector and routinely runs off the edge of the frame.
+    """
+    if bbox is None:
+        return frame_bgr
+    height, width = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = (int(round(float(v))) for v in bbox)
+    x1, x2 = max(0, min(x1, width - 1)), max(0, min(x2, width))
+    y1, y2 = max(0, min(y1, height - 1)), max(0, min(y2, height))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame_bgr[y1:y2, x1:x2]
+
+
+def color_triple(h_mean: float, s_mean: float, v_mean: float) -> str:
+    """The three labels as one space-joined string: "dim muted azure".
+
+    This is what the *stream* carries, and it is deliberately not `color_name`.
+
+    `color_name` is a **lossy projection** of the three, not a concatenation of
+    them: it never calls `dominant_saturation` at all (saturation reaches it only
+    as the `s < 25 -> neutral` threshold inside `dominant_hue`, so muted/vivid
+    vanishes), and it collapses six brightness levels into three prefixes.
+    Enumerated over the whole HSV space that is **150 distinct triples against 41
+    distinct color_names** — 73% of the distinctions gone. The other direction is
+    lossless: `color_name` is a pure function of `dominant_brightness` and
+    `dominant_hue`, both of which are here, so a consumer can recompute it
+    exactly (`test_color_name_recoverable_from_triple` pins that).
+
+    So the triple strictly dominates, and it costs one byte more.
+
+    Ordered brightness-saturation-hue because that reads as English. Splittable
+    on spaces because every word in all three vocabularies is a single token —
+    a property worth preserving if you ever add a name here.
+
+    Neutral colours always come out as "<brightness> gray neutral": `neutral` and
+    `gray` are triggered by the same `s < 25` test, so that pair is redundant by
+    construction. Emitted anyway rather than special-cased to two tokens — four
+    bytes buys every consumer a `split()` with no branch in it.
+    """
+    return (f"{dominant_brightness(v_mean)} {dominant_saturation(s_mean)} "
+            f"{dominant_hue(h_mean, s_mean, v_mean)}")
+
+
+def color_stats(frame_bgr, bbox=None) -> dict:
+    """RGB/HSV mean and variance for a BGR frame or one box inside it.
+
+    Returns 12 numbers plus four labels: hue, saturation and brightness on
+    separate axes, and a combined ``color_name`` an LLM can repeat. The
+    variances answer "is this a flat patch or a busy one" (a lit ceiling
+    panel is bright *and* flat); ``hsv_mean[2]`` is the raw brightness a
+    lights-on check reads.
+    """
+    import cv2
+
+    region = _region(frame_bgr, bbox)
+    if region is None:
+        return {}
+    rgb = region[:, :, ::-1].reshape(-1, 3).astype(np.float32)
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+    rgb_mean, rgb_var = rgb.mean(axis=0), rgb.var(axis=0)
+    hsv_mean, hsv_var = hsv.mean(axis=0), hsv.var(axis=0)
+    h, sat, val = (float(v) for v in hsv_mean)
+    return {
+        "rgb_mean": [round(float(v), 1) for v in rgb_mean],
+        "rgb_var": [round(float(v), 1) for v in rgb_var],
+        "hsv_mean": [round(float(v), 1) for v in hsv_mean],
+        "hsv_var": [round(float(v), 1) for v in hsv_var],
+        "dominant_hue": dominant_hue(h, sat, val),
+        "dominant_saturation": dominant_saturation(sat),
+        "dominant_brightness": dominant_brightness(val),
+        "color_name": color_name(h, sat, val),
+    }
+
+
+COLOR_LEVELS = ("off", "name", "full")
+
+
+def _color_level(value) -> str:
+    """Normalise whatever `publish_color` was set to into one of COLOR_LEVELS.
+
+    Booleans are accepted because this reads as a switch and somebody will
+    eventually write `publish_color: true` in a yaml; mapping it to the default
+    level rather than refusing keeps that card running. An unrecognised string
+    falls back to the default too — a card that stops reporting colour because
+    of a typo would be diagnosed as a model problem, which is a long way from
+    the config line that caused it.
+    """
+    if value is None or value is True:
+        return "name"
+    if value is False:
+        return "off"
+    text = str(value).strip().lower()
+    return text if text in COLOR_LEVELS else "name"
+
+
+def color_block(frame_bgr, bbox, level: str) -> dict:
+    """The colour fields one streamed object carries, at the configured level.
+
+    Returns a dict to **merge into** the object, not to nest — so `off` is an
+    empty dict and the caller needs no branch.
+
+        off     nothing
+        name    {"color": "dim muted azure", "brightness": 120.9}
+        full    the twelve numbers and four labels of `color_stats`
+
+    `brightness` survives at the `name` level because it is the one *continuous*
+    colour value anything reads: the lights-on check wants `hsv_mean[2]` itself,
+    and six buckets cannot answer "is the room getting darker". Everything else
+    that level drops — `rgb_mean`, `rgb_var`, `hsv_var` — has, at the time of
+    writing, no reader anywhere in either repo, and answers "is this patch flat
+    or busy", which is a question asked of one photograph rather than five times
+    a second.
+
+    Why `name` is the default, and why the stream is worth trimming at all:
+    agent-core's topic subscriber puts a subscribed topic's **entire** message
+    into the event bus as an event's text (`agent-core/src/topic_subscriber.py`),
+    so every published byte is a byte of LLM context, per frame. Full colour is
+    239 of the 329 bytes an object used to cost — 73% of the payload, none of it
+    read by anything.
+    """
+    if level == "off":
+        return {}
+    if level == "full":
+        return {"color": color_stats(frame_bgr, bbox)}
+
+    import cv2
+
+    region = _region(frame_bgr, bbox)
+    if region is None:
+        return {}
+    h, s, v = (float(x) for x in
+               cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+                  .reshape(-1, 3).astype(np.float32).mean(axis=0))
+    return {"color": color_triple(h, s, v), "brightness": round(v, 1)}
+
+
 def output_topic_for(input_topic: Optional[str]) -> str:
     """The one place the output topic is derived from the input.
 
@@ -167,6 +358,13 @@ TOOLS = [
             "properties": {
                 "confidence": {"type": "number", "description": "Detection confidence threshold (0-1)", "default": 0.3, "scope": "instance"},
                 "fps":        {"type": "integer", "description": "Max inference frames per second", "default": 5, "scope": "instance"},
+                # Both govern the *streamed* payload only. The one-shot photo
+                # actions always answer in full: that reply is asked for once
+                # and read once, so nothing is gained by trimming it, and a
+                # caller who cannot see the frame has no other way to get the
+                # pixel box back.
+                "publish_bbox":  {"type": "boolean", "description": "在流式结果里带上像素框 [x1,y1,x2,y2]。关掉只剩中心点，下游想按目标区域采样另一张对齐的图（如深度图）就只能取一小块", "default": True, "scope": "instance"},
+                "publish_color": {"type": "string", "enum": list(COLOR_LEVELS), "description": "流式结果里的颜色详略：name=三元组+亮度（默认），full=全部 16 个字段，off=不发。每个对象每帧的差别是 27 B 与 239 B", "default": "name", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
@@ -181,7 +379,8 @@ class _VOPNode(Node):
     """Per-topic YOLO inference node."""
 
     def __init__(self, input_topic: Optional[str], model, confidence: float, fps: float,
-                 node_suffix: str, vocabulary: Optional[list] = None):
+                 node_suffix: str, vocabulary: Optional[list] = None,
+                 publish_bbox: bool = True, publish_color: str = "name"):
         super().__init__(f"vop_{node_suffix}" if node_suffix else "vop")
         # Topic-less is a supported mode, as in plugins/tts.py: a card driven
         # only by recognize_by_photo has no camera to subscribe to, but still
@@ -193,6 +392,8 @@ class _VOPNode(Node):
         self._vocabulary = list(vocabulary or [])
         self._confidence = confidence
         self._fps = fps
+        self._publish_bbox = bool(publish_bbox)
+        self._publish_color = publish_color if publish_color in COLOR_LEVELS else "name"
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
@@ -306,7 +507,7 @@ class _VOPNode(Node):
                 boxes, scores, classes = decode_detections(
                     outputs, meta, self._confidence
                 )
-                objects = self._extract_objects(boxes, scores, classes, frame.shape)
+                objects = self._extract_objects(boxes, scores, classes, frame)
                 self._publish_objects(objects, started)
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)
@@ -322,20 +523,35 @@ class _VOPNode(Node):
             return self._vocabulary[cls_id]
         return str(cls_id)
 
-    def _extract_objects(self, boxes, scores, classes, shape) -> list:
-        H, W = shape[:2]
+    def _extract_objects(self, boxes, scores, classes, frame) -> list:
+        # `frame` is the decoded BGR array; a bare shape tuple is still
+        # accepted (older callers and tests) and just yields no colour.
+        pixels = frame if hasattr(frame, "shape") else None
+        H, W = (pixels.shape if pixels is not None else frame)[:2]
         half_w, half_h = W / 2.0, H / 2.0
         objects = []
         for (x1, y1, x2, y2), score, cls_id in zip(boxes, scores, classes):
             cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            objects.append({
+            obj = {
                 "name": self._class_name(int(cls_id)),
                 "position": [
                     round(float((cx - half_w) / half_w), 3),
                     round(float((cy - half_h) / half_h), 3),
                 ],
                 "confidence": round(float(score), 2),
-            })
+            }
+            if self._publish_bbox:
+                # The pixel box, which this loop has had all along and used to
+                # throw away after computing the colour from it. A consumer that
+                # wants to sample another aligned map (a depth frame, say) over
+                # the object can only do it properly with the box: a centre point
+                # gives it one small patch and no idea how big the thing is.
+                obj["bbox"] = [round(float(v), 1) for v in (x1, y1, x2, y2)]
+            if pixels is not None:
+                # Colour of the box, so "the red ball" is answerable without
+                # the model ever seeing pixels. Level-dependent — see color_block.
+                obj.update(color_block(pixels, (x1, y1, x2, y2), self._publish_color))
+            objects.append(obj)
         return objects
 
     def publish_objects(self, objects: list, started: Optional[float] = None):
@@ -378,6 +594,8 @@ class VideoObjectPerceptionPlugin:
         self._plugin_cfg = dict(plugin_cfg or {})
         self._confidence = float(plugin_cfg.get("confidence", 0.3))
         self._fps = int(plugin_cfg.get("fps", 5))
+        self._publish_bbox = bool(plugin_cfg.get("publish_bbox", True))
+        self._publish_color = _color_level(plugin_cfg.get("publish_color"))
         self._model_name = canonical_model_name(plugin_cfg.get("model", DEFAULT_MODEL))
         self._vocabulary: list[str] = []      # filled from the bundle's vocab.json
         self._model = None  # lazy load
@@ -390,6 +608,12 @@ class VideoObjectPerceptionPlugin:
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _VOPNode] = {}
         self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
+        # What the camera feeding each instance said about its optics
+        # (`motus.camera/1`, arrives as `camera_info` on `start`). vop's
+        # `position` is a **normalised** lateral offset, so without a field of
+        # view it is a dimensionless number to everyone downstream; passing the
+        # declaration on is what makes it an angle. Guarded by `_nodes_lock`.
+        self._upstream_camera: dict[str, dict] = {}
         # Guards _nodes and _instance_configs. Every dispatch() runs on its own
         # ThreadingHTTPServer thread, so an unguarded read-modify-write of
         # _nodes can leave a started node unreachable — see
@@ -629,6 +853,7 @@ class VideoObjectPerceptionPlugin:
                 ],
                 "confidence": round(float(score), 2),
                 "bbox": [round(float(v), 1) for v in (x1, y1, x2, y2)],
+                "color": color_stats(frame, (x1, y1, x2, y2)),
             })
 
         # Echo onto the card's output topic when one is running, so a topic-less
@@ -652,6 +877,9 @@ class VideoObjectPerceptionPlugin:
             # {topic}/objects cannot disagree about how long this took.
             "latency_ms": int((time.time() - started) * 1000),
             "objects": objects,
+            # Whole-frame statistics: an empty room has no boxes, but a
+            # lights-on check still needs a brightness number to read.
+            "frame_color": color_stats(frame),
         }
         return result
 
@@ -692,19 +920,47 @@ class VideoObjectPerceptionPlugin:
             icfg = self._instance_configs.get(node_key, {})
             confidence = float(icfg.get("confidence", self._confidence))
             fps = int(icfg.get("fps", self._fps))
+            publish_bbox = bool(icfg.get("publish_bbox", self._publish_bbox))
+            publish_color = (_color_level(icfg["publish_color"])
+                             if "publish_color" in icfg else self._publish_color)
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
             input_for_node = input_topic or None
             node = _VOPNode(input_for_node, self._model, confidence, fps,
-                            node_suffix=suffix, vocabulary=self._vocabulary)
+                            node_suffix=suffix, vocabulary=self._vocabulary,
+                            publish_bbox=publish_bbox, publish_color=publish_color)
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
         log.info(f"[vop] node started (background): {input_topic}")
 
+    def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
+        """`{"camera_info": [...]}` for an `info()` answered while loading.
+
+        Recorded at `start`, which happens before the engine begins loading, so
+        it is available here — the only reason it was ever missing is that this
+        reply returned early.
+        """
+        from plugins.camera_info import inherit
+
+        topic = args.get("input_topic") or ""
+        if not topic:
+            topics = args.get("input_topics") or []
+            topic = topics[0] if topics else ""
+        key = instance_id or topic or _DEFAULT_INSTANCE
+        with self._nodes_lock:
+            upstream = self._upstream_camera.get(key) or {}
+        declared = inherit(upstream, topic=output_topic_for(topic),
+                           fmt="data/json", stage="perception/vop")
+        return {"camera_info": declared} if declared else {}
+
     def _retire_node(self, node_key: str) -> Optional[dict]:
         """Stop, unregister and destroy one node. Returns its stop() result."""
         with self._nodes_lock:
             node = self._nodes.pop(node_key, None)
+            # Goes with the node: a re-wired card answering info() with the
+            # optics of a camera it is no longer fed by is worse than answering
+            # with nothing, because downstream cannot tell the difference.
+            self._upstream_camera.pop(node_key, None)
         if node is None:
             return None
         node.request_stop()
@@ -754,6 +1010,17 @@ class VideoObjectPerceptionPlugin:
                     "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
                     "state": "loading",
                     "desc": "Loading YOLO model...",
+                    # **The declaration does not wait for the engine.**
+                    #
+                    # This reply used to drop it, and agent-core records
+                    # whatever `info()` returns — so a consumer that started
+                    # while this card was still loading got no camera
+                    # declaration at all, and nothing said so. On r1_sz that
+                    # cost navi its box path and the corridor's real geometry,
+                    # and it only ever reproduced on a *cold* container, because
+                    # a warm one starts immediately and never passes through
+                    # here.
+                    **self._loading_camera_info(args, instance_id),
                 }
             if self._model_load_error:
                 return {
@@ -770,6 +1037,8 @@ class VideoObjectPerceptionPlugin:
                     "output": node._output_topic,
                     "confidence": node._confidence,
                     "fps": node._fps,
+                    "publish_bbox": node._publish_bbox,
+                    "publish_color": node._publish_color,
                     "detect_count": node._detect_count,
                 }
             # Determine topic info: from running instance, args, or empty
@@ -810,6 +1079,36 @@ class VideoObjectPerceptionPlugin:
             if self._rejected_classes:
                 info["ignored_config_classes"] = self._rejected_classes
                 info["warning"] = self._frozen_vocab_error(self._rejected_classes)
+
+            # Pass the camera's optics on. Nothing about the picture's geometry
+            # changes here — vop reads the frame and publishes text — so the
+            # declaration goes through with only `pipeline` extended, and in
+            # particular `width`/`height` and `K` are left exactly as they came.
+            #
+            # It matters twice downstream. navi needs a field of view to turn
+            # `position` into an angle at all; and it compares the `id` on this
+            # port against the one on its depth input, which is the only thing
+            # that catches camera A's detections being paired with camera B's
+            # distances — wirable today, and wrong in a way nothing logs.
+            if topics_out:
+                from plugins.camera_info import inherit
+                # Same key derivation `start` uses, so info() looks up the entry
+                # that start recorded.
+                key = instance_id if instance_id in nodes else (
+                    next(iter(nodes), None) if nodes
+                    else (instance_id or input_topic or _DEFAULT_INSTANCE))
+                with self._nodes_lock:
+                    upstream = self._upstream_camera.get(key) or {}
+                declared = inherit(upstream, topic=topics_out[0]["topic"],
+                                   fmt="data/json", stage="perception/vop")
+                if declared:
+                    info["camera_info"] = declared
+                elif input_topic:
+                    info["camera_info_note"] = (
+                        "上游相机没有声明 camera_info —— 本卡片报的 position 是归一化"
+                        "横向偏移，下游拿不到视场角就没法换算成角度，而导航的避障走廊"
+                        "宽度正是按这个角度算的。相机卡片补上声明即可，见 "
+                        "phanthymotus-driver/README_dev.md 的 Camera Parameters")
             return info
 
         elif action == "start":
@@ -823,6 +1122,14 @@ class VideoObjectPerceptionPlugin:
             # recognize_by_photo / recognize_by_url. It just has nothing to
             # subscribe to, so it consumes no frames.
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+            # Recorded before the node starts, and recorded even when empty, so a
+            # restart that no longer carries a declaration replaces the old entry
+            # rather than leaving one that claims a camera no longer wired.
+            if input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
+                with self._nodes_lock:
+                    self._upstream_camera[node_key] = _camera_for_topic(
+                        args.get("camera_info"), input_topic)
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
             if running is None:
@@ -929,6 +1236,10 @@ class VideoObjectPerceptionPlugin:
                     self._confidence = float(cfg["confidence"])
                 if "fps" in cfg:
                     self._fps = int(cfg["fps"])
+                if "publish_bbox" in cfg:
+                    self._publish_bbox = bool(cfg["publish_bbox"])
+                if "publish_color" in cfg:
+                    self._publish_color = _color_level(cfg["publish_color"])
                 return {"status": "configured", "config": cfg}
 
         return None

@@ -82,6 +82,9 @@ class Recorder:
         self.waypoints = [str(w) for w in (waypoints or [])]
         self._lock = threading.RLock()
         self._started = time.time()
+        # 调用方要把这份记录搬到别的时钟上时需要知道零点在哪
+        # （`benchmark_runner.SimulatorWorld._align`）。
+        self.started = self._started
         self._events: list[dict] = []
         self._acp_posts: list[dict] = []
         # action_id → 派发时记下的东西。结算时查不到 mcp_client 那几张表了

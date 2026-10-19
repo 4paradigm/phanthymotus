@@ -31,6 +31,31 @@ import prompt as prompt_mod
 from api.motus_stream import push_event
 
 
+# 活动面板里一条触发事件能有多长。
+#
+# **原先是 200 字，而且只留开头。** 对一句人说的话够用，对 ACP 的完成事件正好切在
+# 最有用的地方 —— `{"type": "action_complete", "action_id": …, "status": "failed",
+# "result": {"status": "failed", "reason": …}}` 的样板部分就占掉一百八十几个字符，
+# `reason` 在最后面，于是面板上永远停在 `"reaso`。而 `reason` 恰恰是唯一不能从别处
+# 推出来的东西（「目标丢失」和「被挡住十几秒动不了」该做的下一步完全相反）。
+#
+# 这和 `collector._slim_acp_result` 修过的是同一类错，只是那次修的是送进 LLM 的那
+# 一份，面板这一份被漏掉了。所以这里不只是把数字调大：超长时**两头都留**，并写明
+# 中间省了多少 —— 不写明的话，半句话看起来就是全部。
+_ACTIVITY_TEXT_CHARS = 2000
+_ACTIVITY_TEXT_TAIL = 600
+
+
+def _activity_text(text) -> str:
+    text = str(text or '')
+    if len(text) <= _ACTIVITY_TEXT_CHARS:
+        return text
+    head = _ACTIVITY_TEXT_CHARS - _ACTIVITY_TEXT_TAIL
+    dropped = len(text) - _ACTIVITY_TEXT_CHARS
+    return (f'{text[:head]}\n…（中间省略 {dropped} 字）…\n'
+            f'{text[-_ACTIVITY_TEXT_TAIL:]}')
+
+
 def _decoded_json(value):
     """Unwrap a JSON string into the value it encodes, or return it unchanged.
 
@@ -187,34 +212,118 @@ def _compact_turn(turn: list[dict]) -> list[dict]:
     return out
 
 
+_ELIDED = '…(略)'
+
+
+def _elide_arguments(args, value_chars: int = 40, max_chars: int = 400) -> str:
+    """把一条 tool_call 的 arguments 压短，且压完仍是**合法 JSON**。
+
+    `arguments` 按 OpenAI schema 是一个 JSON *字符串*，不是自由文本。所以
+    `args[:100] + '...'` 这种切法压出来的东西看着只是"短了点"，实际是
+    `{"text": "很长的一段话"}` 被切成 `{"text": "很长的一...` —— 引号和花括号
+    都没闭合。严格的服务端直接 400（`messages[N].tool_calls[M].function.arguments`），
+    而那类 400 在 `_classify_error` 里被判为不可重试，于是整个 turn 被丢掉；
+    宽松的服务端不报错，但模型读到的是一段坏掉的 JSON。
+
+    更糟的是这个损坏会**留下来**：`turn_messages` 就是 `self._current_turn`
+    （见 `_one_turn` 里的 alias），压缩是原地改的，改完随 turn 一起进内存历史和
+    SQLite，之后每一轮请求都把它再带回去一次。
+
+    这里改成按结构压：解析出来，逐个字段留键、截值，再 dump 回去。省下来的字数
+    和粗暴切片相当，但结果永远能被解析。解析不出来的（模型自己就写歪了）退回
+    `{}` —— 一个空对象是合法的，坏掉的半截不是。
+    """
+    if not isinstance(args, str):
+        return '{}'
+    if len(args) <= max_chars:
+        return args
+    try:
+        parsed = json.loads(args)
+    except (ValueError, TypeError):
+        return '{}'
+    if not isinstance(parsed, dict):
+        return '{}'
+
+    def _shrink(value):
+        if isinstance(value, str) and len(value) > value_chars:
+            return value[:value_chars] + _ELIDED
+        if isinstance(value, (list, dict)):
+            return _ELIDED
+        return value
+
+    out = {k: _shrink(v) for k, v in parsed.items()}
+    dumped = json.dumps(out, ensure_ascii=False)
+    if len(dumped) > max_chars:
+        # 字段太多，值再短也压不下来：只留键名。标量（数字、布尔）原样留着 ——
+        # 它们本来就短，而把 limit=5 写成 "…(略)" 等于顺手改了类型。
+        dumped = json.dumps(
+            {k: (v if isinstance(v, (int, float, bool)) or v is None else _ELIDED)
+             for k, v in out.items()},
+            ensure_ascii=False)
+    return dumped
+
+
 def _scrub(message_list: list[dict]) -> list[dict]:
-    """丢弃结构非法的 tool_call，以及随之失去归属的 tool 结果。
+    """丢弃结构非法的 tool_call、非法的 arguments，以及失去归属的 tool 结果。
 
     glm 偶发在正常 tool_call 后追加一条 id/name 均为空串的条目。它一旦落盘，
     历史续跑会把它一路带回去，之后每次请求都被服务端 400
     （messages[N].tool_calls[M].function missing required field "name"），
     直到那一轮从 tier1/tier2 里滚出去为止——表现就是「这台机器总是报错」。
+
+    另外两类损坏是**我们自己压缩出来的**，所以这里一并兜底 —— 不只是防御，
+    更是给已经中毒的历史一条修复路径：已部署机器的 `data.db` 里躺着的坏记录，
+    光改压缩函数是修不好的，得在读回来的路上洗掉。
+
+    - `arguments` 不是合法 JSON：修成 `'{}'` 而不是丢掉整个调用。调用一旦丢了，
+      跟它配对的 tool 结果就成了孤儿，等于把一个 400 换成另一个 400。
+    - 孤儿 tool 结果：`role: 'tool'` 的消息必须紧跟在声明了同一个 `tool_call_id`
+      的 assistant 之后，否则服务端拒绝整个请求。tier2 的 `_degrade_turn` 曾经
+      把 assistant 的 `tool_calls` 整个删掉却留着结果，Orin5 上 212 份留存请求里
+      有 25 份带着这种孤儿，最多一份里有 12 条。
     """
     from client.llm import _valid_tool_call
-    orphaned: set = set()
+    declared: set = set()
     out: list[dict] = []
     for msg in message_list:
+        # 内部字段不能进请求体。`_usage` 是我们自己挂在 assistant 消息上给历史 modal
+        # 看的，落盘后又随历史一路带回请求里 —— Orin5 留存的 212 份请求有 139 份的
+        # messages 里带着它。按 OpenAI 的 message schema 它是未知字段，宽松的服务端
+        # 忽略，严格的直接拒。存盘照存，出门之前摘掉。
+        if any(k.startswith('_') for k in msg):
+            msg = {k: v for k, v in msg.items() if not k.startswith('_')}
         if msg.get('role') == 'assistant' and msg.get('tool_calls'):
-            good = [tc for tc in msg['tool_calls'] if _valid_tool_call(tc)]
-            if len(good) != len(msg['tool_calls']):
-                orphaned.update(
-                    tc.get('id') for tc in msg['tool_calls']
-                    if isinstance(tc, dict) and not _valid_tool_call(tc)
-                )
+            good = []
+            for tc in msg['tool_calls']:
+                if not _valid_tool_call(tc):
+                    continue
+                fn = tc['function']
+                args = fn.get('arguments')
+                if args not in (None, '') and not _is_json_object(args):
+                    tc = {**tc, 'function': {**fn, 'arguments': '{}'}}
+                good.append(tc)
+            if good != msg['tool_calls']:
                 msg = {k: v for k, v in msg.items() if k != 'tool_calls'}
                 if good:
                     msg['tool_calls'] = good
                 elif not msg.get('content'):
                     continue  # 既无文本也无有效调用，整条丢掉
-        elif msg.get('role') == 'tool' and msg.get('tool_call_id') in orphaned:
+            declared.update(tc['id'] for tc in good)
+        elif msg.get('role') == 'tool' and msg.get('tool_call_id') not in declared:
             continue
         out.append(msg)
     return out
+
+
+def _is_json_object(args) -> bool:
+    """arguments 能不能被服务端当 JSON 解析出来。"""
+    if not isinstance(args, str):
+        return False
+    try:
+        json.loads(args)
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 def _sanitize(message_list: list[dict]) -> list[dict]:
@@ -301,6 +410,38 @@ def _missed_channel_reply_warning(trigger_event: dict, replied_message_ids: set[
         return ''
     return (f'{len(missed)} channel message(s) in this batch got no channel_reply: '
             f'{json.dumps(missed, ensure_ascii=False)}')
+
+
+def _not_dispatched(name: str, acp_result: dict | None) -> dict:
+    """barrier 没放行时，这次调用的工具结果。
+
+    **这条调用没有发给设备** —— 没有发声、没有动作、设备侧什么都没发生。原先三种
+    状态共用一句 `barrier wait interrupted before dispatch (status=timeout)`，LLM 把
+    它读成了成功：天轶 2026-10-15 的导览里，结束语的 speak 在 barrier 超时后被丢掉，
+    下一轮模型的原话是「结束语已播放完毕」，然后 finish() 收工 —— 而那段话一个字都
+    没播出去。
+
+    所以这里按状态分开说，并且把 `error` 放在顶层：模型对 `status` 的语义不敏感，
+    对 `error` 敏感。timeout 还要显式要求重发，这是唯一一种「该做的事没做、而且没人
+    会替你做」的情况。
+    """
+    status = (acp_result or {}).get('status')
+    aids = (acp_result or {}).get('actions') or []
+    aid_txt = ','.join(str(a) for a in aids) or '(未知)'
+    base = {"status": "not_dispatched", "dispatched": False, "tool": name}
+    if status == 'timeout':
+        return {**base,
+                "error": f"未执行：等 {aid_txt} 超时，`{name}` 没有发给设备。"
+                         f"没有发声、没有动作，设备侧什么都没发生。前一个动作可能仍在"
+                         f"进行。确认仍然需要这一步时请重新调用一次。",
+                "retry": True}
+    if status == 'cancelled':
+        return {**base,
+                "error": f"未执行：等待期间被打断（通常是用户插话或 interrupt），"
+                         f"`{name}` 没有发给设备。请先按新的输入重新判断，不要默认重发。"}
+    return {**base,
+            "reason": f"barrier wait interrupted before dispatch (status={status})",
+            "error": f"未执行：`{name}` 没有发给设备（barrier status={status}）。"}
 
 
 def _acp_barrier_log(name: str, acp_result: dict | None) -> None:
@@ -1140,7 +1281,19 @@ def _waiting_facts() -> str:
 # ── Tiered Retention helpers ──────────────────────────────────────────────────
 
 def _degrade_turn(turn: list[dict]) -> list[dict]:
-    """降质 turn：tool results 截短，tool_calls 只留名称列表。用于 tier2 历史。"""
+    """降质 turn：tool results 截短，tool_calls 的 arguments 压短。用于 tier2 历史。
+
+    **tool_calls 必须留着。** 这里以前把它整个换成一行 `[调用: a, b]` 文本，但
+    后面那几条 `role: 'tool'` 结果原样留在列表里 —— 于是每个滚进 tier2 的 turn
+    都产出一批孤儿 tool 消息（`tool_call_id` 指向一个请求里根本不存在的调用）。
+    `_sanitize` 只管末尾未被回应的调用，`_scrub` 当时只管结构非法的调用，两个都
+    漏掉了这种。Orin5 留存的 212 份请求里 25 份带着这种孤儿，单份最多 12 条 ——
+    而留存目录里只有**成功**的请求，失败的那些根本不落盘，所以真实比例只会更高。
+    glm 容忍了它，严格按 OpenAI 语义校验的服务端会整个 400 掉。
+
+    省字数的目的靠压 arguments 达成，代价是每个调用多留几十个字符 —— 相比一条
+    tool 结果本身微不足道。
+    """
     degraded = []
     for msg in turn:
         if msg.get('role') == 'tool':
@@ -1150,16 +1303,25 @@ def _degrade_turn(turn: list[dict]) -> list[dict]:
             elif isinstance(content, list):
                 msg = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
-            names = [tc['function']['name'] for tc in msg['tool_calls']]
-            text = msg.get('content', '') or ''
-            msg = {'role': 'assistant', 'content': (text + '\n[调用: ' + ', '.join(names) + ']').strip()}
+            msg = {**msg, 'tool_calls': [
+                {**tc, 'function': {
+                    **tc['function'],
+                    'arguments': _elide_arguments(tc['function'].get('arguments', ''),
+                                                  value_chars=20, max_chars=80),
+                }}
+                for tc in msg['tool_calls']
+            ]}
         degraded.append(msg)
     return degraded
 
 
 def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> None:
     """Turn 内 compaction：保留最近 keep_recent 条完整，早期消息的 tool results 截短。
-    直接修改 turn_messages（in-place）。"""
+    直接修改 turn_messages（in-place）。
+
+    注意这个 in-place 不只影响这一次请求：`turn_messages` 就是 `self._current_turn`
+    （`_one_turn` 里的 alias），压完的内容会随 turn 进内存历史和 SQLite。所以这里
+    写坏一条 arguments，坏的就是之后每一次请求 —— 见 `_elide_arguments`。"""
     if len(turn_messages) <= keep_recent:
         return
     # 只压缩 [0 : -keep_recent] 范围内的消息
@@ -1173,12 +1335,14 @@ def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> 
             elif isinstance(content, list):
                 turn_messages[i] = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
-            # 保留 tool_calls 结构（API 需要），但截短 arguments
+            # 保留 tool_calls 结构（API 需要），但截短 arguments —— 按结构压，
+            # 不能直接切片，切出来的半截 JSON 服务端不收。
             new_calls = []
             for tc in msg['tool_calls']:
                 args = tc.get('function', {}).get('arguments', '')
-                if len(args) > 100:
-                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': args[:100] + '...'}}
+                elided = _elide_arguments(args, value_chars=30, max_chars=100)
+                if elided != args:
+                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': elided}}
                 else:
                     new_tc = tc
                 new_calls.append(new_tc)
@@ -1442,6 +1606,7 @@ class Event:
             ('update_memory', event.memory.update),
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
+            ('skill_file', event.skills.skill_file),
             ('set_auto_narration', event.skills.set_auto_narration),
             ('set_progress_report', event.skills.set_progress_report),
             ('task_create', event.task.task_create),
@@ -1578,8 +1743,18 @@ class Event:
 
     # ── 打断：中止正在进行的输出 ─────────────────────────────────────────────
 
-    async def _interrupt_active_outputs(self, reason: str = ''):
-        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled / 新用户 turn 时调用。
+    async def _interrupt_active_outputs(self, reason: str = '',
+                                        scope: frozenset | None = None):
+        """中止正在进行的输出（TTS + 动作）。在 TurnCancelled / 新用户 turn 时调用。
+
+        `scope` 是这次打断**有权**碰的物理通道，None = 全部（急停、TurnCancelled）。
+        通道名不写在这里 —— 由 `hooks.notify_resources(hook_id)` 从绑定自己申报的
+        `x-resource` 推出来，和 `on_notify` 的判断同一条规则（「不能按工具名猜，机器人
+        的嘴叫 tts / speaker / audio_play 各有各的叫法」）。
+
+        加 scope 的原因：这个函数原先无条件 `for aid in _pending_actions` 全标 cancelled。
+        一旦有「长时间后台播放」这种动作（音乐），「别说了」就会把它的 pending 一起标
+        掉 —— 播放器还在放，而 agent-core 认为通道空了，之后没有任何东西知道它还在响。
 
         **hook 与硬编码兜底都跑，不是二选一。** 这两条路覆盖的是**不相交**的两组
         卡片：hook 覆盖「自己声明了 `on_interrupt_all` 绑定」的卡，兜底覆盖「叫
@@ -1606,8 +1781,15 @@ class Event:
         import hooks
         from peer import mcp_bridge
 
+        # on_interrupt_all **和** on_interrupt_speak 都发。后者被 tts / 模拟器 / 天轶
+        # 的卡申报了很久，而 agent-core 生产代码里一次都没有 fire 过它 —— 只有测试手动
+        # 发过。一个只绑了 on_interrupt_speak 的卡（比如混音卡的 flush_speech）在今天
+        # 的代码里永远收不到打断。
+        _hook_ids = ('on_interrupt_all', 'on_interrupt_speak')
         try:
-            hook_results = await hooks.fire('on_interrupt_all')
+            hook_results = []
+            for _hid in _hook_ids:
+                hook_results += await hooks.fire(_hid) or []
         except Exception as exc:
             # 打断路径是最不该抛异常的地方：它跑在 TurnCancelled 处理里，抛出去就
             # 连兜底一起丢了 —— 而兜底恰恰是这时候唯一还能停住机器人的东西。
@@ -1651,7 +1833,12 @@ class Event:
             if mcp_bridge.is_peer_mcp(mcp_id):
                 continue
             tools = info.get('tools', [])
-            for short_name, action in (('tts', 'interrupt'), ('loco', 'stop_move')):
+            # 兜底也受 scope 约束：一次「别说了」不该顺手停掉底盘。叫 phanthy_music
+            # 的卡**故意**不列在这里 —— 停歌只走 on_interrupt_music。
+            _fallback = (('tts', 'interrupt'), ('loco', 'stop_move'))
+            if scope is not None:
+                _fallback = tuple(p for p in _fallback if p[0] == 'tts')
+            for short_name, action in _fallback:
                 if short_name in tools and (mcp_id, short_name) not in covered:
                     tasks.append((f'{mcp_id}:{short_name}',
                                   mcp_client.call_tool_direct(mcp_id, short_name,
@@ -1674,7 +1861,7 @@ class Event:
         # bound, so a robot with no binding kept its pending ACP actions blocked —
         # the barrier never released — and the silence countdown kept running
         # through a barge-in.
-        for aid in list(mcp_client._pending_actions.keys()):
+        for aid in mcp_client.cancellable_by(scope):
             if reason:
                 mcp_client._pending_results[aid] = {'status': 'cancelled', 'reason': reason}
             mcp_client._pending_actions[aid].set()
@@ -2109,12 +2296,18 @@ class Event:
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
         # 自己触发的 turn（subagent 完成 / ACP 回调 / 定时器）不打断：那会掐掉
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
-        if (mcp_client.get_pending_actions() and not bot_restricted
+        # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
+        # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
+        if (mcp_client.has_blocking_pendings() and not bot_restricted
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
             # hook 被触发两遍；而有绑定时兜底被整个跳过。两个问题同源：把 hook 和
             # 兜底当成了二选一，它们覆盖的其实是不相交的两组卡片。
+            # scope 故意留 None（打断一切，含底盘）。把它收窄成「只停嘴」很诱人 ——
+            # 新消息通常只是想让机器人别说了 —— 但这个函数的兜底是本机**唯一**会停
+            # 底盘的路径（见它的 docstring），收窄就等于用户开口不再能叫停正在走的
+            # 机器人。音乐不需要靠收窄来保护：cancellable_by 本身就放过后台动作。
             await self._interrupt_active_outputs(
                 reason='auto-interrupted by new user message')
 
@@ -2129,7 +2322,7 @@ class Event:
         await push_event({
             'type':    'trigger',
             'mcp_id':  trigger_event.get('source', ''),
-            'payload': {'text': trigger_event.get('text', '')[:200]},
+            'payload': {'text': _activity_text(trigger_event.get('text', ''))},
         })
 
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
@@ -2386,7 +2579,21 @@ class Event:
             async def _dispatch(call: dict) -> dict:
                 nonlocal _finish_deferred, _channel_replied
                 name   = call['function']['name']
-                args   = json.loads(call['function']['arguments'] or '{}')
+                # 模型写歪 arguments（被 max_tokens 截断、或者干脆不是 JSON）是随机
+                # 发生的。这里以前不设防，一次 JSONDecodeError 直接冒到 run_forever
+                # 的兜底 except，整个 turn 连同已经做完的活一起丢掉，日志里只留一行
+                # `[错误] JSONDecodeError`。改成把错误当工具结果还给模型 —— 它下一轮
+                # 自己就能改对，turn 不必因此报废。
+                try:
+                    args = json.loads(call['function']['arguments'] or '{}')
+                except (json.JSONDecodeError, TypeError) as _ae:
+                    raw = str(call['function'].get('arguments'))[:200]
+                    print(f'[decision] malformed arguments for {name}: {_ae}; raw={raw!r}')
+                    await push_event({'type': 'error', 'payload': {
+                        'message': f'malformed tool arguments for {name}: {_ae}'}})
+                    return {'id': call['id'], 'result':
+                            f'Error: arguments for {name} were not valid JSON ({_ae}). '
+                            f'Call the tool again with a well-formed JSON object.'}
                 # Set by either barrier branch below, when a barrier wait was cut short
                 # by reconsider_event rather than genuinely completing. Lets the caller
                 # tell "interrupted before it ever reached the device, still had made
@@ -2443,11 +2650,7 @@ class Event:
                                           "请结合新消息继续处理，不要重复已经说过的内容。",
                             }
                         else:
-                            result = {
-                                "status": "not_dispatched",
-                                "reason": f"barrier wait interrupted before dispatch "
-                                          f"(status={_barrier_result.get('status')})",
-                            }
+                            result = _not_dispatched(name, _barrier_result)
                     else:
                         result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
@@ -2470,8 +2673,7 @@ class Event:
                         # still legitimately in flight; the caller decides whether to
                         # void this whole round (reconsidering, nothing dispatched
                         # yet) or just record it as not-dispatched.
-                        result = {"status": "not_dispatched",
-                                  "reason": f"barrier wait interrupted before dispatch (status={_barrier_result.get('status')})"}
+                        result = _not_dispatched(name, _barrier_result)
                         _reconsidered = (_barrier_result.get('status') == 'reconsidering')
                     else:
                         args['_trace_id'] = _trace_id
@@ -2490,7 +2692,14 @@ class Event:
                             _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
                             _act = _split.get('action', args.get('action', ''))
                             if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
-                                for aid in list(mcp_client._pending_actions.keys()):
+                                # 取消范围从「这个工具挂在哪个 interrupt hook 下」推出来：
+                                # on_interrupt_all 是整体打断（None = 全部），其余按那个
+                                # hook 的绑定申报的通道。于是 tts.interrupt 碰不到音乐的
+                                # pending，phanthy_music.stop_music 也碰不到嘴的。
+                                _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
+                                _scope = (None if _hook_id == 'on_interrupt_all'
+                                          else _hooks.notify_resources(_hook_id))
+                                for aid in mcp_client.cancellable_by(_scope):
                                     mcp_client._pending_results[aid] = {
                                         "status": "cancelled",
                                         "reason": "interrupted by user instruction",
@@ -2498,10 +2707,11 @@ class Event:
                                     mcp_client._pending_actions[aid].set()
                                 _stop_countdown()   # 打断 = 用户在说话，不是沉默的起点
                                 # Fire hook to notify ALL registered parties (e.g. perception TTS)
-                                _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
                                 if _hook_id:
                                     asyncio.create_task(_hooks.fire(_hook_id, exclude_mcp_id=_mcp_id))
-                                print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
+                                print(f'[acp] interrupt: cancelled pending + fired {_hook_id} '
+                                      f'(source: {_tool}.{_act}, scope='
+                                      f'{",".join(sorted(_scope)) if _scope else "all"})')
                 else:
                     result = f'未知工具: {name}'
 
@@ -2673,6 +2883,10 @@ class Event:
                       'turn continues (audio keeps playing)')
 
             # ── Rebuild frozen_system if skill state changed (activate/deactivate) ─
+            # `skill_file` is deliberately absent: it returns content as a tool
+            # result, it does not change what is *in* the system prompt. Listing
+            # it here would rebuild the frozen system prompt on every file read
+            # and throw away the prompt cache for nothing.
             skill_tools = {'activate_skill', 'deactivate_skill'}
             if any(c['function']['name'] in skill_tools for c in tool_calls):
                 frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)

@@ -523,7 +523,20 @@ def _resolve_msg_type(fmt: str):
         except ImportError:
             pass
         return None
-    if fmt in ('json', 'data/json') or fmt.startswith('sensor/') or fmt.startswith('data/'):
+    # `control/*` is the command stream an execution model sends to a driver
+    # (motus.control/1); `state/*` is what a driver reports about itself
+    # (motus.odom/1 and friends). Both are JSON inside a std_msgs/String, like
+    # the perception cards — spec in phanthymotus-driver/README_dev.md.
+    #
+    # Neither prefix used to be in this table, and the only consequence was one
+    # line on stderr: an unresolved format means the subscription is silently
+    # abandoned, so the topic stays registered in inspection, the producer keeps
+    # publishing at 10 Hz, and the canvas data-flow panel is empty for ever.
+    # That was navi on r1_sz — subscribing with rclpy received the commands
+    # while the panel showed nothing.
+    if (fmt in ('json', 'data/json') or fmt.startswith('sensor/')
+            or fmt.startswith('data/') or fmt.startswith('control/')
+            or fmt.startswith('state/')):
         try:
             from std_msgs.msg import String
             return String
@@ -540,12 +553,21 @@ def _resolve_msg_type(fmt: str):
             pass
         return None
     if fmt == 'image/depth-z16':
-        try:
-            from sensor_msgs.msg import Image
-            return Image
-        except ImportError as e:
-            print(f'[ros2_bridge] cannot import Image: {e}', file=sys.stderr)
-            pass
+        # Retired. Every driver that published it already produced exactly
+        # 640x480 little-endian 16UC1 — the zlib form's contract — and the raw
+        # form costs ~614 KB/frame, which saturates ARM64 CPU on DDS
+        # serialization. Converted in phanthymotus-driver#419.
+        #
+        # **Said out loud rather than returning None quietly.** An unmapped
+        # format means the topic is never subscribed, so the panel is simply
+        # blank — and a robot still running a pre-#419 driver image lands here
+        # exactly. One printed line is the difference between "the depth card
+        # is broken" and "that robot needs a newer driver image".
+        print(f'[ros2_bridge] image/depth-z16 is retired and will not be '
+              f'subscribed. This machine is publishing raw z16 depth, which '
+              f'means its driver image predates phanthymotus-driver#419 — '
+              f'update it and the topic becomes image/depth-zlib.',
+              file=sys.stderr)
         return None
     if fmt == 'image/depth-zlib':
         try:

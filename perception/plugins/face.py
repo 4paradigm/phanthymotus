@@ -18,7 +18,7 @@ What this plugin adds over OCR:
 * **A 3-second rolling frame window** per instance. `register_by_stream`
   analyses every frame in it rather than one grab, so a blink, a turned head or
   one motion-blurred frame does not decide the enrolment.
-* **A persistent identity database** (`plugins/face_db.py`), shared by all
+* **A persistent identity database** (`plugins/identity_db.py`), shared by all
   instances of the plugin, holding embeddings, names, free-form profiles and a
   visit log.
 * **Structured failure reasons.** Enrolment fails for mundane physical reasons
@@ -30,6 +30,7 @@ What this plugin adds over OCR:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -50,6 +51,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.cv2_compat import load_cv2
 from utils.latest_frame import LatestFrame
 from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
@@ -67,19 +69,24 @@ from plugins.image_input import (
     load_image_bytes as _load_image_bytes_shared,
     read_local as _read_local,
 )
-from plugins.face_db import (
-    DEFAULT_DB_DIR,
+# The identity store is modality-agnostic (see its module docstring); face
+# supplies the dimension, the directory and the log label. `plugins/speaker.py`
+# constructs the same class with 192 dims for voiceprints.
+from plugins.identity_db import (
     DEFAULT_VISIT_CHECKPOINT_S,
     DEFAULT_MAX_SAMPLES_PER_PERSON,
     DEFAULT_UNKNOWN_CAPACITY,
     DEFAULT_VISIT_GAP_S,
     DEFAULT_VISIT_LOG_MAX,
-    FaceDB,
+    IdentityDB,
     is_unknown_id,
 )
 from plugins.face_proxy import FaceServiceProxy
 from plugins.face_runtime import (
+    DEFAULT_DB_DIR,
     DEFAULT_FACE_MODEL,
+    DEFAULT_MATCH_THRESHOLD,
+    EMBEDDING_DIM,
     FACE_MODELS,
     DEFAULT_BLUR_MIN,
     DEFAULT_MAX_IMAGE_PIXELS,
@@ -91,6 +98,8 @@ from plugins.face_runtime import (
     DEFAULT_NMS_THRESH,
     DetectedFace,
     FaceAnalyzer,
+    default_match_threshold,
+    face_db_dir_for,
 )
 
 log = logging.getLogger(__name__)
@@ -98,7 +107,10 @@ log = logging.getLogger(__name__)
 _ERROR_LOG_INTERVAL_SECONDS = 10.0
 _SEEN_FLUSH_INTERVAL_SECONDS = 300.0
 
-DEFAULT_MATCH_THRESHOLD = 0.35
+# DEFAULT_MATCH_THRESHOLD is re-exported from plugins.face_runtime, where it is
+# derived from the default model's row: the right cosine threshold depends on which
+# embedding space is in use, so it cannot be a constant here. `_gates` resolves it
+# per configured model via `default_match_threshold`.
 DEFAULT_SUBJECT_DOMINANCE = 1.6
 DEFAULT_MAX_FACES = 8
 DEFAULT_DETECT_FPS = 1.0
@@ -269,10 +281,11 @@ TOOLS = [
                 # reading the card has no way to know it means SCRFD-500M + ArcFace
                 # MobileFaceNet. Generated from the registry so a second entry
                 # documents itself.
+                "auto_migrate_roster": {"type": "boolean", "default": True, "description": "引擎加载后在后台把另一个模型的花名册迁移到当前模型（用已存的人脸切图重算 embedding）。不阻塞识别——引擎先服务、花名册边跑边补，进度在 info 的 migration 字段里。每个(切图,模型)只算一次并永久保存，所以来回切模型不会重算。**这是唯一的迁移入口**：关掉就不迁移，换模型后需要重新录入每个人"},
                 "model":             {"type": "string", "enum": sorted(FACE_MODELS), "default": DEFAULT_FACE_MODEL, "description": "识别模型：" + "；".join(f"{name} = {spec['description']}" for name, spec in sorted(FACE_MODELS.items())) + "。切换模型会重新加载，并使已存样本失效——不同网络的 embedding 不可比较，已注册人员需重新录入"},
                 "device":            {"type": "string", "enum": ["auto", "cpu", "gpu"], "default": "auto", "description": "推理设备。auto=有 GPU 用 GPU，没有则用 CPU"},
                 "detect_fps":        {"type": "number", "minimum": 0, "default": DEFAULT_DETECT_FPS, "description": "检测频率，每秒 x 次，支持小数（如 0.5 = 每 2 秒一次）；0=每帧都检测", "scope": "instance"},
-                "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）"},
+                "match_threshold":   {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": DEFAULT_MATCH_THRESHOLD, "description": "余弦相似度阈值，越高越严格（越不容易认错人，但越容易认不出）。留空时按所选模型取推荐值（" + "；".join(f"{name} = {spec['match_threshold']}" for name, spec in sorted(FACE_MODELS.items())) + "）——阈值属于 embedding 空间，换模型后不能照搬旧值"},
                 "min_face_px":       {"type": "integer", "minimum": 16, "default": DEFAULT_MIN_FACE_PX, "description": "最小人脸边长(px)，小于此值不做识别"},
                 "blur_min":          {"type": "number", "minimum": 0.0, "default": DEFAULT_BLUR_MIN, "description": "清晰度下限(拉普拉斯方差)，低于此值视为模糊人脸"},
                 "max_faces":         {"type": "integer", "minimum": 1, "default": DEFAULT_MAX_FACES, "description": "单帧最多处理的人脸数"},
@@ -326,7 +339,29 @@ def _analyzer_options(cfg: dict) -> dict:
 
 def _db_options(cfg: dict) -> dict:
     return {
-        "db_dir": str(cfg.get("db_dir", DEFAULT_DB_DIR)),
+        # Per model, so selecting a second model starts its own roster instead of
+        # erroring against the first one's. buffalo_sc keeps /models/face_db — see
+        # face_db_dir_for, which also explains why an explicit value is detected by
+        # comparing against the default rather than by a missing key.
+        "db_dir": face_db_dir_for(
+            str(cfg.get("model", DEFAULT_FACE_MODEL)),
+            str(cfg.get("db_dir", DEFAULT_DB_DIR)),
+        ),
+        # Recorded in persons.json and checked on load. `model` is in here rather
+        # than only in the analyzer options because switching the recogniser
+        # invalidates every stored sample, and the database is where that has to
+        # be refused — see IdentityDB._load.
+        "dim": EMBEDDING_DIM,
+        # Storing the aligned crop per sample is what makes a later model switch
+        # migratable rather than a manual re-enrolment of everybody. It is face
+        # imagery on disk, bounded by max_samples_per_person x unknown_capacity
+        # (8 x 500 ~= 24 MB at ~6 kB a crop), and `store_sample_crops: false`
+        # turns it off for a deployment that must not keep any.
+        "artifact_suffix": (
+            ".jpg" if bool(cfg.get("store_sample_crops", True)) else ""
+        ),
+        "model": str(cfg.get("model", DEFAULT_FACE_MODEL)),
+        "label": "face_db",
         "unknown_capacity": int(
             cfg.get("unknown_capacity", DEFAULT_UNKNOWN_CAPACITY)
         ),
@@ -349,6 +384,30 @@ def _decode_options(cfg: dict) -> dict:
     }
 
 
+def _encode_crop(aligned) -> bytes | None:
+    """JPEG-encode an aligned 112x112 crop for storage, or None if there is none.
+
+    JPEG at quality 92, not PNG or raw: ~6 kB against 37 kB raw, and the crop is
+    only ever fed back through a detector-free embedding step, which is far less
+    sensitive to compression than it would be to the 6x disk cost on a 57 GB eMMC.
+
+    Best-effort — a failure here costs the ability to re-embed this one sample and
+    must not fail the enrolment the operator is waiting on.
+    """
+    if aligned is None:
+        return None
+    try:
+        cv2 = load_cv2()
+        ok, buffer = cv2.imencode(".jpg", aligned,
+                                  [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if not ok:
+            return None
+        return bytes(buffer.tobytes())
+    except Exception:  # noqa: BLE001 - never break enrolment over a crop
+        log.warning("[face] could not encode the sample crop", exc_info=True)
+        return None
+
+
 def _gates(cfg: dict) -> dict:
     """The quality/ambiguity thresholds, resolved once per call."""
     return {
@@ -356,7 +415,14 @@ def _gates(cfg: dict) -> dict:
         "min_face_px": float(cfg.get("min_face_px", DEFAULT_MIN_FACE_PX)),
         "blur_min": float(cfg.get("blur_min", DEFAULT_BLUR_MIN)),
         "dominance": float(cfg.get("subject_dominance", DEFAULT_SUBJECT_DOMINANCE)),
-        "match_threshold": float(cfg.get("match_threshold", DEFAULT_MATCH_THRESHOLD)),
+        # Defaults to the configured model's own threshold rather than one number
+        # for the plugin: buffalo_sc wants 0.35 and scrfd25g_edgeface_s wants 0.55
+        # (see FACE_MODELS). An explicit value in config still wins, so a robot
+        # tuned by hand keeps its number across a model switch.
+        "match_threshold": float(cfg.get(
+            "match_threshold",
+            default_match_threshold(str(cfg.get("model", DEFAULT_FACE_MODEL))),
+        )),
         "max_faces": int(cfg.get("max_faces", DEFAULT_MAX_FACES)),
     }
 
@@ -384,7 +450,7 @@ class _FaceEngine:
     that never opened.
     """
 
-    def __init__(self, analyzer: FaceAnalyzer, db: FaceDB):
+    def __init__(self, analyzer: FaceAnalyzer, db: IdentityDB):
         self.analyzer = analyzer
         self.db = db
 
@@ -418,7 +484,7 @@ def _build_engine(cfg: dict, on_status=None) -> _FaceEngine:
         # holds them for the life of the child instead of taking them per call.
         max_image_side=decode["max_side"], max_image_pixels=decode["max_pixels"],
     )
-    db = FaceDB(**_db_options(cfg))
+    db = IdentityDB(**_db_options(cfg))
     return _FaceEngine(analyzer, db)
 
 
@@ -1094,6 +1160,9 @@ class FaceRecognitionPlugin:
         self._engine_state = "loading"
         self._load_error = None
         self._load_status = None
+        # Progress of the background roster migration, surfaced in info(). None
+        # until one starts; see _maybe_start_roster_migration.
+        self._migration: dict | None = None
         generation = self._load_generation
         cfg = dict(self._plugin_cfg)
         threading.Thread(
@@ -1124,6 +1193,16 @@ class FaceRecognitionPlugin:
         if stale is not None:
             _close_quietly(stale)
             return
+
+        # After publishing, never before: the roster fills in while the plugin is
+        # already answering.
+        try:
+            with self._state_lock:
+                model = str(self._plugin_cfg.get("model", DEFAULT_FACE_MODEL))
+            self._maybe_start_roster_migration(generation, engine, cfg, model)
+        except Exception:  # noqa: BLE001 - serving matters more than migrating
+            log.warning("[face] could not start the roster migration",
+                        exc_info=True)
 
         while True:
             with self._state_lock:
@@ -1245,6 +1324,233 @@ class FaceRecognitionPlugin:
             return self._do_list_visits(args)
         return None
 
+    # ── roster migration ──────────────────────────────────────────────────
+
+    # ── background startup migration ──────────────────────────────────────
+
+    def _auto_migration_source(self, cfg: dict, target_model: str):
+        """Which other model's roster is worth pulling across, if any.
+
+        Returns `(model, db_dir, crop_count)` or None. Picks the candidate with the
+        most re-embeddable samples, deterministically, and says so in the log —
+        with more than two models in FACE_MODELS "the other one" stops being
+        well-defined and silently guessing would be worse than naming the choice.
+        """
+        base_dir = str(cfg.get("db_dir", DEFAULT_DB_DIR))
+        best = None
+        for name in sorted(FACE_MODELS):
+            if name == target_model:
+                continue
+            directory = face_db_dir_for(name, base_dir)
+            if os.path.abspath(directory) == os.path.abspath(
+                    face_db_dir_for(target_model, base_dir)):
+                continue
+            if not os.path.exists(os.path.join(directory, "persons.json")):
+                continue
+            try:
+                probe = IdentityDB(db_dir=directory, dim=EMBEDDING_DIM,
+                                   model=name, label="face_db:probe",
+                                   artifact_suffix=".jpg")
+                crops = probe.stats()["samples_with_artifact"]
+            except Exception:  # noqa: BLE001 - a roster we cannot read is not a
+                # reason to fail the engine load
+                log.warning("[face] could not probe %s for migration", name,
+                            exc_info=True)
+                continue
+            if crops and (best is None or crops > best[2]):
+                best = (name, directory, crops)
+        return best
+
+    def _maybe_start_roster_migration(self, generation: int, engine, cfg: dict,
+                                      target_model: str) -> None:
+        """Fill this model's roster from another model's crops, in the background.
+
+        Migration is **part of coming up, not a precondition for it**. The engine is
+        already published and serving by the time this starts: recognition works
+        against whatever is in the roster right now and simply recognises more
+        people as the pass proceeds. IdentityDB takes its RLock per call, so a
+        `match()` at frame rate and an `add()` from here interleave safely.
+
+        Nothing about this is ACP's business — there is no action to complete and
+        no caller waiting on a result. It is a thread that stops when the engine it
+        belongs to is replaced.
+        """
+        if not bool(cfg.get("auto_migrate_roster", True)):
+            return
+        if not engine.db.artifacts_enabled:
+            return
+        found = self._auto_migration_source(cfg, target_model)
+        if found is None:
+            return
+        source_model, source_dir, crops = found
+        with self._state_lock:
+            if generation != self._load_generation:
+                return
+            self._migration = {
+                "state": "running", "source_model": source_model,
+                "target_model": target_model, "persons_done": 0,
+                "samples_done": 0, "persons_total": 0,
+                "source_crops": crops,
+            }
+        thread = threading.Thread(
+            target=self._roster_migration_worker,
+            args=(generation, engine, source_model, source_dir),
+            name="face-roster-migration", daemon=True)
+        thread.start()
+        log.info("[face] migrating the %s roster into %s in the background "
+                 "(%d sample(s) with crops); recognition is already serving",
+                 source_model, target_model, crops)
+
+    def _mark_migration(self, progress: dict, **fields) -> bool:
+        """Update the progress dict **only while it is still the current one**.
+
+        A cancelled pass must not write into the dict a newer engine's pass has
+        already installed, or the card shows one migration's numbers under
+        another's. Identity comparison rather than a generation check, because the
+        dict is the thing being published and it is what must still be ours.
+        """
+        with self._state_lock:
+            if self._migration is not progress:
+                return False
+            progress.update(fields)
+            return True
+
+    def _roster_migration_worker(self, generation: int, engine,
+                                 source_model: str, source_dir: str) -> None:
+        with self._state_lock:
+            progress = self._migration
+        try:
+            source = IdentityDB(db_dir=source_dir, dim=EMBEDDING_DIM,
+                                model=source_model, label="face_db:source",
+                                artifact_suffix=".jpg")
+            by_person: dict[str, list[dict]] = {}
+            for item in source.sample_artifacts():
+                by_person.setdefault(item["person_id"], []).append(item)
+            records = [record for record in source.list_persons(limit=0)["persons"]
+                       if by_person.get(record["id"])]
+            if not self._mark_migration(progress, persons_total=len(records)):
+                return
+
+            done = samples = 0
+            for record in records:
+                # Cancellation: a stop, or any config change that rebuilds the
+                # engine, bumps the generation. Checked every person rather than
+                # once, so a 500-person pass does not keep writing into a database
+                # the plugin has moved on from.
+                #
+                # Checked again *after* the person too: the generation can change
+                # while one person is being embedded, and returning bare there used
+                # to leave the progress dict reading "running" forever — a
+                # migration that info() reported as live when nothing was.
+                with self._state_lock:
+                    cancelled = generation != self._load_generation
+                if cancelled:
+                    self._mark_migration(progress, state="cancelled")
+                    log.info("[face] roster migration cancelled after %d "
+                             "person(s)", done)
+                    return
+                outcome, detail = self._migrate_one_person(
+                    engine, record, by_person[record["id"]])
+                if outcome == "migrated":
+                    done += 1
+                    samples += detail
+                with self._state_lock:
+                    cancelled = generation != self._load_generation
+                if cancelled:
+                    self._mark_migration(progress, state="cancelled",
+                                         persons_done=done, samples_done=samples)
+                    log.info("[face] roster migration cancelled after %d "
+                             "person(s)", done)
+                    return
+                self._mark_migration(progress, persons_done=done,
+                                     samples_done=samples)
+            self._mark_migration(progress, state="done", persons_done=done,
+                                 samples_done=samples)
+            log.info("[face] roster migration finished: %d person(s), %d sample(s) "
+                     "from %s", done, samples, source_model)
+        except Exception as error:  # noqa: BLE001 - a failed migration must not
+            # take down a plugin that is already serving
+            log.exception("[face] roster migration failed")
+            self._mark_migration(progress, state="error", error=str(error))
+
+    def _migrate_one_person(self, engine, record: dict, items: list):
+        """Re-embed one person's stored crops into `engine`'s database.
+
+        Returns `(outcome, detail)` where outcome is "migrated" (detail = how many
+        samples), "skipped" (detail = why there was nothing to do) or
+        "unmigratable" (detail = why it could not be done). Kept as its own step
+        because the idempotency rule lives here — the part that, when it was wrong,
+        ate real samples — and because the background worker needs to call it one
+        person at a time so it can check for cancellation between people.
+        """
+        person_id = record["id"]
+        crops = []
+        for item in items:
+            try:
+                with open(item["path"], "rb") as handle:
+                    crops.append(handle.read())
+            except OSError:
+                crops.append(None)
+        usable = [crop for crop in crops if crop]
+
+        # Skip crops this person already has here, keyed on content. Without it a
+        # second pass re-embeds the same crops and *appends* them: the sample list
+        # fills with duplicates and, once it hits max_samples_per_person, the
+        # oldest-first trim starts evicting the genuinely new captures made since
+        # the migration. Measured: a second pass took one person from 5 samples to
+        # 8, three of them duplicates.
+        #
+        # Content rather than a recorded source id, because the stored bytes are
+        # the source crop verbatim — so this needs no schema change and also
+        # collapses the same face arriving by two routes.
+        already = set()
+        for existing_item in (engine.db.sample_artifacts()
+                              if engine.db.artifacts_enabled else []):
+            if existing_item["person_id"] != person_id:
+                continue
+            try:
+                with open(existing_item["path"], "rb") as handle:
+                    already.add(hashlib.sha256(handle.read()).hexdigest())
+            except OSError:
+                continue
+        if already:
+            fresh = [crop for crop in usable
+                     if hashlib.sha256(crop).hexdigest() not in already]
+            if not fresh:
+                return "skipped", "already migrated"
+            usable = fresh
+
+        vectors = engine.analyzer.embed_aligned(usable) if usable else []
+        pairs = [(vec, crop) for vec, crop in zip(vectors, usable)
+                 if vec is not None]
+        if not pairs:
+            return "unmigratable", "every stored crop failed to re-embed"
+
+        embeddings = [pair[0] for pair in pairs]
+        artifacts = [pair[1] for pair in pairs]
+        try:
+            try:
+                existing = engine.db.get_person(person_id)
+            except KeyError:
+                existing = None
+            if existing is not None:
+                engine.db.add_samples(person_id, embeddings, artifacts)
+            else:
+                engine.db.add(
+                    record.get("name", ""), embeddings,
+                    named=bool(record.get("named")),
+                    profile=record.get("profile"),
+                    person_id=person_id,
+                    artifacts=artifacts,
+                    registered_at=record.get("registered_at"),
+                )
+        except Exception as error:  # noqa: BLE001 - one person must not abandon
+            # a 500-person migration half-done
+            log.error("[face] could not migrate %s: %s", person_id,
+                      escape_log_text(error))
+            return "unmigratable", str(error)
+        return "migrated", len(embeddings)
+
     _DESC = "Face recognition — identifies registered people in the camera feed"
 
     def _desc_locked(self, state: str) -> str:
@@ -1258,10 +1564,14 @@ class FaceRecognitionPlugin:
     # ── info / start / stop / config ──────────────────────────────────────
 
     def _do_info(self, instance_id: str, input_topic: str) -> dict:
-        base = {"name": "FaceRecognition", "manufacture": "Embodied",
-                "model": "scrfd+arcface"}
         with self._state_lock:
             engine = self._engine
+            # Reports the model pair actually configured, not a fixed string: with
+            # more than one row in FACE_MODELS a hardcoded "scrfd+arcface" would
+            # misreport whichever card is not buffalo_sc. Read under the lock
+            # because `config` replaces _plugin_cfg wholesale.
+            base = {"name": "FaceRecognition", "manufacture": "Embodied",
+                    "model": str(self._plugin_cfg.get("model", DEFAULT_FACE_MODEL))}
             if instance_id:
                 node = self._nodes.get(instance_id)
                 topic = (
@@ -1320,6 +1630,11 @@ class FaceRecognitionPlugin:
         """Attach roster counts. Never fails info — it is the diagnostic path."""
         if engine is None:
             return result
+        migration = self._migration
+        if migration:
+            # Visible because an empty-looking roster that is still filling is a
+            # different situation from one that is simply empty.
+            result["migration"] = dict(migration)
         try:
             result["database"] = engine.db.stats()
         except Exception:  # noqa: BLE001
@@ -1551,8 +1866,16 @@ class FaceRecognitionPlugin:
 
     def _analyze_subject(
         self, engine: _FaceEngine, image_bytes: bytes, gates: dict
-    ) -> tuple[np.ndarray | None, dict | None]:
-        """One image → the subject's embedding, or the failure record."""
+    ) -> tuple[np.ndarray | None, bytes | None, dict | None]:
+        """One image → the subject's embedding and crop, or the failure record.
+
+        The crop is the aligned 112x112 the embedding was actually computed from,
+        JPEG-encoded, and it is what makes a future model switch migratable: an
+        embedding means nothing outside its own network, so without the source there
+        is no re-embedding, only re-enrolling every person by hand. Requested only
+        when the database is storing artifacts, because it costs 37 kB across the
+        ORT worker boundary per face.
+        """
         # embed_all here, unlike the recognition path: `select_subject` picks the
         # subject *after* seeing every candidate's geometry, so the embedding has to
         # exist for whichever one it chooses — including a marginal face that the
@@ -1565,9 +1888,10 @@ class FaceRecognitionPlugin:
             min_face_px=gates["min_face_px"],
             blur_min=gates["blur_min"],
             embed_all=True,
+            want_aligned=engine.db.artifacts_enabled,
         )
         if shape is None:
-            return None, {
+            return None, None, {
                 "ok": False, "reason": REASON_BAD_INPUT,
                 "detail": (
                     "image could not be decoded (cv2 and Pillow both refused it; "
@@ -1577,8 +1901,8 @@ class FaceRecognitionPlugin:
             }
         subject, failure = select_subject(faces, shape, gates)
         if subject is None:
-            return None, failure
-        return subject.embedding, None
+            return None, None, failure
+        return subject.embedding, _encode_crop(subject.aligned), None
 
     def _commit_enrolment(
         self,
@@ -1588,8 +1912,13 @@ class FaceRecognitionPlugin:
         profile: Any,
         person_id: str | None,
         gates: dict,
+        artifacts: list | None = None,
     ) -> dict:
-        """Attach embeddings to the right identity, creating one if needed."""
+        """Attach embeddings to the right identity, creating one if needed.
+
+        `artifacts` is parallel to `embeddings` — the crop each was computed from,
+        stored so the roster can be re-embedded under another model later.
+        """
         database = engine.db
 
         if person_id:
@@ -1601,7 +1930,7 @@ class FaceRecognitionPlugin:
                     "detail": f"no such person: {person_id!r}",
                 }
             was_unknown = not existing["named"]
-            record = database.add_samples(person_id, embeddings)
+            record = database.add_samples(person_id, embeddings, artifacts)
             if name or profile is not None:
                 record = database.update_person(
                     person_id, name=name or None, profile=profile
@@ -1618,7 +1947,7 @@ class FaceRecognitionPlugin:
         # No id given: does this face already exist under some identity?
         matched, score = database.match(embeddings[0], gates["match_threshold"])
         if matched is not None:
-            record = database.add_samples(matched, embeddings)
+            record = database.add_samples(matched, embeddings, artifacts)
             promoted = False
             if is_unknown_id(matched) or not record["named"]:
                 # The face was already being tracked anonymously; naming it now
@@ -1638,7 +1967,8 @@ class FaceRecognitionPlugin:
                 "score_to_existing": round(float(score), 4),
             }
 
-        record = database.add(name, embeddings, named=True, profile=profile)
+        record = database.add(name, embeddings, named=True, profile=profile,
+                              artifacts=artifacts)
         return {
             "ok": True,
             "person_id": record["id"],
@@ -1658,7 +1988,7 @@ class FaceRecognitionPlugin:
         except _BadInput as error:
             return error.as_result()
 
-        embedding, failure = self._analyze_subject(engine, data, gates)
+        embedding, crop, failure = self._analyze_subject(engine, data, gates)
         if embedding is None:
             return {**failure, "source": source}
         # No person_id input: which identity a photo belongs to is decided by
@@ -1669,7 +1999,7 @@ class FaceRecognitionPlugin:
         # batch manifest's `person` key.
         result = self._commit_enrolment(
             engine, [embedding], str(args.get("name") or ""),
-            args.get("profile"), None, gates,
+            args.get("profile"), None, gates, [crop],
         )
         if result.get("ok"):
             log.info("[face] registered %s from %s: %s", result["person_id"],
@@ -1705,13 +2035,15 @@ class FaceRecognitionPlugin:
         selected = list(reversed(frames))[:budget]
 
         embeddings: list[np.ndarray] = []
+        crops: list = []
         failures: list[dict] = []
         for image_bytes, _ts in selected:
-            embedding, failure = self._analyze_subject(engine, image_bytes, gates)
+            embedding, crop, failure = self._analyze_subject(engine, image_bytes, gates)
             if embedding is None:
                 failures.append(failure)
             else:
                 embeddings.append(embedding)
+                crops.append(crop)
 
         if not embeddings:
             return {
@@ -1724,10 +2056,15 @@ class FaceRecognitionPlugin:
         # turns being the dominant face would otherwise be enrolled as one
         # identity whose embeddings match neither of them well.
         anchor = embeddings[0]
-        agreeing = [
-            embedding for embedding in embeddings
+        # Filter embeddings and crops by the same index set rather than in two
+        # comprehensions: they must stay parallel all the way into the database, or
+        # a person is stored with somebody else's face as the artifact behind it.
+        kept = [
+            index for index, embedding in enumerate(embeddings)
             if float(np.dot(anchor, embedding)) >= gates["match_threshold"]
         ]
+        agreeing = [embeddings[index] for index in kept]
+        agreeing_crops = [crops[index] for index in kept]
         if len(agreeing) * 2 < len(embeddings):
             return {
                 "ok": False,
@@ -1743,7 +2080,7 @@ class FaceRecognitionPlugin:
 
         result = self._commit_enrolment(
             engine, agreeing, str(args.get("name") or ""),
-            args.get("profile"), None, gates,
+            args.get("profile"), None, gates, agreeing_crops,
         )
         if result.get("ok"):
             log.info("[face] registered %s from the live stream (%d/%d frames): %s",
@@ -1829,13 +2166,14 @@ class FaceRecognitionPlugin:
                                     "detail": f"cannot read: {error}"})
                     continue
 
-                embedding, failure = self._analyze_subject(engine, data, gates)
+                embedding, crop, failure = self._analyze_subject(engine, data, gates)
                 if embedding is None:
                     results.append({"file": relative, "name": name, **failure})
                     continue
                 try:
                     outcome = self._commit_enrolment(
-                        engine, [embedding], name, profile, person_id, gates
+                        engine, [embedding], name, profile, person_id, gates,
+                        [crop],
                     )
                 except Exception as error:  # noqa: BLE001 - one bad photo must
                     # not abandon the rest of a 200-image batch half-registered

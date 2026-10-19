@@ -4,6 +4,7 @@
  */
 
 import { isRcLoggedIn as _isRcLoggedIn, rcHeaders as _rcHeaders, showAccount } from './account.js';
+import { openWorkbench } from './workbench.js';
 
 let _overlay, _closeBtn, _tabs, _panels;
 let _installedList, _installedEmpty, _browseList, _browseEmpty, _searchInput;
@@ -487,6 +488,10 @@ function _renderSkillDetail(skill, context) {
   const container = context === 'installed' ? _installedList : _browseList;
   const emptyEl = context === 'installed' ? _installedEmpty : _browseEmpty;
   emptyEl.classList.add('hidden');
+  // `attachment` is the whole test. The page used to also sniff a
+  // `taught-<32 hex>` slug; the server resolves legacy slugs from the
+  // prefix each card declares, so the browser does not need the convention.
+  const packagedSkill = !!skill.attachment;
 
   const requiredToolsHtml = (skill.requiredTools || []).length
     ? `<div class="skill-detail-section">
@@ -510,7 +515,9 @@ function _renderSkillDetail(skill, context) {
     <div class="skill-detail-actions">
       <button class="skill-btn skill-btn-primary" id="skill-detail-install">安装</button>
     </div>
-  ` : '';
+  ` : packagedSkill ? `
+    <div class="skill-detail-actions"><button class="skill-btn" id="skill-package-refresh">更新调用说明</button></div>
+    <p class="skill-detail-text" id="skill-package-refresh-status" role="status"></p>` : '';
 
   container.innerHTML = `
     <button class="skill-detail-back" id="skill-detail-back">← 返回</button>
@@ -527,12 +534,18 @@ function _renderSkillDetail(skill, context) {
       </div>
     </div>
     ${skill.description ? `<div class="skill-detail-section"><div class="skill-detail-section-label">描述</div><div class="skill-detail-text">${_esc(skill.description)}</div></div>` : ''}
-    ${skill.instruction ? `<div class="skill-detail-section"><div class="skill-detail-section-label">指令内容</div><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></div>` : ''}
+    ${_compatibilityHtml(skill.compatibility)}
+    ${packagedSkill && context === 'installed' ? '<div id="skill-session" class="skill-detail-section"></div>' : ''}
+    ${skill.instruction ? actionSkill
+      ? `<details class="skill-detail-section"><summary class="skill-detail-text">调用说明</summary><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></details>`
+      : `<div class="skill-detail-section"><div class="skill-detail-section-label">指令内容</div><pre class="skill-detail-instruction">${_esc(skill.instruction)}</pre></div>` : ''}
     ${requiredToolsHtml}
     ${configSchemaHtml}
     ${installedAtHtml}
     ${actionsHtml}
   `;
+  _overlay.querySelector('.skill-modal-body').scrollTop = 0;
+  if (packagedSkill && context === 'installed') _loadSession(skill.slug, container.querySelector('#skill-session'));
 
   // Back button
   container.querySelector('#skill-detail-back').addEventListener('click', () => {
@@ -541,6 +554,18 @@ function _renderSkillDetail(skill, context) {
   });
 
   // Action buttons
+  container.querySelector('#skill-package-refresh')?.addEventListener('click', async event => {
+    const button = event.currentTarget, status = container.querySelector('#skill-package-refresh-status');
+    button.disabled = true; status.textContent = '正在核对来源并更新说明…';
+    try {
+      const response = await fetch(`/api/skills/package/refresh/${encodeURIComponent(skill.slug)}`, {method: 'POST'});
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || '更新失败');
+      await _showSkillDetail(skill.slug);
+      container.querySelector('#skill-package-refresh-status').textContent = '调用说明与型号信息已更新。';
+    } catch (error) { status.textContent = error.message; button.disabled = false; }
+  });
+
   if (context === 'browse') {
     container.querySelector('#skill-detail-install').addEventListener('click', async () => {
       try {
@@ -560,6 +585,60 @@ function _renderSkillDetail(skill, context) {
     });
   }
 }
+
+async function _loadSession(slug, area) {
+  try {
+    const response = await fetch(`/api/skills/package/execution/${encodeURIComponent(slug)}`);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || '无法读取自动执行设置');
+    if (!result.data.supported) return;
+    const current = result.data;
+    area.innerHTML = `<div class="skill-detail-section-label">对话调用</div>
+      <label class="skill-detail-text"><input type="checkbox" id="skill-auto-execute" ${current.enabled ? 'checked' : ''}> 允许自动执行</label>
+      <p class="skill-detail-text">开启后，直接说技能名称即可执行，无需逐次确认。</p>
+      <p class="skill-detail-text">设置保存在本设备，停止项目或重启后保留；每次仍检查设备、起点及控制权。</p>
+      <p class="skill-detail-text" role="status" id="skill-auto-execute-status">${current.binding_changed ? '技能或设备绑定已变化，请核对后重新保存设置。' : ''}</p>`;
+    const checkbox = area.querySelector('#skill-auto-execute');
+    checkbox.onchange = async () => {
+      checkbox.disabled = true;
+      try {
+        const response = await fetch(`/api/skills/package/execution/${encodeURIComponent(slug)}`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled: checkbox.checked})});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || '设置失败');
+        await _loadSession(slug, area);
+      } catch (error) {
+        area.querySelector('#skill-auto-execute-status').textContent = error.message;
+        checkbox.checked = current.enabled; checkbox.disabled = false;
+      }
+    };
+  } catch (error) { area.textContent = error.message; }
+}
+
+
+/** `compatibility` is opaque to Core. The device that wrote it knows what its
+ * fields mean, so it supplies the pills to show in `labels`; we render those
+ * and fall back to the raw scalars. An earlier version mapped `dual_arm` to
+ * 双臂 and `fixed_hand` to 固定手 right here — kinematics vocabulary in the
+ * host, for one robot shape, which a second shape could only extend by editing
+ * this file. */
+function _compatibilityHtml(value) {
+  if (!value || typeof value !== 'object') return '';
+  const labels = (Array.isArray(value.labels) ? value.labels : _scalarLabels(value))
+    .filter(v => typeof v === 'string' && v.trim()).slice(0, 12);
+  if (!labels.length && !Object.keys(value).length) return '';
+  return `<div class="skill-detail-section"><div class="skill-detail-section-label">适用设备</div>
+    <div class="skill-detail-tools">${labels.map(v => `<span class="skill-detail-tool-pill">${_esc(v)}</span>`).join('')}</div>
+    <details><summary class="skill-detail-text">兼容信息</summary><pre class="skill-detail-schema">${_esc(JSON.stringify(value, null, 2))}</pre></details></div>`;
+}
+
+/** Scalar fields, in declaration order, for a device that sends no `labels`. */
+function _scalarLabels(value) {
+  return Object.entries(value)
+    .filter(([key, v]) => key !== 'tool' && (typeof v === 'string' || typeof v === 'number'))
+    .map(([, v]) => String(v));
+}
+
 
 // ── Legacy global handlers (kept for backward compat) ─────────────────────
 

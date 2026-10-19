@@ -90,8 +90,14 @@ def driver(monkeypatch):
         'card-dup-b': [{'topic': '/dup', 'format': 'data/json'}],
     }
 
-    async def _call(mcp_id, req):
+    async def _call(mcp_id, req, timeout_s=None):
+        # **`timeout_s` 要收下并断言，不能只是吞掉。** 一个把出问题的那个参数
+        # 悄悄丢掉的假件，正是这一类 bug 能活下来的原因（画布那个 qos 也是）。
+        # 只读的 `info()` 必须是有界的：无界时一个不回应的 MCP 会让整次启动永久
+        # 挂死，而"取消"按钮对后端无效。`start` 相反，它合法地可以很慢。
         args = dict(req.arguments)
+        if args.get('action') == 'info':
+            assert timeout_s, 'info() 必须带超时，否则轮询循环的 deadline 是摆设'
         action, card_id = args.get('action'), args.get('instance_id')
         if action == 'start':
             starts[card_id] = args
@@ -337,3 +343,78 @@ def test_an_unreachable_consumer_does_not_hide_a_reachable_one(driver):
     _run(layout)
 
     assert driver.starts[VLA]['control_interface'] == ARM_DESCRIPTOR
+
+
+# ── 一次挂住的启动不能永久锁死"启动"这个动作 ─────────────────────────────────
+#
+# 真机实测 2026-09-21（G1）：perception 的 HTTP 服务线程被同进程一个空转线程饿死
+# （GIL 争用，accept 队列 Recv-Q 6 > backlog 5），一次 `tts.start` 再没回来。此前
+# 的实现是 `_start_project_lock = True` 加 `try/finally` —— 那个 finally 防的是
+# **抛异常**，防不住 `await` **挂住**：finally 永远轮不到执行，标志位永久为真，
+# 之后每次点启动都是 409，"取消启动"只是前端的，除了重启进程没有出路。
+#
+# 撞上的是 TTS，但任何一个 MCP 服务器变慢都走同一条路，所以这一组测的是**机制**，
+# 不是 TTS。
+
+
+def _hang_forever(monkeypatch):
+    """让 `_do_start_project_impl` 永不返回 —— 模拟一个不回应的 MCP。"""
+    started = asyncio.Event()
+
+    async def _never():
+        started.set()
+        await asyncio.Event().wait()      # 永远等待
+
+    monkeypatch.setattr(config_api, '_do_start_project_impl', _never)
+    monkeypatch.setattr(config_api, '_start_project_task', None, raising=False)
+    return started
+
+
+def test_a_hung_start_gives_up_instead_of_wedging_the_flag(monkeypatch):
+    """超时兜底加在**锁**上，而不是加在每一次 MCP 调用上。
+
+    后者要逐个审计调用点，而且对 `start` 本来就不该限时（一张卡片的 start 合法地
+    可能冷下载几个 GB）。加在锁上则不管哪个 await 挂住都成立。
+    """
+    _hang_forever(monkeypatch)
+    monkeypatch.setattr(config_api, 'START_PROJECT_TIMEOUT_S', 0.05)
+
+    async def _run():
+        first = await config_api._do_start_project()
+        # 超时之后那个任务必须是 done —— 否则下一次点启动还是被挡在门外。
+        assert config_api._start_project_task.done()
+        return first
+
+    assert asyncio.run(_run()) is False
+
+
+def test_the_cancel_button_actually_cancels(monkeypatch):
+    """此前"取消启动"只去停卡片，挂住的那个协程**继续挂着**，标志位也不清。"""
+    started = _hang_forever(monkeypatch)
+    monkeypatch.setattr(config_api, 'START_PROJECT_TIMEOUT_S', 30)
+
+    async def _run():
+        task = asyncio.ensure_future(config_api._do_start_project())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert config_api._cancel_start_project() is True
+        assert await task is False
+        assert config_api._start_project_task.cancelled()
+        # 没有在飞的启动时，取消是无害的空操作，不是异常。
+        assert config_api._cancel_start_project() is False
+
+    asyncio.run(_run())
+
+
+def test_a_second_start_while_one_is_in_flight_is_still_refused(monkeypatch):
+    """并发保护不能因为换了实现就丢掉 —— 两个重叠的启动会把前端的事件流搅乱。"""
+    started = _hang_forever(monkeypatch)
+    monkeypatch.setattr(config_api, 'START_PROJECT_TIMEOUT_S', 30)
+
+    async def _run():
+        task = asyncio.ensure_future(config_api._do_start_project())
+        await asyncio.wait_for(started.wait(), timeout=2)
+        assert await config_api._do_start_project() is None      # 被挡住
+        config_api._cancel_start_project()
+        await task
+
+    asyncio.run(_run())

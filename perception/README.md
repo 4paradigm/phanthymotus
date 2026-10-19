@@ -1,8 +1,10 @@
 # Perception Stack
 
-Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
-vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
-`face_recognition`). Connects to Agent Core via MCP tool calls and exchanges
+Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`,
+`echo_cancellation` echo handling), vision (`vop` object detection, `visual_depth`
+monocular depth, `ocr`, `face_recognition`, `pose` human keypoints + actions,
+`barcode` QR/条码扫码).
+Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
@@ -40,6 +42,63 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 
 > **Why 512 samples?** The Silero VAD model requires at least one 512-sample window to compute a speech probability. WebRTC VAD requires 480-sample (30 ms) frames. Both backends use 512 samples as the minimum chunk size.
 
+### Wake Direction Timing
+
+Connect Bumi's `sensor/sound-direction` output
+(`/<namespace>/sound_direction`) to ASR's sound-direction input, and
+its microphone to the `audio/pcm-16k` input. The direction port remains a
+specific sensor type, not `data/json`: an ordinary JSON card cannot supply it.
+Like the existing `sensor/pose2d` card, its ROS transport is `std_msgs/String`
+with a structured payload. Core needs no change: its generic `sensor/*`
+transport already carries the message, without compiling a custom direction
+interface or starting the sensor.
+
+The payload has `state: "fresh"`, the exact `angle_deg`, and
+`angle_convention: "robot_front_0_left_positive_ccw"` (front 0°, left positive,
+right negative), plus
+`audio_window_start_us` / `audio_window_end_us`. Driver publishes `no_event` after
+activity stops and `stale` if a valid observation expires. Neither state clears
+ASR's capture history: a transcription can finish after the event expires.
+ASR ignores a direction observation with a missing or different convention.
+Its existing recognition result reports `speaker_direction_state` and, when
+valid, `speaker_direction` as a single string such as
+`"115°, robot_front_0_left_positive_ccw"`. The matched capture window is
+reported as `speaker_direction_window_start_us` /
+`speaker_direction_window_end_us`. The angle refers to the start of the wake
+word, not the full utterance. Unknown and disconnected directions report only
+`speaker_direction_state: "unknown"` or `"no_input"`.
+
+`AudioChunk.header.stamp` must be the Unix capture time of the chunk's first
+sample. Direction windows use the same clock in microseconds. ASR reports an
+unknown wake direction when the audio stamp is missing or either capture
+window is untrusted. Confirm clock alignment on the robot before relying on
+direction results.
+
+For this migration, upgrade Driver and Perception together. Remove/re/add the
+direction and ASR cards and reconnect them — a saved card keeps its old
+`topicIn` list and never gains the second input. The canvas type remains
+`sensor/sound-direction`. ASR picks its direction input by topic name: the
+connection whose topic has a `sound_direction` segment is the direction source,
+every other input is audio, so connection order does not choose the audio
+source. Keep that name — renaming the driver output breaks the binding.
+Direction payloads appear in the monitor as plain data; they are not rendered
+as JSON.
+
+SenseVoice, Parakeet and X-ASR retain the recognizer's token timestamps from
+the same decode. ASR maps the matched wake word's text boundary to a timed
+token and adds its offset to the utterance's capture start before selecting
+direction windows. This supports filler and other speech before a custom wake
+word. Token timing must be finite, ordered, inside the original audio, and
+consistent with the recognized text; a wake boundary inside an indivisible
+token is unavailable. If timing is unavailable, a wake word at the utterance
+start can use the VAD onset; a spoken prefix returns `unknown`. Recognition
+and wake triggering continue normally. Check token timing accuracy on the
+robot; the timestamps do not establish the physical alignment error by themselves.
+Direction history keeps up to 60 seconds / 1201 events, covering a 30-second
+VAD segment plus queueing margin at Bumi's maximum 20 Hz publication rate.
+The worker snapshots history before transcription, so later direction events
+cannot evict a wake window while that utterance is being decoded.
+
 ### Common Pitfalls
 
 #### External USB mic (ALSA, 48 kHz native rate)
@@ -76,6 +135,400 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 | `vad_threshold` | `0.5` | Speech probability threshold (0–1). Raise to `0.7`–`0.85` in noisy environments (e.g. robot motor noise). |
 | `vad_silence_ms` | `400` | Silence duration (ms) required before an utterance is considered complete. |
 | `vad_pre_roll_ms` | `500` | Audio retained from *before* the VAD tripped. Recovers clipped word onsets — without it the first syllable is often missing, which costs wake-word recall. |
+
+---
+
+## Echo Cancellation: keeping the robot's own voice out of its microphone
+
+The robot's TTS reaches its own microphone acoustically, and until this card
+existed nothing in perception removed it. The symptoms did not look like one
+problem: ASR transcribes the robot's own sentence and hands it to the LLM as if
+a person had said it, speaker recognition enrols that voice as a person (see
+`plugins/speaker.py`, which says so in a comment), and nobody can interrupt the
+robot mid-sentence.
+
+Wire it between the microphone card and everything that consumes microphone
+audio:
+
+```
+mic ──▶ echo_cancellation ──▶ asr
+                       └──▶ soundevent
+```
+
+### Why a card and not a switch inside ASR
+
+`soundevent` subscribes to the microphone topic itself, and speaker recognition
+runs off the segment ASR cut. Cleaning the signal inside ASR cleans it for ASR
+alone. As a card it is cleaned once for everything downstream, and the cleaned
+audio is a topic a human can listen to on the dashboard.
+
+Two costs, both real. One extra DDS hop, on loopback — one chunk of latency,
+32-100 ms depending on the mic driver. And the downstream topic names change:
+`/g1/mic/audio/asr` becomes `/g1/mic/audio/clean/asr`, so agent-core's
+`event.subscribe_topics` and any saved canvas have to be re-wired. Inserting
+this card into a working robot is not a no-op.
+
+### The reference signal is config, not a connection
+
+The card has to know what the robot is saying, which is the TTS card's audio
+output — the same PCM the speaker driver plays. That is a config field and not a
+second in-port, for three reasons:
+
+- the canvas matches connections by `format` alone, and a card-level drop takes
+  the first in-port of that format (`agent-core/web/js/canvas.js`), so two
+  `audio/pcm-16k` in-ports would be a coin flip;
+- what reaches a plugin is a role-less `input_topics` list ordered by click
+  order (`web/js/topic-derive.js`);
+- and the reference is not input data. It is "what another card on this machine
+  is publishing right now", and there is almost always exactly one right answer.
+
+So the default, `auto`, asks the TTS plugin in this same process — the way ASR
+is handed a handle to speaker recognition in `main.py`. Nobody fills anything
+in, and it follows the TTS card when that gets re-wired. The dropdown is filled
+per `tools/list` with the topics TTS is publishing at that moment; a topic set
+in `config.yaml` is honoured even when it is not in the list, which is the
+escape hatch for a TTS running in another container.
+
+`auto` can resolve to nothing — vendor TTS that never passes through Agent Core
+(Tianyi speaks over a ROS service), or a TTS in another container. That
+degrades the card to a passthrough, so `info()` always reports
+`robot_voice_topic`, `robot_voice_seen` and `last_robot_voice_s_ago`, and the
+card's own description says which of the two happened.
+
+### One setting
+
+| Field | Choices | Notes |
+|---|---|---|
+| `robot_voice_topic` | `auto` (default), or a live TTS topic | Above. The only thing on the card. |
+
+**There is no mode, and that is a decision.** The card cancels; it does not
+offer muting as an alternative. Half-duplex muting cannot do the job the card
+exists for — being interruptible — so offering it would be offering a setting
+that fails the requirement, and asking an operator to understand the trade in
+order to pick the only workable side of it.
+
+**There is no "how hard to scrub" and no "mute tail" either**, for the same
+reason in a weaker form: both have a defensible default, and neither is a
+question anybody can answer better from the dashboard than from the
+measurements below. They stay settable from `config.yaml` or an `action=config`
+call, which is how `gentle` would get tried on a real robot without a rebuild —
+what they are not is a question put to an operator.
+
+| Fixed at | Why that value |
+|---|---|
+| `removal_strength: normal` | An interrupting voice stays 12 dB above the residual, which is enough for ASR, while removing 5 dB more of the robot than `gentle` — and that 5 dB is the margin against the robot's own speech reaching ASR. The number that could overturn it is not in hand: whether the residual's *absolute* level still trips the VAD needs a real microphone, a real speaker and ASR in the loop. |
+| `mute_tail: auto` | Follows the delay the card measures for itself. Only applies during the warmup below, so there is nothing left to tune. |
+
+Also deliberately not offered: frame size, filter length, adaptation step size,
+double-talk thresholds, and the delay search range. They derive from the above
+or stay internal constants.
+
+**The "filter tail" knob was planned and then dropped**, which is worth stating
+because it was promised. Once the bulk delay is measured and compensated by
+shifting the reference, the filter only has to model the echo's *spread*, and a
+tail longer than the path actively costs cancellation: against a 60 ms
+synthetic room, 64 ms of tail gives 23 dB, 128 ms gives 20, 256 ms gives 18 and
+512 ms gives 14. So "raise it if echo remains" — the only advice an operator
+could act on — would have been wrong advice. It is a 128 ms constant, reported
+as `filter_tail_ms`. The delay *search range* went the same way: it is 1.5 s,
+the measurement costs ~6 ms per second of audio, and 1.5 s covers every robot
+measured.
+
+**`instance_id` is not declared in the `inputSchema`**, though every call
+carries one. The canvas renders each input property it does not recognise as a
+manual field on the card — it hides `input_topic` by name pattern, and an
+`action` whose values are all system actions — so declaring it put an
+`INSTANCE_ID` text box and an 执行 button on the card's face, asking an operator
+to type a canvas id the canvas fills in itself. No other plugin here declares
+it either.
+
+### The two places muting survives, neither of them a setting
+
+- **Warmup.** Before a delay has been measured there is nothing to align to, so
+  the microphone is held silent while the robot is audible — subtracting an
+  unaligned reference adds noise, and passing the audio through hands ASR the
+  robot's own sentence. It lasts about 3 s into the robot's first utterance,
+  once per session, and the card says what it is doing.
+- **Nothing else.** When the coupling disappears mid-session the card *passes
+  audio through* rather than muting: no measurable echo means there is nothing
+  to remove, and a permanent mute would be exactly the behaviour ruled out
+  above.
+
+### Why the mute needs a tail, and why `auto` is the default
+
+Publishing the last frame of an utterance is not the end of the sound. The
+speaker path buffers: the G1 driver prefills 9 600 bytes (~300 ms), merges into
+300 ms blocks and runs up to 240 ms ahead of the MCU's queue
+(`phanthymotus-driver` `unitree/g1/device.py`), and the measured gap between
+"TTS finished publishing" and "the robot stopped being audible" is 0.7-1.2 s on
+that robot. A mute that ended with the reference stream would therefore
+transcribe the last few words of the robot's own sentence — the exact failure
+this card exists to remove.
+
+That number is a property of the robot and its speaker, nobody knows it in
+advance, and it moves with bus load. Hence `auto`: the tail follows the delay
+the card measures for itself (`measured_echo_delay_ms` + 200 ms), falling back
+to 800 ms before the first measurement. The explicit values do exactly what
+they say, and when one of them is shorter than the measured delay the card says
+so on its face rather than only in a diagnostics field.
+
+TTS's 8-byte end-of-utterance marker is **not** used to open the gate: it marks
+the end of *publishing*, which is several hundred milliseconds before the end of
+the sound.
+
+### The delay measurement
+
+`_DelayTracker` cross-correlates the two signals' 100 Hz RMS envelopes over a
+0-1.5 s lag range, once a second, on a 3 s window. Envelope domain rather than
+waveform: what is being measured is a bulk transport delay, and an envelope
+carries that as well at 1/160th of the arithmetic. It runs in
+the warmup too, where only the mute tail needs it — so that an operator
+can read the robot's real delay off a running card before deciding anything.
+
+What the synthetic sweeps in `tests/test_echo_cancellation_plugin.py` establish:
+
+| Condition | Result |
+|---|---|
+| Delays 0-1.45 s, 5 seeds each | Exact, 0 ms error (the lag indexing has no off-by-one) |
+| Echo attenuated 20x | Still exact |
+| No echo at all, noisy room | Reports nothing — never a confident 0 ms |
+| Echo beyond the 1.5 s range | Mostly nothing; a peak pinned to the last lag is refused outright, because that is the signature of a delay *beyond* the range |
+| A person talking over the robot at the robot's own level | **A single window can be wrong by a second.** The median over up to 20 windows held at 420 ms with 80% of windows contaminated, while `echo_delay_spread_ms` grew to ~1 s |
+
+The last row is why `measured` is a median and not the latest value, and why the
+spread is reported at all: an operator needs to be able to tell "this robot's
+delay is 420 ms" from "this number is moving".
+
+Two things it does not and cannot cover, both needing a machine with a speaker
+and a microphone in one room: whether a given robot's speaker path is linear
+enough for *cancellation* to be worth building (the G1 plays through a vendor
+MCU, which may apply EQ, limiting and resampling we cannot see), and the sample
+clock drift between the microphone and the speaker.
+
+### Cancellation
+
+A partitioned-block frequency-domain NLMS filter, 16 ms blocks, 128 ms tail,
+followed by a soft gate on the residual. In numpy, not bound to speexdsp's MDF:
+that binding is a PyPI sdist needing swig and `libspeexdsp-dev` inside a 16 GB
+image built for two JetPack lines and cp38, it exposes `process(near, far)` and
+nothing else — no delay handling, no access to the preprocessor's residual
+stage — and it would have to be hand-fed lock-step frames anyway. This is ~40
+lines of arithmetic, runs on both lines with the numpy already in the image,
+can be tested against synthetic echo paths offline, and can be hot-copied onto
+a rig.
+
+**The delay is measured, not modelled.** The reference is fetched by time from
+`_RefBuffer` at `measured_delay - 32 ms`, so the filter spans the room and the
+alignment error rather than the speaker's several hundred milliseconds of
+buffering. Covering that with taps instead would need 5-75x the arithmetic to
+model what is mostly a constant offset — and, per the tail measurements above,
+would cancel *less*.
+
+Until a delay has been measured the card **mutes** instead: subtracting an
+unaligned reference adds noise rather than removing echo. The card says so on
+its face while that lasts, and it lasts about 3 s into the robot's first
+utterance.
+
+#### A second filter, because the guards cannot be relaxed
+
+The protection the published filter needs makes it unable to recover from
+anything. The skip guard refuses an update whenever the error exceeds the
+microphone — which is what double-talk looks like, and *also* what a changed
+echo path looks like. So when the robot turns its head mid-session the filter
+locks to the old path forever: measured at **-2.9 dB and still -2.9 dB six
+seconds later**, with 355 consecutive updates refused. Worse than passing the
+microphone through, because a stale filter adds a wrong estimate. The same run
+with the guards disabled recovered to 17.4 dB within six seconds.
+
+Double-talk and a changed path cannot be separated by powers — the third time
+that is true in this file. So a second filter adapts with none of the
+protection, its output is never published, and every ~1 s of far-end audio the
+two are compared on the error they produced. The shadow replaces the foreground
+when it is better by 2 dB over a whole window. During double-talk it adapts to a
+person and gets *worse*, so it is not promoted; after a path change it learns
+the new path and gets better, so it is.
+
+| | before | after |
+|---|---|---|
+| steady path | 26.8 dB | 26.8 dB, no promotions |
+| path changes at 9 s | 0.6 dB, never recovers | **20.2 dB**, one promotion |
+| the same on Orin 5, over real DDS | — | 20.2 dB before, 1.4 dB just after, **17.2 dB** six seconds later, two promotions |
+| 4 s of double-talk | 22.9 → 24.2 dB across it | unchanged, no promotions |
+| person preserved during double-talk | 17.0 dB | 17.0 dB |
+
+Recovery after a path change takes 4-6 s offline and 6-9 s on the rig, where
+the robot's speech is bursty and only far-end-active blocks count. The shadow
+costs 5.5 ms per second of audio, a fifth of the cancel path.
+
+Two further guards, both earning their place with a measured failure:
+
+- **Skip the update when the error is bigger than the microphone.** That is
+  either double-talk or divergence, and skipping is what keeps a bad second from
+  undoing a good minute. Measured: 19.8 dB before a 4 s double-talk stretch,
+  1.7 dB during it (the person is in the microphone and is *supposed* to
+  survive, so low ERLE there is correct), 22.1 dB after.
+- **Zero the filter when its output is measurably worse than its input**, over
+  a window of far-end-active blocks. Only that — the guard started out asking
+  the more useful question, "is this filter doing anything at all", at a +1 dB
+  threshold, and a rig showed why that cannot work: *in powers alone* a filter
+  converged to 20 dB and then talked over is indistinguishable from one that
+  has learned nothing, because the residual is dominated by the person either
+  way. On Orin 5 it zeroed a converged filter three times during one 4 s
+  double-talk stretch and put "this microphone barely hears the speaker" on the
+  card — reintroducing from inside the guard the failure the per-block skip
+  exists to prevent.
+
+**Whether there is coupling worth cancelling is decided by correlation, not by
+powers**, because correlation can tell those two cases apart. The delay tracker
+already measures it, so cancelling requires a *fresh* measurement: one
+accepted within the last 15 s **of the robot actually talking** (wall clock
+would be wrong — a delay measured an hour ago is still right if the robot has
+been silent since). Without one the card passes audio
+through, reports `coupling_lost`, and says to check the volume — muting there
+would be the permanent half-duplex microphone this card exists to avoid.
+
+That is also what protects against the no-coupling case, where a canceller makes
+a microphone *worse*: with the reference playing and no echo in the mic, the
+filter cannot explain a person with the reference, the gradient is pure noise
+and it injects that noise — measured at 4.5 dB below passthrough over 18 s. With
+no coupling the tracker accepts nothing, so cancellation never runs at all.
+
+Measured on synthetic rooms (12-18 s, 60 ms path):
+
+| | echo removed | a person talking over the robot, preserved |
+|---|---|---|
+| `gentle` (linear filter only) | 18.1 dB | 18.1 dB |
+| `normal` | 22.9 dB | 12.0 dB |
+| `aggressive` | 27.9 dB | 6.5 dB |
+
+The scale stops at `aggressive` because ERLE saturates there: suppression
+factors of 1.5 and 2.5 also give 27.9 dB and cost another 2-3 dB of the
+person's voice, so offering them would only let somebody pick a strictly worse
+point.
+
+The step size is 0.2, a factor of two below the measured stability edge: 0.3
+reaches 22-25 dB, 0.4 collapses to about 0 dB and 0.5 diverges. A diverged
+filter is worse than no filter, and these robots' speakers have not been
+characterised.
+
+Measured on Orin 5 over real DDS topics, with a 450 ms delay and a 60 ms room
+convolved in (`normal`, one 24 s session):
+
+| phase | microphone in | published out | change |
+|---|---|---|---|
+| person only, robot silent | 3649 | 3649 | **0.0 dB** — untouched |
+| robot only, before the delay was measured | 1659 | 0 | muted (the fallback) |
+| robot only, converging | 1750 | 453 | **11.7 dB** |
+| both talking | 3491 | 2714 | 2.2 dB — the person survives |
+| robot only, after the double-talk | 1704 | 242 | **17.0 dB** |
+| person only again | 3331 | 3331 | **0.0 dB** |
+
+The delay came back as 460 ms against the 450 injected, with a 10 ms spread.
+The reported `echo_removed_db` was 14.1 dB and no filter reset fired.
+
+`echo_removed_db` is an exponentially-weighted average over roughly the last
+1.5 s **of the robot talking**, and only over echo-dominant blocks. Both of
+those are rig findings rather than design: a lifetime average read 3.8 dB at the
+end of that same session, and including double-talk blocks read 4.3 dB — in a
+session whose settled phases removed 11.7 and 17.0. A card that says 4 while
+removing 17 is not a diagnostic.
+
+Cost on Orin 5, callback profiled in isolation:
+
+| | ms per second of audio |
+|---|---|
+| forwarding only (warmup, or a card with nothing to cancel) | 3.7 |
+| cancelling | **27.3** |
+| cancelling, with the shadow filter | **32.8** |
+
+This section said 3.8 ms for cancelling until the shadow filter was measured,
+and that figure was wrong by a factor of eight. The benchmark fed the whole
+reference signal in before the first microphone chunk, so by the time a block
+asked for its echo the audio had aged out of the 2.5 s reference ring: every
+block came back silent, nothing was far-end-active, and **neither filter ever
+ran**. The giveaway was in the output the whole time — `adapted 0 blocks`.
+
+The same trap had already been caught once in `tests/`, where the end-to-end
+test cancelled nothing for the same reason and was fixed by interleaving the
+two streams by stamp, which is what the executor does. Anything that drives
+this card has to interleave them. The live `callback_wall_ms_per_audio_s` reads ~91 ms/s, which is GIL
+contention in a process running nine other plugins, not CPU (see the cost note
+above). Caching the delay median mattered: it is read once per chunk, and
+`np.median` was a third of this path's cost before.
+
+Reframing into 16 ms blocks means published audio is up to one block older than
+the chunk that triggered it, so a cancelled chunk carries **its own** stamp
+rather than the input's — ASR reads that header as the capture time.
+
+### Where this breaks, measured
+
+Every number above comes from a synthetic echo path: linear, time-invariant,
+sample-clock-locked — the assumptions the algorithm itself makes. That makes
+them necessary but not sufficient, so the assumptions were broken one at a time
+to find out what the margin is:
+
+| | ERLE |
+|---|---|
+| baseline | 26.8 dB |
+| speaker clipping at 50% / 30% / 15% of peak | 24.6 / 18.0 / 12.6 dB |
+| sample clock drift 10 / 50 / 200 ppm | 15.0 / **3.0** / ~1 dB |
+| echo path changes mid-session | 20.2 dB (with the shadow filter; 0.6 without) |
+
+Nonlinearity degrades gracefully. A changed path is handled. **Drift is a wall**:
+50 ppm — well inside the spread of two ordinary crystals — leaves nothing. Over
+18 s, 50 ppm is a slide of only 14 samples, but at 8 kHz that is more than half
+a period, so the high band decorrelates completely.
+
+That makes one deployment condition non-negotiable and unverified here: **the
+microphone and the speaker must share a sample clock**, which they do when both
+sit on one codec and do not when the microphone is a USB device and the speaker
+is on-board. Which robots are which is a question only hardware can answer.
+
+Nor has any of this met a real speaker. On a box with no audio hardware the
+echo path is something this file computes, and a real one adds exactly the
+effects above in combinations nobody has measured here.
+
+### What is not here yet
+
+Noise reduction, which is a different thing from echo cancellation and cannot
+remove the robot's own voice (DeepFilterNet3 and GTCRN have no reference input).
+
+A per-bin spectral residual suppressor, which would improve double-talk quality
+rather than remove more echo — the current one is a broadband soft gate, ramped
+across the block so it cannot click, and a spectral one needs its own windowed
+overlap-add framing.
+
+And the two things no amount of code can settle from here: nonlinear echo (a
+speaker driven into its limiter, which is what a vendor MCU may well do) and
+sample clock drift between the microphone and the speaker. Both need a machine
+with a speaker and a microphone in one room.
+
+Processing currently happens in the microphone callback, with no worker thread:
+the work is a comparison and a memset, and the estimate is a 300x150 dot
+product once a second.
+
+Measured on Orin 5 (jp5.11), one stream, idle box, against an injected 450 ms
+echo on real DDS topics:
+
+| | ms per second of audio |
+|---|---|
+| callback profiled in isolation | 3.6 |
+| `callback_wall_ms_per_audio_s`, live, reference playing | 29.7 |
+| same, before the `array.array` fix below | 46.9 |
+| same, live, no reference at all (no correlation) | 40.7 → the correlation costs ~6 |
+
+The two columns differ because the reported figure is **wall** time inside the
+callback, not CPU time: nine other plugins' threads contend for the GIL in this
+process. Treat it as a headroom indicator and a regression tripwire, and
+profile in isolation before concluding anything about cost.
+
+The `array.array` fix is worth repeating elsewhere. Assigning a Python list to
+an `uint8[]` field makes the generated setter validate it element by element
+(`all(isinstance(v, int) and 0 <= v < 256 ...)`, 1024 iterations per chunk);
+assigning an `array.array('B')` takes a buffer fast path. Measured here: 0.226
+vs 0.021 ms per chunk, which was the single largest cost in this callback.
+`plugins/tts.py` and every mic driver in `phanthymotus-driver` still write
+`list(...)` and can have the same saving.
 
 ---
 
@@ -1525,6 +1978,80 @@ asked 「在发生什么了？」. Off-by-one on a syllable also silently change
 in mixed script, where latin and CJK have very different phonemes-per-character and
 one ratio was applied to both.
 
+**And the import itself forked, which wedged perception outright.** The env-var fix
+above stops *phonemizer* from calling `find_library`. It cannot stop `dlinfo` — a
+package phonemizer imports — from calling `find_library('dl')` at **import** time,
+and `ctypes.util.find_library` on Linux `subprocess`es out to `ldconfig -p`.
+
+Forking a 2.4 GB process with dozens of threads, one of them running a TensorRT
+warmup, hangs. Measured on Orin 5: the child never reached `exec` (at fork it
+inherited a lock another thread held), the parent sat in `_execute_child` waiting
+on the error pipe, and both stayed there. Consequences, in the order an operator
+meets them:
+
+| | |
+|---|---|
+| symptom | 「启动控制」卡住 —— the dashboard button never completes |
+| what is actually stuck | every `tools/call`, because the ASR worker holds the import lock |
+| what the logs say | nothing. The last line written is the one before the fork |
+| how it looks | perception dead; CPU at 99% (that is the unrelated TTS warmup thread) |
+
+It is a **race**, which is why it had never been seen: the same card starts cleanly
+when nothing else is loading. It needs the first phonemization (`_worker_inner`
+pre-computes the wake word's IPA at worker start) to land while another thread is
+busy — i.e. exactly what 「启动控制」 does by bringing TTS and ASR up together.
+
+**And it was not one fork, it was four.** Counted on Orin 5 by instrumenting
+`subprocess.Popen` around `from phonemizer.backend import EspeakBackend`:
+
+| | forks | what |
+|---|---|---|
+| before | **4** | `uname -p`, `/sbin/ldconfig -p`, `/usr/bin/gcc -Wl,-t -o /tmp/… -ldl`, `/usr/bin/objdump -p -j .dynamic …/libdl.so` |
+| after | **0** | — |
+
+The gcc/objdump pair is `ctypes.util`'s fallback path: `ldconfig -p` finds nothing,
+because `Dockerfile.jetson` replaces `ldconfig` with a no-op during apt installs and
+the cache is never rebuilt — *the same root cause as the espeak lookup above*. So
+what reads like one library lookup actually **compiles a program** to locate
+`libdl`. Three forks, one of them a compiler, in a process that must not fork.
+
+`uname -p` is **not** `platform.processor()` — that was the obvious guess, it was
+wrong, and patching `processor` measurably changed nothing (still 1 fork). The
+caller is `platform.system()` → `platform.uname()`, which fills its `processor`
+field via `platform._syscmd_uname`. `joblib`, imported by
+`phonemizer.backend.base`, calls `system()` at import time.
+
+So the fix has two halves:
+
+- **`_warm_platform_uname()` at module import.** `platform.uname()` caches, so one
+  call while perception is still loading plugins — nothing inferring, few threads —
+  serves every later caller from `_uname_cache`. This is what actually removes that
+  fork; the `noguard` count above drops 4 → 3 purely from the warm-up being in place.
+- **`_import_without_forking()` around the import.** Resolves the libraries we need
+  from a path list (`_FORK_FREE_LIBRARIES`) and makes `_syscmd_uname` return its
+  `default` instead of forking — which is exactly what `platform` does on a system
+  with no `uname` binary. Both are restored afterwards. A library not in the list
+  falls through to the real implementation, because returning `None` would be read
+  as "not installed". `_syscmd_uname` is private, so its absence is tolerated: a
+  CPython that drops it must not break ASR.
+
+Not a retry and not a timeout: there is no fork left to hang. A tiny child is not a
+safer child, which is why `uname -p` was in scope at all — the hang is *in* fork,
+before exec, so the size of what would have been exec'd is irrelevant.
+
+Verified on Orin 5: 「启动控制」's shape (TTS warmup and the ASR card started
+together) run 4 times in a row, phonemization completing in 5–9 s each time and MCP
+answering in under 130 ms throughout.
+
+Diagnosing the live wedge took `py-spy dump`, which is worth remembering because
+nothing else showed it — `docker logs` was silent, `docker top` showed one busy
+thread (the wrong one), and MCP simply did not answer:
+
+```bash
+docker exec embodied-perception pip3 install -q py-spy
+docker exec --privileged embodied-perception py-spy dump --pid $(pgrep -f "python3 /work/main.py" | head -1)
+```
+
 `_text_to_ipa(text, with_positions=True)` now also returns, per phoneme, the
 character offset in the original string that phoneme ends at — built from growing
 prefixes of each segment, phonemized through the same function that produced the
@@ -1532,6 +2059,113 @@ phonemes. Segments are `(start, end, is_cjk)` offsets rather than `strip()`ed
 substrings, so punctuation and whitespace stay accounted for. `_text_after_phoneme`
 is then a lookup, which also removes the second phonemization pass. Positions are
 opt-in: callers that only need to match pay nothing for the prefix passes.
+
+---
+
+## 语音情绪和音频事件（SenseVoice 顺带给的）
+
+SenseVoice-small 的输出前几个 token 不是文字，而是四个 tag：语种、情绪、音频事件、
+ITN 开关。sherpa-onnx 在把它们从 `text` 里剥掉的同时填进了结果对象的三个字段：
+
+```python
+res = stream.result
+res.text      # 'Yeah.'
+res.lang      # '<|en|>'
+res.emotion   # '<|HAPPY|>' / '<|NEUTRAL|>' / '<|EMO_UNKNOWN|>' …
+res.event     # '<|Laughter|>' / '<|Speech|>' / '<|BGM|>' …
+```
+
+也就是说这些信息**本来就已经算出来了**，而适配器以前 `return text` 把其余三个一起
+扔了。捡回来不加载任何模型、不多跑一次推理、不多占一字节显存 —— 这是它和另一条路
+（emotion2vec+ 作为独立卡片）唯一但决定性的区别。
+
+`emit_audio_tags`（默认 **开**，只对 `sensevoice-small` 显示）把 `lang` 和
+`audio_event` 合进 `<topic>/asr` 和 `<topic>/asr_background` 两条 payload。
+`emit_emotion` 是**第二个开关，默认关** —— 理由在下面，是量出来的，不是谨慎。
+
+### 没信息的取值被压掉，而不是照发
+
+`_UNINFORMATIVE_AUDIO_TAGS` 挡掉 `NEUTRAL` / `EMO_UNKNOWN` / `UNKNOWN` /
+`Speech` / `Event_UNK` / `withitn` / `woitn`。所以一句语气平淡的普通话只多出
+`{"lang": "zh"}`，笑了才会多出 `"audio_event": "Laughter"`。
+
+两个理由，第二个更重要。payload 的每个 key 都会进 L4 trigger 让 LLM 读一遍，每句
+挂一个 `"emotion": "NEUTRAL"` 是让它为零信息付 token；而且它会把「模型没判断出情
+绪」读成「这个人语气平淡」—— 那是两件不同的事。`Speech` 同理：说话这件事由 `text`
+本身证明。这跟 `plugins/speaker.py` 只返回带信息的 key 是同一条规则。
+
+`lang` 不在压掉的名单里：它每次都有值，而值本身就是信息（zh/en/ja/ko/yue）。
+
+字段叫 `audio_event` 而不是 `event`，因为 agent-core 那边 `event` 是事件总线的词
+（`src/event/llm.py`、`config['event']`），payload 里再出现一个同名 key 只会让读日
+志的人以为是同一件事。
+
+### tag 走返回值，不走适配器上的状态
+
+`ASRAdapter.transcribe_rich()` 返回 `(text, extras)`；基类默认实现返回
+`(transcribe(...), {})`，所以 parakeet / x-asr 下这些 key 干脆不出现，而不是出现一
+个空值让 LLM 以为「判断过、没有情绪」。
+
+不要改成在适配器上记一个 `self._last_emotion`：`ASRPlugin._adapter` 是 **plugin 级
+的单个实例**，被所有 `_ASRNode` 共用（见 `_apply_shared`），而每个 node 有自己的
+worker 线程。两个麦克风同时转写时，挂在实例上的状态会把情绪配到另一句话上 —— 不报
+错，也不会有任何日志。
+
+三个字段都用 `getattr(..., "")` 取：它们来自 sherpa 的 C++ binding，换个版本少一个
+就直接取属性会让整条 ASR 路径抛异常。少一个 tag 不值得让机器人听不见。
+
+### 三个字段的实测价值差得很远（351 段真机语音）
+
+Orin 6 上 `/models/vad_segments/` 攒的 351 段真实语音，全部过一遍
+`sensevoice-small` int8：
+
+| 字段 | 分布 | 结论 |
+|---|---|---|
+| `lang` | zh 212 / en 116 / ko 12 / ja 6 / yue 3 / nospeech 2 | 每条都有值，而且都对得上 —— **真有用** |
+| `emotion` | NEUTRAL 180 + EMO_UNKNOWN 160 = **340/351**；SAD 5、HAPPY 6 | 剩下那 11 条基本是**错的**，见下 |
+| `audio_event` | Speech 348 + Event_UNK 3 | 压掉之后**一条都不剩** |
+
+情绪那 11 条长这样：
+
+| 真实句子 | 判成 |
+|---|---|
+| 小范小范，你好呀。 | SAD（同一种误判出现 3 次） |
+| 我的断网了，我断网了吗？ | HAPPY |
+| 也行先试试看吧也好不？对嗯，那我看了一下，好像也没有特别慢吧。 | HAPPY |
+
+不是「信号稀疏」，是噪音。而且它的错误方式最坏：一个挂在愉快问候上的
+`"emotion": "SAD"` 会让 LLM 按一种不存在的低落语气回应 —— 比没有这个字段更糟。
+所以 `emit_emotion` 默认关。开关留着，因为换一批说话人、换个场景也许不一样，而要量
+就得能打开；但默认值要对得起测出来的东西。真要做情绪识别，该上的是 emotion2vec+
+独立卡片，而不是把这个字段当它用。
+
+`audio_event` 全是 `Speech` 还有一个**结构性**原因，不只是语料里没人笑：这些段是
+**VAD 门控之后**的语音段，纯笑声/掌声/音乐根本走不到 ASR。所以在这条管道里，这个
+字段只可能在笑声**混在说话里**时触发。它默认开着是因为成本已经是零，不是因为验证
+过它会响。要检非语音事件，`plugins/soundevent.py` 才是直接订阅原始音频的那个；两者
+在 Laughter/Applause 这类标签上重叠，谁更准没比过。
+
+复现这个测量（只读，不动容器里的代码）：
+
+```bash
+# 拿 351 段真机语音过一遍，统计三个 tag 的分布
+ssh nvidia@10.100.121.16 'docker exec embodied-perception python3 - <<EOF
+import glob, wave, struct, collections, sherpa_onnx
+r = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+    model="/models/sherpa-onnx/sensevoice/model.int8.onnx",
+    tokens="/models/sherpa-onnx/sensevoice/tokens.txt",
+    num_threads=2, use_itn=True, language="auto")
+tally = collections.Counter()
+for f in sorted(glob.glob("/models/vad_segments/*.wav")):
+    with wave.open(f) as wf: pcm = wf.readframes(wf.getnframes())
+    n = len(pcm) // 2
+    st = r.create_stream()
+    st.accept_waveform(16000, [v/32768.0 for v in struct.unpack(f"<{n}h", pcm)] + [0.0]*8000)
+    r.decode_streams([st])
+    if st.result.text.strip(): tally[(st.result.emotion, st.result.event)] += 1
+print(tally)
+EOF'
+```
 
 ---
 
@@ -1678,13 +2312,248 @@ enrols new people from a photo, the live stream, or a batch package.
 
 ### Models
 
-InsightFace **buffalo_sc**, the smallest pack that still ships landmarks (alignment
-needs them):
+Two detector+recogniser pairs, selected by `model` on the card (registry:
+`plugins/face_runtime.FACE_MODELS`). **`scrfd25g_edgeface_s` is the default**, at
+`match_threshold` 0.55 — see the table below for why that number and not 0.35.
+
+`buffalo_sc` — the previous default. InsightFace's smallest pack that still ships
+landmarks (alignment needs them):
 
 | File | Size | Role |
 |------|------|------|
 | `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
 | `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
+
+`scrfd25g_edgeface_s` — the default. A bigger detector and a stronger recogniser,
+same contract:
+
+| File | Size | Role |
+|------|------|------|
+| `scrfd_2.5g_bnkps.onnx` | 3.3 MB | SCRFD-2.5G-BNKPS — detection + 5 keypoints |
+| `edgeface_s_gamma_05.onnx` | 15 MB | EdgeFace-S-GAMMA-0.5 — 512-d embedding |
+
+Measured over a 100-image LFW sample (4849 impostor pairs, 2 genuine pairs), both
+pairs detected 99 of the 100 faces:
+
+| | impostor p99 | impostor max | genuine | margin | `match_threshold` |
+|---|---|---|---|---|---|
+| `buffalo_sc` | 0.158 | 0.323 | 0.52 / 0.71 | +0.199 | 0.35 |
+| `scrfd25g_edgeface_s` | 0.246 | 0.450 | 0.70 / 0.88 | +0.252 | 0.55 |
+
+EdgeFace separates identities better, but its whole similarity distribution sits
+higher — which is why **`match_threshold` is per-model** and why reusing 0.35 on
+the second pair puts four of those impostor pairs over the line. Leave the key out
+of config to get the configured model's recommended value; an explicit value still
+wins, so a hand-tuned robot keeps its number.
+
+**Adding a third pair is a row in `FACE_MODELS`, not a plugin.** What a candidate
+has to satisfy: the detector emits **nine** outputs (score/bbox/kps for strides
+8/16/32, 2 anchors) because `plugins/scrfd_decode.py` decodes exactly that and
+alignment needs the landmarks; the recogniser takes 112x112 and returns 512-d,
+because every stored sample and FaceDB row is that. Pre/post-processing is
+*shared* — RGB `(x-127.5)/128` into the detector, RGB `(x-127.5)/127.5` into the
+recogniser — so a model with different normalisation does not belong in the table,
+it belongs behind a branch in `embed()`. All of this is asserted at load time
+rather than discovered as bad embeddings, and
+`tests/test_face_models_registry.py` pins the table-level invariants.
+
+**Each model keeps its own roster, and switching means re-enrolling.** Embeddings
+from different networks are not comparable, so `IdentityDB._load` refuses a store
+written by another model rather than silently confusing people, and already-stored
+samples are never re-embedded.
+
+That refusal is right, but with one shared default it fired on the act of *selecting*
+a second model — the card went to `state: error` and the only way out was inventing a
+`db_dir` by hand. So `db_dir` is resolved per model (`face_db_dir_for`):
+`buffalo_sc` **pins `/models/face_db`** and any model without a pin gets
+`/models/face_db-<model>`. An explicit `db_dir` different from the default pins it
+and disables the suffix. The refusal stays as a backstop against pointing a model at
+a foreign store.
+
+The pin lives on buffalo_sc's row and **not** on "whichever model is the default",
+which matters now that the default has moved: keying it on `DEFAULT_FACE_MODEL`
+would hand the new default a store written by buffalo_sc — recreating the very
+`state: error` above — and orphan the real roster behind a `face_db-buffalo_sc` path
+nothing looks at. `tests/test_face_models_registry.py` pins exactly that.
+
+> **Upgrading an existing robot changes what it recognises.** The default moved to
+> `scrfd25g_edgeface_s`, and the roster moves with it, so a robot that had people
+> enrolled comes up with an **empty** roster and recognises nobody until they are
+> re-enrolled. Nothing is destroyed — selecting `buffalo_sc` on the card brings the
+> old roster back intact — but the upgrade itself is silent apart from
+> `database.persons` dropping to 0. There is no migration, and § Why there is no
+> migration explains why not.
+
+So switching is **not destructive** and switching back restores the previous roster
+intact. But the newly selected model **starts empty and recognises nobody** until
+people are re-enrolled, which no amount of plumbing can avoid — the old embeddings
+are in the wrong space. `info()`'s `database.persons` and `database.db_dir` say
+which roster is loaded, so an empty one does not read as lost people.
+
+#### Why there is no migration
+
+The obvious ask is a backfill: carry the roster across a model switch so nobody has
+to be re-enrolled. It cannot be done from what is on disk, and the reason is worth
+stating once so it is not re-proposed.
+
+An identity is stored as a 512-d embedding. An embedding is only meaningful inside
+the network that produced it — there is no transform from ArcFace's space to
+EdgeFace's, learned or otherwise, because the two were trained independently and
+their axes mean nothing to each other. So the stored rows cannot be converted.
+
+The other route is to re-embed the original faces, and **the database keeps no
+imagery to re-embed from**. That is deliberate, not an oversight: a face DB is three
+files — `persons.json`, `embeddings-<n>.npy`, `visits.jsonl` — and
+`config.yaml`'s `image_input` block says it outright, *"an upload is a transfer, not
+storage: enrolling a face leaves an embedding behind and never the photograph."*
+`/models/uploads` holds registration photos for `retention_days` (7) but it is a
+transfer buffer keyed by upload, not by person, and stream-enrolled people never had
+a photo there at all. It is not a roster.
+
+So the two things that *would* make a switch free both have to be decided before
+enrolment, not after:
+
+| Approach | What it costs | What it buys |
+|---|---|---|
+| Store the aligned 112x112 crop per sample — **implemented**, `store_sample_crops: true` | ~6 KB/sample JPEG (≈24 MB at 500 people x 8). Keeps face imagery on disk, bounded and deleted with its sample | Re-embedding under *any* future model, offline, with nobody present |
+| Embed under every installed model at enrolment | Both models resident; enrolment latency x N; an IdentityDB schema change that also lands on voiceprints | Instant lossless switching between *those* models only |
+| Dual-model transition window | Both models resident during migration; each person must appear once | Migrates an *existing* roster automatically: match with the old model to recover the name, enrol that name under the new one |
+
+The third is the only one that helps a roster that already exists, because it
+recovers the identity from the old model while the person is in frame rather than
+from storage.
+
+**The first is now implemented**, so this is the last switch that has to be painful.
+Every sample enrolled from here on stores the aligned crop it was embedded from
+under `<db_dir>/samples/<sample_id>.jpg`, and `stats()` reports
+`samples_with_artifact` against `samples` so the shortfall on an older roster is
+visible rather than discovered at switch time. `IdentityDB.sample_artifacts()` is
+the surface a re-embedding pass reads.
+
+Two things about that storage are load-bearing:
+
+- **Crops are keyed by a stable sample id, never by row index.** Rows get reindexed
+  by the max-samples trim, by `forget`, by capacity eviction and by the orphan
+  filter on load; a crop filed under an index would, after any of those, be served
+  up as a different person's face — which is worse than having no crop, because it
+  is wrong rather than absent. Ids come from a counter that only ever increases and
+  is restored from disk, so a retired id can never be handed to a new sample and
+  adopt its file.
+- **Files are written before the commit and swept after it**, the same ordering and
+  for the same reason as the embeddings file: a crash then leaves an unreferenced
+  file, which the next commit removes, rather than a referenced id with nothing
+  behind it.
+
+For a roster enrolled *before* this existed — which includes every robot deployed
+to date — there is still nothing to re-embed, so the cheap path applies:
+auto-enrolment re-learns people as they appear, and only **named** people need
+their name re-attached. On the Orin 5 rig that was 4 names out of 44 identities.
+
+#### Migrating a roster
+
+Migration is automatic and has **exactly one entry point**: `auto_migrate_roster`,
+the background pass described below. There is no action to call.
+
+There used to be a `reembed_from` action for triggering it by hand. It is removed,
+and the reason is worth keeping: `agent-core`'s `_to_openai_schema` splits **every**
+`x-action-params` entry into an LLM-callable function, unconditionally — there is no
+allowlist and no way to mark one as internal. `canvas_binding.is_bound` then matches
+sub-tools by prefix, so they inherit the parent card's binding. The upshot was that
+a maintenance operation which blocks for tens of seconds became a tool in the
+robot's own toolbox, on a `processor` card where an ACP barrier would wait for it.
+Nobody needed to migrate by hand, so the action was the wrong side of that trade.
+
+**It is neither an overwrite nor an extra column.** Each model owns its own
+database, so this reads the source, re-embeds, and writes into the *target's*
+store, leaving the source byte-for-byte intact — which is what makes it safe to
+retry and trivial to abandon: if the migrated roster is worse, select the old model
+again and the original is still there, untouched.
+
+A single database with one embedding column per model was the alternative, and is
+worse here for three independent reasons. `dim` is a per-database property and a
+future recogniser need not be 512-d. `IdentityDB` is deliberately
+modality-agnostic and shared with voiceprints, so widening its schema for
+face-specific multi-model rows taxes a module with no stake in it. And every
+`match()` would then have to choose a column — which is exactly the "matching
+across two networks does not fail, it silently confuses identities" failure the
+model check exists to prevent.
+
+Carried across: `person_id` (so `visits.jsonl` stays attributable), name, profile,
+named/unnamed, and `registered_at` — resetting that would make everybody look newly
+met against a visit log that disagrees.
+
+**Each model's vectors live in that model's own database, not in a shared column
+that gets rewritten.** This is what makes switching cheap: every `(crop, model)`
+pair is embedded **once** and kept in that model's store permanently, so going
+A -> B -> A recomputes nothing — A's roster is still sitting there, complete. Only
+a genuinely new model costs a pass. Within a model, the content-hash check below
+makes a repeat pass a no-op too, so the guarantee is exactly-once per pair rather
+than once-per-switch.
+
+**It runs in the background at startup, and does not gate service.** When
+`auto_migrate_roster` is true (the default) the engine loader publishes the engine
+first and *then* starts the pass on a daemon thread: recognition answers
+immediately against whatever is in the roster and recognises more people as the
+pass proceeds. `IdentityDB` takes its `RLock` per call, so a `match()` at frame
+rate and an `add()` from the migration interleave safely. Progress is in `info()`
+under `migration` (`state`, `persons_done`, `persons_total`, `samples_done`), which
+matters because a roster that is still filling looks exactly like one that is
+simply empty.
+
+The source is chosen automatically: the other model with the most re-embeddable
+samples, named in the log rather than guessed silently — with more than two rows in
+`FACE_MODELS` "the other one" stops being well defined. A config change or a stop
+bumps the load generation and the pass notices within one person and stops, rather
+than keeping on writing into a database the plugin has moved on from.
+
+Selecting a different `model` by itself migrates nothing beyond that automatic
+pass — it swaps which database is in use.
+
+**Turning `auto_migrate_roster` off means no migration at all**, now that the manual
+action is gone: changing model then requires re-enrolling every person. That is a
+legitimate choice for a deployment that does not want the background writes, but it
+is the whole cost, not a reduced one.
+
+The work is dominated by one decode-plus-embed per stored crop, measured at
+**6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
+
+| roster | crops | embedding time alone |
+|---|---|---|
+| 45 persons x 1 | 45 | ~0.3 s |
+| 100 persons x 4 | 400 | ~2.6 s |
+| 500 persons x 8 | 4000 | ~26 s |
+
+Add one `persons.json` + full-matrix rewrite per person on top. A maxed-out 500x8
+roster is therefore ~30-60 s of work — which is exactly why it runs with nobody
+waiting on it. `info()`'s `migration.persons_done` against `persons_total` is how
+you watch it; there is no synchronous form to time out.
+
+**Re-running is idempotent, including at sample level.** Crops this person already
+has here are skipped, keyed on content — the stored bytes are the source crop
+verbatim, so no provenance column is needed and the same face arriving by two
+routes collapses too. So restarting perception, or coming back to a model later,
+re-embeds nothing.
+
+That distinction is load-bearing and was a real defect first: without the content
+check a second pass re-embedded the same crops and *appended* them, taking one
+person from 5 samples to 8 with three duplicates. Once that fills
+`max_samples_per_person`, the oldest-first trim starts evicting the genuinely new
+captures made since the migration — the migration eating real data. The original
+test asserted only that the person *count* was unchanged, which it was, the whole
+time it was happening.
+
+What it cannot do is invent crops. Samples enrolled before `store_sample_crops`
+have nothing to re-embed and are simply left behind — `migration.persons_total`
+counts only the people that *can* move, against `source_crops` for the samples that
+had one, so the shortfall is visible rather than a surprise. One corrupt crop, or
+one person that fails, is logged and skipped rather than abandoning the pass.
+
+The embedding step deliberately **skips detection and alignment**
+(`FaceService.embed_aligned`). The stored crop is already aligned, so re-detecting
+would at best apply a second similarity transform on top of the first and at worst
+find no face at all — a 112x112 image letterboxed to 640x640 is not what SCRFD was
+trained on. Re-embedding has to put the new network on the *same pixels* the old one
+saw, or the migrated embedding is not comparable to a fresh capture of that person.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
@@ -1785,6 +2654,28 @@ be pinned, and the robots have no reliable route to GitHub. To refresh, download
 (`prisma/articles/upload-figs.js` cannot do it — it only accepts image extensions
 and forces its own key shape), then re-download from COS and paste the *verified*
 `size`/`sha256` into `FACE_MODEL_FILES`.
+
+`scrfd25g_edgeface_s` lives at `public/face/scrfd25g_edgeface_s/`
+(`FACE_SCRFD25G_BASE`, pins in `FACE_SCRFD25G_FILES`) and its two halves come from
+different places:
+
+- **The detector** is insightface's own `scrfd_2.5g_bnkps`, re-hosted from
+  `hsuyabc/scrfd_2.5g_bnkps.onnx` on HuggingFace. Its pinned size and SHA256 are
+  that repo's LFS oid, so the re-host is verifiable against upstream.
+- **The recogniser ONNX does not exist upstream.** Idiap publish EdgeFace as
+  PyTorch weights only, so this file is *our* export from `anjith2006/edgeface` —
+  fp32, opset 17, single-file (weights inlined, no `.onnx.data` companion), one
+  input `(batch,3,112,112)` and one output `(batch,512)`. It was checked against
+  the reference implementation before upload: worst cosine 0.9999999 over 8
+  inputs. Re-exporting is therefore the only way to refresh it, and a new export
+  means a new hash.
+- **Not the INT8 export.** On the same graph it measured no faster at all (16.0 ms
+  vs 15.7 ms p50, 2 threads) while moving the embedding by cosine 0.84 — it buys
+  disk in exchange for an unvalidated recogniser. If someone wants it, validate it
+  against a real face set first and give it its own row and threshold.
+
+Either way the rule is the same as everywhere else: **re-download from COS and pin
+the hash of what came back**, not of what you uploaded.
 
 ### The person record: `name` vs `profile`
 
@@ -1918,13 +2809,28 @@ what an operator reasons about, and it stays meaningful when the camera's own ra
 changes. (`min_interval_ms`, the knob this replaced, is still honoured when
 `detect_fps` is absent, so a canvas saved by an earlier build keeps working.)
 
+**OCR has the same knob, `ocr_fps`**, with the same semantics, the same 1.0
+default and the same `min_interval_ms` fallback. It used to default to every
+frame, which on a 14fps 720p camera cost a full core: inference is TensorRT and
+sits on the GPU, but the JPEG decode in front of it does not — measured on Tianyi
+(Orin, 30W), **37.6 ms/frame** to decode 1280x720 plus 7.1 ms for the shape-
+preserving enhancement. Text in front of a robot does not change at frame rate, so
+once a second is the sensible default and the rest was heat.
+
+Note that lowering `max_side_len` is *not* a way to make the decode cheaper. The
+same measurement at 960 took **66.5 ms** — worse than 1600, because a bound below
+the source resolution turns a straight decode into a decode plus a resample. The
+frame rate is the knob that matters.
+
 A face that *fails* the gate is reported with `person_id: null`, `quality: "low"`
 and a `reason`, and is neither matched nor enrolled. Matching a blurred 30 px face
 is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
 smear that never matches anything again. Relax `min_face_px` / `blur_min` if you
 want identities at greater distance.
 
-`match_threshold` defaults to **0.35**. Measured separations on this model, same
+`match_threshold` defaults to the configured model's value — **0.35** for
+`buffalo_sc`, **0.55** for `scrfd25g_edgeface_s`; see § Models for how those were
+measured and why they differ. Measured separations on `buffalo_sc`, same
 photo transformed: same face at half resolution **0.983**, same face +35
 brightness **0.979**, a different person **-0.108**. Real same-person /
 different-photo scores sit well below the first two, so **tune this against your own
@@ -2197,6 +3103,67 @@ weights, so it cannot drift out of order or out of date — and falls back to th
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
+### vop's streamed payload: `publish_bbox` and `publish_color`
+
+Two knobs govern what one detected object costs on the topic. **They affect the
+stream only** — `recognize` / `recognize_by_url` always answer in full, because
+that reply is asked for once and read once, and a caller who cannot see the
+frame has no other way to recover the pixel box.
+
+```yaml
+vop:
+  publish_bbox: true      # default
+  publish_color: name     # off | name | full — default name
+```
+
+| level | one object carries | bytes |
+|---|---|---|
+| `publish_bbox: true` | `+ "bbox": [x1,y1,x2,y2]` | +33 |
+| `publish_color: off` | — | 0 |
+| `publish_color: name` | `"color": "dim muted azure", "brightness": 120.9` | 27 |
+| `publish_color: full` | the twelve numbers and four labels of `color_stats` | 239 |
+
+Defaults give 118 B per object, against 329 B for everything.
+
+**Why trimming the stream is worth anything at all.** agent-core's topic
+subscriber enqueues a subscribed topic's **entire message** as an event's text
+(`agent-core/src/topic_subscriber.py`), so every published byte is a byte of LLM
+context, on every frame. At the time of writing, `rgb_mean`, `rgb_var`,
+`hsv_var` and the three `dominant_*` labels had **no reader anywhere in either
+repo** — they were 73% of the payload and nothing consumed them.
+
+**Why `name` sends the triple and not `color_name`.** This is the part that is
+easy to get backwards, and the expensive direction to get wrong.
+
+`color_name` is not a concatenation of the three labels, it is a **lossy
+projection** of them: it never calls `dominant_saturation` at all (saturation
+reaches it only through the `s < 25 → neutral` test inside `dominant_hue`, so
+muted/vivid disappears), and it collapses six brightness levels into three
+prefixes. Over the whole HSV space that is **150 distinct triples against 41
+distinct `color_name`s** — 73% of the distinctions gone.
+
+The other direction is lossless: `color_name` is a pure function of
+`dominant_brightness` and `dominant_hue`, both of which are in the triple, so
+any consumer can recompute it exactly. `test_color_name_is_recoverable_from_the_triple`
+pins that, and is the test to look at if this trade is ever questioned.
+
+So the triple strictly dominates, and costs **one byte more** (27 vs 26).
+
+Splitting is safe: every word in all three vocabularies is a single token, so
+`split(" ")` always yields exactly three. Keep that property if you add a label.
+Neutral colours always read `"<brightness> gray neutral"` — `neutral` and `gray`
+are the same `s < 25` test, so that pair is redundant by construction; it is
+emitted anyway rather than special-cased to two tokens, because four bytes buys
+every consumer a `split()` with no branch in it.
+
+`brightness` survives at the `name` level because it is the one *continuous*
+colour value anything reads — the lights-on check wants `hsv_mean[2]` itself,
+and six buckets cannot answer "is the room getting darker".
+
+`info()` reports both settings per instance. A card whose payload has been
+trimmed and a card whose detector has stopped working look identical from
+downstream, so the level has to be visible from outside.
+
 ### visual_depth outputs metres — this file used to say otherwise
 
 Every payload is in **metres**, with `"scale": "metric"` and `"unit": "m"`.
@@ -2378,12 +3345,1031 @@ other bundles in that file state.
 
 ---
 
+## `pose`: human keypoints and action labels
+
+COCO-17 keypoints per person plus **what each person is doing**. Same shape as
+`vop` and `visual_depth` — a prebuilt TensorRT engine fetched as a pinned bundle
+(`ensure_pose_model`), driven directly through `utils.tensorrt_runtime` with the
+letterbox and decode in `plugins/vision_runtime.py` (`decode_poses`). The engine
+loads on the **first `start`**, like `visual_depth`: on an 8 GB Orin already
+running vop, depth, OCR, ASR and TTS the binding constraint is memory, not GPU
+time, so an enabled-but-unwired card has to cost nothing.
+
+Action labels come from `plugins/pose_action.py` — pure numpy geometry over a
+window of keypoints. **No second model and no second inference runtime**, and
+that is not a shortcut: a second ONNX Runtime in this process shares one provider
+bridge with the first, which throws on jp6.1 and SIGSEGVs the whole of perception
+on jp5.11 (see `plugins/kokoro_worker.py`). A learned skeleton-action model
+(ST-GCN and friends) would replace `PoseActionClassifier` and nothing else —
+hence `action_backend`, and hence `classify()` taking plain `PoseFrame`s and
+returning a plain dict.
+
+### Four output topics, and why it is not one
+
+| topic | format | who consumes it |
+|---|---|---|
+| `{input}/poses` | `data/json` | **lean** per-frame state: action, centre, bbox |
+| `{input}/poses/skeleton` | `sensor/pose2d` | the dashboard renderer — **full** keypoints |
+| `{input}/poses/gesture` | `data/json` | wired to `decision_core` — **sparse**, one message per transition |
+| `{input}/poses/overlay_img` | `image/jpeg` | skeleton drawn on the frame (`publish_overlay`, off by default) |
+
+Two of them are `data/json` and that is not an oversight: the format picks the
+renderer, and what separates these two is the **rate**. One publishes every
+frame; the other only when something changes. See "The gesture topic is the one
+to wire into `decision_core`" below — the lean topic was the obvious thing to
+wire there and it is the wrong one.
+
+agent-core copies the **whole message** of a subscribed topic into the event bus
+as event text (`agent-core/src/topic_subscriber.py`), so every byte on the topic
+wired to `decision_core` is a byte of LLM context *on every frame*. 17 keypoints x
+3 floats x N people at 5 fps does not fit in that budget — and a skeleton is
+useless to a text model anyway, while being exactly what the dashboard wants to
+draw. So the fat payload goes on a topic the LLM does not subscribe to.
+
+Measured on a 640x480 frame, bytes per published message:
+
+| | lean `off` | lean `compact` | lean `full` | skeleton topic |
+|---|---|---|---|---|
+| 1 person | **196** | 399 | 554 | 982 |
+| 3 people | **441** | 1076 | 1534 | 1936 |
+
+At 5 fps and three people, `publish_keypoints: full` would be ~7.7 kB/s of LLM
+context against 2.2 kB/s — and none of it readable by a text model. (The skeleton
+topic's figures include ~750 B of constant self-description per message, the
+keypoint names and the bone table. It is on the topic nothing reads into a
+prompt, and it is what lets a consumer that is not our renderer work without
+knowing COCO-17 by heart.)
+
+`publish_keypoints` (`off` | `compact` | `full`) can put them on the lean topic
+anyway if something downstream needs them; it does not affect the skeleton topic,
+which is always full. Note `publish_keypoints: "off"` is **quoted** in
+`config.yaml` on purpose — YAML 1.1 parses a bare `off` as boolean `false`.
+
+The one-shot photo actions always answer in full, like vop's: that reply is asked
+for once and read once, so trimming it saves nothing.
+
+### The gesture topic is the one to wire into `decision_core`
+
+The lean topic publishes every frame, so wiring *it* into `decision_core` means
+a person holding a hand up for three seconds at 12 fps is thirty-six full
+payloads of LLM context all saying the same thing. The robot does not need to be
+told thirty-six times. It needs to be told once, when the gesture starts.
+
+So the activity channel is also published as **transitions**, on a topic that is
+silent the rest of the time (`plugins/gesture_events.py`):
+
+| field | |
+|---|---|
+| `priority` | `1` — see below, this one is load-bearing |
+| `event` | `gesture_start` / `gesture_end` |
+| `gesture` | e.g. `raising hand` |
+| `track` | the person's temporary id, **not** an identity |
+| `position` | normalised lateral offset, so "on your left" is derivable |
+| `point_direction` | present for a pointing gesture, which is its entire content |
+| `held_s`, `reason` | on an end only: `released` or `track_lost` |
+
+**The `priority` field is load-bearing.** `collector._PRIORITY_SOURCES` is
+`{asr, message, channel, subagent, acp, scheduler}` — `dds` is not in it, so a
+DDS-sourced event scores P=0 and lands in the background batch instead of
+reaching the main agent. But `collector._extract_priority()` parses the event
+text first and honours a `priority` field when it finds one. Without it a wave
+is delivered, logged, and ignored, with nothing in any log saying why. That is
+the whole reason the transitions are their own payload rather than a field on
+the per-frame one.
+
+Three thresholds shape the stream, all of them **durations**, not frame counts:
+
+| config | default | what it is for |
+|---|---|---|
+| `gesture_hold_s` | 0.6 | an arm passing through the raised position on its way to scratch a nose reads as `raising hand` for a few frames |
+| `gesture_release_s` | 0.5 | one dropped frame, or one frame of the label stabiliser holding a label back, must not close and reopen the event |
+| `gesture_cooldown_s` | 2.0 | somebody waving in bursts is one request, not one per burst |
+
+They are seconds because the two channels that feed this run at different
+rates: the body channel at the card's `fps` (12), and the hand channel — when it
+arrives — throttled to about 4 Hz. "Hold for three frames" would mean 250 ms in
+one and 750 ms in the other. A gesture is also never announced from a *single*
+sighting however small `gesture_hold_s` is: the first frame a label appears on
+registers it as a candidate and the earliest a start can fire is the frame
+after, because one frame of a label is exactly the case the dwell exists for.
+
+**A lost track ends its gesture.** Somebody who raises a hand and walks out of
+frame would otherwise leave an unmatched open: the cooldown never arms, and a
+consumer tracking state cannot tell "still holding" from "walked away". The end
+carries `reason: "track_lost"` rather than `"released"` so the two stay
+distinguishable.
+
+`gesture_whitelist` defaults to `["raising hand", "hand waving",
+"point to something"]`. All three are read from the **COCO-17 skeleton**, so they
+work at any distance the body is visible at and do not depend on a hand model —
+being called from across a room is this topic's main job. The wider set
+(`clapping`, `salute`, `cross hands in front`, ...) comes from the skeleton-action
+model alone, and that model has no "not gesturing" class, so it is available but
+off. `list_actions` returns both lists under `gestures`.
+
+When the topic is silent, `info` says why: `gesture_whitelist`,
+`gesture_event_count` and `recent_gestures`, per instance. Without those three,
+"no gesture events" is indistinguishable between nobody gesturing, a whitelist
+that excludes what they did, and a dwell nobody satisfies.
+
+The one-shot photo actions do **not** emit transitions. Every threshold here is
+a duration over consecutive frames and a photo is one frame with made-up track
+ids; feeding it in would either emit nothing while polluting the state machine
+with ids belonging to no track, or — with a zero dwell — announce a gesture from
+a still image that cannot support one.
+
+This topic is also the only one of the four published **RELIABLE**. A dropped
+frame on the others is replaced by the next one; a dropped transition is not,
+and the stream would then hold an unmatched open for as long as the gesture
+lasts. Reliability costs nothing on a topic that emits a handful of messages a
+minute.
+
+### The hand channel is off by default, and near-range only
+
+`hands: keypoints` adds 21 joints per hand from a **second** engine
+(`plugins/hand_runtime.py`). It is off unless asked for, and the engine is not
+even fetched until it is: on an 8 GB Orin already running vop, depth, OCR, ASR
+and TTS the binding constraint is memory, not GPU time.
+
+**It does not help with being called from across the room.** That is what
+`raising hand` and `hand waving` on the gesture topic are for — both are read
+from the COCO-17 skeleton, so they work at whatever distance the body is
+visible at. The hand channel is for near-range detail: which way a finger
+points, an open palm versus a fist.
+
+**The model is RTMPose-m (hand5), and it replaced a YOLO26-pose model
+fine-tuned on hand keypoints.** That one was not good enough to build gestures
+on: on a real camera an OK sign came back with the wrist in the middle of the
+palm, an open hand came back as a clump, and motion blur collapsed the joints
+— while its detection score stayed around 0.8, so nothing downstream could
+tell. Compared on the same crops, RTMPose was right on every picture it was
+wrong on, and it is also cheaper: 3.58 ms against 7.99 ms per hand on an Orin
+NX at 1020 MHz, 4.33 against 8.19 on jp5.11.
+
+Three things follow from it being a **top-down** model rather than a detector:
+
+- **The box must be roughly right, and the arm supplies it.** Measured on a
+  real photograph, RTMPose read the hand correctly from an arm-derived box
+  anywhere between 0.30 and 0.65 of the crop the old model needed — a 2.2x
+  range. An early comparison appeared to show RTMPose losing on one of three
+  pictures; it had been handed the loose crop the *old* model wanted, and that
+  was a mistake in the test, not in the model.
+- **There is no detection step and no detection score.** It returns 21 joints
+  for whatever is in the box. `hand_confidence` therefore answers "was there a
+  hand in this box at all", not "did I find one", and it was calibrated by
+  measuring both distributions: a box with no hand in it (grey, shirt,
+  background, face, jeans, noise) scored 0.11–0.37, a real hand 0.48–0.74. The
+  default sits in the gap at 0.42. It was 0.25 while the old model was in
+  place, where the same field meant a detection score — at that setting every
+  one of those negatives except the flat grey reads as a hand.
+- **It does not measure blur.** Sharp and blurred frames of the same hand
+  scored 0.55/0.67 and 0.55/0.65. The confidence is a localisation peak, so it
+  can reject an absent hand and cannot reject a badly fitted one.
+
+The budget, per hand, through the production runtime: 3.58 ms on an Orin NX at
+1020 MHz. `hand_interval_s: 0.25` throttles per hand and staggers by track id
+so two people do not both pay on the same frame. `hand_max_rois` is spent on
+the largest hands in frame — largest means nearest, and a nearer hand is both
+likelier to be addressing the robot and the one whose fingers resolve.
+
+Three more things worth knowing before changing any of it:
+
+- **The body gate applies on every frame, not just the first.** The previous
+  frame's hand box makes the next crop tighter, but it does not decide whether
+  to crop at all — otherwise a hand would keep being tracked from a stale box
+  after the wrist went out of view, and the distance gate would hold for one
+  frame and then stop existing.
+- **A hand is held briefly after a bad read** (`hand_hold_s`, 0.5 s). Without
+  it a single bad frame erases the hand until the next inference, which at the
+  throttled rate is a quarter of a second of nothing and reads as flickering
+  fingers. The stale *box* is dropped immediately all the same — reporting a
+  hand that was there an instant ago is reasonable, cropping from where it
+  used to be is not.
+- **Hand keypoints are appended to the skeleton payload, never interleaved.**
+  Indices 0–16 stay the body, 17–37 the left hand, 38–58 the right.
+  `pose2d.js` prefers a payload-carried `keypoint_names`/`skeleton` over its
+  own copy, so the renderer draws 59 joints with no frontend change — and any
+  consumer already indexing the first 17 keeps reading what it read before.
+  The hand names carry a `_hand_` infix because COCO-17 already has a
+  `left_wrist` and so does the hand set.
+
+`info` reports `hand_ran` and `hand_skipped` broken down by `too_far`,
+`wrist_occluded`, `elbow_occluded` and `throttled`, plus `hand_engine_error` if
+the engine could not be fetched at all. From outside, all five look like "no
+hands". A card whose hand engine fails keeps running **without** hands rather
+than refusing to start: the body channel is what answers "is somebody calling
+me", and losing that because a second engine could not be downloaded would be
+the wrong trade.
+
+Two traps are recorded at `HAND_MODEL_BUNDLES` and worth repeating here. The
+engine's two outputs, `simcc_x` and `simcc_y`, are **identical in shape**
+(N, 21, 512), so they can only be told apart by name — and TensorRT has
+already been observed listing an engine's outputs in a different order on the
+two JetPack lines. Reading them the wrong way round transposes every hand and
+still draws a plausible one. And RTMPose normalises with **ImageNet mean/std
+on RGB**, not the [0, 1] scaling the YOLO engines use, which is why the hand
+path has its own `HandEngine` wrapper instead of reusing
+`VisionEngineSession`: feeding the wrong normalisation produces a confident
+hand in the wrong place, with nothing raising.
+
+### Why the overlay is a third topic rather than drawn in the browser
+
+A dashboard renderer only ever sees **one** topic — `detail-panel.js` opens a
+single `/ws/bus/{topic}` for the selected port — so a camera feed and a keypoint
+feed cannot be combined client-side. Hence `publish_overlay`, which costs a draw
+plus a JPEG encode per frame and a DDS topic carrying JPEGs, and is therefore
+**off** unless asked for. No publisher is created until it is. (The per-frame cost
+has not been measured on an Orin yet — it is bounded by the encode, not the
+drawing, and it is paid at the card's `fps`, not the camera's.)
+
+### Where to look at each one
+
+The card's **查看数据流** button opens the *first* output topic, i.e. the lean
+`data/json` one (`canvas.js` `_openTopicDetailFor` takes the first entry with a
+topic). The skeleton and the overlay are reached from the **监控** tab, which
+gives every resolved output topic its own card with the renderer for its format.
+That ordering is deliberate: the lean topic is the card's primary product — it is
+what the robot acts on — so it stays first and stays the one `camera_info` is
+declared against.
+
+The skeleton renderer is `web/js/renderers/pose2d.js`. It is **not**
+`sensor/skeleton`: that one drives a URDF of the *robot's own* joints and needs a
+`model` resource tool to supply it, with joint names matching the URDF exactly.
+Pointing it at human keypoints gives an empty panel and nothing in any log.
+
+### The action labels
+
+Two fields per person, not one. `action` is the single primary label — what goes
+into the prompt — and `actions` is everything that holds, because "standing while
+waving" is two simultaneously true things.
+
+| group | labels |
+|---|---|
+| posture | `standing` `sitting` `crouching` `bending` `lying` |
+| arms | `raising_hand` `waving` `pointing` `arms_crossed` |
+| motion | `walking` `turning` `still` |
+| event | `fall` |
+| — | `unknown` |
+
+`ACTION_PRIORITY` picks the primary, and it is deliberately **not** "posture
+before motion": a walking person is also standing, and `standing` for someone
+crossing the room in front of the robot is the less useful of two true answers.
+So `walking` sits above `standing` while staying below the postures that
+contradict it, and `still` is last for the mirror-image reason — it says less
+than `standing` does.
+
+Three rules worth knowing before reading the thresholds:
+
+* **Everything is a fraction of the person's bbox height.** The same person at
+  1 m and at 3 m produces the same numbers. A pixel threshold would be a
+  distance threshold wearing a disguise.
+* **`waving` is gated on `raising_hand`.** It is the "someone is calling the
+  robot over" signal, and what separates it from an arm swinging past shoulder
+  height while walking is that the motion *comes back* — reversals in the
+  wrist's horizontal travel, at 0.5-4 Hz. Ungated, every walker waves.
+* **`pointing` reports `point_direction`.** A normalised vector, promoted out of
+  `evidence` to the top level, because "someone is pointing" is far less
+  actionable than where.
+
+### The posture rules use angles, and which angles matters
+
+The first version of these rules was poor enough on a robot that standing,
+sitting, waving and falling were all unreliable. Most of it was two bugs, both
+worth recording because both were a *category* of mistake rather than a bad
+constant.
+
+**Image-space length ratios cannot survive a camera below eye level.**
+`standing` was gated on `hip_knee_dy >= 0.15` — the hip-to-knee vertical gap as
+a fraction of bounding-box height — *on top of* the torso-tilt and knee-angle
+tests. For a person who is definitely standing, with the legs foreshortened as a
+low camera foreshortens them:
+
+| leg compression | `hip_knee_dy` | `knee_deg` | `torso_deg` | verdict |
+|---|---|---|---|---|
+| 1.00 | 0.232 | 180.0 | 0.0 | `standing` |
+| 0.60 | 0.171 | 180.0 | 0.0 | `standing` |
+| **0.45** | 0.140 | **180.0** | **0.0** | **`unknown`** |
+| 0.25 | 0.089 | 180.0 | 0.0 | `unknown` |
+
+The angles were right the whole way down. The ratio added no information and
+only a viewpoint dependence — and a robot camera at 0.4-1.2 m looking at someone
+1-2 m away is well past 0.45. Worse, `sitting` keyed on the *other side of the
+same fragile quantity* (`|hip_knee_dy| <= 0.15`), so a standing person seen from
+below either vanished into `unknown` or landed in the sitting band. Both labels
+being wrong was the consequence, not bad luck.
+
+So `sitting` is a **hip angle** (shoulder-hip-knee: the thigh folded towards the
+chest), `standing` is the absence of folding, and the three `_dy` thresholds are
+gone. A test asserts no length-ratio threshold can come back. Visibility is also
+graded rather than all-or-nothing: legs are readable as soon as *either* the hip
+or the knee angle is available, so the common robot framing — knees in frame,
+feet cropped — reads as standing instead of unknown. A torso-only view still
+refuses, because standing and sitting genuinely share a torso axis.
+
+**And then the same mistake one level down.** Running the fixed rules against
+**real engine keypoints** rather than synthetic bodies caught it: 2D joint angles
+are invariant to scale and rotation but **not to foreshortening**, which is
+anisotropic scaling. With a real skeleton's legs compressed to 0.35, the hip
+angle moved 170.3 → 162.7 deg while the knee angle moved 151.1 → **126.0** —
+thigh and shin are never exactly collinear, and squashing y amplifies whatever
+lateral offset they have. Requiring a straight knee for `standing` was therefore
+a fragile measurement vetoing a robust one: the hip angle spans the torso, the
+longest and best-detected segment, while the knee spans two short noisy ones.
+`standing` now holds on *either* an open hip or a straight knee, and the knee
+keeps exactly one job — objecting to a leg folded past a squat, so a crouch
+cannot read as standing.
+
+"Use angles, they are robust" was too strong. Use the angle over the longest
+segment you can see, and let the short ones corroborate rather than veto.
+
+### The track has to survive the fall
+
+A standing box `[260,100,380,500]` against the same person's lying box
+`[140,436,500,492]` scores **IoU 0.109** — under any usable `iou_min`. So the
+track split at the instant of the fall, the new track began with an empty
+history, and `_fall_evidence` could only ever see horizontal frames and report
+"no fast drop". Fall detection required continuity across the one event that
+destroys box overlap.
+
+Association therefore has a second, independent cue: the centroid of the visible
+joints against the body's own scale. The box changes shape when someone falls;
+the body does not teleport. Either cue passing is enough, because they fail in
+different situations. The gate is 1.0 body height and is a **sanity bound, not
+the discriminator** — greedy nearest-match does the work, since each detection
+and each track is used once and the closest pair is taken first. 0.5 was tried
+and vetoed a real fall by 0.03, which is what a threshold set to the magnitude of
+the thing it must admit does: a fall moves the centroid about half a body height
+*by definition*. Erring loose is the right direction — merging two people costs
+one wrong label, splitting a track makes every temporal label undetectable.
+
+**This fix is a prerequisite for the learned backend, not an alternative to it.**
+ST-GCN++ is fed one continuous `(T, V, C)` sequence per person, so a track that
+splits mid-action hides the action from the model exactly as it did from the
+rules.
+
+Not confirmed, and recorded because it was the first suspicion: **fps is not why
+waving failed.** Simulated 1-4 Hz waves are detected at 5, 10, 15 and 30 fps on
+clean signals, so Nyquist does not explain the field reports. fps matters for a
+different reason — see the backends below.
+
+### Action backends: `hybrid` (default), `rules`, `stgcn`
+
+The first version of this card had one backend — hand-written geometry — and on
+a robot it was poor enough that standing, sitting, waving and falling were all
+unreliable. Two of those were outright bugs (see the two subsections above on
+angles and on track continuity); the rest is a ceiling. Hand-tuned ratios over
+2D keypoints from a low camera will only ever get so far, so the card now
+selects a backend.
+
+| `action_backend` | postures | `fall` / `waving` / `pointing` | needs an engine |
+|---|---|---|---|
+| `hybrid` **(default)** | geometry | ST-GCN++ | yes, degrades to `rules` |
+| `rules` | geometry | geometry | no |
+| `stgcn` | — see below | ST-GCN++ | yes |
+
+**ST-GCN++, joint stream, NTU60-XSub, 2D 17-keypoint input.** 1.39 M parameters
+and 1.95 GFLOPs, top-1 89.3% on that benchmark, where ST-GCN is 3.1 M/3.8 G,
+AGCN 3.5 M/4.4 G and CTR-GCN 1.43 M/2.82 G — so it is both the smallest and the
+most accurate of the options with a published 2D-COCO17 checkpoint. Single
+stream, not the four-stream ensemble: 4x the compute for +3.9 points. Against
+the `yolo26s-pose` engine already running ahead of it (10.4 M / 24.1 G) the
+action model is **13% of the parameters and 8% of the compute**.
+
+It runs on **TensorRT**, not ONNX Runtime, and that is not a performance
+preference: a second ONNX Runtime in this process shares one provider bridge
+with the first, which throws on jp6.1 and SIGSEGVs the whole of perception on
+jp5.11.
+
+**Why the default is `hybrid` and not `stgcn`.** NTU-60's label space is built
+from events and transitions, not postures. It has `sit down` (A08), `stand up`
+(A09), `falling down` (A43), `hand waving` (A23) and `pointing` (A31) — and no
+`standing` class and no `sitting` class, because a motionless person is not an
+action. A bare `stgcn` backend therefore maps those two *transitions* onto our
+two *states*, which only fires while someone is in the act of getting up or
+sitting down; a person who has been standing still for a minute produces no
+event at all and reads as `unknown`. `list_actions` returns
+`transition_derived_actions` so a caller can see which labels are like that.
+NTU's mutual classes (A50-A60) are not mapped at all — they are defined on a
+*pair* of skeletons and this backend is fed one person at a time, which is also
+why `walking` stays with the geometry.
+
+Where both backends have an opinion, the learned one wins on its own classes and
+defers on the transitions. `point_direction` always comes from the geometry: the
+model names the act, only the geometry measures where.
+
+**fps matters now in a way it did not before.** The geometry judges most things
+per frame; a skeleton-action model judges a *clip*. At 5 fps a 2.5 s window is
+13 real frames resampled up to the engine's 48, most of it interpolation — and
+the frequency of a wave and the speed of a fall live in exactly those frames. So
+the default fps is **12**, and below that `info` returns an `action_fps_note`.
+The card does not refuse: a thin window still beats no actions, but a quietly
+starved model looks like a wrong model, and that is weeks of misdirected tuning.
+
+**The preprocessing is where this silently fails.** PYSKL's pipeline is
+`PreNormalize2D` → `GenSkeFeat('j')` → `UniformSample(T)` → `FormatGCNInput`,
+and a model fed a differently-normalised skeleton returns confident nonsense
+rather than an error. It is reimplemented in `plugins/pose_stgcn.py` rather than
+imported, because pulling in pyskl/mmaction2 would drag torch into an image that
+deliberately carries neither. Two details worth knowing:
+
+* Normalisation is by the **frame**, not by the person's box. Where someone
+  stands and how large they appear within the frame is information the network
+  trained with. `PoseFrame` therefore carries `image_size`, and the backend
+  **refuses** rather than deriving it from the bounding box — that substitution
+  looks reasonable and is a silent misnormalisation.
+* `UniformSample` is made deterministic (the centre of each bin). Random offsets
+  are for training; a robot wants the same answer twice for the same input.
+
+**Engine not published yet.** `ACTION_MODEL_BUNDLES` has zero pins, so
+`ensure_action_model` raises with the build instructions instead of fetching
+anything unverified. A card configured `hybrid` therefore runs the geometry
+today and says so — `action_backend_effective`, `action_backend_note` and
+`action_engine_error` in `info`. That reporting is the point: a card running
+geometry while its config names a model is how the model gets blamed for the
+geometry's mistakes.
+
+**The checkpoint is in hand and pinned.** PYSKL's
+`stgcn++_ntu60_xsub_hrnet` joint `j.pth` (89.3 top-1), 5,854,105 bytes,
+`sha256 b274888d…`, mirrored to COS under
+`public/vision/stgcnpp-ntu60-2d/checkpoint/` and verified **byte-identical to the
+upstream openmmlab download**. `tools/export_vision_engines.py --model action`
+fetches it with no arguments; `--action-checkpoint` overrides. Mirroring is not
+about trust — the size+SHA256 pins are what establish that — it is so the engine
+build does not depend on `download.openmmlab.com` being reachable from wherever
+it runs.
+
+One fact to settle outside this file: PYSKL's **code** is Apache-2.0, but the
+weights are trained on **NTU RGB+D**, whose dataset terms are academic-research.
+A model trained on it inherits that question for a commercial deployment.
+
+**The ONNX export is still not implemented** and says so when run, rather than
+emitting a graph whose input is not the tensor the robot has: PYSKL's recogniser
+wraps the backbone in a test-time pipeline that averages over clips and people,
+so the backbone and head must be traced directly on `(1, 1, T, 17, 2)`.
+
+The checkpoint's `state_dict` says exactly what has to be traced —
+`backbone.data_bn`, ten `backbone.gcn.N` blocks each carrying a `.gcn` (with the
+adjacency `A` *stored in the checkpoint*, so the graph does not have to be
+rebuilt) and a six-branch `.tcn`, then `cls_head.fc_cls`. Reimplementing that by
+hand in plain torch is possible and is deliberately **not** the path: a mis-wired
+branch loads without complaint and returns wrong numbers, and there is no
+reference output to check against without pyskl itself. Install pyskl in the
+throwaway container and trace its own modules.
+
+**None of the learned path has run against real weights.** The tests cover the
+tensor layout, the normalisation arithmetic, the sampling, the logit/probability
+handling, the label mapping and every failure path — against a fake engine. They
+cannot establish that ST-GCN++ agrees with these labels on a robot. Read a green
+suite as "the plumbing is right".
+
+### Occlusion is `unknown`, and that is the point
+
+A person behind a desk has no visible hips or knees — and sitting and standing
+have **the same torso axis**. So the posture rules refuse rather than guess.
+`still` carries the same gate, for a reason that only appeared in test: without
+it, a barely-visible motionless person came back as `still`, which turns "I
+cannot see them" into a positive observation *about them*. The arm rules need
+only shoulder/elbow/wrist, so someone visible from the waist up can still be seen
+calling the robot over.
+
+This is the same rule `visual_depth`'s lens-barrel mask exists for: **"I don't
+know" and "nothing is wrong" have to be two different answers**, because the
+second is acted on and the first is not.
+
+### `fall` judges a transition, not a state
+
+Lying on the floor and lying on a sofa are the same terminal pose, so no posture
+test can separate them and neither can any single frame. A fall requires all of:
+
+1. the hip centre drops more than `fall_drop_ratio` of **standing** height,
+2. within `fall_drop_window_s`,
+3. staying horizontal for `fall_settle_s` afterwards,
+4. with **no `sitting` phase** on the way down — sitting is slow and has an
+   unambiguous knee angle.
+
+Standing height is the **tallest bbox in the window**, not the current one: a
+person on the floor has a short, wide box, and normalising by that would divide
+the drop by the post-fall height and overstate it wildly.
+
+Only 2 and 3 holding reports `lying`, and the **rejected evidence comes back
+anyway** (`drop_ratio`, `drop_ms`, `settle_ms`, `had_sitting_phase`, `reason`).
+That is on purpose: "they are lying down and here is why this was not called a
+fall" is what somebody reads when asking why the robot said nothing.
+
+Four things about it that are limitations, not bugs:
+
+* **The thresholds are instance config because they are not constants.** The
+  same fall measures differently with the camera at 0.4 m and at 1.2 m, and pitch
+  and focal length come into it too. The defaults in `config.yaml` are a starting
+  point — tune them on the rig with the camera where it will actually be, and
+  record what you saw.
+* **From a single monocular camera facing the person, "fell over" and "crouched
+  then lay down" are close to indistinguishable.** A side view is far more
+  reliable. `list_actions` says so in its reply, so a caller cannot assume
+  otherwise.
+* **A false positive costs more than a miss.** Every one makes the robot drop
+  what it is doing to ask whether someone is hurt. The plugin therefore only
+  publishes the label — whether to say anything is agent-core's prompt's
+  decision, not this card's.
+* **Occlusion refuses.** Hips not visible at landing yields
+  `is_fall: false` with that as the reason, not a guess.
+
+### Tracking is not re-identification
+
+`PoseTracker` is greedy IoU association, and it exists only to give the action
+rules a timeline. Someone who leaves the frame and comes back gets a **new id**.
+Recognising *who* a person is belongs to the `face_recognition` card; conflating
+the two would promise an identity this cannot keep. `list_actions` states this as
+well.
+
+### What a single photo cannot answer
+
+`recognize_by_photo` / `recognize_by_url` drop the hold requirement on a raised
+hand — that only exists to tell a held gesture from an arm passing through
+shoulder height, and a photo has no "passing through". But `waving`, `walking`,
+`turning`, `still` and `fall` are motion, and one image carries none of them. The
+reply says so (`temporal: false`, `unavailable_actions`) rather than handing back
+`raising_hand` as though it settled "is she waving".
+
+### Which model, and why `s`
+
+`yolo26s-pose` — COCO-17, single class. The ladder, from ultralytics' own table
+(`params`, `mAP`, `FLOPs`) with engine sizes extrapolated from the two engines
+this repo already ships (`yolo26n-depth` 14.0 MB, `yoloe-26s-seg` 24.8 MB, both
+fp16/640):
+
+| | mAP(pose) 50-95 | params | FLOPs | `.pt` | engine (est.) |
+|---|---|---|---|---|---|
+| `yolo26n-pose` | 57.2 | 2.9 M | 7.6 B | 7 MB | ~13 MB |
+| **`yolo26s-pose`** | **63.0** | 10.4 M | 24.1 B | 23 MB | ~25 MB |
+| `yolo26m-pose` | 68.8 | 21.5 M | 73.3 B | 46 MB | ~48 MB |
+| `yolo26l-pose` | 70.4 | 25.9 M | 91.7 B | 55 MB | ~58 MB |
+
+`s` rather than `n`, which is what every other nano-class model here uses,
+because **keypoint precision is the input to the action rules, not a cosmetic
+property**. A noisy wrist breaks the reversal count that separates `waving` from
+reaching; a noisy hip breaks the drop ratio that separates `fall` from `lying`.
+So the 57.2 → 63.0 step buys fewer misjudged actions rather than prettier
+skeletons, which is worth ~12 MB resident and (extrapolating from the 19.8 ms
+measured for the same-class `yoloe-26s-seg`) ~8 ms per frame over `n`. On an
+8 GB Orin that is a real cost — if memory gets tight on a robot that does not
+need pose, `enabled: false` is the lever, not a smaller model whose keypoints
+the rules cannot rely on.
+
+`--pose-weights` picks another size without a code change. Changing it also
+means updating `POSE_MODEL_BUNDLES`, whose COS paths name the model.
+
+### Building the engine
+
+`tools/export_vision_engines.py --model pose`, **inside a container built from
+the target perception image, on an Orin** — two separate requirements, each of
+which has cost a failed build:
+
+* **Not on the Jetson host.** The jp6.1 image ships TensorRT 10.4 while its hosts
+  carry 10.3, and an engine plan only loads on the TensorRT that built it.
+* **Not on the x86 build host either.** `172.18.66.241` has no GPU, and exporting
+  an engine means actually running the TensorRT builder. That host's role in this
+  is the COS upload, because it holds the keys — so the path is: export on the
+  Orin, `scp` to the build host, upload to COS, download the copy back, hash
+  *that*, and pin it.
+
+One bundle per JetPack line, from the Orin on that line: Orin 6 (jp6.1) for
+`jp61`, Orin 5 (jp5.11) for `jp511`. A line with no published bundle reports
+`state: error` on that machine and affects nothing else.
+
+### Measured on the real engine (Orin 6, jp6.1, TensorRT 10.4)
+
+Built in 529 s, 24,704,612 bytes, FP16 at 640. The engine declares one output,
+`output0` with shape `(1, 300, 57)` — pinned as a test, see
+`test_the_real_pose_engine_geometry_decodes`.
+
+| | ms |
+|---|---|
+| `infer()` only, p50 over 20 runs after warmup | **~30** |
+| `decode_poses`, p50 over 50 runs | **0.26** |
+| jpeg decode + infer + decode, 4 people | ~46 |
+
+**These are an upper bound, not the figure to quote.** Orin 6 had its own
+`perception` and `actucore` containers running throughout, so part of this is the
+neighbours — the repo's own rule is that a benchmark taken with services up
+measures them too. An idle number needs those containers stopped first.
+
+Note `decode_poses` measured **10.3 ms on its first call** and 0.26 ms in a loop.
+A single cold timing of a numpy path is almost all first-touch cost; it is not a
+measurement of anything.
+
+30 ms is ~50% worse than the ~20 ms extrapolated from `yoloe-26s-seg`'s 19.8 ms,
+which is what extrapolation across model families is worth. At the default
+`fps: 5` the card asks for 30 ms every 200 ms, so it is not the constraint —
+memory is, as everywhere else on these boxes.
+
+### What the first real photos showed, and why it is the occlusion rule
+
+Two photos, 6 people between them, through the real engine and the real rules:
+
+* **A full-body shot** (4 people): the three with their legs in frame came back
+  `standing` at 0.95-0.98, with torso tilt 1.0-2.7 deg and knee angles
+  151-179 deg — upright and straight-legged, which is what `standing` means. The
+  fourth, half out of frame at the edge with 5 of 17 joints visible, came back
+  `unknown`.
+* **A waist-up shot** (2 people): both `unknown`.
+
+That second result is the design working, not a failure, and the per-keypoint
+visibilities say why. The model reported **hips at v=0.011-0.068, knees at
+0.002-0.004, ankles at 0.001-0.004** — it was explicitly saying it could not see
+the lower body — and it placed those invisible joints at y=696-731 on a
+720-pixel-tall frame, i.e. **pinned to the bottom edge**. That is precisely the
+invented-position-at-the-border effect `undo_letterbox_points` refuses to create
+and `kpt_confidence` refuses to believe. Had the gate not been there, two people
+photographed from the waist up would have been reported standing on the strength
+of coordinates the model itself disclaimed.
+
+It also confirms left/right are not transposed: for a person facing the camera,
+`right_shoulder` came back at x=314 and `left_shoulder` at x=637 — mirrored, as
+COCO defines them.
+
+`POSE_MODEL_BUNDLES` ships with **zero pins**, so `ensure_pose_model` raises with
+the build instructions instead of fetching anything unverified — the standing
+rule for every bundle in that file. Until the engines are exported and published,
+the pose card reports `state: error` with that message and the rest of perception
+is unaffected.
+
+---
+
+## Barcode Scanning (`barcode`)
+
+扫码：QR / 条形码，按需识别。`plugins/barcode.py` + `plugins/barcode_runtime.py`.
+
+Zero models and nothing to download — zxing-cpp is a decoder, not a network. The
+card is up the moment the container is.
+
+### It is an actuator, and that is the design
+
+The card declares `topic_in` (a camera, optional) and **no `topic_out`**, which is
+what `canvas.js` reads as an actuator: one input port, no output port.
+
+Nothing wants a barcode *stream*. A code is read because somebody is holding one
+up — 扫码配网, 读物料码, 读快递单 — and the answer belongs to whoever asked, as the
+tool's return value. A processor publishing at camera rate would be putting "no
+code in this frame" on the bus 30 times a second.
+
+What follows from that:
+
+| | |
+|---|---|
+| no worker thread, no model | `start` has nothing to wait for; the node holds a subscription and a 1s frame window, nothing else |
+| `scan_by_stream` | reads the window newest-first, stops at the first frame that decodes, reports `frames_examined` |
+| `scan_by_photo` / `scan_by_url` | work with no camera and no `start` at all — shared `plugins/image_input.py`, so the path confinement and transfer caps are the same ones vop/ocr/face use |
+
+**Nothing found is a success.** `ok: true, count: 0` — `ok: false` is reserved for
+a scan that could not happen (bad path, dead URL, no frames, no decoder), because
+an LLM handed `ok: false` retries a scan that worked fine.
+
+**Several frames, not several votes.** A code either decodes or it does not;
+there is nothing to average. Scanning up to `max_frames_scanned` (3) frames only
+guards motion blur, which is why it stops at the first hit rather than
+cross-checking.
+
+### A decoded payload is untrusted text
+
+It is chosen by whoever printed the sticker, and this card feeds it straight into
+an LLM's context. Hence, and please keep all three:
+
+* `max_text_chars` (2048) truncates, and says `truncated: true` — never silently,
+  because an LLM acting on a URL that lost its tail acts on a different URL;
+* every logged payload goes through `escape_log_text`;
+* the warning rides along in both the tool description *and* every hit's `note`.
+  The description is read once at registration; the note travels with the payload
+  it is about.
+
+### The two JetPack lines cannot run the same zxing-cpp
+
+```
+jp6.1   cp310   PyPI wheel, pinned 3.1.1
+jp5.11  cp38    in-house wheel on COS, built from the 2.2.0 sdist
+```
+
+Two independent reasons, either one sufficient:
+
+* **zxing-cpp has never published a cp38 aarch64 wheel**, at any version — the
+  oldest release carrying aarch64 wheels starts at cp310. Checked against the
+  PyPI JSON API rather than inferred from `requires_python`, which lies (see the
+  Thai deps section for the same trap).
+* **2.3.0 and up do not compile on focal's gcc 9.** `core/src/WriteBarcode.h`
+  uses a C++20 `requires` clause and gcc 9 answers `'requires' does not name a
+  type`. This was first written here as "2.3.0 leaves
+  `CMAKE_CXX_STANDARD_REQUIRED OFF` so it builds on gcc 9" — a reasonable read
+  of the CMakeLists that the build then disproved at 4%. The CMake flag is
+  irrelevant when the *source* is C++20.
+
+**2.2.0 is the version to build**, for two reasons that happen to agree: it is
+the newest release whose core has no reachable C++20 (`Generator.h` includes
+`<concepts>`, but nothing includes `Generator.h`), and it is the newest release
+below 2.3.0 that exists on PyPI at all — 2.2.1 is a git tag only, so
+`pip wheel "zxing-cpp==2.2.1"` fails with "no matching distribution".
+
+Building the sdist inside `Dockerfile.jetson` is not the answer: the x86 build
+host cross-compiles this image under qemu, where this compile took ~8 minutes
+single-threaded — payable once on COS, or on every image build. The
+in-house-wheel-on-COS route is the one sherpa-onnx already uses.
+
+`plugins/barcode_runtime.py` absorbs the API difference by reading
+`read_barcodes`' real signature out of its docstring, which both pybind11 (2.x)
+and nanobind (3.x) generate from the actual binding. Not from the `TypeError`:
+pybind11 answers an unexpected keyword with
+`Invoked with: ... kwargs: try_rotate=True, try_invert=True`, listing *every*
+keyword passed rather than the one it rejected, so retry-on-error cannot tell
+them apart and would drop all of them.
+
+What the two shipped builds actually declare, read off the installed wheels
+rather than a changelog:
+
+| | 2.2.0 (jp5.11) | 3.1.1 (jp6.1) |
+|---|---|---|
+| `try_rotate`, `try_downscale`, `is_pure`, `formats` | yes | yes |
+| `try_invert` | **no** | yes |
+| `max_number_of_symbols` | **no** | **no** |
+| writer | `write_barcode` | `create_barcode` |
+| `__version__` on the module | yes | **no** (use `importlib.metadata`) |
+
+`max_number_of_symbols` is therefore capped in Python on both lines, and the
+round-trip test feature-detects the writer rather than picking one.
+
+A missing wheel does not fail the image build: the import is lazy and `info`
+reports `decoder.available: false` with the reason on the card. The build log
+says `[build] zxing-cpp: NOT INSTALLED` — if you see that, the image cannot scan
+anything.
+
+#### Rebuilding the cp38 wheel
+
+Done once on the **x86 build host** (`172.18.66.241`) under qemu, not on a rig:
+the rigs are what the image is tested on, and installing a toolchain on one to
+produce a build artefact is the wrong place for it. The jp5.11 image is already
+present there, and running the build *inside that image* is the point — the
+wheel is then tagged for, and linked against, the exact interpreter and
+libstdc++ that will import it.
+
+```bash
+# on 172.18.66.241 (x86_64, qemu-aarch64 binfmt registered; ~8 min)
+IMG=bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:<tag>-jetson-jp5.11
+docker run --rm -v /root/zxwheels:/out "$IMG" bash -lc '
+  pip3 wheel "zxing-cpp==2.2.0" --no-binary zxing-cpp \
+    -i https://mirrors.tencentyun.com/pypi/simple/ -w /out'
+```
+
+`--no-binary zxing-cpp`, **not** `--no-binary :all:`: the latter also forbids
+wheels for the build dependencies, so pip starts compiling hatchling, cmake and
+ninja from source under qemu and the run sits on "Installing build
+dependencies: still running..." for as long as you let it. No `apt-get` is
+needed — the image already has g++ 9.4, cmake 3.27 and `Python.h`.
+
+Then verify in a **clean** container of the same image, which is the step that
+proves there is no ABI mismatch and that the keyword set is what the code
+expects:
+
+```bash
+docker run --rm -v /root/zxwheels:/w "$IMG" bash -lc '
+  pip3 install /w/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl &&
+  python3 -c "import zxingcpp, numpy as np;
+sig=zxingcpp.read_barcodes.__doc__.splitlines()[0];
+print(\"try_invert\" in sig);
+a=np.asarray(zxingcpp.write_barcode(zxingcpp.BarcodeFormat.QRCode, \"x\", width=240, height=240));
+print([b.text for b in zxingcpp.read_barcodes(a)])"'
+```
+
+Upload with the artefact script (`upload-figs.js` cannot be used — it forces the
+`resource-center/uploads/` prefix and image MIME types):
+
+```bash
+cd resource-center && node prisma/articles/upload-artifact.js deploy/values.env \
+  /tmp/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl \
+  public/zxing-cpp/jp511/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl
+curl -sI <the printed URL> | head -1     # must be 200 before building the image
+```
+
+That key is what `ZXING_WHEEL_511` names.
+
+### ArUco / AprilTag are deliberately not here
+
+Their output is a 6-DoF pose, not text, and producing it needs the marker's
+printed size plus camera intrinsics. That is a different card with a different
+config and a different output port; `info` says so in `markers` rather than
+leaving the question open. `cv2.aruco`'s presence in the JetPack base OpenCV is
+also unverified, and the only clean way to add it would be replacing OpenCV —
+`opencv-contrib-python` from pip would shadow the base `cv2` the whole vision
+stack and rapidocr are built against (see the `pip uninstall opencv-python` step
+in `Dockerfile.jetson`).
+
+### Verifying
+
+```bash
+# in the container
+curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"barcode","arguments":{"action":"info"}}}'   # decoder + formats
+# a photo, no camera needed
+curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"barcode","arguments":{"action":"scan_by_photo",
+  "image_path":"/tmp/qr.png"}}}'
+```
+
+### The card stores a mode, not format names
+
+`scan_mode` is `all` | `qr` | `2d` | `1d`, and `plugins/barcode_runtime.resolve_scan_mode`
+turns it into the names **this build actually has** at scan time. Two separate
+reasons, and the first one alone settles it:
+
+* **The names are not portable between the two lines.** 3.1.1 spells the
+  aggregates `AllMatrix` / `AllLinear`; 2.2.0 spells them `MatrixCodes` /
+  `LinearCodes`. A card configured on Orin 6 and moved to Orin 5 would be
+  rejected with `unknown barcode format(s): AllMatrix` — and the blame would
+  land on whoever typed it. Storing the mode means the card survives the move.
+* **Nobody is choosing between 51 symbologies.** What a person configuring this
+  decides is what they are pointing the camera at.
+
+`info`'s `decoder.formats` still reports the real list per build (51 names on
+3.1.1, 20 on 2.2.0) — it is the answer to "what does this image support", not a
+thing to copy into config.
+
+`formats` remains readable from `config.yaml` as a raw list, for a narrowing no
+mode expresses (`[DataMatrix]`). A non-empty list wins over the mode: somebody
+who wrote one meant it. It is deliberately offered neither on the card nor to
+the LLM.
+
+### What is on the card, and what is not
+
+Two fields: **Code types to scan** (a dropdown, via `oneOf` titles) and
+**Stream look-back (seconds)**. Everything else — `try_rotate`, `try_invert`,
+`try_downscale`, `is_pure`, `max_frames_scanned`, `max_symbols`,
+`max_text_chars`, `window_max_frames`, `image_roots` — is `config.yaml`-only and
+still honoured by dispatch.
+
+The cut is "can the person in front of this card answer the question". Nobody
+knows what to put in *max symbols per frame*, and a field like that is worse
+than no field. Three things about the rendering, all of them learned by looking
+at the form rather than the schema (`web/js/sidebar.js`):
+
+* **An array of strings is not a multi-select.** `_isStringList` catches it
+  first and renders a comma-separated text box — carrying vop's placeholder,
+  `逗号分隔，如 person, chair`, which is nonsense on a barcode card. `oneOf`
+  with `const` + `title` is the only path to a real dropdown with readable
+  option text; a bare `enum` renders the raw values.
+* **Without `title`, the whole `description` becomes the label.** Set `title`
+  for the label and keep `description` for the explanation.
+* **The config panel is English.** The LLM-facing `inputSchema` is not bound by
+  this — it is read by a model, not shown in the form.
+
+
+## Camera Parameters (`camera_info`)
+
+`vop` and `visual_depth` both sit in the middle of a chain that starts at a camera
+card and ends at something that has to act on metres. **Camera parameters travel
+along that chain**, and each stop rewrites the parts its own processing changed.
+
+The format is `motus.camera/1`, specified in
+`phanthymotus-driver/README_dev.md` § Camera Parameters. The implementation here
+is `plugins/camera_info.py` — deliberately a **separate implementation** of the
+same document rather than a shared import, as with `motus.control/1`.
+
+### Why these two cards have to care
+
+Neither of them uses the field of view itself. `vop` reports a **normalised**
+lateral offset (−1 … +1) and `visual_depth` reports metres per pixel; both are
+complete without any lens geometry. The consumer is what needs it:
+
+- navi's avoidance corridor is **metric** (half-width ≈ 0.33 m), so every tick it
+  converts that width back into a range of image columns — and that conversion is
+  the field of view.
+- `position` is only an angle once someone multiplies it by the half field of
+  view. Until then it is dimensionless.
+
+That number used to be typed into navi's own config by hand. On r1_sz it read
+0.55 rad against a lens measuring 0.888, the corridor came out **1.86 m wide —
+wider than any door**, every doorframe counted as dead ahead, and the robot turned
+away 0.6 m short of openings it fitted through. The depth map reported clear the
+whole time. The value had been measured on that robot the day before; it went into
+a report and not into a config file, and nothing noticed.
+
+### What each card changes, and what it must not
+
+| | `vop` | `visual_depth` |
+|---|---|---|
+| `id` | unchanged | unchanged — this is what lets navi check both its inputs are the same lens |
+| `half_fov_rad` | unchanged | **unchanged** — `cv2.resize` stretches rather than crops, so the same angular extent is still in the picture |
+| `width`/`height` | unchanged | rewritten to 640×480: the declaration describes the image **this port** publishes |
+| `K` | unchanged | **rescaled** — see below |
+| `D` | unchanged | unchanged (radial terms are dimensionless in normalised coords) |
+| `pipeline` | `+ perception/vop` | `+ perception/visual_depth` |
+| `source` | `inherited` | `inherited` |
+
+**The `K` trap.** `fx` is in pixels and a consumer derives the angle as
+`atan((width/2) / fx)`. Publish a resized image while passing `K` through
+untouched and both fields stay individually plausible while their ratio is wrong
+by exactly the resize factor — the same silent, confidently wrong geometry the
+format exists to prevent. `_rescale_K` scales the two axes independently, because
+1280×720 → 640×480 is not a uniform scale and `fx`/`fy` are separate entries
+precisely so that is expressible.
+
+If `visual_depth` ever **crops** instead of resizing, `half_fov_rad` stops being
+carried unchanged and has to be recomputed. That is why the reason is in the code
+rather than only here.
+
+### The lens barrel is masked, because "unknown" could not catch it
+
+r1_sz's main camera looks out through a round barrel, so a wide black ring fills
+the corners of every frame. The depth model does not know that and invents a
+distance for it. Measured 2026-09-23:
+
+| | median depth |
+|---|---|
+| four corners (solid black housing in the RGB) | **0.64 – 0.83 m** |
+| centre of frame | 1.76 m |
+| **valid-pixel fraction of the whole map** | **100%** |
+
+So every edge of the picture reported "something right in front of me", and
+`coverage` — the entire "unknown is not free" protection downstream — never
+fired, because **this is not a missing reading. It is a confident wrong one**,
+which is strictly worse.
+
+What it cost, before this existed: the angular thirds navi used to choose an
+escape direction were reading the barrel rather than the room (left 0.906, right
+0.993, centre 1.368, on a corridor that was clear), and at close range the metric
+corridor could be tripped to a stop by the robot's own lens.
+
+**The discriminator is "near-black **and** connected to the frame edge."** No
+scene has that signature; a black object in the middle of the room is surrounded
+by scene and is its own component, so it is not masked — masking it would throw
+away a real obstacle, which is the opposite of the intended error.
+
+Detected per frame rather than declared as a region in `camera_info`: a declared
+circle has to be measured per camera and goes stale the moment a mount changes,
+while the signature does not. The remaining false positive — a genuinely dark
+region touching the edge — **fails safe**: masked pixels become "no reading",
+coverage drops, and navi refuses to drive into what it cannot see.
+
+`lens_barrel_max_fraction` (0.6) is the backstop for the one case where that is
+useless: a dark enough room makes one border-connected blob out of everything,
+and a fully masked map is a blind robot. Past that fraction nothing is masked —
+"the room is dark" and "my lens is blocked" want different responses from a
+person, so the card does not guess. `info().instances[*].lens_barrel_pct` says
+how much of the last frame was housing.
+
+Masked pixels become `NaN`, which `encode_depth` already maps to the 0 that the
+renderer contract reserves for "no reading". Writing a far value instead would
+say *clear*, which is the same mistake pointing the other way.
+
+### Nothing upstream means nothing downstream
+
+A card whose camera declared nothing emits **no** `camera_info` — not an entry
+full of nulls. The format requires a non-empty `id` and neither card can invent
+one; a camera's identity is not derivable from a topic name. A consumer that sees
+no entry falls back conservatively and says so, which is correct. A consumer that
+saw a made-up `id` would compare it against another made-up one and conclude two
+different lenses are the same.
+
+Instead both cards report `camera_info_note` in `info()`, naming the upstream as
+the thing to fix. "The camera declared nothing" and "this card dropped it" look
+identical from downstream, and only the first is somebody else's problem.
+
+A declaration is also dropped when its node is retired: a re-wired card answering
+`info()` with the optics of a camera it is no longer fed by is worse than
+answering with nothing.
+
+### The depth calibration is looked up by camera identity, not chosen
+
+`cal_a`/`cal_b` are a property of **camera x depth model**, so they cannot move to
+the camera card — the camera has no idea which model is downstream of it. What is
+automated is the **lookup**: the camera declares who it is, that identity survives
+every hop, and `visual_depth` picks its own row out of its own table.
+
+| `calibration_preset` | what it does |
+|---|---|
+| `auto (by camera)` | **default.** Match `camera_info.id` against `CALIBRATION_PRESETS[*].camera_ids`; no match falls back to the engine's generic fit |
+| `no calibrate` | no correction at all, whatever the camera says |
+| `manual set` | the typed `cal_a`/`cal_b` |
+| a preset name | that row, regardless of which camera is attached |
+
+Three rules that follow, each with a reason:
+
+- **The match is exact, never by prefix.** A fit is measured on one lens.
+  Matching `unitree/...` would silently apply r1's numbers to a camera that
+  merely shares a vendor — the wrong-camera failure wearing a convenience.
+- **`no calibrate` was not repurposed.** Cards already deployed hold that value
+  explicitly, and on r1_sz the difference between it and the preset is a factor
+  of **2.65 in every distance**. Redefining what a stored value means is not
+  something to do to a running robot, so `auto (by camera)` was added alongside.
+  Existing cards therefore keep their behaviour and have to be switched by hand.
+- **`info().calibration` distinguishes the outcomes**: `auto:<preset>`,
+  `auto:no-match(<id>)`, `auto:no-camera`, `preset:<name>`, `manual`,
+  `model-default`. A card whose depth is 2.65x out and one whose depth is right
+  look identical from outside; this field is what separates them.
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |
 |-----------|--------------|--------|
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
+| Output (echo_cancellation) | `{input_topic}/clean` | `audio/pcm-16k` |
 | Output (vop) | `{input_topic}/objects` | `data/json` |
 | Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
 | Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |

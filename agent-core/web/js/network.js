@@ -51,7 +51,8 @@ async function _loadInterfaces() {
           ${i.gateway ? `<div class="network-iface-cell"><span class="network-iface-label">网关</span><span class="network-iface-value">${_esc(i.gateway)}</span></div>` : ''}
           ${i.mac ? `<div class="network-iface-cell"><span class="network-iface-label">MAC</span><span class="network-iface-value">${_esc(i.mac)}</span></div>` : ''}
         </div>` : ''}
-        ${i.state === 'connected' && i.gateway ? `<div class="network-iface-policy-route" title="开启后，来自此网卡的连接会强制从此网卡回复，用于此网卡不是主上行网络时避免外部无法访问其 IP。不影响此网卡作为默认出口。旧版 NetworkManager 上切换时可能会短暂断开重连此网卡">
+        ${_uplinkRow(i, ifaces)}
+        ${i.state === 'connected' && i.gateway ? `<div class="network-iface-policy-route" title="开启后，来自此网卡的连接会强制从此网卡回复，用于此网卡不是主上行网络时避免外部无法访问其 IP。不影响此网卡作为默认出口。旧版 NetworkManager 上切换时可能会短暂断开重连其网卡">
           <span class="network-iface-label">策略路由（防止回包走错网卡）</span>
           <label class="toggle-switch">
             <input type="checkbox" class="network-policy-route-toggle" data-device="${_attr(i.device)}" ${i.policy_route ? 'checked' : ''} />
@@ -63,6 +64,9 @@ async function _loadInterfaces() {
 
     _interfacesList.querySelectorAll('.network-policy-route-toggle').forEach(el => {
       el.addEventListener('change', () => _togglePolicyRoute(el));
+    });
+    _interfacesList.querySelectorAll('.network-prefer-uplink').forEach(el => {
+      el.addEventListener('click', () => _preferUplink(el));
     });
   } catch {
     _interfacesList.innerHTML = '<div class="network-empty">无法获取接口信息</div>';
@@ -93,6 +97,60 @@ async function _togglePolicyRoute(el) {
     alert('设置失败: ' + e.message);
   } finally {
     el.disabled = false;
+  }
+}
+
+// 出网接口。`网关` 一栏只说明这张网卡配了网关，不说明它是真正在用的那条 ——
+// 多网口机器人上两张网卡都有网关是常态，而只有 metric 最低的那条承载流量。
+// 机器人本体那条线常常带着一个不通的静态网关且 metric 更低，于是 WiFi 显示
+// 已连接、机器却上不了网，页面上原本看不出任何异常。
+function _uplinkRow(i, ifaces) {
+  if (i.state !== 'connected' || !i.default_route) return '';
+  const metric = i.route_metric == null ? '' : `（metric ${i.route_metric}）`;
+  if (i.carries_internet) {
+    return `<div class="network-iface-uplink is-active">
+      <span class="network-iface-label">出网接口</span>
+      <span class="network-iface-value">当前由此网卡出网${_esc(metric)}</span>
+    </div>`;
+  }
+  const winner = ifaces.find(x => x.carries_internet);
+  const who = winner ? _esc(winner.device) : '另一张网卡';
+  return `<div class="network-iface-uplink">
+    <span class="network-iface-label">出网接口</span>
+    <span class="network-iface-value">未在出网${_esc(metric)}，当前出网走 ${who}</span>
+    <button class="network-prefer-uplink" data-device="${_attr(i.device)}"
+      title="把此网卡的路由优先级调到其它网卡之前，使它成为出网接口。可随时恢复默认。">改为由此网卡出网</button>
+  </div>`;
+}
+
+// 修复入口，而不只是提示 —— 碰到这个问题的人未必能去 SSH 改系统网络配置。
+// 只改这一张网卡自己的 ipv4.route-metric：改动最小、完全可逆，而且不去猜另一
+// 张网卡接的是机器人本体还是真正的有线上行（那件事只有人知道）。
+async function _preferUplink(el) {
+  const device = el.dataset.device;
+  if (!confirm(`将把 ${device} 的路由优先级调到其它网卡之前，使它成为出网接口。\n\n会重新应用该网卡配置，旧版 NetworkManager 上可能短暂断开重连。确认继续？`)) return;
+  el.disabled = true;
+  const label = el.textContent;
+  el.textContent = '设置中…';
+  try {
+    const res = await fetch('/api/network/route-priority', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device, prefer: true }),
+    });
+    const json = await res.json();
+    if (!json.data?.success) {
+      alert('设置失败: ' + (json.data?.error || '未知错误'));
+    } else if (!json.data?.carries_internet) {
+      // 接口层面成功、路由表却没变 —— 说出来，否则用户会以为已经修好了。
+      alert(`已写入配置，但出网接口仍然不是 ${device}。可能需要重启网络或检查另一张网卡的静态网关。`);
+    }
+  } catch (e) {
+    alert('设置失败: ' + e.message);
+  } finally {
+    el.disabled = false;
+    el.textContent = label;
+    _loadInterfaces();
   }
 }
 

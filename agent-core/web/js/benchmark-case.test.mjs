@@ -444,3 +444,23 @@ test('判定排成表：结论、项目、来源、权重各占一列', () => {
   // 理由另起一行、跨列，不挤在项目那一格里。
   assert.match(html, /colspan="3"/);
 });
+
+
+// ── 刷新是原地更新，不是重开 ──────────────────────────────────────────────────
+
+import { paneFor } from './benchmark-timeline.js';
+
+test('刷新同一条运行，tab 停在原处', () => {
+  // 刷新会重建整块 HTML。不记住当前 tab，每次刷新都弹回「打分细节」——
+  // 而人按刷新往往正是因为在看运行日志、想看有没有新的一行。
+  assert.equal(paneFor('run-1', 'run-1', 'log'), 'log');
+});
+
+test('换一条运行看，从打分细节开始', () => {
+  assert.equal(paneFor('run-2', 'run-1', 'log'), 'score');
+});
+
+test('关掉之后重新打开也从打分细节开始', () => {
+  // `close()` 把 openRunId 清空，所以重开算换了一条。
+  assert.equal(paneFor('run-1', '', 'log'), 'score');
+});

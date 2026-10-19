@@ -59,6 +59,13 @@ def verify(token: str) -> bool:
 _LOOPBACK_HOSTS = frozenset({'127.0.0.1', '::1', 'localhost', '::ffff:127.0.0.1'})
 
 
+def from_loopback(request: Request) -> bool:
+    """Public alias. Three other modules reached for `_from_loopback`; a name
+    two packages depend on is part of the interface whatever the underscore
+    says."""
+    return _from_loopback(request)
+
+
 def _from_loopback(request: Request) -> bool:
     """Whether this request originated on this machine.
 
@@ -84,6 +91,13 @@ async def auth_middleware(request: Request, call_next):
 
     # Exempt paths
     if path == '/api/auth/verify':
+        return await call_next(request)
+    # The same-host driver reads whether a skill may run unattended before every
+    # preview. Read-only: it cannot create a permission, only observe one, which
+    # is why loopback alone is enough. (A companion exemption for a one-use
+    # session receipt was removed with the session-grant feature itself.)
+    if (path == '/api/skills/package/execution/read'
+            and request.method == 'POST' and _from_loopback(request)):
         return await call_next(request)
     if path.startswith('/api/channel/webhook/'):
         return await call_next(request)

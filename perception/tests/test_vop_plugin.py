@@ -19,6 +19,7 @@ from vision_stubs import (  # noqa: F401
     _FakeExecutor,
     _FakeNode,
     _wait_until,
+    frame_bytes,
 )
 
 import plugins.vop as vop_plugin  # noqa: E402
@@ -244,7 +245,45 @@ def test_objects_are_published_with_center_relative_coordinates():
 
     boxes = np.array([[100.0, 0.0, 200.0, 50.0]], dtype=np.float32)
     objects = node._extract_objects(boxes, np.array([0.9]), np.array([0]), (100, 200, 3))
+    # `bbox` rides along because publish_bbox defaults to on. No colour: this
+    # path is given a bare shape tuple rather than pixels.
+    assert objects == [{"name": "person", "position": [0.5, -0.5],
+                        "confidence": 0.9, "bbox": [100.0, 0.0, 200.0, 50.0]}]
+
+
+def test_bbox_can_be_switched_off():
+    plugin, executor = _plugin(model=_FakeModel())
+    node = _node_with(plugin, executor)
+    node._publish_bbox = False
+
+    boxes = np.array([[100.0, 0.0, 200.0, 50.0]], dtype=np.float32)
+    objects = node._extract_objects(boxes, np.array([0.9]), np.array([0]), (100, 200, 3))
     assert objects == [{"name": "person", "position": [0.5, -0.5], "confidence": 0.9}]
+
+
+def test_the_streamed_bbox_matches_the_one_shot_bbox():
+    """The two paths must not disagree about where the object is.
+
+    They compute the box from the same decode and round it the same way; this
+    pins that, because a consumer that samples a depth map by box has no way to
+    notice a half-pixel divergence and every way to be quietly wrong about it.
+    """
+    plugin, executor = _plugin(model=_FakeModel())
+    node = _node_with(plugin, executor)
+    boxes = np.array([[100.4, 0.0, 200.6, 50.0]], dtype=np.float32)
+    streamed = node._extract_objects(boxes, np.array([0.9]), np.array([0]), (100, 200, 3))
+    assert streamed[0]["bbox"] == [round(float(v), 1) for v in (100.4, 0.0, 200.6, 50.0)]
+
+
+def test_publish_settings_are_reported_by_info():
+    """An operator has to be able to see which level a card is actually on —
+    a trimmed payload and a broken detector look identical from downstream."""
+    plugin, executor = _plugin(model=_FakeModel())
+    _node_with(plugin, executor)
+    info = plugin.dispatch("vop", {"action": "info"})
+    instance = next(iter(info["instances"].values()))
+    assert instance["publish_bbox"] is True
+    assert instance["publish_color"] == "name"
 
 
 def test_class_ids_resolve_through_the_frozen_vocabulary():
@@ -267,13 +306,19 @@ def test_the_full_frame_path_publishes_decoded_objects():
         model=_FakeModel(rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 1]])
     )
     node = _node_with(plugin, executor)
-    node._image_cb(_FakeCompressedImage(b"200x100"))
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
 
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))
     payload = json.loads(pub.messages[0])
+    # The whole object, not a subset: `publish_bbox` and `publish_color`
+    # default to on, so bbox/colour/brightness are part of the streamed
+    # contract. Asserting only the three original keys let them be added
+    # without anything pinning their shape.
     assert payload["objects"] == [
-        {"name": "door", "position": [0.5, -0.5], "confidence": 0.9}
+        {"name": "door", "position": [0.5, -0.5], "confidence": 0.9,
+         "bbox": [100.0, 0.0, 200.0, 50.0],
+         "color": "black gray neutral", "brightness": 0.0}
     ]
 
 
@@ -282,7 +327,7 @@ def test_low_confidence_detections_are_dropped():
         model=_FakeModel(rows=[[10.0, 10.0, 20.0, 20.0, 0.05, 0]])
     )
     node = _node_with(plugin, executor)
-    node._image_cb(_FakeCompressedImage(b"200x100"))
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
 
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))
@@ -330,7 +375,7 @@ def _photo_plugin(tmp_path, rows=(), **cfg):
     return plugin, executor
 
 
-def _write_frame(tmp_path, name="scene.jpg", marker=b"200x100"):
+def _write_frame(tmp_path, name="scene.jpg", marker=frame_bytes(200, 100)):
     path = tmp_path / name
     path.write_bytes(marker)
     return str(path)
@@ -397,7 +442,7 @@ def test_recognize_by_photo_on_an_undecodable_file(tmp_path):
 
 def test_recognize_by_url_shares_the_photo_path(tmp_path, monkeypatch):
     import plugins.image_input as image_input
-    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: b"200x100")
+    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: frame_bytes(200, 100))
     plugin, _ = _photo_plugin(tmp_path, rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 0]])
     result = plugin.dispatch("vop", {"action": "recognize_by_url",
                                      "url": "https://example.com/a.jpg"})
@@ -578,7 +623,7 @@ def test_published_payload_carries_count_and_latency():
         model=_FakeModel(rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 1]]))
     plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
-    node._image_cb(_FakeCompressedImage(b"200x100"))
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
 
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))
@@ -596,7 +641,7 @@ def test_an_empty_detection_still_reports_count_zero():
     plugin, executor = _plugin(model=_FakeModel(rows=[]))
     plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
-    node._image_cb(_FakeCompressedImage(b"200x100"))
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
 
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))

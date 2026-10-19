@@ -189,14 +189,8 @@ function _requirementHtml(req, index) {
 
 function _bindRequirementRows() {
   document.querySelectorAll('[data-rdrop]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const test = _test();
-      const kept = (test.requirements || []).filter((r) => r.id !== '__procedure__');
-      kept.splice(Number(button.dataset.rdrop), 1);
-      _collectInto();
-      _test().requirements = kept;
-      _render();
-    });
+    button.addEventListener('click', () => _dropRow(
+      (test) => (test.requirements ||= []), button.dataset.rdrop));
   });
 }
 
@@ -247,20 +241,30 @@ function _injectionHtml(injection, index) {
     </div>`;
 }
 
+/** 删掉列表里的第 index 条。
+ *
+ * **顺序是这个函数存在的理由：先把表单读回来，再删。** 反过来的话，`_collectInto()`
+ * 会从 DOM 重建整个列表 —— 而 DOM 里那一行还在，刚删掉的那条又被写了回去。表现就是
+ * 「点删除没反应」，而且控制台干干净净。插话那一段原先就是反的。
+ *
+ * 顺带：先 collect 也保住了用户在别的框里刚敲的字，那些还没进 payload。
+ */
+function _dropRow(pick, index) {
+  _collectInto();
+  const list = pick(_test());
+  list.splice(Number(index), 1);
+  _render();
+}
+
 function _bindInjectionRows() {
   document.querySelectorAll('[data-drop]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const run = _test().run || {};
-      run.injections = (run.injections || []).filter(
-        (_, i) => i !== Number(button.dataset.drop));
-      _collectInto(false);
-      _render();
-    });
+    button.addEventListener('click', () => _dropRow(
+      (test) => (test.run ||= {}).injections ||= [], button.dataset.drop));
   });
 }
 
 function _addInjection() {
-  _collectInto(false);
+  _collectInto();
   const run = _test().run || {};
   run.injections = [...(run.injections || []), { after_action: 1, delay: 0, text: '' }];
   _render();
@@ -291,7 +295,14 @@ function _collectInto() {
   _editing.name = _value('bm-ed-name') || _editing.name;
   test.name = _editing.name;
   test.procedure = document.getElementById('bm-ed-procedure')?.value ?? '';
-  test.requirements = _readRequirements();
+  // 参考流程那条要求（`__procedure__`）不在渲染的行里 —— 它的文本由后端按 procedure
+  // 生成，只有权重和归属可能被改过。`_readRequirements()` 整个替换数组，不把它带上
+  // 的话，那份改动每保存一次就被抹掉一次，而且不报错。
+  //
+  // 放在**末尾**：上面那些行的下标就是渲染顺序，删除按下标走（见 `_dropRow`），
+  // 插在前面会让每一次删除都删错一条。
+  const procedure = (test.requirements || []).find((r) => r.id === '__procedure__');
+  test.requirements = [..._readRequirements(), ...(procedure ? [procedure] : [])];
   test.run = {
     ...(test.run || {}),
     prompt: document.getElementById('bm-ed-prompt')?.value ?? '',

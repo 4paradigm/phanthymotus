@@ -75,6 +75,10 @@ class MockProvider:
 
     DEFAULT_AMPLITUDE = 0.05
 
+    # 末端姿态摆动的满幅。见 `_sample` —— 四元数必须整体生成，所以这里是**角度**
+    # 而不是四个分量各自的幅度。
+    MOCK_MAX_ANGLE = math.pi / 4
+
     # A normalized 0-1 axis is a gripper, not a joint: 5% of a grip is a twitch
     # nobody can see, and "the hand is not being driven" is exactly how it was
     # reported. Half of the grip is unmistakable and still returns to open every
@@ -103,6 +107,18 @@ class MockProvider:
         self._chunk = chunk_size
         self._hz = control_hz
         self._phase = 0.0
+        self._mode = str((descriptor or {}).get("mode") or "joint_position")
+        # 末端位姿段里四元数的起始下标（每段 7 维：xyz + qx,qy,qz,qw）。
+        # 逐分量的正弦对四元数是**错的**：它生成的不是单位四元数，而
+        # `ControlSink._check_contract` 会把每一条都拒掉——于是通路依然验不成，
+        # 只是失败挪后了一道。见 `_sample`。
+        self._quat_offsets = []
+        for group in (descriptor or {}).get("groups") or []:
+            if not isinstance(group, dict) or group.get("mode") != "eef_pose":
+                continue
+            offset, count = int(group.get("offset", 0)), int(group.get("count", 0))
+            for start in range(offset, offset + count, 7):
+                self._quat_offsets.append(start + 3)
 
         # Precomputed rather than derived per sample: this runs at control rate,
         # and the two numbers depend only on the descriptor.
@@ -120,10 +136,18 @@ class MockProvider:
     def capabilities(self) -> dict:
         return {
             "model": f"mock-sine@{self._period_s:g}s",
-            # 正弦轨迹走的是绝对关节角 —— 它照着下游 descriptor 的 limits 生成，
-            # 那组 limits 就是关节限位。声明它不是形式：negotiate 现在会拒绝一个
-            # 不声明动作空间的模型，因为维度相同不代表空间相同。
-            "control_mode": "joint_position",
+            # **跟着下游 descriptor 走，不写死。** 这个信号本来就是照着下游的
+            # limits 生成的 —— 它没有自己的动作空间，只有下游那个。
+            #
+            # 写死 `joint_position` 的后果是 mock **验不了任何非关节空间的卡片**，
+            # 而"验证通路"是它存在的全部理由。真机实测 2026-09-21（G1）：接到一张
+            # `eef_pose` 卡片上，协商当场拒掉——
+            #
+            #   模型 mock-sine@8s，下游 eef_pose/17 关节：模型输出
+            #   'joint_position' 空间的动作，下游接受 'eef_pose'
+            #
+            # 拒得对，但那说明这条通路根本没法用 mock 验。
+            "control_mode": self._mode,
             "action_dim": self._dof,
             "chunk_size": self._chunk,
             "control_hz": self._hz,
@@ -164,8 +188,16 @@ class MockProvider:
         # sine would need a centre with room on both sides, which a finger
         # resting at 0.0 does not have.
         wave = (1.0 - math.cos(2 * math.pi * t / self._period_s)) / 2.0
-        return [rest + wave * reach * amp
-                for rest, reach, amp in zip(self._rest, self._reach, self._amplitude)]
+        values = [rest + wave * reach * amp
+                  for rest, reach, amp in zip(self._rest, self._reach, self._amplitude)]
+        for offset in self._quat_offsets:
+            # 绕 z 转 `wave × amp × MOCK_MAX_ANGLE`，从单位四元数出发。**必须整体
+            # 生成**，不能逐分量摆：四元数的四个分量各自是一条正弦的话，合起来不是
+            # 单位长度，sink 会在契约检查处拒掉每一条。
+            angle = wave * self._amplitude[offset] * self.MOCK_MAX_ANGLE
+            values[offset:offset + 4] = [0.0, 0.0, math.sin(angle / 2),
+                                         math.cos(angle / 2)]
+        return values
 
 
 def _per_joint_amplitude(amplitude, groups, dof: int) -> list:

@@ -192,9 +192,71 @@ def _register_core_mcp(silent=False):
                     'image_file': {'type': 'string', 'format': 'file', 'accept': 'image/*', 'description': '图片文件'},
                 }, 'required': ['action', 'image_file']},
                 'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+            },
+            {
+                'name': 'remote_camera',
+                'type': 'sensor',
+                'description': (
+                    'Remote camera — stream a video device attached to the '
+                    'browser as a live image source for the robot. Publishes '
+                    'image/jpeg, the same format the on-robot camera drivers '
+                    'emit, so any vision card accepts it directly.'
+                ),
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['start', 'stop', 'info'],
+                               'description': 'Action to perform'},
+                }, 'required': ['action']},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'device_id': {
+                            'type': 'string',
+                            'description': 'Video input device',
+                            'format': 'video-input-device',
+                            'scope': 'instance',
+                        },
+                        'fps': {
+                            'type': 'integer', 'minimum': 1, 'maximum': 30,
+                            'default': 12, 'scope': 'instance',
+                            'description': (
+                                'Frames per second. 12 matches the pose card, '
+                                'whose action model classifies a clip rather '
+                                'than a frame. Capped at 30 because each frame '
+                                'is JPEG-encoded on the browser main thread.'),
+                        },
+                        'width': {
+                            'type': 'integer', 'minimum': 160, 'maximum': 1920,
+                            'default': 640, 'scope': 'instance',
+                            'description': ('Long edge in pixels. Scaled to the '
+                                            'camera\'s own aspect ratio, never '
+                                            'stretched.'),
+                        },
+                        # No default, deliberately. See
+                        # `remote_camera_declaration`: a guessed focal length
+                        # does not break a metric-depth consumer, it makes it
+                        # publish wrong metres silently.
+                        'camera_fov_deg': {
+                            'type': 'number', 'minimum': 1, 'exclusiveMaximum': 180,
+                            'scope': 'instance',
+                            'title': 'Horizontal field of view (deg)',
+                            'description': (
+                                '镜头的水平视场角，整个视场不是一半。填了之后这张卡才会'
+                                '声明相机内参（motus.camera/1），需要内参的卡片（如 '
+                                'visual_depth 的 DepthART 模型）才能用它；留空就什么也'
+                                '不声明，那些卡片会拒绝启动并说明原因 —— 这是故意的，'
+                                '浏览器不提供焦距，猜一个会让深度静悄悄地错。\n\n'
+                                '从设备规格里查（常见 webcam 60–78 度，手机主摄约 '
+                                '65–75 度）。这是标称值不是标定：数字变焦、防抖裁切都会'
+                                '改变实际视场，所以接上之后用 visual_depth 的 calibrate '
+                                '量一次已知距离，把剩下的尺度误差去掉。'),
+                        },
+                    },
+                },
+                'topic_out': [{'topic': '/remote_control/camera',
+                               'format': 'image/jpeg'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}, {'topic': '/remote_control/camera', 'format': 'image/jpeg'}],
         'topic_in': [{'format': 'data/json'}],
     })
 
@@ -439,6 +501,19 @@ async def lifespan(app):
     from api import canvas as canvas_api
     canvas_api.start_editor_sweeper()
 
+    # 出网接口偏好。一次 netplan 重新生成就能把另一张网卡的静态默认路由放回来，
+    # 而它的 metric 可能更低 —— 于是重启之后机器又没有出口了，表现为每一次 LLM
+    # 调用 5 秒超时，而 WiFi 显示已连接、一切正常。在这里重新确立一次。
+    #
+    # 放在线程里跑：它要和 NetworkManager 做几次 D-Bus 往返，最坏情况下还要等一
+    # 次 Reapply，不该挡住启动。没人设置过偏好时它立刻返回。
+    try:
+        from api.network import ensure_preferred_uplink
+        await loop.run_in_executor(None, ensure_preferred_uplink)
+    except Exception as _uplink_error:      # noqa: BLE001
+        # 网络没理顺不该让机器人起不来，那是更坏的结果。
+        print(f'[network] uplink check skipped: {_uplink_error}')
+
     # 启动 DDS topic 订阅（依据 config event.subscribe_topics）
     topics = config.main.get('event', {}).get('subscribe_topics', [])
     topic_subscriber.start(topics, asyncio.get_event_loop())
@@ -629,17 +704,22 @@ async def acp_complete(request: fastapi.Request):
     import benchmark_facts
     benchmark_facts.note_acp_post(body)
 
+    # **必须在 mark_action_complete 之前问**：一个并发的 barrier 随时可能把这一项
+    # 回收掉，回收之后 _pending_silent 里就查不到了，于是一句「播完了」的回执会被
+    # 当成新消息唤醒一个 turn。
+    silent = mcp_client.completion_is_silent(action_id)
+
     # 通道1: 解锁 sync() 等待
     mcp_client.mark_action_complete(action_id, body)
 
     # 通道2: 进 event_bus → steering 注入 LLM
     import event_bus
+    _event = {'type': 'action_complete', 'action_id': action_id,
+              'status': status, 'result': result, 'silent': silent}
     await event_bus.enqueue(
         source=f'acp:{action_id}',
-        text=json.dumps({'type': 'action_complete', 'action_id': action_id,
-                         'status': status, 'result': result}, ensure_ascii=False),
-        payload={'type': 'action_complete', 'action_id': action_id,
-                 'status': status, 'result': result},
+        text=json.dumps(_event, ensure_ascii=False),
+        payload=dict(_event),
     )
 
     return {'ok': True, 'action_id': action_id}
@@ -885,6 +965,84 @@ async def _ws_mic(ws: fastapi.WebSocket):
                     _mic_chunk_count += 1
     except Exception:
         pass
+
+# ── Camera WebSocket endpoint (receive browser JPEG frames, publish to ROS2) ──
+#
+# The visual twin of /ws/mic: a video device on whatever machine has the browser
+# open becomes an image source for the robot. Published as image/jpeg, the
+# format the on-robot camera drivers emit, so no consumer needs a special case.
+_camera_pub = None
+_camera_frame_count = 0
+_camera_ws_connected = False
+# Arrival times of the last few frames, for the achieved-rate figure in `info`.
+# A configured 12 fps and an achieved 1 fps are indistinguishable from a frame
+# counter alone, and the difference decides whether anything temporal can work
+# at all: at 1 fps a track expires between frames and the action model never
+# accumulates the seconds of history it needs.
+_camera_recent: "collections.deque" = __import__("collections").deque(maxlen=30)
+# The frame shape the browser actually settled on lives in remote_camera,
+# with the code that reads and uses it.
+import remote_camera
+
+
+def _ensure_camera_pub():
+    """Lazily create the ROS2 publisher for /remote_control/camera."""
+    global _camera_pub
+    if _camera_pub is not None:
+        return _camera_pub
+    try:
+        from sensor_msgs.msg import CompressedImage
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            # BEST_EFFORT with a shallow queue, like every other image topic in
+            # this project: a late frame is worse than a dropped one, because
+            # the action rules measure velocity between frames and a backlog
+            # delivered in a burst reads as motion that did not happen.
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=2,
+                             durability=DurabilityPolicy.VOLATILE)
+            _camera_pub = node.create_publisher(
+                CompressedImage, "/remote_control/camera", qos)
+    except Exception:
+        pass
+    return _camera_pub
+
+
+@app.websocket('/ws/camera')
+async def _ws_camera(ws: fastapi.WebSocket):
+    """Receive JPEG frames from the browser and republish them on DDS."""
+    global _camera_frame_count, _camera_ws_connected
+    await ws.accept()
+    _camera_ws_connected = True
+    try:
+        _ensure_camera_pub()
+        while True:
+            data = await ws.receive_bytes()
+            if not data or _camera_pub is None:
+                continue
+            from sensor_msgs.msg import CompressedImage
+            msg = CompressedImage()
+            try:
+                msg.header.stamp = ros2_bridge._node_main.get_clock().now().to_msg()
+            except Exception:
+                pass
+            msg.format = "jpeg"
+            msg.data = data
+            _camera_pub.publish(msg)
+            _camera_frame_count += 1
+            # Re-read periodically, not once: the operator can change the card's
+            # `width`, and a declaration describing the previous resolution is
+            # worse than none — K is in pixels.
+            if remote_camera.frame_size() is None or _camera_frame_count % 30 == 0:
+                remote_camera.note_frame(data)
+            _camera_recent.append(time.time())
+    except Exception:
+        pass
+    finally:
+        _camera_ws_connected = False
+
 
 class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
     async def __call__(self, scope, receive, send):

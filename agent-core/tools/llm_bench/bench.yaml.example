@@ -26,9 +26,18 @@ request:
   max_tokens: 10240           # 与生产 src/client/llm.py 一致
   timeout_s: 180
   extra_body:
-    # 生产在 think_mode=false 时会带这个（src/client/llm.py:136-139）
-    chat_template_kwargs:
+    # 生产在 think_mode=false 时会把下面这几种关 thinking 的写法全带上
+    # （src/client/llm.py 的 THINKING_OFF_EXTRA）——同一个模型换个供应商就
+    # 换一种关法，少发一种就可能测到「其实还在想」的延迟。
+    chat_template_kwargs:         # vLLM / SGLang 托管的 Qwen3、GLM
       enable_thinking: false
+    thinking:                     # 智谱 OpenAI 接口、Anthropic 兼容网关
+      type: disabled
+    enable_thinking: false        # DashScope 等放在顶层的同名开关
+    thinking_budget: 0
+    reasoning:                    # OpenRouter
+      enabled: false
+    reasoning_effort: none        # OpenAI 风格
 
 run:
   # 只跑一轮，每条 payload 每组各请求一次。总请求数 = count × 组数。

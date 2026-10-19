@@ -42,9 +42,15 @@ def calls(monkeypatch):
     """Record every MCP call the layout write makes."""
     seen = []
 
-    async def _fake_call(mcp_id, req):
-        seen.append((mcp_id, req.tool, dict(req.arguments)))
-        return {'state': 'idle'}
+    async def _fake_call(mcp_id, req, timeout_s=None):
+        # `timeout_s` 不是可选的摆设：`_stop_cards` 现在每张卡片都带死线，而这个
+        # 替身不接受它的话，TypeError 会被那边的 except 吞成「这张卡片没停下来」。
+        #
+        # 返回值也不是：`stop_one` 现在**读结果**，所以替身必须长得像
+        # `mcp_call_tool` 真正返回的东西 —— `{'code': 200, 'data': ...}`。
+        # 少一个 `code` 就被判成「设备拒绝停止请求」，于是每张卡片都报失败。
+        seen.append((mcp_id, req.tool, dict(req.arguments), timeout_s))
+        return {'code': 200, 'data': {'state': 'idle'}}
 
     class _Req:
         def __init__(self, tool, arguments):
@@ -66,7 +72,9 @@ def _run(old, new):
 def test_the_orphan_case_stops_exactly_the_deleted_card(calls):
     """The reported layout: the old TTS card is replaced by a new one."""
     assert _run([TTS_OLD, ASR], [TTS_NEW, ASR]) == (1, [])
-    assert calls == [('mcp-1', 'tts', {'action': 'stop', 'instance_id': 'card_mt4rkb752py8'})]
+    assert calls == [('mcp-1', 'tts',
+                      {'action': 'stop', 'instance_id': 'card_mt4rkb752py8'},
+                      config_api.STOP_CARD_TIMEOUT_S)]
 
 
 def test_an_unchanged_layout_calls_nothing(calls):
@@ -85,6 +93,8 @@ def test_a_moved_card_is_not_a_removed_card(calls):
 def test_clearing_the_canvas_stops_every_card(calls):
     assert _run([TTS_OLD, ASR], []) == (2, [])
     assert {c[2]['instance_id'] for c in calls} == {'card_mt4rkb752py8', 'card_asr'}
+    assert all(c[3] == config_api.STOP_CARD_TIMEOUT_S for c in calls), \
+        '删卡片的清理也要带死线 —— 一台不回应的设备不能卡住保存布局'
 
 
 def test_adding_a_card_stops_nothing(calls):
@@ -107,24 +117,25 @@ def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
     """All removals are attempted and unconfirmed stops are returned."""
     seen = []
 
-    async def _flaky(mcp_id, req):
+    async def _flaky(mcp_id, req, timeout_s=None):
         seen.append(req.arguments['instance_id'])
         if req.arguments['instance_id'] == 'card_mt4rkb752py8':
             raise RuntimeError('connection refused')
-        return {'state': 'idle'}
+        return {'code': 200, 'data': {'state': 'idle'}}
 
     sys.modules['api.mcp_manage'].mcp_call_tool = _flaky
     stopped, failures = _run([TTS_OLD, ASR], [])
     assert stopped == 1
     assert failures[0]['card_id'] == TTS_OLD['id']
-    assert seen == ['card_mt4rkb752py8', 'card_asr']
+    assert sorted(seen) == ['card_asr', 'card_mt4rkb752py8']
 
 
 @pytest.mark.parametrize('response', [None, {}, {'state': 'stopping'}, {'status': 'finalizing'}])
 def test_only_an_explicit_terminal_stop_is_confirmed(monkeypatch, calls, response):
-    async def _unconfirmed(_mcp_id, _req):
-        return response
+    async def _unconfirmed(_mcp_id, _req, timeout_s=None):
+        return {'code': 200, 'data': response}
 
+    monkeypatch.setattr(config_api, 'STOP_CARD_TIMEOUT_S', 0.02)
     monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _unconfirmed)
     stopped, failures = _run([TTS_OLD], [])
 
@@ -305,8 +316,8 @@ def test_running_state_is_checked_after_waiting_for_lifecycle_lock(
 def test_layout_is_not_saved_when_removed_card_stop_is_unconfirmed(
     monkeypatch, calls
 ):
-    async def _pending(_mcp_id, _req):
-        return {'ok': False, 'state': 'error', 'error': 'stop pending'}
+    async def _pending(_mcp_id, _req, timeout_s=None):
+        return {'code': 200, 'data': {'ok': False, 'state': 'error', 'error': 'stop pending'}}
 
     monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _pending)
     original = {'cards': [TTS_OLD], 'connections': []}
@@ -326,17 +337,17 @@ def test_layout_is_not_saved_when_removed_card_stop_is_unconfirmed(
     assert config_api.config.main['canvas_layout'] == original
 
 
-def test_project_stop_does_not_emit_terminal_state_until_every_card_confirms(
+def test_project_stop_reports_agent_off_and_device_failure_separately(
     monkeypatch, calls
 ):
-    async def _pending(_mcp_id, _req):
-        return {
+    async def _pending(_mcp_id, _req, timeout_s=None):
+        return {'code': 200, 'data': {
             'ok': False,
             'state': 'error',
             'status': 'error',
             'error': 'mapping finalization is pending',
             'retryable': True,
-        }
+        }}
 
     events = []
 
@@ -364,4 +375,8 @@ def test_project_stop_does_not_emit_terminal_state_until_every_card_confirms(
     assert result['ok'] is False
     assert result['failures'][0]['card_id'] == TTS_OLD['id']
     assert config_api.config.main['core']['project_running'] is False
-    assert not any(event.get('type') == 'project_state' for event in events)
+    assert events[0] == {'type': 'project_state', 'payload': {'running': False}}
+    done = next(e['payload'] for e in events if e['type'] == 'project_stop_done')
+    assert done['stopped'] == 0
+    assert done['failed'][0]['card_id'] == TTS_OLD['id']
+    assert 'mapping finalization' in done['failed'][0]['message']

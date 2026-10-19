@@ -30,12 +30,18 @@ class _FakePublisher:
     def __init__(self, topic):
         self.topic = topic
         self.messages = []
+        # The whole message, alongside `messages` (which keeps only `data`, as
+        # every existing test indexes it that way). A card that republishes
+        # audio has to preserve the *input's* header stamp, and that assertion
+        # needs the header.
+        self.raw_messages = []
         # TTS gates each utterance on a matched reader; tests that do not care
         # about the gate get a reader by default.
         self.subscription_count = 1
 
     def publish(self, msg):
         self.messages.append(msg.data)
+        self.raw_messages.append(msg)
 
     def get_subscription_count(self):
         return self.subscription_count
@@ -108,6 +114,17 @@ class _FakeString:
         self.data = ""
 
 
+class _FakeHeader:
+    """`stamp` is the only field anything here sets, but the attribute has to
+    exist: a publisher that stamps its outgoing frames (pose's overlay) would
+    otherwise fail inside its own try/except and publish nothing, which looks
+    like a disabled feature rather than a missing stub."""
+
+    def __init__(self):
+        self.stamp = 0
+        self.frame_id = ""
+
+
 class _FakeCompressedImage:
     # Defaults so a plugin that *publishes* one can construct it the way ROS
     # does — `CompressedImage()` then assign — as well as tests that build an
@@ -115,13 +132,18 @@ class _FakeCompressedImage:
     def __init__(self, data: bytes = b"", fmt="jpeg"):
         self.data = data
         self.format = fmt
+        self.header = _FakeHeader()
 
 
 class _FakeAudioChunk:
     """Stands in for audio_msgs.msg.AudioChunk (built from a ROS .msg on device)."""
 
     def __init__(self):
-        self.header = types.SimpleNamespace(stamp=None)
+        # A real AudioChunk always *has* a stamp (a zeroed builtin_interfaces
+        # Time), so a plugin may assign `header.stamp.sec`. This used to be
+        # None, which only works for code that replaces the whole stamp object.
+        self.header = types.SimpleNamespace(
+            stamp=types.SimpleNamespace(sec=0, nanosec=0))
         self.format = ""
         self.data = []
 
@@ -197,6 +219,9 @@ def _install_fake_cv2():
     cv2.IMREAD_COLOR = 1
     cv2.INTER_NEAREST = 0
     cv2.INTER_LINEAR = 1
+    cv2.INTER_CUBIC = 2
+    cv2.INTER_AREA = 3
+    cv2.BORDER_REFLECT_101 = 4
 
     def imdecode(buf, flags):
         # Tests hand in a raw "WxH" marker rather than a real JPEG; anything
@@ -213,13 +238,194 @@ def _install_fake_cv2():
         cols = (_np.arange(width) * src.shape[1] // width).clip(0, src.shape[1] - 1)
         return src[rows][:, cols]
 
+    def copyMakeBorder(src, top, bottom, left, right, borderType):
+        """Only BORDER_REFLECT_101, which is what the hand crop asks for.
+
+        numpy's `reflect` is exactly OpenCV's REFLECT_101 — it mirrors without
+        repeating the edge pixel. The other border modes raise rather than
+        falling back to this one: a stub that silently substituted a different
+        extension would change the pixels the hand engine sees at the frame
+        edge, which is precisely where a raised hand sits.
+        """
+        if borderType != cv2.BORDER_REFLECT_101:
+            raise NotImplementedError(
+                f"fake cv2.copyMakeBorder only implements BORDER_REFLECT_101, "
+                f"got {borderType}")
+        pad = [(int(top), int(bottom)), (int(left), int(right))]
+        pad += [(0, 0)] * (src.ndim - 2)
+        return _np.pad(src, pad, mode="reflect")
+
+    def _bgr2hsv(src):
+        """OpenCV's 8-bit HSV ranges, not the textbook ones.
+
+        H is halved to 0..179 so it fits a byte, S and V are 0..255. A stub
+        that returned H in 0..359 would look right and put every hue in the
+        wrong bin, which is the sort of green nobody would question.
+        """
+        bgr = src.astype(_np.float32)
+        blue, green, red = bgr[..., 0], bgr[..., 1], bgr[..., 2]
+        value = bgr.max(axis=-1)
+        chroma = value - bgr.min(axis=-1)
+        # Grey pixels have no hue and no saturation; the divisions below are
+        # masked rather than guarded so a whole flat frame stays vectorised.
+        safe_chroma = _np.where(chroma == 0, 1.0, chroma)
+        hue = _np.select(
+            [value == red, value == green],
+            [60.0 * (green - blue) / safe_chroma,
+             120.0 + 60.0 * (blue - red) / safe_chroma],
+            default=240.0 + 60.0 * (red - green) / safe_chroma,
+        )
+        hue = _np.where(chroma == 0, 0.0, hue) % 360.0
+        saturation = _np.where(value == 0, 0.0, chroma / _np.where(value == 0, 1.0, value) * 255.0)
+        return _np.stack([
+            _np.round(hue / 2.0), _np.round(saturation), _np.round(value),
+        ], axis=-1).astype(_np.uint8)
+
+    def cvtColor(src, code):
+        if code == cv2.COLOR_BGR2GRAY:
+            return src.mean(axis=2).astype(_np.uint8)
+        if code == cv2.COLOR_BGR2HSV:
+            return _bgr2hsv(src)
+        raise NotImplementedError(f"fake cv2: cvtColor code {code}")
+
+    def connectedComponents(image, connectivity=8):
+        """Two-pass labelling with union-find. 4-connectivity only.
+
+        Small and slow, which is fine: the frames in these tests are tens of
+        pixels across. It exists so `lens_barrel_mask` runs for real here —
+        stubbing it out to "no mask" would make every test of the masking path
+        pass by not testing it.
+        """
+        rows, cols = image.shape
+        labels = _np.zeros((rows, cols), dtype=_np.int32)
+        parent = [0]
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[max(ra, rb)] = min(ra, rb)
+
+        for r in range(rows):
+            for c in range(cols):
+                if not image[r, c]:
+                    continue
+                up = labels[r - 1, c] if r else 0
+                left = labels[r, c - 1] if c else 0
+                if up and left:
+                    labels[r, c] = min(up, left)
+                    union(up, left)
+                elif up or left:
+                    labels[r, c] = up or left
+                else:
+                    parent.append(len(parent))
+                    labels[r, c] = len(parent) - 1
+
+        remap, nxt = {0: 0}, 1
+        for r in range(rows):
+            for c in range(cols):
+                if not labels[r, c]:
+                    continue
+                root = find(labels[r, c])
+                if root not in remap:
+                    remap[root] = nxt
+                    nxt += 1
+                labels[r, c] = remap[root]
+        return nxt, labels
+
+    cv2.COLOR_BGR2GRAY = 6
+    # ── drawing + encoding, for the pose overlay path ────────────────────
+    #
+    # Approximations, and deliberately so: their only job is to let a test
+    # assert that the drawing code ran and touched the canvas. Without them
+    # `draw_skeleton` raises AttributeError inside the plugin's own
+    # try/except, the overlay silently publishes nothing, and the test passes
+    # on a host with no OpenCV while the real path is never exercised — which
+    # is precisely the failure mode frame_bytes() exists to prevent.
+
+    def line(img, pt1, pt2, colour, thickness=1, lineType=0):
+        steps = max(abs(pt2[0] - pt1[0]), abs(pt2[1] - pt1[1]), 1) + 1
+        xs = _np.linspace(pt1[0], pt2[0], steps).round().astype(int)
+        ys = _np.linspace(pt1[1], pt2[1], steps).round().astype(int)
+        inside = ((xs >= 0) & (xs < img.shape[1]) & (ys >= 0) & (ys < img.shape[0]))
+        img[ys[inside], xs[inside]] = colour
+        return img
+
+    def circle(img, centre, radius, colour, thickness=1, lineType=0):
+        x, y = int(centre[0]), int(centre[1])
+        r = max(int(radius), 1)
+        y0, y1 = max(y - r, 0), min(y + r + 1, img.shape[0])
+        x0, x1 = max(x - r, 0), min(x + r + 1, img.shape[1])
+        img[y0:y1, x0:x1] = colour       # a square, not a disc
+        return img
+
+    def putText(img, text, org, fontFace, fontScale, colour, thickness=1,
+                lineType=0):
+        cv2.__text_calls__.append((text, tuple(org)))
+        return img
+
+    def imencode(ext, img, params=None):
+        # Returns the same b"WxH" marker frame_bytes() produces, so an encoded
+        # overlay can be handed straight back to imdecode in a test.
+        height, width = img.shape[:2]
+        return True, _np.frombuffer(f"{width}x{height}".encode(), dtype=_np.uint8)
+
+    cv2.LINE_AA = 16
+    cv2.FONT_HERSHEY_SIMPLEX = 0
+    cv2.IMWRITE_JPEG_QUALITY = 1
+    cv2.__text_calls__ = []
+    cv2.line = line
+    cv2.circle = circle
+    cv2.putText = putText
+    cv2.imencode = imencode
+
+    cv2.COLOR_BGR2HSV = 40
     cv2.imdecode = imdecode
     cv2.resize = resize
+    cv2.copyMakeBorder = copyMakeBorder
+    cv2.cvtColor = cvtColor
+    cv2.connectedComponents = connectedComponents
+    cv2.__motus_fake__ = True
     sys.modules["cv2"] = cv2
 
 
 _install_fake_ros()
 _install_fake_cv2()
+
+
+def frame_bytes(width: int = 200, height: int = 100, fill: int = 0) -> bytes:
+    """A payload the *active* cv2 decodes into a height×width×3 BGR frame.
+
+    The fake cv2's `imdecode` reads a `b"WxH"` marker, which is cheap and needs
+    no encoder on a host that has no OpenCV. But those markers were written as
+    literals throughout the plugin tests, so on a machine that *does* have
+    OpenCV — every perception image, and therefore every PR-review-bot run —
+    real `imdecode` returned None, the worker skipped the frame, and 29 tests
+    across vop and visual_depth failed on "nothing was published". The suite
+    was green exactly where the code does not run and red exactly where it
+    does, which is the worst way round.
+
+    Going through this helper means one payload format per host: a marker when
+    the frame will be decoded by the stub, a genuine JPEG when it will be
+    decoded by OpenCV. A uniform fill survives JPEG quantisation exactly, so
+    colour and brightness assertions hold either way.
+    """
+    import cv2
+
+    if getattr(cv2, "__motus_fake__", False):
+        return f"{width}x{height}".encode()
+
+    import numpy as np
+
+    ok, buffer = cv2.imencode(".jpg", np.full((height, width, 3), fill, dtype=np.uint8))
+    if not ok:
+        raise RuntimeError("cv2.imencode failed to build a test frame")
+    return buffer.tobytes()
 
 
 def _wait_until(predicate, timeout=3.0):

@@ -29,6 +29,22 @@
  * Protocol: phanthymotus-driver/README_dev.md § "Continuous Control".
  */
 
+// motus.control/1 `twist`: a body velocity in this order. Mirrors
+// common/control/descriptor.py's MODES comment and loco_servo's
+// AXIS_NAMES — three places name these, and they must not drift.
+const TWIST_AXES = ['vx', 'vy', 'vz', 'wx', 'wy', 'wz'];
+
+// `wz` is precise but not self-evident: it is angular velocity **about** the z
+// axis, which is vertical — so it is turning on the spot, not "rotating in the z
+// direction". A ground robot has exactly three live degrees of freedom, vx, vy
+// and wz; the other three describe rising, rolling and pitching, which a chassis
+// cannot do, which is why its descriptor pins them to zero.
+const TWIST_HINTS = {
+  vx: '前后（+ 前进）', vy: '左右平移（+ 左）', vz: '上下（底盘无此自由度）',
+  wx: '翻滚（底盘无此自由度）', wy: '俯仰（底盘无此自由度）',
+  wz: '转向，绕竖直轴（− 顺时针/右转）',
+};
+
 const BAR_COLOUR   = '#4D9EE8';
 const WARN_COLOUR  = '#D97757';
 // Within this fraction of a limit the bar turns warm. Not a threshold the sink
@@ -102,6 +118,13 @@ export const ControlRenderer = {
   _absorbDescriptor(msg) {
     const d = msg.control_interface;
     if (d && Array.isArray(d.joint_names)) this._names = d.joint_names;
+    // `twist` is not a joint space: the six values are a body velocity, and
+    // labelling them joint1..joint6 tells the reader the robot has six joints
+    // it is driving. On a navigating chassis the only non-zero entry sat next
+    // to "joint6", which is the yaw rate — the one name that makes the panel
+    // readable is the one it was not using. Only when the producer has not
+    // named them itself.
+    else if (msg.mode === 'twist') this._names = TWIST_AXES;
     if (d && d.limits && Array.isArray(d.limits.lower) && Array.isArray(d.limits.upper)) {
       this._limits = { lower: d.limits.lower, upper: d.limits.upper, declared: true };
     }
@@ -137,10 +160,17 @@ export const ControlRenderer = {
         'flex:1;height:10px;background:rgba(255,255,255,0.06);border-radius:5px;' +
         'position:relative;overflow:hidden';
 
+      // The zero tick. It used to be rgba(255,255,255,0.18) — white, and so
+      // **entirely invisible** on a light theme, which left a bar anchored at
+      // zero looking like a block floating in space. Follows the theme now.
+      //
+      // Its position cannot be hardcoded at 50% either: that is only where zero
+      // sits when the range is symmetric. In a [0, 1] range zero is at the left
+      // edge. The real position is computed per frame in _paint.
       const zero = document.createElement('div');
       zero.style.cssText =
         'position:absolute;left:50%;top:0;bottom:0;width:1px;' +
-        'background:rgba(255,255,255,0.18)';
+        'background:var(--text-dim, rgba(0,0,0,0.35))';
       track.appendChild(zero);
 
       const fill = document.createElement('div');
@@ -153,7 +183,7 @@ export const ControlRenderer = {
 
       row.append(name, track, value);
       this._rows.appendChild(row);
-      this._bars.push({ row, fill, value, name, idx: i });
+      this._bars.push({ row, fill, value, name, zero, idx: i });
     }
   },
 
@@ -165,22 +195,47 @@ export const ControlRenderer = {
     msg.values.forEach((v, i) => {
       const bar = this._bars[i];
       if (!bar) return;
-      bar.name.textContent = (this._names && this._names[i]) || `joint${i + 1}`;
+      const label = (this._names && this._names[i]) || `joint${i + 1}`;
+      bar.name.textContent = label;
+      if (TWIST_HINTS[label]) bar.name.title = TWIST_HINTS[label];
       bar.value.textContent = Number(v).toFixed(3);
 
       const lo = lower[i];
       const hi = upper[i];
       // A bar needs both ends and a non-zero span; an inferred range starts
       // with neither, so the first frame draws no fill rather than a full one.
+      //
+      // With an inferred range this degenerate case lasts a long time: an axis
+      // that has only ever held one value has lo === hi, so a plainly non-zero
+      // 0.4 sits beside an empty track. Drawing nothing is honest — without a
+      // range there is no proportion to draw — but it has to read as "no range
+      // yet" rather than as "the value is zero".
       if (lo === undefined || hi === undefined || hi === lo) {
         bar.fill.style.width = '0';
+        bar.row.title = (v === 0)
+          ? ''
+          : '尚无量程：这个轴目前只出现过一个取值，按已见极值推断不出范围';
         return;
       }
+      bar.row.title = '';
+      // The bar is anchored at **zero**, not at the left edge. The tick in the
+      // track is zero, and drawing from the left contradicts it: with wz in
+      // [-2, 2] a value of 0 computes frac = 0.5, so a value that is plainly
+      // zero renders as a half-full bar. That is how it was reported from the
+      // robot.
       const span = hi - lo;
-      const frac = Math.max(0, Math.min(1, (v - lo) / span));
-      bar.fill.style.left  = '0';
-      bar.fill.style.width = (frac * 100).toFixed(2) + '%';
-      const near = frac >= NEAR_LIMIT || frac <= 1 - NEAR_LIMIT;
+      const clamp = (x) => Math.max(0, Math.min(1, x));
+      const zeroFrac = clamp((0 - lo) / span);          // 零位在量程里的位置
+      const valFrac  = clamp((v - lo) / span);
+      const left  = Math.min(zeroFrac, valFrac);
+      const width = Math.abs(valFrac - zeroFrac);
+      if (bar.zero) bar.zero.style.left = (zeroFrac * 100).toFixed(2) + '%';
+      bar.fill.style.left  = (left * 100).toFixed(2) + '%';
+      bar.fill.style.width = (width * 100).toFixed(2) + '%';
+      // Warn only near the ends of the range, keyed on where the value sits in
+      // it rather than on the bar's length — for a zero-anchored bar, length
+      // says how far from zero, not how close to a limit.
+      const near = valFrac >= NEAR_LIMIT || valFrac <= 1 - NEAR_LIMIT;
       bar.fill.style.background = near ? WARN_COLOUR : BAR_COLOUR;
     });
 
