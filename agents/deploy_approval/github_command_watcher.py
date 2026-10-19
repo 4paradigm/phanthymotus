@@ -103,6 +103,11 @@ class GitHubCommandWatcher:
         # pending-generation. Prevents rebaselining PRs that
         # already succeeded this generation.
         self._baseline_progress: dict[str, set[int]] = {}
+        # Bounded polling cursors: repository order rotates each cycle, while
+        # each repository resumes its ordinary scan position in PR-number order.
+        self._repo_poll_cursor = 0
+        self._pr_scan_cursor: dict[str, int] = {}
+        self._recent_pr_cursor: dict[str, int] = {}
         # Startup alone may resume unfinished evidence finalization. Auth
         # reactivation never grants replay authority to historical commands.
         self._startup_recovery_repos: set[str] = set()
@@ -238,7 +243,10 @@ class GitHubCommandWatcher:
         """
         if not self.config.active_repos or not getattr(self.config, "auth_valid", True):
             return
-        repos = list(self.config.active_repos)
+        repos = list(dict.fromkeys(self.config.active_repos))
+        if repos:
+            repo_start = self._repo_poll_cursor % len(repos)
+            repos = repos[repo_start:] + repos[:repo_start]
         for repo in repos:
             if (not self.config.auth_valid or repo not in self.config.active_repos
                     or repo not in self.config.github_repos):
@@ -248,62 +256,92 @@ class GitHubCommandWatcher:
             except GitHubError as e:
                 logger.warning("watcher list PRs %s: %s", repo, e)
                 continue
+            except Exception as e:
+                logger.warning("watcher list PRs %s failed: %s", repo, type(e).__name__)
+                continue
             baseline_all = repo in self._pending_baseline_repos
             baseline_done = self._baseline_progress.get(repo, set())
-            open_pr_numbers = [
-                int(pr.get("number") or 0) for pr in prs
-                if int(pr.get("number") or 0)
-            ]
-
-            # New commands for PRs already baselined in this authorization
-            # generation take priority over the remaining startup work.
-            # A small baseline batch bounds each cycle when a repo has many PRs.
-            baseline_budget = 5
-            baseline_attempted = 0
+            valid_prs = []
             for pr in prs:
-                if not self.config.auth_valid or repo not in self.config.active_repos:
-                    break
-                pr_number = int(pr.get("number") or 0)
-                if not pr_number or (baseline_all and pr_number not in baseline_done):
-                    continue
                 try:
-                    await self._process_pr(repo, pr_number)
-                    # The existing serial watcher projects durable attachment
-                    # events after the normal command slot; never a second writer.
-                    await self.controller.project_evidence(repo, pr_number)
-                except Exception as e:
-                    logger.error(
-                        "watcher process %s#%s: %s", repo, pr_number, e
-                    )
-
-            if baseline_all:
-                pending_prs = [
-                    pr for pr in prs
-                    if int(pr.get("number") or 0)
-                    and int(pr.get("number") or 0) not in baseline_done
-                ]
-                if pending_prs:
-                    interval = max(1, int(self.config.poll_interval_seconds))
-                    start = int(self._monotonic() // interval) % len(pending_prs)
-                    pending_prs = pending_prs[start:] + pending_prs[:start]
-                for pr in pending_prs:
-                    if not self.config.auth_valid or repo not in self.config.active_repos:
-                        break
                     pr_number = int(pr.get("number") or 0)
-                    if baseline_attempted >= baseline_budget:
-                        break
-                    baseline_attempted += 1
-                    try:
-                        logger.debug("watcher baseline %s#%s started", repo, pr_number)
+                except (TypeError, ValueError):
+                    continue
+                if pr_number > 0:
+                    valid_prs.append((pr_number, pr))
+            valid_prs.sort(key=lambda item: item[0])
+            open_pr_numbers = [number for number, _ in valid_prs]
+
+            # Each repo gets a hard cap for all PR work, including command
+            # processing, baseline attempts and evidence projection.
+            pr_work_budget = 6
+            fast_lane_size = 2
+            by_number = {number: pr for number, pr in valid_prs}
+            recent_pool = sorted(
+                valid_prs,
+                key=lambda item: str(item[1].get("updated_at") or ""),
+                reverse=True,
+            )[:12]
+            recent_start = self._recent_pr_cursor.get(repo, 0) % len(recent_pool) if recent_pool else 0
+            recent_order = recent_pool[recent_start:] + recent_pool[:recent_start]
+            fast_lane = recent_order[:fast_lane_size]
+            if recent_pool:
+                self._recent_pr_cursor[repo] = (
+                    recent_start + len(fast_lane)
+                ) % len(recent_pool)
+            selected_numbers = [number for number, _ in fast_lane]
+            selected_set = set(selected_numbers)
+
+            # Sort by PR number above, then rotate from the saved position.
+            # Modulo adjustment handles PR additions/removals; API ordering
+            # changes do not affect this deterministic scan order.
+            scan_start = (
+                self._pr_scan_cursor.get(repo, 0) % len(open_pr_numbers)
+                if open_pr_numbers else 0
+            )
+            ordinary_order = open_pr_numbers[scan_start:] + open_pr_numbers[:scan_start]
+            ordinary_slots = max(0, pr_work_budget - len(selected_numbers))
+            ordinary_added = 0
+            ordinary_scanned = 0
+            ordinary_cursor_after = {}
+            for pr_number in ordinary_order:
+                ordinary_scanned += 1
+                if pr_number in selected_set:
+                    continue
+                selected_numbers.append(pr_number)
+                selected_set.add(pr_number)
+                ordinary_added += 1
+                ordinary_cursor_after[pr_number] = (
+                    scan_start + ordinary_scanned
+                ) % len(open_pr_numbers)
+                if ordinary_added >= ordinary_slots:
+                    break
+
+            processed_count = 0
+            for pr_number in selected_numbers[:pr_work_budget]:
+                if (not self.config.auth_valid or repo not in self.config.active_repos
+                        or repo not in self.config.github_repos):
+                    break
+                pr = by_number[pr_number]
+                processed_count += 1
+                try:
+                    if baseline_all and pr_number not in baseline_done:
+                        # Baseline only. Never dispatch historical comments in
+                        # the same operation that establishes the cursor.
                         success = await self._baseline_pr(repo, pr_number)
                         if success:
                             self._baseline_progress.setdefault(repo, set()).add(pr_number)
-                            logger.debug("watcher baseline %s#%s completed", repo, pr_number)
-                        await self.controller.project_evidence(repo, pr_number)
-                    except Exception as e:
-                        # One failing baseline must not prevent the rest of this
-                        # bounded batch, or command processing above.
-                        logger.error("watcher baseline %s#%s: %s", repo, pr_number, e)
+                    else:
+                        await self._process_pr(repo, pr_number)
+                    # The existing serial watcher remains the sole writer of
+                    # durable attachment projections.
+                    await self.controller.project_evidence(repo, pr_number)
+                except Exception as e:
+                    # A failed PR consumes only its own slot; later selected
+                    # PRs still get their serial attempt this cycle.
+                    logger.error("watcher process %s#%s: %s", repo, pr_number, e)
+                if pr_number in ordinary_cursor_after:
+                    self._pr_scan_cursor[repo] = ordinary_cursor_after[pr_number]
             # Baselining uses per-PR progress tracking: only discard from
             # _pending_baseline_repos when ALL open PRs for this repo have
             # been successfully baselined this generation.  PRs whose
@@ -318,12 +356,16 @@ class GitHubCommandWatcher:
                 if all_baselined:
                     self._pending_baseline_repos.discard(repo)
                     self._startup_recovery_repos.discard(repo)
-                elif baseline_attempted:
-                    logger.debug(
-                        "watcher baseline progress %s: %s/%s open PRs",
-                        repo, sum(n in self._baseline_progress[repo] for n in open_pr_numbers),
-                        len(open_pr_numbers),
-                    )
+            remaining = (
+                sum(n not in self._baseline_progress.get(repo, set()) for n in open_pr_numbers)
+                if repo in self._pending_baseline_repos else 0
+            )
+            logger.info(
+                "watcher poll %s processed_prs=%s remaining_baselines=%s scan_cursor=%s",
+                repo, processed_count, remaining, self._pr_scan_cursor.get(repo, 0),
+            )
+        if repos:
+            self._repo_poll_cursor = (repo_start + 1) % len(repos)
 
     async def _baseline_pr(self, repo: str, pr_number: int) -> bool:
         """Baseline old commands, allowing only guarded startup record_test recovery.
