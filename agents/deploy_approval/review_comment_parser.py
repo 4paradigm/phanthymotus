@@ -33,6 +33,7 @@ PR_REVIEW_MARKER = "<!-- pr-review-agent -->"
 BUILD_HEADING = "## PR Review Agent — Build Result"
 TEST_HEADING = "## PR Review Agent — Test Results"
 CODE_REVIEW_HEADING = "## PR Review Agent — Code Review"
+ERROR_HEADING = "## PR Review Agent — Error"
 # Published by agents/pr_review/models.py DEFAULT_JP_VERSION. The isolated
 # Controller image does not ship that package; keep the protocol default here.
 _DEFAULT_REQUEST_VARIANT = "5.11"
@@ -74,6 +75,17 @@ def _is_review_job_anchor_body(body: str) -> bool:
         return False
     return bool(_extract_review_job_commit_prefix(body)
                 or re.search(r"(?m)^## PR Review Agent\s*$", body))
+
+
+def _is_terminal_review_error_body(body: str) -> bool:
+    """Recognize the Review Agent's explicit terminal error protocol."""
+    return (
+        _has_marker(body)
+        and body.count(ERROR_HEADING) == 1
+        and not any(heading in body for heading in (BUILD_HEADING, TEST_HEADING, CODE_REVIEW_HEADING))
+        and bool(_SHORT_SHA_RE.fullmatch(_extract_review_job_commit_prefix(body)))
+        and "Push a fix and comment `/request_bot_review` again to retrigger." in body
+    )
 
 
 def extract_latest_review_job_anchor(
@@ -121,7 +133,9 @@ def extract_latest_review_job_anchor(
             return None  # Invalid run provenance must never fall back to an older run.
         # Determine anchor state based on comment content
         anchor_state = "reviewing"
-        if BUILD_HEADING in body:
+        if _is_terminal_review_error_body(body):
+            anchor_state = "terminal"
+        elif BUILD_HEADING in body:
             # This is a Build Result comment — parse rows for state determination
             rows = _parse_build_table(body)
             images = _parse_build_images(body)
@@ -950,6 +964,13 @@ def extract_review_evidence(
         boundary = min(position for position in
                        [anchor_position, *prior_positions, *request_positions]
                        if position > old_position)
+        # The Review Agent's explicit error comment closes that run even
+        # though failed runs have neither a Build Result nor a Code Review.
+        old_body = str(older.get("body", ""))
+        if (_is_terminal_review_error_body(old_body)
+                and old_updated < boundary[0]
+                and old_position < boundary):
+            continue
         # A failed build is a real terminal run; upstream emits no Code Review
         # for it. It must have finished before the new request, not overlap it.
         old_rows = _parse_build_table(str(older.get("body", "")))
