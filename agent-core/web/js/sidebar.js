@@ -991,6 +991,46 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // What the shared settings are set to, shown read-only above the per-instance
+  // ones. **Context, not a second place to edit them** — they belong to the
+  // tool, so editing them here would mean one dialog silently changing every
+  // other card on the same tool.
+  //
+  // Without this the two halves of a card's configuration are invisible to each
+  // other, and for visual_depth that is the difference between a number that
+  // means something and one that does not: `cal_a`/`cal_b` are a fit measured
+  // against a particular depth model, and `backend` — which model is running —
+  // is shared. Editing the coefficients while unable to see the model they
+  // apply to is how r1_bj ended up with a YOLO fit selected under DepthART.
+  const sharedKeys = Object.keys(props).filter(k => props[k].scope !== 'instance');
+  if (sharedKeys.length) {
+    const sharedSaved = _toolConfigs[`${mcpId}:${toolName}`] || {};
+    const box = document.createElement('div');
+    box.className = 'tool-config-shared-context';
+    const heading = document.createElement('div');
+    heading.className = 'tool-config-shared-heading';
+    heading.textContent = '工具级设置（所有卡片共用，在侧栏修改）';
+    box.appendChild(heading);
+    for (const key of sharedKeys) {
+      const def = props[key];
+      const row = document.createElement('div');
+      row.className = 'tool-config-shared-row';
+      const name = document.createElement('span');
+      name.textContent = def.title || key;
+      const value = document.createElement('code');
+      const current = sharedSaved[key] !== undefined ? sharedSaved[key] : def.default;
+      // `undefined` and a literal empty string are different states and the
+      // operator needs to tell them apart: unset falls back to whatever the
+      // service decides, while empty was chosen.
+      value.textContent = current === undefined || current === null
+        ? '(未设置)' : String(current);
+      row.appendChild(name);
+      row.appendChild(value);
+      box.appendChild(row);
+    }
+    bodyEl.appendChild(box);
+  }
+
   // Expert settings go in a fold. A card whose every tuning knob is laid out
   // flat is a card nobody can configure: the pose card reached 26 fields, each
   // labelled with its own paragraph of rationale, and finding `fps` in it meant
