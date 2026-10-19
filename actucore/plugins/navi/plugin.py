@@ -310,8 +310,6 @@ class NaviPlugin:
                          "于是一眼能同时看到它看见了什么和它在反应什么"},
                 {"format": "image/depth-zlib",
                  "desc": "zlib 压缩深度图 640x480 uint16 mm（与深度摘要二选一）"},
-                {"format": "image/depth-z16",
-                 "desc": "原始 16UC1/mono16 深度图 640x480 或 848x480 uint16 mm（与深度摘要二选一）"},
                 {"format": "state/odom",
                  "desc": "motus.odom/1（可选，接上才有卡死检测）"},
             ],
@@ -922,7 +920,7 @@ class NaviPlugin:
         # on the canvas. It goes into the degradations.
         bound["unknown"] = unknown
 
-        from sensor_msgs.msg import CompressedImage, Image
+        from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
         qos = _sensor_qos()
@@ -934,15 +932,32 @@ class NaviPlugin:
             fmt = self._declared_format(input_bindings, topic)
             if not fmt:
                 fmt = self._declared_format(declarations, topic)
-            declared = {"image/depth-z16": Image,
-                        "image/depth-zlib": CompressedImage}.get(fmt)
+            declared = {"image/depth-zlib": CompressedImage}.get(fmt)
             if fmt and declared is None:
+                # `image/depth-z16` used to be accepted here. It is retired:
+                # every driver that published it was already producing exactly
+                # 640x480 little-endian 16UC1 — the zlib form's contract — and
+                # the raw form costs ~614 KB/frame, which saturates ARM64 CPU
+                # on DDS serialization. The sources were converted in
+                # phanthymotus-driver#419. Named explicitly rather than lumped
+                # in with "incompatible", because a robot still running a
+                # pre-#419 driver image hits exactly this and the fix is to
+                # update that image, not to rewire the canvas.
+                if fmt == "image/depth-z16":
+                    return bound, (
+                        f"深度输入是 image/depth-z16：{topic}。该格式已停用 —— "
+                        f"请把这台机器的驱动镜像更新到含 phanthymotus-driver#419 "
+                        f"的版本，它会改发 image/depth-zlib（同样是 640x480 "
+                        f"uint16 毫米，只是压缩过）。")
                 return bound, f"深度输入格式不兼容：{fmt}（JPEG预览不能作米制深度）"
 
             def bind_depth():
                 types = set(dict(node.get_topic_names_and_types()).get(topic) or [])
-                supported = {"sensor_msgs/msg/Image": Image,
-                             "sensor_msgs/msg/CompressedImage": CompressedImage}
+                # Only CompressedImage now. A raw `sensor_msgs/msg/Image` on a
+                # depth topic lands in the `types and not observed` branch
+                # below and is refused by type rather than bound to a decoder
+                # that no longer exists.
+                supported = {"sensor_msgs/msg/CompressedImage": CompressedImage}
                 observed = [supported[t] for t in types if t in supported]
                 if len(types) > 1 or (types and not observed):
                     raise ValueError(f"深度话题类型冲突：{topic}: {sorted(types)}")
@@ -953,7 +968,7 @@ class NaviPlugin:
                     selected = CompressedImage
                 if selected is None:
                     return False
-                callback = self._on_depth_z16 if selected is Image else self._on_depth_map
+                callback = self._on_depth_map
                 node.create_subscription(selected, topic, callback, qos)
                 self._cancel_pending_depth_bind(node)
                 with self._lock:
@@ -1126,22 +1141,6 @@ class NaviPlugin:
             self._depth_map = depth
             self._depth_bands = depth_mod.nearest_by_band(depth)
             self._depth_ms = int(time.time() * 1000)
-
-    def _on_depth_z16(self, message):
-        try:
-            depth = depth_mod.decode_z16(
-                bytes(getattr(message, "data", b"") or b""),
-                width=int(getattr(message, "width", 0)),
-                height=int(getattr(message, "height", 0)),
-                step=int(getattr(message, "step", 0)),
-                is_bigendian=bool(getattr(message, "is_bigendian", False)),
-                encoding=str(getattr(message, "encoding", "")),
-            )
-        except (ValueError, depth_mod.DepthError) as error:
-            with self._lock:
-                self._last_error = f"深度图解码失败：{error}"
-            return
-        self._set_depth_map(depth)
 
     def _on_depth_map(self, message):
         data = bytes(getattr(message, "data", b"") or b"")

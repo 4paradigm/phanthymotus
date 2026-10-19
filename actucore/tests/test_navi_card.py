@@ -146,7 +146,7 @@ def test_the_prefix_has_no_underscore():
 
 def test_it_declares_every_input_format_it_accepts():
     formats = {entry["format"] for entry in _tool()["topic_in"]}
-    assert formats == {"data/json", "image/depth-zlib", "image/depth-z16",
+    assert formats == {"data/json", "image/depth-zlib",
                        "state/odom",
                        # The raw camera, optional and only for the overlay.
                        "image/jpeg"}
@@ -279,26 +279,6 @@ def test_a_driver_camera_depth_topic_binds_as_metric_depth():
     assert bound["depth_map"] == "/ubuntu/camera/depth"
 
 
-
-def test_a_raw_driver_depth_topic_uses_image_subscription_and_z16_decoder():
-    """A hardware z16 stream must not be subscribed/decoded as zlib."""
-    from types import SimpleNamespace
-
-    card = _card()
-    node = _FakeNode({"/ubuntu/camera/depth": ["sensor_msgs/msg/Image"]})
-    bound, problem = card._bind_inputs(
-        node, ["/ubuntu/camera/color/objects", "/ubuntu/camera/depth"])
-    assert problem == ""
-    depth_subscriptions = [item for item in node.subscription_details
-                           if item[1] == "/ubuntu/camera/depth"]
-    assert {item[0].__name__ for item in depth_subscriptions} == {"Image"}
-    callback = next(item[2] for item in depth_subscriptions if item[0].__name__ == "Image")
-
-    raw = bytearray(640 * 480 * 2)
-    raw[:2] = (1500).to_bytes(2, "little")
-    callback(SimpleNamespace(data=raw, width=640, height=480, step=1280,
-                             is_bigendian=False, encoding="16UC1"))
-    assert card._depth_map[0, 0] == pytest.approx(1.5)
 
 def test_the_summary_suffix_is_not_swallowed_by_the_depth_map_suffix():
     """`/visual_depth_summary` starts with `/visual_depth`; matched in the
@@ -962,14 +942,21 @@ def test_depth_loading_defers_one_type_until_publisher_is_known():
     bound, problem = card._bind_inputs(node, ['/cam/objects', '/q5/camera/depth'])
     assert problem == '' and bound['depth_map'] == '/q5/camera/depth'
     assert not any(t[1] == '/q5/camera/depth' for t in node.subscription_details)
-    node.graph['/q5/camera/depth'] = ['sensor_msgs/msg/Image']
+    # A CompressedImage publisher appears and the deferred bind completes.
+    # It used to be `sensor_msgs/msg/Image` here: `image/depth-z16` is retired,
+    # because every driver that published it already produced exactly 640x480
+    # little-endian 16UC1 and now compresses in the driver
+    # (phanthymotus-driver#419). A depth topic still carrying a raw Image is a
+    # stale driver image, and is refused by type rather than decoded.
+    node.graph['/q5/camera/depth'] = ['sensor_msgs/msg/CompressedImage']
     node.timers[0]()
-    assert [t[0].__name__ for t in node.subscription_details if t[1] == '/q5/camera/depth'] == ['Image']
+    assert [t[0].__name__ for t in node.subscription_details
+            if t[1] == '/q5/camera/depth'] == ['CompressedImage']
     assert node.timers == []
 
 
 def test_bumi_zlib_and_q5_raw_declarations_each_bind_one_type_without_graph():
-    for fmt, name in [('image/depth-zlib', 'CompressedImage'), ('image/depth-z16', 'Image')]:
+    for fmt, name in [('image/depth-zlib', 'CompressedImage')]:
         card = _card(); node = _FakeNode()
         _, problem = card._bind_inputs(node, ['/cam/objects', '/camera/depth'], {'/camera/depth': {'format': fmt}})
         assert problem == ''
@@ -999,17 +986,6 @@ def test_bumi_compressed_depth_creates_only_the_compressed_subscription():
     assert details[0][2] == card._on_depth_map
 
 
-def test_raw_depth_creates_only_the_image_subscription():
-    card = _card()
-    node = _FakeNode({'/robot/camera/depth': ['sensor_msgs/msg/Image']})
-    _, problem = card._bind_inputs(node, ['/cam/objects', '/robot/camera/depth'])
-    assert problem == ''
-    details = [entry for entry in node.subscription_details
-               if entry[1] == '/robot/camera/depth']
-    assert [entry[0].__name__ for entry in details] == ['Image']
-    assert details[0][2] == card._on_depth_z16
-
-
 def test_explicit_input_binding_selects_depth_type_while_ros_graph_is_empty():
     card = _card()
     node = _FakeNode()
@@ -1031,7 +1007,12 @@ def test_type_conflict_is_reported_before_any_depth_subscription_is_created():
         node, ['/cam/objects', '/camera/depth'], None,
         {'/camera/depth': {'format': 'image/depth-zlib', 'port_index': 2}},
     )
-    assert '不一致' in problem
+    # Reported as a type conflict rather than a declaration mismatch: with z16
+    # retired, `sensor_msgs/msg/Image` is not a supported depth type at all, so
+    # an Image-only topic fails the observed-type check before its declaration
+    # is ever compared. Either way nothing is subscribed, which is the part
+    # that matters.
+    assert '类型冲突' in problem
     assert not [entry for entry in node.subscription_details
                 if entry[1] == '/camera/depth']
 
@@ -1161,26 +1142,3 @@ def test_tianyi_head_depth_topic_binds_as_metric_depth():
     assert bound["depth_map"] == "/nvidia_desktop/camera/head/depth"
 
 
-def test_tianyi_head_depth_raw_image_uses_image_subscription():
-    card = _card()
-    node = _FakeNode({
-        "/nvidia_desktop/camera/head/depth":
-            ["sensor_msgs/msg/Image"]
-    })
-
-    bound, problem = card._bind_inputs(
-        node,
-        [
-            "/cam/objects",
-            "/nvidia_desktop/camera/head/depth",
-        ],
-    )
-
-    assert problem == ""
-
-    depth = [
-        x for x in node.subscription_details
-        if x[1] == "/nvidia_desktop/camera/head/depth"
-    ]
-
-    assert [x[0].__name__ for x in depth] == ["Image"]

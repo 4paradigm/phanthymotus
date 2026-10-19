@@ -89,29 +89,6 @@ def decode(payload: bytes) -> np.ndarray:
 
 
 
-def decode_z16(payload: bytes, *, width: int, height: int, step: int,
-               is_bigendian: bool = False, encoding: str = "16UC1") -> np.ndarray:
-    """A raw ``image/depth-z16`` ROS frame as the card's metres map.
-
-    Raw depth drivers use ``sensor_msgs/Image`` rather than zlib-wrapped
-    ``CompressedImage``.  640x480 and Q5's native 848x480 grids are accepted without resampling;
-    sampling and corridor geometry use the actual array shape. Registration
-    with RGB and metric units remain producer responsibilities.
-    """
-    if str(encoding).lower() not in {"16uc1", "mono16"}:
-        raise DepthError(f"expected 16UC1/mono16 depth image, got {encoding!r}")
-    if (width, height) not in {(WIDTH, HEIGHT), (848, 480)}:
-        raise DepthError(f"expected 640x480 or 848x480 depth image, got {width}x{height}")
-    row_bytes = width * 2
-    if step < row_bytes or len(payload) != step * height:
-        raise DepthError(f"invalid z16 layout: step={step}, bytes={len(payload)}")
-    dtype = ">u2" if is_bigendian else "<u2"
-    rows = np.frombuffer(payload, dtype=np.uint8).reshape(height, step)[:, :row_bytes]
-    millimetres = rows.reshape(height, width, 2).copy().view(dtype).reshape(height, width)
-    metres = millimetres.astype(np.float32) / 1000.0
-    metres[millimetres == 0] = np.nan
-    return metres
-
 def _valid(patch: np.ndarray) -> np.ndarray:
     return patch[np.isfinite(patch) & (patch > 0)]
 
