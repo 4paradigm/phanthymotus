@@ -765,12 +765,11 @@ html, body {
   color: var(--text-muted);
   opacity: 0.85;
 }
-/* The tool-level settings, shown read-only at the top of a card's own config.
-   Deliberately not inputs: they belong to the tool, so editing them here would
-   mean one card's dialog silently changing every other card on that tool. The
-   point is only that a per-camera number can be read next to the shared
-   setting it depends on. */
-.tool-config-shared-context {
+/* The tool-level settings, editable at the top of a card's own config so the
+   card is the only dialog you need. Boxed and labelled because the blast radius
+   is unusual: this group is shared, so a change here lands on every other card
+   of the same tool. */
+.tool-config-shared-group {
   margin-bottom: 16px;
   padding: 8px 10px;
   border-radius: 6px;
@@ -789,7 +788,7 @@ html, body {
   font-size: 12px;
   padding: 2px 0;
 }
-.tool-config-shared-row > code {
+.tool-config-shared-group .tool-config-label {
   color: var(--text-primary, var(--text-secondary));
   font-size: 11px;
 }

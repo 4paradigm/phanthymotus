@@ -1,10 +1,10 @@
-/** The tool-level settings a card's own config dialog shows, read-only.
+/** A card's config dialog owns both scopes: what it shows, and where it saves.
  *
- * Covers the selection rule rather than the DOM: which keys are shown, and
- * what value each resolves to. A card's per-instance numbers can depend on a
- * shared setting — visual_depth's `cal_a`/`cal_b` are a fit measured against
- * whichever `backend` is running — and editing them with no way to see that
- * setting is how r1_bj ended up with a YOLO fit selected under DepthART.
+ * Covers the two rules rather than the DOM — which keys land in the shared
+ * group and which saved row each value is written to. A card's per-instance
+ * numbers can depend on a shared setting (visual_depth's `cal_a`/`cal_b` are a
+ * fit measured against whichever `backend` is running), and configuring them in
+ * two dialogs is how r1_bj ended up with a YOLO fit selected under DepthART.
  */
 import { test } from 'node:test';
 import assert from 'node:assert';
@@ -65,4 +65,42 @@ test('false and 0 are rendered, not treated as unset', () => {
   };
   const rows = sharedContext(props, { dry_run: false, gain: 0 });
   assert.deepStrictEqual(rows.map(r => r.value), ['false', '0']);
+});
+
+
+/** Mirrors the save split in sidebar.js: each row receives only its own keys. */
+function splitByScope(props, values, sharedKeys) {
+  const instanceValues = {}, sharedValues = {};
+  for (const [k, v] of Object.entries(values)) {
+    ((props[k] && props[k].scope !== 'instance') ? sharedValues : instanceValues)[k] = v;
+  }
+  const writes = [['instance', instanceValues]];
+  if (sharedKeys.length) writes.push(['shared', sharedValues]);
+  return writes;
+}
+
+test('each saved row receives only the keys it owns', () => {
+  // A merged payload is rejected by plugins keeping one engine per process —
+  // the same contract agent-core/src/tool_config.py applies on start.
+  const writes = splitByScope(DEPTH_PROPS,
+    { backend: 'depthart', fps: 2, cal_a: 1, cal_b: -0.31 }, ['backend']);
+  assert.deepStrictEqual(writes, [
+    ['instance', { fps: 2, cal_a: 1, cal_b: -0.31 }],
+    ['shared', { backend: 'depthart' }],
+  ]);
+});
+
+test('a tool with no shared fields never writes the tool-level row', () => {
+  // Otherwise opening and saving a card would overwrite that row with {}.
+  const props = { fps: { scope: 'instance', default: 2 } };
+  const writes = splitByScope(props, { fps: 4 }, []);
+  assert.deepStrictEqual(writes.map(w => w[0]), ['instance']);
+});
+
+test('an unknown key defaults to the instance row rather than the shared one', () => {
+  // A stale saved key absent from the current schema must not be promoted to
+  // tool-wide, where it would affect every other card.
+  const writes = splitByScope(DEPTH_PROPS, { legacy_knob: 7 }, ['backend']);
+  assert.deepStrictEqual(writes[0], ['instance', { legacy_knob: 7 }]);
+  assert.deepStrictEqual(writes[1], ['shared', {}]);
 });
