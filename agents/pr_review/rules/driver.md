@@ -90,12 +90,17 @@ conventionally the MCP port + 1.
 
 `topic_out[].format` decides which renderer runs, so a wrong value produces a
 wrong visualisation rather than an error. Valid values include `audio/*`,
-`video/*`, `image/jpeg`, `image/depth-z16`, `image/depth-zlib`, `data/json`,
+`video/*`, `image/jpeg`, `image/depth-zlib`, `data/json`,
 `text/*`, `sensor/skeleton`, `sensor/lidar*`, `sensor/pointcloud`,
 `sensor/mapping`.
 
-Prefer `image/depth-zlib` over `image/depth-z16`: the raw form is ~614 KB/frame
-and saturates ARM64 CPU, the compressed form ~10–15 KB.
+Depth is `image/depth-zlib`, and there is no raw alternative: `image/depth-z16`
+was retired in phanthymotus-driver#419 because every driver publishing it was
+already producing exactly 640x480 little-endian 16UC1 — the zlib form's fixed
+contract — while costing ~614 KB/frame instead of ~10–15 KB and saturating
+ARM64 CPU on DDS serialization. A camera whose native depth is not 640x480
+resizes in its own driver, and **must rescale its `camera_info` K to match** or
+it reproduces the r1_sz field-of-view bug.
 
 For `sensor/skeleton`, the driver needs a `model` tool (`type: resource`)
 returning the URDF, and the joint `name` values published by the `joints` sensor

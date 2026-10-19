@@ -253,12 +253,21 @@ def _resolve_msg_type(fmt: str):
             pass
         return None
     if fmt == 'image/depth-z16':
-        try:
-            from sensor_msgs.msg import Image
-            return Image
-        except ImportError as e:
-            print(f'[ros2_bridge] cannot import Image: {e}', file=sys.stderr)
-            pass
+        # Retired. Every driver that published it already produced exactly
+        # 640x480 little-endian 16UC1 — the zlib form's contract — and the raw
+        # form costs ~614 KB/frame, which saturates ARM64 CPU on DDS
+        # serialization. Converted in phanthymotus-driver#419.
+        #
+        # **Said out loud rather than returning None quietly.** An unmapped
+        # format means the topic is never subscribed, so the panel is simply
+        # blank — and a robot still running a pre-#419 driver image lands here
+        # exactly. One printed line is the difference between "the depth card
+        # is broken" and "that robot needs a newer driver image".
+        print(f'[ros2_bridge] image/depth-z16 is retired and will not be '
+              f'subscribed. This machine is publishing raw z16 depth, which '
+              f'means its driver image predates phanthymotus-driver#419 — '
+              f'update it and the topic becomes image/depth-zlib.',
+              file=sys.stderr)
         return None
     if fmt == 'image/depth-zlib':
         try:

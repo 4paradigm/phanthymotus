@@ -1,4 +1,5 @@
-/** camera.js — Renders image/jpeg (live JPEG stream), image/depth-z16 (raw depth), image/depth-zlib (zlib-compressed depth) */
+/** camera.js — Renders image/jpeg (live JPEG stream) and image/depth-zlib (zlib-compressed depth).
+ *  image/depth-z16 is retired; DepthRenderer is now a tombstone that says so. */
 
 // ── Depth colour ────────────────────────────────────────────────────────────
 //
@@ -167,79 +168,38 @@ export const CameraRenderer = {
 
 
 export const DepthRenderer = {
-  name: 'depth',
+  // `image/depth-z16` is retired — phanthymotus-driver#419 converted every
+  // driver that published it to the zlib form (same 640x480 uint16 mm, ~614 KB
+  // down to ~10-15 KB; the raw form saturated ARM64 CPU on DDS serialization).
+  //
+  // This stays as a tombstone rather than being deleted, because a robot still
+  // running a pre-#419 driver image declares z16 and would otherwise get a
+  // panel that renders nothing, with no hint that the driver is the thing to
+  // update. It decodes no pixels; it only says what to do.
+  name: 'depth-z16-retired',
   canRender: (hint) => hint === 'image/depth-z16',
   _el: null,
-  _canvas: null,
-  _ctx: null,
-  _label: null,
-  _fps: 0,
-  _frameCount: 0,
-  _lastFpsTime: 0,
-  _width: 640,
-  _height: 480,
 
   mount(container) {
     this._el = document.createElement('div');
-    this._el.className = 'renderer-depth';
-    this._el.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative;background:#000';
-    this._canvas = document.createElement('canvas');
-    this._canvas.width = this._width;
-    this._canvas.height = this._height;
-    this._canvas.style.cssText = 'max-width:100%;max-height:100%;object-fit:contain';
-    this._ctx = this._canvas.getContext('2d');
-    this._label = document.createElement('span');
-    this._label.style.cssText = 'position:absolute;top:6px;right:8px;font-size:11px;color:#fff;background:rgba(0,0,0,0.5);padding:2px 6px;border-radius:3px';
-    this._el.appendChild(this._canvas);
-    this._el.appendChild(this._label);
+    this._el.className = 'renderer-depth-retired';
+    this._el.style.cssText = 'width:100%;height:100%;display:flex;align-items:center;'
+      + 'justify-content:center;padding:16px;text-align:center;background:#111;'
+      + 'color:#e0b050;font-size:12px;line-height:1.6';
+    this._el.textContent =
+      'image/depth-z16 已停用。这台机器的驱动镜像早于 phanthymotus-driver#419，'
+      + '仍在发原始 z16 深度。更新驱动镜像后话题会变成 image/depth-zlib，本面板即恢复。';
     container.appendChild(this._el);
-    this._frameCount = 0;
-    this._lastFpsTime = performance.now();
   },
 
-  onData(buffer, hint) {
-    if (!this._ctx) return;
-    const u16 = new Uint16Array(buffer);
-    const w = this._width;
-    const h = this._height;
-
-    // Expect w*h uint16 pixels
-    if (u16.length < w * h) return;
-
-    const imgData = this._ctx.createImageData(w, h);
-    const rgba = imgData.data;
-
-    paintDepth(u16, rgba, w * h);
-
-    this._ctx.putImageData(imgData, 0, 0);
-
-    // FPS counter
-    this._frameCount++;
-    const now = performance.now();
-    if (now - this._lastFpsTime >= 1000) {
-      this._fps = this._frameCount;
-      this._frameCount = 0;
-      this._lastFpsTime = now;
-      if (this._label) this._label.textContent = `${this._fps} fps`;
-    }
-  },
+  onData() {},
 
   unmount() {
     this._el?.remove();
     this._el = null;
-    this._canvas = null;
-    this._ctx = null;
-    this._label = null;
   },
 };
 
-
-/**
- * DepthZlibRenderer — renders zlib-compressed 16-bit depth images.
- * Driver publishes CompressedImage with format="16UC1; compressedDepth zlib",
- * data = zlib.compress(raw_uint16_buffer, level=1).
- * Decompresses in browser then paints with the same ramp as DepthRenderer.
- */
 export const DepthZlibRenderer = {
   name: 'depth-zlib',
   canRender: (hint) => hint === 'image/depth-zlib',
