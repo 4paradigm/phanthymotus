@@ -23,6 +23,7 @@ import asyncio
 import copy
 import time
 import logging
+from datetime import datetime, timezone
 
 from . import commands as commands_mod
 from .config import Config, resolve_authorized_repos
@@ -99,6 +100,9 @@ class GitHubCommandWatcher:
         # command processing resumes, so preexisting comments never execute
         # as fresh approvals.
         self._pending_baseline_repos: set[str] = set()
+        # Fixed UTC boundary for each active authorization generation. A slow
+        # baseline must not move the boundary forward and absorb new commands.
+        self._repo_baseline_cutoff_utc: dict[str, datetime] = {}
         # Per-repo set of PRs already baselined in the current
         # pending-generation. Prevents rebaselining PRs that
         # already succeeded this generation.
@@ -129,11 +133,13 @@ class GitHubCommandWatcher:
         This includes the configured primary repository: commands posted during
         an authorization outage must never become fresh approvals on recovery.
         """
+        cutoff_utc = datetime.now(timezone.utc)
         for repo in repos:
             if repo not in self.config.github_repos or repo not in self.config.active_repos:
                 continue
             self._pending_baseline_repos.add(repo)
             self._baseline_progress[repo] = set()
+            self._repo_baseline_cutoff_utc[repo] = cutoff_utc
             if startup:
                 self._startup_recovery_repos.add(repo)
             else:
@@ -384,6 +390,7 @@ class GitHubCommandWatcher:
         posted while the repo was unauthorized are skipped on reactivation.
         """
         initial_state = await self.proxy.read_hidden_state(repo, pr_number)
+        expected_state = initial_state
 
         baseline_id = 0
         if _needs_initial_comment_baseline(initial_state):
@@ -424,6 +431,7 @@ class GitHubCommandWatcher:
             state_after = await self.proxy.read_hidden_state(repo, pr_number)
             if state_after is None:
                 return False
+            expected_state = state_after
 
             # AFTER reconcile: second snapshot.
             try:
@@ -461,14 +469,41 @@ class GitHubCommandWatcher:
                 )
                 return False
 
-            max_cid = 0
-            for c in comments:
-                cid = c.get("id")
-                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid:
-                    max_cid = cid
-
             old_cursor = initial_state.get("last_processed_comment_id", 0)
-            baseline_id = max(old_cursor, max_cid)
+            if (not isinstance(old_cursor, int) or isinstance(old_cursor, bool)
+                    or old_cursor < 0):
+                return False
+            cutoff = self._repo_baseline_cutoff_utc.get(repo)
+            if not isinstance(cutoff, datetime) or cutoff.tzinfo is None:
+                logger.warning("watcher baseline cutoff missing %s#%s — fail closed", repo, pr_number)
+                return False
+            baseline_id = old_cursor
+            historical_comment_ids: set[int] = set()
+            try:
+                ordered_comments = sorted(comments, key=lambda c: c["id"])
+                for comment in ordered_comments:
+                    cid = comment.get("id")
+                    if not isinstance(cid, int) or isinstance(cid, bool) or cid < 0:
+                        return False
+                    if cid <= old_cursor:
+                        continue
+                    created_at = comment.get("created_at")
+                    if not isinstance(created_at, str) or not created_at.strip():
+                        break
+                    try:
+                        created_utc = datetime.fromisoformat(
+                            created_at.strip().replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        break
+                    if created_utc.tzinfo is None or created_utc.utcoffset() is None:
+                        break
+                    if created_utc.astimezone(timezone.utc) > cutoff.astimezone(timezone.utc):
+                        break
+                    baseline_id = cid
+                    historical_comment_ids.add(cid)
+            except (TypeError, KeyError):
+                return False
             key = (repo, pr_number)
             if key in self._recovery_states and initial_state.get("status") == "testing":
                 if initial_state != self._recovery_states[key]:
@@ -481,6 +516,7 @@ class GitHubCommandWatcher:
                     (c for c in comments
                      if isinstance(c.get("id"), int) and not isinstance(c["id"], bool)
                      and c["id"] > old_cursor
+                     and c["id"] in historical_comment_ids
                      and commands_mod.parse_command(c.get("body", "") or "").is_command),
                     key=lambda c: c["id"],
                 )
@@ -509,6 +545,27 @@ class GitHubCommandWatcher:
                         repo, pr_number, initial_state, snapshot,
                     ):
                         return False
+
+        # Revalidate the PR, authorization generation, and lifecycle identity
+        # after all reads/recovery work and immediately before cursor mutation.
+        if (not self.config.auth_valid or repo not in self.config.active_repos
+                or repo not in self.config.github_repos):
+            return False
+        try:
+            latest_pr = await self.proxy.get_pr(repo, pr_number)
+            latest_state = await self.proxy.read_hidden_state(repo, pr_number)
+        except Exception as e:
+            logger.warning("watcher baseline recheck %s#%s: %s — fail closed", repo, pr_number, type(e).__name__)
+            return False
+        expected_head = expected_state.get("head_sha") if isinstance(expected_state, dict) else None
+        expected_status = expected_state.get("status") if isinstance(expected_state, dict) else None
+        if (not isinstance(latest_pr, dict) or latest_pr.get("state") != "open"
+                or latest_pr.get("merged")
+                or (latest_pr.get("head") or {}).get("sha") != expected_head
+                or not isinstance(latest_state, dict)
+                or latest_state.get("head_sha") != expected_head
+                or latest_state.get("status") != expected_status):
+            return False
 
         # Persist baseline cursor (shared by both paths).
         try:
@@ -804,6 +861,45 @@ class GitHubCommandWatcher:
                         repo, pr_number, comment_id,
                     ) or state
                 continue
+
+            cutoff = self._repo_baseline_cutoff_utc.get(repo)
+            created_at = fresh_comment_obj.get("created_at")
+            if (not isinstance(cutoff, datetime) or cutoff.tzinfo is None
+                    or not isinstance(created_at, str) or not created_at.strip()):
+                logger.warning(
+                    "watcher command timestamp unavailable %s#%s #%s — fail closed",
+                    repo, pr_number, comment_id,
+                )
+                return
+            try:
+                created_utc = datetime.fromisoformat(
+                    created_at.strip().replace("Z", "+00:00")
+                )
+            except ValueError:
+                return
+            if created_utc.tzinfo is None or created_utc.utcoffset() is None:
+                return
+            if created_utc.astimezone(timezone.utc) <= cutoff.astimezone(timezone.utc):
+                # A pre-generation command can be safely consumed as history,
+                # but must never be dispatched as a fresh approval.
+                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                return
+            updated_at = fresh_comment_obj.get("updated_at")
+            if not isinstance(updated_at, str) or not updated_at.strip():
+                return
+            try:
+                updated_utc = datetime.fromisoformat(
+                    updated_at.strip().replace("Z", "+00:00")
+                )
+            except ValueError:
+                return
+            if updated_utc.tzinfo is None or updated_utc.utcoffset() is None:
+                return
+            if updated_utc.astimezone(timezone.utc) != created_utc.astimezone(timezone.utc):
+                # GitHub edits retain created_at; an edited command is not a
+                # newly authored approval and is terminally skipped.
+                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                return
 
             # TOCTOU recheck: the auth snapshot was validated at cycle start,
             # but awaits have run since. Fail closed if authorization was
