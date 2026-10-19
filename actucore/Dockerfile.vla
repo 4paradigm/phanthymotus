@@ -46,7 +46,7 @@ COPY actucore/plugins/control_stream/ /work/plugins/control_stream/
 COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
 # JP6.1 has no published navigation base; never advertise an unusable card.
-RUN python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"
+RUN python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; c['plugins']['navi']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"
 # Atomic-write stdout guard. The build context is the repo root, so this reuses
 # perception's copy instead of adding a fourth one to keep in sync — see the
 # DUPLICATION note in perception/utils/logsafe.py.

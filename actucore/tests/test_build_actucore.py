@@ -92,7 +92,7 @@ def test_final_native_check_fails_closed(tmp_path, output, status, success):
 def test_jp61_copied_plugins_can_import_without_source_tree(tmp_path):
     final = (ROOT / 'actucore/Dockerfile.vla').read_text()
     for line in final.splitlines():
-        if not line.startswith('COPY actucore/plugins/'):
+        if not line.startswith('COPY ') or '/work/' not in line:
             continue
         _, source, destination = line.split()
         target = tmp_path / Path(destination).relative_to('/work')
@@ -101,8 +101,22 @@ def test_jp61_copied_plugins_can_import_without_source_tree(tmp_path):
             shutil.copytree(ROOT / source, target)
         else:
             shutil.copyfile(ROOT / source, target)
+    config_command = next(line for line in final.splitlines()
+                          if line.startswith('RUN python3 -c "import yaml;'))
+    config_code = config_command.split('"', 1)[1].rsplit('"', 1)[0]
+    subprocess.run([sys.executable, '-c', config_code.replace('/work/', f'{tmp_path}/')],
+                   check=True, timeout=10)
+    entry_code = """
+import sys, types
+for name in ('rclpy', 'rclpy.executors', 'rclpy._rclpy_pybind11'):
+    sys.modules[name] = types.ModuleType(name)
+sys.modules['rclpy._rclpy_pybind11'].InvalidHandle = type('InvalidHandle', (Exception,), {})
+import main
+bundle = main.ActuCoreBundle(main._load_config(), None)
+assert [tool['name'] for tool in bundle.get_all_tools()] == ['vla']
+"""
     result = subprocess.run(
-        [sys.executable, '-c', 'from plugins.vla import VLAPlugin'],
+        [sys.executable, '-c', entry_code],
         cwd=tmp_path, env={'PYTHONPATH': str(tmp_path)},
         capture_output=True, text=True, timeout=10,
     )
