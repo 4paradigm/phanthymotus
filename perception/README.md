@@ -3044,46 +3044,43 @@ actually covers. The horizontal terms and `half_fov_rad` stay correct, and
 consumer that starts using vertical geometry would be misled. Folding the crop
 through `inherit` is the fix.
 
-#### Calibration belongs to camera × model, and a mismatch is dropped, not refused
+#### Calibration belongs to camera × model, so each model keeps its own pair
 
 A log-affine fit corrects one camera's optics *as that model sees them*, so it
-is not transferable between the two backends: on r1_sz's ultra-wide lens YOLO
-needs `cal_b: -0.9753` — a factor of 2.65 — and what it is correcting there is a
-fixed-K model's guess at a 102° lens, which is not the error DepthART makes,
-since DepthART is handed the real `K`. **DepthART's own residual on that lens
-has not been measured**, so "it should need less" is an expectation, not a
-result; measure it with `calibrate` before trusting either number.
-`calibration_backend` records which model a
-fit was measured against; `calibrate` stamps it, and it only has to be typed in
-when a fit is copied from somewhere else. DepthART does not use the YOLO camera
-presets either, for the same reason.
+is not transferable between backends: on r1_sz's ultra-wide lens YOLO needs
+`cal_b: -0.9753` — a factor of 2.65 — and what it corrects there is a fixed-K
+model's guess at a 102° lens, which is not the error DepthART makes, since
+DepthART is handed the real `K`. **DepthART's own residual on that lens has not
+been measured**, so "it should need less" is an expectation, not a result;
+measure it with `calibrate` before trusting either number.
 
-**An absent marker means `yolo`.** The field is new; before it there was one
-depth model, so every coefficient already saved on a deployed card was measured
-against YOLO26-depth by construction. Reading absence as "unknown" and refusing
-the config instead rejected the saved row of every card that had ever been
-calibrated — and because Agent Core replaces a rejected config's reason with its
-own generic text, the symptom was `配置无效（缺少 url/key）` at project start on a
-card that has neither a url nor a key (see `agent-core/src/api/mcp_manage.py`).
+So the coefficients are **keyed by model**: `cal_a`/`cal_b` are YOLO's pair and
+`cal_a_depthart`/`cal_b_depthart` are DepthART's. Switching models swaps which
+pair is read and changes nothing else — both survive in the saved row, and
+switching back restores the earlier fit rather than nothing.
 
-There are **two** ways this rejected a card, and the second is the one seen on
-a real machine. Orin 5 held `{"backend": "depthart"}` shared plus
-`{"fps": 2, "cal_a": 1, "cal_b": 0, "calibration_preset": "Unitree R1"}` on the
-card: the coefficients are at their defaults, so the provenance check never
-runs — the raise came from the YOLO preset being unusable under DepthART. Note
-it needs no reconfiguring to trigger: a machine that ran that build once has the
-row, and a later build with the field reads it back.
+**There is deliberately no marker saying which model a fit belongs to.** An
+earlier cut of this carried `calibration_backend` alongside a single pair and
+compared it against the active model. Two fields that must agree eventually did
+not, and the failure was expensive: on r1_bj the mismatch dropped the card's
+only calibration to `no calibrate`, **the canvas persisted the dropped row**,
+and every distance was then uncalibrated on a 102° lens — with a
+`calibration_note` as the only trace. Keyed storage cannot contradict itself,
+and `_select_backend` no longer strips calibration keys, which was the step
+that did the erasing.
 
-A genuine mismatch — a YOLO fit under DepthART, or a YOLO preset under DepthART
-— therefore **drops the coefficients and says so** rather than failing the
-config: depth falls back to the model's own fit, `info()` reports
-`calibration: model-default` plus a `calibration_note` saying which model the
-numbers were measured on, the `config` response carries the same note, and it is
-logged. This is the rule the card already had for a typed-in fit the selector is
-ignoring (`calibration_conflict`), and the one `_select_backend` already applied
-when the switch happens on a live plugin — it strips the same keys silently.
-Refusing instead meant one path dropped quietly and the other stopped the robot.
-Recalibrate after changing models; do not relabel an old fit.
+No migration is needed: `cal_a`/`cal_b` keep their names and meaning, and every
+row already saved holds a YOLO fit by construction — it was the only model
+there was when those rows were written.
+
+The one cross-model rule that survives is the **preset table**, which is
+measured against YOLO26-depth. A preset selected under DepthART is dropped back
+to `no calibrate` — never silently: the note is on the `config` response, on
+`info()`, and in the log.
+
+What this does not fix on R1: a pinhole `K` is an approximation at ~102° with
+`distortion_model: unknown` and `D: null`, and `tan` overstates the lateral
+offset towards the edges. Expect DepthART to need site calibration there too.
 
 ### Why TensorRT *directly*, and not through ultralytics
 

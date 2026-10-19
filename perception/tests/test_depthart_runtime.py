@@ -114,19 +114,6 @@ def test_model_selection_schema_and_manual_fields():
         assert 'x-show-when' not in props[key]
 
 
-def test_idle_model_switch_is_lazy_and_resets_calibration():
-    p = make_plugin()
-    calls = []
-    p._model = types.SimpleNamespace(close=lambda: calls.append('closed'))
-    p._instance_configs['a'] = dict(fps=3, cal_a=2., cal_b=.2, calibration_preset=vd.CAL_MANUAL)
-    p._cal_samples = [{'measured_m': 1.}]
-    result = p.dispatch('visual_depth', dict(action='config', backend='yolo'))
-    assert result['status'] == 'configured' and p._backend == 'yolo'
-    assert p._model is None and calls == ['closed']
-    assert p._instance_configs['a'] == {'fps': 3}
-    assert (p._cal_a, p._cal_b) == (1., 0.) and not p._cal_samples
-    p.dispatch('visual_depth', dict(action='config', backend='yolo'))
-    assert calls == ['closed']
 
 
 @pytest.mark.parametrize('busy', ['node', 'loading', 'closing'])
@@ -223,31 +210,6 @@ def test_depthart_explicit_paths_bypass_download_and_partial_override_fails(monk
         make_plugin({'depthart_engine_path': '/custom/engine'})._ensure_model()
 
 
-@pytest.mark.parametrize('target', ['yolo', 'depthart'])
-@pytest.mark.parametrize('tag', [None, 'other'])
-def test_restored_calibration_from_another_model_is_dropped_not_refused(target, tag):
-    # Simulate shared model config followed by a persisted instance row. An
-    # absent marker is the legacy case: it means yolo, because that was the
-    # only model when the row was saved. Either way the config must *succeed* —
-    # it is replayed on every project start, and a rejection there surfaces
-    # through Core as the unrelated "missing url/key" and stops the card.
-    p = vd.VideoDepthPerceptionPlugin({'backend': target}, 'test', _FakeExecutor())
-    assert p.dispatch('visual_depth', dict(action='config', backend=target))['status'] == 'configured'
-    cfg = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL, cal_a=1., cal_b=.5)
-    if tag:cfg['calibration_backend'] = 'yolo' if target == 'depthart' else 'depthart'
-    result = p.dispatch('visual_depth', cfg)
-    assert result['status'] == 'configured'
-    stored = p._instance_configs['a']
-    if target == 'yolo' and not tag:
-        # Legacy row on the legacy model: applied unchanged, nothing to say.
-        assert stored['cal_b'] == .5 and 'calibration_note' not in result
-        assert vd.calibration_origin(stored) == 'manual'
-    else:
-        assert 'cal_b' not in stored and 'cal_a' not in stored
-        assert stored['calibration_preset'] == vd.CAL_NONE
-        assert 'cal_b' in result['calibration_note'] or '标定' in result['calibration_note']
-        assert vd.calibration_origin(stored) == 'model-default'
-        assert p.dispatch('visual_depth', dict(action='info', instance_id='a'))['calibration_note']
 
 
 @pytest.mark.parametrize('backend', ['yolo', 'depthart'])
@@ -261,41 +223,10 @@ def test_matching_calibration_replay_and_no_correction(backend):
                       calibration_preset=vd.CAL_NONE))['status'] == 'configured'
 
 
-def test_nonidentity_calibration_cannot_bypass_binding_with_auto_preset():
-    # cal_b alone counts as a fit even with the selector on auto, so under
-    # DepthART it is an unmarked YOLO fit: dropped, and said out loud.
-    p = make_plugin()
-    result = p.dispatch('visual_depth', dict(action='config', instance_id='a',
-                                           calibration_preset=vd.CAL_AUTO, cal_b=.5))
-    assert result['status'] == 'configured' and result['calibration_note']
-    assert p._instance_configs['a'] == {'calibration_preset': vd.CAL_NONE}
 
 
-def test_calibration_model_is_persistable_but_never_auto_stamped():
-    for backend in ('yolo', 'depthart'):
-        p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
-        prop = p.get_tools()[0]['configSchema']['properties']['calibration_backend']
-        assert prop['scope'] == 'instance'
-        assert 'default' not in prop
-        assert 'x-show-when' not in prop
 
 
-def test_switch_then_restore_old_row_rejected_after_process_restart(tmp_path):
-    artifact = tmp_path / 'artifact'
-    artifact.write_bytes(b'test')
-    p = vd.VideoDepthPerceptionPlugin({'depthart_engine_path': str(artifact),
-        'depthart_plugin_path': str(artifact)}, 'test', _FakeExecutor())
-    old = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
-               calibration_backend='yolo', cal_b=.5)
-    assert p.dispatch('visual_depth', old)['status'] == 'configured'
-    assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'configured'
-    # The live switch already stripped the keys from the stored row silently;
-    # a replay of the old row has to reach the same state, not a hard failure.
-    assert p.dispatch('visual_depth', old)['calibration_note']
-    assert 'cal_b' not in p._instance_configs['a']
-    restarted = make_plugin()
-    assert restarted.dispatch('visual_depth', old)['calibration_note']
-    assert 'cal_b' not in restarted._instance_configs['a']
 
 
 def test_laziness_missing_camera_and_presets(monkeypatch):
@@ -415,46 +346,10 @@ def test_photo_missing_k_does_not_initialize_model(monkeypatch):
     assert result['ok'] is False and 'camera_info' in result['detail']
 
 
-def test_manual_calibration_preserved():
-    p=make_plugin({'calibration_preset':vd.CAL_MANUAL,'cal_b':.2,'calibration_backend':'depthart'})
-    assert p._cal_b==pytest.approx(.2)
 
 
-@pytest.mark.parametrize('backend', ['yolo', 'depthart'])
-@pytest.mark.parametrize('tag', [None, 'wrong'])
-@pytest.mark.parametrize('preset', [None, vd.CAL_MANUAL])
-def test_startup_drops_mismatched_calibration_without_failing_construction(backend, tag, preset):
-    # perception/config.yaml has no dropdown, so an unmarked fit there is a
-    # YOLO fit — same legacy rule as a saved row. Raising would not surface as
-    # a config error either: it drops visual_depth out of the plugin list.
-    cfg = {'backend': backend, 'cal_b': .5}
-    if preset:cfg['calibration_preset'] = preset
-    if tag:cfg['calibration_backend'] = 'yolo' if backend == 'depthart' else 'depthart'
-    p = vd.VideoDepthPerceptionPlugin(cfg, 'test', _FakeExecutor())
-    measured_on = 'depthart' if (tag and backend == 'yolo') else 'yolo'
-    if measured_on == backend:
-        assert (p._cal_a, p._cal_b) == (1., .5) and not p._cal_notes
-    else:
-        assert (p._cal_a, p._cal_b) == (1., 0.) and p._cal_notes['']
 
 
-@pytest.mark.parametrize('backend', ['yolo', 'depthart'])
-@pytest.mark.parametrize('previous_fit', [False, True])
-def test_calibrate_save_roundtrip_and_reset_provenance(backend, previous_fit, monkeypatch):
-    cfg = {'backend': backend}
-    if previous_fit:cfg.update(calibration_backend=backend, calibration_preset=vd.CAL_MANUAL, cal_b=.2)
-    p = vd.VideoDepthPerceptionPlugin(cfg, 'test', _FakeExecutor())
-    monkeypatch.setattr(p, '_raw_depth_for_calibration',
-                        lambda *args: ([np.full((480,640), 2., np.float32)], 'test'))
-    result = p.dispatch('visual_depth', {'action': 'calibrate', 'distance_m': 3.})
-    saved = result['save_to_config']
-    assert saved['calibration_backend'] == backend
-    restored = vd.VideoDepthPerceptionPlugin(dict(saved, backend=backend), 'test', _FakeExecutor())
-    assert restored._cal_b == pytest.approx(np.log(1.5), abs=1e-6)
-    assert restored.dispatch('visual_depth', dict(saved, action='config', instance_id='a'))['status'] == 'configured'
-    p.dispatch('visual_depth', {'action': 'reset_calibration'})
-    assert p._plugin_cfg.get('calibration_backend') == (backend if previous_fit else None)
-    assert (p._cal_a, p._cal_b) == (1., .2 if previous_fit else 0.)
 
 
 @pytest.mark.parametrize('topic', ['/camera', None])
@@ -607,48 +502,10 @@ def test_bundle_shutdown_calls_opted_in_hooks_and_continues_after_error():
 # and Core turns a rejected config into its own generic credential message — so
 # a robot came up with `配置无效（缺少 url/key）` on a card that has neither.
 
-@pytest.mark.parametrize('row', [
-    dict(calibration_preset=vd.CAL_MANUAL, cal_a=1., cal_b=-0.9753),  # measured
-    dict(cal_b=-0.9753),                                              # pre-selector
-    dict(calibration_preset=vd.CAL_NONE, cal_a=1., cal_b=-0.9753),    # left in the dialog
-    dict(depth_scale=0.377),                                          # pre-cal_b
-])
-def test_legacy_unmarked_calibration_replays_on_yolo(row):
-    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
-    result = p.dispatch('visual_depth', dict(action='config', instance_id='a', **row))
-    assert result['status'] == 'configured'
-    assert result.get('adapter_ok', True) is True
-    assert 'calibration_note' not in result
-    assert p._instance_configs['a'] == row
 
 
-def test_legacy_unmarked_calibration_in_startup_yaml_does_not_kill_the_plugin():
-    # `__init__` used to raise here, which does not produce a config error —
-    # it removes visual_depth from the service's plugin list entirely.
-    p = vd.VideoDepthPerceptionPlugin({'cal_b': -0.9753}, 'test', _FakeExecutor())
-    assert (p._cal_a, p._cal_b) == (1., -0.9753)
-    assert p.dispatch('visual_depth', {'action': 'info'})['calibration'] == 'site:manual'
 
 
-def test_orin5_saved_rows_replay(monkeypatch):
-    """The two rows literally in Orin 5's agent-core DB on 2026-10-15.
-
-    This is the second, independent way #286 killed the card, and the one that
-    actually fired on a real machine: `cal_a`/`cal_b` are at their defaults so
-    the provenance check never runs, and the raise comes from the YOLO preset
-    being unusable under DepthART. Agent Core sends these as two calls —
-    shared without instance_id, then the card's own row with it — so they are
-    replayed that way here rather than merged.
-    """
-    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
-    monkeypatch.setattr(p, '_ensure_model', lambda: pytest.fail('config must not load an engine'))
-    assert p.dispatch('visual_depth', {'action': 'config', 'backend': 'depthart'})['status'] == 'configured'
-    row = {'action': 'config', 'instance_id': 'card-mv8w41sh6a45',
-           'fps': 2, 'cal_a': 1, 'cal_b': 0, 'calibration_preset': 'Unitree R1'}
-    result = p.dispatch('visual_depth', row)
-    assert result['status'] == 'configured' and result.get('adapter_ok', True) is True
-    assert result['config'] == {'fps': 2, 'calibration_preset': vd.CAL_NONE}
-    assert 'Unitree R1' in result['calibration_note']
 
 
 @pytest.mark.parametrize('declaration', [None, {}, {'schema': 'motus.camera/1'}])
@@ -735,3 +592,154 @@ def test_r1_main_needs_no_crop():
     # 1280x720 lands on the 864x480 canvas untouched, so R1 loses no field of
     # view to the canvas — only to the pinhole approximation on a 102 deg lens.
     assert fit_to_canvas(1280, 720, (864, 480)) == (0, 0, 1280, 720)
+
+
+# ── Calibration is stored per model, with no marker to contradict ────────────
+#
+# These replace an earlier design where one `cal_a`/`cal_b` pair was tagged with
+# a `calibration_backend` marker naming the model it was measured against. Two
+# fields that must agree eventually did not: on r1_bj a depthart/yolo mismatch
+# dropped the card's only calibration to `no calibrate`, the canvas persisted
+# the dropped row, and every distance was then uncalibrated on a 102 degree
+# lens. Keyed storage cannot disagree with itself.
+#
+# `cal_a`/`cal_b` stay the YOLO pair, which is what every row already saved
+# holds — it was the only model there was — so nothing needs migrating.
+
+R1_PRESET = next(iter(vd.CALIBRATION_PRESETS))
+
+
+def test_the_marker_is_gone_from_the_schema():
+    props = make_plugin().get_tools()[0]['configSchema']['properties']
+    assert 'calibration_backend' not in props
+    for key in ('cal_a', 'cal_b', 'cal_a_depthart', 'cal_b_depthart'):
+        assert key in props
+    # No conditional display: #286 avoids x-show-when for Core compatibility.
+    assert all('x-show-when' not in props[k] for k in props)
+
+
+@pytest.mark.parametrize('backend,keys', [
+    ('yolo', ('cal_a', 'cal_b')),
+    ('depthart', ('cal_a_depthart', 'cal_b_depthart')),
+])
+def test_each_model_reads_only_its_own_coefficients(backend, keys):
+    p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
+    # Both pairs present, deliberately different. The active model must take
+    # its own and ignore the other entirely.
+    cfg = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
+               cal_a=1., cal_b=-0.9753, cal_a_depthart=1., cal_b_depthart=-0.31)
+    assert p.dispatch('visual_depth', cfg)['status'] == 'configured'
+    expected = -0.9753 if backend == 'yolo' else -0.31
+    stored = p._instance_configs['a']
+    assert stored[keys[1]] == expected
+    # The other model's pair survives in the row untouched — that is the point.
+    other = 'cal_b_depthart' if backend == 'yolo' else 'cal_b'
+    assert other in stored
+
+
+def test_switching_models_keeps_both_fits():
+    """The r1_bj incident, as a test: a switch must not erase a calibration."""
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    row = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
+               cal_a=1., cal_b=-0.9753, cal_a_depthart=1., cal_b_depthart=-0.31)
+    assert p.dispatch('visual_depth', row)['status'] == 'configured'
+    # Card-level `_cal_b` is untouched by an instance-scoped call: it stores
+    # into `_instance_configs` and returns, and the fit reaches the node at
+    # start. So the yolo pair is checked where it actually lives.
+    assert p._instance_configs['a']['cal_b'] == -0.9753
+    assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'configured'
+    # Neither pair was stripped from the stored row.
+    stored = p._instance_configs['a']
+    assert stored['cal_b'] == -0.9753 and stored['cal_b_depthart'] == -0.31
+    # And switching back restores yolo's own numbers rather than nothing.
+    assert p.dispatch('visual_depth', dict(action='config', backend='yolo'))['status'] == 'configured'
+    assert p.dispatch('visual_depth', row)['status'] == 'configured'
+    assert p._instance_configs['a']['cal_b'] == -0.9753
+
+
+@pytest.mark.parametrize('backend', ['yolo', 'depthart'])
+def test_a_row_holding_only_the_other_models_fit_is_not_misapplied(backend):
+    # A card calibrated under one model and then switched: the active model
+    # finds no pair of its own and falls back to the engine's fit rather than
+    # borrowing numbers measured against something else.
+    p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
+    foreign = 'cal_b_depthart' if backend == 'yolo' else 'cal_b'
+    p.dispatch('visual_depth', {'action': 'config', 'instance_id': 'a',
+                                'calibration_preset': vd.CAL_MANUAL, foreign: -0.9753})
+    assert (p._cal_a, p._cal_b) == (1., 0.)
+
+
+@pytest.mark.parametrize('backend,key', [('yolo', 'cal_b'), ('depthart', 'cal_b_depthart')])
+def test_startup_yaml_applies_the_active_models_pair(backend, key):
+    # perception/config.yaml has no dropdown, so a bare coefficient there has
+    # always meant "apply this". It must still work, per model.
+    p = vd.VideoDepthPerceptionPlugin({'backend': backend, key: -0.5}, 'test', _FakeExecutor())
+    assert (p._cal_a, p._cal_b) == (1., -0.5)
+
+
+@pytest.mark.parametrize('backend,key', [('yolo', 'cal_b'), ('depthart', 'cal_b_depthart')])
+def test_calibrate_writes_and_reset_restores_the_active_models_pair(backend, key, monkeypatch):
+    p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
+    monkeypatch.setattr(p, '_raw_depth_for_calibration',
+                        lambda *a, **kw: ([np.full((480, 640), 2.0, np.float32)], 'test'))
+    result = p.dispatch('visual_depth', {'action': 'calibrate', 'distance_m': 1.0})
+    assert result['ok'] is True
+    # The pair it tells the operator to save is the active model's, and carries
+    # no marker — there is no longer one to carry.
+    saved = result['save_to_config']
+    assert set(saved) == {'calibration_preset', key.replace('cal_b', 'cal_a'), key}
+    assert saved['calibration_preset'] == vd.CAL_MANUAL
+    assert p._plugin_cfg[key] == saved[key]
+    # reset puts the config back as it found it.
+    assert p.dispatch('visual_depth', {'action': 'reset_calibration'})['ok'] is True
+    assert key not in p._plugin_cfg
+    assert (p._cal_a, p._cal_b) == (1., 0.)
+
+
+def test_yolo_presets_are_still_refused_under_depthart():
+    # The one cross-model rule that survives, and for a measured reason: the
+    # preset table is fitted against YOLO26-depth, and r1's -0.9753 is a factor
+    # of 2.65 that would push DepthART the wrong way.
+    p = make_plugin()
+    result = p.dispatch('visual_depth', {'action': 'config', 'calibration_preset': R1_PRESET})
+    assert result['status'] == 'configured'
+    assert result['config']['calibration_preset'] == vd.CAL_NONE
+    assert R1_PRESET in result['calibration_note']
+    assert p.dispatch('visual_depth', {'action': 'info'})['calibration_note']
+
+
+def test_yolo_presets_still_work_under_yolo():
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    # Sent the way the canvas sends it — every field, defaults included.
+    result = p.dispatch('visual_depth', {'action': 'config', 'cal_a': 1., 'cal_b': 0.,
+                                         'calibration_preset': R1_PRESET})
+    assert result['status'] == 'configured'
+    assert result['config']['calibration_preset'] == R1_PRESET
+    assert 'calibration_note' not in result
+    assert p._cal_b == pytest.approx(vd.CALIBRATION_PRESETS[R1_PRESET]['cal_b'])
+
+
+def test_a_dropdown_only_config_call_still_recomputes_the_fit():
+    """A hand-made MCP call that only flips the selector must take effect.
+
+    The recompute condition listed the numeric keys but not
+    `calibration_preset`, which is what selects them. The canvas masks this by
+    sending every field on every call; a `config` typed by hand does not.
+    """
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    p.dispatch('visual_depth', {'action': 'config', 'calibration_preset': R1_PRESET})
+    assert p._cal_b == pytest.approx(vd.CALIBRATION_PRESETS[R1_PRESET]['cal_b'])
+    p.dispatch('visual_depth', {'action': 'config', 'calibration_preset': vd.CAL_NONE})
+    assert (p._cal_a, p._cal_b) == (1., 0.)
+
+
+def test_the_orin5_row_that_used_to_kill_the_card_still_configures():
+    # The two rows literally in Orin 5's agent-core DB. Under the marker design
+    # this returned adapter_ok: false, which Core rewrote as "缺少 url/key" and
+    # the card never started.
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    assert p.dispatch('visual_depth', {'action': 'config', 'backend': 'depthart'})['status'] == 'configured'
+    result = p.dispatch('visual_depth', {
+        'action': 'config', 'instance_id': 'card-mv8w41sh6a45',
+        'fps': 2, 'cal_a': 1, 'cal_b': 0, 'calibration_preset': R1_PRESET})
+    assert result['status'] == 'configured' and result.get('adapter_ok', True) is True
