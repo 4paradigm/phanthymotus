@@ -249,27 +249,25 @@ class GitHubCommandWatcher:
                 logger.warning("watcher list PRs %s: %s", repo, e)
                 continue
             baseline_all = repo in self._pending_baseline_repos
+            baseline_done = self._baseline_progress.get(repo, set())
+            open_pr_numbers = [
+                int(pr.get("number") or 0) for pr in prs
+                if int(pr.get("number") or 0)
+            ]
+
+            # New commands for PRs already baselined in this authorization
+            # generation take priority over the remaining startup work.
+            # A small baseline batch bounds each cycle when a repo has many PRs.
+            baseline_budget = 5
+            baseline_attempted = 0
             for pr in prs:
                 if not self.config.auth_valid or repo not in self.config.active_repos:
                     break
                 pr_number = int(pr.get("number") or 0)
-                if not pr_number:
+                if not pr_number or (baseline_all and pr_number not in baseline_done):
                     continue
                 try:
-                    if baseline_all:
-                        # A1 fix: skip PRs already successfully baselined in the
-                        # CURRENT authorization generation. Re-baselining them
-                        # would advance their cursor past legitimate new
-                        # comments posted while a sibling PR keeps failing.
-                        if pr_number in self._baseline_progress.get(repo, set()):
-                            await self.controller.project_evidence(repo, pr_number)
-                            continue
-                        success = await self._baseline_pr(repo, pr_number)
-                        if success:
-                            self._baseline_progress.setdefault(repo, set())
-                            self._baseline_progress[repo].add(pr_number)
-                    else:
-                        await self._process_pr(repo, pr_number)
+                    await self._process_pr(repo, pr_number)
                     # The existing serial watcher projects durable attachment
                     # events after the normal command slot; never a second writer.
                     await self.controller.project_evidence(repo, pr_number)
@@ -277,6 +275,35 @@ class GitHubCommandWatcher:
                     logger.error(
                         "watcher process %s#%s: %s", repo, pr_number, e
                     )
+
+            if baseline_all:
+                pending_prs = [
+                    pr for pr in prs
+                    if int(pr.get("number") or 0)
+                    and int(pr.get("number") or 0) not in baseline_done
+                ]
+                if pending_prs:
+                    interval = max(1, int(self.config.poll_interval_seconds))
+                    start = int(self._monotonic() // interval) % len(pending_prs)
+                    pending_prs = pending_prs[start:] + pending_prs[:start]
+                for pr in pending_prs:
+                    if not self.config.auth_valid or repo not in self.config.active_repos:
+                        break
+                    pr_number = int(pr.get("number") or 0)
+                    if baseline_attempted >= baseline_budget:
+                        break
+                    baseline_attempted += 1
+                    try:
+                        logger.debug("watcher baseline %s#%s started", repo, pr_number)
+                        success = await self._baseline_pr(repo, pr_number)
+                        if success:
+                            self._baseline_progress.setdefault(repo, set()).add(pr_number)
+                            logger.debug("watcher baseline %s#%s completed", repo, pr_number)
+                        await self.controller.project_evidence(repo, pr_number)
+                    except Exception as e:
+                        # One failing baseline must not prevent the rest of this
+                        # bounded batch, or command processing above.
+                        logger.error("watcher baseline %s#%s: %s", repo, pr_number, e)
             # Baselining uses per-PR progress tracking: only discard from
             # _pending_baseline_repos when ALL open PRs for this repo have
             # been successfully baselined this generation.  PRs whose
@@ -286,14 +313,17 @@ class GitHubCommandWatcher:
                 self._baseline_progress.setdefault(repo, set())
                 all_baselined = all(
                     pr_number in self._baseline_progress[repo]
-                    for pr_number in [
-                        int(pr.get("number") or 0) for pr in prs
-                        if int(pr.get("number") or 0)
-                    ]
+                    for pr_number in open_pr_numbers
                 )
                 if all_baselined:
                     self._pending_baseline_repos.discard(repo)
                     self._startup_recovery_repos.discard(repo)
+                elif baseline_attempted:
+                    logger.debug(
+                        "watcher baseline progress %s: %s/%s open PRs",
+                        repo, sum(n in self._baseline_progress[repo] for n in open_pr_numbers),
+                        len(open_pr_numbers),
+                    )
 
     async def _baseline_pr(self, repo: str, pr_number: int) -> bool:
         """Baseline old commands, allowing only guarded startup record_test recovery.
