@@ -173,6 +173,74 @@ class CosAttachmentStore:
             raise EvidenceStoreError('invalid COS part listing')
         return await self._io(read)
 
+    async def put_part(self, *, operation, part_number, body, content_length):
+        """Store one bounded raw browser part against a trusted operation."""
+        key = self._operation_key(operation)
+        upload_id = operation.get('upload_id')
+        chunk = operation.get('part_bytes', self.config.evidence_part_bytes)
+        size = operation.get('size')
+        if (not isinstance(upload_id, str) or not upload_id
+                or type(part_number) is not int or not 1 <= part_number <= 10000
+                or type(chunk) is not int or not 1 <= chunk <= 8 * 1024 * 1024
+                or type(size) is not int or not 1 <= size <= 512 * 1024 * 1024
+                or type(content_length) is not int or not 1 <= content_length <= chunk
+                or not hasattr(body, 'read')):
+            raise ValueError('invalid multipart part')
+        count = (size + chunk - 1) // chunk
+        expected_size = min(chunk, size - (part_number - 1) * chunk)
+        if part_number > count or content_length != expected_size:
+            raise ValueError('multipart part size mismatch')
+
+        digest = hashlib.md5(usedforsecurity=False)
+        read = 0
+        while read < content_length:
+            block = await asyncio.to_thread(body.read, min(1024 * 1024, content_length - read))
+            if not block:
+                raise EvidenceStoreError('multipart part ended early')
+            read += len(block)
+            digest.update(block)
+        if await asyncio.to_thread(body.read, 1):
+            raise EvidenceStoreError('multipart part exceeded declared size')
+        expected_etag = digest.hexdigest()
+        await asyncio.to_thread(body.seek, 0)
+
+        def matching_part(parts):
+            existing = next((p for p in parts if p['part_number'] == part_number), None)
+            if existing is None:
+                return None
+            etag = str(existing.get('etag', '')).strip('"').lower()
+            return existing['size'] == content_length and etag == expected_etag
+
+        parts = await self.list_parts(key=key, upload_id=upload_id)
+        existing = next((p for p in parts if p['part_number'] == part_number), None)
+        if existing is not None:
+            return {'conflict': not matching_part(parts), 'uploaded': matching_part(parts) is True,
+                    'part_number': part_number, 'size': content_length}
+        try:
+            result = await self._io(self._sdk().upload_part,
+                Bucket=self.config.cos_bucket, Key=key, UploadId=upload_id,
+                PartNumber=part_number, Body=body)
+        except EvidenceStoreError:
+            # The response may be lost after COS stored the part. Reconcile by
+            # listing it and comparing both size and the COS part MD5 ETag.
+            reconciled = await self.list_parts(key=key, upload_id=upload_id)
+            present = next((p for p in reconciled if p['part_number'] == part_number), None)
+            if present is None:
+                raise
+            matches = matching_part(reconciled)
+            return {'conflict': not matches, 'uploaded': bool(matches),
+                    'part_number': part_number, 'size': content_length}
+        etag = result.get('ETag') if isinstance(result, dict) else None
+        if not isinstance(etag, str) or not etag:
+            reconciled = await self.list_parts(key=key, upload_id=upload_id)
+            present = next((p for p in reconciled if p['part_number'] == part_number), None)
+            if present is None:
+                raise EvidenceStoreError('COS multipart part was not confirmed')
+            matches = matching_part(reconciled)
+            return {'conflict': not matches, 'uploaded': bool(matches),
+                    'part_number': part_number, 'size': content_length}
+        return {'uploaded': True, 'part_number': part_number, 'size': content_length}
+
     async def complete_upload(self, *, key, upload_id, size, metadata, sha256=None, part_bytes=None, **_):
         """Reconcile uncertain complete via real HEAD/GET; never recreate/overwrite."""
         self._key(key)
@@ -439,6 +507,10 @@ class CosAttachmentStore:
             if not 1 <= part <= (size + chunk - 1) // chunk:
                 raise ValueError('part outside declared object')
             return await self._io(self.issue_part_url, key=key, upload_id=operation['upload_id'], part_number=part)
+        if action == 'put_part':
+            return await self.put_part(operation=operation,
+                part_number=payload['part_number'], body=payload['body'],
+                content_length=payload['content_length'])
         if action == 'complete':
             return await self.complete_upload(key=key, upload_id=operation['upload_id'], size=size,
                 metadata=metadata, sha256=sha, part_bytes=operation.get('part_bytes', self.config.evidence_part_bytes))

@@ -45,6 +45,7 @@ def _validate(payload, action, config):
     extras = {'init': {'filename', 'size', 'content_type', 'note', 'replaces_id', 'sha256', 'submitter'},
               'complete': {'sha256', 'parts'}, 'note': {'text', 'note', 'replaces_id', 'submitter'}}.get(action, set())
     route_fields = {'status': {'upload_id'}, 'resume': {'upload_id'}, 'sign_part': {'upload_id', 'part_number'},
+                    'put_part': {'upload_id', 'part_number'},
                     'complete': {'upload_id'}, 'download': {'attachment_id'},
                     'delete': {'attachment_id'}}.get(action, set())
     if not isinstance(payload, dict) or payload.keys() - (_BASE | extras | route_fields):
@@ -120,6 +121,8 @@ async def _payload(request, action, **path):
     else:
         payload = dict(request.query_params)
         payload.pop('cap', None)
+        if action == 'put_part' and payload.keys() - {'head_sha', 'round_id'}:
+            raise HTTPException(400, detail='invalid_evidence_payload')
     if not isinstance(payload, dict) or any(field in payload for field in path):
         raise HTTPException(400, detail='invalid_evidence_payload')
     # Older browser JS sends this display-only value. It is discarded before
@@ -170,7 +173,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     elif action == 'log_download':
         resource = 'log:' + path.get('round_id', '')
     principal, _ = await evidence_auth.verified_principal(
-        request, canonical, pr, write=request.method in ('POST', 'DELETE'),
+        request, canonical, pr, write=request.method in ('POST', 'PUT', 'DELETE'),
         purpose=purpose, resource=resource)
     # This read is deliberately before dispatch, including historic downloads;
     # a closed PR must never trigger a lifecycle write or a comment reply.
@@ -198,7 +201,9 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     if action in {'resume', 'download', 'log_download'}:
         if action == 'resume' and not _BASE <= payload.keys():
             raise HTTPException(400, detail='evidence_context_required')
-    if action in {'init', 'resume', 'sign_part', 'complete', 'note', 'delete'}:
+    if action in {'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete'}:
+        if action == 'put_part' and not {'head_sha', 'round_id'} <= payload.keys():
+            raise HTTPException(400, detail='evidence_context_required')
         payload.setdefault('head_sha', claims['head'])
         payload.setdefault('round_id', claims['round'])
         # Compatibility with the current browser UI: a display name is not
@@ -208,8 +213,21 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         payload.setdefault('idempotency_key', hashlib.sha256(
             json.dumps([action, path], sort_keys=True).encode()).hexdigest())
     try:
-        result = await request.app.state.evidence_service.dispatch(
-            action, repo=canonical, pr_number=pr, principal=principal, payload=payload)
+        if action == 'put_part':
+            cap = min(8 * 1024 * 1024, request.app.state.config.evidence_part_bytes)
+            content_length = request.headers.get('content-length')
+            if content_length:
+                try:
+                    if int(content_length) > cap:
+                        raise HTTPException(413, detail='evidence_part_too_large')
+                except ValueError:
+                    raise HTTPException(400, detail='invalid_content_length') from None
+            payload['_body_stream'] = request.stream()
+            result = await request.app.state.evidence_service.dispatch(
+                action, repo=canonical, pr_number=pr, principal=principal, payload=payload)
+        else:
+            result = await request.app.state.evidence_service.dispatch(
+                action, repo=canonical, pr_number=pr, principal=principal, payload=payload)
     except EvidenceStoreError:
         raise HTTPException(503, detail='evidence_object_unavailable') from None
     except Exception as exc:
@@ -275,7 +293,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                   'github_user_authenticated': bool(principal.get('github_user_authenticated')),
                   'actor_verified': principal.get('actor_verified') is True,
                   'readiness': evidence_auth.readiness(
-                      request.app.state.config, request.app.state.evidence_service),
+                      request.app.state.config, request.app.state.evidence_service, request=request),
                   'attachments': attachments, 'repo': canonical, 'pr_number': pr,
                   'max_file_bytes': request.app.state.config.evidence_max_file_bytes,
                   'part_bytes': request.app.state.config.evidence_part_bytes}
@@ -314,6 +332,11 @@ async def resume(request: Request, owner: str, repo: str, pr: int, upload_id: st
 @router.post(_PREFIX + '/uploads/{upload_id}/parts/{part_number}/url')
 async def sign_part(request: Request, owner: str, repo: str, pr: int, upload_id: str, part_number: int):
     return _json(await _dispatch(request, owner, repo, pr, 'sign_part', upload_id=upload_id, part_number=part_number))
+
+
+@router.put(_PREFIX + '/uploads/{upload_id}/parts/{part_number}/data')
+async def upload_part(request: Request, owner: str, repo: str, pr: int, upload_id: str, part_number: int):
+    return _json(await _dispatch(request, owner, repo, pr, 'put_part', upload_id=upload_id, part_number=part_number))
 
 
 @router.post(_PREFIX + '/uploads/{upload_id}/complete')

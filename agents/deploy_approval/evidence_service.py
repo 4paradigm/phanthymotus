@@ -177,6 +177,10 @@ class EvidenceService:
         total = 0
         digest = hashlib.sha256()
         filename = ''
+        content_type = ''
+        prefix = bytearray()
+        from .evidence_store import safe_filename
+
         started = time.monotonic()
         try:
             for redirect_count in range(4):
@@ -216,6 +220,7 @@ class EvidenceService:
                         response.close()
                         raise EvidenceError('attachment_too_large', 413)
                 disposition = response.headers.get('Content-Disposition', '')
+                content_type = response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
                 try:
                     from email.message import Message
                     header = Message()
@@ -223,6 +228,8 @@ class EvidenceService:
                     filename = header.get_filename() or ''
                 except (TypeError, ValueError):
                     filename = ''
+                if not filename:
+                    filename = unquote(urlsplit(current).path.rsplit('/', 1)[-1])
                 if not filename:
                     filename = unquote(urlsplit(source_url).path.rsplit('/', 1)[-1])
                 try:
@@ -239,15 +246,109 @@ class EvidenceService:
                             raise EvidenceError('attachment_too_large', 413)
                         if time.monotonic() - started > 300:
                             raise EvidenceError('attachment_download_timeout', 502)
+                        if len(prefix) < 4096:
+                            prefix.extend(chunk[:4096 - len(prefix)])
                         target.write(chunk)
                         digest.update(chunk)
                 finally:
                     response.close()
                 if total < 1:
                     raise EvidenceError('attachment_empty', 400)
+                sample = bytes(prefix).lstrip(b'\xef\xbb\xbf \t\r\n').lower()
+                error_markers = (
+                    b'accessdenied', b'access denied', b'signaturedoesnotmatch',
+                    b'request has expired', b'nosuchkey', b'no such key',
+                    b'403 forbidden', b'404 not found', b'502 bad gateway',
+                    b'503 service unavailable', b'request blocked',
+                    b'internal server error', b'<title>error', b'<error',
+                )
+                if (sample.startswith((b'<!doctype html', b'<html', b'<?xml'))
+                        and any(marker in sample for marker in error_markers)):
+                    raise EvidenceError('attachment_source_error_content', 400)
+                if (sample.startswith((b'<!doctype html', b'<html'))
+                        and content_type not in {'text/html', 'application/xhtml+xml'}):
+                    raise EvidenceError('attachment_source_error_content', 400)
+                if any(sample.startswith(marker) for marker in error_markers):
+                    raise EvidenceError('attachment_source_error_content', 400)
+
+                suffix = PurePosixPath(filename).suffix.lower()
+                if (sample.startswith((b'<!doctype html', b'<html'))
+                        and content_type in {'text/html', 'application/xhtml+xml'}
+                        and suffix not in {'.html', '.htm'}):
+                    raise EvidenceError('attachment_source_error_content', 400)
+                webm_signature = bytes(prefix).startswith(b'\x1a\x45\xdf\xa3')
+                ftyp_signature = len(prefix) >= 8 and prefix[4:8] == b'ftyp'
+                mp4_declared = (content_type == 'video/mp4'
+                                or (suffix == '.mp4' and content_type != 'video/webm'))
+                is_mp4 = mp4_declared or ftyp_signature
+                if mp4_declared and not ftyp_signature:
+                    raise EvidenceError('attachment_video_invalid', 400)
+                if is_mp4:
+                    target.flush()
+                    offset = 0
+                    box_count = 0
+                    has_ftyp = False
+                    has_media = False
+                    while offset < total and box_count < 10000:
+                        target.seek(offset)
+                        box_header = target.read(8)
+                        if len(box_header) != 8:
+                            raise EvidenceError('attachment_video_invalid', 400)
+                        box_size = int.from_bytes(box_header[:4], 'big')
+                        box_type = box_header[4:8]
+                        header_size = 8
+                        if box_size == 1:
+                            extended_size = target.read(8)
+                            if len(extended_size) != 8:
+                                raise EvidenceError('attachment_video_invalid', 400)
+                            box_size = int.from_bytes(extended_size, 'big')
+                            header_size = 16
+                        elif box_size == 0:
+                            box_size = total - offset
+                        if (box_size < header_size or box_size > total - offset
+                                or (box_count == 0 and box_type != b'ftyp')):
+                            raise EvidenceError('attachment_video_invalid', 400)
+                        if box_type == b'ftyp':
+                            target.seek(offset + header_size)
+                            major_brand = target.read(4)
+                            if (box_size < header_size + 8
+                                    or (box_size - header_size - 8) % 4
+                                    or len(major_brand) != 4
+                                    or any(char < 0x20 or char > 0x7e for char in major_brand)):
+                                raise EvidenceError('attachment_video_invalid', 400)
+                            has_ftyp = True
+                        if box_type == b'mdat':
+                            if box_size <= header_size:
+                                raise EvidenceError('attachment_video_invalid', 400)
+                            has_media = True
+                        offset += box_size
+                        box_count += 1
+                    if (offset != total or (box_count >= 10000 and offset < total)
+                            or not has_ftyp or not has_media):
+                        raise EvidenceError('attachment_video_invalid', 400)
+
+                extension_by_type = {
+                    'video/mp4': '.mp4', 'video/webm': '.webm',
+                    'video/quicktime': '.mov', 'image/jpeg': '.jpg',
+                    'image/png': '.png', 'image/gif': '.gif',
+                    'image/webp': '.webp', 'text/plain': '.txt',
+                    'application/pdf': '.pdf', 'audio/mpeg': '.mp3',
+                    'audio/wav': '.wav', 'audio/ogg': '.ogg',
+                }
+                inferred_extension = (
+                    '.mp4' if is_mp4 else '.webm' if webm_signature
+                    else extension_by_type.get(content_type, '')
+                )
+                if inferred_extension and not suffix:
+                    filename += inferred_extension
+                elif (inferred_extension and suffix != inferred_extension
+                      and (is_mp4 or webm_signature or content_type.startswith('video/'))):
+                    filename = filename[:-len(suffix)] + inferred_extension
+                filename = safe_filename(filename)
                 target.flush()
                 target.seek(0)
-                return {'filename': filename, 'size': total, 'sha256': digest.hexdigest()}
+                return {'filename': filename, 'size': total, 'sha256': digest.hexdigest(),
+                        'content_type': content_type}
             raise EvidenceError('attachment_redirect_not_allowed', 400)
         finally:
             session.close()
@@ -497,6 +598,8 @@ class EvidenceService:
                 if existing.get('status') == 'ready':
                     completed.append(existing)
                     continue
+                if existing.get('status') in {'deleted', 'invalid'}:
+                    continue
             prepared = prepared_operations.get(attachment_id)
             metadata = {'repo': repo, 'pr_number': pr_number, 'head_sha': head_sha,
                         'round_id': round_id, 'attachment_id': attachment_id}
@@ -564,7 +667,7 @@ class EvidenceService:
         return {'attachments': completed}
 
     async def dispatch(self, action: str, *, repo: str, pr_number: int, principal: dict, payload: dict) -> dict:
-        if action not in {'context', 'status', 'init', 'resume', 'sign_part', 'complete', 'note', 'delete', 'download', 'log_download'}:
+        if action not in {'context', 'status', 'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete', 'download', 'log_download'}:
             raise EvidenceError('unknown_action', 400)
         if type(pr_number) is not int or pr_number <= 0 or not isinstance(payload, dict) or not isinstance(principal, dict):
             raise EvidenceError('invalid_request', 400)
@@ -602,7 +705,7 @@ class EvidenceService:
                 payload.setdefault('round_id', source['round_id'])
             if action == 'resume':
                 payload.setdefault('idempotency_key', hashlib.sha256(('resume:' + source['upload_ref']).encode()).hexdigest())
-            if action in {'init', 'sign_part', 'complete', 'note', 'delete'}:
+            if action in {'init', 'sign_part', 'put_part', 'complete', 'note', 'delete'}:
                 if 'head_sha' not in payload or 'round_id' not in payload:
                     raise EvidenceError('explicit_context_required', 400)
             round_id = payload.get('round_id', active_round)
@@ -619,7 +722,7 @@ class EvidenceService:
                     raise EvidenceError('round_not_found', 404)
                 selected = archives[-1]['snapshot']
             authorized_writer = await self._authorize(repo, principal, selected, pr=pr)
-            write = action in {'init', 'resume', 'sign_part', 'complete', 'note', 'delete'}
+            write = action in {'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete'}
             if write and not authorized_writer:
                 raise EvidenceError('evidence_write_permission_required', 403)
             expected_head = payload.get('head_sha', selected.get('head_sha'))
@@ -666,6 +769,75 @@ class EvidenceService:
                     latest[data['attachment_id']] = data
                 if record['kind'] == 'operation':
                     operations[data['operation_id']] = data
+            if action == 'put_part':
+                ref = payload.get('operation_id')
+                source = next((r['data'] for r in reversed(records)
+                               if r['kind'] == 'operation'
+                               and r['data'].get('upload_ref') == ref), None)
+                if (not source or source.get('repo') != repo
+                        or source.get('pr_number') != pr_number
+                        or source.get('head_sha') != expected_head
+                        or source.get('round_id') != round_id):
+                    raise EvidenceError('operation_not_found', 404)
+                if source.get('actor_id') != principal.get('id'):
+                    raise EvidenceError('upload_owner_mismatch', 403)
+                saved = latest.get(source.get('attachment_id'))
+                if (source.get('status') != 'uploading' or saved
+                        and saved.get('status') in {'deleted', 'invalid'}):
+                    raise EvidenceError('upload_not_writable', 409)
+                if not source.get('object_key') or not source.get('upload_id'):
+                    raise EvidenceError('upload_not_recoverable', 503)
+                part = payload.get('part_number')
+                chunk = source.get('part_bytes', self.config.evidence_part_bytes)
+                if (type(part) is not int or not 1 <= part <= 10000
+                        or type(chunk) is not int or not 1 <= chunk <= 8 * 1024 * 1024
+                        or type(source.get('size')) is not int
+                        or not 1 <= source['size'] <= min(
+                            512 * 1024 * 1024, self.config.evidence_max_file_bytes)
+                        or part > (source['size'] + chunk - 1) // chunk):
+                    raise EvidenceError('invalid_part_request', 400)
+                expected_length = min(chunk, source['size'] - (part - 1) * chunk)
+                body_stream = payload.get('_body_stream')
+                if not hasattr(body_stream, '__aiter__'):
+                    raise EvidenceError('invalid_part_body', 400)
+
+                nonce_consumed = False
+
+                async def current_part():
+                    nonlocal nonce_consumed
+                    fresh_pr = await self.proxy.get_pr(repo, pr_number)
+                    fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    validate_context(fresh_pr, fresh_state, expected_head, round_id, write=True)
+                    if not await self._authorize(repo, principal, fresh_state, pr=fresh_pr):
+                        raise EvidenceError('evidence_write_permission_required', 403)
+                    if not nonce_consumed:
+                        await self._consume_auth_nonce(principal)
+                        nonce_consumed = True
+
+                await current_part()
+                with tempfile.SpooledTemporaryFile(max_size=256 * 1024, mode='w+b') as body:
+                    length = 0
+                    async for block in body_stream:
+                        if not isinstance(block, bytes):
+                            raise EvidenceError('invalid_part_body', 400)
+                        length += len(block)
+                        if length > min(8 * 1024 * 1024, chunk):
+                            raise EvidenceError('evidence_part_too_large', 413)
+                        body.write(block)
+                    if length != expected_length:
+                        raise EvidenceError(
+                            'evidence_part_too_large' if length > expected_length
+                            else 'invalid_part_size',
+                            413 if length > expected_length else 400)
+                    body.seek(0)
+                    await current_part()
+                    result = await self._store('put_part', source, {
+                        'part_number': part, 'body': body, 'content_length': length,
+                    })
+                await current_part()
+                if result.get('conflict') is True:
+                    raise EvidenceError('part_conflict', 409)
+                return {'uploaded': True, 'part_number': part, 'size': length}
             if action == 'context':
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'status': selected['status'], 'authenticated': True, 'enabled': True,

@@ -73,18 +73,34 @@ def public_https_ingress_ready(config):
     return not _public_base_reason(base) and urlsplit(base).scheme == 'https'
 
 
-def readiness(config, evidence_service=None):
+def readiness(config, evidence_service=None, request=None):
     storage = cos_ready(config)
     backend = storage and evidence_service is not None and bool(getattr(config, 'auth_valid', False))
     ingress = public_https_ingress_ready(config)
+    local_tunnel = bool(backend and request is not None and _is_local_tunnel_request(
+        request, require_origin=False))
     return {
         'COS_READY': storage,
         'EVIDENCE_BACKEND_READY': backend,
         'PUBLIC_HTTPS_INGRESS_READY': ingress,
-        'BROWSER_UPLOAD_READY': backend and ingress,
-        'status': '' if backend and ingress else (
+        'LOCAL_SSH_TUNNEL_READY': local_tunnel,
+        'BROWSER_UPLOAD_READY': backend and (ingress or local_tunnel),
+        'status': '' if backend and (ingress or local_tunnel) else (
             'EVIDENCE_BACKEND_PENDING' if not backend else 'PUBLIC_INGRESS_PENDING'),
     }
+
+
+def _is_local_tunnel_request(request, *, require_origin=True):
+    """Recognize only the documented loopback SSH forward; ignore proxy headers."""
+    headers = request.headers
+    origin = headers.get('origin', '').lower()
+    return (
+        request.scope.get('scheme') == 'http'
+        and headers.get('host', '').lower() == '127.0.0.1:25001'
+        and (origin == 'http://127.0.0.1:25001'
+             or (not origin and not require_origin))
+        and headers.get('sec-fetch-site', '').lower() == 'same-origin'
+    )
 
 
 def require_enabled(request):
@@ -203,6 +219,10 @@ def bind_page_capability(request, repo, pr_number):
 
 def _trusted_origin(request, *, require_header=True):
     config = request.app.state.config
+    if _is_local_tunnel_request(request, require_origin=require_header):
+        return 'http://127.0.0.1:25001'
+    if request.headers.get('host', '').lower() == '127.0.0.1:25001':
+        raise HTTPException(403, detail='evidence_origin_failed')
     base = getattr(config, 'evidence_public_base_url', '')
     if not public_https_ingress_ready(config):
         raise HTTPException(503, detail='PUBLIC_INGRESS_PENDING')
@@ -289,7 +309,7 @@ async def _comment_proof_principal(request, repo, pr_number):
         raise HTTPException(403, detail='evidence_comment_identity_invalid')
     # Every authenticated read/write after proof issuance is same-origin and
     # tied to the configured HTTPS ingress; Host and forwarded headers are ignored.
-    _trusted_origin(request, require_header=request.method in ('POST', 'DELETE'))
+    _trusted_origin(request, require_header=request.method in ('POST', 'PUT', 'DELETE'))
     return {
         'id': int(uid), 'login': login, 'actor': login,
         'actor_verified': True, 'github_user_authenticated': True,
@@ -304,7 +324,7 @@ async def verified_principal(request: Request, repo: str, pr_number: int, *, wri
                              purpose=PURPOSE, resource=None):
     require_enabled(request)
     if request.headers.get(PROOF_HEADER):
-        if write and request.method not in ('POST', 'DELETE'):
+        if write and request.method not in ('POST', 'PUT', 'DELETE'):
             raise HTTPException(405, detail='evidence_write_method_required')
         if write:
             _trusted_origin(request)
