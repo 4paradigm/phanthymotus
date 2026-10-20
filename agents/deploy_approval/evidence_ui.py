@@ -225,11 +225,11 @@ _JAVASCRIPT = r'''"use strict";
         item.replaces_id ? "替换 " + item.replaces_id : ""].filter(Boolean).join(" · ");
       li.append(description);
       if (!deleted && item.status === "ready" && attachmentId && item.download_capability) {
-        li.append(" ", anchor("COS 下载（短期签名）", "/attachments/" + id(attachmentId) +
+        li.append(" ", anchor("COS 下载", "/attachments/" + id(attachmentId) +
           "/download?cap=" + encodeURIComponent(item.download_capability)));
       } else if (!deleted && item.status === "ready" && attachmentId && item.object_key) {
         const hint = document.createElement("span");
-        hint.textContent = " · 通过 PR 评论 /evidence_link id=" + attachmentId + " 获取 15 分钟 COS 链接";
+        hint.textContent = " · 可通过 PR 评论 /evidence_link id=" + attachmentId + " 获取 COS 下载链接";
         li.append(hint);
       }
       const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&

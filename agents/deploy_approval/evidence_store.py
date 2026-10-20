@@ -12,7 +12,7 @@ import time
 import unicodedata
 import zlib
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 from .config import validate_repository_names
@@ -92,9 +92,17 @@ class CosAttachmentStore:
         return key
 
     @staticmethod
-    def _ttl(ttl):
+    def _part_ttl(ttl):
         if isinstance(ttl, bool) or not isinstance(ttl, int) or not 1 <= ttl <= 900:
             raise ValueError('TTL must be 1..900 seconds')
+        return ttl
+
+    @staticmethod
+    def _download_ttl(ttl):
+        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        if (isinstance(ttl, bool) or not isinstance(ttl, int)
+                or not 1 <= ttl <= EVIDENCE_PRESIGNED_URL_TTL_SECONDS):
+            raise ValueError('download TTL exceeds the configured evidence lifetime')
         return ttl
 
     def issue_part_url(self, *, key, upload_id, part_number, ttl=900) -> dict:
@@ -103,19 +111,86 @@ class CosAttachmentStore:
             raise ValueError('invalid upload ID')
         if isinstance(part_number, bool) or not isinstance(part_number, int) or not 1 <= part_number <= 10000:
             raise ValueError('invalid part number')
-        ttl = self._ttl(ttl)
+        ttl = self._part_ttl(ttl)
         url = self._sdk().get_presigned_url(
             Method='PUT', Bucket=self.config.cos_bucket, Key=key, Expired=ttl,
             Params={'uploadId': upload_id, 'partNumber': str(part_number)})
         return {'url': url, 'method': 'PUT', 'headers': {},
                 'expires_at': (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()}
 
-    def issue_download_url(self, *, key, filename, ttl=900) -> str:
+    def issue_download_url(self, *, key, filename, ttl=None) -> str:
+        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        if ttl is None:
+            ttl = EVIDENCE_PRESIGNED_URL_TTL_SECONDS
         disposition = "attachment; filename=download; filename*=UTF-8''" + quote(safe_filename(filename), safe='')
         return self._sdk().get_presigned_url(
-            Method='GET', Bucket=self.config.cos_bucket, Key=self._key(key), Expired=self._ttl(ttl),
+            Method='GET', Bucket=self.config.cos_bucket, Key=self._key(key), Expired=self._download_ttl(ttl),
             Params={'response-content-disposition': disposition,
                     'response-content-type': 'application/octet-stream'})
+
+    def download_url_expiry(self, url, *, key, filename=None, attachment_id=None):
+        """Return a trusted signed-URL expiry, or None for any mismatch.
+
+        Reuse is limited to links previously projected in the trusted lifecycle
+        comment. The exact configured bucket host, object path, attachment
+        identity, COS signing fields, response disposition, and one-year window
+        must all match before a prior URL is retained.
+        """
+        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        try:
+            key = self._key(key)
+            if attachment_id is not None and f'/attachments/{_segment(attachment_id)}/' not in f'/{key}/':
+                return None
+            parsed = urlsplit(url)
+            expected_host = f'{self.config.cos_bucket}.cos.{self.config.cos_region}.myqcloud.com'
+            if (parsed.scheme != 'https' or parsed.hostname != expected_host
+                    or parsed.username is not None or parsed.password is not None
+                    or parsed.port is not None or parsed.fragment
+                    or unquote(parsed.path.lstrip('/')) != key):
+                return None
+            pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+            query = {}
+            for name, value in pairs:
+                if name in query:
+                    return None
+                query[name] = value
+            required = {'q-sign-algorithm', 'q-ak', 'q-sign-time', 'q-key-time',
+                        'q-header-list', 'q-url-param-list', 'q-signature',
+                        'response-content-disposition'}
+            if (not required <= query.keys() or not query['q-ak']
+                    or query['q-ak'] != self.config.cos_secret_id):
+                return None
+            if query['q-sign-algorithm'] not in {'sha1', 'sha256'}:
+                return None
+            signature = query['q-signature']
+            if not re.fullmatch(r'[0-9a-fA-F]{40,128}', signature) or len(signature) % 2:
+                return None
+            time_match = re.fullmatch(r'([0-9]+);([0-9]+)', query['q-sign-time'])
+            if not time_match or query['q-key-time'] != query['q-sign-time']:
+                return None
+            start, expiry = map(int, time_match.groups())
+            if expiry <= start or expiry - start != EVIDENCE_PRESIGNED_URL_TTL_SECONDS:
+                return None
+            signed_params = {part.lower() for part in query['q-url-param-list'].split(';') if part}
+            if 'response-content-disposition' not in signed_params:
+                return None
+            if ('response-content-type' in query
+                    and ('response-content-type' not in signed_params
+                         or query['response-content-type'] != 'application/octet-stream')):
+                return None
+            if filename is not None:
+                disposition = query['response-content-disposition']
+                safe_name = safe_filename(filename)
+                if ("filename*=UTF-8''" + quote(safe_name, safe='') not in disposition
+                        and f'filename="{safe_name}"' not in disposition
+                        and f'filename={safe_name}' not in disposition):
+                    return None
+            now = int(time.time())
+            if start > now or expiry <= now:
+                return None
+            return expiry
+        except (TypeError, ValueError, UnicodeError):
+            return None
 
     async def _io(self, function, **kwargs):
         async with self._slots:

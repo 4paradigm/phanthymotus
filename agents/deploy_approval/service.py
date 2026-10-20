@@ -2231,7 +2231,7 @@ class DeployController:
     async def handle_evidence_link(
         self, repo: str, pr_number: int, comment_id: int, actor: str, actor_id: str,
     ) -> bool:
-        """Issue one verified short-lived link in a separate Conversation reply."""
+        """Issue one verified one-year link in a separate Conversation reply."""
         from .commands import parse_command
         from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
         from .evidence_models import EvidenceError
@@ -2402,7 +2402,7 @@ class DeployController:
                     )
                 return await reply(
                     f"[Download COS attachment: {comments_mod._escape(attachment.get('filename', 'file'))}]({url})\n\n"
-                    "COS re-verification succeeded. This signed link expires within 900 seconds; "
+                    f"COS re-verification succeeded. This signed link is valid for up to {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds; "
                     "post a new `/evidence_link id=<attachment_id>` after expiry.",
                     original,
                 )
@@ -2424,7 +2424,7 @@ class DeployController:
                 return False
             return await reply(
                 f"[Download COS evidence]({url})\n\n"
-                f"Expires in {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds from issuance. "
+                f"Valid for up to {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds from issuance. "
                 "Post a new `/evidence_link` after expiry. Open PRs only.",
                 original,
             )
@@ -3655,13 +3655,70 @@ class DeployController:
         seen_rounds = set()
         from .evidence_auth import DOWNLOAD_PURPOSE, issue_capability
 
-        def bind_download_capabilities(rows, head_sha, round_id):
+        # Reuse only long-lived COS URLs from the previous trusted lifecycle
+        # projection. They are matched to their exact decoded object key and
+        # checked for the configured HTTPS bucket host and COS signature fields.
+        # Signed URLs remain ephemeral presentation data; they are never saved
+        # into hidden state or evidence records.
+        store = getattr(self.evidence_service, "store", None)
+        cached_cos_urls = {}
+        if backend_ready and store is not None:
+            for match in re.finditer(r"<(?P<url>https://[^<>\s]+)>", visible):
+                candidate = match.group("url")
+                try:
+                    from urllib.parse import unquote, urlsplit
+                    object_key = unquote(urlsplit(candidate).path.lstrip("/"))
+                    expiry = store.download_url_expiry(candidate, key=object_key)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if expiry is not None and expiry > cached_cos_urls.get(object_key, (0, ""))[0]:
+                    cached_cos_urls[object_key] = (expiry, candidate)
+
+        async def stable_cos_url(object_key, filename, *, attachment_id=None):
+            if not backend_ready or store is None:
+                return ""
+            cached = cached_cos_urls.get(object_key)
+            now = int(time.time())
+            if cached:
+                checked_expiry = store.download_url_expiry(
+                    cached[1], key=object_key, filename=filename,
+                    attachment_id=attachment_id,
+                )
+                if checked_expiry is not None:
+                    cached = (checked_expiry, cached[1])
+                    cached_cos_urls[object_key] = cached
+                    if checked_expiry - now > 7 * 24 * 60 * 60:
+                        return cached[1]
+                else:
+                    cached = None
+            try:
+                candidate = await store._io(
+                    store.issue_download_url, key=object_key, filename=filename,
+                )
+                expiry = store.download_url_expiry(
+                    candidate, key=object_key, filename=filename,
+                    attachment_id=attachment_id,
+                )
+                if expiry is not None and expiry > now:
+                    cached_cos_urls[object_key] = (expiry, candidate)
+                    return candidate
+            except Exception as exc:
+                logger.warning("COS evidence link refresh failed %s#%s exception=%s",
+                               repo, pr_number, type(exc).__name__)
+            # A transient signing failure must not erase a still-valid link,
+            # including one inside the renewal window.
+            if cached and cached[0] > now:
+                return cached[1]
+            return ""
+
+        async def bind_download_capabilities(rows, head_sha, round_id):
             bound = []
             for row in rows:
                 item = copy.deepcopy(row)
                 attachment_id = item.get("attachment_id")
                 valid_row = (
-                    item.get("head_sha") == head_sha
+                    verified_evidence_row(item, head_sha, round_id)
+                    and item.get("head_sha") == head_sha
                     and item.get("round_id") == round_id
                     and item.get("actor_verified") is True
                     and item.get("status") == "ready"
@@ -3685,10 +3742,38 @@ class DeployController:
                         self.config, repo, pr_number, head_sha, round_id,
                         purpose=DOWNLOAD_PURPOSE, resource="attachment:" + attachment_id,
                     )
+                    item["cos_download_url"] = await stable_cos_url(
+                        expected_key, item.get("filename", ""),
+                        attachment_id=attachment_id,
+                    )
                 else:
                     item.pop("download_capability", None)
+                    item.pop("cos_download_url", None)
                 bound.append(item)
             return bound
+
+        async def bind_log_url(target, head_sha, round_id):
+            metadata = target.get("cos") if isinstance(target.get("cos"), dict) else {}
+            if (not backend_ready or not isinstance(metadata, dict)
+                    or not self._valid_cos_metadata(repo, pr_number, head_sha, metadata)):
+                target.pop("cos_log_download_url", None)
+                return
+            object_key = metadata["object_key"]
+            filename = object_key.rsplit("/", 1)[-1]
+            cached = cached_cos_urls.get(object_key)
+            now = int(time.time())
+            # A log is exposed only after the existing COS HEAD/GET verification
+            # confirms its stored size and SHA256 against the round metadata.
+            if not await self.cos.verify_upload(object_key, metadata["sha256"], metadata["size"]):
+                target.pop("cos_log_download_url", None)
+                return
+            url = await stable_cos_url(object_key, filename)
+            if url:
+                target["cos_log_download_url"] = url
+            elif cached and cached[0] > now:
+                target["cos_log_download_url"] = cached[1]
+            else:
+                target.pop("cos_log_download_url", None)
 
         if backend_ready:
             render_state["capability"] = issue_capability(
@@ -3700,8 +3785,9 @@ class DeployController:
                 purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
             )
         if backend_ready:
-            current_rows = bind_download_capabilities(current_rows, state["head_sha"], current_round)
+            current_rows = await bind_download_capabilities(current_rows, state["head_sha"], current_round)
             render_state["attachments"] = current_rows
+            await bind_log_url(render_state, state["head_sha"], current_round)
         for archive in reversed(archives):
             if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
                 continue
@@ -3714,9 +3800,11 @@ class DeployController:
                 )
             snapshot["deployments"] = self._enrich_deployments_for_render(snapshot.get("deployments", []))
             snapshot_attachments = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
-            snapshot["attachments"] = (bind_download_capabilities(
+            snapshot["attachments"] = (await bind_download_capabilities(
                 snapshot_attachments, snapshot["head_sha"], archive["round_id"],
             ) if backend_ready else snapshot_attachments)
+            if backend_ready:
+                await bind_log_url(snapshot, snapshot["head_sha"], archive["round_id"])
             bundles.append({**archive, "snapshot": snapshot})
             if len(bundles) == 3:
                 break

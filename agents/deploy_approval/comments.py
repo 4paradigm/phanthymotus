@@ -146,12 +146,12 @@ def _safe_download_url(url: str) -> str:
         return ""
     if len(url) > 8192:
         return ""
-    if "\r" in url or "\n" in url:
+    if any(ch.isspace() or ch in "<>\\`" for ch in url):
         return ""
-    for ch in url:
-        if ord(ch) < 0x20 and ch not in ("\t",):
-            return ""
-    parsed = urllib.parse.urlsplit(url)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return ""
     if parsed.scheme != "https":
         return ""
     if not parsed.hostname:
@@ -197,12 +197,13 @@ def _cos_evidence_block(
     if size:
         text += f" \u00b7 `{_human_size(size)}`"
     lines.append(text)
-    # Keep the argument for existing callers, but never persist expiring COS
-    # URLs in the lifecycle summary. render_evidence_section owns stable links.
-    if (isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
-            and isinstance(size, int) and not isinstance(size, bool)
-            and 1 <= size <= 10 * 1024 * 1024):
-        lines.append("For a short-lived download link, post `/evidence_link` on this open PR.")
+    # A validated signed URL is intentionally visible to readers of this
+    # Summary. Callers provide it only after verifying the COS object.
+    safe_url = _safe_download_url(download_url)
+    if (safe_url and isinstance(sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", sha256)
+            and isinstance(size, int) and not isinstance(size, bool) and size > 0):
+        lines.append(f"[Download verified COS archive (365-day link)](<{safe_url}>)")
     return lines
 
 
@@ -983,8 +984,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     """Render current evidence and three archived rounds without mutating history.
 
     Records may be attachment rows, round bundles, or archive_snapshot entries.
-    Archive links must come from trusted server-side discovery. Signed COS URLs
-    and user-supplied URLs are deliberately not used as download destinations.
+    Archive links must come from trusted server-side discovery. COS download
+    URLs are used only when supplied on a verified ready attachment row.
     The caller supplies evidence_enabled=True in the render state only when
     the configured feature is enabled; absent flags fail closed for API links.
     """
@@ -1077,9 +1078,17 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
                 size = _human_size(size)
             sha256 = item.get("sha256")
-            cos_verified = (status == "ready" and bool(item.get("object_key"))
+            item_head = item.get("head_sha")
+            item_round = item.get("round_id")
+            cos_verified = (not deleted and status == "ready"
+                            and isinstance(item.get("object_key"), str) and bool(item.get("object_key"))
                             and isinstance(sha256, str)
-                            and re.fullmatch(r"[0-9a-f]{64}", sha256))
+                            and re.fullmatch(r"[0-9a-f]{64}", sha256)
+                            and item.get("actor_verified") is True
+                            and isinstance(item_head, str) and item_head == h
+                            and re.fullmatch(r"[0-9a-f]{40}", item_head)
+                            and isinstance(item_round, str) and item_round == r
+                            and re.fullmatch(re.escape(item_head) + r"-[0-9]+", item_round))
             cells = [filename, size, media_type,
                      ((item.get("actor_login") or item.get("actor"))
                       if item.get("actor_verified") is True else "unverified"),
@@ -1095,14 +1104,17 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             if deleted:
                 cells[8] = str(cells[8]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
             attachment_id = item.get("attachment_id")
-            cos_download = download(attachment_id, "/attachments/{id}/download", item.get("download_capability"))
+            cos_download = _safe_download_url(item.get("cos_download_url", "")) if cos_verified else ""
             if status == "text":
                 download_cell = "Text note (no file)"
             elif cos_verified and cos_download:
-                download_cell = f"[COS 副本下载（本机签名入口）](<{cos_download}>)"
+                download_cell = f"[下载 COS 文件（365 天有效）](<{cos_download}>)"
             elif cos_verified and attachment_id:
-                download_cell = ("COS 已归档；运行 Mac 启动器建立隧道后下载，或在 PR 评论中发送 "
-                                 f"`/evidence_link id={_escape(attachment_id)}` 获取 15 分钟链接")
+                fallback = ("可在 PR 评论中发送 "
+                            f"`/evidence_link id={_escape(attachment_id)}` 获取 COS 下载链接")
+                download_cell = (f"[GitHub 原始附件](<{native_url}>) · COS 已验证归档；{fallback}"
+                                 if native_url else
+                                 "COS 已验证归档；当前直接下载链接暂不可用；" + fallback)
             elif native_url:
                 download_cell = f"[GitHub 原始附件](<{native_url}>)"
             else:
@@ -1126,9 +1138,9 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         for field in ("case_results", "test_result", "summary", "history", "cos_object_key", "cos_bundle_sha256", "cos"):
             if group.get(field):
                 lines.extend(["", f"**{_escape(field)}:** {_escape(json.dumps(group[field], ensure_ascii=False) if isinstance(group[field], (list, dict)) else group[field])}"])
-        log = download(r, "/rounds/{id}/log/download", group.get("log_capability", ""))
+        log = _safe_download_url(group.get("cos_log_download_url", ""))
         if log and (group.get("cos_object_key") or group.get("cos", {}).get("object_key") or group.get("log_available") or group.get("log_ready")):
-            lines.extend(["", f"[Download round COS log]({log})"])
+            lines.extend(["", f"[Download round COS log](<{log}>)"])
         return lines
 
     lines = ["<!-- deploy-approval-evidence:start -->", "### Current round evidence", ""]
@@ -1157,7 +1169,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             f"绑定：HEAD `{_escape(head)}` · round `{_escape(current_round)}`。",
             "在页面选择视频、图片、文档或其他文件，也可提交纯文本说明；所有文件都通过本机隧道直接上传到私有 COS。",
             f"状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。只有归档后再执行 `/record_test result=pass|fail`。",
-            "每个 COS 下载链接都使用该附件的短期 capability；没有隧道时可发送 `/evidence_link id=<attachment_id>` 获取 15 分钟签名链接。",
+            "已验证归档的附件可直接使用 Summary 中的 COS 下载链接；没有可用直链时，可发送 `/evidence_link id=<attachment_id>` 获取下载链接。",
         ])
     if state.get("evidence_enabled") is True and state.get("browser_upload_ready") is not True:
         readiness = (state.get("evidence_readiness") or {}).get("status")
