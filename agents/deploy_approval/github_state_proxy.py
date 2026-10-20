@@ -59,6 +59,8 @@ _MAX_HIDDEN_STATE_BYTES = 8192
 
 # Maximum lifecycle comment body size (64 KB)
 _MAX_COMMENT_BODY_BYTES = 65536
+_EVIDENCE_SINGLE_RECORD_MAX_BYTES = 24000
+_EVIDENCE_PART_BYTES = 24000
 
 # Maximum visible lifecycle markdown soft budget (48 KiB)
 _MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024
@@ -1149,7 +1151,37 @@ class GitHubStateProxy:
             return result
         try:
             data = json.loads(body[start:-len("\n-->")], object_pairs_hook=unique_object)
-            return data if isinstance(data, dict) else None
+            if not isinstance(data, dict):
+                return None
+            kind = data.get("kind")
+            common = {"repo", "pr_number", "kind", "key", "sha256", "type"}
+            if (not isinstance(data.get("repo"), str) or not data["repo"]
+                    or type(data.get("pr_number")) is not int or data["pr_number"] <= 0
+                    or kind not in {"round", "operation", "attachment"}
+                    or not isinstance(data.get("key"), str) or not data["key"]
+                    or len(data["key"]) > 512
+                    or not isinstance(data.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", data["sha256"]) is None):
+                raise ValueError("invalid evidence envelope identity")
+            envelope_type = data.get("type")
+            if envelope_type == "record":
+                if set(data) != common | {"data"} or not isinstance(data["data"], str):
+                    raise ValueError("invalid single-record envelope")
+            elif envelope_type == "part":
+                if (set(data) != common | {"index", "data"}
+                        or type(data.get("index")) is not int or data["index"] < 0
+                        or not isinstance(data.get("data"), str)):
+                    raise ValueError("invalid evidence part envelope")
+            elif envelope_type == "manifest":
+                ids = data.get("parts")
+                if (set(data) != common | {"parts"} or not isinstance(ids, list)
+                        or not 1 <= len(ids) <= 512
+                        or any(type(cid) is not int or cid <= 0 for cid in ids)
+                        or len(set(ids)) != len(ids)):
+                    raise ValueError("invalid evidence manifest envelope")
+            else:
+                raise ValueError("unknown evidence envelope type")
+            return data
         except ValueError:
             raise GitHubStateProxyError("Malformed trusted evidence envelope")
 
@@ -1165,8 +1197,10 @@ class GitHubStateProxy:
         if envelope.get("type") == "part":
             index = envelope.get("index")
             detail = f"part {index}" if type(index) is int and index >= 0 else "part"
-        else:
+        elif envelope.get("type") == "manifest":
             detail = "manifest"
+        else:
+            detail = "record"
         return (f"### Deploy Approval — Evidence Archive\n\n"
                 f"{pr_label} · {category_label} · {detail}")
 
@@ -1277,64 +1311,98 @@ class GitHubStateProxy:
         return repaired
 
     async def read_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
-        """Read immutable committed documents; ignore uncommitted upload parts."""
+        """Read immutable single-comment and historical paged evidence documents."""
         self._evidence_repo_guard(repo)
         comments = await self.get_issue_comments(repo, pr_number)
+        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
         trusted = {c["id"]: c for c in comments
-                   if type(c.get("id")) is int and self.is_bot_comment(c)}
+                   if type(c.get("id")) is int and c["id"] > 0
+                   and c.get("issue_url") == expected_url and self.is_bot_comment(c)}
         result = []
         seen = {}
+
+        def decode_document(envelope):
+            if (envelope.get("repo") != repo or envelope.get("pr_number") != pr_number):
+                raise GitHubStateProxyError("Evidence document repository mismatch")
+            try:
+                raw = base64.b64decode(envelope["data"], validate=True)
+            except (ValueError, KeyError, TypeError):
+                raise GitHubStateProxyError("Invalid evidence document encoding")
+            if (len(raw) > 8 * 1024 * 1024
+                    or hashlib.sha256(raw).hexdigest() != envelope.get("sha256")):
+                raise GitHubStateProxyError("Evidence document integrity mismatch")
+            try:
+                data = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise GitHubStateProxyError("Invalid evidence document JSON")
+            if (not isinstance(data, dict) or data.get("repo") != repo
+                    or type(data.get("pr_number")) is not int
+                    or data.get("pr_number") != pr_number):
+                raise GitHubStateProxyError("Evidence record identity mismatch")
+            return raw, data
+
+        def add_record(envelope, comment, raw=None, data=None):
+            if raw is None or data is None:
+                raw, data = decode_document(envelope)
+            key = (envelope["kind"], envelope["key"])
+            if key in seen:
+                if seen[key] != raw:
+                    raise GitHubStateProxyError("Conflicting immutable evidence documents")
+                return
+            seen[key] = raw
+            result.append({"kind": key[0], "key": key[1], "data": data,
+                           "comment_id": comment["id"], "url": comment.get("html_url", ""),
+                           "sha256": envelope["sha256"]})
+
         for comment in trusted.values():
-            manifest = self._evidence_envelope(comment)
-            if not manifest or manifest.get("type") != "manifest":
+            envelope = self._evidence_envelope(comment)
+            if not envelope:
                 continue
-            if manifest.get("repo") != repo or manifest.get("pr_number") != pr_number:
-                raise GitHubStateProxyError("Evidence manifest repository mismatch")
-            ids = manifest.get("parts")
-            if (not isinstance(ids, list) or not 1 <= len(ids) <= 512
-                    or any(type(cid) is not int for cid in ids) or len(set(ids)) != len(ids)):
-                raise GitHubStateProxyError("Invalid evidence manifest parts")
+            if envelope["type"] == "record":
+                add_record(envelope, comment)
+                continue
+            if envelope["type"] != "manifest":
+                continue
+            ids = envelope["parts"]
             chunks = []
             for index, cid in enumerate(ids):
                 part = self._evidence_envelope(trusted.get(cid, {}))
                 if (not part or part.get("type") != "part" or part.get("index") != index
-                        or any(part.get(k) != manifest.get(k) for k in ("repo", "pr_number", "kind", "key", "sha256"))):
+                        or any(part.get(k) != envelope.get(k)
+                               for k in ("repo", "pr_number", "kind", "key", "sha256"))):
                     raise GitHubStateProxyError("Untrusted or incomplete evidence document")
                 try:
                     chunks.append(base64.b64decode(part["data"], validate=True))
                 except (ValueError, KeyError, TypeError):
                     raise GitHubStateProxyError("Invalid evidence document encoding")
             raw = b"".join(chunks)
-            if len(raw) > 8 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != manifest.get("sha256"):
+            if len(raw) > 8 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != envelope.get("sha256"):
                 raise GitHubStateProxyError("Evidence document integrity mismatch")
             try:
                 data = json.loads(raw)
-            except ValueError:
+            except (ValueError, UnicodeDecodeError):
                 raise GitHubStateProxyError("Invalid evidence document JSON")
-            if (not isinstance(data, dict) or manifest.get("kind") not in {"round", "operation", "attachment"}
-                    or not isinstance(manifest.get("key"), str)
-                    or data.get("repo") != repo or data.get("pr_number") != pr_number):
+            if (not isinstance(data, dict) or data.get("repo") != repo
+                    or type(data.get("pr_number")) is not int
+                    or data.get("pr_number") != pr_number):
                 raise GitHubStateProxyError("Evidence record identity mismatch")
-            key = (manifest.get("kind"), manifest.get("key"))
-            if key in seen:
-                if seen[key] != raw:
-                    raise GitHubStateProxyError("Conflicting immutable evidence documents")
-                continue
-            seen[key] = raw
-            result.append({"kind": key[0], "key": key[1], "data": data,
-                           "comment_id": comment["id"], "url": comment.get("html_url", ""),
-                           "sha256": manifest["sha256"]})
+            add_record(envelope, comment, raw, data)
         return sorted(result, key=lambda record: record["comment_id"])
 
     async def write_evidence_record(
         self, repo: str, pr_number: int, kind: str, key: str, data: dict,
     ) -> dict:
-        """Append paged evidence then a commit manifest; verify every POST by GET.
+        """Persist small evidence in one comment and page larger records.
 
         This never PATCHes Lifecycle. The Controller's evidence lock serializes
         HTTP operations; the existing watcher is the only Lifecycle projector.
         """
         self._evidence_repo_guard(repo)
+        if (kind not in {"round", "operation", "attachment"}
+                or not isinstance(key, str) or not key or len(key) > 512
+                or not isinstance(data, dict) or data.get("repo") != repo
+                or data.get("pr_number") != pr_number):
+            raise GitHubStateProxyError("Evidence record identity is invalid")
         raw = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(raw) > 8 * 1024 * 1024:
             raise GitHubStateProxyError("Evidence snapshot exceeds safe archive capacity")
@@ -1357,18 +1425,42 @@ class GitHubStateProxy:
                 return record
         comments = await self.get_issue_comments(repo, pr_number)
         pending = {}
+        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
         for comment in comments:
-            if not self.is_bot_comment(comment):
+            if (not self.is_bot_comment(comment)
+                    or comment.get("issue_url") != expected_url):
                 continue
             part = self._evidence_envelope(comment)
             if (part and part.get("type") == "part" and part.get("repo") == repo
                     and part.get("pr_number") == pr_number and part.get("kind") == kind
                     and part.get("key") == key and type(part.get("index")) is int):
                 pending.setdefault(part.get("sha256"), {})[part["index"]] = part
+        resumed_paged_record = False
+        pending_identity_found = bool(pending)
         for expected_digest, parts in pending.items():
+            if expected_digest == digest:
+                expected_count = (len(raw) + _EVIDENCE_PART_BYTES - 1) // _EVIDENCE_PART_BYTES
+                exact_partial = all(
+                    0 <= index < expected_count
+                    and part.get("data") == base64.b64encode(
+                        raw[index * _EVIDENCE_PART_BYTES:
+                             (index + 1) * _EVIDENCE_PART_BYTES]
+                    ).decode("ascii")
+                    for index, part in parts.items()
+                )
+                if exact_partial:
+                    resumed_paged_record = True
+                    break
             try:
-                candidate_raw = b"".join(base64.b64decode(parts[i]["data"], validate=True)
-                                         for i in range(len(parts)))
+                indices = sorted(parts)
+                if indices != list(range(len(indices))):
+                    continue
+                decoded_parts = [base64.b64decode(parts[i]["data"], validate=True)
+                                 for i in indices]
+                if any(len(chunk) != _EVIDENCE_PART_BYTES
+                       for chunk in decoded_parts[:-1]):
+                    continue
+                candidate_raw = b"".join(decoded_parts)
                 if hashlib.sha256(candidate_raw).hexdigest() != expected_digest:
                     continue
                 candidate = json.loads(candidate_raw)
@@ -1379,7 +1471,12 @@ class GitHubStateProxy:
             # All pages exist; finish their manifest instead of republishing
             # a logically identical document with different retry timestamps.
             raw, data, digest = candidate_raw, candidate, expected_digest
+            resumed_paged_record = True
             break
+        if pending_identity_found and not resumed_paged_record:
+            raise GitHubStateProxyError(
+                "Incomplete uncommitted evidence pages require recovery before retry"
+            )
 
         async def publish(envelope: dict) -> dict:
             body = (self._evidence_visible_description(envelope) + "\n\n"
@@ -1408,14 +1505,21 @@ class GitHubStateProxy:
             return confirmed
 
         common = {"repo": repo, "pr_number": pr_number, "kind": kind, "key": key, "sha256": digest}
-        part_ids = []
-        for index, offset in enumerate(range(0, len(raw), 24000)):
-            part = await publish({**common, "type": "part", "index": index,
-                                  "data": base64.b64encode(raw[offset:offset + 24000]).decode("ascii")})
-            part_ids.append(part["id"])
-        manifest = await publish({**common, "type": "manifest", "parts": part_ids})
+        if len(raw) <= _EVIDENCE_SINGLE_RECORD_MAX_BYTES and not resumed_paged_record:
+            envelope = {**common, "type": "record",
+                        "data": base64.b64encode(raw).decode("ascii")}
+            stored = await publish(envelope)
+        else:
+            part_ids = []
+            for index, offset in enumerate(range(0, len(raw), _EVIDENCE_PART_BYTES)):
+                part = await publish({**common, "type": "part", "index": index,
+                                      "data": base64.b64encode(
+                                          raw[offset:offset + _EVIDENCE_PART_BYTES]
+                                      ).decode("ascii")})
+                part_ids.append(part["id"])
+            stored = await publish({**common, "type": "manifest", "parts": part_ids})
         verified = await self.read_evidence_records(repo, pr_number)
-        result = next((r for r in verified if r["comment_id"] == manifest["id"]), None)
+        result = next((r for r in verified if r["comment_id"] == stored["id"]), None)
         if result is None or result["sha256"] != digest:
             raise GitHubStateProxyError("Committed evidence archive readback failed")
         return result

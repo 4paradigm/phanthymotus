@@ -768,7 +768,71 @@ class EvidenceService:
                 if record['kind'] == 'attachment':
                     latest[data['attachment_id']] = data
                 if record['kind'] == 'operation':
-                    operations[data['operation_id']] = data
+                    operation_id = data.get('operation_id')
+                    upload_ref = data.get('upload_ref')
+                    head_sha = data.get('head_sha')
+                    operation_round = data.get('round_id')
+                    attachment_id = data.get('attachment_id')
+                    native = data.get('native_attachment') is True
+                    status = data.get('status')
+
+                    # A one-time server-side diagnostic wrote these legacy
+                    # records under a separate namespace without creating a
+                    # resumable EvidenceService operation. Keep them out of
+                    # the operation index while leaving attachment records
+                    # (and their Summary projection) untouched.
+                    legacy_server_operation = (
+                        isinstance(record.get('key'), str)
+                        and re.fullmatch(r'server:[A-Za-z0-9._:-]{1,128}', record['key']) is not None
+                        and 'operation_id' not in data and 'upload_ref' not in data
+                        and not native and data.get('repo') == repo
+                        and data.get('pr_number') == pr_number
+                        and isinstance(attachment_id, str)
+                        and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', attachment_id) is not None
+                        and isinstance(data.get('upload_id'), str)
+                        and 1 <= len(data['upload_id']) <= 1024
+                        and all(32 <= ord(char) < 127 for char in data['upload_id'])
+                        and isinstance(head_sha, str)
+                        and re.fullmatch(r'[0-9a-f]{40}', head_sha) is not None
+                        and isinstance(operation_round, str)
+                        and re.fullmatch(re.escape(head_sha) + r'-[0-9]+', operation_round) is not None
+                        and isinstance(status, str)
+                        and status in {'initializing', 'uploading', 'completing', 'verifying',
+                                       'processing', 'ready', 'deleted', 'invalid'}
+                    )
+                    if legacy_server_operation:
+                        continue
+
+                    valid_attachment = (isinstance(attachment_id, str)
+                                        and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', attachment_id) is not None)
+                    valid_id = (valid_attachment and operation_id == attachment_id if native else
+                                isinstance(operation_id, str)
+                                and re.fullmatch(r'[0-9a-f]{64}', operation_id) is not None)
+                    valid_context = (
+                        data.get('repo') == repo and data.get('pr_number') == pr_number
+                        and isinstance(head_sha, str)
+                        and re.fullmatch(r'[0-9a-f]{40}', head_sha) is not None
+                        and isinstance(operation_round, str)
+                        and re.fullmatch(re.escape(head_sha) + r'-[0-9]+', operation_round) is not None
+                    )
+                    valid_status = (isinstance(status, str)
+                                    and status in {'prepared', 'initializing', 'uploading',
+                                                   'completing', 'verifying', 'processing',
+                                                   'ready', 'deleted', 'invalid'})
+                    valid_reference = (native and operation_id == attachment_id
+                                       or not native and isinstance(upload_ref, str)
+                                       and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', upload_ref) is not None)
+                    if not (valid_id and valid_attachment and valid_context and valid_status
+                            and valid_reference and data.get('native_attachment') in (None, True)):
+                        raise EvidenceError('operation_record_invalid', 503)
+
+                    previous = operations.get(operation_id)
+                    if previous is not None and any(
+                            previous.get(field) != data.get(field)
+                            for field in ('repo', 'pr_number', 'head_sha', 'round_id',
+                                          'attachment_id', 'upload_ref', 'actor_id')):
+                        raise EvidenceError('operation_identity_conflict', 503)
+                    operations[operation_id] = data
             if action == 'put_part':
                 ref = payload.get('operation_id')
                 source = next((r['data'] for r in reversed(records)
