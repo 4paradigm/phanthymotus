@@ -1133,13 +1133,148 @@ class GitHubStateProxy:
     def _evidence_envelope(comment: dict) -> dict | None:
         marker = "<!-- deploy-approval-evidence:v1\n"
         body = comment.get("body", "")
-        if not isinstance(body, str) or not body.startswith(marker) or not body.endswith("\n-->"):
+        if not isinstance(body, str) or marker not in body:
             return None
+        # Exactly one marker and one terminal envelope are accepted. Visible
+        # Markdown may precede the hidden document; it never contributes data.
+        if body.count(marker) != 1 or not body.endswith("\n-->"):
+            raise GitHubStateProxyError("Malformed trusted evidence envelope")
+        start = body.index(marker) + len(marker)
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON key")
+                result[key] = value
+            return result
         try:
-            data = json.loads(body[len(marker):-len("\n-->")])
+            data = json.loads(body[start:-len("\n-->")], object_pairs_hook=unique_object)
             return data if isinstance(data, dict) else None
         except ValueError:
             raise GitHubStateProxyError("Malformed trusted evidence envelope")
+
+    @staticmethod
+    def _evidence_visible_description(envelope: dict) -> str:
+        category = envelope.get("kind")
+        category_label = {
+            "round": "Round evidence", "operation": "Operation evidence",
+            "attachment": "Attachment evidence",
+        }.get(category, "Evidence")
+        pr_number = envelope.get("pr_number")
+        pr_label = f"PR #{pr_number}" if type(pr_number) is int and pr_number > 0 else "PR archive"
+        if envelope.get("type") == "part":
+            index = envelope.get("index")
+            detail = f"part {index}" if type(index) is int and index >= 0 else "part"
+        else:
+            detail = "manifest"
+        return (f"### Deploy Approval — Evidence Archive\n\n"
+                f"{pr_label} · {category_label} · {detail}")
+
+    @staticmethod
+    def _evidence_envelope_text(body: str) -> str:
+        marker = "<!-- deploy-approval-evidence:v1\n"
+        start = body.index(marker)
+        return body[start:]
+
+    @staticmethod
+    def _evidence_has_visible_text(body: str) -> bool:
+        visible = re.sub(r"<!--[\s\S]*?-->", "", body)
+        return bool(visible.strip())
+
+    async def ensure_visible_evidence_archive_comments(
+        self, repo: str, pr_number: int, limit: int = 2,
+    ) -> int:
+        """Add concise visible labels to legacy empty evidence comments in place."""
+        self._evidence_repo_guard(repo)
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative int")
+        if limit == 0:
+            return 0
+        pr = await self.get_pr(repo, pr_number)
+        if pr.get("state") != "open" or pr.get("merged") or pr.get("draft"):
+            return 0
+        comments = await self.get_issue_comments(repo, pr_number)
+        records = await self.read_evidence_records(repo, pr_number)
+        committed_ids = {record["comment_id"] for record in records}
+        archive_sha_by_comment = {}
+        for comment in comments:
+            if not self.is_bot_comment(comment):
+                continue
+            envelope = self._evidence_envelope(comment)
+            if (envelope and envelope.get("type") == "manifest"
+                    and comment.get("id") in committed_ids
+                    and isinstance(envelope.get("sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", envelope["sha256"])):
+                archive_sha_by_comment[comment["id"]] = envelope["sha256"]
+                for cid in envelope.get("parts", []):
+                    if type(cid) is int:
+                        committed_ids.add(cid)
+                        archive_sha_by_comment[cid] = envelope["sha256"]
+        repaired = 0
+        for listed in comments:
+            if repaired >= limit:
+                break
+            if not self.is_bot_comment(listed):
+                continue
+            body = listed.get("body")
+            comment_id = listed.get("id")
+            if type(comment_id) is not int or not isinstance(body, str):
+                continue
+            if self._evidence_has_visible_text(body):
+                continue
+            envelope = self._evidence_envelope(listed)
+            if (not envelope or envelope.get("repo") != repo
+                    or envelope.get("pr_number") != pr_number
+                    or envelope.get("type") not in {"part", "manifest"}
+                    or comment_id not in committed_ids
+                    or not isinstance(envelope.get("sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", envelope["sha256"])
+                    or archive_sha_by_comment.get(comment_id) != envelope["sha256"]):
+                continue
+            # Refuse malformed or non-unique archives before editing anything.
+            if len(self._evidence_envelope_text(body)) != len(body):
+                continue
+            fresh = await self.get_comment(repo, comment_id)
+            listed_user = listed.get("user")
+            if (not isinstance(fresh, dict) or fresh.get("id") != comment_id
+                    or not self.is_bot_comment(fresh) or fresh.get("body") != body
+                    or not isinstance(listed_user, dict)
+                    or not isinstance(fresh.get("user"), dict)
+                    or fresh["user"].get("id") != listed_user.get("id")):
+                continue
+            fresh_pr = await self.get_pr(repo, pr_number)
+            if (fresh_pr.get("state") != "open" or fresh_pr.get("merged")
+                    or fresh_pr.get("draft")):
+                return repaired
+            patch_body = self._evidence_visible_description(envelope) + "\n\n" + body
+            await self.update_comment(repo, comment_id, patch_body)
+            confirmed = await self.get_comment(repo, comment_id)
+            if (not isinstance(confirmed, dict) or confirmed.get("id") != comment_id
+                    or not self.is_bot_comment(confirmed) or confirmed.get("body") != patch_body):
+                raise GitHubStateProxyError("Evidence comment repair readback failed")
+            parsed = self._evidence_envelope(confirmed)
+            if (parsed != envelope or parsed.get("sha256") != envelope["sha256"]):
+                raise GitHubStateProxyError("Evidence envelope changed during repair")
+            # Re-run full manifest, part, order and digest verification.
+            verified_records = await self.read_evidence_records(repo, pr_number)
+            post_comments = await self.get_issue_comments(repo, pr_number)
+            verified_archive_sha = {}
+            for record in verified_records:
+                if record.get("sha256") != envelope["sha256"]:
+                    continue
+                verified_archive_sha[record["comment_id"]] = record["sha256"]
+                manifest_comment = next((item for item in post_comments
+                                         if item.get("id") == record["comment_id"]
+                                         and self.is_bot_comment(item)), None)
+                manifest = self._evidence_envelope(manifest_comment or {})
+                if manifest and manifest.get("type") == "manifest":
+                    verified_archive_sha.update({cid: record["sha256"]
+                                                 for cid in manifest.get("parts", [])
+                                                 if type(cid) is int})
+            if verified_archive_sha.get(comment_id) != envelope["sha256"]:
+                raise GitHubStateProxyError("Evidence archive digest changed during repair")
+            repaired += 1
+        return repaired
 
     async def read_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
         """Read immutable committed documents; ignore uncommitted upload parts."""
@@ -1247,8 +1382,13 @@ class GitHubStateProxy:
             break
 
         async def publish(envelope: dict) -> dict:
-            body = "<!-- deploy-approval-evidence:v1\n" + json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n-->"
-            found = next((c for c in comments if c.get("body") == body and self.is_bot_comment(c)), None)
+            body = (self._evidence_visible_description(envelope) + "\n\n"
+                    + "<!-- deploy-approval-evidence:v1\n"
+                    + json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n-->")
+            found = next((c for c in comments
+                          if self.is_bot_comment(c)
+                          and (c.get("body") == body
+                               or self._evidence_envelope(c) == envelope)), None)
             if found is None:
                 self._evidence_repo_guard(repo)
                 pr = await self.get_pr(repo, pr_number)
@@ -1257,10 +1397,11 @@ class GitHubStateProxy:
                 found = await self.post_issue_comment(repo, pr_number, body)
             if not isinstance(found, dict) or type(found.get("id")) is not int:
                 raise GitHubStateProxyError("Evidence comment write unconfirmed")
+            expected_body = found.get("body") if self._evidence_envelope(found) == envelope else body
             confirmed = await self.get_comment(repo, found["id"])
             expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
             if (not isinstance(confirmed, dict) or not self.is_bot_comment(confirmed)
-                    or confirmed.get("body") != body or confirmed.get("issue_url") != expected_url
+                    or confirmed.get("body") != expected_body or confirmed.get("issue_url") != expected_url
                     or confirmed.get("id") != found["id"]):
                 raise GitHubStateProxyError("Evidence comment readback failed")
             comments.append(confirmed)

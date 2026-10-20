@@ -4,11 +4,11 @@ Commands must start a line. Only the PR's main-conversation comments are read.
 Parsing is strict: unknown flags, a duplicated required arg or a stray argument
 are rejected as ``unknown``.
 
-Eight commands are public:
+Commands are public:
   - ``/request_deploy`` — PR Author requests a deployment (ZERO parameters)
   - ``/approve_deploy`` — Machine Owner approves a deployment
   - ``/record_test`` — Machine Owner records test result (no machine=)
-  - ``/evidence_link`` — Read-only short-lived evidence download link (no parameters)
+  - ``/evidence_link`` — Read-only short-lived evidence download link
   - ``/deploy_status`` — Read-only status query
   - ``/deploy_help`` — Help for commands
   - ``/submit_evidence`` — Persist native PR attachments and notes
@@ -90,7 +90,7 @@ _ALLOWED_KV = {
     "request_deploy": frozenset(),        # ZERO parameters
     "approve_deploy": frozenset({"machine"}),
     "record_test": frozenset({"result", "summary"}),
-    "evidence_link": frozenset(),
+    "evidence_link": frozenset({"id"}),
     "deploy_status": frozenset(),
     "deploy_help": frozenset(),
     "submit_evidence": frozenset({"head", "round", "machine", "note", "replaces"}),
@@ -280,9 +280,14 @@ def _build_command(name: str, positional: list[str], kv: dict[str, str],
             kind="record_test", result=result, summary=summary, raw=raw
         )
     if name == "evidence_link":
-        if positional or kv:
+        if positional:
             return ParsedCommand(kind="unknown", raw="")
-        return ParsedCommand(kind="evidence_link", raw=raw)
+        attachment_id = kv.get("id", "")
+        if kv and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id):
+            return ParsedCommand(kind="unknown", raw="")
+        return ParsedCommand(
+            kind="evidence_link", evidence_args={"id": attachment_id} if attachment_id else {}, raw=raw,
+        )
     if name == "deploy_status":
         if positional:
             return ParsedCommand(kind="unknown", raw="")

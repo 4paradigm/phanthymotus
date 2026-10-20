@@ -1688,6 +1688,8 @@ class DeployController:
                 repo, pr_number, pr_head, case_result="",
                 deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
                 components=state.get("components", []),
+                deployments_complete=(bool(all_component_ids)
+                                      and all_component_ids.issubset(deployed_component_ids)),
             )
             # The LAST machine also gets its own per-machine history event,
             # mirroring the partial-coverage path, so every successful machine
@@ -2232,6 +2234,7 @@ class DeployController:
         """Issue one verified short-lived link in a separate Conversation reply."""
         from .commands import parse_command
         from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        from .evidence_models import EvidenceError
 
         def authorized_repo() -> bool:
             return (self.config.auth_valid and repo in self.config.active_repos
@@ -2272,7 +2275,8 @@ class DeployController:
                     or comment.get("updated_at") != comment["created_at"]
                     or (app is not None and (not isinstance(app, dict)
                         or type(app.get("id")) is not int or app["id"] <= 0))
-                    or pr.get("number") != pr_number or pr.get("state") != "open" or pr.get("merged")):
+                    or pr.get("number") != pr_number or pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft")):
                 raise PolicyError("Evidence request denied")
             head = state.get("head_sha", "")
             if (not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None
@@ -2312,6 +2316,96 @@ class DeployController:
             state = original[0]
             if comment_id <= state.get("last_processed_comment_id", 0):
                 return True  # Never replay a consumed historical request.
+            parsed_link = parse_command(original[1][3])
+            attachment_id = (parsed_link.evidence_args or {}).get("id", "")
+            if attachment_id:
+                records = await self.proxy.read_evidence_records(repo, pr_number)
+                latest = {}
+                for record in records:
+                    if record.get("kind") == "attachment":
+                        data = record.get("data")
+                        if isinstance(data, dict) and data.get("attachment_id"):
+                            latest[data["attachment_id"]] = data
+                attachment = latest.get(attachment_id)
+                if (not isinstance(attachment, dict)
+                        or attachment.get("status") in {"deleted", "invalid"}
+                        or attachment.get("status") != "ready"
+                        or attachment.get("repo") != repo
+                        or attachment.get("pr_number") != pr_number
+                        or not isinstance(attachment.get("head_sha"), str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", attachment.get("head_sha", ""))
+                        or not isinstance(attachment.get("round_id"), str)
+                        or not re.fullmatch(r"[0-9a-f]{40}-[0-9]+", attachment.get("round_id", ""))
+                        or not attachment["round_id"].startswith(attachment["head_sha"] + "-")
+                        or attachment.get("actor_verified") is not True
+                        or (attachment.get("source_comment_id") is not None
+                            and (type(attachment.get("source_comment_id")) is not int
+                                 or attachment.get("source_comment_id") <= 0))
+                        or not isinstance(attachment.get("sha256"), str)
+                        or re.fullmatch(r"[0-9a-f]{64}", attachment.get("sha256", "")) is None):
+                    return await reply(
+                        "That COS attachment is unavailable for the current PR round.", original,
+                    )
+                try:
+                    from .evidence_store import build_attachment_key
+                    expected_key = build_attachment_key(
+                        repo, pr_number, attachment["head_sha"], attachment["round_id"],
+                        attachment_id, attachment.get("created_at", ""),
+                        attachment.get("filename", ""),
+                    )
+                except (ValueError, TypeError, AttributeError):
+                    return await reply(
+                        "That COS attachment is unavailable for the current PR round.", original,
+                    )
+                if attachment.get("object_key") != expected_key:
+                    return await reply(
+                        "That COS attachment is unavailable for the current PR round.", original,
+                    )
+                evidence = self.evidence_service
+                if evidence is None:
+                    return False
+                principal = {
+                    "id": int(actor_id), "login": actor, "actor": actor,
+                    "actor_verified": True, "github_user_authenticated": True,
+                }
+                try:
+                    result = await evidence.dispatch(
+                        "download", repo=repo, pr_number=pr_number,
+                        principal=principal,
+                        payload={"attachment_id": attachment_id,
+                                 "head_sha": attachment["head_sha"],
+                                 "round_id": attachment["round_id"]},
+                    )
+                except EvidenceError as exc:
+                    if exc.status_code in {400, 403, 404, 409, 410}:
+                        return await reply(
+                            "That COS attachment is unavailable or no longer authorized.", original,
+                        )
+                    return False
+                if not isinstance(result, dict):
+                    return False
+                url = comments_mod._safe_download_url(result.get("url", ""))
+                if not url or await read_context() != original:
+                    return False
+                latest_records = await self.proxy.read_evidence_records(repo, pr_number)
+                latest_attachment = next((row.get("data") for row in reversed(latest_records)
+                    if row.get("kind") == "attachment"
+                    and isinstance(row.get("data"), dict)
+                    and row["data"].get("attachment_id") == attachment_id), None)
+                if (not isinstance(latest_attachment, dict)
+                        or latest_attachment.get("status") != "ready"
+                        or latest_attachment.get("object_key") != attachment.get("object_key")
+                        or latest_attachment.get("sha256") != attachment.get("sha256")):
+                    return await reply(
+                        "That COS attachment is no longer available for the current PR round.",
+                        original,
+                    )
+                return await reply(
+                    f"[Download COS attachment: {comments_mod._escape(attachment.get('filename', 'file'))}]({url})\n\n"
+                    "COS re-verification succeeded. This signed link expires within 900 seconds; "
+                    "post a new `/evidence_link id=<attachment_id>` after expiry.",
+                    original,
+                )
             metadata = state.get("cos", {}) or {}
             if not self._valid_cos_metadata(repo, pr_number, state["head_sha"], metadata):
                 return await reply("No verified COS evidence is available for this PR HEAD.", original)
@@ -3440,6 +3534,18 @@ class DeployController:
         return {"round_id": rid, "comment_id": record["comment_id"],
                 "url": record["url"], "sha256": record["sha256"]}
 
+    @staticmethod
+    def _replace_markdown_section(markdown, heading, content, next_heading):
+        """Replace one heading-delimited lifecycle section idempotently."""
+        start = markdown.find(heading)
+        if start < 0 or markdown.find(heading, start + len(heading)) >= 0:
+            return markdown
+        content_start = start + len(heading)
+        end = markdown.find(next_heading, content_start)
+        if end < 0:
+            return markdown
+        return markdown[:content_start] + "\n\n" + content.rstrip() + "\n\n" + markdown[end:]
+
     async def _render_evidence_projection(self, repo, pr_number, state, visible):
         renderer = getattr(comments_mod, "render_evidence_section", None)
         if renderer is None:
@@ -3450,7 +3556,72 @@ class DeployController:
         attachments = [r["data"] for r in records if r["kind"] == "attachment"]
         latest = {r["attachment_id"]: r for r in attachments}
         current_round = round_id_for_state(state)
-        current_rows = [r for r in latest.values() if r["round_id"] == current_round]
+        current_rows = [r for r in latest.values()
+                        if r.get("round_id") == current_round
+                        and r.get("head_sha") == state.get("head_sha")]
+
+        def verified_evidence_row(row, head_sha, round_id):
+            if (not isinstance(row, dict)
+                    or row.get("head_sha") != head_sha
+                    or row.get("round_id") != round_id
+                    or not isinstance(head_sha, str)
+                    or not isinstance(round_id, str)
+                    or re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id) is None
+                    or row.get("actor_verified") is not True):
+                return False
+            if row.get("status") == "text":
+                source_id = row.get("source_comment_id")
+                digest = row.get("sha256")
+                return (type(source_id) is int and source_id > 0
+                        and isinstance(digest, str)
+                        and re.fullmatch(r"[0-9a-f]{64}", digest) is not None)
+            if row.get("status") != "ready":
+                return False
+            digest = row.get("sha256")
+            source_id = row.get("source_comment_id")
+            if source_id is not None and (type(source_id) is not int or source_id <= 0):
+                return False
+            if (not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+                return False
+            try:
+                from .evidence_store import build_attachment_key
+                expected_key = build_attachment_key(
+                    repo, pr_number, head_sha, round_id, row.get("attachment_id", ""),
+                    row.get("created_at", ""), row.get("filename", ""),
+                )
+            except (ValueError, TypeError, AttributeError):
+                return False
+            return row.get("object_key") == expected_key
+
+        confirmed_current = any(
+            verified_evidence_row(row, state.get("head_sha"), current_round)
+            for row in current_rows
+        )
+        if state.get("status") == "testing":
+            component_ids = {c.get("component_id") for c in state.get("components", [])
+                             if isinstance(c, dict) and c.get("component_id")}
+            deployed_ids = _component_id_set(state.get("deployments", []))
+            deployments_complete = bool(component_ids) and component_ids.issubset(deployed_ids)
+            workflow = comments_mod._workflow_lines(
+                "testing", evidence_complete=confirmed_current,
+                deployments_complete=deployments_complete,
+                record_test_complete=(
+                    state.get("test_result") in {"pass", "fail"}
+                    and state.get("command", {}).get("kind") == "record_test"
+                    and state.get("command", {}).get("phase") == "completed"
+                    and state.get("command", {}).get("args", {}).get("result")
+                    == state.get("test_result")
+                ),
+            )
+            visible = self._replace_markdown_section(
+                visible, "### Workflow", workflow, "### Next action",
+            )
+            visible = self._replace_markdown_section(
+                visible, "### Next action",
+                comments_mod._testing_next_action(confirmed_current),
+                "### Current Deployment",
+            )
         # Presentation flags are deliberately ephemeral. Hidden state has a
         # strict schema and must never learn about browser feature config.
         render_state = copy.deepcopy(state)
@@ -3478,6 +3649,7 @@ class DeployController:
             enabled=bool(backend_ready),
             pr_state=(pr.get("state") if backend_ready else "closed"),
             merged=(bool(pr.get("merged")) if backend_ready else False),
+            attachments=current_rows,
         )
         bundles = []
         seen_rounds = set()
@@ -3488,15 +3660,37 @@ class DeployController:
             for row in rows:
                 item = copy.deepcopy(row)
                 attachment_id = item.get("attachment_id")
-                if isinstance(attachment_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id):
+                valid_row = (
+                    item.get("head_sha") == head_sha
+                    and item.get("round_id") == round_id
+                    and item.get("actor_verified") is True
+                    and item.get("status") == "ready"
+                    and isinstance(item.get("sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")) is not None
+                )
+                if valid_row:
+                    try:
+                        from .evidence_store import build_attachment_key
+                        expected_key = build_attachment_key(
+                            repo, pr_number, head_sha, round_id, attachment_id,
+                            item.get("created_at", ""), item.get("filename", ""),
+                        )
+                    except (ValueError, TypeError, AttributeError):
+                        valid_row = False
+                    else:
+                        valid_row = item.get("object_key") == expected_key
+                if (valid_row and isinstance(attachment_id, str)
+                        and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id)):
                     item["download_capability"] = issue_capability(
                         self.config, repo, pr_number, head_sha, round_id,
                         purpose=DOWNLOAD_PURPOSE, resource="attachment:" + attachment_id,
                     )
+                else:
+                    item.pop("download_capability", None)
                 bound.append(item)
             return bound
 
-        if browser_upload_ready:
+        if backend_ready:
             render_state["capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="page",
@@ -3505,14 +3699,15 @@ class DeployController:
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
             )
-        if browser_upload_ready:
+        if backend_ready:
             current_rows = bind_download_capabilities(current_rows, state["head_sha"], current_round)
+            render_state["attachments"] = current_rows
         for archive in reversed(archives):
             if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
                 continue
             seen_rounds.add(archive["round_id"])
             snapshot = copy.deepcopy(archive["snapshot"])
-            if browser_upload_ready:
+            if backend_ready:
                 snapshot["log_capability"] = issue_capability(
                     self.config, repo, pr_number, snapshot["head_sha"], archive["round_id"],
                     purpose=DOWNLOAD_PURPOSE, resource="log:" + archive["round_id"],
@@ -3521,7 +3716,7 @@ class DeployController:
             snapshot_attachments = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
             snapshot["attachments"] = (bind_download_capabilities(
                 snapshot_attachments, snapshot["head_sha"], archive["round_id"],
-            ) if browser_upload_ready else snapshot_attachments)
+            ) if backend_ready else snapshot_attachments)
             bundles.append({**archive, "snapshot": snapshot})
             if len(bundles) == 3:
                 break
@@ -4718,10 +4913,17 @@ class DeployController:
             deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
         )
         if state["status"] == "testing":
+            required_component_ids = {
+                c.get("component_id") for c in state.get("components", [])
+                if isinstance(c, dict) and c.get("component_id")
+            }
             markdown = comments_mod.testing(
                 repo, pr_number, current_head, case_result="",
                 deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
                 components=state.get("components", []),
+                deployments_complete=(bool(required_component_ids)
+                                      and required_component_ids.issubset(
+                                          _component_id_set(state.get("deployments", [])))),
             )
         event = {
             "event": "Restart recovery: evidence refreshed",
@@ -4967,6 +5169,11 @@ class DeployController:
             return await self.handle_deploy_help(
                 repo, pr_number, comment_id,
                 topic=cmd.help_topic,
+            )
+
+        if cmd.kind == "evidence_link":
+            return await self.handle_evidence_link(
+                repo, pr_number, comment_id, author_login, author_id,
             )
 
         if cmd.kind in {"submit_evidence", "remove_evidence"}:

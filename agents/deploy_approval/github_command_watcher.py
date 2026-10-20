@@ -20,7 +20,6 @@ Safety rules:
 from __future__ import annotations
 
 import asyncio
-import copy
 import time
 import logging
 from datetime import datetime, timezone
@@ -71,6 +70,15 @@ def _needs_initial_comment_baseline(state: dict | None) -> bool:
     return True
 
 
+def _top_level_command(text: str, name: str) -> str:
+    """Return a recognized top-level special command line, if present."""
+    expected = "/" + name
+    for line in commands_mod._iter_top_level_command_lines(text or ""):
+        if line.split(None, 1)[0].lower() == expected:
+            return line
+    return ""
+
+
 class GitHubCommandWatcher:
     """Polls PR comments using `POLL_INTERVAL_SECONDS` and dispatches commands.
 
@@ -112,11 +120,6 @@ class GitHubCommandWatcher:
         self._repo_poll_cursor = 0
         self._pr_scan_cursor: dict[str, int] = {}
         self._recent_pr_cursor: dict[str, int] = {}
-        # Startup alone may resume unfinished evidence finalization. Auth
-        # reactivation never grants replay authority to historical commands.
-        self._startup_recovery_repos: set[str] = set()
-        self._recovery_comments: dict[tuple[str, int], dict] = {}
-        self._recovery_states: dict[tuple[str, int], dict] = {}
 
     def start(self) -> None:
         if self._running:
@@ -140,10 +143,6 @@ class GitHubCommandWatcher:
             self._pending_baseline_repos.add(repo)
             self._baseline_progress[repo] = set()
             self._repo_baseline_cutoff_utc[repo] = cutoff_utc
-            if startup:
-                self._startup_recovery_repos.add(repo)
-            else:
-                self._startup_recovery_repos.discard(repo)
 
     async def stop(self) -> None:
         self._running = False
@@ -288,13 +287,14 @@ class GitHubCommandWatcher:
                 key=lambda item: str(item[1].get("updated_at") or ""),
                 reverse=True,
             )[:12]
-            recent_start = self._recent_pr_cursor.get(repo, 0) % len(recent_pool) if recent_pool else 0
-            recent_order = recent_pool[recent_start:] + recent_pool[:recent_start]
-            fast_lane = recent_order[:fast_lane_size]
-            if recent_pool:
-                self._recent_pr_cursor[repo] = (
-                    recent_start + len(fast_lane)
-                ) % len(recent_pool)
+            if len(recent_pool) > 1:
+                rotating_recent = recent_pool[1:]
+                recent_start = self._recent_pr_cursor.get(repo, 0) % len(rotating_recent)
+                recent_order = rotating_recent[recent_start:] + rotating_recent[:recent_start]
+                fast_lane = [recent_pool[0], *recent_order[:fast_lane_size - 1]]
+                self._recent_pr_cursor[repo] = (recent_start + 1) % len(rotating_recent)
+            else:
+                fast_lane = list(recent_pool)
             selected_numbers = [number for number, _ in fast_lane]
             selected_set = set(selected_numbers)
 
@@ -346,6 +346,23 @@ class GitHubCommandWatcher:
                     # A failed PR consumes only its own slot; later selected
                     # PRs still get their serial attempt this cycle.
                     logger.error("watcher process %s#%s: %s", repo, pr_number, e)
+                try:
+                    current_pr = None
+                    if (self.config.auth_valid and repo in self.config.active_repos
+                            and repo in self.config.github_repos):
+                        current_pr = await self.proxy.get_pr(repo, pr_number)
+                    if (isinstance(current_pr, dict)
+                            and current_pr.get("state") == "open"
+                            and not current_pr.get("merged")
+                            and not current_pr.get("draft")):
+                        await self.proxy.ensure_visible_evidence_archive_comments(
+                            repo, pr_number, limit=2,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "watcher evidence archive visibility %s#%s: %s",
+                        repo, pr_number, type(e).__name__,
+                    )
                 if pr_number in ordinary_cursor_after:
                     self._pr_scan_cursor[repo] = ordinary_cursor_after[pr_number]
             # Baselining uses per-PR progress tracking: only discard from
@@ -361,7 +378,6 @@ class GitHubCommandWatcher:
                 )
                 if all_baselined:
                     self._pending_baseline_repos.discard(repo)
-                    self._startup_recovery_repos.discard(repo)
             remaining = (
                 sum(n not in self._baseline_progress.get(repo, set()) for n in open_pr_numbers)
                 if repo in self._pending_baseline_repos else 0
@@ -374,21 +390,21 @@ class GitHubCommandWatcher:
             self._repo_poll_cursor = (repo_start + 1) % len(repos)
 
     async def _baseline_pr(self, repo: str, pr_number: int) -> bool:
-        """Baseline old commands, allowing only guarded startup record_test recovery.
+        """Baseline old commands without replaying historical business commands.
 
         Used on first observation AND when a repo is newly (re)activated by an
         authorization refresh: the cursor is advanced to the maximum comment
         id observed on GitHub so preexisting comments never execute as fresh
-        approvals.  Commands posted AFTER the baseline persist are processed
-        normally by subsequent cycles. An unfinished record_test in testing is
-        resumed only at startup through the Controller's validation path; a
-        failed or ambiguous recovery blocks baseline cursor advancement.
+        approvals. Commands posted AFTER the baseline persist are processed
+        normally by subsequent cycles. Historical commands are never replayed.
 
         For PRs that already have a baselined cursor (existing lifecycle state
         from a previous authorized period), advance the cursor to the maximum
         observed comment id using ``persist_cursor`` so that any commands
         posted while the repo was unauthorized are skipped on reactivation.
         """
+        from .evidence_models import EvidenceError, round_id_for_state
+
         initial_state = await self.proxy.read_hidden_state(repo, pr_number)
         expected_state = initial_state
 
@@ -478,7 +494,6 @@ class GitHubCommandWatcher:
                 logger.warning("watcher baseline cutoff missing %s#%s — fail closed", repo, pr_number)
                 return False
             baseline_id = old_cursor
-            historical_comment_ids: set[int] = set()
             try:
                 ordered_comments = sorted(comments, key=lambda c: c["id"])
                 for comment in ordered_comments:
@@ -501,51 +516,136 @@ class GitHubCommandWatcher:
                     if created_utc.astimezone(timezone.utc) > cutoff.astimezone(timezone.utc):
                         break
                     baseline_id = cid
-                    historical_comment_ids.add(cid)
             except (TypeError, KeyError):
                 return False
-            key = (repo, pr_number)
-            if key in self._recovery_states and initial_state.get("status") == "testing":
-                if initial_state != self._recovery_states[key]:
-                    return False
-                # Deleted/edited-away commands cannot silently become consumed.
-                if self._recovery_comments[key] not in comments:
-                    return False
-            if initial_state.get("status") == "testing":
-                pending_commands = sorted(
-                    (c for c in comments
-                     if isinstance(c.get("id"), int) and not isinstance(c["id"], bool)
-                     and c["id"] > old_cursor
-                     and c["id"] in historical_comment_ids
-                     and commands_mod.parse_command(c.get("body", "") or "").is_command),
-                    key=lambda c: c["id"],
-                )
-                pending_tests = [c for c in pending_commands
-                                 if commands_mod.parse_command(c.get("body", "")).kind == "record_test"]
-                if pending_tests:
-                    candidate = pending_tests[0]
-                    snapshot = self._recovery_comments.setdefault(key, copy.deepcopy(candidate))
-                    self._recovery_states.setdefault(key, copy.deepcopy(initial_state))
-                    # An intervening mutation, edit, HEAD drift, or auth outage
-                    # blocks recovery; never consume the unfinished test cursor.
-                    if (repo not in self._startup_recovery_repos
-                            or not self.config.auth_valid
-                            or repo not in self.config.active_repos
-                            or pr_info.get("merged")
-                            or pr_info.get("head", {}).get("sha") != initial_state.get("head_sha")
-                            or candidate != snapshot
-                            or not candidate.get("created_at")
-                            or candidate.get("updated_at") != candidate.get("created_at")
-                            or any(commands_mod.parse_command(c.get("body", "")).kind
-                                   in ("request_deploy", "approve_deploy")
-                                   for c in pending_commands if c["id"] < candidate["id"])):
-                        logger.warning("record_test restart recovery blocked %s#%s", repo, pr_number)
-                        return False
-                    if not await self.controller.resume_record_test(
-                        repo, pr_number, initial_state, snapshot,
-                    ):
-                        return False
 
+            # A restart/authorization baseline must not jump over unarchived
+            # evidence from the active testing round. Recover only ordinary
+            # comments newer than round_started_at; command comments remain
+            # governed by the baseline and are never dispatched here.
+            if initial_state.get("status") == "testing":
+                head_sha = initial_state.get("head_sha")
+                try:
+                    round_id = round_id_for_state(initial_state)
+                    round_started_at = initial_state.get("round_started_at")
+                    round_started = datetime.fromisoformat(
+                        str(round_started_at).replace("Z", "+00:00")
+                    )
+                    if (round_started.tzinfo is None
+                            or not isinstance(head_sha, str)
+                            or len(head_sha) != 40):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    logger.warning("watcher evidence baseline context invalid %s#%s", repo, pr_number)
+                    return False
+                pr_head = (pr_info.get("head") or {}).get("sha")
+                if (pr_info.get("state") != "open" or pr_info.get("merged")
+                        or pr_info.get("draft") or pr_head != head_sha):
+                    return False
+                evidence_service = getattr(self.controller, "evidence_service", None)
+                for candidate in ordered_comments:
+                    comment_id = candidate.get("id")
+                    if comment_id <= old_cursor:
+                        continue
+                    body = candidate.get("body", "")
+                    if (not isinstance(body, str) or not body.strip()
+                            or commands_mod.command_starts_line_any(body)
+                            or _top_level_command(body, "authorize_evidence")
+                            or _top_level_command(body, "submit_cos_evidence")):
+                        continue
+                    try:
+                        created = datetime.fromisoformat(
+                            str(candidate.get("created_at", "")).replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                    if created.tzinfo is None or created <= round_started:
+                        continue
+                    if evidence_service is None:
+                        return False
+                    try:
+                        fresh_comment = await self.proxy.get_comment(repo, comment_id)
+                    except Exception as e:
+                        logger.warning(
+                            "watcher evidence recovery comment %s#%s #%s: %s",
+                            repo, pr_number, comment_id, type(e).__name__,
+                        )
+                        return False
+                    if (not isinstance(fresh_comment, dict)
+                            or fresh_comment.get("id") != comment_id):
+                        return False
+                    if self.proxy.is_bot_comment(fresh_comment):
+                        continue
+                    fresh_body = fresh_comment.get("body", "")
+                    if (not isinstance(fresh_body, str) or not fresh_body.strip()
+                            or commands_mod.command_starts_line_any(fresh_body)
+                            or _top_level_command(fresh_body, "authorize_evidence")
+                            or _top_level_command(fresh_body, "submit_cos_evidence")):
+                        continue
+                    try:
+                        fresh_created = datetime.fromisoformat(
+                            str(fresh_comment.get("created_at", "")).replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        return False
+                    if (fresh_created.tzinfo is None or fresh_created <= round_started
+                            or fresh_comment.get("created_at") != candidate.get("created_at")):
+                        return False
+                    if (not self.config.auth_valid or repo not in self.config.active_repos
+                            or repo not in self.config.github_repos):
+                        return False
+                    try:
+                        current_pr = await self.proxy.get_pr(repo, pr_number)
+                        current_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    except Exception as e:
+                        logger.warning(
+                            "watcher evidence recovery state %s#%s: %s",
+                            repo, pr_number, type(e).__name__,
+                        )
+                        return False
+                    if (not isinstance(current_pr, dict) or current_pr.get("state") != "open"
+                            or current_pr.get("merged") or current_pr.get("draft")
+                            or (current_pr.get("head") or {}).get("sha") != head_sha
+                            or not isinstance(current_state, dict)
+                            or current_state.get("status") != "testing"
+                            or current_state.get("head_sha") != head_sha):
+                        return False
+                    try:
+                        if round_id_for_state(current_state) != round_id:
+                            return False
+                    except ValueError:
+                        return False
+                    user = fresh_comment.get("user", {})
+                    actor_id = user.get("id") if isinstance(user, dict) else None
+                    actor_login = user.get("login") if isinstance(user, dict) else None
+                    if (isinstance(actor_id, bool) or not str(actor_id or "").isdigit()
+                            or not isinstance(actor_login, str) or not actor_login.strip()):
+                        return False
+                    try:
+                        await evidence_service.handle_native_comment(
+                            repo=repo, pr_number=pr_number, comment_id=comment_id,
+                            actor_id=int(actor_id), actor_login=actor_login,
+                            action="submit_evidence", arguments={}, automatic=True,
+                        )
+                    except EvidenceError as e:
+                        if (e.status_code in {400, 403, 404, 410, 413}
+                                and e.code not in {"app_access_revoked", "repository_not_authorized"}):
+                            logger.info(
+                                "watcher evidence recovery skipped %s#%s comment=%s reason=%s",
+                                repo, pr_number, comment_id, e.code,
+                            )
+                            continue
+                        logger.warning(
+                            "watcher evidence recovery retry %s#%s comment=%s reason=%s",
+                            repo, pr_number, comment_id, e.code,
+                        )
+                        return False
+                    except Exception as e:
+                        logger.warning(
+                            "watcher evidence recovery retry %s#%s comment=%s error=%s",
+                            repo, pr_number, comment_id, type(e).__name__,
+                        )
+                        return False
         # Revalidate the PR, authorization generation, and lifecycle identity
         # after all reads/recovery work and immediately before cursor mutation.
         if (not self.config.auth_valid or repo not in self.config.active_repos
@@ -737,6 +837,8 @@ class GitHubCommandWatcher:
             if isinstance(c.get("id"), int) and not isinstance(c.get("id"), bool) and c["id"] > cursor
         ]
         new_comments.sort(key=lambda c: c["id"])
+        native_comment_budget = 3
+        native_comments_processed = 0
 
         for c in new_comments:
             comment_id = c["id"]
@@ -780,8 +882,21 @@ class GitHubCommandWatcher:
                     ) or state
                 continue
 
+            if _top_level_command(fresh_body, "authorize_evidence"):
+                # This comment proves browser identity; it is not test evidence.
+                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                continue
+
+            if _top_level_command(fresh_body, "submit_cos_evidence"):
+                # Retire the former COS receipt command without treating its
+                # payload as evidence or sending it to a second writer.
+                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                continue
+
             if not commands_mod.command_starts_line_any(fresh_body):
                 if state.get("status") == "testing":
+                    if native_comments_processed >= native_comment_budget:
+                        return
                     if (not self.config.auth_valid or repo not in self.config.active_repos
                             or repo not in self.config.github_repos):
                         return
@@ -799,6 +914,12 @@ class GitHubCommandWatcher:
                         if pr_head != state.get("head_sha"):
                             return
                         evidence_service = getattr(self.controller, "evidence_service", None)
+                        if evidence_service is None:
+                            logger.warning(
+                                "watcher native evidence unavailable %s#%s comment=%s",
+                                repo, pr_number, comment_id,
+                            )
+                            return
                         user = fresh_comment_obj.get("user", {})
                         actor_id = user.get("id") if isinstance(user, dict) else None
                         actor_login = user.get("login") if isinstance(user, dict) else None
@@ -812,41 +933,50 @@ class GitHubCommandWatcher:
                             if state.get("head_sha"):
                                 await self._consume_comment_cursor(repo, pr_number, comment_id)
                             return
-                        if evidence_service is not None:
-                            try:
-                                await evidence_service.handle_native_comment(
-                                    repo=repo, pr_number=pr_number, comment_id=comment_id,
-                                    actor_id=int(actor_id), actor_login=actor_login,
-                                    action="submit_evidence", arguments={}, automatic=True,
-                                )
-                            except EvidenceError as e:
-                                terminal_skip = (
-                                    e.status_code in {400, 401, 403, 404, 409, 410, 413}
-                                    and e.code not in {
-                                        "attachment_retry_conflict", "comment_unavailable",
-                                        "object_not_verified",
-                                    }
-                                )
-                                if terminal_skip:
-                                    logger.info(
-                                        "watcher native evidence skipped %s#%s comment=%s reason=%s",
-                                        repo, pr_number, comment_id, e.code,
-                                    )
-                                    await self._consume_comment_cursor(repo, pr_number, comment_id)
-                                    return
-                                logger.warning(
-                                    "watcher native evidence retry %s#%s comment=%s reason=%s",
+                        try:
+                            await evidence_service.handle_native_comment(
+                                repo=repo, pr_number=pr_number, comment_id=comment_id,
+                                actor_id=int(actor_id), actor_login=actor_login,
+                                action="submit_evidence", arguments={}, automatic=True,
+                            )
+                        except EvidenceError as e:
+                            terminal_skip = (
+                                e.status_code in {400, 401, 403, 404, 409, 410, 413}
+                                and e.code not in {
+                                    "attachment_retry_conflict", "comment_unavailable",
+                                    "object_not_verified",
+                                }
+                            )
+                            if terminal_skip:
+                                logger.info(
+                                    "watcher native evidence skipped %s#%s comment=%s reason=%s",
                                     repo, pr_number, comment_id, e.code,
                                 )
+                                await self._consume_comment_cursor(repo, pr_number, comment_id)
                                 return
-                            except Exception as e:
-                                logger.warning(
-                                    "watcher native evidence retry %s#%s comment=%s error=%s",
-                                    repo, pr_number, comment_id, type(e).__name__,
-                                )
-                                return
-                            await self._consume_comment_cursor(repo, pr_number, comment_id)
+                            logger.warning(
+                                "watcher native evidence retry %s#%s comment=%s reason=%s",
+                                repo, pr_number, comment_id, e.code,
+                            )
                             return
+                        except Exception as e:
+                            logger.warning(
+                                "watcher native evidence retry %s#%s comment=%s error=%s",
+                                repo, pr_number, comment_id, type(e).__name__,
+                            )
+                            return
+                        await self._consume_comment_cursor(repo, pr_number, comment_id)
+                        try:
+                            state = await self.proxy.read_hidden_state(repo, pr_number)
+                        except Exception:
+                            return
+                        cursor_after = (state.get("last_processed_comment_id", 0)
+                                        if isinstance(state, dict) else 0)
+                        if (not isinstance(cursor_after, int) or isinstance(cursor_after, bool)
+                                or cursor_after < comment_id):
+                            return
+                        native_comments_processed += 1
+                        continue
                 # Non-command comment — use cursor-only persistence
                 if state.get("head_sha"):
                     state = await self.proxy.persist_cursor(
@@ -861,6 +991,12 @@ class GitHubCommandWatcher:
                         repo, pr_number, comment_id,
                     ) or state
                 continue
+
+            # Keep the existing one-business-action-per-PR-cycle behavior:
+            # comments after this cycle's recovered evidence wait for the next
+            # poll before command dispatch.
+            if native_comments_processed:
+                return
 
             cutoff = self._repo_baseline_cutoff_utc.get(repo)
             created_at = fresh_comment_obj.get("created_at")
