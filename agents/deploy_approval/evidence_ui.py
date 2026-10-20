@@ -229,7 +229,7 @@ _JAVASCRIPT = r'''"use strict";
           "/download?cap=" + encodeURIComponent(item.download_capability)));
       } else if (!deleted && item.status === "ready" && attachmentId && item.object_key) {
         const hint = document.createElement("span");
-        hint.textContent = " · 可通过 PR 评论 /evidence_link id=" + attachmentId + " 获取 COS 下载链接";
+        hint.textContent = " · 下载链接暂不可用";
         li.append(hint);
       }
       const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&

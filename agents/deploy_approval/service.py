@@ -2402,8 +2402,7 @@ class DeployController:
                     )
                 return await reply(
                     f"[Download COS attachment: {comments_mod._escape(attachment.get('filename', 'file'))}]({url})\n\n"
-                    f"COS re-verification succeeded. This signed link is valid for up to {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds; "
-                    "post a new `/evidence_link id=<attachment_id>` after expiry.",
+                    f"COS re-verification succeeded. This signed link is valid for up to {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds.",
                     original,
                 )
             metadata = state.get("cos", {}) or {}
@@ -2424,8 +2423,7 @@ class DeployController:
                 return False
             return await reply(
                 f"[Download COS evidence]({url})\n\n"
-                f"Valid for up to {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds from issuance. "
-                "Post a new `/evidence_link` after expiry. Open PRs only.",
+                f"Valid for up to {EVIDENCE_PRESIGNED_URL_TTL_SECONDS} seconds from issuance. Open PRs only.",
                 original,
             )
         except PolicyError:
@@ -3760,18 +3758,12 @@ class DeployController:
                 return
             object_key = metadata["object_key"]
             filename = object_key.rsplit("/", 1)[-1]
-            cached = cached_cos_urls.get(object_key)
-            now = int(time.time())
-            # A log is exposed only after the existing COS HEAD/GET verification
-            # confirms its stored size and SHA256 against the round metadata.
-            if not await self.cos.verify_upload(object_key, metadata["sha256"], metadata["size"]):
-                target.pop("cos_log_download_url", None)
-                return
+            # Lifecycle COS metadata is persisted only after the existing
+            # upload verification. Reuse or sign a URL from that trusted record
+            # without downloading historical logs again on every projection.
             url = await stable_cos_url(object_key, filename)
             if url:
                 target["cos_log_download_url"] = url
-            elif cached and cached[0] > now:
-                target["cos_log_download_url"] = cached[1]
             else:
                 target.pop("cos_log_download_url", None)
 

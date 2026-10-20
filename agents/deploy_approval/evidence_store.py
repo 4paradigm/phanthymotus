@@ -169,7 +169,10 @@ class CosAttachmentStore:
             if not time_match or query['q-key-time'] != query['q-sign-time']:
                 return None
             start, expiry = map(int, time_match.groups())
-            if expiry <= start or expiry - start != EVIDENCE_PRESIGNED_URL_TTL_SECONDS:
+            signed_lifetime = expiry - start
+            if (expiry <= start
+                    or not EVIDENCE_PRESIGNED_URL_TTL_SECONDS <= signed_lifetime
+                    <= EVIDENCE_PRESIGNED_URL_TTL_SECONDS + 120):
                 return None
             signed_params = {part.lower() for part in query['q-url-param-list'].split(';') if part}
             if 'response-content-disposition' not in signed_params:

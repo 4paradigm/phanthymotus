@@ -203,7 +203,7 @@ def _cos_evidence_block(
     if (safe_url and isinstance(sha256, str)
             and re.fullmatch(r"[0-9a-f]{64}", sha256)
             and isinstance(size, int) and not isinstance(size, bool) and size > 0):
-        lines.append(f"[Download verified COS archive (365-day link)](<{safe_url}>)")
+        lines.append(f"[Download verified COS archive](<{safe_url}>)")
     return lines
 
 
@@ -870,7 +870,7 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/record_test result=pass|fail [summary=\"...\"]` \u2014 Record overall test result",
         "",
         "**Read-only commands:**",
-        "- `/evidence_link` \u2014 Request a short-lived evidence download link (open PRs only)",
+        "- Verified COS evidence is available from the download links in this PR Summary.",
         "- `/deploy_status` \u2014 Show deployment status",
         "- `/deploy_help [topic]` \u2014 Show this help",
         "",
@@ -1103,18 +1103,15 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 cells[8] = str(cells[8]) + " · replaces " + str(item["replaces_id"])
             if deleted:
                 cells[8] = str(cells[8]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
-            attachment_id = item.get("attachment_id")
             cos_download = _safe_download_url(item.get("cos_download_url", "")) if cos_verified else ""
             if status == "text":
                 download_cell = "Text note (no file)"
             elif cos_verified and cos_download:
-                download_cell = f"[下载 COS 文件（365 天有效）](<{cos_download}>)"
-            elif cos_verified and attachment_id:
-                fallback = ("可在 PR 评论中发送 "
-                            f"`/evidence_link id={_escape(attachment_id)}` 获取 COS 下载链接")
-                download_cell = (f"[GitHub 原始附件](<{native_url}>) · COS 已验证归档；{fallback}"
+                download_cell = f"[下载 COS 文件](<{cos_download}>)"
+            elif cos_verified:
+                download_cell = (f"[GitHub 原始附件](<{native_url}>) · COS 已验证归档；下载链接当前暂不可用。"
                                  if native_url else
-                                 "COS 已验证归档；当前直接下载链接暂不可用；" + fallback)
+                                 "COS 已验证归档；下载链接当前暂不可用。")
             elif native_url:
                 download_cell = f"[GitHub 原始附件](<{native_url}>)"
             else:
@@ -1169,7 +1166,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             f"绑定：HEAD `{_escape(head)}` · round `{_escape(current_round)}`。",
             "在页面选择视频、图片、文档或其他文件，也可提交纯文本说明；所有文件都通过本机隧道直接上传到私有 COS。",
             f"状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。只有归档后再执行 `/record_test result=pass|fail`。",
-            "已验证归档的附件可直接使用 Summary 中的 COS 下载链接；没有可用直链时，可发送 `/evidence_link id=<attachment_id>` 获取下载链接。",
+            "已验证归档的附件可直接使用 Summary 中的 COS 下载链接。",
         ])
     if state.get("evidence_enabled") is True and state.get("browser_upload_ready") is not True:
         readiness = (state.get("evidence_readiness") or {}).get("status")
