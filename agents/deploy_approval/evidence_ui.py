@@ -30,24 +30,20 @@ pre,code{{overflow-wrap:anywhere;white-space:pre-wrap}}li{{padding:.6rem 0;borde
 <body><h1>部署验证附件</h1>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}">
 <p>项目 <strong>{esc(repo)}</strong> · PR #{esc(pr_number)}<br>HEAD <code>{esc(head_sha)}</code><br>round <code>{esc(round_id)}</code></p>
-<section id="authorization"><h2>授权上传</h2>
-<p>浏览器生成一次性随机密钥并只保存在当前标签页会话中。将显示的命令作为独立评论亲自发送到当前 PR Conversation；评论会公开 proof，但不会公开密钥。</p>
-<button id="make-proof" type="button">生成授权命令</button>
-<button id="verify-proof" type="button" disabled>验证我已发送的评论</button>
-<pre id="proof-command" aria-live="polite"></pre>
-<p>请不要转发或公开浏览器密钥。HEAD 或 round 改变后必须重新授权。</p></section>
+<section id="authorization"><h2>授权状态</h2>
+<p>请先运行 Mac 启动器建立 SSH 隧道并通过它打开本页。页面会自动校验启动器提供的一次性 proof 和当前 GitHub 用户身份。</p>
+<p>proof 只保存在当前标签页的 sessionStorage，不会写入 localStorage 或显示在页面中。</p></section>
 <p id="auth">正在检查当前 PR/HEAD/round capability。</p>
 <p id="message" role="status" aria-live="polite"></p><button id="refresh" type="button">刷新状态</button>
 <section><h2>当前轮</h2><p id="summary">等待服务端状态</p>
 <fieldset id="writes" disabled hidden><legend>上传与备注</legend>
-<label>文件（支持视频和普通文件）<input id="file" type="file"></label>
+<label>文件（每个文件最大 512 MiB，可多选）<input id="file" type="file" multiple></label>
 <label>备注<textarea id="note" maxlength="10000"></textarea></label>
 <label>替换当前轮附件<select id="replace"><option value="">新增附件</option></select></label>
-<button id="upload" type="button">上传 / 继续</button><button id="pause" type="button" disabled>暂停</button>
-<button id="retry" type="button" disabled>重试</button><button id="resubmit" type="button" disabled>重新提交完成请求</button>
+<button id="upload" type="button">上传到 COS</button>
 <label>文本证据<textarea id="text" maxlength="50000"></textarea></label>
 <button id="save-note" type="button">提交文本与备注</button>
-</fieldset><progress id="progress" value="0" max="100" aria-label="上传进度"></progress><p id="progress-label">尚未上传</p>
+</fieldset><ul id="queue" aria-live="polite"></ul>
 <ul id="attachments"></ul></section>
 <section><h2>历史轮次（只读）</h2><div id="history"></div></section>
 </main></body></html>'''
@@ -66,97 +62,153 @@ _JAVASCRIPT = r'''"use strict";
   const bound = {head_sha: app.dataset.head, round_id: app.dataset.round};
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const proofKey = "evidence-proof:" + api + ":" + bound.head_sha + ":" + bound.round_id;
-  const active = new Set();
-  let context = null, stopped = false, paused = true, busy = false;
-  let session = null, chosen = null, fingerprint = "", completeUnknown = false, pollGeneration = 0;
-  let proofSecret = "";
+  const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024;
+  const active = new Set(), jobs = [];
+  let context = null, stopped = false, busy = false, proofSecret = "", savedUploads = {};
   let noteOperation = null;
+  const fragment = new URLSearchParams(window.location.hash.slice(1));
+  const incomingProof = fragment.get("proof");
+  if (window.location.hash) history.replaceState(history.state, "", window.location.pathname + window.location.search);
+  try {
+    if (incomingProof !== null) {
+      if (/^[0-9a-f]{64}$/.test(incomingProof)) {
+        sessionStorage.setItem(proofKey, incomingProof);
+        proofSecret = incomingProof;
+      } else sessionStorage.removeItem(proofKey);
+    } else {
+      const stored = sessionStorage.getItem(proofKey) || "";
+      if (/^[0-9a-f]{64}$/.test(stored)) proofSecret = stored;
+      else sessionStorage.removeItem(proofKey);
+    }
+  } catch (_) { proofSecret = ""; }
   const message = text => { $("message").textContent = String(text); };
   const id = value => {
     if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("服务端返回了无效标识符");
     return encodeURIComponent(value);
   };
   const uid = () => crypto.randomUUID();
-  const randomHex = (size = 32) => {
-    const bytes = crypto.getRandomValues(new Uint8Array(size));
-    return [...bytes].map(value => value.toString(16).padStart(2, "0")).join("");
-  };
+  const randomHex = (size = 32) => [...crypto.getRandomValues(new Uint8Array(size))]
+    .map(value => value.toString(16).padStart(2, "0")).join("");
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const roundMatches = value => value && value.head_sha === bound.head_sha && value.round_id === bound.round_id;
+  function proofTransportAllowed(target) {
+    if (target.origin !== window.location.origin) return false;
+    if (window.location.protocol === "https:") return target.protocol === "https:";
+    return window.location.origin === "http://127.0.0.1:25001" && target.origin === window.location.origin;
+  }
   function writable() {
     return context && roundMatches(context) && context.enabled !== false && context.evidence_enabled !== false &&
       context.authenticated === true && context.can_write === true && context.status === "testing" &&
       context.actor_verified === true && context.github_user_authenticated === true && !!proofSecret &&
-      context.readiness && context.readiness.BROWSER_UPLOAD_READY === true &&
+      context.readiness && context.readiness.COS_READY === true &&
+      context.readiness.EVIDENCE_BACKEND_READY === true &&
+      (context.readiness.BROWSER_UPLOAD_READY === true || context.readiness.LOCAL_SSH_TUNNEL_READY === true) &&
       (context.pr_state === undefined || context.pr_state === "open") && !context.merged && !stopped;
   }
   function permissionMessage() {
-    if (!context.authenticated) return "Evidence capability 无效或已过期；请从当前 PR Summary 的 View Evidence 链接重新打开。";
+    if (!context || context.authenticated !== true) return "正在验证启动器提供的 proof 与 GitHub 用户身份。";
     if (context.enabled === false || context.evidence_enabled === false) return "Evidence 功能当前未启用。";
-    if (context.readiness && context.readiness.status === "PUBLIC_INGRESS_PENDING") return "PUBLIC_INGRESS_PENDING：等待可信 HTTPS 入口配置；不会通过 HTTP 发送授权密钥。";
-    if (context.readiness && context.readiness.BROWSER_UPLOAD_READY !== true) return "Evidence 后端尚未就绪，当前只读。";
-    if (context.pr_state && context.pr_state !== "open" || context.merged) return "PR 已关闭或已合并，当前证据只读。";
-    if (context.head_sha !== bound.head_sha || context.round_id !== bound.round_id) return "HEAD 或 round 已变化；本页面绑定历史轮次，只读。";
-    if (context.status !== "testing") return `当前状态为 ${context.status || "unknown"}；仅 testing 阶段允许写入。`;
-    if (context.github_user_authenticated !== true || context.actor_verified !== true) return "请先在当前 PR Conversation 发送页面生成的授权命令，再验证评论。";
-    if (context.can_write !== true) return "当前 capability 没有本轮写入权限。";
-    return "当前轮可写。";
+    const local = context.readiness && context.readiness.LOCAL_SSH_TUNNEL_READY === true;
+    if (context.readiness && context.readiness.status === "PUBLIC_INGRESS_PENDING" && !local)
+      return "公网 HTTPS 入口不可用；请运行 Mac 启动器建立本机 SSH 隧道。不会通过普通 HTTP 发送 proof。";
+    if (context.readiness && (context.readiness.COS_READY !== true ||
+        context.readiness.EVIDENCE_BACKEND_READY !== true ||
+        (context.readiness.BROWSER_UPLOAD_READY !== true && !local)))
+      return "Evidence 后端尚未就绪，当前只读。";
+    if ((context.pr_state && context.pr_state !== "open") || context.merged) return "PR 已关闭或已合并，当前证据只读。";
+    if (context.head_sha !== bound.head_sha || context.round_id !== bound.round_id) return "HEAD 或 round 已变化；本页面绑定的历史轮次只读。";
+    if (context.status !== "testing") return "当前状态为 " + (context.status || "unknown") + "；仅 testing 阶段允许写入。";
+    if (context.github_user_authenticated !== true || context.actor_verified !== true)
+      return "GitHub proof 身份尚未验证；请通过 Mac 启动器提供的链接打开本页。";
+    if (context.can_write !== true) return "当前 GitHub 用户没有本轮写入权限。";
+    return "当前 HEAD/round、GitHub 身份及写入权限均已验证。";
   }
   function controls() {
-    $("writes").hidden = !writable();
-    $("writes").disabled = !writable();
-    $("upload").disabled = busy;
-    $("file").disabled = busy;
-    $("note").disabled = busy;
-    $("replace").disabled = busy;
-    $("save-note").disabled = busy;
-    $("pause").disabled = !busy;
-    $("retry").disabled = busy || !session;
-    $("resubmit").disabled = busy || !session || !completeUnknown;
-    for (const button of document.querySelectorAll("button[data-delete]")) button.disabled = busy || !writable();
+    const canWrite = writable();
+    $("writes").hidden = !canWrite; $("writes").disabled = !canWrite;
+    $("upload").disabled = busy || !canWrite; $("file").disabled = busy || !canWrite;
+    $("note").disabled = busy || !canWrite; $("replace").disabled = busy || !canWrite;
+    $("save-note").disabled = busy || !canWrite;
+    for (const button of document.querySelectorAll("button[data-job-action]"))
+      button.disabled = !canWrite || (busy && button.dataset.jobAction !== "pause");
+    for (const button of document.querySelectorAll("button[data-delete]")) button.disabled = busy || !canWrite;
   }
+  function abortRequest(request) { try { request.abort(); } catch (_) {} }
   function halt(text) {
-    stopped = true; paused = true;
-    for (const request of active) request.abort();
+    stopped = true;
+    for (const request of active) abortRequest(request);
     controls(); message(text);
   }
   class ApiError extends Error {
-    constructor(status, text) { super(text); this.status = status; }
+    constructor(status, text, detail = "") { super(text); this.status = status; this.detail = detail; }
   }
-  async function request(path, {method = "GET", body, key} = {}) {
+  function clearProof() {
+    proofSecret = "";
+    try { sessionStorage.removeItem(proofKey); } catch (_) {}
+  }
+  async function request(path, {method = "GET", body, key, job, timeoutMs = 30000} = {}) {
     const write = method !== "GET";
     if (write && !writable()) throw new Error("当前轮不可写，请刷新并核对 HEAD/round。");
-    const controller = new AbortController(); active.add(controller);
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const target = new URL(api + path, window.location.href);
+    if (target.origin !== window.location.origin) throw new Error("拒绝跨站 Evidence 请求。");
+    const headers = {Accept: "application/json"};
+    if (proofSecret && proofTransportAllowed(target)) {
+      headers["X-Evidence-Secret"] = proofSecret;
+      headers["X-Evidence-Nonce"] = randomHex();
+    } else if (write) {
+      throw new Error("只允许 HTTPS 或 http://127.0.0.1:25001 发送 proof；请运行 Mac 启动器。");
+    }
+    if (write) headers["Content-Type"] = "application/json";
+    const controller = new AbortController(); active.add(controller); if (job) job.requests.add(controller);
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const headers = {Accept: "application/json"};
-      if (proofSecret) {
-        if (window.location.protocol !== "https:") throw new Error("授权密钥只会通过 HTTPS 发送；当前页面没有可信 HTTPS 入口。");
-        headers["X-Evidence-Secret"] = proofSecret;
-        headers["X-Evidence-Nonce"] = randomHex();
-      }
-      if (write) {
-        headers["Content-Type"] = "application/json";
-        if (!proofSecret) throw new Error("请先完成当前 HEAD/round 的评论 proof 授权。");
-      }
-      const response = await fetch(api + path, {
+      const response = await fetch(target.href, {
         method, headers, credentials: "same-origin", redirect: "error", cache: "no-store", signal: controller.signal,
         ...(write ? {body: JSON.stringify({...body, ...bound, idempotency_key: key || uid()})} : {})
       });
-      let value;
-      try { value = await response.json(); } catch (_) { value = {}; }
+      let value; try { value = await response.json(); } catch (_) { value = {}; }
       if (!response.ok) {
         const detail = typeof value.detail === "string" ? value.detail : typeof value.error === "string" ? value.error : "";
-        if (response.status === 401) {
-          halt("Capability 不可用，请从 PR Summary 的 Evidence 链接重新打开页面。");
-          $("auth").textContent = "Capability 不可用，请从 PR Summary 的 Evidence 链接重新打开页面。";
-        }
-        if (response.status === 409) halt("HEAD/round 或上传状态已变化，已停止所有写入。请刷新当前轮。 " + detail);
-        if (response.status === 413) throw new ApiError(413, "超过服务端大小限制。" + detail);
-        throw new ApiError(response.status, `${response.status}: ${detail || response.statusText}`);
+        if (response.status === 401 && proofSecret) clearProof();
+        if (response.status === 409 && ["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched"].includes(detail))
+          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新当前轮。");
+        if (response.status === 413) throw new ApiError(413, "超过服务端大小限制。 " + detail, detail);
+        throw new ApiError(response.status, response.status + ": " + (detail || response.statusText), detail);
       }
       return value;
-    } finally { clearTimeout(timeout); active.delete(controller); }
+    } finally { clearTimeout(timeout); active.delete(controller); if (job) job.requests.delete(controller); }
+  }
+  function requestRaw(path, blob, job, onProgress) {
+    return new Promise((resolve, reject) => {
+      if (!writable()) return reject(new Error("当前轮不可写，请刷新并核对 HEAD/round。"));
+      const target = new URL(api + path, window.location.href);
+      if (target.origin !== window.location.origin || !proofSecret || !proofTransportAllowed(target))
+        return reject(new Error("只允许 HTTPS 或精确的本机 SSH 隧道入口发送 proof。"));
+      const xhr = new XMLHttpRequest(); active.add(xhr); job.requests.add(xhr);
+      let finished = false;
+      const cleanup = () => { if (finished) return; finished = true; active.delete(xhr); job.requests.delete(xhr); };
+      xhr.open("PUT", target.href); xhr.withCredentials = true; xhr.timeout = 120000;
+      xhr.setRequestHeader("Accept", "application/json");
+      xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      xhr.setRequestHeader("X-Evidence-Secret", proofSecret);
+      xhr.setRequestHeader("X-Evidence-Nonce", randomHex());
+      xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(event.loaded); };
+      xhr.onload = () => {
+        cleanup();
+        let value = {}; try { value = JSON.parse(xhr.responseText || "{}"); } catch (_) {}
+        let responseOrigin = ""; try { responseOrigin = new URL(xhr.responseURL).origin; } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300 && responseOrigin === target.origin) return resolve(value);
+        const detail = typeof value.detail === "string" ? value.detail : "";
+        if (xhr.status === 401) clearProof();
+        if (xhr.status === 409 && ["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched"].includes(detail))
+          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新当前轮。");
+        reject(new ApiError(xhr.status, xhr.status + ": " + (detail || "分块上传失败"), detail));
+      };
+      xhr.onerror = () => { cleanup(); reject(new Error("网络中断；将先查询 COS 分块状态再决定是否重试。")); };
+      xhr.ontimeout = () => { cleanup(); reject(new Error("分块上传超时；将先查询 COS 分块状态再决定是否重试。")); };
+      xhr.onabort = () => { cleanup(); reject(new Error("上传已暂停。")); };
+      xhr.send(blob);
+    });
   }
   function anchor(label, path) {
     const a = document.createElement("a"); a.textContent = label; a.href = api + path;
@@ -164,27 +216,28 @@ _JAVASCRIPT = r'''"use strict";
   }
   function attachmentList(rows, parent, current) {
     for (const item of rows || []) {
-      const li = document.createElement("li");
-      const deleted = item.status === "deleted" || !!item.deleted_at;
-      const attachmentId = item.attachment_id || item.id;
-      const description = document.createElement("span");
-      description.textContent = [item.filename || item.text || "文本证据", item.size === undefined ? "" : `${item.size} B`,
-        item.actor_verified === true ? (item.actor_login || item.actor || "") : "未验证身份",
-        item.created_at || "",
-        item.head_sha || "", item.round_id || "", item.note || "",
-        deleted ? `已删除 ${item.deleted_at || ""} ${item.deleted_by || ""}` : item.status || "pending",
-        item.replaces_id ? `替换 ${item.replaces_id}` : ""].filter(Boolean).join(" · ");
+      const li = document.createElement("li"), deleted = item.status === "deleted" || !!item.deleted_at;
+      const attachmentId = item.attachment_id || item.id, description = document.createElement("span");
+      description.textContent = [item.filename || item.text || "文本证据", item.size === undefined ? "" : item.size + " B",
+        item.media_type || item.content_type || "", item.actor_verified === true ? (item.actor_login || item.actor || "") : "未验证身份",
+        item.created_at || "", item.head_sha || "", item.round_id || "", item.sha256 || "", item.note || "",
+        deleted ? "已删除 " + (item.deleted_at || "") + " " + (item.deleted_by || "") : item.status || "pending",
+        item.replaces_id ? "替换 " + item.replaces_id : ""].filter(Boolean).join(" · ");
       li.append(description);
-      if (!deleted && item.status === "ready" && attachmentId) {
-        const capability = item.download_capability ? "?cap=" + encodeURIComponent(item.download_capability) : "";
-        li.append(" ", anchor("下载", "/attachments/" + id(attachmentId) + "/download" + capability));
+      if (!deleted && item.status === "ready" && attachmentId && item.download_capability) {
+        li.append(" ", anchor("COS 下载（短期签名）", "/attachments/" + id(attachmentId) +
+          "/download?cap=" + encodeURIComponent(item.download_capability)));
+      } else if (!deleted && item.status === "ready" && attachmentId && item.object_key) {
+        const hint = document.createElement("span");
+        hint.textContent = " · 通过 PR 评论 /evidence_link id=" + attachmentId + " 获取 15 分钟 COS 链接";
+        li.append(hint);
       }
       const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&
         (!item.round_id || item.round_id === bound.round_id);
       if (!deleted && same && writable() && attachmentId) {
         const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "删除";
-        remove.dataset.delete = attachmentId;
-        remove.addEventListener("click", () => deleteAttachment(item, remove)); li.append(" ", remove);
+        remove.dataset.delete = attachmentId; remove.addEventListener("click", () => deleteAttachment(item));
+        li.append(" ", remove);
         if (item.status === "ready") {
           const option = document.createElement("option"); option.value = attachmentId;
           option.textContent = item.filename || attachmentId; $("replace").append(option);
@@ -197,332 +250,295 @@ _JAVASCRIPT = r'''"use strict";
     $("auth").textContent = permissionMessage();
     $("summary").textContent = typeof context.summary === "string" ? context.summary : JSON.stringify(context.summary || {status: context.status});
     $("attachments").replaceChildren(); $("history").replaceChildren();
-    const replacement = $("replace").value;
-    $("replace").replaceChildren(new Option("新增附件", ""));
+    const replacement = $("replace").value; $("replace").replaceChildren(new Option("新增附件", ""));
     attachmentList(context.attachments || [], $("attachments"), true);
     for (const round of context.rounds || context.history || []) {
       if (roundMatches(round)) continue;
       const details = document.createElement("details"), summary = document.createElement("summary");
-      summary.textContent = `HEAD ${round.head_sha || "unknown"} · round ${round.round_id || "unknown"} · ${round.status || "unknown"}`;
+      summary.textContent = "HEAD " + (round.head_sha || "unknown") + " · round " + (round.round_id || "unknown") + " · " + (round.status || "unknown");
       details.append(summary);
       const ul = document.createElement("ul"); attachmentList(round.attachments || [], ul, false); details.append(ul);
-      if (round.round_id && (round.cos_object_key || round.cos?.object_key || round.log_available || round.log_ready) && context.enabled !== false && context.evidence_enabled !== false) details.append(anchor("下载本轮日志", "/rounds/" + id(round.round_id) + "/log/download?cap=" + encodeURIComponent(round.capability || "")));
+      if (round.round_id && (round.cos_object_key || round.cos?.object_key || round.log_available || round.log_ready) &&
+          context.enabled !== false && context.evidence_enabled !== false)
+        details.append(anchor("下载本轮日志", "/rounds/" + id(round.round_id) + "/log/download?cap=" + encodeURIComponent(round.capability || "")));
       $("history").append(details);
     }
     for (const archive of context.archive_links || []) {
-      // This is the GitHub comment discovered by the authenticated service,
-      // restricted again here to this repository and PR.
       try {
-        const url = new URL(archive.url);
-        const prefix = "/" + app.dataset.repo;
+        const url = new URL(archive.url), prefix = "/" + app.dataset.repo;
         if (url.origin !== "https://github.com" || url.username || url.password || url.search ||
             ![prefix + "/issues/" + app.dataset.pr, prefix + "/pull/" + app.dataset.pr].includes(url.pathname) ||
             !/^#issuecomment-[0-9]+$/.test(url.hash)) continue;
         const a = document.createElement("a"), p = document.createElement("p");
         a.textContent = "历史索引 · " + (archive.round_id || ""); a.href = url.href; a.rel = "noopener";
         p.append(a); $("history").append(p);
-      } catch (_) { /* Do not use arbitrary archive redirect destinations. */ }
+      } catch (_) { /* Ignore untrusted archive redirect destinations. */ }
     }
     if ([...$("replace").options].some(o => o.value === replacement)) $("replace").value = replacement;
     controls();
   }
-  async function refresh() {
-    const next = await request("/context");
-    context = next;
-    if (!roundMatches(next)) {
-      halt("当前 HEAD/round 已变化。本页面绑定的历史轮次只读，请从新的生命周期评论进入当前轮。");
-    }
+  async function refresh(job) {
+    const next = await request("/context", {job}); context = next;
+    if (!roundMatches(next)) halt("当前 HEAD/round 已变化。本页面绑定的历史轮次只读。");
     render(); return next;
   }
-  function persist() {
-    if (!session) return;
-    try { localStorage.setItem(storageKey, JSON.stringify({upload_id: session.upload_id, fingerprint, parts: session.parts || [], complete_unknown: completeUnknown})); }
-    catch (_) { message("浏览器无法保存恢复信息；当前上传仍可继续。"); }
+  function persist(job) {
+    if (!job.fingerprint) return;
+    const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
+    savedUploads[key] = {upload_id: job.uploadId || "", init_key: job.initKey || "",
+      fingerprint: job.fingerprint, filename: job.file.name, size: job.file.size,
+      replaces_id: job.replacesId, note_digest: job.noteDigest, complete_unknown: job.completeUnknown === true};
+    try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
   }
   function restore() {
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) || "null");
-      if (saved && typeof saved.fingerprint === "string" && saved.fingerprint.length === 64) {
-        id(saved.upload_id); session = {upload_id: saved.upload_id, parts: []}; fingerprint = saved.fingerprint;
-        completeUnknown = saved.complete_unknown === true;
-        message("发现未清除的上传记录。请重新选择相同文件，继续时将先核对文件指纹和服务端分块状态。");
+      if (saved && saved.uploads && typeof saved.uploads === "object") savedUploads = saved.uploads;
+      else if (saved && typeof saved.fingerprint === "string" && typeof saved.upload_id === "string") {
+        savedUploads[saved.fingerprint + ":new:"] = {upload_id: saved.upload_id,
+          fingerprint: saved.fingerprint, complete_unknown: saved.complete_unknown === true};
       }
-    } catch (_) { /* Invalid local hints never become server authority. */ }
+    } catch (_) { savedUploads = {}; }
   }
-  async function fileFingerprint(file) {
-    // Hash every byte using bounded WebCrypto calls. This is a file identity,
-    // not a claim to be the object's SHA-256 checksum (the server verifies it).
+  async function fileFingerprint(file, job) {
     let chain = new Uint8Array(32);
     for (let start = 0; start < file.size; start += 4 * 1024 * 1024) {
-      if (paused || stopped) throw new Error("已暂停文件核对。");
+      if (job.paused || stopped) throw new Error("已暂停文件核对。");
       const chunk = await crypto.subtle.digest("SHA-256", await file.slice(start, start + 4 * 1024 * 1024).arrayBuffer());
       const both = new Uint8Array(64); both.set(chain); both.set(new Uint8Array(chunk), 32);
       chain = new Uint8Array(await crypto.subtle.digest("SHA-256", both));
-      $("progress-label").textContent = `正在核对文件：${Math.min(file.size, start + 4 * 1024 * 1024)} / ${file.size} B`;
+      job.progress.value = Math.min(99, (start + 4 * 1024 * 1024) * 100 / file.size);
+      job.statusNode.textContent = "核对指纹 " + Math.min(file.size, start + 4 * 1024 * 1024) + " / " + file.size + " B";
     }
     const metadata = new TextEncoder().encode(JSON.stringify([file.name, file.size, file.type, file.lastModified]));
     const last = new Uint8Array(chain.length + metadata.length); last.set(chain); last.set(metadata, chain.length);
     return [...new Uint8Array(await crypto.subtle.digest("SHA-256", last))].map(v => v.toString(16).padStart(2, "0")).join("");
   }
-  function partsOf(value) {
-    const rows = value.uploaded_parts || value.parts || [];
-    if (Array.isArray(rows)) return rows.map(row => typeof row === "number" ? {part_number: row} : row);
-    return Object.entries(rows).map(([number, row]) => ({...(typeof row === "object" ? row : {etag: row}), part_number: Number(number)}));
-  }
-  async function uploadState() {
-    const value = await request("/uploads/" + id(session.upload_id));
+  const partsOf = value => (Array.isArray(value.uploaded_parts || value.parts) ? (value.uploaded_parts || value.parts) : [])
+    .map(row => typeof row === "number" ? {part_number: row} : row);
+  async function uploadState(job) {
+    const value = await request("/uploads/" + id(job.uploadId), {job});
     if ((value.head_sha && value.head_sha !== bound.head_sha) || (value.round_id && value.round_id !== bound.round_id)) {
       halt("上传属于其他 HEAD/round，已停止。"); throw new Error("轮次不匹配");
     }
-    if (value.upload_id && value.upload_id !== session.upload_id) throw new Error("上传标识不匹配");
-    session = {...session, ...value, parts: partsOf(value)}; persist(); return session;
+    if (value.upload_id && value.upload_id !== job.uploadId) throw new Error("上传标识不匹配");
+    job.state = {...job.state, ...value, parts: partsOf(value)}; return job.state;
   }
-  const terminalReady = value => value.status === "ready" && value.verified === true;
-  async function resumeIfRequired(state) {
-    // GET status is read-only. An initializing record means the prior init
-    // response was lost, so an explicit Upload / Continue can recover it.
-    if (state.status !== "initializing" && state.initialization_pending !== true) return state;
-    if (!chosen || !fingerprint) throw new Error("恢复上传前请重新选择原文件并完成指纹核对。");
-    const resumed = await request("/uploads/" + id(session.upload_id) + "/resume", {
-      method: "POST", key: session.upload_id + ":resume", body: {}
-    });
-    if ((resumed.head_sha && resumed.head_sha !== bound.head_sha) ||
-        (resumed.round_id && resumed.round_id !== bound.round_id) ||
-        (resumed.upload_id && resumed.upload_id !== session.upload_id)) {
-      halt("恢复结果属于其他 HEAD/round 或上传，已停止。"); throw new Error("恢复结果不匹配");
-    }
-    const checked = await uploadState();
-    if (checked.filename && chosen && checked.filename !== chosen.name ||
-        checked.size !== undefined && chosen && Number(checked.size) !== chosen.size) {
-      throw new Error("恢复后的文件元数据与所选文件不匹配");
-    }
-    return checked;
+  const terminalReady = value => value && value.status === "ready" && value.verified === true;
+  function updateJob(job, text) {
+    if (text) job.statusNode.textContent = text;
+    job.actionButton.textContent = job.running ? "暂停" : (job.status === "succeeded" ? "完成" : "重试 / 继续");
+    job.actionButton.dataset.jobAction = job.running ? "pause" : "retry";
+    job.actionButton.disabled = !writable() || (busy && job.actionButton.dataset.jobAction !== "pause") || job.status === "succeeded";
+    job.actionButton.onclick = () => {
+      if (job.running) {
+        job.paused = true;
+        for (const request of job.requests) abortRequest(request);
+        updateJob(job, "暂停中；续传前会重新查询 COS 状态。");
+      } else if (!busy && job.status !== "succeeded") runSingle(job);
+    };
   }
-  function progress(parts, partBytes, inflight = new Map()) {
-    const total = chosen ? chosen.size : 0;
+  function makeJob(file) {
+    const row = document.createElement("li"), title = document.createElement("strong");
+    const progress = document.createElement("progress"), status = document.createElement("span"), action = document.createElement("button");
+    title.textContent = file.name; progress.max = 100; progress.value = 0;
+    status.textContent = "排队中"; action.type = "button"; action.textContent = "重试 / 继续";
+    row.append(title, document.createElement("br"), progress, document.createElement("br"), status, " ", action);
+    $("queue").append(row);
+    const job = {file, row, progress, statusNode: status, actionButton: action,
+      requests: new Set(), parts: new Map(), paused: false, running: false, status: "排队中", completeUnknown: false};
+    jobs.push(job); updateJob(job); return job;
+  }
+  function progressJob(job, parts, inflight, partBytes) {
     let bytes = 0;
-    for (const part of parts.values()) bytes += Math.min(partBytes, Math.max(0, total - (part.part_number - 1) * partBytes));
+    for (const part of parts.values()) bytes += Math.min(partBytes, Math.max(0, job.file.size - (part.part_number - 1) * partBytes));
     for (const amount of inflight.values()) bytes += amount;
-    const percentage = total ? Math.min(100, bytes * 100 / total) : 0;
-    $("progress").value = percentage;
-    $("progress-label").textContent = `${percentage.toFixed(1)}% · ${bytes} / ${total} B（分块已传输，最终状态以服务端 ready 为准）`;
+    job.progress.value = job.file.size ? Math.min(100, bytes * 100 / job.file.size) : 0;
+    job.statusNode.textContent = (job.statusText || "上传中") + " · " + job.progress.value.toFixed(1) +
+      "% · " + bytes + " / " + job.file.size + " B";
   }
-  function putPart(signed, blob, number, inflight, update) {
-    return new Promise((resolve, reject) => {
-      const target = new URL(signed.url);
-      if (target.protocol !== "https:" || target.username || target.password || target.hash) return reject(new Error("无效的上传地址"));
-      if (signed.method && signed.method !== "PUT") return reject(new Error("不支持的上传方法"));
-      const xhr = new XMLHttpRequest(); active.add(xhr);
-      const cleanup = () => { active.delete(xhr); inflight.delete(number); update(); };
-      xhr.open("PUT", target.href); xhr.withCredentials = false; xhr.timeout = 120000;
-      // Only storage headers returned by the authenticated API go to COS.
-      for (const [name, value] of Object.entries(signed.headers || {})) {
-        if (/^(cookie|authorization|x-csrf-token|x-evidence-secret|x-evidence-nonce)$/i.test(name)) { cleanup(); return reject(new Error("拒绝向存储地址发送认证头")); }
-        xhr.setRequestHeader(name, value);
-      }
-      xhr.upload.onprogress = event => { inflight.set(number, event.loaded); update(); };
-      xhr.onload = () => {
-        cleanup();
-        if (xhr.status >= 200 && xhr.status < 300 && new URL(xhr.responseURL).href === target.href) {
-          resolve({part_number: number, etag: xhr.getResponseHeader("ETag") || "", size: blob.size});
-        } else reject(new ApiError(xhr.status, "分块上传失败：" + xhr.status));
-      };
-      xhr.onerror = () => { cleanup(); reject(new Error("网络中断，可继续上传")); };
-      xhr.ontimeout = () => { cleanup(); reject(new Error("分块上传超时，可继续上传")); };
-      xhr.onabort = () => { cleanup(); reject(new Error("上传已暂停")); };
-      xhr.send(blob);
-    });
-  }
-  async function waitReady(uploadId, attachmentId = session && session.attachment_id, clearUpload = true) {
-    const generation = ++pollGeneration;
-    message("文件已提交，等待服务端校验及摘要更新。");
-    for (let count = 0; count < 30 && generation === pollGeneration && !stopped; count++) {
-      const current = await refresh();
-      const rows = current.attachments || [];
-      const item = rows.find(row => (uploadId && row.upload_id === uploadId) ||
-        (attachmentId && (row.attachment_id === attachmentId || row.id === attachmentId)));
-      const ready = item && item.status === "ready";
-      const summaryReady = current.summary_status === "ready" || current.summary_updated === true ||
-        (current.summary && typeof current.summary === "object" && current.summary.status === "ready");
-      if (ready && summaryReady) {
-        message("服务端已确认附件 ready，摘要已更新。");
-        $("progress").value = 100; $("progress-label").textContent = "服务端确认完成";
-        if (clearUpload) {
-          try { localStorage.removeItem(storageKey); } catch (_) {}
-          session = null; fingerprint = ""; completeUnknown = false;
+  async function waitReady(job, attachmentId = "") {
+    if (!job.isNote) updateJob(job, "COS 已接收；等待 SHA256 校验及 Summary 投影。");
+    for (let count = 0; count < 30 && !stopped && !job.paused; count++) {
+      const status = await uploadState(job), current = await refresh(job);
+      const item = (current.attachments || []).find(row =>
+        (attachmentId && (row.attachment_id === attachmentId || row.id === attachmentId)) ||
+        row.upload_id === job.uploadId);
+      if (terminalReady(status) && current.summary_updated === true && item && item.status === "ready") {
+        if (!job.isNote) {
+          job.progress.value = 100; job.completeUnknown = false; job.status = "succeeded";
+          job.statusText = "成功 · COS ready/verified，Summary 已更新";
+          const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
+          delete savedUploads[key]; try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
+          updateJob(job, job.statusText);
         }
-        controls(); return;
+        return true;
       }
-      if (item && ["failed", "rejected"].includes(item.status)) throw new Error(item.error || "服务端校验失败");
       await delay(2000);
     }
-    message("仍在等待服务端 ready/summary 更新；请刷新状态后继续确认。");
+    throw new Error("COS ready 与 Summary 更新尚未同时确认；可重试以先查询真实状态。");
   }
-  async function complete(explicit = false) {
-    const state = await uploadState();
-    if (terminalReady(state) || ["completing", "verifying", "processing"].includes(state.status)) {
-      await waitReady(session.upload_id); return;
+  async function startOrRestore(job) {
+    job.status = "核对中"; updateJob(job, "正在以 4 MiB 有界分块核对文件指纹。");
+    job.fingerprint = await fileFingerprint(job.file, job);
+    job.noteDigest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(job.note)))]
+      .map(v => v.toString(16).padStart(2, "0")).join("");
+    const resumeKey = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
+    const legacyKey = job.fingerprint + ":" + (job.replacesId || "new") + ":";
+    const saved = savedUploads[resumeKey] || savedUploads[legacyKey];
+    if (saved) {
+      if (saved.filename && saved.filename !== job.file.name || saved.size && Number(saved.size) !== job.file.size ||
+          saved.replaces_id && saved.replaces_id !== job.replacesId || saved.note_digest && saved.note_digest !== job.noteDigest)
+        throw new Error("保存的上传记录与所选文件或备注不匹配，拒绝混用。");
+      job.uploadId = saved.upload_id || ""; job.initKey = saved.init_key || uid();
+      job.completeUnknown = saved.complete_unknown === true;
+    } else job.initKey = uid();
+    persist(job);
+    if (!job.uploadId) {
+      const initialized = await request("/uploads", {method: "POST", key: job.initKey,
+        body: {filename: job.file.name, size: job.file.size, content_type: job.file.type || "application/octet-stream",
+          note: job.note, replaces_id: job.replacesId || null}, job});
+      id(initialized.upload_id); job.uploadId = initialized.upload_id;
+      job.state = {...initialized, parts: partsOf(initialized)}; persist(job);
     }
-    if (state.status === "ready" || state.status === "complete_unknown" || state.status === "completion_unknown") {
-      completeUnknown = true; persist(); controls();
-      if (!explicit) {
-        message("服务端完成状态尚未验证。请核对状态后点“重新提交完成请求”。"); return;
-      }
-    }
-    if (["failed", "deleted", "aborted", "expired"].includes(state.status)) throw new Error(state.error || `上传状态：${state.status}`);
-    if (completeUnknown && !explicit) {
-      message("上次完成请求结果未知，已查询服务端状态。请核对后点“重新提交完成请求”。"); return;
-    }
-    completeUnknown = true; persist(); controls();
-    const uploadId = session.upload_id;
-    try {
-      const result = await request("/uploads/" + id(uploadId) + "/complete", {
-        method: "POST", key: uploadId + ":complete", body: {}
+    let state = await uploadState(job);
+    if (state.status === "initializing" || state.initialization_pending === true) {
+      const resumed = await request("/uploads/" + id(job.uploadId) + "/resume", {
+        method: "POST", key: job.uploadId + ":resume", body: {}, job
       });
-      session = {...session, ...result};
-      // A POST response without a verified ready state remains uncertain.
-      completeUnknown = !terminalReady(result); persist(); controls();
-      if (["failed", "rejected"].includes(result.status)) throw new Error(result.error || "服务端校验失败");
-      await waitReady(uploadId);
-    } catch (error) {
-      // Never automatically replay an uncertain multipart completion.
-      if (!stopped) {
-        try { const checked = await uploadState(); if (terminalReady(checked)) { completeUnknown = false; persist(); await waitReady(uploadId); return; } }
-        catch (_) { /* Keep uncertainty visible for an explicit user retry. */ }
+      if (resumed.upload_id && resumed.upload_id !== job.uploadId) throw new Error("恢复结果上传标识不匹配");
+      state = await uploadState(job);
+    }
+    if (terminalReady(state)) return waitReady(job, state.attachment_id || "");
+    if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, state.attachment_id || "");
+    return state;
+  }
+  async function uploadParts(job, state) {
+    const partBytes = Number(state.part_bytes || PART_BYTES);
+    if (!Number.isSafeInteger(partBytes) || partBytes < 1 || partBytes > PART_BYTES) throw new Error("服务端分片大小无效。");
+    if (state.filename && state.filename !== job.file.name || state.size !== undefined && Number(state.size) !== job.file.size)
+      throw new Error("服务端文件元数据与所选文件不匹配。");
+    const count = Math.ceil(job.file.size / partBytes), done = new Map();
+    for (const part of state.parts || []) {
+      const n = Number(part.part_number);
+      if (!Number.isInteger(n) || n < 1 || n > count ||
+          part.size !== undefined && Number(part.size) !== Math.min(partBytes, job.file.size - (n - 1) * partBytes))
+        throw new Error("COS 分片状态与本文件不匹配。");
+      done.set(n, {...part, part_number: n});
+    }
+    const inflight = new Map(), queue = Array.from({length: count}, (_, n) => n + 1).filter(n => !done.has(n));
+    let cursor = 0;
+    const update = () => progressJob(job, done, inflight, partBytes);
+    async function worker() {
+      while (cursor < queue.length && !job.paused && !stopped) {
+        const number = queue[cursor++], blob = job.file.slice((number - 1) * partBytes, Math.min(number * partBytes, job.file.size));
+        let complete = false;
+        for (let attempt = 0; attempt < 3 && !job.paused && !stopped; attempt++) {
+          try {
+            const query = "?head_sha=" + encodeURIComponent(bound.head_sha) + "&round_id=" + encodeURIComponent(bound.round_id);
+            const path = "/uploads/" + id(job.uploadId) + "/parts/" + number + "/data" + query;
+            await requestRaw(path, blob, job, amount => { inflight.set(number, amount); update(); });
+            done.set(number, {part_number: number, size: blob.size}); complete = true;
+          } catch (error) {
+            inflight.delete(number); update();
+            if (job.paused || stopped) break;
+            if ([401, 403, 409, 413].includes(error.status)) throw error;
+            const checked = await uploadState(job);
+            const found = (checked.parts || []).find(part => Number(part.part_number) === number);
+            if (found) {
+              if (Number(found.size) !== blob.size) throw new ApiError(409, "COS 已有分片大小冲突，已停止该文件。");
+              done.set(number, found); complete = true;
+            } else if (attempt < 2) await delay((attempt + 1) * 500);
+            else throw error;
+          }
+          if (complete) { inflight.delete(number); update(); break; }
+        }
+        if (!complete && !job.paused && !stopped) throw new Error("分片重试次数已用完。");
       }
+    }
+    const results = await Promise.allSettled([worker(), worker()]);
+    const failed = results.find(result => result.status === "rejected");
+    job.parts = done; progressJob(job, done, inflight, partBytes);
+    if (failed) throw failed.reason;
+    if (job.paused || stopped) throw new Error("文件上传已暂停。");
+    return done;
+  }
+  async function completeUpload(job, attachmentId = "") {
+    let state = await uploadState(job);
+    if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
+    if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
+    if (job.completeUnknown && state.status !== "uploading") throw new Error("完成状态仍未明确；未重复提交 complete。");
+    job.completeUnknown = true; persist(job);
+    try {
+      const result = await request("/uploads/" + id(job.uploadId) + "/complete", {
+        method: "POST", key: job.uploadId + ":complete", body: {}, job
+      });
+      if (result.attachment_id) attachmentId = result.attachment_id;
+      if (terminalReady(result)) return waitReady(job, attachmentId);
+      state = await uploadState(job);
+      if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
+      if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
+      throw new Error("complete 后 COS 尚未 ready；已先查询状态，没有盲目重试。");
+    } catch (error) {
+      try {
+        state = await uploadState(job);
+        if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
+        if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
+      } catch (_) { /* Preserve the uncertain marker for an explicit retry. */ }
       throw error;
     }
   }
+  async function uploadOne(job) {
+    if (!(job.file.size >= 1 && job.file.size <= MAX_BYTES)) throw new Error("单个文件必须为 1..512 MiB。");
+    job.note = $("note").value; job.replacesId = $("replace").value || "";
+    let state = await startOrRestore(job);
+    if (job.status === "succeeded") return;
+    if (["failed", "deleted", "aborted", "expired", "invalid"].includes(state.status))
+      throw new Error("服务端上传状态不可继续：" + state.status);
+    await uploadParts(job, state);
+    const completed = await uploadState(job), partBytes = Number(completed.part_bytes || PART_BYTES);
+    const count = Math.ceil(job.file.size / partBytes);
+    if ((completed.parts || []).length < count) throw new Error("COS 尚未确认全部分片；请继续重试。");
+    await completeUpload(job, completed.attachment_id || "");
+  }
+  async function processJob(job) {
+    if (job.running || !writable()) return;
+    job.running = true; job.paused = false; job.status = "running"; updateJob(job, "处理中。"); controls();
+    try {
+      await uploadOne(job);
+      if (job.status !== "succeeded") { job.status = "waiting"; updateJob(job, "等待 Summary 更新；重试会先查询 COS 状态。"); }
+    } catch (error) {
+      if (job.paused) { job.status = "paused"; updateJob(job, "已暂停；重试前会查询 COS 状态。"); }
+      else if (!stopped) { job.status = "failed"; updateJob(job, "失败：" + (error.message || String(error))); }
+    } finally { job.running = false; controls(); }
+  }
+  async function runSingle(job) {
+    if (busy || stopped) return;
+    busy = true; controls(); await processJob(job); busy = false; controls();
+  }
   async function runUpload() {
     if (busy || !writable()) return;
-    chosen = $("file").files[0];
-    if (!chosen) { message("请选择文件；恢复上传必须重新选择原文件。"); return; }
-    if (!chosen.size) { message("请选择非空文件。"); return; }
-    busy = true; paused = false; controls();
-    try {
-      message("正在核对完整文件指纹，尚未上传成功。");
-      const selectedFingerprint = await fileFingerprint(chosen);
-      if (session && selectedFingerprint !== fingerprint) throw new Error("文件与原上传不一致，已拒绝拼接。请重新选择原文件。");
-      fingerprint = selectedFingerprint;
-      if (!session) {
-        await refresh();
-      const result = await request("/uploads", {method: "POST", key: bound.round_id + ":" + fingerprint + ":" + ($("replace").value || "new") + ":" + uid(),
-          body: {filename: chosen.name, size: chosen.size, content_type: chosen.type || "application/octet-stream", note: $("note").value, replaces_id: $("replace").value || null}});
-        id(result.upload_id); session = {...result, parts: partsOf(result)}; persist();
-      }
-      let state = await uploadState();
-      state = await resumeIfRequired(state);
-      if (terminalReady(state) || ["completing", "verifying", "processing"].includes(state.status) || completeUnknown) { await complete(); return; }
-      const partBytes = Number(state.part_bytes || context.part_bytes);
-      if (!Number.isSafeInteger(partBytes) || partBytes <= 0) throw new Error("服务端未提供有效的 part_bytes，无法安全分块。");
-      if (state.filename && state.filename !== chosen.name || state.size !== undefined && Number(state.size) !== chosen.size) throw new Error("服务端上传文件元数据不匹配");
-      const count = Math.ceil(chosen.size / partBytes);
-      const done = new Map();
-      for (const part of state.parts) {
-        const n = Number(part.part_number);
-        if (!Number.isInteger(n) || n < 1 || n > count) throw new Error("服务端分块状态无效");
-        if (part.size !== undefined && Number(part.size) !== Math.min(partBytes, chosen.size - (n - 1) * partBytes)) throw new Error("服务端分块大小与所选文件不匹配");
-        done.set(n, {...part, part_number: n});
-      }
-      const inflight = new Map();
-      const update = () => progress(done, partBytes, inflight);
-      update();
-      const queue = Array.from({length: count}, (_, n) => n + 1).filter(n => !done.has(n));
-      let cursor = 0;
-      async function worker() {
-        while (cursor < queue.length && !paused && !stopped) {
-          const number = queue[cursor++];
-          const blob = chosen.slice((number - 1) * partBytes, Math.min(number * partBytes, chosen.size));
-          let finished = false;
-          for (let attempt = 0; attempt < 3 && !paused && !stopped; attempt++) {
-            try {
-              const signed = await request("/uploads/" + id(session.upload_id) + "/parts/" + number + "/url", {
-                method: "POST", key: `${session.upload_id}:part:${number}:${attempt}:${uid()}`, body: {}
-              });
-              const part = await putPart(signed, blob, number, inflight, update);
-              done.set(number, part); session.parts = [...done.values()]; persist(); update(); finished = true; break;
-            } catch (error) {
-              if (paused || stopped || [401, 409, 413].includes(error.status) || attempt === 2) throw error;
-              // A successful PUT may have lost its response. Reconcile before
-              // requesting a fresh signed URL; expiration never restarts upload.
-              const checked = await uploadState();
-              const found = checked.parts.find(part => Number(part.part_number) === number);
-              if (found) { done.set(number, found); finished = true; update(); break; }
-              await delay((attempt + 1) * 500);
-            }
-          }
-          if (!finished && !paused) throw new Error("分块重试次数已用完，请手动继续。");
-        }
-      }
-      const outcomes = await Promise.allSettled([worker(), worker()]);
-      const failed = outcomes.find(outcome => outcome.status === "rejected");
-      if (failed) throw failed.reason;
-      if (paused || stopped) throw new Error("上传已暂停，可继续。");
-      session.parts = [...done.values()].sort((a, b) => a.part_number - b.part_number);
-      await complete();
-    } catch (error) { message(error.message || String(error)); }
-    finally { busy = false; paused = true; controls(); }
-  }
-  async function deleteAttachment(item, button) {
-    if (busy || !writable()) return;
-    if (!window.confirm(`确认删除当前轮附件“${item.filename || item.attachment_id || item.id}”？删除将保留审计记录，历史轮次不会自动删除。`)) return;
+    const files = Array.from($("file").files || []); $("file").value = "";
+    if (!files.length) { message("请选择一个或多个文件。"); return; }
+    for (const file of files) makeJob(file);
     busy = true; controls();
-    // A deterministic operation key survives refresh after an unknown result.
+    for (const job of jobs) {
+      if (job.status !== "排队中" || stopped) continue;
+      await processJob(job);
+    }
+    busy = false; controls(); message("队列已处理；各文件状态与恢复进度分别显示在队列中。");
+  }
+  async function deleteAttachment(item) {
+    if (busy || !writable()) return;
+    if (!window.confirm("确认删除当前轮附件“" + (item.filename || item.attachment_id || item.id) +
+        "”？删除将保留审计记录，历史轮次不会自动删除。")) return;
+    busy = true; controls();
     const key = bound.round_id + ":delete:" + (item.attachment_id || item.id);
-    try {
-      await request("/attachments/" + id(item.attachment_id || item.id), {method: "DELETE", key, body: {}});
-      await refresh(); message("删除结果已从服务端刷新，审计记录保留。");
-    } catch (error) { message(error.message); try { await refresh(); } catch (_) {} }
+    try { await request("/attachments/" + id(item.attachment_id || item.id), {method: "DELETE", key, body: {}}); await refresh(); message("删除结果已刷新，审计记录保留。"); }
+    catch (error) { message(error.message); try { await refresh(); } catch (_) {} }
     finally { busy = false; controls(); }
   }
-  $("upload").addEventListener("click", runUpload);
-  function loadProof() {
-    try {
-      const value = sessionStorage.getItem(proofKey) || "";
-      if (/^[0-9a-f]{64}$/.test(value)) proofSecret = value;
-    } catch (_) { proofSecret = ""; }
-    $("verify-proof").disabled = !proofSecret;
-  }
-  $("make-proof").addEventListener("click", async () => {
-    try {
-      const bytes = crypto.getRandomValues(new Uint8Array(32));
-      proofSecret = [...bytes].map(value => value.toString(16).padStart(2, "0")).join("");
-      sessionStorage.setItem(proofKey, proofSecret);
-      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-      const proof = [...digest].map(value => value.toString(16).padStart(2, "0")).join("");
-      $("proof-command").textContent = `/authorize_evidence head=${bound.head_sha} round=${bound.round_id} proof=${proof}`;
-      $("verify-proof").disabled = false;
-      context = null; controls();
-      message("授权命令已生成。请在当前 PR Conversation 亲自发送，然后点击“验证我已发送的评论”。密钥只保存在本标签页会话中。");
-    } catch (_) {
-      proofSecret = ""; message("无法安全生成或保存授权密钥；请使用安全上下文打开页面。");
-    }
-  });
-  $("verify-proof").addEventListener("click", async () => {
-    if (!proofSecret) return;
-    try {
-      const next = await refresh();
-      if (next.actor_verified === true && next.github_user_authenticated === true) {
-        message("GitHub 评论身份已验证；服务端将对每次写入重新检查 PR 与权限。");
-      } else {
-        message("尚未找到与本密钥匹配的当前 PR 评论。请确认命令完整、评论已发布且 HEAD/round 未变化。");
-      }
-    } catch (error) {
-      message(error.message || String(error));
-    }
-  });
-  $("retry").addEventListener("click", runUpload);
-  $("pause").addEventListener("click", () => {
-    paused = true; pollGeneration++;
-    for (const request of active) request.abort(); message("已暂停；继续时先查询服务端分块状态。");
-  });
-  $("resubmit").addEventListener("click", async () => {
-    if (busy || !writable()) return;
-    busy = true; controls();
-    try { await refresh(); await complete(true); } catch (error) { message(error.message); }
-    finally { busy = false; controls(); }
-  });
-  $("save-note").addEventListener("click", async () => {
+  async function saveNote() {
     if (busy || !writable()) return;
     const body = {text: $("text").value, note: $("note").value};
     if (!body.text.trim() && !body.note.trim()) { message("请输入文本或备注。"); return; }
@@ -532,20 +548,19 @@ _JAVASCRIPT = r'''"use strict";
     try {
       const result = await request("/notes", {method: "POST", key: noteOperation.key, body});
       await refresh();
-      const attachmentId = result.attachment_id || result.id;
-      if (attachmentId) await waitReady(null, attachmentId, false);
-      else message("文本已提交，正在等待摘要更新；请刷新服务端状态确认。");
+      const noteJob = {uploadId: result.upload_id, requests: new Set(), isNote: true};
+      if (result.upload_id && (result.attachment_id || result.id)) await waitReady(noteJob, result.attachment_id || result.id);
+      else message("文本已提交，等待 Summary 更新；请刷新服务端状态确认。");
       noteOperation = null;
     } catch (error) { message(error.message); }
     finally { busy = false; controls(); }
-  });
+  }
+  $("upload").addEventListener("click", runUpload);
+  $("save-note").addEventListener("click", saveNote);
   $("refresh").addEventListener("click", async () => {
-    try {
-      if (busy) { message("上传进行中，请暂停后刷新。"); return; }
-      stopped = false; await refresh();
-      // Refresh is read-only. Resume and completion require an explicit button action.
-    } catch (error) { message(error.message); }
+    try { if (busy) { message("上传进行中；可暂停对应文件后刷新。"); return; } stopped = false; await refresh(); }
+    catch (error) { message(error.message); }
   });
-  loadProof(); restore(); refresh().catch(error => message(error.message));
+  restore(); refresh().catch(error => { $("auth").textContent = error.message || String(error); message(error.message || String(error)); });
 })();
 '''

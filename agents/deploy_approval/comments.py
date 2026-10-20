@@ -218,7 +218,11 @@ def _human_size(size: int) -> str:
 # ── Workflow helper ──────────────────────────────────────────────
 
 
-def _workflow_lines(status: str) -> str:
+def _workflow_lines(
+    status: str, evidence_complete: bool = False,
+    deployments_complete: bool | None = None,
+    record_test_complete: bool = False,
+) -> str:
     """Return the fixed 8-step workflow as markdown.
 
     Always forward order. [x] for complete, [ ] for pending.
@@ -226,14 +230,14 @@ def _workflow_lines(status: str) -> str:
     If all checked, last step is marked done.
     """
     step_defs = [
-        ("1. Request Review", 0),
-        ("2. Review Agent completed", 1),
-        ("3. Request deployment", 2),
-        ("4. Machine Owner approval(s)", 3),
-        ("5. All required components deployed", 4),
-        ("6. Machine Owner uploads evidence", 4),
-        ("7. Record validation result", 5),
-        ("8. Deployment accepted", 6),
+        ("1. Request Review", 0, "review"),
+        ("2. Review Agent completed", 1, "reviewed"),
+        ("3. Request deployment", 2, "request"),
+        ("4. Machine Owner approval(s)", 3, "approval"),
+        ("5. All required components deployed", 4, "deployment"),
+        ("6. Machine Owner uploads evidence", 4, "evidence"),
+        ("7. Record validation result", 5, "result"),
+        ("8. Deployment accepted", 6, "accepted"),
     ]
 
     status_levels = {
@@ -249,8 +253,14 @@ def _workflow_lines(status: str) -> str:
 
     lines = []
     next_marked = False
-    for label, required_level in step_defs:
+    for label, required_level, step in step_defs:
         checked = current_level > required_level
+        if status == "testing" and step == "deployment":
+            checked = bool(deployments_complete)
+        if status == "testing" and step == "evidence":
+            checked = bool(evidence_complete)
+        if status == "testing" and step == "result":
+            checked = bool(record_test_complete)
         mark = "[x]" if checked else "[ ]"
         line = f"- {mark} {label}"
         if not checked and not next_marked:
@@ -263,6 +273,15 @@ def _workflow_lines(status: str) -> str:
         return "\n".join(lines)
 
     return "\n".join(lines)
+
+
+def _testing_next_action(evidence_complete: bool) -> str:
+    if evidence_complete:
+        return ("**Machine Owner**\n\n"
+                '`/record_test result=pass|fail [summary="..."]`')
+    return ("**PR developer and deployed Machine Owner**\n\n"
+            "Upload evidence for this HEAD and round first; after it is archived, "
+            'record the result with `/record_test result=pass|fail [summary="..."]`.')
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -530,6 +549,9 @@ def testing(
     components: list[dict] | None = None,
     machine_groups: list[dict] | None = None,
     attempt: dict | None = None,
+    evidence_complete: bool = False,
+    deployments_complete: bool | None = None,
+    record_test_complete: bool = False,
 ) -> str:
     lines = [
         BOT_MARKER,
@@ -542,13 +564,13 @@ def testing(
         "",
         "### Workflow",
         "",
-        _workflow_lines("testing"),
+        _workflow_lines("testing", evidence_complete=evidence_complete,
+                        deployments_complete=deployments_complete,
+                        record_test_complete=record_test_complete),
         "",
         "### Next action",
         "",
-        "**Machine Owner**",
-        "",
-        '`/record_test result=pass|fail [summary="..."]`',
+        *_testing_next_action(evidence_complete).split("\n"),
         "",
         "### Current Deployment",
     ]
@@ -1014,11 +1036,11 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
 
     def download(identifier, suffix, capability):
         identifier = str(identifier or "")
-        if not base or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
             return ""
         if not capability:
             return ""
-        return base + api + suffix.format(id=identifier) + "?cap=" + urllib.parse.quote(capability, safe="")
+        return "http://127.0.0.1:25001" + api + suffix.format(id=identifier) + "?cap=" + urllib.parse.quote(capability, safe="")
 
     def render_round(key, group):
         h, r = key
@@ -1026,8 +1048,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                  f"**Submitter:** {_escape(group.get('actor') or group.get('actor_login') or group.get('submitted_by') or group.get('requested_by') or group.get('command', {}).get('args', {}).get('actor') or 'unknown')}",
                  f"**Time:** {_escape(group.get('created_at') or group.get('started_at') or group.get('round_started_at') or 'unknown')}",
                  f"**Status:** {_escape(group.get('status') or 'unknown')}", "",
-                 "| Attachment | Size | GitHub uploader | Machine | Time | HEAD | Round | Note | COS | Download |",
-                 "|---|---|---|---|---|---|---|---|---|---|"]
+                 "| Attachment | Size | Type | GitHub uploader | Machine | Time | HEAD | Round | Note | COS | Source | Download |",
+                 "|---|---:|---|---|---|---|---|---|---|---|---|---|"]
         latest_items = {}
         for offset, item in enumerate(group.get("attachments", [])):
             if not isinstance(item, dict):
@@ -1045,7 +1067,20 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
             status = "deleted" if deleted else item.get("status", "pending")
             native_url = _trusted_github_attachment_url(item) if not deleted else ""
-            cells = [item.get("filename") or item.get("text") or "Note", item.get("size", "—"),
+            filename = item.get("filename") or item.get("text") or "Note"
+            import mimetypes
+            media_type = item.get("media_type", "")
+            if (not isinstance(media_type, str)
+                    or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", media_type)):
+                media_type = mimetypes.guess_type(str(filename))[0] or "unknown"
+            size = item.get("size", "—")
+            if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+                size = _human_size(size)
+            sha256 = item.get("sha256")
+            cos_verified = (status == "ready" and bool(item.get("object_key"))
+                            and isinstance(sha256, str)
+                            and re.fullmatch(r"[0-9a-f]{64}", sha256))
+            cells = [filename, size, media_type,
                      ((item.get("actor_login") or item.get("actor"))
                       if item.get("actor_verified") is True else "unverified"),
                      item.get("machine") or item.get("machine_alias") or "—",
@@ -1053,17 +1088,39 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                      item.get("round_id") or r, item.get("note", ""),
                      ("Deleted" if deleted else
                       "Text note" if status == "text" else
-                      "COS verified" if status == "ready" and item.get("object_key") else
+                      f"COS SHA256 verified: {sha256}; playback unverified" if cos_verified else
                       "Pending" if status != "ready" else "Unavailable")]
             if item.get("replaces_id"):
-                cells[7] = str(cells[7]) + " · replaces " + str(item["replaces_id"])
+                cells[8] = str(cells[8]) + " · replaces " + str(item["replaces_id"])
             if deleted:
-                cells[7] = str(cells[7]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
-            download_cell = (
-                f"[GitHub attachment](<{native_url}>)" if native_url else
-                "Text note (no file)" if status == "text" else "Source unavailable"
+                cells[8] = str(cells[8]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
+            attachment_id = item.get("attachment_id")
+            cos_download = download(attachment_id, "/attachments/{id}/download", item.get("download_capability"))
+            if status == "text":
+                download_cell = "Text note (no file)"
+            elif cos_verified and cos_download:
+                download_cell = f"[COS 副本下载（本机签名入口）](<{cos_download}>)"
+            elif cos_verified and attachment_id:
+                download_cell = ("COS 已归档；运行 Mac 启动器建立隧道后下载，或在 PR 评论中发送 "
+                                 f"`/evidence_link id={_escape(attachment_id)}` 获取 15 分钟链接")
+            elif native_url:
+                download_cell = f"[GitHub 原始附件](<{native_url}>)"
+            else:
+                download_cell = "Source unavailable"
+            comment_id = item.get("source_comment_id")
+            source_cell = "—"
+            valid_comment_id = (
+                (type(comment_id) is int and comment_id > 0)
+                or (isinstance(comment_id, str)
+                    and re.fullmatch(r"[1-9][0-9]{0,19}", comment_id))
             )
-            lines.append("| " + " | ".join(_escape(v) for v in cells) + " | " + download_cell + " |")
+            if api and valid_comment_id:
+                source_url = f"https://github.com/{repo}/pull/{pr_number}#issuecomment-{comment_id}"
+                source_cell = f"[GitHub 评论](<{source_url}>)"
+                if native_url:
+                    source_cell += f" · [原始附件](<{native_url}>)"
+            lines.append("| " + " | ".join(_escape(v) for v in cells) + " | "
+                         + source_cell + " | " + download_cell + " |")
         if group.get("deployments"):
             lines.extend(["", _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
         for field in ("case_results", "test_result", "summary", "history", "cos_object_key", "cos_bundle_sha256", "cos"):
@@ -1081,46 +1138,38 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             and not state.get("merged") and re.fullmatch(r"[0-9a-f]{40}", str(head))
             and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
             and state.get("evidence_enabled") is True and api):
+        machine_names = sorted({str(d.get("machine") or d.get("alias"))
+                                for d in state.get("deployments", [])
+                                if isinstance(d, dict) and (d.get("machine") or d.get("alias"))})
+        pending = sum(1 for item in state.get("attachments", [])
+                      if isinstance(item, dict)
+                      and item.get("status") not in {"ready", "text", "deleted", "invalid"})
+        archived = sum(1 for item in state.get("attachments", [])
+                       if isinstance(item, dict) and item.get("status") == "ready"
+                       and item.get("object_key") and item.get("actor_verified") is True)
         lines.extend([
             "", "### 上传测试证据", "",
-            f"[上传视频 / 文件 / 图片（GitHub）](https://github.com/{repo}/pull/{pr_number})", "",
-            "**适用人员**",
-            "开发者、已部署机器的 Machine Owner，以及现有权限策略允许的协作者。",
-            "",
-            "**操作说明**",
-            "1. 点击上面的上传入口，打开当前 PR。",
-            "2. 在 GitHub 评论框点击 **Attach files**。",
-            "3. 选择视频、图片或文件，可同时填写测试说明。",
-            "4. 点击 **Comment** 提交。",
-            "5. Controller 自动下载 GitHub 附件、保存到 COS，并校验 SHA256。",
-            "6. COS 验证成功后，Summary 展示附件记录和下载链接。",
-            "无需输入 `/submit_evidence`。",
-            "",
-            "**文件大小**",
-            "- 免费组织仓库：视频上限 10 MB。",
-            "- 付费组织仓库且上传者符合 GitHub 资格时：视频最高 100 MB。",
-            "- 图片/GIF：10 MB。",
-            "- 其他支持的文件：25 MB。",
-            "- 超过 GitHub 限制的文件不能通过此入口上传。",
-            "",
-            "**重新上传**",
-            "可直接再次上传并发布新评论；新附件会保留为独立历史记录。",
-            "",
-            "**下载**",
-            "Summary 中的 GitHub attachment 链接下载 GitHub 原始附件。COS 是另外保存的、经过 SHA256 校验的私有副本；GitHub 原始链接不是 COS 下载地址。",
-            "",
+            f"[上传到 COS](<http://127.0.0.1:25001/evidence/{repo}/pulls/{pr_number}"
+            + (f"?cap={urllib.parse.quote(str(state.get('capability')), safe='')}" if state.get("capability") else "")
+            + ">)",
+            "需先运行 Mac 启动器建立 SSH 隧道；此入口通过本机转发访问，不能从公网直接访问。",
+            f"适用人员：PR 开发者、已部署 Machine Owner（{_escape(', '.join(machine_names) or '见当前部署记录')}）。",
+            f"绑定：HEAD `{_escape(head)}` · round `{_escape(current_round)}`。",
+            "在页面选择视频、图片、文档或其他文件，也可提交纯文本说明；所有文件都通过本机隧道直接上传到私有 COS。",
+            f"状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。只有归档后再执行 `/record_test result=pass|fail`。",
+            "每个 COS 下载链接都使用该附件的短期 capability；没有隧道时可发送 `/evidence_link id=<attachment_id>` 获取 15 分钟签名链接。",
         ])
     if state.get("evidence_enabled") is True and state.get("browser_upload_ready") is not True:
         readiness = (state.get("evidence_readiness") or {}).get("status")
         if readiness == "PUBLIC_INGRESS_PENDING":
-            lines.extend(["", "**自建网页上传：** `PUBLIC_INGRESS_PENDING` 仅表示自建网页上传入口暂不可用，不影响上方的 GitHub 原生附件上传入口。"])
-    if (base and state.get("evidence_enabled") is True and state.get("status") == "testing"
+            lines.extend(["", "**公网 HTTPS 入口：** `PUBLIC_INGRESS_PENDING` 只表示公网网页入口不可用；运行 Mac 启动器建立 SSH 隧道后，仍可使用上方本机上传入口。"])
+    if (state.get("evidence_enabled") is True and state.get("status") == "testing"
             and state.get("pr_state", "open") == "open" and not state.get("merged")):
         # The signed Summary capability is bound to this trusted HEAD/round.
         capability = state.get("capability", "")
         if capability:
-            evidence_url = f"{base}/evidence/{repo}/pulls/{pr_number}?cap={urllib.parse.quote(capability, safe='')}"
-            lines.extend(["", f"[View Evidence]({evidence_url})"])
+            evidence_url = f"http://127.0.0.1:25001/evidence/{repo}/pulls/{pr_number}?cap={urllib.parse.quote(capability, safe='')}"
+            lines.extend(["", f"[查看 COS 证据与历史](<{evidence_url}>)"])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: str(pair[1].get("archived_at") or pair[1].get("ended_at") or pair[1].get("created_at") or ""), reverse=True)
     lines.extend(["", "### Previous rounds", ""])
