@@ -771,26 +771,43 @@ def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
         "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
     node = executor.nodes[0]
 
-    # 场景 1：右帧迟到——拍摄时刻差 1 s（远超 50 ms 窗口），但两条
-    # 回调背靠背到达（旧实现会放行这对错配帧）。
-    node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_000))
-    node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_001))
-    _wait_until(lambda: False, timeout=0.2)
-    assert node._stereo_queue.empty(), "拍摄时刻差 1 s 的帧不得配对"
+    # CI 镜像里有真 cv2：worker 会拿配上的 6x8 帧跑真 SGBM，在 qemu 下
+    # 直接把 OpenCV 干 abort（套件 61% 处硬中止就是它）。本测试只关心
+    # 配对逻辑，emit 换 no-op —— 与 test_stereo_pairing_publishes_with_
+    # rectified_blob 同一做法。
+    def _noop_emit(self_inner, left, right):
+        pass
 
-    # 场景 2：真同步对——拍摄时刻同刻（stamp 相同），即使左帧回调早
-    # 0.3 s 到达（模拟传输/调度抖动），也必须配对成功。
-    node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
-    _wait_until(lambda: False, timeout=0.3)   # 左帧先到，右帧在"路上"
-    node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
-    assert _wait_until(lambda: not node._stereo_queue.empty()), \
-        "同刻拍摄、回调错峰到达的帧必须配对"
+    original = type(node)._emit_stereo
+    type(node)._emit_stereo = _noop_emit
+    try:
+        # 场景 1：右帧迟到——拍摄时刻差 1 s（远超 50 ms 窗口），但两条
+        # 回调背靠背到达（旧实现会放行这对错配帧）。
+        node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_000))
+        node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_001))
+        _wait_until(lambda: False, timeout=0.2)
+        assert node._stereo_queue.empty(), "拍摄时刻差 1 s 的帧不得配对"
+        assert node._stereo_pair_seq == 0, "错配帧不得进 worker"
 
-    # 场景 3：无 stamp（老驱动不写 header）→ 退回到达时刻，窗口内仍可配对
-    node._left_latest = None
-    node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
-    node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
-    assert _wait_until(lambda: node._last_stereo_pair is not None)
+        # 场景 2：真同步对——拍摄时刻同刻（stamp 相同），即使左帧回调早
+        # 到达（模拟传输/调度抖动），也必须配对成功。用 seq 断言而不是
+        # 队列非空：worker 取走队列极快，查队列是竞态。
+        node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
+        _wait_until(lambda: False, timeout=0.05)   # 左帧先到，右帧在"路上"
+        node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
+        assert _wait_until(lambda: node._stereo_pair_seq >= 1), \
+            "同刻拍摄、回调错峰到达的帧必须配对"
+
+        # 场景 3：无 stamp（老驱动不写 header）→ 退回到达时刻，窗口内仍
+        # 可配对。重置节流时钟：场景 2 的右帧刚消耗了配额，1 ms 内的下一
+        # 帧会被 _throttled 误丢（fps=1000）。
+        node._left_latest = None
+        node._last_emit_time = 0.0
+        node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+        node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+        assert _wait_until(lambda: node._stereo_pair_seq >= 2)
+    finally:
+        type(node)._emit_stereo = original
 
 
 def test_stereo_pairing_publishes_with_rectified_blob():
