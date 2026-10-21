@@ -124,6 +124,11 @@ def test_tool_is_a_measurement_card_with_user_actions():
     assert tool["topic_out"][0]["format"] == "data/json"
 
 
+def test_a_single_frame_is_refused_because_there_is_no_spread_to_check():
+    with pytest.raises(ValueError, match="at least 2|frames"):
+        _plugin(frames=1)
+
+
 def test_schema_defaults_match_the_documented_config_defaults():
     properties = height_plugin.TOOLS[0]["configSchema"]["properties"]
     for key, value in height_plugin._CONFIG_DEFAULTS.items():

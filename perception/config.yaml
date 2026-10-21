@@ -700,7 +700,8 @@ plugins:
     fy: 0.0
     cx: 0.0
     cy: 0.0
-    # Frames averaged per measurement; the target must hold still for them.
+    # Frames averaged per measurement (at least 2; the target must hold still
+    # for them, and the spread across the frames is checked).
     frames: 5
     # Depth beyond this is ignored for the floor fit and the target.
     max_range_m: 4.5

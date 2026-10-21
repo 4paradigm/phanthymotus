@@ -184,11 +184,11 @@ _TOOL = {
             },
             "frames": {
                 "type": "integer", "default": 5, "scope": "shared",
-                "minimum": 1, "maximum": 30,
+                "minimum": 2, "maximum": 30,
                 "title": "Frames averaged per measurement",
                 "description": "The target must hold still for this many "
-                               "frames; at least 2 are needed and the spread "
-                               "must stay under 3 cm.",
+                               "frames; the spread across them must stay "
+                               "under 3 cm.",
             },
             "max_range_m": {
                 "type": "number", "default": 4.5, "scope": "shared",
@@ -408,8 +408,9 @@ class HeightPlugin:
         for key in ("fx", "fy", "cx", "cy"):
             if self._cfg[key] < 0.0:
                 raise ValueError(f"{key} must be >= 0")
-        if not 1 <= self._cfg["frames"] <= 30:
-            raise ValueError("frames must be in [1, 30]")
+        if not 2 <= self._cfg["frames"] <= 30:
+            raise ValueError("frames must be in [2, 30] (a single frame has "
+                             "no spread to check)")
         if not 0.5 <= self._cfg["max_range_m"] <= 10.0:
             raise ValueError("max_range_m must be in [0.5, 10]")
         if not 0.05 <= self._cfg["max_detection_age_s"] <= 5.0:
