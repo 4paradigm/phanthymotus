@@ -19,6 +19,7 @@ import { toggleMicStream, isMicActive } from './mic-stream.js';
 import { toggleCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
+import { installVisionCaptureDownloads } from './vision-capture-download.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
@@ -1274,6 +1275,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       e.stopPropagation();
       _removeCard(id);
     });
+
+    installVisionCaptureDownloads(el, mcpId, toolName);
 
     // x-action-params: 根据选中的 action 动态显隐参数字段
     const actionParams = schema?.['x-action-params'];
