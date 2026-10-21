@@ -25,6 +25,11 @@ def frontend_data_dir() -> Path:
     return _root() / "frontend_data"
 
 
+def gold_lexicon_path() -> Path:
+    """Return the separately downloaded, verified Gold overlay."""
+    return _root() / "frontend" / "en_gold_pronunciations.json"
+
+
 def nltk_data_dir() -> Path:
     """Return the verified release NLTK-data directory."""
     return _root() / "nltk_data"

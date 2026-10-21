@@ -1,13 +1,12 @@
-"""Gold lexicon integration, without acoustic inference or resource downloads.
+"""Gold resource loading and frontend integration without network or inference.
 
-The full shipped overlay, production lookup/conversion functions, both G2P
-routes, inflect, and structured TN rules are real. Small CMU and OOV fixtures
-make lookup precedence observable without importing NLTK models. A deliberately
-destructive normalizer tests the external FST boundary; it is not an acoustic
-or real-FST quality test.
+Small explicit Gold, CMU and OOV fixtures make lookup precedence observable;
+the production lookup/conversion functions, both G2P routes, inflect and
+structured TN rules are real. The complete externally downloaded overlay is
+verified separately by the pinned resource manifest. A deliberately destructive
+normalizer tests the external FST boundary, not acoustic or real-FST quality.
 """
 
-import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -23,7 +22,19 @@ import numpy  # Load the extension before temporary sys.modules isolation.
 
 
 FRONTEND = Path(__file__).resolve().parents[1] / "plugins/vits2_tts_trt/frontend"
-GOLD_SHA256 = "0c6fd2adb51aeae0fd83968f1902dedb16c73db695a3e3ad088bfc23cc05d57a"
+# These eight readings are copied from the pinned Gold overlay. Keep the fixture
+# deliberately small: the production asset belongs in the verified model cache,
+# not in the Git checkout or in an encoded test copy of the full lexicon.
+GOLD_FIXTURE = {
+    "SQL": ["EH2", "S", "K", "Y", "UW2", "EH1", "L"],
+    "NVIDIA": ["EH1", "N", "V", "IH1", "D", "IY0", "AH0"],
+    "QWEN": ["K", "W", "IY1", "N"],
+    "AIRBNB": ["EH1", "R", "B", "IY1", "EH1", "N", "B", "IY1"],
+    "TAKE-TWO": ["T", "EY1", "K", "T", "UW1"],
+    "RISC-V": ["R", "IH1", "S", "K", "F", "AY1", "V"],
+    "GB": ["JH", "IY1", "B", "IY1"],
+    "USD": ["Y", "UW1", "EH1", "S", "D", "IY1"],
+}
 
 
 def load_frontends(cache):
@@ -31,6 +42,9 @@ def load_frontends(cache):
     # root. Keep test resources behind that same contract, not environment
     # overrides that production deliberately no longer accepts.
     release_root = cache.parent
+    gold_path = release_root / "frontend" / "en_gold_pronunciations.json"
+    gold_path.parent.mkdir()
+    gold_path.write_text(json.dumps(GOLD_FIXTURE), encoding="utf-8")
     data_dir = release_root / "frontend_data"
     data_dir.mkdir()
     cache = data_dir / "cmudict_cache.pickle"
@@ -97,14 +111,13 @@ class GoldLexiconTest(unittest.TestCase):
             language="EN",
         )
 
-    def test_full_source_overlay_is_exact_valid_and_below_one_megabyte(self):
-        source = FRONTEND / "en_gold_pronunciations.json"
-        self.assertLess(source.stat().st_size, 1_000_000)
-        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), GOLD_SHA256)
+    def test_gold_resource_is_loaded_from_configured_release_and_cached(self):
+        expected_path = self.directory / "frontend" / "en_gold_pronunciations.json"
+        self.assertEqual(self.english.gold_lexicon_path(), expected_path)
         entries = self.english.gold_en_pronunciations()
-        self.assertEqual(len(entries), 13083)
+        self.assertEqual(entries, {word: tuple(phones)
+                                   for word, phones in GOLD_FIXTURE.items()})
         self.assertIs(self.english.gold_en_pronunciations(), entries)
-        self.assertFalse(any(word.isdecimal() or len(word) == 1 for word in entries))
         for word, pronunciation in entries.items():
             phones, tones = self.english.refine_syllables((pronunciation,))
             converted = [self.english.post_replace_ph(phone) for phone in phones]
@@ -336,15 +349,14 @@ class GoldLexiconTest(unittest.TestCase):
                 self.assertNotIn("Feat Insight", actual)
 
     def test_missing_lexicon_raises_instead_of_silently_using_cmu(self):
-        self.english.current_file_path = str(self.directory)
+        self.english.gold_lexicon_path().unlink()
         self.english.gold_en_pronunciations.cache_clear()
         with self.assertRaises(FileNotFoundError):
             self.english.g2p_token("known")
         self.english._g2p.assert_not_called()
 
     def test_malformed_json_and_schema_fail_explicitly(self):
-        path = self.directory / "en_gold_pronunciations.json"
-        self.english.current_file_path = str(self.directory)
+        path = self.english.gold_lexicon_path()
         path.write_text("{malformed", encoding="utf-8")
         self.english.gold_en_pronunciations.cache_clear()
         with self.assertRaises(json.JSONDecodeError):

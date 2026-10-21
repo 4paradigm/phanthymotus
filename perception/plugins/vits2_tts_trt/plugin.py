@@ -677,7 +677,7 @@ class TTSPlugin:
     """VITS2 TensorRT implementation behind the standard ``tts`` tool.
 
     Lifecycle mirrors plugins/ocr.py, for the same reason: the slow work (a
-    60 MB release download, three TensorRT engines, a warmup pass) is open-ended,
+    160 MB release download, three TensorRT engines, a warmup pass) is open-ended,
     so it must not run on the request thread. The bound it would blow through is
     the 60 s the *LLM* tool path allows a processor tools/call
     (agent-core/src/mcp_client.py); the dashboard's start-project path sets no
@@ -714,6 +714,7 @@ class TTSPlugin:
         self._adapter = None
         self._adapter_state = "idle"     # idle|loading|ready|error
         self._load_error = None
+        self._load_status = None
         self._load_generation = 0
         self._model_name = "vits2"
 
@@ -738,28 +739,43 @@ class TTSPlugin:
         """Start the one background adapter loader. Caller holds the lock."""
         self._adapter_state = "loading"
         self._load_error = None
+        self._load_status = "Downloading and initializing the VITS2 TensorRT model..."
         threading.Thread(
             target=self._loader, args=(self._load_generation, dict(self._cfg)),
             name="vits2-adapter-loader", daemon=True,
         ).start()
 
+    def _set_load_status(self, generation: int, status: str) -> None:
+        """Publish progress only for the current, still-loading model."""
+        with self._state_lock:
+            if generation == self._load_generation and self._adapter_state == "loading":
+                self._load_status = status
+
     def _loader(self, generation: int, cfg: dict) -> None:
         try:
             from utils.model_downloader import ensure_vits2_model, vits2_release_root
+            from utils.model_progress import fetch_status
+
+            progress_cb, stage_cb = fetch_status(
+                lambda status: self._set_load_status(generation, status), "VITS2"
+            )
 
             # Returns the engine directory of the family that matches the
             # TensorRT actually importable here, so the adapter never has to
             # guess between engines/jp61 and engines/jp511.
             cfg["engine_dir"] = ensure_vits2_model(
-                cfg.get("model_dir", "/models/vits2")
+                cfg.get("model_dir", "/models/vits2"),
+                progress_cb=progress_cb, stage_cb=stage_cb,
             )
             # The verified archive may have a release-root directory. Frontend
             # data and config must come from that same bundle as its engines.
             cfg["model_dir"] = vits2_release_root(cfg["engine_dir"])
+            self._set_load_status(generation, "Initializing the VITS2 TensorRT model...")
             adapter = build_adapter(cfg)
             if not isinstance(adapter, Vits2TensorRTAdapter):
                 raise RuntimeError("Unexpected non-TensorRT VITS2 adapter")
             if cfg.get("warmup", True):
+                self._set_load_status(generation, "Warming up the VITS2 TensorRT model...")
                 started = time.monotonic()
                 warmup_bytes = adapter.warmup()
                 log.info(
@@ -773,6 +789,7 @@ class TTSPlugin:
                     return
                 self._adapter_state = "error"
                 self._load_error = _error_chain(error)
+                self._load_status = None
                 # Abandon the queued work rather than leave the caller's ACP
                 # action pending forever; the reason is on the tool state.
                 self._pending_starts.clear()
@@ -786,6 +803,7 @@ class TTSPlugin:
                 self._adapter = adapter
                 self._adapter_state = "ready"
                 self._load_error = None
+                self._load_status = None
                 self._model_name = "vits2-tensorrt"
         if superseded:
             # A config change happened mid-load; never install the result.
@@ -920,11 +938,11 @@ class TTSPlugin:
         base.update(extra)
         return base
 
-    def _describe(self, state: str) -> str:
+    def _describe(self, state: str, load_status, error) -> str:
         if state == "loading":
-            return "Downloading and initializing the VITS2 TensorRT model..."
-        if state == "error" and self._load_error:
-            return f"Model load failed: {self._load_error}"
+            return load_status or "Downloading and initializing the VITS2 TensorRT model..."
+        if state == "error" and error:
+            return f"Model load failed: {error}"
         return self.DESC
 
     def _request_load_locked(self) -> None:
@@ -967,6 +985,7 @@ class TTSPlugin:
             adapter_state = self._adapter_state
             pending = bool(self._pending_starts)
             error = self._load_error
+            load_status = self._load_status
             # An instance that started while the model loads has no node yet, and
             # info is routinely called without input_topic (Agent Core's start
             # sequencer does). Remembering the topic the pending start asked for
@@ -982,7 +1001,7 @@ class TTSPlugin:
             if adapter_state == "loading" and state != "running":
                 state = "loading"
             return self._identity(**{**node.status(), "state": state,
-                                     "desc": self._describe(state)})
+                                     "desc": self._describe(state, load_status, error)})
 
         if instance_id:
             # Known instance that is not up yet: report the shared model state
@@ -996,7 +1015,7 @@ class TTSPlugin:
                           if input_topic else []),
                 topic_out=[{"topic": output_topic, "format": "audio/pcm-16k",
                             "desc": ""}],
-                desc=self._describe(state),
+                desc=self._describe(state, load_status, error),
             )
             if state == "error" and error:
                 result["error"] = error
@@ -1021,7 +1040,8 @@ class TTSPlugin:
             topics_out = [{"topic": output_topic, "format": "audio/pcm-16k",
                            "desc": ""}]
         result = self._identity(state=state, topic_in=topics_in,
-                                topic_out=topics_out, desc=self._describe(state))
+                                topic_out=topics_out,
+                                desc=self._describe(state, load_status, error))
         if state == "error" and error:
             result["error"] = error
         return result
@@ -1141,6 +1161,7 @@ class TTSPlugin:
                 self._load_generation += 1
                 self._adapter_state = "idle"
                 self._load_error = None
+                self._load_status = None
                 if self._pending_starts or self._pending_speech:
                     self._spawn_loader_locked()
         if adapter is not None:

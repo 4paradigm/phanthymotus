@@ -1,7 +1,7 @@
 """
 tests/test_vits2_tts_plugin.py — VITS2 TTS lifecycle tests (host-side).
 
-The point of these: the VITS2 model is a 60 MB download plus three TensorRT
+The point of these: the VITS2 model is a 160 MB download plus three TensorRT
 engines plus a warmup pass, while Agent Core gives a processor tools/call 60 s
 (agent-core/src/mcp_client.py). So `start` must never wait for the model, and
 every path that abandons an utterance must still release its ACP action.
@@ -100,12 +100,13 @@ def _plugin(monkeypatch, *, gated=False, fail=None):
     """
     gate = threading.Event()
     state = {
-        "loads": 0, "engine_dirs": [], "adapters": [],
+        "loads": 0, "engine_dirs": [], "adapters": [], "callbacks": [],
         "release": gate.set, "entered": threading.Event(),
     }
 
-    def fake_ensure(model_dir, family=None):
+    def fake_ensure(model_dir, family=None, progress_cb=None, stage_cb=None):
         state["loads"] += 1
+        state["callbacks"].append((progress_cb, stage_cb))
         state["entered"].set()
         if gated and not gate.wait(10):
             raise RuntimeError("test never released the load gate")
@@ -202,6 +203,89 @@ def test_info_never_triggers_a_load(monkeypatch):
     assert state["loads"] == 0
 
 
+def test_loading_info_reports_download_progress_and_extraction(monkeypatch):
+    plugin, _, state = _plugin(monkeypatch, gated=True)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say",
+                            "instance_id": "a"})
+    try:
+        assert state["entered"].wait(3)
+        progress, stage = state["callbacks"][0]
+        assert callable(progress) and callable(stage)
+        progress(25, 40, 160)
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            info = plugin.dispatch("tts", args)
+            assert info["state"] == "loading"
+            assert "25% (40/160 MB)" in info["desc"]
+        stage("extract")
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            info = plugin.dispatch("tts", args)
+            assert "正在解压模型 'VITS2'" in info["desc"]
+            assert "%" not in info["desc"]
+    finally:
+        state["release"]()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
+def test_loading_info_advances_to_initialization_and_warmup(monkeypatch):
+    # A verified cache hit emits no download callbacks. Slow initialization and
+    # warmup still need observable stages, with info responsive from this thread.
+    plugin, _, _ = _plugin(monkeypatch)
+    build_entered, build_release = threading.Event(), threading.Event()
+    warmup_entered, warmup_release = threading.Event(), threading.Event()
+
+    class GatedAdapter(_FakeAdapter):
+        def warmup(self):
+            warmup_entered.set()
+            if not warmup_release.wait(10):
+                raise RuntimeError("test never released warmup")
+            return super().warmup()
+
+    def build(cfg):
+        build_entered.set()
+        if not build_release.wait(10):
+            raise RuntimeError("test never released initialization")
+        return GatedAdapter()
+
+    monkeypatch.setattr(vits2, "build_adapter", build)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say", "instance_id": "a"})
+    try:
+        assert build_entered.wait(3)
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            assert plugin.dispatch("tts", args)["desc"] == "Initializing the VITS2 TensorRT model..."
+        build_release.set()
+        assert warmup_entered.wait(3)
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            assert plugin.dispatch("tts", args)["desc"] == "Warming up the VITS2 TensorRT model..."
+    finally:
+        build_release.set()
+        warmup_release.set()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
+def test_stale_download_callbacks_cannot_replace_current_status(monkeypatch):
+    plugin, _, state = _plugin(monkeypatch, gated=True)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say", "instance_id": "a"})
+    try:
+        assert state["entered"].wait(3)
+        old_progress, old_stage = state["callbacks"][0]
+        old_progress(80, 128, 160)
+        plugin.dispatch("tts", {"action": "config", "speed": 0.8})
+        assert _wait_until(lambda: len(state["callbacks"]) == 2)
+        progress, _ = state["callbacks"][1]
+        progress(10, 16, 160)
+        old_progress(99, 159, 160)
+        old_stage("extract")
+        assert "10% (16/160 MB)" in plugin.dispatch("tts", {"action": "info"})["desc"]
+    finally:
+        state["release"]()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    progress(100, 160, 160)
+    old_stage("extract")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
 # ── failure and retry ────────────────────────────────────────────────────────
 
 def test_load_failure_surfaces_then_next_start_retries(monkeypatch):
@@ -214,6 +298,10 @@ def test_load_failure_surfaces_then_next_start_retries(monkeypatch):
     )
     info = plugin.dispatch("tts", {"action": "info"})
     assert "release download failed" in info["error"]
+    progress, stage = state["callbacks"][0]
+    progress(50, 80, 160)
+    stage("extract")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == "Model load failed: release download failed"
 
     # A retry is not blocked by the sticky error, and it succeeds.
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
@@ -406,7 +494,7 @@ def test_config_speed_updates_a_resident_model_without_a_reload(monkeypatch):
         "status": "configured"
     }
     assert _installed(plugin).speed == pytest.approx(1.4)
-    # A slider change must not cost a 60 MB reload or drop the live node.
+    # A slider change must not cost a 160 MB reload or drop the live node.
     assert state["loads"] == 1
     assert executor.nodes == [node] and node.state == "running"
 
@@ -502,7 +590,7 @@ def test_load_error_keeps_the_underlying_cause(monkeypatch):
 
     import utils.model_downloader as md
 
-    def explode(model_dir, family=None):
+    def explode(model_dir, family=None, progress_cb=None, stage_cb=None):
         try:
             raise ImportError(
                 "libnvdla_compiler.so: cannot open shared object file: "

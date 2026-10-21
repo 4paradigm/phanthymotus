@@ -8,7 +8,7 @@ import numpy as np
 
 from .symbols import punctuation, symbols
 from .technical_text import normalize_technical_lexemes
-from .release_paths import frontend_data_dir, nltk_data_dir
+from .release_paths import frontend_data_dir, gold_lexicon_path, nltk_data_dir
 
 current_file_path = os.path.dirname(__file__)
 
@@ -330,7 +330,7 @@ CUSTOM_EN_PRONUNCIATIONS = {
 @lru_cache(maxsize=1)
 def gold_en_pronunciations():
     """Load fanyi's verified ARPAbet overlay once for English and MIX G2P."""
-    path = os.path.join(current_file_path, "en_gold_pronunciations.json")
+    path = gold_lexicon_path()
     with open(path, encoding="utf-8") as source:
         entries = json.load(source)
     if not isinstance(entries, dict):

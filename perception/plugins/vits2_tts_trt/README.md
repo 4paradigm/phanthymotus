@@ -163,7 +163,8 @@ supported; the panel field is tool-wide, as declared by its shared scope.
 
 The frontend incorporates fanyi's 13,083-entry English Gold lexicon with
 `CUSTOM → Gold → CMU → G2P` lookup for English and mixed text. The lexicon
-ships with the plugin source, so changes are versioned with the code.
+is fetched from the pinned public ModelScope release below and cached with
+the model resources. Its full contents are not committed to the code repository.
 
 Context-aware normalization covers telephone numbers, dates and times,
 order IDs, last-four digits, model numbers, fractions, scientific notation,
@@ -200,9 +201,24 @@ container does not download them at runtime. These archives have different
 engine and Chinese TN hashes from the former COS bundles; they are pinned
 explicitly rather than treated as interchangeable copies.
 
+The separate `frontend/en_gold_pronunciations.json` in that same ModelScope
+revision is 672,106 bytes, with SHA256
+`0c6fd2adb51aeae0fd83968f1902dedb16c73db695a3e3ad088bfc23cc05d57a`.
+The downloader verifies and installs it at
+`<model_dir>/<release_root>/frontend/en_gold_pronunciations.json` before creating
+the adapter, including when the engine archive is already cached. Missing or
+corrupt copies are downloaded again through the existing lock and staging
+mechanism; a failed verification fails loading rather than omitting Gold.
+This uses the existing `/models` cache and needs no extra volume or image layer.
+The public ModelScope source follows the PR submission procedure; a later
+approved COS mirror can use `VITS2_MODEL_BASE_URL` with the same relative file
+paths and checksums.
+
 Installation happens in a background loader on the first `start`/`speak`, which
 returns `{"state": "loading"}` immediately — the download plus three TensorRT
 engines plus warmup takes far longer than the 60 s Agent Core allows a
 processor `tools/call`. Instances that were requested while the model loaded
 come up on their own when it is ready, and utterances queued in the meantime
 play then. `info` never blocks and never triggers a load.
+While loading, `info.desc` reports byte progress, extraction, initialization and
+warmup. Superseded loaders cannot overwrite the current load's status.

@@ -1075,6 +1075,15 @@ VITS2_MODEL_BASE = os.environ.get(
     "https://www.modelscope.cn/api/v1/models/lanxijiang/TTSV4_Ch_Eng/repo"
     f"?Revision={VITS2_MODEL_REVISION}&FilePath={{file}}",
 )
+# The Gold overlay is an independent resource in the same immutable release.
+# Keep its full contents outside Git; the archive predates this overlay, so a
+# cached engine archive does not imply that the lexicon has been installed.
+VITS2_FRONTEND_FILES = {
+    "frontend/en_gold_pronunciations.json": {
+        "size": 672106,
+        "sha256": "0c6fd2adb51aeae0fd83968f1902dedb16c73db695a3e3ad088bfc23cc05d57a",
+    },
+}
 VITS2_MODEL_ARCHIVES = {
     "jp61": {
         "archive": "lc1_male_v6_frontend_146k_jp6_runtime.tar.gz",
@@ -1122,7 +1131,14 @@ def ensure_vits2_model(model_dir: str, family: str | None = None,
         progress_cb=progress_cb,
         stage_cb=stage_cb,
     )
-    return os.path.join(model_dir, entry["release_root"], "engines")
+    release_root = require_models_subpath(os.path.join(model_dir, entry["release_root"]))
+    # Also runs for a warm archive cache: missing/corrupt frontend resources
+    # must be repaired before the adapter can load or report itself ready.
+    ensure_verified_bundle(
+        "vits2/frontend", release_root, VITS2_MODEL_BASE, VITS2_FRONTEND_FILES,
+        progress_cb=progress_cb,
+    )
+    return os.path.join(release_root, "engines")
 
 
 # The Thai TTS voice: an ONNX export of VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR,
