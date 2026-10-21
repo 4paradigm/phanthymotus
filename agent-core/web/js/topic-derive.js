@@ -49,7 +49,7 @@ export function topicOfPort(card, portIdx) {
  * while the driver had long since fallen back to /perception/tts.
  */
 export function hasInboundConnection(card, connections) {
-  return connections.some(c => c.toCardId === card.id);
+  return connections.some(c => c.toCardId === card.id && c.format !== 'file/reference');
 }
 
 /**
@@ -99,7 +99,7 @@ function topicOfConnection(conn, cards, allowStale) {
  */
 export function inputTopicsOf(card, cards, connections, allowStale = false) {
   const topics = [];
-  for (const conn of connections.filter(c => c.toCardId === card.id)) {
+  for (const conn of connections.filter(c => c.toCardId === card.id && c.format !== 'file/reference')) {
     const topic = topicOfConnection(conn, cards, allowStale);
     if (!topic) return [];
     if (!topics.includes(topic)) topics.push(topic);
@@ -263,6 +263,7 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
 export function syncConnectionTopics(cards, connections) {
   const fixed = [];
   for (const conn of connections) {
+    if (conn.format === 'file/reference') continue;
     const src = cards.find(c => c.id === conn.fromCardId);
     if (!src) continue;
     const topic = topicOfPort(src, parseInt(conn.fromPortIdx, 10) || 0);

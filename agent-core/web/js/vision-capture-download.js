@@ -1,5 +1,5 @@
 // Downloads use Agent Core's existing authenticated file APIs and shared volume.
-// The local menu entries never become driver actions or saved canvas parameters.
+// vision_capture is the first provider for the independent file_download card.
 async function captureInfo(mcpId) {
   const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call?timeout_s=20`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -55,7 +55,7 @@ export async function downloadCaptureFile(path) {
   }
 }
 
-function openCaptureDownloads(mcpId, mediaType) {
+export function openCaptureDownloads(getSources, mediaType) {
   const previousFocus = document.activeElement;
   const title = mediaType === 'photo' ? '下载照片' : '下载视频';
   const overlay = document.createElement('div');
@@ -90,14 +90,29 @@ function openCaptureDownloads(mcpId, mediaType) {
     list.replaceChildren();
     status.textContent = '正在读取保存目录…';
     try {
-      const files = await listCaptureFiles(mcpId, mediaType);
+      const sources = getSources();
+      if (!sources.length) {
+        status.textContent = '请先将 vision_capture 的文件输出口连接到下载卡片。';
+        return;
+      }
+      const results = await Promise.allSettled(sources.map(source => listCaptureFiles(source.mcpId, mediaType)));
       if (!overlay.isConnected) return;
+      const connected = new Set(getSources().map(source => source.id));
+      const files = [], errors = [];
+      results.forEach((result, i) => {
+        const source = sources[i];
+        if (!connected.has(source.id)) return;
+        const label = source.driverName || source.mcpId;
+        if (result.status === 'fulfilled') files.push(...result.value.map(file => ({ ...file, source, label })));
+        else errors.push(`${label}：${result.reason.message}`);
+      });
       status.textContent = files.length ? `共 ${files.length} 个文件，点击下载保存到本机。`
         : (mediaType === 'photo' ? '暂无已保存的照片。' : '暂无已完成的视频，录制结束后可刷新。');
+      if (errors.length) status.textContent += ' ' + errors.join('；');
       for (const file of files) {
         const row = document.createElement('li');
         const name = document.createElement('span');
-        name.textContent = file.name;
+        name.textContent = `${file.name} · ${file.label}`;
         name.title = file.name;
         const button = document.createElement('button');
         button.type = 'button';
@@ -107,6 +122,7 @@ function openCaptureDownloads(mcpId, mediaType) {
         button.onclick = async () => {
           button.disabled = true;
           try {
+            if (!getSources().some(source => source.id === file.source.id)) throw new Error('文件来源已断开，请刷新列表');
             await downloadCaptureFile(file.path);
             status.textContent = `已发起下载：${file.name}`;
           } catch (error) { status.textContent = error.message; }
@@ -125,27 +141,4 @@ function openCaptureDownloads(mcpId, mediaType) {
   document.body.append(overlay);
   close.focus();
   reload();
-}
-
-export function installVisionCaptureDownloads(el, mcpId, toolName) {
-  if (toolName !== 'vision_capture') return;
-  const select = el.querySelector('select[data-key="action"]');
-  if (!select) return;
-  let action = select.value;
-  const downloads = { __download_photos: 'photo', __download_videos: 'video' };
-  for (const [value, label] of [['__download_photos', '下载照片…'], ['__download_videos', '下载视频…']]) {
-    const option = document.createElement('option');
-    option.value = value;
-    option.textContent = label;
-    select.append(option);
-  }
-  // Registered before the card's action handler, so opening a read-only list
-  // neither claims the canvas edit lock nor changes the current capture action.
-  select.addEventListener('change', event => {
-    const mediaType = downloads[select.value];
-    if (!mediaType) { action = select.value; return; }
-    select.value = action;
-    event.stopImmediatePropagation();
-    openCaptureDownloads(mcpId, mediaType);
-  });
 }

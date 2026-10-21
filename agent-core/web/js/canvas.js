@@ -19,7 +19,7 @@ import { toggleMicStream, isMicActive } from './mic-stream.js';
 import { toggleCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
-import { installVisionCaptureDownloads } from './vision-capture-download.js';
+import { FILE_FORMAT, filePortHtml, connectedFileSources, installFileDownloadCard } from './file-download-card.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
 // same way, and with api/config.py's _start_and_resolve so the canvas and the
 // start agree about what a card consumes.
@@ -910,6 +910,7 @@ async function _removeCard(id) {
   _connections = _connections.filter(c => c.fromCardId !== id && c.toCardId !== id);
   // Trigger auto-stop on downstream cards that lost their input
   for (const conn of outgoing) {
+    if (conn.format === FILE_FORMAT) continue;
     _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
   }
   // Clean up executor connections
@@ -962,14 +963,14 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     const fmt = t.format || '';
     const colorCls = _fmtColorClass(fmt);
     return `<div class="canvas-port in ${colorCls}" data-dir="in" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-idx="${i}"></div>`;
-  }).join('');
+  }).join('') + filePortHtml({ mcpId, toolName }, 'in');
 
   const outPortsHtml = topicOut.map((t, i) => {
     const fmt = t.format || '';
     const colorCls = _fmtColorClass(fmt);
     const staticAttr = t.topic ? `data-static-topic="${_esc(t.topic)}"` : '';
     return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}"></div>`;
-  }).join('');
+  }).join('') + filePortHtml({ mcpId, toolName }, 'out');
 
   if (effectiveType === 'controller') {
     // Controller cards: no fields, no execute button — only start/stop/info via header
@@ -1276,8 +1277,6 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       _removeCard(id);
     });
 
-    installVisionCaptureDownloads(el, mcpId, toolName);
-
     // x-action-params: 根据选中的 action 动态显隐参数字段
     const actionParams = schema?.['x-action-params'];
     if (actionParams) {
@@ -1398,6 +1397,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     });
   }
 
+  if (mcpId === 'agentcore' && toolName === 'file_download') {
+    installFileDownloadCard(el, () => connectedFileSources(id, _cards, _connections));
+  }
   return el;
 }
 
@@ -1596,7 +1598,7 @@ function _setupPortDrag() {
         _saveLayout();
 
         const toCardData = _cards.find(c => c.id === toCard.dataset.cardId);
-        if (toCardData && _projectRunning) {
+        if (toCardData && _projectRunning && _draggingConn.format !== FILE_FORMAT) {
           // Restart on the card's *whole* input set, not just the link that was
           // just drawn. Perception rebuilds a node whose input_topic differs
           // from the one it holds (plugins/tts.py), so naming only the new topic
@@ -1833,7 +1835,7 @@ function _removeTopicConnection(connId) {
   if (!conn) return;
   _connections = _connections.filter(c => c.id !== connId);
   _resolveAllTopics();
-  _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
+  if (conn.format !== FILE_FORMAT) _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
   _scheduleRedraw();
   _saveLayout();
 }
@@ -1972,6 +1974,7 @@ function _resolveAllTopics() {
     inDegree[card.id] = 0;
   }
   for (const conn of _connections) {
+    if (conn.format === FILE_FORMAT) continue;
     if (outgoing[conn.fromCardId]) outgoing[conn.fromCardId].push(conn);
     inDegree[conn.toCardId] = (inDegree[conn.toCardId] || 0) + 1;
   }
@@ -2606,7 +2609,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
  */
 function _inputTopicsFor(card) {
   const topics = [];
-  for (const conn of _connections.filter(c => c.toCardId === card.id)) {
+  for (const conn of _connections.filter(c => c.toCardId === card.id && c.format !== FILE_FORMAT)) {
     const src = _cards.find(c => c.id === conn.fromCardId);
     const outPort = src?.el?.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
     const topic = outPort?.dataset.topic || '';

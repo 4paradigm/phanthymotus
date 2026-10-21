@@ -27,6 +27,15 @@ const CONNS = [
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
+test('文件来源连线不变成 DDS 订阅，也不阻塞正常话题解析', () => {
+  const fileLink = { fromCardId: MIC.id, toCardId: ASR.id, fromPortIdx: 'files',
+    toPortIdx: 'files', format: 'file/reference', fromTopic: '' };
+  assert.equal(hasInboundConnection(ASR, [fileLink]), false);
+  assert.deepEqual(inputTopicsOf(ASR, [MIC, ASR], [fileLink, CONNS[0]]), ['/remote_control/mic']);
+  assert.deepEqual(syncConnectionTopics([MIC, ASR], [fileLink]), []);
+  assert.equal(fileLink.fromTopic, '');
+});
+
 /** A driver that infers `input + '/' + tool`, like the real topic inference. */
 function driver(log = []) {
   return async (url, init) => {

@@ -142,6 +142,12 @@ def _register_core_mcp(silent=False):
                 ],
             },
             {
+                'name': 'file_download',
+                'type': 'resource',
+                'description': '文件下载 — 连接文件输出口，查看并下载历史照片和已完成的视频。',
+                'inputSchema': {'type': 'object', 'properties': {}},
+            },
+            {
                 'name': 'remote_mic',
                 'type': 'sensor',
                 'description': '浏览器麦克风 — 通过 WebSocket 采集本地麦克风 PCM-16k 音频流',

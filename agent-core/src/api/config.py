@@ -576,7 +576,8 @@ async def _do_start_project_impl():
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
-    connections = layout.get('connections', [])
+    # File references bind download sources; they are not DDS startup dependencies.
+    connections = [c for c in layout.get('connections', []) if c.get('format') != 'file/reference']
 
     if not cards:
         return

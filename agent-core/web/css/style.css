@@ -1014,6 +1014,7 @@ html, body {
 .cap-type-badge.actuator  { background: rgba(217,119,6,0.10); color: #B45309; }
 .cap-type-badge.processor { background: var(--purple-bg); color: var(--purple); }
 .cap-type-badge.controller { background: rgba(5,150,105,0.10); color: var(--emerald); }
+.cap-type-badge.resource { background: var(--bg-input); color: var(--text-muted); }
 
 /* ── Tool Detail Modal ─────────────────────────────────────────────────── */
 .tool-detail-modal-backdrop {
@@ -2014,7 +2015,7 @@ html, body {
 /* Read-only mode: visual hint that editing is disabled */
 .canvas-readonly .canvas-card-close,
 .canvas-readonly .canvas-exec-btn:not(.locked),
-.canvas-readonly .canvas-field-input {
+.canvas-readonly .canvas-field-input:not(.canvas-download-type) {
   cursor: not-allowed;
   opacity: 0.6;
 }
