@@ -334,6 +334,38 @@ def test_stop_cancels_pending_mono_start(monkeypatch):
     assert _wait_until(lambda: len(executor.nodes) == 0, timeout=2.0)
 
 
+def test_stop_without_instance_cancels_all_pending_mono_starts(monkeypatch):
+    """review 第 15 轮：全停（不带 instance_id）同样要清 _model_pending_starts。
+    一张卡在等共享模型下载、另一张已落地时调用全停——回复 idle 后 loader
+    落完加载不能把等待中的那张卡重新拉起。"""
+    import threading
+
+    plugin, executor = _plugin()
+
+    block = threading.Event()
+
+    def _blocked_ensure_model():
+        block.wait()  # 永远阻塞，直到测试放行
+
+    plugin._ensure_model = _blocked_ensure_model
+
+    r1 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c1", "mode": "mono"})
+    assert r1["state"] == "loading"
+    assert _wait_until(
+        lambda: any(e[0] == "/cam/c1"
+                    for e in plugin._model_pending_starts), timeout=2.0)
+
+    stop = plugin.dispatch("pointcloud", {"action": "stop"})
+    assert stop["state"] == "idle"
+    assert "/cam/c1" not in plugin._nodes
+    # pending 队列被整个清空：loader 落完加载后无任何条目可拉起。
+    assert plugin._model_pending_starts == []
+
+    block.set()  # loader 走完最后一步，不会再有节点被创建
+    assert _wait_until(lambda: len(executor.nodes) == 0, timeout=2.0)
+
+
 def test_info_reports_error_when_engine_load_fails():
     plugin, _ = _plugin()
 

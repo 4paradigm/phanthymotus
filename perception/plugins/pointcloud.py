@@ -1358,6 +1358,11 @@ class PointCloudPerceptionPlugin:
                         e for e in self._model_pending_starts
                         if e[0] != instance_id]
                 return result if result is not None else {"state": "idle"}
+            # review 第 15 轮：全停（不带 instance_id）同样要清 pending 队列
+            # ——否则还在等共享模型下载的显式 mono 实例会在加载落地后被
+            # _bg_start 按"已停掉"的状态重新拉起（回复却已是 idle）。
+            with self._pending_lock:
+                self._model_pending_starts = []
             with self._nodes_lock:
                 keys = list(self._nodes.keys())
             results = [key for key in keys if self._retire_node(key) is not None]
