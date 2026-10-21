@@ -278,7 +278,8 @@ class _PointCloudNode(Node):
         self._subs: list = []
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stereo_queue: queue.Queue = queue.Queue(maxsize=1)
-        # 双目左右帧按到达配对：{stamp: frame}，旧于 sync 窗口的直接丢
+        # 双目左右帧按拍摄时刻（header.stamp，缺省退回到达时刻）配对：
+        # {stamp: frame}，旧于 sync 窗口的直接丢
         self._left_latest: Optional[tuple[float, np.ndarray]] = None
         self._left_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -423,25 +424,55 @@ class _PointCloudNode(Node):
             self._drop_stale(self._frame_queue, ("jpeg", bytes(msg.data)))
 
     def _left_cb(self, msg: CompressedImage):
+        # review 第 16 轮：配对必须用拍摄时刻（header.stamp）而非回调到达
+        # 时刻。调度/传输抖动下"右帧晚到"会把旧右帧配新左帧——SGBM 出错
+        # 视差、发布几何无效的云；同时刻拍的两帧也会因到达差超窗被误丢。
+        # stamp 缺失（老驱动不写 header）才退回到达时间。stereo 单位是
+        # 两条消息 stamp 之差，同一时钟域即可（ROS stamp 是 epoch 秒）。
         frame = _decode_jpeg(bytes(msg.data))
         if frame is None:
             return
         # 只存最新左帧；配对在 _right_cb 里做（右帧到达时找时间最近的左帧）。
         with self._left_lock:
-            self._left_latest = (time.monotonic(), frame)
+            self._left_latest = (self._frame_stamp(msg, time.monotonic()), frame)
 
     def _right_cb(self, msg: CompressedImage):
+        # review 第 16 轮建议：节流在解码前——出云 2 fps 时右路 30 Hz 全量
+        # JPEG 解码纯属浪费（Jetson CPU 上是双路 60 解码/s 换 2 次配对）。
+        # 左路不能照搬：配对要的是"最新左帧"，节流跳过任何左帧都会让右帧
+        # 无对可配，所以左路保持全量解码、只留最新一帧（解码是最便宜的一
+        # 侧，真正贵的 SGBM 只对配上的对跑）。
+        if self._throttled():
+            return
         frame = _decode_jpeg(bytes(msg.data))
         if frame is None:
             return
-        stamp = time.monotonic()
-        if self._throttled():
-            return
+        stamp = self._frame_stamp(msg, time.monotonic())
         with self._left_lock:
             left = self._left_latest
-            if left is not None and stamp - left[0] <= _STEREO_SYNC_S:
+            if left is not None and abs(stamp - left[0]) <= _STEREO_SYNC_S:
                 self._drop_stale(self._stereo_queue, (left[1], frame))
             self._left_latest = None
+
+    @staticmethod
+    def _frame_stamp(msg, arrival: float) -> float:
+        """帧的"拍摄时刻"：header.stamp（sec + nanosec，epoch 秒）；发布端
+        没写 stamp 时退回回调到达时刻。左右帧混用两种来源也能配对——
+        差值恒 > 50 ms 的跨域组合本来就该被 sync 窗口拒绝。"""
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None) if header is not None else None
+        if stamp is None:
+            return arrival
+        # 同域配对用差值，无需换算 epoch；但要防"发布端写了 stamp 却恒 0"
+        # 的老驱动——0 也是"没写"，退回到达时间（对齐 ASR 的判定习惯）。
+        try:
+            sec = getattr(stamp, "sec", 0) or 0
+            nanosec = getattr(stamp, "nanosec", 0) or 0
+        except (TypeError, ValueError):
+            return arrival
+        if sec == 0 and nanosec == 0:
+            return arrival
+        return float(sec) + float(nanosec) * 1e-9
 
     # ── worker：按模式出云 ─────────────────────────────────────────────────
 
@@ -646,6 +677,46 @@ def _raw_stereo_params(blob: dict) -> tuple:
         if not np.all(np.isfinite(arr)):
             raise ValueError(f"raw 标定的 {name} 含非有限值（NaN/inf）")
     return K1, D1, K2, D2, R, T
+
+
+def _pinhole_params(blob: dict, w: int, h: int) -> tuple:
+    """解析 pinhole 档 blob → (fx, fy, cx, cy)，全部有限、fx/fy>0。
+
+    review 第 16 轮建议：depth/mono 的显式内参与 stereo 同理——fx=0/NaN
+    让 backprojection 深度恒 0 或全 NaN，云被 filter_cloud 剔光/几何无效，
+    卡片 running 却一帧不出。start/config 预检与 _pinhole_for 共用这一份
+    （两处各写一遍必然漂移），坏配置当场报清楚。w/h 只用于 hfov 兜底换算，
+    预检传典型分辨率即可（fx 正性与分辨率无关，hfov 的 fx 恒正）。"""
+    try:
+        fx = float(blob.get("fx") or 0.0)
+        fy = float(blob.get("fy") or 0.0)
+        cx = float(blob.get("cx") or 0.0)
+        cy = float(blob.get("cy") or 0.0)
+        hfov = float(blob["hfov"]) if "hfov" in blob else None
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"pinhole 标定数值异常：{error}")
+    if "hfov" in blob and fx == 0.0 and fy == 0.0:
+        if not np.isfinite(hfov) or not (0.0 < hfov < 180.0):
+            raise ValueError(
+                f"pinhole 标定的 hfov 无效（hfov={blob.get('hfov')!r}）："
+                "需要 (0, 180) 的有限角度（度），否则焦距算不出")
+        return intrinsics_from_hfov(w, h, hfov)
+    if not np.isfinite(fx) or fx <= 0:
+        raise ValueError(
+            f"pinhole 标定的焦距无效（fx={blob.get('fx')!r}）："
+            "需要正的有限值（像素），否则反投影深度恒 0、一帧云不出")
+    # fy 显式给出就得同 fx 一个标准；没给（0）才缺省取 fx。inf/NaN 混进来
+    # 会让 y 方向反投影全废，不能悄悄折到 fx。
+    if "fy" in blob and blob["fy"] is not None and (not np.isfinite(fy) or fy <= 0):
+        raise ValueError(
+            f"pinhole 标定的焦距无效（fy={blob.get('fy')!r}）："
+            "需要正的有限值（像素），否则反投影 y 坐标恒 0/全 NaN")
+    if fy == 0.0:
+        fy = fx  # 缺省与 pinhole_of 一致：fy 缺省取 fx
+    if not (np.isfinite(cx) and np.isfinite(cy)):
+        raise ValueError(
+            f"pinhole 标定的主点无效（cx={blob.get('cx')!r}, cy={blob.get('cy')!r}）")
+    return fx, fy, cx, cy
 
 
 def _rectified_params(blob: dict) -> tuple:
@@ -1294,6 +1365,17 @@ class PointCloudPerceptionPlugin:
                 # stereo 已在上面要求双路，这里覆盖其余全部模式。
                 return {"state": "error",
                         "message": "需要一路输入：input_topic（深度图/单目）或 input_topics（双目）"}
+            if calibration and calibration_tier(calibration) == "pinhole":
+                # review 第 16 轮建议：depth/mono 的显式 pinhole 内参
+                # （fx/fy/cx/cy 或 hfov）同样在 start 时预检——fx=0/NaN
+                # 会让反投影深度恒 0 或全 NaN，卡片 running 却一帧不出
+                # （与 stereo 的 rectified/raw 预检同一个道理）。放在
+                # stereo 分支外：pinhole 档主要服务 depth/mono，stereo 拿到
+                # pinhole 档本来就走 capture-only。
+                try:
+                    _pinhole_params(calibration, 640, 480)
+                except ValueError as error:
+                    return {"state": "error", "message": str(error)}
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
             # 先记录再起节点（同 visual_depth）：loading 期间 info() 也能回答；
             # 空声明同样记录 —— 重启不再带声明时要替换旧值而不是留过期镜头。
@@ -1387,7 +1469,16 @@ class PointCloudPerceptionPlugin:
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
             if "calibration" in cfg:
-                self._calibration = load_calibration_blob(cfg["calibration"])
+                # review 第 16 轮建议：config 与 start 同一份预检（stereo 的
+                # raw/rectified 档同理）。坏标定当场报清楚，而不是先落库、
+                # 等 start 预检才拒——卡片会以为配置已生效。
+                blob = load_calibration_blob(cfg["calibration"])
+                if calibration_tier(blob) == "pinhole":
+                    try:
+                        _pinhole_params(blob, 640, 480)
+                    except ValueError as error:
+                        return {"state": "error", "message": str(error)}
+                self._calibration = blob
             if any(k in cfg for k in ("cal_a", "cal_b")):
                 self._cal_a = float(cfg.get("cal_a", self._cal_a))
                 self._cal_b = float(cfg.get("cal_b", self._cal_b))

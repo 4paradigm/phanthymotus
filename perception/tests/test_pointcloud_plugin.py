@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import struct
 import threading
+import types
 import zlib
 
 import numpy as np
@@ -753,6 +754,45 @@ def test_stereo_frame_pairing_requires_sync_window():
     assert node._stereo_queue.empty()
 
 
+def _stamped(data: bytes, sec: int, nanosec: int = 0) -> _FakeCompressedImage:
+    msg = _FakeCompressedImage(data, fmt="jpeg")
+    msg.header.stamp = types.SimpleNamespace(sec=sec, nanosec=nanosec)
+    return msg
+
+
+def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
+    """review 第 16 轮：配对以前用回调到达时刻——右帧传输延迟会把**旧右帧**
+    配上新左帧（两回调都在 50 ms 内到达就放行），SGBM 出错视差、发几何
+    无效的云；调度抖动超窗时真同步对又被误丢。配对必须用拍摄时刻
+    （header.stamp），stamp 缺失才退回到达时间。"""
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RECTIFIED_BLOB),
+                                    "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    # 场景 1：右帧迟到——拍摄时刻差 1 s（远超 50 ms 窗口），但两条
+    # 回调背靠背到达（旧实现会放行这对错配帧）。
+    node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_000))
+    node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_001))
+    _wait_until(lambda: False, timeout=0.2)
+    assert node._stereo_queue.empty(), "拍摄时刻差 1 s 的帧不得配对"
+
+    # 场景 2：真同步对——拍摄时刻同刻（stamp 相同），即使左帧回调早
+    # 0.3 s 到达（模拟传输/调度抖动），也必须配对成功。
+    node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
+    _wait_until(lambda: False, timeout=0.3)   # 左帧先到，右帧在"路上"
+    node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
+    assert _wait_until(lambda: not node._stereo_queue.empty()), \
+        "同刻拍摄、回调错峰到达的帧必须配对"
+
+    # 场景 3：无 stamp（老驱动不写 header）→ 退回到达时刻，窗口内仍可配对
+    node._left_latest = None
+    node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    assert _wait_until(lambda: node._last_stereo_pair is not None)
+
+
 def test_stereo_pairing_publishes_with_rectified_blob():
     """rectified 档端到端：左右同帧 → 配对 → worker → 发布。
 
@@ -1372,6 +1412,79 @@ def test_start_accepts_a_good_raw_blob():
         "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
     assert reply["state"] == "running"
     assert len(executor.nodes) == 1
+
+
+# ── review 第 16 轮建议：start/config 预检 pinhole 标定（depth/mono） ──────
+
+@pytest.mark.parametrize("field,bad,needle", [
+    ("fx", 0, "fx"),
+    ("fx", float("nan"), "fx"),
+    ("fx", "abc", "标定数值异常"),
+    ("fy", float("inf"), "fy"),
+    ("cx", float("nan"), "主点"),
+    ("cy", float("inf"), "主点"),
+    ("hfov", 0, "hfov"),      # hfov=0 → 焦距无穷
+    ("hfov", 180, "hfov"),    # hfov=180 → 焦距为 0
+    ("hfov", float("nan"), "hfov"),
+])
+def test_start_rejects_invalid_pinhole_calibration(field, bad, needle):
+    """review 第 16 轮建议：depth/mono 的显式 pinhole 内参以前 start 照收
+    —— fx=0/NaN 让反投影深度恒 0 或全 NaN，云被 filter_cloud 剔光，卡片
+    running 却一帧不出（与 stereo 的 raw/rectified 预检同一个坑）。
+    start 参数直接传 blob，绕开 JSON 对 NaN/inf 的限制。"""
+    blob = {"fx": 300.0, "fy": 300.0, "cx": 160.0, "cy": 120.0}
+    if field == "hfov":
+        blob = {"hfov": bad}
+    else:
+        blob[field] = bad
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
+        "calibration": blob})
+    assert reply["state"] == "error", f"{field}={bad} 应被拒收"
+    assert needle in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_accepts_good_pinhole_calibration():
+    """预检不误伤：完整 fx/fy/cx/cy 与 hfov 档都照常启动（mono 起节点需要
+    引擎，这里用 depth 档走纯订阅路径）。fy 缺省取 fx、cx/cy 缺省放行——
+    与 pinhole_of 的缺省规则一致。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
+        "calibration": {"fx": 300.0, "cx": 160.0, "cy": 120.0}})
+    assert reply["state"] == "running"
+    assert len(executor.nodes) == 1
+
+    plugin2, executor2 = _plugin()
+    reply2 = plugin2.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
+        "calibration": {"hfov": 90.0}})
+    assert reply2["state"] == "running"
+    assert len(executor2.nodes) == 1
+
+
+def test_config_rejects_invalid_pinhole_calibration():
+    """config 同一份预检：坏标定当场报错且不落库 —— 卡片不会以为配置已
+    生效，下一次 start 也不会再踩一遍。"""
+    plugin, _ = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "calibration": json.dumps({"fx": 0, "cx": 160})})
+    assert reply["state"] == "error"
+    assert plugin._calibration is None  # 未落库
+
+    # hfov 档同理
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "calibration": json.dumps({"hfov": 0})})
+    assert reply["state"] == "error"
+
+    # 合法 blob 照常落库
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config",
+        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})})
+    assert reply["status"] == "configured"
+    assert plugin._calibration["fx"] == 300.0
 
 
 # ── review 第 7 轮：标定优先级 start 参数 > 实例 config > 全局 ────────────────

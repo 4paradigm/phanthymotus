@@ -125,10 +125,15 @@ class _FakeHeader:
     """`stamp` is the only field anything here sets, but the attribute has to
     exist: a publisher that stamps its outgoing frames (pose's overlay) would
     otherwise fail inside its own try/except and publish nothing, which looks
-    like a disabled feature rather than a missing stub."""
+    like a disabled feature rather than a missing stub.
+
+    `stamp` defaults to None so a consumer can tell "publisher did not stamp
+    this" from "stamped at time 0"; stereo pair selection relies on that
+    distinction (it falls back to arrival time only for unstamped frames)."""
+    _UNSET = object()
 
     def __init__(self):
-        self.stamp = 0
+        self.stamp = None
         self.frame_id = ""
 
 
