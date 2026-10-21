@@ -676,3 +676,39 @@ plugins:
     # Detection rate: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
+
+  # Height measurement from a metric depth map (`height` card).
+  #
+  # **Disabled by default on purpose.** This is a new capability, not a change
+  # to an existing one: an existing deployment starts measuring nothing until
+  # an operator wires the depth card into this card and flips `enabled`. The
+  # code is loaded only when enabled, so a machine that does not use it carries
+  # no subscription, no buffer and no new failure mode.
+  height:
+    enabled: false
+    # 0 means "not calibrated". The card's `calibrate` action fills these from
+    # the floor in view, or measure them once with a tape and an inclinometer;
+    # the camera is fixed, so it is a one-time job per robot. The same values
+    # are in configSchema because agent-core sends schema defaults on every
+    # config call — keep them in sync or the schema wins (see actucore's navi
+    # card for the long version of that trap).
+    camera_height_m: 0.0
+    camera_pitch_deg: 0.0     # positive = optical axis below horizontal
+    camera_roll_deg: 0.0
+    # Manual intrinsics, 0 = use the camera's `motus.camera/1` declaration.
+    fx: 0.0
+    fy: 0.0
+    cx: 0.0
+    cy: 0.0
+    # Frames averaged per measurement; the target must hold still for them.
+    frames: 5
+    # Depth beyond this is ignored for the floor fit and the target.
+    max_range_m: 4.5
+    # Deriving intrinsics from declared FOV angles is a guess; opt in only if
+    # a camera cannot declare K at all.
+    allow_fov_intrinsics: false
+    # Card-only settings, deliberately not in configSchema so a schema default
+    # cannot silently override this file.
+    max_detection_age_s: 0.8
+    min_valid_ratio: 0.5
+    calibration_frames: 12

@@ -279,6 +279,18 @@ class PerceptionBundle:
                 log.error("FaceRecognitionPlugin failed to load; continuing without it",
                           exc_info=True)
 
+        if plugins_cfg.get("height", {}).get("enabled", False):
+            from plugins.height import HeightPlugin
+            # Guarded like pose/visual_depth: this is a measurement card, and a
+            # camera with unusual depth output must not be able to take ASR or
+            # TTS down with it. A failure here means the card does not appear.
+            try:
+                self._plugins.append(HeightPlugin(plugins_cfg["height"], executor))
+                log.info("HeightPlugin loaded")
+            except Exception:
+                log.error("HeightPlugin failed to load; continuing without height",
+                          exc_info=True)
+
     def _plugin_for(self, full_name: str):
         """Resolve a tool name to (plugin, action) by longest matching prefix.
 
