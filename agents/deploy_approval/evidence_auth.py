@@ -1,4 +1,4 @@
-"""Read-only public Evidence capabilities and GitHub-comment proof writes."""
+"""Read-only capabilities, scoped upload invitations, and proof-bound writes."""
 from __future__ import annotations
 
 import base64
@@ -20,7 +20,12 @@ SESSION_COOKIE = CAPABILITY_COOKIE
 SESSION_SECONDS = 3600
 PURPOSE = 'deploy-evidence'
 DOWNLOAD_PURPOSE = 'deploy-evidence-download'
-_PURPOSES = {PURPOSE, DOWNLOAD_PURPOSE}
+UPLOAD_PURPOSE = 'deploy-evidence-upload'
+_PURPOSES = {PURPOSE, DOWNLOAD_PURPOSE, UPLOAD_PURPOSE}
+UPLOAD_COOKIE = 'evidence-upload-capability'
+UPLOAD_MAX_FILES = 20
+UPLOAD_MAX_BYTES = 10 * 1024 * 1024 * 1024
+UPLOAD_MAX_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 PROOF_HEADER = 'x-evidence-secret'
 NONCE_HEADER = 'x-evidence-nonce'
 PROOF_SECONDS = 24 * 60 * 60
@@ -71,6 +76,47 @@ def cos_ready(config):
 def public_https_ingress_ready(config):
     base = getattr(config, 'evidence_public_base_url', '')
     return not _public_base_reason(base) and urlsplit(base).scheme == 'https'
+
+
+def _configured_https_authority(config):
+    parsed = urlsplit(config.evidence_public_base_url)
+    host = parsed.hostname.lower()
+    if ':' in host:
+        host = '[' + host + ']'
+    port = parsed.port
+    if port is not None and port != 443:
+        host += ':' + str(port)
+    return host
+
+
+def _configured_https_request(request):
+    """Accept direct TLS or the HTTPS marker from the loopback-only proxy path.
+
+    Docker publishes the application port on host loopback only; the existing
+    Nginx listener is also loopback-bound and sets X-Forwarded-Proto itself.
+    Never use forwarded host data to select or validate the public origin.
+    """
+    config = request.app.state.config
+    if not public_https_ingress_ready(config):
+        return False
+    parsed = urlsplit(config.evidence_public_base_url)
+    supplied_host = request.headers.get('host', '').lower()
+    if supplied_host not in {parsed.netloc.lower(), _configured_https_authority(config)}:
+        return False
+    if request.scope.get('scheme') == 'https':
+        return True
+    if request.scope.get('scheme') != 'http':
+        return False
+    forwarded_proto = [value.strip().lower() for name, value in request.scope.get('headers', [])
+                       if name.lower() == b'x-forwarded-proto']
+    peer = getattr(request, 'client', None)
+    try:
+        peer_ip = ipaddress.ip_address(peer.host) if peer and peer.host else None
+    except ValueError:
+        peer_ip = None
+    trusted_proxy_peer = bool(peer_ip and (
+        peer_ip.is_loopback or peer_ip.is_private or peer_ip.is_link_local))
+    return forwarded_proto == [b'https'] and trusted_proxy_peer
 
 
 def readiness(config, evidence_service=None, request=None):
@@ -134,11 +180,24 @@ def _b64(data):
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
 
 
-def issue_capability(config, repo, pr_number, head_sha, round_id, purpose=PURPOSE, *, resource=None):
+def issue_capability(config, repo, pr_number, head_sha, round_id, purpose=PURPOSE, *, resource=None,
+                     expires_at=None):
     if purpose not in _PURPOSES:
         raise ValueError('invalid evidence capability purpose')
+    if purpose == UPLOAD_PURPOSE:
+        now = int(time.time())
+        if (type(pr_number) is not int or pr_number <= 0
+                or not isinstance(repo, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo)
+                or not re.fullmatch(r'[0-9a-f]{40}', str(head_sha))
+                or not re.fullmatch(re.escape(str(head_sha)) + r'-[0-9]+', str(round_id))
+                or type(expires_at) is not int or not now < expires_at <= now + UPLOAD_MAX_LIFETIME_SECONDS):
+            raise ValueError('upload capability expiry required')
+    elif expires_at is not None:
+        raise ValueError('expiry is only valid for upload capabilities')
     claims = {'repo': repo, 'pr': pr_number, 'head': head_sha,
               'round': round_id, 'purpose': purpose}
+    if purpose == UPLOAD_PURPOSE:
+        claims.update(expires_at=expires_at, status='testing')
     if purpose == DOWNLOAD_PURPOSE:
         if not isinstance(resource, str) or not 1 <= len(resource) <= 160 or any(ord(c) < 33 for c in resource):
             raise ValueError('download capability resource required')
@@ -155,23 +214,29 @@ def verify_capability(config, token, repo, pr_number, *, purpose=None, resource=
         if not isinstance(token, str) or len(token) > 2048:
             raise ValueError()
         body, signature = token.split('.', 1)
+        raw = base64.urlsafe_b64decode(body + '=' * (-len(body) % 4))
+        claims = json.loads(raw)
         keys = [_key(config)]
-        legacy = _legacy_key(config)
+        legacy = None if isinstance(claims, dict) and claims.get('purpose') == UPLOAD_PURPOSE else _legacy_key(config)
         if legacy and legacy not in keys:
             keys.append(legacy)
         if not any(hmac.compare_digest(
                 signature, _b64(hmac.new(key, body.encode('ascii'), hashlib.sha256).digest()))
                 for key in keys):
             raise ValueError()
-        raw = base64.urlsafe_b64decode(body + '=' * (-len(body) % 4))
-        claims = json.loads(raw)
         if (not isinstance(claims, dict) or claims.get('repo') != repo
                 or type(claims.get('pr')) is not int or claims['pr'] != pr_number
                 or claims.get('purpose') not in _PURPOSES
                 or (purpose is not None and claims.get('purpose') != purpose)
                 or (claims.get('purpose') == DOWNLOAD_PURPOSE
                     and (not isinstance(resource, str) or claims.get('resource') != resource))
-                or (claims.get('purpose') == PURPOSE and 'resource' in claims)
+                or (claims.get('purpose') in {PURPOSE, UPLOAD_PURPOSE} and 'resource' in claims)
+                or (claims.get('purpose') == UPLOAD_PURPOSE
+                    and (type(claims.get('expires_at')) is not int
+                         or not int(time.time()) < claims['expires_at'] <=
+                         int(time.time()) + UPLOAD_MAX_LIFETIME_SECONDS
+                         or claims.get('status') != 'testing'))
+                or (claims.get('purpose') != UPLOAD_PURPOSE and 'expires_at' in claims)
                 or not re.fullmatch(r'[0-9a-f]{40}', str(claims.get('head', '')))
                 or not re.fullmatch(r'[0-9a-f]{40}-[0-9]+', str(claims.get('round', '')))
                 or not claims['round'].startswith(claims['head'] + '-')):
@@ -189,6 +254,10 @@ def _verify_page_capability(config, token, repo, pr_number):
                                  purpose=DOWNLOAD_PURPOSE, resource='page')
 
 
+def _verify_upload_capability(config, token, repo, pr_number):
+    return verify_capability(config, token, repo, pr_number, purpose=UPLOAD_PURPOSE)
+
+
 def _secure(request):
     base = getattr(request.app.state.config, 'evidence_public_base_url', '')
     return not _public_base_reason(base) and urlsplit(base).scheme == 'https'
@@ -200,21 +269,38 @@ def _cookie(response, request, name, token, max_age):
 
 
 def bind_page_capability(request, repo, pr_number):
-    """Exchange a Summary query capability for an HttpOnly read-only cookie."""
+    """Exchange a Summary read or upload capability for an HttpOnly cookie."""
     require_enabled(request)
     token = request.query_params.get('cap')
     if token:
-        _verify_page_capability(request.app.state.config, token, repo, pr_number)
+        try:
+            claims = _verify_upload_capability(request.app.state.config, token, repo, pr_number)
+            upload = True
+        except HTTPException:
+            claims = _verify_page_capability(request.app.state.config, token, repo, pr_number)
+            upload = False
+        if upload:
+            if not _configured_https_request(request):
+                raise HTTPException(403, detail='evidence_origin_failed')
         response = RedirectResponse(request.url.path, status_code=303,
                                     headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
-        _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
+        if upload:
+            _cookie(response, request, UPLOAD_COOKIE, token,
+                    max(1, claims['expires_at'] - int(time.time())))
+        else:
+            _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
         return response
     token = request.cookies.get(CAPABILITY_COOKIE, '')
     if token:
         _verify_page_capability(request.app.state.config, token, repo, pr_number)
-    else:
-        raise HTTPException(403, detail='invalid_evidence_capability')
-    return None
+        return None
+    token = request.cookies.get(UPLOAD_COOKIE, '')
+    if token:
+        _verify_upload_capability(request.app.state.config, token, repo, pr_number)
+        if not _configured_https_request(request):
+            raise HTTPException(403, detail='evidence_origin_failed')
+        return None
+    raise HTTPException(403, detail='invalid_evidence_capability')
 
 
 def _trusted_origin(request, *, require_header=True):
@@ -227,19 +313,28 @@ def _trusted_origin(request, *, require_header=True):
     if not public_https_ingress_ready(config):
         raise HTTPException(503, detail='PUBLIC_INGRESS_PENDING')
     parsed = urlsplit(base)
-    host = parsed.hostname.lower()
-    if ':' in host:
-        host = '[' + host + ']'
-    port = parsed.port
-    if port is not None and port != 443:
-        host += ':' + str(port)
-    origin = f'{parsed.scheme}://{host}'.lower()
+    origin = f'{parsed.scheme}://{_configured_https_authority(config)}'.lower()
+    if not _configured_https_request(request):
+        raise HTTPException(403, detail='evidence_origin_failed')
     supplied = request.headers.get('origin', '').rstrip('/').lower()
     if (require_header and not supplied) or (supplied and supplied != origin):
         raise HTTPException(403, detail='evidence_origin_failed')
     if request.headers.get('sec-fetch-site', '').lower() not in ('', 'same-origin'):
         raise HTTPException(403, detail='evidence_origin_failed')
     return origin
+
+
+def _trusted_upload_origin(request):
+    """Require the configured HTTPS origin for bearer-capability writes."""
+    if not public_https_ingress_ready(request.app.state.config):
+        raise HTTPException(503, detail='PUBLIC_INGRESS_PENDING')
+    parsed = urlsplit(request.app.state.config.evidence_public_base_url)
+    expected_origin = f'https://{_configured_https_authority(request.app.state.config)}'.lower()
+    origin = request.headers.get('origin', '').rstrip('/').lower()
+    if (not _configured_https_request(request)
+            or not origin or origin != expected_origin
+            or request.headers.get('sec-fetch-site', '').lower() not in ('', 'same-origin')):
+        raise HTTPException(403, detail='evidence_origin_failed')
 
 
 def _comment_timestamp(comment):
@@ -312,6 +407,7 @@ async def _comment_proof_principal(request, repo, pr_number):
     _trusted_origin(request, require_header=request.method in ('POST', 'PUT', 'DELETE'))
     return {
         'id': int(uid), 'login': login, 'actor': login,
+        'auth_method': 'github_comment_proof', 'upload_method': 'github_comment_proof',
         'actor_verified': True, 'github_user_authenticated': True,
         'evidence_auth': {'comment_id': comment_id, 'repo': repo,
                           'pr_number': pr_number, 'head_sha': head_sha,
@@ -329,12 +425,45 @@ async def verified_principal(request: Request, repo: str, pr_number: int, *, wri
         if write:
             _trusted_origin(request)
         return await _comment_proof_principal(request, repo, pr_number), ''
+    invite_token = request.cookies.get(UPLOAD_COOKIE, '')
+    if invite_token and purpose in {PURPOSE, UPLOAD_PURPOSE}:
+        try:
+            claims = _verify_upload_capability(request.app.state.config, invite_token, repo, pr_number)
+        except HTTPException:
+            claims = None
+        if claims is not None:
+            if write:
+                if request.method not in ('POST', 'PUT', 'DELETE'):
+                    raise HTTPException(405, detail='evidence_write_method_required')
+                _trusted_upload_origin(request)
+            client_key = request.headers.get('x-evidence-client-key', '')
+            if not re.fullmatch(r'[0-9a-f]{64}', client_key):
+                if (request.method == 'GET' and request.url.path.startswith('/evidence/')
+                        and not request.url.path.startswith('/api/')):
+                    return {'id': 0, 'login': 'shared-link', 'actor': 'shared-link',
+                            'upload_invite': claims, 'upload_method': 'signed_invite',
+                            'auth_method': 'signed_invite', 'actor_verified': False,
+                            'github_user_authenticated': False}, ''
+                raise HTTPException(401, detail='evidence_client_key_required')
+            scope = '\0'.join((repo, str(pr_number), claims['head'], claims['round']))
+            identity = hmac.new(_key(request.app.state.config),
+                                b'phanthymotus/evidence-browser/v1\0'
+                                + scope.encode('utf-8') + b'\0' + bytes.fromhex(client_key),
+                                hashlib.sha256).digest()
+            pseudo_id = int.from_bytes(identity[:16], 'big') or 1
+            return {'id': pseudo_id, 'login': 'shared-link', 'actor': 'shared-link',
+                    'upload_invite': claims, 'upload_method': 'signed_invite',
+                    'auth_method': 'signed_invite', 'actor_verified': False,
+                    'github_user_authenticated': False}, ''
     if write:
-        _trusted_origin(request)
+        if purpose == UPLOAD_PURPOSE:
+            _trusted_upload_origin(request)
+        else:
+            _trusted_origin(request)
         raise HTTPException(401, detail='evidence_comment_proof_required')
     config = request.app.state.config
     token = request.query_params.get('cap') or request.cookies.get(CAPABILITY_COOKIE, '')
-    if (purpose == PURPOSE and request.method == 'GET'
+    if (purpose in {PURPOSE, UPLOAD_PURPOSE} and request.method == 'GET'
             and request.url.path.endswith('/context')):
         claims = _verify_page_capability(config, token, repo, pr_number)
     elif purpose == DOWNLOAD_PURPOSE:
@@ -350,4 +479,5 @@ async def verified_principal(request: Request, repo: str, pr_number: int, *, wri
     actor_id = int.from_bytes(hashlib.sha256(token.encode()).digest()[:8], 'big') or 1
     return {'id': actor_id, 'login': 'evidence-capability', 'actor': 'evidence-capability',
             'capability': claims, 'capability_token': token,
-            'actor_verified': False, 'github_user_authenticated': False}, ''
+            'auth_method': 'capability', 'actor_verified': False,
+            'github_user_authenticated': False}, ''

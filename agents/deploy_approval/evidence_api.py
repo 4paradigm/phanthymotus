@@ -137,7 +137,9 @@ async def _payload(request, action, **path):
 def _public_attachment(row):
     allowed = {'attachment_id', 'filename', 'size', 'sha256', 'note', 'round_id', 'head_sha',
                'status', 'created_at', 'updated_at', 'completed_at', 'deleted_at', 'replaces_id',
-               'actor', 'actor_login', 'actor_verified', 'submitter', 'download_capability'}
+               'actor', 'actor_login', 'actor_verified', 'github_user_authenticated',
+               'upload_method', 'upload_link_authorized', 'cos_content_verified',
+               'submitter', 'download_capability', 'can_delete'}
     result = {k: v for k, v in row.items() if k in allowed}
     if row.get('upload_ref'):
         result['upload_id'] = row['upload_ref']
@@ -166,7 +168,9 @@ async def _summary_updated(request, repo, pr, result):
 async def _dispatch(request, owner, repo, pr, action, **path):
     canonical = _repo(owner, repo, pr)
     purpose = (evidence_auth.DOWNLOAD_PURPOSE if action in {'download', 'log_download'}
-               else evidence_auth.PURPOSE)
+               else evidence_auth.UPLOAD_PURPOSE if action in {
+                   'context', 'status', 'init', 'resume', 'sign_part', 'put_part',
+                   'complete', 'note', 'delete'} else evidence_auth.PURPOSE)
     resource = None
     if action == 'download':
         resource = 'attachment:' + path.get('attachment_id', '')
@@ -185,7 +189,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
             or snapshot.get('base', {}).get('repo', {}).get('full_name', '').lower() != canonical):
         raise HTTPException(409, detail='pr_closed_or_mismatched')
     payload = await _payload(request, action, **path)
-    claims = principal.get('capability') or {
+    claims = principal.get('capability') or principal.get('upload_invite') or {
         'head': payload.get('head_sha'), 'round': payload.get('round_id')}
     if 'upload_id' in payload:
         # The public upload handle is A's durable operation identity, rather
@@ -292,6 +296,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         result = {**result, 'authenticated': True, 'enabled': True,
                   'github_user_authenticated': bool(principal.get('github_user_authenticated')),
                   'actor_verified': principal.get('actor_verified') is True,
+                  'auth_method': principal.get('auth_method', 'github_comment_proof'),
                   'readiness': evidence_auth.readiness(
                       request.app.state.config, request.app.state.evidence_service, request=request),
                   'attachments': attachments, 'repo': canonical, 'pr_number': pr,

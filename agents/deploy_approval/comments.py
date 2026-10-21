@@ -1090,18 +1090,30 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             sha256 = item.get("sha256")
             item_head = item.get("head_sha")
             item_round = item.get("round_id")
+            invitation_upload = (
+                item.get("upload_method") == "signed_invite"
+                and item.get("upload_link_authorized") is True
+                and item.get("actor_verified") is False
+                and item.get("github_user_authenticated") is False
+                and item.get("cos_content_verified") is True
+            )
+            signed_invite = item.get("upload_method") == "signed_invite"
             cos_verified = (not deleted and status == "ready"
+                            and item.get("cos_projection_verified") is True
                             and isinstance(item.get("object_key"), str) and bool(item.get("object_key"))
                             and isinstance(sha256, str)
                             and re.fullmatch(r"[0-9a-f]{64}", sha256)
-                            and item.get("actor_verified") is True
+                            and ((item.get("actor_verified") is True and not signed_invite)
+                                 or invitation_upload)
                             and isinstance(item_head, str) and item_head == h
                             and re.fullmatch(r"[0-9a-f]{40}", item_head)
                             and isinstance(item_round, str) and item_round == r
                             and re.fullmatch(re.escape(item_head) + r"-[0-9]+", item_round))
-            cells = [filename, size, media_type,
-                     ((item.get("actor_login") or item.get("actor"))
-                      if item.get("actor_verified") is True else "unverified"),
+            uploader = ("分享链接上传，GitHub 身份未验证" if invitation_upload else
+                        (item.get("actor_login") or item.get("actor"))
+                        if item.get("actor_verified") is True and not signed_invite else
+                        "unverified")
+            cells = [filename, size, media_type, uploader,
                      item.get("machine") or item.get("machine_alias") or "—",
                      item.get("created_at") or "unknown", item.get("head_sha") or h,
                      item.get("round_id") or r, item.get("note", ""),
@@ -1157,25 +1169,32 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             and not state.get("merged") and re.fullmatch(r"[0-9a-f]{40}", str(head))
             and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
             and state.get("evidence_enabled") is True and api):
-        machine_names = sorted({str(d.get("machine") or d.get("alias"))
-                                for d in state.get("deployments", [])
-                                if isinstance(d, dict) and (d.get("machine") or d.get("alias"))})
         pending = sum(1 for item in state.get("attachments", [])
                       if isinstance(item, dict)
                       and item.get("status") not in {"ready", "text", "deleted", "invalid"})
         archived = sum(1 for item in state.get("attachments", [])
                        if isinstance(item, dict) and item.get("status") == "ready"
-                       and item.get("object_key") and item.get("actor_verified") is True)
+                       and item.get("cos_projection_verified") is True
+                       and item.get("object_key") and isinstance(item.get("sha256"), str)
+                       and re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                       and item.get("head_sha") == head and item.get("round_id") == current_round
+                       and ((item.get("actor_verified") is True
+                             and item.get("upload_method") != "signed_invite")
+                            or item.get("upload_method") == "signed_invite"
+                            and item.get("upload_link_authorized") is True
+                            and item.get("actor_verified") is False
+                            and item.get("github_user_authenticated") is False
+                            and item.get("cos_content_verified") is True))
         lines.extend(["", "### 上传测试证据", ""])
-        upload_url = page_url(state.get("capability"))
+        upload_url = page_url(state.get("upload_capability"))
         if upload_url:
             lines.extend([
                 f"[上传到 COS](<{upload_url}>)",
-                f"适用人员：PR 开发者、已部署 Machine Owner（{_escape(', '.join(machine_names) or '见当前部署记录')}）。",
+                "上传权限：本轮测试邀请链接；上传者显示为“分享链接上传，GitHub 身份未验证”，不会伪装为开发者或 Machine Owner。",
                 f"绑定：HEAD `{_escape(head)}` · round `{_escape(current_round)}`。",
-                "在页面选择视频、图片、文档或其他文件，也可提交纯文本说明；文件保存到私有 COS。",
+                "打开即进入上传页，无需登录、proof、SSH 隧道或手动填写 HEAD/round。可上传视频、图片、文档或文本；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
                 f"状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。只有归档后再执行 `/record_test result=pass|fail`。",
-                "已验证归档的附件可直接使用 Summary 中的 COS 下载链接。",
+                "上传链接有期限，仅允许当前 testing 轮次写入；HEAD、round 或 Lifecycle 状态变化后立即失效。COS 下载地址与上传链接分离。已验证归档的附件可直接使用 Summary 中的 COS 下载链接。",
             ])
         else:
             lines.append("上传入口尚未就绪：未配置可用的 HTTPS 基地址，当前不能通过 Summary 上传证据。")

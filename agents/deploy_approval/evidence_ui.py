@@ -24,25 +24,22 @@ body{{font:16px system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 
 section{{background:white;border:1px solid #ccd5dd;border-radius:10px;padding:1rem;margin:1rem 0}}
 label{{display:block;margin:.7rem 0}}input,textarea,select,button{{font:inherit;max-width:100%}}
 textarea{{display:block;width:95%;min-height:5rem}}button{{padding:.45rem .8rem;margin:.25rem}}progress{{width:100%}}
+#dropzone{{border:2px dashed #8395a7;border-radius:8px;padding:1rem;text-align:center}}
+#dropzone.dragging{{background:#eef6ff;border-color:#2463a6}}
 pre,code{{overflow-wrap:anywhere;white-space:pre-wrap}}li{{padding:.6rem 0;border-bottom:1px solid #ddd}}
 #message{{white-space:pre-wrap}}[hidden]{{display:none!important}}
 </style><script src="/evidence/assets/app.js" defer></script></head>
 <body><h1>部署验证附件</h1>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}">
 <p>项目 <strong>{esc(repo)}</strong> · PR #{esc(pr_number)}<br>HEAD <code>{esc(head_sha)}</code><br>round <code>{esc(round_id)}</code></p>
-<section id="authorization"><h2>授权状态</h2>
-<p>请先运行 Mac 启动器建立 SSH 隧道并通过它打开本页。页面会自动校验启动器提供的一次性 proof 和当前 GitHub 用户身份。</p>
-<p>proof 只保存在当前标签页的 sessionStorage，不会写入 localStorage 或显示在页面中。</p></section>
-<p id="auth">正在检查当前 PR/HEAD/round capability。</p>
 <p id="message" role="status" aria-live="polite"></p><button id="refresh" type="button">刷新状态</button>
 <section><h2>当前轮</h2><p id="summary">等待服务端状态</p>
 <fieldset id="writes" disabled hidden><legend>上传与备注</legend>
-<label>文件（每个文件最大 512 MiB，可多选）<input id="file" type="file" multiple></label>
+<label id="dropzone">选择或拖入文件（每个文件最大 512 MiB，可多选）<input id="file" type="file" multiple></label>
 <label>备注<textarea id="note" maxlength="10000"></textarea></label>
+<button id="save-note" type="button">保存备注</button>
 <label>替换当前轮附件<select id="replace"><option value="">新增附件</option></select></label>
-<button id="upload" type="button">上传到 COS</button>
-<label>文本证据<textarea id="text" maxlength="50000"></textarea></label>
-<button id="save-note" type="button">提交文本与备注</button>
+<button id="upload" type="button">开始上传</button>
 </fieldset><ul id="queue" aria-live="polite"></ul>
 <ul id="attachments"></ul></section>
 <section><h2>历史轮次（只读）</h2><div id="history"></div></section>
@@ -62,9 +59,10 @@ _JAVASCRIPT = r'''"use strict";
   const bound = {head_sha: app.dataset.head, round_id: app.dataset.round};
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const proofKey = "evidence-proof:" + api + ":" + bound.head_sha + ":" + bound.round_id;
+  const clientKeyStorage = "evidence-client-key:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024;
   const active = new Set(), jobs = [];
-  let context = null, stopped = false, busy = false, proofSecret = "", savedUploads = {};
+  let context = null, stopped = false, busy = false, proofSecret = "", clientKey = "", savedUploads = {};
   let noteOperation = null;
   const fragment = new URLSearchParams(window.location.hash.slice(1));
   const incomingProof = fragment.get("proof");
@@ -89,6 +87,24 @@ _JAVASCRIPT = r'''"use strict";
   const uid = () => crypto.randomUUID();
   const randomHex = (size = 32) => [...crypto.getRandomValues(new Uint8Array(size))]
     .map(value => value.toString(16).padStart(2, "0")).join("");
+  const validClientKey = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+  let savedClientKey = "";
+  try {
+    const saved = localStorage.getItem(clientKeyStorage) || "";
+    if (validClientKey(saved)) savedClientKey = saved;
+  } catch (_) {}
+  if (!savedClientKey) {
+    try {
+      const legacy = sessionStorage.getItem(clientKeyStorage) || "";
+      if (validClientKey(legacy)) savedClientKey = legacy;
+    } catch (_) {}
+  }
+  clientKey = savedClientKey || randomHex();
+  let clientKeyStored = false;
+  try { localStorage.setItem(clientKeyStorage, clientKey); clientKeyStored = true; } catch (_) {}
+  if (!clientKeyStored) {
+    try { sessionStorage.setItem(clientKeyStorage, clientKey); } catch (_) {}
+  }
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const roundMatches = value => value && value.head_sha === bound.head_sha && value.round_id === bound.round_id;
   function proofTransportAllowed(target) {
@@ -96,32 +112,26 @@ _JAVASCRIPT = r'''"use strict";
     if (window.location.protocol === "https:") return target.protocol === "https:";
     return window.location.origin === "http://127.0.0.1:25001" && target.origin === window.location.origin;
   }
+  function inviteTransportAllowed(target) {
+    const invite = context && (context.auth_method === "signed_invite" || context.upload_invite === true);
+    return !!invite && target.origin === window.location.origin &&
+      window.location.protocol === "https:" && target.protocol === "https:";
+  }
   function writable() {
+    const secureInvite = context && context.auth_method === "signed_invite" && context.can_write === true &&
+      context.actor_verified === false && context.github_user_authenticated === false &&
+      window.location.protocol === "https:";
+    const invite = context && context.upload_invite === true &&
+      context.actor_verified === false && context.github_user_authenticated === false;
+    const proofUser = context && context.actor_verified === true &&
+      context.github_user_authenticated === true && !!proofSecret;
     return context && roundMatches(context) && context.enabled !== false && context.evidence_enabled !== false &&
-      context.authenticated === true && context.can_write === true && context.status === "testing" &&
-      context.actor_verified === true && context.github_user_authenticated === true && !!proofSecret &&
+      context.can_write === true && context.status === "testing" &&
+      (secureInvite || (invite && proofTransportAllowed(new URL(api, window.location.href))) || proofUser) &&
       context.readiness && context.readiness.COS_READY === true &&
       context.readiness.EVIDENCE_BACKEND_READY === true &&
-      (context.readiness.BROWSER_UPLOAD_READY === true || context.readiness.LOCAL_SSH_TUNNEL_READY === true) &&
+      context.readiness.BROWSER_UPLOAD_READY === true &&
       (context.pr_state === undefined || context.pr_state === "open") && !context.merged && !stopped;
-  }
-  function permissionMessage() {
-    if (!context || context.authenticated !== true) return "正在验证启动器提供的 proof 与 GitHub 用户身份。";
-    if (context.enabled === false || context.evidence_enabled === false) return "Evidence 功能当前未启用。";
-    const local = context.readiness && context.readiness.LOCAL_SSH_TUNNEL_READY === true;
-    if (context.readiness && context.readiness.status === "PUBLIC_INGRESS_PENDING" && !local)
-      return "公网 HTTPS 入口不可用；请运行 Mac 启动器建立本机 SSH 隧道。不会通过普通 HTTP 发送 proof。";
-    if (context.readiness && (context.readiness.COS_READY !== true ||
-        context.readiness.EVIDENCE_BACKEND_READY !== true ||
-        (context.readiness.BROWSER_UPLOAD_READY !== true && !local)))
-      return "Evidence 后端尚未就绪，当前只读。";
-    if ((context.pr_state && context.pr_state !== "open") || context.merged) return "PR 已关闭或已合并，当前证据只读。";
-    if (context.head_sha !== bound.head_sha || context.round_id !== bound.round_id) return "HEAD 或 round 已变化；本页面绑定的历史轮次只读。";
-    if (context.status !== "testing") return "当前状态为 " + (context.status || "unknown") + "；仅 testing 阶段允许写入。";
-    if (context.github_user_authenticated !== true || context.actor_verified !== true)
-      return "GitHub proof 身份尚未验证；请通过 Mac 启动器提供的链接打开本页。";
-    if (context.can_write !== true) return "当前 GitHub 用户没有本轮写入权限。";
-    return "当前 HEAD/round、GitHub 身份及写入权限均已验证。";
   }
   function controls() {
     const canWrite = writable();
@@ -146,17 +156,22 @@ _JAVASCRIPT = r'''"use strict";
     proofSecret = "";
     try { sessionStorage.removeItem(proofKey); } catch (_) {}
   }
-  async function request(path, {method = "GET", body, key, job, timeoutMs = 30000} = {}) {
+  async function request(path, {method = "GET", body, key, job, timeoutMs = 30000, authMode = "auto"} = {}) {
     const write = method !== "GET";
     if (write && !writable()) throw new Error("当前轮不可写，请刷新并核对 HEAD/round。");
     const target = new URL(api + path, window.location.href);
     if (target.origin !== window.location.origin) throw new Error("拒绝跨站 Evidence 请求。");
     const headers = {Accept: "application/json"};
-    if (proofSecret && proofTransportAllowed(target)) {
+    headers["X-Evidence-Client-Key"] = clientKey;
+    const sendProof = proofSecret && (authMode === "proof" ||
+      authMode === "auto" && !(context && (context.auth_method === "signed_invite" || context.upload_invite === true))) &&
+      proofTransportAllowed(target);
+    const transportAllowed = sendProof ? proofTransportAllowed(target) : inviteTransportAllowed(target);
+    if (sendProof) {
       headers["X-Evidence-Secret"] = proofSecret;
       headers["X-Evidence-Nonce"] = randomHex();
-    } else if (write) {
-      throw new Error("只允许 HTTPS 或 http://127.0.0.1:25001 发送 proof；请运行 Mac 启动器。");
+    } else if (write && !transportAllowed) {
+      throw new Error("当前链接没有有效上传授权，或请求不是安全的同源 HTTPS 请求。");
     }
     if (write) headers["Content-Type"] = "application/json";
     const controller = new AbortController(); active.add(controller); if (job) job.requests.add(controller);
@@ -169,9 +184,16 @@ _JAVASCRIPT = r'''"use strict";
       let value; try { value = await response.json(); } catch (_) { value = {}; }
       if (!response.ok) {
         const detail = typeof value.detail === "string" ? value.detail : typeof value.error === "string" ? value.error : "";
-        if (response.status === 401 && proofSecret) clearProof();
+        if ([401, 403].includes(response.status) && proofSecret && authMode === "proof") clearProof();
+        else if (response.status === 401 && proofSecret && authMode !== "invite") clearProof();
+        if (response.status === 401) {
+          const expired = "上传链接可能已过期或失效。请刷新 PR Summary 并打开最新上传链接。";
+          if (!(path === "/context" && authMode === "invite")) halt(expired);
+          throw new ApiError(401, expired, detail);
+        }
+        if (response.status === 403) throw new ApiError(403, "权限不足：当前上传者无权执行此操作。", detail);
         if (response.status === 409 && ["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched"].includes(detail))
-          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新当前轮。");
+          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新 PR Summary 并打开最新上传链接。");
         if (response.status === 413) throw new ApiError(413, "超过服务端大小限制。 " + detail, detail);
         throw new ApiError(response.status, response.status + ": " + (detail || response.statusText), detail);
       }
@@ -182,16 +204,21 @@ _JAVASCRIPT = r'''"use strict";
     return new Promise((resolve, reject) => {
       if (!writable()) return reject(new Error("当前轮不可写，请刷新并核对 HEAD/round。"));
       const target = new URL(api + path, window.location.href);
-      if (target.origin !== window.location.origin || !proofSecret || !proofTransportAllowed(target))
-        return reject(new Error("只允许 HTTPS 或精确的本机 SSH 隧道入口发送 proof。"));
+      const useProof = proofSecret && !(context && (context.auth_method === "signed_invite" || context.upload_invite === true));
+      const transportAllowed = useProof ? proofTransportAllowed(target) : inviteTransportAllowed(target);
+      if (target.origin !== window.location.origin || !transportAllowed)
+        return reject(new Error("当前链接没有有效上传授权，或请求不是安全的同源 HTTPS 请求。"));
       const xhr = new XMLHttpRequest(); active.add(xhr); job.requests.add(xhr);
       let finished = false;
       const cleanup = () => { if (finished) return; finished = true; active.delete(xhr); job.requests.delete(xhr); };
       xhr.open("PUT", target.href); xhr.withCredentials = true; xhr.timeout = 120000;
       xhr.setRequestHeader("Accept", "application/json");
       xhr.setRequestHeader("Content-Type", "application/octet-stream");
-      xhr.setRequestHeader("X-Evidence-Secret", proofSecret);
-      xhr.setRequestHeader("X-Evidence-Nonce", randomHex());
+      xhr.setRequestHeader("X-Evidence-Client-Key", clientKey);
+      if (useProof) {
+        xhr.setRequestHeader("X-Evidence-Secret", proofSecret);
+        xhr.setRequestHeader("X-Evidence-Nonce", randomHex());
+      }
       xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(event.loaded); };
       xhr.onload = () => {
         cleanup();
@@ -200,8 +227,10 @@ _JAVASCRIPT = r'''"use strict";
         if (xhr.status >= 200 && xhr.status < 300 && responseOrigin === target.origin) return resolve(value);
         const detail = typeof value.detail === "string" ? value.detail : "";
         if (xhr.status === 401) clearProof();
+        if (xhr.status === 401) halt("上传链接可能已过期或失效。请刷新 PR Summary 并打开最新上传链接。");
+        if (xhr.status === 403) return reject(new ApiError(403, "权限不足：当前上传者无权执行此操作。", detail));
         if (xhr.status === 409 && ["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched"].includes(detail))
-          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新当前轮。");
+          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新 PR Summary 并打开最新上传链接。");
         reject(new ApiError(xhr.status, xhr.status + ": " + (detail || "分块上传失败"), detail));
       };
       xhr.onerror = () => { cleanup(); reject(new Error("网络中断；将先查询 COS 分块状态再决定是否重试。")); };
@@ -219,7 +248,8 @@ _JAVASCRIPT = r'''"use strict";
       const li = document.createElement("li"), deleted = item.status === "deleted" || !!item.deleted_at;
       const attachmentId = item.attachment_id || item.id, description = document.createElement("span");
       description.textContent = [item.filename || item.text || "文本证据", item.size === undefined ? "" : item.size + " B",
-        item.media_type || item.content_type || "", item.actor_verified === true ? (item.actor_login || item.actor || "") : "未验证身份",
+        item.media_type || item.content_type || "", item.actor_verified === true ? (item.actor_login || item.actor || "") :
+          item.upload_method === "signed_invite" ? "分享链接上传，GitHub 身份未验证" : "未验证身份",
         item.created_at || "", item.head_sha || "", item.round_id || "", item.sha256 || "", item.note || "",
         deleted ? "已删除 " + (item.deleted_at || "") + " " + (item.deleted_by || "") : item.status || "pending",
         item.replaces_id ? "替换 " + item.replaces_id : ""].filter(Boolean).join(" · ");
@@ -234,11 +264,11 @@ _JAVASCRIPT = r'''"use strict";
       }
       const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&
         (!item.round_id || item.round_id === bound.round_id);
-      if (!deleted && same && writable() && attachmentId) {
+      if (!deleted && same && writable() && item.can_delete === true && attachmentId) {
         const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "删除";
         remove.dataset.delete = attachmentId; remove.addEventListener("click", () => deleteAttachment(item));
         li.append(" ", remove);
-        if (item.status === "ready") {
+        if (item.status === "ready" && item.can_delete === true) {
           const option = document.createElement("option"); option.value = attachmentId;
           option.textContent = item.filename || attachmentId; $("replace").append(option);
         }
@@ -247,7 +277,6 @@ _JAVASCRIPT = r'''"use strict";
     }
   }
   function render() {
-    $("auth").textContent = permissionMessage();
     $("summary").textContent = typeof context.summary === "string" ? context.summary : JSON.stringify(context.summary || {status: context.status});
     $("attachments").replaceChildren(); $("history").replaceChildren();
     const replacement = $("replace").value; $("replace").replaceChildren(new Option("新增附件", ""));
@@ -278,8 +307,28 @@ _JAVASCRIPT = r'''"use strict";
     controls();
   }
   async function refresh(job) {
-    const next = await request("/context", {job}); context = next;
-    if (!roundMatches(next)) halt("当前 HEAD/round 已变化。本页面绑定的历史轮次只读。");
+    let next, useProofFallback = false;
+    try {
+      // Let the browser's HttpOnly upload cookie authenticate first. An old
+      // proof is a one-time compatibility fallback only after invite auth fails.
+      next = await request("/context", {job, authMode: "invite"});
+    } catch (inviteError) {
+      if (!proofSecret || ![401, 403].includes(inviteError.status)) throw inviteError;
+      useProofFallback = true;
+    }
+    if (!useProofFallback && proofSecret && next.auth_method !== "signed_invite" &&
+        roundMatches(next) && next.pr_state === "open" && !next.merged) {
+      // A valid read-only page cookie is not an upload invitation. Preserve
+      // the legacy proof path when it is available, but never replace stale
+      // HEAD/round or closed-PR responses with a second auth result.
+      useProofFallback = true;
+    }
+    if (useProofFallback) next = await request("/context", {job, authMode: "proof"});
+    context = next;
+    if (!roundMatches(next)) halt("当前 HEAD/round 已变化，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
+    else if ((next.pr_state && next.pr_state !== "open") || next.merged)
+      halt("PR 已关闭或已合并，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
+    else if (next.auth_method === "signed_invite") clearProof();
     render(); return next;
   }
   function persist(job) {
@@ -526,7 +575,7 @@ _JAVASCRIPT = r'''"use strict";
       if (job.status !== "排队中" || stopped) continue;
       await processJob(job);
     }
-    busy = false; controls(); message("队列已处理；各文件状态与恢复进度分别显示在队列中。");
+    busy = false; controls(); if (!stopped) message("队列已处理；各文件状态与恢复进度分别显示在队列中。");
   }
   async function deleteAttachment(item) {
     if (busy || !writable()) return;
@@ -540,8 +589,8 @@ _JAVASCRIPT = r'''"use strict";
   }
   async function saveNote() {
     if (busy || !writable()) return;
-    const body = {text: $("text").value, note: $("note").value};
-    if (!body.text.trim() && !body.note.trim()) { message("请输入文本或备注。"); return; }
+    const body = {text: $("note").value, note: ""};
+    if (!body.text.trim()) { message("请输入备注。"); return; }
     const content = JSON.stringify(body);
     if (!noteOperation || noteOperation.content !== content) noteOperation = {content, key: uid()};
     busy = true; controls();
@@ -550,17 +599,28 @@ _JAVASCRIPT = r'''"use strict";
       await refresh();
       const noteJob = {uploadId: result.upload_id, requests: new Set(), isNote: true};
       if (result.upload_id && (result.attachment_id || result.id)) await waitReady(noteJob, result.attachment_id || result.id);
-      else message("文本已提交，等待 Summary 更新；请刷新服务端状态确认。");
+      else message("备注已提交；请刷新服务端状态确认 Summary 更新。");
       noteOperation = null;
     } catch (error) { message(error.message); }
     finally { busy = false; controls(); }
   }
   $("upload").addEventListener("click", runUpload);
   $("save-note").addEventListener("click", saveNote);
+  const dropzone = $("dropzone");
+  for (const eventName of ["dragenter", "dragover"]) dropzone.addEventListener(eventName, event => {
+    event.preventDefault(); dropzone.classList.add("dragging");
+  });
+  for (const eventName of ["dragleave", "drop"]) dropzone.addEventListener(eventName, event => {
+    event.preventDefault(); dropzone.classList.remove("dragging");
+    if (eventName === "drop" && event.dataTransfer && event.dataTransfer.files.length) {
+      try { $("file").files = event.dataTransfer.files; }
+      catch (_) { message("浏览器无法读取拖入文件；请使用文件选择框。"); }
+    }
+  });
   $("refresh").addEventListener("click", async () => {
     try { if (busy) { message("上传进行中；可暂停对应文件后刷新。"); return; } stopped = false; await refresh(); }
     catch (error) { message(error.message); }
   });
-  restore(); refresh().catch(error => { $("auth").textContent = error.message || String(error); message(error.message || String(error)); });
+  restore(); refresh().catch(error => { message(error.message || String(error)); });
 })();
 '''

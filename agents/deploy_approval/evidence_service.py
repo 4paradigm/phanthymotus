@@ -22,8 +22,12 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urljoin, urlsplit
 
-from .evidence_auth import DOWNLOAD_PURPOSE, PURPOSE
+from .evidence_auth import (
+    DOWNLOAD_PURPOSE, PURPOSE, UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES, UPLOAD_PURPOSE,
+)
 from .evidence_models import EvidenceError, round_id_for_state, utc_now, validate_context
+
+UPLOAD_MAX_NOTES = 20
 
 
 class EvidenceService:
@@ -40,6 +44,8 @@ class EvidenceService:
         authorized = await self.github.list_installation_repositories()
         if repo not in authorized:
             raise EvidenceError('app_access_revoked', 403)
+        if isinstance(principal.get('upload_invite'), dict):
+            return False
         uid, login = principal.get('id'), principal.get('login')
         if type(uid) is not int or uid <= 0 or not isinstance(login, str) or not login:
             raise EvidenceError('identity_required', 401)
@@ -694,7 +700,9 @@ class EvidenceService:
                                and r['data'].get('upload_ref') == upload_ref), None)
                 if not source:
                     raise EvidenceError('operation_not_found', 404)
-                if source.get('actor_id') != principal.get('id'):
+                if (source.get('actor_id') != principal.get('id')
+                        or isinstance(principal.get('upload_invite'), dict)
+                        and source.get('upload_method') != 'signed_invite'):
                     raise EvidenceError('upload_owner_mismatch', 403)
                 if source.get('repo') != repo or source.get('pr_number') != pr_number:
                     raise EvidenceError('operation_not_found', 404)
@@ -721,15 +729,43 @@ class EvidenceService:
                 if not archives:
                     raise EvidenceError('round_not_found', 404)
                 selected = archives[-1]['snapshot']
+            expected_head = payload.get('head_sha', selected.get('head_sha'))
             authorized_writer = await self._authorize(repo, principal, selected, pr=pr)
             write = action in {'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete'}
-            if write and not authorized_writer:
+            invite = principal.get('upload_invite')
+
+            def invite_context_matches(target_pr, target_state, target_round):
+                return bool(
+                    isinstance(invite, dict)
+                    and invite.get('purpose') == UPLOAD_PURPOSE
+                    and principal.get('auth_method') == 'signed_invite'
+                    and principal.get('upload_method') == 'signed_invite'
+                    and principal.get('actor_verified') is False
+                    and principal.get('github_user_authenticated') is False
+                    and type(principal.get('id')) is int
+                    and (principal['id'] > 0 or action == 'context' and principal['id'] == 0)
+                    and invite.get('repo') == repo and invite.get('pr') == pr_number
+                    and invite.get('head') == expected_head
+                    and invite.get('round') == target_round
+                    and invite.get('status') == 'testing'
+                    and type(invite.get('expires_at')) is int
+                    and invite['expires_at'] > int(time.time())
+                    and target_pr.get('state') == 'open' and not target_pr.get('merged')
+                    and not target_pr.get('draft')
+                    and target_pr.get('head', {}).get('sha') == expected_head
+                    and target_state.get('head_sha') == expected_head
+                    and target_state.get('status') == 'testing'
+                    and round_id_for_state(target_state) == target_round
+                )
+
+            invite_allowed = (action in {'context', 'status'} or write) and invite_context_matches(
+                pr, selected, round_id)
+            if write and not (authorized_writer or invite_allowed):
                 raise EvidenceError('evidence_write_permission_required', 403)
-            expected_head = payload.get('head_sha', selected.get('head_sha'))
             validate_context(pr, selected, expected_head, round_id, write=write)
             if write and round_id != active_round:
                 raise EvidenceError('round_changed', 409)
-            if write:
+            if write and not invite_allowed:
                 self._validate_proof_context(
                     principal, repo, pr_number, expected_head, round_id,
                 )
@@ -755,11 +791,11 @@ class EvidenceService:
                     action == 'status' and purpose == PURPOSE
                     and 'resource' not in capability
                 )
-                if (capability.get('repo') != repo or capability.get('pr') != pr_number
+                if (not invite_allowed and (capability.get('repo') != repo or capability.get('pr') != pr_number
                         or capability.get('head') != expected_head
                         or capability.get('round') != round_id
                         or not (context_capability or scoped_read_capability
-                                or legacy_read_capability)):
+                                or legacy_read_capability))):
                     raise EvidenceError('capability_context_mismatch', 403)
             latest = {}
             operations = {}
@@ -843,7 +879,9 @@ class EvidenceService:
                         or source.get('head_sha') != expected_head
                         or source.get('round_id') != round_id):
                     raise EvidenceError('operation_not_found', 404)
-                if source.get('actor_id') != principal.get('id'):
+                if (source.get('actor_id') != principal.get('id')
+                        or isinstance(principal.get('upload_invite'), dict)
+                        and source.get('upload_method') != 'signed_invite'):
                     raise EvidenceError('upload_owner_mismatch', 403)
                 saved = latest.get(source.get('attachment_id'))
                 if (source.get('status') != 'uploading' or saved
@@ -872,9 +910,11 @@ class EvidenceService:
                     fresh_pr = await self.proxy.get_pr(repo, pr_number)
                     fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
                     validate_context(fresh_pr, fresh_state, expected_head, round_id, write=True)
-                    if not await self._authorize(repo, principal, fresh_state, pr=fresh_pr):
+                    fresh_authorized = await self._authorize(repo, principal, fresh_state, pr=fresh_pr)
+                    if not (fresh_authorized or invite_allowed and invite_context_matches(
+                            fresh_pr, fresh_state, round_id)):
                         raise EvidenceError('evidence_write_permission_required', 403)
-                    if not nonce_consumed:
+                    if not nonce_consumed and not invite_allowed:
                         await self._consume_auth_nonce(principal)
                         nonce_consumed = True
 
@@ -903,16 +943,32 @@ class EvidenceService:
                     raise EvidenceError('part_conflict', 409)
                 return {'uploaded': True, 'part_number': part, 'size': length}
             if action == 'context':
+                def context_attachment(row):
+                    return {**row, 'can_delete': bool(
+                        authorized_writer or invite_allowed
+                        and row.get('actor_id') == principal['id']
+                        and row.get('upload_method') == 'signed_invite')}
+
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'status': selected['status'], 'authenticated': True, 'enabled': True,
                         'github_user_authenticated': bool(
                             principal.get('actor_verified') is True
                             and principal.get('github_user_authenticated') is True),
-                        'can_write': bool(authorized_writer and selected.get('status') == 'testing'
+                        'can_write': bool((authorized_writer or invite_allowed) and selected.get('status') == 'testing'
                                           and selected.get('head_sha') == pr.get('head', {}).get('sha')),
-                        'attachments': [r for r in latest.values() if r['round_id'] == round_id],
+                        'upload_invite': bool(invite_allowed),
+                        'upload_identity_label': ('分享链接上传，GitHub 身份未验证'
+                                                  if invite_allowed else ''),
+                        'auth_method': principal.get('auth_method', 'github_comment_proof'),
+                        'actor_verified': principal.get('actor_verified') is True,
+                        'upload_method': principal.get('upload_method', 'github_comment_proof'),
+                        'upload_max_files': (UPLOAD_MAX_FILES if invite_allowed else None),
+                        'upload_max_bytes': (UPLOAD_MAX_BYTES if invite_allowed else None),
+                        'attachments': [context_attachment(r) for r in latest.values()
+                                        if r['round_id'] == round_id],
                         'rounds': [{**r['data']['snapshot'], 'round_id': r['data']['round_id'],
-                                    'attachments': [a for a in latest.values() if a['round_id'] == r['data']['round_id']]}
+                                    'attachments': [context_attachment(a) for a in latest.values()
+                                                    if a['round_id'] == r['data']['round_id']]}
                                    for r in records if r['kind'] == 'round'],
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
                                        for r in operations.values() if not r.get('auth_nonce_marker')
@@ -1012,6 +1068,48 @@ class EvidenceService:
                              or existing.get('head_sha') != expected_head or existing.get('round_id') != round_id):
                 raise EvidenceError('idempotency_conflict', 409)
 
+            if invite_allowed and action in {'init', 'note'} and existing is None:
+                invite_rows = {}
+                for row in [*latest.values(), *operations.values()]:
+                    if (row.get('upload_method') != 'signed_invite' or row.get('round_id') != round_id
+                            or not isinstance(row.get('attachment_id'), str)):
+                        continue
+                    # Older note operations predate this marker; note.txt was
+                    # their fixed filename. New operations carry an explicit
+                    # kind so an uploaded file named note.txt still counts as a file.
+                    row_kind = row.get('evidence_kind')
+                    if row_kind not in {'file', 'note'}:
+                        legacy_note_size = row.get('size')
+                        row_kind = ('note' if row.get('filename') == 'note.txt'
+                                    and type(legacy_note_size) is int and 1 <= legacy_note_size
+                                    <= int(self.config.evidence_max_note_bytes) else 'file')
+                    if row_kind not in {'file', 'note'}:
+                        row_kind = 'file'
+                    if row_kind != ('note' if action == 'note' else 'file'):
+                        continue
+                    attachment_id = row['attachment_id']
+                    size = row.get('size', 0) if type(row.get('size')) is int else 0
+                    invite_rows[attachment_id] = max(invite_rows.get(attachment_id, 0), size)
+
+                if action == 'init':
+                    requested_size = payload.get('size', 0)
+                    if (type(requested_size) is not int
+                            or not 1 <= requested_size <= 512 * 1024 * 1024):
+                        raise EvidenceError('invalid_file_size', 413)
+                    if len(invite_rows) >= UPLOAD_MAX_FILES:
+                        raise EvidenceError('upload_invitation_file_quota_exceeded', 429)
+                    if sum(invite_rows.values()) + requested_size > UPLOAD_MAX_BYTES:
+                        raise EvidenceError('upload_invitation_byte_quota_exceeded', 413)
+                else:
+                    note_text = payload.get('text') or payload.get('note', '')
+                    requested_size = len(note_text.encode('utf-8')) if isinstance(note_text, str) else 0
+                    note_limit = int(self.config.evidence_max_note_bytes)
+                    if len(invite_rows) >= UPLOAD_MAX_NOTES:
+                        raise EvidenceError('upload_invitation_note_quota_exceeded', 429)
+                    if (requested_size <= note_limit
+                            and sum(invite_rows.values()) + requested_size > UPLOAD_MAX_BYTES):
+                        raise EvidenceError('upload_invitation_note_byte_quota_exceeded', 413)
+
             def public(operation, result=None):
                 value = copy.deepcopy(operation)
                 # HTTP upload_id is a stable operation reference, never a key
@@ -1029,9 +1127,11 @@ class EvidenceService:
                 fresh_pr = await self.proxy.get_pr(repo, pr_number)
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
                 validate_context(fresh_pr, fresh_state, expected_head, round_id, write=True)
-                if not await self._authorize(repo, principal, fresh_state, pr=fresh_pr):
+                fresh_authorized = await self._authorize(repo, principal, fresh_state, pr=fresh_pr)
+                if not (fresh_authorized or invite_allowed and invite_context_matches(
+                        fresh_pr, fresh_state, round_id)):
                     raise EvidenceError('evidence_write_permission_required', 403)
-                if not nonce_consumed:
+                if not nonce_consumed and not invite_allowed:
                     await self._consume_auth_nonce(principal)
                     nonce_consumed = True
 
@@ -1078,7 +1178,8 @@ class EvidenceService:
                             or not re.fullmatch('[0-9a-f]{64}', sha)
                             or (source.get('sha256') and sha != source['sha256'])):
                         raise EvidenceError('object_not_verified', 409)
-                    recovered.update(status='ready', sha256=sha, completed_at=utc_now())
+                    recovered.update(status='ready', sha256=sha, cos_content_verified=True,
+                                     completed_at=utc_now())
                     await self._save(repo, pr_number, 'operation', recovered, 'ready')
                     await self._save(repo, pr_number, 'attachment', recovered, 'ready')
                 else:
@@ -1115,6 +1216,9 @@ class EvidenceService:
                 replaces = payload.get('replaces_id') or ''
                 if replaces and (replaces not in latest or latest[replaces]['round_id'] != round_id):
                     raise EvidenceError('replacement_not_found', 404)
+                if (invite_allowed and replaces
+                        and latest[replaces].get('actor_id') != principal['id']):
+                    raise EvidenceError('upload_owner_mismatch', 403)
                 from .evidence_builder import _redact_secrets
                 note = payload.get('note', '')
                 if not isinstance(note, str):
@@ -1123,8 +1227,14 @@ class EvidenceService:
                 operation = existing or {
                     'operation_id': opid, 'upload_ref': opid, 'attachment_id': opid, 'repo': repo, 'pr_number': pr_number,
                     'head_sha': expected_head, 'round_id': round_id, 'actor_id': principal['id'],
-                    'actor_login': submitter, 'actor': submitter, 'submitter': submitter,
-                    'actor_verified': True, 'created_by': submitter,
+                    'actor_login': submitter, 'actor': 'shared-link' if invite_allowed else submitter,
+                    'submitter': submitter,
+                    'actor_verified': principal.get('actor_verified') is True,
+                    'github_user_authenticated': principal.get('github_user_authenticated') is True,
+                    'upload_method': ('signed_invite' if invite_allowed else 'github_comment_proof'),
+                    'evidence_kind': 'note' if action == 'note' else 'file',
+                    'upload_link_authorized': bool(invite_allowed),
+                    'created_by': submitter,
                     'created_at': utc_now(), 'updated_at': utc_now(), 'filename': filename, 'size': size, 'sha256': sha,
                     'note': _redact_secrets(text if action == 'note' else note)[:256],
                     'replaces_id': replaces, 'status': 'initializing', 'request_sha256': request_hash,
@@ -1150,16 +1260,23 @@ class EvidenceService:
                     raise EvidenceError('round_changed', 409)
                 if current_attachment and current_attachment.get('status') == 'deleted':
                     raise EvidenceError('attachment_deleted', 410)
-                if source.get('actor_id') != principal['id'] and action != 'delete':
+                if ((source.get('actor_id') != principal['id']
+                     or invite_allowed and source.get('upload_method') != 'signed_invite')
+                        and action != 'delete'):
                     raise EvidenceError('upload_owner_mismatch', 403)
                 if action != 'delete' and current_attachment and current_attachment.get('status') == 'ready':
                     return public(current_attachment)
                 operation = existing or {**source, 'operation_id': opid,
                                          'source_operation_id': source['operation_id'], 'request_sha256': request_hash}
                 if action == 'delete':
+                    if (invite_allowed and (source.get('actor_id') != principal['id']
+                                            or source.get('upload_method') != 'signed_invite')):
+                        raise EvidenceError('upload_owner_mismatch', 403)
                     operation.update(status='deleted', deleted_at=utc_now(), deleted_by=principal['login'],
                                      deleted_by_login=principal['login'], deleted_by_id=principal['id'],
-                                     actor_verified=True, updated_at=utc_now())
+                                     actor_verified=principal.get('actor_verified') is True,
+                                     github_user_authenticated=principal.get('github_user_authenticated') is True,
+                                     updated_at=utc_now())
                     await current()
                     await self._save(repo, pr_number, 'operation', operation, 'deleted')
                     await self._save(repo, pr_number, 'attachment', operation, 'deleted')
@@ -1226,7 +1343,8 @@ class EvidenceService:
                         or not re.fullmatch('[0-9a-f]{64}', actual_sha)
                         or (operation.get('sha256') and actual_sha != operation['sha256'])):
                     raise EvidenceError('object_not_verified', 409)
-                operation.update(status='ready', sha256=actual_sha, completed_at=utc_now())
+                operation.update(status='ready', sha256=actual_sha, cos_content_verified=True,
+                                 completed_at=utc_now())
                 await self._save(repo, pr_number, 'operation', operation, 'ready')
                 await self._save(repo, pr_number, 'attachment', operation, 'ready')
             else:

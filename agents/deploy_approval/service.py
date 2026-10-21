@@ -23,7 +23,7 @@ import asyncio
 import logging
 import time
 import copy
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from . import comments as comments_mod
@@ -3354,13 +3354,23 @@ class DeployController:
                         and r.get("head_sha") == state.get("head_sha")]
 
         def verified_evidence_row(row, head_sha, round_id):
-            if (not isinstance(row, dict)
-                    or row.get("head_sha") != head_sha
+            if not isinstance(row, dict):
+                return False
+            invitation_upload = (
+                row.get("upload_method") == "signed_invite"
+                and row.get("upload_link_authorized") is True
+                and row.get("actor_verified") is False
+                and row.get("github_user_authenticated") is False
+                and row.get("cos_content_verified") is True
+            )
+            if row.get("upload_method") == "signed_invite" and not invitation_upload:
+                return False
+            if (row.get("head_sha") != head_sha
                     or row.get("round_id") != round_id
                     or not isinstance(head_sha, str)
                     or not isinstance(round_id, str)
                     or re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id) is None
-                    or row.get("actor_verified") is not True):
+                    or not (row.get("actor_verified") is True or invitation_upload)):
                 return False
             if row.get("status") == "text":
                 source_id = row.get("source_comment_id")
@@ -3376,6 +3386,8 @@ class DeployController:
                 return False
             if (not isinstance(digest, str)
                     or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+                return False
+            if invitation_upload and row.get("cos_content_verified") is not True:
                 return False
             try:
                 from .evidence_store import build_attachment_key
@@ -3446,7 +3458,7 @@ class DeployController:
         )
         bundles = []
         seen_rounds = set()
-        from .evidence_auth import DOWNLOAD_PURPOSE, issue_capability
+        from .evidence_auth import DOWNLOAD_PURPOSE, UPLOAD_PURPOSE, issue_capability
 
         # Reuse only long-lived COS URLs from the previous trusted lifecycle
         # projection. They are matched to their exact decoded object key and
@@ -3513,7 +3525,6 @@ class DeployController:
                     verified_evidence_row(item, head_sha, round_id)
                     and item.get("head_sha") == head_sha
                     and item.get("round_id") == round_id
-                    and item.get("actor_verified") is True
                     and item.get("status") == "ready"
                     and isinstance(item.get("sha256"), str)
                     and re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")) is not None
@@ -3529,6 +3540,7 @@ class DeployController:
                         valid_row = False
                     else:
                         valid_row = item.get("object_key") == expected_key
+                item["cos_projection_verified"] = bool(valid_row)
                 if (valid_row and isinstance(attachment_id, str)
                         and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id)):
                     item["download_capability"] = issue_capability(
@@ -3567,6 +3579,25 @@ class DeployController:
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="page",
             )
+            if browser_upload_ready and state.get("status") == "testing":
+                started_at = state.get("round_started_at")
+                try:
+                    if not isinstance(started_at, str):
+                        raise ValueError("round start unavailable")
+                    parsed_started_at = datetime.fromisoformat(
+                        started_at.replace("Z", "+00:00"),
+                    )
+                    if parsed_started_at.utcoffset() is None:
+                        raise ValueError("round start timezone unavailable")
+                    upload_expiry = int((parsed_started_at + timedelta(days=30)).timestamp())
+                    if upload_expiry > int(time.time()):
+                        render_state["upload_capability"] = issue_capability(
+                            self.config, repo, pr_number, state["head_sha"], current_round,
+                            purpose=UPLOAD_PURPOSE, expires_at=upload_expiry,
+                        )
+                except (OverflowError, TypeError, ValueError):
+                    logger.warning("Evidence upload capability unavailable %s#%s: invalid round start time",
+                                   repo, pr_number)
             render_state["log_capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
