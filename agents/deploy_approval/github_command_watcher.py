@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+from collections import deque
 from datetime import datetime, timezone
 
 from . import commands as commands_mod
@@ -120,6 +121,26 @@ class GitHubCommandWatcher:
         self._repo_poll_cursor = 0
         self._pr_scan_cursor: dict[str, int] = {}
         self._recent_pr_cursor: dict[str, int] = {}
+        self._priority_pr_queue: deque[tuple[str, int]] = deque()
+        self._priority_pr_set: set[tuple[str, int]] = set()
+
+    def enqueue_pr(self, repo: str, pr_number: int) -> None:
+        """Prioritize an authorized PR after a webhook observes a new comment."""
+        if (not isinstance(repo, str)
+                or not getattr(self.config, "auth_valid", False)
+                or repo not in self.config.active_repos
+                or repo not in self.config.github_repos
+                or type(pr_number) is not int
+                or pr_number <= 0):
+            return
+        item = (repo, pr_number)
+        if item in self._priority_pr_set:
+            return
+        if len(self._priority_pr_queue) >= 128:
+            evicted = self._priority_pr_queue.popleft()
+            self._priority_pr_set.discard(evicted)
+        self._priority_pr_queue.append(item)
+        self._priority_pr_set.add(item)
 
     def start(self) -> None:
         if self._running:
@@ -279,9 +300,41 @@ class GitHubCommandWatcher:
 
             # Each repo gets a hard cap for all PR work, including command
             # processing, baseline attempts and evidence projection.
-            pr_work_budget = 6
-            fast_lane_size = 2
+            pr_work_budget = 8
+            fast_lane_size = 6
             by_number = {number: pr for number, pr in valid_prs}
+            selected_numbers: list[int] = []
+            selected_set: set[int] = set()
+            priority_numbers: list[int] = []
+
+            # Drain this repo's queued work first. The Open PR response above
+            # is the authority: stale, closed, merged, or missing entries are
+            # discarded without invoking any PR writer.
+            queued_count = len(self._priority_pr_queue)
+            for _ in range(queued_count):
+                queued_repo, queued_number = self._priority_pr_queue.popleft()
+                queued_item = (queued_repo, queued_number)
+                if (queued_repo not in self.config.active_repos
+                        or queued_repo not in self.config.github_repos):
+                    self._priority_pr_set.discard(queued_item)
+                    continue
+                if queued_repo != repo:
+                    self._priority_pr_queue.append(queued_item)
+                    continue
+                queued_pr = by_number.get(queued_number)
+                if (queued_pr is None
+                        or queued_pr.get("state", "open") != "open"
+                        or queued_pr.get("merged")):
+                    self._priority_pr_set.discard(queued_item)
+                    continue
+                if len(selected_numbers) >= pr_work_budget:
+                    self._priority_pr_queue.append(queued_item)
+                    continue
+                self._priority_pr_set.discard(queued_item)
+                selected_numbers.append(queued_number)
+                selected_set.add(queued_number)
+                priority_numbers.append(queued_number)
+
             recent_pool = sorted(
                 valid_prs,
                 key=lambda item: str(item[1].get("updated_at") or ""),
@@ -295,8 +348,17 @@ class GitHubCommandWatcher:
                 self._recent_pr_cursor[repo] = (recent_start + 1) % len(rotating_recent)
             else:
                 fast_lane = list(recent_pool)
-            selected_numbers = [number for number, _ in fast_lane]
-            selected_set = set(selected_numbers)
+            recent_added = 0
+            for number, _ in fast_lane:
+                if len(selected_numbers) >= pr_work_budget:
+                    break
+                if number in selected_set:
+                    continue
+                selected_numbers.append(number)
+                selected_set.add(number)
+                recent_added += 1
+                if recent_added >= fast_lane_size or len(selected_numbers) >= pr_work_budget:
+                    break
 
             # Sort by PR number above, then rotate from the saved position.
             # Modulo adjustment handles PR additions/removals; API ordering
@@ -323,13 +385,13 @@ class GitHubCommandWatcher:
                 if ordinary_added >= ordinary_slots:
                     break
 
-            processed_count = 0
+            processed_prs: list[int] = []
             for pr_number in selected_numbers[:pr_work_budget]:
                 if (not self.config.auth_valid or repo not in self.config.active_repos
                         or repo not in self.config.github_repos):
                     break
                 pr = by_number[pr_number]
-                processed_count += 1
+                processed_prs.append(pr_number)
                 try:
                     if baseline_all and pr_number not in baseline_done:
                         # Baseline only. Never dispatch historical comments in
@@ -383,8 +445,9 @@ class GitHubCommandWatcher:
                 if repo in self._pending_baseline_repos else 0
             )
             logger.info(
-                "watcher poll %s processed_prs=%s remaining_baselines=%s scan_cursor=%s",
-                repo, processed_count, remaining, self._pr_scan_cursor.get(repo, 0),
+                "watcher poll %s selected_prs=%s priority_prs=%s processed_prs=%s remaining_baselines=%s scan_cursor=%s",
+                repo, selected_numbers[:pr_work_budget], priority_numbers,
+                processed_prs, remaining, self._pr_scan_cursor.get(repo, 0),
             )
         if repos:
             self._repo_poll_cursor = (repo_start + 1) % len(repos)

@@ -103,6 +103,16 @@ async def webhook(request: Request):
     if not isinstance(body, str) or not body:
         return {"status": "ignored"}
 
+    # Prioritize every freshly confirmed PR comment, including native evidence
+    # attachment comments that are not commands. Webhook remains enqueue-only.
+    try:
+        request.app.state.watcher.enqueue_pr(repo, pr_number)
+    except Exception as exc:
+        logger.warning(
+            "webhook enqueue failed repo=%s pr=%s exception=%s",
+            repo, pr_number, type(exc).__name__,
+        )
+
     # Skip bot's own comments
     if HIDDEN_STATE_MARKER in body:
         return {"status": "ignored", "reason": "bot comment"}
