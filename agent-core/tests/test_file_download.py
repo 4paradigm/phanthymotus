@@ -38,6 +38,42 @@ class FileDownloadTest(unittest.TestCase):
         self.assertEqual(len([m for m in saved if m['id'] == 'agentcore']), 1)
         self.assertIn({'id': 'driver'}, saved)
 
+    def test_discovery_preserves_provider_declaration_without_calling_listing(self):
+        schema = {'properties': {'action': {'enum': ['list_assets']}},
+                  'x-file-download': {'protocol': 'motus.files/1', 'action': 'list_assets'}}
+        methods = []
+
+        class Response:
+            status = 200
+
+            def __init__(self, method):
+                self.method = method
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def json(self, **kwargs):
+                return {'result': {'tools': [{'name': 'arbitrary_export', 'inputSchema': schema}]}}
+
+        class Session(Response):
+            def __init__(self, **kwargs):
+                pass
+
+            def post(self, url, json, **kwargs):
+                methods.append(json['method'])
+                return Response(json['method'])
+
+        ping = load_function('api/mcp_manage.py', '_ping_mcp_http', {
+            'aiohttp': types.SimpleNamespace(ClientTimeout=lambda **kwargs: None, ClientSession=Session),
+            'asyncio': asyncio,
+        })
+        result = asyncio.run(ping('http://fixture/mcp'))
+        self.assertEqual(result['tools'][0]['inputSchema'], schema)
+        self.assertEqual(methods, ['initialize', 'tools/list', 'resources/list'])
+
     def test_download_lifecycle_does_not_start_camera_or_subscribe_to_dds(self):
         call = load_function('api/mcp_manage.py', 'mcp_call_tool', {
             'MCPCallRequest': object, 'typing': __import__('typing'),

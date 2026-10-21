@@ -1,41 +1,35 @@
-// Downloads use Agent Core's existing authenticated file APIs and shared volume.
-// vision_capture is the first provider for the independent file_download card.
-async function captureInfo(mcpId) {
-  const response = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call?timeout_s=20`, {
+// Providers declare a read-only listing action; file bytes use the shared volume.
+export function fileDownloadSpec(schema) {
+  const spec = schema?.['x-file-download'];
+  return spec?.protocol === 'motus.files/1' && typeof spec.action === 'string' && spec.action.trim()
+    ? { protocol: spec.protocol, action: spec.action } : null;
+}
+
+export async function listDownloadFiles(source, mediaType = 'all') {
+  const spec = fileDownloadSpec({ 'x-file-download': source.fileDownload });
+  if (!spec) throw new Error('文件来源未声明支持的下载能力');
+  const args = { action: spec.action };
+  if (source.multiInstance) args.instance_id = source.id;
+  const response = await fetch(`/api/mcp/${encodeURIComponent(source.mcpId)}/call?timeout_s=20`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tool: 'vision_capture', arguments: { action: 'info' } }),
+    body: JSON.stringify({ tool: source.toolName, arguments: args }),
   });
-  if (!response.ok) throw new Error(`无法读取拍摄信息（HTTP ${response.status}）`);
+  if (!response.ok) throw new Error(`无法读取文件列表（HTTP ${response.status}）`);
   const result = await response.json();
-  if (result.code !== 200) throw new Error(result.message || '无法读取拍摄信息');
-  const data = Array.isArray(result.data)
+  if (result.code !== 200) throw new Error(result.message || '无法读取文件列表');
+  const payload = Array.isArray(result.data)
     ? result.data.find(part => part.type === 'text')?.text : result.data;
-  return typeof data === 'string' ? JSON.parse(data) : data;
+  const data = typeof payload === 'string' ? JSON.parse(payload) : payload;
+  if (data?.ok !== true || !Array.isArray(data.files)) throw new Error(data?.message || '文件来源返回了无效列表');
+  return data.files.filter(file => file && typeof file.name === 'string' && file.name.trim() &&
+    !/[\\/]/.test(file.name) && typeof file.path === 'string' && file.path.startsWith('/') &&
+    file.path.split('/').pop() === file.name && Number.isFinite(file.size) && file.size > 0)
+    .map(file => ({ ...file, mime_type: typeof file.mime_type === 'string' ? file.mime_type : 'application/octet-stream' }))
+    .filter(file => mediaType === 'photo' ? file.mime_type.startsWith('image/')
+      : mediaType === 'video' ? file.mime_type.startsWith('video/') : true);
 }
 
-export async function listCaptureFiles(mcpId, mediaType) {
-  const info = await captureInfo(mcpId);
-  const dir = mediaType === 'photo' ? info?.photos_dir : info?.videos_dir;
-  if (typeof dir !== 'string' || !dir.startsWith('/')) throw new Error('driver 未返回有效的保存目录');
-  const path = dir.replace(/\/+$/, '');
-  const response = await fetch('/api/file/list', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
-  });
-  if (!response.ok) throw new Error(`无法读取保存目录（HTTP ${response.status}），请确认目录已创建且已共享给 Agent Core`);
-  const result = await response.json();
-  if (result.code !== 200 || !Array.isArray(result.data?.files)) throw new Error(result.message || '无法读取保存目录');
-  // Inspect AFTER listing: a recording may have started while the list was read.
-  const activePath = mediaType === 'video' ? (await captureInfo(mcpId))?.active_recording?.path : null;
-  const extension = mediaType === 'photo' ? /\.(jpe?g|png)$/i : /\.mp4$/i;
-  return result.data.files.filter(file => file.type === 'file' && file.size > 0 &&
-    typeof file.name === 'string' && !/[\\/]/.test(file.name) && !file.name.startsWith('.') &&
-    extension.test(file.name) && `${path}/${file.name}` !== activePath)
-    .sort((a, b) => b.name.localeCompare(a.name))
-    .map(file => ({ name: file.name, path: `${path}/${file.name}`, size: file.size }));
-}
-
-export async function downloadCaptureFile(path) {
+export async function downloadFile(path) {
   // fetch is patched by auth.js; a plain link would bypass its Bearer header.
   const response = await fetch('/api/file/download?path=' + encodeURIComponent(path));
   if (!response.ok) throw new Error(`下载失败（HTTP ${response.status}），文件可能已删除或访问权限已失效`);
@@ -55,12 +49,12 @@ export async function downloadCaptureFile(path) {
   }
 }
 
-export function openCaptureDownloads(getSources, mediaType) {
+export function openFileDownloads(getSources, mediaType) {
   const previousFocus = document.activeElement;
-  const title = mediaType === 'photo' ? '下载照片' : '下载视频';
+  const title = mediaType === 'photo' ? '下载照片' : mediaType === 'video' ? '下载视频' : '文件下载';
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
-  overlay.innerHTML = `<section class="modal vision-capture-downloads" role="dialog" aria-modal="true">
+  overlay.innerHTML = `<section class="modal file-downloads" role="dialog" aria-modal="true">
     <header class="modal-header"><strong class="modal-title"></strong>
       <div><button type="button" class="btn-ghost" data-refresh>刷新</button>
       <button type="button" class="btn-icon" aria-label="关闭">✕</button></div></header>
@@ -92,10 +86,10 @@ export function openCaptureDownloads(getSources, mediaType) {
     try {
       const sources = getSources();
       if (!sources.length) {
-        status.textContent = '请先将 vision_capture 的文件输出口连接到下载卡片。';
+        status.textContent = '请先将支持文件下载的输出口连接到下载卡片。';
         return;
       }
-      const results = await Promise.allSettled(sources.map(source => listCaptureFiles(source.mcpId, mediaType)));
+      const results = await Promise.allSettled(sources.map(source => listDownloadFiles(source, mediaType)));
       if (!overlay.isConnected) return;
       const connected = new Set(getSources().map(source => source.id));
       const files = [], errors = [];
@@ -107,7 +101,7 @@ export function openCaptureDownloads(getSources, mediaType) {
         else errors.push(`${label}：${result.reason.message}`);
       });
       status.textContent = files.length ? `共 ${files.length} 个文件，点击下载保存到本机。`
-        : (mediaType === 'photo' ? '暂无已保存的照片。' : '暂无已完成的视频，录制结束后可刷新。');
+        : '暂无可下载文件，可在生成完成后刷新。';
       if (errors.length) status.textContent += ' ' + errors.join('；');
       for (const file of files) {
         const row = document.createElement('li');
@@ -123,7 +117,7 @@ export function openCaptureDownloads(getSources, mediaType) {
           button.disabled = true;
           try {
             if (!getSources().some(source => source.id === file.source.id)) throw new Error('文件来源已断开，请刷新列表');
-            await downloadCaptureFile(file.path);
+            await downloadFile(file.path);
             status.textContent = `已发起下载：${file.name}`;
           } catch (error) { status.textContent = error.message; }
           finally { button.disabled = false; }

@@ -144,7 +144,7 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'file_download',
                 'type': 'resource',
-                'description': '文件下载 — 连接文件输出口，查看并下载历史照片和已完成的视频。',
+                'description': '文件下载 — 连接文件输出口，查看并下载已保存的文件。',
                 'inputSchema': {'type': 'object', 'properties': {}},
             },
             {

@@ -2083,12 +2083,12 @@ html, body {
   cursor: text;
 }
 .canvas-result-pre.error { color: var(--red); }
-.vision-capture-downloads .modal-body { padding: 16px 22px; overflow-y: auto; }
-.vision-capture-downloads [role="status"] { font-size: 12px; color: var(--text-muted); }
-.vision-capture-downloads ul { list-style: none; padding: 0; margin: 12px 0 0; }
-.vision-capture-downloads li { display: flex; align-items: center; gap: 12px; padding: 6px 0; }
-.vision-capture-downloads li span { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
-.vision-capture-downloads li button { flex-shrink: 0; }
+.file-downloads .modal-body { padding: 16px 22px; overflow-y: auto; }
+.file-downloads [role="status"] { font-size: 12px; color: var(--text-muted); }
+.file-downloads ul { list-style: none; padding: 0; margin: 12px 0 0; }
+.file-downloads li { display: flex; align-items: center; gap: 12px; padding: 6px 0; }
+.file-downloads li span { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.file-downloads li button { flex-shrink: 0; }
 /* The box is focusable so Ctrl/Cmd+A can be scoped to it; without a visible
    focus ring, which key went where would be guesswork. */
 .canvas-result-pre:focus,
