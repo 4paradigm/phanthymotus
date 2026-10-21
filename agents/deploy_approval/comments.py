@@ -998,6 +998,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     except ValueError:
         current_round = state.get("round_id", "")
     base = _public_base(public_base_url)
+    if not base.startswith("https://"):
+        base = ""
     enabled = (state.get("evidence_enabled", state.get("enabled", False)) is True
                and state.get("enabled", True) is not False)
     api = _evidence_path(repo, pr_number)
@@ -1037,11 +1039,19 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
 
     def download(identifier, suffix, capability):
         identifier = str(identifier or "")
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", identifier):
+        if (not base or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier)):
             return ""
         if not capability:
             return ""
-        return "http://127.0.0.1:25001" + api + suffix.format(id=identifier) + "?cap=" + urllib.parse.quote(capability, safe="")
+        return base + api + suffix.format(id=identifier) + "?cap=" + urllib.parse.quote(capability, safe="")
+
+    page_path = api.replace("/api/evidence/", "/evidence/", 1)
+
+    def page_url(capability):
+        if not base or not capability or not page_path.startswith("/evidence/"):
+            return ""
+        return (base + page_path + "?cap="
+                + urllib.parse.quote(str(capability), safe=""))
 
     def render_round(key, group):
         h, r = key
@@ -1156,28 +1166,25 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         archived = sum(1 for item in state.get("attachments", [])
                        if isinstance(item, dict) and item.get("status") == "ready"
                        and item.get("object_key") and item.get("actor_verified") is True)
-        lines.extend([
-            "", "### 上传测试证据", "",
-            f"[上传到 COS](<http://127.0.0.1:25001/evidence/{repo}/pulls/{pr_number}"
-            + (f"?cap={urllib.parse.quote(str(state.get('capability')), safe='')}" if state.get("capability") else "")
-            + ">)",
-            "需先运行 Mac 启动器建立 SSH 隧道；此入口通过本机转发访问，不能从公网直接访问。",
-            f"适用人员：PR 开发者、已部署 Machine Owner（{_escape(', '.join(machine_names) or '见当前部署记录')}）。",
-            f"绑定：HEAD `{_escape(head)}` · round `{_escape(current_round)}`。",
-            "在页面选择视频、图片、文档或其他文件，也可提交纯文本说明；所有文件都通过本机隧道直接上传到私有 COS。",
-            f"状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。只有归档后再执行 `/record_test result=pass|fail`。",
-            "已验证归档的附件可直接使用 Summary 中的 COS 下载链接。",
-        ])
-    if state.get("evidence_enabled") is True and state.get("browser_upload_ready") is not True:
-        readiness = (state.get("evidence_readiness") or {}).get("status")
-        if readiness == "PUBLIC_INGRESS_PENDING":
-            lines.extend(["", "**公网 HTTPS 入口：** `PUBLIC_INGRESS_PENDING` 只表示公网网页入口不可用；运行 Mac 启动器建立 SSH 隧道后，仍可使用上方本机上传入口。"])
+        lines.extend(["", "### 上传测试证据", ""])
+        upload_url = page_url(state.get("capability"))
+        if upload_url:
+            lines.extend([
+                f"[上传到 COS](<{upload_url}>)",
+                f"适用人员：PR 开发者、已部署 Machine Owner（{_escape(', '.join(machine_names) or '见当前部署记录')}）。",
+                f"绑定：HEAD `{_escape(head)}` · round `{_escape(current_round)}`。",
+                "在页面选择视频、图片、文档或其他文件，也可提交纯文本说明；文件保存到私有 COS。",
+                f"状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。只有归档后再执行 `/record_test result=pass|fail`。",
+                "已验证归档的附件可直接使用 Summary 中的 COS 下载链接。",
+            ])
+        else:
+            lines.append("上传入口尚未就绪：未配置可用的 HTTPS 基地址，当前不能通过 Summary 上传证据。")
     if (state.get("evidence_enabled") is True and state.get("status") == "testing"
             and state.get("pr_state", "open") == "open" and not state.get("merged")):
         # The signed Summary capability is bound to this trusted HEAD/round.
         capability = state.get("capability", "")
-        if capability:
-            evidence_url = f"http://127.0.0.1:25001/evidence/{repo}/pulls/{pr_number}?cap={urllib.parse.quote(capability, safe='')}"
+        evidence_url = page_url(capability)
+        if evidence_url:
             lines.extend(["", f"[查看 COS 证据与历史](<{evidence_url}>)"])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: str(pair[1].get("archived_at") or pair[1].get("ended_at") or pair[1].get("created_at") or ""), reverse=True)

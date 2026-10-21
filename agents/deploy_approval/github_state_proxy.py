@@ -29,6 +29,8 @@ import base64
 import hashlib
 import logging
 import re
+import time
+from urllib.parse import parse_qs, urlsplit
 from typing import Any
 
 from .config import Config
@@ -1187,22 +1189,7 @@ class GitHubStateProxy:
 
     @staticmethod
     def _evidence_visible_description(envelope: dict) -> str:
-        category = envelope.get("kind")
-        category_label = {
-            "round": "Round evidence", "operation": "Operation evidence",
-            "attachment": "Attachment evidence",
-        }.get(category, "Evidence")
-        pr_number = envelope.get("pr_number")
-        pr_label = f"PR #{pr_number}" if type(pr_number) is int and pr_number > 0 else "PR archive"
-        if envelope.get("type") == "part":
-            index = envelope.get("index")
-            detail = f"part {index}" if type(index) is int and index >= 0 else "part"
-        elif envelope.get("type") == "manifest":
-            detail = "manifest"
-        else:
-            detail = "record"
-        return (f"### Deploy Approval — Evidence Archive\n\n"
-                f"{pr_label} · {category_label} · {detail}")
+        return "<details>\n<summary>自动保存的内部证据记录（无需操作）</summary>\n</details>"
 
     @staticmethod
     def _evidence_envelope_text(body: str) -> str:
@@ -1216,99 +1203,273 @@ class GitHubStateProxy:
         return bool(visible.strip())
 
     async def ensure_visible_evidence_archive_comments(
-        self, repo: str, pr_number: int, limit: int = 2,
+        self, repo: str, pr_number: int, limit: int = 10,
     ) -> int:
-        """Add concise visible labels to legacy empty evidence comments in place."""
+        """Fold legacy archive headings in place without changing evidence data."""
         self._evidence_repo_guard(repo)
         if type(limit) is not int or limit < 0:
             raise ValueError("limit must be a non-negative int")
         if limit == 0:
             return 0
         pr = await self.get_pr(repo, pr_number)
-        if pr.get("state") != "open" or pr.get("merged") or pr.get("draft"):
+        if (not isinstance(pr, dict) or pr.get("state") != "open"
+                or pr.get("merged") or pr.get("draft")):
             return 0
         comments = await self.get_issue_comments(repo, pr_number)
         records = await self.read_evidence_records(repo, pr_number)
-        committed_ids = {record["comment_id"] for record in records}
-        archive_sha_by_comment = {}
-        for comment in comments:
-            if not self.is_bot_comment(comment):
-                continue
-            envelope = self._evidence_envelope(comment)
-            if (envelope and envelope.get("type") == "manifest"
-                    and comment.get("id") in committed_ids
-                    and isinstance(envelope.get("sha256"), str)
-                    and re.fullmatch(r"[0-9a-f]{64}", envelope["sha256"])):
-                archive_sha_by_comment[comment["id"]] = envelope["sha256"]
-                for cid in envelope.get("parts", []):
-                    if type(cid) is int:
-                        committed_ids.add(cid)
-                        archive_sha_by_comment[cid] = envelope["sha256"]
+        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
+        trusted = {item["id"]: item for item in comments
+                   if type(item.get("id")) is int and item.get("issue_url") == expected_url
+                   and self.is_bot_comment(item)}
+        archive_by_comment = {}
+        for record in records:
+            comment = trusted.get(record["comment_id"])
+            envelope = self._evidence_envelope(comment or {})
+            if (not envelope or envelope.get("repo") != repo
+                    or envelope.get("pr_number") != pr_number
+                    or envelope.get("sha256") != record.get("sha256")
+                    or envelope.get("kind") != record.get("kind")
+                    or envelope.get("key") != record.get("key")):
+                raise GitHubStateProxyError("Evidence archive identity changed during migration")
+            if envelope["type"] == "manifest":
+                archive_by_comment[record["comment_id"]] = (record, envelope)
+                for part_id in envelope["parts"]:
+                    archive_by_comment[part_id] = (record, None)
+            elif envelope["type"] == "record":
+                archive_by_comment[record["comment_id"]] = (record, envelope)
+
+        legacy_heading = "### Deploy Approval — Evidence Archive"
+        legacy_prefix = re.compile(
+            re.escape(legacy_heading) + r"\s*\n\s*"
+            r"(?:PR #\d+|PR archive) · "
+            r"(?:Round evidence|Operation evidence|Attachment evidence|Evidence) · "
+            r"(?:part \d+(?:\s*/\s*manifest)?|manifest|record)\s*$"
+        )
+        legacy_inline_suffix = re.compile(
+            r"\s*(?:[·—-]\s*(?:(?:part\s+\d+)(?:\s*/\s*manifest)?|manifest|record))?\s*$",
+            re.IGNORECASE,
+        )
         repaired = 0
         for listed in comments:
             if repaired >= limit:
                 break
-            if not self.is_bot_comment(listed):
+            if (not self.is_bot_comment(listed)
+                    or listed.get("issue_url") != expected_url):
                 continue
             body = listed.get("body")
             comment_id = listed.get("id")
-            if type(comment_id) is not int or not isinstance(body, str):
+            verified = archive_by_comment.get(comment_id)
+            if (type(comment_id) is not int or not isinstance(body, str)
+                    or verified is None):
                 continue
-            if self._evidence_has_visible_text(body):
+            marker = "<!-- deploy-approval-evidence:v1\n"
+            if body.count(marker) != 1:
                 continue
             envelope = self._evidence_envelope(listed)
+            record, verified_envelope = verified
             if (not envelope or envelope.get("repo") != repo
                     or envelope.get("pr_number") != pr_number
-                    or envelope.get("type") not in {"part", "manifest"}
-                    or comment_id not in committed_ids
-                    or not isinstance(envelope.get("sha256"), str)
-                    or not re.fullmatch(r"[0-9a-f]{64}", envelope["sha256"])
-                    or archive_sha_by_comment.get(comment_id) != envelope["sha256"]):
+                    or envelope.get("type") not in {"record", "part", "manifest"}
+                    or envelope.get("sha256") != record.get("sha256")
+                    or envelope.get("kind") != record.get("kind")
+                    or envelope.get("key") != record.get("key")
+                    or (verified_envelope is not None and envelope != verified_envelope)):
                 continue
-            # Refuse malformed or non-unique archives before editing anything.
-            if len(self._evidence_envelope_text(body)) != len(body):
+            marker_pos = body.find(marker)
+            if marker_pos < 0:
+                continue
+            visible_prefix = body[:marker_pos]
+            original_suffix = body[marker_pos:]
+            old_heading = visible_prefix.strip()
+            is_legacy_heading = (
+                old_heading == legacy_heading
+                or (old_heading.startswith(legacy_heading)
+                    and legacy_inline_suffix.fullmatch(old_heading[len(legacy_heading):]))
+                or bool(legacy_prefix.fullmatch(old_heading))
+            )
+            if old_heading and not is_legacy_heading:
+                continue
+            patch_body = self._evidence_visible_description(envelope) + "\n\n" + original_suffix
+            if visible_prefix == self._evidence_visible_description(envelope) + "\n\n":
                 continue
             fresh = await self.get_comment(repo, comment_id)
             listed_user = listed.get("user")
             if (not isinstance(fresh, dict) or fresh.get("id") != comment_id
                     or not self.is_bot_comment(fresh) or fresh.get("body") != body
+                    or fresh.get("issue_url") != expected_url
                     or not isinstance(listed_user, dict)
                     or not isinstance(fresh.get("user"), dict)
-                    or fresh["user"].get("id") != listed_user.get("id")):
+                    or fresh["user"].get("id") != listed_user.get("id")
+                    or (fresh.get("performed_via_github_app") or {}).get("id")
+                    != (listed.get("performed_via_github_app") or {}).get("id")):
                 continue
             fresh_pr = await self.get_pr(repo, pr_number)
             if (fresh_pr.get("state") != "open" or fresh_pr.get("merged")
                     or fresh_pr.get("draft")):
                 return repaired
-            patch_body = self._evidence_visible_description(envelope) + "\n\n" + body
+            self._evidence_repo_guard(repo)
             await self.update_comment(repo, comment_id, patch_body)
-            confirmed = await self.get_comment(repo, comment_id)
-            if (not isinstance(confirmed, dict) or confirmed.get("id") != comment_id
-                    or not self.is_bot_comment(confirmed) or confirmed.get("body") != patch_body):
+            readback = await self.get_comment(repo, comment_id)
+            readback_body = readback.get("body") if isinstance(readback, dict) else None
+            readback_marker_pos = (readback_body.find(marker)
+                                   if isinstance(readback_body, str) else -1)
+            if (not isinstance(readback, dict) or readback.get("id") != comment_id
+                    or not self.is_bot_comment(readback) or readback_body != patch_body
+                    or readback.get("issue_url") != expected_url
+                    or not isinstance(readback.get("user"), dict)
+                    or readback["user"].get("id") != listed_user.get("id")
+                    or (readback.get("performed_via_github_app") or {}).get("id")
+                    != (listed.get("performed_via_github_app") or {}).get("id")):
                 raise GitHubStateProxyError("Evidence comment repair readback failed")
-            parsed = self._evidence_envelope(confirmed)
-            if (parsed != envelope or parsed.get("sha256") != envelope["sha256"]):
+            parsed = self._evidence_envelope(readback)
+            if (parsed != envelope or parsed.get("sha256") != envelope["sha256"]
+                    or readback_marker_pos < 0
+                    or readback_body[readback_marker_pos:] != original_suffix):
                 raise GitHubStateProxyError("Evidence envelope changed during repair")
-            # Re-run full manifest, part, order and digest verification.
+            # Re-read all archive comments and fully verify manifest, part
+            # identity, ordering and payload SHA256 after each in-place edit.
             verified_records = await self.read_evidence_records(repo, pr_number)
-            post_comments = await self.get_issue_comments(repo, pr_number)
-            verified_archive_sha = {}
-            for record in verified_records:
-                if record.get("sha256") != envelope["sha256"]:
-                    continue
-                verified_archive_sha[record["comment_id"]] = record["sha256"]
-                manifest_comment = next((item for item in post_comments
-                                         if item.get("id") == record["comment_id"]
-                                         and self.is_bot_comment(item)), None)
-                manifest = self._evidence_envelope(manifest_comment or {})
-                if manifest and manifest.get("type") == "manifest":
-                    verified_archive_sha.update({cid: record["sha256"]
-                                                 for cid in manifest.get("parts", [])
-                                                 if type(cid) is int})
-            if verified_archive_sha.get(comment_id) != envelope["sha256"]:
+            if not any(item.get("kind") == record.get("kind")
+                       and item.get("key") == record.get("key")
+                       and item.get("sha256") == record.get("sha256")
+                       and item.get("comment_id") == record.get("comment_id")
+                       for item in verified_records):
                 raise GitHubStateProxyError("Evidence archive digest changed during repair")
             repaired += 1
         return repaired
+
+    async def retire_legacy_evidence_link_replies(
+        self, repo: str, pr_number: int,
+        validated_summary_urls: set[str], limit: int = 10,
+    ) -> int:
+        """Retire old manual-link replies only when Summary has a valid COS URL."""
+        if not isinstance(validated_summary_urls, set) or not validated_summary_urls:
+            return 0
+        self._evidence_repo_guard(repo)
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative int")
+        if limit == 0:
+            return 0
+        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
+        replacement_body = "This legacy reply is obsolete. Open the current PR Summary and click the verified COS download link. The link is maintained automatically; no manual command is needed."
+        legacy_expiry_prompt = re.compile(
+            r"(?:expires\s+within\s+900\s+seconds|"
+            r"valid\s+for\s+up\s+to\s+900\s+seconds|"
+            r"after\s+expiry|after\s+it\s+expires)",
+            re.IGNORECASE,
+        )
+        old_command = re.compile(r"/evidence_link\s+id=(?:<attachment_id>|[A-Za-z0-9_-]+)")
+
+        async def current_summary_cos_links() -> set[str]:
+            pr = await self.get_pr(repo, pr_number)
+            state = await self.read_hidden_state(repo, pr_number)
+            lifecycle = await self.find_trusted_lifecycle_comment(repo, pr_number)
+            if (not isinstance(pr, dict) or pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft")
+                    or not isinstance(state, dict) or not isinstance(lifecycle, dict)
+                    or (pr.get("head") or {}).get("sha") != state.get("head_sha")):
+                return set()
+            body = lifecycle.get("body", "")
+            if not isinstance(body, str) or HIDDEN_STATE_MARKER not in body:
+                return set()
+            visible = body.split(HIDDEN_STATE_MARKER, 1)[0]
+            urls = set(re.findall(r"<(https://[^<>\s]+)>", visible))
+            bucket = str(getattr(self.config, "cos_bucket", "") or "").strip().lower()
+            region = str(getattr(self.config, "cos_region", "") or "").strip().lower()
+            expected_host = f"{bucket}.cos.{region}.myqcloud.com" if bucket and region else ""
+            valid = set()
+            now = int(time.time())
+            for url in urls:
+                try:
+                    parsed = urlsplit(url)
+                    query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+                    def one(name):
+                        values = query.get(name, [])
+                        return values[0] if len(values) == 1 else ""
+                    signature = one("q-signature")
+                    signed_time = one("q-sign-time")
+                    time_match = re.fullmatch(r"([0-9]+);([0-9]+)", signed_time)
+                    signed_params = {part.lower() for part in one("q-url-param-list").split(";") if part}
+                    if (parsed.scheme != "https" or parsed.hostname != expected_host
+                            or parsed.username is not None or parsed.password is not None
+                            or parsed.port is not None or parsed.fragment or not parsed.path.strip("/")
+                            or not re.fullmatch(r"[0-9a-fA-F]{40,128}", signature)
+                            or len(signature) % 2 or not time_match
+                            or one("q-key-time") != signed_time
+                            or one("q-sign-algorithm") not in {"sha1", "sha256"}
+                            or not one("q-ak")
+                            or one("q-ak") != getattr(self.config, "cos_secret_id", "")
+                            or "response-content-disposition" not in signed_params
+                            or not one("response-content-disposition")):
+                        continue
+                    start, expiry = map(int, time_match.groups())
+                    duration = expiry - start
+                    if (not 31536000 <= duration <= 31536120
+                            or start > now or expiry <= now):
+                        continue
+                    valid.add(url)
+                except (TypeError, ValueError):
+                    continue
+            valid.intersection_update(validated_summary_urls)
+            return valid
+
+        if not await current_summary_cos_links():
+            return 0
+        comments = await self.get_issue_comments(repo, pr_number)
+        retired = 0
+        for listed in comments:
+            if retired >= limit:
+                break
+            body = listed.get("body")
+            comment_id = listed.get("id")
+            if (not self.is_bot_comment(listed) or listed.get("issue_url") != expected_url
+                    or type(comment_id) is not int or not isinstance(body, str)
+                    or not legacy_expiry_prompt.search(body)
+                    or not old_command.search(body)):
+                continue
+            fresh = await self.get_comment(repo, comment_id)
+            listed_app = listed.get("performed_via_github_app")
+            fresh_app = fresh.get("performed_via_github_app") if isinstance(fresh, dict) else None
+            if (not isinstance(fresh, dict) or fresh.get("id") != comment_id
+                    or fresh.get("issue_url") != expected_url or fresh.get("body") != body
+                    or not self.is_bot_comment(fresh)
+                    or not isinstance(listed_app, dict) or not isinstance(fresh_app, dict)
+                    or fresh_app.get("id") != listed_app.get("id")
+                    or not isinstance(listed.get("user"), dict)
+                    or not isinstance(fresh.get("user"), dict)
+                    or fresh["user"].get("id") != listed["user"].get("id")):
+                continue
+            fresh_pr = await self.get_pr(repo, pr_number)
+            if (fresh_pr.get("state") != "open" or fresh_pr.get("merged")
+                    or fresh_pr.get("draft")):
+                return retired
+            if not await current_summary_cos_links():
+                return retired
+            fresh = await self.get_comment(repo, comment_id)
+            if (not isinstance(fresh, dict) or fresh.get("id") != comment_id
+                    or fresh.get("body") != body or fresh.get("issue_url") != expected_url
+                    or not self.is_bot_comment(fresh)
+                    or not isinstance(fresh.get("user"), dict)
+                    or fresh["user"].get("id") != listed["user"].get("id")
+                    or (fresh.get("performed_via_github_app") or {}).get("id")
+                    != listed_app.get("id")):
+                continue
+            self._evidence_repo_guard(repo)
+            await self.update_comment(repo, comment_id, replacement_body)
+            confirmed = await self.get_comment(repo, comment_id)
+            if (not isinstance(confirmed, dict) or confirmed.get("id") != comment_id
+                    or confirmed.get("issue_url") != expected_url
+                    or not self.is_bot_comment(confirmed)
+                    or confirmed.get("body") != replacement_body
+                    or not isinstance(confirmed.get("user"), dict)
+                    or confirmed["user"].get("id") != listed["user"].get("id")
+                    or (confirmed.get("performed_via_github_app") or {}).get("id")
+                    != listed_app.get("id")
+                    or legacy_expiry_prompt.search(confirmed.get("body", ""))
+                    or old_command.search(confirmed.get("body", ""))):
+                raise GitHubStateProxyError("Legacy evidence reply retirement readback failed")
+            retired += 1
+        return retired
 
     async def read_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
         """Read immutable single-comment and historical paged evidence documents."""

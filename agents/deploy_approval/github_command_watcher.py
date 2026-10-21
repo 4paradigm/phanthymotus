@@ -22,13 +22,14 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+import re
 from collections import deque
 from datetime import datetime, timezone
 
 from . import commands as commands_mod
 from .config import Config, resolve_authorized_repos
 from .github_client import GitHubClient, GitHubError
-from .github_state_proxy import GitHubStateProxy, GitHubStateProxyError
+from .github_state_proxy import HIDDEN_STATE_MARKER, GitHubStateProxy, GitHubStateProxyError
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,82 @@ class GitHubCommandWatcher:
         self._recent_pr_cursor: dict[str, int] = {}
         self._priority_pr_queue: deque[tuple[str, int]] = deque()
         self._priority_pr_set: set[tuple[str, int]] = set()
+
+    async def _validated_current_summary_cos_links(self, repo: str, pr_number: int) -> set[str]:
+        """Return one-year COS URLs present in the trusted current Summary."""
+        store = getattr(getattr(self.controller, "evidence_service", None), "store", None)
+        if store is None or not callable(getattr(store, "download_url_expiry", None)):
+            return set()
+        pr = await self.proxy.get_pr(repo, pr_number)
+        state = await self.proxy.read_hidden_state(repo, pr_number)
+        lifecycle = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+        if (not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("merged")
+                or not isinstance(state, dict)
+                or not isinstance(lifecycle, dict)
+                or (pr.get("head") or {}).get("sha") != state.get("head_sha")):
+            return set()
+        body = lifecycle.get("body", "")
+        if not isinstance(body, str) or HIDDEN_STATE_MARKER not in body:
+            return set()
+        visible = body.split(HIDDEN_STATE_MARKER, 1)[0]
+        urls = set(re.findall(r"<(https://[^<>\s]+)>", visible))
+        if not urls:
+            return set()
+
+        objects = []
+        metadata = state.get("cos")
+        if isinstance(metadata, dict):
+            object_key = metadata.get("object_key", "")
+            try:
+                from .cos_client import CosClient
+                CosClient.validate_object_key(repo, pr_number, state["head_sha"], object_key)
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                if (isinstance(metadata.get("sha256"), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"])
+                        and type(metadata.get("size")) is int and metadata["size"] > 0):
+                    objects.append((object_key, object_key.rsplit("/", 1)[-1], None))
+
+        try:
+            from .evidence_models import round_id_for_state
+            from .evidence_store import build_attachment_key
+            current_round = round_id_for_state(state)
+            records = await self.proxy.read_evidence_records(repo, pr_number)
+        except (GitHubStateProxyError, ValueError, TypeError):
+            return set()
+        for record in records:
+            if record.get("kind") != "attachment":
+                continue
+            item = record.get("data")
+            if (not isinstance(item, dict) or item.get("status") != "ready"
+                    or item.get("actor_verified") is not True
+                    or item.get("head_sha") != state.get("head_sha")
+                    or item.get("round_id") != current_round
+                    or not isinstance(item.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+                    or type(item.get("size")) is not int or item["size"] <= 0):
+                continue
+            attachment_id = item.get("attachment_id")
+            filename = item.get("filename")
+            try:
+                expected_key = build_attachment_key(
+                    repo, pr_number, state["head_sha"], current_round,
+                    attachment_id, item.get("created_at", ""), filename,
+                )
+            except (TypeError, ValueError):
+                continue
+            if item.get("object_key") == expected_key:
+                objects.append((expected_key, filename, attachment_id))
+
+        valid = set()
+        for url in urls:
+            for key, filename, attachment_id in objects:
+                if store.download_url_expiry(
+                        url, key=key, filename=filename, attachment_id=attachment_id) is not None:
+                    valid.add(url)
+                    break
+        return valid
 
     def enqueue_pr(self, repo: str, pr_number: int) -> None:
         """Prioritize an authorized PR after a webhook observes a new comment."""
@@ -415,10 +492,15 @@ class GitHubCommandWatcher:
                         current_pr = await self.proxy.get_pr(repo, pr_number)
                     if (isinstance(current_pr, dict)
                             and current_pr.get("state") == "open"
-                            and not current_pr.get("merged")
-                            and not current_pr.get("draft")):
+                            and not current_pr.get("merged")):
                         await self.proxy.ensure_visible_evidence_archive_comments(
                             repo, pr_number, limit=2,
+                        )
+                        valid_cos_links = await self._validated_current_summary_cos_links(
+                            repo, pr_number,
+                        )
+                        await self.proxy.retire_legacy_evidence_link_replies(
+                            repo, pr_number, valid_cos_links, limit=2,
                         )
                 except Exception as e:
                     logger.warning(
