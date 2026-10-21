@@ -317,7 +317,7 @@ _JAVASCRIPT = r'''"use strict";
       useProofFallback = true;
     }
     if (!useProofFallback && proofSecret && next.auth_method !== "signed_invite" &&
-        roundMatches(next) && next.pr_state === "open" && !next.merged) {
+        roundMatches(next) && !next.merged) {
       // A valid read-only page cookie is not an upload invitation. Preserve
       // the legacy proof path when it is available, but never replace stale
       // HEAD/round or closed-PR responses with a second auth result.
