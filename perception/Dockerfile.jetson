@@ -693,4 +693,4 @@ CMD ["/bin/bash", "-c", \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     python3 /work/main.py"]
+     exec python3 /deploy/run_perception.py /work/main.py"]

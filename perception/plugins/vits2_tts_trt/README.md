@@ -67,6 +67,22 @@ the package is installed rather than importing it.
 
 ## Configure
 
+### Container ports for parallel evaluation
+
+The Jetson image starts through `deploy/run_perception.py`. When `MCP_PORT`
+or `WS_PORT` is supplied, it copies the source YAML (including a custom
+`CONFIG_PATH`) into a private file under `/run/perception`, overrides only
+the supplied ports, and launches the unchanged `main.py` with that file as
+`CONFIG_PATH`. Without port overrides it uses the original configuration.
+
+For Darvin's three host-network containers, supply `15720/15721`,
+`15820/15821`, and `15920/15921` respectively. Each container gets its own
+configuration; plugin settings, models, and source YAML are preserved.
+Deployment scripts that replace the image's command should also invoke
+`python3 /deploy/run_perception.py /work/main.py` to apply these overrides.
+
+### TTS engine
+
 The engine is a `configSchema` field, so it is visible and switchable in the
 device panel:
 
