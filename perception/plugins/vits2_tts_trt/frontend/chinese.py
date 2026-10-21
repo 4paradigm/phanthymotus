@@ -14,6 +14,9 @@ from .fst_tn import FstTextNormalizer
 
 from .heteronym import custom_dict, jieba_phrases
 from .release_paths import frontend_data_dir, tn_cache_dir
+from .technical_text import normalize_technical_lexemes
+from .lexicon_rules import apply_lexeme_rules
+from .special_text import normalize_special_text, verbalize_chinese_number
 
 log = logging.getLogger(__name__)
 
@@ -277,10 +280,42 @@ def _remove_redundant_newlines_after_punctuation(text):
     return re.sub(r"([。！？!?；;：:，,.])[\t ]*(?:\r\n|\r|\n)+[\t ]*", r"\1", text)
 
 
+def _special_number(value, language):
+    """Speak a number inside a protected formula/unit, bypassing lexeme rules."""
+    if language == "ZH":
+        return verbalize_chinese_number(value)
+    from .english import normalize_numbers
+    sign = ""
+    if value.startswith(("+", "-")):
+        sign, value = ("plus " if value[0] == "+" else "minus "), value[1:]
+    if "." in value:
+        whole, fraction = value.split(".", 1)
+        digits = "zero one two three four five six seven eight nine".split()
+        return sign + normalize_numbers(whole or "0") + " point " + " ".join(digits[int(c)] for c in fraction)
+    return sign + normalize_numbers(value)
+
+
+def _normalize_ordinary_text(text):
+    # Written entities are handled by normalize_special_text first. Preserve
+    # only complete known English words so the FST cannot translate a brand
+    # before the shared English/MIX pronunciation lookup sees it.
+    from .english import normalize_preserving_english_pronunciations
+    return normalize_preserving_english_pronunciations(text, _normalizer.normalize)
+
+
+def _normalize_raw_text(text, lexeme_language="MIX"):
+    return normalize_special_text(
+        text, lambda ordinary: _normalize_ordinary_text(
+            apply_lexeme_rules(ordinary, language=lexeme_language)
+        ),
+        _special_number,
+    )
+
+
 def text_normalize(text):
     text = _remove_redundant_newlines_after_punctuation(text)
-    text = _normalizer.normalize(text)
-    text = _post_replace(text)
+    text = _normalize_raw_text(text)
+    text = normalize_technical_lexemes(_post_replace(text))
     text = replace_punctuation(text)
     return text
 
@@ -292,9 +327,17 @@ def mix_normalize(text: str) -> str:
     such as ``AI`` and ``CTO`` into letter-by-letter forms before G2P.
     """
     from .english import replace_punctuation as en_replace_punct
+    from .mixed_context import normalize_mixed_context
     text = _remove_redundant_newlines_after_punctuation(text)
-    text = _normalizer.normalize(text)
-    text = _post_replace(text)
+    # Select lexeme language from the complete input, never a Chinese clause's
+    # isolated Latin name (e.g. Qwen in a Chinese product list).
+    normalize_original = _normalize_raw_text
+    if re.search(r"[A-Za-z]", text) and not re.search(r"[\u4e00-\u9fff]", text):
+        normalize_original = lambda value: _normalize_raw_text(value, lexeme_language="EN")
+    text = normalize_mixed_context(
+        text, normalize_original, _normalize_ordinary_text, _special_number
+    )
+    text = normalize_technical_lexemes(_post_replace(text))
     text = en_replace_punct(text)
     return text
 

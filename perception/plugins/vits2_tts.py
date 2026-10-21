@@ -1,6 +1,6 @@
 """VITS2 TensorRT implementation for the standard ``tts`` plugin."""
 
-from plugins.vits2_tts_trt.plugin import TTSPlugin as _Vits2TTSPlugin
+from plugins.vits2_tts_language.plugin import TTSPlugin as _Vits2TTSPlugin
 
 
 class Vits2TTSPlugin(_Vits2TTSPlugin):

@@ -165,13 +165,16 @@ TOOLS = [
         "multiInstance": True,
         "description": "TTS — 把文本说出来（speak），或立即掐断正在说的话（interrupt）。"
                        "注意 stop 是停掉整个插件节点、不是停住这句话；"
-                       "要让机器人别说了用 interrupt。",
+                       "要让机器人别说了用 interrupt。"
+                       "VITS2 可在生成对话回复前调用 language，传入当前用户文本或 ASR 的 text/lang，"
+                       "将返回的 instruction 交给对话模型，再用 turn_id 播报其回复。"
+                       "直接播报不要求 language；本工具不翻译或生成回复。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "speak", "info", "config", "interrupt"],
+                    "enum": ["start", "stop", "speak", "info", "config", "interrupt", "language"],
                     "description": "Action to perform"
                 },
                 "input_topic": {
@@ -182,6 +185,19 @@ TOOLS = [
                     "type": "string",
                     "description": "Text to synthesize (required for action=speak)"
                 },
+                "instance_id": {"type": "string", "description": "TTS instance; required for language"},
+                "asr_result": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}, "lang": {"type": "string"}},
+                    "required": ["text"],
+                    "description": "VITS2 language action: current recognized text and optional detected lang. The ASR language setting is not a detection result.",
+                },
+                "input_language": {"type": "string", "enum": ["zh", "en"],
+                                   "description": "Optional current-turn ASR tag for VITS2 language"},
+                "requested_reply_language": {"type": "string", "enum": ["zh", "en"],
+                                             "description": "Current user preference, interpreted by the caller; overrides panel preference for this turn only"},
+                "turn_id": {"type": "string",
+                            "description": "Required after an explicit VITS2 language call; direct speak does not require it"},
             },
             "required": ["action"],
             "x-completion": {
@@ -268,6 +284,16 @@ TOOLS = [
                     "default": False, "scope": "shared",
                     "x-show-when": {"tts_engine": "mms-th"}},
                 "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared"},
+                "reply_language": {
+                    "type": "string", "title": "回复语言",
+                    "enum": ["auto", "zh", "en"],
+                    "oneOf": [{"const": "auto", "title": "自动"},
+                              {"const": "zh", "title": "中文"},
+                              {"const": "en", "title": "English"}],
+                    "default": "auto", "scope": "shared",
+                    "x-show-when": {"tts_engine": "vits2-zh-en"},
+                    "description": "VITS2: auto/自动, zh/中文, en/English. Direct speech follows its text; language uses the current ASR tag or user text, defaulting to Chinese when unclear. Mixed speech is allowed. This selects readings and returns a dialogue instruction; it does not translate or generate replies.",
+                },
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
             "required": []
@@ -2360,6 +2386,8 @@ class TTSPlugin:
             building = self._building
             error = self._build_error
             engine = self._engine
+        if action == "language" and engine != "vits2-zh-en":
+            raise ValueError("The language action is supported by vits2-zh-en only")
         if impl is not None:
             result = impl.dispatch(name, args)
             if isinstance(result, dict) and action == "info":
@@ -2442,10 +2470,17 @@ class TTSPlugin:
     def _config(self, name: str, args: dict) -> dict:
         """Apply shared config, switching engines when tts_engine changes."""
         requested = args.get("tts_engine") or args.get("engine")
+        target_engine = self._select_engine(requested) if requested else self._engine
+        if target_engine == "vits2-zh-en":
+            from plugins.vits2_tts_language.plugin import validate_config
+            validate_config(args)
+        if "reply_language" in args:
+            from plugins.vits2_tts_language.plugin import reply_language_mode
+            args = {**args, "reply_language": reply_language_mode(args["reply_language"])}
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
         for key in SHARED_CONFIG_KEYS:
-            if key in args:
+            if key in args and not (key == "reply_language" and args.get("instance_id")):
                 self._cfg[key] = args[key]
 
         if requested:

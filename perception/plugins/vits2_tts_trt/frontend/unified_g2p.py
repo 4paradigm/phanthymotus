@@ -28,7 +28,7 @@ import re
 
 from g2p_en import G2p
 from .symbols import punctuation
-from .english import eng_dict, refine_ph, post_replace_ph, arpa
+from .english import english_pronunciation, refine_ph, post_replace_ph, arpa
 
 log = logging.getLogger(__name__)
 
@@ -61,11 +61,6 @@ _MIX_TOKEN_RE = re.compile(
     re.DOTALL,
 )
 _LETTER_SPELLED_UNITS = {"KB", "MB", "GB", "TB", "PB", "KBPS", "MBPS", "GBPS"}
-# Deterministic pronunciations missing from the stock CMU dictionary. Keep this
-# tiny and release-controlled: training/export and deployed runtime must match.
-_CUSTOM_EN_PRONUNCIATIONS = {
-    "IELTS": [["AY1"], ["EH0", "L", "T", "S"]],
-}
 
 
 def _split_pinyin(tone3: str):
@@ -125,7 +120,7 @@ def _zh_pinyin_to_phones(tone3: str):
 def _en_token_to_phones(word: str):
     """Convert a single English word/token to (phones, tones).
 
-    Lookup order: CMU dict → g2p_en fallback.
+    Lookup order: explicit corrections → Gold → CMU dict → g2p_en fallback.
     All outputs go through refine_ph() + post_replace_ph() so they match
     the lowercase ARPAbet symbols in en_symbols (e.g. 'IY1' → 'iy', tone=2).
     """
@@ -142,7 +137,7 @@ def _en_token_to_phones(word: str):
             phones.extend(letter_phones)
             tones.extend(letter_tones)
         return phones, tones
-    syllables = _CUSTOM_EN_PRONUNCIATIONS.get(word.upper(), eng_dict.get(word.upper()))
+    syllables = english_pronunciation(word)
     if syllables is not None:
         for syllable in syllables:
             for phn in syllable:
