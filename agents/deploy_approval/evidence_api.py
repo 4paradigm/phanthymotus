@@ -84,6 +84,7 @@ def _validate(payload, action, config):
             raise HTTPException(400, detail='invalid_content_type')
     for field in ('note', 'text'):
         if field in payload and (not isinstance(payload[field], str) or
+                               len(payload[field]) > 5000 or
                                _byte_length(payload[field]) > config.evidence_max_note_bytes):
             raise HTTPException(413, detail='invalid_note_size')
     if action == 'note' and not (payload.get('text') or payload.get('note')):
@@ -100,7 +101,8 @@ def _validate(payload, action, config):
         note = payload.get('note', '')
         if note:
             text = (text + '\n\n' + note) if text else note
-        if not 1 <= _byte_length(text) <= config.evidence_max_note_bytes:
+        if (not 1 <= len(text) <= 5000
+                or _byte_length(text) > config.evidence_max_note_bytes):
             raise HTTPException(413, detail='invalid_note_size')
         payload.update(text=text, size=_byte_length(text),
                        sha256=hashlib.sha256(text.encode('utf-8')).hexdigest())
