@@ -485,6 +485,26 @@ THINKING_MIN_EXTRA = {
 }
 
 
+def _refuses_to_disable_thinking(err: str) -> bool:
+    """400 的文案像不像「这个模型关不掉思考」。
+
+    实测 2026-10-22，router.phanthy.com 的 G53 对整组关闭参数回
+    `{"message":"该模型始终思考，不支持关闭思考；请使用 low、high 或 max。",
+      "type":"upstream_error","param":"","code":"1210"}` —— **param 是空的**，
+    所以按字段名撤的那条路匹配不到任何键，而 `_looks_like_unknown_param` 也不认
+    这句中文（它找的是 parameter/unknown/unsupported 那类词，`"param":""` 里的
+    param 不是 parameter 的子串）。结果是整个调用抛 BadRequestError —— 也就是说
+    `model=G53` 配上 `think_mode=False`（而这是默认值）会让每一次 LLM 调用都失败。
+    """
+    if any(k in err for k in ('不支持关闭思考', '始终思考', '必须思考', '无法关闭思考')):
+        return True
+    low = err.lower()
+    return any(k in low for k in ('always thinks', 'always reasoning',
+                                  'cannot be disabled', "can't be disabled",
+                                  'cannot disable thinking', 'does not support disabling',
+                                  'thinking is always', 'reasoning is always'))
+
+
 def _looks_like_unknown_param(err: str) -> bool:
     """400 的文案像不像「有个参数我不认识」。"""
     low = err.lower()
@@ -534,6 +554,12 @@ class Client():
         def _extra(client, think_mode: bool) -> dict:
             # think_mode 只决定发哪一组：关掉，还是开着但压到最低档。两组共用
             # 同一条「被 400 点名就撤掉」的降级记账。
+            #
+            # 另一种情况是模型压根关不掉思考（G53 就是），这时它已经被下面的
+            # _create() 记在 client 上，之后直接发最低档那组——既不再白吃一次
+            # 400，也不至于退回「什么都不发」的默认档。
+            if getattr(client, '_thinking_cannot_disable', False):
+                think_mode = True
             base = THINKING_MIN_EXTRA if think_mode else THINKING_OFF_EXTRA
             # 之前被这个 endpoint 400 掉的字段不再发
             rejected = getattr(client, '_thinking_rejected', ())
@@ -543,8 +569,10 @@ class Client():
         async def _create(client, model, url, kwargs):
             """发起 create()，并对「网关不认某个字段」逐级降级后重试。
 
-            每一轮都严格减少 kwargs，所以循环必然收敛。
+            每一轮要么严格减少 kwargs，要么走那个只做一次的 OFF→MIN 置换，
+            所以循环必然收敛。
             """
+            swapped_to_min = False
             while True:
                 try:
                     return await client.chat.completions.create(**kwargs)
@@ -557,6 +585,19 @@ class Client():
                         kwargs.pop('stream_options')
                         continue
                     extra = kwargs.get('extra_body') or {}
+                    if extra and not swapped_to_min and _refuses_to_disable_thinking(err):
+                        # 这个模型关不掉思考。退回「什么都不发」会让它按供应商
+                        # 默认档跑（G53 上实测是最贵那档），所以换成最低档那组
+                        # ——它接受的最低值正是报错里点的 low。记在 client 上，
+                        # 这个 endpoint 之后不再试着关了。
+                        swapped_to_min = True
+                        client._thinking_cannot_disable = True
+                        rejected = getattr(client, '_thinking_rejected', ())
+                        kwargs['extra_body'] = {k: v for k, v in THINKING_MIN_EXTRA.items()
+                                                if k not in rejected}
+                        print(f'[llm] {model} @ {url} cannot disable thinking — '
+                              f'retrying at the lowest reasoning setting')
+                        continue
                     # 必须按词边界匹配：`thinking` 是 `thinking_budget` 的前缀，
                     # 子串匹配会因为后者被拒而把前者一起撤掉——而前者正是对智谱
                     # 那条线唯一管用的关法。

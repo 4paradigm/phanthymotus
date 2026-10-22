@@ -376,6 +376,60 @@ def test_unnamed_400_drops_the_whole_group_once():
     assert not getattr(fake, '_thinking_rejected', None)
 
 
+# ── 模型关不掉思考时的降级 ───────────────────────────────────────────────────
+
+# router.phanthy.com 的 G53 对整组关闭参数的真实回包（2026-10-22 实测）。
+# 关键是 `param` 为空：按字段名撤的那条路一个键都匹配不到。
+G53_REFUSAL = ('{"error":{"message":"该模型始终思考，不支持关闭思考；'
+               '请使用 low、high 或 max。","type":"upstream_error",'
+               '"param":"","code":"1210"}}')
+
+
+def test_model_that_cannot_disable_thinking_falls_back_to_min():
+    """关不掉思考的模型要换成最低档重试，而不是让整次调用失败。
+
+    `model=G53` + `think_mode=False`（默认值）在修之前是每一次 LLM 调用都抛
+    BadRequestError：报错不点字段名，这句中文也不在 `_looks_like_unknown_param`
+    的词表里，于是两条降级路都没接住。
+    """
+    fake = _RejectingClient([_chunk('hi')])
+    calls = fake.calls
+
+    async def create(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise openai.BadRequestError(
+                G53_REFUSAL,
+                response=httpx.Response(400, request=httpx.Request('POST', fake.base_url)),
+                body=None)
+        fake.stream = _FakeStream(fake.script)
+        fake.kwargs = kwargs
+        return fake.stream
+
+    fake.chat.completions.create = create
+    assert _call(fake)['content'] == 'hi'
+    # 第一次发的是关闭那组，第二次换成最低档那组——而不是整组撤掉
+    assert calls[0]['extra_body'] == llm_mod.THINKING_OFF_EXTRA
+    assert calls[1]['extra_body'] == llm_mod.THINKING_MIN_EXTRA
+    # 报错里点的「请使用 low」正是这组用的值
+    assert calls[1]['extra_body']['reasoning_effort'] == 'low'
+
+    # 记在 client 上：第二次调用直接发最低档，不再白吃一个 400 往返
+    fake.script = [_chunk('hi')]
+    fake.stream = _FakeStream(fake.script)
+    _call(fake)
+    assert calls[2]['extra_body'] == llm_mod.THINKING_MIN_EXTRA
+
+
+def test_refusal_detector_ignores_ordinary_400s():
+    """别把别的 400 也当成「关不掉思考」——那会悄悄把思考打开。"""
+    assert llm_mod._refuses_to_disable_thinking(G53_REFUSAL)
+    assert llm_mod._refuses_to_disable_thinking('this model always thinks')
+    assert not llm_mod._refuses_to_disable_thinking('unrecognized parameter: thinking')
+    assert not llm_mod._refuses_to_disable_thinking(
+        "This model's maximum context length is 32768 tokens")
+
+
 # ── 思考内容要能在日志里看见 ─────────────────────────────────────────────────
 
 def test_reasoning_deltas_are_captured():
