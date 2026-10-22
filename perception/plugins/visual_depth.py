@@ -1605,11 +1605,18 @@ class VideoDepthPerceptionPlugin:
             key: props[key] for key in ("backend", "fps", "calibration_preset",
                                         "cal_a", "cal_b")
         }
-        if self._backend == "depthart":
-            preset = tools[0]["configSchema"]["properties"]["calibration_preset"]
-            preset["enum"] = [CAL_NONE, CAL_MANUAL]
-            preset["default"] = CAL_NONE
-            preset["description"] = "Use metric output as-is, or apply manual site calibration. YOLO presets do not apply to DepthART."
+        # **The preset list does not depend on the selected model.** It used
+        # to be narrowed to [none, manual] under DepthART, which is true —
+        # the table is fitted against YOLO26-depth — but it made the form
+        # depend on server state that the same form can change: the card's
+        # dialog sets `backend`, and the dependent enum only catches up after
+        # a save, a re-register and a re-fetch. Choosing `yolo` and a preset in
+        # one go was impossible, and the list simply looked wrong.
+        #
+        # Nothing is lost by listing them: a YOLO preset selected under
+        # DepthART is dropped at `config` time by `_backend_calibration_cfg`,
+        # with a note on the response, on `info()` and in the log. The guard
+        # that matters is the one that cannot be bypassed by a stale form.
         return tools
 
     def _select_backend(self, backend):

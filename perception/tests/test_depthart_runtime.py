@@ -416,15 +416,27 @@ def test_yolo_inference_error_behavior_unchanged(monkeypatch):
         p.dispatch('visual_depth',{'action':'recognize_by_photo','image_path':'dummy'})
 
 
-def test_depthart_schema_hides_yolo_presets_without_mutating_default():
-    p=make_plugin()
-    prop=p.get_tools()[0]['configSchema']['properties']['calibration_preset']
-    assert prop['enum']==[vd.CAL_NONE,vd.CAL_MANUAL]
-    assert prop['default']==vd.CAL_NONE
-    yolo=vd.VideoDepthPerceptionPlugin({},'test',_FakeExecutor())
-    default=yolo.get_tools()[0]['configSchema']['properties']['calibration_preset']
-    assert vd.CAL_AUTO in default['enum'] and next(iter(vd.CALIBRATION_PRESETS)) in default['enum']
-    assert p._model is None
+def test_the_preset_list_does_not_depend_on_the_selected_model():
+    """It used to be narrowed under DepthART, and that made the form lie.
+
+    The card's own dialog sets `backend`, so a model-dependent enum only
+    catches up after a save, a re-register and a re-fetch — picking `yolo` and
+    a preset in one go was impossible and the list looked wrong. The guard that
+    matters is `_backend_calibration_cfg`, which drops a YOLO preset under
+    DepthART at config time and says so; a stale form cannot bypass it.
+    """
+    preset = next(iter(vd.CALIBRATION_PRESETS))
+    for backend in ('yolo', 'depthart'):
+        p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
+        prop = p.get_tools()[0]['configSchema']['properties']['calibration_preset']
+        assert vd.CAL_AUTO in prop['enum'] and preset in prop['enum'], backend
+        assert prop['default'] == vd.CAL_AUTO
+        assert p._model is None          # still no engine load from a schema read
+    # And the guard still fires, so listing it costs nothing.
+    d = make_plugin()
+    result = d.dispatch('visual_depth', {'action': 'config', 'calibration_preset': preset})
+    assert result['config']['calibration_preset'] == vd.CAL_NONE
+    assert preset in result['calibration_note']
 
 
 def test_process_shutdown_retires_nodes_before_engine_close():
