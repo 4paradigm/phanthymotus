@@ -18,7 +18,7 @@ def render_upload_page(repo, pr_number, head_sha, round_id) -> str:
     return f'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer"><title>测试附件 · {esc(repo)} PR #{esc(pr_number)}</title>
+<meta name="referrer" content="no-referrer"><title>附件 · {esc(repo)} PR #{esc(pr_number)}</title>
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;background:#f5f5f7;color:#1d1d1f;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}}
@@ -80,6 +80,10 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 .attachment-meta dd{{margin:0;color:#424245;overflow-wrap:anywhere}}
 .media-preview{{margin-top:12px}}
 .media-preview video,.media-preview img{{display:block;width:100%;max-height:520px;border-radius:10px;background:#111}}
+.attachment-meta-inline{{margin:5px 0 0;color:#6e6e73;font-size:13px}}
+.attachment-note{{margin-top:10px;padding:10px 12px;border-radius:10px;background:#f5f5f7;overflow-wrap:anywhere}}
+.attachment-note p{{margin:0 0 8px}}.attachment-note p:last-child{{margin-bottom:0}}
+.attachment-note pre,.attachment-note code{{white-space:pre-wrap;overflow-wrap:anywhere}}
 .media-hint,.empty-state{{color:#6e6e73;font-size:14px}}
 .media-hint{{margin:7px 0 0}}
 .media-hint:empty{{display:none}}
@@ -103,24 +107,22 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 </style><script src="/evidence/assets/app.js" defer></script></head>
 <body>
 <main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}">
-<header class="page-header"><div><p class="eyebrow">部署验证</p><h1>测试附件</h1>
-<p class="subtitle">{esc(repo)} · PR #{esc(pr_number)}</p></div>
-<div class="header-actions"><span id="status" class="status-pill" data-state="unknown" role="status">正在读取状态</span>
-<button id="refresh" type="button">刷新</button></div></header>
+<header class="page-header"><div><p class="eyebrow">部署验证</p><h1>附件</h1>
+<p class="subtitle">{esc(repo)} · PR #{esc(pr_number)}</p></div></header>
 <p id="message" role="status" aria-live="polite"></p>
-<section class="panel"><div class="section-heading"><h2>本轮附件</h2><p id="summary" class="muted">正在读取测试状态与附件。</p></div>
-<fieldset id="writes" disabled hidden><legend>上传与备注</legend>
+<section id="current-section" class="panel" hidden><div class="section-heading"><h2 id="round-title">附件</h2><p id="summary" class="muted">当前轮附件与说明。</p></div>
+<fieldset id="writes" disabled hidden><legend>上传附件</legend>
 <label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">支持多文件 · 单个文件最大 512 MiB</span><input id="file" type="file" multiple></label>
-<details class="secondary"><summary>备注与替换附件</summary><div class="secondary-fields">
-<label class="control" for="note">测试备注<textarea id="note" maxlength="10000"></textarea></label>
-<label class="control" for="replace">替换当前轮附件<select id="replace"><option value="">新增附件</option></select></label>
-</div><div class="secondary-actions"><button id="save-note" type="button">保存备注</button></div></details>
-<div class="primary-row"><button id="upload" class="primary" type="button">上传文件</button></div>
+<div class="secondary"><div class="secondary-fields">
+<label class="control" for="note">本次上传说明（可选）<textarea id="note" maxlength="5000" aria-describedby="note-help"></textarea><span id="note-help" class="file-hint">最多 5000 字，支持 Markdown；本说明会附加到本次选择的每个文件。更长说明请另存为 .txt 上传，图片请作为附件上传。</span></label>
+<label class="control" for="replace">附件操作<select id="replace"><option value="">新增附件（保留现有附件）</option></select></label>
+</div></div>
+<div class="primary-row"><button id="upload" class="primary" type="button">上传所选文件</button></div>
 </fieldset>
 <h3 class="list-heading" id="queue-heading" hidden>上传进度</h3><ul id="queue" class="queue" aria-labelledby="queue-heading" aria-live="polite"></ul>
-<h3 class="list-heading" id="attachments-heading">文件</h3><ul id="attachments" class="attachments" aria-labelledby="attachments-heading"></ul>
+<h3 class="list-heading" id="attachments-heading">附件</h3><ul id="attachments" class="attachments" aria-labelledby="attachments-heading"></ul>
 </section>
-<section id="history-section" class="panel" hidden><h2>历史记录</h2><div id="history"></div></section>
+<section id="history-section" class="panel" hidden><h2>历史轮次</h2><div id="history"></div></section>
 </main></body></html>'''
 
 
@@ -247,7 +249,6 @@ _JAVASCRIPT = r'''"use strict";
     $("writes").hidden = !canWrite; $("writes").disabled = !canWrite;
     $("upload").disabled = busy || !canWrite; $("file").disabled = busy || !canWrite;
     $("note").disabled = busy || !canWrite; $("replace").disabled = busy || !canWrite;
-    $("save-note").disabled = busy || !canWrite;
     for (const button of document.querySelectorAll("button[data-job-action]"))
       button.disabled = !canWrite || (busy && button.dataset.jobAction !== "pause");
     for (const button of document.querySelectorAll("button[data-delete]")) button.disabled = busy || !canWrite;
@@ -390,99 +391,187 @@ _JAVASCRIPT = r'''"use strict";
     term.textContent = label; description.textContent = String(value);
     list.append(term, description);
   }
+  function itemTimestamp(item) {
+    const value = Date.parse(item && (item.created_at || item.uploaded_at || item.updated_at) || "");
+    return Number.isFinite(value) ? value : 0;
+  }
+  function displayFilename(item) {
+    const value = String(item && item.filename || "").trim();
+    if (!value || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))
+      return item && item.status === "text" ? "附件说明" : "附件文件";
+    return value;
+  }
+  function appendInlineMarkdown(parent, text) {
+    const tick = String.fromCharCode(96);
+    const tokenPattern = new RegExp("(\\*\\*[^*]+\\*\\*|\\*[^*]+\\*|" + tick + "[^" + tick + "]+" + tick + "|\\[[^\\]]+\\]\\([^)]+\\))", "g");
+    let offset = 0, match;
+    while ((match = tokenPattern.exec(text))) {
+      if (match.index > offset) parent.append(document.createTextNode(text.slice(offset, match.index)));
+      const token = match[0];
+      let node = null;
+      if (token.startsWith("**") && token.endsWith("**")) {
+        node = document.createElement("strong"); node.textContent = token.slice(2, -2);
+      } else if (token.startsWith("*") && token.endsWith("*")) {
+        node = document.createElement("em"); node.textContent = token.slice(1, -1);
+      } else if (token.startsWith(tick) && token.endsWith(tick)) {
+        node = document.createElement("code"); node.textContent = token.slice(1, -1);
+      } else {
+        const linkMatch = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+        if (linkMatch) {
+          try {
+            const target = new URL(linkMatch[2], window.location.href);
+            if (target.protocol === "https:" && !target.username && !target.password) {
+              node = document.createElement("a"); node.textContent = linkMatch[1];
+              node.href = target.href; node.rel = "noopener noreferrer";
+            }
+          } catch (_) {}
+        }
+      }
+      parent.append(node || document.createTextNode(token));
+      offset = tokenPattern.lastIndex;
+    }
+    if (offset < text.length) parent.append(document.createTextNode(text.slice(offset)));
+  }
+  function renderMarkdown(container, source) {
+    const lines = String(source || "").split(/\r?\n/);
+    let list = null;
+    for (const line of lines) {
+      if (!line.trim()) { list = null; continue; }
+      const heading = line.match(/^(#{1,3})\s+(.+)$/);
+      if (heading) {
+        list = null;
+        const node = document.createElement(heading[1].length === 1 ? "h3" : "h4");
+        appendInlineMarkdown(node, heading[2]); container.append(node); continue;
+      }
+      const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+      if (bullet) {
+        if (!list) { list = document.createElement("ul"); container.append(list); }
+        const item = document.createElement("li"); appendInlineMarkdown(item, bullet[1]); list.append(item); continue;
+      }
+      list = null;
+      const paragraph = document.createElement("p");
+      appendInlineMarkdown(paragraph, line); container.append(paragraph);
+    }
+  }
+  function syntheticBotNote(item, note) {
+    const actor = String(item.actor_login || item.actor || "");
+    return actor.toLowerCase() === "4pd-pr-assistant[bot]" &&
+      /^(?:Server-side COS multipart acceptance|Server-side 20MB H\.264 COS transport acceptance)/i.test(note.trim());
+  }
   function attachmentList(rows, parent, current) {
-    for (const item of rows || []) {
-      if (!item || typeof item !== "object") continue;
-      const li = document.createElement("li"), deleted = item.status === "deleted" || !!item.deleted_at;
+    const ordered = [...(rows || [])].filter(item => item && typeof item === "object")
+      .sort((a, b) => itemTimestamp(b) - itemTimestamp(a));
+    for (const item of ordered) {
+      const deleted = item.status === "deleted" || !!item.deleted_at;
+      const li = document.createElement("li");
       li.className = "attachment";
       const heading = document.createElement("div"), title = document.createElement("strong"), size = document.createElement("span");
       heading.className = "attachment-heading"; title.className = "attachment-title"; size.className = "file-size";
-      title.textContent = item.status === "text" ? "测试备注" : item.filename || "附件";
+      title.textContent = displayFilename(item);
       size.textContent = formatBytes(item.size);
       heading.append(title); if (size.textContent) heading.append(size);
       li.append(heading);
+      const actor = item.actor_verified === true ? (item.actor_login || item.actor || "已验证用户") :
+        item.upload_method === "signed_invite" ? "分享链接（身份未验证）" : "身份未验证";
+      const meta = document.createElement("p");
+      meta.className = "attachment-meta-inline";
+      meta.textContent = actor + " · " + formatDate(item.created_at || item.uploaded_at, true);
+      li.append(meta);
       if (deleted) {
-        const badge = document.createElement("p"); badge.className = "muted"; badge.textContent = "已删除，保留历史记录";
+        const badge = document.createElement("p"); badge.className = "muted";
+        badge.textContent = "已删除，历史记录保留";
         li.append(badge);
       }
-      const url = deleted ? "" : attachmentDownloadUrl(item);
-      const previewUrl = deleted ? "" : attachmentPreviewUrl(item), actions = document.createElement("div");
-      actions.className = "attachment-actions";
+      const previewUrl = deleted ? "" : attachmentPreviewUrl(item);
       const kind = previewUrl ? mediaType(item) : "";
-      let preview = null, previewMedia = null;
       if (kind) {
-        const toggle = document.createElement("button"); toggle.type = "button"; toggle.textContent = "预览";
-        toggle.setAttribute("aria-expanded", "false");
-        toggle.addEventListener("click", () => {
-          if (preview) {
-            if (previewMedia && typeof previewMedia.pause === "function") previewMedia.pause();
-            if (previewMedia) { previewMedia.removeAttribute("src"); if (typeof previewMedia.load === "function") previewMedia.load(); }
-            preview.remove(); preview = null; previewMedia = null;
-            toggle.textContent = "预览"; toggle.setAttribute("aria-expanded", "false"); return;
-          }
-          preview = document.createElement("div"); preview.className = "media-preview";
-          const media = document.createElement(kind === "video" ? "video" : "img");
-          previewMedia = media;
-          if (kind === "video") { media.controls = true; media.playsInline = true; media.preload = "none"; }
-          else { media.alt = item.filename || "附件图片预览"; media.loading = "lazy"; }
-          const hint = document.createElement("p"); hint.className = "media-hint";
-          media.addEventListener("error", () => { hint.textContent = "暂无法预览，可下载查看。"; });
-          preview.append(media, hint); media.src = previewUrl;
-          li.append(preview); toggle.textContent = "收起预览"; toggle.setAttribute("aria-expanded", "true");
-        });
-        actions.append(toggle);
+        const preview = document.createElement("div");
+        const media = document.createElement(kind === "video" ? "video" : "img");
+        preview.className = "media-preview";
+        if (kind === "video") {
+          media.controls = true; media.playsInline = true; media.preload = "metadata";
+        } else {
+          media.alt = displayFilename(item); media.loading = "lazy";
+        }
+        const hint = document.createElement("p"); hint.className = "media-hint";
+        media.addEventListener("error", () => { hint.textContent = "暂时无法预览；请重新打开附件页面。"; });
+        preview.append(media, hint); media.src = previewUrl; li.append(preview);
       }
-      if (url) actions.append(anchor("下载", "/attachments/" + id(item.attachment_id || item.id) +
-        "/download?cap=" + encodeURIComponent(item.download_capability)));
-      else if (!deleted && item.status === "ready") {
-        const hint = document.createElement("span"); hint.className = "media-hint"; hint.textContent = "下载暂不可用"; actions.append(hint);
+      const note = String(item.note || (item.status === "text" ? item.text : "") || "").trim();
+      if (note && !syntheticBotNote(item, note)) {
+        const noteBlock = document.createElement("div");
+        noteBlock.className = "attachment-note";
+        renderMarkdown(noteBlock, note);
+        li.append(noteBlock);
+      }
+      const actions = document.createElement("div");
+      actions.className = "attachment-actions";
+      const url = deleted ? "" : attachmentDownloadUrl(item);
+      if (url && !kind) {
+        actions.append(anchor("下载", "/attachments/" + id(item.attachment_id || item.id) +
+          "/download?cap=" + encodeURIComponent(item.download_capability)));
       }
       const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&
         (!item.round_id || item.round_id === bound.round_id);
       const attachmentId = item.attachment_id || item.id;
       if (!deleted && same && writable() && item.can_delete === true && attachmentId) {
         const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "删除";
-        remove.dataset.delete = attachmentId; remove.addEventListener("click", () => deleteAttachment(item)); actions.append(remove);
+        remove.dataset.delete = attachmentId;
+        remove.addEventListener("click", () => deleteAttachment(item)); actions.append(remove);
         if (item.status === "ready" && item.can_delete === true) {
           const option = document.createElement("option"); option.value = attachmentId;
-          option.textContent = item.filename || "附件"; $("replace").append(option);
+          option.textContent = displayFilename(item); $("replace").append(option);
         }
       }
       if (actions.childNodes.length) li.append(actions);
-      const details = document.createElement("details"), detailSummary = document.createElement("summary"), meta = document.createElement("dl");
-      details.className = "attachment-details"; detailSummary.textContent = "文件详情"; meta.className = "attachment-meta";
-      const actor = item.actor_verified === true ? (item.actor_login || item.actor || "已验证用户") :
-        item.upload_method === "signed_invite" ? "分享链接上传，GitHub 身份未验证" : "未验证身份";
-      appendMeta(meta, "上传者", actor);
-      appendMeta(meta, "时间", formatDate(item.created_at || item.uploaded_at, true));
-      appendMeta(meta, "状态", deleted ? "已删除" : item.status === "ready" ? "已验证" : lifecycleLabel(item.status));
-      appendMeta(meta, "备注", item.note || item.text || "");
-      if (meta.childNodes.length) { details.append(detailSummary, meta); li.append(details); }
       parent.append(li);
     }
   }
   function render() {
     const state = typeof context.status === "string" ? context.status : "";
-    $("status").textContent = lifecycleLabel(state); $("status").dataset.state = ["testing", "succeeded", "failed"].includes(state) ? state : "other";
-    $("summary").textContent = state === "testing" ? "当前测试轮的文件与备注。" : "查看当前 PR 的测试附件记录。";
+    const stageAvailable = ["testing", "succeeded", "failed"].includes(state);
+    $("current-section").hidden = !stageAvailable;
+    $("history-section").hidden = true;
     $("attachments").replaceChildren(); $("history").replaceChildren();
-    const replacement = $("replace").value; $("replace").replaceChildren(new Option("新增附件", ""));
-    attachmentList(context.attachments || [], $("attachments"), true);
-    if (!$("attachments").childNodes.length) {
-      const empty = document.createElement("li"); empty.className = "empty-state"; empty.textContent = "当前暂无附件。"; $("attachments").append(empty);
+    if (!stageAvailable) {
+      $("writes").hidden = true; $("writes").disabled = true;
+      $("message").textContent = "";
+      controls();
+      return;
     }
     const oldRounds = (context.rounds || context.history || []).filter(round => !roundMatches(round));
-    for (const round of oldRounds) {
+    oldRounds.sort((a, b) => {
+      const getTime = round => {
+        const value = Date.parse(round && (round.archived_at || round.ended_at || round.round_started_at || round.started_at || round.created_at) || "");
+        return Number.isFinite(value) ? value : 0;
+      };
+      return getTime(b) - getTime(a);
+    });
+    const roundNumber = oldRounds.length + 1;
+    $("round-title").textContent = "第 " + roundNumber + " 轮 · 附件";
+    $("summary").textContent = state === "testing" ?
+      "当前轮附件与说明；视频默认显示播放器。" : "本轮附件只读查看。";
+    const replacement = $("replace").value;
+    $("replace").replaceChildren(new Option("新增附件（保留现有附件）", ""));
+    attachmentList(context.attachments || [], $("attachments"), true);
+    if (!$("attachments").childNodes.length) {
+      const empty = document.createElement("li"); empty.className = "empty-state";
+      empty.textContent = "本轮暂无附件；上传完成后会显示在这里。"; $("attachments").append(empty);
+    }
+    for (let index = 0; index < oldRounds.length; index++) {
+      const round = oldRounds[index];
       const details = document.createElement("details"), summary = document.createElement("summary"), content = document.createElement("div");
       const roundDate = formatDate(round.created_at || round.started_at || round.round_started_at || round.archived_at || round.ended_at);
-      const count = Array.isArray(round.attachments) ? round.attachments.length : 0;
+      const count = Array.isArray(round.attachments) ? round.attachments.filter(item => item && item.status !== "deleted" && !item.deleted_at).length : 0;
+      const number = Math.max(1, roundNumber - index - 1);
       details.className = "history-record";
-      summary.textContent = "历史记录 · " + (roundDate || "日期未知") + " · " + count + " 个附件";
+      summary.textContent = "第 " + number + " 轮 · " + roundDate + " · " + (count ? count + " 个附件" : "该轮未保存附件");
       details.append(summary);
       content.className = "history-content";
-      const status = document.createElement("p"); status.className = "muted"; status.textContent = "状态：" + lifecycleLabel(round.status); content.append(status);
+      const status = document.createElement("p"); status.className = "muted";
+      status.textContent = "阶段：" + lifecycleLabel(round.status); content.append(status);
       const ul = document.createElement("ul"); attachmentList(round.attachments || [], ul, false); content.append(ul); details.append(content);
-      if (round.round_id && (round.cos_object_key || round.cos?.object_key || round.log_available || round.log_ready) &&
+      if (round.round_id && (round.cos_object_key || round.cos && round.cos.object_key || round.log_available || round.log_ready) &&
           context.enabled !== false && context.evidence_enabled !== false)
         details.append(anchor("下载本轮日志", "/rounds/" + id(round.round_id) + "/log/download?cap=" + encodeURIComponent(round.capability || "")));
       $("history").append(details);
@@ -495,9 +584,9 @@ _JAVASCRIPT = r'''"use strict";
             ![prefix + "/issues/" + app.dataset.pr, prefix + "/pull/" + app.dataset.pr].includes(url.pathname) ||
             !/^#issuecomment-[0-9]+$/.test(url.hash)) continue;
         const a = document.createElement("a"), p = document.createElement("p");
-        a.textContent = "查看更多历史记录"; a.href = url.href; a.rel = "noopener";
+        a.textContent = "查看完整历史记录"; a.href = url.href; a.rel = "noopener";
         p.append(a); p.className = "history-links"; $("history").append(p); archiveCount++;
-      } catch (_) { /* Ignore untrusted archive redirect destinations. */ }
+      } catch (_) {}
     }
     $("history-section").hidden = oldRounds.length === 0 && archiveCount === 0;
     if ([...$("replace").options].some(o => o.value === replacement)) $("replace").value = replacement;
@@ -792,25 +881,7 @@ _JAVASCRIPT = r'''"use strict";
     catch (error) { message(error.message); try { await refresh(); } catch (_) {} }
     finally { busy = false; controls(); }
   }
-  async function saveNote() {
-    if (busy || !writable()) return;
-    const body = {text: $("note").value, note: ""};
-    if (!body.text.trim()) { message("请输入备注。"); return; }
-    const content = JSON.stringify(body);
-    if (!noteOperation || noteOperation.content !== content) noteOperation = {content, key: uid()};
-    busy = true; controls();
-    try {
-      const result = await request("/notes", {method: "POST", key: noteOperation.key, body});
-      await refresh();
-      const noteJob = {uploadId: result.upload_id, requests: new Set(), isNote: true};
-      if (result.upload_id && (result.attachment_id || result.id)) await waitReady(noteJob, result.attachment_id || result.id);
-      else message("备注已提交；请刷新服务端状态确认 Summary 更新。");
-      noteOperation = null;
-    } catch (error) { message(error.message); }
-    finally { busy = false; controls(); }
-  }
   $("upload").addEventListener("click", runUpload);
-  $("save-note").addEventListener("click", saveNote);
   const dropzone = $("dropzone");
   for (const eventName of ["dragenter", "dragover"]) dropzone.addEventListener(eventName, event => {
     event.preventDefault(); dropzone.classList.add("dragging");
@@ -822,10 +893,13 @@ _JAVASCRIPT = r'''"use strict";
       catch (_) { message("浏览器无法读取拖入文件；请使用文件选择框。"); }
     }
   });
-  $("refresh").addEventListener("click", async () => {
-    try { if (busy) { message("上传进行中；可暂停对应文件后刷新。"); return; } stopped = false; await refresh(); }
-    catch (error) { message(error.message); }
+  restore(); refresh().catch(error => {
+    const status = error && Number(error.status || 0);
+    const detail = String(error && error.message || "");
+    $("current-section").hidden = true; $("history-section").hidden = true;
+    if ([401, 403].includes(status) || /invalid_evidence_capability|invalid_evidence/i.test(detail))
+      message("此附件链接当前不可用。请从 PR Summary 重新打开；附件只在测试阶段开放。");
+    else message("暂时无法读取附件，请稍后从 PR Summary 重新打开。");
   });
-  restore(); refresh().catch(error => { message(error.message || String(error)); });
 })();
 '''
