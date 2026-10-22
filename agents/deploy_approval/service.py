@@ -3635,8 +3635,6 @@ class DeployController:
                            public_base_url=public_base_url)
         if not isinstance(section, str):
             raise GitHubStateProxyError("Evidence renderer must return markdown")
-        section += ("\n\nAttachment preview is bounded; complete records and archive chains remain in trusted GitHub "
-                    "comments and the capability-protected evidence page.")
         start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
         if start in visible or end in visible:
             if visible.count(start) != 1 or visible.count(end) != 1 or visible.index(start) >= visible.index(end):
@@ -3644,7 +3642,13 @@ class DeployController:
             before, rest = visible.split(start, 1)
             _, after = rest.split(end, 1)
             visible = before.rstrip() + after
-        return visible.rstrip() + "\n\n" + start + "\n" + section + "\n" + end
+        projection = start + "\n" + section + "\n" + end
+        # Keep lifecycle History as the final visible Summary section.
+        history_index = visible.find("\n### History")
+        if history_index >= 0:
+            return (visible[:history_index].rstrip() + "\n\n" + projection
+                    + "\n\n" + visible[history_index + 1:].lstrip())
+        return visible.rstrip() + "\n\n" + projection
 
     async def project_evidence(self, repo: str, pr_number: int) -> None:
         """Watcher-only projection. HTTP handlers never call this writer."""
