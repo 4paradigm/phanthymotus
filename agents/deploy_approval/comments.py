@@ -1098,90 +1098,30 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 f"**时间：** {_escape(summary_time(historical_time))}",
                 f"**状态：** {_escape(group.get('status') if isinstance(group.get('status'), str) else '未知')}", "",
             ])
-        lines.extend([f"### 第 {round_number} 轮 · 附件" if not historical else f"### 第 {round_number} 轮 · 附件", "",
-                      "| 文件 | 大小 | 操作 |", "|---|---:|---|"])
-        detail_blocks = []
+        lines.extend([f"### 第 {round_number} 轮 · 附件", "",
+                      "| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
         for item in items:
             if not isinstance(item, dict):
                 continue
             deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
             status = "deleted" if deleted else item.get("status", "pending")
-            native_url = _trusted_github_attachment_url(item) if not deleted else ""
-            filename = item.get("filename") or item.get("text") or "Note"
+            filename = item.get("filename") or ("附件说明" if status == "text" else "附件文件")
             size = item.get("size", "—")
             if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
                 size = _human_size(size)
-            sha256 = item.get("sha256")
-            item_head = item.get("head_sha")
-            item_round = item.get("round_id")
-            invitation_upload = (
-                item.get("upload_method") == "signed_invite"
-                and item.get("upload_link_authorized") is True
-                and item.get("actor_verified") is False
-                and item.get("github_user_authenticated") is False
-                and item.get("cos_content_verified") is True
-            )
-            signed_invite = item.get("upload_method") == "signed_invite"
-            cos_verified = (not deleted and status == "ready"
-                            and item.get("cos_projection_verified") is True
-                            and isinstance(item.get("object_key"), str) and bool(item.get("object_key"))
-                            and isinstance(sha256, str)
-                            and re.fullmatch(r"[0-9a-f]{64}", sha256)
-                            and ((item.get("actor_verified") is True and not signed_invite)
-                                 or invitation_upload)
-                            and isinstance(item_head, str) and item_head == h
-                            and re.fullmatch(r"[0-9a-f]{40}", item_head)
-                            and isinstance(item_round, str) and item_round == r
-                            and re.fullmatch(re.escape(item_head) + r"-[0-9]+", item_round))
-            cos_download = _safe_download_url(item.get("cos_download_url", "")) if cos_verified else ""
-            if "|" in cos_download:
-                cos_download = ""
-            if status == "text":
-                source_id = item.get("source_comment_id")
-                if api and ((type(source_id) is int and source_id > 0)
-                            or isinstance(source_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", source_id)):
-                    action = f"[查看备注](<https://github.com/{repo}/pull/{pr_number}#issuecomment-{source_id}>)"
-                else:
-                    action = "查看备注"
-            elif cos_verified and cos_download:
-                action = f"[下载](<{cos_download}>)"
-            elif cos_verified:
-                action = (f"[下载原始附件](<{native_url}>) · COS 已验证，下载链接暂不可用"
-                          if native_url else "COS 已验证，下载链接暂不可用")
-            elif native_url:
-                action = f"[下载原始附件](<{native_url}>)"
-            elif deleted:
-                action = "已删除"
-            elif status not in {"ready", "text"}:
-                action = "处理中，尚未归档"
+            if item.get("actor_verified") is True and item.get("upload_method") != "signed_invite":
+                actor = item.get("actor_login") or item.get("actor") or "已验证用户"
+            elif item.get("upload_method") == "signed_invite":
+                actor = "分享链接（身份未验证）"
             else:
-                action = "下载暂不可用"
-            lines.append("| " + " | ".join((_escape(filename), _escape(size), action)) + " |")
-
-            detail_values = []
-            if item.get("actor_verified") is True and not signed_invite:
-                detail_values.append("上传者：" + _escape(item.get("actor_login") or item.get("actor") or "已验证"))
-            elif signed_invite:
-                detail_values.append("上传者：分享链接上传，身份未验证")
-            detail_values.append("时间：" + _escape(summary_time(item.get("created_at"))))
-            note = item.get("note") or (item.get("text") if status == "text" else "")
-            if note and not (str(item.get("actor_login") or item.get("actor") or "").lower() == "4pd-pr-assistant[bot]" and re.match(r"^(?:Server-side COS multipart acceptance|Server-side 20MB H\\.264 COS transport acceptance)", str(note).strip(), re.I)):
-                detail_values.append("说明：" + _escape(note))
-            if status == "ready" and cos_verified:
-                detail_values.append("校验：COS SHA256 已验证；媒体可播放性未验证")
-            elif status == "text":
-                detail_values.append("状态：文字说明")
-            elif not deleted and status != "ready":
-                detail_values.append("状态：尚未完成归档")
-            elif not deleted and status == "ready" and not cos_verified:
-                detail_values.append("状态：归档信息未通过完整性校验")
-            if item.get("replaces_id"):
-                detail_values.append("替换了上一附件")
-            if detail_values:
-                detail_blocks.extend(["<details>", f"<summary>{_escape(filename)} · 详情</summary>", "",
-                                      *["- " + value for value in detail_values], "", "</details>", ""])
+                actor = "身份未验证"
+            uploaded_at = summary_time(item.get("created_at") or item.get("uploaded_at"))
+            if deleted:
+                filename = filename + "（已删除）"
+            lines.append("| " + " | ".join(_escape(value) for value in
+                (filename, size, actor, uploaded_at)) + " |")
         if not items:
-            lines.append("| 当前轮暂无附件，上传后会显示 | — | — |")
+            lines.append("| 当前轮暂无附件，上传后会显示 | — | — | — |")
         lines.extend(detail_blocks)
         if group.get("deployments"):
             lines.extend(["", "### 部署记录", "",
