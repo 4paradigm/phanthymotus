@@ -128,6 +128,23 @@ class CosAttachmentStore:
             Params={'response-content-disposition': disposition,
                     'response-content-type': 'application/octet-stream'})
 
+    def issue_preview_url(self, *, key, filename, ttl=900) -> str:
+        filename = safe_filename(filename)
+        media_types = {
+            '.mp4': 'video/mp4', '.webm': 'video/webm', '.png': 'image/png',
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+            '.webp': 'image/webp',
+        }
+        suffix = '.' + filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+        media_type = media_types.get(suffix)
+        if media_type is None:
+            raise EvidenceStoreError('inline preview media type is not allowed')
+        ttl = self._part_ttl(ttl)
+        return self._sdk().get_presigned_url(
+            Method='GET', Bucket=self.config.cos_bucket, Key=self._key(key), Expired=ttl,
+            Params={'response-content-disposition': 'inline',
+                    'response-content-type': media_type})
+
     def download_url_expiry(self, url, *, key, filename=None, attachment_id=None):
         """Return a trusted signed-URL expiry, or None for any mismatch.
 
@@ -535,6 +552,10 @@ class CosAttachmentStore:
         if action == 'download':
             await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha)
             return {'url': await self._io(self.issue_download_url, key=key, filename=operation['filename'])}
+        if action == 'preview':
+            await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha)
+            return {'url': await self._io(self.issue_preview_url,
+                key=key, filename=operation['filename'], ttl=900)}
         if action == 'note':
             text = payload.get('text', '')
             if not isinstance(text, str):

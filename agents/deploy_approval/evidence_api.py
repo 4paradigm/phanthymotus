@@ -47,6 +47,7 @@ def _validate(payload, action, config):
     route_fields = {'status': {'upload_id'}, 'resume': {'upload_id'}, 'sign_part': {'upload_id', 'part_number'},
                     'put_part': {'upload_id', 'part_number'},
                     'complete': {'upload_id'}, 'download': {'attachment_id'},
+                    'preview': {'attachment_id'},
                     'delete': {'attachment_id'}}.get(action, set())
     if not isinstance(payload, dict) or payload.keys() - (_BASE | extras | route_fields):
         raise HTTPException(400, detail='invalid_evidence_payload')
@@ -167,12 +168,12 @@ async def _summary_updated(request, repo, pr, result):
 
 async def _dispatch(request, owner, repo, pr, action, **path):
     canonical = _repo(owner, repo, pr)
-    purpose = (evidence_auth.DOWNLOAD_PURPOSE if action in {'download', 'log_download'}
+    purpose = (evidence_auth.DOWNLOAD_PURPOSE if action in {'download', 'preview', 'log_download'}
                else evidence_auth.UPLOAD_PURPOSE if action in {
                    'context', 'status', 'init', 'resume', 'sign_part', 'put_part',
                    'complete', 'note', 'delete'} else evidence_auth.PURPOSE)
     resource = None
-    if action == 'download':
+    if action in {'download', 'preview'}:
         resource = 'attachment:' + path.get('attachment_id', '')
     elif action == 'log_download':
         resource = 'log:' + path.get('round_id', '')
@@ -195,14 +196,14 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         # The public upload handle is A's durable operation identity, rather
         # than an unauthenticated client-selected COS UploadId.
         payload['operation_id'] = payload.pop('upload_id')
-    if action == 'download' and 'round_id' not in payload:
+    if action in {'download', 'preview'} and 'round_id' not in payload:
         records = await request.app.state.proxy.read_evidence_records(canonical, pr)
         candidates = [r['data'] for r in records if r['kind'] == 'attachment'
                       and r['data'].get('attachment_id') == payload['attachment_id']]
         if candidates:
             row = candidates[-1]
             payload.update(head_sha=row['head_sha'], round_id=row['round_id'])
-    if action in {'resume', 'download', 'log_download'}:
+    if action in {'resume', 'download', 'preview', 'log_download'}:
         if action == 'resume' and not _BASE <= payload.keys():
             raise HTTPException(400, detail='evidence_context_required')
     if action in {'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete'}:
@@ -213,7 +214,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         # Compatibility with the current browser UI: a display name is not
         # an identity source. The service records only the verified /user login.
         payload.pop('submitter', None)
-    if action in {'download', 'log_download'}:
+    if action in {'download', 'preview', 'log_download'}:
         payload.setdefault('idempotency_key', hashlib.sha256(
             json.dumps([action, path], sort_keys=True).encode()).hexdigest())
     try:
@@ -371,6 +372,11 @@ async def _download(request, owner, repo, pr, action, **path):
 @router.get(_PREFIX + '/attachments/{attachment_id}/download')
 async def download(request: Request, owner: str, repo: str, pr: int, attachment_id: str):
     return await _download(request, owner, repo, pr, 'download', attachment_id=attachment_id)
+
+
+@router.get(_PREFIX + '/attachments/{attachment_id}/preview')
+async def preview(request: Request, owner: str, repo: str, pr: int, attachment_id: str):
+    return await _download(request, owner, repo, pr, 'preview', attachment_id=attachment_id)
 
 
 @router.get(_PREFIX + '/rounds/{round_id}/log/download')

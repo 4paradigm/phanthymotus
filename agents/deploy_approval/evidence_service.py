@@ -673,7 +673,7 @@ class EvidenceService:
         return {'attachments': completed}
 
     async def dispatch(self, action: str, *, repo: str, pr_number: int, principal: dict, payload: dict) -> dict:
-        if action not in {'context', 'status', 'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete', 'download', 'log_download'}:
+        if action not in {'context', 'status', 'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete', 'download', 'preview', 'log_download'}:
             raise EvidenceError('unknown_action', 400)
         if type(pr_number) is not int or pr_number <= 0 or not isinstance(payload, dict) or not isinstance(principal, dict):
             raise EvidenceError('invalid_request', 400)
@@ -717,7 +717,7 @@ class EvidenceService:
                 if 'head_sha' not in payload or 'round_id' not in payload:
                     raise EvidenceError('explicit_context_required', 400)
             round_id = payload.get('round_id', active_round)
-            if action == 'download' and 'round_id' not in payload:
+            if action in {'download', 'preview'} and 'round_id' not in payload:
                 targets = [r['data'] for r in records if r['kind'] == 'attachment'
                            and r['data'].get('attachment_id') == payload.get('attachment_id')]
                 if targets:
@@ -771,7 +771,7 @@ class EvidenceService:
                 )
             capability = principal.get('capability', {})
             resource = (('attachment:' + str(payload.get('attachment_id', '')))
-                        if action == 'download' else ('log:' + round_id)
+                        if action in {'download', 'preview'} else ('log:' + round_id)
                         if action == 'log_download' else None)
             if not principal.get('github_user_authenticated'):
                 purpose = capability.get('purpose')
@@ -782,7 +782,7 @@ class EvidenceService:
                          and capability.get('resource') == 'page')
                 )
                 scoped_read_capability = (
-                    action in {'download', 'log_download'}
+                    action in {'download', 'preview', 'log_download'}
                     and ((purpose == PURPOSE and 'resource' not in capability)
                          or (purpose == DOWNLOAD_PURPOSE
                              and capability.get('resource') == resource))
@@ -1031,7 +1031,7 @@ class EvidenceService:
                     value['sha256'] = result.get('sha256', value.get('sha256', ''))
                     value['verified'] = True
                 return value
-            if action in {'download', 'log_download'}:
+            if action in {'download', 'preview', 'log_download'}:
                 if action == 'log_download':
                     obj = selected.get('cos', {})
                     if not self.controller._valid_cos_metadata(repo, pr_number, expected_head, obj):
@@ -1045,13 +1045,32 @@ class EvidenceService:
                         raise EvidenceError('attachment_deleted', 410)
                     if operation['status'] != 'ready':
                         raise EvidenceError('attachment_not_ready', 409)
+                # Recheck the live PR and hidden state immediately before
+                # verifying/signing. Historical rounds remain readable from
+                # their trusted archived snapshot while the PR itself is open.
+                before_pr = await self.proxy.get_pr(repo, pr_number)
+                before_state = await self.proxy.read_hidden_state(repo, pr_number)
+                if (before_pr.get('state') != 'open' or before_pr.get('merged')
+                        or before_pr.get('draft')
+                        or before_pr.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo):
+                    raise EvidenceError('pr_closed', 409)
+                if not isinstance(before_state, dict):
+                    raise EvidenceError('state_unavailable', 409)
+                if round_id == active_round:
+                    validate_context(before_pr, before_state, expected_head, round_id, write=False)
                 # Store may sign ONLY the server-loaded object, never payload key.
                 result = await self._store(action, operation, {})
                 fresh = await self.proxy.get_pr(repo, pr_number)
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+                if (fresh.get('state') != 'open' or fresh.get('merged') or fresh.get('draft')
+                        or fresh.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo
+                        or not isinstance(fresh_state, dict)):
+                    raise EvidenceError('pr_closed', 409)
+                if round_id == active_round:
+                    validate_context(fresh, fresh_state, expected_head, round_id, write=False)
                 await self._authorize(repo, principal, selected, pr=fresh)
                 validate_context(fresh, selected, expected_head, round_id, write=False)
-                if action == 'download':
+                if action in {'download', 'preview'}:
                     revisions = await self.proxy.read_evidence_records(repo, pr_number)
                     deleted = any(r['kind'] == 'attachment' and r['data'].get('attachment_id') == operation['attachment_id']
                                   and r['data'].get('status') == 'deleted' for r in revisions)
