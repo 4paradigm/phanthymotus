@@ -129,6 +129,20 @@ let _projectStateKnown = false;
 
 export function isProjectRunning() { return _projectRunning; }
 
+/** Cards on the canvas for this tool — `[{ id }]`, empty when there are none.
+ *
+ * The sidebar asks so it can step out of the way: once a tool has a card, that
+ * card's dialog configures everything (tool-level fields included), and a
+ * second entry point is how one card's settings and another's drift apart.
+ * The sidebar's own form stays for the case it is the only one there is — a
+ * tool with no card yet, which still has to be configurable before you can
+ * usefully place one.
+ */
+export function cardsForTool(mcpId, toolName) {
+  return _cards.filter(c => c.mcpId === mcpId && c.toolName === toolName)
+               .map(c => ({ id: c.id }));
+}
+
 /** Why editing is refused right now, or '' when it is allowed. */
 function _editLockReason() {
   if (!_projectStateKnown) return '正在确认运行状态，请稍候重试';

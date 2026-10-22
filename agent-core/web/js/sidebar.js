@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 
@@ -310,6 +310,36 @@ function _buildSubgroupLabel(type, count) {
   return label;
 }
 
+/** Does the sidebar still own this tool's configuration?
+ *
+ * Only while the tool has no card on the canvas. Once a card exists that card's
+ * dialog sets everything, tool-level fields included, and a second entry point
+ * is how one card's settings and another's drift apart — the split across two
+ * dialogs is how r1_bj ended up with a YOLO fit selected under DepthART.
+ *
+ * **One function because there were two copies of this test.** The gear on the
+ * chip and the status on the tool card each recomputed it, I gated only the
+ * second, and the chip went on opening the dialog I had just removed. Two
+ * copies of a rule that must agree is the bug, not the symptom.
+ */
+function sidebarOwnsConfig(mcpId, tool) {
+  const schema = typeof tool === 'object' ? tool.configSchema : null;
+  if (!schema) return false;
+  const props = Object.values(schema.properties || {});
+  if (!props.some(def => def.scope !== 'instance')) return false;   // nothing to set here
+
+  // **Only step aside if the card can actually take over.** A card's dialog
+  // exists only when the tool has instance-scope fields (`canvas.js`, the
+  // `hasInstanceFields` test that renders the gear). A tool whose settings are
+  // all shared — `loco_servo`, whose config is `dry_run`, `rotate_only` and
+  // `require_standing` — gets no dialog on its card, so hiding the sidebar
+  // entry for it removed the only way to reach those settings. On R1 that put
+  // `dry_run` out of reach, which is not a cosmetic field on a chassis.
+  if (!props.some(def => def.scope === 'instance')) return true;
+
+  return cardsForTool(mcpId, tool.name).length === 0;
+}
+
 function _buildChip(mcp, tool) {
   const chip = document.createElement('div');
   const toolType = tool.type || '';
@@ -322,7 +352,7 @@ function _buildChip(mcp, tool) {
 
   // Config button for tools with shared fields
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   const configKey = `${mcp.id}:${tool.name}`;
   // 「已配置」只看会产生输入的字段。纯展示字段（二维码）永远不保存任何值，
   // 把它算进来的话，一个只声明了二维码的工具会永久挂着未配置的警告三角。
@@ -432,8 +462,19 @@ function _buildToolCard(mcp, tool) {
 
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const configKey = `${mcp.id}:${tool.name}`;
-  // Only tools with shared (non-instance-scope) fields need sidebar-level configuration
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  // Only tools with shared (non-instance-scope) fields need sidebar-level
+  // configuration — **and only while the tool has no card on the canvas.**
+  //
+  // Once a card exists, that card's dialog sets everything, tool-level fields
+  // included, so keeping this entry would leave two places to change one
+  // setting. That is not merely redundant: per-camera numbers are only
+  // meaningful against the shared model they were measured on, and splitting
+  // the two across dialogs is how r1_bj ended up with a YOLO fit selected
+  // under DepthART.
+  //
+  // It is not removed outright because a tool with no card still has to be
+  // configurable — ASR's url/key has to be set before placing one.
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
   const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
     .some(def => def.scope !== 'instance' && !isDisplayOnly(def));

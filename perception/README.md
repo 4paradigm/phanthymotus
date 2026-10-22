@@ -3101,43 +3101,29 @@ actually covers. The horizontal terms and `half_fov_rad` stay correct, and
 consumer that starts using vertical geometry would be misled. Folding the crop
 through `inherit` is the fix.
 
-#### Calibration belongs to camera × model, so each model keeps its own pair
+#### One calibration pair, cleared when the model changes
 
-A log-affine fit corrects one camera's optics *as that model sees them*, so it
-is not transferable between backends: on r1_sz's ultra-wide lens YOLO needs
-`cal_b: -0.9753` — a factor of 2.65 — and what it corrects there is a fixed-K
-model's guess at a 102° lens, which is not the error DepthART makes, since
-DepthART is handed the real `K`. **DepthART's own residual on that lens has not
-been measured**, so "it should need less" is an expectation, not a result;
-measure it with `calibrate` before trusting either number.
+A log-affine fit is two numbers. They are `cal_a`/`cal_b`, there is one pair,
+and there is no field recording which model it belongs to — a per-model pair and
+a provenance marker are the same mistake in two shapes: both make the operator
+responsible for matching a number to a model, and that bookkeeping is exactly
+what goes wrong.
 
-So the coefficients are **keyed by model**: `cal_a`/`cal_b` are YOLO's pair and
-`cal_a_depthart`/`cal_b_depthart` are DepthART's. Switching models swaps which
-pair is read and changes nothing else — both survive in the saved row, and
-switching back restores the earlier fit rather than nothing.
+What makes one pair safe is that **switching `backend` clears it**, because a
+fit does not transfer between models: on r1_sz's ultra-wide lens YOLO needs
+`cal_b: -0.9753`, a factor of 2.65, correcting a fixed-K model's guess at a 102°
+lens — not an error DepthART makes, since DepthART is handed the real `K`.
+DepthART's own residual there has not been measured.
 
-**There is deliberately no marker saying which model a fit belongs to.** An
-earlier cut of this carried `calibration_backend` alongside a single pair and
-compared it against the active model. Two fields that must agree eventually did
-not, and the failure was expensive: on r1_bj the mismatch dropped the card's
-only calibration to `no calibrate`, **the canvas persisted the dropped row**,
-and every distance was then uncalibrated on a 102° lens — with a
-`calibration_note` as the only trace. Keyed storage cannot contradict itself,
-and `_select_backend` no longer strips calibration keys, which was the step
-that did the erasing.
+The clearing is not new; it is what #286 did. What is new is that it is **loud**:
+the `config` response and `info()` both carry a note saying the calibration was
+cleared and why, and it is logged. On r1_bj the same clearing happened silently,
+the canvas persisted the cleared row, and the card ran `model-default` on a 102°
+lens with nothing to say so. The stripping was never the defect — the silence was.
 
-No migration is needed: `cal_a`/`cal_b` keep their names and meaning, and every
-row already saved holds a YOLO fit by construction — it was the only model
-there was when those rows were written.
-
-The one cross-model rule that survives is the **preset table**, which is
-measured against YOLO26-depth. A preset selected under DepthART is dropped back
-to `no calibrate` — never silently: the note is on the `config` response, on
-`info()`, and in the log.
-
-What this does not fix on R1: a pinhole `K` is an approximation at ~102° with
-`distortion_model: unknown` and `D: null`, and `tan` overstates the lateral
-offset towards the edges. Expect DepthART to need site calibration there too.
+So the sequence after a model change is: recalibrate with `calibrate`, then put
+the returned `cal_a`/`cal_b` into the card's config. Until you do, `info()`
+reports `model-default` and distances are the engine's own fit.
 
 ### Why TensorRT *directly*, and not through ultralytics
 
