@@ -47,7 +47,13 @@ class PrSnapshot:
 
 
 class GitHubError(Exception):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class GitHubRefConflict(GitHubError):
+    """A Git reference changed between read and compare-and-swap update."""
 
 
 class GitHubClient:
@@ -107,7 +113,15 @@ class GitHubClient:
         label_projection = len(path_parts) >= 5 and path_parts[1] == "repos" and (
             path_parts[4] == "labels" or (
                 len(path_parts) >= 7 and path_parts[4] == "issues" and path_parts[6] == "labels"))
-        if resp.status_code == 401 or (resp.status_code == 403 and not label_projection):
+        # Git Data API 403s commonly indicate missing repository contents
+        # permission. They still fail the operation, but do not invalidate an
+        # otherwise usable installation token; 401 remains an auth failure.
+        repo_index = next((index for index, part in enumerate(path_parts[:-3])
+                           if part == "repos"), -1)
+        git_data_api = (repo_index >= 0 and len(path_parts) > repo_index + 3
+                        and path_parts[repo_index + 3] == "git")
+        if resp.status_code == 401 or (
+                resp.status_code == 403 and not label_projection and not git_data_api):
             self.config.auth_valid = False
         return resp
 
@@ -161,6 +175,62 @@ class GitHubClient:
         if not isinstance(data, list):
             raise GitHubError("github returned a non-array payload")
         return data
+
+    async def _git_data_json(self, method: str, path: str, action: str,
+                             *, ref_update: bool = False, **kwargs) -> dict:
+        resp = await self._request(method, path, timeout=self.config.total_timeout, **kwargs)
+        if not 200 <= resp.status_code < 300:
+            error = GitHubRefConflict if ref_update and resp.status_code in (409, 422) else GitHubError
+            raise error(f"github {action} failed with HTTP {resp.status_code}",
+                        status_code=resp.status_code)
+        return await self._read_json(resp)
+
+    async def get_git_ref(self, repo: str, ref: str) -> dict:
+        if not isinstance(ref, str) or not ref or ref.startswith("refs/"):
+            raise GitHubError("github git ref name is invalid")
+        return await self._git_data_json("GET", f"/repos/{repo}/git/ref/{ref}",
+                                         "get git ref")
+
+    async def get_git_commit(self, repo: str, sha: str) -> dict:
+        return await self._git_data_json("GET", f"/repos/{repo}/git/commits/{sha}",
+                                         "get git commit")
+
+    async def get_git_tree(self, repo: str, sha: str, *, recursive: bool = False) -> dict:
+        params = {"recursive": "1"} if recursive else None
+        return await self._git_data_json("GET", f"/repos/{repo}/git/trees/{sha}",
+                                         "get git tree", params=params)
+
+    async def get_git_blob(self, repo: str, sha: str) -> dict:
+        return await self._git_data_json("GET", f"/repos/{repo}/git/blobs/{sha}",
+                                         "get git blob")
+
+    async def create_git_blob(self, repo: str, content: str) -> dict:
+        return await self._git_data_json(
+            "POST", f"/repos/{repo}/git/blobs", "create git blob",
+            json={"content": content, "encoding": "utf-8"})
+
+    async def create_git_tree(self, repo: str, tree: list[dict], *, base_tree: str | None = None) -> dict:
+        body = {"tree": tree}
+        if base_tree:
+            body["base_tree"] = base_tree
+        return await self._git_data_json("POST", f"/repos/{repo}/git/trees",
+                                         "create git tree", json=body)
+
+    async def create_git_commit(self, repo: str, message: str, tree: str,
+                                parents: list[str]) -> dict:
+        return await self._git_data_json(
+            "POST", f"/repos/{repo}/git/commits", "create git commit",
+            json={"message": message, "tree": tree, "parents": parents})
+
+    async def create_git_ref(self, repo: str, ref: str, sha: str) -> dict:
+        return await self._git_data_json(
+            "POST", f"/repos/{repo}/git/refs", "create git ref", ref_update=True,
+            json={"ref": "refs/" + ref, "sha": sha})
+
+    async def update_git_ref(self, repo: str, ref: str, sha: str) -> dict:
+        return await self._git_data_json(
+            "PATCH", f"/repos/{repo}/git/refs/{ref}", "update git ref",
+            ref_update=True, json={"sha": sha, "force": False})
 
     async def get_pr(self, repo: str, pr_number: int) -> dict:
         path = f"/repos/{repo}/pulls/{pr_number}"

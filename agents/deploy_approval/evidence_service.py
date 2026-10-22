@@ -1,4 +1,4 @@
-"""Attachment operations persisted as immutable, trusted GitHub documents.
+"""Attachment operations persisted as immutable, trusted Git Notes records.
 
 Store adapter contract (B): async dispatch(action, *, operation, payload) -> dict.
 init/note must be idempotent by operation_id; resume must locate an uncertain
@@ -681,7 +681,8 @@ class EvidenceService:
                 or repo not in self.config.active_repos):
             raise EvidenceError('repository_not_authorized', 403)
         # A process-local serialization lock is scheduling, not persistence.
-        # All operation identities and recovery facts live in GitHub comments.
+        # Operation identities and recovery facts live in Git Notes records;
+        # the lifecycle comment remains the sole business-state projection.
         async with self.controller._evidence_lock:
             pr = await self.proxy.get_pr(repo, pr_number)
             state = await self.proxy.read_hidden_state(repo, pr_number)
@@ -975,7 +976,9 @@ class EvidenceService:
                                        and not r.get('native_attachment')
                                        and r.get('round_id') == round_id
                                        and r.get('actor_id') == principal['id']], 'records': [r for r in latest.values() if r['round_id'] == round_id],
-                        'archive_links': [{'round_id': r['data']['round_id'], 'url': r['url']} for r in records if r['kind'] == 'round']}
+                        # Evidence history is projected from verified round data;
+                        # storage comment URLs/IDs are intentionally not exposed.
+                        'archive_links': []}
             if action == 'status':
                 if source.get('head_sha') != expected_head or source.get('round_id') != round_id:
                     raise EvidenceError('round_changed', 409)

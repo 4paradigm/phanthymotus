@@ -3315,7 +3315,9 @@ class DeployController:
     async def _archive_round_unlocked(self, repo, pr_number, state, reason):
         rid = round_id_for_state(state)
         records = await self.proxy.read_evidence_records(repo, pr_number)
-        attachments = [r for r in records if r["kind"] in ("operation", "attachment")
+        attachments = [{"kind": r["kind"], "key": r["key"],
+                        "data": copy.deepcopy(r["data"]), "sha256": r["sha256"]}
+                       for r in records if r["kind"] in ("operation", "attachment")
                        and r["data"].get("round_id") == rid]
         snapshot = archive_snapshot(repo, pr_number, state, utc_now(), reason)
         snapshot["attachment_records"] = attachments
@@ -3324,8 +3326,10 @@ class DeployController:
         key = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         existing = next((r for r in records if r["kind"] == "round" and r["key"] == key), None)
         record = existing or await self.proxy.write_evidence_record(repo, pr_number, "round", key, snapshot)
-        return {"round_id": rid, "comment_id": record["comment_id"],
-                "url": record["url"], "sha256": record["sha256"]}
+        result = {"round_id": rid, "sha256": record["sha256"]}
+        if type(record.get("comment_id")) is int and isinstance(record.get("url"), str):
+            result.update(comment_id=record["comment_id"], url=record["url"])
+        return result
 
     @staticmethod
     def _replace_markdown_section(markdown, heading, content, next_heading):
@@ -3344,8 +3348,7 @@ class DeployController:
         if renderer is None:
             return visible
         records = await self.proxy.read_evidence_records(repo, pr_number)
-        archives = [dict(r["data"], url=r["url"], comment_id=r["comment_id"])
-                    for r in records if r["kind"] == "round"]
+        archives = [r["data"] for r in records if r["kind"] == "round"]
         attachments = [r["data"] for r in records if r["kind"] == "attachment"]
         latest = {r["attachment_id"]: r for r in attachments}
         current_round = round_id_for_state(state)

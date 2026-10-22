@@ -1,8 +1,8 @@
-"""GitHub-only state proxy for Deploy Approval (pre-merge validation).
+"""GitHub state and immutable evidence proxy for Deploy Approval.
 
 The GitHubStateProxy provides a narrow, read/write boundary for GitHub PR
-state. It is the ONLY module that reads/writes the GitHub lifecycle comment
-and labels. It MUST NOT import or call any Deploy Approval business logic
+state and Git Notes evidence records. It is the ONLY module that reads/writes
+the GitHub lifecycle comment and labels. It MUST NOT import or call business logic
 (RegistryClient, AgentCoreClient, CaseRunner, CosClient,
 EvidenceBuilder, DeploymentService internals).
 
@@ -20,6 +20,7 @@ Responsibilities:
 - preserve non-status labels
 - enforce trusted identity on lifecycle hidden state
 - persist cursor while preserving exact visible markdown (no stale state write)
+- persist immutable per-PR evidence in a dedicated Git Notes ref
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from typing import Any
 
 from .config import Config
 from .image_ref import validate_image_ref
-from .github_client import GitHubClient, GitHubError
+from .github_client import GitHubClient, GitHubError, GitHubRefConflict
 from .comments import beijing_now_str
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,7 @@ _MAX_HIDDEN_STATE_BYTES = 8192
 
 # Maximum lifecycle comment body size (64 KB)
 _MAX_COMMENT_BODY_BYTES = 65536
-_EVIDENCE_SINGLE_RECORD_MAX_BYTES = 24000
-_EVIDENCE_PART_BYTES = 24000
+_EVIDENCE_GIT_REF_RETRIES = 5
 
 # Maximum visible lifecycle markdown soft budget (48 KiB)
 _MAX_VISIBLE_LIFECYCLE_BYTES = 48 * 1024
@@ -269,11 +269,13 @@ def _validate_hidden_state(data: dict) -> dict:
             raise MalformedHiddenStateError("invalid round_started_at") from exc
     if "round_archive" in data:
         link = data["round_archive"]
-        if (not isinstance(link, dict) or set(link) != {"round_id", "comment_id", "url", "sha256"}
-                or type(link["comment_id"]) is not int or link["comment_id"] <= 0
+        legacy_archive = isinstance(link, dict) and set(link) == {"round_id", "comment_id", "url", "sha256"}
+        note_archive = isinstance(link, dict) and set(link) == {"round_id", "sha256"}
+        if (not (legacy_archive or note_archive)
+                or (legacy_archive and (type(link["comment_id"]) is not int or link["comment_id"] <= 0
+                    or not isinstance(link["url"], str) or not link["url"].startswith("https://github.com/")))
                 or not isinstance(link["round_id"], str)
                 or not re.fullmatch(r"[0-9a-f]{40}-[0-9]+", link["round_id"])
-                or not isinstance(link["url"], str) or not link["url"].startswith("https://github.com/")
                 or not isinstance(link["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", link["sha256"])):
             raise MalformedHiddenStateError("invalid round_archive")
 
@@ -1187,156 +1189,14 @@ class GitHubStateProxy:
         except ValueError:
             raise GitHubStateProxyError("Malformed trusted evidence envelope")
 
-    @staticmethod
-    def _evidence_visible_description(envelope: dict) -> str:
-        return "<details>\n<summary>自动保存的内部证据记录（无需操作）</summary>\n</details>"
-
-    @staticmethod
-    def _evidence_envelope_text(body: str) -> str:
-        marker = "<!-- deploy-approval-evidence:v1\n"
-        start = body.index(marker)
-        return body[start:]
-
-    @staticmethod
-    def _evidence_has_visible_text(body: str) -> bool:
-        visible = re.sub(r"<!--[\s\S]*?-->", "", body)
-        return bool(visible.strip())
-
     async def ensure_visible_evidence_archive_comments(
         self, repo: str, pr_number: int, limit: int = 10,
     ) -> int:
-        """Fold legacy archive headings in place without changing evidence data."""
+        """Keep legacy evidence comments read-only while preserving the call contract."""
         self._evidence_repo_guard(repo)
         if type(limit) is not int or limit < 0:
             raise ValueError("limit must be a non-negative int")
-        if limit == 0:
-            return 0
-        pr = await self.get_pr(repo, pr_number)
-        if (not isinstance(pr, dict) or pr.get("state") != "open"
-                or pr.get("merged") or pr.get("draft")):
-            return 0
-        comments = await self.get_issue_comments(repo, pr_number)
-        records = await self.read_evidence_records(repo, pr_number)
-        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
-        trusted = {item["id"]: item for item in comments
-                   if type(item.get("id")) is int and item.get("issue_url") == expected_url
-                   and self.is_bot_comment(item)}
-        archive_by_comment = {}
-        for record in records:
-            comment = trusted.get(record["comment_id"])
-            envelope = self._evidence_envelope(comment or {})
-            if (not envelope or envelope.get("repo") != repo
-                    or envelope.get("pr_number") != pr_number
-                    or envelope.get("sha256") != record.get("sha256")
-                    or envelope.get("kind") != record.get("kind")
-                    or envelope.get("key") != record.get("key")):
-                raise GitHubStateProxyError("Evidence archive identity changed during migration")
-            if envelope["type"] == "manifest":
-                archive_by_comment[record["comment_id"]] = (record, envelope)
-                for part_id in envelope["parts"]:
-                    archive_by_comment[part_id] = (record, None)
-            elif envelope["type"] == "record":
-                archive_by_comment[record["comment_id"]] = (record, envelope)
-
-        legacy_heading = "### Deploy Approval — Evidence Archive"
-        legacy_prefix = re.compile(
-            re.escape(legacy_heading) + r"\s*\n\s*"
-            r"(?:PR #\d+|PR archive) · "
-            r"(?:Round evidence|Operation evidence|Attachment evidence|Evidence) · "
-            r"(?:part \d+(?:\s*/\s*manifest)?|manifest|record)\s*$"
-        )
-        legacy_inline_suffix = re.compile(
-            r"\s*(?:[·—-]\s*(?:(?:part\s+\d+)(?:\s*/\s*manifest)?|manifest|record))?\s*$",
-            re.IGNORECASE,
-        )
-        repaired = 0
-        for listed in comments:
-            if repaired >= limit:
-                break
-            if (not self.is_bot_comment(listed)
-                    or listed.get("issue_url") != expected_url):
-                continue
-            body = listed.get("body")
-            comment_id = listed.get("id")
-            verified = archive_by_comment.get(comment_id)
-            if (type(comment_id) is not int or not isinstance(body, str)
-                    or verified is None):
-                continue
-            marker = "<!-- deploy-approval-evidence:v1\n"
-            if body.count(marker) != 1:
-                continue
-            envelope = self._evidence_envelope(listed)
-            record, verified_envelope = verified
-            if (not envelope or envelope.get("repo") != repo
-                    or envelope.get("pr_number") != pr_number
-                    or envelope.get("type") not in {"record", "part", "manifest"}
-                    or envelope.get("sha256") != record.get("sha256")
-                    or envelope.get("kind") != record.get("kind")
-                    or envelope.get("key") != record.get("key")
-                    or (verified_envelope is not None and envelope != verified_envelope)):
-                continue
-            marker_pos = body.find(marker)
-            if marker_pos < 0:
-                continue
-            visible_prefix = body[:marker_pos]
-            original_suffix = body[marker_pos:]
-            old_heading = visible_prefix.strip()
-            is_legacy_heading = (
-                old_heading == legacy_heading
-                or (old_heading.startswith(legacy_heading)
-                    and legacy_inline_suffix.fullmatch(old_heading[len(legacy_heading):]))
-                or bool(legacy_prefix.fullmatch(old_heading))
-            )
-            if old_heading and not is_legacy_heading:
-                continue
-            patch_body = self._evidence_visible_description(envelope) + "\n\n" + original_suffix
-            if visible_prefix == self._evidence_visible_description(envelope) + "\n\n":
-                continue
-            fresh = await self.get_comment(repo, comment_id)
-            listed_user = listed.get("user")
-            if (not isinstance(fresh, dict) or fresh.get("id") != comment_id
-                    or not self.is_bot_comment(fresh) or fresh.get("body") != body
-                    or fresh.get("issue_url") != expected_url
-                    or not isinstance(listed_user, dict)
-                    or not isinstance(fresh.get("user"), dict)
-                    or fresh["user"].get("id") != listed_user.get("id")
-                    or (fresh.get("performed_via_github_app") or {}).get("id")
-                    != (listed.get("performed_via_github_app") or {}).get("id")):
-                continue
-            fresh_pr = await self.get_pr(repo, pr_number)
-            if (fresh_pr.get("state") != "open" or fresh_pr.get("merged")
-                    or fresh_pr.get("draft")):
-                return repaired
-            self._evidence_repo_guard(repo)
-            await self.update_comment(repo, comment_id, patch_body)
-            readback = await self.get_comment(repo, comment_id)
-            readback_body = readback.get("body") if isinstance(readback, dict) else None
-            readback_marker_pos = (readback_body.find(marker)
-                                   if isinstance(readback_body, str) else -1)
-            if (not isinstance(readback, dict) or readback.get("id") != comment_id
-                    or not self.is_bot_comment(readback) or readback_body != patch_body
-                    or readback.get("issue_url") != expected_url
-                    or not isinstance(readback.get("user"), dict)
-                    or readback["user"].get("id") != listed_user.get("id")
-                    or (readback.get("performed_via_github_app") or {}).get("id")
-                    != (listed.get("performed_via_github_app") or {}).get("id")):
-                raise GitHubStateProxyError("Evidence comment repair readback failed")
-            parsed = self._evidence_envelope(readback)
-            if (parsed != envelope or parsed.get("sha256") != envelope["sha256"]
-                    or readback_marker_pos < 0
-                    or readback_body[readback_marker_pos:] != original_suffix):
-                raise GitHubStateProxyError("Evidence envelope changed during repair")
-            # Re-read all archive comments and fully verify manifest, part
-            # identity, ordering and payload SHA256 after each in-place edit.
-            verified_records = await self.read_evidence_records(repo, pr_number)
-            if not any(item.get("kind") == record.get("kind")
-                       and item.get("key") == record.get("key")
-                       and item.get("sha256") == record.get("sha256")
-                       and item.get("comment_id") == record.get("comment_id")
-                       for item in verified_records):
-                raise GitHubStateProxyError("Evidence archive digest changed during repair")
-            repaired += 1
-        return repaired
+        return 0
 
     async def retire_legacy_evidence_link_replies(
         self, repo: str, pr_number: int,
@@ -1471,16 +1331,161 @@ class GitHubStateProxy:
             retired += 1
         return retired
 
+    @staticmethod
+    def _evidence_note_ref(pr_number: int) -> str:
+        return f"notes/deploy-approval-evidence-v1/pr-{pr_number}"
+
+    @staticmethod
+    def _canonical_evidence_data(data: dict) -> bytes:
+        return json.dumps(data, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+    @classmethod
+    def _evidence_note_target(cls, kind: str, key: str, data: dict) -> tuple[bytes, str]:
+        raw = cls._canonical_evidence_data({"kind": kind, "key": key, "data": data})
+        git_blob_sha = hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+        return raw, git_blob_sha
+
+    @staticmethod
+    def _evidence_note_data(repo: str, pr_number: int, payload: dict) -> tuple[bytes, dict]:
+        def unique_object(pairs):
+            result = {}
+            for name, value in pairs:
+                if name in result:
+                    raise ValueError("duplicate JSON key")
+                result[name] = value
+            return result
+
+        if not isinstance(payload, dict):
+            raise GitHubStateProxyError("Malformed Git Notes evidence record")
+        try:
+            envelope = json.loads(json.dumps(payload, ensure_ascii=False),
+                                  object_pairs_hook=unique_object)
+            required = {"version", "repo", "pr_number", "kind", "key", "head_sha",
+                        "round_id", "sha256", "data"}
+            if (set(envelope) != required or type(envelope.get("version")) is not int
+                    or envelope.get("version") != 1):
+                raise ValueError("invalid keys")
+            kind, key, data = envelope["kind"], envelope["key"], envelope["data"]
+            if (envelope["repo"] != repo or type(envelope["pr_number"]) is not int
+                    or envelope["pr_number"] != pr_number
+                    or kind not in {"round", "operation", "attachment"}
+                    or not isinstance(key, str) or not key or len(key) > 512
+                    or not isinstance(data, dict) or data.get("repo") != repo
+                    or type(data.get("pr_number")) is not int or data.get("pr_number") != pr_number):
+                raise ValueError("invalid identity")
+            head_sha, round_id = envelope["head_sha"], envelope["round_id"]
+            if (not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                    or not isinstance(round_id, str)
+                    or not re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id)
+                    or data.get("head_sha") != head_sha or data.get("round_id") != round_id):
+                raise ValueError("invalid round binding")
+            raw = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+            digest = hashlib.sha256(raw).hexdigest()
+            if envelope.get("sha256") != digest:
+                raise ValueError("digest mismatch")
+            return raw, envelope
+        except (TypeError, ValueError, KeyError):
+            raise GitHubStateProxyError("Git Notes evidence identity or SHA256 is invalid") from None
+
+    async def _read_git_note_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
+        ref = self._evidence_note_ref(pr_number)
+        try:
+            ref_data = await self._github.get_git_ref(repo, ref)
+        except GitHubError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return []
+            if getattr(exc, "status_code", None) == 403:
+                raise GitHubStateProxyError(
+                    "Git Notes evidence read denied: Git Data API permission is insufficient"
+                ) from exc
+            raise GitHubStateProxyError("Git Notes evidence ref could not be read") from exc
+        target = ref_data.get("object") if isinstance(ref_data, dict) else None
+        commit_sha = target.get("sha") if isinstance(target, dict) else None
+        if (not isinstance(target, dict) or target.get("type") != "commit"
+                or not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha)):
+            raise GitHubStateProxyError("Git Notes evidence ref is malformed")
+        return await self._read_git_note_commit_records(repo, pr_number, commit_sha)
+
+    async def _read_git_note_commit_records(
+        self, repo: str, pr_number: int, commit_sha: str,
+    ) -> list[dict]:
+        try:
+            commit = await self._github.get_git_commit(repo, commit_sha)
+            tree_sha = (commit.get("tree") or {}).get("sha")
+            if not isinstance(tree_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
+                raise ValueError("invalid tree sha")
+            tree = await self._github.get_git_tree(repo, tree_sha, recursive=True)
+            entries = tree.get("tree")
+            if tree.get("truncated") is not False or not isinstance(entries, list):
+                raise ValueError("truncated or malformed tree")
+            result = []
+            seen_paths = set()
+            seen_identities = {}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("malformed tree entry")
+                path = entry.get("path")
+                if (not isinstance(path, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", path)
+                        or path in seen_paths or entry.get("type") != "blob"
+                        or entry.get("mode") != "100644"
+                        or not isinstance(entry.get("sha"), str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", entry["sha"])):
+                    raise ValueError("unexpected evidence tree entry")
+                seen_paths.add(path)
+                blob = await self._github.get_git_blob(repo, entry["sha"])
+                if blob.get("encoding") != "base64" or not isinstance(blob.get("content"), str):
+                    raise ValueError("malformed evidence blob")
+                encoded_blob = re.sub(r"\s+", "", blob["content"])
+                raw_blob = base64.b64decode(encoded_blob, validate=True)
+                if len(raw_blob) > 8 * 1024 * 1024:
+                    raise ValueError("oversized evidence blob")
+
+                def unique_object(pairs):
+                    decoded = {}
+                    for name, value in pairs:
+                        if name in decoded:
+                            raise ValueError("duplicate JSON key")
+                        decoded[name] = value
+                    return decoded
+
+                payload = json.loads(raw_blob, object_pairs_hook=unique_object)
+                raw, envelope = self._evidence_note_data(repo, pr_number, payload)
+                _, expected_path = self._evidence_note_target(
+                    envelope["kind"], envelope["key"], envelope["data"])
+                if path != expected_path:
+                    raise ValueError("evidence path does not match identity")
+                identity = (envelope["kind"], envelope["key"])
+                if identity in seen_identities:
+                    raise ValueError("duplicate evidence identity in Git Notes")
+                seen_identities[identity] = raw
+                result.append({"kind": envelope["kind"], "key": envelope["key"],
+                               "data": envelope["data"], "sha256": envelope["sha256"]})
+            return result
+        except GitHubStateProxyError:
+            raise
+        except GitHubError as exc:
+            if getattr(exc, "status_code", None) == 403:
+                raise GitHubStateProxyError(
+                    "Git Notes evidence read denied: Git Data API permission is insufficient"
+                ) from exc
+            raise GitHubStateProxyError("Git Notes evidence integrity validation failed") from exc
+        except Exception as exc:
+            raise GitHubStateProxyError("Git Notes evidence integrity validation failed") from exc
+
     async def read_evidence_records(self, repo: str, pr_number: int) -> list[dict]:
-        """Read immutable single-comment and historical paged evidence documents."""
+        """Read Git Notes records and trusted legacy comment records."""
         self._evidence_repo_guard(repo)
+        result = await self._read_git_note_evidence_records(repo, pr_number)
+        seen = {(row["kind"], row["key"]): self._canonical_evidence_data(row["data"])
+                for row in result}
         comments = await self.get_issue_comments(repo, pr_number)
         expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
         trusted = {c["id"]: c for c in comments
                    if type(c.get("id")) is int and c["id"] > 0
                    and c.get("issue_url") == expected_url and self.is_bot_comment(c)}
-        result = []
-        seen = {}
 
         def decode_document(envelope):
             if (envelope.get("repo") != repo or envelope.get("pr_number") != pr_number):
@@ -1548,23 +1553,38 @@ class GitHubStateProxy:
                     or data.get("pr_number") != pr_number):
                 raise GitHubStateProxyError("Evidence record identity mismatch")
             add_record(envelope, comment, raw, data)
-        return sorted(result, key=lambda record: record["comment_id"])
+        return sorted(result, key=lambda record: (
+            str(record.get("data", {}).get("updated_at")
+                or record.get("data", {}).get("deleted_at")
+                or record.get("data", {}).get("completed_at")
+                or record.get("data", {}).get("created_at", "")),
+            record.get("comment_id", 0), record["kind"], record["key"],
+        ))
 
     async def write_evidence_record(
         self, repo: str, pr_number: int, kind: str, key: str, data: dict,
     ) -> dict:
-        """Persist small evidence in one comment and page larger records.
+        """Persist one immutable record in the PR's Git Notes ref.
 
-        This never PATCHes Lifecycle. The Controller's evidence lock serializes
-        HTTP operations; the existing watcher is the only Lifecycle projector.
+        Evidence writes never create issue comments. Ref updates are non-forced
+        compare-and-swap operations; concurrent writers reread and merge.
         """
         self._evidence_repo_guard(repo)
-        if (kind not in {"round", "operation", "attachment"}
+        if (not isinstance(repo, str) or type(pr_number) is not int or pr_number <= 0
+                or not isinstance(kind, str) or kind not in {"round", "operation", "attachment"}
                 or not isinstance(key, str) or not key or len(key) > 512
                 or not isinstance(data, dict) or data.get("repo") != repo
-                or data.get("pr_number") != pr_number):
+                or type(data.get("pr_number")) is not int or data.get("pr_number") != pr_number):
             raise GitHubStateProxyError("Evidence record identity is invalid")
-        raw = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        head_sha, round_id = data.get("head_sha"), data.get("round_id")
+        if (not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+                or not isinstance(round_id, str)
+                or not re.fullmatch(re.escape(head_sha) + r"-[0-9]+", round_id)):
+            raise GitHubStateProxyError("Evidence record HEAD/round identity is invalid")
+        try:
+            raw = self._canonical_evidence_data(data)
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise GitHubStateProxyError("Evidence record structure is invalid") from None
         if len(raw) > 8 * 1024 * 1024:
             raise GitHubStateProxyError("Evidence snapshot exceeds safe archive capacity")
         digest = hashlib.sha256(raw).hexdigest()
@@ -1578,112 +1598,114 @@ class GitHubStateProxy:
             return ({k: v for k, v in left.items() if k not in volatile}
                     == {k: v for k, v in right.items() if k not in volatile})
 
-        existing = await self.read_evidence_records(repo, pr_number)
-        for record in existing:
-            if (record["kind"], record["key"]) == (kind, key):
-                if not same_operation(record["data"], data):
-                    raise GitHubStateProxyError("Immutable evidence operation conflicts")
-                return record
-        comments = await self.get_issue_comments(repo, pr_number)
-        pending = {}
-        expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
-        for comment in comments:
-            if (not self.is_bot_comment(comment)
-                    or comment.get("issue_url") != expected_url):
-                continue
-            part = self._evidence_envelope(comment)
-            if (part and part.get("type") == "part" and part.get("repo") == repo
-                    and part.get("pr_number") == pr_number and part.get("kind") == kind
-                    and part.get("key") == key and type(part.get("index")) is int):
-                pending.setdefault(part.get("sha256"), {})[part["index"]] = part
-        resumed_paged_record = False
-        pending_identity_found = bool(pending)
-        for expected_digest, parts in pending.items():
-            if expected_digest == digest:
-                expected_count = (len(raw) + _EVIDENCE_PART_BYTES - 1) // _EVIDENCE_PART_BYTES
-                exact_partial = all(
-                    0 <= index < expected_count
-                    and part.get("data") == base64.b64encode(
-                        raw[index * _EVIDENCE_PART_BYTES:
-                             (index + 1) * _EVIDENCE_PART_BYTES]
-                    ).decode("ascii")
-                    for index, part in parts.items()
-                )
-                if exact_partial:
-                    resumed_paged_record = True
-                    break
+        note_payload = {"version": 1, "repo": repo, "pr_number": pr_number,
+                        "kind": kind, "key": key, "head_sha": head_sha,
+                        "round_id": round_id, "sha256": digest, "data": data}
+        note_raw = json.dumps(note_payload, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(note_raw) > 8 * 1024 * 1024:
+            raise GitHubStateProxyError("Evidence Git Notes record exceeds safe capacity")
+        target_raw, path = self._evidence_note_target(kind, key, data)
+        ref = self._evidence_note_ref(pr_number)
+
+        async def assert_writable_pr():
+            self._evidence_repo_guard(repo)
+            pr = await self.get_pr(repo, pr_number)
+            if (not isinstance(pr, dict) or pr.get("state") != "open"
+                    or pr.get("merged") is not False or pr.get("draft") is not False):
+                raise GitHubStateProxyError("Evidence records require an Open, unmerged, non-draft PR")
+
+        for _attempt in range(_EVIDENCE_GIT_REF_RETRIES):
+            await assert_writable_pr()
+            existing = await self.read_evidence_records(repo, pr_number)
+            for record in existing:
+                if (record["kind"], record["key"]) == (kind, key):
+                    if not same_operation(record["data"], data):
+                        raise GitHubStateProxyError("Immutable evidence operation conflicts")
+                    return record
             try:
-                indices = sorted(parts)
-                if indices != list(range(len(indices))):
-                    continue
-                decoded_parts = [base64.b64decode(parts[i]["data"], validate=True)
-                                 for i in indices]
-                if any(len(chunk) != _EVIDENCE_PART_BYTES
-                       for chunk in decoded_parts[:-1]):
-                    continue
-                candidate_raw = b"".join(decoded_parts)
-                if hashlib.sha256(candidate_raw).hexdigest() != expected_digest:
-                    continue
-                candidate = json.loads(candidate_raw)
-            except (ValueError, KeyError, TypeError):
+                ref_data = await self._github.get_git_ref(repo, ref)
+            except GitHubError as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    ref_data = None
+                elif getattr(exc, "status_code", None) == 403:
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence write denied: Git Data API permission is insufficient"
+                    ) from exc
+                else:
+                    raise GitHubStateProxyError("Git Notes evidence ref could not be read") from exc
+            base_commit = None
+            base_tree = None
+            if ref_data is not None:
+                target = ref_data.get("object") if isinstance(ref_data, dict) else None
+                base_commit = target.get("sha") if isinstance(target, dict) else None
+                if (not isinstance(target, dict) or target.get("type") != "commit"
+                        or not isinstance(base_commit, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", base_commit)):
+                    raise GitHubStateProxyError("Git Notes evidence ref is malformed")
+                try:
+                    commit = await self._github.get_git_commit(repo, base_commit)
+                except GitHubError as exc:
+                    if getattr(exc, "status_code", None) == 403:
+                        raise GitHubStateProxyError(
+                            "Git Notes evidence read denied: Git Data API permission is insufficient"
+                        ) from exc
+                    raise GitHubStateProxyError("Git Notes evidence base commit could not be read") from exc
+                base_tree = (commit.get("tree") or {}).get("sha")
+                if not isinstance(base_tree, str) or not re.fullmatch(r"[0-9a-f]{40}", base_tree):
+                    raise GitHubStateProxyError("Git Notes evidence base tree is malformed")
+                base_records = await self._read_git_note_commit_records(
+                    repo, pr_number, base_commit)
+                for record in base_records:
+                    if (record["kind"], record["key"]) == (kind, key):
+                        if not same_operation(record["data"], data):
+                            raise GitHubStateProxyError("Immutable evidence operation conflicts")
+                        return record
+
+            try:
+                target_blob = await self._github.create_git_blob(repo, target_raw.decode("utf-8"))
+                target_sha = target_blob.get("sha") if isinstance(target_blob, dict) else None
+                if target_sha != path:
+                    raise GitHubStateProxyError("Git Notes evidence target object was not confirmed")
+                blob = await self._github.create_git_blob(repo, note_raw.decode("utf-8"))
+                blob_sha = blob.get("sha") if isinstance(blob, dict) else None
+                if not isinstance(blob_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+                    raise GitHubStateProxyError("Git Notes evidence blob creation was not confirmed")
+                tree = await self._github.create_git_tree(
+                    repo, [{"path": path, "mode": "100644", "type": "blob", "sha": blob_sha}],
+                    base_tree=base_tree,
+                )
+                tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+                if not isinstance(tree_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
+                    raise GitHubStateProxyError("Git Notes evidence tree creation was not confirmed")
+                parents = [base_commit] if base_commit else []
+                commit = await self._github.create_git_commit(
+                    repo, "Store Deploy Approval evidence record", tree_sha, parents)
+                commit_sha = commit.get("sha") if isinstance(commit, dict) else None
+                if not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+                    raise GitHubStateProxyError("Git Notes evidence commit creation was not confirmed")
+                await assert_writable_pr()
+                if base_commit:
+                    await self._github.update_git_ref(repo, ref, commit_sha)
+                else:
+                    await self._github.create_git_ref(repo, ref, commit_sha)
+            except GitHubRefConflict:
                 continue
-            if not isinstance(candidate, dict) or not same_operation(candidate, data):
-                raise GitHubStateProxyError("Uncommitted evidence operation conflicts")
-            # All pages exist; finish their manifest instead of republishing
-            # a logically identical document with different retry timestamps.
-            raw, data, digest = candidate_raw, candidate, expected_digest
-            resumed_paged_record = True
-            break
-        if pending_identity_found and not resumed_paged_record:
-            raise GitHubStateProxyError(
-                "Incomplete uncommitted evidence pages require recovery before retry"
-            )
-
-        async def publish(envelope: dict) -> dict:
-            body = (self._evidence_visible_description(envelope) + "\n\n"
-                    + "<!-- deploy-approval-evidence:v1\n"
-                    + json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n-->")
-            found = next((c for c in comments
-                          if self.is_bot_comment(c)
-                          and (c.get("body") == body
-                               or self._evidence_envelope(c) == envelope)), None)
-            if found is None:
-                self._evidence_repo_guard(repo)
-                pr = await self.get_pr(repo, pr_number)
-                if pr.get("state") != "open" or pr.get("merged"):
-                    raise GitHubStateProxyError("Closed PR cannot receive evidence records")
-                found = await self.post_issue_comment(repo, pr_number, body)
-            if not isinstance(found, dict) or type(found.get("id")) is not int:
-                raise GitHubStateProxyError("Evidence comment write unconfirmed")
-            expected_body = found.get("body") if self._evidence_envelope(found) == envelope else body
-            confirmed = await self.get_comment(repo, found["id"])
-            expected_url = f"{self.config.github_api_url.rstrip('/')}/repos/{repo}/issues/{pr_number}"
-            if (not isinstance(confirmed, dict) or not self.is_bot_comment(confirmed)
-                    or confirmed.get("body") != expected_body or confirmed.get("issue_url") != expected_url
-                    or confirmed.get("id") != found["id"]):
-                raise GitHubStateProxyError("Evidence comment readback failed")
-            comments.append(confirmed)
-            return confirmed
-
-        common = {"repo": repo, "pr_number": pr_number, "kind": kind, "key": key, "sha256": digest}
-        if len(raw) <= _EVIDENCE_SINGLE_RECORD_MAX_BYTES and not resumed_paged_record:
-            envelope = {**common, "type": "record",
-                        "data": base64.b64encode(raw).decode("ascii")}
-            stored = await publish(envelope)
-        else:
-            part_ids = []
-            for index, offset in enumerate(range(0, len(raw), _EVIDENCE_PART_BYTES)):
-                part = await publish({**common, "type": "part", "index": index,
-                                      "data": base64.b64encode(
-                                          raw[offset:offset + _EVIDENCE_PART_BYTES]
-                                      ).decode("ascii")})
-                part_ids.append(part["id"])
-            stored = await publish({**common, "type": "manifest", "parts": part_ids})
-        verified = await self.read_evidence_records(repo, pr_number)
-        result = next((r for r in verified if r["comment_id"] == stored["id"]), None)
-        if result is None or result["sha256"] != digest:
-            raise GitHubStateProxyError("Committed evidence archive readback failed")
-        return result
+            except GitHubError as exc:
+                if getattr(exc, "status_code", None) == 403:
+                    raise GitHubStateProxyError(
+                        "Git Notes evidence write denied: Git Data API permission is insufficient"
+                    ) from exc
+                raise GitHubStateProxyError(
+                    f"Git Notes evidence persistence failed (HTTP {getattr(exc, 'status_code', 'unknown')})"
+                ) from exc
+            verified = await self.read_evidence_records(repo, pr_number)
+            result = next((r for r in verified
+                           if r["kind"] == kind and r["key"] == key), None)
+            if result is None or result.get("sha256") != digest:
+                raise GitHubStateProxyError("Git Notes evidence commit readback failed")
+            return result
+        raise GitHubStateProxyError("Git Notes evidence ref remained contended after bounded retries")
 
     async def persist_cursor(
         self,
