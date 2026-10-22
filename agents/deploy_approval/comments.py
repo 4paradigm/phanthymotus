@@ -983,6 +983,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     from .evidence_models import round_id_for_state
 
     state = state or {}
+    if state.get("status") not in {"testing", "succeeded", "failed"}:
+        return "<!-- deploy-approval-evidence:start -->\\n<!-- deploy-approval-evidence:end -->"
     head = state.get("head_sha", "")
     try:
         current_round = round_id_for_state(state)
@@ -1081,9 +1083,10 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 return value
         return None
 
-    def render_round(key, group, *, historical=False):
+    def render_round(key, group, *, historical=False, round_number=1):
         h, r = key
         items = latest_attachments(group)
+        items.sort(key=lambda item: (parsed_timestamp(item.get("created_at")) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)), reverse=True)
         lines = []
         if historical:
             historical_time = first_valid_time(
@@ -1095,7 +1098,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 f"**时间：** {_escape(summary_time(historical_time))}",
                 f"**状态：** {_escape(group.get('status') if isinstance(group.get('status'), str) else '未知')}", "",
             ])
-        lines.extend(["### 测试附件", "",
+        lines.extend([f"### 第 {round_number} 轮 · 附件" if not historical else f"### 第 {round_number} 轮 · 附件", "",
                       "| 文件 | 大小 | 操作 |", "|---|---:|---|"])
         detail_blocks = []
         for item in items:
@@ -1162,8 +1165,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 detail_values.append("上传者：分享链接上传，身份未验证")
             detail_values.append("时间：" + _escape(summary_time(item.get("created_at"))))
             note = item.get("note") or (item.get("text") if status == "text" else "")
-            if note:
-                detail_values.append("备注：" + _escape(note))
+            if note and not (str(item.get("actor_login") or item.get("actor") or "").lower() == "4pd-pr-assistant[bot]" and re.match(r"^(?:Server-side COS multipart acceptance|Server-side 20MB H\\.264 COS transport acceptance)", str(note).strip(), re.I)):
+                detail_values.append("说明：" + _escape(note))
             if status == "ready" and cos_verified:
                 detail_values.append("校验：COS SHA256 已验证；媒体可播放性未验证")
             elif status == "text":
@@ -1178,7 +1181,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 detail_blocks.extend(["<details>", f"<summary>{_escape(filename)} · 详情</summary>", "",
                                       *["- " + value for value in detail_values], "", "</details>", ""])
         if not items:
-            lines.append("| 暂无附件 | — | — |")
+            lines.append("| 当前轮暂无附件，上传后会显示 | — | — |")
         lines.extend(detail_blocks)
         if group.get("deployments"):
             lines.extend(["", "### 部署记录", "",
@@ -1218,8 +1221,17 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             lines.extend(["", f"[下载本轮归档日志](<{log}>)"])
         return lines
 
+    round_keys = list(groups.keys())
+    def round_sort_time(key):
+        group = groups[key]
+        value = first_valid_time(group.get("round_started_at"), group.get("started_at"), group.get("created_at"), group.get("archived_at"), group.get("ended_at"))
+        parsed = parsed_timestamp(value)
+        return parsed.timestamp() if parsed is not None else 0
+    ordered_rounds = sorted(round_keys, key=round_sort_time)
+    round_numbers = {key: index + 1 for index, key in enumerate(ordered_rounds)}
+    current_round_number = round_numbers.get((head, current_round), max(1, len(round_numbers)))
     lines = ["<!-- deploy-approval-evidence:start -->"]
-    lines.extend(render_round((head, current_round), groups[(head, current_round)]))
+    lines.extend(render_round((head, current_round), groups[(head, current_round)], round_number=current_round_number))
     round_pattern = re.escape(str(head)) + r"-[0-9]+"
     current_context_valid = (
         state.get("pr_state") == "open" and not state.get("merged")
@@ -1234,7 +1246,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         if upload_url:
             lines.extend(["", f"[上传或查看附件](<{upload_url}>)"])
         elif read_url:
-            lines.extend(["", f"[查看测试附件](<{read_url}>)"])
+            lines.extend(["", f"[查看附件](<{read_url}>)"])
     if current_context_valid and state.get("status") == "testing" and page_url(state.get("upload_capability")):
         pending = sum(1 for item in state.get("attachments", [])
                       if isinstance(item, dict)
@@ -1272,8 +1284,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 if not (item.get("deleted_at") or item.get("status") == "deleted")
             )
             lines.extend(["<details>",
-                          f"<summary>历史测试 · {_escape(summary_date(timestamp))} · {attachment_count} 个附件</summary>",
-                          "", *render_round(key, group, historical=True), "", "</details>", ""])
+                          f"<summary>第 {round_numbers.get(key, 1)} 轮 · {_escape(summary_date(timestamp))} · {attachment_count} 个附件</summary>",
+                          "", *render_round(key, group, historical=True, round_number=round_numbers.get(key, 1)), "", "</details>", ""])
     linked_index = False
     seen_archive_urls = set()
     for link in archive_links or []:
