@@ -609,91 +609,26 @@ def test_r1_main_needs_no_crop():
 R1_PRESET = next(iter(vd.CALIBRATION_PRESETS))
 
 
-def test_the_marker_is_gone_from_the_schema():
+def test_the_schema_has_exactly_one_calibration_pair():
     props = make_plugin().get_tools()[0]['configSchema']['properties']
+    # Neither a provenance marker nor a pair per model: a fit is two numbers,
+    # and anything that multiplies them puts the bookkeeping on the operator.
     assert 'calibration_backend' not in props
-    for key in ('cal_a', 'cal_b', 'cal_a_depthart', 'cal_b_depthart'):
+    assert 'cal_a_depthart' not in props and 'cal_b_depthart' not in props
+    for key in ('cal_a', 'cal_b'):
         assert key in props
     # No conditional display: #286 avoids x-show-when for Core compatibility.
     assert all('x-show-when' not in props[k] for k in props)
 
 
-@pytest.mark.parametrize('backend,keys', [
-    ('yolo', ('cal_a', 'cal_b')),
-    ('depthart', ('cal_a_depthart', 'cal_b_depthart')),
-])
-def test_each_model_reads_only_its_own_coefficients(backend, keys):
-    p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
-    # Both pairs present, deliberately different. The active model must take
-    # its own and ignore the other entirely.
-    cfg = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
-               cal_a=1., cal_b=-0.9753, cal_a_depthart=1., cal_b_depthart=-0.31)
-    assert p.dispatch('visual_depth', cfg)['status'] == 'configured'
-    expected = -0.9753 if backend == 'yolo' else -0.31
-    stored = p._instance_configs['a']
-    assert stored[keys[1]] == expected
-    # The other model's pair survives in the row untouched — that is the point.
-    other = 'cal_b_depthart' if backend == 'yolo' else 'cal_b'
-    assert other in stored
 
 
-def test_switching_models_keeps_both_fits():
-    """The r1_bj incident, as a test: a switch must not erase a calibration."""
-    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
-    row = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
-               cal_a=1., cal_b=-0.9753, cal_a_depthart=1., cal_b_depthart=-0.31)
-    assert p.dispatch('visual_depth', row)['status'] == 'configured'
-    # Card-level `_cal_b` is untouched by an instance-scoped call: it stores
-    # into `_instance_configs` and returns, and the fit reaches the node at
-    # start. So the yolo pair is checked where it actually lives.
-    assert p._instance_configs['a']['cal_b'] == -0.9753
-    assert p.dispatch('visual_depth', dict(action='config', backend='depthart'))['status'] == 'configured'
-    # Neither pair was stripped from the stored row.
-    stored = p._instance_configs['a']
-    assert stored['cal_b'] == -0.9753 and stored['cal_b_depthart'] == -0.31
-    # And switching back restores yolo's own numbers rather than nothing.
-    assert p.dispatch('visual_depth', dict(action='config', backend='yolo'))['status'] == 'configured'
-    assert p.dispatch('visual_depth', row)['status'] == 'configured'
-    assert p._instance_configs['a']['cal_b'] == -0.9753
 
 
-@pytest.mark.parametrize('backend', ['yolo', 'depthart'])
-def test_a_row_holding_only_the_other_models_fit_is_not_misapplied(backend):
-    # A card calibrated under one model and then switched: the active model
-    # finds no pair of its own and falls back to the engine's fit rather than
-    # borrowing numbers measured against something else.
-    p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
-    foreign = 'cal_b_depthart' if backend == 'yolo' else 'cal_b'
-    p.dispatch('visual_depth', {'action': 'config', 'instance_id': 'a',
-                                'calibration_preset': vd.CAL_MANUAL, foreign: -0.9753})
-    assert (p._cal_a, p._cal_b) == (1., 0.)
 
 
-@pytest.mark.parametrize('backend,key', [('yolo', 'cal_b'), ('depthart', 'cal_b_depthart')])
-def test_startup_yaml_applies_the_active_models_pair(backend, key):
-    # perception/config.yaml has no dropdown, so a bare coefficient there has
-    # always meant "apply this". It must still work, per model.
-    p = vd.VideoDepthPerceptionPlugin({'backend': backend, key: -0.5}, 'test', _FakeExecutor())
-    assert (p._cal_a, p._cal_b) == (1., -0.5)
 
 
-@pytest.mark.parametrize('backend,key', [('yolo', 'cal_b'), ('depthart', 'cal_b_depthart')])
-def test_calibrate_writes_and_reset_restores_the_active_models_pair(backend, key, monkeypatch):
-    p = vd.VideoDepthPerceptionPlugin({'backend': backend}, 'test', _FakeExecutor())
-    monkeypatch.setattr(p, '_raw_depth_for_calibration',
-                        lambda *a, **kw: ([np.full((480, 640), 2.0, np.float32)], 'test'))
-    result = p.dispatch('visual_depth', {'action': 'calibrate', 'distance_m': 1.0})
-    assert result['ok'] is True
-    # The pair it tells the operator to save is the active model's, and carries
-    # no marker — there is no longer one to carry.
-    saved = result['save_to_config']
-    assert set(saved) == {'calibration_preset', key.replace('cal_b', 'cal_a'), key}
-    assert saved['calibration_preset'] == vd.CAL_MANUAL
-    assert p._plugin_cfg[key] == saved[key]
-    # reset puts the config back as it found it.
-    assert p.dispatch('visual_depth', {'action': 'reset_calibration'})['ok'] is True
-    assert key not in p._plugin_cfg
-    assert (p._cal_a, p._cal_b) == (1., 0.)
 
 
 def test_yolo_presets_are_still_refused_under_depthart():
@@ -743,3 +678,44 @@ def test_the_orin5_row_that_used_to_kill_the_card_still_configures():
         'action': 'config', 'instance_id': 'card-mv8w41sh6a45',
         'fps': 2, 'cal_a': 1, 'cal_b': 0, 'calibration_preset': R1_PRESET})
     assert result['status'] == 'configured' and result.get('adapter_ok', True) is True
+
+
+def test_switching_models_clears_the_fit_and_says_so():
+    """One pair cannot survive a model change, so it is cleared — out loud.
+
+    A fit measured on YOLO and left under DepthART is the r1_bj failure:
+    `cal_b: -0.9753` on that lens is a factor of 2.65, and nothing downstream
+    can tell a corrected metre from an uncorrected one. The stripping itself
+    was never the bug — doing it silently was.
+    """
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    row = dict(action='config', instance_id='a', calibration_preset=vd.CAL_MANUAL,
+               cal_a=1., cal_b=-0.9753)
+    assert p.dispatch('visual_depth', row)['status'] == 'configured'
+    assert p._instance_configs['a']['cal_b'] == -0.9753
+
+    switched = p.dispatch('visual_depth', dict(action='config', backend='depthart'))
+    assert switched['status'] == 'configured'
+    # Gone from the stored row, and the response says why.
+    assert 'cal_b' not in p._instance_configs['a']
+    assert 'calibration_preset' not in p._instance_configs['a']
+    assert '标定' in switched['calibration_note'] and 'calibrate' in switched['calibration_note']
+    assert (p._cal_a, p._cal_b) == (1., 0.)
+
+
+def test_the_cleared_note_is_reported_once():
+    # Reported on the next config, then not repeated — a note that reappears
+    # on every call is a note nobody reads.
+    p = vd.VideoDepthPerceptionPlugin({}, 'test', _FakeExecutor())
+    first = p.dispatch('visual_depth', dict(action='config', backend='depthart'))
+    assert first.get('calibration_note')
+    second = p.dispatch('visual_depth', dict(action='config', fps=2))
+    assert 'calibration_note' not in second
+
+
+def test_a_single_pair_applies_under_either_model():
+    # The pair is not model-keyed: whichever model is selected reads cal_a/cal_b.
+    for backend in ('yolo', 'depthart'):
+        p = vd.VideoDepthPerceptionPlugin({'backend': backend, 'cal_b': -0.5},
+                                          'test', _FakeExecutor())
+        assert (p._cal_a, p._cal_b) == (1., -0.5)

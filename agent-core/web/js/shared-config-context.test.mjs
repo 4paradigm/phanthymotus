@@ -104,3 +104,23 @@ test('an unknown key defaults to the instance row rather than the shared one', (
   assert.deepStrictEqual(writes[0], ['instance', { legacy_knob: 7 }]);
   assert.deepStrictEqual(writes[1], ['shared', {}]);
 });
+
+/** The card is the only config entry once one exists. */
+function sidebarOffersConfig(props, cardsOnCanvas) {
+  if (cardsOnCanvas.length) return false;
+  return Object.values(props).some(d => d.scope !== 'instance');
+}
+
+test('the sidebar steps aside once the tool has a card', () => {
+  assert.strictEqual(sidebarOffersConfig(DEPTH_PROPS, [{ id: 'card-1' }]), false);
+});
+
+test('with no card the sidebar is still the only way in', () => {
+  // A tool has to be configurable before you can usefully place a card —
+  // ASR's url/key is the case.
+  assert.strictEqual(sidebarOffersConfig(DEPTH_PROPS, []), true);
+});
+
+test('a tool with only instance fields never offers sidebar config', () => {
+  assert.strictEqual(sidebarOffersConfig({ fps: { scope: 'instance' } }, []), false);
+});

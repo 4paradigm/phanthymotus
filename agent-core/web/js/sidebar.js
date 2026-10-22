@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 
@@ -432,8 +432,21 @@ function _buildToolCard(mcp, tool) {
 
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const configKey = `${mcp.id}:${tool.name}`;
-  // Only tools with shared (non-instance-scope) fields need sidebar-level configuration
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  // Only tools with shared (non-instance-scope) fields need sidebar-level
+  // configuration — **and only while the tool has no card on the canvas.**
+  //
+  // Once a card exists, that card's dialog sets everything, tool-level fields
+  // included, so keeping this entry would leave two places to change one
+  // setting. That is not merely redundant: per-camera numbers are only
+  // meaningful against the shared model they were measured on, and splitting
+  // the two across dialogs is how r1_bj ended up with a YOLO fit selected
+  // under DepthART.
+  //
+  // It is not removed outright because a tool with no card still has to be
+  // configurable — ASR's url/key has to be set before placing one.
+  const onCanvas = cardsForTool(mcp.id, tool.name).length > 0;
+  const hasSharedFields = !onCanvas && configSchema
+    && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
   // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
   const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
     .some(def => def.scope !== 'instance' && !isDisplayOnly(def));

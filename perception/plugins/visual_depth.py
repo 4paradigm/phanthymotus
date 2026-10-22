@@ -301,18 +301,16 @@ TOOLS = [
                 # identity — i.e. trust the engine.
                 "cal_a": {"type": "number", "title": "Calibration a", "description": "Depth exponent; 1 means no exponent correction.", "default": 1.0, "scope": "instance"},
                 "cal_b": {"type": "number", "title": "Calibration b", "description": "Log scale offset; 0 means no scale correction.", "default": 0.0, "scope": "instance"},
-                # No `calibration_backend` marker. It recorded which model a
-                # fit was measured against — information the plugin already
-                # has — and two fields that must agree will eventually not:
-                # on r1_bj a depthart/yolo mismatch dropped the card's only
-                # calibration to `no calibrate`, the canvas persisted that,
-                # and every distance was then uncalibrated on a 102 degree
-                # lens. Keyed storage cannot contradict itself.
+                # **One pair, not one per model.** A log-affine fit is two
+                # numbers; multiplying the form by the number of backends made
+                # the operator responsible for knowing which pair belonged to
+                # which model, which is the same burden `calibration_backend`
+                # imposed and the same reason it was wrong.
                 #
-                # `cal_a`/`cal_b` stay the YOLO pair, which is what every row
-                # already saved holds — so this needs no migration.
-                "cal_a_depthart": {"type": "number", "title": "Calibration a (DepthART)", "description": "DepthART 的深度指数；1 表示不做指数修正。和上面那对互不影响，切换模型不会丢。", "default": 1.0, "scope": "instance"},
-                "cal_b_depthart": {"type": "number", "title": "Calibration b (DepthART)", "description": "DepthART 的 log 尺度偏移；0 表示不做尺度修正。YOLO 上量的系数在这只镜头上会差 2.65 倍，不要抄过来 —— 用 calibrate 重量。", "default": 0.0, "scope": "instance"},
+                # What keeps that safe is `_select_backend`: switching models
+                # clears this pair and says so. A fit measured on one model and
+                # left in place under another is the r1_bj failure — YOLO's
+                # `cal_b: -0.9753` is a factor of 2.65 on that lens.
                 # Presets are for the common case (a known robot, a known
                 # camera); cal_a/cal_b above stay for anything else, and a
                 # non-identity value there wins — see _calibration_from_cfg.
@@ -463,20 +461,8 @@ def _preset_for_camera(camera_id: str):
     return None, None
 
 
-def _cal_keys(backend: str) -> tuple[str, str]:
-    """Which pair of config keys this backend's fit lives in.
-
-    A log-affine fit belongs to a camera x model pair, so the two models keep
-    separate coefficients rather than sharing one pair plus a marker saying
-    whose they are. `yolo` keeps the original `cal_a`/`cal_b` names, because
-    every row already saved was measured against YOLO by construction — it was
-    the only model there was — so nothing needs migrating.
-    """
-    return ("cal_a_depthart", "cal_b_depthart") if backend == "depthart" else ("cal_a", "cal_b")
-
-
 def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
-                          camera_id: str = "", backend: str = "yolo") -> tuple[float, float]:
+                          camera_id: str = "") -> tuple[float, float]:
     """Resolve (cal_a, cal_b): typed-in value, then preset, then legacy, then engine.
 
     **Non-identity wins over a preset, and that test is deliberate.** The canvas
@@ -490,9 +476,8 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
     cal_a = 1 — so an existing card keeps the behaviour it was configured for
     rather than silently reverting to identity.
     """
-    key_a, key_b = _cal_keys(backend)
-    cal_a = float(cfg.get(key_a, default[0]))
-    cal_b = float(cfg.get(key_b, default[1]))
+    cal_a = float(cfg.get("cal_a", default[0]))
+    cal_b = float(cfg.get("cal_b", default[1]))
     # **The dropdown decides — when there is one.**
     #
     # The canvas sends `calibration_preset` on every config call, so its
@@ -535,7 +520,7 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
     return 1.0, 0.0
 
 
-def calibration_origin(cfg: dict, camera_id: str = "", backend: str = "yolo") -> str:
+def calibration_origin(cfg: dict, camera_id: str = "") -> str:
     """Which of the four sources is in effect, for `info()`.
 
     A card whose depth is 3.2x out and a card whose depth is right look the same
@@ -558,8 +543,7 @@ def calibration_origin(cfg: dict, camera_id: str = "", backend: str = "yolo") ->
             return f"auto:{name}" if name else (
                 f"auto:no-match({camera_id})" if camera_id else "auto:no-camera")
         return "model-default"
-    key_a, key_b = _cal_keys(backend)
-    if (float(cfg.get(key_a, 1.0)), float(cfg.get(key_b, 0.0))) != (1.0, 0.0):
+    if (float(cfg.get("cal_a", 1.0)), float(cfg.get("cal_b", 0.0))) != (1.0, 0.0):
         return "manual"
     if cfg.get("depth_scale") not in (None, "") and "cal_b" not in cfg:
         return "legacy-depth_scale"
@@ -1108,6 +1092,9 @@ class VideoDepthPerceptionPlugin:
         # scope a fit has. Surfaced on `info()` — a dropped coefficient that
         # nothing says out loud is the failure this card keeps repeating.
         self._cal_notes: dict[str, str] = {"": note} if note else {}
+        # Set by `_select_backend`; reported once on the next config and info,
+        # so a cleared calibration cannot pass unnoticed.
+        self._cal_cleared_note = ""
         # What cal_a/cal_b were before `calibrate` overwrote them, so
         # `reset_calibration` can put the dict back exactly as it found it.
         self._cal_cfg_backup = None
@@ -1121,8 +1108,7 @@ class VideoDepthPerceptionPlugin:
         self._barrel_max_fraction = float(
             plugin_cfg.get("lens_barrel_max_fraction", 0.6))
         self._barrel_scale = int(plugin_cfg.get("lens_barrel_scale", 4))
-        self._cal_a, self._cal_b = _calibration_from_cfg(
-            self._plugin_cfg, backend=self._backend)
+        self._cal_a, self._cal_b = _calibration_from_cfg(self._plugin_cfg)
         # (measured_m, predicted_m) reference readings from the `calibrate`
         # action, in call order. Refit from scratch on every addition, so a
         # bad sample can be undone with reset rather than compounding.
@@ -1155,7 +1141,8 @@ class VideoDepthPerceptionPlugin:
         mismatch dropped the card's only calibration to `no calibrate`, the
         canvas persisted the dropped row, and every distance was then
         uncalibrated on a 102 degree lens. The coefficients are keyed by model
-        now (`_cal_keys`), so there is nothing left to contradict.
+        now a single pair cleared on every model switch, so there is nothing
+        left to contradict.
 
         What remains is the presets, which are genuinely YOLO-only: the table
         is measured against YOLO26-depth, and r1's `cal_b: -0.9753` is a factor
@@ -1335,10 +1322,8 @@ class VideoDepthPerceptionPlugin:
                 **dict(zip(("cal_a", "cal_b"),
                            _calibration_from_cfg(
                                icfg, (self._cal_a, self._cal_b),
-                               camera_id=self._camera_id_for(node_key),
-                               backend=self._backend))),
-                cal_origin=calibration_origin(icfg, self._camera_id_for(node_key),
-                                              self._backend),
+                               camera_id=self._camera_id_for(node_key)))),
+                cal_origin=calibration_origin(icfg, self._camera_id_for(node_key)),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
                 mask_barrel=bool(icfg.get("mask_lens_barrel",
@@ -1488,7 +1473,7 @@ class VideoDepthPerceptionPlugin:
             return f"site:calibrate({len(self._cal_samples)} 样本)"
         if self._cal_a == 1.0 and self._cal_b == 0.0:
             return "model-default"
-        return f"site:{calibration_origin(self._plugin_cfg, camera_id, self._backend)}"
+        return f"site:{calibration_origin(self._plugin_cfg, camera_id)}"
 
     def _require_engine(self):
         """Return a loaded engine, loading it on demand.
@@ -1618,7 +1603,7 @@ class VideoDepthPerceptionPlugin:
         props["backend"]["default"] = self._backend
         tools[0]["configSchema"]["properties"] = {
             key: props[key] for key in ("backend", "fps", "calibration_preset",
-                                        "cal_a", "cal_b", "cal_a_depthart", "cal_b_depthart")
+                                        "cal_a", "cal_b")
         }
         if self._backend == "depthart":
             preset = tools[0]["configSchema"]["properties"]["calibration_preset"]
@@ -1644,14 +1629,27 @@ class VideoDepthPerceptionPlugin:
                     self._model = None
                 self._backend = backend
                 self._plugin_cfg["backend"] = backend
-                # **Nothing is stripped any more.** This used to drop every
-                # calibration key so a fit measured on one model could not be
-                # applied to the other. With the coefficients keyed by model
-                # that cannot happen by construction, and the stripping was
-                # itself the bug: on r1_bj it erased the card's only fit, the
-                # canvas saved the erased row, and the robot ran uncalibrated.
+                # **Switching models clears the site calibration, and says
+                # so.** There is one `cal_a`/`cal_b` pair, because a fit is two
+                # numbers and the operator should not have to track which model
+                # each pair belongs to. The price of one pair is that it cannot
+                # survive a model change: a fit measured on YOLO left in place
+                # under DepthART is the r1_bj failure — `cal_b: -0.9753` on
+                # that lens is a factor of 2.65, and nothing downstream can
+                # tell a corrected metre from an uncorrected one.
+                #
+                # This stripping existed before and was removed as the cause of
+                # that incident. It was not the cause. **Doing it silently
+                # was**: the note below is the whole difference, and
+                # `info()` reports `model-default` alongside it.
                 for config in [self._plugin_cfg, *self._instance_configs.values()]:
-                    config.pop("depth_scale", None)
+                    for key in ("cal_a", "cal_b", "depth_scale", "calibration_preset"):
+                        config.pop(key, None)
+                self._cal_cleared_note = (
+                    f"深度模型已切换为 {backend!r} —— 站点标定（cal_a / cal_b）"
+                    f"已清空，因为它是在上一个模型上量的，照搬过来会整体偏掉。"
+                    f"请用 calibrate 重新量一次，并把结果填回卡片配置。")
+                log.warning(f"[visual_depth] {self._cal_cleared_note}")
                 self._cal_a, self._cal_b = 1.0, 0.0
                 self._cal_samples = []
                 self._cal_notes.clear()
@@ -1873,6 +1871,9 @@ class VideoDepthPerceptionPlugin:
                     self._cal_notes[instance_id] = cal_note
                 else:
                     self._cal_notes.pop(instance_id, None)
+            if self._cal_cleared_note:
+                cal_note = (self._cal_cleared_note + (" " + cal_note if cal_note else ""))
+                self._cal_cleared_note = ""
             note_field = {"calibration_note": cal_note} if cal_note else {}
             if instance_id:
                 with self._nodes_lock:
@@ -1884,10 +1885,10 @@ class VideoDepthPerceptionPlugin:
                         "config": cfg, **note_field}
             if "fps" in cfg:
                 self._fps = int(cfg["fps"])
-            if any(k in cfg for k in (*_cal_keys(self._backend), "depth_scale",
+            if any(k in cfg for k in ("cal_a", "cal_b", "depth_scale",
                                       "calibration_preset")):
                 self._cal_a, self._cal_b = _calibration_from_cfg(
-                    cfg, (self._cal_a, self._cal_b), backend=self._backend)
+                    cfg, (self._cal_a, self._cal_b))
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
             return {"status": "configured", "config": cfg, **note_field}
@@ -1901,7 +1902,7 @@ class VideoDepthPerceptionPlugin:
                 # engine's own fit.
                 if self._cal_cfg_backup is not None:
                     for key, value in zip(
-                            (*_cal_keys(self._backend), "calibration_preset"),
+                            ("cal_a", "cal_b", "calibration_preset"),
                             self._cal_cfg_backup):
                         if value is _ABSENT:
                             self._plugin_cfg.pop(key, None)
@@ -1909,7 +1910,7 @@ class VideoDepthPerceptionPlugin:
                             self._plugin_cfg[key] = value
                     self._cal_cfg_backup = None
                 self._apply_calibration(*_calibration_from_cfg(
-                    self._plugin_cfg, backend=self._backend))
+                    self._plugin_cfg))
                 return self._calibration_report({"message": "标定已清空，恢复成 engine 自带的标定"})
 
             distance = args.get("distance_m")
@@ -1969,14 +1970,12 @@ class VideoDepthPerceptionPlugin:
             # perception/config.yaml) a restart loses the fit — and it has,
             # twice, on r1_sz, each time silently restoring a 3.2x error.
             if self._cal_cfg_backup is None:
-                _ka, _kb = _cal_keys(self._backend)
                 self._cal_cfg_backup = (
-                    self._plugin_cfg.get(_ka, _ABSENT),
-                    self._plugin_cfg.get(_kb, _ABSENT),
+                    self._plugin_cfg.get("cal_a", _ABSENT),
+                    self._plugin_cfg.get("cal_b", _ABSENT),
                     self._plugin_cfg.get("calibration_preset", _ABSENT))
-            _ka, _kb = _cal_keys(self._backend)
-            self._plugin_cfg[_ka] = 1.0
-            self._plugin_cfg[_kb] = round(cal_b, 6)
+            self._plugin_cfg["cal_a"] = 1.0
+            self._plugin_cfg["cal_b"] = round(cal_b, 6)
             # ...and switch the selector, or the rule above would ignore the fit
             # that was just measured — writing two numbers nothing reads is
             # worse than not writing them.
@@ -1991,7 +1990,7 @@ class VideoDepthPerceptionPlugin:
                 # thing that has to survive a restart, and prose does not get
                 # copied accurately.
                 "save_to_config": {"calibration_preset": CAL_MANUAL,
-                                   _ka: 1.0, _kb: round(cal_b, 6)},
+                                   "cal_a": 1.0, "cal_b": round(cal_b, 6)},
                 "message": _calibration_message(self._cal_samples),
             }
             warnings = []
