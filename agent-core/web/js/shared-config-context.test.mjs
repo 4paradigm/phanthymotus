@@ -124,3 +124,25 @@ test('with no card the sidebar is still the only way in', () => {
 test('a tool with only instance fields never offers sidebar config', () => {
   assert.strictEqual(sidebarOffersConfig({ fps: { scope: 'instance' } }, []), false);
 });
+
+/** Mirrors sidebarOwnsConfig: step aside only if the card has a dialog. */
+function ownsConfig(props, cards) {
+  const v = Object.values(props);
+  if (!v.some(d => d.scope !== 'instance')) return false;
+  if (!v.some(d => d.scope === 'instance')) return true;
+  return cards.length === 0;
+}
+
+test('a shared-only tool keeps its sidebar config even with a card', () => {
+  // loco_servo: dry_run / rotate_only / require_standing are all shared, so
+  // its card renders no config button — the sidebar is the only way in, and
+  // hiding it put a chassis dry_run out of reach on R1.
+  const loco = { dry_run: {}, rotate_only: {}, require_standing: {} };
+  assert.strictEqual(ownsConfig(loco, [{ id: 'card-1' }]), true);
+  assert.strictEqual(ownsConfig(loco, []), true);
+});
+
+test('a tool with both scopes still hands over once it has a card', () => {
+  assert.strictEqual(ownsConfig(DEPTH_PROPS, [{ id: 'c' }]), false);
+  assert.strictEqual(ownsConfig(DEPTH_PROPS, []), true);
+});

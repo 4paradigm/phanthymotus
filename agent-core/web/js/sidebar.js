@@ -325,8 +325,19 @@ function _buildSubgroupLabel(type, count) {
 function sidebarOwnsConfig(mcpId, tool) {
   const schema = typeof tool === 'object' ? tool.configSchema : null;
   if (!schema) return false;
-  if (cardsForTool(mcpId, tool.name).length) return false;
-  return Object.values(schema.properties || {}).some(def => def.scope !== 'instance');
+  const props = Object.values(schema.properties || {});
+  if (!props.some(def => def.scope !== 'instance')) return false;   // nothing to set here
+
+  // **Only step aside if the card can actually take over.** A card's dialog
+  // exists only when the tool has instance-scope fields (`canvas.js`, the
+  // `hasInstanceFields` test that renders the gear). A tool whose settings are
+  // all shared — `loco_servo`, whose config is `dry_run`, `rotate_only` and
+  // `require_standing` — gets no dialog on its card, so hiding the sidebar
+  // entry for it removed the only way to reach those settings. On R1 that put
+  // `dry_run` out of reach, which is not a cosmetic field on a chassis.
+  if (!props.some(def => def.scope === 'instance')) return true;
+
+  return cardsForTool(mcpId, tool.name).length === 0;
 }
 
 function _buildChip(mcp, tool) {
