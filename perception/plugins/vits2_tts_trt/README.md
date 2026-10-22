@@ -116,12 +116,11 @@ utterance, including one abandoned before it reached a node.
 
 ### Audio delivery
 
-Each full PCM frame contains 100 ms of audio. The base send interval is 70 ms,
-bounded by a persistent one-second budget for audio already sent ahead of
-playback. Each node retains that budget across ordinary utterances and resets
-it on interrupt, so long sentences and queued short replies share the same
-limit. Reaching the limit delays the next send; it does not change the audio
-sample rate, waveform or speech speed.
+Each full PCM frame contains 100 ms of audio, with the original 70 ms base
+send interval; the final frame may be shorter. The additional one-second
+playback-lead limiter has been removed. This restores the original send
+cadence without changing the waveform, sample rate or speech speed. The
+current lifecycle, bounded synthesis queue and five-frame prebuffer remain.
 
 ### Chinese / English preference
 

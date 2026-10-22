@@ -58,18 +58,11 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return value
 
 
-# Recover the playback cushion at the original 70ms cadence. The persistent
-# playback window below bounds the total lead, including across utterances;
-# this is not an unlimited faster-than-realtime stream.
+# Keep Liaoqianqian's original 70ms delivery cadence for 100ms PCM frames.
 FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", 70, 0, 1000)
-# Leave room for the browser's 0.2s underrun padding under its 1.5s lead limit.
-# This limit applies to every consumer, including with legacy fast-delivery
-# environment settings. It cannot be disabled by deployment configuration.
-PLAYBACK_LEAD_MS = 1000
 FIRST_FRAME_DELAY_MS = _env_int("MIX_VITS_FIRST_FRAME_DELAY_MS", 0, 0, 1000)
-# Five 100ms frames provide an initial 0.5s cushion. They also pass through
-# the playback window, so queued replies cannot accumulate a new unbounded
-# cushion on each EOF. This burst stays below the subscriber's depth of 20.
+# Five 100ms frames provide an initial 0.5s cushion. This burst stays below
+# the subscriber's depth of 20.
 PREBUFFER_FRAMES = _env_int("MIX_VITS_PREBUFFER_FRAMES", 5, 0, 100)
 # Depth of the synthesis→publish handoff queue, in frames. Bounds memory while
 # still letting TensorRT run a whole text chunk ahead of the paced publisher.
@@ -86,24 +79,6 @@ SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 200, 0, 5000)
 # start/speak. Keep the normal asynchronous start contract and put a finite
 # bound on preparation when downloading or initializing a cold model is slow.
 _CONFIG_PREPARE_WAIT_S = 20.0
-
-class _PlaybackWindow:
-    """Bound queued audio duration on one output timeline, across utterances."""
-
-    def __init__(self, lead_seconds: float):
-        self.lead_seconds = lead_seconds
-        self.end_time = 0.0
-
-    def next_time(self, now: float, audio_seconds: float) -> float:
-        if self.lead_seconds <= 0:
-            return now
-        return max(now, max(self.end_time, now) + audio_seconds - self.lead_seconds)
-
-    def record(self, published_at: float, audio_seconds: float) -> None:
-        self.end_time = max(self.end_time, published_at) + audio_seconds
-
-    def reset(self) -> None:
-        self.end_time = 0.0
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -241,7 +216,6 @@ class _Vits2TTSNode(Node):
         # consume it, so it survives and swallows the *next* speak instead.
         self._interrupt_lock = threading.Lock()
         self._interrupt_gen = 0
-        self._playback_window = _PlaybackWindow(PLAYBACK_LEAD_MS / 1000.0)
         self._pub = self.create_publisher(AudioChunk, self._output_topic, _LOW_LAT_QOS)
         self._sub = (
             self.create_subscription(
@@ -392,8 +366,6 @@ class _Vits2TTSNode(Node):
             with self._interrupt_lock:
                 stale = gen is not None and gen < self._interrupt_gen
                 if not stale:
-                    # Keep the budget for audio already published: EOF and
-                    # interrupt do not acknowledge downstream queue removal.
                     # Arm for this utterance: whatever the last interrupt left
                     # behind is spent, and only an interrupt from here on may
                     # cancel it.
@@ -509,20 +481,8 @@ class _Vits2TTSNode(Node):
                                 burst_frames = 0
                     if self._utterance_cancelled():
                         return False
-                    audio_seconds = len(frame) / (SAMPLE_RATE * 2)
-                    target = self._playback_window.next_time(
-                        time.monotonic(), audio_seconds
-                    )
-                    while True:
-                        if self._utterance_cancelled():
-                            return False
-                        remaining = target - time.monotonic()
-                        if remaining <= 0:
-                            break
-                        self._interrupt_event.wait(min(remaining, 0.05))
                     self._publish(frame)
                     published_at = time.monotonic()
-                    self._playback_window.record(published_at, audio_seconds)
                     if first_published_at is None:
                         first_published_at = published_at
                     else:
@@ -633,7 +593,6 @@ class _Vits2TTSNode(Node):
                         "ttft=%.3fs elapsed=%.3fs audio=%.3fs rtf=%.4f "
                         "chunk_bytes=%d frame_interval_ms=%d "
                         "max_frame_gap_ms=%.1f prebuffer_frames=%d "
-                        "playback_lead_ms=%d "
                         "first_frame_delay_ms=%d subscriber_wait_ms=%.1f "
                         "subscriber_settle_ms=%.1f subscriber_count=%d",
                         total_bytes,
@@ -646,7 +605,6 @@ class _Vits2TTSNode(Node):
                         FRAME_INTERVAL_MS,
                         max_frame_gap * 1000.0,
                         PREBUFFER_FRAMES,
-                        PLAYBACK_LEAD_MS,
                         FIRST_FRAME_DELAY_MS,
                         (subscriber_wait_seconds or 0.0) * 1000.0,
                         (subscriber_settle_seconds or 0.0) * 1000.0,
