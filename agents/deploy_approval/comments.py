@@ -984,7 +984,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
 
     state = state or {}
     if state.get("status") not in {"testing", "succeeded", "failed"}:
-        return "<!-- deploy-approval-evidence:start -->\\n<!-- deploy-approval-evidence:end -->"
+        return "<!-- deploy-approval-evidence:start -->\n<!-- deploy-approval-evidence:end -->"
     head = state.get("head_sha", "")
     try:
         current_round = round_id_for_state(state)
