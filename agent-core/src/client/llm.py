@@ -425,6 +425,59 @@ THINKING_OFF_EXTRA = {
 }
 
 
+# ── think_mode=True：开着思考，但只给最低限度 ─────────────────────────────────
+#
+# 「开 thinking」不等于「随它想多久」。这个 agent 的每一轮都卡在用户面前——
+# 关与不关实测是 4 倍延迟差（见上表），而一轮里真正需要长链推理的只有少数。
+# 所以 think_mode=True 时仍然把档位压到各家支持的最低：留下思考能力，不留
+# 「想 2000 token 再开口」的尾巴。原先这里返回 {}，即完全不带参数，等于每家
+# 网关各按自己的默认档跑——同一个配置在两个供应商上行为不同，且都是最贵的那档。
+#
+# 和关闭那组一样：没有通用参数，所以几种写法全发，多余的字段绝大多数网关忽略，
+# 被 400 点名的由 _create() 逐个撤掉。两组走的是同一条降级路径。
+#
+# 几个取值上的坑：
+#   * `reasoning_effort` 用 "low" 而不是 OpenAI gpt-5 才有的 "minimal"——
+#     "low" 是各家都认的最低档，"minimal" 在别处会 400。
+#   * `thinking.budget_tokens` 必须 >= 1024（Anthropic 兼容层的硬下限，更小
+#     的值直接 400），所以 MIN_BUDGET 取 1024 而不是更激进的数。
+#   * `reasoning` 里只给 effort，不同时给 max_tokens——OpenRouter 要求二选一。
+#   * 智谱那条线只有 `thinking.type` 这一种开关，没有「低档」的说法，所以那边
+#     能做到的就是 type=enabled 加一个它可能忽略的 budget_tokens。
+#
+# 实测（2026-10-22，Orin5 对生产入口 router.phanthy.com，模型 glm-5.3，
+# baseline 与 MIN 交替各 12 次同一个 prompt，判据是 completion_tokens）：
+#
+#                       tokens 中位  tokens 均值  延迟中位
+#     不发任何字段            129         146      3.23s   ← 原先 think_mode=True 的行为
+#     这组六个一起发          100          85      2.38s
+#
+# 六个字段也逐个单发过（在生产配的那个别名模型上），没有任何一个被 400 —— 这组
+# 取值对这条线是全部可用的，不依赖降级路径。
+#
+# **但不要把单发的名次读成「哪个字段管用」。** 这个 router 的别名是按请求分发到
+# 多个上游渠道的，所以逐样本的 completion_tokens 方差极大：同一组参数五次采样
+# 拿到过 2 / 5 / 1227 / 1440 / 1485。关闭那张表（2026-10-14）的名次能成立是因为
+# 关掉之后答案本身只剩一个数字，差异盖过了方差；最低档这边没有这种放大效应，
+# 只能交替多采样看中位。换一条线要重测，重测也要交替，别按顺序跑完一组再跑下一组。
+THINKING_MIN_BUDGET = 1024
+
+THINKING_MIN_EXTRA = {
+    # vLLM / SGLang 托管的 Qwen3、GLM 系列：chat template 里同时认开关和预算
+    "chat_template_kwargs": {"enable_thinking": True,
+                             "thinking_budget": THINKING_MIN_BUDGET},
+    # 智谱 GLM-4.5/4.6/5.x 的 OpenAI 接口、Anthropic 兼容网关
+    "thinking": {"type": "enabled", "budget_tokens": THINKING_MIN_BUDGET},
+    # DashScope 及部分自建网关放在顶层的同名开关
+    "enable_thinking": True,
+    "thinking_budget": THINKING_MIN_BUDGET,
+    # OpenRouter：effort 和 max_tokens 二选一，这里只给 effort
+    "reasoning": {"enabled": True, "effort": "low"},
+    # OpenAI 风格。"low" 是各家通认的最低档，"minimal" 只有 gpt-5 认
+    "reasoning_effort": "low",
+}
+
+
 def _looks_like_unknown_param(err: str) -> bool:
     """400 的文案像不像「有个参数我不认识」。"""
     low = err.lower()
@@ -472,11 +525,12 @@ class Client():
     ) -> dict:
 
         def _extra(client, think_mode: bool) -> dict:
-            if think_mode:
-                return {}
+            # think_mode 只决定发哪一组：关掉，还是开着但压到最低档。两组共用
+            # 同一条「被 400 点名就撤掉」的降级记账。
+            base = THINKING_MIN_EXTRA if think_mode else THINKING_OFF_EXTRA
             # 之前被这个 endpoint 400 掉的字段不再发
             rejected = getattr(client, '_thinking_rejected', ())
-            extra = {k: v for k, v in THINKING_OFF_EXTRA.items() if k not in rejected}
+            extra = {k: v for k, v in base.items() if k not in rejected}
             return {"extra_body": extra} if extra else {}
 
         async def _create(client, model, url, kwargs):
