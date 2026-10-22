@@ -507,7 +507,7 @@ _JAVASCRIPT = r'''"use strict";
       const actions = document.createElement("div");
       actions.className = "attachment-actions";
       const url = deleted ? "" : attachmentDownloadUrl(item);
-      if (url && !kind) {
+      if (url && kind !== "video") {
         actions.append(anchor("下载", "/attachments/" + id(item.attachment_id || item.id) +
           "/download?cap=" + encodeURIComponent(item.download_capability)));
       }
