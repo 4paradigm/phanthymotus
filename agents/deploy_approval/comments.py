@@ -1004,11 +1004,13 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     api = _evidence_path(repo, pr_number)
     if not enabled or not api:
         base = ""
-    groups = {(head, current_round): dict(state, attachments=list(state.get("attachments") or []))}
+    groups = {(head, current_round): dict(
+        state, attachments=list(state.get("attachments") or []),
+        attachment_details_complete=isinstance(state.get("attachments"), list),
+    )}
     if isinstance(records, dict):
         records = records.get("rounds", records.get("records", records.get("attachments", [])))
     archive_links = list(archive_links or [])
-    archive_available = bool(archive_links) or isinstance(state.get("round_archive"), dict)
     entries = list(records or []) + [a for a in archive_links if isinstance(a, dict) and "snapshot" in a]
     for row in entries:
         if not isinstance(row, dict):
@@ -1031,11 +1033,17 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             group["attachments"] = attachments + list(snapshot.get("attachments") or [])
             if row is not snapshot:
                 group["attachments"].extend(row.get("attachments") or [])
+            if isinstance(snapshot.get("attachments"), list):
+                group["attachment_details_complete"] = True
+            if isinstance(row.get("attachments"), list):
+                group["attachment_details_complete"] = True
             for record in row.get("attachment_records", []):
                 if isinstance(record, dict) and isinstance(record.get("data"), dict):
                     group["attachments"].append(record["data"])
+                    group["attachment_details_complete"] = True
         else:
             group.setdefault("attachments", []).append(row)
+            group["attachment_details_complete"] = True
 
     page_path = api.replace("/api/evidence/", "/evidence/", 1)
 
@@ -1059,6 +1067,24 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 latest_items[identity] = item
         return list(latest_items.values())
 
+    def is_internal_test_note(item):
+        if not isinstance(item, dict) or item.get("status") != "text":
+            return False
+        actor = item.get("actor_login") or item.get("actor") or item.get("uploader")
+        if not isinstance(actor, str) or actor.casefold() != "4pd-pr-assistant[bot]":
+            return False
+        note = item.get("note") or item.get("text") or item.get("filename")
+        if not isinstance(note, str):
+            return False
+        normalized = " ".join(note.split()).casefold()
+        return normalized in {
+            "server-side cos multipart acceptance",
+            "server-side 20mb h.264 cos transport acceptance",
+        }
+
+    def visible_attachments(group):
+        return [item for item in latest_attachments(group) if not is_internal_test_note(item)]
+
     def parsed_timestamp(value):
         if not isinstance(value, str) or not value.strip():
             return None
@@ -1076,6 +1102,14 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         # Preserve naive historical wall time without assigning it a timezone.
         return parsed.strftime("%Y-%m-%d %H:%M")
 
+    def sortable_time(value):
+        parsed = parsed_timestamp(value)
+        if parsed is None:
+            return (0, "")
+        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            return (2, parsed.astimezone(_dt.timezone.utc).timestamp())
+        return (1, parsed.isoformat())
+
     def summary_date(value):
         parsed = parsed_timestamp(value)
         if parsed is None:
@@ -1092,8 +1126,9 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
 
     def render_round(key, group, *, historical=False, round_number=1):
         h, r = key
-        items = latest_attachments(group)
-        items.sort(key=lambda item: (parsed_timestamp(item.get("created_at")) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)), reverse=True)
+        items = visible_attachments(group)
+        items.sort(key=lambda item: sortable_time(first_valid_time(
+            item.get("created_at"), item.get("uploaded_at"))), reverse=True)
         lines = []
         if historical:
             historical_time = first_valid_time(
@@ -1106,8 +1141,11 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             lines.extend([
                 f"**状态：** {_escape(group.get('status') if isinstance(group.get('status'), str) else '未知')}", "",
             ])
-        lines.extend([f"### 第 {round_number} 轮 · 附件", "",
-                      "| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
+        if items:
+            if historical:
+                lines.extend([f"### 第 {round_number} 轮", ""])
+            lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
+        note_blocks = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1128,16 +1166,30 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 actor = "分享链接（身份未验证）"
             else:
                 actor = "身份未验证"
-            uploaded_at = summary_time(item.get("created_at") or item.get("uploaded_at"))
+            uploaded_at = summary_time(first_valid_time(item.get("created_at"), item.get("uploaded_at")))
             if deleted:
                 filename = filename + "（已删除）"
             lines.append("| " + " | ".join(_escape(value) for value in
                 (filename, size, actor, uploaded_at)) + " |")
+            note = item.get("note") or (item.get("text") if status == "text" else "")
+            if isinstance(note, str) and note.strip():
+                note_blocks.extend([
+                    "<details>",
+                    f"<summary>{_escape(filename)} · 备注</summary>",
+                    "",
+                    _escape(note.strip()),
+                    "",
+                    "</details>",
+                    "",
+                ])
+        lines.extend(note_blocks)
         if not items:
-            empty_label = ("附件明细请查看历史归档" if historical and archive_available
-                           else "该轮未保存附件" if historical
-                           else "本轮暂无附件，上传后会显示")
-            lines.append("| " + empty_label + " | — | — | — |")
+            if historical:
+                lines.extend([f"### 第 {round_number} 轮", "",
+                              "附件明细请查看历史归档" if not group.get("attachment_details_complete")
+                              else "该轮未保存附件"])
+            else:
+                lines.append("本轮暂无附件，上传后会显示")
         if group.get("deployments"):
             lines.extend(["", "### 部署记录", "",
                           _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
@@ -1180,8 +1232,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     def round_sort_time(key):
         group = groups[key]
         value = first_valid_time(group.get("round_started_at"), group.get("started_at"), group.get("created_at"), group.get("archived_at"), group.get("ended_at"))
-        parsed = parsed_timestamp(value)
-        return parsed.timestamp() if parsed is not None else 0
+        return sortable_time(value)
     ordered_rounds = sorted(round_keys, key=round_sort_time)
     round_numbers = {key: index + 1 for index, key in enumerate(ordered_rounds)}
     current_round_number = round_numbers.get((head, current_round), max(1, len(round_numbers)))
@@ -1199,9 +1250,9 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                       if state.get("status") == "testing" else "")
         read_url = page_url(state.get("capability"))
         if upload_url:
-            lines.extend(["", f"[上传或查看附件](<{upload_url}>)"])
+            lines.extend(["", f"[打开附件页](<{upload_url}>)"])
         elif read_url:
-            lines.extend(["", f"[查看附件](<{read_url}>)"])
+            lines.extend(["", f"[打开附件页](<{read_url}>)"])
     if current_context_valid and state.get("status") == "testing" and page_url(state.get("upload_capability")):
         pending = sum(1 for item in state.get("attachments", [])
                       if isinstance(item, dict)
@@ -1225,7 +1276,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后再记录 `/record_test result=pass|fail`。",
         ])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
-    old.sort(key=lambda pair: str(pair[1].get("archived_at") or pair[1].get("ended_at") or pair[1].get("created_at") or ""), reverse=True)
+    old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
     if old:
         lines.extend(["", "### 历史轮次", ""])
         for key, group in old[:3]:
@@ -1235,11 +1286,12 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 group.get("created_at"),
             )
             attachment_count = sum(
-                1 for item in latest_attachments(group)
+                1 for item in visible_attachments(group)
                 if not (item.get("deleted_at") or item.get("status") == "deleted")
             )
             count_label = (f"{attachment_count} 个附件" if attachment_count else
-                           "附件明细请查看历史归档" if archive_available else "该轮未保存附件")
+                           "0 个附件" if group.get("attachment_details_complete")
+                           else "附件明细请查看历史归档")
             date_label = summary_date(timestamp)
             if date_label == "时间未知":
                 date_label = "历史归档"
