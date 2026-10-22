@@ -1113,7 +1113,12 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 continue
             deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
             status = "deleted" if deleted else item.get("status", "pending")
-            filename = item.get("filename") or ("附件说明" if status == "text" else "附件文件")
+            filename = item.get("filename")
+            if (not isinstance(filename, str) or not filename.strip()
+                    or re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", filename.strip())):
+                filename = "附件说明" if status == "text" else "附件文件"
+            else:
+                filename = filename.strip()
             size = item.get("size", "—")
             if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
                 size = _human_size(size)
