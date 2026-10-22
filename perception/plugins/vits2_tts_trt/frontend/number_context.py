@@ -32,8 +32,7 @@ _PHONE_CUED = re.compile(
 _ID_VALUE = rf"[A-Za-z0-9]+(?:[{_DASH}_][A-Za-z0-9]+)*"
 _ID_CUED = re.compile(
     r"(?:订单\s*(?i:ID)|订单号|项目编号|订单编号|编号|序列号|验证码|尾号|"
-    r"最后\s*(?:四|4)\s*位|后\s*(?:四|4)\s*位|"
-    r"(?i:\b(?:order\s+(?:id|number)|serial\s+number|verification\s+code|last\s+four\s+digits)))"
+    r"(?i:\b(?:order\s+(?:id|number)|serial\s+number|verification\s+code)))"
     rf"\s*(?:是|为|(?i:is|are))?\s*[:：]?\s*(?P<value>{_ID_VALUE})(?![A-Za-z0-9_]|\.\d)"
 )
 # An explicitly named identifier may have an owner between its field name and
@@ -65,6 +64,10 @@ _TRAILING_FOUR_DIGITS = re.compile(
     r"(?:\s+(?:is|are)\s*[:：]?\s*|\s*[:：]\s*|\s+)"
     r"(?P<value>\d{4})(?![A-Za-z0-9_]|[.,]\d)",
     re.IGNORECASE,
+)
+_ZH_TRAILING_FOUR_DIGITS = re.compile(
+    r"(?:最后|末|后)\s*(?:四|4)\s*位\s*(?:是|为)?\s*[:：]?\s*"
+    r"(?P<value>\d{4})(?![A-Za-z0-9_]|[.,]\d)"
 )
 _NUMBERED_ID = re.compile(
     r"(?<![A-Za-z0-9_])(?i:NO)\.(?P<value>\d+)(?![A-Za-z0-9_]|\.\d)"
@@ -116,8 +119,9 @@ def find_spans(text, language, verbalize_number):
 
     # An explicit field label takes priority over date/phone/unit shapes:
     # order ID 12A is an identifier, not twelve amperes.
-    for match in _TRAILING_FOUR_DIGITS.finditer(text):
-        add(match.start("value"), match.end("value"), _digits(match["value"], language))
+    for pattern in (_TRAILING_FOUR_DIGITS, _ZH_TRAILING_FOUR_DIGITS):
+        for match in pattern.finditer(text):
+            add(match.start("value"), match.end("value"), _digits(match["value"], language))
     for match in _ID_CUED.finditer(text):
         if any(c.isdigit() for c in match["value"]):
             add(match.start("value"), match.end("value"), _identifier(match["value"], language))

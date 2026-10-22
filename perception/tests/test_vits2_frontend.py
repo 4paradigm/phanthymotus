@@ -16,6 +16,7 @@ or from the repo, with a release under /models/vits2:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -131,3 +132,87 @@ def test_pure_chinese_still_takes_the_chinese_path():
     assert chinese.zh_speakable("今天天气不错，") is True
     _, _, langs, _ = g2p_normalized_text_mix(normalize_text_mix("今天天气不错。"))
     assert set(langs) == {"ZH"}
+
+
+@pytest.fixture(scope="module")
+def production_text_adapter():
+    """Use the real chunking/ID methods without constructing a CUDA engine."""
+    from plugins.vits2_tts_trt.adapter import Vits2TensorRTAdapter
+    from plugins.vits2_tts_trt.runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
+
+    engine = TensorRTNumpyTTSEngine.__new__(TensorRTNumpyTTSEngine)
+    engine.add_blank = bool(json.loads((MODEL_DIR / "config.json").read_text())["data"].get("add_blank", True))
+    adapter = Vits2TensorRTAdapter.__new__(Vits2TensorRTAdapter)
+    adapter._engine = engine
+    adapter.max_chunk_tokens = 256
+    return adapter
+
+
+def _production_chunks(adapter, text):
+    from plugins.vits2_tts_language.plugin import _direct_request, _prepare_chunks
+    from plugins.vits2_tts_language.policy import LanguagePolicy
+
+    request = _direct_request(LanguagePolicy("auto"), text)
+    return _prepare_chunks(adapter, request).chunks
+
+
+@pytest.mark.parametrize("text", [
+    "NVIDIA uses Agentic.",
+    "今天 NVIDIA 使用 Agentic。",
+    "请读这句英文，Nvidia uses AGENTIC，然后继续。",
+])
+def test_verified_terms_survive_real_fst_in_production_language_routes(production_text_adapter, text):
+    from plugins.vits2_tts_trt.frontend.symbols import symbols
+
+    chunks = _production_chunks(production_text_adapter, text)
+    normalized = " ".join(value for value, _ in chunks)
+    assert "nvidia" in normalized.lower()
+    assert "agentic" in normalized.lower()
+    assert "英伟达" not in normalized
+    all_phones, all_tones, all_languages = [], [], []
+    for value, ids in chunks:
+        phones, tones, languages, word2ph = g2p_normalized_text_mix(value)
+        assert len(phones) == len(tones) == len(languages) == sum(word2ph)
+        expected_ids = 2 * len(phones) + 1 if production_text_adapter._engine.add_blank else len(phones)
+        assert len(ids[0]) == len(ids[1]) == len(ids[2]) == expected_ids
+        assert all(phone in symbols and phone != "UNK" for phone in phones)
+        all_phones.extend(phones)
+        all_tones.extend(tones)
+        all_languages.extend(languages)
+    for expected_phones, expected_tones in (
+            (["eh", "n", "V", "ih", "d", "iy", "ah"], [1, 3, 3, 2, 3, 1, 1]),
+            (["ah", "jh", "eh", "n", "t", "ih", "k"], [1, 3, 2, 3, 3, 1, 3])):
+        matches = [index for index in range(len(all_phones) - len(expected_phones) + 1)
+                   if all_phones[index:index + len(expected_phones)] == expected_phones]
+        assert len(matches) == 1
+        start, end = matches[0], matches[0] + len(expected_phones)
+        assert all_tones[start:end] == expected_tones
+        assert all_languages[start:end] == ["EN"] * len(expected_phones)
+        if expected_phones[-1] == "k":
+            assert all_phones[end] in {".", ","}, "Agentic acquired an extra final phone"
+
+
+def test_verified_terms_leave_real_numeric_and_address_spans_intact(production_text_adapter):
+    text = ("NVIDIA uses 8.5GB. Agentic reads https://nvidia.com/Agentic?x=2 "
+            "and agentic+nvidia_2@example.com.")
+    normalized = " ".join(" ".join(
+        value for value, _ in _production_chunks(production_text_adapter, text)
+    ).split())
+    assert "NVIDIA" in normalized
+    assert "Agentic reads" in normalized
+    assert "eight point five gigabytes" in normalized
+    assert "N V I D I A dot C O M slash A G E N T I C question mark X equals two" in normalized
+    assert "A G E N T I C plus N V I D I A underscore two at E X A M P L E dot C O M" in normalized
+    assert not any(char.isdecimal() for char in normalized)
+
+
+def test_uppercase_abbreviations_keep_letter_readings_through_real_fst(production_text_adapter):
+    text = "The US team uses this IP address and order ID. IT support is available."
+    chunks = _production_chunks(production_text_adapter, text)
+    normalized = " ".join(value for value, _ in chunks)
+    for phrase in ("U S team", "I P address", "order I D", "I T support"):
+        assert phrase in normalized
+    for value, _ in chunks:
+        phones, tones, languages, word2ph = g2p_normalized_text_mix(value)
+        assert len(phones) == len(tones) == len(languages) == sum(word2ph)
+        assert "UNK" not in phones

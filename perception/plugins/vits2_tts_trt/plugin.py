@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -57,21 +58,18 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return value
 
 
-# Pace at exactly the audio duration each frame carries. It used to be 70ms for
-# a 100ms frame, which over-delivers by 1.43x *forever*: that was this engine's
-# way of slowly accruing a downstream cushion at 30ms/frame back when it had no
-# prebuffer, and it cost an unbounded lead. PREBUFFER_FRAMES now hands the
-# consumer its whole cushion up front, so the accrual is pure surplus — and
-# surplus with no end has no safe landing. A consumer can only absorb it by
-# buffering without bound or by discarding audio; the browser player tried to
-# cap its lead instead and rewound its own schedule into audio it had already
-# queued, which played back overlapped and 1.43x too fast.
-FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", int(PCM_FRAME_MS), 0, 1000)
+# Recover the playback cushion at the original 70ms cadence. The persistent
+# playback window below bounds the total lead, including across utterances;
+# this is not an unlimited faster-than-realtime stream.
+FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", 70, 0, 1000)
+# Leave room for the browser's 0.2s underrun padding under its 1.5s lead limit.
+# This limit applies to every consumer, including with legacy fast-delivery
+# environment settings. It cannot be disabled by deployment configuration.
+PLAYBACK_LEAD_MS = 1000
 FIRST_FRAME_DELAY_MS = _env_int("MIX_VITS_FIRST_FRAME_DELAY_MS", 0, 0, 1000)
-# Frames held back before pacing starts, then published in one burst so every
-# consumer begins with a real cushion instead of zero. This — not the pacing
-# interval — is where the downstream margin comes from. The sherpa engine has
-# always done this (plugins/tts.py PREBUF_FRAMES); same idea on this engine.
+# Five 100ms frames provide an initial 0.5s cushion. They also pass through
+# the playback window, so queued replies cannot accumulate a new unbounded
+# cushion on each EOF. This burst stays below the subscriber's depth of 20.
 PREBUFFER_FRAMES = _env_int("MIX_VITS_PREBUFFER_FRAMES", 5, 0, 100)
 # Depth of the synthesis→publish handoff queue, in frames. Bounds memory while
 # still letting TensorRT run a whole text chunk ahead of the paced publisher.
@@ -83,22 +81,29 @@ SYNTH_QUEUE_FRAMES = _env_int("MIX_VITS_SYNTH_QUEUE_FRAMES", 200, 1, 4000)
 MAX_BURST_FRAMES = _env_int("MIX_VITS_MAX_BURST_FRAMES", 20, 1, 200)
 SUBSCRIBER_WAIT_MS = _env_int("MIX_VITS_SUBSCRIBER_WAIT_MS", 5000, 0, 60000)
 SUBSCRIBER_POLL_MS = _env_int("MIX_VITS_SUBSCRIBER_POLL_MS", 10, 1, 1000)
-SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 500, 0, 5000)
-# Off by default: sending faster than realtime has no safe landing on a live
-# consumer. It either buffers without bound or has to discard audio, and the
-# browser player's attempt to bound its lead instead produced overlapped,
-# 1.43x-fast playback. Only useful for an offline benchmark that drains as fast
-# as it can, so it must be asked for explicitly.
-ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "0") == "1"
-if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
-    log.warning(
-        "[vits2_tts_trt] MIX_VITS_FRAME_INTERVAL_MS=%d sends %.0fms PCM frames "
-        "faster than realtime, which a live consumer cannot absorb; pacing at "
-        "%.0fms instead (set MIX_VITS_ALLOW_FAST_DELIVERY=1 for an offline "
-        "benchmark)",
-        FRAME_INTERVAL_MS, PCM_FRAME_MS, PCM_FRAME_MS,
-    )
-    FRAME_INTERVAL_MS = int(PCM_FRAME_MS)
+SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 200, 0, 5000)
+# Optional deployment preparation belongs to config, which is issued before
+# start/speak. Keep the normal asynchronous start contract and put a finite
+# bound on preparation when downloading or initializing a cold model is slow.
+_CONFIG_PREPARE_WAIT_S = 20.0
+
+class _PlaybackWindow:
+    """Bound queued audio duration on one output timeline, across utterances."""
+
+    def __init__(self, lead_seconds: float):
+        self.lead_seconds = lead_seconds
+        self.end_time = 0.0
+
+    def next_time(self, now: float, audio_seconds: float) -> float:
+        if self.lead_seconds <= 0:
+            return now
+        return max(now, max(self.end_time, now) + audio_seconds - self.lead_seconds)
+
+    def record(self, published_at: float, audio_seconds: float) -> None:
+        self.end_time = max(self.end_time, published_at) + audio_seconds
+
+    def reset(self) -> None:
+        self.end_time = 0.0
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -236,6 +241,7 @@ class _Vits2TTSNode(Node):
         # consume it, so it survives and swallows the *next* speak instead.
         self._interrupt_lock = threading.Lock()
         self._interrupt_gen = 0
+        self._playback_window = _PlaybackWindow(PLAYBACK_LEAD_MS / 1000.0)
         self._pub = self.create_publisher(AudioChunk, self._output_topic, _LOW_LAT_QOS)
         self._sub = (
             self.create_subscription(
@@ -386,6 +392,8 @@ class _Vits2TTSNode(Node):
             with self._interrupt_lock:
                 stale = gen is not None and gen < self._interrupt_gen
                 if not stale:
+                    # Keep the budget for audio already published: EOF and
+                    # interrupt do not acknowledge downstream queue removal.
                     # Arm for this utterance: whatever the last interrupt left
                     # behind is spent, and only an interrupt from here on may
                     # cancel it.
@@ -501,8 +509,20 @@ class _Vits2TTSNode(Node):
                                 burst_frames = 0
                     if self._utterance_cancelled():
                         return False
+                    audio_seconds = len(frame) / (SAMPLE_RATE * 2)
+                    target = self._playback_window.next_time(
+                        time.monotonic(), audio_seconds
+                    )
+                    while True:
+                        if self._utterance_cancelled():
+                            return False
+                        remaining = target - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._interrupt_event.wait(min(remaining, 0.05))
                     self._publish(frame)
                     published_at = time.monotonic()
+                    self._playback_window.record(published_at, audio_seconds)
                     if first_published_at is None:
                         first_published_at = published_at
                     else:
@@ -613,6 +633,7 @@ class _Vits2TTSNode(Node):
                         "ttft=%.3fs elapsed=%.3fs audio=%.3fs rtf=%.4f "
                         "chunk_bytes=%d frame_interval_ms=%d "
                         "max_frame_gap_ms=%.1f prebuffer_frames=%d "
+                        "playback_lead_ms=%d "
                         "first_frame_delay_ms=%d subscriber_wait_ms=%.1f "
                         "subscriber_settle_ms=%.1f subscriber_count=%d",
                         total_bytes,
@@ -625,6 +646,7 @@ class _Vits2TTSNode(Node):
                         FRAME_INTERVAL_MS,
                         max_frame_gap * 1000.0,
                         PREBUFFER_FRAMES,
+                        PLAYBACK_LEAD_MS,
                         FIRST_FRAME_DELAY_MS,
                         (subscriber_wait_seconds or 0.0) * 1000.0,
                         (subscriber_settle_seconds or 0.0) * 1000.0,
@@ -708,6 +730,9 @@ class TTSPlugin:
         # for dict/flag updates — never across a download, an engine build or a
         # node start/stop. See perception/README.md § Plugin Concurrency.
         self._state_lock = threading.RLock()
+        # Serialize resident speed changes without holding the lifecycle lock:
+        # set_speed can wait for the adapter's current synthesis to finish.
+        self._config_update_lock = threading.Lock()
         self._nodes = {}
         self._pending_starts = {}        # node_key -> input_topic
         self._pending_speech = {}        # node_key -> [(text, action_id, context), ...]
@@ -763,9 +788,11 @@ class TTSPlugin:
             # Returns the engine directory of the family that matches the
             # TensorRT actually importable here, so the adapter never has to
             # guess between engines/jp61 and engines/jp511.
+            download_options = {"progress_cb": progress_cb, "stage_cb": stage_cb}
+            if "model_base_url" in cfg:
+                download_options["base_url"] = cfg["model_base_url"]
             cfg["engine_dir"] = ensure_vits2_model(
-                cfg.get("model_dir", "/models/vits2"),
-                progress_cb=progress_cb, stage_cb=stage_cb,
+                cfg.get("model_dir", "/models/vits2"), **download_options,
             )
             # The verified archive may have a release-root directory. Frontend
             # data and config must come from that same bundle as its engines.
@@ -782,6 +809,19 @@ class TTSPlugin:
                     "[vits2_tts_trt] engine ready: bytes=%d elapsed=%.3fs",
                     warmup_bytes, time.monotonic() - started,
                 )
+            with self._state_lock:
+                superseded = generation != self._load_generation
+                if not superseded:
+                    if self._cfg.get("prepare_on_config", False):
+                        # Preparation configs may update speed while this one
+                        # loader is running. Apply the latest value atomically
+                        # with installation instead of building another engine.
+                        adapter.set_speed(float(self._cfg.get("speed", 1.0)))
+                    self._adapter = adapter
+                    self._adapter_state = "ready"
+                    self._load_error = None
+                    self._load_status = None
+                    self._model_name = "vits2-tensorrt"
         except Exception as error:  # noqa: BLE001 - surfaced via state/info
             log.exception("[vits2_tts_trt] adapter load failed")
             with self._state_lock:
@@ -797,14 +837,6 @@ class TTSPlugin:
             _release_actions(abandoned)
             return
 
-        with self._state_lock:
-            superseded = generation != self._load_generation
-            if not superseded:
-                self._adapter = adapter
-                self._adapter_state = "ready"
-                self._load_error = None
-                self._load_status = None
-                self._model_name = "vits2-tensorrt"
         if superseded:
             # A config change happened mid-load; never install the result.
             return
@@ -970,7 +1002,13 @@ class TTSPlugin:
             return self._speak(args, instance_id)
 
         if action == "config":
-            return self._config(args)
+            result = self._config(args)
+            if self._cfg.get("prepare_on_config", False):
+                # The language wrapper also owns _config and may not delegate
+                # an empty config. Prepare after its validation/state update,
+                # at this shared dispatch boundary, exactly once per request.
+                result = {**result, **self._prepare_config({})}
+            return result
 
         if action == "interrupt":
             return self._interrupt(instance_id)
@@ -1141,6 +1179,8 @@ class TTSPlugin:
                 "state": "loading", **self._speech_metadata(context)}
 
     def _config(self, args: dict) -> dict:
+        if self._cfg.get("prepare_on_config", False):
+            return self._prepare_config(args, wait=False)
         if "speaker_id" in args:
             self._cfg["speaker_id"] = int(args["speaker_id"])
         if "speed" in args:
@@ -1167,6 +1207,60 @@ class TTSPlugin:
         if adapter is not None:
             adapter.set_speed(speed)
         return {"status": "configured"}
+
+    def _prepare_config(self, args: dict, wait: bool = True) -> dict:
+        """Prepare a resident model before use, with bounded config latency.
+
+        This is opt-in for deployments that configure their service before
+        accepting speech requests. It does not create a ROS node or change
+        start's non-blocking behavior. Repeated config calls share the same
+        loader; a speed update is applied when that loader installs its model.
+        """
+        timeout = float(self._cfg.get("prepare_timeout_s", _CONFIG_PREPARE_WAIT_S))
+        if not math.isfinite(timeout) or not 0 <= timeout <= 50:
+            raise ValueError("prepare_timeout_s must be between zero and 50 seconds")
+        with self._config_update_lock:
+            with self._state_lock:
+                speaker_id = int(args.get("speaker_id", self._cfg.get("speaker_id", 0)))
+                if speaker_id != 0:
+                    raise ValueError("The VITS2 model supports only speaker_id=0")
+                speed = float(args.get("speed", self._cfg.get("speed", 1.0)))
+                if not math.isfinite(speed) or not 0 < speed <= 4:
+                    raise ValueError("TTS speed must be greater than zero and at most four")
+                adapter = self._adapter
+                if adapter is not None and speed == float(self._cfg.get("speed", 1.0)):
+                    return {"status": "configured", "model_state": "ready"}
+                if adapter is None:
+                    self._cfg["speaker_id"] = speaker_id
+                    self._cfg["speed"] = speed
+                    if not wait:
+                        return {"status": "configured"}
+                    self._request_load_locked()
+            if adapter is not None:
+                # The adapter holds its lock across yielded PCM. Keep info,
+                # interrupt and stop available while waiting for that lock.
+                # Commit only after success, so a failed setting is not saved.
+                adapter.set_speed(speed)
+                with self._state_lock:
+                    self._cfg["speaker_id"] = speaker_id
+                    self._cfg["speed"] = speed
+                return {"status": "configured", "model_state": "ready"}
+
+        deadline = time.monotonic() + timeout
+        while True:
+            # Never hold the state lock while waiting: the loader and info
+            # need it to publish progress, errors and the final ready state.
+            with self._state_lock:
+                if self._adapter_state == "error":
+                    return {"status": "error", "state": "error",
+                            "message": self._load_error or "VITS2 model preparation failed"}
+                if self._adapter is not None and self._adapter_state == "ready":
+                    return {"status": "configured", "model_state": "ready"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"status": "configured", "state": "loading",
+                        "message": "VITS2 model preparation is still in progress"}
+            time.sleep(min(0.02, remaining))
 
     def _interrupt(self, instance_id: str) -> dict:
         with self._state_lock:

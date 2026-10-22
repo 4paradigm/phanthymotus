@@ -103,6 +103,9 @@ class TrailingDigitsContextTest(unittest.TestCase):
         for text in (
             "请确认手机号码的最后四位是5690。",
             "请确认最后4位为0056。",
+            "我的电话号码是13800138000，末四位是5690。",
+            "请确认末4位为0056。",
+            "后 四 位：0056。",
             "订单编号为8492610。",
         ):
             with self.subTest(text=text):
@@ -110,6 +113,27 @@ class TrailingDigitsContextTest(unittest.TestCase):
                     ("8492610", "八四九二六一零") if "8492610" in text else ("5690", "五六九零")
                 )
                 self.assertEqual(replacements(text, "ZH"), [expected])
+
+    def test_chinese_trailing_digits_require_a_complete_four_digit_value(self):
+        for label in ("末四位", "最后四位", "后4位"):
+            for value in ("569", "56900", "5690.5", "5690,5", "5690A", "5690GB", "A5690"):
+                with self.subTest(label=label, value=value):
+                    self.assertEqual(replacements(label + "是" + value + "。", "ZH"), [])
+
+    def test_last_digit_labels_do_not_capture_later_quantities(self):
+        for text in (
+            "末四位需要核对。共有5690个样本。",
+            "末四位尚不明确，累计5690次调用。",
+            "最后四位不是5690。",
+            "最后四位是根据5690条数据计算的。",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(replacements(text, "ZH"), [])
+
+    def test_short_english_trailing_label_cannot_bypass_four_digit_boundary(self):
+        for value in ("569", "56900", "5690.5", "5690GB"):
+            with self.subTest(value=value):
+                self.assertEqual(replacements("Last four digits are " + value + "."), [])
 
     def test_last_digits_context_uses_explicit_requested_number_language(self):
         text = "The last four digits of your phone number are 0056."

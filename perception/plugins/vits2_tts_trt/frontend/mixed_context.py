@@ -28,7 +28,7 @@ _MODEL = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9]*(?:[.\-_‑][A-Za-z0-
 _MEASURE = re.compile(r"(?<![A-Za-z0-9_.,])[+\-±]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*(?:[kKMGTmun]?B(?:/s)?|[kKMm]?Hz|[kKmM]?V|[mµu]?A|[kKm]?W|dB|℃|°[CF]|%)(?![A-Za-z])")
 _ZH_FIELD = re.compile(r"(?:内存(?:阈值)?|信噪比|电流|电压|功率|温度|误差|学习率|"
                        r"日期|时间|下单时间|订单(?:号|编号|\s*ID)?|编号|验证码|尾号|"
-                       r"最后(?:四|4)位|后(?:四|4)位|客服电话|电话|容量|阈值)"
+                       r"(?:最后|末|后)\s*(?:四|4)\s*位|客服电话|电话|容量|阈值)"
                        r"\s*(?:[A-Za-z]{1,5}\s*)?(?:设为|设置为|是|为|等于)?\s*[:：=≥≤<>]*\s*$", re.I)
 _EN_FIELD = re.compile(r"\b(?:memory(?:\s+(?:limit|threshold))?|current|voltage|power|"
                        r"temperature|error|learning\s+rate|date|time|order\s+(?:id|number)|"

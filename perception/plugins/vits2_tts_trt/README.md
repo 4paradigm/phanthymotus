@@ -96,6 +96,7 @@ plugins:
     speed: 1.0
     reply_language: auto   # auto / zh / en; VITS2 only
     warmup: true
+    prepare_on_config: true  # optional VITS2 preparation before speech
 ```
 
 `action=config` with `tts_engine` switches engines at runtime: the outgoing
@@ -103,9 +104,24 @@ engine's nodes are disposed first (two live publishers on one audio topic is
 the duplicate-audio failure mode), then the incoming one is built in the
 background. `speaker_id` must stay 0 — the model has one voice.
 
+With `prepare_on_config: true`, `action=config` also starts model loading and
+warmup, waiting up to 20 seconds by default. It returns `model_state: ready`
+when ready, or `state: loading` while preparation continues in the background.
+`info` remains available during preparation, and `start` remains non-blocking.
+Set this option to false to defer loading until `start` or `speak`.
+
 `speak` keeps the standard action-completion contract: a `speak-*` action id,
 `interrupt` support, and the end-of-utterance marker on every terminated
 utterance, including one abandoned before it reached a node.
+
+### Audio delivery
+
+Each full PCM frame contains 100 ms of audio. The base send interval is 70 ms,
+bounded by a persistent one-second budget for audio already sent ahead of
+playback. Each node retains that budget across ordinary utterances and resets
+it on interrupt, so long sentences and queued short replies share the same
+limit. Reaching the limit delays the next send; it does not change the audio
+sample rate, waveform or speech speed.
 
 ### Chinese / English preference
 
@@ -161,10 +177,20 @@ supported; the panel field is tool-wide, as declared by its shared scope.
 
 ### Pronunciation frontend
 
-The frontend incorporates fanyi's 13,083-entry English Gold lexicon with
-`CUSTOM → Gold → CMU → G2P` lookup for English and mixed text. The lexicon
-is fetched from the pinned public ModelScope release below and cached with
-the model resources. Its full contents are not committed to the code repository.
+English and mixed text share the model's original 129,464-entry CMU cache
+and Liaoqianqian's three CUSTOM entries: `CUDA`, `HAMI`, and `IELTS`.
+Two additional targeted corrections for `Agentic` and `NVIDIA` use the
+checked terminology annotations. These corrections are separate from the
+original dictionary; an existing fanyi Gold file is not loaded as an overlay.
+The complete uppercase abbreviations `US`, `IT`, `ID`, and `IP` are spelled
+as letters before normalization; ordinary lowercase words keep their readings.
+
+The terminology layer retains 3,558 text mappings and 828 IPA reference
+records from jinghong's `frontend_res` collection, whose source fields name
+zhangjinghong and i-wangtianshuo. The generated data matches those annotations;
+577 generated rules are active after filtering unchanged readings, bare
+numbers and curated overrides. IPA records are reference metadata, not direct
+runtime phoneme overrides. This layer is distinct from the CMU dictionary.
 
 Context-aware normalization covers telephone numbers, dates and times,
 order IDs, last-four digits, model numbers, fractions, scientific notation,
@@ -201,20 +227,17 @@ container does not download them at runtime. These archives have different
 engine and Chinese TN hashes from the former COS bundles; they are pinned
 explicitly rather than treated as interchangeable copies.
 
-The separate `frontend/en_gold_pronunciations.json` in that same ModelScope
-revision is 672,106 bytes, with SHA256
-`0c6fd2adb51aeae0fd83968f1902dedb16c73db695a3e3ad088bfc23cc05d57a`.
-The downloader verifies and installs it at
-`<model_dir>/<release_root>/frontend/en_gold_pronunciations.json` before creating
-the adapter, including when the engine archive is already cached. Missing or
-corrupt copies are downloaded again through the existing lock and staging
-mechanism; a failed verification fails loading rather than omitting Gold.
-This uses the existing `/models` cache and needs no extra volume or image layer.
+The CMU dictionary and its runtime cache are included in the size- and
+SHA256-verified model archive. No separate Gold lexicon download is required.
+Old installations may retain `frontend/en_gold_pronunciations.json`; it is
+ignored and does not affect loading or pronunciation. The installation uses
+the existing `/models` cache and needs no extra volume or image layer.
 The public ModelScope source follows the PR submission procedure; a later
 approved COS mirror can use `VITS2_MODEL_BASE_URL` with the same relative file
 paths and checksums.
 
-Installation happens in a background loader on the first `start`/`speak`, which
+Installation happens in a background loader, triggered by the optional config
+preparation above or the first `start`/`speak`. Starting an unloaded instance
 returns `{"state": "loading"}` immediately — the download plus three TensorRT
 engines plus warmup takes far longer than the 60 s Agent Core allows a
 processor `tools/call`. Instances that were requested while the model loaded

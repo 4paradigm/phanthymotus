@@ -1,14 +1,12 @@
 import pickle
 import os
 import re
-import json
-from functools import lru_cache
 import inflect
 import numpy as np
 
 from .symbols import punctuation, symbols
 from .technical_text import normalize_technical_lexemes
-from .release_paths import frontend_data_dir, gold_lexicon_path, nltk_data_dir
+from .release_paths import frontend_data_dir, nltk_data_dir
 
 current_file_path = os.path.dirname(__file__)
 
@@ -202,24 +200,34 @@ KNOWN_ACRONYMS = {
     'linkedin': 'linked in',
     'ios': 'I OS',
 }
+# These uppercase abbreviations share CMU keys with ordinary lowercase words.
+# Expand only complete uppercase tokens, before FST can lowercase them (IP).
+_EXPLICIT_UPPERCASE_ACRONYMS = frozenset({"US", "IT", "ID", "IP"})
+
+
+def _spell_explicit_uppercase_acronyms(text):
+    return _EN_LEXICON_WORD_RE.sub(
+        lambda match: " ".join(match.group())
+        if match.group() in _EXPLICIT_UPPERCASE_ACRONYMS else match.group(),
+        text,
+    )
 
 
 def _split_acronym(m):
     """Keep a known pronunciation; spell unknown uppercase acronyms."""
     word = m.group(0)
-    if word in CUSTOM_EN_PRONUNCIATIONS or word in gold_en_pronunciations():
+    if english_pronunciation(word) is not None:
         return word
     return " ".join(m.group(0))
 
 
 def _split_unknown_acronyms(text):
-    """Keep complete Gold words, including hyphens and apostrophes, intact."""
-    gold = gold_en_pronunciations()
+    """Keep known dictionary words, including hyphens and apostrophes, intact."""
+    text = _spell_explicit_uppercase_acronyms(text)
     protected = [
         match.span()
         for match in _EN_LEXICON_WORD_RE.finditer(text)
-        if (match.group().upper() in CUSTOM_EN_PRONUNCIATIONS
-            or match.group().upper() in gold)
+        if english_pronunciation(match.group()) is not None
     ]
 
     def replace(match):
@@ -319,41 +327,31 @@ eng_dict = get_dict()
 
 CUSTOM_EN_PRONUNCIATIONS = {
     "CUDA": [["K", "UW1", "D", "AH0"]],
-    # "HAMi" is spoken as 哈米 (/ˈhɑːmi/), not /ˈhæmi/.
-    "HAMI": [["HH", "AA1", "M", "IY0"]],
-    # OOV for g2p_en, which appended a spurious final T: AH0 JH EH1 N T IH0 K T.
-    "AGENTIC": [["AH0", "JH", "EH1", "N", "T", "IH0", "K"]],
+    "HAMI": [["HH", "AE1", "M", "IY0"]],
     "IELTS": [["AY1"], ["EH0", "L", "T", "S"]],
 }
 
 
-@lru_cache(maxsize=1)
-def gold_en_pronunciations():
-    """Load fanyi's verified ARPAbet overlay once for English and MIX G2P."""
-    path = gold_lexicon_path()
-    with open(path, encoding="utf-8") as source:
-        entries = json.load(source)
-    if not isinstance(entries, dict):
-        raise ValueError("English gold lexicon must be a word-to-ARPAbet mapping")
-    result = {}
-    for word, phones in entries.items():
-        if (not isinstance(word, str) or not word or word != word.upper()
-                or not isinstance(phones, list) or not phones
-                or any(not isinstance(phone, str) or phone not in arpa for phone in phones)):
-            raise ValueError(f"Invalid English gold pronunciation: {word!r}")
-        result[word] = tuple(phones)
-    return result
+# Narrow corrections from the IPA retained in lexicon_rules_generated.py.
+# Keep them separate from Liaoqianqian's original three CUSTOM entries.
+VERIFIED_EN_PRONUNCIATIONS = {
+    # wordlist_37, i-wangtianshuo: /əˈdʒɛntɪk/; g2p_en adds a final T.
+    "AGENTIC": [["AH0", "JH", "EH1", "N", "T", "IH0", "K"]],
+    # user_terms_397, zhangjinghong: /ɛnˈvɪdiə/, stressed on the second syllable.
+    "NVIDIA": [["EH0", "N", "V", "IH1", "D", "IY0", "AH0"]],
+}
 
 
 def english_pronunciation(token):
-    """Return syllables using explicit corrections, then Gold, then CMU."""
+    """Liaoqianqian CUSTOM, verified terms, then CMU, shared by both G2P routes.
+
+    Return None for the caller's existing G2P fallback. Previously installed
+    external overlays are deliberately not consulted.
+    """
     word = token.upper()
-    if word in CUSTOM_EN_PRONUNCIATIONS:
-        return CUSTOM_EN_PRONUNCIATIONS[word]
-    phones = gold_en_pronunciations().get(word)
-    if phones is not None:
-        return (phones,)
-    return eng_dict.get(word)
+    return CUSTOM_EN_PRONUNCIATIONS.get(
+        word, VERIFIED_EN_PRONUNCIATIONS.get(word, eng_dict.get(word)),
+    )
 
 
 _EN_LEXICON_WORD_RE = re.compile(
@@ -365,19 +363,22 @@ _EN_TN_CONTEXT_WORDS = frozenset({
 
 
 def normalize_preserving_english_pronunciations(text, normalize_plain):
-    """Preserve complete known words through TN, without rewriting numbers.
+    """Preserve complete custom and verified pronunciation tokens through TN.
 
     Called only on ordinary spans after the existing address, number, unit and
     identifier handlers. Explicit lexeme rewrites retain priority. Versioned
     model names are deliberately not split here: their digits and surrounding
     context remain owned by the existing frontend.
+
+    All other words follow the existing text normalizer and CMU/G2P path.
     """
-    gold = gold_en_pronunciations()
+    text = _spell_explicit_uppercase_acronyms(text)
     protected = []
     for match in _EN_LEXICON_WORD_RE.finditer(text):
         word = match.group().upper()
         if (len(word) >= 3 and word not in _EN_TN_CONTEXT_WORDS
-                and (word in CUSTOM_EN_PRONUNCIATIONS or word in gold)):
+                and (word in CUSTOM_EN_PRONUNCIATIONS
+                     or word in VERIFIED_EN_PRONUNCIATIONS)):
             protected.append(match)
     if not protected:
         return normalize_plain(text)

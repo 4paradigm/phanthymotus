@@ -120,7 +120,8 @@ def _zh_pinyin_to_phones(tone3: str):
 def _en_token_to_phones(word: str):
     """Convert a single English word/token to (phones, tones).
 
-    Lookup order: explicit corrections → Gold → CMU dict → g2p_en fallback.
+    Lookup order: Liaoqianqian's explicit corrections → verified term fixes
+    → CMU → g2p_en fallback.
     All outputs go through refine_ph() + post_replace_ph() so they match
     the lowercase ARPAbet symbols in en_symbols (e.g. 'IY1' → 'iy', tone=2).
     """

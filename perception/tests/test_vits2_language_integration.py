@@ -95,6 +95,34 @@ def call(state, action, **args):
     return state.plugin.dispatch("tts", {"action": action, **args})
 
 
+def test_opt_in_prepare_runs_through_empty_language_config(make_plugin):
+    state = make_plugin(prepare_on_config=True)
+    result = call(state, "config", instance_id="evaluation")
+    assert result["status"] == "configured"
+    assert result["model_state"] == "ready"
+    assert state.loads == 1
+    assert state.adapter is not None
+    assert call(state, "config", instance_id="evaluation")["model_state"] == "ready"
+    assert state.loads == 1
+    assert call(state, "start", instance_id="evaluation", input_topic="/say/evaluation")["state"] == "running"
+
+
+def test_opt_in_prepare_keeps_language_config_and_loading_bounded(make_plugin, monkeypatch):
+    monkeypatch.setattr(base, "_CONFIG_PREPARE_WAIT_S", 0.02)
+    state = make_plugin(gated=True, prepare_on_config=True)
+    first = call(state, "config", instance_id="evaluation", reply_language="en")
+    assert first["state"] == "loading"
+    assert first["reply_language"] == "en"
+    second = call(state, "config", instance_id="evaluation", speed=0.8)
+    assert second["state"] == "loading"
+    assert state.loads == 1
+    state.gate.set()
+    assert _wait_until(lambda: state.adapter is not None
+                       and state.adapter.speed == pytest.approx(0.8))
+    assert call(state, "config", instance_id="evaluation")["model_state"] == "ready"
+    assert state.loads == 1
+
+
 def start(state, key="a"):
     call(state, "start", instance_id=key, input_topic=f"/say/{key}")
     assert _wait_until(lambda: call(state, "info", instance_id=key)["state"] == "running")

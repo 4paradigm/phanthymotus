@@ -1075,15 +1075,6 @@ VITS2_MODEL_BASE = os.environ.get(
     "https://www.modelscope.cn/api/v1/models/lanxijiang/TTSV4_Ch_Eng/repo"
     f"?Revision={VITS2_MODEL_REVISION}&FilePath={{file}}",
 )
-# The Gold overlay is an independent resource in the same immutable release.
-# Keep its full contents outside Git; the archive predates this overlay, so a
-# cached engine archive does not imply that the lexicon has been installed.
-VITS2_FRONTEND_FILES = {
-    "frontend/en_gold_pronunciations.json": {
-        "size": 672106,
-        "sha256": "0c6fd2adb51aeae0fd83968f1902dedb16c73db695a3e3ad088bfc23cc05d57a",
-    },
-}
 VITS2_MODEL_ARCHIVES = {
     "jp61": {
         "archive": "lc1_male_v6_frontend_146k_jp6_runtime.tar.gz",
@@ -1113,7 +1104,7 @@ def vits2_release_root(engine_dir: str) -> str:
 
 
 def ensure_vits2_model(model_dir: str, family: str | None = None,
-                       progress_cb=None, stage_cb=None) -> str:
+                       progress_cb=None, stage_cb=None, base_url: str | None = None) -> str:
     """Ensure the VITS2 release matching the runtime TensorRT is installed.
 
     Returns the engine directory for this runtime, which is what the adapter
@@ -1122,22 +1113,17 @@ def ensure_vits2_model(model_dir: str, family: str | None = None,
     model_dir = require_models_subpath(model_dir)
     key = select_bundle_family(VITS2_MODEL_ARCHIVES, family)
     entry = VITS2_MODEL_ARCHIVES[key]
+    source_base = VITS2_MODEL_BASE if base_url is None else base_url
     log.info(f"[model_downloader] vits2: using {key} archive")
     ensure_verified_archive(
         f"vits2/{key}",
         model_dir,
-        _source_url(VITS2_MODEL_BASE, entry["archive"]),
+        _source_url(source_base, entry["archive"]),
         entry,
         progress_cb=progress_cb,
         stage_cb=stage_cb,
     )
     release_root = require_models_subpath(os.path.join(model_dir, entry["release_root"]))
-    # Also runs for a warm archive cache: missing/corrupt frontend resources
-    # must be repaired before the adapter can load or report itself ready.
-    ensure_verified_bundle(
-        "vits2/frontend", release_root, VITS2_MODEL_BASE, VITS2_FRONTEND_FILES,
-        progress_cb=progress_cb,
-    )
     return os.path.join(release_root, "engines")
 
 

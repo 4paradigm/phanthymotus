@@ -146,6 +146,15 @@ class MixedContextTest(unittest.TestCase):
 
 
 class IdentifierContextTest(unittest.TestCase):
+    def test_chinese_trailing_field_keeps_digit_language_in_english_sentence(self):
+        for label in ("末四位", "末4位", "最后 四 位", "后4位"):
+            text = f"Please confirm that the last record shows {label}是0056 today. We have 12 samples."
+            with self.subTest(label=label):
+                normalized = normalize_for_routing(text)
+                self.assertIn("零零五六", normalized)
+                self.assertNotIn("zero zero five six", normalized)
+                self.assertIn("N[EN:12]", normalized)
+
     def test_named_owner_keeps_id_digits_and_leading_zero(self):
         text = "The order ID for 北京 is 001234."
         spans = number_spans(text, "EN", number)

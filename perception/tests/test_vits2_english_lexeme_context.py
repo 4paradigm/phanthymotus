@@ -42,7 +42,7 @@ class EnglishLexemeContextTest(unittest.TestCase):
         english = types.ModuleType("plugins.vits2_tts_trt.frontend.english")
         english.replace_punctuation = lambda value: value
         # These tests isolate context routing with an identity FST. The real
-        # Gold protection/lookup is exercised in test_vits2_gold_lexicon.py.
+        # Dictionary lookup is exercised in test_vits2_liaoqianqian_lexicon.py.
         english.normalize_preserving_english_pronunciations = (
             lambda value, normalize_plain: normalize_plain(value)
         )

@@ -297,8 +297,8 @@ def _special_number(value, language):
 
 def _normalize_ordinary_text(text):
     # Written entities are handled by normalize_special_text first. Preserve
-    # only complete known English words so the FST cannot translate a brand
-    # before the shared English/MIX pronunciation lookup sees it.
+    # complete custom and verified pronunciation tokens so the FST cannot
+    # change them before the shared English/MIX pronunciation lookup sees them.
     from .english import normalize_preserving_english_pronunciations
     return normalize_preserving_english_pronunciations(text, _normalizer.normalize)
 
