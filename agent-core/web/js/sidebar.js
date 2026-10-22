@@ -310,6 +310,25 @@ function _buildSubgroupLabel(type, count) {
   return label;
 }
 
+/** Does the sidebar still own this tool's configuration?
+ *
+ * Only while the tool has no card on the canvas. Once a card exists that card's
+ * dialog sets everything, tool-level fields included, and a second entry point
+ * is how one card's settings and another's drift apart — the split across two
+ * dialogs is how r1_bj ended up with a YOLO fit selected under DepthART.
+ *
+ * **One function because there were two copies of this test.** The gear on the
+ * chip and the status on the tool card each recomputed it, I gated only the
+ * second, and the chip went on opening the dialog I had just removed. Two
+ * copies of a rule that must agree is the bug, not the symptom.
+ */
+function sidebarOwnsConfig(mcpId, tool) {
+  const schema = typeof tool === 'object' ? tool.configSchema : null;
+  if (!schema) return false;
+  if (cardsForTool(mcpId, tool.name).length) return false;
+  return Object.values(schema.properties || {}).some(def => def.scope !== 'instance');
+}
+
 function _buildChip(mcp, tool) {
   const chip = document.createElement('div');
   const toolType = tool.type || '';
@@ -322,7 +341,7 @@ function _buildChip(mcp, tool) {
 
   // Config button for tools with shared fields
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   const configKey = `${mcp.id}:${tool.name}`;
   // 「已配置」只看会产生输入的字段。纯展示字段（二维码）永远不保存任何值，
   // 把它算进来的话，一个只声明了二维码的工具会永久挂着未配置的警告三角。
@@ -444,9 +463,7 @@ function _buildToolCard(mcp, tool) {
   //
   // It is not removed outright because a tool with no card still has to be
   // configurable — ASR's url/key has to be set before placing one.
-  const onCanvas = cardsForTool(mcp.id, tool.name).length > 0;
-  const hasSharedFields = !onCanvas && configSchema
-    && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
   const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
     .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
