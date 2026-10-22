@@ -233,12 +233,17 @@ def test_laziness_missing_camera_and_presets(monkeypatch):
     p=make_plugin({'calibration_preset':vd.CAL_AUTO})
     monkeypatch.setattr(p,'_ensure_model',lambda:pytest.fail('unexpected model load'))
     assert p.dispatch('visual_depth',{'action':'info'})['model']=='depthart-metric-s'
-    assert p.dispatch('visual_depth',{'action':'config','instance_id':'a','calibration_preset':vd.CAL_AUTO})['config']['calibration_preset']==vd.CAL_NONE
+    # `auto` survives under DepthART now: the lookup is keyed on camera *and*
+    # model, so it finds that model's row or nothing.
+    assert p.dispatch('visual_depth',{'action':'config','instance_id':'a','calibration_preset':vd.CAL_AUTO})['config']['calibration_preset']==vd.CAL_AUTO
     assert p.dispatch('visual_depth',{'action':'start','input_topic':'/a'})['state']=='error'
     preset=next(iter(vd.CALIBRATION_PRESETS))
-    rejected=p.dispatch('visual_depth',{'action':'config','calibration_preset':preset})
+    # A row measured on the other model is still refused, by its own backend
+    # field rather than by "is it a preset at all".
+    yolo_row = next(n for n, r in vd.CALIBRATION_PRESETS.items() if r.get('backend', 'yolo') == 'yolo')
+    rejected=p.dispatch('visual_depth',{'action':'config','calibration_preset':yolo_row})
     assert rejected['status']=='configured' and rejected['config']['calibration_preset']==vd.CAL_NONE
-    assert preset in rejected['calibration_note']
+    assert yolo_row in rejected['calibration_note']
     assert p.dispatch('visual_depth',{'action':'config','backend':'invalid'})['status']=='error'
     assert p._model is None
 
@@ -710,7 +715,9 @@ def test_switching_models_clears_the_fit_and_says_so():
     assert switched['status'] == 'configured'
     # Gone from the stored row, and the response says why.
     assert 'cal_b' not in p._instance_configs['a']
-    assert 'calibration_preset' not in p._instance_configs['a']
+    # The selector survives: it is a rule, not a measurement. Clearing it left
+    # YOLO uncalibrated after a switch back, with nobody to re-pick it.
+    assert p._instance_configs['a']['calibration_preset'] == vd.CAL_MANUAL
     assert '标定' in switched['calibration_note'] and 'calibrate' in switched['calibration_note']
     assert (p._cal_a, p._cal_b) == (1., 0.)
 
@@ -731,3 +738,39 @@ def test_a_single_pair_applies_under_either_model():
         p = vd.VideoDepthPerceptionPlugin({'backend': backend, 'cal_b': -0.5},
                                           'test', _FakeExecutor())
         assert (p._cal_a, p._cal_b) == (1., -0.5)
+
+
+def test_r1_resolves_a_different_preset_row_per_model():
+    """The same lens, two models, two fits — chosen automatically.
+
+    R1's main camera needs `cal_b: -0.9753` under YOLO and
+    `cal_a: 1.2454, cal_b: -0.550755` under DepthART; reporting one under the
+    other is a factor of more than two in every metre.
+    """
+    cam = 'unitree/r1/camera_main'
+    seen = {}
+    for backend in ('yolo', 'depthart'):
+        name, row = vd._preset_for_camera(cam, backend)
+        assert row is not None, backend
+        assert row['backend'] == backend
+        seen[backend] = (row['cal_a'], row['cal_b'])
+        # And `auto` resolves to it.
+        cfg = {'calibration_preset': vd.CAL_AUTO}
+        assert vd._calibration_from_cfg(cfg, camera_id=cam, backend=backend) == seen[backend]
+    assert seen['yolo'] != seen['depthart']
+    # DepthART's row needs a non-unit exponent; `calibrate` cannot produce it.
+    assert seen['depthart'][0] != 1.0
+
+
+def test_a_camera_with_no_row_for_this_model_falls_back_to_the_engine():
+    # Not to the other model's row — that is the failure the keying prevents.
+    assert vd._preset_for_camera('unknown/camera', 'yolo') == (None, None)
+    assert vd._calibration_from_cfg({'calibration_preset': vd.CAL_AUTO},
+                                    camera_id='unknown/camera', backend='depthart') == (1.0, 0.0)
+
+
+def test_a_row_without_a_backend_field_counts_as_yolo():
+    # The table had one entry and one model when it was written.
+    row = dict(vd.CALIBRATION_PRESETS['Unitree R1'])
+    row.pop('backend', None)
+    assert row.get('backend', 'yolo') == 'yolo'

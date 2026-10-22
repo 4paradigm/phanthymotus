@@ -213,6 +213,11 @@ CALIBRATION_PRESETS = {
         # because one robot's cameras can share a fit and because a fit measured
         # on one model often applies to a whole family.
         "camera_ids": ["unitree/r1/camera_main"],
+        # **Which depth model this row was measured against.** A fit belongs to
+        # a camera x model pair, so the table needs both — the lookup is keyed
+        # on them together. This is the one place that keying is right: it is
+        # internal, so nobody has to maintain the correspondence by hand.
+        "backend": "yolo",
         "cal_a": 1.0,
         "cal_b": -0.9753,
         "camera": "Unitree R1 主相机 1280x720（超广角，实测约 102° 全视场）",
@@ -223,6 +228,31 @@ CALIBRATION_PRESETS = {
         "note": "单帧取样拟合的 —— 多帧平均是这次之后才加的，同一距离先后两次"
                 "测量曾差 31%。整体比例可信（5 个样本在 log 空间取均值），"
                 "逐点残差约 ±20%。想要更准就用现在的 calibrate 重量两三个点。",
+    },
+    "Unitree R1 (DepthART)": {
+        "camera_ids": ["unitree/r1/camera_main"],
+        "backend": "depthart",
+        # **`cal_a` is not 1.0, and that is the point.** DepthART's error on
+        # this lens is not a single ratio: measured 1.862x at 0.5 m, 1.572x at
+        # 1.0 m, 1.33x at 1.5 m and 1.43x at 2.0 m — it falls and then rises.
+        # Pinning the exponent at 1.0, which is what `calibrate` does, leaves
+        # 25.7% worst-case error; solving for both cuts it to 10.3%.
+        #
+        # So this row cannot be reproduced by running `calibrate` — that fits
+        # `b` alone. It came from a least-squares fit in log space over the six
+        # samples `calibrate` collected. **Anyone re-running `calibrate` here
+        # will push `cal_a` back to 1.0 and the error back to 26%.**
+        "cal_a": 1.2454,
+        "cal_b": -0.550755,
+        "camera": "Unitree R1 主相机 1280x720（超广角，实测约 102° 全视场）",
+        "measured_on": "robot_local (R1), 2026-10-22",
+        "samples": 6,
+        "range_m": "0.5–2.0",
+        "residual_pct": 10,
+        "note": "每点 15 帧平均；1.5 m 与 2.0 m 各复测一次，两次分别吻合 2.4% "
+                "与 0.6%，所以 ±10% 是模型的下限而不是测量噪声 —— 偏差非单调，"
+                "两参数的 log-affine 表达不了。要更准得改 apply_site_calibration "
+                "的形式（分段或更高阶），再量点没用。",
     },
 }
 
@@ -445,24 +475,36 @@ def _calibration_message(samples: list) -> str:
     )
 
 
-def _preset_for_camera(camera_id: str):
-    """The preset row a camera identity selects, or `(None, None)`.
+def _preset_for_camera(camera_id: str, backend: str = "yolo"):
+    """The preset row a camera identity and depth model select, or `(None, None)`.
 
     The join that makes the calibration stop being a thing somebody has to know
     to pick. Exact match only — a fit is measured on one lens, and guessing by
     prefix would silently apply r1's numbers to a camera that merely shares a
     vendor.
+
+    **Keyed on the model as well as the camera**, because a fit belongs to the
+    pair: R1's main lens needs `cal_b: -0.9753` under YOLO and
+    `cal_a: 1.2454, cal_b: -0.550755` under DepthART, a difference of more than
+    two in the reported metres. This is the one place that keying is right —
+    it is internal, so no operator maintains the correspondence.
+
+    A row without `backend` is treated as YOLO: the table had one entry and one
+    model when it was written, so that is what those numbers were measured on.
     """
     if not camera_id:
         return None, None
     for name, preset in CALIBRATION_PRESETS.items():
-        if camera_id in (preset.get("camera_ids") or ()):
-            return name, preset
+        if camera_id not in (preset.get("camera_ids") or ()):
+            continue
+        if preset.get("backend", "yolo") != backend:
+            continue
+        return name, preset
     return None, None
 
 
 def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
-                          camera_id: str = "") -> tuple[float, float]:
+                          camera_id: str = "", backend: str = "yolo") -> tuple[float, float]:
     """Resolve (cal_a, cal_b): typed-in value, then preset, then legacy, then engine.
 
     **Non-identity wins over a preset, and that test is deliberate.** The canvas
@@ -499,7 +541,7 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
             # The camera said who it is; that is enough to pick the row. No
             # match is not a failure — it is a camera nobody has measured, and
             # the honest answer is the engine's own generic fit.
-            _, preset = _preset_for_camera(camera_id)
+            _, preset = _preset_for_camera(camera_id, backend)
             if preset:
                 return float(preset["cal_a"]), float(preset["cal_b"])
         return 1.0, 0.0
@@ -520,7 +562,7 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0),
     return 1.0, 0.0
 
 
-def calibration_origin(cfg: dict, camera_id: str = "") -> str:
+def calibration_origin(cfg: dict, camera_id: str = "", backend: str = "yolo") -> str:
     """Which of the four sources is in effect, for `info()`.
 
     A card whose depth is 3.2x out and a card whose depth is right look the same
@@ -535,7 +577,7 @@ def calibration_origin(cfg: dict, camera_id: str = "") -> str:
         if choice in CALIBRATION_PRESETS:
             return f"preset:{choice}"
         if choice == CAL_AUTO:
-            name, _ = _preset_for_camera(camera_id)
+            name, _ = _preset_for_camera(camera_id, backend)
             # Which of the two "automatic" outcomes happened has to be
             # distinguishable: a card whose depth is 2.65x out and one whose
             # depth is right look identical from outside, and this is the field
@@ -1108,7 +1150,8 @@ class VideoDepthPerceptionPlugin:
         self._barrel_max_fraction = float(
             plugin_cfg.get("lens_barrel_max_fraction", 0.6))
         self._barrel_scale = int(plugin_cfg.get("lens_barrel_scale", 4))
-        self._cal_a, self._cal_b = _calibration_from_cfg(self._plugin_cfg)
+        self._cal_a, self._cal_b = _calibration_from_cfg(
+            self._plugin_cfg, backend=self._backend)
         # (measured_m, predicted_m) reference readings from the `calibrate`
         # action, in call order. Refit from scratch on every addition, so a
         # bad sample can be undone with reset rather than compounding.
@@ -1152,14 +1195,19 @@ class VideoDepthPerceptionPlugin:
         """
         cfg = dict(cfg)
         note = ""
-        if self._backend == "depthart" and cfg.get("calibration_preset") in CALIBRATION_PRESETS:
-            note = (f"{cfg['calibration_preset']!r} 是在 YOLO26-depth 上量的预设，"
-                    f"DepthART 用不了 —— 已按「{CAL_NONE}」处理。要标定请用 "
-                    f"calibrate 现场量，结果存进 Calibration a/b (DepthART)。")
+        chosen = cfg.get("calibration_preset")
+        row = CALIBRATION_PRESETS.get(chosen)
+        if row is not None and row.get("backend", "yolo") != self._backend:
+            note = (f"{chosen!r} 是在 {row.get('backend', 'yolo')!r} 上量的预设，"
+                    f"当前模型是 {self._backend!r} —— 已按「{CAL_NONE}」处理。"
+                    f"选 {CAL_AUTO!r} 可以按相机与模型自动查到对的那一行。")
             log.warning(f"[visual_depth] {note}")
             cfg["calibration_preset"] = CAL_NONE
-        if self._backend == "depthart" and cfg.get("calibration_preset") == CAL_AUTO:
-            cfg["calibration_preset"] = CAL_NONE
+        # `auto (by camera)` is left alone whatever the model: the lookup is
+        # keyed on camera *and* model, so it resolves to that model's row or to
+        # nothing. Rewriting it to `no calibrate` under DepthART was what left
+        # this card uncalibrated on R1 while YOLO stayed corrected — the two
+        # models were then not comparable at all.
         return cfg, note
 
     def _camera_declaration(self, key):
@@ -1322,8 +1370,10 @@ class VideoDepthPerceptionPlugin:
                 **dict(zip(("cal_a", "cal_b"),
                            _calibration_from_cfg(
                                icfg, (self._cal_a, self._cal_b),
-                               camera_id=self._camera_id_for(node_key)))),
-                cal_origin=calibration_origin(icfg, self._camera_id_for(node_key)),
+                               camera_id=self._camera_id_for(node_key),
+                               backend=self._backend))),
+                cal_origin=calibration_origin(icfg, self._camera_id_for(node_key),
+                                              self._backend),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
                 mask_barrel=bool(icfg.get("mask_lens_barrel",
@@ -1473,7 +1523,7 @@ class VideoDepthPerceptionPlugin:
             return f"site:calibrate({len(self._cal_samples)} 样本)"
         if self._cal_a == 1.0 and self._cal_b == 0.0:
             return "model-default"
-        return f"site:{calibration_origin(self._plugin_cfg, camera_id)}"
+        return f"site:{calibration_origin(self._plugin_cfg, camera_id, self._backend)}"
 
     def _require_engine(self):
         """Return a loaded engine, loading it on demand.
@@ -1649,8 +1699,15 @@ class VideoDepthPerceptionPlugin:
                 # that incident. It was not the cause. **Doing it silently
                 # was**: the note below is the whole difference, and
                 # `info()` reports `model-default` alongside it.
+                # `calibration_preset` is **not** cleared. It is a rule, not a
+                # measurement: `auto (by camera)` resolves per camera and per
+                # model, so it stays correct across a switch, and a named row
+                # that belongs to the other model is refused on the next config
+                # with a note. Clearing it meant that switching back to YOLO
+                # left YOLO uncalibrated too, and nobody would know to re-pick
+                # it. Only the hand-measured pair goes.
                 for config in [self._plugin_cfg, *self._instance_configs.values()]:
-                    for key in ("cal_a", "cal_b", "depth_scale", "calibration_preset"):
+                    for key in ("cal_a", "cal_b", "depth_scale"):
                         config.pop(key, None)
                 self._cal_cleared_note = (
                     f"深度模型已切换为 {backend!r} —— 站点标定（cal_a / cal_b）"
@@ -1895,7 +1952,7 @@ class VideoDepthPerceptionPlugin:
             if any(k in cfg for k in ("cal_a", "cal_b", "depth_scale",
                                       "calibration_preset")):
                 self._cal_a, self._cal_b = _calibration_from_cfg(
-                    cfg, (self._cal_a, self._cal_b))
+                    cfg, (self._cal_a, self._cal_b), backend=self._backend)
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
             return {"status": "configured", "config": cfg, **note_field}
@@ -1917,7 +1974,7 @@ class VideoDepthPerceptionPlugin:
                             self._plugin_cfg[key] = value
                     self._cal_cfg_backup = None
                 self._apply_calibration(*_calibration_from_cfg(
-                    self._plugin_cfg))
+                    self._plugin_cfg, backend=self._backend))
                 return self._calibration_report({"message": "标定已清空，恢复成 engine 自带的标定"})
 
             distance = args.get("distance_m")
