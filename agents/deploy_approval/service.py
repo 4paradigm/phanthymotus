@@ -3343,6 +3343,144 @@ class DeployController:
             return markdown
         return markdown[:content_start] + "\n\n" + content.rstrip() + "\n\n" + markdown[end:]
 
+    @staticmethod
+    def _extract_visible_history(visible):
+        """Remove recognized History sections for safe repositioning verbatim."""
+        if not isinstance(visible, str):
+            return visible, ""
+        history_start = VISIBLE_HISTORY_START_MARKER
+        history_end = VISIBLE_HISTORY_END_MARKER
+        if visible.count(history_start) != visible.count(history_end):
+            raise GitHubStateProxyError("Malformed visible History markers")
+        history_spans = []
+        if history_start in visible:
+            cursor = 0
+            while True:
+                start = visible.find(history_start, cursor)
+                end_before_start = visible.find(history_end, cursor)
+                if start < 0 and end_before_start < 0:
+                    break
+                if end_before_start >= 0 and (start < 0 or end_before_start < start):
+                    raise GitHubStateProxyError("Malformed visible History markers")
+                end = visible.find(history_end, start + len(history_start))
+                if end < 0 or visible.find(history_start, start + len(history_start), end) >= 0:
+                    raise GitHubStateProxyError("Malformed visible History markers")
+                history_spans.append((start, end + len(history_end)))
+                cursor = end + len(history_end)
+
+        heading_re = re.compile(
+            r"(?mi)^(#{2,6})[ \t]+(?:历史记录|history|archived history)[ \t]*$",
+        )
+        heading_matches = list(heading_re.finditer(visible))
+        all_heading_matches = list(re.finditer(r"(?m)^(#{1,6})[ \t]+", visible))
+        for heading in heading_matches:
+            level = len(heading.group(1))
+            end = len(visible)
+            for following in all_heading_matches:
+                if following.start() > heading.start() and len(following.group(1)) <= level:
+                    end = min(end, following.start())
+                    break
+            projection_start = visible.find("<!-- evidence-projection:start -->", heading.end())
+            if projection_start >= 0:
+                end = min(end, projection_start)
+            history_spans.append((heading.start(), end))
+
+        if not history_spans:
+            return visible, ""
+        history_spans.sort()
+        merged = []
+        for start, end in history_spans:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        pieces = []
+        cursor = 0
+        history = []
+        for start, end in merged:
+            pieces.append(visible[cursor:start])
+            history.append(visible[start:end])
+            cursor = end
+        pieces.append(visible[cursor:])
+        return "".join(pieces), "".join(history)
+
+    @classmethod
+    def _strip_legacy_evidence_blocks(cls, visible):
+        """Remove obsolete evidence display while preserving History verbatim."""
+        visible, history = cls._extract_visible_history(visible)
+        projection_start = "<!-- evidence-projection:start -->"
+        projection_end = "<!-- evidence-projection:end -->"
+        starts, ends = visible.count(projection_start), visible.count(projection_end)
+        if starts != ends:
+            raise GitHubStateProxyError("Malformed evidence projection")
+        if starts:
+            cleaned = []
+            cursor = 0
+            for _ in range(starts):
+                start = visible.find(projection_start, cursor)
+                end_before_start = visible.find(projection_end, cursor)
+                if start < 0 or end_before_start >= 0 and end_before_start < start:
+                    raise GitHubStateProxyError("Malformed evidence projection")
+                end = visible.find(projection_end, start + len(projection_start))
+                if start < 0 or end < 0 or visible.find(projection_start, start + len(projection_start), end) >= 0:
+                    raise GitHubStateProxyError("Malformed evidence projection")
+                cleaned.append(visible[cursor:start])
+                cursor = end + len(projection_end)
+            cleaned.append(visible[cursor:])
+            visible = "".join(cleaned)
+
+        lines = visible.splitlines(keepends=True)
+        result = []
+        index = 0
+        heading_re = re.compile(r"^(#{2,6})[ \t]+测试附件[ \t]*#*[ \t]*(?:\r?\n)?$")
+        cos_link_re = re.compile(
+            r"\[[^\]]*\]\((?:<)?https://[^<>\s]*\.cos\.[^<>\s]*\.myqcloud\.com/[^)<>\s]*(?:>)?\)",
+            re.IGNORECASE,
+        )
+        legacy_link_re = re.compile(r"\[(?:查看测试附件|上传或查看附件)\]\((?:<[^>]*>|[^)]*)\)")
+        metadata_value_re = re.compile(
+            r"[\"']?(?:object_key|sha256|size|cos_object_key|cos_bundle_sha256|cos_bundle_size|cos_download_url)"
+            r"[\"']?[ \t]*[:=][ \t]*(\"[^\"]*\"|'[^']*'|[0-9]+|null|None)",
+            re.IGNORECASE,
+        )
+        while index < len(lines):
+            heading = heading_re.match(lines[index])
+            if heading:
+                level = len(heading.group(1))
+                index += 1
+                while index < len(lines):
+                    next_heading = re.match(r"^(#{1,6})[ \t]+", lines[index])
+                    if next_heading and len(next_heading.group(1)) <= level:
+                        break
+                    index += 1
+                continue
+            line = lines[index]
+            legacy_link = legacy_link_re.search(line)
+            old_cos_download = cos_link_re.search(line)
+            metadata_values = metadata_value_re.findall(line)
+            empty_cos_metadata = bool(metadata_values) and all(
+                value.strip("\\\"' ").lower() in {"", "0", "null", "none"}
+                for value in metadata_values
+            ) and bool(re.search(r"(?i)cos|object_key|sha256", line))
+            if legacy_link or old_cos_download or empty_cos_metadata:
+                remainder = line
+                if legacy_link:
+                    remainder = legacy_link_re.sub("", remainder)
+                if old_cos_download:
+                    remainder = cos_link_re.sub("", remainder)
+                    if re.search(r"(?i)cos|download|下载|归档", line):
+                        remainder = ""
+                if empty_cos_metadata or not remainder.strip(" \t\r\n|·-*"):
+                    index += 1
+                    continue
+                line = remainder
+            result.append(line)
+            index += 1
+        visible = "".join(result).rstrip()
+        if history:
+            visible += ("\n\n" if visible else "") + history
+        return visible
+
     async def _render_evidence_projection(self, repo, pr_number, state, visible):
         renderer = getattr(comments_mod, "render_evidence_section", None)
         if renderer is None:
@@ -3635,20 +3773,12 @@ class DeployController:
                            public_base_url=public_base_url)
         if not isinstance(section, str):
             raise GitHubStateProxyError("Evidence renderer must return markdown")
+        visible = self._strip_legacy_evidence_blocks(visible)
+        visible, history = self._extract_visible_history(visible)
         start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
-        if start in visible or end in visible:
-            if visible.count(start) != 1 or visible.count(end) != 1 or visible.index(start) >= visible.index(end):
-                raise GitHubStateProxyError("Malformed evidence projection")
-            before, rest = visible.split(start, 1)
-            _, after = rest.split(end, 1)
-            visible = before.rstrip() + after
         projection = start + "\n" + section + "\n" + end
-        # Keep lifecycle History as the final visible Summary section.
-        history_index = visible.find("\n### History")
-        if history_index >= 0:
-            return (visible[:history_index].rstrip() + "\n\n" + projection
-                    + "\n\n" + visible[history_index + 1:].lstrip())
-        return visible.rstrip() + "\n\n" + projection
+        return (visible.rstrip() + "\n\n" + projection
+                + ("\n\n" + history if history else ""))
 
     async def project_evidence(self, repo: str, pr_number: int) -> None:
         """Watcher-only projection. HTTP handlers never call this writer."""
