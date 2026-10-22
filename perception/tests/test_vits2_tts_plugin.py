@@ -12,8 +12,12 @@ Run: python -m pytest perception/tests -q
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -886,3 +890,207 @@ def test_info_while_loading_reports_the_pending_output_topic(monkeypatch):
     assert [t["topic"] for t in running["topic_out"]] == [
         "/remote_control/message/tts"
     ]
+
+
+# Use a separate copy of the real plugin for pacing tests. The autouse fixture
+# above deliberately sets the ordinary module's interval to zero for lifecycle
+# tests, which would otherwise hide regressions in live audio delivery.
+def _pacing_plugin(monkeypatch):
+    name = "plugins.vits2_tts_trt._pacing_test"
+    spec = importlib.util.spec_from_file_location(name, Path(vits2.__file__))
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _VirtualPacingClock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._now = 0.0
+        self.on_sleep = None
+
+    def monotonic(self):
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds):
+        with self._lock:
+            self._now += seconds
+
+    def sleep(self, seconds):
+        assert seconds >= 0
+        with self._lock:
+            self._now += seconds
+        if self.on_sleep is not None:
+            self.on_sleep(seconds)
+        # Give the synth and publisher threads a scheduling opportunity.
+        threading.Event().wait(0)
+
+
+class _PacingAdapter(_FakeAdapter):
+    def __init__(self, payloads):
+        super().__init__()
+        self.payloads = payloads
+
+    def synthesize_stream(self, text):
+        self.spoken.append(text)
+        yield self.payloads[text]
+
+
+def _pcm_frame(module, value):
+    return bytes((value, 0)) * (module.CHUNK_BYTES // 2)
+
+
+def _pacing_node(monkeypatch, module, clock, payloads):
+    monkeypatch.setattr(
+        module, "time", SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)
+    )
+    monkeypatch.setattr(module, "SUBSCRIBER_SETTLE_MS", 0)
+    monkeypatch.setattr(module, "FIRST_FRAME_DELAY_MS", 0)
+    monkeypatch.setattr(module, "PREBUFFER_FRAMES", 5)
+    monkeypatch.setattr(module, "MAX_BURST_FRAMES", 20)
+    completions = []
+    monkeypatch.setattr(
+        module, "_complete_action",
+        lambda action_id, text, frames, interrupted: completions.append(
+            (action_id, text, frames, interrupted)
+        ),
+    )
+    node = module._Vits2TTSNode(None, _PacingAdapter(payloads))
+    monkeypatch.setattr(node, "_wait_for_audio_subscriber", lambda *_: (0.0, 0.0, 1))
+    published = []
+    original_publish = node._publish
+
+    def record(pcm):
+        published.append((clock.monotonic(), bytes(pcm)))
+        original_publish(pcm)
+
+    monkeypatch.setattr(node, "_publish", record)
+    node.start()
+    return node, published, completions
+
+
+@pytest.mark.parametrize(
+    ("allow_fast", "requested", "expected"),
+    [
+        (None, None, 100),
+        (None, "70", 100),
+        (None, "0", 100),
+        ("false", "70", 100),
+        ("1", "70", 70),
+        ("1", "0", 0),
+        (None, "150", 150),
+        ("1", "bad", 100),
+        ("1", "-1", 100),
+        (None, "1001", 100),
+    ],
+)
+def test_live_frame_interval_requires_explicit_fast_delivery(
+    monkeypatch, allow_fast, requested, expected
+):
+    for name, value in (
+        ("MIX_VITS_ALLOW_FAST_DELIVERY", allow_fast),
+        ("MIX_VITS_FRAME_INTERVAL_MS", requested),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    module = _pacing_plugin(monkeypatch)
+    assert module.PCM_FRAME_MS == pytest.approx(100)
+    assert module.FRAME_INTERVAL_MS == pytest.approx(expected)
+
+
+def test_live_pacing_preserves_pcm_and_eof_over_long_utterance(monkeypatch):
+    monkeypatch.delenv("MIX_VITS_ALLOW_FAST_DELIVERY", raising=False)
+    monkeypatch.delenv("MIX_VITS_FRAME_INTERVAL_MS", raising=False)
+    module = _pacing_plugin(monkeypatch)
+    clock = _VirtualPacingClock()
+    frames = [_pcm_frame(module, i + 1) for i in range(80)]
+    tail = b"\x01\x02" * 7
+    payload = b"".join(frames) + tail
+    node, published, completions = _pacing_node(
+        monkeypatch, module, clock, {"long": payload}
+    )
+    try:
+        node.enqueue("long", action_id="long-1")
+        assert _wait_until(lambda: len(completions) == 1, timeout=5)
+        assert completions == [("long-1", "long", 81, False)]
+        assert [pcm for _, pcm in published[:-1]] == frames + [tail]
+        assert published[-1][1] == module.AUDIO_EOF_MAGIC
+        times = [at for at, _ in published[:-1]]
+        assert times[:5] == pytest.approx([times[0]] * 5)
+        assert times[5] - times[0] == pytest.approx(0.1)
+        assert times[79] - times[0] == pytest.approx(7.5)
+        assert times[80] - times[0] == pytest.approx(7.6)
+    finally:
+        node.stop()
+
+
+def test_idle_refills_at_most_the_original_prebuffer(monkeypatch):
+    monkeypatch.delenv("MIX_VITS_ALLOW_FAST_DELIVERY", raising=False)
+    monkeypatch.delenv("MIX_VITS_FRAME_INTERVAL_MS", raising=False)
+    module = _pacing_plugin(monkeypatch)
+    clock = _VirtualPacingClock()
+    node, published, completions = _pacing_node(
+        monkeypatch,
+        module,
+        clock,
+        {
+            "first": _pcm_frame(module, 1) * 10,
+            "after-idle": _pcm_frame(module, 2) * 12,
+        },
+    )
+    try:
+        node.enqueue("first", action_id="first-1")
+        assert _wait_until(lambda: len(completions) == 1, timeout=5)
+        clock.advance(10.0)
+        node.enqueue("after-idle", action_id="second-1")
+        assert _wait_until(lambda: len(completions) == 2, timeout=5)
+        assert completions[-1] == ("second-1", "after-idle", 12, False)
+        assert published[-1][1] == module.AUDIO_EOF_MAGIC
+        second_times = [at for at, pcm in published if pcm == _pcm_frame(module, 2)]
+        assert len(second_times) == 12
+        assert sum(abs(at - second_times[0]) < 1e-9 for at in second_times) <= 5
+        assert second_times[5] - second_times[0] == pytest.approx(0.1)
+    finally:
+        node.stop()
+
+
+def test_interrupt_while_pacing_allows_next_utterance(monkeypatch):
+    monkeypatch.delenv("MIX_VITS_ALLOW_FAST_DELIVERY", raising=False)
+    monkeypatch.delenv("MIX_VITS_FRAME_INTERVAL_MS", raising=False)
+    module = _pacing_plugin(monkeypatch)
+    clock = _VirtualPacingClock()
+    first = _pcm_frame(module, 1) * 12
+    second = _pcm_frame(module, 2) * 2
+    node, published, completions = _pacing_node(
+        monkeypatch, module, clock, {"first": first, "second": second}
+    )
+    interrupted = threading.Event()
+
+    def interrupt_once(seconds):
+        if seconds > 0 and not interrupted.is_set():
+            interrupted.set()
+            node.interrupt()
+
+    clock.on_sleep = interrupt_once
+    try:
+        node.enqueue("first", action_id="first-1")
+        assert _wait_until(lambda: len(completions) == 1, timeout=5)
+        assert interrupted.is_set()
+        assert completions[0][0] == "first-1"
+        assert completions[0][3] is True
+        assert [pcm for _, pcm in published].count(module.AUDIO_EOF_MAGIC) == 1
+        clock.on_sleep = None
+        node.enqueue("second", action_id="second-1")
+        assert _wait_until(lambda: len(completions) == 2, timeout=5)
+        assert completions[1] == ("second-1", "second", 2, False)
+        assert [pcm for _, pcm in published][-3:] == [
+            _pcm_frame(module, 2),
+            _pcm_frame(module, 2),
+            module.AUDIO_EOF_MAGIC,
+        ]
+    finally:
+        node.stop()

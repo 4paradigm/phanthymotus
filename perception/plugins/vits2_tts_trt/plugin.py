@@ -58,8 +58,16 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return value
 
 
-# Keep Liaoqianqian's original 70ms delivery cadence for 100ms PCM frames.
-FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", 70, 0, 1000)
+# Pace at exactly the audio duration each frame carries. It used to be 70ms for
+# a 100ms frame, which over-delivers by 1.43x *forever*: that was this engine's
+# way of slowly accruing a downstream cushion at 30ms/frame back when it had no
+# prebuffer, and it cost an unbounded lead. PREBUFFER_FRAMES now hands the
+# consumer its whole cushion up front, so the accrual is pure surplus — and
+# surplus with no end has no safe landing. A consumer can only absorb it by
+# buffering without bound or by discarding audio; the browser player tried to
+# cap its lead instead and rewound its own schedule into audio it had already
+# queued, which played back overlapped and 1.43x too fast.
+FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", int(PCM_FRAME_MS), 0, 1000)
 FIRST_FRAME_DELAY_MS = _env_int("MIX_VITS_FIRST_FRAME_DELAY_MS", 0, 0, 1000)
 # Five 100ms frames provide an initial 0.5s cushion. This burst stays below
 # the subscriber's depth of 20.
@@ -79,6 +87,22 @@ SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 200, 0, 5000)
 # start/speak. Keep the normal asynchronous start contract and put a finite
 # bound on preparation when downloading or initializing a cold model is slow.
 _CONFIG_PREPARE_WAIT_S = 20.0
+
+# Off by default: sending faster than realtime has no safe landing on a live
+# consumer. It either buffers without bound or has to discard audio, and the
+# browser player's attempt to bound its lead instead produced overlapped,
+# 1.43x-fast playback. Only useful for an offline benchmark that drains as fast
+# as it can, so it must be asked for explicitly.
+ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "0") == "1"
+if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
+    log.warning(
+        "[vits2_tts_trt] MIX_VITS_FRAME_INTERVAL_MS=%d sends %.0fms PCM frames "
+        "faster than realtime, which a live consumer cannot absorb; pacing at "
+        "%.0fms instead (set MIX_VITS_ALLOW_FAST_DELIVERY=1 for an offline "
+        "benchmark)",
+        FRAME_INTERVAL_MS, PCM_FRAME_MS, PCM_FRAME_MS,
+    )
+    FRAME_INTERVAL_MS = int(PCM_FRAME_MS)
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
