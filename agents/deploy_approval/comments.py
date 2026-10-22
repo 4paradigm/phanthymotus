@@ -188,23 +188,14 @@ def _cos_evidence_block(
     download_url: str = "",
 ) -> list[str]:
     """Render the COS evidence block. Returns empty list if no evidence."""
-    if not object_key:
-        return []
-    lines = [""]
-    text = f"COS: `{_escape(object_key)}`"
-    if sha256:
-        text += f" \u00b7 `@sha256:{_escape(sha256)}`"
-    if size:
-        text += f" \u00b7 `{_human_size(size)}`"
-    lines.append(text)
     # A validated signed URL is intentionally visible to readers of this
     # Summary. Callers provide it only after verifying the COS object.
     safe_url = _safe_download_url(download_url)
-    if (safe_url and isinstance(sha256, str)
+    if (isinstance(object_key, str) and object_key and safe_url and isinstance(sha256, str)
             and re.fullmatch(r"[0-9a-f]{64}", sha256)
             and isinstance(size, int) and not isinstance(size, bool) and size > 0):
-        lines.append(f"[Download verified COS archive](<{safe_url}>)")
-    return lines
+        return ["", f"[下载已验证归档文件（{_human_size(size)}）](<{safe_url}>)"]
+    return []
 
 
 def _human_size(size: int) -> str:
@@ -1037,14 +1028,6 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         else:
             group.setdefault("attachments", []).append(row)
 
-    def download(identifier, suffix, capability):
-        identifier = str(identifier or "")
-        if (not base or not re.fullmatch(r"[A-Za-z0-9_-]+", identifier)):
-            return ""
-        if not capability:
-            return ""
-        return base + api + suffix.format(id=identifier) + "?cap=" + urllib.parse.quote(capability, safe="")
-
     page_path = api.replace("/api/evidence/", "/evidence/", 1)
 
     def page_url(capability):
@@ -1053,14 +1036,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         return (base + page_path + "?cap="
                 + urllib.parse.quote(str(capability), safe=""))
 
-    def render_round(key, group):
-        h, r = key
-        lines = [f"**HEAD:** `{_escape(h)}` · **round:** `{_escape(r)}`",
-                 f"**Submitter:** {_escape(group.get('actor') or group.get('actor_login') or group.get('submitted_by') or group.get('requested_by') or group.get('command', {}).get('args', {}).get('actor') or 'unknown')}",
-                 f"**Time:** {_escape(group.get('created_at') or group.get('started_at') or group.get('round_started_at') or 'unknown')}",
-                 f"**Status:** {_escape(group.get('status') or 'unknown')}", "",
-                 "| Attachment | Size | Type | GitHub uploader | Machine | Time | HEAD | Round | Note | COS | Source | Download |",
-                 "|---|---:|---|---|---|---|---|---|---|---|---|---|"]
+    def latest_attachments(group):
         latest_items = {}
         for offset, item in enumerate(group.get("attachments", [])):
             if not isinstance(item, dict):
@@ -1072,18 +1048,63 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             rank = lambda row: 4 if row.get("deleted_at") or row.get("status") == "deleted" else 3 if row.get("status") == "ready" else 1
             if previous is None or rank(item) >= rank(previous):
                 latest_items[identity] = item
-        for item in latest_items.values():
+        return list(latest_items.values())
+
+    def parsed_timestamp(value):
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            return _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+
+    def summary_time(value):
+        parsed = parsed_timestamp(value)
+        if parsed is None:
+            return "时间未知"
+        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            return parsed.astimezone(_BEIJING).strftime("%Y-%m-%d %H:%M") + "（北京时间）"
+        # Preserve naive historical wall time without assigning it a timezone.
+        return parsed.strftime("%Y-%m-%d %H:%M")
+
+    def summary_date(value):
+        parsed = parsed_timestamp(value)
+        if parsed is None:
+            return "时间未知"
+        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            parsed = parsed.astimezone(_BEIJING)
+        return parsed.date().isoformat()
+
+    def first_valid_time(*values):
+        for value in values:
+            if parsed_timestamp(value) is not None:
+                return value
+        return None
+
+    def render_round(key, group, *, historical=False):
+        h, r = key
+        items = latest_attachments(group)
+        lines = []
+        if historical:
+            historical_time = first_valid_time(
+                group.get("archived_at"), group.get("ended_at"),
+                group.get("round_started_at"), group.get("started_at"),
+                group.get("created_at"),
+            )
+            lines.extend([
+                f"**时间：** {_escape(summary_time(historical_time))}",
+                f"**状态：** {_escape(group.get('status') if isinstance(group.get('status'), str) else '未知')}", "",
+            ])
+        lines.extend(["### 测试附件", "",
+                      "| 文件 | 大小 | 操作 |", "|---|---:|---|"])
+        detail_blocks = []
+        for item in items:
             if not isinstance(item, dict):
                 continue
             deleted = bool(item.get("deleted_at") or item.get("status") == "deleted")
             status = "deleted" if deleted else item.get("status", "pending")
             native_url = _trusted_github_attachment_url(item) if not deleted else ""
             filename = item.get("filename") or item.get("text") or "Note"
-            import mimetypes
-            media_type = item.get("media_type", "")
-            if (not isinstance(media_type, str)
-                    or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", media_type)):
-                media_type = mimetypes.guess_type(str(filename))[0] or "unknown"
             size = item.get("size", "—")
             if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
                 size = _human_size(size)
@@ -1109,66 +1130,112 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                             and re.fullmatch(r"[0-9a-f]{40}", item_head)
                             and isinstance(item_round, str) and item_round == r
                             and re.fullmatch(re.escape(item_head) + r"-[0-9]+", item_round))
-            uploader = ("分享链接上传，GitHub 身份未验证" if invitation_upload else
-                        (item.get("actor_login") or item.get("actor"))
-                        if item.get("actor_verified") is True and not signed_invite else
-                        "unverified")
-            cells = [filename, size, media_type, uploader,
-                     item.get("machine") or item.get("machine_alias") or "—",
-                     item.get("created_at") or "unknown", item.get("head_sha") or h,
-                     item.get("round_id") or r, item.get("note", ""),
-                     ("Deleted" if deleted else
-                      "Text note" if status == "text" else
-                      f"COS SHA256 verified: {sha256}; playback unverified" if cos_verified else
-                      "Pending" if status != "ready" else "Unavailable")]
-            if item.get("replaces_id"):
-                cells[8] = str(cells[8]) + " · replaces " + str(item["replaces_id"])
-            if deleted:
-                cells[8] = str(cells[8]) + " · deleted " + str(item.get("deleted_at") or "") + " by " + str(item.get("deleted_by") or "unknown")
             cos_download = _safe_download_url(item.get("cos_download_url", "")) if cos_verified else ""
+            if "|" in cos_download:
+                cos_download = ""
             if status == "text":
-                download_cell = "Text note (no file)"
+                source_id = item.get("source_comment_id")
+                if api and ((type(source_id) is int and source_id > 0)
+                            or isinstance(source_id, str) and re.fullmatch(r"[1-9][0-9]{0,19}", source_id)):
+                    action = f"[查看备注](<https://github.com/{repo}/pull/{pr_number}#issuecomment-{source_id}>)"
+                else:
+                    action = "查看备注"
             elif cos_verified and cos_download:
-                download_cell = f"[下载 COS 文件](<{cos_download}>)"
+                action = f"[下载](<{cos_download}>)"
             elif cos_verified:
-                download_cell = (f"[GitHub 原始附件](<{native_url}>) · COS 已验证归档；下载链接当前暂不可用。"
-                                 if native_url else
-                                 "COS 已验证归档；下载链接当前暂不可用。")
+                action = (f"[下载原始附件](<{native_url}>) · COS 已验证，下载链接暂不可用"
+                          if native_url else "COS 已验证，下载链接暂不可用")
             elif native_url:
-                download_cell = f"[GitHub 原始附件](<{native_url}>)"
+                action = f"[下载原始附件](<{native_url}>)"
+            elif deleted:
+                action = "已删除"
+            elif status not in {"ready", "text"}:
+                action = "处理中，尚未归档"
             else:
-                download_cell = "Source unavailable"
-            comment_id = item.get("source_comment_id")
-            source_cell = "—"
-            valid_comment_id = (
-                (type(comment_id) is int and comment_id > 0)
-                or (isinstance(comment_id, str)
-                    and re.fullmatch(r"[1-9][0-9]{0,19}", comment_id))
-            )
-            if api and valid_comment_id:
-                source_url = f"https://github.com/{repo}/pull/{pr_number}#issuecomment-{comment_id}"
-                source_cell = f"[GitHub 评论](<{source_url}>)"
-                if native_url:
-                    source_cell += f" · [原始附件](<{native_url}>)"
-            lines.append("| " + " | ".join(_escape(v) for v in cells) + " | "
-                         + source_cell + " | " + download_cell + " |")
+                action = "下载暂不可用"
+            lines.append("| " + " | ".join((_escape(filename), _escape(size), action)) + " |")
+
+            detail_values = []
+            if item.get("actor_verified") is True and not signed_invite:
+                detail_values.append("上传者：" + _escape(item.get("actor_login") or item.get("actor") or "已验证"))
+            elif signed_invite:
+                detail_values.append("上传者：分享链接上传，身份未验证")
+            detail_values.append("时间：" + _escape(summary_time(item.get("created_at"))))
+            note = item.get("note") or (item.get("text") if status == "text" else "")
+            if note:
+                detail_values.append("备注：" + _escape(note))
+            if status == "ready" and cos_verified:
+                detail_values.append("校验：COS SHA256 已验证；媒体可播放性未验证")
+            elif status == "text":
+                detail_values.append("状态：文字说明")
+            elif not deleted and status != "ready":
+                detail_values.append("状态：尚未完成归档")
+            elif not deleted and status == "ready" and not cos_verified:
+                detail_values.append("状态：归档信息未通过完整性校验")
+            if item.get("replaces_id"):
+                detail_values.append("替换了上一附件")
+            if detail_values:
+                detail_blocks.extend(["<details>", f"<summary>{_escape(filename)} · 详情</summary>", "",
+                                      *["- " + value for value in detail_values], "", "</details>", ""])
+        if not items:
+            lines.append("| 暂无附件 | — | — |")
+        lines.extend(detail_blocks)
         if group.get("deployments"):
-            lines.extend(["", _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
-        for field in ("case_results", "test_result", "summary", "history", "cos_object_key", "cos_bundle_sha256", "cos"):
-            if group.get(field):
-                lines.extend(["", f"**{_escape(field)}:** {_escape(json.dumps(group[field], ensure_ascii=False) if isinstance(group[field], (list, dict)) else group[field])}"])
+            lines.extend(["", "### 部署记录", "",
+                          _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
+        test_result = group.get("test_result")
+        if isinstance(test_result, str) and test_result in {"pass", "fail"}:
+            lines.extend(["", "**测试结果：** " + ("通过" if test_result == "pass" else "未通过")])
+        case_results = group.get("case_results")
+        if isinstance(case_results, dict) and case_results:
+            labels = {"pass": "通过", "fail": "失败", "running": "运行中", "n/a": "不适用"}
+            counts = {}
+            for value in case_results.values():
+                if not isinstance(value, str) or value not in labels:
+                    continue
+                label = labels[value]
+                counts[label] = counts.get(label, 0) + 1
+            if counts:
+                lines.extend(["", "**自动用例：** " + " · ".join(
+                    f"{_escape(label)} {count}" for label, count in counts.items())])
+        summary = group.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            summary_text = summary.strip()
+            try:
+                json.loads(summary_text)
+                summary_text = ""
+            except (TypeError, ValueError):
+                pass
+            if summary_text:
+                lines.extend(["", "**摘要：** " + _escape(summary_text[:500])])
+        history = group.get("history")
+        if isinstance(history, (list, dict)) and history:
+            history_count = len(history)
+            lines.extend(["", f"历史事件：{history_count} 条（详情保留在归档记录中）"])
         log = _safe_download_url(group.get("cos_log_download_url", ""))
-        if log and (group.get("cos_object_key") or group.get("cos", {}).get("object_key") or group.get("log_available") or group.get("log_ready")):
-            lines.extend(["", f"[Download round COS log](<{log}>)"])
+        cos_metadata = group.get("cos") if isinstance(group.get("cos"), dict) else {}
+        if log and (cos_metadata.get("object_key") or group.get("log_available") or group.get("log_ready")):
+            lines.extend(["", f"[下载本轮归档日志](<{log}>)"])
         return lines
 
-    lines = ["<!-- deploy-approval-evidence:start -->", "### Current round evidence", ""]
+    lines = ["<!-- deploy-approval-evidence:start -->"]
     lines.extend(render_round((head, current_round), groups[(head, current_round)]))
     round_pattern = re.escape(str(head)) + r"-[0-9]+"
-    if (state.get("status") == "testing" and state.get("pr_state") == "open"
-            and not state.get("merged") and re.fullmatch(r"[0-9a-f]{40}", str(head))
-            and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
-            and state.get("evidence_enabled") is True and api):
+    current_context_valid = (
+        state.get("pr_state") == "open" and not state.get("merged")
+        and re.fullmatch(r"[0-9a-f]{40}", str(head))
+        and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
+        and state.get("evidence_enabled") is True and bool(api)
+    )
+    if current_context_valid:
+        upload_url = (page_url(state.get("upload_capability"))
+                      if state.get("status") == "testing" else "")
+        read_url = page_url(state.get("capability"))
+        if upload_url:
+            lines.extend(["", f"[上传或查看附件](<{upload_url}>)"])
+        elif read_url:
+            lines.extend(["", f"[查看测试附件](<{read_url}>)"])
+    if current_context_valid and state.get("status") == "testing" and page_url(state.get("upload_capability")):
         pending = sum(1 for item in state.get("attachments", [])
                       if isinstance(item, dict)
                       and item.get("status") not in {"ready", "text", "deleted", "invalid"})
@@ -1185,41 +1252,40 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                             and item.get("actor_verified") is False
                             and item.get("github_user_authenticated") is False
                             and item.get("cos_content_verified") is True))
-        lines.extend(["", "### 上传测试证据", ""])
-        upload_url = page_url(state.get("upload_capability"))
-        if upload_url:
-            lines.extend([
-                f"[上传到 COS](<{upload_url}>)",
-                "上传权限：本轮测试邀请链接；上传者显示为“分享链接上传，GitHub 身份未验证”，不会伪装为开发者或 Machine Owner。",
-                f"绑定：HEAD `{_escape(head)}` · round `{_escape(current_round)}`。",
-                "打开即进入上传页，无需登录、proof、SSH 隧道或手动填写 HEAD/round。可上传视频、图片、文档或文本；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
-                f"状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。只有归档后再执行 `/record_test result=pass|fail`。",
-                "上传链接有期限，仅允许当前 testing 轮次写入；HEAD、round 或 Lifecycle 状态变化后立即失效。COS 下载地址与上传链接分离。已验证归档的附件可直接使用 Summary 中的 COS 下载链接。",
-            ])
-        else:
-            lines.append("上传入口尚未就绪：未配置可用的 HTTPS 基地址，当前不能通过 Summary 上传证据。")
-    if (state.get("evidence_enabled") is True and state.get("status") == "testing"
-            and state.get("pr_state", "open") == "open" and not state.get("merged")):
-        # The signed Summary capability is bound to this trusted HEAD/round.
-        capability = state.get("capability", "")
-        evidence_url = page_url(capability)
-        if evidence_url:
-            lines.extend(["", f"[查看 COS 证据与历史](<{evidence_url}>)"])
+        lines.extend([
+            "上传权限：仅限本轮测试邀请；分享链接上传会标示身份未验证。",
+            "可上传视频、图片、文件或文字说明；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
+            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后再记录 `/record_test result=pass|fail`。",
+        ])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: str(pair[1].get("archived_at") or pair[1].get("ended_at") or pair[1].get("created_at") or ""), reverse=True)
-    lines.extend(["", "### Previous rounds", ""])
-    for key, group in old[:3]:
-        lines.extend(["<details>", f"<summary>HEAD {_escape(key[0])} · round {_escape(key[1])} · {_escape(group.get('status', 'unknown'))}</summary>", "", *render_round(key, group), "", "</details>", ""])
+    if old:
+        lines.extend(["", "### 历史测试", ""])
+        for key, group in old[:3]:
+            timestamp = first_valid_time(
+                group.get("archived_at"), group.get("ended_at"),
+                group.get("round_started_at"), group.get("started_at"),
+                group.get("created_at"),
+            )
+            attachment_count = sum(
+                1 for item in latest_attachments(group)
+                if not (item.get("deleted_at") or item.get("status") == "deleted")
+            )
+            lines.extend(["<details>",
+                          f"<summary>历史测试 · {_escape(summary_date(timestamp))} · {attachment_count} 个附件</summary>",
+                          "", *render_round(key, group, historical=True), "", "</details>", ""])
     linked_index = False
+    seen_archive_urls = set()
     for link in archive_links or []:
         if isinstance(link, dict):
             url = _trusted_archive_url(link.get("url", ""), repo, pr_number, base)
-            if url:
-                lines.append(f"[History index {_escape(link.get('page', ''))}]({url})")
+            if url and url not in seen_archive_urls:
+                seen_archive_urls.add(url)
+                lines.append(f"[查看更多历史记录](<{url}>)")
                 linked_index = True
     if len(old) > 3:
-        lines.append(f"{len(old) - 3} additional rounds retained. " +
-                     ("Use the trusted history index above." if linked_index else
-                      "History index unavailable; history has not been deleted."))
+        lines.append(f"其余 {len(old) - 3} 轮历史仍保留。" +
+                     ("可通过可信历史索引查看更多。" if linked_index else
+                      "可信历史索引暂不可用。"))
     lines.append("<!-- deploy-approval-evidence:end -->")
     return "\n".join(lines)
