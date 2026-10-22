@@ -277,7 +277,8 @@ def _g2p(segments):
 
 def _remove_redundant_newlines_after_punctuation(text):
     """Avoid creating duplicate stops from an existing stop plus a newline."""
-    return re.sub(r"([。！？!?；;：:，,.])[\t ]*(?:\r\n|\r|\n)+[\t ]*", r"\1", text)
+    # Preserve a word boundary: AI.\nII. must not become the identifier AI.II.
+    return re.sub(r"([。！？!?；;：:，,.])[\t ]*(?:\r\n|\r|\n)+[\t ]*", r"\1 ", text)
 
 
 def _special_number(value, language):
@@ -297,7 +298,7 @@ def _special_number(value, language):
 
 def _normalize_ordinary_text(text):
     # Written entities are handled by normalize_special_text first. Preserve
-    # complete custom and verified pronunciation tokens so the FST cannot
+    # explicit letter spellings and selected whole words so the FST cannot
     # change them before the shared English/MIX pronunciation lookup sees them.
     from .english import normalize_preserving_english_pronunciations
     return normalize_preserving_english_pronunciations(text, _normalizer.normalize)

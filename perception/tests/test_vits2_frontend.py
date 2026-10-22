@@ -216,3 +216,54 @@ def test_uppercase_abbreviations_keep_letter_readings_through_real_fst(productio
         phones, tones, languages, word2ph = g2p_normalized_text_mix(value)
         assert len(phones) == len(tones) == len(languages) == sum(word2ph)
         assert "UNK" not in phones
+
+
+@pytest.mark.parametrize("text,spelling,expected_phones", [
+    ("NVIDIA supports Agentic AI.", "A I", ["ey", "ay"]),
+    ("Please check the API.", "A P I", ["ey", "p", "iy", "ay"]),
+    ("今天测试AI.", "A I", ["ey", "ay"]),
+    ("今天测试AI。", "A I", ["ey", "ay"]),
+    ("Please read A I.", "A I", ["ey", "ay"]),
+    ("The CAR is ready.", "CAR", ["k", "aa", "r"]),
+    ("Car is ready.", "Car", ["k", "aa", "r"]),
+    ("今天 CAR 可以用 cash 支付。", "CAR", ["k", "aa", "r"]),
+])
+def test_letter_spellings_and_cmu_car_survive_real_fst(
+        production_text_adapter, text, spelling, expected_phones):
+    chunks = _production_chunks(production_text_adapter, text)
+    normalized = " ".join(value for value, _ in chunks)
+    assert spelling in normalized
+    assert "CA R" not in normalized
+    assert "一" not in normalized
+    all_phones, all_languages = [], []
+    for value, _ in chunks:
+        phones, tones, languages, word2ph = g2p_normalized_text_mix(value)
+        assert len(phones) == len(tones) == len(languages) == sum(word2ph)
+        assert "UNK" not in phones
+        all_phones.extend(phones)
+        all_languages.extend(languages)
+    matches = [i for i in range(len(all_phones) - len(expected_phones) + 1)
+               if all_phones[i:i + len(expected_phones)] == expected_phones]
+    assert len(matches) == 1
+    start = matches[0]
+    assert all_languages[start:start + len(expected_phones)] == ["EN"] * len(expected_phones)
+
+
+def test_letter_spelling_protection_preserves_roman_number_and_unit_context():
+    for roman, spoken in (("I.", "一."), ("II.", "二."), ("IV.", "四.")):
+        assert normalize_text_mix(roman) == spoken
+    normalized = normalize_text_mix("电流1.2A，日期2026-08-07，订单ID是0056。")
+    assert "一点二安培" in normalized
+    assert "二零二六年八月七日" in normalized
+    assert "零零五六" in normalized
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("AI\nNext step.", "AI.Nextstep."),
+    ("今天学习AI\n明天测试API", "今天学习AI.明天测试API"),
+    ("AI.\nII. Methods", "AI.二.Methods"),
+    ("API.\r\nIV. Methods", "API.四.Methods"),
+])
+def test_protected_letters_keep_paragraph_boundaries(production_text_adapter, text, expected):
+    chunks = _production_chunks(production_text_adapter, text)
+    assert "".join("".join(value.split()) for value, _ in chunks) == expected

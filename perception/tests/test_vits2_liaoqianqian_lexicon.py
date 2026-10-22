@@ -253,7 +253,7 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                 plain = Mock(side_effect=lambda value: value)
                 self.assertEqual(self.english.normalize_preserving_english_pronunciations(token, plain),
                                  " ".join(token))
-                plain.assert_called_once_with(" ".join(token))
+                plain.assert_not_called()
                 for ordinary in (token.lower(), token.title()):
                     self.assertEqual(self.english.text_normalize(ordinary), ordinary)
                     self.assertEqual(self.english.english_pronunciation(ordinary),
@@ -285,6 +285,36 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
         result = self.english.normalize_preserving_english_pronunciations(text, normalizer)
         normalizer.assert_called_once_with(text)
         self.assertEqual(result, text.replace("HAMI2.5", "version handled"))
+
+    def test_explicit_letter_sequences_do_not_become_roman_numbers(self):
+        for text in ("A I.", "A P I.", "今天A I.", "Read 'A I'.", "A\tI."):
+            with self.subTest(text=text):
+                normalizer = Mock(side_effect=lambda part: part.replace("I.", "一."))
+                result = self.english.normalize_preserving_english_pronunciations(text, normalizer)
+                self.assertNotIn("一", result)
+                self.assertTrue(all("I." not in call.args[0] for call in normalizer.call_args_list))
+
+        for text in ("I.", "II.", "IV.", "A I2", "my_A I", "A I.foo", "A I-X"):
+            with self.subTest(text=text):
+                normalizer = Mock(return_value="ordinary normalization")
+                self.assertEqual(self.english.normalize_preserving_english_pronunciations(
+                    text, normalizer), "ordinary normalization")
+                normalizer.assert_called_once_with(text)
+
+    def test_car_keeps_cmu_word_while_other_tokens_keep_their_normalizer(self):
+        for text in ("CAR", "Car", "car"):
+            with self.subTest(text=text):
+                normalizer = Mock(return_value="CA R")
+                self.assertEqual(self.english.normalize_preserving_english_pronunciations(
+                    text, normalizer), text)
+                normalizer.assert_not_called()
+                self.assert_both_routes(text, ("k", "aa", "r"), (3, 2, 3))
+        for text in ("SCAR", "CARGO", "CART", "CAR2", "CAR_model", "CAR-T", "my_CAR"):
+            with self.subTest(text=text):
+                normalizer = Mock(return_value="ordinary normalization")
+                self.assertEqual(self.english.normalize_preserving_english_pronunciations(
+                    text, normalizer), "ordinary normalization")
+                normalizer.assert_called_once_with(text)
 
     def test_existing_names_units_punctuation_and_letter_a_keep_semantics(self):
         self.assert_both_routes("A", ("ey",), (2,))

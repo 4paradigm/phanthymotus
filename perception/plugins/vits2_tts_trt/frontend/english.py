@@ -360,30 +360,49 @@ _EN_LEXICON_WORD_RE = re.compile(
 _EN_TN_CONTEXT_WORDS = frozenset({
     "USD", "EUR", "GBP", "CNY", "RMB", "DR", "MR", "MRS", "MS", "ST",
 })
+# The released Chinese FST treats CAR as C + AR and produces "CA R".
+# Preserve the word through TN; its pronunciation still comes from CMU.
+_EN_TN_PRESERVED_WORDS = frozenset({"CAR"})
+# Lexeme rules already spell initialisms such as AI/API as A I/A P I.
+# Keep that explicit spelling together so sentence-final I. is not interpreted
+# as a Roman list number. A standalone I./II./IV. still belongs to the FST.
+_SPELLED_LETTERS_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?<![A-Za-z0-9_]['.-])"
+    r"[A-Z](?:[ \t]+[A-Z])+(?![A-Za-z0-9_]|['.-][A-Za-z0-9_])"
+)
 
 
 def normalize_preserving_english_pronunciations(text, normalize_plain):
-    """Preserve complete custom and verified pronunciation tokens through TN.
+    """Preserve explicit letter spellings and selected complete words in TN.
 
     Called only on ordinary spans after the existing address, number, unit and
     identifier handlers. Explicit lexeme rewrites retain priority. Versioned
     model names are deliberately not split here: their digits and surrounding
     context remain owned by the existing frontend.
 
-    All other words follow the existing text normalizer and CMU/G2P path.
+    Custom/verified terms and known FST exceptions keep their spelling. Other
+    words follow the existing text normalizer and CMU/G2P path.
     """
     text = _spell_explicit_uppercase_acronyms(text)
-    protected = []
+    protected = list(_SPELLED_LETTERS_RE.finditer(text))
     for match in _EN_LEXICON_WORD_RE.finditer(text):
         word = match.group().upper()
         if (len(word) >= 3 and word not in _EN_TN_CONTEXT_WORDS
                 and (word in CUSTOM_EN_PRONUNCIATIONS
-                     or word in VERIFIED_EN_PRONUNCIATIONS)):
+                     or word in VERIFIED_EN_PRONUNCIATIONS
+                     or word in _EN_TN_PRESERVED_WORDS)):
             protected.append(match)
     if not protected:
         return normalize_plain(text)
+    if re.search(r"[\r\n]", text):
+        # A protected token can leave a newline at the edge of an FST span,
+        # where it is stripped. Keep paragraph boundaries for punctuation TN.
+        return "\n".join(
+            normalize_preserving_english_pronunciations(line, normalize_plain)
+            for line in re.split(r"\r\n|\r|\n", text)
+        )
     output, cursor = [], 0
-    for match in protected:
+    for match in sorted(protected, key=lambda item: item.start()):
         if cursor < match.start():
             output.append(normalize_plain(text[cursor:match.start()]))
         output.append(match.group())
