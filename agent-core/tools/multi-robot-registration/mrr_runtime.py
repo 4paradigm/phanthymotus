@@ -1,13 +1,59 @@
 #!/usr/bin/env python3
-import sys, os, json, uuid, hashlib, tempfile, shutil
+"""Deterministic storage runtime for multi-robot registration.
+
+Protocol values and persisted JSON are untrusted whenever they are used as a
+filesystem path component.  All such paths must be constructed by the helpers
+below and remain beneath ROOT.  A process-wide file lock serializes the short
+CLI transactions; it is never held while the Agent performs dialogue, TTS, or
+face recognition.
+"""
+import sys, os, json, uuid, hashlib, tempfile, shutil, fcntl
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 VERSION = "8.0"
-ROOT = Path(os.environ.get("MRR_ROOT", "/work/resource/multi-robot-registration"))
-RESPONSES = ROOT / "responses"
+ROOT = Path(os.environ.get("MRR_ROOT", "/work/resource/multi-robot-registration")).resolve()
 DEFAULT_TTL_SECONDS = 1800
 DEFAULT_STOP_SECONDS = 600
+
+def require_component(value, field="identifier"):
+    if not isinstance(value, str) or not value or len(value) > 128:
+        raise ValueError(f"{field} must be a nonempty string of at most 128 characters")
+    if value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+        raise ValueError(f"{field} must be one safe path component")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError(f"{field} contains control characters")
+    if Path(value).is_absolute() or len(Path(value).parts) != 1:
+        raise ValueError(f"{field} must be one safe path component")
+    return value
+
+def root_path(*components):
+    """Build a non-symlink path proven to remain below ROOT."""
+    path = ROOT
+    for index, component in enumerate(components):
+        path = path / require_component(component, f"path component {index}")
+        if path.is_symlink():
+            raise RuntimeError(f"symlink path component is not allowed: {path}")
+        try:
+            path.resolve(strict=False).relative_to(ROOT)
+        except ValueError as exc:
+            raise RuntimeError(f"path escapes registration root: {path}") from exc
+    return path
+
+RESPONSES = root_path("responses")
+
+@contextmanager
+def runtime_transaction():
+    """Serialize complete CLI operations across Agent/runtime processes."""
+    ROOT.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = ROOT.parent / f".{ROOT.name}.runtime.lock"
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 def now_dt():
     return datetime.now(timezone.utc)
@@ -92,42 +138,49 @@ def create_json_once(path, data):
         raise RuntimeError(f"immutable file conflict: {p}")
 
 def current_path():
-    return ROOT / "current.json"
+    return root_path("current.json")
 
 def round_dir(round_id):
-    return ROOT / "rounds" / round_id
+    return root_path("rounds", require_component(round_id, "round_id"))
 
 def config_path(round_id, version):
-    return round_dir(round_id) / f"config-v{version}.json"
+    version = int(version)
+    if version < 1 or version > 1_000_000_000:
+        raise ValueError("config_version out of range")
+    return root_path("rounds", require_component(round_id, "round_id"),
+                     f"config-v{version}.json")
 
 def records_dir(round_id):
-    return round_dir(round_id) / "records"
+    return root_path("rounds", require_component(round_id, "round_id"), "records")
 
 def runtime_dir(round_id):
-    return round_dir(round_id) / "runtime"
+    return root_path("rounds", require_component(round_id, "round_id"), "runtime")
 
 def lock_path(round_id):
     return runtime_dir(round_id) / "interaction-lock.json"
 
 def interactions_dir(round_id):
-    return runtime_dir(round_id) / "interactions"
+    return root_path("rounds", require_component(round_id, "round_id"),
+                     "runtime", "interactions")
 
 def snapshots_dir(round_id):
-    return round_dir(round_id) / "snapshots"
+    return root_path("rounds", require_component(round_id, "round_id"), "snapshots")
 
 def final_path(round_id):
     return round_dir(round_id) / "final.json"
 
 def response_path(request_id):
-    return RESPONSES / f"{request_id}.json"
+    request_id = require_component(request_id, "request_id")
+    return root_path("responses", f"{request_id}.json")
 
 def archive_path():
-    return ROOT / "archive.json"
+    return root_path("archive.json")
 
 def setup_round_dirs(round_id):
     for p in [
         RESPONSES, records_dir(round_id), interactions_dir(round_id),
-        snapshots_dir(round_id), round_dir(round_id) / "received" / "snapshots"
+        snapshots_dir(round_id), root_path("rounds", require_component(round_id, "round_id"),
+                                           "received", "snapshots")
     ]:
         p.mkdir(parents=True, exist_ok=True)
 
@@ -139,9 +192,12 @@ def save_current(cur):
     atomic_write_json(current_path(), cur)
 
 def load_config(cur):
-    path = cur.get("config_path")
-    if not path:
+    stored = cur.get("config_path")
+    if not stored:
         raise RuntimeError("config_path missing")
+    path = config_path(cur.get("round_id"), cur.get("config_version"))
+    if Path(stored).resolve(strict=False) != path.resolve(strict=False):
+        raise RuntimeError("config_path does not match round/config version")
     cfg = read_json(path)
     if not isinstance(cfg, dict):
         raise RuntimeError("config file missing or invalid")
@@ -163,7 +219,9 @@ def current_lock(cur):
     return read_json(lock_path(cur["round_id"]))
 
 def session_path(round_id, session_id):
-    return interactions_dir(round_id) / f"{session_id}.json"
+    session_id = require_component(session_id, "session_id")
+    return root_path("rounds", require_component(round_id, "round_id"),
+                     "runtime", "interactions", f"{session_id}.json")
 
 def mark_session(round_id, session_id, status, reason=None):
     p = session_path(round_id, session_id)
@@ -213,7 +271,10 @@ def validate_pending(cur):
     pp = cur.get("pending_config_path")
     if pv is None or not pp:
         raise RuntimeError("pending config fields missing")
-    cfg = read_json(pp)
+    expected = config_path(cur.get("round_id"), pv)
+    if Path(pp).resolve(strict=False) != expected.resolve(strict=False):
+        raise RuntimeError("pending_config_path does not match round/config version")
+    cfg = read_json(expected)
     if not isinstance(cfg, dict):
         raise RuntimeError("pending config missing or invalid")
     if cfg.get("round_id") != cur.get("round_id"):
@@ -229,8 +290,12 @@ def count_records(round_id, file_names=None):
     names = list(file_names) if file_names is not None else sorted(p.name for p in rdir.glob("*.json"))
     valid, invalid, events = [], [], []
     for name in names:
-        p = rdir / name
         try:
+            name = require_component(name, "record filename")
+            if not name.endswith(".json"):
+                raise ValueError("record filename must end in .json")
+            p = root_path("rounds", require_component(round_id, "round_id"),
+                          "records", name)
             obj = read_json(p)
             if not isinstance(obj, dict):
                 raise ValueError("not an object")
@@ -354,6 +419,8 @@ def validate_envelope(req):
             raise ValueError(f"{k} missing")
     if req["command"] not in {"START","STATUS","SNAPSHOT","UPDATE","STOP","CLEANUP"}:
         raise ValueError("unsupported command")
+    require_component(req["request_id"], "request_id")
+    require_component(req["round_id"], "round_id")
     return req
 
 def cached_response(req):
@@ -493,7 +560,9 @@ def handle_status(req, role):
     return base_response(req, cur["self"], effect="already_applied", **info)
 
 def make_snapshot(cur, snapshot_id, mode):
-    sp = snapshots_dir(cur["round_id"]) / f"{snapshot_id}.json"
+    snapshot_id = require_component(snapshot_id, "snapshot_id")
+    sp = root_path("rounds", require_component(cur["round_id"], "round_id"),
+                   "snapshots", f"{snapshot_id}.json")
     existing = read_json(sp)
     if existing:
         if existing.get("round_id") != cur["round_id"] or existing.get("mode") != mode:
@@ -537,7 +606,11 @@ def handle_snapshot(req, role):
     records, invalid = [], []
     for name in chunk:
         try:
-            obj = read_json(records_dir(cur["round_id"]) / name)
+            name = require_component(name, "record filename")
+            if not name.endswith(".json"):
+                raise ValueError("record filename must end in .json")
+            obj = read_json(root_path("rounds", require_component(cur["round_id"], "round_id"),
+                                      "records", name))
             if not isinstance(obj, dict):
                 raise ValueError("not an object")
             if obj.get("round_id") != cur["round_id"]:
@@ -583,7 +656,7 @@ def handle_update(req, role):
     if ver < curver:
         raise RuntimeError("config version rollback is not allowed")
     if ver == curver:
-        existing = read_json(cur.get("config_path"))
+        existing = load_config(cur)
         if existing and canonical(existing)==canonical(expected):
             return base_response(req, cur["self"], effect="already_applied",
                                  runtime_state=cur.get("state"),
@@ -657,10 +730,26 @@ def handle_stop(req, role):
                          registration_active=False, config_version=cur.get("config_version"),
                          **{k:v for k,v in info.items() if k not in {"runtime_state","registration_active","config_version"}})
 
-def remove_tree(path):
-    p = Path(path)
-    if p.exists():
-        shutil.rmtree(p)
+def remove_round(round_id):
+    """Delete exactly one direct, non-symlink child of ROOT/rounds."""
+    round_id = require_component(round_id, "round_id")
+    rounds_root = root_path("rounds")
+    raw = ROOT / "rounds" / round_id
+    if raw.is_symlink():
+        raise RuntimeError("cleanup target must not be a symlink")
+    target = round_dir(round_id)
+    if target.parent.resolve(strict=False) != rounds_root.resolve(strict=False):
+        raise RuntimeError("cleanup target is not a direct round directory")
+    if target.exists():
+        shutil.rmtree(target)
+
+def remove_responses():
+    raw = ROOT / "responses"
+    if raw.is_symlink():
+        raise RuntimeError("responses directory must not be a symlink")
+    target = root_path("responses")
+    if target.exists():
+        shutil.rmtree(target)
 
 def handle_cleanup(req, role):
     p = req.get("payload") or {}
@@ -681,7 +770,7 @@ def handle_cleanup(req, role):
     else:
         responder = {"peer_id": target_peer, "name": target.get("name")}
 
-    rid = req["round_id"]
+    rid = require_component(req["round_id"], "round_id")
     rd = round_dir(rid)
     already = (not rd.exists()) and not (cur and cur.get("round_id") == rid)
 
@@ -699,14 +788,14 @@ def handle_cleanup(req, role):
             raise RuntimeError("leader archive confirmation required before member cleanup")
 
     if rd.exists():
-        remove_tree(rd)
+        remove_round(rid)
     cp = current_path()
     cur2 = read_json(cp)
     if isinstance(cur2, dict) and cur2.get("round_id") == rid:
         cp.unlink(missing_ok=True)
     if RESPONSES.exists():
-        remove_tree(RESPONSES)
-    rounds_root = ROOT / "rounds"
+        remove_responses()
+    rounds_root = root_path("rounds")
     try:
         if rounds_root.exists() and not any(rounds_root.iterdir()):
             rounds_root.rmdir()
@@ -907,7 +996,11 @@ def commit_record(inp):
         allowed = not deadline or now_dt() <= deadline
     if not allowed:
         emit({"status":"error","code":"ROUND_NOT_WRITABLE","state":cur.get("state")})
-    cfg = read_json(s.get("config_path"))
+    expected_config = config_path(cur["round_id"], s.get("config_version"))
+    stored_config = s.get("config_path")
+    if not stored_config or Path(stored_config).resolve(strict=False) != expected_config.resolve(strict=False):
+        emit({"status":"error","code":"SESSION_CONFIG_INVALID"})
+    cfg = read_json(expected_config)
     if not cfg or cfg.get("round_id") != cur["round_id"] or int(cfg.get("config_version",-1)) != int(s.get("config_version",-2)):
         emit({"status":"error","code":"SESSION_CONFIG_INVALID"})
     answers = inp.get("answers") or {}
@@ -980,7 +1073,18 @@ def store_page(inp):
     rid = resp.get("request_id")
     if not sid or cursor is None or not rid:
         emit({"status":"error","code":"NOT_A_SNAPSHOT_PAGE"})
-    p = round_dir(cur["round_id"]) / "received" / "snapshots" / target / sid / f"page-{cursor}-{rid}.json"
+    try:
+        target = require_component(target, "target_peer_id")
+        sid = require_component(sid, "snapshot_id")
+        rid = require_component(rid, "request_id")
+        cursor = int(cursor)
+        if cursor < 0:
+            raise ValueError("cursor must be nonnegative")
+        p = root_path("rounds", require_component(cur["round_id"], "round_id"),
+                      "received", "snapshots", target, sid,
+                      f"page-{cursor}-{rid}.json")
+    except Exception as e:
+        emit({"status":"error","code":"INVALID_SNAPSHOT_PATH","error":str(e)})
     try:
         create_json_once(p, resp)
     except RuntimeError:
@@ -1010,7 +1114,10 @@ def leader_note(inp):
     emit({"status":"ok","peer_id":peer,"kind":kind})
 
 def snapshot_bundle(round_id, peer_id, snapshot_id):
-    base = round_dir(round_id) / "received" / "snapshots" / peer_id / snapshot_id
+    round_id = require_component(round_id, "round_id")
+    peer_id = require_component(peer_id, "peer_id")
+    snapshot_id = require_component(snapshot_id, "snapshot_id")
+    base = root_path("rounds", round_id, "received", "snapshots", peer_id, snapshot_id)
     raw_pages = []
     if base.exists():
         for p in base.glob("page-*.json"):
@@ -1358,14 +1465,7 @@ def archive_read(inp):
     index.sort(key=lambda x: str(x.get("ended_at") or x.get("started_at") or ""))
     emit({"status":"ok","schema":arc.get("schema"),"updated_at":arc.get("updated_at"),"rounds":index})
 
-def cli():
-    if len(sys.argv) < 2:
-        emit({"status":"error","code":"COMMAND_REQUIRED"}, 2)
-    cmd = sys.argv[1]
-    if cmd == "--version":
-        print(VERSION)
-        return
-    inp = load_stdin()
+def dispatch(cmd, inp):
     if cmd == "control-member":
         control(inp, "member")
     elif cmd == "control-leader":
@@ -1395,6 +1495,22 @@ def cli():
         emit({"status":"ok","current":cur})
     else:
         emit({"status":"error","code":"UNKNOWN_COMMAND","command":cmd}, 2)
+
+def cli():
+    if len(sys.argv) < 2:
+        emit({"status":"error","code":"COMMAND_REQUIRED"}, 2)
+    cmd = sys.argv[1]
+    if cmd == "--version":
+        print(VERSION)
+        return
+    inp = load_stdin()
+    try:
+        with runtime_transaction():
+            dispatch(cmd, inp)
+    except SystemExit:
+        raise
+    except Exception as e:
+        emit({"status":"error","code":"RUNTIME_ERROR","error":str(e)}, 2)
 
 if __name__ == "__main__":
     cli()
