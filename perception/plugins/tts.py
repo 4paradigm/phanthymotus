@@ -175,6 +175,12 @@ TOOLS = [
                 "action": {
                     "type": "string",
                     "enum": ["start", "stop", "speak", "info", "config", "interrupt", "language"],
+                    "oneOf": [{"const": value, "title": title} for value, title in [
+                        ("start", "start"), ("stop", "stop"), ("info", "info"),
+                        ("config", "config"), ("speak", "播报（speak）"),
+                        ("interrupt", "打断（interrupt）"),
+                        ("language", "语言策略（接口调试）"),
+                    ]],
                     "description": "Action to perform"
                 },
                 "input_topic": {
@@ -185,21 +191,44 @@ TOOLS = [
                     "type": "string",
                     "description": "Text to synthesize (required for action=speak)"
                 },
-                "instance_id": {"type": "string", "description": "TTS instance; required for language"},
+                "instance_id": {"type": "string", "description": "可选：指定 TTS 实例；language 接口调用时必填"},
                 "asr_result": {
                     "type": "object",
                     "properties": {"text": {"type": "string"}, "lang": {"type": "string"}},
                     "required": ["text"],
-                    "description": "VITS2 language action: current recognized text and optional detected lang. The ASR language setting is not a detection result.",
+                    "description": "API 结构化参数：当前识别的 text/lang；卡片调试请使用 text。ASR 的 language 配置不是识别结果。",
                 },
-                "input_language": {"type": "string", "enum": ["zh", "en"],
-                                   "description": "Optional current-turn ASR tag for VITS2 language"},
-                "requested_reply_language": {"type": "string", "enum": ["zh", "en"],
-                                             "description": "Current user preference, interpreted by the caller; overrides panel preference for this turn only"},
+                # Optional tags must start empty: this dashboard selects the
+                # first enum value even when the field is optional/hidden.
+                "input_language": {"type": "string", "pattern": "^(zh|en)$",
+                                   "examples": ["zh", "en"],
+                                   "description": "可选：本轮 ASR 识别语种 zh/en；未提供时留空"},
+                "requested_reply_language": {"type": "string", "pattern": "^(zh|en)$",
+                                             "examples": ["zh", "en"],
+                                             "description": "可选：本轮明确要求的回复语种 zh/en；留空遵循面板和自动策略"},
                 "turn_id": {"type": "string",
-                            "description": "Required after an explicit VITS2 language call; direct speak does not require it"},
+                            "description": "直接试听留空；显式调用 language 后填入返回的 turn_id"},
             },
             "required": ["action"],
+            # Existing canvas support: show only fields relevant to the action.
+            # Core also uses these lists for LLM tool schemas, so retain the
+            # optional instance/turn routing fields on speak.
+            "x-action-params": {
+                "speak": {
+                    "params": ["text", "instance_id", "turn_id"],
+                    "required": ["text"],
+                    "description": "播报文本。直接试听无需 turn_id；language 后使用其返回值。",
+                },
+                "interrupt": {
+                    "params": ["instance_id"],
+                    "description": "打断当前播报，保留 TTS 实例。",
+                },
+                "language": {
+                    "params": ["instance_id", "text", "asr_result", "input_language", "requested_reply_language"],
+                    "required": ["instance_id"],
+                    "description": "VITS2 对话接口：提供当前用户 text 或 asr_result，返回回复语言指令与 turn_id。",
+                },
+            },
             "x-completion": {
                 "actions": ["speak"],
                 "timeout": 60,
