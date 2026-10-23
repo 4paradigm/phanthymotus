@@ -1201,15 +1201,10 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     // Actuator/processor/default card
     const props   = schema?.properties || {};
     const required = schema?.required || [];
-    // Presentation is separate from x-action-params, which also defines LLM tools.
-    // Only opting-in cards hide these fields/actions; the API schema stays intact.
-    const hiddenParams = new Set(Array.isArray(schema?.['x-card-hidden-params']) ? schema['x-card-hidden-params'] : []);
-    const hiddenActions = new Set(Array.isArray(schema?.['x-card-hidden-actions']) ? schema['x-card-hidden-actions'] : []);
 
     const _SYSTEM_ACTIONS = new Set(['start', 'stop', 'info', 'config']);
     const _TOPIC_KEY_RE = /input.*topic|topic.*in|output.*topic|topic.*out/i;
     const fieldsHtml = Object.entries(props).map(([key, def]) => {
-      if (hiddenParams.has(key)) return '';
       // Hide auto-populated topic fields for processor cards
       if ((effectiveType === 'processor' || effectiveType === 'actuator') && _TOPIC_KEY_RE.test(key)) return '';
       const isReq = required.includes(key);
@@ -1219,7 +1214,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         // Filter system actions from processor cards
         let enumVals = def.enum;
         if (key === 'action') {
-          enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v) && !hiddenActions.has(v));
+          enumVals = enumVals.filter(v => !_SYSTEM_ACTIONS.has(v));
           // The page owns internal actions; the card exposes its entry and public actions.
           if (schema['x-workbench'] && schema['x-action-params']) {
             enumVals = enumVals.filter(v => v === schema['x-workbench'].entry || v in schema['x-action-params']);
@@ -2728,15 +2723,9 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   btn.disabled = true;
   btn.textContent = '执行中…';
 
-  const _mcp = _allMcps.find(m => m.id === mcpId);
-  const _toolObj = _mcp?.tools?.find(t => (typeof t === 'string' ? t : t.name) === toolName);
-  const schema = typeof _toolObj === 'object' ? _toolObj.inputSchema : null;
-  const hiddenParams = new Set(Array.isArray(schema?.['x-card-hidden-params']) ? schema['x-card-hidden-params'] : []);
   const args = {};
   el.querySelectorAll('.canvas-field-input').forEach(input => {
     const key = input.dataset.key;
-    // Do not forward stale inputs from a card rendered before a schema refresh.
-    if (hiddenParams.has(key)) return;
     const val = input.value.trim();
     if (val !== '') {
       if (input.type === 'number') args[key] = Number(val);
@@ -2747,13 +2736,14 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   });
 
   // Inject instance_id from card identity so multiInstance tools can resolve device_path
-  if (!instanceId && hiddenParams.has('instance_id')) instanceId = el.dataset.cardId;
   if (instanceId && !args.instance_id) args.instance_id = instanceId;
 
   // Auto-inject resolved topics from connected ports (based on schema, not DOM fields)
   const inPorts = [...el.querySelectorAll('.canvas-port.in')];
   const outPorts = [...el.querySelectorAll('.canvas-port.out')];
-  const _schemaProps = schema?.properties || {};
+  const _mcp = _allMcps.find(m => m.id === mcpId);
+  const _toolObj = _mcp?.tools?.find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  const _schemaProps = (typeof _toolObj === 'object' ? _toolObj.inputSchema : null)?.properties || {};
   let inIdx = 0, outIdx = 0;
   for (const key of Object.keys(_schemaProps)) {
     if (args[key]) continue;
