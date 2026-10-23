@@ -262,8 +262,8 @@ def _workflow_lines(
 
 def _testing_next_action(evidence_complete: bool) -> str:
     result_guidance = (
-        "测试成功时：`/record_test result=pass summary=\"视频播放和COS校验通过\"`\n\n"
-        "测试失败时：`/record_test result=fail summary=\"视频预览失败\"`"
+        "测试成功时：`/record_test result=pass summary=\"视频播放和 COS 校验通过\"`\n\n"
+        "测试失败时：`/record_test result=fail summary=\"视频播放失败，HTTP 403\"`"
     )
     if evidence_complete:
         return "**Machine Owner**\n\n" + result_guidance
@@ -844,11 +844,11 @@ def deploy_help_text(topic: str = "") -> str:
             "参数：",
             "- `result=pass` 表示本轮测试成功。",
             "- `result=fail` 表示本轮测试失败。",
-            "- `summary` 是可选说明；不要写入凭据或签名链接。",
+            "- `summary` 是测试结果说明（可选）；不要写入凭据或签名链接。",
             "",
             "示例：",
-            "- `/record_test result=pass summary=\"视频播放和COS校验通过\"`",
-            "- `/record_test result=fail summary=\"视频预览失败\"`",
+            "- `/record_test result=pass summary=\"视频播放和 COS 校验通过\"`",
+            "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`",
             "",
         ])
     return "\n".join([
@@ -859,12 +859,12 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
         "- `/approve_deploy machine=<alias-or-ip>`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段审批指定机器。",
-        "- `/record_test result=pass summary=\"视频播放和COS校验通过\"`：Machine Owner 或有 write/maintain/admin 权限的协作者，在 testing 阶段记录成功。",
-        "- `/record_test result=fail summary=\"视频预览失败\"`：由同一权限角色在 testing 阶段记录失败。",
+        "- `/record_test result=pass summary=\"视频播放和 COS 校验通过\"`：Machine Owner 或有 write/maintain/admin 权限的协作者，在 testing 阶段记录成功。",
+        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：由同一权限角色在 testing 阶段记录失败。",
         "- `/deploy_status`：只读查询当前部署状态，可在任意阶段使用。",
         "- `/deploy_help record_test`：查看测试结果命令说明；可在任意阶段使用。",
         "",
-        "结果含义：`pass`=成功；`fail`=失败；`summary`=可选说明。",
+        "结果含义：`pass`=成功；`fail`=失败；`summary`=测试结果说明（可选）。",
         "",
         "详细帮助：`/deploy_help request_bot_review`、`/deploy_help request_deploy`、`/deploy_help approve_deploy`、`/deploy_help record_test`。",
     ])
@@ -1193,11 +1193,24 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 group.get("round_started_at"), group.get("started_at"),
                 group.get("created_at"),
             )
-            if historical_time:
-                lines.append(f"**时间：** {_escape(summary_time(historical_time))}")
-            lines.extend([
-                f"**状态：** {_escape(group.get('status') if isinstance(group.get('status'), str) else '未知')}", "",
-            ])
+            lines.append(f"**时间：** {_escape(summary_time(historical_time))}")
+            status_labels = {
+                "review-required": "待审查",
+                "reviewing": "审查中",
+                "deploy-ready": "待部署",
+                "deploy-requested": "已请求部署",
+                "deploying": "部署中",
+                "testing": "测试中",
+                "succeeded": "已通过",
+                "failed": "未通过",
+                "cancelled": "已取消",
+            }
+            status = group.get("status")
+            status_label = (
+                status_labels.get(status, "状态未知")
+                if isinstance(status, str) else "状态未知"
+            )
+            lines.extend([f"**状态：** {_escape(status_label)}", ""])
         else:
             round_number = group.get("round_number")
             round_label = (f"第 {round_number} 轮"
@@ -1347,7 +1360,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         lines.extend([
             "上传权限：仅限本轮测试邀请；分享链接上传会标示身份未验证。",
             "可上传视频、图片、文件或文字说明；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
-            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后，成功用 `/record_test result=pass summary=\"视频播放和COS校验通过\"`；失败用 `/record_test result=fail summary=\"视频预览失败\"`。",
+            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后，成功用 `/record_test result=pass summary=\"视频播放和 COS 校验通过\"`；失败用 `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`。",
         ])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
@@ -1370,8 +1383,6 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 else "附件明细请查看历史归档"
             )
             date_label = summary_date(timestamp)
-            if date_label == "时间未知":
-                date_label = "历史归档"
             lines.extend(["<details>",
                           f"<summary>{_escape(group.get('round_number') if type(group.get('round_number')) is int and group.get('round_number') > 0 else '历史轮次')} · {_escape(date_label)} · {_escape(count_label)}</summary>",
                           "", *render_round(key, group, historical=True), "", "</details>", ""])
