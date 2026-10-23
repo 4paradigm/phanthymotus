@@ -1052,6 +1052,11 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
 
     # ── Handle internal agentcore MCP (no HTTP transport) ──
     if mcp_id == 'agentcore':
+        if req.tool == 'file_download':
+            action = req.arguments.get('action', 'info')
+            if action in ('start', 'info', 'stop'):
+                return {'code': 200, 'data': {'state': 'idle' if action == 'stop' else 'ready'}}
+            return {'code': 400, 'message': '文件下载由浏览器中的下载卡片操作', 'data': None}
         # remote_mic and remote_message — simple internal tools
         if req.tool == 'remote_mic':
             action = req.arguments.get('action', 'start')

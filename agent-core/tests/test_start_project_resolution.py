@@ -179,6 +179,21 @@ def driver(monkeypatch):
     return types.SimpleNamespace(starts=starts, events=events, registered=registered)
 
 
+def test_file_source_connection_does_not_register_dds_or_block_start(driver):
+    capture = {'id': 'capture', 'mcpId': 'bumi', 'toolName': 'vision_capture'}
+    download = {'id': 'download', 'mcpId': 'agentcore', 'toolName': 'file_download'}
+    _start({'cards': [download, capture], 'connections': [{
+        'fromCardId': 'capture', 'toCardId': 'download', 'fromPortIdx': 'files',
+        'toPortIdx': 'files', 'format': 'file/reference', 'fromTopic': '',
+    }]})
+    assert 'download' in driver.starts
+    assert not driver.starts['download'].get('input_topic')
+    assert not driver.starts['download'].get('input_topics')
+    assert driver.registered == []
+    assert not [event for event in driver.events if event.get('type') == 'project_start_item'
+                and event['payload'].get('status') == 'error']
+
+
 def _start(layout):
     config.main['canvas_layout'] = layout
     return asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
