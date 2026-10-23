@@ -187,7 +187,6 @@ class PluginTests(unittest.TestCase):
         self.plugin.stop()
 
     def test_schema_declares_an_actuator_that_only_emits_music(self):
-        import jsonschema
         tool = self.plugin.get_tools()[0]
         self.assertEqual(tool['name'], 'phanthy_music')
         # An actuator with an output topic and no input: mixing is audio_mixer's
@@ -203,10 +202,36 @@ class PluginTests(unittest.TestCase):
                          {'list_genres', 'play_music', 'play_sleep_audio', 'next', 'previous',
                           'pause', 'resume', 'stop_music', 'now_playing',
                           'set_volume', 'set_autoplay', 'search_music', 'search_sleep_audio'})
-        jsonschema.validate({'action': 'play_music', 'genre': 'pop'}, schema)
-        jsonschema.validate({'action': 'play_sleep_audio', 'category': 'bedtime_story'}, schema)
-        jsonschema.validate({'action': 'next'}, schema)
-        jsonschema.validate({'action': 'list_genres'}, schema)
+        # Structural checks only, and deliberately so: jsonschema is not part
+        # of the test environment the PR bot installs (pytest + pytest-asyncio),
+        # and an import here fails 2100 collected tests' sibling with
+        # ModuleNotFoundError — this file's other tests included.
+        self.assertEqual(schema['type'], 'object')
+        self.assertEqual(schema['required'], ['action'])
+        properties = schema['properties']
+        self.assertEqual(set(properties) -
+                         {'action', 'query', 'genre', 'language', 'vocal',
+                          'tags', 'artist', 'category', 'top_k', 'volume',
+                          'autoplay'},
+                         set(), 'unexpected properties declared in the schema')
+        self.assertEqual(properties['action']['enum'],
+                         ['list_genres', 'play_music', 'play_sleep_audio', 'next', 'previous',
+                          'pause', 'resume', 'stop_music', 'now_playing',
+                          'set_volume', 'set_autoplay', 'search_music',
+                          'search_sleep_audio'])
+        self.assertNotIn('stop', properties['action']['enum'],
+                         'a `stop` next to `stop_music` tears the ROS node down')
+        self.assertNotIn('track_id', properties,
+                         'search-by-id is not speakable; play reaches it via query')
+        for name in ('query', 'genre', 'language', 'vocal', 'tags', 'artist',
+                     'category'):
+            self.assertEqual(properties[name]['type'], 'string')
+        self.assertEqual(properties['top_k'],
+                         {'type': 'integer', 'minimum': 1, 'maximum': 10,
+                          'default': 3})
+        self.assertEqual(properties['volume'],
+                         {'type': 'number', 'minimum': 0, 'maximum': 100})
+        self.assertEqual(properties['autoplay']['type'], 'boolean')
 
     def test_play_only_takes_what_a_person_actually_says(self):
         """Pins the param set against drift back toward the REST shape.
