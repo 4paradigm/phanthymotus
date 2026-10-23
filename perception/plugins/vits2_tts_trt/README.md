@@ -211,6 +211,20 @@ needed. The backend defaults to `auto` when the setting is absent.
 
 #### Direct card audition
 
+The TTS card offers `speak` and `interrupt`. For `speak`, enter the text;
+the card supplies its instance ID. The card does not create input fields for
+`instance_id` or `turn_id`, and keeps the integration-only `language` action
+out of its menu. The language selector remains in TTS settings. All three
+actions and their routing parameters remain available through the MCP API.
+
+This presentation requires both the Perception schema and an Agent Core
+frontend supporting `x-card-hidden-params` / `x-card-hidden-actions`.
+Updating only Perception on an older Core does not remove the fields.
+Refresh an already-open canvas after updating both components.
+The small Core change separates card presentation from the shared API/LLM
+schema: deleting the API parameters would break explicit instance and turn
+routing. Cards without these presentation declarations keep their behavior.
+
 Direct `speak` remains supported without a preceding `language` call. In
 automatic mode it uses the speech text; ambiguous numeric input falls back
 to Chinese. It does not read a previous ASR message. A fixed selection gives

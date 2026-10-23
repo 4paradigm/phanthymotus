@@ -210,6 +210,10 @@ TOOLS = [
                             "description": "直接试听留空；显式调用 language 后填入返回的 turn_id"},
             },
             "required": ["action"],
+            # Card presentation only. Keep the full API/LLM contract below;
+            # the card supplies its own instance and does not manage turns.
+            "x-card-hidden-params": ["instance_id", "turn_id"],
+            "x-card-hidden-actions": ["language"],
             # Existing canvas support: show only fields relevant to the action.
             # Core also uses these lists for LLM tool schemas, so retain the
             # optional instance/turn routing fields on speak.
