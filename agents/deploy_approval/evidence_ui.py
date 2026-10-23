@@ -487,6 +487,7 @@ _JAVASCRIPT = r'''"use strict";
       .sort((a, b) => itemTimestamp(b) - itemTimestamp(a));
     const latestVideo = current ? ordered.find(item => !item.deleted_at && item.status === "ready" &&
       mediaType(item) === "video" && attachmentPreviewUrl(item)) : null;
+    if (latestVideo) ordered.unshift(ordered.splice(ordered.indexOf(latestVideo), 1)[0]);
     for (const item of ordered) {
       const deleted = isDeletedAttachment(item);
       const li = document.createElement("li");

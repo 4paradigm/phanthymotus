@@ -813,6 +813,8 @@ def deploy_help_text(topic: str = "") -> str:
             "阶段：部署状态为 testing。",
             "",
             "参数：",
+            "- `/record_test result=pass [summary=\"...\"]`",
+            "- `/record_test result=fail [summary=\"...\"]`",
             "- `result=pass` 表示本轮测试成功。",
             "- `result=fail` 表示本轮测试失败。",
             "- `summary` 是测试结果说明（可选）；不要写入凭据或签名链接。",
@@ -965,10 +967,19 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     groups = {(head, current_round): dict(
         state, attachments=list(current_attachments) if isinstance(current_attachments, list) else [],
         attachment_details_complete=attachment_list_matches(current_attachments, (head, current_round)),
+        attachment_details_unreadable=(
+            "attachments" in state
+            and not attachment_list_matches(current_attachments, (head, current_round))
+        ),
     )}
     if isinstance(records, dict):
         records = records.get("rounds", records.get("records", records.get("attachments", [])))
     archive_links = list(archive_links or [])
+    trusted_archive_urls = list(dict.fromkeys(
+        url for link in archive_links if isinstance(link, dict)
+        for url in [_trusted_archive_url(link.get("url", ""), repo, pr_number, base)]
+        if url
+    ))
     entries = list(records or []) + [a for a in archive_links if isinstance(a, dict) and "snapshot" in a]
     for envelope in entries:
         row = envelope
@@ -996,7 +1007,10 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         if not valid_round_binding(h, r):
             continue
         key = (h, r)
-        group = groups.setdefault(key, {"attachments": [], "attachment_details_complete": False})
+        group = groups.setdefault(key, {
+            "attachments": [], "attachment_details_complete": False,
+            "attachment_details_unreadable": False,
+        })
         if "snapshot" in row or "attachments" in row or "deployments" in row:
             attachments = list(group.get("attachments") or [])
             details_complete = group.get("attachment_details_complete") is True
@@ -1010,14 +1024,19 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             row_attachments = row.get("attachments")
             if isinstance(snapshot_attachments, list):
                 group["attachments"] = attachments + snapshot_attachments
-                details_complete = (details_complete
-                                    or attachment_list_matches(snapshot_attachments, key))
+                snapshot_complete = attachment_list_matches(snapshot_attachments, key)
+                details_complete = details_complete or snapshot_complete
+                group["attachment_details_unreadable"] |= not snapshot_complete
             else:
                 group["attachments"] = attachments
+                group["attachment_details_unreadable"] |= "attachments" in snapshot
             if row is not snapshot and isinstance(row_attachments, list):
                 group["attachments"].extend(row_attachments)
-                details_complete = (details_complete
-                                    or attachment_list_matches(row_attachments, key))
+                row_complete = attachment_list_matches(row_attachments, key)
+                details_complete = details_complete or row_complete
+                group["attachment_details_unreadable"] |= not row_complete
+            elif row is not snapshot and "attachments" in row:
+                group["attachment_details_unreadable"] = True
             attachment_records = row.get("attachment_records")
             if isinstance(attachment_records, list):
                 records_complete = all(
@@ -1035,6 +1054,9 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                     if isinstance(record, dict) and isinstance(record.get("data"), dict):
                         group["attachments"].append(record["data"])
                 details_complete = details_complete or records_complete
+                group["attachment_details_unreadable"] |= not records_complete
+            elif "attachment_records" in row:
+                group["attachment_details_unreadable"] = True
             group["attachment_details_complete"] = details_complete
         else:
             group.setdefault("attachments", []).append(row)
@@ -1090,6 +1112,13 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     def visible_attachments(group, key):
         return [item for item in latest_attachments(group, key)
                 if not (item.get("status") == "text" and is_internal_test_note(item))]
+
+    def only_hidden_internal_notes(group, key):
+        items = latest_attachments(group, key)
+        return bool(items) and all(
+            item.get("status") == "text" and is_internal_test_note(item)
+            for item in items
+        )
 
     def parsed_timestamp(value):
         if not isinstance(value, str) or not value.strip():
@@ -1244,8 +1273,24 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             lines.extend(["", "<details>", "<summary>附件说明</summary>", "", *notes, "", "</details>"])
         if not items:
             if historical:
-                lines.extend(["附件明细请查看历史归档" if not group.get("attachment_details_complete")
-                              else "该轮未保存附件"])
+                if group.get("attachment_details_unreadable"):
+                    detail_status = (
+                        "请查看下方原始归档链接。"
+                        if trusted_archive_urls else "可信原始归档链接暂不可用。"
+                    )
+                    lines.append(f"历史附件数据不可读取或校验失败；{detail_status}")
+                elif not group.get("attachment_details_complete"):
+                    detail_status = (
+                        "请查看下方原始归档链接。"
+                        if trusted_archive_urls else "可信原始归档链接暂不可用。"
+                    )
+                    lines.append(f"历史快照未包含附件明细；{detail_status}")
+                elif only_hidden_internal_notes(group, key):
+                    lines.append("内部验收备注已隐藏；该轮未保存可展示附件")
+                else:
+                    lines.append("该轮未保存附件")
+            elif state.get("status") in {"succeeded", "failed"}:
+                lines.append("本轮未保存附件")
             else:
                 lines.append("本轮暂无附件，上传后会显示")
         if group.get("deployments"):
@@ -1344,28 +1389,30 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 group.get("created_at"),
             )
             attachment_items = latest_attachments(group, key)
+            round_items = visible_attachments(group, key)
             attachment_count = sum(
-                1 for item in visible_attachments(group, key)
+                1 for item in round_items
                 if not (item.get("deleted_at") or item.get("status") == "deleted")
             )
             count_label = (
+                "历史数据不可读取" if group.get("attachment_details_unreadable") else
                 f"{attachment_count} 个附件" if attachment_count else
                 "该轮未保存附件" if not attachment_items and group.get("attachment_details_complete")
-                else "附件明细请查看历史归档"
+                else "内部验收备注已隐藏" if only_hidden_internal_notes(group, key)
+                else "附件记录均已删除" if round_items and all(
+                    item.get("deleted_at") or item.get("status") == "deleted"
+                    for item in round_items
+                )
+                else "历史快照未包含附件明细"
             )
             date_label = summary_date(timestamp)
             lines.extend(["<details>",
                           f"<summary>{_escape(group.get('round_number') if type(group.get('round_number')) is int and group.get('round_number') > 0 else '历史轮次')} · {_escape(date_label)} · {_escape(count_label)}</summary>",
                           "", *render_round(key, group, historical=True), "", "</details>", ""])
     linked_index = False
-    seen_archive_urls = set()
-    for link in archive_links or []:
-        if isinstance(link, dict):
-            url = _trusted_archive_url(link.get("url", ""), repo, pr_number, base)
-            if url and url not in seen_archive_urls:
-                seen_archive_urls.add(url)
-                lines.append(f"[查看更多历史记录](<{url}>)")
-                linked_index = True
+    for url in trusted_archive_urls:
+        lines.append(f"[查看原始归档](<{url}>)")
+        linked_index = True
     if len(old) > 3:
         lines.append(f"其余 {len(old) - 3} 轮历史仍保留。" +
                      ("可通过可信历史索引查看更多。" if linked_index else
