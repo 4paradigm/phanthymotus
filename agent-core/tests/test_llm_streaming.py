@@ -257,17 +257,51 @@ def test_thinking_off_sends_every_known_spelling():
     assert extra['reasoning_effort'] == 'none'
 
 
-def test_think_mode_on_sends_no_extra_body():
-    fake = _FakeClient([_chunk('hi')])
+def _call_with_think_mode(fake):
     # ConfigDB.__getitem__ 每次反序列化一份新 dict，改嵌套键改的是副本——
     # 必须整段回写才算数。
     saved = config.main['client']
     config.main['client'] = {'llm': [{**saved['llm'][0], 'think_mode': True}]}
     try:
-        _call(fake)
+        return _call(fake)
     finally:
         config.main['client'] = saved
-    assert 'extra_body' not in fake.kwargs
+
+
+def test_think_mode_on_sends_min_extra_body():
+    """开 thinking 不等于「随它想」：仍要把档位压到各家支持的最低。
+
+    这里原先断言的是 `'extra_body' not in kwargs`，即什么都不发——那样每家
+    网关各按自己的默认档跑，同一份配置在两个供应商上行为不同，且都是最贵
+    的那一档。
+    """
+    fake = _FakeClient([_chunk('hi')])
+    _call_with_think_mode(fake)
+    assert fake.kwargs['extra_body'] == llm_mod.THINKING_MIN_EXTRA
+
+
+def test_think_mode_on_sends_every_known_minimal_spelling():
+    """和关闭那组一样：没有通用参数，所以几种写法全发。回归锁，不是可选项。"""
+    fake = _FakeClient([_chunk('hi')])
+    _call_with_think_mode(fake)
+    extra = fake.kwargs['extra_body']
+    assert extra['chat_template_kwargs'] == {'enable_thinking': True,
+                                             'thinking_budget': 1024}
+    # 智谱 GLM-5.x / Anthropic 兼容层。budget_tokens 的下限是 1024，更小会 400
+    assert extra['thinking'] == {'type': 'enabled', 'budget_tokens': 1024}
+    assert extra['enable_thinking'] is True
+    assert extra['thinking_budget'] == 1024
+    # OpenRouter 要求 effort 和 max_tokens 二选一
+    assert extra['reasoning'] == {'enabled': True, 'effort': 'low'}
+    # "minimal" 只有 gpt-5 认，"low" 是各家通认的最低档
+    assert extra['reasoning_effort'] == 'low'
+
+
+def test_think_mode_groups_are_mutually_exclusive():
+    """两组键名完全一致，值互为反面——否则降级记账和「发哪一组」会错位。"""
+    assert set(llm_mod.THINKING_MIN_EXTRA) == set(llm_mod.THINKING_OFF_EXTRA)
+    for k, v in llm_mod.THINKING_MIN_EXTRA.items():
+        assert v != llm_mod.THINKING_OFF_EXTRA[k], k
 
 
 # ── 网关不认某个关闭参数时的降级 ──────────────────────────────────────────────
@@ -340,6 +374,60 @@ def test_unnamed_400_drops_the_whole_group_once():
     assert 'extra_body' in calls[0]
     assert 'extra_body' not in calls[1]
     assert not getattr(fake, '_thinking_rejected', None)
+
+
+# ── 模型关不掉思考时的降级 ───────────────────────────────────────────────────
+
+# router.phanthy.com 的 G53 对整组关闭参数的真实回包（2026-10-22 实测）。
+# 关键是 `param` 为空：按字段名撤的那条路一个键都匹配不到。
+G53_REFUSAL = ('{"error":{"message":"该模型始终思考，不支持关闭思考；'
+               '请使用 low、high 或 max。","type":"upstream_error",'
+               '"param":"","code":"1210"}}')
+
+
+def test_model_that_cannot_disable_thinking_falls_back_to_min():
+    """关不掉思考的模型要换成最低档重试，而不是让整次调用失败。
+
+    `model=G53` + `think_mode=False`（默认值）在修之前是每一次 LLM 调用都抛
+    BadRequestError：报错不点字段名，这句中文也不在 `_looks_like_unknown_param`
+    的词表里，于是两条降级路都没接住。
+    """
+    fake = _RejectingClient([_chunk('hi')])
+    calls = fake.calls
+
+    async def create(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise openai.BadRequestError(
+                G53_REFUSAL,
+                response=httpx.Response(400, request=httpx.Request('POST', fake.base_url)),
+                body=None)
+        fake.stream = _FakeStream(fake.script)
+        fake.kwargs = kwargs
+        return fake.stream
+
+    fake.chat.completions.create = create
+    assert _call(fake)['content'] == 'hi'
+    # 第一次发的是关闭那组，第二次换成最低档那组——而不是整组撤掉
+    assert calls[0]['extra_body'] == llm_mod.THINKING_OFF_EXTRA
+    assert calls[1]['extra_body'] == llm_mod.THINKING_MIN_EXTRA
+    # 报错里点的「请使用 low」正是这组用的值
+    assert calls[1]['extra_body']['reasoning_effort'] == 'low'
+
+    # 记在 client 上：第二次调用直接发最低档，不再白吃一个 400 往返
+    fake.script = [_chunk('hi')]
+    fake.stream = _FakeStream(fake.script)
+    _call(fake)
+    assert calls[2]['extra_body'] == llm_mod.THINKING_MIN_EXTRA
+
+
+def test_refusal_detector_ignores_ordinary_400s():
+    """别把别的 400 也当成「关不掉思考」——那会悄悄把思考打开。"""
+    assert llm_mod._refuses_to_disable_thinking(G53_REFUSAL)
+    assert llm_mod._refuses_to_disable_thinking('this model always thinks')
+    assert not llm_mod._refuses_to_disable_thinking('unrecognized parameter: thinking')
+    assert not llm_mod._refuses_to_disable_thinking(
+        "This model's maximum context length is 32768 tokens")
 
 
 # ── 思考内容要能在日志里看见 ─────────────────────────────────────────────────
