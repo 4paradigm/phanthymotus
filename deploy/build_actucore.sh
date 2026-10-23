@@ -1,26 +1,18 @@
 #!/usr/bin/env bash
 # build_actucore.sh — 构建 actucore（执行模型层）镜像并推送
 #
-# 只有 Jetson GPU 版：执行模型（VLA / 抓取策略 / locomotion）都要 GPU，
-# 没有 CPU 变体。
+# 只有 Jetson 版：执行模型多数要 GPU（VLA / 抓取策略 / locomotion），
+# 没有 CPU 变体。navigation 卡片本身不用 GPU，但和它们共用这一个镜像。
+#
+# FAST-LIVO2 与 Nav2 只在 navigation base 中从锁定源码编译；日常镜像用
+# 它编译仓库自有 ROS 包，最终运行阶段回到同一个 digest-pinned 平台基线。
 #
 # Usage:
-#   ./build_actucore.sh                          # JetPack 5.11（默认，与 build_perception.sh 一致）
-#   ./build_actucore.sh --jp-version 6.1         # JetPack 6.1
+#   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
+#   ./build_actucore.sh --jp-version 6.1         # VLA-only，保留上游本地推理
 #   ./build_actucore.sh --mirror tuna
-#
-# 默认值与 build_perception.sh 保持一致（5.11）。两个脚本并排放着，不带参数跑
-# 却落到不同的 JetPack 线上，是那种要等到部署时才发现的意外。
-#
-# 两条线用同一份 Dockerfile，只有 base 不同 —— 应用层是逐字节一样的：
-#
-#   5.11  jetson-base           只有远端 provider，薄镜像（默认）
-#   6.1   jetson-base-actucore  本地推理（lerobot + CUDA torch 2.9），~18.6 GB
-#
-# 这个差别不是取舍，是事实：jp5.11 的 CUDA 是 11.4，而 lerobot 要 torch >= 2.2.1，
-# 没有任何 torch >= 2.2 支持 CUDA 11.4（官方矩阵最低 11.8）。所以那条线上
-# **不可能**有本地推理，跑远端 provider 才是它的形态。详见
-# deploy/prepare_actucore_base.sh 的说明。
+#   ./build_actucore.sh --base --mirror tuna     # 依赖变化时才构建 navigation base
+#   BUILD_JOBS=2 ./build_actucore.sh --base --mirror tuna  # 小内存 ARM64 主机
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,8 +29,10 @@ eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
 JP_VERSION="5.11"
+BUILD_BASE=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --base) BUILD_BASE=true; shift ;;
         --jp-version) JP_VERSION="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -61,47 +55,119 @@ DATE="$(date +%y%m%d)"
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 
 # ── Jetson-only：执行模型都要 GPU，没有 CPU 变体 ──────────────────────
-DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
 BUILD_CONTEXT="${REPO_ROOT}"
-TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-
-# 数组，不是字符串。do_build 把每个额外参数当一个独立的 --build-arg，所以把
-# 多个 KEY=VALUE 拼进一个字符串传过去会变成一个畸形参数：第二个之后的全部
-# 被当成第一个的值，静默不生效。build_perception.sh 至今只传一个参数，所以
-# 那个写法在它那里一直没露馅 —— 这里传两个，第一次构建 jp5.11 就拿到了
-# jp6.1 的 base（Python 3.10、带 lerobot 的 18.6 GB 镜像），构建本身还成功了。
-BUILD_ARGS=()
+BUILD_JOBS="${BUILD_JOBS:-4}"
+if [[ ! "${BUILD_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR=BUILD_JOBS must be a positive integer" >&2
+    exit 2
+fi
+BUILD_ARGS=("BUILD_JOBS=${BUILD_JOBS}")
 # ── 根据 jp_version 选择 base image  ────────────────────────
 # 表在 build_common.sh 的 jetpack_vars 里，build_perception.sh 共用同一份。
 jetpack_vars "${JP_VERSION}" || exit 1
-BUILD_ARGS+=("JP_VERSION=${JP_ARG}")
-
-# 同一份 Dockerfile，两个 base。只有 6.1 那条线有本地推理所需的 torch/lerobot。
-#
-# base 的来源和推送目标是两件事，不能共用 REGISTRY：上面那段在没配凭据时会把
-# REGISTRY 设成 "local"（表示"只构建不推送"），而 base 无论如何都要从真实仓库
-# 拉 —— TCR 对 phanthy-motus 允许匿名拉取，所以没凭据的机器照样构建得了。
-BASE_REGISTRY="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}"
-BASE_NAMESPACE="${BASE_NAMESPACE:-phanthy-motus}"
-if [ "${JP_VERSION}" = "6.1" ]; then
-    BASE_IMAGE="${BASE_REGISTRY}/${BASE_NAMESPACE}/jetson-base-actucore:jp${JP_ARG}-torch"
-else
-    BASE_IMAGE="${BASE_REGISTRY}/${BASE_NAMESPACE}/jetson-base:jp${JP_ARG}-torch"
-    echo ""
-    echo "[note] JetPack ${JP_VERSION}：只构建远端 provider 可用的薄镜像。"
-    echo "       本机推理（provider: smolvla）在这条线上装不了 —— CUDA 11.4 撑不住"
-    echo "       lerobot 要求的 torch >= 2.2.1。卡片会在启动时说明，不会静默失败。"
-    echo ""
-fi
-BUILD_ARGS+=("BASE_IMAGE=${BASE_IMAGE}")
 
 # Dockerfile.jetson 基于 L4T base image —— 只有 arm64
 CPU_ARCH="arm64"
+case "${JP_VERSION}" in
+    5.11) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
+    6.1) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
+esac
 
-FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/actucore:${TAG}"
+CARDS_JSON='[{"name":"ControlledSemanticSpatial","type":"processor"},{"name":"vla","type":"processor"}]'
+if ! ${BUILD_BASE} && [ "${JP_VERSION}" = "6.1" ]; then
+    if [ -n "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" ]; then
+        echo "ERROR=JP6.1 navigation runtime is not supported; build VLA without a navigation override" >&2
+        exit 2
+    fi
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.vla"
+    IMAGE_NAME="actucore"
+    TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
+    BASE_IMAGE="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}/${BASE_NAMESPACE:-phanthy-motus}/jetson-base-actucore:jp${JP_ARG}-torch"
+    BUILD_ARGS+=("JP_VERSION=${JP_ARG}" "BASE_IMAGE=${BASE_IMAGE}")
+    CARDS_JSON='[{"name":"vla","type":"processor"}]'
+    echo "[info] JP6.1: VLA providers enabled; navigation is unavailable on this image."
+elif ${BUILD_BASE}; then
+    if ! ${IS_ARM64}; then
+        echo "ERROR=build the navigation base on native ARM64, not through QEMU" >&2
+        exit 2
+    fi
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.navigation-base"
+    IMAGE_NAME="actucore-navigation-base"
+    TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
+
+    NAV_RUNTIME_DIR="${REPO_ROOT}/actucore/plugins/navigation/runtime"
+    GIT_MIRROR_PREFIX="${GIT_MIRROR_PREFIX:-}"
+    source "${NAV_RUNTIME_DIR}/fast_livo2-source.lock"
+    source "${NAV_RUNTIME_DIR}/nav2-source.lock"
+    BUILD_ARGS+=(
+        "ACTUCORE_NAVIGATION_PARENT_IMAGE=${NAVIGATION_PARENT_IMAGE}"
+        "GIT_MIRROR_PREFIX=${GIT_MIRROR_PREFIX}"
+        "FAST_LIVO2_REPO=${FAST_LIVO2_REPO}"
+        "FAST_LIVO2_COMMIT=${FAST_LIVO2_COMMIT}"
+        "FAST_LIVO2_RUNTIME_PATCH_SHA256=${FAST_LIVO2_RUNTIME_PATCH_SHA256}"
+        "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}"
+        "FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}"
+        "RPG_VIKIT_REPO=${RPG_VIKIT_REPO}"
+        "RPG_VIKIT_COMMIT=${RPG_VIKIT_COMMIT}"
+        "SOPHUS_REPO=${SOPHUS_REPO}"
+        "SOPHUS_COMMIT=${SOPHUS_COMMIT}"
+        "NAVIGATION2_REPO=${NAVIGATION2_REPO}"
+        "NAVIGATION2_COMMIT=${NAVIGATION2_COMMIT}"
+        "NAVIGATION2_RUNTIME_PATCH_SHA256=${NAVIGATION2_RUNTIME_PATCH_SHA256}"
+        "BEHAVIORTREE_CPP_REPO=${BEHAVIORTREE_CPP_REPO}"
+        "BEHAVIORTREE_CPP_COMMIT=${BEHAVIORTREE_CPP_COMMIT}"
+        "ANGLES_REPO=${ANGLES_REPO}"
+        "ANGLES_COMMIT=${ANGLES_COMMIT}"
+        "BOND_CORE_REPO=${BOND_CORE_REPO}"
+        "BOND_CORE_COMMIT=${BOND_CORE_COMMIT}"
+        "DIAGNOSTICS_REPO=${DIAGNOSTICS_REPO}"
+        "DIAGNOSTICS_COMMIT=${DIAGNOSTICS_COMMIT}"
+        "NAVIGATION_MSGS_REPO=${NAVIGATION_MSGS_REPO}"
+        "NAVIGATION_MSGS_COMMIT=${NAVIGATION_MSGS_COMMIT}"
+        "LASER_GEOMETRY_REPO=${LASER_GEOMETRY_REPO}"
+        "LASER_GEOMETRY_COMMIT=${LASER_GEOMETRY_COMMIT}"
+        "PCL_MSGS_REPO=${PCL_MSGS_REPO}"
+        "PCL_MSGS_COMMIT=${PCL_MSGS_COMMIT}"
+        "PERCEPTION_PCL_REPO=${PERCEPTION_PCL_REPO}"
+        "PERCEPTION_PCL_COMMIT=${PERCEPTION_PCL_COMMIT}"
+        "ROSBAG2_STORAGE_MCAP_REPO=${ROSBAG2_STORAGE_MCAP_REPO}"
+        "ROSBAG2_STORAGE_MCAP_COMMIT=${ROSBAG2_STORAGE_MCAP_COMMIT}"
+        "MCAP_REPO=${MCAP_REPO}"
+        "MCAP_COMMIT=${MCAP_COMMIT}"
+        "LZ4_REPO=${LZ4_REPO}"
+        "LZ4_COMMIT=${LZ4_COMMIT}"
+    )
+else
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
+    IMAGE_NAME="actucore"
+    TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
+    case "${JP_VERSION}" in
+        5.11)
+            DEFAULT_NAVIGATION_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b"
+            ;;
+        6.1)
+            DEFAULT_NAVIGATION_BASE_IMAGE=""
+            ;;
+    esac
+    ACTUCORE_NAVIGATION_BASE_IMAGE="${ACTUCORE_NAVIGATION_BASE_IMAGE:-${DEFAULT_NAVIGATION_BASE_IMAGE}}"
+    if [ -z "${ACTUCORE_NAVIGATION_BASE_IMAGE}" ]; then
+        echo "ERROR=JP${JP_VERSION} navigation base is not published; set ACTUCORE_NAVIGATION_BASE_IMAGE to its exact @sha256 digest" >&2
+        exit 2
+    fi
+    if [[ ! "${ACTUCORE_NAVIGATION_BASE_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+        echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE override must use an exact @sha256 digest" >&2
+        exit 2
+    fi
+    BUILD_ARGS+=(
+        "ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}"
+        "ACTUCORE_RUNTIME_BASE_IMAGE=${NAVIGATION_PARENT_IMAGE}"
+    )
+fi
+
+FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${TAG}"
 
 echo "============================================"
-echo "Building actucore image (Jetson only)"
+echo "Building ${IMAGE_NAME} image (Jetson only)"
 echo "PyTorch for JetPack: JP${JP_VERSION}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
@@ -115,7 +181,9 @@ fi
 
 select_mirror
 
+BUILD_STARTED_AT="$(date +%s)"
 do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${BUILD_ARGS[@]}"
+echo "ACTUCORE_BUILD_DURATION_SEC=$(( $(date +%s) - BUILD_STARTED_AT ))"
 
 if ${PUSH_ENABLED}; then
     do_push "${FULL_IMAGE}"
@@ -126,8 +194,12 @@ else
     echo "Done. Image built locally: ${FULL_IMAGE}"
 fi
 
+if ${BUILD_BASE} && ${PUSH_ENABLED}; then
+    echo "ACTUCORE_NAVIGATION_BASE_IMAGE=$(docker image inspect --format '{{index .RepoDigests 0}}' "${FULL_IMAGE}")"
+fi
+
 # ── 注册到 resource-center（可选）────────────────────────────────────────────
-if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
+if ! ${BUILD_BASE} && ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     # Ask only if there is a terminal to ask on; otherwise sync (the key being
     # set is the opt-in). Test by opening /dev/tty, not with `[ -e ]`: the device
     # node exists in any container, but opening it without a controlling
@@ -140,9 +212,6 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     fi
     if [[ ! "${SYNC_CONFIRM}" =~ ^[Nn] ]]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
-        # cards 目前为空：actucore/plugins/ 还没有任何已注册的卡片（见
-        # actucore/main.py 的卡片注册区注释和 actucore/README.md）。第一个卡片落地时
-        # 把它加进这个数组，不要漏掉。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
             -X POST "${RESOURCE_CENTER_URL}/api/admin/register" \
             -H "Content-Type: application/json" \
@@ -156,8 +225,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"ActuCore\",
                 \"port\": 15730,
-                \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\",
-                \"cards\": []
+                \"description\": \"执行模型层（导航支持 JP5.11；VLA 按 JetPack 提供模型后端）\",
+                \"cards\": ${CARDS_JSON}
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

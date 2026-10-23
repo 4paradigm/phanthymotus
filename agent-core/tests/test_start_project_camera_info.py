@@ -70,6 +70,7 @@ def _conn(src, dst, topic):
 @pytest.fixture
 def rig(monkeypatch):
     """Cards that answer `info` the way a camera and a depth processor do."""
+    monkeypatch.setattr(config, 'main', {'services': {'mcp': []}, 'core': {}})
     starts = {}
     infos = []
 

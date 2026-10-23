@@ -1,3 +1,5 @@
+import asyncio
+import json
 import time
 from urllib.parse import urlparse
 from typing import List
@@ -11,6 +13,84 @@ from tool_config import find_tool
 import openai as openai_lib
 
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
+# ponytail: one project exists per Core process; split the lock only if that changes.
+layout_lifecycle_lock = asyncio.Lock()
+
+
+def _mcp_payload(result) -> dict:
+    """Unwrap an MCP call result without hiding a direct plugin response."""
+    if not isinstance(result, dict):
+        return {}
+    if 'code' not in result:
+        return result
+    if result.get('code') != 200:
+        return {}
+    payload = result.get('data')
+    if isinstance(payload, list) and payload:
+        payload = payload[0].get('text', '{}') if isinstance(payload[0], dict) else {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _stop_confirmed(payload: dict) -> bool:
+    return (
+        payload.get('terminal_confirmed') is True
+        or (payload.get('status') or payload.get('state'))
+        in {'idle', 'stopped', 'disabled'}
+    )
+
+
+def _tool_accepts_input_bindings(mcp_id: str, tool_name: str) -> bool:
+    """Use port-aware wiring only when the target tool declares it."""
+    import mcp_client
+
+    tools = mcp_client.registry.get(mcp_id, {}).get('tool_definitions', [])
+    for tool in tools:
+        if tool.get('name') == tool_name:
+            properties = (tool.get('inputSchema') or {}).get('properties') or {}
+            return 'input_bindings' in properties
+    return False
+
+
+def _resolve_processor_inputs(card, connections, cards, resolved_topics):
+    """Resolve inbound topics while preserving each destination port."""
+    cards_by_id = {item.get('id'): item for item in cards if item.get('id')}
+    target_inputs = card.get('topicIn') or []
+    bindings = []
+    topics = []
+    for conn in connections:
+        if conn.get('toCardId') != card.get('id'):
+            continue
+        try:
+            source_index = int(conn.get('fromPortIdx', 0))
+            target_index = int(conn.get('toPortIdx', 0))
+        except (TypeError, ValueError):
+            continue
+        source = cards_by_id.get(conn.get('fromCardId'), {})
+        outputs = resolved_topics.get(source.get('id')) or source.get('topicOut') or []
+        topic = ''
+        if 0 <= source_index < len(outputs):
+            topic = str(outputs[source_index].get('topic') or '').strip()
+        if not topic:
+            topic = str(conn.get('fromTopic') or '').strip()
+        if not topic:
+            continue
+        topics.append(topic)
+        if 0 <= target_index < len(target_inputs):
+            port = str(target_inputs[target_index].get('port') or '').strip()
+            if port:
+                bindings.append({'port': port, 'topic': topic})
+
+    unique_topics = list(dict.fromkeys(topics))
+    if len(unique_topics) > 1:
+        return '', unique_topics, bindings
+    if unique_topics:
+        return unique_topics[0], [], bindings
+    return '', [], bindings
 
 
 # ── Models ──────────────────────────────────────────────────────────────────
@@ -176,7 +256,7 @@ _start_project_task = None
 START_PROJECT_TIMEOUT_S = 900
 
 
-async def _do_start_project():
+async def _do_start_project(*, _lock_held: bool = False):
     """Serializes concurrent callers behind the in-flight task.
 
     The frontend's start button used to accept a second click while the first
@@ -217,7 +297,13 @@ async def _do_start_project():
         print('[start-project] already in progress, ignoring concurrent call')
         return None
 
-    task = _aio.ensure_future(_do_start_project_impl())
+    async def start_locked():
+        if _lock_held:
+            return await _do_start_project_impl()
+        async with layout_lifecycle_lock:
+            return await _do_start_project_impl()
+
+    task = _aio.ensure_future(start_locked())
     _start_project_task = task
     try:
         # wait_for 超时会 cancel 掉 task，于是它变成 done —— 下一次点启动就能进来。
@@ -504,6 +590,9 @@ async def _do_start_project_impl():
         topic_out = data.get('topic_out') or []
         if topic_out:
             resolved_topics[card_id] = topic_out
+            card = next((item for item in cards if item.get('id') == card_id), None)
+            if card is not None:
+                card['topicOut'] = topic_out
             from api.inspection import register_topic_internal
             for tp in topic_out:
                 if tp.get('topic') and tp.get('format'):
@@ -660,7 +749,7 @@ async def _do_start_project_impl():
             return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
-                                 control_interface: dict = None,
+                                 control_interface: dict = None, input_bindings: list = None,
                                  camera_info: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
@@ -676,7 +765,10 @@ async def _do_start_project_impl():
         args = {'action': 'start', 'instance_id': card_id}
         info_args: dict = {}
         wanted: list = []
-        if input_topics and len(input_topics) > 1:
+        if input_bindings and _tool_accepts_input_bindings(mcp_id, tool_name):
+            args['input_bindings'] = input_bindings
+            info_args['input_bindings'] = input_bindings
+        elif input_topics and len(input_topics) > 1:
             wanted = list(input_topics)
             args['input_topics'] = input_topics
             info_args['input_topics'] = input_topics
@@ -1085,18 +1177,33 @@ async def _do_start_project_impl():
             errors.append(tool_name)
             continue
 
+        _, _, input_bindings = _resolve_processor_inputs(
+            card, connections, cards, resolved_topics
+        )
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
-                                 control_interface=descriptor,
+                                 control_interface=descriptor, input_bindings=input_bindings,
                                  camera_info=_upstream_camera_info(card.get('id', '')))
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
         print(f'[start-project] {len(errors)} cards failed ({", ".join(errors)}), rolling back')
         await push_event({'type': 'project_start_done', 'payload': {'has_error': True, 'errors': errors}})
-        await _do_stop_project()
+        await _do_stop_project(_lock_held=True)
         return False
 
-    # 全部成功 → 标记 running
+    # 路由先在不可派发状态下安装；全部成功后再开放 project_running 门。
+    try:
+        from topic_actions import manager as topic_action_mgr
+        await topic_action_mgr.start(layout)
+    except Exception as e:
+        print(f'[start-project] topic-actions failed: {e}')
+        errors.append('topic-actions')
+        await push_event({'type': 'project_start_done', 'payload': {
+            'has_error': True, 'errors': errors,
+        }})
+        await _do_stop_project(_lock_held=True)
+        return False
+
     core = config.main.get('core', {})
     core['project_running'] = True
     config.main['core'] = core
@@ -1118,7 +1225,7 @@ async def _do_start_project_impl():
 STOP_CARD_TIMEOUT_S = 5.0
 
 
-async def _stop_cards(cards, progress: bool = False) -> list[dict]:
+async def _stop_cards(cards, progress: bool = False, *, require_confirmation: bool = False) -> list[dict]:
     """Send `stop` to each card's instance. Returns one result per card.
 
     `stop` is idempotent — a plugin that is already idle returns
@@ -1170,6 +1277,8 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
                         raise RuntimeError(reason or str(payload.get('reason') or '')[:200]
                                            or '设备停止未确认')
                     if not is_pending(payload, state, rules):
+                        if require_confirmation and not _stop_confirmed(payload):
+                            raise RuntimeError('stop was not confirmed')
                         return
                     # Never resend stop while a device is still releasing. Read
                     # its actual state within the existing per-card deadline --
@@ -1203,7 +1312,7 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
     return list(await _aio.gather(*(stop_one(c) for c in targets)))
 
 
-async def stop_removed_cards(old_cards, new_cards) -> int:
+async def stop_removed_cards(old_cards, new_cards) -> tuple[int, list[dict]]:
     """Stop instances belonging to cards that just left the layout.
 
     `_do_stop_project` stops what the *saved layout* lists, so a card removed
@@ -1222,12 +1331,12 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
     live = {c.get('id', '') for c in (new_cards or []) if c.get('id')}
     removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
     if not removed:
-        return 0
-    results = await _stop_cards(removed)
+        return 0, []
+    results = await _stop_cards(removed, require_confirmation=True)
     count = sum(1 for r in results if r.get('ok'))
     print(f'[layout] stopped {count}/{len(results)} instance(s) for removed '
           f'card(s): {", ".join(c.get("id", "") for c in removed)}')
-    return count
+    return count, [r for r in results if not r.get('ok')]
 
 
 # 正在进行中的设备收尾。再点一次停止不会并发出第二轮 —— 停止是幂等的，但两轮
@@ -1241,7 +1350,7 @@ def teardown_running() -> bool:
     return task is not None and not task.done()
 
 
-async def _do_stop_project():
+async def _do_stop_project(*, _lock_held: bool = False):
     """停止智能控制。**两段，保证不同。**
 
     第 1 段 —— 关掉 agent loop。本地一个赋值，≤1ms，不可能失败。
@@ -1258,7 +1367,10 @@ async def _do_stop_project():
     有一件是假的。
     """
     await _do_stop_project_agent()
-    return await _do_stop_project_teardown()
+    results = await _do_stop_project_teardown(_lock_held=_lock_held)
+    failures = [r for r in results if not r.get('ok')]
+    return {'ok': not failures, 'stopped': len(results) - len(failures),
+            'failures': failures}
 
 
 async def _do_stop_project_agent() -> None:
@@ -1268,12 +1380,18 @@ async def _do_stop_project_agent() -> None:
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
+    from topic_actions import manager as topic_action_mgr
+    await topic_action_mgr.stop()
+
     await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] agent loop stopped')
 
 
-async def _do_stop_project_teardown() -> list[dict]:
+async def _do_stop_project_teardown(*, _lock_held: bool = False) -> list[dict]:
     """第 2 段：设备收尾。并行、每卡死线、逐项报进度、允许部分失败。"""
+    if not _lock_held:
+        async with layout_lifecycle_lock:
+            return await _do_stop_project_teardown(_lock_held=True)
     from api.motus_stream import push_event
 
     layout = config.main.get('canvas_layout', {})
@@ -1919,5 +2037,3 @@ async def reset_config(req: ResetRequest):
             )
 
     return {'ok': True, 'reset': reset_items}
-
-

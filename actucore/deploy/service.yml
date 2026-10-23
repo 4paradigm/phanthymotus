@@ -20,6 +20,9 @@ actucore:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
+    # navigation 卡片：FAST-LIVO2 的点云地图与采集数据要活过容器重建
+    - /opt/phanthy-motus/data/fast_livo2/maps:/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw
+    - /opt/phanthy-motus/data/fast_livo2/recordings:/opt/phanthy-motus/data/fast_livo2/recordings:rw
     # DDS profile 只读挂载。必须与其它 DDS 容器加载同一份，
     # 否则本容器会与本机其余部分失联。
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro

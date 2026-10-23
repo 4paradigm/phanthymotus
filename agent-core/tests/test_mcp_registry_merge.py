@@ -165,5 +165,39 @@ class TestConnectTriggerSurvivesAHeartbeatOnlyDevice(unittest.TestCase):
         self.assertTrue(self._would_connect({'connected': False}))
 
 
+class TestNavigationHeartbeat(unittest.IsolatedAsyncioTestCase):
+    async def test_real_ping_refreshes_navigation_contract_without_reconnecting(self):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from api import mcp_manage
+
+        tool = {
+            'name': 'ControlledSemanticSpatial', 'type': 'processor',
+            'inputSchema': {
+                'type': 'object', 'properties': {'action': {'type': 'string'}},
+                'x-topic-actions': [{'port': 'goal_pose', 'action': 'navigate_to_pose'}],
+                'x-completion': {'passthrough_actions': ['stop']},
+            },
+        }
+        target = {'id': 'nav-test', 'name': 'nav', 'url': 'http://example.invalid/mcp',
+                  'online': True}
+        caps = {'tools': [tool], 'resources': [], 'server_name': 'nav'}
+        with patch.dict(mcp_client.registry, {
+            'nav-test': {'connected': True, 'tool_definitions': [], 'input_schemas': {}}
+        }, clear=True), patch.object(mcp_manage, '_get_mcp_list', return_value=[target]), \
+             patch.object(mcp_manage, '_save_mcp_list'), \
+             patch.object(mcp_manage, '_ping_mcp_http', new=AsyncMock(return_value=caps)), \
+             patch.object(mcp_manage, '_notify_inspector', new=AsyncMock()), \
+             patch.object(mcp_client, '_connect_one', new=AsyncMock()) as connect:
+            result = await mcp_manage._do_ping('nav-test')
+            await asyncio.sleep(0)
+            self.assertTrue(result['online'])
+            entry = mcp_client.registry['nav-test']
+            self.assertEqual(entry['tool_definitions'], [tool])
+            self.assertIn(tool['inputSchema'], entry['input_schemas'].values())
+            self.assertTrue(entry['connected'])
+            connect.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

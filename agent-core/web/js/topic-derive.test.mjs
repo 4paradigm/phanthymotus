@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, topicOfPort } from './topic-derive.js';
+import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, selectPreviewTopic, topicOfPort } from './topic-derive.js';
 
 // The layout that produced the report: mic → asr → tts, both derived cards saved
 // with no topic because nothing had asked the driver yet.
@@ -177,6 +177,18 @@ test('inputTopicOf and topicOfPort read the port that the connection names', () 
   assert.equal(topicOfPort({ }, 0), '');
   const conns = [{ fromCardId: 'c', fromPortIdx: '1', toCardId: 'd', toPortIdx: '0' }];
   assert.equal(inputTopicOf({ id: 'd' }, [two], conns), '/b');
+});
+
+test('the declared default preview wins without accepting a topic-less entry', () => {
+  const topics = [
+    { port: 'velocity', topic: '/velocity', format: 'data/json' },
+    { port: 'costmap', topic: '/costmap', format: 'sensor/costmap' },
+  ];
+  assert.equal(
+    selectPreviewTopic(topics, [{ port: 'costmap', default_preview: true }]),
+    topics[1],
+  );
+  assert.equal(selectPreviewTopic([{ format: 'audio/pcm-16k' }]), null);
 });
 
 test('an unresolved port does not borrow another port\'s topic', () => {

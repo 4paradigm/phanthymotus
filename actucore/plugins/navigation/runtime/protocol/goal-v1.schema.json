@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Phanthy Navigation Goal v1",
+  "type": "object",
+  "required": ["schema", "goal_id", "x", "y", "yaw"],
+  "properties": {
+    "schema": {"const": "phanthy.navigation.goal.v1"},
+    "goal_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+    },
+    "x": {"type": "number"},
+    "y": {"type": "number"},
+    "yaw": {"type": "number"},
+    "speed": {
+      "type": "number",
+      "minimum": 0.30,
+      "maximum": 1.0,
+      "default": 0.5
+    },
+    "mode": {"type": "integer", "const": 0, "default": 0}
+  },
+  "additionalProperties": false
+}

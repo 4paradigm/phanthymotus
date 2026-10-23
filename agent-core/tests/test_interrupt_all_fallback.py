@@ -13,6 +13,7 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_interrupt_all
 """
 
 import asyncio
+import importlib
 import os
 import pathlib
 import sys
@@ -76,15 +77,9 @@ def bind_vla():
 
 def interrupt(reason=''):
     agent = DecisionLoop.__new__(DecisionLoop)
-    # `patch.object(sys.modules['event.llm'], ...)` rather than the dotted
-    # string: `event/__init__.py` binds `llm = event.llm.Event()`, so the
-    # package attribute `event.llm` is that **instance**, not the module. On
-    # Python 3.12 mock resolves the dotted target via `sys.modules` and happens
-    # to find the module; on 3.10 — which the shipped image runs — it walks
-    # getattr and lands on the instance, and all 12 tests here die with
-    # "Event object has no attribute '_stop_countdown'" before the code under
-    # test ever runs. Green on a laptop, red in the image.
-    with mock.patch.object(sys.modules['event.llm'], '_stop_countdown') as stop:
+    # event.__init__ exposes an Event instance as `llm`; patch the module
+    # explicitly so Python 3.10 does not resolve the instance instead.
+    with mock.patch.object(importlib.import_module('event.llm'), '_stop_countdown') as stop:
         asyncio.run(DecisionLoop._interrupt_active_outputs(agent, reason=reason))
     return stop
 
