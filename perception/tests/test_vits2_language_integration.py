@@ -174,6 +174,44 @@ def test_direct_speech_uses_panel_readings_and_completes_acp(make_plugin, mode, 
     assert state.plugin._impl._nodes["a"]._pub.messages[-1] == list(base.AUDIO_EOF_MAGIC)
 
 
+@pytest.mark.parametrize("mode,text", [
+    ("zh", "WAIC NVIDIA OpenMLDB AI API CAR Agentic"),
+    ("zh", "Hello, the robot is ready."),
+    ("en", "你好，小方。"),
+    ("zh", "你好，Qwen 3 is ready，然后继续。"),
+])
+def test_direct_speech_treats_panel_language_as_reading_preference(make_plugin, mode, text):
+    state = make_plugin(reply_language=mode)
+    start(state)
+    result = call(state, "speak", instance_id="a", text=text)
+    assert result["reply_language"] == mode
+    assert finished(state, result)[3] is False
+    assert finished(state, result)[1] == text
+    assert state.adapter.spoken
+    assert len(state.adapter.prepared) == 1
+
+
+def test_literal_speech_exception_does_not_relax_explicit_dialogue(make_plugin):
+    state = make_plugin(reply_language="zh")
+    start(state)
+    turn = call(state, "language", instance_id="a", text="你好")
+    with pytest.raises(LanguagePolicyError, match="selected primary language"):
+        call(state, "speak", instance_id="a", text="The robot is ready.", turn_id=turn["turn_id"])
+    with pytest.raises(LanguagePolicyError) as missing:
+        call(state, "speak", instance_id="a", text="你好。")
+    assert missing.value.code == "stale_turn"
+    assert state.adapter.spoken == []
+
+
+@pytest.mark.parametrize("text", ["🙂", "?!", "สวัสดี"])
+def test_literal_speech_still_rejects_unspoken_or_unsupported_input(make_plugin, text):
+    state = make_plugin(reply_language="zh")
+    start(state)
+    with pytest.raises(LanguagePolicyError):
+        call(state, "speak", instance_id="a", text=text)
+    assert state.adapter.spoken == []
+
+
 def test_loading_keeps_each_instances_language_context_and_own_topic(make_plugin):
     state = make_plugin(gated=True)
     for key, mode in (("a", "zh"), ("b", "en")):

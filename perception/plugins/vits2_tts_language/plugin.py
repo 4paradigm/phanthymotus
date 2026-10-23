@@ -70,6 +70,11 @@ def _language_input(args):
 
 
 @dataclass(frozen=True)
+class LiteralSpeechRequest(SpeechRequest):
+    """Directly supplied text: the selected language is a reading preference."""
+
+
+@dataclass(frozen=True)
 class PreparedSpeech(SpeechRequest):
     chunks: tuple
 
@@ -86,7 +91,8 @@ def _prepare_chunks(adapter, request):
                                   frontend=True, require_primary=False)
             chunks.append((normalized, tuple(tuple(values) for values in ids)))
             parts.append(normalized)
-        validate_reply_script(" ".join(parts), request.language, frontend=True)
+        validate_reply_script(" ".join(parts), request.language, frontend=True,
+                              require_primary=not isinstance(request, LiteralSpeechRequest))
         return PreparedSpeech(request.text, request.language, request.turn_id, tuple(chunks))
     except InvalidDateError as error:
         raise LanguagePolicyError("invalid_numeric_date", str(error)) from error
@@ -101,7 +107,14 @@ def _direct_request(policy, text):
     if (turn["reply_language_mode"] == "auto" and turn["language_source"] == "default"
             and _scripts(normalize_standalone_name(text, "zh")) == {"en"}):
         turn = policy.begin_turn(text, requested_reply_language="en")
-    return policy.prepare(text, turn["turn_id"])
+    # A manual utterance is not a generated dialogue reply. Read its supported
+    # Chinese/English content literally, including standalone names or acronyms.
+    # Explicit language -> speak still goes through policy.prepare and its turn
+    # and primary-language checks; this does not bypass that dialogue contract.
+    validate_reply_script(normalize_standalone_name(text, turn["reply_language"]),
+                          turn["reply_language"], allow_neutral=is_neutral_numeric(text),
+                          require_primary=False)
+    return LiteralSpeechRequest(text, turn["reply_language"], turn["turn_id"])
 
 
 @dataclass(frozen=True)
