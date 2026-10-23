@@ -410,8 +410,7 @@ _JAVASCRIPT = r'''"use strict";
     return !!(item && (item.status === "text" || item.evidence_kind === "note" || item.kind === "note"));
   }
   function displayNote(item) {
-    if (!item || item.evidence_kind !== "note" || typeof item.display_note !== "string" ||
-        item.display_note_complete === false) return "";
+    if (!item || item.evidence_kind !== "note" || typeof item.display_note !== "string") return "";
     return item.display_note.trim();
   }
   function displayFilename(item) {
@@ -473,9 +472,15 @@ _JAVASCRIPT = r'''"use strict";
     }
   }
   function syntheticBotNote(item, note) {
+    if (!item || item.actor_verified !== true) return false;
     const actor = String(item.actor_login || item.actor || "");
-    return actor.toLowerCase() === "4pd-pr-assistant[bot]" &&
-      /^(?:Server-side COS multipart acceptance|Server-side 20MB H\.264 COS transport acceptance)/i.test(note.trim());
+    if (actor.toLowerCase() !== "4pd-pr-assistant[bot]") return false;
+    const normalized = String(note || "").trim().replace(/\s+/g, " ").toLowerCase();
+    return [
+      "server-side cos multipart acceptance",
+      "server-side 20mb h.264 cos transport acceptance"
+    ].some(template => normalized === template ||
+      normalized.startsWith(template) && /^[ :;,.!?…-]/.test(normalized.slice(template.length)));
   }
   function attachmentList(rows, parent, current) {
     const ordered = [...(rows || [])].filter(item => item && typeof item === "object")
@@ -757,7 +762,6 @@ _JAVASCRIPT = r'''"use strict";
       if (!row.round_id || !row.head_sha) return null;
       if (row.round_id !== bound.round_id || row.head_sha !== bound.head_sha) continue;
       if (isTextRecord(row)) continue;
-      if (!row.evidence_kind && row.filename === "note.txt") return null;
       const attachmentId = row.attachment_id || row.id;
       if (typeof attachmentId !== "string" || !attachmentId) return null;
       records.set(attachmentId, row);
