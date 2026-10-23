@@ -163,6 +163,94 @@ def _safe_download_url(url: str) -> str:
     return url
 
 
+def _safe_cos_evidence_download_url(item: dict) -> str:
+    """Return a trusted one-year COS URL for an exact ready attachment row.
+
+    The service sets ``cos_projection_verified`` only after validating the
+    configured COS bucket, object key, attachment identity and signed URL.
+    This renderer repeats the row/path/signature-shape checks before emitting
+    the URL as a Markdown link.
+    """
+    if (not isinstance(item, dict) or item.get("cos_projection_verified") is not True
+            or item.get("status") != "ready" or item.get("deleted_at")
+            or not isinstance(item.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
+        return ""
+    attachment_id = item.get("attachment_id")
+    filename = item.get("filename")
+    object_key = item.get("object_key")
+    if (not isinstance(attachment_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id) is None
+            or not isinstance(filename, str)):
+        return ""
+    try:
+        from .evidence_store import safe_filename
+        if safe_filename(filename) != filename:
+            return ""
+    except (TypeError, ValueError, UnicodeError):
+        return ""
+    if (not isinstance(object_key, str)
+            or not object_key.endswith(f"/attachments/{attachment_id}/{filename}")):
+        return ""
+
+    url = _safe_download_url(item.get("cos_download_url", ""))
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host_ok = re.fullmatch(
+            r"[a-z0-9][a-z0-9-]*\.cos\.[a-z]+-[a-z]+[0-9]*\.myqcloud\.com",
+            parsed.hostname or "",
+        ) is not None
+        if (not host_ok or parsed.netloc != parsed.hostname
+                or parsed.port is not None or parsed.fragment
+                or urllib.parse.unquote(parsed.path.lstrip("/")) != object_key):
+            return ""
+        pairs = urllib.parse.parse_qsl(
+            parsed.query, keep_blank_values=True, strict_parsing=True,
+        )
+        query = {}
+        for name, value in pairs:
+            if name in query:
+                return ""
+            query[name] = value
+        required = {
+            "q-sign-algorithm", "q-ak", "q-sign-time", "q-key-time",
+            "q-header-list", "q-url-param-list", "q-signature",
+            "response-content-disposition", "response-content-type",
+        }
+        if (not required.issubset(query) or not query["q-ak"]
+                or query["q-sign-algorithm"] not in {"sha1", "sha256"}
+                or re.fullmatch(r"[0-9a-fA-F]{40,128}", query["q-signature"]) is None
+                or len(query["q-signature"]) % 2):
+            return ""
+        sign_time = re.fullmatch(r"([0-9]+);([0-9]+)", query["q-sign-time"])
+        if not sign_time or query["q-key-time"] != query["q-sign-time"]:
+            return ""
+        start, expiry = map(int, sign_time.groups())
+        from .cos_client import EVIDENCE_PRESIGNED_URL_TTL_SECONDS
+        signed_lifetime = expiry - start
+        now = int(_dt.datetime.now(_dt.timezone.utc).timestamp())
+        if (start > now or expiry <= now
+                or not EVIDENCE_PRESIGNED_URL_TTL_SECONDS <= signed_lifetime
+                <= EVIDENCE_PRESIGNED_URL_TTL_SECONDS + 120):
+            return ""
+        signed_params = {
+            part.lower() for part in query["q-url-param-list"].split(";") if part
+        }
+        if "response-content-disposition" not in signed_params:
+            return ""
+        if ("response-content-type" not in signed_params
+                or query["response-content-type"] != "application/octet-stream"):
+            return ""
+        expected_filename = "filename*=UTF-8''" + urllib.parse.quote(filename, safe="")
+        if expected_filename not in query["response-content-disposition"]:
+            return ""
+    except (TypeError, ValueError, UnicodeError):
+        return ""
+    return url
+
+
 def _build_table(builds: list[BuildInfo]) -> str:
     """Render the build results table for deploy-ready comment."""
     lines = [
@@ -1244,8 +1332,13 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             uploaded_at = summary_time(first_valid_time(item.get("created_at"), item.get("uploaded_at")))
             if deleted:
                 filename = filename + "（已删除）"
-            lines.append("| " + " | ".join(_escape(value) for value in
-                (filename, size, actor, uploaded_at)) + " |")
+            filename_cell = _escape(filename)
+            download_url = "" if deleted else _safe_cos_evidence_download_url(item)
+            if download_url:
+                filename_cell = f"[{filename_cell}](<{download_url}>)"
+            lines.append("| " + " | ".join((
+                filename_cell, _escape(size), _escape(actor), _escape(uploaded_at),
+            )) + " |")
             note = item.get("note") or (item.get("text") if status == "text" else "")
             if is_internal_test_note(item):
                 note = ""
