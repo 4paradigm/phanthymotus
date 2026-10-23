@@ -1081,8 +1081,7 @@ class EvidenceService:
                         value.update(display_note=display_note,
                                      # Older page clients render `note`; retain that safe display alias.
                                      note=display_note)
-                        if complete:
-                            value['display_note_complete'] = True
+                        value['display_note_complete'] = bool(complete)
                     value['can_delete'] = bool(
                         authorized_writer or invite_allowed
                         and row.get('actor_id') == principal['id']
@@ -1402,7 +1401,7 @@ class EvidenceService:
                     'upload_link_authorized': bool(invite_allowed),
                     'created_by': submitter,
                     'created_at': utc_now(), 'updated_at': utc_now(), 'filename': filename, 'size': size, 'sha256': sha,
-                    'note': _redact_secrets(text if action == 'note' else note)[:256],
+                    'note': _redact_secrets(text if action == 'note' else note),
                     'replaces_id': replaces, 'status': 'initializing', 'request_sha256': request_hash,
                     'part_bytes': self.config.evidence_part_bytes,
                 }

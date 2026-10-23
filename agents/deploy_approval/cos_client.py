@@ -138,7 +138,9 @@ class CosClient:
                 Region=self.config.cos_region,
                 SecretId=self.config.cos_secret_id,
                 SecretKey=self.config.cos_secret_key,
+                Scheme="https",
                 Token=None,
+                VerifySSL=True,
             )
             client = CosS3Client(sdk_config)
             url = client.get_presigned_url(
@@ -364,7 +366,9 @@ class CosClient:
                 Region=self.config.cos_region,
                 SecretId=self.config.cos_secret_id,
                 SecretKey=self.config.cos_secret_key,
+                Scheme="https",
                 Token=None,
+                VerifySSL=True,
             )
             # An uncertain PUT must return to the HEAD/GET guard on the next
             # bounded watcher poll, never be blindly replayed inside the SDK.
@@ -942,7 +946,9 @@ class CosClient:
                 Region=self.config.cos_region,
                 SecretId=self.config.cos_secret_id,
                 SecretKey=self.config.cos_secret_key,
+                Scheme="https",
                 Token=None,
+                VerifySSL=True,
             )
             client = CosS3Client(config)
 
@@ -1103,7 +1109,9 @@ class CosClient:
                 Region=self.config.cos_region,
                 SecretId=self.config.cos_secret_id,
                 SecretKey=self.config.cos_secret_key,
+                Scheme="https",
                 Token=None,
+                VerifySSL=True,
             )
             client = CosS3Client(config)
             head = await asyncio.to_thread(

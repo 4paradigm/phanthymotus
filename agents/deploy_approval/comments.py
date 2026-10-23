@@ -12,7 +12,6 @@ import hashlib
 import re
 import html
 import json
-import ipaddress
 from zoneinfo import ZoneInfo
 
 import urllib.parse
@@ -888,32 +887,10 @@ def _attempt_lines(attempt: dict | None) -> list[str]:
 
 
 def _public_base(value: str) -> str:
-    """Accept HTTPS origins and HTTP origins on internal hosts only."""
-    if not isinstance(value, str) or any(ord(c) < 33 for c in value):
-        return ""
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        if (parsed.scheme not in {"https", "http"} or not parsed.hostname
-                or parsed.username or parsed.password or parsed.query or parsed.fragment
-                or parsed.path not in ("", "/") or parsed.netloc.endswith(":")
-                or any(c.isspace() or ord(c) < 33 or ord(c) == 127 for c in parsed.netloc)
-                or any(c in value for c in '<>"\\')):
-            return ""
-        if parsed.port is not None and not 1 <= parsed.port <= 65535:
-            return ""
-        if parsed.scheme == "http":
-            host = parsed.hostname.lower()
-            if host != "localhost" and not host.endswith(".localhost"):
-                try:
-                    address = ipaddress.ip_address(host)
-                except ValueError:
-                    return ""
-                if (address.is_unspecified or address.is_multicast or not
-                        (address.is_private or address.is_loopback or address.is_link_local)):
-                    return ""
-        return value.rstrip("/")
-    except (TypeError, ValueError):
-        return ""
+    """Accept only a configured, stable public HTTPS origin for Summary links."""
+    from .config import is_stable_public_base_url
+
+    return value.rstrip("/") if is_stable_public_base_url(value) else ""
 
 
 def _evidence_path(repo: str, pr_number: int) -> str:

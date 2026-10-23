@@ -33,7 +33,9 @@ from .agent_core_client import (
     AgentCoreError,
 )
 from .case_runner import CaseRunner
-from .config import Config, DEFAULT_GITHUB_REPOS, validate_repository_names
+from .config import (
+    Config, DEFAULT_GITHUB_REPOS, is_stable_public_base_url, validate_repository_names,
+)
 from .cos_client import CosClient
 from .evidence_builder import EvidenceBuilder
 from .evidence_models import (
@@ -3599,7 +3601,10 @@ class DeployController:
                              and pr.get("state") == "open" and not pr.get("merged")
                              and not pr.get("draft")
                              and pr.get("head", {}).get("sha") == state.get("head_sha"))
-            browser_upload_ready = backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
+            browser_upload_ready = (
+                backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
+                and is_stable_public_base_url(self.config.evidence_public_base_url)
+            )
         except Exception:
             status = {"status": "EVIDENCE_BACKEND_PENDING",
                       "PUBLIC_HTTPS_INGRESS_READY": False}
@@ -3790,8 +3795,9 @@ class DeployController:
             bundles.append(bundle)
             if len(bundles) == 3:
                 break
-        public_base_url = (getattr(self.config, "evidence_public_base_url", "")
-                           if browser_upload_ready else "")
+        configured_public_base = getattr(self.config, "evidence_public_base_url", "")
+        public_base_url = (configured_public_base
+                           if is_stable_public_base_url(configured_public_base) else "")
         section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, archives[-4:],
                            public_base_url=public_base_url)
         if not isinstance(section, str):
