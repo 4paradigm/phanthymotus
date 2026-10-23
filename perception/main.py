@@ -9,6 +9,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   phanthy_music    曲库检索与 HTTPS 播放（歌曲 + ASMR 助眠音频）
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
+  lidar_depth      相机硬件深度适配（接收 camera_depth，无模型推理）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
@@ -225,6 +226,16 @@ class PerceptionBundle:
                 log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
             except Exception:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
+
+        if plugins_cfg.get("lidar_depth", {}).get("enabled", False):
+            from plugins.lidar_depth import LidarDepthPerceptionPlugin
+            try:
+                self._plugins.append(LidarDepthPerceptionPlugin(
+                    plugins_cfg["lidar_depth"], executor))
+                log.info("LidarDepthPerceptionPlugin loaded")
+            except Exception:
+                log.error("LidarDepthPerceptionPlugin failed to load; continuing without hardware depth",
                           exc_info=True)
 
         if plugins_cfg.get("pose", {}).get("enabled", False):
