@@ -69,6 +69,7 @@ class LanguagePolicyTest(unittest.TestCase):
     def test_config_change_invalidates_pending_reply(self):
         first = self.policy.begin_turn("hello")
         self.policy.configure("zh")
+        self.assertIsNone(self.policy.snapshot()["remembered_language"])
         self.assert_code("language_turn_required", lambda: self.policy.prepare("Hello", first["turn_id"]))
         next_turn = self.policy.begin_turn("hello")
         self.assertEqual(next_turn["reply_language"], "zh")
@@ -77,6 +78,8 @@ class LanguagePolicyTest(unittest.TestCase):
         first = self.policy.begin_turn("hello")
         self.policy.configure("auto")
         self.assertEqual(self.policy.prepare("Hello", first["turn_id"]).language, "en")
+        next_turn = self.policy.begin_turn("2026 10/23")
+        self.assertEqual((next_turn["reply_language"], next_turn["language_source"]), ("en", "history"))
 
     def test_invalid_input_and_config_do_not_mutate_accepted_turn(self):
         accepted = self.policy.begin_turn("hello")
@@ -174,8 +177,8 @@ class LanguagePolicyTest(unittest.TestCase):
         for text, expected, source in (
             ("请查看 https://we.are.at.example.com/this/is/our/path 和 me@our.example.com。", "zh", "text"),
             ("Please check 北京 at https://example.com/qwen3 and tell me the result.", "en", "text"),
-            ("https://we.are.at.example.com/this/is/our/path", "zh", "default"),
-            ("2026-08-07 14:25 RTX-4090 8.5GB", "zh", "default"),
+            ("https://we.are.at.example.com/this/is/our/path", "en", "history"),
+            ("2026-08-07 14:25 RTX-4090 8.5GB", "en", "history"),
         ):
             with self.subTest(text=text):
                 turn = self.policy.begin_turn(text)
@@ -234,17 +237,85 @@ class LanguagePolicyTest(unittest.TestCase):
                 self.assertIn("Chinese", result["instruction"])
                 self.assertEqual(policy.prepare("你好。", result["turn_id"]).language, "zh")
 
-    def test_neutral_and_mixed_input_default_to_chinese_after_english(self):
-        for text in ("12345", "你好 hello", "🙂!?"):
+    def test_neutral_input_inherits_english_but_ambiguous_prose_keeps_fallback(self):
+        for text, language, source in (("12345", "en", "history"),
+                                      ("2026 10/23", "en", "history"),
+                                      ("你好 hello", "zh", "default"),
+                                      ("🙂!?", "zh", "default")):
             with self.subTest(text=text):
                 previous = self.policy.begin_turn("hello")
                 result = self.policy.begin_turn(text)
-                self.assertEqual(result["reply_language"], "zh")
+                self.assertEqual((result["reply_language"], result["language_source"]), (language, source))
                 self.assertIsNone(result["detected_language"])
-                self.assertEqual(self.policy.prepare("你好。", result["turn_id"]).language, "zh")
+                reply = "Hello." if language == "en" else "你好。"
+                self.assertEqual(self.policy.prepare(reply, result["turn_id"]).language, language)
                 self.assert_code(
                     "stale_turn", lambda: self.policy.prepare("Hello", previous["turn_id"]),
                 )
+
+    def test_auto_remembers_latest_clear_language_across_neutral_turns(self):
+        for text, language, source, detected in (
+            ("2026 10/23", "zh", "default", None),
+            ("Hello", "en", "text", "en"),
+            ("2026 10/23", "en", "history", None),
+            ("y=2x-3", "en", "history", None),
+            ("user@example.com", "en", "history", None),
+            ("你好", "zh", "text", "zh"),
+            ("RTX-4090", "zh", "history", None),
+            ("2/3", "zh", "history", None),
+        ):
+            with self.subTest(text=text):
+                turn = self.policy.begin_turn(text)
+                self.assertEqual((turn["reply_language"], turn["language_source"], turn["detected_language"]),
+                                 (language, source, detected))
+
+    def test_auto_asr_and_explicit_selection_update_neutral_followup_language(self):
+        for arguments, source in (({"input_language": "en"}, "asr"),
+                                  ({"requested_reply_language": "en"}, "requested")):
+            with self.subTest(arguments=arguments):
+                policy = self.module.LanguagePolicy()
+                # Direct speech's all-Latin fallback also uses an explicit
+                # requested language; it must not be lost on the next number.
+                first = policy.begin_turn("A100", **arguments)
+                self.assertEqual((first["reply_language"], first["language_source"]), ("en", source))
+                following = policy.begin_turn("2026 10/23")
+                self.assertEqual((following["reply_language"], following["language_source"]), ("en", "history"))
+                self.assertIsNone(following["detected_language"])
+
+    def test_changed_mode_and_recreated_policy_start_without_memory(self):
+        self.policy.begin_turn("Hello")
+        self.policy.configure("zh")
+        self.policy.begin_turn("Hello")
+        self.assertIsNone(self.policy.snapshot()["remembered_language"])
+        self.policy.configure("auto")
+        turn = self.policy.begin_turn("2026 10/23")
+        self.assertEqual((turn["reply_language"], turn["language_source"]), ("zh", "default"))
+        self.policy.begin_turn("Hello")
+        replacement = self.module.LanguagePolicy()
+        fresh = replacement.begin_turn("2026 10/23")
+        self.assertEqual((fresh["reply_language"], fresh["language_source"]), ("zh", "default"))
+
+    def test_fixed_preferences_do_not_record_inputs_or_one_turn_overrides(self):
+        for mode, other in (("zh", "en"), ("en", "zh")):
+            with self.subTest(mode=mode):
+                policy = self.module.LanguagePolicy(mode)
+                fixed = policy.begin_turn("2026 10/23", input_language=other)
+                self.assertEqual((fixed["reply_language"], fixed["language_source"]), (mode, "fixed"))
+                policy.begin_turn("2026 10/23", requested_reply_language=other)
+                self.assertIsNone(policy.snapshot()["remembered_language"])
+                policy.configure("auto")
+                fresh = policy.begin_turn("2026 10/23")
+                self.assertEqual((fresh["reply_language"], fresh["language_source"]), ("zh", "default"))
+
+    def test_ambiguous_prose_and_generated_replies_do_not_replace_language_memory(self):
+        accepted = self.policy.begin_turn("Hello")
+        before = self.policy.snapshot()
+        self.policy.prepare("Hello, 我们检查机器人的状态。", accepted["turn_id"])
+        self.assertEqual(self.policy.snapshot(), before)
+        ambiguous = self.policy.begin_turn("你好 hello")
+        self.assertEqual((ambiguous["reply_language"], ambiguous["language_source"]), ("zh", "default"))
+        following = self.policy.begin_turn("2026 10/23")
+        self.assertEqual((following["reply_language"], following["language_source"]), ("en", "history"))
 
     def test_fixed_mode_accepts_first_neutral_input(self):
         for mode in ("zh", "en"):
@@ -297,7 +368,7 @@ class LanguagePolicyTest(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.policy.begin_turn("Hello")
                 turn = self.policy.begin_turn(raw)
-                self.assertEqual((turn["reply_language"], turn["language_source"]), ("zh", "default"))
+                self.assertEqual((turn["reply_language"], turn["language_source"]), ("en", "history"))
                 self.assertIsNone(turn["detected_language"])
                 self.assertEqual(self.policy.prepare(raw, turn["turn_id"]).text, raw)
                 for supplied in ("zh", "en"):
@@ -387,7 +458,7 @@ class LanguagePolicyTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(is_neutral_symbolic(text))
 
-    def test_complete_addresses_follow_mode_without_inheriting_english(self):
+    def test_complete_addresses_follow_fixed_mode_or_auto_language_memory(self):
         from plugins.vits2_tts_language.neutral_text import is_neutral_symbolic, normalize_neutral_text
 
         for mode in ("zh", "en", "auto"):
@@ -404,8 +475,9 @@ class LanguagePolicyTest(unittest.TestCase):
                 with self.subTest(mode=mode, text=text):
                     self.assertTrue(is_neutral_symbolic(text))
                     turn = policy.begin_turn(text)
-                    language = "en" if mode == "en" else "zh"
+                    language = "zh" if mode == "zh" else "en"
                     self.assertEqual(turn["reply_language"], language)
+                    self.assertEqual(turn["language_source"], "history" if mode == "auto" else "fixed")
                     self.assertIsNone(turn["detected_language"])
                     request = policy.prepare(text, turn["turn_id"])
                     self.assertEqual(request.text, text)
@@ -448,6 +520,8 @@ class LanguagePolicyTest(unittest.TestCase):
         self.assertEqual(self.policy.prepare("Hello", a["turn_id"]).language, "en")
         self.assertEqual(other.prepare("你好", b["turn_id"]).language, "zh")
         self.assert_code("stale_turn", lambda: other.prepare("你好", a["turn_id"]))
+        self.assertEqual(self.policy.begin_turn("2026 10/23")["reply_language"], "en")
+        self.assertEqual(other.begin_turn("2026 10/23")["reply_language"], "zh")
 
     def test_concurrent_turn_switch_never_relabels_an_accepted_reply(self):
         for _ in range(20):

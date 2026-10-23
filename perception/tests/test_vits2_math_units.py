@@ -54,6 +54,9 @@ class MathUnitsTest(unittest.TestCase):
             "kg/m³": ("千克每立方米", "kilograms per cubic meter"),
             "GB": ("G B", "gigabytes"), "MB": ("M B", "megabytes"),
             "KB": ("K B", "kilobytes"), "degrees Celsius": ("摄氏度", "degrees Celsius"),
+            "V": ("伏特", "volts"), "mV": ("毫伏", "millivolts"),
+            "kV": ("千伏", "kilovolts"), "W": ("瓦特", "watts"),
+            "mW": ("毫瓦", "milliwatts"), "kW": ("千瓦", "kilowatts"),
         }
         for unit, (zh, en) in units.items():
             with self.subTest(unit=unit):
@@ -62,6 +65,30 @@ class MathUnitsTest(unittest.TestCase):
         self.assertEqual(self.spoken("2.5%"), "百分之 NUM(2.5)")
         self.assertEqual(self.spoken("2.5%", "EN"), "NUM(2.5) percent")
         self.assertEqual(self.spoken("1kg", "EN"), "NUM(1) kilogram")
+
+    def test_omitted_zero_decimals_in_math_measurements_and_uncertainty(self):
+        for text, expected in (
+            ("x=.5", "x 等于 NUM(.5)"),
+            ("x=-.5", "x 等于 负 NUM(.5)"),
+            ("y=.5x-.25", "y 等于 NUM(.5) 乘以 x 减 NUM(.25)"),
+            ("-.5V", "NUM(-.5) 伏特"),
+            ("±.5°C", "正负 NUM(.5) 摄氏度"),
+            ("-.5°C～.5°C", "NUM(-.5) 摄氏度 到 NUM(.5) 摄氏度"),
+            (".50mW", "NUM(.50) 毫瓦"),
+            (".5e-3V", "NUM(.5) 乘以 十的 NUM(-3) 次方 伏特"),
+        ):
+            with self.subTest(text=text):
+                spans = self.spans(text)
+                self.assertEqual(spans, [(0, len(text), expected)])
+
+    def test_decimal_and_new_unit_boundaries_preserve_versions_and_ids(self):
+        for text in (
+            "v1.2.3", "version 1.2.3", "x=1.2.3", "NO.0917", "ID_0.5V",
+            "v1.2.3V", "model1.5W", "3.05VModel", "2.5mWh", "1kVA",
+            "2V/day", "2kW/h", "1V.2", "1W.2", "file.5V",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.spans(text), [])
 
     def test_parentheses_comparators_negative_values_and_powers(self):
         self.assertEqual(self.spoken("(x+2)^3=27"),
@@ -119,6 +146,21 @@ class EnglishCardinalTest(unittest.TestCase):
 
     def test_math_uses_actual_english_number_readings(self):
         self.assertEqual(self.spoken("y=2x-3"), "y equals two times x minus three")
+
+    def test_omitted_zero_and_electrical_units_use_real_english_quantities(self):
+        for text, expected in (
+            ("x=.5", "x equals zero point five"),
+            ("x=-.5", "x equals negative zero point five"),
+            ("-.5V", "minus zero point five volts"),
+            ("±.5°C", "plus or minus zero point five degrees Celsius"),
+            (".5e-3V", "zero point five times ten to the power of minus three volts"),
+            ("1V", "one volt"), ("2.5mV", "two point five millivolts"),
+            ("1kV", "one kilovolt"), ("2W", "two watts"),
+            (".50mW", "zero point five zero milliwatts"),
+            ("1kW", "one kilowatt"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.spoken(text), expected)
 
     def test_standalone_fractions_use_natural_singular_and_plural_nouns(self):
         for text, expected in (

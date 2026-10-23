@@ -8,6 +8,7 @@ import re
 from .lexicon_rules import apply_lexeme_rules, has_chinese_name_reading
 from .special_text import _ADDRESSES, normalize_special_text
 from .number_context import _DATE, _TIME, _PHONE, _NUMBERED_ID, _GPU_MODEL
+from .numeric_formats import protected_ranges as numeric_format_ranges
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _EN_WORD = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)*")
@@ -52,6 +53,8 @@ def protected_spans(text):
             found.append((a, b, kind))
     for match in _ADDRESSES.finditer(text):
         add(match.start(), match.start() + len(_trim_address(match.group())), "address")
+    for start, end in numeric_format_ranges(text):
+        add(start, end, "numeric-format")
     for kind, pattern in (("date", _DATE), ("time", _TIME), ("phone", _PHONE),
                           ("identifier", _NUMBERED_ID), ("model", _GPU_MODEL),
                           ("measurement", _MEASURE), ("number", _DECIMAL)):

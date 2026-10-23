@@ -14,7 +14,7 @@ _URL = r"(?:https?://|www\.)[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
 _ADDRESSES = re.compile(r"(?<![A-Za-z0-9_])(?:" + _URL + "|" + _EMAIL + ")", re.I)
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _EN_CARDINAL = re.compile(
-    r"(?<![A-Za-z0-9_.$£€¥￥])[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+    r"(?<![A-Za-z0-9_.,$£€¥￥/\-])[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
     r"(?![A-Za-z0-9_]|\.\d)"
 )
 _DIGITS = {"ZH": tuple("零一二三四五六七八九"),
@@ -96,7 +96,7 @@ def _read_address(address, language):
 
 
 def normalize_special_text(text, normalize_plain, verbalize_number, language=None,
-                           language_resolver=None):
+                           language_resolver=None, normalize_cardinals=True):
     """Normalize only recognized special spans; delegate all other text.
 
     Without an override, language follows the original legacy behavior.
@@ -104,6 +104,8 @@ def normalize_special_text(text, normalize_plain, verbalize_number, language=Non
     the resolver receives raw-text start/end offsets. Address punctuation is
     pronounced literally and is never sent through lexical rewriting.
     `verbalize_number(value, language)` must preserve decimal digits.
+    A caller providing its own quantity reader can disable the English
+    cardinal pass and handle unclaimed numbers in normalize_plain instead.
     """
     if language is None:
         language = "ZH" if _CJK.search(text) else "EN"
@@ -152,7 +154,7 @@ def normalize_special_text(text, normalize_plain, verbalize_number, language=Non
     # remaining numeric quantities using the existing English number reader;
     # otherwise even "111 samples" can become a Chinese quantity plus "秒amples".
     # Structured fields and formulas have priority over cardinal readings.
-    if language == "EN":
+    if language == "EN" and normalize_cardinals:
         for match in _EN_CARDINAL.finditer(text):
             if not any(match.start() < b and match.end() > a for a, b, _ in spans):
                 number_language = local_language(match.start(), match.end())

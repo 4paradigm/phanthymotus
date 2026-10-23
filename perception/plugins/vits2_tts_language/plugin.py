@@ -12,7 +12,7 @@ import threading
 
 from ..vits2_tts_trt.plugin import TTSPlugin as BaseTTSPlugin, _Vits2TTSNode, _node_suffix
 from .policy import LanguagePolicy, LanguagePolicyError, SpeechRequest, _scripts, validate_reply_script
-from .neutral_text import InvalidDateError, is_neutral_text, normalize_neutral_text
+from .neutral_text import InvalidDateError, is_neutral_text, normalize_mixed_text, normalize_neutral_text
 from .name_text import normalize_standalone_name
 
 log = logging.getLogger(__name__)
@@ -73,6 +73,10 @@ def _language_input(args):
 class LiteralSpeechRequest(SpeechRequest):
     """Directly supplied text: the selected language is a reading preference."""
 
+    # Freeze only fixed panel preferences. Auto prose retains MIX's existing
+    # local clause readings; explicit dialogue SpeechRequest uses its language.
+    reading_language: str = ""
+
 
 @dataclass(frozen=True)
 class PreparedSpeech(SpeechRequest):
@@ -82,9 +86,14 @@ class PreparedSpeech(SpeechRequest):
 def _prepare_chunks(adapter, request):
     """Freeze frontend output once, before it is handed to the worker."""
     try:
-        text = (normalize_neutral_text(request.text, request.language)
-                if is_neutral_text(request.text)
-                else normalize_standalone_name(request.text, request.language))
+        if is_neutral_text(request.text):
+            text = normalize_neutral_text(request.text, request.language)
+        else:
+            text = normalize_standalone_name(request.text, request.language)
+            reading_language = (request.reading_language if isinstance(request, LiteralSpeechRequest)
+                                else request.language)
+            if reading_language:
+                text = normalize_mixed_text(text, reading_language)
         chunks, parts = [], []
         for normalized, ids in adapter.iter_text_chunks(text):
             validate_reply_script(normalized, request.language, allow_neutral=True,
@@ -115,7 +124,10 @@ def _direct_request(policy, text):
     validate_reply_script(normalize_standalone_name(text, turn["reply_language"]),
                           turn["reply_language"], allow_neutral=is_neutral_text(text),
                           require_primary=False)
-    return LiteralSpeechRequest(text, turn["reply_language"], turn["turn_id"])
+    return LiteralSpeechRequest(
+        text, turn["reply_language"], turn["turn_id"],
+        reading_language=turn["reply_language"] if turn["reply_language_mode"] != "auto" else "",
+    )
 
 
 @dataclass(frozen=True)

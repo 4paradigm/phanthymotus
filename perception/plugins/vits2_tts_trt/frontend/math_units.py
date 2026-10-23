@@ -29,15 +29,21 @@ _UNITS = {
     "KB": ("K B", "kilobyte", "kilobytes"),
     "A": ("安培", "ampere", "amperes"),
     "mA": ("毫安", "milliampere", "milliamperes"),
+    "V": ("伏特", "volt", "volts"),
+    "mV": ("毫伏", "millivolt", "millivolts"),
+    "kV": ("千伏", "kilovolt", "kilovolts"),
+    "W": ("瓦特", "watt", "watts"),
+    "mW": ("毫瓦", "milliwatt", "milliwatts"),
+    "kW": ("千瓦", "kilowatt", "kilowatts"),
     "dB": ("分贝", "decibel", "decibels"),
 }
-_NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_NUMBER = r"(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
 _DASH = r"\-‐‑−﹣－"
 _NORMALIZE_DASH = str.maketrans({char: "-" for char in "‐‑−﹣－"})
 _UNIT_FORMS = sorted(_UNITS, key=len, reverse=True)
 _UNIT_PATTERN = "|".join(re.escape(unit).replace(r"/", r"\s*/\s*") for unit in _UNIT_FORMS)
 _UNIT_EXPR = rf"(?:{_UNIT_PATTERN})|℃|℉|(?i:degrees?\s+(?:Celsius|Fahrenheit))"
-_UNIT_END = r"(?![A-Za-z0-9_/²³^])"
+_UNIT_END = r"(?![A-Za-z0-9_/²³^]|\.\d)"
 _COMPARATOR_PATTERN = r"<=|>=|!=|[=<>≤≥≠]"
 _MEASURE = re.compile(
     rf"(?<![A-Za-z0-9_.])(?P<uncertainty>±\s*)?(?P<number>[+-]?{_NUMBER})\s*"
@@ -61,7 +67,7 @@ _FRACTION = re.compile(
     r"(?![A-Za-z0-9_/]|\.\d)"
 )
 _COEFFICIENT = rf"{_NUMBER}[A-Za-z]"
-_ATOM = rf"(?<![A-Za-z0-9_.])(?:{_COEFFICIENT}|{_NUMBER}|[A-Za-z])(?![A-Za-z0-9_])|π"
+_ATOM = rf"(?<![A-Za-z0-9_.])(?:{_COEFFICIENT}|{_NUMBER}|[A-Za-z])(?![A-Za-z0-9_]|\.\d)|π"
 _TOKEN = rf"(?:{_ATOM}|<=|>=|!=|[+\-*×/÷^=<>≤≥≠²³()])"
 _CANDIDATE = re.compile(rf"{_TOKEN}(?:\s*{_TOKEN})*")
 _TOKENIZER = re.compile(_TOKEN)

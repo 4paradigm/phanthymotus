@@ -212,11 +212,15 @@ needed. The backend defaults to `auto` when the setting is absent.
 #### Direct card audition
 
 Direct `speak` remains supported without a preceding `language` call. In
-automatic mode it uses the speech text; ambiguous numeric input falls back
-to Chinese. It does not read a previous ASR message. A fixed selection gives
-numeric-only text, complete supported symbolic expressions, and supported names
-the corresponding Chinese or English
-reading. For example, `2026 10/ 20` is read as a date in the selected language.
+automatic mode it uses the speech text. Neutral numbers/dates/symbols and supported
+standalone names retain the same instance's most recent explicit language;
+without that history they fall back to Chinese. For example, `Hello` followed by
+`2026 10/23` reads the date in English; `你好` then changes subsequent neutral
+readings to Chinese. Ordinary ambiguous bilingual prose keeps its conservative
+Chinese fallback. This does not automatically subscribe to ASR. A fixed selection gives
+supported dates, numeric fields, quantities, symbolic expressions and standalone
+names the corresponding Chinese or English reading, including fields within
+mixed prose. For example, `2026 10/ 20` is read as a date in the selected language.
 For manual speech, this selection is a reading preference: Chinese-English
 mixed text and standalone names or acronyms are allowed without requiring
 characters from the selected language. It does not translate the input.
@@ -226,8 +230,8 @@ English mode. Empty input and unsupported scripts are still rejected.
 Standalone formulas, unit quantities, recognized model/identifier formats,
 URLs and email addresses use the resolved language too: variable letters,
 unit/model prefixes and address characters alone are not evidence of English
-prose. The existing format parsers must cover the
-whole input; ordinary sentences and mixed prose retain their contextual routing.
+prose. For direct auto speech, the existing parsers must cover the whole input
+to treat it as neutral; ordinary sentences retain their local contextual routing.
 This is deterministic text normalization, not semantic interpretation of
 arbitrary notation or translation of an English sentence.
 
@@ -237,19 +241,51 @@ arbitrary notation or translation of an English sentence.
 | `RTX‑4090` | `R T X 四零九零` | `R T X four zero nine zero` |
 | `1.2A` | `一点二安培` | `one point two amperes` |
 | `2/3` | `三分之二` | `two thirds` |
+| `$1,234.50` | `一千二百三十四点五零美元` | `one thousand two hundred thirty four dollars and fifty cents` |
+| `21st` | `第二十一` | `twenty first` |
+| `v1.2.3` | `V 一点二点三` | `V one point two point three` |
+| `-.5V` | `负零点五伏特` | `minus zero point five volts` |
 
 For standalone addresses, Chinese mode uses `点`, `艾特`, `冒号` and `斜杠`
 where English mode uses `dot`, `at`, `colon` and `slash`. Address letters are
 spelled and digits are read individually; URL paths are not reinterpreted as
-fractions or dates. Direct auto falls back to Chinese for these addresses.
-When an address or number occurs within ordinary prose, the existing clause
-context still determines its reading; selecting English does not translate a
-Chinese sentence (or vice versa).
+fractions or dates. Direct auto falls back to Chinese for these addresses when
+the instance has no remembered language.
+In fixed Chinese/English modes, addresses and recognized numeric fields within
+prose also use the selected reading. `2026 10/23 message` in Chinese mode reads
+the date as `二零二六年十月二十三日` and retains the English word `message`.
+`2026 10/23 星期五` in English mode reads the date as
+`October twenty third, two thousand twenty-six` and retains `星期五` in Chinese.
+Explicit newlines remain separate; dates do not span multiple lines. Ordinary
+words are not translated. Auto prose keeps the existing clause-local readings.
+The fixed preference is captured when the request is accepted, so a later
+panel change does not alter queued speech. An explicit `language` turn uses
+its resolved language for these fields as well.
 
 English standalone fractions use fraction nouns (`one half`, `two thirds`,
 `three quarters`). An explicit arithmetic context such as `Calculate 2/3` or
 `x=2/3` retains the division reading. Dates and URL paths keep priority over
 fraction parsing.
+
+Currency parsing recognizes complete `$`, `£` and `€` amounts with valid comma
+grouping. English uses major/minor units for up to two decimal places; greater
+precision is retained as a decimal amount. Ambiguous currency symbols are not
+assigned a currency by guessing. English ordinal suffixes must be valid (`11th`,
+`21st`); generated word hyphens are normalized to spaces to avoid artificial
+pauses. Version readings require `v`/`V` or a `version`/`版本` label and preserve
+leading zeros in each component. Explicit IDs have priority and read their
+digits separately, including dotted IDs. Unlabelled unknown names such as
+`abc123` retain the existing lexical route. Prerelease/build suffixes are not
+interpreted as a partial version. Leading-dot decimals such as `.5` and `-.5`
+are supported in quantities, formulas and measurements, including the additional
+`V`, `mV`, `kV`, `W`, `mW` and `kW` units. This does not add or replace a lexicon,
+change acoustic parameters, or alter audio delivery timing.
+
+A complete ASCII-labelled field such as `ID:abc123` or `Order ID:abc123` is
+also neutral notation for auto mode: its digits follow the remembered language,
+or Chinese in a new instance. Full sentences such as `The order ID is abc123`
+and Chinese labels retain their language evidence. This does not merge labels
+with values across line breaks.
 
 #### ASR-driven dialogue integration
 
@@ -290,7 +326,9 @@ The precedence for an explicit `language` request is:
 2. The fixed panel selection (`zh` or `en`).
 3. A valid `input_language` or recognized `asr_result.lang`.
 4. Rules applied to the current user text.
-5. Chinese when the text is ambiguous.
+5. The same instance's remembered language for neutral notation or a supported
+   standalone name, if available.
+6. Chinese when no rule above resolves the input.
 
 With panel mode `auto` and no per-turn override, examples are:
 
@@ -300,11 +338,14 @@ With panel mode `auto` and no per-turn override, examples are:
 | `你好，Qwen3 is ready，然后继续。` | `zh` | Chinese, with mixed content allowed | `asr` |
 | `Hello, please check the battery.` | absent | English | `text` |
 | `2026 10/20` | `en` | English | `asr` |
-| `2026 10/20` | absent | Chinese | `default` |
+| `2026 10/20`, no earlier language | absent | Chinese | `default` |
+| `2026 10/20`, after explicit English in this instance | absent | English | `history` |
 
 `asr_result.language` is not used as a recognition result. Missing or unknown
-`lang` values fall back to text rules. Previous-turn language is not used as
-the fallback. Text rules are heuristics for this bilingual application, not
+`lang` values fall back to text rules. Neutral input can inherit the most recent
+explicit language in the same instance; this is reported as `history` with
+`detected_language=null`, never as a fresh ASR detection. Text rules are
+heuristics for this bilingual application, not
 a general language detector. A recognized `lang` takes priority over text
 inference; this layer does not validate ASR confidence or correct an incorrect
 tag. Forward the original `text` and `lang` together when available: a
@@ -317,7 +358,11 @@ After an explicit `language` call, that instance requires its current
 primary language (mixed content remains allowed). The manual-speech exception
 above does not bypass this dialogue check. A newer turn rejects a late reply; it does not cancel
 already queued audio. Use `interrupt` to stop audio. Language context is kept
-in memory, and `stop` clears it. Instance-specific API configuration is
+in memory, and `stop` clears it. Changing the configured mode also clears the
+remembered language; repeating the same configuration preserves it. A generated
+reply passed to `prepare` does not update input-language history. Stateless
+HTTP audition through `/tts/test` has no instance identifier and does not share
+the MCP card's history. Instance-specific API configuration is
 supported; the panel field is tool-wide, as declared by its shared scope.
 
 ### Pronunciation frontend

@@ -3,7 +3,9 @@
 This policy serves an explicitly Chinese/English product. Script checks cannot
 identify arbitrary languages that share a writing system. A caller-provided
 reply preference or ASR label takes precedence over conservative text grammar
-rules. Unclear input defaults to Chinese, regardless of previous turns.
+rules. Auto mode remembers the latest explicit language in this instance for
+neutral numbers, symbols and supported standalone names. A new instance and
+ambiguous prose retain the Chinese fallback.
 """
 
 from dataclasses import dataclass
@@ -14,7 +16,7 @@ import uuid
 
 from ..vits2_tts_trt.frontend.mixed_context import context_diagnostics, protected_spans
 from .name_text import normalize_standalone_name
-from .neutral_text import is_neutral_text
+from .neutral_text import has_reading_fields, is_neutral_text
 
 
 class LanguagePolicyError(ValueError):
@@ -112,13 +114,18 @@ _EN_PREDICATE = re.compile(
 )
 
 
+def _is_language_neutral_input(text):
+    """Only recognized notation and complete curated names may inherit."""
+    return is_neutral_text(text) or (
+        _scripts(text) == {"en"}
+        and _scripts(normalize_standalone_name(text, "zh")) == {"zh"}
+    )
+
+
 def _detect_text_language(text):
-    if is_neutral_text(text):
-        return None
     # A standalone curated name is not evidence of English prose. Treat its
     # spaced and joined version forms equally; explicit/ASR tags still win.
-    if (_scripts(text) == {"en"}
-            and _scripts(normalize_standalone_name(text, "zh")) == {"zh"}):
+    if _is_language_neutral_input(text):
         return None
     prose = _language_evidence_text(text)
     scripts = _scripts(prose)
@@ -191,6 +198,7 @@ class LanguagePolicy:
         self.lock = threading.RLock()
         self._mode = _mode(reply_language)
         self._resolved_language = None
+        self._remembered_language = None
         self._turn_id = None
         self._last_error = None
 
@@ -202,6 +210,7 @@ class LanguagePolicy:
                 # A pending LLM answer no longer belongs to the new setting.
                 self._turn_id = None
                 self._resolved_language = None
+                self._remembered_language = None
             self._last_error = None
             return self.snapshot()
 
@@ -230,11 +239,16 @@ class LanguagePolicy:
                 resolved, source = input_language, "asr"
             elif detected is not None:
                 resolved, source = detected, "text"
+            elif self._remembered_language is not None and _is_language_neutral_input(text):
+                resolved, source = self._remembered_language, "history"
             else:
-                # Do not report fallback as detection or inherit a prior turn.
+                # An ambiguous bilingual sentence is not neutral notation;
+                # retain its existing fallback without claiming detection.
                 resolved, source = "zh", "default"
             # All validation precedes mutation so a rejected turn cannot cancel
             # the last accepted turn. UUIDs also prevent stop/restart token reuse.
+            if self._mode == "auto" and source in ("requested", "asr", "text"):
+                self._remembered_language = resolved
             self._resolved_language = resolved
             self._turn_id = uuid.uuid4().hex
             self._last_error = None
@@ -273,7 +287,11 @@ class LanguagePolicy:
             # do not load number readers or normalize speech under this lock.
             validate_reply_script(
                 normalize_standalone_name(text, self._resolved_language),
-                self._resolved_language, allow_neutral=neutral, require_primary=not neutral,
+                self._resolved_language, allow_neutral=neutral,
+                # A date/quantity in mixed prose may introduce the selected
+                # script during TN. The final prepared reply is checked again
+                # before enqueue; foreign prose without fields still rejects.
+                require_primary=not neutral and not has_reading_fields(text),
             )
             return SpeechRequest(text, self._resolved_language, self._turn_id)
 
@@ -296,6 +314,7 @@ class LanguagePolicy:
             return {
                 "reply_language": self._mode,
                 "resolved_language": self._resolved_language,
+                "remembered_language": self._remembered_language,
                 "turn_id": self._turn_id,
                 "last_language_error": dict(self._last_error) if self._last_error else None,
             }

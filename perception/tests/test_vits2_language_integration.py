@@ -224,6 +224,144 @@ def test_formula_loading_freezes_language_and_explicit_asr_still_wins(make_plugi
     assert state.adapter.spoken == ["y 等于二乘以 x 减三", "R T X four zero nine zero"]
 
 
+def test_auto_card_keeps_neutral_reading_within_instance_and_resets_on_stop(make_plugin):
+    state = make_plugin(reply_language="auto")
+    start(state, "a")
+    start(state, "b")
+    first = call(state, "speak", instance_id="a", text="Hello")
+    assert first["reply_language"] == "en"
+    finished(state, first)
+    date = call(state, "speak", instance_id="a", text="2026 10/23")
+    assert date["reply_language"] == "en"
+    finished(state, date)
+    assert "October twenty third" in state.adapter.spoken[-1]
+
+    # A second card/instance has not received English evidence.
+    other = call(state, "speak", instance_id="b", text="2026 10/23")
+    assert other["reply_language"] == "zh"
+    finished(state, other)
+    assert "二零二六年十月二十三日" in state.adapter.spoken[-1]
+
+    # Current Chinese evidence wins over the previous English context.
+    greeting = call(state, "speak", instance_id="a", text="你好")
+    assert greeting["reply_language"] == "zh"
+    finished(state, greeting)
+    following = call(state, "speak", instance_id="a", text="2/3")
+    assert following["reply_language"] == "zh"
+    finished(state, following)
+    assert state.adapter.spoken[-1] == "三分之二"
+
+    again = call(state, "speak", instance_id="a", text="Hello")
+    finished(state, again)
+    call(state, "stop", instance_id="a")
+    start(state, "a")
+    restarted = call(state, "speak", instance_id="a", text="2026 10/23")
+    assert restarted["reply_language"] == "zh"
+    finished(state, restarted)
+
+
+@pytest.mark.parametrize("mode,user_text,reply,expected", [
+    ("zh", "你好", "2026 10/23 message", "二零二六年十月二十三日 message"),
+    ("en", "Hello", "2026 10/23 星期五", "October twenty third, two thousand twenty-six 星期五"),
+    ("zh", "你好", "Current is 1.2A", "一点二安培"),
+])
+def test_explicit_turn_checks_primary_script_after_supported_fields(make_plugin, mode, user_text, reply, expected):
+    state = make_plugin(reply_language=mode)
+    start(state)
+    turn = call(state, "language", instance_id="a", text=user_text)
+    result = call(state, "speak", instance_id="a", text=reply, turn_id=turn["turn_id"])
+    finished(state, result)
+    assert expected in state.adapter.spoken[-1]
+    assert result["reply_language"] == mode
+
+
+def test_explicit_turn_still_rejects_foreign_prose_without_selected_reading(make_plugin):
+    state = make_plugin(reply_language="zh")
+    start(state)
+    turn = call(state, "language", instance_id="a", text="你好")
+    with pytest.raises(LanguagePolicyError, match="selected primary language"):
+        call(state, "speak", instance_id="a", text="Hello, the robot is ready.", turn_id=turn["turn_id"])
+    assert state.adapter.spoken == []
+
+
+@pytest.mark.parametrize("mode,text,expected", [
+    ("zh", "2026 10/23 message", ("二零二六年十月二十三日", "message")),
+    ("en", "2026 10/23 星期五", ("October twenty third", "two thousand twenty-six", "星期五")),
+    ("zh", "message 2026-10-23 received", ("message", "二零二六年十月二十三日", "received")),
+    ("en", "开始2026-10-23结束", ("开始", "October twenty third", "two thousand twenty-six", "结束")),
+    ("zh", "ratio 2/3 confirmed", ("ratio", "三分之二", "confirmed")),
+    ("en", "电流1.2A已确认", ("电流", "one point two amperes", "已确认")),
+])
+def test_fixed_mode_reads_fields_in_selected_language_without_translating_prose(
+        make_plugin, mode, text, expected):
+    state = make_plugin(reply_language=mode)
+    start(state)
+    result = call(state, "speak", instance_id="a", text=text)
+    assert result["reply_language"] == mode
+    assert finished(state, result)[3] is False
+    assert finished(state, result)[1] == text
+    assert len(state.adapter.prepared) == 1, "accepted text must be prepared once"
+    spoken = " ".join(state.adapter.spoken)
+    compact = lambda value: "".join(value.split())
+    for fragment in expected:
+        assert compact(fragment) in compact(spoken)
+    assert not any(char.isdecimal() for char in spoken)
+
+
+@pytest.mark.parametrize("text", [
+    "The robot has 12 sensors, 它有3个摄像头。",
+    "日期是2026-10-23，the current is 1.2A.",
+])
+def test_auto_prose_keeps_original_fields_for_local_frontend_context(make_plugin, text):
+    state = make_plugin(reply_language="auto")
+    start(state)
+    result = call(state, "speak", instance_id="a", text=text)
+    assert finished(state, result)[3] is False
+    # The fake adapter records the request handed to the actual local-language
+    # frontend. Auto must not pre-read every field in one global language.
+    assert state.adapter.prepared == [text]
+    assert state.adapter.spoken == [text]
+
+
+def test_loading_preserves_each_fixed_mode_for_fields_inside_prose(make_plugin):
+    state = make_plugin(gated=True, reply_language="zh")
+    call(state, "start", instance_id="a", input_topic="/say/a")
+    first_text, second_text = "2026 10/23 message", "2026 10/23 星期五"
+    first = call(state, "speak", instance_id="a", text=first_text)
+    call(state, "config", instance_id="a", reply_language="en")
+    second = call(state, "speak", instance_id="a", text=second_text)
+    state.gate.set()
+    assert finished(state, first)[3] is False
+    assert finished(state, second)[3] is False
+    assert first["reply_language"] == "zh"
+    assert second["reply_language"] == "en"
+    assert len(state.adapter.prepared) == 2
+    assert "二零二六年十月二十三日" in state.adapter.spoken[0]
+    assert "message" in state.adapter.spoken[0]
+    assert "October twenty third" in state.adapter.spoken[1]
+    assert "星期五" in state.adapter.spoken[1]
+    assert finished(state, first)[1] == first_text
+    assert finished(state, second)[1] == second_text
+
+
+@pytest.mark.parametrize("language,text,expected", [
+    ("zh", "请查看2026 10/23 message", "二零二六年十月二十三日"),
+    ("en", "Please read 2026 10/23 星期五", "October twenty third"),
+])
+def test_explicit_current_turn_reads_embedded_date_in_resolved_language(
+        make_plugin, language, text, expected):
+    state = make_plugin(reply_language="auto")
+    start(state)
+    turn = call(state, "language", instance_id="a",
+                asr_result={"text": "2026 10/23", "lang": language})
+    result = call(state, "speak", instance_id="a", text=text, turn_id=turn["turn_id"])
+    assert result["reply_language"] == language
+    assert finished(state, result)[3] is False
+    assert expected in " ".join(state.adapter.spoken)
+    assert ("message" if language == "zh" else "星期五") in " ".join(state.adapter.spoken)
+    assert finished(state, result)[1] == text
+
+
 @pytest.mark.parametrize("mode,text", [
     ("zh", "WAIC NVIDIA OpenMLDB AI API CAR Agentic"),
     ("zh", "Hello, the robot is ready."),

@@ -140,5 +140,60 @@ class TrailingDigitsContextTest(unittest.TestCase):
         self.assertEqual(replacements(text, "ZH"), [("0056", "零零五六")])
 
 
+class EmbeddedDateTest(unittest.TestCase):
+    def test_spaced_date_is_one_field_inside_either_language(self):
+        for text in ("2026 10/23 message", "2026 10/ 23 星期五", "Date: 2026\t10/23."):
+            with self.subTest(text=text):
+                result = replacements(text)
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result[0][1], "October twenty third, CARDINAL[EN:2026]")
+
+    def test_date_match_does_not_cross_lines_or_truncate_identifiers(self):
+        for text in ("2026\n10/23", "v2026 10/23", "2026 10/23.5", "2026 10/23_suffix"):
+            with self.subTest(text=text):
+                self.assertEqual(replacements(text), [])
+
+    def test_identifier_cue_keeps_priority_over_date_shape(self):
+        self.assertEqual(replacements("Order ID: 2026-10-23"), [
+            ("2026-10-23", "two zero two six hyphen one zero hyphen two three")
+        ])
+
+    def test_invalid_calendar_date_is_not_claimed_as_valid(self):
+        for text in ("message 2026 02/30", "message 2026 13/23"):
+            with self.subTest(text=text):
+                self.assertEqual(replacements(text), [])
+
+    def test_numeric_only_date_with_decimal_suffix_still_rejects(self):
+        from plugins.vits2_tts_language.neutral_text import InvalidDateError, normalize_neutral_text
+        for text in ("2026 10/23.5", "2026-10-23.5"):
+            with self.subTest(text=text), self.assertRaises(InvalidDateError):
+                normalize_neutral_text(text, "zh")
+
+
+class FixedMixedReadingTest(unittest.TestCase):
+    def test_preprocessing_preserves_explicit_line_breaks(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+        self.assertEqual(normalize_mixed_text("AI\n2/3\r\nCAR", "zh"), "AI\n三分之二\r\nCAR")
+        self.assertEqual(normalize_mixed_text("AI\n2/3\r\nCAR", "en"), "AI\ntwo thirds\r\nCAR")
+
+    def test_ordinary_words_versions_and_unknown_identifiers_are_not_split(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+        text = "Qwen3 abc123 foo_123_bar 123-ABC 1,234XYZ"
+        for language in ("zh", "en"):
+            with self.subTest(language=language):
+                self.assertEqual(normalize_mixed_text(text, language), text)
+
+    def test_addresses_keep_literal_digits_and_separators(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+        text = "Visit https://example.com/2026/10/23?q=2/3 now"
+        zh = normalize_mixed_text(text, "zh")
+        en = normalize_mixed_text(text, "en")
+        self.assertIn("斜杠二零二六斜杠一零斜杠二三", zh)
+        self.assertIn("slash two zero two six slash one zero slash two three", en)
+        self.assertNotIn("October", en)
+        self.assertNotIn("thirds", en)
+        self.assertTrue(zh.startswith("Visit ") and zh.endswith(" now"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -8,6 +8,8 @@ Offsets always refer to the original text, including Unicode hyphens.
 import datetime
 import re
 
+from .numeric_formats import find_spans as find_numeric_format_spans
+
 
 _DASH = r"\-‐‑‒–−﹣－"
 _DIGITS = {"ZH": tuple("零一二三四五六七八九"),
@@ -15,6 +17,11 @@ _DIGITS = {"ZH": tuple("零一二三四五六七八九"),
 _DATE = re.compile(
     rf"(?<![A-Za-z0-9_])(?P<year>\d{{4}})(?P<sep>[{_DASH}/.])"
     rf"(?P<month>\d{{1,2}})(?P=sep)(?P<day>\d{{1,2}})(?![A-Za-z0-9_])"
+)
+_SPACED_DATE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<year>\d{4})[ \t]+"
+    r"(?P<month>\d{1,2})[ \t]*/[ \t]*(?P<day>\d{1,2})"
+    r"(?![A-Za-z0-9_]|[./]\d)"
 )
 _TIME = re.compile(
     r"(?<![A-Za-z0-9_:])(?P<hour>\d{1,2})[:：](?P<minute>\d{2})"
@@ -29,10 +36,10 @@ _PHONE_CUED = re.compile(
     rf"\s*(?:号码)?\s*(?:是|为|is)?\s*[:：]?\s*"
     rf"(?P<number>\d{{2,4}}\s*[{_DASH}]\s*\d{{7,8}})(?![A-Za-z0-9_]|\.\d)"
 )
-_ID_VALUE = rf"[A-Za-z0-9]+(?:[{_DASH}_][A-Za-z0-9]+)*"
+_ID_VALUE = rf"[A-Za-z0-9]+(?:[{_DASH}_.][A-Za-z0-9]+)*"
 _ID_CUED = re.compile(
     r"(?:订单\s*(?i:ID)|订单号|项目编号|订单编号|编号|序列号|验证码|尾号|"
-    r"(?i:\b(?:order\s+(?:id|number)|serial\s+number|verification\s+code)))"
+    r"(?i:\b(?:order\s+(?:id|number)|serial\s+number|verification\s+code|ID\b)))"
     rf"\s*(?:是|为|(?i:is|are))?\s*[:：]?\s*(?P<value>{_ID_VALUE})(?![A-Za-z0-9_]|\.\d)"
 )
 # An explicitly named identifier may have an owner between its field name and
@@ -99,6 +106,7 @@ def _identifier(value, language):
     return " ".join(
         _DIGITS[language][int(c)] if c.isdecimal() else c.upper() if c.isalpha()
         else ("下划线" if language == "ZH" else "underscore") if c == "_"
+        else ("点" if language == "ZH" else "dot") if c == "."
         else ("连字符" if language == "ZH" else "hyphen")
         for c in value
     )
@@ -131,7 +139,15 @@ def find_spans(text, language, verbalize_number):
     for match in _NUMBERED_ID.finditer(text):
         add(match.start(), match.end(), "N O " + _digits(match["value"], language))
 
-    for match in _DATE.finditer(text):
+    for start, end, spoken in find_numeric_format_spans(text, language, verbalize_number):
+        add(start, end, spoken)
+
+    # Recognize a date inside prose before math can consume its month/day as a
+    # fraction. Horizontal whitespace is intentional: never join separate lines.
+    for match in sorted(
+        (match for pattern in (_DATE, _SPACED_DATE) for match in pattern.finditer(text)),
+        key=lambda match: match.start(),
+    ):
         year, month, day = (int(match[key]) for key in ("year", "month", "day"))
         try:
             datetime.date(year, month, day)
