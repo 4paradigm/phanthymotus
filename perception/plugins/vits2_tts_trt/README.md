@@ -214,13 +214,42 @@ needed. The backend defaults to `auto` when the setting is absent.
 Direct `speak` remains supported without a preceding `language` call. In
 automatic mode it uses the speech text; ambiguous numeric input falls back
 to Chinese. It does not read a previous ASR message. A fixed selection gives
-numeric-only text and supported names the corresponding Chinese or English
+numeric-only text, complete supported symbolic expressions, and supported names
+the corresponding Chinese or English
 reading. For example, `2026 10/ 20` is read as a date in the selected language.
 For manual speech, this selection is a reading preference: Chinese-English
 mixed text and standalone names or acronyms are allowed without requiring
 characters from the selected language. It does not translate the input.
 `Qwen3` and `Qwen 3` both read as `千问三` in Chinese mode and `Qwen three` in
 English mode. Empty input and unsupported scripts are still rejected.
+
+Standalone formulas, unit quantities, recognized model/identifier formats,
+URLs and email addresses use the resolved language too: variable letters,
+unit/model prefixes and address characters alone are not evidence of English
+prose. The existing format parsers must cover the
+whole input; ordinary sentences and mixed prose retain their contextual routing.
+This is deterministic text normalization, not semantic interpretation of
+arbitrary notation or translation of an English sentence.
+
+| Input | 中文 (also direct auto without prose evidence) | English |
+| --- | --- | --- |
+| `y = 2x‑3` | `y 等于二乘以 x 减三` | `y equals two times x minus three` |
+| `RTX‑4090` | `R T X 四零九零` | `R T X four zero nine zero` |
+| `1.2A` | `一点二安培` | `one point two amperes` |
+| `2/3` | `三分之二` | `two thirds` |
+
+For standalone addresses, Chinese mode uses `点`, `艾特`, `冒号` and `斜杠`
+where English mode uses `dot`, `at`, `colon` and `slash`. Address letters are
+spelled and digits are read individually; URL paths are not reinterpreted as
+fractions or dates. Direct auto falls back to Chinese for these addresses.
+When an address or number occurs within ordinary prose, the existing clause
+context still determines its reading; selecting English does not translate a
+Chinese sentence (or vice versa).
+
+English standalone fractions use fraction nouns (`one half`, `two thirds`,
+`three quarters`). An explicit arithmetic context such as `Calculate 2/3` or
+`x=2/3` retains the division reading. Dates and URL paths keep priority over
+fraction parsing.
 
 #### ASR-driven dialogue integration
 

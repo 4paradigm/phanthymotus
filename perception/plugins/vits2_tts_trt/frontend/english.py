@@ -360,9 +360,10 @@ _EN_LEXICON_WORD_RE = re.compile(
 _EN_TN_CONTEXT_WORDS = frozenset({
     "USD", "EUR", "GBP", "CNY", "RMB", "DR", "MR", "MRS", "MS", "ST",
 })
-# The released Chinese FST treats CAR as C + AR and produces "CA R".
-# Preserve the word through TN; its pronunciation still comes from CMU.
-_EN_TN_PRESERVED_WORDS = frozenset({"CAR"})
+# The released Chinese FST splits CAR and rewrites the internal "log" in
+# kilogram(s) as 对数. Protect complete words only, including unit words
+# already expanded by the language layer; pronunciation still uses CMU/G2P.
+_EN_TN_PRESERVED_WORDS = frozenset({"CAR", "KILOGRAM", "KILOGRAMS"})
 # Lexeme rules already spell initialisms such as AI/API as A I/A P I.
 # Keep that explicit spelling together so sentence-final I. is not interpreted
 # as a Roman list number. A standalone I./II./IV. still belongs to the FST.

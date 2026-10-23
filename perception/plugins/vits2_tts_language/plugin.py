@@ -12,7 +12,7 @@ import threading
 
 from ..vits2_tts_trt.plugin import TTSPlugin as BaseTTSPlugin, _Vits2TTSNode, _node_suffix
 from .policy import LanguagePolicy, LanguagePolicyError, SpeechRequest, _scripts, validate_reply_script
-from .neutral_text import InvalidDateError, is_neutral_numeric, normalize_neutral_text
+from .neutral_text import InvalidDateError, is_neutral_text, normalize_neutral_text
 from .name_text import normalize_standalone_name
 
 log = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ def _prepare_chunks(adapter, request):
     """Freeze frontend output once, before it is handed to the worker."""
     try:
         text = (normalize_neutral_text(request.text, request.language)
-                if is_neutral_numeric(request.text)
+                if is_neutral_text(request.text)
                 else normalize_standalone_name(request.text, request.language))
         chunks, parts = [], []
         for normalized, ids in adapter.iter_text_chunks(text):
@@ -105,6 +105,7 @@ def _prepare_chunks(adapter, request):
 def _direct_request(policy, text):
     turn = policy.begin_turn(text)
     if (turn["reply_language_mode"] == "auto" and turn["language_source"] == "default"
+            and not is_neutral_text(text)
             and _scripts(normalize_standalone_name(text, "zh")) == {"en"}):
         turn = policy.begin_turn(text, requested_reply_language="en")
     # A manual utterance is not a generated dialogue reply. Read its supported
@@ -112,7 +113,7 @@ def _direct_request(policy, text):
     # Explicit language -> speak still goes through policy.prepare and its turn
     # and primary-language checks; this does not bypass that dialogue contract.
     validate_reply_script(normalize_standalone_name(text, turn["reply_language"]),
-                          turn["reply_language"], allow_neutral=is_neutral_numeric(text),
+                          turn["reply_language"], allow_neutral=is_neutral_text(text),
                           require_primary=False)
     return LiteralSpeechRequest(text, turn["reply_language"], turn["turn_id"])
 

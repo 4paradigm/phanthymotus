@@ -14,7 +14,7 @@ import uuid
 
 from ..vits2_tts_trt.frontend.mixed_context import context_diagnostics, protected_spans
 from .name_text import normalize_standalone_name
-from .neutral_text import is_neutral_numeric
+from .neutral_text import is_neutral_text
 
 
 class LanguagePolicyError(ValueError):
@@ -113,6 +113,8 @@ _EN_PREDICATE = re.compile(
 
 
 def _detect_text_language(text):
+    if is_neutral_text(text):
+        return None
     # A standalone curated name is not evidence of English prose. Treat its
     # spaced and joined version forms equally; explicit/ASR tags still win.
     if (_scripts(text) == {"en"}
@@ -265,9 +267,13 @@ class LanguagePolicy:
                 raise LanguagePolicyError(
                     "stale_turn", "A current turn_id from action=language is required"
                 )
+            neutral = is_neutral_text(text)
+            # Variables/units/model labels are language-neutral notation. The
+            # frontend will verbalize them and validate the selected script;
+            # do not load number readers or normalize speech under this lock.
             validate_reply_script(
                 normalize_standalone_name(text, self._resolved_language),
-                self._resolved_language, allow_neutral=is_neutral_numeric(text),
+                self._resolved_language, allow_neutral=neutral, require_primary=not neutral,
             )
             return SpeechRequest(text, self._resolved_language, self._turn_id)
 

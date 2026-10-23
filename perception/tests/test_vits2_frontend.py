@@ -75,6 +75,22 @@ def _units(text: str) -> list[str]:
     return [u for u in split_punctuation_units(normalize_text_mix(text)) if u.strip()]
 
 
+@pytest.mark.parametrize("text,expected", [
+    ("1kg", "one kilogram"),
+    ("3.05kg", "three point zero five kilograms"),
+    ("x=2kg", "x equals two kilograms"),
+    ("2kg/m³", "two kilograms per cubic meter"),
+])
+def test_selected_english_unit_reading_survives_real_fst_and_g2p(text, expected):
+    from plugins.vits2_tts_language.neutral_text import normalize_neutral_text
+
+    normalized = normalize_text_mix(normalize_neutral_text(text, "en"))
+    assert normalized == expected
+    phones, tones, languages, _ = g2p_normalized_text_mix(normalized)
+    assert phones and len(phones) == len(tones) == len(languages)
+    assert set(languages) == {"EN"}
+
+
 def test_every_unit_of_a_pasted_paragraph_converts():
     """A whitespace run used to abort the whole utterance.
 

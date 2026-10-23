@@ -104,6 +104,26 @@ def _english_quantity(value):
     return sign + spoken
 
 
+def _english_fraction(numerator, denominator):
+    """Use natural fraction nouns; arithmetic slash is handled separately."""
+    count, divisor = int(numerator), int(denominator)
+    number = _english_quantity(numerator)
+    if divisor < 2:
+        return f"{number} over {_english_quantity(denominator)}"
+    if divisor == 2:
+        noun = "half" if count == 1 else "halves"
+    elif divisor == 4:
+        noun = "quarter" if count == 1 else "quarters"
+    else:
+        engine = _english_cardinals()
+        noun = engine.number_to_words(engine.ordinal(divisor), andword="").replace(",", "")
+        if re.fullmatch(r"10+", str(divisor)) and noun.startswith("one "):
+            noun = noun[4:]  # one hundredth, two hundredths (not two one hundredths)
+        if count != 1:
+            noun = engine.plural(noun)
+    return f"{number} {noun}"
+
+
 def _valid_math(tokens):
     """Validate token order, returning implicit multiplication positions."""
     expect_operand, depth, explicit = True, 0, False
@@ -290,7 +310,8 @@ def find_spans(text, language, verbalize_number):
             continue
         numerator = verbalize_number(match["numerator"], language)
         denominator = verbalize_number(match["denominator"], language)
-        spoken = f"{denominator} 分之 {numerator}" if zh else f"{numerator} over {denominator}"
+        spoken = (f"{denominator} 分之 {numerator}" if zh else
+                  _english_fraction(match["numerator"], match["denominator"]))
         spans.append((match.start(), match.end(), spoken))
     for candidate in _CANDIDATE.finditer(text):
         if any(candidate.start() < end and candidate.end() > start for start, end in preserved):

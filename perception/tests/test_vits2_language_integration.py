@@ -174,6 +174,56 @@ def test_direct_speech_uses_panel_readings_and_completes_acp(make_plugin, mode, 
     assert state.plugin._impl._nodes["a"]._pub.messages[-1] == list(base.AUDIO_EOF_MAGIC)
 
 
+@pytest.mark.parametrize("mode", ["zh", "en", "auto"])
+@pytest.mark.parametrize("text,zh,en", [
+    ("y = 2x-3", "y 等于二乘以 x 减三", "y equals two times x minus three"),
+    ("y = 2x‑3", "y 等于二乘以 x 减三", "y equals two times x minus three"),
+    ("y = 2x−3", "y 等于二乘以 x 减三", "y equals two times x minus three"),
+    ("RTX‑4090", "R T X 四零九零", "R T X four zero nine zero"),
+    ("1.2A", "一点二安培", "one point two amperes"),
+    ("8.5GB", "八点五 G B", "eight point five gigabytes"),
+    ("SNR≥28dB", "S N R 大于等于二十八分贝",
+     "S N R greater than or equal to twenty-eight decibels"),
+    ("lr=1e‑4", "L R 等于一乘以十的负四次方",
+     "L R equals one times ten to the power of minus four"),
+    ("NO.0917", "N O 零九一七", "N O zero nine one seven"),
+    ("2/3", "三分之二", "two thirds"),
+    ("x^2", "x 的平方", "x squared"),
+    ("https://example.com", "H T T P S 冒号斜杠斜杠 E X A M P L E 点 C O M",
+     "H T T P S colon slash slash E X A M P L E dot C O M"),
+    ("user@example.com", "U S E R 艾特 E X A M P L E 点 C O M",
+     "U S E R at E X A M P L E dot C O M"),
+    ("https://example.com/2026/10/20?q=2/3",
+     "H T T P S 冒号斜杠斜杠 E X A M P L E 点 C O M 斜杠二零二六斜杠一零斜杠二零问号 Q 等号二斜杠三",
+     "H T T P S colon slash slash E X A M P L E dot C O M slash two zero two six slash one zero slash two zero question mark Q equals two slash three"),
+    ("user+qwen3@example.com", "U S E R 加号 Q W E N 三艾特 E X A M P L E 点 C O M",
+     "U S E R plus Q W E N three at E X A M P L E dot C O M"),
+])
+def test_symbolic_speech_uses_selected_reading_through_facade(make_plugin, mode, text, zh, en):
+    state = make_plugin(reply_language=mode)
+    start(state)
+    result = call(state, "speak", instance_id="a", text=text)
+    assert finished(state, result)[3] is False
+    assert result["reply_language"] == ("en" if mode == "en" else "zh")
+    assert state.adapter.spoken == [en if mode == "en" else zh]
+    assert finished(state, result)[1] == text
+
+
+def test_formula_loading_freezes_language_and_explicit_asr_still_wins(make_plugin):
+    state = make_plugin(gated=True)
+    call(state, "config", instance_id="a", reply_language="zh")
+    call(state, "start", instance_id="a", input_topic="/say/a")
+    first = call(state, "speak", instance_id="a", text="y = 2x‑3")
+    call(state, "config", instance_id="a", reply_language="auto")
+    turn = call(state, "language", instance_id="a",
+                asr_result={"text": "y = 2x‑3", "lang": "en"})
+    second = call(state, "speak", instance_id="a", text="RTX‑4090", turn_id=turn["turn_id"])
+    state.gate.set()
+    assert finished(state, first)[3] is False
+    assert finished(state, second)[3] is False
+    assert state.adapter.spoken == ["y 等于二乘以 x 减三", "R T X four zero nine zero"]
+
+
 @pytest.mark.parametrize("mode,text", [
     ("zh", "WAIC NVIDIA OpenMLDB AI API CAR Agentic"),
     ("zh", "Hello, the robot is ready."),

@@ -324,6 +324,20 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                     text, normalizer), "ordinary normalization")
                 normalizer.assert_called_once_with(text)
 
+    def test_expanded_kilogram_words_are_not_partially_read_as_logarithms(self):
+        for text in ("kilogram", "kilograms", "Kilograms", "KILOGRAMS"):
+            with self.subTest(text=text):
+                normalizer = Mock(return_value="ki对数rams")
+                self.assertEqual(self.english.normalize_preserving_english_pronunciations(
+                    text, normalizer), text)
+                normalizer.assert_not_called()
+        for text in ("kilogram_id", "kilograms2", "mykilogram", "log"):
+            with self.subTest(text=text):
+                normalizer = Mock(return_value="ordinary normalization")
+                self.assertEqual(self.english.normalize_preserving_english_pronunciations(
+                    text, normalizer), "ordinary normalization")
+                normalizer.assert_called_once_with(text)
+
     def test_existing_names_units_punctuation_and_letter_a_keep_semantics(self):
         self.assert_both_routes("A", ("ey",), (2,))
         self.assertEqual(self.mixed._en_token_to_phones("GB"),

@@ -120,6 +120,38 @@ class EnglishCardinalTest(unittest.TestCase):
     def test_math_uses_actual_english_number_readings(self):
         self.assertEqual(self.spoken("y=2x-3"), "y equals two times x minus three")
 
+    def test_standalone_fractions_use_natural_singular_and_plural_nouns(self):
+        for text, expected in (
+            ("1/2", "one half"),
+            ("2/2", "two halves"),
+            ("1/3", "one third"),
+            ("2/3", "two thirds"),
+            ("1/4", "one quarter"),
+            ("3/4", "three quarters"),
+            ("5/6", "five sixths"),
+            ("0/8", "zero eighths"),
+            ("2/21", "two twenty-firsts"),
+            ("1/100", "one hundredth"),
+            ("2/100", "two hundredths"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.spoken(text), expected)
+
+    def test_degenerate_fraction_denominators_keep_literal_over_reading(self):
+        self.assertEqual(self.spoken("3/0"), "three over zero")
+        self.assertEqual(self.spoken("7/1"), "seven over one")
+
+    def test_explicit_arithmetic_slash_still_means_division(self):
+        for text, expected in (
+            ("Calculate 2/3.", "two divided by three"),
+            ("x=2/3", "x equals two divided by three"),
+            ("2/3+1", "two divided by three plus one"),
+            ("2/3-1", "two divided by three minus one"),
+            ("(2/3)", "open parenthesis two divided by three close parenthesis"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.spoken(text), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

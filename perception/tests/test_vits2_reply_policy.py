@@ -304,14 +304,13 @@ class LanguagePolicyTest(unittest.TestCase):
                     tagged = self.policy.begin_turn(raw, input_language=supplied)
                     self.assertEqual((tagged["reply_language"], tagged["language_source"]), (supplied, "asr"))
 
-    def test_chinese_name_exception_rejects_clauses_addresses_and_partial_names(self):
+    def test_chinese_name_exception_rejects_clauses_and_partial_names(self):
         policy = self.module.LanguagePolicy("zh")
         turn = policy.begin_turn("Qwen3")
         before = policy.snapshot()
         for raw in (
             "myqwen", "qwenish", "Qwen3x", "Qwen3_abc", "Qwen3/ABC",
             "Qwen3 is ready", "This is Qwen3", "Qwen3 Qwen3",
-            "https://qwen.ai/Qwen3", "qwen3@example.com",
             "Qwen 3x", "Qwen 3_abc", "Qwen 3/ABC", "Qwen 3 is ready",
             "This is Qwen 3", "Qwen 3 Qwen 3", "Qwen\n3",
         ):
@@ -361,6 +360,77 @@ class LanguagePolicyTest(unittest.TestCase):
                     request = self.policy.prepare(reply, turn["turn_id"])
                     self.assertEqual((request.text, request.language), (reply, language))
                     self.assertEqual(request.turn_id, turn["turn_id"])
+
+    def test_formula_variables_and_model_prefixes_are_not_english_prose(self):
+        from plugins.vits2_tts_language.neutral_text import is_neutral_symbolic
+
+        for text in ("y = 2x‑3", "RTX‑4090", "RTX4090", "1.2A", "SNR≥28dB",
+                     "lr=1e‑4", "NO.0917", "x^2", "x=1e-4", "x=2kg"):
+            with self.subTest(text=text):
+                self.assertTrue(is_neutral_symbolic(text))
+                turn = self.policy.begin_turn(text)
+                self.assertEqual(turn["reply_language"], "zh")
+                self.assertEqual(turn["language_source"], "default")
+                self.assertIsNone(turn["detected_language"])
+                request = self.policy.prepare(text, turn["turn_id"])
+                self.assertEqual(request.text, text)
+                self.assertEqual(request.language, "zh")
+
+    def test_symbolic_detection_does_not_reinterpret_prose_names_or_partial_fields(self):
+        from plugins.vits2_tts_language.neutral_text import is_neutral_symbolic
+
+        for text in ("The equation is y=2x-3.", "公式 y=2x-3。", "A100", "Qwen 3",
+                     "CAR", "AI", "I/O", "2kg/day", "3.05kgModel", "100MBps",
+                     "Visit https://example.com/2/3", "请访问https://example.com。",
+                     "Email user@example.com", "请联系user@example.com。",
+                     "https://", "user@", "x^", "(x+2"):
+            with self.subTest(text=text):
+                self.assertFalse(is_neutral_symbolic(text))
+
+    def test_complete_addresses_follow_mode_without_inheriting_english(self):
+        from plugins.vits2_tts_language.neutral_text import is_neutral_symbolic, normalize_neutral_text
+
+        for mode in ("zh", "en", "auto"):
+            policy = self.module.LanguagePolicy(mode)
+            policy.begin_turn("Hello, the robot is ready.")
+            for text, zh_fragment, en_fragment in (
+                ("https://example.com", "冒号斜杠斜杠", "colon slash slash"),
+                ("user@example.com", "艾特", " at "),
+                ("https://example.com/2026/10/20?q=2/3", "二斜杠三", "two slash three"),
+                ("user+qwen3@example.com", "Q W E N 三艾特", "Q W E N three at"),
+                ("https://qwen.ai/Qwen3", "Q W E N 三", "Q W E N three"),
+                ("qwen3@example.com", "Q W E N 三艾特", "Q W E N three at"),
+            ):
+                with self.subTest(mode=mode, text=text):
+                    self.assertTrue(is_neutral_symbolic(text))
+                    turn = policy.begin_turn(text)
+                    language = "en" if mode == "en" else "zh"
+                    self.assertEqual(turn["reply_language"], language)
+                    self.assertIsNone(turn["detected_language"])
+                    request = policy.prepare(text, turn["turn_id"])
+                    self.assertEqual(request.text, text)
+                    normalized = normalize_neutral_text(request.text, request.language)
+                    self.assertIn(en_fragment if language == "en" else zh_fragment, normalized)
+                    self.assertNotIn("October", normalized)
+                    self.assertNotIn("two thirds", normalized)
+                    self.assertNotIn("分之", normalized)
+                    self.assertNotIn("千问", normalized)
+
+    def test_unseen_symbolic_values_use_the_existing_format_readers(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_neutral_text
+
+        for text, zh, en in (
+            ("z=4a+7", "z 等于四乘以 a 加七", "z equals four times a plus seven"),
+            ("GTX-1650", "G T X 一六五零", "G T X one six five zero"),
+            ("0.75mA", "零点七五毫安", "zero point seven five milliamperes"),
+            ("5/8", "八分之五", "five eighths"),
+            ("x=1e-4", "x 等于一乘以十的负四次方",
+             "x equals one times ten to the power of minus four"),
+            ("x=2kg", "x 等于二千克", "x equals two kilograms"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(normalize_neutral_text(text, "zh"), zh)
+                self.assertEqual(normalize_neutral_text(text, "en"), en)
 
     def test_punctuation_and_emoji_only_reply_still_require_spoken_words(self):
         for utterance in ("hello", "你好"):

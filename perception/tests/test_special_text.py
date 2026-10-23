@@ -101,6 +101,26 @@ class EnglishQuantityTests(unittest.TestCase):
         self.assertIn("two zero two six", result)
         self.assertIn("August seventh, twenty twenty-six", result)
 
+    def test_fraction_sentence_and_explicit_division_keep_distinct_readings(self):
+        self.assertEqual(self.normalize("2/3 of the samples passed."),
+                         "two thirds of the samples passed.")
+        self.assertEqual(self.normalize("Calculate 2/3."),
+                         "Calculate two divided by three .")
+        self.assertEqual(self.normalize("y = 2/3."),
+                         "y equals two divided by three .")
+        self.assertEqual(
+            normalize_special_text("合格样本占2/3。", lambda text: text,
+                                   lambda value, language: verbalize_chinese_number(value),
+                                   language="ZH"),
+            "合格样本占三分之二。",
+        )
+
+    def test_date_and_address_slashes_are_not_fraction_nouns(self):
+        self.assertEqual(self.normalize("Date: 2026/10/20."),
+                         "Date: October twentieth, twenty twenty-six .")
+        self.assertEqual(self.normalize("https://example.com/2/3"),
+                         "H T T P S colon slash slash E X A M P L E dot C O M slash two slash three")
+
     def test_local_chinese_quantity_resolver_is_respected(self):
         result = normalize_special_text(
             "There are 7 samples.", lambda value: value,
