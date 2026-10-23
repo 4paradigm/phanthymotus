@@ -153,7 +153,7 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                     self.assertEqual(self.english.english_pronunciation(token), VERIFIED_EXPECTED[word])
                     self.assert_both_routes(token, phones, tones)
         self.english._g2p.assert_not_called()
-        self.assertIsNone(self.mixed._g2p_en)
+        self.assertIs(self.mixed._g2p_en, self.english._g2p)
 
     def test_custom_wins_over_conflicting_cmu_and_gold_in_both_routes(self):
         examples = (
@@ -168,7 +168,7 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                     self.assertEqual(self.english.english_pronunciation(token), CUSTOM_EXPECTED[word])
                     self.assert_both_routes(token, phones, tones)
         self.english._g2p.assert_not_called()
-        self.assertIsNone(self.mixed._g2p_en)
+        self.assertIs(self.mixed._g2p_en, self.english._g2p)
 
     def test_cmu_words_use_whole_word_readings_in_every_case(self):
         examples = (
@@ -189,7 +189,15 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                     self.assert_both_routes(token, phones, tones)
                     self.assertEqual(self.english.text_normalize(token), token)
         self.english._g2p.assert_not_called()
-        self.assertIsNone(self.mixed._g2p_en)
+        self.assertIs(self.mixed._g2p_en, self.english._g2p)
+
+    def test_first_mixed_unknown_word_reuses_loaded_english_predictor(self):
+        expected = self.english.g2p_token("Qwen")
+        calls_before = self.english._g2p.call_count
+        phones, tones = self.mixed._en_token_to_phones("Qwen")
+        self.assertEqual((tuple(phones), tuple(tones)), expected)
+        self.assertEqual(self.english._g2p.call_count, calls_before + 1)
+        self.assertIs(self.mixed._g2p_en, self.english._g2p)
 
     def test_other_oov_words_use_g2p_in_both_routes(self):
         for token in ("zyxqnoncetest", "Qwen"):

@@ -26,9 +26,9 @@ import logging
 import os
 import re
 
-from g2p_en import G2p
 from .symbols import punctuation
 from .english import english_pronunciation, refine_ph, post_replace_ph, arpa
+from .english import _g2p as _g2p_en
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +39,10 @@ with open(os.path.join(current_file_path, "opencpop-strict.txt"), encoding="utf-
         for line in _f
     }
 
-_g2p_en = None
+# Reuse the predictor already loaded by the English frontend. Constructing
+# another G2p on the first mixed-language unknown word reloads the same weights
+# and dictionary during speak. Predictions use local state and read-only model
+# data; the mixed path below keeps its existing pronunciation/refinement rules.
 
 # Chinese initials — longest-first so 'zh'/'ch'/'sh' match before 'z'/'c'/'s'
 _INITIALS = [
@@ -146,9 +149,6 @@ def _en_token_to_phones(word: str):
                 phones.append(post_replace_ph(phn))
                 tones.append(tone)
     else:
-        global _g2p_en
-        if _g2p_en is None:
-            _g2p_en = G2p()
         for ph in filter(lambda p: p != " ", _g2p_en(word)):
             if ph in arpa:
                 ph, tone = refine_ph(ph)
