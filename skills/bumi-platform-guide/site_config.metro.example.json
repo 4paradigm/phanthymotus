@@ -1,0 +1,15 @@
+{
+  "mode": "demo",
+  "site_type": "metro",
+  "station_name": "地铁演示站",
+  "platform_name": "模拟地铁站台",
+  "carriage_count": 8,
+  "carriage_routes": [],
+  "staff_confirmed": false,
+  "phase": "waiting",
+  "periodic_enabled": false,
+  "visual_enabled": false,
+  "config_version": "demo-metro-v1",
+  "scene_id": "demo-metro-8-v1",
+  "confirmed_config_sha256": null
+}
