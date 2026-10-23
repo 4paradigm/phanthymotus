@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1400 3600" width="1400" height="3600" role="img"
+     aria-label="Deploy Approval GitHub-driven sequence diagram"
+     xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10z" fill="#6B7A8D"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10z" fill="#C4673A"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10z" fill="#5C7A6A"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10z" fill="#A55E5E"/>
+    </marker>
+    <style>
+      .mono { font-family: JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .actor { rx:10; stroke-width:2; }
+      .title { font-size:14px; font-weight:600; letter-spacing:.05em; }
+      .small { font-size:10px; fill:#78716C; }
+      .msg { font-size:10px; fill:#4F5C6B; }
+      .msgStrong { font-size:10px; font-weight:600; fill:#4F5C6B; }
+      .lifeline { stroke:#D6D3D1; stroke-width:1.5; stroke-dasharray:5 5; }
+      .blue { stroke:#6B7A8D; fill:none; stroke-width:2; marker-end:url(#arrow-blue); }
+      .orange { stroke:#C4673A; fill:none; stroke-width:2; marker-end:url(#arrow-orange); }
+      .green { stroke:#5C7A6A; fill:none; stroke-width:2; marker-end:url(#arrow-green); }
+      .red { stroke:#A55E5E; fill:none; stroke-width:2; marker-end:url(#arrow-red); }
+      .statusWait { fill:#FBF4E8; stroke:#B07A3C; stroke-width:1.4; rx:5; }
+      .statusRun { fill:#EFF1F5; stroke:#6B7A8D; stroke-width:1.4; rx:5; }
+      .statusOk { fill:#EEF4F1; stroke:#5C7A6A; stroke-width:1.4; rx:5; }
+      .statusFail { fill:#FBF1EC; stroke:#A55E5E; stroke-width:1.4; rx:5; }
+      .statusText { font-size:10px; font-weight:600; }
+      .gate { fill:#FAFAF9; stroke:#B07A3C; stroke-width:1.5; rx:8; }
+      .callout { fill:#FFF8F0; stroke:#C4673A; stroke-width:1.2; rx:6; stroke-dasharray:5 3; }
+    </style>
+  </defs>
+
+  <text x="40" y="42" class="mono title" fill="#425A4B">DEPLOY APPROVAL · GITHUB-DRIVEN SEQUENCE</text>
+  <text x="40" y="62" class="mono small">GitHub PR status labels: best-effort UI projection (not a lifecycle gate). Lifecycle: review-required · reviewing · deploy-ready · deploy-requested · testing · succeeded · failed</text>
+
+  <!-- High-level actors only -->
+  <g class="mono">
+    <rect x="40" y="92" width="150" height="48" class="actor" fill="#EEF4F1" stroke="#5C7A6A"/>
+    <text x="115" y="122" text-anchor="middle" class="title" fill="#425A4B">Developer</text>
+
+    <rect x="225" y="92" width="165" height="48" class="actor" fill="#EFF1F5" stroke="#6B7A8D"/>
+    <text x="307" y="122" text-anchor="middle" class="title" fill="#4F5C6B">GitHub PR</text>
+
+    <rect x="425" y="92" width="160" height="48" class="actor" fill="#EFF1F5" stroke="#6B7A8D"/>
+    <text x="505" y="122" text-anchor="middle" class="title" fill="#4F5C6B">Review Agent</text>
+
+    <rect x="620" y="92" width="185" height="48" class="actor" fill="#FBF1EC" stroke="#C4673A"/>
+    <text x="712" y="122" text-anchor="middle" class="title" fill="#9A4F2F">Deploy Approval</text>
+
+    <rect x="840" y="92" width="160" height="48" class="actor" fill="#EEF4F1" stroke="#5C7A6A"/>
+    <text x="920" y="122" text-anchor="middle" class="title" fill="#425A4B">Machine Owner</text>
+
+    <rect x="1035" y="92" width="160" height="48" class="actor" fill="#FBF1EC" stroke="#C4673A"/>
+    <text x="1115" y="122" text-anchor="middle" class="title" fill="#9A4F2F">Agent Core</text>
+
+    <rect x="1230" y="92" width="130" height="48" class="actor" fill="#EFF1F5" stroke="#6B7A8D"/>
+    <text x="1295" y="122" text-anchor="middle" class="title" fill="#4F5C6B">COS</text>
+  </g>
+
+  <g>
+    <line x1="115" y1="140" x2="115" y2="3575" class="lifeline"/>
+    <line x1="307" y1="140" x2="307" y2="3575" class="lifeline"/>
+    <line x1="505" y1="140" x2="505" y2="3575" class="lifeline"/>
+    <line x1="712" y1="140" x2="712" y2="3575" class="lifeline"/>
+    <line x1="920" y1="140" x2="920" y2="3575" class="lifeline"/>
+    <line x1="1115" y1="140" x2="1115" y2="3575" class="lifeline"/>
+    <line x1="1295" y1="140" x2="1295" y2="3575" class="lifeline"/>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- SECTION 01: REVIEW CURRENT HEAD                              -->
+  <!-- ============================================================ -->
+  <g id="section-01-review">
+    <text x="40" y="178" class="mono small">01 · REVIEW CURRENT HEAD</text>
+
+    <path d="M115 214 L307 214" class="blue"/>
+    <text x="211" y="205" text-anchor="middle" class="mono msg">/request_bot_review</text>
+
+    <rect x="238" y="234" width="138" height="24" class="statusRun"/>
+    <text x="307" y="250" text-anchor="middle" class="mono statusText" fill="#4F5C6B">status: reviewing</text>
+
+    <path d="M307 286 L505 286" class="blue"/>
+    <text x="406" y="277" text-anchor="middle" class="mono msg">review current PR HEAD</text>
+
+    <path d="M505 326 L505 360" class="blue"/>
+    <text x="521" y="348" class="mono msg">build + review</text>
+
+    <path d="M505 394 L307 394" class="green"/>
+    <text x="406" y="385" text-anchor="middle" class="mono msg">review complete</text>
+
+    <rect x="238" y="414" width="138" height="24" class="statusOk"/>
+    <text x="307" y="430" text-anchor="middle" class="mono statusText" fill="#425A4B">status: deploy-ready</text>
+
+    <line x1="40" y1="470" x2="1360" y2="470" stroke="#E7E5E4"/>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- SECTION 02: EXPLICIT DEPLOY REQUEST                          -->
+  <!-- ============================================================ -->
+  <g id="section-02-request-deploy">
+    <text x="40" y="502" class="mono small">02 · EXPLICIT DEPLOY REQUEST · EXACT HEAD BINDING</text>
+
+    <path d="M115 538 L307 538" class="orange"/>
+    <text x="211" y="529" text-anchor="middle" class="mono msg">/request_deploy</text>
+
+    <path d="M307 576 L712 576" class="orange"/>
+    <text x="510" y="567" text-anchor="middle" class="mono msg">fresh PR + full HEAD + hidden state</text>
+
+    <path d="M712 700 L307 700" class="green"/>
+    <text x="510" y="691" text-anchor="middle" class="mono msg">bind exact reviewed build + immutable image snapshot</text>
+
+    <rect x="228" y="722" width="158" height="24" class="statusWait"/>
+    <text x="307" y="738" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+
+
+    <line x1="40" y1="790" x2="1360" y2="790" stroke="#E7E5E4"/>
+  </g>
+
+  <!-- ============================================================ -->
+  <!-- SECTION 03: APPROVE / CLEAN / DEPLOY                         -->
+  <!-- ============================================================ -->
+  <g id="section-03-approve-deploy">
+    <text x="40" y="822" class="mono small">03 · APPROVAL · PARTIAL COVERAGE · RUNTIME EVIDENCE · DEPLOY</text>
+
+    <path d="M920 858 L307 858" class="orange"/>
+    <text x="614" y="849" text-anchor="middle" class="mono msg">/approve_deploy machine=&lt;alias-or-ip&gt; → canonical alias</text>
+
+    <path d="M307 898 L712 898" class="orange"/>
+    <text x="510" y="889" text-anchor="middle" class="mono msg">fresh PR HEAD (commit SHA) + fresh approver + fresh saved state</text>
+
+    <!-- Decision box is visually isolated: branch arrows start below it. -->
+    <rect x="557" y="936" width="310" height="58" class="gate"/>
+    <text x="712" y="958" text-anchor="middle" class="mono statusText" fill="#9A6A32">MACHINE SUPPORT CHECK</text>
+    <text x="712" y="979" text-anchor="middle" class="mono small">select compatible undeployed subset on this machine</text>
+
+    <path d="M712 1018 L307 1018" class="red"/>
+    <text x="510" y="1009" text-anchor="middle" class="mono small">NOT SUPPORTED</text>
+    <rect x="228" y="1040" width="158" height="24" class="statusWait"/>
+    <text x="307" y="1056" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+    <text x="307" y="1084" text-anchor="middle" class="mono small">zero coverage: zero POST; send a NEW compatible approval</text>
+
+    <text x="728" y="1098" class="mono msgStrong">SUPPORTED ↓</text>
+
+    <path d="M712 1124 L1115 1124" class="blue"/>
+    <text x="914" y="1107" text-anchor="middle" class="mono msg">check the compatible undeployed subset on the selected machine</text>
+    <text x="914" y="1120" text-anchor="middle" class="mono msg">+ read its current running image</text>
+
+    <path d="M1115 1170 L712 1170" class="green"/>
+    <text x="914" y="1161" text-anchor="middle" class="mono msg">current running images as preflight evidence</text>
+
+    <rect x="582" y="1202" width="260" height="60" class="gate"/>
+    <text x="712" y="1224" text-anchor="middle" class="mono statusText" fill="#9A6A32">RUNTIME PREFLIGHT EVIDENCE</text>
+    <text x="712" y="1247" text-anchor="middle" class="mono small">non-empty is allowed; Agent Core replaces existing runtime</text>
+
+    <!-- Existing runtime is evidence and does not block the unsafe operation. -->
+    <path d="M712 1296 L307 1296" class="red"/>
+    <text x="510" y="1287" text-anchor="middle" class="mono msgStrong">persist executing before unsafe POST; unknown outcome → uncertain</text>
+
+    <rect x="228" y="1318" width="158" height="24" class="statusWait"/>
+    <text x="307" y="1334" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+
+    <path d="M307 1368 L920 1368" class="blue"/>
+    <text x="614" y="1359" text-anchor="middle" class="mono msg">partial success persists subset; all durable components → testing</text>
+
+    <path d="M920 1410 L307 1410" class="orange"/>
+    <text x="614" y="1401" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
+    <text x="510" y="1437" text-anchor="middle" class="mono small">new approval restarts Section 03 from fresh state</text>
+
+    <text x="728" y="1480" class="mono msgStrong">EMPTY ↓</text>
+
+    <path d="M712 1510 L307 1510" class="blue"/>
+    <text x="510" y="1501" text-anchor="middle" class="mono msg">re-check the approval comment + current PR HEAD</text>
+
+    <path d="M307 1550 L712 1550" class="green"/>
+    <text x="510" y="1541" text-anchor="middle" class="mono msg">fresh approval + current PR HEAD</text>
+
+    <!-- Final safety gate: no branch line crosses the box or its text. -->
+    <rect x="532" y="1582" width="360" height="70" class="gate"/>
+    <text x="712" y="1605" text-anchor="middle" class="mono statusText" fill="#9A6A32">FINAL SAFETY CHECK</text>
+    <text x="712" y="1628" text-anchor="middle" class="mono small">approval unchanged · same machine</text>
+    <text x="712" y="1644" text-anchor="middle" class="mono small">PR HEAD unchanged</text>
+
+    <path d="M712 1688 L307 1688" class="red"/>
+    <text x="510" y="1679" text-anchor="middle" class="mono small">approval changed / removed → ZERO deploy POST</text>
+    <rect x="228" y="1710" width="158" height="24" class="statusWait"/>
+    <text x="307" y="1726" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+
+    <path d="M712 1764 L307 1764" class="red"/>
+    <text x="510" y="1755" text-anchor="middle" class="mono small">PR HEAD changed → ZERO deploy POST</text>
+    <rect x="238" y="1786" width="138" height="24" class="statusFail"/>
+    <text x="307" y="1802" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: review-required</text>
+
+    <text x="728" y="1846" class="mono msgStrong">VALID ↓</text>
+
+    <path d="M712 1874 L307 1874" class="blue"/>
+    <text x="510" y="1865" text-anchor="middle" class="mono msgStrong">record deployment start in GitHub FIRST</text>
+
+    <path d="M712 1920 L1115 1920" class="orange"/>
+    <text x="914" y="1911" text-anchor="middle" class="mono msg">POST /api/drivers/{id}/deploy {image: repo@sha256}</text>
+
+    <path d="M1115 1960 L712 1960" class="green"/>
+    <text x="914" y="1951" text-anchor="middle" class="mono msg">deploy response</text>
+
+    <path d="M712 2006 L307 2006" class="red"/>
+    <text x="510" y="1997" text-anchor="middle" class="mono small">confirmed failure</text>
+    <rect x="254" y="2026" width="106" height="24" class="statusFail"/>
+    <text x="307" y="2042" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: failed</text>
+
+    <rect x="760" y="1990" width="560" height="62" class="callout"/>
+    <text x="1040" y="2013" text-anchor="middle" class="mono msgStrong">confirmed failure: save failed state to GitHub FIRST</text>
+    <text x="1040" y="2035" text-anchor="middle" class="mono small">then COS evidence best effort · metadata written back to GitHub</text>
+
+    <path d="M712 2080 L307 2080" class="red"/>
+    <text x="510" y="2071" text-anchor="middle" class="mono small">response uncertain</text>
+    <rect x="228" y="2100" width="158" height="24" class="statusWait"/>
+    <text x="307" y="2116" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+
+    <path d="M920 2156 L307 2156" class="orange"/>
+    <text x="614" y="2147" text-anchor="middle" class="mono msg">Machine Owner sends NEW /approve_deploy</text>
+
+    <text x="728" y="2198" class="mono msgStrong">ALL deploy POSTs succeeded ↓</text>
+
+    <path d="M712 2224 L307 2224" class="green"/>
+    <text x="510" y="2215" text-anchor="middle" class="mono msg">save deployment result + completed command</text>
+
+    <rect x="236" y="2244" width="142" height="24" class="statusRun"/>
+    <text x="307" y="2260" text-anchor="middle" class="mono statusText" fill="#4F5C6B">status: testing</text>
+  </g>
+
+  <line x1="40" y1="2306" x2="1360" y2="2306" stroke="#E7E5E4"/>
+
+  <!-- ============================================================ -->
+  <!-- SECTION 04: HUMAN FINAL TEST                                 -->
+  <!-- ============================================================ -->
+  <g id="section-04-record-test">
+    <text x="40" y="2338" class="mono small">04 · HUMAN FINAL TEST · GITHUB STATE · COS EVIDENCE</text>
+
+    <path d="M920 2376 L307 2376" class="orange"/>
+    <text x="614" y="2367" text-anchor="middle" class="mono msg">/record_test result=pass|fail [summary=...]</text>
+
+    <path d="M307 2416 L712 2416" class="orange"/>
+    <text x="510" y="2407" text-anchor="middle" class="mono msg">fresh PR HEAD (commit SHA) + saved state + command actor</text>
+
+    <path d="M712 2464 L307 2464" class="green"/>
+    <text x="510" y="2455" text-anchor="middle" class="mono msgStrong">result=pass · save terminal state to GitHub FIRST</text>
+    <rect x="244" y="2484" width="126" height="24" class="statusOk"/>
+    <text x="307" y="2500" text-anchor="middle" class="mono statusText" fill="#425A4B">status: succeeded</text>
+
+    <path d="M712 2538 L307 2538" class="red"/>
+    <text x="510" y="2529" text-anchor="middle" class="mono msgStrong">result=fail · save terminal state to GitHub FIRST</text>
+    <rect x="254" y="2558" width="106" height="24" class="statusFail"/>
+    <text x="307" y="2574" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: failed</text>
+
+    <text x="712" y="2612" text-anchor="middle" class="mono small">succeeded / failed already saved in GitHub</text>
+    <path d="M712 2636 L1295 2636" class="blue"/>
+    <text x="1004" y="2627" text-anchor="middle" class="mono msg">evidence.log.gz · best effort</text>
+
+    <path d="M1295 2676 L712 2676" class="green"/>
+    <text x="1004" y="2667" text-anchor="middle" class="mono msg">object_key + sha256 + size</text>
+
+    <path d="M712 2722 L307 2722" class="green"/>
+    <text x="510" y="2713" text-anchor="middle" class="mono msgStrong">Download COS evidence -> 120-second HTTPS presigned GET URL -> private COS object</text>
+    <text x="510" y="2740" text-anchor="middle" class="mono small">Temporary bearer access; URL not persisted in hidden state; bucket remains private</text>
+  </g>
+
+  <line x1="40" y1="2780" x2="1360" y2="2780" stroke="#E7E5E4"/>
+
+  <!-- ============================================================ -->
+  <!-- SECTION 05: RESTART / RECOVERY                              -->
+  <!-- ============================================================ -->
+  <g id="section-05-recovery">
+    <text x="40" y="2812" class="mono small">05 · RESTART / RECOVERY · GITHUB REMAINS THE PERSISTENT STATE SOURCE</text>
+
+    <path d="M307 2850 L712 2850" class="blue"/>
+    <text x="510" y="2841" text-anchor="middle" class="mono msg">new command → saved state + bound PR HEAD</text>
+
+    <!-- Decision box is isolated from SAME/CHANGED branch arrows. -->
+    <rect x="567" y="2878" width="290" height="64" class="gate"/>
+    <text x="712" y="2901" text-anchor="middle" class="mono statusText" fill="#9A6A32">PR HEAD CHECK</text>
+    <text x="712" y="2924" text-anchor="middle" class="mono small">is this still the exact reviewed PR HEAD?</text>
+
+    <path d="M712 2972 L307 2972" class="green"/>
+    <text x="510" y="2963" text-anchor="middle" class="mono small">UNCHANGED</text>
+    <rect x="228" y="2994" width="158" height="24" class="statusWait"/>
+    <text x="307" y="3010" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+
+    <path d="M920 3054 L307 3054" class="orange"/>
+    <text x="614" y="3045" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
+
+    <path d="M307 3094 L712 3094" class="green"/>
+    <text x="510" y="3085" text-anchor="middle" class="mono msg">continue Section 03 · select next compatible subset + runtime evidence</text>
+
+    <path d="M712 3142 L307 3142" class="red"/>
+    <text x="510" y="3133" text-anchor="middle" class="mono msgStrong">PR HEAD CHANGED</text>
+    <rect x="238" y="3162" width="138" height="24" class="statusFail"/>
+    <text x="307" y="3178" text-anchor="middle" class="mono statusText" fill="#8F4B4B">status: review-required</text>
+
+    <path d="M115 3220 L307 3220" class="blue"/>
+    <text x="211" y="3211" text-anchor="middle" class="mono msg">/request_bot_review</text>
+
+    <path d="M307 3260 L505 3260" class="blue"/>
+    <text x="406" y="3251" text-anchor="middle" class="mono msg">review / build new HEAD</text>
+
+    <path d="M505 3300 L307 3300" class="green"/>
+    <text x="406" y="3291" text-anchor="middle" class="mono msg">review complete</text>
+
+    <rect x="238" y="3320" width="138" height="24" class="statusOk"/>
+    <text x="307" y="3336" text-anchor="middle" class="mono statusText" fill="#425A4B">status: deploy-ready</text>
+
+    <path d="M115 3376 L307 3376" class="orange"/>
+    <text x="211" y="3367" text-anchor="middle" class="mono msg">/request_deploy</text>
+
+    <path d="M307 3416 L712 3416" class="orange"/>
+    <text x="510" y="3407" text-anchor="middle" class="mono msg">bind the newly reviewed PR HEAD</text>
+
+    <rect x="228" y="3436" width="158" height="24" class="statusWait"/>
+    <text x="307" y="3452" text-anchor="middle" class="mono statusText" fill="#9A6A32">status: deploy-requested</text>
+
+    <path d="M920 3498 L307 3498" class="orange"/>
+    <text x="614" y="3489" text-anchor="middle" class="mono msg">NEW /approve_deploy machine=&lt;alias-or-ip&gt;</text>
+
+    <path d="M307 3538 L712 3538" class="green"/>
+    <text x="510" y="3529" text-anchor="middle" class="mono msg">continue Section 03</text>
+  </g>
+</svg>
