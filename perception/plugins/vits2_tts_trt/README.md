@@ -114,28 +114,71 @@ Set this option to false to defer loading until `start` or `speak`.
 `interrupt` support, and the end-of-utterance marker on every terminated
 utterance, including one abandoned before it reached a node.
 
+### Text chunking and synthesis
+
+The frontend normalizes the complete input, including numbers and units,
+before choosing synthesis chunks. The default `max_chunk_tokens: 256` in
+`config.yaml` limits each chunk by the model's input ID count: phoneme IDs
+plus blank IDs when enabled by the model. The number of written characters
+and the resulting audio duration vary with the text.
+
+The shared [text splitter](frontend/chunking.py) applies these steps:
+
+1. Split at punctuation boundaries, retaining punctuation and closing quotes.
+2. For a unit over the token limit, try Chinese/English transition boundaries,
+   then jieba word boundaries, then remaining permitted character positions.
+   Each step chooses a fitting prefix and recursively handles the remainder.
+   Recognized Chinese-number/KB/MB/GB-style expressions are protected from
+   internal cuts. The character fallback can split an unusually long word;
+   this is not a semantic or prosody-aware sentence parser.
+3. Greedily join adjacent valid units while the combined token count fits.
+   Several short sentences, including mixed Chinese/English text, can therefore
+   share one synthesis chunk. Reject input that cannot fit safely rather than
+   silently discard its remainder.
+
+The [adapter](adapter.py) calls `engine.synthesize` once per text chunk and
+receives that chunk's complete PCM before yielding its audio frames. The engine
+may decode long latent sequences internally with overlapping windows; those windows are
+reassembled before the adapter receives PCM. Streaming to the caller therefore
+begins after the first text chunk has been synthesized.
+
+`MIX_VITS_CHUNK_PAUSE_MS` defaults to `0`: no extra silence is inserted between
+synthesis chunks. Punctuation-related pauses can still be present in the
+generated waveform. Smaller text chunks can reduce the first synthesis wait,
+but add inference calls and prosody boundaries; increasing or decreasing this
+limit needs listening and performance checks on the target device.
+
 ### Audio delivery
 
-Each full PCM frame contains 100 ms of audio and is delivered at a 100 ms
-interval by default; the final frame may be shorter. The five-frame initial
-prebuffer remains. The default and the fast-delivery guard are restored from
-upstream main. This patch leaves the existing per-utterance scheduling,
-waveform, sample rate and speech speed unchanged.
+Audio frames are transport units created from the synthesized PCM. With the
+default 16 kHz, mono, signed 16-bit output:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `MIX_VITS_CHUNK_BYTES` | `3200` bytes | Each full frame carries 100 ms of audio; the final frame may be shorter. |
+| `MIX_VITS_PREBUFFER_FRAMES` | `5` | Send an initial burst of up to 0.5 s of available audio, then continue paced delivery. This does not insert silence. |
+| `MIX_VITS_FRAME_INTERVAL_MS` | `100` ms | Pace full frames at their playback duration. |
+| `MIX_VITS_SYNTH_QUEUE_FRAMES` | `200` | Bound the frame queue between synthesis and publishing; the producer waits when it is full. |
+
+Synthesis and publishing run in separate threads so queued audio can continue
+to be sent while the next text chunk is being generated. The queue bounds the
+handoff buffer; it does not cap TensorRT workspace or the complete PCM held for
+an individual text chunk. Scheduling and initial prebuffering are per utterance.
 
 `MIX_VITS_FRAME_INTERVAL_MS` cannot select an interval below the PCM duration
 in live mode. Faster delivery requires **both** an explicit smaller interval
 and the existing `MIX_VITS_ALLOW_FAST_DELIVERY=1` option. This opt-in is only
-for an offline consumer that stores every PCM frame; do not enable it with the web player or robot
-speakers. No default config enables it, and the plugin never detects or changes
-delivery mode based on a benchmark name or input topic.
+for an offline consumer that stores every PCM frame; do not enable it with the
+web player or robot speakers. No default config enables it, and the plugin
+never detects or changes delivery mode based on a benchmark name or input topic.
 
 Measure generation time separately from time to receive the last PCM frame:
-realtime delivery normally makes the latter RTF approach 1 for long speech.
-An earlier single-instance JP6 timing comparison had identical PCM with both
-intervals, but the 70 ms stream dropped frames in a replay of the web player.
-These results do not establish Darvin performance for this patch; the current
-build still needs device and end-to-end validation. Scheduling remains per
-utterance, so consecutive queued replies need playback validation as well.
+realtime delivery normally makes the latter RTF approach 1 for long speech,
+even when generation is faster. Report the timing boundaries with each RTF;
+changing delivery intervals does not demonstrate faster model inference.
+Build and unit-test results do not establish device playback or Darvin
+performance. Validate complete audio reception, consecutive queued replies,
+interrupts and the required concurrent instances on the deployment device.
 
 ### Image test dependency
 
@@ -166,23 +209,47 @@ The existing UI renders the translated labels through `oneOf`. With no saved
 selection it can initially show a placeholder; select and save “自动” if
 needed. The backend defaults to `auto` when the setting is absent.
 
+#### Direct card audition
+
 Direct `speak` remains supported without a preceding `language` call. In
 automatic mode it uses the speech text; ambiguous numeric input falls back
-to Chinese. A fixed selection gives numeric-only text and supported names
-the corresponding Chinese or English reading. For example, `2026 10/ 20`
-is read as a date in the selected language. Chinese-English mixed text is
-allowed; a complete reply must contain the selected language's script.
+to Chinese. It does not read a previous ASR message. A fixed selection gives
+numeric-only text and supported names the corresponding Chinese or English
+reading. For example, `2026 10/ 20` is read as a date in the selected language.
+For manual speech, this selection is a reading preference: Chinese-English
+mixed text and standalone names or acronyms are allowed without requiring
+characters from the selected language. It does not translate the input.
+`Qwen3` and `Qwen 3` both read as `千问三` in Chinese mode and `Qwen three` in
+English mode. Empty input and unsupported scripts are still rejected.
 
-To follow the user's current turn rather than infer from generated speech:
+#### ASR-driven dialogue integration
+
+The `language` action is an integration API. The dialogue caller must forward
+the **current user utterance's** ASR result, use the returned instruction when
+generating a reply, and attach the returned turn ID when speaking. Selecting
+“自动” in the panel alone does not create this connection. This plugin does not
+subscribe to ASR results or insert instructions into the dialogue model itself.
+
+```text
+ASR text + lang
+    -> tts(action=language)
+    -> reply_language + instruction + turn_id
+    -> dialogue model generates the reply using instruction
+    -> tts(action=speak, text=reply, turn_id=returned_turn_id)
+```
+
+Configure automatic selection and start a conversation instance, then supply
+the recognized user utterance before generating its reply:
 
 ```json
-{"action":"start","instance_id":"conversation","input_topic":"/robot/reply"}
 {"action":"config","reply_language":"auto"}
+{"action":"start","instance_id":"conversation","input_topic":"/robot/reply"}
 {"action":"language","instance_id":"conversation","asr_result":{"text":"Hello, please check the battery.","lang":"en"}}
 ```
 
-Pass the returned `instruction` to the dialogue model, then use its reply
-and the returned `turn_id` in `speak`:
+For this request the result includes `reply_language: "en"` and
+`language_source: "asr"`. Pass its `instruction` to the dialogue model, then
+use the generated reply and the returned `turn_id` in `speak`:
 
 ```json
 {"action":"speak","instance_id":"conversation","text":"The battery is ready.","turn_id":"<returned turn_id>"}
@@ -196,13 +263,30 @@ The precedence for an explicit `language` request is:
 4. Rules applied to the current user text.
 5. Chinese when the text is ambiguous.
 
+With panel mode `auto` and no per-turn override, examples are:
+
+| Current ASR text | ASR `lang` | Reply language | Source |
+| --- | --- | --- | --- |
+| `Hello, please check the battery.` | `en` | English | `asr` |
+| `你好，Qwen3 is ready，然后继续。` | `zh` | Chinese, with mixed content allowed | `asr` |
+| `Hello, please check the battery.` | absent | English | `text` |
+| `2026 10/20` | `en` | English | `asr` |
+| `2026 10/20` | absent | Chinese | `default` |
+
 `asr_result.language` is not used as a recognition result. Missing or unknown
 `lang` values fall back to text rules. Previous-turn language is not used as
 the fallback. Text rules are heuristics for this bilingual application, not
-a general language detector.
+a general language detector. A recognized `lang` takes priority over text
+inference; this layer does not validate ASR confidence or correct an incorrect
+tag. Forward the original `text` and `lang` together when available: a
+text-only forwarding path can only use the text fallback. If the caller also
+supplies `input_language`, it must agree with a recognized `asr_result.lang`;
+conflicting labels are rejected.
 
 After an explicit `language` call, that instance requires its current
-`turn_id` with speech. A newer turn rejects a late reply; it does not cancel
+`turn_id` with speech, and the generated reply must include its selected
+primary language (mixed content remains allowed). The manual-speech exception
+above does not bypass this dialogue check. A newer turn rejects a late reply; it does not cancel
 already queued audio. Use `interrupt` to stop audio. Language context is kept
 in memory, and `stop` clears it. Instance-specific API configuration is
 supported; the panel field is tool-wide, as declared by its shared scope.
