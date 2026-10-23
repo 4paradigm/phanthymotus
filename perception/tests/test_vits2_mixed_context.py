@@ -57,7 +57,7 @@ class MixedContextTest(unittest.TestCase):
         self.assertNotIn("N[EN:8.5]", normalized)
 
     def test_curated_name_in_chinese_list_keeps_chinese_reading_context(self):
-        for name in ("qwen", "Qwen", "QWEN", "Qwen3", "Qwen2.5"):
+        for name in ("qwen", "Qwen", "QWEN", "Qwen3", "Qwen2.5", "Qwen 3", "Qwen 2.5"):
             text = f"我们在waic会议上看到许多产品和模型，{name}、豆包等都有出现"
             with self.subTest(name=name):
                 diagnostic = context_diagnostics(text)

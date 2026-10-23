@@ -113,6 +113,11 @@ _EN_PREDICATE = re.compile(
 
 
 def _detect_text_language(text):
+    # A standalone curated name is not evidence of English prose. Treat its
+    # spaced and joined version forms equally; explicit/ASR tags still win.
+    if (_scripts(text) == {"en"}
+            and _scripts(normalize_standalone_name(text, "zh")) == {"zh"}):
+        return None
     prose = _language_evidence_text(text)
     scripts = _scripts(prose)
     if len(scripts) == 1:

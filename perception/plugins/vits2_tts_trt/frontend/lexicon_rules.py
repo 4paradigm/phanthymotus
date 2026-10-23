@@ -242,13 +242,16 @@ _GENERATED_RULES = [(pattern, spoken) for pattern, spoken, _ in _GENERATED_RULES
 
 
 _QWEN_VERSION_RE = re.compile(
-    r"(?<![A-Za-z0-9])qwen(\d+(?:\.\d+)?)(?![A-Za-z0-9])", re.IGNORECASE
+    # A typed space between the brand and version does not change its reading.
+    # Limit separators to horizontal whitespace: a newline starts a new item.
+    r"(?<![A-Za-z0-9])qwen[ \t\u00a0\u3000]*(\d+(?:\.\d+)?)(?![A-Za-z0-9])",
+    re.IGNORECASE,
 )
 _CN_DIGITS = "零一二三四五六七八九"
 
 
 def _qwen_version(match) -> str:
-    """Qwen3 -> 千问三, Qwen2.5 -> 千问二点五."""
+    """Qwen3 / Qwen 3 -> 千问三; Qwen 2.5 -> 千问二点五."""
     digits = match.group(1)
     spoken = "".join(
         _CN_DIGITS[int(ch)] if ch.isdigit() else "点" for ch in digits

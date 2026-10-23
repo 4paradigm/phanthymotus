@@ -155,6 +155,10 @@ def test_unified_schema_exposes_vits_only_preference_and_keeps_acp():
     ("en", "2026 10/ 20", "October"),
     ("zh", "Qwen3", "千问"),
     ("en", "Qwen3", "Qwen three"),
+    ("zh", "Qwen 3", "千问三"),
+    ("en", "Qwen 3", "Qwen three"),
+    ("auto", "Qwen 3", "千问三"),
+    ("zh", "Qwen 2.5。", "千问二点五。"),
     ("auto", "Hello.", "Hello."),
     ("auto", "你好，Qwen3 is ready，然后继续。", "你好"),
     ("auto", "123", "一百二十三"),
@@ -477,6 +481,9 @@ def test_interrupt_during_frontend_discards_old_request(make_plugin, monkeypatch
     ("en", "2026 10/ 20", "October"),
     ("zh", "Qwen3", "千问"),
     ("en", "Qwen3", "Qwen three"),
+    ("zh", "Qwen 3", "千问三"),
+    ("en", "Qwen 3", "Qwen three"),
+    ("auto", "Qwen 3", "千问三"),
 ])
 def test_http_audition_applies_shared_preference_without_changing_turn(make_plugin, mode, text, expected):
     state = make_plugin(reply_language=mode)

@@ -285,11 +285,24 @@ class LanguagePolicyTest(unittest.TestCase):
         for language in ("zh", "en"):
             policy = self.module.LanguagePolicy(language)
             turn = policy.begin_turn("Qwen3")
-            for raw in ("Qwen", "qwen", "Qwen3", "QWEN3", "Qwen2.5", " \tQwen3\n"):
+            for raw in ("Qwen", "qwen", "Qwen3", "QWEN3", "Qwen2.5", " \tQwen3\n",
+                        "Qwen 3", "Qwen 2.5", "QWEN\t3", "Qwen\u00a03", "Qwen\u30003。"):
                 with self.subTest(language=language, raw=raw):
                     request = policy.prepare(raw, turn["turn_id"])
                     self.assertEqual((request.text, request.language, request.turn_id),
                                      (raw, language, turn["turn_id"]))
+
+    def test_standalone_curated_names_do_not_supply_auto_language_evidence(self):
+        for raw in ("Qwen", "Qwen3", "Qwen 3", "Qwen 2.5", "QWEN\t3", "Qwen\u00a03!", "Qwen\u30003。"):
+            with self.subTest(raw=raw):
+                self.policy.begin_turn("Hello")
+                turn = self.policy.begin_turn(raw)
+                self.assertEqual((turn["reply_language"], turn["language_source"]), ("zh", "default"))
+                self.assertIsNone(turn["detected_language"])
+                self.assertEqual(self.policy.prepare(raw, turn["turn_id"]).text, raw)
+                for supplied in ("zh", "en"):
+                    tagged = self.policy.begin_turn(raw, input_language=supplied)
+                    self.assertEqual((tagged["reply_language"], tagged["language_source"]), (supplied, "asr"))
 
     def test_chinese_name_exception_rejects_clauses_addresses_and_partial_names(self):
         policy = self.module.LanguagePolicy("zh")
@@ -299,6 +312,8 @@ class LanguagePolicyTest(unittest.TestCase):
             "myqwen", "qwenish", "Qwen3x", "Qwen3_abc", "Qwen3/ABC",
             "Qwen3 is ready", "This is Qwen3", "Qwen3 Qwen3",
             "https://qwen.ai/Qwen3", "qwen3@example.com",
+            "Qwen 3x", "Qwen 3_abc", "Qwen 3/ABC", "Qwen 3 is ready",
+            "This is Qwen 3", "Qwen 3 Qwen 3", "Qwen\n3",
         ):
             with self.subTest(raw=raw):
                 self.assert_code(
@@ -306,6 +321,26 @@ class LanguagePolicyTest(unittest.TestCase):
                     lambda: policy.prepare(raw, turn["turn_id"]),
                 )
                 self.assertEqual(policy.snapshot(), before)
+
+    def test_english_spaced_versions_preserve_name_boundaries_and_identifiers(self):
+        from plugins.vits2_tts_language.name_text import normalize_standalone_name
+
+        for raw, expected in (
+            ("Qwen 3", "Qwen three"),
+            ("Qwen\t2.5", "Qwen two point five"),
+            ("Qwen\u00a03!", "Qwen three!"),
+            ("Qwen 3 is ready.", "Qwen three is ready."),
+            ("你好，Qwen 3 is ready，然后继续。", "你好，Qwen three is ready，然后继续。"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_standalone_name(raw, "en"), expected)
+        for raw in (
+            "myqwen 3", "qwenish 3", "Qwen 3x", "Qwen 3_abc", "Qwen 3/ABC",
+            "Qwen 3.5.1", "Qwen\n3", "https://qwen.ai/Qwen3", "qwen3@example.com",
+            "order id: Qwen3", "order id: Qwen 3", "model_id=Qwen 3",
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_standalone_name(raw, "en"), raw)
 
     def test_request_is_frozen_and_preserves_original_text(self):
         result = self.policy.begin_turn("hello")

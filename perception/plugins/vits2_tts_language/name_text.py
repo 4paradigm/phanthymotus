@@ -44,7 +44,7 @@ def _english_version_names(text, allowed_ranges=None):
             return match.group()
         if _ID_PREFIX.search(text[:start]):
             return match.group()
-        brand = text[start:match.start(1)]
+        brand = text[start:match.start(1)].rstrip()
         return brand + " " + _english_quantity(match.group(1))
 
     return _QWEN_VERSION_RE.sub(replace, text)
