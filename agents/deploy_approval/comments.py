@@ -1313,14 +1313,20 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         and state.get("evidence_enabled") is True and bool(api)
     )
     if current_context_valid:
-        upload_url = (page_url(state.get("upload_capability"))
-                      if state.get("status") == "testing" else "")
+        upload_url = (
+            page_url(state.get("upload_capability"))
+            if state.get("status") == "testing"
+            and state.get("browser_upload_ready") is True
+            else ""
+        )
         read_url = page_url(state.get("capability"))
         if upload_url:
             lines.extend(["", f"[打开附件页](<{upload_url}>)"])
         elif read_url:
             lines.extend(["", f"[打开附件页](<{read_url}>)"])
-    if current_context_valid and state.get("status") == "testing" and page_url(state.get("upload_capability")):
+    if (current_context_valid and state.get("status") == "testing"
+            and state.get("browser_upload_ready") is True
+            and page_url(state.get("upload_capability"))):
         current_items = latest_attachments(groups[(head, current_round)], (head, current_round))
         pending = sum(1 for item in current_items
                       if isinstance(item, dict)
