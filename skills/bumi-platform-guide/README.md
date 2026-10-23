@@ -1,5 +1,7 @@
 # Bumi站台引导员 1.0.0
 
+新增：用户指定的“检测到人 → 101挥手 → 迎宾 → 车厢问路 → 104指向A并播报 → 安全提示3遍”已有独立、显式启动的室内演示控制程序，见 [FLOW.md](FLOW.md)。下文1.0.0指手动问答Skill；仅更新安装指令不会启用附加流程。附加流程尚未真机验收。
+
 Phanthy Motus 平台 Skill，slug `bumi-platform-guide`，存入 Agent Core SQLite `config.skills.installed`。固定位置提供中文安全提醒和车厢问答。不是 Codex 个人技能，也不需要构建 Driver 镜像。
 
 ## 当前交付状态
