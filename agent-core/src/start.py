@@ -124,7 +124,7 @@ def _register_core_mcp(silent=False):
                         'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password'},
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
-                        'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
+                        'think_mode': {'type': 'boolean', 'description': '思考模式：开启后模型会先推理再回答，但只给各家支持的最低推理档位（延迟仍高于关闭）；关闭则完全不推理，响应最快', 'default': False},
                         'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
                         'auto_narration': {'type': 'boolean', 'description': '自动播报：模型长时间不出声时，由系统自动生成一句进展汇报并通过已注册的语音/灯效等输出播报给用户', 'default': True},
                         'narration_silence_seconds': {'type': 'integer', 'description': '主动播报：距上次对用户说话多少秒后自动汇报一次进展（0 = 关闭）', 'default': 15, 'x-show-when': {'auto_narration': 'true'}},
