@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
 
+from .config import is_stable_public_base_url
+
 CAPABILITY_COOKIE = 'evidence-capability'
 SESSION_COOKIE = CAPABILITY_COOKIE
 SESSION_SECONDS = 3600
@@ -43,22 +45,7 @@ def _internal_http_host(host):
 
 
 def _public_base_reason(base):
-    try:
-        if not isinstance(base, str) or any(ord(c) < 33 or ord(c) == 127 for c in base):
-            return 'evidence_public_url_required'
-        parsed = urlsplit(base)
-        if (parsed.scheme not in {'https', 'http'} or not parsed.hostname
-                or parsed.username or parsed.password or parsed.query or parsed.fragment
-                or parsed.path not in ('', '/') or parsed.netloc.endswith(':')
-                or any(c.isspace() or ord(c) < 33 or ord(c) == 127 for c in parsed.netloc)):
-            return 'evidence_public_url_required'
-        if parsed.port is not None and not 1 <= parsed.port <= 65535:
-            return 'evidence_public_url_required'
-        if parsed.scheme == 'http' and not _internal_http_host(parsed.hostname.lower()):
-            return 'evidence_public_url_required'
-        return ''
-    except (TypeError, ValueError):
-        return 'evidence_public_url_required'
+    return '' if is_stable_public_base_url(base) else 'evidence_public_url_required'
 
 
 def disabled_reason(config):
@@ -75,7 +62,7 @@ def cos_ready(config):
 
 def public_https_ingress_ready(config):
     base = getattr(config, 'evidence_public_base_url', '')
-    return not _public_base_reason(base) and urlsplit(base).scheme == 'https'
+    return is_stable_public_base_url(base)
 
 
 def _configured_https_authority(config):
@@ -130,8 +117,10 @@ def readiness(config, evidence_service=None, request=None):
         'EVIDENCE_BACKEND_READY': backend,
         'PUBLIC_HTTPS_INGRESS_READY': ingress,
         'LOCAL_SSH_TUNNEL_READY': local_tunnel,
-        'BROWSER_UPLOAD_READY': backend and (ingress or local_tunnel),
-        'status': '' if backend and (ingress or local_tunnel) else (
+        # A loopback SSH tunnel is useful for local development, but it cannot
+        # back Summary links that must remain usable after the tunnel ends.
+        'BROWSER_UPLOAD_READY': backend and ingress,
+        'status': '' if backend and ingress else (
             'EVIDENCE_BACKEND_PENDING' if not backend else 'PUBLIC_INGRESS_PENDING'),
     }
 

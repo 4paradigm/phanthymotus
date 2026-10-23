@@ -271,12 +271,12 @@ def _validate_hidden_state(data: dict) -> dict:
         link = data["round_archive"]
         legacy_archive = isinstance(link, dict) and set(link) == {"round_id", "comment_id", "url", "sha256"}
         note_archive = isinstance(link, dict) and set(link) == {"round_id", "sha256"}
-        if (not (legacy_archive or note_archive)
+        if (link is not None and (not (legacy_archive or note_archive)
                 or (legacy_archive and (type(link["comment_id"]) is not int or link["comment_id"] <= 0
                     or not isinstance(link["url"], str) or not link["url"].startswith("https://github.com/")))
                 or not isinstance(link["round_id"], str)
                 or not re.fullmatch(r"[0-9a-f]{40}-[0-9]+", link["round_id"])
-                or not isinstance(link["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", link["sha256"])):
+                or not isinstance(link["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", link["sha256"]))):
             raise MalformedHiddenStateError("invalid round_archive")
 
     # Explicitly reject unbounded history fields — history must persist

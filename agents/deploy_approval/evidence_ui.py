@@ -58,7 +58,7 @@ label.control{{display:block;color:#424245;font-size:14px;font-weight:600}}
 textarea,select{{display:block;width:100%;margin-top:6px;padding:10px 12px;border:1px solid #d2d2d7;border-radius:9px;background:#fff;color:#1d1d1f}}
 textarea{{min-height:88px;resize:vertical}}
 .secondary-actions{{display:flex;justify-content:flex-end;margin-top:12px}}
-.primary-row{{display:flex;justify-content:flex-end;margin-top:14px}}
+.primary-row{{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}}
 .list-heading{{margin:24px 0 8px;font-size:16px}}
 .queue,.attachments{{list-style:none;margin:0;padding:0}}
 .queue:empty,.attachments:empty{{display:none}}
@@ -99,6 +99,8 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
   .header-actions{{width:100%;justify-content:space-between}}
   section.panel{{padding:18px;border-radius:14px}}
   .secondary-fields{{grid-template-columns:1fr}}
+  .primary-row{{flex-direction:column}}
+  .primary-row button{{width:100%}}
   .job-heading,.attachment-heading{{gap:6px;flex-direction:column}}
   .file-size{{white-space:normal}}
   .job-footer{{align-items:flex-start;flex-direction:column}}
@@ -112,12 +114,12 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 <p id="message" role="status" aria-live="polite"></p>
 <section id="current-section" class="panel" hidden><div class="section-heading"><h2 id="round-title">附件</h2><p id="summary" class="muted">当前轮附件与说明。</p></div>
 <fieldset id="writes" disabled hidden><legend>上传附件</legend>
-<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">支持多文件 · 单个文件最大 512 MiB</span><input id="file" type="file" multiple></label>
+<label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
 <div class="secondary"><div class="secondary-fields">
-<label class="control" for="note">本次上传说明（可选）<textarea id="note" maxlength="5000" aria-describedby="note-help"></textarea><span id="note-help" class="file-hint">最多 5000 字，支持 Markdown；本说明会附加到本次选择的每个文件。更长说明请另存为 .txt 上传，图片请作为附件上传。</span></label>
-<label class="control" for="replace">附件操作<select id="replace"><option value="">新增附件（保留现有附件）</option></select></label>
+<label class="control" for="note">文件说明或独立备注<textarea id="note" aria-describedby="note-help"></textarea><span id="note-help" class="file-hint">最多 5000 字，支持 Markdown；短备注可随文件保存或单独保存。超出后，点击“单独保存备注”或“上传文件”都会将原文完整转为 UTF-8 TXT 附件。图片可作为独立附件上传。配额按当前可见附件及本浏览器未完成任务估算；其他并发上传以服务端最终校验为准。</span></label>
+<label class="control" for="replace">附件操作<select id="replace"><option value="">新增附件（保留已有附件）</option><optgroup id="replace-targets" label="替换指定附件（旧记录保留历史）"></optgroup></select></label>
 </div></div>
-<div class="primary-row"><button id="upload" class="primary" type="button">上传所选文件</button></div>
+<div class="primary-row"><button id="save-note" type="button">单独保存备注</button><button id="upload" class="primary" type="button">上传所选文件</button></div>
 </fieldset>
 <h3 class="list-heading" id="queue-heading" hidden>上传进度</h3><ul id="queue" class="queue" aria-labelledby="queue-heading" aria-live="polite"></ul>
 <h3 class="list-heading" id="attachments-heading">附件</h3><ul id="attachments" class="attachments" aria-labelledby="attachments-heading"></ul>
@@ -140,7 +142,8 @@ _JAVASCRIPT = r'''"use strict";
   const storageKey = "evidence:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const proofKey = "evidence-proof:" + api + ":" + bound.head_sha + ":" + bound.round_id;
   const clientKeyStorage = "evidence-client-key:" + api + ":" + bound.head_sha + ":" + bound.round_id;
-  const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024;
+  const PART_BYTES = 8 * 1024 * 1024, MAX_BYTES = 512 * 1024 * 1024, MAX_NOTE_CHARS = 5000;
+  const MAX_FILES = 20, MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;
   const active = new Set(), jobs = [];
   let context = null, stopped = false, busy = false, proofSecret = "", clientKey = "", savedUploads = {};
   let noteOperation = null;
@@ -242,13 +245,14 @@ _JAVASCRIPT = r'''"use strict";
       context.readiness && context.readiness.COS_READY === true &&
       context.readiness.EVIDENCE_BACKEND_READY === true &&
       context.readiness.BROWSER_UPLOAD_READY === true &&
-      (context.pr_state === undefined || context.pr_state === "open") && !context.merged && !stopped;
+      context.pr_state === "open" && !context.merged && !stopped;
   }
   function controls() {
     const canWrite = writable();
     $("writes").hidden = !canWrite; $("writes").disabled = !canWrite;
     $("upload").disabled = busy || !canWrite; $("file").disabled = busy || !canWrite;
-    $("note").disabled = busy || !canWrite; $("replace").disabled = busy || !canWrite;
+    $("note").disabled = busy || !canWrite; $("save-note").disabled = busy || !canWrite;
+    $("replace").disabled = busy || !canWrite;
     for (const button of document.querySelectorAll("button[data-job-action]"))
       button.disabled = !canWrite || (busy && button.dataset.jobAction !== "pause");
     for (const button of document.querySelectorAll("button[data-delete]")) button.disabled = busy || !canWrite;
@@ -294,6 +298,8 @@ _JAVASCRIPT = r'''"use strict";
       let value; try { value = await response.json(); } catch (_) { value = {}; }
       if (!response.ok) {
         const detail = typeof value.detail === "string" ? value.detail : typeof value.error === "string" ? value.error : "";
+        if (/invalid_evidence_capability|invalid_evidence|evidence_capability/i.test(detail))
+          throw new ApiError(response.status, "上传链接无效或已失效。请从当前 PR Summary 重新打开附件页面。", detail);
         if ([401, 403].includes(response.status) && proofSecret && authMode === "proof") clearProof();
         else if (response.status === 401 && proofSecret && authMode !== "invite") clearProof();
         if (response.status === 401) {
@@ -336,6 +342,8 @@ _JAVASCRIPT = r'''"use strict";
         let responseOrigin = ""; try { responseOrigin = new URL(xhr.responseURL).origin; } catch (_) {}
         if (xhr.status >= 200 && xhr.status < 300 && responseOrigin === target.origin) return resolve(value);
         const detail = typeof value.detail === "string" ? value.detail : "";
+        if (/invalid_evidence_capability|invalid_evidence|evidence_capability/i.test(detail))
+          return reject(new ApiError(xhr.status, "上传链接无效或已失效。请从当前 PR Summary 重新打开附件页面。", detail));
         if (xhr.status === 401) clearProof();
         if (xhr.status === 401) halt("上传链接可能已过期或失效。请刷新 PR Summary 并打开最新上传链接。");
         if (xhr.status === 403) return reject(new ApiError(403, "权限不足：当前上传者无权执行此操作。", detail));
@@ -394,6 +402,17 @@ _JAVASCRIPT = r'''"use strict";
   function itemTimestamp(item) {
     const value = Date.parse(item && (item.created_at || item.uploaded_at || item.updated_at) || "");
     return Number.isFinite(value) ? value : 0;
+  }
+  function isDeletedAttachment(item) {
+    return !!(item && (item.status === "deleted" || item.deleted_at));
+  }
+  function isTextRecord(item) {
+    return !!(item && (item.status === "text" || item.evidence_kind === "note" || item.kind === "note"));
+  }
+  function displayNote(item) {
+    if (!item || item.evidence_kind !== "note" || typeof item.display_note !== "string" ||
+        item.display_note_complete === false) return "";
+    return item.display_note.trim();
   }
   function displayFilename(item) {
     const value = String(item && item.filename || "").trim();
@@ -461,13 +480,17 @@ _JAVASCRIPT = r'''"use strict";
   function attachmentList(rows, parent, current) {
     const ordered = [...(rows || [])].filter(item => item && typeof item === "object")
       .sort((a, b) => itemTimestamp(b) - itemTimestamp(a));
+    const latestVideo = current ? ordered.find(item => !item.deleted_at && item.status === "ready" &&
+      mediaType(item) === "video" && attachmentPreviewUrl(item)) : null;
     for (const item of ordered) {
-      const deleted = item.status === "deleted" || !!item.deleted_at;
+      const deleted = isDeletedAttachment(item);
       const li = document.createElement("li");
       li.className = "attachment";
       const heading = document.createElement("div"), title = document.createElement("strong"), size = document.createElement("span");
       heading.className = "attachment-heading"; title.className = "attachment-title"; size.className = "file-size";
-      title.textContent = displayFilename(item);
+      const attachmentId = item.attachment_id || item.id;
+      const independentNote = isTextRecord(item);
+      title.textContent = independentNote ? "独立备注" : displayFilename(item);
       size.textContent = formatBytes(item.size);
       heading.append(title); if (size.textContent) heading.append(size);
       li.append(heading);
@@ -489,7 +512,9 @@ _JAVASCRIPT = r'''"use strict";
         const media = document.createElement(kind === "video" ? "video" : "img");
         preview.className = "media-preview";
         if (kind === "video") {
-          media.controls = true; media.playsInline = true; media.preload = "metadata";
+          media.controls = true; media.playsInline = true;
+          media.preload = item === latestVideo ? "auto" : "metadata";
+          if (item === latestVideo) { media.muted = true; media.autoplay = true; }
         } else {
           media.alt = displayFilename(item); media.loading = "lazy";
         }
@@ -497,7 +522,7 @@ _JAVASCRIPT = r'''"use strict";
         media.addEventListener("error", () => { hint.textContent = "暂时无法预览；请重新打开附件页面。"; });
         preview.append(media, hint); media.src = previewUrl; li.append(preview);
       }
-      const note = String(item.note || (item.status === "text" ? item.text : "") || "").trim();
+      const note = independentNote ? displayNote(item) : String(item.note || "").trim();
       if (note && !syntheticBotNote(item, note)) {
         const noteBlock = document.createElement("div");
         noteBlock.className = "attachment-note";
@@ -513,14 +538,13 @@ _JAVASCRIPT = r'''"use strict";
       }
       const same = current && (!item.head_sha || item.head_sha === bound.head_sha) &&
         (!item.round_id || item.round_id === bound.round_id);
-      const attachmentId = item.attachment_id || item.id;
       if (!deleted && same && writable() && item.can_delete === true && attachmentId) {
         const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "删除";
         remove.dataset.delete = attachmentId;
         remove.addEventListener("click", () => deleteAttachment(item)); actions.append(remove);
-        if (item.status === "ready" && item.can_delete === true) {
+        if (item.status === "ready" && item.can_delete === true && !independentNote) {
           const option = document.createElement("option"); option.value = attachmentId;
-          option.textContent = displayFilename(item); $("replace").append(option);
+          option.textContent = displayFilename(item); $("replace-targets").append(option);
         }
       }
       if (actions.childNodes.length) li.append(actions);
@@ -547,12 +571,16 @@ _JAVASCRIPT = r'''"use strict";
       };
       return getTime(b) - getTime(a);
     });
-    const roundNumber = oldRounds.length + 1;
-    $("round-title").textContent = "第 " + roundNumber + " 轮 · 附件";
+    const roundNumber = Number.isSafeInteger(context.round_number) && context.round_number > 0
+      ? context.round_number : null;
+    $("round-title").textContent = (roundNumber ? "第 " + roundNumber + " 轮 · " : "当前轮 · ") + "附件";
     $("summary").textContent = state === "testing" ?
       "当前轮附件与说明；视频默认显示播放器。" : "本轮附件只读查看。";
     const replacement = $("replace").value;
-    $("replace").replaceChildren(new Option("新增附件（保留现有附件）", ""));
+    const replacementGroup = document.createElement("optgroup");
+    replacementGroup.id = "replace-targets";
+    replacementGroup.label = "替换指定附件（旧记录保留历史）";
+    $("replace").replaceChildren(new Option("新增附件（保留已有附件）", ""), replacementGroup);
     attachmentList(context.attachments || [], $("attachments"), true);
     if (!$("attachments").childNodes.length) {
       const empty = document.createElement("li"); empty.className = "empty-state";
@@ -561,16 +589,31 @@ _JAVASCRIPT = r'''"use strict";
     for (let index = 0; index < oldRounds.length; index++) {
       const round = oldRounds[index];
       const details = document.createElement("details"), summary = document.createElement("summary"), content = document.createElement("div");
-      const roundDate = formatDate(round.created_at || round.started_at || round.round_started_at || round.archived_at || round.ended_at);
-      const count = Array.isArray(round.attachments) ? round.attachments.filter(item => item && item.status !== "deleted" && !item.deleted_at).length : 0;
-      const number = Math.max(1, roundNumber - index - 1);
+      const rawRoundDate = round.created_at || round.started_at || round.round_started_at || round.archived_at || round.ended_at;
+      const roundDate = rawRoundDate && Number.isFinite(Date.parse(rawRoundDate)) ? formatDate(rawRoundDate) : "";
+      const hasAttachmentDetails = Array.isArray(round.attachments);
+      const count = hasAttachmentDetails ? round.attachments.filter(item => item && !isDeletedAttachment(item)).length : null;
+      const number = Number.isSafeInteger(round.round_number) && round.round_number > 0
+        ? round.round_number : null;
       details.className = "history-record";
-      summary.textContent = "第 " + number + " 轮 · " + roundDate + " · " + (count ? count + " 个附件" : "该轮未保存附件");
+      const summaryParts = [number ? "第 " + number + " 轮" : "历史轮次"];
+      if (roundDate) summaryParts.push(roundDate);
+      const historyAttachmentLabel = !hasAttachmentDetails ? "附件明细请查看历史归档" :
+        round.attachments.length === 0 ? "该轮未保存附件" :
+        count ? count + " 个附件" : round.attachments.length + " 条历史附件记录（已删除）";
+      summaryParts.push(historyAttachmentLabel);
+      summary.textContent = summaryParts.join(" · ");
       details.append(summary);
       content.className = "history-content";
       const status = document.createElement("p"); status.className = "muted";
       status.textContent = "阶段：" + lifecycleLabel(round.status); content.append(status);
-      const ul = document.createElement("ul"); attachmentList(round.attachments || [], ul, false); content.append(ul); details.append(content);
+      if (hasAttachmentDetails) {
+        const ul = document.createElement("ul"); attachmentList(round.attachments, ul, false); content.append(ul);
+      } else {
+        const missing = document.createElement("p"); missing.className = "muted";
+        missing.textContent = "附件明细请查看历史归档。"; content.append(missing);
+      }
+      details.append(content);
       if (round.round_id && (round.cos_object_key || round.cos && round.cos.object_key || round.log_available || round.log_ready) &&
           context.enabled !== false && context.evidence_enabled !== false)
         details.append(anchor("下载本轮日志", "/rounds/" + id(round.round_id) + "/log/download?cap=" + encodeURIComponent(round.capability || "")));
@@ -602,6 +645,12 @@ _JAVASCRIPT = r'''"use strict";
       if (!proofSecret || ![401, 403].includes(inviteError.status)) throw inviteError;
       useProofFallback = true;
     }
+    if (!useProofFallback && (!next || next.pr_state !== "open" || next.merged)) {
+      context = next || null;
+      halt("无法确认 PR 仍处于 Open 状态，已停止写入。");
+      if (next) render();
+      return next;
+    }
     if (!useProofFallback && proofSecret && next.auth_method !== "signed_invite" &&
         roundMatches(next) && next.pr_state === "open" && !next.merged) {
       // A valid read-only page cookie is not an upload invitation. Preserve
@@ -612,8 +661,8 @@ _JAVASCRIPT = r'''"use strict";
     if (useProofFallback) next = await request("/context", {job, authMode: "proof"});
     context = next;
     if (!roundMatches(next)) halt("当前 HEAD/round 已变化，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
-    else if ((next.pr_state && next.pr_state !== "open") || next.merged)
-      halt("PR 已关闭或已合并，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
+    else if (next.pr_state !== "open" || next.merged)
+      halt("无法确认 PR 仍处于 Open 状态，或 PR 已关闭/合并；已停止写入。请从当前 PR Summary 重新打开。");
     else if (next.auth_method === "signed_invite") clearProof();
     render(); return next;
   }
@@ -676,7 +725,7 @@ _JAVASCRIPT = r'''"use strict";
       } else if (!busy && job.status !== "succeeded") runSingle(job);
     };
   }
-  function makeJob(file) {
+  function makeJob(file, replacesId = "", note = "") {
     const row = document.createElement("li"), heading = document.createElement("div"), title = document.createElement("strong");
     const size = document.createElement("span"), progress = document.createElement("progress");
     const footer = document.createElement("div"), status = document.createElement("span"), detail = document.createElement("span");
@@ -689,8 +738,132 @@ _JAVASCRIPT = r'''"use strict";
     footer.append(status, action); row.append(heading, progress, footer, detail);
     $("queue").append(row); $("queue-heading").hidden = false;
     const job = {file, row, progress, statusNode: status, detailNode: detail, actionButton: action,
-      requests: new Set(), parts: new Map(), paused: false, running: false, status: "排队中", completeUnknown: false};
+      requests: new Set(), parts: new Map(), paused: false, running: false, status: "排队中",
+      completeUnknown: false, replacesId, note};
     jobs.push(job); updateJob(job); return job;
+  }
+  function convertLongNoteToTextAttachment(note) {
+    const file = new File([note], "附件说明-" + Date.now() + ".txt", {
+      type: "text/plain;charset=utf-8", lastModified: Date.now()
+    });
+    if (file.size > MAX_BYTES) throw new Error("说明转换后的 TXT 超过 512 MiB，未上传；请缩短说明后重试。");
+    return file;
+  }
+  function currentRoundFileQuota(replacementId) {
+    if (!context || !Array.isArray(context.attachments) || !Array.isArray(context.operations)) return null;
+    const records = new Map();
+    for (const row of [...context.operations, ...context.attachments]) {
+      if (!row || typeof row !== "object") return null;
+      if (!row.round_id || !row.head_sha) return null;
+      if (row.round_id !== bound.round_id || row.head_sha !== bound.head_sha) continue;
+      if (isTextRecord(row)) continue;
+      if (!row.evidence_kind && row.filename === "note.txt") return null;
+      const attachmentId = row.attachment_id || row.id;
+      if (typeof attachmentId !== "string" || !attachmentId) return null;
+      records.set(attachmentId, row);
+    }
+    const completedFiles = [], pendingFiles = [];
+    for (const row of records.values()) {
+      if (isDeletedAttachment(row) || row.status === "invalid" ||
+          ["failed", "aborted", "expired"].includes(row.status)) continue;
+      if (typeof row.status !== "string") return null;
+      if (!["ready", "initializing", "uploading", "completing", "verifying", "processing"].includes(row.status))
+        return null;
+      const size = Number(row.size);
+      if (!Number.isSafeInteger(size) || size < 1) return null;
+      const item = {id: row.attachment_id || row.id, size, row};
+      (row.status === "ready" ? completedFiles : pendingFiles).push(item);
+    }
+    const serverIds = new Set(records.keys());
+    for (const job of jobs) {
+      if (job.status === "succeeded") continue;
+      if (job.uploadId && serverIds.has(job.uploadId)) continue;
+      if (!job.file || !Number.isSafeInteger(job.file.size) || job.file.size < 1) return null;
+      pendingFiles.push({id: "local:" + job.fingerprint + ":" + (job.replacesId || "new"), size: job.file.size, row: job});
+    }
+    const activeFiles = [...completedFiles, ...pendingFiles];
+    let fileCount = activeFiles.length;
+    let totalBytes = activeFiles.reduce((sum, row) => sum + row.size, 0);
+    if (!Number.isSafeInteger(totalBytes)) return null;
+    if (replacementId) {
+      const target = activeFiles.find(row => row.id === replacementId);
+      if (!target || target.row.status !== "ready" || target.row.can_delete !== true)
+        return {error: "替换目标已删除、不可替换或状态已变化；请刷新附件页面后重选。"};
+      fileCount -= 1;
+      totalBytes -= target.size;
+    }
+    const configuredFiles = context.upload_max_files;
+    const configuredBytes = context.upload_max_bytes;
+    const invite = context.auth_method === "signed_invite" || context.upload_invite === true;
+    if (!Number.isSafeInteger(configuredFiles) || configuredFiles < 0 ||
+        !Number.isSafeInteger(configuredBytes) || configuredBytes < 0) {
+      if (invite) return null;
+    }
+    return {
+      fileCount, totalBytes,
+      maxFiles: Number.isSafeInteger(configuredFiles) && configuredFiles >= 0
+        ? Math.min(MAX_FILES, configuredFiles) : MAX_FILES,
+      maxBytes: Number.isSafeInteger(configuredBytes) && configuredBytes >= 0
+        ? Math.min(MAX_TOTAL_BYTES, configuredBytes) : MAX_TOTAL_BYTES
+    };
+  }
+  function validateSelectedFiles(files, replacementId = "") {
+    const selected = Array.from(files || []);
+    if (!selected.length) return "请选择文件，或填写超过 5000 字的说明以生成 TXT 附件。";
+    if (selected.length > MAX_FILES) return "一次最多上传 20 个文件（自动生成的 TXT 也计入数量）。";
+    let totalBytes = 0;
+    for (let index = 0; index < selected.length; index++) {
+      const file = selected[index], size = Number(file && file.size);
+      if (!Number.isFinite(size) || size < 1)
+        return "第 " + (index + 1) + " 个文件为空或大小无效；每个文件必须至少为 1 B。";
+      if (size > MAX_BYTES)
+        return "第 " + (index + 1) + " 个文件超过 512 MiB 单文件上限。";
+      totalBytes += size;
+      if (totalBytes > MAX_TOTAL_BYTES) return "所选文件总大小超过 10 GiB 上限。";
+    }
+    const quota = currentRoundFileQuota(replacementId);
+    if (!quota) return "无法确认当前轮附件及剩余配额，请刷新页面后重试。";
+    if (quota.error) return quota.error;
+    const maxFiles = Math.min(MAX_FILES, quota.maxFiles);
+    const maxBytes = Math.min(MAX_TOTAL_BYTES, quota.maxBytes);
+    if (quota.fileCount + selected.length > maxFiles)
+      return "加上当前轮已有文件后将超过 " + maxFiles + " 个文件的上限。";
+    if (quota.totalBytes + totalBytes > maxBytes)
+      return "加上当前轮已有文件后将超过 " + formatBytes(maxBytes) + " 的总大小上限。";
+    return "";
+  }
+  async function saveStandaloneNote() {
+    if (busy || !writable()) return;
+    const text = $("note").value;
+    if (!text.trim()) { message("请输入要单独保存的备注。"); return; }
+    if ([...text].length > MAX_NOTE_CHARS) {
+      message("备注超过 5000 字，正在将原文完整转为 UTF-8 TXT 附件。");
+      await runUpload({longNoteOnly: true});
+      return;
+    }
+    busy = true; controls();
+    try {
+      if (!noteOperation || noteOperation.text !== text) {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(
+          JSON.stringify([bound.head_sha, bound.round_id, text])));
+        const hash = [...new Uint8Array(digest)].map(value => value.toString(16).padStart(2, "0")).join("");
+        noteOperation = {text, key: "note-" + hash, saved: false};
+      }
+      if (!noteOperation.saved) {
+        const result = await request("/notes", {method: "POST", key: noteOperation.key, body: {text}});
+        if (result.status !== "ready" || result.cos_content_verified !== true)
+          throw new Error("服务端尚未确认备注内容已校验保存；可再次尝试，操作会保持幂等。");
+        noteOperation.saved = true;
+      }
+      try { await refresh(); }
+      catch (_) {
+        message("备注已保存并通过内容校验；页面暂未刷新，请稍后重试查看。");
+        return;
+      }
+      message(context.summary_updated === true ? "备注已保存，页面已更新。" : "备注已安全保存，Summary 正在等待自动更新。");
+    } catch (error) {
+      message(error.message || "备注保存失败；可重试，操作会保持幂等。");
+    } finally { busy = false; controls(); }
   }
   function progressJob(job, parts, inflight, partBytes) {
     let bytes = 0;
@@ -833,7 +1006,6 @@ _JAVASCRIPT = r'''"use strict";
   }
   async function uploadOne(job) {
     if (!(job.file.size >= 1 && job.file.size <= MAX_BYTES)) throw new Error("单个文件必须为 1..512 MiB。");
-    job.note = $("note").value; job.replacesId = $("replace").value || "";
     let state = await startOrRestore(job);
     if (job.status === "succeeded") return;
     if (["failed", "deleted", "aborted", "expired", "invalid"].includes(state.status))
@@ -859,11 +1031,30 @@ _JAVASCRIPT = r'''"use strict";
     if (busy || stopped) return;
     busy = true; controls(); await processJob(job); busy = false; controls();
   }
-  async function runUpload() {
+  async function runUpload({longNoteOnly = false} = {}) {
     if (busy || !writable()) return;
-    const files = Array.from($("file").files || []); $("file").value = "";
-    if (!files.length) { message("请选择一个或多个文件。"); return; }
-    for (const file of files) makeJob(file);
+    const note = $("note").value;
+    let files = longNoteOnly ? [] : Array.from($("file").files || []);
+    const longNote = [...note].length > MAX_NOTE_CHARS;
+    const replacementId = longNoteOnly ? "" : $("replace").value || "";
+    if (longNote) {
+      try { files.push(convertLongNoteToTextAttachment(note)); }
+      catch (error) { message(error.message || "说明无法转换为附件。"); return; }
+    }
+    if (replacementId && (longNote || files.length !== 1)) {
+      message("替换模式每次只能选择一个文件；不能与多文件或自动生成的 TXT 同时使用。请选择“新增附件”或调整选择。");
+      return;
+    }
+    if (replacementId && jobs.some(job => job.replacesId === replacementId && job.status !== "succeeded")) {
+      message("该附件已有替换任务；请在上传队列中继续或重试，避免重复替换同一附件。");
+      return;
+    }
+    const validationError = validateSelectedFiles(files, replacementId);
+    if (validationError) { message(validationError); return; }
+    if (!longNoteOnly) $("file").value = "";
+    for (const file of files) {
+      const job = makeJob(file, replacementId, longNote ? "" : note);
+    }
     busy = true; controls();
     for (const job of jobs) {
       if (job.status !== "排队中" || stopped) continue;
@@ -881,6 +1072,7 @@ _JAVASCRIPT = r'''"use strict";
     catch (error) { message(error.message); try { await refresh(); } catch (_) {} }
     finally { busy = false; controls(); }
   }
+  $("save-note").addEventListener("click", saveStandaloneNote);
   $("upload").addEventListener("click", runUpload);
   const dropzone = $("dropzone");
   for (const eventName of ["dragenter", "dragover"]) dropzone.addEventListener(eventName, event => {

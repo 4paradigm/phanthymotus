@@ -137,15 +137,23 @@ async def _payload(request, action, **path):
     return _validate(payload, action, request.app.state.config)
 
 
-def _public_attachment(row):
-    allowed = {'attachment_id', 'filename', 'size', 'sha256', 'note', 'round_id', 'head_sha',
+def _public_attachment(row, *, operation_context=None):
+    allowed = {'attachment_id', 'filename', 'size', 'sha256', 'note', 'display_note',
+               'display_note_complete', 'evidence_kind', 'round_id', 'head_sha',
                'status', 'created_at', 'updated_at', 'completed_at', 'deleted_at', 'replaces_id',
-               'actor', 'actor_login', 'actor_verified', 'github_user_authenticated',
-               'upload_method', 'upload_link_authorized', 'cos_content_verified',
-               'submitter', 'download_capability', 'can_delete'}
+               'actor', 'actor_login', 'actor_verified', 'cos_content_verified',
+               'submitter', 'upload_method', 'download_capability', 'can_delete'}
     result = {k: v for k, v in row.items() if k in allowed}
-    if row.get('upload_ref'):
-        result['upload_id'] = row['upload_ref']
+    upload_ref = row.get('upload_ref')
+    if (operation_context is not None and isinstance(upload_ref, str)
+            and _ID.fullmatch(upload_ref)
+            and row.get('repo') == operation_context.get('repo')
+            and row.get('pr_number') == operation_context.get('pr_number')
+            and row.get('head_sha') == operation_context.get('head_sha')
+            and row.get('round_id') == operation_context.get('round_id')):
+        # This is the durable, scoped operation handle; the COS multipart
+        # UploadId and other internal upload facts are never exposed.
+        result['upload_id'] = upload_ref
     return result
 
 
@@ -281,7 +289,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         rounds = []
         for row in result.get('rounds', []):
             round_value = {**{k: v for k, v in row.items() if k in {
-                'head_sha', 'round_id', 'status', 'created_at', 'started_at', 'ended_at', 'archived_at'}},
+                'head_sha', 'round_id', 'round_number', 'status', 'created_at', 'started_at', 'ended_at', 'archived_at'}},
                 'attachments': scoped(row.get('attachments', [])),
                 'log_available': bool(row.get('cos', {}).get('object_key'))}
             head, round_id = round_value.get('head_sha'), round_value.get('round_id')
@@ -294,7 +302,11 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                 )
             rounds.append(round_value)
         result['rounds'] = rounds
-        result['operations'] = [_public_attachment(row) for row in result.get('operations', [])]
+        operation_context = {key: result.get(key) for key in ('repo', 'pr_number', 'head_sha', 'round_id')}
+        result['operations'] = [
+            _public_attachment(row, operation_context=operation_context)
+            for row in result.get('operations', [])
+        ]
         result['summary_updated'] = await _summary_updated(request, canonical, pr, result)
         result = {**result, 'authenticated': True, 'enabled': True,
                   'github_user_authenticated': bool(principal.get('github_user_authenticated')),
@@ -307,7 +319,8 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                   'part_bytes': request.app.state.config.evidence_part_bytes}
         if not {'head_sha', 'round_id', 'status', 'can_write', 'attachments', 'archive_links'} <= result.keys():
             raise HTTPException(503, detail='incomplete_evidence_context')
-    for name in ('object_key', 'actor_id', 'actor_login', 'deleted_by', 'records', 'request_sha256'):
+    for name in ('object_key', 'upload_ref', 'operation_id', 'source_operation_id',
+                 'actor_id', 'actor_login', 'deleted_by', 'records', 'request_sha256'):
         result.pop(name, None)
     return result
 
@@ -388,18 +401,34 @@ async def log_download(request: Request, owner: str, repo: str, pr: int, round_i
 
 @router.get('/evidence/{owner}/{repo}/pulls/{pr}', response_class=HTMLResponse)
 async def page(request: Request, owner: str, repo: str, pr: int):
-    evidence_auth.require_enabled(request)
-    canonical = _repo(owner, repo, pr)
-    redirect = evidence_auth.bind_page_capability(request, canonical, pr)
-    if redirect is not None:
-        return redirect
-    result = await _dispatch(request, owner, repo, pr, 'context')
+    headers = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+               'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY'}
+    try:
+        evidence_auth.require_enabled(request)
+        canonical = _repo(owner, repo, pr)
+        redirect = evidence_auth.bind_page_capability(request, canonical, pr)
+        if redirect is not None:
+            return redirect
+        result = await _dispatch(request, owner, repo, pr, 'context')
+    except HTTPException as exc:
+        # Keep the authorization status and never echo exception detail,
+        # capability input, cookies, or backend diagnostics into HTML.
+        messages = {
+            401: '附件链接身份验证失败，请从当前 PR Summary 重新打开。',
+            403: '附件链接已失效或无权访问，请从当前 PR Summary 重新打开。',
+            409: 'PR 或测试轮次已变化，请刷新当前 PR Summary 后重新打开。',
+            503: '附件服务暂时不可用，请稍后从当前 PR Summary 重新打开。',
+        }
+        message = messages.get(exc.status_code, '附件链接暂不可用，请从当前 PR Summary 重新打开。')
+        html = ('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<title>附件链接不可用</title><main><h1>附件链接不可用</h1><p>'
+                + message + '</p></main></html>')
+        return HTMLResponse(html, status_code=exc.status_code, headers=headers)
     from . import evidence_ui
     page_html = evidence_ui.render_upload_page(
         result['repo'], pr, result['head_sha'], result['round_id'])
-    return HTMLResponse(page_html,
-        headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
-                 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY'})
+    return HTMLResponse(page_html, headers=headers)
 
 
 @router.get('/evidence/assets/app.js')

@@ -8,6 +8,7 @@ No obsolete lifecycle states, no build_index, no dpl_x.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import re
 import html
 import json
@@ -187,14 +188,7 @@ def _cos_evidence_block(
     size: int = 0,
     download_url: str = "",
 ) -> list[str]:
-    """Render the COS evidence block. Returns empty list if no evidence."""
-    # A validated signed URL is intentionally visible to readers of this
-    # Summary. Callers provide it only after verifying the COS object.
-    safe_url = _safe_download_url(download_url)
-    if (isinstance(object_key, str) and object_key and safe_url and isinstance(sha256, str)
-            and re.fullmatch(r"[0-9a-f]{64}", sha256)
-            and isinstance(size, int) and not isinstance(size, bool) and size > 0):
-        return ["", f"[下载已验证归档文件（{_human_size(size)}）](<{safe_url}>)"]
+    """Keep signed COS bearer URLs out of GitHub Summary markdown."""
     return []
 
 
@@ -268,12 +262,15 @@ def _workflow_lines(
 
 
 def _testing_next_action(evidence_complete: bool) -> str:
+    result_guidance = (
+        "测试成功时：`/record_test result=pass summary=\"视频播放和COS校验通过\"`\n\n"
+        "测试失败时：`/record_test result=fail summary=\"视频预览失败\"`"
+    )
     if evidence_complete:
-        return ("**Machine Owner**\n\n"
-                '`/record_test result=pass|fail [summary="..."]`')
+        return "**Machine Owner**\n\n" + result_guidance
     return ("**PR developer and deployed Machine Owner**\n\n"
             "Upload evidence for this HEAD and round first; after it is archived, "
-            'record the result with `/record_test result=pass|fail [summary="..."]`.')
+            "record one result:\n\n" + result_guidance)
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -796,85 +793,81 @@ def deploying_comment(
 
 
 def deploy_help_text(topic: str = "") -> str:
+    if topic == "request_bot_review":
+        return "\n".join([
+            BOT_MARKER,
+            "### Deploy Approval — Help: /request_bot_review",
+            "",
+            "用途：触发当前 HEAD 的代码审查。",
+            "执行人：PR 开发者（PR 作者）。",
+            "阶段：PR 开放且处于 review-required；审查绑定当前 HEAD。",
+            "",
+            "命令：`/request_bot_review`",
+        ])
     if topic == "request_deploy":
         return "\n".join([
             BOT_MARKER,
             "### Deploy Approval \u2014 Help: /request_deploy",
             "",
-            "Request a deployment for the current PR HEAD.",
+            "用途：开发者确认已阅读当前 HEAD 的审查意见并发起部署请求。",
             "",
-            "**Syntax:**",
+            "执行人：PR 作者。",
+            "阶段：PR 开放且状态为 deploy-ready。",
+            "",
+            "命令：",
             "`/request_deploy`",
-            "",
-            "**Parameters:** None.",
-            "Binds the current PR HEAD\'s latest complete current-HEAD trusted Review Agent GitHub comment evidence and all deployable components.",
-            "",
-            "**Who can run:** PR Author only.",
-            "**When:** PR must be open and not merged.",
         ])
     if topic == "approve_deploy":
         return "\n".join([
             BOT_MARKER,
             "### Deploy Approval \u2014 Help: /approve_deploy",
             "",
-            "Approve a deployment and bind it to a machine.",
+            "用途：审批部署并将其绑定到指定机器。",
             "",
-            "**Syntax:**",
+            "执行人：对应 Machine Owner，或有 write/maintain/admin 权限的协作者。",
+            "阶段：PR 状态为 deploy-requested，且机器与剩余组件兼容。",
+            "",
+            "命令：",
             "`/approve_deploy machine=<alias-or-ip>`",
             "",
-            "**Parameters:**",
-            "- `machine=<alias-or-ip>` \u2014 Machine alias or unique IPv4 address.",
-            "",
-            "**Who can run:** Machine Owner (machine owners[] or write/maintain/admin collaborator).",
-            "**Note:** Deploy Approval reads `running_image` as evidence only before "
-            "each deploy POST. Agent Core handles container replacement. "
-            "If a runtime is already running, Agent Core will perform an in-place "
-            "upgrade or idempotent no-op as appropriate.",
+            "`machine` 可填写兼容机器的别名或 IP 地址。",
         ])
     if topic == "record_test":
         return "\n".join([
             BOT_MARKER,
             "### Deploy Approval \u2014 Help: /record_test",
             "",
-            "Record the overall validation result for the current PR.",
+            "用途：记录本轮部署验证结果。",
             "",
-            "**Syntax:**",
-            "`/record_test result=pass|fail [summary=\"...\"]`",
+            "执行人：Machine Owner，或有 write/maintain/admin 权限的协作者。",
+            "阶段：部署状态为 testing。",
             "",
-            "**Parameters:**",
-            "- `result=pass` — Validation succeeded; all required checks passed.",
-            "- `result=fail` — Validation failed; the PR lifecycle becomes `failed`.",
-            "- `summary=\"...\"` — Optional short explanation; never include credentials or signed URLs.",
+            "参数：",
+            "- `result=pass` 表示本轮测试成功。",
+            "- `result=fail` 表示本轮测试失败。",
+            "- `summary` 是可选说明；不要写入凭据或签名链接。",
             "",
-            "**Examples:**",
-            "- `/record_test result=pass summary=\"Video preview and COS SHA256 verified\"` — success.",
-            "- `/record_test result=fail summary=\"MP4 preview returned an error\"` — failure.",
+            "示例：",
+            "- `/record_test result=pass summary=\"视频播放和COS校验通过\"`",
+            "- `/record_test result=fail summary=\"视频预览失败\"`",
             "",
-            "**Who can run:** Machine Owner or write/maintain/admin collaborator.",
-            "**When:** Deployment status must be `testing`.",
-            "**Effect:** `result=fail` sets the PR to `failed`.",
         ])
     return "\n".join([
         BOT_MARKER,
         "### Deploy Approval \u2014 Help",
         "",
-        "**Developer commands:**",
-        "- `/request_bot_review` \u2014 Trigger Review Agent for current HEAD",
-        "- `/request_deploy` \u2014 Request deployment for current HEAD",
+        "命令用途、执行人和阶段：",
+        "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
+        "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
+        "- `/approve_deploy machine=<alias-or-ip>`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段审批指定机器。",
+        "- `/record_test result=pass summary=\"视频播放和COS校验通过\"`：Machine Owner 或有 write/maintain/admin 权限的协作者，在 testing 阶段记录成功。",
+        "- `/record_test result=fail summary=\"视频预览失败\"`：由同一权限角色在 testing 阶段记录失败。",
+        "- `/deploy_status`：只读查询当前部署状态，可在任意阶段使用。",
+        "- `/deploy_help record_test`：查看测试结果命令说明；可在任意阶段使用。",
         "",
-        "**Machine Owner commands:**",
-        "- `/approve_deploy machine=<alias-or-ip>` \u2014 Approve and bind machine",
-        "- `/record_test result=pass|fail [summary=\"...\"]` \u2014 Record overall test result",
+        "结果含义：`pass`=成功；`fail`=失败；`summary`=可选说明。",
         "",
-        "**Read-only commands:**",
-        "- Verified COS evidence is available from the download links in this PR Summary.",
-        "- `/deploy_status` \u2014 Show deployment status",
-        "- `/deploy_help [topic]` \u2014 Show this help",
-        "",
-        "**Detailed help:**",
-        "- `/deploy_help request_deploy`",
-        "- `/deploy_help approve_deploy`",
-        "- `/deploy_help record_test`",
+        "详细帮助：`/deploy_help request_bot_review`、`/deploy_help request_deploy`、`/deploy_help approve_deploy`、`/deploy_help record_test`。",
     ])
 
 
@@ -989,13 +982,21 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     from .evidence_models import round_id_for_state
 
     state = state or {}
-    if state.get("status") not in {"testing", "succeeded", "failed"}:
-        return "<!-- deploy-approval-evidence:start -->\n<!-- deploy-approval-evidence:end -->"
     head = state.get("head_sha", "")
     try:
         current_round = round_id_for_state(state)
     except ValueError:
         current_round = state.get("round_id", "")
+    def valid_round_binding(bound_head, bound_round):
+        return (isinstance(bound_head, str)
+                and re.fullmatch(r"[0-9a-f]{40}", bound_head) is not None
+                and isinstance(bound_round, str)
+                and re.fullmatch(re.escape(bound_head) + r"-[0-9]+", bound_round) is not None)
+
+    show_current_round = (
+        state.get("status") in {"testing", "succeeded", "failed"}
+        and valid_round_binding(head, current_round)
+    )
     base = _public_base(public_base_url)
     if not base.startswith("https://"):
         base = ""
@@ -1004,46 +1005,91 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     api = _evidence_path(repo, pr_number)
     if not enabled or not api:
         base = ""
+    def attachment_list_matches(items, key):
+        return (isinstance(items, list) and all(
+            isinstance(item, dict)
+            and item.get("head_sha", key[0]) == key[0]
+            and item.get("round_id", key[1]) == key[1]
+            for item in items
+        ))
+
+    current_attachments = state.get("attachments")
     groups = {(head, current_round): dict(
-        state, attachments=list(state.get("attachments") or []),
-        attachment_details_complete=isinstance(state.get("attachments"), list),
+        state, attachments=list(current_attachments) if isinstance(current_attachments, list) else [],
+        attachment_details_complete=attachment_list_matches(current_attachments, (head, current_round)),
     )}
     if isinstance(records, dict):
         records = records.get("rounds", records.get("records", records.get("attachments", [])))
     archive_links = list(archive_links or [])
     entries = list(records or []) + [a for a in archive_links if isinstance(a, dict) and "snapshot" in a]
-    for row in entries:
+    for envelope in entries:
+        row = envelope
         if not isinstance(row, dict):
             continue
         if isinstance(row.get("data"), dict):
             row = row["data"]
         snapshot = row.get("snapshot", row)
-        h = row.get("head_sha") or snapshot.get("head_sha") or "unknown"
-        r = row.get("round_id") or snapshot.get("round_id") or "unknown"
+        if not isinstance(snapshot, dict):
+            continue
+        sources = (envelope, row, snapshot)
+        declared_repos = [source.get("repo") for source in sources if source.get("repo") is not None]
+        declared_prs = [source.get("pr_number") for source in sources if source.get("pr_number") is not None]
+        if (not declared_repos or not declared_prs
+                or any(value != repo for value in declared_repos)
+                or any(type(value) is not int or value != pr_number for value in declared_prs)):
+            continue
+        row_head, snapshot_head = row.get("head_sha"), snapshot.get("head_sha")
+        row_round, snapshot_round = row.get("round_id"), snapshot.get("round_id")
+        if (row_head is not None and snapshot_head is not None and row_head != snapshot_head
+                or row_round is not None and snapshot_round is not None and row_round != snapshot_round):
+            continue
+        h = row_head if row_head is not None else snapshot_head
+        r = row_round if row_round is not None else snapshot_round
+        if not valid_round_binding(h, r):
+            continue
         key = (h, r)
-        group = groups.setdefault(key, {"attachments": []})
+        group = groups.setdefault(key, {"attachments": [], "attachment_details_complete": False})
         if "snapshot" in row or "attachments" in row or "deployments" in row:
             attachments = list(group.get("attachments") or [])
+            details_complete = group.get("attachment_details_complete") is True
             if key != (head, current_round):
                 capability = group.get("capability")
                 group.update(snapshot)
                 group.update({k: v for k, v in row.items() if k != "snapshot"})
                 if not group.get("capability") and capability:
                     group["capability"] = capability
-            group["attachments"] = attachments + list(snapshot.get("attachments") or [])
-            if row is not snapshot:
-                group["attachments"].extend(row.get("attachments") or [])
-            if isinstance(snapshot.get("attachments"), list):
-                group["attachment_details_complete"] = True
-            if isinstance(row.get("attachments"), list):
-                group["attachment_details_complete"] = True
-            for record in row.get("attachment_records", []):
-                if isinstance(record, dict) and isinstance(record.get("data"), dict):
-                    group["attachments"].append(record["data"])
-                    group["attachment_details_complete"] = True
+            snapshot_attachments = snapshot.get("attachments")
+            row_attachments = row.get("attachments")
+            if isinstance(snapshot_attachments, list):
+                group["attachments"] = attachments + snapshot_attachments
+                details_complete = (details_complete
+                                    or attachment_list_matches(snapshot_attachments, key))
+            else:
+                group["attachments"] = attachments
+            if row is not snapshot and isinstance(row_attachments, list):
+                group["attachments"].extend(row_attachments)
+                details_complete = (details_complete
+                                    or attachment_list_matches(row_attachments, key))
+            attachment_records = row.get("attachment_records")
+            if isinstance(attachment_records, list):
+                records_complete = all(
+                    isinstance(record, dict)
+                    and record.get("kind") == "attachment"
+                    and isinstance(record.get("data"), dict)
+                    and record["data"].get("head_sha") == key[0]
+                    and record["data"].get("round_id") == key[1]
+                    and record["data"].get("repo") == repo
+                    and type(record["data"].get("pr_number")) is int
+                    and record["data"].get("pr_number") == pr_number
+                    for record in attachment_records
+                )
+                for record in attachment_records:
+                    if isinstance(record, dict) and isinstance(record.get("data"), dict):
+                        group["attachments"].append(record["data"])
+                details_complete = details_complete or records_complete
+            group["attachment_details_complete"] = details_complete
         else:
             group.setdefault("attachments", []).append(row)
-            group["attachment_details_complete"] = True
 
     page_path = api.replace("/api/evidence/", "/evidence/", 1)
 
@@ -1053,10 +1099,13 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         return (base + page_path + "?cap="
                 + urllib.parse.quote(str(capability), safe=""))
 
-    def latest_attachments(group):
+    def latest_attachments(group, key):
         latest_items = {}
         for offset, item in enumerate(group.get("attachments", [])):
             if not isinstance(item, dict):
+                continue
+            if (item.get("head_sha", key[0]) != key[0]
+                    or item.get("round_id", key[1]) != key[1]):
                 continue
             identity = item.get("attachment_id") or item.get("id") or f"record-{offset}"
             previous = latest_items.get(identity)
@@ -1068,22 +1117,31 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         return list(latest_items.values())
 
     def is_internal_test_note(item):
-        if not isinstance(item, dict) or item.get("status") != "text":
+        if not isinstance(item, dict) or item.get("actor_verified") is not True:
             return False
         actor = item.get("actor_login") or item.get("actor") or item.get("uploader")
         if not isinstance(actor, str) or actor.casefold() != "4pd-pr-assistant[bot]":
             return False
-        note = item.get("note") or item.get("text") or item.get("filename")
-        if not isinstance(note, str):
-            return False
-        normalized = " ".join(note.split()).casefold()
-        return normalized in {
+        candidates = [item.get("note")]
+        if item.get("status") == "text":
+            candidates.extend([item.get("text"), item.get("filename")])
+        templates = {
             "server-side cos multipart acceptance",
             "server-side 20mb h.264 cos transport acceptance",
         }
+        for note in candidates:
+            if not isinstance(note, str):
+                continue
+            normalized = " ".join(note.split()).casefold()
+            for template in templates:
+                suffix = normalized[len(template):] if normalized.startswith(template) else None
+                if suffix is not None and (not suffix or suffix[0] in " :;,.!?…-"):
+                    return True
+        return False
 
-    def visible_attachments(group):
-        return [item for item in latest_attachments(group) if not is_internal_test_note(item)]
+    def visible_attachments(group, key):
+        return [item for item in latest_attachments(group, key)
+                if not (item.get("status") == "text" and is_internal_test_note(item))]
 
     def parsed_timestamp(value):
         if not isinstance(value, str) or not value.strip():
@@ -1092,6 +1150,23 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             return _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
         except (TypeError, ValueError):
             return None
+
+    def safe_note_text(value):
+        from .evidence_builder import _redact_secrets
+
+        value = _redact_secrets(value)
+        value = re.sub(
+            r'(?i)((?:x-evidence-secret|x-evidence-client-key|evidence-capability|capability|cap)\s*[=:]\s*)[^\s&;]+',
+            r'\1[REDACTED]', value)
+
+        def redact_url(match):
+            url = match.group(0)
+            try:
+                return "[签名链接已省略]" if urllib.parse.urlsplit(url).query else url
+            except ValueError:
+                return "[链接已省略]"
+
+        return re.sub(r"https?://[^\s<>()]+", redact_url, value)
 
     def summary_time(value):
         parsed = parsed_timestamp(value)
@@ -1124,13 +1199,18 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 return value
         return None
 
-    def render_round(key, group, *, historical=False, round_number=1):
+    def render_round(key, group, *, historical=False):
         h, r = key
-        items = visible_attachments(group)
+        items = visible_attachments(group, key)
         items.sort(key=lambda item: sortable_time(first_valid_time(
             item.get("created_at"), item.get("uploaded_at"))), reverse=True)
         lines = []
         if historical:
+            round_number = group.get("round_number")
+            round_label = (f"第 {round_number} 轮"
+                           if type(round_number) is int and round_number > 0
+                           else "历史轮次")
+            lines.append(f"**轮次：** {_escape(round_label)}")
             historical_time = first_valid_time(
                 group.get("archived_at"), group.get("ended_at"),
                 group.get("round_started_at"), group.get("started_at"),
@@ -1141,11 +1221,16 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             lines.extend([
                 f"**状态：** {_escape(group.get('status') if isinstance(group.get('status'), str) else '未知')}", "",
             ])
+        else:
+            round_number = group.get("round_number")
+            round_label = (f"第 {round_number} 轮"
+                           if type(round_number) is int and round_number > 0
+                           else "当前轮")
+            lines.extend([f"**轮次：** {_escape(round_label)}", ""])
+        lines.extend(["### 附件", ""])
         if items:
-            if historical:
-                lines.extend([f"### 第 {round_number} 轮", ""])
             lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
-        note_blocks = []
+        notes = []
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1172,21 +1257,33 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             lines.append("| " + " | ".join(_escape(value) for value in
                 (filename, size, actor, uploaded_at)) + " |")
             note = item.get("note") or (item.get("text") if status == "text" else "")
+            if is_internal_test_note(item):
+                note = ""
+            if item.get("evidence_kind") == "note":
+                complete_text_note = False
+                if status == "text" and isinstance(note, str):
+                    try:
+                        note_bytes = note.encode("utf-8")
+                        complete_text_note = (
+                            len(note) <= 5000 and item.get("size") == len(note_bytes)
+                            and isinstance(item.get("sha256"), str)
+                            and hashlib.sha256(note_bytes).hexdigest() == item["sha256"]
+                            and type(item.get("source_comment_id")) is int
+                            and item["source_comment_id"] > 0
+                            and item.get("actor_verified") is True
+                        )
+                    except UnicodeError:
+                        complete_text_note = False
+                if not complete_text_note:
+                    note = ((note.rstrip() + "\n\n") if isinstance(note, str) and note.strip() else "") + \
+                        "[摘要中仅保留备注摘要，完整内容请在附件页查看；内容不完整]"
             if isinstance(note, str) and note.strip():
-                note_blocks.extend([
-                    "<details>",
-                    f"<summary>{_escape(filename)} · 备注</summary>",
-                    "",
-                    _escape(note.strip()),
-                    "",
-                    "</details>",
-                    "",
-                ])
-        lines.extend(note_blocks)
+                notes.append(f"- **{_escape(filename)}：** {_escape(safe_note_text(note.strip()))}")
+        if notes:
+            lines.extend(["", "<details>", "<summary>附件说明</summary>", "", *notes, "", "</details>"])
         if not items:
             if historical:
-                lines.extend([f"### 第 {round_number} 轮", "",
-                              "附件明细请查看历史归档" if not group.get("attachment_details_complete")
+                lines.extend(["附件明细请查看历史归档" if not group.get("attachment_details_complete")
                               else "该轮未保存附件"])
             else:
                 lines.append("本轮暂无附件，上传后会显示")
@@ -1222,25 +1319,18 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         if isinstance(history, (list, dict)) and history:
             history_count = len(history)
             lines.extend(["", f"历史事件：{history_count} 条（详情保留在归档记录中）"])
-        log = _safe_download_url(group.get("cos_log_download_url", ""))
-        cos_metadata = group.get("cos") if isinstance(group.get("cos"), dict) else {}
-        if log and (cos_metadata.get("object_key") or group.get("log_available") or group.get("log_ready")):
-            lines.extend(["", f"[下载本轮归档日志](<{log}>)"])
         return lines
 
-    round_keys = list(groups.keys())
     def round_sort_time(key):
         group = groups[key]
         value = first_valid_time(group.get("round_started_at"), group.get("started_at"), group.get("created_at"), group.get("archived_at"), group.get("ended_at"))
         return sortable_time(value)
-    ordered_rounds = sorted(round_keys, key=round_sort_time)
-    round_numbers = {key: index + 1 for index, key in enumerate(ordered_rounds)}
-    current_round_number = round_numbers.get((head, current_round), max(1, len(round_numbers)))
     lines = ["<!-- deploy-approval-evidence:start -->"]
-    lines.extend(render_round((head, current_round), groups[(head, current_round)], round_number=current_round_number))
+    if show_current_round:
+        lines.extend(render_round((head, current_round), groups[(head, current_round)]))
     round_pattern = re.escape(str(head)) + r"-[0-9]+"
     current_context_valid = (
-        state.get("pr_state") == "open" and not state.get("merged")
+        show_current_round and state.get("pr_state") == "open" and not state.get("merged")
         and re.fullmatch(r"[0-9a-f]{40}", str(head))
         and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
         and state.get("evidence_enabled") is True and bool(api)
@@ -1254,10 +1344,11 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         elif read_url:
             lines.extend(["", f"[打开附件页](<{read_url}>)"])
     if current_context_valid and state.get("status") == "testing" and page_url(state.get("upload_capability")):
-        pending = sum(1 for item in state.get("attachments", [])
+        current_items = latest_attachments(groups[(head, current_round)], (head, current_round))
+        pending = sum(1 for item in current_items
                       if isinstance(item, dict)
                       and item.get("status") not in {"ready", "text", "deleted", "invalid"})
-        archived = sum(1 for item in state.get("attachments", [])
+        archived = sum(1 for item in current_items
                        if isinstance(item, dict) and item.get("status") == "ready"
                        and item.get("cos_projection_verified") is True
                        and item.get("object_key") and isinstance(item.get("sha256"), str)
@@ -1273,7 +1364,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         lines.extend([
             "上传权限：仅限本轮测试邀请；分享链接上传会标示身份未验证。",
             "可上传视频、图片、文件或文字说明；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
-            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后再记录 `/record_test result=pass|fail`。",
+            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后，成功用 `/record_test result=pass summary=\"视频播放和COS校验通过\"`；失败用 `/record_test result=fail summary=\"视频预览失败\"`。",
         ])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
@@ -1285,19 +1376,22 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 group.get("round_started_at"), group.get("started_at"),
                 group.get("created_at"),
             )
+            attachment_items = latest_attachments(group, key)
             attachment_count = sum(
-                1 for item in visible_attachments(group)
+                1 for item in visible_attachments(group, key)
                 if not (item.get("deleted_at") or item.get("status") == "deleted")
             )
-            count_label = (f"{attachment_count} 个附件" if attachment_count else
-                           "0 个附件" if group.get("attachment_details_complete")
-                           else "附件明细请查看历史归档")
+            count_label = (
+                f"{attachment_count} 个附件" if attachment_count else
+                "该轮未保存附件" if not attachment_items and group.get("attachment_details_complete")
+                else "附件明细请查看历史归档"
+            )
             date_label = summary_date(timestamp)
             if date_label == "时间未知":
                 date_label = "历史归档"
             lines.extend(["<details>",
-                          f"<summary>第 {round_numbers.get(key, 1)} 轮 · {_escape(date_label)} · {_escape(count_label)}</summary>",
-                          "", *render_round(key, group, historical=True, round_number=round_numbers.get(key, 1)), "", "</details>", ""])
+                          f"<summary>{_escape(group.get('round_number') if type(group.get('round_number')) is int and group.get('round_number') > 0 else '历史轮次')} · {_escape(date_label)} · {_escape(count_label)}</summary>",
+                          "", *render_round(key, group, historical=True), "", "</details>", ""])
     linked_index = False
     seen_archive_urls = set()
     for link in archive_links or []:

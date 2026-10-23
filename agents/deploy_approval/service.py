@@ -36,7 +36,9 @@ from .case_runner import CaseRunner
 from .config import Config, DEFAULT_GITHUB_REPOS, validate_repository_names
 from .cos_client import CosClient
 from .evidence_builder import EvidenceBuilder
-from .evidence_models import archive_snapshot, make_round_id, round_id_for_state, utc_now
+from .evidence_models import (
+    archive_snapshot, make_round_id, round_id_for_state, trusted_round_numbers, utc_now,
+)
 from .github_client import GitHubClient, GitHubError
 from .github_state_proxy import (
     GitHubStateProxy,
@@ -447,6 +449,7 @@ class DeployController:
                 "args": {},
             },
             "last_processed_comment_id": 0,
+            "round_archive": None,
         }
         self._validate_hidden_state(state)
         return state
@@ -3406,7 +3409,7 @@ class DeployController:
 
     @classmethod
     def _strip_legacy_evidence_blocks(cls, visible):
-        """Remove obsolete evidence display while preserving History verbatim."""
+        """Remove obsolete evidence displays before History is isolated."""
         visible, history = cls._extract_visible_history(visible)
         projection_start = "<!-- evidence-projection:start -->"
         projection_end = "<!-- evidence-projection:end -->"
@@ -3432,12 +3435,22 @@ class DeployController:
         lines = visible.splitlines(keepends=True)
         result = []
         index = 0
-        heading_re = re.compile(r"^(#{2,6})[ \t]+测试附件[ \t]*#*[ \t]*(?:\r?\n)?$")
+        heading_re = re.compile(
+            r"^(#{2,6})[ \t]+(?:\*\*)?测试附件(?:\*\*)?[ \t]*#*[ \t]*(?:\r?\n)?$",
+        )
         cos_link_re = re.compile(
             r"\[[^\]]*\]\((?:<)?https://[^<>\s]*\.cos\.[^<>\s]*\.myqcloud\.com/[^)<>\s]*(?:>)?\)",
             re.IGNORECASE,
         )
-        legacy_link_re = re.compile(r"\[(?:查看测试附件|上传或查看附件)\]\((?:<[^>]*>|[^)]*)\)")
+        legacy_link_re = re.compile(
+            r"\[(?:查看测试附件|打开附件页|上传或查看附件|查看 COS 证据与历史|上传到 COS)\]"
+            r"\((?:<[^>]*>|[^)]*)\)"
+        )
+        raw_cos_metadata_re = re.compile(
+            r"(?i)(?:\*{1,2}cos(?:_object_key|_bundle_sha256|_bundle_size)?\*{1,2}"
+            r"|[\"']?cos(?:_object_key|_bundle_sha256|_bundle_size)?[\"']?)"
+            r"[ \t]*[:：=]",
+        )
         metadata_value_re = re.compile(
             r"[\"']?(?:object_key|sha256|size|cos_object_key|cos_bundle_sha256|cos_bundle_size|cos_download_url)"
             r"[\"']?[ \t]*[:=][ \t]*(\"[^\"]*\"|'[^']*'|[0-9]+|null|None)",
@@ -3458,19 +3471,23 @@ class DeployController:
             legacy_link = legacy_link_re.search(line)
             old_cos_download = cos_link_re.search(line)
             metadata_values = metadata_value_re.findall(line)
+            raw_cos_metadata = bool(raw_cos_metadata_re.search(line))
             empty_cos_metadata = bool(metadata_values) and all(
                 value.strip("\\\"' ").lower() in {"", "0", "null", "none"}
                 for value in metadata_values
             ) and bool(re.search(r"(?i)cos|object_key|sha256", line))
-            if legacy_link or old_cos_download or empty_cos_metadata:
+            if legacy_link or old_cos_download or empty_cos_metadata or raw_cos_metadata:
                 remainder = line
                 if legacy_link:
                     remainder = legacy_link_re.sub("", remainder)
                 if old_cos_download:
                     remainder = cos_link_re.sub("", remainder)
-                    if re.search(r"(?i)cos|download|下载|归档", line):
+                    if line.lstrip().startswith("|") or re.fullmatch(
+                            r"[ \t|·:*_`-]*(?:COS[ \t]+)?(?:下载|Download(?:[ \t]+COS)?|"
+                            r"下载已验证归档文件)[ \t:：|·*_`-]*\r?\n?",
+                            remainder, re.IGNORECASE):
                         remainder = ""
-                if empty_cos_metadata or not remainder.strip(" \t\r\n|·-*"):
+                if empty_cos_metadata or raw_cos_metadata or not remainder.strip(" \t\r\n|·-*"):
                     index += 1
                     continue
                 line = remainder
@@ -3597,6 +3614,9 @@ class DeployController:
             merged=(bool(pr.get("merged")) if backend_ready else False),
             attachments=current_rows,
         )
+        round_numbers = trusted_round_numbers(records, state, repo, pr_number)
+        if current_round in round_numbers:
+            render_state["round_number"] = round_numbers[current_round]
         bundles = []
         seen_rounds = set()
         from .evidence_auth import DOWNLOAD_PURPOSE, UPLOAD_PURPOSE, issue_capability
@@ -3764,7 +3784,10 @@ class DeployController:
             ) if backend_ready else snapshot_attachments)
             if backend_ready:
                 await bind_log_url(snapshot, snapshot["head_sha"], archive["round_id"])
-            bundles.append({**archive, "snapshot": snapshot})
+            bundle = {**archive, "snapshot": snapshot}
+            if archive.get("round_id") in round_numbers:
+                bundle["round_number"] = round_numbers[archive["round_id"]]
+            bundles.append(bundle)
             if len(bundles) == 3:
                 break
         public_base_url = (getattr(self.config, "evidence_public_base_url", "")
@@ -3873,6 +3896,15 @@ class DeployController:
             if old is None:
                 raise GitHubStateProxyError("Cannot replace unreadable prior round")
             old = _validate_hidden_state(old)
+            if evidence_projection_only:
+                if old != state:
+                    raise GitHubStateProxyError("Lifecycle state changed before evidence projection")
+                projected = await self._render_evidence_projection(
+                    repo, pr_number, old, new_visible_markdown,
+                )
+                if projected == new_visible_markdown:
+                    return True
+                return await write_if_current(projected)
             old_round = round_id_for_state(old)
             head_changed = old.get("head_sha") != state.get("head_sha")
             if "round_id" not in state and not head_changed:
@@ -3893,12 +3925,9 @@ class DeployController:
                     state["round_started_at"] = utc_now()
             if "round_started_at" not in state and old.get("round_started_at") and not head_changed and not round_changed:
                 state["round_started_at"] = old["round_started_at"]
-            if evidence_projection_only:
-                projected = await self._render_evidence_projection(repo, pr_number, state, new_visible_markdown)
-                if projected == new_visible_markdown:
-                    return True
-                return await write_if_current(projected)
         if comment is None:
+            if evidence_projection_only:
+                return False
             if events is not None:
                 # Multiple events: newest-first; then insert existing fresh markdown
                 built = new_visible_markdown

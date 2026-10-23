@@ -25,7 +25,9 @@ from urllib.parse import unquote, urljoin, urlsplit
 from .evidence_auth import (
     DOWNLOAD_PURPOSE, PURPOSE, UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES, UPLOAD_PURPOSE,
 )
-from .evidence_models import EvidenceError, round_id_for_state, utc_now, validate_context
+from .evidence_models import (
+    EvidenceError, round_id_for_state, trusted_round_numbers, utc_now, validate_context,
+)
 
 UPLOAD_MAX_NOTES = 20
 
@@ -123,6 +125,112 @@ class EvidenceService:
         if not isinstance(result, dict):
             raise EvidenceError('store_result_invalid', 502)
         return result
+
+    async def _verified_note_display(self, row, repo, pr_number, principal):
+        """Read a note only through its exact, verified persisted attachment identity."""
+        from .evidence_builder import _redact_secrets
+        fallback = _redact_secrets(str(row.get('note') or ''))
+        fallback = re.sub(
+            r'(?i)((?:x-evidence-secret|x-evidence-client-key|evidence-capability|capability|cap)\s*[=:]\s*)[^\s&;]+',
+            r'\1[REDACTED]', fallback)
+        incomplete = fallback + ('\n\n[历史备注仅保存了摘要，内容不完整]' if fallback
+                                 else '[历史备注内容不完整]')
+        try:
+            claims = (principal.get('upload_invite') or principal.get('capability')
+                      or principal.get('evidence_auth'))
+            if (row.get('evidence_kind') != 'note'
+                    or row.get('repo') != repo or row.get('pr_number') != pr_number
+                    or not isinstance(claims, dict) or claims.get('repo') != repo
+                    or claims.get('pr', claims.get('pr_number')) != pr_number
+                    or claims.get('head', claims.get('head_sha')) != row.get('head_sha')
+                    or claims.get('round', claims.get('round_id')) != row.get('round_id')
+                    or row.get('filename') != 'note.txt'
+                    or not isinstance(row.get('head_sha'), str)
+                    or not re.fullmatch(r'[0-9a-f]{40}', row['head_sha'])
+                    or not isinstance(row.get('round_id'), str)
+                    or not re.fullmatch(re.escape(row['head_sha']) + r'-[0-9]+', row['round_id'])
+                    or not isinstance(row.get('attachment_id'), str)
+                    or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', row['attachment_id'])
+                    or type(row.get('size')) is not int
+                    or not 1 <= row['size'] <= min(64 * 1024, self.config.evidence_max_note_bytes)
+                    or not isinstance(row.get('sha256'), str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', row['sha256'])):
+                return incomplete, False
+            if row.get('status') == 'text':
+                text = row.get('note')
+                if (not isinstance(text, str) or len(text) > 5000
+                        or type(row.get('source_comment_id')) is not int
+                        or row['source_comment_id'] <= 0
+                        or type(row.get('actor_id')) is not int or row['actor_id'] <= 0
+                        or row.get('actor_verified') is not True
+                        or row.get('size') != len(text.encode('utf-8'))
+                        or hashlib.sha256(text.encode('utf-8')).hexdigest() != row['sha256']):
+                    return incomplete, False
+                text = _redact_secrets(text)
+                text = re.sub(
+                    r'(?i)((?:[?&])?(?:cap|capability|x-evidence-secret|x-evidence-client-key)[=:=])[^&#\s]+',
+                    r'\1[REDACTED]', text)
+                return text, True
+            if (self.store is None or row.get('status') != 'ready'
+                    or row.get('cos_content_verified') is not True):
+                return incomplete, False
+            key = self.store._operation_key(row)
+            if row.get('object_key') != key:
+                return incomplete, False
+            metadata = self.store._identity_metadata(row)
+            verified = await self.store.verify_object(
+                key=key, size=row['size'], metadata=metadata, sha256=row['sha256'])
+            if (verified.get('verified') is not True or verified.get('size') != row['size']
+                    or verified.get('sha256') != row['sha256'] or verified.get('object_key') != key):
+                return incomplete, False
+
+            def read_exact_note():
+                client = self.store._sdk()
+                args = {'Bucket': self.config.cos_bucket, 'Key': self.store._key(key)}
+                head = client.head_object(**args)
+                lowered = {str(k).lower(): str(v) for k, v in head.items()}
+                expected = self.store._metadata(metadata)
+                if (int(lowered.get('content-length', '-1')) != row['size']
+                        or any(lowered.get(name.lower()) != str(value)
+                               for name, value in expected.items())):
+                    raise ValueError('note object identity mismatch')
+                etag = head.get('ETag', head.get('etag'))
+                if etag:
+                    args['IfMatch'] = etag
+                response = client.get_object(**args)
+                stream = response['Body'].get_raw_stream()
+                chunks, count = [], 0
+                digest = hashlib.sha256()
+                try:
+                    while True:
+                        block = stream.read(16 * 1024)
+                        if not block:
+                            break
+                        count += len(block)
+                        if count > row['size'] or count > self.config.evidence_max_note_bytes:
+                            raise ValueError('note object exceeds bounds')
+                        digest.update(block)
+                        chunks.append(block)
+                finally:
+                    stream.close()
+                if count != row['size'] or digest.hexdigest() != row['sha256']:
+                    raise ValueError('note object digest mismatch')
+                return b''.join(chunks)
+
+            body = await self.store._io(read_exact_note)
+            text = body.decode('utf-8', errors='strict')
+            if len(text) > 5000:
+                return incomplete, False
+            text = _redact_secrets(text)
+            # Redact page/session capabilities and evidence request keys too;
+            # note text is never echoed into logs or stored in Git Notes.
+            text = re.sub(
+                r'(?i)((?:[?&])?(?:cap|capability|x-evidence-secret|x-evidence-client-key)[=:=])[^&#\s]+',
+                r'\1[REDACTED]', text)
+            return text, True
+        except Exception:
+            # COS SDK errors and malformed historical records are not public.
+            return incomplete, False
 
     @staticmethod
     def _native_asset_id(source_url):
@@ -692,6 +800,7 @@ class EvidenceService:
                 raise EvidenceError('pr_closed', 409)
             records = await self.proxy.read_evidence_records(repo, pr_number)
             active_round = round_id_for_state(state)
+            round_numbers = trusted_round_numbers(records, state, repo, pr_number)
             payload = dict(payload)
             if action in {'resume', 'status'}:
                 upload_ref = payload.get('operation_id') or payload.get('upload_id')
@@ -944,13 +1053,55 @@ class EvidenceService:
                     raise EvidenceError('part_conflict', 409)
                 return {'uploaded': True, 'part_number': part, 'size': length}
             if action == 'context':
-                def context_attachment(row):
-                    return {**row, 'can_delete': bool(
+                note_display_cache = {}
+                async def context_attachment(row):
+                    public_fields = {
+                        'attachment_id', 'filename', 'size', 'sha256', 'note', 'evidence_kind',
+                        'round_id', 'head_sha', 'status', 'created_at', 'updated_at',
+                        'completed_at', 'deleted_at', 'replaces_id', 'actor', 'actor_login',
+                        'actor_verified', 'cos_content_verified', 'submitter',
+                        'upload_method',
+                    }
+                    value = {key: copy.deepcopy(item) for key, item in row.items()
+                             if key in public_fields}
+                    if row.get('upload_method') in ('signed_invite', 'github_comment_proof'):
+                        # A display-safe enum only; actor IDs and proof/capability
+                        # material stay private.
+                        value['upload_method'] = row['upload_method']
+                    note_row = (row.get('evidence_kind') == 'note'
+                                or row.get('status') == 'text')
+                    if note_row:
+                        value['evidence_kind'] = 'note'
+                        attachment_id = row.get('attachment_id')
+                        if attachment_id not in note_display_cache:
+                            note_source = {**row, 'evidence_kind': 'note'}
+                            note_display_cache[attachment_id] = await self._verified_note_display(
+                                note_source, repo, pr_number, principal)
+                        display_note, complete = note_display_cache[attachment_id]
+                        value.update(display_note=display_note,
+                                     # Older page clients render `note`; retain that safe display alias.
+                                     note=display_note)
+                        if complete:
+                            value['display_note_complete'] = True
+                    value['can_delete'] = bool(
                         authorized_writer or invite_allowed
                         and row.get('actor_id') == principal['id']
-                        and row.get('upload_method') == 'signed_invite')}
+                        and row.get('upload_method') == 'signed_invite')
+                    return value
+
+                current_attachments = [await context_attachment(r) for r in latest.values()
+                                       if r['round_id'] == round_id]
+                round_attachments = {}
+                for row in records:
+                    if row['kind'] != 'round':
+                        continue
+                    row_round = row['data']['round_id']
+                    round_attachments[row_round] = [
+                        await context_attachment(a) for a in latest.values()
+                        if a['round_id'] == row_round]
 
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
+                        'round_number': round_numbers.get(round_id),
                         'status': selected['status'], 'authenticated': True, 'enabled': True,
                         'github_user_authenticated': bool(
                             principal.get('actor_verified') is True
@@ -965,11 +1116,10 @@ class EvidenceService:
                         'upload_method': principal.get('upload_method', 'github_comment_proof'),
                         'upload_max_files': (UPLOAD_MAX_FILES if invite_allowed else None),
                         'upload_max_bytes': (UPLOAD_MAX_BYTES if invite_allowed else None),
-                        'attachments': [context_attachment(r) for r in latest.values()
-                                        if r['round_id'] == round_id],
+                        'attachments': current_attachments,
                         'rounds': [{**r['data']['snapshot'], 'round_id': r['data']['round_id'],
-                                    'attachments': [context_attachment(a) for a in latest.values()
-                                                    if a['round_id'] == r['data']['round_id']]}
+                                    'round_number': round_numbers.get(r['data']['round_id']),
+                                    'attachments': round_attachments.get(r['data']['round_id'], [])}
                                    for r in records if r['kind'] == 'round'],
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
                                        for r in operations.values() if not r.get('auth_nonce_marker')
@@ -1096,15 +1246,7 @@ class EvidenceService:
                     if (row.get('upload_method') != 'signed_invite' or row.get('round_id') != round_id
                             or not isinstance(row.get('attachment_id'), str)):
                         continue
-                    # Older note operations predate this marker; note.txt was
-                    # their fixed filename. New operations carry an explicit
-                    # kind so an uploaded file named note.txt still counts as a file.
                     row_kind = row.get('evidence_kind')
-                    if row_kind not in {'file', 'note'}:
-                        legacy_note_size = row.get('size')
-                        row_kind = ('note' if row.get('filename') == 'note.txt'
-                                    and type(legacy_note_size) is int and 1 <= legacy_note_size
-                                    <= int(self.config.evidence_max_note_bytes) else 'file')
                     if row_kind not in {'file', 'note'}:
                         row_kind = 'file'
                     if row_kind != ('note' if action == 'note' else 'file'):
@@ -1222,6 +1364,8 @@ class EvidenceService:
                 if action == 'note':
                     if not isinstance(text, str) or not text:
                         raise EvidenceError('text_required', 400)
+                    if len(text) > 5000:
+                        raise EvidenceError('text_too_large', 413)
                     body = text.encode('utf-8')
                     if len(body) > self.config.evidence_max_note_bytes:
                         raise EvidenceError('text_too_large', 413)

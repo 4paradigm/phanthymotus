@@ -22,6 +22,7 @@ import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -37,6 +38,46 @@ DEFAULT_GITHUB_REPOS = (
 # Compatibility names for the legacy defaults, not runtime authorization gates.
 SUPPORTED_GITHUB_REPOS = frozenset(DEFAULT_GITHUB_REPOS)
 DESIRED_REPOS = DEFAULT_GITHUB_REPOS
+
+
+def is_stable_public_base_url(value: str) -> bool:
+    """Accept only a configured HTTPS origin suitable for persistent links."""
+    try:
+        if (not isinstance(value, str) or not value
+                or any(ord(char) < 33 or ord(char) == 127 for char in value)
+                or '?' in value or '#' in value):
+            return False
+        parsed = urlsplit(value)
+        if (parsed.scheme.lower() != 'https' or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or '@' in parsed.netloc or parsed.query or parsed.fragment
+                or parsed.path not in ('', '/') or parsed.netloc.endswith(':')
+                or any(char.isspace() or ord(char) < 33 or ord(char) == 127
+                       for char in parsed.netloc)):
+            return False
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            return False
+
+        host = parsed.hostname.lower().rstrip('.')
+        if (not host or host == 'localhost' or host.endswith('.localhost')
+                or host == 'local' or host.endswith('.local')
+                or host == 'trycloudflare.com' or host.endswith('.trycloudflare.com')):
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            ascii_host = host.encode('idna').decode('ascii')
+            labels = ascii_host.split('.')
+            if (len(ascii_host) > 253 or len(labels) < 2
+                    or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                           for label in labels)):
+                return False
+        else:
+            if not address.is_global:
+                return False
+        return True
+    except (UnicodeError, TypeError, ValueError):
+        return False
 
 _OWNER_RE = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
 _REPOSITORY_RE = re.compile(rf"{_OWNER_RE}/[A-Za-z0-9_.-]{{1,100}}")
@@ -374,7 +415,7 @@ def load_config() -> Config:
             isinstance(cos.get(name), str) and bool(cos.get(name).strip())
             for name in ("region", "bucket", "secret_id", "secret_key")
         ),
-        evidence_public_base_url=evidence.get("public_base_url", "").rstrip("/"),
+        evidence_public_base_url=evidence.get("public_base_url", "").strip().rstrip("/"),
         evidence_session_key=evidence.get("session_key", ""),
         agent_core_tokens=secrets.get("agent_core_tokens", {}),
         agent_core_tls_mode=validate_agent_core_tls_mode(os.getenv("AGENT_CORE_TLS_MODE", "strict")),
