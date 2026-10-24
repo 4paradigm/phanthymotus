@@ -108,6 +108,31 @@ class MathUnitsTest(unittest.TestCase):
     def test_unsupported_unit_suffix_is_not_partially_consumed(self):
         self.assertEqual(self.spans("2kg/day"), [])
 
+    def test_measurement_range_keeps_connector_and_original_offsets(self):
+        for separator in ("–", "—", "~", "～", "至", "到", " to "):
+            for language, connector, unit in (("ZH", "到", "安培"), ("EN", "to", "amperes")):
+                text = f"0.5{separator}1.5A"
+                with self.subTest(text=text, language=language):
+                    self.assertEqual(self.spans(text, language), [
+                        (0, len(text), f"NUM(0.5) {connector} NUM(1.5) {unit}")])
+        self.assertEqual(self.spoken("0.5A–1.5A", "EN"), "NUM(0.5) amperes to NUM(1.5) amperes")
+        self.assertEqual(self.spoken("5~10%"), "百分之 NUM(5) 到 百分之 NUM(10)")
+        self.assertEqual(self.spoken("5~10%", "EN"), "NUM(5) to NUM(10) percent")
+        self.assertNotIn("to", self.spoken("y=2x-3", "EN"))
+
+    def test_rates_are_whole_case_sensitive_units(self):
+        self.assertEqual(self.spans("100MB/s", "EN"), [(0, 7, "NUM(100) megabytes per second")])
+        self.assertEqual(self.spans("100MB/s"), [(0, 7, "NUM(100) M B 每秒")])
+        for text in ("100MBps", "100Mb/s", "100MB/sec", "ID_100MB/s", "1.2.3MB/s"):
+            with self.subTest(text=text):
+                self.assertEqual(self.spans(text, "EN"), [])
+
+    def test_ranges_do_not_consume_scientific_exponents_or_lines(self):
+        for text in ("1e-3–2A", "0.5\n–1.5A", "0.5–\n1.5A", "1\vto\v2GB", "1\fto\f2GB", "1~2MB/\ns"):
+            with self.subTest(text=text):
+                self.assertFalse(any(start == 0 and end == len(text)
+                                     for start, end, _ in self.spans(text, "EN")))
+
     def test_spans_preserve_original_offsets_and_do_not_overlap(self):
         text = "公式x=2，重3.05kg，面积πr²。"
         spans = self.spans(text)
@@ -146,6 +171,11 @@ class EnglishCardinalTest(unittest.TestCase):
 
     def test_math_uses_actual_english_number_readings(self):
         self.assertEqual(self.spoken("y=2x-3"), "y equals two times x minus three")
+
+    def test_rate_and_range_use_actual_english_readings(self):
+        self.assertEqual(self.spoken("100MB/s"), "one hundred megabytes per second")
+        self.assertEqual(self.spoken("1MB/s"), "one megabyte per second")
+        self.assertEqual(self.spoken("0.5–1.5A"), "zero point five to one point five amperes")
 
     def test_omitted_zero_and_electrical_units_use_real_english_quantities(self):
         for text, expected in (

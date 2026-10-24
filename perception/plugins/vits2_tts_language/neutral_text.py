@@ -8,6 +8,7 @@ import datetime
 import re
 
 from ..vits2_tts_trt.frontend.math_units import _english_quantity, find_spans as math_spans
+from ..vits2_tts_trt.frontend.lexicon_rules import normalize_numeric_lexemes
 from ..vits2_tts_trt.frontend.number_context import _DATE, _ID_CUED, find_spans as field_spans
 from ..vits2_tts_trt.frontend.special_text import (
     _ADDRESSES, normalize_special_text, verbalize_chinese_number,
@@ -124,6 +125,10 @@ def normalize_mixed_text(text, language):
         return verbalize_chinese_number(value) if chosen == "ZH" else _english_quantity(value)
 
     def normalize_plain(fragment):
+        # Known names can introduce digits only after ordinary field parsing
+        # (e.g. a generated Roman-numeral pronunciation). Resolve those narrow
+        # name rules here so the fixed request language survives later MIX TN.
+        fragment = normalize_numeric_lexemes(fragment, language=selected)
         # Do not split numbers inside names/IDs, versions or currency notation.
         # Their existing frontend rules still run after this preprocessing.
         return _PROSE_NUMBER.sub(lambda match: verbalize(match.group(), selected), fragment)

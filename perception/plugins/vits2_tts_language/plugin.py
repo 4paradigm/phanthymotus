@@ -76,6 +76,8 @@ class LiteralSpeechRequest(SpeechRequest):
     # Freeze only fixed panel preferences. Auto prose retains MIX's existing
     # local clause readings; explicit dialogue SpeechRequest uses its language.
     reading_language: str = ""
+    direct_turn: object = None
+    language_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,12 +113,13 @@ def _prepare_chunks(adapter, request):
         raise LanguagePolicyError("frontend_error", "VITS2 could not prepare the supplied text") from error
 
 
-def _direct_request(policy, text):
-    turn = policy.begin_turn(text)
+def _direct_request(policy, text, direct_turn=None):
+    direct_turn = direct_turn or policy.reserve_direct(text)
+    turn = policy.preview_direct(direct_turn, text)
     if (turn["reply_language_mode"] == "auto" and turn["language_source"] == "default"
             and not is_neutral_text(text)
             and _scripts(normalize_standalone_name(text, "zh")) == {"en"}):
-        turn = policy.begin_turn(text, requested_reply_language="en")
+        turn = policy.preview_direct(direct_turn, text, requested_reply_language="en")
     # A manual utterance is not a generated dialogue reply. Read its supported
     # Chinese/English content literally, including standalone names or acronyms.
     # Explicit language -> speak still goes through policy.prepare and its turn
@@ -127,6 +130,7 @@ def _direct_request(policy, text):
     return LiteralSpeechRequest(
         text, turn["reply_language"], turn["turn_id"],
         reading_language=turn["reply_language"] if turn["reply_language_mode"] != "auto" else "",
+        direct_turn=direct_turn, language_source=turn["language_source"],
     )
 
 
@@ -147,9 +151,10 @@ class _PreparedAdapterView:
 
 
 class _LanguageNode(_Vits2TTSNode):
-    def __init__(self, input_topic, adapter, suffix, policy, prepare_topic):
+    def __init__(self, input_topic, adapter, suffix, policy, prepare_topic, accept_speech):
         self.policy = policy
         self._prepare_topic = prepare_topic
+        self._accept_speech = accept_speech
         super().__init__(input_topic, adapter, suffix)
 
     def enqueue(self, text, action_id="", context=None, generation=None):
@@ -160,11 +165,24 @@ class _LanguageNode(_Vits2TTSNode):
         if not isinstance(context, SpeechRequest) or context.text != text:
             raise LanguagePolicyError("unvalidated_request", "Missing language context for speech")
         try:
+            if isinstance(context, LiteralSpeechRequest):
+                # Deferred items are flushed in FIFO order. Resolve neutral
+                # readings now, after preceding items passed their frontend.
+                context = _direct_request(self.policy, text, context.direct_turn)
             prepared = _prepare_chunks(self._adapter, context)
+            self._accept_speech(self, context, generation, lambda: super(_LanguageNode, self).enqueue(
+                text, action_id=action_id, context=prepared, generation=generation))
         except LanguagePolicyError as error:
-            self.policy.record_error(error)
+            self._record_request_error(error, context)
             raise
-        super().enqueue(text, action_id=action_id, context=prepared, generation=generation)
+        except Exception:
+            self._record_request_error(
+                LanguagePolicyError("speech_error", "TTS could not accept speech"), context)
+            raise
+
+    def _record_request_error(self, error, context=None):
+        self.policy.record_error(error, direct_turn=getattr(context, "direct_turn", None),
+                                 turn_id=getattr(context, "turn_id", None))
 
     def _synthesize_stream(self, text, context=None):
         if not isinstance(context, PreparedSpeech):
@@ -176,6 +194,7 @@ class _LanguageNode(_Vits2TTSNode):
         if self.state != "running":
             return
         generation = self._current_gen()
+        context = None
         try:
             try:
                 payload = json.loads(message.data)
@@ -188,10 +207,11 @@ class _LanguageNode(_Vits2TTSNode):
             text, context = self._prepare_topic(payload)
             self.enqueue(text, context=context, generation=generation)
         except LanguagePolicyError as error:
-            self.policy.record_error(error)
+            self._record_request_error(error, context)
             log.warning("[vits2] topic speech rejected: %s", error.code)
         except Exception:
-            self.policy.record_error(LanguagePolicyError("speech_error", "TTS could not accept topic speech"))
+            self._record_request_error(
+                LanguagePolicyError("speech_error", "TTS could not accept topic speech"), context)
             log.exception("[vits2] topic speech failed")
 
     def status(self):
@@ -219,7 +239,28 @@ class TTSPlugin(BaseTTSPlugin):
         with self._language_lock:
             policy = self._policy(key)
         return _LanguageNode(input_topic or None, adapter, _node_suffix(key), policy,
-                             lambda args: self._prepare_speech(args, key))
+                             lambda args: self._prepare_speech(args, key),
+                             lambda node, request, gen, enqueue: self._accept_speech(
+                                 key, node, request, gen, enqueue))
+
+    def _accept_speech(self, key, node, request, generation, enqueue):
+        # Match stop/language lock ordering. No frontend/GPU work or thread
+        # joins occur here; enqueue only puts into the existing unbounded queue.
+        with self._state_lock, self._language_lock, node.policy.lock, node._interrupt_lock:
+            if (self._nodes.get(key) is not node or self._policies.get(key) is not node.policy
+                    or node._stop_event.is_set()):
+                raise LanguagePolicyError("stale_instance", "Speech instance has stopped")
+            enqueue()
+            if generation != node._interrupt_gen:
+                # Keep the base worker's stale-generation ACP completion, but
+                # cancelled frontend work must not establish language history.
+                if isinstance(request, LiteralSpeechRequest):
+                    node.policy.cancel_direct(request.direct_turn)
+                return
+            if isinstance(request, LiteralSpeechRequest):
+                node.policy.accept_direct(request.direct_turn, request.language, request.language_source)
+            else:
+                node.policy.clear_error(turn_id=request.turn_id)
 
     def _forget_instances(self, instance_id):
         # The base stop detaches nodes under _state_lock. Only short policy
@@ -234,6 +275,15 @@ class TTSPlugin(BaseTTSPlugin):
 
     def _speech_metadata(self, context):
         # Report the accepted request, even if a concurrent new turn arrives.
+        if isinstance(context, LiteralSpeechRequest):
+            turn = context.direct_turn
+            with turn.owner.lock:
+                if turn.accepted_language is None:
+                    # Cold-start queued speech has not passed the frontend.
+                    # Its neutral auto reading may follow an earlier success.
+                    return {"language_pending": not turn.completed, **(
+                        {"reply_language": turn.mode} if turn.mode != "auto" else {})}
+                return {"reply_language": turn.accepted_language, "turn_id": turn.turn_id}
         return {"reply_language": context.language, "turn_id": context.turn_id}
 
     def _prepare_speech(self, args, instance_id):
@@ -245,7 +295,6 @@ class TTSPlugin(BaseTTSPlugin):
                     request = _direct_request(policy, text)
                 else:
                     request = policy.prepare(text, args.get("turn_id"))
-                policy.clear_error()
                 return request.text, request
             except LanguagePolicyError as error:
                 policy.record_error(error)

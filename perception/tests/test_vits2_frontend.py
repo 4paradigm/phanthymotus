@@ -150,6 +150,87 @@ def test_pure_chinese_still_takes_the_chinese_path():
     assert set(langs) == {"ZH"}
 
 
+@pytest.mark.parametrize("text,expected", [
+    ("啊", "啊"),
+    ("啊啊", "啊啊"),
+    ("你好啊", "你好啊"),
+    ("你好啊！", "你好啊!"),
+    ("啊，你好。", "啊,你好."),
+    ("你好，啊。", "你好,啊."),
+    ("啊哈", "啊哈"),
+    ("阿哈", "阿哈"),
+    ("啊，你好啊，Hello啊。", "啊,你好啊,Hello啊."),
+    ("Hello啊world", "Hello啊world"),
+    ("啊2026年10月23日啊", "啊二零二六年十月二十三日啊"),
+    ("啊2/3", "啊三分之二"),
+    ("12啊34", "十二啊三十四"),
+    ("呃，啊，好的。", ",啊,好的."),
+    ("啊呀呢吧哦啦", "啊呀呢吧哦啦"),
+])
+def test_real_fst_retains_literal_ah_with_original_token_context(text, expected):
+    # The released tagger recognizes 啊, but its verbalizer removes it.
+    # Classify the complete input before preserving literal char tokens, so
+    # neither dates nor quantities are split into unrelated normalization calls.
+    assert chinese._normalizer.normalize(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "你好呀，没问题呢，开始吧，好啦，好的哦。",
+    "呃，我想一想。",
+    "阿哈，阿明到了。",
+    "2026年10月23日14点25分，价格12.5元，合格样本占2/3。",
+    "普通中文，以及 Hello world。",
+])
+def test_ah_fix_keeps_other_tokens_on_the_original_fst_path(text):
+    from plugins.vits2_tts_trt.frontend.fst_tn import token_parser
+
+    normalizer = chinese._normalizer
+    tagged = normalizer._tagger(text)
+    with normalizer._token_parser_lock:
+        original_escape = token_parser.escape_value
+        try:
+            token_parser.escape_value = lambda value: value
+            reordered = token_parser.TokenParser("zh", "tn").reorder(tagged)
+        finally:
+            token_parser.escape_value = original_escape
+    assert normalizer.normalize(text) == normalizer._verbalizer(reordered)
+
+
+@pytest.mark.parametrize("tagged", [
+    'char { value: "啊哈" }',
+    'cardinal { integer: "啊" }',
+    'char { value: "啊" extra: "keep" }',
+])
+def test_ah_fix_only_bypasses_complete_literal_char_tokens(monkeypatch, tagged):
+    from plugins.vits2_tts_trt.frontend.fst_tn import FstTextNormalizer
+
+    calls = []
+    def verbalize(value):
+        calls.append(value)
+        return "original graph output"
+
+    monkeypatch.setattr(FstTextNormalizer, "_tagger", property(lambda _: lambda text: tagged))
+    monkeypatch.setattr(FstTextNormalizer, "_verbalizer", property(lambda _: verbalize))
+    assert chinese._normalizer.normalize("啊") == "original graph output"
+    assert calls == [tagged]
+
+
+def test_ah_fix_restores_parser_escape_after_reorder_failure(monkeypatch):
+    from plugins.vits2_tts_trt.frontend.fst_tn import token_parser
+
+    original_escape = token_parser.escape_value
+    def fail_reorder(self, tagged):
+        raise RuntimeError("controlled reorder failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(token_parser.TokenParser, "reorder", fail_reorder)
+        with pytest.raises(RuntimeError, match="controlled reorder failure"):
+            chinese._normalizer.normalize("你好啊")
+    assert token_parser.escape_value is original_escape
+    # The failed call also released the shared parser lock.
+    assert chinese._normalizer.normalize("你好啊") == "你好啊"
+
+
 @pytest.fixture(scope="module")
 def production_text_adapter():
     """Use the real chunking/ID methods without constructing a CUDA engine."""
@@ -170,6 +251,41 @@ def _production_chunks(adapter, text):
 
     request = _direct_request(LanguagePolicy("auto"), text)
     return _prepare_chunks(adapter, request).chunks
+
+
+@pytest.mark.parametrize("mode", ["zh", "en", "auto"])
+@pytest.mark.parametrize("text", [
+    "啊", "啊啊", "你好啊", "你好啊！", "啊，你好。", "啊哈", "阿哈",
+    "你好啊，Hello啊。", "1.2A啊", "啊2/3", "2026年10月23日啊",
+])
+def test_ah_reaches_real_model_inputs_in_all_panel_modes(production_text_adapter, mode, text):
+    from plugins.vits2_tts_language.plugin import _direct_request, _prepare_chunks
+    from plugins.vits2_tts_language.policy import LanguagePolicy
+    from plugins.vits2_tts_trt.frontend.symbols import symbols
+
+    request = _direct_request(LanguagePolicy(mode), text)
+    chunks = _prepare_chunks(production_text_adapter, request).chunks
+    normalized = "".join(value for value, _ in chunks)
+    assert normalized.count("啊") == text.count("啊")
+    assert normalized.count("阿") == text.count("阿")
+    assert chunks
+    for value, ids in chunks:
+        phones, tones, languages, word2ph = g2p_normalized_text_mix(value)
+        assert len(phones) == len(tones) == len(languages) == sum(word2ph)
+        assert all(phone in symbols and phone != "UNK" for phone in phones)
+        expected_ids = 2 * len(phones) + 1 if production_text_adapter._engine.add_blank else len(phones)
+        assert len(ids[0]) == len(ids[1]) == len(ids[2]) == expected_ids
+
+
+def test_ah_has_a_real_neutral_tone_vowel_not_a_replacement_character():
+    plain_phones, plain_tones, _, _ = g2p_normalized_text_mix(normalize_text_mix("你好"))
+    ah_phones, ah_tones, ah_langs, _ = g2p_normalized_text_mix(normalize_text_mix("你好啊"))
+    a_phones, a_tones, _, _ = g2p_normalized_text_mix(normalize_text_mix("你好阿"))
+    assert ah_phones == plain_phones[:-1] + ["AA", "a", "_"]
+    assert ah_tones == plain_tones[:-1] + [5, 5, 0]
+    assert ah_langs[-3:] == ["ZH", "ZH", "ZH"]
+    assert a_phones == ah_phones
+    assert a_tones[-3:] == [1, 1, 0]
 
 
 @pytest.mark.parametrize("text", [
@@ -283,3 +399,109 @@ def test_letter_spelling_protection_preserves_roman_number_and_unit_context():
 def test_protected_letters_keep_paragraph_boundaries(production_text_adapter, text, expected):
     chunks = _production_chunks(production_text_adapter, text)
     assert "".join("".join(value.split()) for value, _ in chunks) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "Please check the log file.",
+    "The catalog and analog dialogue are ready.",
+    "Please show your id.",
+    "NASA is ready.",
+    "You and I.",
+    "The car and cash apps are ready.",
+])
+def test_ordinary_english_does_not_enter_chinese_fst(text):
+    from plugins.vits2_tts_trt.frontend import english
+
+    normalized = normalize_text_mix(text)
+    assert normalized == text
+    phones, tones, languages, word2ph = g2p_normalized_text_mix(normalized)
+    expected_phones, expected_tones, _ = english.g2p(text)
+    assert phones == expected_phones
+    assert tones == expected_tones
+    assert all(language == "EN" for language in languages)
+    assert sum(word2ph) == len(phones)
+
+
+def test_known_nasa_acronym_uses_dictionary_word_reading():
+    normalized = normalize_text_mix("NASA is ready.")
+    phones, _, _, _ = g2p_normalized_text_mix(normalized)
+    assert normalized.startswith("NASA ")
+    assert phones[1:5] == ["n", "ae", "s", "ah"]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Dr. Smith is here.", "doctor Smith is here."),
+    ("Dr. José is here.", "doctor José is here."),
+    ("Keep DR as a road abbreviation.", "Keep DR as a road abbreviation."),
+    ("The address is Oak Dr.", "The address is Oak Dr."),
+])
+def test_doctor_expansion_requires_title_and_name_context(text, expected):
+    assert normalize_text_mix(text) == expected
+
+
+@pytest.mark.parametrize("word,expected_phones", [
+    ("José", ["hh", "ow", "z", "ey"]),
+    ("Jose\u0301", ["hh", "ow", "z", "ey"]),
+    ("café", ["k", "ah", "f", "ey"]),
+    ("cafe\u0301", ["k", "ah", "f", "ey"]),
+])
+def test_latin_accents_are_whole_words_in_mixed_and_english_text(word, expected_phones):
+    from plugins.vits2_tts_trt.frontend import english
+
+    normalized = normalize_text_mix("请联系" + word + "。")
+    phones, tones, languages, word2ph = g2p_normalized_text_mix(normalized)
+    english_positions = [i for i, language in enumerate(languages) if language == "EN"]
+    mixed_phones = [phones[i] for i in english_positions]
+    mixed_tones = [tones[i] for i in english_positions]
+    pure_phones, pure_tones = english.g2p_token(word)
+    assert mixed_phones == expected_phones == list(pure_phones)
+    assert mixed_tones == list(pure_tones)
+    assert sum(word2ph) == len(phones)
+    assert "UNK" not in phones
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\r", "\v", "\f", "\x85", "\u2028", "\u2029"])
+@pytest.mark.parametrize("left,right", [("你好", "Hello"), ("Hello", "你好"),
+                                         ("请检查2026-08-07", "Hello again")])
+def test_mixed_line_boundaries_remain_a_pause(separator, left, right):
+    normalized = normalize_text_mix(left + separator + right)
+    assert normalized.count(".") == 1
+    phones, _, _, _ = g2p_normalized_text_mix(normalized)
+    assert phones.count(".") == 1
+    assert phones.index(".") > 1
+    assert phones.index(".") < len(phones) - 2
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\u2028", "\u2029"])
+def test_punctuation_plus_line_boundary_does_not_duplicate_pause(separator):
+    normalized = normalize_text_mix("你好。" + separator + "Hello.")
+    phones, _, _, _ = g2p_normalized_text_mix(normalized)
+    assert normalized.count(".") == 2
+    assert phones.count(".") == 2
+    assert ".." not in normalized
+
+
+def test_protected_letter_spelling_does_not_disable_following_roman_list():
+    normalized = normalize_text_mix("AI.\nII. 项目")
+    assert normalized.startswith("A I.")
+    assert "二" in normalized
+    assert "一" not in normalized
+
+
+def test_unicode_normalization_preserves_mathematical_superscripts():
+    normalized = normalize_text_mix("x² + 2x + 1")
+    assert normalized == "x squared plus two times x plus one"
+
+
+@pytest.mark.parametrize("text,mode,expected", [
+    ("2026 10/23", "en", "October twenty third, two thousand twenty six"),
+    ("2026 10/23 message", "en", "October twenty third, two thousand twenty six message"),
+    ("2026 10/23 message", "zh", "二零二六年十月二十三日 message"),
+])
+def test_expanded_dates_do_not_acquire_pauses_inside_english_number(text, mode, expected):
+    from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+
+    normalized = normalize_text_mix(normalize_mixed_text(text, mode))
+    assert normalized == expected
+    assert "twenty,six" not in normalized
+    assert "twenty,third" not in normalized

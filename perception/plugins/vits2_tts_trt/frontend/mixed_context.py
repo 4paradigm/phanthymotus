@@ -84,7 +84,7 @@ def _strong_spans(text, entities):
     for i, char in enumerate(text):
         if _protected(i, entities):
             continue
-        if char in "。！？!?；;\n" or (char == "." and _is_period_boundary(text, i)):
+        if char in "。！？!?；;\r\n\v\f\x85\u2028\u2029" or (char == "." and _is_period_boundary(text, i)):
             yield start, i + 1
             start = i + 1
     if start < len(text):
@@ -218,15 +218,9 @@ def normalize_mixed_context(text, normalize_original, normalize_plain, verbalize
 
     def english_ordinary(ordinary):
         ordinary = apply_lexeme_rules(ordinary, language="EN")
-        parts, cursor = [], 0
-        for match in _ASCII_TOKEN.finditer(ordinary):
-            parts.append(normalize_plain(ordinary[cursor:match.start()]))
-            token = match.group()
-            spoken = normalize_plain(token)
-            parts.append(token if _CJK.search(spoken) else spoken)
-            cursor = match.end()
-        parts.append(normalize_plain(ordinary[cursor:]))
-        return " ".join(p.strip() for p in parts if p.strip())
+        # The ordinary frontend protects complete Latin words (including
+        # accents); splitting ASCII words here would truncate mixed names.
+        return normalize_plain(ordinary)
 
     output = []
     for piece in diagnostic["segments"]:
@@ -238,6 +232,6 @@ def normalize_mixed_context(text, normalize_original, normalize_plain, verbalize
             ))
         else:
             output.append(normalize_original(raw))
-    normalized = " ".join(part.strip() for part in output if part.strip())
+    normalized = " ".join(part.strip(" \t") for part in output if part.strip(" \t"))
     return re.sub(r"(?<=[\u4e00-\u9fff，。！？；：、,.!?;:]) +"
                   r"(?=[\u4e00-\u9fff，。！？；：、,.!?;:])", "", normalized)

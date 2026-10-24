@@ -79,10 +79,17 @@ _ZH_TRAILING_FOUR_DIGITS = re.compile(
 _NUMBERED_ID = re.compile(
     r"(?<![A-Za-z0-9_])(?i:NO)\.(?P<value>\d+)(?![A-Za-z0-9_]|\.\d)"
 )
+# Unicode space separators (Zs) plus TAB, restricted to this model-name field.
+# Do not include vertical whitespace: CR/LF, VT/FF, NEL, line/paragraph separators.
+_GPU_HORIZONTAL_SPACE = r"[\t \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]"
 _GPU_MODEL = re.compile(
-    rf"(?<![A-Za-z0-9_])(?P<series>(?i:RTX|GTX))\s*[{_DASH}]?\s*"
+    rf"(?<![A-Za-z0-9_])(?P<series>(?i:RTX|GTX))"
+    rf"{_GPU_HORIZONTAL_SPACE}*[{_DASH}]?{_GPU_HORIZONTAL_SPACE}*"
     r"(?P<number>\d{3,4})(?![A-Za-z0-9_]|\.\d)"
 )
+# Reviewed product-name readings, not a general rule for four-digit numbers.
+# Unknown models and all Chinese readings retain their existing digit form.
+_EN_GPU_MODEL_READINGS = {("RTX", "4090"): "forty ninety"}
 _SYMBOL_LABEL = re.compile(
     r"(?<![A-Za-z0-9_])(?P<label>(?i:lr|snr))(?=\s*(?:=|>=|<=|≥|≤|>|<))"
 )
@@ -196,7 +203,11 @@ def find_spans(text, language, verbalize_number):
         add(match.start(), match.end(), _digits(match["area"], language) + ", " + _digits(match["local"], language))
 
     for match in _GPU_MODEL.finditer(text):
-        add(match.start(), match.end(), " ".join(match["series"].upper()) + " " + _digits(match["number"], language))
+        series, number = match["series"].upper(), match["number"]
+        spoken_number = _digits(number, language)
+        if not zh:
+            spoken_number = _EN_GPU_MODEL_READINGS.get((series, number), spoken_number)
+        add(match.start(), match.end(), " ".join(series) + " " + spoken_number)
     for match in _SYMBOL_LABEL.finditer(text):
         add(match.start(), match.end(), " ".join(match["label"].upper()))
     return sorted(spans)

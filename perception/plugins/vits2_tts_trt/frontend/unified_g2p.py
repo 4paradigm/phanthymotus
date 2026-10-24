@@ -25,9 +25,10 @@ Returns:
 import logging
 import os
 import re
+import unicodedata
 
 from .symbols import punctuation
-from .english import english_pronunciation, refine_ph, post_replace_ph, arpa
+from .english import english_pronunciation, refine_ph, post_replace_ph, arpa, iter_latin_words
 from .english import _g2p as _g2p_en
 
 log = logging.getLogger(__name__)
@@ -57,12 +58,35 @@ _INITIALS = [
 
 # ASCII punctuation that survives mix_normalize (same set as symbols.punctuation)
 _PUNCT_SET = set(punctuation)
-_EN_TOKEN_RE = re.compile(r"[A-Za-z0-9'-]+")
-_NON_ZH_PIECE_RE = re.compile(r"[A-Za-z0-9'-]+|[^\w\s]", re.UNICODE)
-_MIX_TOKEN_RE = re.compile(
-    r"[\u4e00-\u9fff]+|[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*|\s+|.",
-    re.DOTALL,
-)
+def _mixed_tokens(text):
+    """Keep Unicode Latin words whole while retaining Chinese/space boundaries."""
+    latin_ends = dict(iter_latin_words(text))
+    index = 0
+    while index < len(text):
+        start = index
+        if index in latin_ends:
+            index = latin_ends[index]
+            yield "EN", text[start:index]
+        elif "\u4e00" <= text[index] <= "\u9fff":
+            index += 1
+            while index < len(text) and "\u4e00" <= text[index] <= "\u9fff":
+                index += 1
+            yield "ZH", text[start:index]
+        elif text[index].isspace():
+            index += 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            yield "SPACE", text[start:index]
+        elif text[index].isascii() and text[index].isdigit():
+            index += 1
+            while index < len(text) and text[index].isascii() and text[index].isdigit():
+                index += 1
+            yield "EN", text[start:index]
+        else:
+            index += 1
+            yield "OTHER", text[start:index]
+
+
 _LETTER_SPELLED_UNITS = {"KB", "MB", "GB", "TB", "PB", "KBPS", "MBPS", "GBPS"}
 
 
@@ -128,6 +152,7 @@ def _en_token_to_phones(word: str):
     All outputs go through refine_ph() + post_replace_ph() so they match
     the lowercase ARPAbet symbols in en_symbols (e.g. 'IY1' → 'iy', tone=2).
     """
+    word = unicodedata.normalize("NFC", word)
     phones: list = []
     tones: list = []
     if word == "A":
@@ -172,9 +197,10 @@ def _non_zh_token_to_phones(token: str):
     langs: list = []
 
     unvoiced = []
-    for match in _NON_ZH_PIECE_RE.finditer(token):
-        piece = match.group(0)
-        if _EN_TOKEN_RE.fullmatch(piece):
+    for kind, piece in _mixed_tokens(token):
+        if kind == "SPACE":
+            continue
+        if kind == "EN":
             word = piece
             ph_list, tone_list = _en_token_to_phones(word)
             if ph_list:
@@ -243,9 +269,8 @@ def unified_g2p(text: str):
     # Import lazily to avoid the cleaner -> unified_g2p -> chinese cycle.
     from . import chinese
 
-    for match in _MIX_TOKEN_RE.finditer(text):
-        token = match.group(0)
-        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+    for kind, token in _mixed_tokens(text):
+        if kind == "ZH":
             ph_list, tone_list, zh_word2ph = chinese.g2p(token)
             ph_list, tone_list = ph_list[1:-1], tone_list[1:-1]
             zh_word2ph = zh_word2ph[1:-1]
@@ -254,7 +279,7 @@ def unified_g2p(text: str):
                 tones.extend(tone_list)
                 langs.extend(["ZH"] * len(ph_list))
             word2ph.extend(zh_word2ph)
-        elif _EN_TOKEN_RE.fullmatch(token):
+        elif kind == "EN":
             ph_list, tone_list = _en_token_to_phones(token)
             phones.extend(ph_list)
             tones.extend(tone_list)

@@ -3,7 +3,7 @@
 import re
 
 from ..vits2_tts_trt.frontend.lexicon_rules import (
-    _QWEN_VERSION_RE, apply_lexeme_rules, has_chinese_name_reading,
+    _QWEN_VERSION_RE, _sub_lexeme, apply_lexeme_rules, has_chinese_name_reading,
 )
 from ..vits2_tts_trt.frontend.math_units import _english_quantity
 from ..vits2_tts_trt.frontend.mixed_context import context_diagnostics
@@ -47,7 +47,7 @@ def _english_version_names(text, allowed_ranges=None):
         brand = text[start:match.start(1)].rstrip()
         return brand + " " + _english_quantity(match.group(1))
 
-    return _QWEN_VERSION_RE.sub(replace, text)
+    return _sub_lexeme(_QWEN_VERSION_RE, replace, text)
 
 
 def normalize_standalone_name(text, language):

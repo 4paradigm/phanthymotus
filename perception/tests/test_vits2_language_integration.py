@@ -179,7 +179,9 @@ def test_direct_speech_uses_panel_readings_and_completes_acp(make_plugin, mode, 
     ("y = 2x-3", "y 等于二乘以 x 减三", "y equals two times x minus three"),
     ("y = 2x‑3", "y 等于二乘以 x 减三", "y equals two times x minus three"),
     ("y = 2x−3", "y 等于二乘以 x 减三", "y equals two times x minus three"),
-    ("RTX‑4090", "R T X 四零九零", "R T X four zero nine zero"),
+    ("RTX‑4090", "R T X 四零九零", "R T X forty ninety"),
+    ("RTX 4090", "R T X 四零九零", "R T X forty ninety"),
+    ("rtx4090", "R T X 四零九零", "R T X forty ninety"),
     ("1.2A", "一点二安培", "one point two amperes"),
     ("8.5GB", "八点五 G B", "eight point five gigabytes"),
     ("SNR≥28dB", "S N R 大于等于二十八分贝",
@@ -221,7 +223,30 @@ def test_formula_loading_freezes_language_and_explicit_asr_still_wins(make_plugi
     state.gate.set()
     assert finished(state, first)[3] is False
     assert finished(state, second)[3] is False
-    assert state.adapter.spoken == ["y 等于二乘以 x 减三", "R T X four zero nine zero"]
+    assert state.adapter.spoken == ["y 等于二乘以 x 减三", "R T X forty ninety"]
+
+
+def test_gpu_model_auto_reading_follows_current_instance_language(make_plugin):
+    state = make_plugin(reply_language="auto")
+    start(state, "a")
+    start(state, "b")
+    for greeting, language, spoken in (
+        ("Hello", "en", "R T X forty ninety"),
+        ("你好", "zh", "R T X 四零九零"),
+    ):
+        finished(state, call(state, "speak", instance_id="a", text=greeting))
+        for text in ("RTX4090", "RTX 4090", "rtx‑4090"):
+            result = call(state, "speak", instance_id="a", text=text)
+            assert result["reply_language"] == language
+            assert finished(state, result)[1] == text
+            assert state.adapter.spoken[-1] == spoken
+            assert call(state, "info", instance_id="a")["remembered_language"] == language
+        if language == "en":
+            # English history in a must not leak into another card/instance.
+            other = call(state, "speak", instance_id="b", text="RTX4090")
+            finished(state, other)
+            assert other["reply_language"] == "zh"
+            assert state.adapter.spoken[-1] == "R T X 四零九零"
 
 
 def test_auto_card_keeps_neutral_reading_within_instance_and_resets_on_stop(make_plugin):
@@ -282,6 +307,7 @@ def test_explicit_turn_still_rejects_foreign_prose_without_selected_reading(make
     with pytest.raises(LanguagePolicyError, match="selected primary language"):
         call(state, "speak", instance_id="a", text="Hello, the robot is ready.", turn_id=turn["turn_id"])
     assert state.adapter.spoken == []
+
 
 
 @pytest.mark.parametrize("mode,text,expected", [
@@ -700,6 +726,8 @@ def test_interrupt_during_frontend_discards_old_request(make_plugin, monkeypatch
         assert _wait_until(lambda: bool(state.completions))
         assert state.completions[-1][3] is True
     assert state.adapter.spoken == []
+    info = call(state, "info", instance_id="a")
+    assert info["remembered_language"] is None and info["turn_id"] is None
 
 
 @pytest.mark.parametrize("mode,text,expected", [
@@ -755,3 +783,172 @@ def test_speak_response_keeps_request_turn_during_concurrent_language_update(mak
     assert result["turn_id"] == old["turn_id"]
     assert result["reply_language"] == "en"
     assert finished(state, result)[3] is False
+
+
+@pytest.mark.parametrize("invalid", ["呃", "2026-02-30", "...", "🙂"])
+def test_rejected_direct_speech_keeps_last_accepted_language(make_plugin, monkeypatch, invalid):
+    state = make_plugin()
+    start(state)
+    finished(state, call(state, "speak", instance_id="a", text="Hello"))
+    before = call(state, "info", instance_id="a")
+    original = state.adapter.iter_text_chunks
+
+    def filtering_frontend(text):
+        if text != "呃":
+            yield from original(text)
+
+    monkeypatch.setattr(state.adapter, "iter_text_chunks", filtering_frontend)
+    with pytest.raises(LanguagePolicyError):
+        call(state, "speak", instance_id="a", text=invalid)
+    after = call(state, "info", instance_id="a")
+    for field in ("remembered_language", "resolved_language", "turn_id"):
+        assert after[field] == before[field]
+    result = call(state, "speak", instance_id="a", text="2026 10/23")
+    finished(state, result)
+    assert result["reply_language"] == "en"
+    assert "October twenty third" in state.adapter.spoken[-1]
+
+
+def test_loading_fifo_ignores_rejected_history_and_reports_pending_metadata(make_plugin, monkeypatch):
+    state = make_plugin(gated=True)
+    original = _Adapter.iter_text_chunks
+
+    def filtering_frontend(adapter, text):
+        if text != "呃":
+            yield from original(adapter, text)
+
+    monkeypatch.setattr(_Adapter, "iter_text_chunks", filtering_frontend)
+    results = [call(state, "speak", instance_id="a", text=text)
+               for text in ("Hello", "呃", "2026 10/23")]
+    for result in results:
+        assert result["language_pending"] is True
+        assert "reply_language" not in result and "turn_id" not in result
+    assert call(state, "info", instance_id="a")["remembered_language"] is None
+    state.gate.set()
+    assert [finished(state, result)[3] for result in results] == [False, True, False]
+    assert len(state.adapter.spoken) == 2
+    assert "October twenty third" in state.adapter.spoken[-1]
+    assert call(state, "info", instance_id="a")["remembered_language"] == "en"
+
+
+def test_loading_failure_does_not_accept_language(make_plugin):
+    state = make_plugin(gated=True, fail=True)
+    result = call(state, "speak", instance_id="a", text="Hello")
+    state.gate.set()
+    assert finished(state, result)[3] is True
+    info = call(state, "info", instance_id="a")
+    assert info["remembered_language"] is None and info["turn_id"] is None
+
+
+@pytest.mark.parametrize("new_event", ["direct", "asr", "config", "stop"])
+def test_slow_old_direct_cannot_overwrite_newer_state(make_plugin, monkeypatch, new_event):
+    state = make_plugin()
+    start(state)
+    original = _Adapter.iter_text_chunks
+    entered, release = threading.Event(), threading.Event()
+    results, failures = [], []
+
+    def slow_frontend(adapter, text):
+        if text == "你好":
+            entered.set()
+            assert release.wait(3)
+        yield from original(adapter, text)
+
+    monkeypatch.setattr(_Adapter, "iter_text_chunks", slow_frontend)
+
+    def old_request():
+        try:
+            results.append(call(state, "speak", instance_id="a", text="你好"))
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=old_request)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        if new_event == "direct":
+            finished(state, call(state, "speak", instance_id="a", text="Hello"))
+        elif new_event == "asr":
+            call(state, "language", instance_id="a", asr_result={"text": "Hello", "lang": "en"})
+        elif new_event == "config":
+            call(state, "config", instance_id="a", reply_language="en")
+        else:
+            call(state, "stop", instance_id="a")
+            start(state)
+            finished(state, call(state, "speak", instance_id="a", text="Hello"))
+        expected = call(state, "info", instance_id="a")
+    finally:
+        release.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    if new_event == "stop":
+        assert [error.code for error in failures] == ["stale_instance"]
+        assert "你好" not in state.adapter.spoken
+    else:
+        assert not failures
+        assert finished(state, results[0])[3] is False
+    actual = call(state, "info", instance_id="a")
+    for field in ("reply_language", "remembered_language", "resolved_language", "turn_id", "last_language_error"):
+        assert actual[field] == expected[field]
+
+
+def test_enqueue_failure_does_not_commit_direct_language(make_plugin, monkeypatch):
+    state = make_plugin()
+    start(state)
+    finished(state, call(state, "speak", instance_id="a", text="Hello"))
+    before = call(state, "info", instance_id="a")
+
+    def reject(*args, **kwargs):
+        raise RuntimeError("controlled enqueue failure")
+
+    monkeypatch.setattr(base._Vits2TTSNode, "enqueue", reject)
+    with pytest.raises(RuntimeError, match="controlled enqueue failure"):
+        call(state, "speak", instance_id="a", text="你好")
+    after = call(state, "info", instance_id="a")
+    for field in ("remembered_language", "resolved_language", "turn_id"):
+        assert after[field] == before[field]
+
+
+@pytest.mark.parametrize("loading", [False, True])
+def test_real_fst_filtered_interjection_cannot_change_auto_history(make_plugin, monkeypatch, loading):
+    """Real released FST/G2P/model IDs; only downloads, ROS and PCM are fake."""
+    import importlib.util
+    import os
+    from pathlib import Path
+
+    root = Path(os.getenv("VITS2_MODEL_DIR", "/models/vits2"))
+    deps = ("jieba", "pypinyin", "wetext", "kaldifst", "g2p_en", "inflect", "nltk")
+    if not (root / "tn_cache").is_dir() or any(importlib.util.find_spec(name) is None for name in deps):
+        pytest.skip("requires installed VITS2 frontend release and dependencies")
+    from plugins.vits2_tts_trt.frontend.release_paths import configure_release_paths
+    from plugins.vits2_tts_trt.runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
+
+    configure_release_paths(root)
+    engine = TensorRTNumpyTTSEngine.__new__(TensorRTNumpyTTSEngine)
+    engine.add_blank = bool(json.loads((root / "config.json").read_text())["data"].get("add_blank", True))
+    adapter = Vits2TensorRTAdapter.__new__(Vits2TensorRTAdapter)
+    adapter._engine, adapter.max_chunk_tokens = engine, 256
+    monkeypatch.setattr(_Adapter, "iter_text_chunks", lambda self, text: adapter.iter_text_chunks(text))
+    state = make_plugin(gated=loading)
+    if loading:
+        hello, rejected, date = [call(state, "speak", instance_id="a", text=text)
+                                 for text in ("Hello", "呃", "2026 10/23")]
+        assert all(item["language_pending"] for item in (hello, rejected, date))
+        state.gate.set()
+        assert finished(state, hello)[3] is False
+        assert finished(state, rejected)[3] is True
+    else:
+        start(state)
+        finished(state, call(state, "speak", instance_id="a", text="Hello"))
+        before = call(state, "info", instance_id="a")
+        with pytest.raises(LanguagePolicyError) as caught:
+            call(state, "speak", instance_id="a", text="呃")
+        assert caught.value.code == "frontend_language_mismatch"
+        after = call(state, "info", instance_id="a")
+        for field in ("remembered_language", "resolved_language", "turn_id"):
+            assert after[field] == before[field]
+        date = call(state, "speak", instance_id="a", text="2026 10/23")
+    assert finished(state, date)[3] is False
+    assert len(state.adapter.spoken) == 2
+    assert "october twenty third" in state.adapter.spoken[-1].lower()
+    assert call(state, "info", instance_id="a")["remembered_language"] == "en"

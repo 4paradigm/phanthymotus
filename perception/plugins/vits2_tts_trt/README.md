@@ -238,7 +238,7 @@ arbitrary notation or translation of an English sentence.
 | Input | 中文 (also direct auto without prose evidence) | English |
 | --- | --- | --- |
 | `y = 2x‑3` | `y 等于二乘以 x 减三` | `y equals two times x minus three` |
-| `RTX‑4090` | `R T X 四零九零` | `R T X four zero nine zero` |
+| `RTX‑4090` | `R T X 四零九零` | `R T X forty ninety` |
 | `1.2A` | `一点二安培` | `one point two amperes` |
 | `2/3` | `三分之二` | `two thirds` |
 | `$1,234.50` | `一千二百三十四点五零美元` | `one thousand two hundred thirty four dollars and fifty cents` |
@@ -262,10 +262,23 @@ The fixed preference is captured when the request is accepted, so a later
 panel change does not alter queued speech. An explicit `language` turn uses
 its resolved language for these fields as well.
 
+Direct speech updates automatic language memory only after frontend validation
+and successful queue acceptance. A filtered/invalid request, such as an empty
+result after normalization, cannot change the language of a following date.
+Speech waiting for model loading reports `language_pending`; deferred items
+resolve in FIFO order using preceding accepted language evidence. Old work
+cannot overwrite a newer ASR turn, changed setting, or restarted instance.
+Explicit `action=language` still establishes current-user context immediately.
+
 English standalone fractions use fraction nouns (`one half`, `two thirds`,
 `three quarters`). An explicit arithmetic context such as `Calculate 2/3` or
 `x=2/3` retains the division reading. Dates and URL paths keep priority over
 fraction parsing.
+
+Explicit ranges such as `0.5–1.5A` retain the range relation (`到` / `to`),
+and `KB/s`, `MB/s`, `GB/s` are complete byte-rate units. Unit case matters:
+`MB/s` is not treated as `Mb/s`. An ASCII subtraction sign in a formula keeps
+its arithmetic meaning.
 
 Currency parsing recognizes complete `$`, `£` and `€` amounts with valid comma
 grouping. English uses major/minor units for up to two decimal places; greater
@@ -375,12 +388,58 @@ original dictionary; an existing fanyi Gold file is not loaded as an overlay.
 The complete uppercase abbreviations `US`, `IT`, `ID`, and `IP` are spelled
 as letters before normalization; ordinary lowercase words keep their readings.
 
+#### Reviewed domain hotwords
+
+`frontend/hotwords.py` adds a small optional supplement shared by English and
+mixed speech. Lookup keeps CUSTOM and verified corrections first, then an
+eligible hotword, then CMU and G2P. It never loads the complete Gold dictionary.
+The initial OOV candidates are `Airbnb` (case-insensitive) and `ASML` (exact
+uppercase), taken from fanyi's source SHA256
+`1fbc44b3a222ff92d9f74082a0236f96dc23d84ef44d3f4e226f7a777abd5ffb`.
+Their phone sequences are checked against the source and model inventory;
+device listening acceptance is a separate check.
+
+Deployments may supply a local version-1 JSON manifest using
+`VITS2_HOTWORDS_PATH`, optionally pinned by `VITS2_HOTWORDS_SHA256`.
+`VITS2_HOTWORD_DOMAIN` defaults to `general`; selecting a domain is explicit,
+not inferred from a sentence. For example, a reviewed financial ticker may
+override a word only in a financial deployment. Ordinary `Wen` and `car` retain
+CMU readings in the default deployment. Token language is `en` even when the
+English word appears inside Chinese speech; panel language does not translate it.
+
+Each manifest entry must declare `text`, `arpa` (stressed ARPAbet), `case`
+(`exact`/`fold`), `languages` (`["en"]`), `domain`, integer `priority`,
+`enabled`, `reviewed`, `source`, and `source_sha256`. `override_cmu` defaults
+to false; enabling it requires exact case and a specific non-general domain.
+Higher priority wins between eligible entries; ambiguous equal priorities,
+invalid phones, checksum errors, and raw Gold files are rejected. The local
+manifest is bounded to 64 KiB / 128 reviewed entries and performs no downloads.
+Changing its configured path/SHA selects a new cached manifest. Editing the
+same file requires `reload_hotwords()` or a service restart; speech does not
+reread the file for each token. This adds no UI, new model, or runtime package
+dependency.
+
 The terminology layer retains 3,558 text mappings and 828 IPA reference
 records from jinghong's `frontend_res` collection, whose source fields name
 zhangjinghong and i-wangtianshuo. The generated data matches those annotations;
 577 generated rules are active after filtering unchanged readings, bare
 numbers and curated overrides. IPA records are reference metadata, not direct
 runtime phoneme overrides. This layer is distinct from the CMU dictionary.
+
+Known lexical versions are resolved before later normalization can reinterpret
+their digits. Fixed Chinese/English preferences also apply inside opposite-
+language prose: `StyleTTS2` uses 二/two and `Velo3D` uses 三 D/three D.
+Generated phrase matches preserve line boundaries and do not match inside
+longer Latin words, including accented letters. `OpenAI`, `SkyAI`, and
+`MBody AI` retain both letter names in AI; ordinary words such as `Hello`
+keep the published CMU pronunciation and stress.
+
+The Chinese frontend keeps its inherited 105 effective custom phrases and
+adds nine reviewed robot/UI phrases with matching segmentation support:
+长时间、长按、重试、重连、重发、调高、调低、调参、这行代码。
+The particle 地 is handled in its grammatical context, separately from lexical
+dì in 土地/目的地. These are targeted frontend corrections; unknown names and
+ambiguous readings still require pronunciation review and device listening.
 
 Context-aware normalization covers telephone numbers, dates and times,
 order IDs, last-four digits, model numbers, fractions, scientific notation,

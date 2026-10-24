@@ -27,6 +27,9 @@ _UNITS = {
     "GB": ("G B", "gigabyte", "gigabytes"),
     "MB": ("M B", "megabyte", "megabytes"),
     "KB": ("K B", "kilobyte", "kilobytes"),
+    "GB/s": ("G B 每秒", "gigabyte per second", "gigabytes per second"),
+    "MB/s": ("M B 每秒", "megabyte per second", "megabytes per second"),
+    "KB/s": ("K B 每秒", "kilobyte per second", "kilobytes per second"),
     "A": ("安培", "ampere", "amperes"),
     "mA": ("毫安", "milliampere", "milliamperes"),
     "V": ("伏特", "volt", "volts"),
@@ -61,6 +64,15 @@ _TEMPERATURE_RANGE = re.compile(
     rf"(?<![A-Za-z0-9_.])(?P<low>[+-]?{_NUMBER})\s*(?P<low_unit>℃|℉|°C|°F)"
     rf"\s*(?:～|~|–|—|-|(?i:to))\s*"
     rf"(?P<high>[+-]?{_NUMBER})\s*(?P<high_unit>℃|℉|°C|°F){_UNIT_END}"
+)
+# An en/em dash, tilde or explicit range word is unambiguous here. Do not
+# reinterpret an ASCII subtraction sign in formulas as a measurement range.
+_HWS = r"[^\S\r\n\v\f\u0085\u2028\u2029]*"
+_MEASURE_RANGE = re.compile(
+    rf"(?<![A-Za-z0-9_.])(?P<low>[+-]?{_NUMBER}){_HWS}"
+    rf"(?:(?P<low_unit>{_UNIT_EXPR}){_HWS})?"
+    rf"(?:～|~|–|—|到|至|(?i:to)){_HWS}"
+    rf"(?P<high>[+-]?{_NUMBER}){_HWS}(?P<high_unit>{_UNIT_EXPR}){_UNIT_END}"
 )
 _FRACTION = re.compile(
     r"(?<![A-Za-z0-9_./])(?P<numerator>\d+)\s*/\s*(?P<denominator>\d+)"
@@ -282,6 +294,18 @@ def find_spans(text, language, verbalize_number):
         high = _measure_spoken(match["high"], match["high_unit"], language, verbalize_number)
         spoken = f"{low} {'到' if zh else 'to'} {high}"
         spans.append((match.start(), match.end(), spoken))
+
+    for match in _MEASURE_RANGE.finditer(text):
+        if re.search(r"[\r\n\v\f\u0085\u2028\u2029]", match.group()) or overlaps(match.start(), match.end()) or any(
+            match.start() < end and match.end() > start for start, end in scientific_cores
+        ):
+            continue
+        low = (_measure_spoken(match["low"], match["low_unit"], language, verbalize_number)
+               if match["low_unit"] else verbalize_number(match["low"], language))
+        if zh and not match["low_unit"] and match["high_unit"] == "%":
+            low = "百分之 " + low
+        high = _measure_spoken(match["high"], match["high_unit"], language, verbalize_number)
+        spans.append((match.start(), match.end(), f"{low} {'到' if zh else 'to'} {high}"))
 
     for match in _SCIENTIFIC.finditer(text):
         if overlaps(match.start(), match.end()):

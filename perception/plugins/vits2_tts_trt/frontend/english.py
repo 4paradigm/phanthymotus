@@ -1,12 +1,14 @@
 import pickle
 import os
 import re
+import unicodedata
 import inflect
 import numpy as np
 
 from .symbols import punctuation, symbols
 from .technical_text import normalize_technical_lexemes
 from .release_paths import frontend_data_dir, nltk_data_dir
+from .hotwords import lookup_hotword
 
 current_file_path = os.path.dirname(__file__)
 
@@ -55,7 +57,8 @@ def post_replace_ph(ph):
 rep_map = {
     ":": ",", ";": ",",
     "：": ",", "；": ",", "，": ",", "。": ".", "！": "!", "？": "?",
-    "\n": ".", "．": ".", "…": "...", "···": "...", "・・・": "...",
+    "\n": ".", "\r": ".", "\v": ".", "\f": ".",
+    "\x85": ".", "\u2028": ".", "\u2029": ".", "．": ".", "…": "...", "···": "...", "・・・": "...",
     "·": ",", "・": ",", "、": ",", "$": ".", "\u201c": "'", "\u201d": "'",
     '"': "'", "\u2018": "'", "\u2019": "'", "（": "'", "）": "'",
     "(": "'", ")": "'", "《": "'", "》": "'", "【": "'", "】": "'",
@@ -194,7 +197,7 @@ def normalize_numbers(text):
 ACRONYM_SPLIT_RE = re.compile(r'\b([A-Z]{2,})\b')
 KNOWN_ACRONYMS = {
     'chatgpt': 'chat GPT',
-    'openai': 'open AI',
+    'openai': 'open A I',
     'github': 'git hub',
     'youtube': 'you tube',
     'linkedin': 'linked in',
@@ -202,15 +205,22 @@ KNOWN_ACRONYMS = {
 }
 # These uppercase abbreviations share CMU keys with ordinary lowercase words.
 # Expand only complete uppercase tokens, before FST can lowercase them (IP).
-_EXPLICIT_UPPERCASE_ACRONYMS = frozenset({"US", "IT", "ID", "IP"})
+_EXPLICIT_UPPERCASE_ACRONYMS = frozenset({"US", "IT", "ID", "IP", "AI"})
 
 
 def _spell_explicit_uppercase_acronyms(text):
-    return _EN_LEXICON_WORD_RE.sub(
-        lambda match: " ".join(match.group())
-        if match.group() in _EXPLICIT_UPPERCASE_ACRONYMS else match.group(),
-        text,
-    )
+    def spell(match):
+        if match.group() not in _EXPLICIT_UPPERCASE_ACRONYMS:
+            return match.group()
+        # CJK adjacency is allowed, but an accented Latin prefix/suffix or
+        # combining mark still belongs to the same word (e.g. caféAI/AIé).
+        neighbors = text[max(0, match.start() - 1):match.start()] + text[match.end():match.end() + 1]
+        if any(is_latin_letter(char) or unicodedata.category(char).startswith("M")
+               for char in neighbors):
+            return match.group()
+        return " ".join(match.group())
+
+    return _EN_LEXICON_WORD_RE.sub(spell, text)
 
 
 def _split_acronym(m):
@@ -343,15 +353,17 @@ VERIFIED_EN_PRONUNCIATIONS = {
 
 
 def english_pronunciation(token):
-    """Liaoqianqian CUSTOM, verified terms, then CMU, shared by both G2P routes.
+    """CUSTOM, verified terms, eligible hotwords, then CMU in both G2P routes.
 
-    Return None for the caller's existing G2P fallback. Previously installed
-    external overlays are deliberately not consulted.
+    Return None for the caller's G2P fallback. Raw Gold overlays stay disabled;
+    only explicitly reviewed supplements can participate in lookup.
     """
     word = token.upper()
-    return CUSTOM_EN_PRONUNCIATIONS.get(
-        word, VERIFIED_EN_PRONUNCIATIONS.get(word, eng_dict.get(word)),
-    )
+    if word in CUSTOM_EN_PRONUNCIATIONS:
+        return CUSTOM_EN_PRONUNCIATIONS[word]
+    if word in VERIFIED_EN_PRONUNCIATIONS:
+        return VERIFIED_EN_PRONUNCIATIONS[word]
+    return lookup_hotword(token, has_cmu=word in eng_dict) or eng_dict.get(word)
 
 
 _EN_LEXICON_WORD_RE = re.compile(
@@ -391,7 +403,8 @@ def normalize_preserving_english_pronunciations(text, normalize_plain):
         if (len(word) >= 3 and word not in _EN_TN_CONTEXT_WORDS
                 and (word in CUSTOM_EN_PRONUNCIATIONS
                      or word in VERIFIED_EN_PRONUNCIATIONS
-                     or word in _EN_TN_PRESERVED_WORDS)):
+                     or word in _EN_TN_PRESERVED_WORDS
+                     or lookup_hotword(match.group(), has_cmu=word in eng_dict) is not None)):
             protected.append(match)
     if not protected:
         return normalize_plain(text)
@@ -413,7 +426,90 @@ def normalize_preserving_english_pronunciations(text, normalize_plain):
     return " ".join(part.strip() for part in output if part.strip())
 
 
+
+def is_latin_letter(char):
+    """Recognize Latin letters without treating CJK, Greek or math as English."""
+    return char.isalpha() and "LATIN" in unicodedata.name(char, "")
+
+
+def iter_latin_words(text):
+    """Yield complete Latin words, retaining attached marks and identifier tails."""
+    index = 0
+    while index < len(text):
+        if not is_latin_letter(text[index]):
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < len(text):
+            char = text[index]
+            if is_latin_letter(char) or unicodedata.category(char).startswith("M") or char.isascii() and (char.isdigit() or char == "_"):
+                index += 1
+            elif char in "'’-" and index + 1 < len(text) and (is_latin_letter(text[index + 1]) or text[index + 1].isascii() and text[index + 1].isdigit()):
+                index += 1
+            else:
+                break
+        yield start, index
+
+
+def normalize_ordinary_latin_text(text, normalize_plain):
+    """Keep ordinary English prose out of the Chinese FST.
+
+    Structured quantities, addresses and identifiers are resolved by the caller
+    first. Remaining alphanumeric identifiers stay on the original TN path.
+    Latin words use the existing number-free English cleanup and shared G2P.
+    Line boundaries remain explicit until punctuation conversion.
+    """
+    if re.search(r"[\r\n\v\f\x85\u2028\u2029]", text):
+        return "\n".join(
+            normalize_ordinary_latin_text(line, normalize_plain)
+            for line in re.split(r"\r\n|[\r\n\v\f\x85\u2028\u2029]", text)
+        )
+    # A title before a capitalized name, including CJK-adjacent titles. Bare
+    # DR and road abbreviations retain CMU; accented Latin prefixes are still
+    # part of a word and cannot create a title boundary.
+    def doctor_title(match):
+        previous = text[match.start() - 1] if match.start() else ""
+        if previous and (is_latin_letter(previous)
+                         or unicodedata.category(previous).startswith("M")):
+            return match.group()
+        return "doctor"
+
+    text = re.sub(r"(?<![A-Za-z0-9_])(?i:dr)\.(?=[ \t]+[A-ZÀ-ÖØ-Þ])",
+                  doctor_title, text)
+    # Keep standalone line-initial Roman list markers on the legacy FST route,
+    # while a sentence-final pronoun in "You and I." remains an English word.
+    romans = [match.span() for match in re.finditer(
+        r"(?<![A-Za-z])(?:[IVXLCDM]{2,}\.|^[ \t]*[IVXLCDM]\.)(?=$|[ \t]+\S)", text
+    )]
+    pieces, cursor = [], 0
+    for start, end in iter_latin_words(text):
+        word = text[start:end]
+        if (any(c.isdigit() for c in word)
+                or start and (text[start - 1].isascii() and (text[start - 1].isalnum() or text[start - 1] == "_"))
+                or any(a <= start < b for a, b in romans)):
+            continue
+        if cursor < start:
+            pieces.append(normalize_plain(text[cursor:start]))
+        if "_" in word:
+            # The release FST also contains product rewrites that ignore
+            # underscore identifier boundaries. Preserve nonnumeric identifier
+            # pieces here; final punctuation cleanup still voices each piece
+            # separately. Keep explicit uppercase letter spellings, but do not
+            # apply product aliases inside the identifier.
+            pieces.append("_".join(_spell_explicit_uppercase_acronyms(part)
+                                   for part in word.split("_")))
+        else:
+            pieces.append(text_normalize_without_numbers(unicodedata.normalize("NFC", word)))
+        cursor = end
+    if cursor < len(text):
+        pieces.append(normalize_plain(text[cursor:]))
+    normalized = " ".join(piece.strip() for piece in pieces if piece.strip())
+    return re.sub(r" +([,.!?;:])", r"\1", normalized)
+
+
 def g2p_token(token):
+    token = unicodedata.normalize("NFC", token)
     if token in punctuation:
         return (token,), (0,)
     # Uppercase A is a spelled letter (for example, OA), not the article "a".

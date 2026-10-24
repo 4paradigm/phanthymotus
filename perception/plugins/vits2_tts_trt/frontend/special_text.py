@@ -177,7 +177,7 @@ def normalize_special_text(text, normalize_plain, verbalize_number, language=Non
         cursor = end
     if cursor < len(text):
         output.append(normalize_plain(text[cursor:]))
-    normalized = re.sub(r"\s+", " ", "".join(output)).strip()
+    normalized = re.sub(r"[^\S\r\n\v\f\x85\u2028\u2029]+", " ", "".join(output)).strip(" \t")
     # A MIX request can later produce a Chinese-only chunk. Chinese G2P
     # removes whitespace after punctuation while splitting sentences, so
     # retaining it here breaks word2ph alignment in those merged chunks.

@@ -1,0 +1,131 @@
+"""Small reviewed English-token supplement; the source Gold is never loaded.
+
+Optional local manifest: VITS2_HOTWORDS_PATH, VITS2_HOTWORDS_SHA256 (optional).
+VITS2_HOTWORD_DOMAIN selects a deployment domain, defaulting to ``general``.
+Manifests stay fixed until the path/SHA changes or reload_hotwords() is called.
+English tokens in Chinese speech still use language="en". This does not infer
+the sentence's language, translate text, or match substrings/whole sentences.
+"""
+
+from functools import lru_cache
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+
+from .symbols import en_symbols
+
+_MAX_BYTES = 64 * 1024
+_MAX_ENTRIES = 128
+_TOKEN = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*\Z")
+_VOWELS = set("AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW".split())
+_CONSONANTS = set("B CH D DH F G HH JH K L M N NG P R S SH T TH V W Y Z ZH".split())
+_MODEL_PHONES = set(en_symbols)
+_GOLD_SHA = "1fbc44b3a222ff92d9f74082a0236f96dc23d84ef44d3f4e226f7a777abd5ffb"
+
+# Reviewed phone sequences from the pinned source, not new acoustic acceptance.
+# Neither key occurs in the released CMU. No finance/ticker overrides by default.
+_DEFAULTS = (
+    {"text": "Airbnb", "arpa": ["EH1", "R", "B", "IY1", "EH1", "N", "B", "IY1"], "case": "fold"},
+    {"text": "ASML", "arpa": ["EY1", "EH1", "S", "EH1", "M", "EH1", "L"], "case": "exact"},
+)
+
+
+def _entry(row):
+    """Validate to an immutable tuple; disabled candidates never become active."""
+    if not isinstance(row, dict) or type(row.get("enabled")) is not bool or type(row.get("reviewed")) is not bool:
+        raise ValueError("Hotword entries require explicit enabled and reviewed booleans")
+    if not row["enabled"]:
+        return None
+    if not row["reviewed"]:
+        raise ValueError("Enabled hotwords must be reviewed")
+    text, case = row.get("text"), row.get("case")
+    languages, domain = row.get("languages"), row.get("domain")
+    priority, override = row.get("priority"), row.get("override_cmu", False)
+    if not isinstance(text, str) or not _TOKEN.fullmatch(text) or case not in ("exact", "fold"):
+        raise ValueError("Hotwords require a complete Latin token and case=exact or fold")
+    if not isinstance(languages, list) or not languages or any(x != "en" for x in languages):
+        raise ValueError("Hotword language is the English token language: languages=['en']")
+    if not isinstance(domain, str) or not re.fullmatch(r"\*|[a-z][a-z0-9_-]{0,31}", domain):
+        raise ValueError("Hotwords require an explicit domain")
+    if type(priority) is not int or not -1000 <= priority <= 1000 or type(override) is not bool:
+        raise ValueError("Hotwords require an integer priority and boolean override_cmu")
+    if override and (case != "exact" or domain in ("*", "general")):
+        raise ValueError("CMU overrides require exact case and a specific non-general domain")
+    if not isinstance(row.get("source"), str) or not row["source"].strip() or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("source_sha256", ""))):
+        raise ValueError("Hotwords require source and source_sha256 provenance")
+    arpa = row.get("arpa")
+    if not isinstance(arpa, list) or not 1 <= len(arpa) <= 64:
+        raise ValueError("Hotword arpa must be a nonempty list of at most 64 phones")
+    for phone in arpa:
+        match = re.fullmatch(r"([A-Z]+)([012])?", phone) if isinstance(phone, str) else None
+        if not match:
+            raise ValueError("Invalid hotword ARPAbet phone")
+        base, stress = match.groups()
+        model_phone = "V" if base == "V" else base.lower()
+        if not ((base in _VOWELS and stress is not None) or (base in _CONSONANTS and stress is None)) or model_phone not in _MODEL_PHONES:
+            raise ValueError("Hotword ARPAbet phone is incompatible with the model")
+    return text, case, tuple(languages), domain, priority, override, tuple(arpa)
+
+
+_BUILTINS = tuple(_entry(dict(row, enabled=True, reviewed=True, languages=["en"],
+                            domain="*", priority=0, override_cmu=False,
+                            source="fanyi/en_gold_pronunciations.json", source_sha256=_GOLD_SHA))
+                  for row in _DEFAULTS)
+
+
+@lru_cache(maxsize=8)
+def _load_external(path, checksum):
+    # Read once per explicit configuration, avoiding disk I/O for every token.
+    with open(path, "rb") as stream:
+        payload = stream.read(_MAX_BYTES + 1)
+    if len(payload) > _MAX_BYTES:
+        raise ValueError("Hotword manifest exceeds 64 KiB; raw Gold is not a manifest")
+    if checksum and hashlib.sha256(payload).hexdigest() != checksum:
+        raise ValueError("Hotword manifest SHA256 mismatch")
+    data = json.loads(payload)
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("entries"), list):
+        raise ValueError("Hotword manifest requires version=1 and entries; raw Gold is not supported")
+    if len(data["entries"]) > _MAX_ENTRIES:
+        raise ValueError("Hotword manifest exceeds 128 reviewed entries")
+    entries = tuple(filter(None, (_entry(row) for row in data["entries"])))
+    for index, left in enumerate(_BUILTINS + entries):
+        for right in (_BUILTINS + entries)[index + 1:]:
+            shared_case = left[0] == right[0] if left[1] == right[1] == "exact" else left[0].upper() == right[0].upper()
+            shared_domain = left[3] == right[3] or "*" in (left[3], right[3])
+            if shared_case and shared_domain and set(left[2]) & set(right[2]) and left[4] == right[4]:
+                raise ValueError("Overlapping hotwords require different explicit priorities")
+    return entries
+
+
+def reload_hotwords():
+    """Explicitly reload an edited local manifest on the next lookup."""
+    _load_external.cache_clear()
+
+
+def lookup_hotword(token, *, language="en", domain=None, has_cmu=False):
+    """Return a fresh CMU-shaped pronunciation, or None to retain normal lookup.
+
+    Caller keeps CUSTOM/VERIFIED first and passes has_cmu for the CMU guard.
+    Explicit domain overrides can precede CMU; general supplements cannot.
+    """
+    if not isinstance(token, str) or not _TOKEN.fullmatch(token):
+        return None
+    selected_domain = domain if domain is not None else os.environ.get("VITS2_HOTWORD_DOMAIN", "general")
+    entries = _BUILTINS
+    path = os.environ.get("VITS2_HOTWORDS_PATH", "")
+    checksum = os.environ.get("VITS2_HOTWORDS_SHA256", "").strip().lower()
+    if checksum and (not path or not re.fullmatch(r"[0-9a-f]{64}", checksum)):
+        raise ValueError("Hotword SHA256 requires a manifest path and 64 hexadecimal digits")
+    if path:
+        source = Path(path).expanduser().resolve()
+        entries += _load_external(str(source), checksum)
+    matches = [row for row in entries
+               if language in row[2] and row[3] in ("*", selected_domain)
+               and (token == row[0] if row[1] == "exact" else token.upper() == row[0].upper())
+               and (not has_cmu or row[5])]
+    if not matches:
+        return None
+    chosen = max(matches, key=lambda row: row[4])
+    return [list(chosen[6])]

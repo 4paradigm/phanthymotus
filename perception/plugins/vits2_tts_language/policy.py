@@ -13,6 +13,7 @@ import re
 import threading
 import unicodedata
 import uuid
+import weakref
 
 from ..vits2_tts_trt.frontend.mixed_context import context_diagnostics, protected_spans
 from .name_text import normalize_standalone_name
@@ -32,6 +33,21 @@ class SpeechRequest:
     text: str
     language: str
     turn_id: str
+
+
+@dataclass
+class DirectTurn:
+    """Unaccepted direct speech; pending queues own its lifetime, not policy."""
+
+    owner: object
+    epoch: int
+    sequence: int
+    mode: str
+    remembered_language: object
+    history_sequence: int
+    turn_id: str
+    accepted_language: object = None
+    completed: bool = False
 
 
 def _mode(value):
@@ -201,6 +217,8 @@ class LanguagePolicy:
         self._remembered_language = None
         self._turn_id = None
         self._last_error = None
+        self._epoch = self._sequence = self._language_sequence = self._error_sequence = 0
+        self._pending_direct = weakref.WeakValueDictionary()
 
     def configure(self, reply_language):
         validated = _mode(reply_language)
@@ -211,8 +229,79 @@ class LanguagePolicy:
                 self._turn_id = None
                 self._resolved_language = None
                 self._remembered_language = None
+                self._epoch += 1
+                self._sequence += 1
+                self._language_sequence = self._sequence
             self._last_error = None
+            self._error_sequence = self._sequence
             return self.snapshot()
+
+    def reserve_direct(self, text):
+        """Allocate ordering only. Frontend rejection must not change history."""
+        text = _text(text)
+        if "other" in _scripts(text):
+            raise LanguagePolicyError("unsupported_script", "Only Chinese and Latin scripts are supported")
+        with self.lock:
+            self._sequence += 1
+            turn = DirectTurn(self, self._epoch, self._sequence, self._mode,
+                              self._remembered_language, self._language_sequence,
+                              uuid.uuid4().hex)
+            self._pending_direct[turn.sequence] = turn
+            return turn
+
+    def preview_direct(self, turn, text, requested_reply_language=None):
+        """Read a candidate's captured mode and last accepted predecessor."""
+        with self.lock:
+            if turn.owner is not self:
+                raise LanguagePolicyError("stale_turn", "Speech belongs to another instance")
+            detected = _detect_text_language(text)
+            if requested_reply_language is not None:
+                resolved, source = requested_reply_language, "requested"
+            elif turn.mode != "auto":
+                resolved, source = turn.mode, "fixed"
+            elif detected is not None:
+                resolved, source = detected, "text"
+            elif turn.remembered_language is not None and _is_language_neutral_input(text):
+                resolved, source = turn.remembered_language, "history"
+            else:
+                resolved, source = "zh", "default"
+            return {"reply_language": resolved, "reply_language_mode": turn.mode,
+                    "language_source": source, "turn_id": turn.turn_id}
+
+    def accept_direct(self, turn, language, source):
+        """Commit after validated speech enters its live node's queue.
+
+        Earlier successes can inform later deferred requests without replacing
+        a newer ASR turn/configuration. Failed/loading requests never seed them.
+        """
+        with self.lock:
+            if turn.owner is not self:
+                raise LanguagePolicyError("stale_turn", "Speech belongs to another instance")
+            remember = turn.mode == "auto" and source in ("requested", "text")
+            if remember:
+                for pending in list(self._pending_direct.values()):
+                    if (pending.epoch == turn.epoch and pending.sequence > turn.sequence
+                            and pending.history_sequence < turn.sequence):
+                        pending.remembered_language = language
+                        pending.history_sequence = turn.sequence
+            turn.accepted_language = language
+            turn.completed = True
+            self._pending_direct.pop(turn.sequence, None)
+            if turn.epoch != self._epoch:
+                return
+            if turn.sequence > self._language_sequence:
+                self._resolved_language, self._turn_id = language, turn.turn_id
+                if remember:
+                    self._remembered_language = language
+                self._language_sequence = turn.sequence
+            if turn.sequence >= self._error_sequence:
+                self._last_error = None
+                self._error_sequence = turn.sequence
+
+    def cancel_direct(self, turn):
+        with self.lock:
+            turn.completed = True
+            self._pending_direct.pop(turn.sequence, None)
 
     def begin_turn(self, text, input_language=None, requested_reply_language=None):
         text = _text(text)
@@ -252,6 +341,8 @@ class LanguagePolicy:
             self._resolved_language = resolved
             self._turn_id = uuid.uuid4().hex
             self._last_error = None
+            self._sequence += 1
+            self._language_sequence = self._error_sequence = self._sequence
             instruction = (
                 "Reply mainly in Chinese. Chinese-English mixing is allowed; "
                 "include English words or passages where appropriate, including "
@@ -295,8 +386,20 @@ class LanguagePolicy:
             )
             return SpeechRequest(text, self._resolved_language, self._turn_id)
 
-    def record_error(self, error):
+    def record_error(self, error, direct_turn=None, turn_id=None):
         with self.lock:
+            if direct_turn is not None:
+                direct_turn.completed = True
+                self._pending_direct.pop(direct_turn.sequence, None)
+                if (direct_turn.owner is not self or direct_turn.epoch != self._epoch
+                        or direct_turn.sequence < self._error_sequence):
+                    return
+                self._error_sequence = direct_turn.sequence
+            elif turn_id is not None and turn_id != self._turn_id:
+                return
+            else:
+                self._sequence += 1
+                self._error_sequence = self._sequence
             if isinstance(error, LanguagePolicyError):
                 self._last_error = {"code": error.code, "message": str(error)}
             else:
@@ -305,9 +408,12 @@ class LanguagePolicy:
                     "message": "Invalid language-aware TTS request",
                 }
 
-    def clear_error(self):
+    def clear_error(self, turn_id=None):
         with self.lock:
+            if turn_id is not None and turn_id != self._turn_id:
+                return
             self._last_error = None
+            self._error_sequence = self._sequence
 
     def snapshot(self):
         with self.lock:

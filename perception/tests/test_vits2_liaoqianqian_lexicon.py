@@ -8,6 +8,7 @@ No acoustic inference, network access or full dictionary copy is needed.
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import pickle
 import re
@@ -207,6 +208,39 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                 self.english._g2p.assert_called_with(token)
                 self.mixed._g2p_en.assert_called_with(token)
 
+    def test_reviewed_hotwords_reach_both_g2p_routes_without_whole_gold(self):
+        for token, phones, tones in (
+            ("Airbnb", ("eh", "r", "b", "iy", "eh", "n", "b", "iy"), (2, 3, 3, 2, 2, 3, 3, 2)),
+            ("ASML", ("ey", "eh", "s", "eh", "m", "eh", "l"), (2, 2, 3, 2, 3, 2, 3)),
+        ):
+            with self.subTest(token=token):
+                self.assertNotIn(token.upper(), self.english.eng_dict)
+                self.assertEqual(self.english.text_normalize_without_numbers(token), token)
+                self.assert_both_routes(token, phones, tones)
+        self.english._g2p.assert_not_called()
+
+    def test_domain_override_never_changes_ordinary_words_or_curated_priority(self):
+        def term(text, arpa):
+            return dict(text=text, arpa=arpa, case="exact", languages=["en"], domain="finance",
+                        priority=10, enabled=True, reviewed=True, override_cmu=True,
+                        source="fixture", source_sha256="a" * 64)
+        path = self.directory / "reviewed.json"
+        path.write_text(json.dumps({"version": 1, "entries": [
+            term("WEN", ["W", "EH1", "N", "D", "IY0", "Z"]),
+            term("CUDA", ["B", "AE1", "D"]), term("NVIDIA", ["B", "AE1", "D"]),
+        ]}), encoding="utf-8")
+        with patch.dict(os.environ, {"VITS2_HOTWORDS_PATH": str(path), "VITS2_HOTWORDS_SHA256": "",
+                                     "VITS2_HOTWORD_DOMAIN": "general"}):
+            self.assert_both_routes("WEN", ("w", "eh", "n"), (3, 2, 3))
+            os.environ["VITS2_HOTWORD_DOMAIN"] = "finance"
+            self.assert_both_routes("WEN", ("w", "eh", "n", "d", "iy", "z"), (3, 2, 3, 3, 1, 3))
+            for token in ("Wen", "wen"):
+                self.assert_both_routes(token, ("w", "eh", "n"), (3, 2, 3))
+            self.assertEqual(self.english.english_pronunciation("CUDA"), CUSTOM_EXPECTED["CUDA"])
+            self.assertEqual(self.english.english_pronunciation("NVIDIA"), VERIFIED_EXPECTED["NVIDIA"])
+            self.assert_both_routes("car", ("k", "aa", "r"), (3, 2, 3))
+        self.assert_both_routes("WEN", ("w", "eh", "n"), (3, 2, 3))
+
     def test_gold_present_malformed_or_missing_cannot_change_lookup(self):
         for state in ("valid", "malformed", "missing"):
             with self.subTest(state=state):
@@ -346,6 +380,75 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
         self.assertEqual(self.lexicon.apply_lexeme_rules("Qwen", language="EN"), "Qwen")
         self.assertEqual(self.english.g2p_token("."), ((".",), (0,)))
 
+    def test_generated_replacements_are_opaque_to_curated_lexemes(self):
+        rules = [(self.lexicon._edge("ExampleTerm"), "AI platform")]
+        for language in ("EN", "MIX", "ZH"):
+            with self.subTest(language=language), patch.object(self.lexicon, "_GENERATED_RULES", rules):
+                self.assertEqual(self.lexicon.apply_lexeme_rules("ExampleTerm AI", language),
+                                 "AI platform A I")
+
+    def test_literal_old_markers_and_private_use_input_never_collide(self):
+        rules = [(self.lexicon._edge("ExampleTerm"), "AI platform")]
+        for literal in (r"\x00LEX0\x00", r"\x00LEX1\x00", "\ue000\ue001\ue010\ue002", "\ue000\ue000"):
+            with self.subTest(literal=literal), patch.object(self.lexicon, "_GENERATED_RULES", rules):
+                self.assertEqual(self.lexicon.apply_lexeme_rules(literal + " ExampleTerm"),
+                                 literal + " AI platform")
+
+    def test_identifier_boundaries_keep_names_and_acronyms_whole(self):
+        for text in ("foo_Qwen_bar", "foo_Qwen3_bar", "foo_AI_bar", "foo_SkyAI_bar"):
+            for language in ("EN", "ZH", "MIX"):
+                with self.subTest(text=text, language=language):
+                    self.assertEqual(self.lexicon.apply_lexeme_rules(text, language), text)
+        self.assertEqual(self.lexicon.apply_lexeme_rules("你好Qwen3和AI"), "你好千问三和A I")
+
+    def test_latin_letters_and_combining_marks_are_lexeme_boundaries(self):
+        for text in ("éMongoDBé", "caféAI", "你好Qwené", "Qwen3é", "éStyleTTS2",
+                     "MongoDB\u0301", "e\u0301MongoDB", "ＡQwen", "foo_Velo3D_bar"):
+            for language in ("EN", "ZH", "MIX"):
+                with self.subTest(text=text, language=language):
+                    self.assertEqual(self.lexicon.apply_lexeme_rules(text, language), text)
+                    self.assertEqual(self.lexicon.normalize_numeric_lexemes(text, language), text)
+        self.assertEqual(self.lexicon.apply_lexeme_rules("使用MongoDB数据库"),
+                         "使用Mongo DB数据库")
+        self.assertEqual(self.lexicon.apply_lexeme_rules("你好Qwen和AI"), "你好千问和A I")
+
+    def test_generated_phrase_spacing_never_consumes_a_line_boundary(self):
+        for separator in ("\n", "\r\n", "\r", "\v", "\f", "\x85", "\u2028", "\u2029"):
+            raw = "FACT II" + separator + "Acquisition"
+            for language in ("EN", "ZH", "MIX"):
+                with self.subTest(separator=repr(separator), language=language):
+                    self.assertEqual(self.lexicon.apply_lexeme_rules(raw, language), raw)
+        for separator in (" ", "\t", "\u00a0", "\u3000"):
+            raw = "FACT II" + separator + "Acquisition"
+            self.assertEqual(self.lexicon.apply_lexeme_rules(raw, "EN"), "Fact two Acquisition")
+
+    def test_generated_numbers_are_spoken_before_the_language_context_is_lost(self):
+        for raw, en, zh in (
+            ("FACT II Acquisition", "Fact two Acquisition", "Fact 二 Acquisition"),
+            ("X3 Acquisition", "X three Acquisition", "X 三 Acquisition"),
+            ("X4 Pharmaceuticals", "X four Pharmaceuticals", "X 四 Pharmaceuticals"),
+            ("Velo3D", "Velo three D", "Velo 三 D"),
+            ("StyleTTS2", "style T T S two", "style T T S 二"),
+        ):
+            for language, expected in (("EN", en), ("ZH", zh), ("MIX", zh)):
+                with self.subTest(raw=raw, language=language):
+                    self.assertEqual(self.lexicon.apply_lexeme_rules(raw, language), expected)
+                    actual = self.lexicon.normalize_numeric_lexemes(raw, language)
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(self.lexicon.normalize_numeric_lexemes(actual, language), actual)
+                    # A later local language choice cannot reinterpret an
+                    # already resolved numeric name from a fixed panel mode.
+                    other = "ZH" if language == "EN" else "EN"
+                    self.assertEqual(self.lexicon.apply_lexeme_rules(actual, other), actual)
+
+    def test_numeric_lexeme_helper_does_not_rewrite_unregistered_input(self):
+        for raw in ("111 310 910", "X3", "Velo3DX", "Widget3D", "RTX-4090",
+                    "2026-10-23", "lr=1e-4", "y=2x-3", "1.2A", "NO.0917",
+                    "JFrog AAON JIADE WaFd", "car apps Wen Anna cash"):
+            for language in ("EN", "ZH", "MIX"):
+                with self.subTest(raw=raw, language=language):
+                    self.assertEqual(self.lexicon.normalize_numeric_lexemes(raw, language), raw)
+
     def test_quantities_decimals_and_calendar_context_keep_existing_readings(self):
         examples = (
             ("There are 5690 samples and 2026 robots.",
@@ -432,9 +535,9 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
             with patch.object(self.lexicon, "RULES", prior_rules):
                 prior = self.lexicon.apply_lexeme_rules(identifier, language=language)
             self.assertEqual(actual, prior)
-            # The pre-existing API rule spells the suffix after an underscore.
-            # Restoring these two product names must not alter that baseline.
-            self.assertEqual(actual, "foo_OpenMLDB_v2 featinsight_A P I")
+            # Underscores belong to identifiers for every lexeme rule, so an
+            # acronym suffix must not rewrite part of an otherwise intact ID.
+            self.assertEqual(actual, identifier)
             self.assertNotIn("Open M L D B", actual)
             self.assertNotIn("Feat Insight", actual)
 

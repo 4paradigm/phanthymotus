@@ -43,7 +43,7 @@ class EnglishLexemeContextTest(unittest.TestCase):
         english.replace_punctuation = lambda value: value
         # These tests isolate context routing with an identity FST. The real
         # Dictionary lookup is exercised in test_vits2_liaoqianqian_lexicon.py.
-        english.normalize_preserving_english_pronunciations = (
+        english.normalize_ordinary_latin_text = (
             lambda value, normalize_plain: normalize_plain(value)
         )
         boundary = patch.dict(sys.modules, {english.__name__: english})

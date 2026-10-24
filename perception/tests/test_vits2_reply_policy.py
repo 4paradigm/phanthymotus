@@ -81,6 +81,64 @@ class LanguagePolicyTest(unittest.TestCase):
         next_turn = self.policy.begin_turn("2026 10/23")
         self.assertEqual((next_turn["reply_language"], next_turn["language_source"]), ("en", "history"))
 
+    def test_direct_preview_never_replaces_accepted_history(self):
+        accepted = self.policy.begin_turn("Hello")
+        before = self.policy.snapshot()
+        candidate = self.policy.reserve_direct("你好")
+        self.assertEqual(self.policy.preview_direct(candidate, "你好")["reply_language"], "zh")
+        self.assertEqual(self.policy.snapshot(), before)
+        self.policy.record_error(self.module.LanguagePolicyError("frontend_error", "rejected"), candidate)
+        after = self.policy.snapshot()
+        self.assertEqual(after["turn_id"], accepted["turn_id"])
+        self.assertEqual(after["remembered_language"], "en")
+
+    def test_policy_does_not_retain_abandoned_pending_requests(self):
+        import gc
+        import weakref
+
+        candidate = self.policy.reserve_direct("Hello")
+        reference = weakref.ref(candidate)
+        del candidate
+        gc.collect()
+        self.assertIsNone(reference())
+        self.assertFalse(self.policy._pending_direct)
+
+    def test_pending_neutral_uses_only_successful_earlier_directs(self):
+        first = self.policy.reserve_direct("Hello")
+        failed = self.policy.reserve_direct("呃")
+        date = self.policy.reserve_direct("2026 10/23")
+        self.policy.accept_direct(first, "en", "text")
+        self.policy.record_error(self.module.LanguagePolicyError("frontend_error", "rejected"), failed)
+        self.assertEqual(self.policy.preview_direct(date, "2026 10/23")["reply_language"], "en")
+        self.assertEqual(self.policy.snapshot()["remembered_language"], "en")
+
+    def test_old_direct_can_inform_its_queue_without_overwriting_new_asr(self):
+        first = self.policy.reserve_direct("Hello")
+        date = self.policy.reserve_direct("2026 10/23")
+        current = self.policy.begin_turn("你好", input_language="zh")
+        self.policy.accept_direct(first, "en", "text")
+        self.assertEqual(self.policy.preview_direct(date, "2026 10/23")["reply_language"], "en")
+        self.policy.accept_direct(date, "en", "history")
+        self.assertEqual(self.policy.snapshot()["turn_id"], current["turn_id"])
+        self.assertEqual(self.policy.snapshot()["remembered_language"], "zh")
+
+    def test_failed_newer_request_does_not_block_older_success_or_lose_error(self):
+        first = self.policy.reserve_direct("Hello")
+        failed = self.policy.reserve_direct("呃")
+        self.policy.record_error(self.module.LanguagePolicyError("frontend_error", "rejected"), failed)
+        self.policy.accept_direct(first, "en", "text")
+        self.assertEqual(self.policy.snapshot()["remembered_language"], "en")
+        self.assertEqual(self.policy.snapshot()["last_language_error"]["code"], "frontend_error")
+
+    def test_late_success_and_error_cannot_override_newer_accepted_direct(self):
+        older = self.policy.reserve_direct("你好")
+        newer = self.policy.reserve_direct("Hello")
+        self.policy.accept_direct(newer, "en", "text")
+        before = self.policy.snapshot()
+        self.policy.accept_direct(older, "zh", "text")
+        self.policy.record_error(self.module.LanguagePolicyError("frontend_error", "rejected"), older)
+        self.assertEqual(self.policy.snapshot(), before)
+
     def test_invalid_input_and_config_do_not_mutate_accepted_turn(self):
         accepted = self.policy.begin_turn("hello")
         before = self.policy.snapshot()
@@ -503,6 +561,26 @@ class LanguagePolicyTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(normalize_neutral_text(text, "zh"), zh)
                 self.assertEqual(normalize_neutral_text(text, "en"), en)
+
+    def test_reviewed_gpu_reading_does_not_become_english_language_evidence(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_neutral_text
+
+        for text in ("RTX4090", "RTX 4090", "rtx‑4090"):
+            for prior, language, source, expected in (
+                (None, "zh", "default", "R T X 四零九零"),
+                ("Hello", "en", "history", "R T X forty ninety"),
+                ("你好", "zh", "history", "R T X 四零九零"),
+            ):
+                with self.subTest(text=text, prior=prior):
+                    policy = self.module.LanguagePolicy("auto")
+                    if prior is not None:
+                        policy.begin_turn(prior)
+                    turn = policy.begin_turn(text)
+                    self.assertEqual((turn["reply_language"], turn["language_source"]), (language, source))
+                    self.assertIsNone(turn["detected_language"])
+                    request = policy.prepare(text, turn["turn_id"])
+                    self.assertEqual(request.text, text)
+                    self.assertEqual(normalize_neutral_text(request.text, request.language), expected)
 
     def test_punctuation_and_emoji_only_reply_still_require_spoken_words(self):
         for utterance in ("hello", "你好"):

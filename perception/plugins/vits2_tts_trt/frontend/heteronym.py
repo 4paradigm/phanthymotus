@@ -120,3 +120,18 @@ jieba_phrases = (
     "警惕地",
     "那得要",
 )
+
+# Context-specific robot/UI readings. Keep these separate from the inherited
+# dictionary: only these reviewed phrases also establish jieba boundaries.
+# Registering every legacy phrase would activate unrelated ambiguous entries.
+robot_phrase_pinyin = {
+    "长时间": [["cháng"], ["shí"], ["jiān"]],
+    "长按": [["cháng"], ["àn"]],
+    "重试": [["chóng"], ["shì"]],
+    "重连": [["chóng"], ["lián"]],
+    "重发": [["chóng"], ["fā"]],
+    "调高": [["tiáo"], ["gāo"]],
+    "调低": [["tiáo"], ["dī"]],
+    "调参": [["tiáo"], ["cān"]],
+    "这行代码": [["zhè"], ["háng"], ["dài"], ["mǎ"]],
+}

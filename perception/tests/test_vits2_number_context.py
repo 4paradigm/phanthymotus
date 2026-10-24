@@ -140,6 +140,85 @@ class TrailingDigitsContextTest(unittest.TestCase):
         self.assertEqual(replacements(text, "ZH"), [("0056", "零零五六")])
 
 
+class GpuModelReadingTest(unittest.TestCase):
+    def test_reviewed_model_reading_accepts_spacing_case_and_unicode_hyphens(self):
+        for text in ("RTX4090", "RTX 4090", "RTX-4090", "RTX‑4090", "rtx 4090", "RtX−4090",
+                     "RTX\t4090", "RTX　4090"):
+            with self.subTest(text=text):
+                self.assertEqual(replacements(text), [(text, "R T X forty ninety")])
+                self.assertEqual(replacements(text, "ZH"), [(text, "R T X 四零九零")])
+
+    def test_model_reading_accepts_unicode_horizontal_spaces_in_either_language(self):
+        horizontal_spaces = (
+            "\t", " ", "\u00a0", "\u1680", "\u2000", "\u2001", "\u2002",
+            "\u2003", "\u2004", "\u2005", "\u2006", "\u2007", "\u2008",
+            "\u2009", "\u200a", "\u202f", "\u205f", "\u3000",
+        )
+        for space in horizontal_spaces:
+            for text in (f"RTX{space}4090", f"RTX{space}‑4090", f"RTX‑{space}4090"):
+                for language, expected in (("ZH", "R T X 四零九零"), ("EN", "R T X forty ninety")):
+                    with self.subTest(text=text, language=language):
+                        self.assertEqual(replacements(text, language), [(text, expected)])
+
+    def test_model_name_does_not_consume_a_number_across_vertical_whitespace(self):
+        vertical_spaces = ("\n", "\r", "\r\n", "\v", "\f", "\x85", "\u2028", "\u2029")
+        for space in vertical_spaces:
+            for text in (f"RTX{space}4090", f"RTX-{space}4090", f"RTX{space}-4090"):
+                for language in ("ZH", "EN"):
+                    with self.subTest(text=text, language=language):
+                        self.assertEqual(replacements(text, language), [])
+
+    def test_model_reading_does_not_capture_longer_names_or_decimal_suffixes(self):
+        for text in ("RTX40900", "myRTX4090", "my_RTX4090", "RTX4090.5",
+                     "RTX4090Ti", "RTX4090_Ti", "RTX4090abc"):
+            with self.subTest(text=text):
+                self.assertEqual(replacements(text), [])
+
+    def test_unreviewed_models_keep_existing_readings(self):
+        for text, expected in (
+            ("RTX3090", "R T X three zero nine zero"),
+            ("RTX 4091", "R T X four zero nine one"),
+            ("GTX-4090", "G T X four zero nine zero"),
+            ("GTX-1650", "G T X one six five zero"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(replacements(text), [(text, expected)])
+
+    def test_identifier_phone_and_last_digits_keep_their_meaning(self):
+        for text, expected in (
+            ("Order ID: RTX4090", [("RTX4090", "R T X four zero nine zero")]),
+            ("Order ID: RTX-4090", [("RTX-4090", "R T X hyphen four zero nine zero")]),
+            ("Order ID: 4090", [("4090", "four zero nine zero")]),
+            ("Last four digits are 4090.", [("4090", "four zero nine zero")]),
+            ("020-87654090", [("020-87654090", "zero two zero, eight seven six five four zero nine zero")]),
+            ("4090 samples", []),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(replacements(text), expected)
+
+    def test_embedded_model_does_not_replace_nearby_numeric_fields(self):
+        text = "GPU: RTX 4090; order ID: 4090; last four digits are 4090."
+        self.assertEqual(replacements(text), [
+            ("RTX 4090", "R T X forty ninety"),
+            ("4090", "four zero nine zero"),
+            ("4090", "four zero nine zero"),
+        ])
+
+    def test_mixed_preference_changes_only_model_reading_and_preserves_prose(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+        text = "本次实验 GPU 为 RTX‑4090，ready。"
+        self.assertEqual(normalize_mixed_text(text, "zh"), "本次实验 GPU 为 R T X 四零九零,ready。")
+        self.assertEqual(normalize_mixed_text(text, "en"), "本次实验 GPU 为 R T X forty ninety ,ready。")
+
+    def test_address_protection_precedes_product_name_readings(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+        for text in ("https://example.com/RTX4090", "RTX4090@example.com"):
+            with self.subTest(text=text):
+                spoken = normalize_mixed_text(text, "en")
+                self.assertNotIn("forty ninety", spoken)
+                self.assertIn("four zero nine zero", spoken)
+
+
 class EmbeddedDateTest(unittest.TestCase):
     def test_spaced_date_is_one_field_inside_either_language(self):
         for text in ("2026 10/23 message", "2026 10/ 23 星期五", "Date: 2026\t10/23."):

@@ -31,12 +31,27 @@ so training and deployed runtime keep producing identical phonemes.
 """
 
 import re
+import unicodedata
 from .lexicon_rules_generated import GENERATED_REPLACEMENTS
+from .math_units import _english_quantity
+from .special_text import verbalize_chinese_number
 
 
 def _edge(pattern: str) -> re.Pattern:
     """Match ``pattern`` as a standalone ASCII token, CJK included."""
-    return re.compile(rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])", re.IGNORECASE)
+    return re.compile(rf"(?<![A-Za-z0-9_]){pattern}(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _sub_lexeme(pattern, replacement, text):
+    """Keep complete Latin words while still matching names next to CJK."""
+    def replace(match):
+        neighbors = text[max(0, match.start() - 1):match.start()] + text[match.end():match.end() + 1]
+        if any(unicodedata.category(char).startswith("M")
+               or char.isalpha() and "LATIN" in unicodedata.name(char, "")
+               for char in neighbors):
+            return match.group()
+        return replacement(match) if callable(replacement) else match.expand(replacement)
+    return pattern.sub(replace, text)
 
 
 # 0) Phrase-level rules. These must run before the per-token rules below,
@@ -201,17 +216,38 @@ def _generated_key(value: str) -> str:
 
 def _generated_pattern(value: str) -> str:
     parts = re.split(r"\s+", value.strip())
-    return r"\s+".join(re.escape(part) for part in parts)
+    # A line break separates utterances/items, not words of a company name.
+    return r"[^\S\r\n\v\f\x85\u2028\u2029]+".join(re.escape(part) for part in parts)
+
+
+_GENERATED_NUMBER = re.compile(r"(?<![A-Za-z0-9_])\d+(?:\.\d+)?(?=$|\s|[A-Z](?![A-Za-z0-9_]))")
+
+
+def _generated_spoken(spoken, language):
+    """Verbalize numbers introduced by a reviewed mapping before the FST.
+
+    The original structured-number pass already ran before lexeme rewriting.
+    A generated ``Velo 3D`` must therefore separate D and resolve 3 here rather
+    than sending it back through an unqualified Chinese FST. Only numbers in
+    matched, generated spoken forms are handled; arbitrary input is untouched.
+    """
+    def replace(match):
+        if language == "EN":
+            number = _english_quantity(match.group())
+        else:
+            number = verbalize_chinese_number(match.group())
+        return " " + number + " "
+    return re.sub(r" +", " ", _GENERATED_NUMBER.sub(replace, spoken)).strip()
 
 
 def _pattern_literal_key(pattern) -> str:
     source = pattern.pattern
-    prefix = r"(?<![A-Za-z0-9])"
-    suffix = r"(?![A-Za-z0-9])"
-    if source.startswith(prefix):
-        source = source[len(prefix):]
-    if source.endswith(suffix):
-        source = source[:-len(suffix)]
+    for prefix in (r"(?<![A-Za-z0-9])", r"(?<![A-Za-z0-9_])"):
+        if source.startswith(prefix):
+            source = source[len(prefix):]
+    for suffix in (r"(?![A-Za-z0-9])", r"(?![A-Za-z0-9_])"):
+        if source.endswith(suffix):
+            source = source[:-len(suffix)]
     source = source.replace(r"\s+", " ").replace(r"\s*", " ")
     source = re.sub(r"\\(.)", r"\1", source)
     return re.sub(r"\s+", " ", source).strip().casefold()
@@ -231,20 +267,39 @@ for _term, _spoken in GENERATED_REPLACEMENTS.items():
     if _key in _CURATED_KEYS:
         continue
     _pattern = re.compile(
-        r"(?<![A-Za-z0-9])(?:"
+        r"(?<![A-Za-z0-9_])(?:"
         + _generated_pattern(_term)
-        + r")(?![A-Za-z0-9])",
+        + r")(?![A-Za-z0-9_])",
         re.IGNORECASE,
     )
     _GENERATED_RULES.append((_pattern, _spoken, len(_term)))
 _GENERATED_RULES.sort(key=lambda item: item[2], reverse=True)
 _GENERATED_RULES = [(pattern, spoken) for pattern, spoken, _ in _GENERATED_RULES]
+_NUMERIC_GENERATED_RULES = [
+    (pattern, spoken) for pattern, spoken in _GENERATED_RULES
+    if _GENERATED_NUMBER.search(spoken)
+]
+_STYLE_TTS_VERSION = _edge(r"StyleTTS2")
+
+
+def normalize_numeric_lexemes(text, language="MIX"):
+    """Resolve only known lexical numbers, preserving a caller's preference.
+
+    Fixed-language callers may run this before clause-local routing. The normal
+    lexeme pass also uses it for automatic EN/MIX context. Fully spoken output
+    is idempotent and ordinary quantities/identifiers remain untouched.
+    """
+    for pattern, spoken in _NUMERIC_GENERATED_RULES:
+        text = _sub_lexeme(pattern, lambda match: _generated_spoken(spoken, language), text)
+    return _sub_lexeme(
+        _STYLE_TTS_VERSION, lambda match: _generated_spoken("style T T S 2", language), text,
+    )
 
 
 _QWEN_VERSION_RE = re.compile(
     # A typed space between the brand and version does not change its reading.
     # Limit separators to horizontal whitespace: a newline starts a new item.
-    r"(?<![A-Za-z0-9])qwen[ \t\u00a0\u3000]*(\d+(?:\.\d+)?)(?![A-Za-z0-9])",
+    r"(?<![A-Za-z0-9_])qwen[ \t\u00a0\u3000]*(\d+(?:\.\d+)?)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 _CN_DIGITS = "零一二三四五六七八九"
@@ -280,28 +335,36 @@ def apply_lexeme_rules(text: str, language: str = "MIX") -> str:
     """Rewrite known English lexemes into their intended spoken form."""
     if not text:
         return text
+    text = normalize_numeric_lexemes(text, language)
 
     # Protect generated frontend_res matches from the older broad rules.
     protected = []
+    # Choose a prefix absent from user input, and encode the index entirely in
+    # private-use characters. Neither input resembling old markers nor later
+    # ASCII lexeme rules can collide with these opaque placeholders.
+    prefix = "\ue000"
+    while prefix in text:
+        prefix += "\ue000"
     for pattern, replacement in _GENERATED_RULES:
         if language == "EN" and re.search(r"[\u4e00-\u9fff]", replacement):
             continue
         def _protect(match):
-            marker = f"\\x00LEX{len(protected)}\\x00"
-            protected.append((marker, replacement))
+            encoded = "".join(chr(0xE010 + int(digit, 16)) for digit in format(len(protected), "x"))
+            marker = prefix + "\ue001" + encoded + "\ue002"
+            protected.append((marker, _generated_spoken(replacement, language)))
             return marker
-        text = pattern.sub(_protect, text)
+        text = _sub_lexeme(pattern, _protect, text)
 
     if language != "EN":
-        text = _QWEN_VERSION_RE.sub(_qwen_version, text)
+        text = _sub_lexeme(_QWEN_VERSION_RE, _qwen_version, text)
     for pattern, replacement in RULES:
         if language == "EN":
             def _english_replacement(match):
                 spoken = replacement(match) if callable(replacement) else match.expand(replacement)
                 return match.group() if re.search(r"[\u4e00-\u9fff]", spoken) else spoken
-            text = pattern.sub(_english_replacement, text)
+            text = _sub_lexeme(pattern, _english_replacement, text)
         else:
-            text = pattern.sub(replacement, text)
+            text = _sub_lexeme(pattern, replacement, text)
     for marker, replacement in protected:
         text = text.replace(marker, replacement)
     return text
