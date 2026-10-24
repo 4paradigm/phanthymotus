@@ -233,7 +233,7 @@ def _workflow_lines(
 
 def _testing_next_action(evidence_complete: bool) -> str:
     result_guidance = (
-        "测试成功时：`/record_test result=pass summary=\"视频播放和 COS 校验通过\"`\n\n"
+        "测试成功时：`/record_test result=pass summary=\"视频播放和附件校验通过\"`\n\n"
         "测试失败时：`/record_test result=fail summary=\"视频播放失败，HTTP 403\"`"
     )
     if evidence_complete:
@@ -820,7 +820,7 @@ def deploy_help_text(topic: str = "") -> str:
             "- `summary` 是测试结果说明（可选）；不要写入凭据或签名链接。",
             "",
             "示例：",
-            "- `/record_test result=pass summary=\"视频播放和 COS 校验通过\"`",
+            "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`",
             "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`",
             "",
         ])
@@ -832,7 +832,7 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
         "- `/approve_deploy machine=<alias-or-ip>`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段审批指定机器。",
-        "- `/record_test result=pass summary=\"视频播放和 COS 校验通过\"`：Machine Owner 或有 write/maintain/admin 权限的协作者，在 testing 阶段记录成功。",
+        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：Machine Owner 或有 write/maintain/admin 权限的协作者，在 testing 阶段记录成功。",
         "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：由同一权限角色在 testing 阶段记录失败。",
         "- `/deploy_status`：只读查询当前部署状态，可在任意阶段使用。",
         "- `/deploy_help record_test`：查看测试结果命令说明；可在任意阶段使用。",
@@ -1039,22 +1039,26 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 group["attachment_details_unreadable"] = True
             attachment_records = row.get("attachment_records")
             if isinstance(attachment_records, list):
-                records_complete = all(
-                    isinstance(record, dict)
-                    and record.get("kind") == "attachment"
-                    and isinstance(record.get("data"), dict)
-                    and record["data"].get("head_sha") == key[0]
-                    and record["data"].get("round_id") == key[1]
-                    and record["data"].get("repo") == repo
-                    and type(record["data"].get("pr_number")) is int
-                    and record["data"].get("pr_number") == pr_number
-                    for record in attachment_records
-                )
+                records_complete = True
                 for record in attachment_records:
-                    if isinstance(record, dict) and isinstance(record.get("data"), dict):
-                        group["attachments"].append(record["data"])
+                    if isinstance(record, dict) and record.get("kind") == "operation":
+                        continue
+                    if not isinstance(record, dict) or record.get("kind") != "attachment":
+                        records_complete = False
+                        group["attachment_details_unreadable"] = True
+                        continue
+                    data = record.get("data")
+                    if (not isinstance(data, dict)
+                            or data.get("repo") != repo
+                            or type(data.get("pr_number")) is not int
+                            or data.get("pr_number") != pr_number
+                            or data.get("head_sha") != key[0]
+                            or data.get("round_id") != key[1]):
+                        records_complete = False
+                        group["attachment_details_unreadable"] = True
+                        continue
+                    group["attachments"].append(data)
                 details_complete = details_complete or records_complete
-                group["attachment_details_unreadable"] |= not records_complete
             elif "attachment_records" in row:
                 group["attachment_details_unreadable"] = True
             group["attachment_details_complete"] = details_complete
@@ -1216,8 +1220,9 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             round_label = (f"第 {round_number} 轮"
                            if type(round_number) is int and round_number > 0
                            else "当前轮")
-            lines.extend([f"**轮次：** {_escape(round_label)}", ""])
-        lines.extend(["### 附件", ""])
+            lines.extend([f"### {_escape(round_label)} · 附件", ""])
+        if historical:
+            lines.extend(["### 附件", ""])
         if items:
             lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
         notes = []
@@ -1271,6 +1276,8 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 notes.append(f"- **{_escape(filename)}：** {_escape(safe_note_text(note.strip()))}")
         if notes:
             lines.extend(["", "<details>", "<summary>附件说明</summary>", "", *notes, "", "</details>"])
+        if historical and items and group.get("attachment_details_unreadable"):
+            lines.append("部分历史附件明细无法读取或校验；此处仅显示通过校验的记录。")
         if not items:
             if historical:
                 if group.get("attachment_details_unreadable"):
@@ -1376,7 +1383,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
         lines.extend([
             "上传权限：仅限本轮测试邀请；分享链接上传会标示身份未验证。",
             "可上传视频、图片、文件或文字说明；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
-            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后，成功用 `/record_test result=pass summary=\"视频播放和 COS 校验通过\"`；失败用 `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`。",
+            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后，成功用 `/record_test result=pass summary=\"视频播放和附件校验通过\"`；失败用 `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`。",
         ])
     old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
     old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
@@ -1395,7 +1402,9 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
                 if not (item.get("deleted_at") or item.get("status") == "deleted")
             )
             count_label = (
-                "历史数据不可读取" if group.get("attachment_details_unreadable") else
+                (f"{attachment_count} 个附件；部分明细不可读取"
+                 if attachment_count else "历史数据不可读取")
+                if group.get("attachment_details_unreadable") else
                 f"{attachment_count} 个附件" if attachment_count else
                 "该轮未保存附件" if not attachment_items and group.get("attachment_details_complete")
                 else "内部验收备注已隐藏" if only_hidden_internal_notes(group, key)

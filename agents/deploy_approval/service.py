@@ -594,7 +594,15 @@ class DeployController:
         )
 
     def _review_build_infos(self, repo: str, evidence: "ReviewCommentEvidence") -> list[BuildInfo]:
-        """Keep every parsed row; build validity is independent of project tests."""
+        """Keep deployment candidates while ignoring the legacy CORE summary row.
+
+        ``CORE`` (uppercase) is a non-deployable aggregate row in the legacy
+        alignment scenario. It must never be normalized into the deployable
+        ``core`` target. Keeping it beside a real component rejected the entire
+        snapshot, even when the requested deployable matrix was valid.
+        All other rows remain subject to the existing strict target/build
+        checks in ``_build_component_snapshot``.
+        """
         return [
             BuildInfo(
                 target=build.target,
@@ -605,6 +613,11 @@ class DeployController:
                 deployable=_is_deployable_build(repo, build, self.config.github_repos),
             )
             for build in evidence.builds
+            if not (
+                str(getattr(build, "target", "") or "").strip() == "CORE"
+                and not str(getattr(build, "driver_path", "") or "").strip()
+                and not str(getattr(build, "variant", "") or "").strip()
+            )
         ]
 
     async def _build_component_snapshot(
@@ -3411,8 +3424,15 @@ class DeployController:
 
     @classmethod
     def _strip_legacy_evidence_blocks(cls, visible):
-        """Remove obsolete evidence displays before History is isolated."""
-        visible, history = cls._extract_visible_history(visible)
+        """Remove duplicate evidence presentation before History is isolated.
+
+        Operate on the whole visible body first so obsolete evidence nested
+        under a legacy History heading cannot be copied into the preserved
+        History block. Only presentation rows are removed; archive links and
+        lifecycle prose remain intact.
+        """
+        if not isinstance(visible, str):
+            return visible
         projection_start = "<!-- evidence-projection:start -->"
         projection_end = "<!-- evidence-projection:end -->"
         starts, ends = visible.count(projection_start), visible.count(projection_end)
@@ -3438,66 +3458,84 @@ class DeployController:
         result = []
         index = 0
         heading_re = re.compile(
-            r"^(#{2,6})[ \t]+(?:\*\*)?测试附件(?:\*\*)?[ \t]*#*[ \t]*(?:\r?\n)?$",
-        )
-        cos_link_re = re.compile(
-            r"\[[^\]]*\]\((?:<)?https://[^<>\s]*\.cos\.[^<>\s]*\.myqcloud\.com/[^)<>\s]*(?:>)?\)",
-            re.IGNORECASE,
+            r"^(#{2,6})[ \t]+(?:\*\*)?(?:测试附件|附件)(?:\*\*)?[ \t]*#*[ \t]*(?:\r?\n)?$",
         )
         legacy_link_re = re.compile(
             r"\[(?:查看测试附件|打开附件页|上传或查看附件|查看 COS 证据与历史|上传到 COS)\]"
             r"\((?:<[^>]*>|[^)]*)\)"
         )
-        raw_cos_metadata_re = re.compile(
-            r"(?i)(?:\*{1,2}cos(?:_object_key|_bundle_sha256|_bundle_size)?\*{1,2}"
-            r"|[\"']?cos(?:_object_key|_bundle_sha256|_bundle_size)?[\"']?)"
-            r"[ \t]*[:：=]",
+        cos_link_re = re.compile(
+            r"\[[^\]]*\]\((?:<)?https://[^<>\s)]*\.cos\.[^<>\s)]*\.myqcloud\.com/[^<>\s)]*(?:>)?\)",
+            re.IGNORECASE,
+        )
+        cos_url_re = re.compile(
+            r"https?://[^\s<>()\]]*\.cos\.[^\s<>()\]]*\.myqcloud\.com/[^\s<>()\]]*",
+            re.IGNORECASE,
+        )
+        cos_download_field_re = re.compile(
+            r'''(?i)\bcos_download_url\b[ \t]*[:=][ \t]*(?:"[^"]*"|'[^']*'|[^|,}\s]+)'''
         )
         metadata_value_re = re.compile(
-            r"[\"']?(?:object_key|sha256|size|cos_object_key|cos_bundle_sha256|cos_bundle_size|cos_download_url)"
+            r"[\"']?(?:object_key|sha256|size|cos_object_key|cos_bundle_sha256|cos_bundle_size|cos_download_url|cos)"
             r"[\"']?[ \t]*[:=][ \t]*(\"[^\"]*\"|'[^']*'|[0-9]+|null|None)",
             re.IGNORECASE,
+        )
+        empty_metadata_assignment_re = re.compile(
+            r"(?i)(?:\*{1,2}cos(?:_object_key|_bundle_sha256|_bundle_size)?\*{1,2}"
+            r"|[\"']?cos(?:_object_key|_bundle_sha256|_bundle_size)?[\"']?)"
+            r"[ \t]*[:：=][ \t]*(?:[|·*_`-]*)(?:\r?\n)?$",
         )
         while index < len(lines):
             heading = heading_re.match(lines[index])
             if heading:
-                level = len(heading.group(1))
                 index += 1
-                while index < len(lines):
-                    next_heading = re.match(r"^(#{1,6})[ \t]+", lines[index])
-                    if next_heading and len(next_heading.group(1)) <= level:
-                        break
+                # Remove the old heading and its immediate Markdown table,
+                # while retaining following History prose/events.
+                while index < len(lines) and not lines[index].strip():
                     index += 1
+                if index < len(lines) and lines[index].lstrip().startswith("|"):
+                    while index < len(lines) and lines[index].lstrip().startswith("|"):
+                        index += 1
                 continue
             line = lines[index]
             legacy_link = legacy_link_re.search(line)
-            old_cos_download = cos_link_re.search(line)
+            cos_link = cos_link_re.search(line)
+            cos_url = cos_url_re.search(line)
             metadata_values = metadata_value_re.findall(line)
-            raw_cos_metadata = bool(raw_cos_metadata_re.search(line))
-            empty_cos_metadata = bool(metadata_values) and all(
-                value.strip("\\\"' ").lower() in {"", "0", "null", "none"}
-                for value in metadata_values
-            ) and bool(re.search(r"(?i)cos|object_key|sha256", line))
-            if legacy_link or old_cos_download or empty_cos_metadata or raw_cos_metadata:
+            empty_cos_metadata = (
+                bool(metadata_values) and all(
+                    value.strip("\\\"' ").lower() in {"", "0", "null", "none"}
+                    for value in metadata_values
+                ) and bool(re.search(r"(?i)cos|object_key|sha256", line))
+            ) or bool(empty_metadata_assignment_re.search(line))
+            old_cos_download_row = (
+                bool(re.search(r"(?i)\b(?:COS[ \t]+下载|下载[ \t]+COS|verified[ \t]+COS[ \t]+download)\b", line))
+                and (".cos." in line.lower() or "cos_download_url" in line.lower())
+            )
+            if cos_download_field_re.search(line):
+                line = cos_download_field_re.sub("COS 下载链接已省略", line)
+                cos_link = cos_link_re.search(line)
+                cos_url = cos_url_re.search(line)
+            if legacy_link or cos_link or cos_url or old_cos_download_row or empty_cos_metadata:
                 remainder = line
                 if legacy_link:
                     remainder = legacy_link_re.sub("", remainder)
-                if old_cos_download:
+                if cos_link:
                     remainder = cos_link_re.sub("", remainder)
-                    if line.lstrip().startswith("|") or re.fullmatch(
-                            r"[ \t|·:*_`-]*(?:COS[ \t]+)?(?:下载|Download(?:[ \t]+COS)?|"
-                            r"下载已验证归档文件)[ \t:：|·*_`-]*\r?\n?",
-                            remainder, re.IGNORECASE):
-                        remainder = ""
-                if empty_cos_metadata or raw_cos_metadata or not remainder.strip(" \t\r\n|·-*"):
+                if cos_url:
+                    remainder = cos_url_re.sub("", remainder)
+                if old_cos_download_row and re.fullmatch(
+                        r"[ \t|·:*_`-]*(?:COS[ \t]+)?(?:下载|Download(?:[ \t]+COS)?|"
+                        r"下载已验证归档文件)[ \t:：|·*_`-]*\r?\n?",
+                        remainder, re.IGNORECASE):
+                    remainder = ""
+                if empty_cos_metadata or not remainder.strip(" \t\r\n|·-*"):
                     index += 1
                     continue
                 line = remainder
             result.append(line)
             index += 1
         visible = "".join(result).rstrip()
-        if history:
-            visible += ("\n\n" if visible else "") + history
         return visible
 
     async def _render_evidence_projection(self, repo, pr_number, state, visible):
@@ -3610,11 +3648,14 @@ class DeployController:
                       "PUBLIC_HTTPS_INGRESS_READY": False}
             backend_ready = False
             browser_upload_ready = False
+        attachment_access_allowed = state.get("status") in {
+            "testing", "succeeded", "failed",
+        }
         render_state.update(
-            evidence_enabled=bool(backend_ready),
+            evidence_enabled=bool(backend_ready and attachment_access_allowed),
             browser_upload_ready=bool(browser_upload_ready),
             evidence_readiness=status,
-            enabled=bool(backend_ready),
+            enabled=bool(backend_ready and attachment_access_allowed),
             pr_state=(pr.get("state") if backend_ready else "closed"),
             merged=(bool(pr.get("merged")) if backend_ready else False),
             attachments=current_rows,
@@ -3740,7 +3781,7 @@ class DeployController:
             else:
                 target.pop("cos_log_download_url", None)
 
-        if backend_ready:
+        if backend_ready and attachment_access_allowed:
             render_state["capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="page",
@@ -3768,7 +3809,7 @@ class DeployController:
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
             )
-        if backend_ready:
+        if backend_ready and attachment_access_allowed:
             current_rows = await bind_download_capabilities(current_rows, state["head_sha"], current_round)
             render_state["attachments"] = current_rows
             await bind_log_url(render_state, state["head_sha"], current_round)
@@ -3777,7 +3818,7 @@ class DeployController:
                 continue
             seen_rounds.add(archive["round_id"])
             snapshot = copy.deepcopy(archive["snapshot"])
-            if backend_ready:
+            if backend_ready and attachment_access_allowed:
                 snapshot["log_capability"] = issue_capability(
                     self.config, repo, pr_number, snapshot["head_sha"], archive["round_id"],
                     purpose=DOWNLOAD_PURPOSE, resource="log:" + archive["round_id"],
@@ -3786,8 +3827,8 @@ class DeployController:
             snapshot_attachments = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
             snapshot["attachments"] = (await bind_download_capabilities(
                 snapshot_attachments, snapshot["head_sha"], archive["round_id"],
-            ) if backend_ready else snapshot_attachments)
-            if backend_ready:
+            ) if backend_ready and attachment_access_allowed else snapshot_attachments)
+            if backend_ready and attachment_access_allowed:
                 await bind_log_url(snapshot, snapshot["head_sha"], archive["round_id"])
             bundle = {**archive, "snapshot": snapshot}
             if archive.get("round_id") in round_numbers:
@@ -3806,8 +3847,10 @@ class DeployController:
         visible, history = self._extract_visible_history(visible)
         start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
         projection = start + "\n" + section + "\n" + end
-        return (visible.rstrip() + "\n\n" + projection
-                + ("\n\n" + history if history else ""))
+        body = visible.rstrip()
+        if history:
+            body += "\n\n" + history
+        return body + "\n\n" + projection
 
     async def project_evidence(self, repo: str, pr_number: int) -> None:
         """Watcher-only projection. HTTP handlers never call this writer."""
@@ -3851,6 +3894,7 @@ class DeployController:
         Preserves existing History events across lifecycle rewrites.
         """
         archive_source = None
+        projection_state_expected = copy.deepcopy(state) if evidence_projection_only else None
         async def write_if_current(visible: str) -> bool:
             async with self._evidence_lock:
                 if archive_source is not None:
@@ -3887,6 +3931,19 @@ class DeployController:
                             current_comment.get("id") != comment.get("id")
                             or current_comment.get("body") != comment.get("body")))):
                     raise GitHubStateProxyError("Lifecycle History changed before write")
+                if evidence_projection_only:
+                    current_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    if current_state != projection_state_expected:
+                        raise GitHubStateProxyError(
+                            "Lifecycle state changed before evidence projection write",
+                        )
+                    final_pr = await self.proxy.get_pr(repo, pr_number)
+                    if (final_pr.get("state") != "open" or final_pr.get("merged")
+                            or final_pr.get("draft")
+                            or final_pr.get("head", {}).get("sha") != state.get("head_sha")):
+                        raise GitHubStateProxyError(
+                            "Lifecycle PR context changed before evidence projection write",
+                        )
                 written = await self.proxy.write_hidden_state(
                     repo, pr_number, visible, state,
                     expected_comment=((comment.get("id"), comment.get("body"))
