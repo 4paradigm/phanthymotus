@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -68,10 +69,8 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
 # queued, which played back overlapped and 1.43x too fast.
 FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", int(PCM_FRAME_MS), 0, 1000)
 FIRST_FRAME_DELAY_MS = _env_int("MIX_VITS_FIRST_FRAME_DELAY_MS", 0, 0, 1000)
-# Frames held back before pacing starts, then published in one burst so every
-# consumer begins with a real cushion instead of zero. This — not the pacing
-# interval — is where the downstream margin comes from. The sherpa engine has
-# always done this (plugins/tts.py PREBUF_FRAMES); same idea on this engine.
+# Five 100ms frames provide an initial 0.5s cushion. This burst stays below
+# the subscriber's depth of 20.
 PREBUFFER_FRAMES = _env_int("MIX_VITS_PREBUFFER_FRAMES", 5, 0, 100)
 # Depth of the synthesis→publish handoff queue, in frames. Bounds memory while
 # still letting TensorRT run a whole text chunk ahead of the paced publisher.
@@ -83,7 +82,12 @@ SYNTH_QUEUE_FRAMES = _env_int("MIX_VITS_SYNTH_QUEUE_FRAMES", 200, 1, 4000)
 MAX_BURST_FRAMES = _env_int("MIX_VITS_MAX_BURST_FRAMES", 20, 1, 200)
 SUBSCRIBER_WAIT_MS = _env_int("MIX_VITS_SUBSCRIBER_WAIT_MS", 5000, 0, 60000)
 SUBSCRIBER_POLL_MS = _env_int("MIX_VITS_SUBSCRIBER_POLL_MS", 10, 1, 1000)
-SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 500, 0, 5000)
+SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 200, 0, 5000)
+# Optional deployment preparation belongs to config, which is issued before
+# start/speak. Keep the normal asynchronous start contract and put a finite
+# bound on preparation when downloading or initializing a cold model is slow.
+_CONFIG_PREPARE_WAIT_S = 20.0
+
 # Off by default: sending faster than realtime has no safe landing on a live
 # consumer. It either buffers without bound or has to discard audio, and the
 # browser player's attempt to bound its lead instead produced overlapped,
@@ -140,7 +144,8 @@ def _error_chain(error: BaseException) -> str:
 
 def _release_actions(items) -> None:
     """Cancel ACP actions for utterances that will never be played."""
-    for text, action_id in items:
+    for item in items:
+        text, action_id = item[:2]
         _complete_action(action_id, text, 0, interrupted=True)
 
 
@@ -300,10 +305,16 @@ class _Vits2TTSNode(Node):
             _complete_action(action_id, text, 0, interrupted=True)
         return len(discarded)
 
-    def enqueue(self, text: str, action_id: str = ""):
+    def enqueue(self, text: str, action_id: str = "", context=None, generation=None):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        self._text_queue.put((text, action_id, self._current_gen()))
+        if generation is None:
+            generation = self._current_gen()
+        self._text_queue.put((text, action_id, generation, context))
+
+    def _synthesize_stream(self, text: str, context=None):
+        """Optional request context must not replace the action/generation queue."""
+        yield from self._adapter.synthesize_stream(text)
 
     def _text_callback(self, message: String):
         if self.state != "running":
@@ -372,6 +383,7 @@ class _Vits2TTSNode(Node):
             except queue.Empty:
                 continue
             text, action_id, gen = _unpack_utterance(item)
+            context = item[3] if isinstance(item, tuple) and len(item) > 3 else None
             # Discard only utterances that predate the latest interrupt. An
             # interrupt that landed while this node was idle must not touch the
             # next speak — that is what used to swallow a whole reply.
@@ -549,7 +561,7 @@ class _Vits2TTSNode(Node):
                     """
                     buffer = bytearray()
                     try:
-                        for pcm in self._adapter.synthesize_stream(text):
+                        for pcm in self._synthesize_stream(text, context):
                             buffer.extend(pcm)
                             while len(buffer) >= CHUNK_BYTES:
                                 frame = bytes(buffer[:CHUNK_BYTES])
@@ -669,7 +681,7 @@ class TTSPlugin:
     """VITS2 TensorRT implementation behind the standard ``tts`` tool.
 
     Lifecycle mirrors plugins/ocr.py, for the same reason: the slow work (a
-    60 MB release download, three TensorRT engines, a warmup pass) is open-ended,
+    160 MB release download, three TensorRT engines, a warmup pass) is open-ended,
     so it must not run on the request thread. The bound it would blow through is
     the 60 s the *LLM* tool path allows a processor tools/call
     (agent-core/src/mcp_client.py); the dashboard's start-project path sets no
@@ -700,12 +712,16 @@ class TTSPlugin:
         # for dict/flag updates — never across a download, an engine build or a
         # node start/stop. See perception/README.md § Plugin Concurrency.
         self._state_lock = threading.RLock()
+        # Serialize resident speed changes without holding the lifecycle lock:
+        # set_speed can wait for the adapter's current synthesis to finish.
+        self._config_update_lock = threading.Lock()
         self._nodes = {}
         self._pending_starts = {}        # node_key -> input_topic
-        self._pending_speech = {}        # node_key -> [(text, action_id), ...]
+        self._pending_speech = {}        # node_key -> [(text, action_id, context), ...]
         self._adapter = None
         self._adapter_state = "idle"     # idle|loading|ready|error
         self._load_error = None
+        self._load_status = None
         self._load_generation = 0
         self._model_name = "vits2"
 
@@ -730,31 +746,64 @@ class TTSPlugin:
         """Start the one background adapter loader. Caller holds the lock."""
         self._adapter_state = "loading"
         self._load_error = None
+        self._load_status = "Downloading and initializing the VITS2 TensorRT model..."
         threading.Thread(
             target=self._loader, args=(self._load_generation, dict(self._cfg)),
             name="vits2-adapter-loader", daemon=True,
         ).start()
 
+    def _set_load_status(self, generation: int, status: str) -> None:
+        """Publish progress only for the current, still-loading model."""
+        with self._state_lock:
+            if generation == self._load_generation and self._adapter_state == "loading":
+                self._load_status = status
+
     def _loader(self, generation: int, cfg: dict) -> None:
         try:
-            from utils.model_downloader import ensure_vits2_model
+            from utils.model_downloader import ensure_vits2_model, vits2_release_root
+            from utils.model_progress import fetch_status
+
+            progress_cb, stage_cb = fetch_status(
+                lambda status: self._set_load_status(generation, status), "VITS2"
+            )
 
             # Returns the engine directory of the family that matches the
             # TensorRT actually importable here, so the adapter never has to
             # guess between engines/jp61 and engines/jp511.
+            download_options = {"progress_cb": progress_cb, "stage_cb": stage_cb}
+            if "model_base_url" in cfg:
+                download_options["base_url"] = cfg["model_base_url"]
             cfg["engine_dir"] = ensure_vits2_model(
-                cfg.get("model_dir", "/models/vits2")
+                cfg.get("model_dir", "/models/vits2"), **download_options,
             )
+            # The verified archive may have a release-root directory. Frontend
+            # data and config must come from that same bundle as its engines.
+            cfg["model_dir"] = vits2_release_root(cfg["engine_dir"])
+            self._set_load_status(generation, "Initializing the VITS2 TensorRT model...")
             adapter = build_adapter(cfg)
             if not isinstance(adapter, Vits2TensorRTAdapter):
                 raise RuntimeError("Unexpected non-TensorRT VITS2 adapter")
             if cfg.get("warmup", True):
+                self._set_load_status(generation, "Warming up the VITS2 TensorRT model...")
                 started = time.monotonic()
                 warmup_bytes = adapter.warmup()
                 log.info(
                     "[vits2_tts_trt] engine ready: bytes=%d elapsed=%.3fs",
                     warmup_bytes, time.monotonic() - started,
                 )
+            with self._state_lock:
+                superseded = generation != self._load_generation
+                if not superseded:
+                    if self._cfg.get("prepare_on_config", False):
+                        # Preparation configs may update speed while this one
+                        # loader is running. Apply the latest value atomically
+                        # with installation instead of building another engine.
+                        adapter.set_speed(float(self._cfg.get("speed", 1.0)))
+                    self._adapter = adapter
+                    self._adapter_state = "ready"
+                    self._load_error = None
+                    self._load_status = None
+                    self._model_name = "vits2-tensorrt"
         except Exception as error:  # noqa: BLE001 - surfaced via state/info
             log.exception("[vits2_tts_trt] adapter load failed")
             with self._state_lock:
@@ -762,6 +811,7 @@ class TTSPlugin:
                     return
                 self._adapter_state = "error"
                 self._load_error = _error_chain(error)
+                self._load_status = None
                 # Abandon the queued work rather than leave the caller's ACP
                 # action pending forever; the reason is on the tool state.
                 self._pending_starts.clear()
@@ -769,13 +819,6 @@ class TTSPlugin:
             _release_actions(abandoned)
             return
 
-        with self._state_lock:
-            superseded = generation != self._load_generation
-            if not superseded:
-                self._adapter = adapter
-                self._adapter_state = "ready"
-                self._load_error = None
-                self._model_name = "vits2-tensorrt"
         if superseded:
             # A config change happened mid-load; never install the result.
             return
@@ -790,9 +833,7 @@ class TTSPlugin:
                     return
                 node_key, input_topic = next(iter(self._pending_starts.items()))
             try:
-                node = _Vits2TTSNode(
-                    input_topic or None, adapter, _node_suffix(node_key)
-                )
+                node = self._new_node(node_key, input_topic, adapter)
             except Exception:  # noqa: BLE001 - keep serving the other instances
                 log.exception("[vits2_tts_trt] failed to build instance %r", node_key)
                 with self._state_lock:
@@ -841,10 +882,13 @@ class TTSPlugin:
     def _flush_pending_speech(self, node_key: str, node) -> None:
         """Hand a freshly started node the utterances queued while it loaded."""
         with self._state_lock:
+            generation = node._current_gen()
             queued = self._pending_speech.pop(node_key, [])
-        for text, action_id in queued:
+        for item in queued:
+            text, action_id = item[:2]
+            context = item[2] if len(item) > 2 else None
             try:
-                node.enqueue(text, action_id=action_id)
+                node.enqueue(text, action_id=action_id, context=context, generation=generation)
             except Exception:  # noqa: BLE001
                 log.exception("[vits2_tts_trt] failed to queue deferred utterance")
                 _complete_action(action_id, text, 0, interrupted=True)
@@ -861,6 +905,22 @@ class TTSPlugin:
         return taken
 
     # ── helpers ─────────────────────────────────────────────────────────
+
+    def _new_node(self, key, input_topic, adapter):
+        return _Vits2TTSNode(input_topic or None, adapter, _node_suffix(key))
+
+    def _prepare_speech(self, args, instance_id):
+        """Validate synchronously; immutable context follows deferred speech too."""
+        text = args.get("text", "").strip()
+        if not text:
+            raise ValueError("text is required")
+        return text, None
+
+    def _speech_metadata(self, context):
+        return {}
+
+    def _forget_instances(self, instance_id):
+        """Optional small state cleanup; caller holds _state_lock."""
 
     def _dispose_node(self, node, key):
         """Release a node after its caller has removed it from _nodes."""
@@ -892,11 +952,11 @@ class TTSPlugin:
         base.update(extra)
         return base
 
-    def _describe(self, state: str) -> str:
+    def _describe(self, state: str, load_status, error) -> str:
         if state == "loading":
-            return "Downloading and initializing the VITS2 TensorRT model..."
-        if state == "error" and self._load_error:
-            return f"Model load failed: {self._load_error}"
+            return load_status or "Downloading and initializing the VITS2 TensorRT model..."
+        if state == "error" and error:
+            return f"Model load failed: {error}"
         return self.DESC
 
     def _request_load_locked(self) -> None:
@@ -924,7 +984,13 @@ class TTSPlugin:
             return self._speak(args, instance_id)
 
         if action == "config":
-            return self._config(args)
+            result = self._config(args)
+            if self._cfg.get("prepare_on_config", False):
+                # The language wrapper also owns _config and may not delegate
+                # an empty config. Prepare after its validation/state update,
+                # at this shared dispatch boundary, exactly once per request.
+                result = {**result, **self._prepare_config({})}
+            return result
 
         if action == "interrupt":
             return self._interrupt(instance_id)
@@ -939,6 +1005,7 @@ class TTSPlugin:
             adapter_state = self._adapter_state
             pending = bool(self._pending_starts)
             error = self._load_error
+            load_status = self._load_status
             # An instance that started while the model loads has no node yet, and
             # info is routinely called without input_topic (Agent Core's start
             # sequencer does). Remembering the topic the pending start asked for
@@ -954,7 +1021,7 @@ class TTSPlugin:
             if adapter_state == "loading" and state != "running":
                 state = "loading"
             return self._identity(**{**node.status(), "state": state,
-                                     "desc": self._describe(state)})
+                                     "desc": self._describe(state, load_status, error)})
 
         if instance_id:
             # Known instance that is not up yet: report the shared model state
@@ -968,7 +1035,7 @@ class TTSPlugin:
                           if input_topic else []),
                 topic_out=[{"topic": output_topic, "format": "audio/pcm-16k",
                             "desc": ""}],
-                desc=self._describe(state),
+                desc=self._describe(state, load_status, error),
             )
             if state == "error" and error:
                 result["error"] = error
@@ -993,7 +1060,8 @@ class TTSPlugin:
             topics_out = [{"topic": output_topic, "format": "audio/pcm-16k",
                            "desc": ""}]
         result = self._identity(state=state, topic_in=topics_in,
-                                topic_out=topics_out, desc=self._describe(state))
+                                topic_out=topics_out,
+                                desc=self._describe(state, load_status, error))
         if state == "error" and error:
             result["error"] = error
         return result
@@ -1051,20 +1119,25 @@ class TTSPlugin:
             abandoned = self._take_pending_speech_locked(
                 [instance_id] if instance_id else list(self._pending_speech)
             )
+            self._forget_instances(instance_id)
         for key, node in nodes:
             self._dispose_node(node, key)
         _release_actions(abandoned)
         return {"state": "idle"}
 
     def _speak(self, args: dict, instance_id: str) -> dict:
-        text = args.get("text", "").strip()
-        if not text:
-            raise ValueError("text is required")
+        text, context = self._prepare_speech(args, instance_id)
         import uuid
 
         action_id = f"speak-{uuid.uuid4().hex[:8]}"
         with self._state_lock:
-            node = next((n for n in self._nodes.values() if n.state == "running"), None)
+            # An explicit instance must never publish on another instance's
+            # topic. A not-yet-loaded instance keeps its own deferred queue.
+            node = (self._nodes.get(instance_id) if instance_id else
+                    next((n for n in self._nodes.values() if n.state == "running"), None))
+            if node is not None and node.state != "running":
+                node = None
+            generation = node._current_gen() if node is not None else None
             if node is None:
                 # Queue against the instance that will serve it and make sure a
                 # load is in flight. The ACP action stays pending until the
@@ -1074,19 +1147,22 @@ class TTSPlugin:
                 if self._adapter_state == "error" and self._load_error:
                     return {"state": "error", "message": self._load_error}
                 self._pending_starts.setdefault(key, args.get("input_topic") or "")
-                self._pending_speech.setdefault(key, []).append((text, action_id))
+                self._pending_speech.setdefault(key, []).append((text, action_id, context))
                 self._request_load_locked()
                 adapter = self._adapter
         if node is not None:
-            node.enqueue(text, action_id=action_id)
-            return {"status": "queued", "action_id": action_id, "text": text}
+            node.enqueue(text, action_id=action_id, context=context, generation=generation)
+            return {"status": "queued", "action_id": action_id, "text": text,
+                    **self._speech_metadata(context)}
         if adapter is not None:
             # Model is resident (a stopped instance, say) — start it now.
             self._bring_up_pending(self._load_generation, adapter)
         return {"status": "queued", "action_id": action_id, "text": text,
-                "state": "loading"}
+                "state": "loading", **self._speech_metadata(context)}
 
     def _config(self, args: dict) -> dict:
+        if self._cfg.get("prepare_on_config", False):
+            return self._prepare_config(args, wait=False)
         if "speaker_id" in args:
             self._cfg["speaker_id"] = int(args["speaker_id"])
         if "speed" in args:
@@ -1107,11 +1183,66 @@ class TTSPlugin:
                 self._load_generation += 1
                 self._adapter_state = "idle"
                 self._load_error = None
+                self._load_status = None
                 if self._pending_starts or self._pending_speech:
                     self._spawn_loader_locked()
         if adapter is not None:
             adapter.set_speed(speed)
         return {"status": "configured"}
+
+    def _prepare_config(self, args: dict, wait: bool = True) -> dict:
+        """Prepare a resident model before use, with bounded config latency.
+
+        This is opt-in for deployments that configure their service before
+        accepting speech requests. It does not create a ROS node or change
+        start's non-blocking behavior. Repeated config calls share the same
+        loader; a speed update is applied when that loader installs its model.
+        """
+        timeout = float(self._cfg.get("prepare_timeout_s", _CONFIG_PREPARE_WAIT_S))
+        if not math.isfinite(timeout) or not 0 <= timeout <= 50:
+            raise ValueError("prepare_timeout_s must be between zero and 50 seconds")
+        with self._config_update_lock:
+            with self._state_lock:
+                speaker_id = int(args.get("speaker_id", self._cfg.get("speaker_id", 0)))
+                if speaker_id != 0:
+                    raise ValueError("The VITS2 model supports only speaker_id=0")
+                speed = float(args.get("speed", self._cfg.get("speed", 1.0)))
+                if not math.isfinite(speed) or not 0 < speed <= 4:
+                    raise ValueError("TTS speed must be greater than zero and at most four")
+                adapter = self._adapter
+                if adapter is not None and speed == float(self._cfg.get("speed", 1.0)):
+                    return {"status": "configured", "model_state": "ready"}
+                if adapter is None:
+                    self._cfg["speaker_id"] = speaker_id
+                    self._cfg["speed"] = speed
+                    if not wait:
+                        return {"status": "configured"}
+                    self._request_load_locked()
+            if adapter is not None:
+                # The adapter holds its lock across yielded PCM. Keep info,
+                # interrupt and stop available while waiting for that lock.
+                # Commit only after success, so a failed setting is not saved.
+                adapter.set_speed(speed)
+                with self._state_lock:
+                    self._cfg["speaker_id"] = speaker_id
+                    self._cfg["speed"] = speed
+                return {"status": "configured", "model_state": "ready"}
+
+        deadline = time.monotonic() + timeout
+        while True:
+            # Never hold the state lock while waiting: the loader and info
+            # need it to publish progress, errors and the final ready state.
+            with self._state_lock:
+                if self._adapter_state == "error":
+                    return {"status": "error", "state": "error",
+                            "message": self._load_error or "VITS2 model preparation failed"}
+                if self._adapter is not None and self._adapter_state == "ready":
+                    return {"status": "configured", "model_state": "ready"}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return {"status": "configured", "state": "loading",
+                        "message": "VITS2 model preparation is still in progress"}
+            time.sleep(min(0.02, remaining))
 
     def _interrupt(self, instance_id: str) -> dict:
         with self._state_lock:

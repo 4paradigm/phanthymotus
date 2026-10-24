@@ -1062,34 +1062,49 @@ def _merge_tree(source: str, destination: str) -> None:
 # chosen from the TensorRT that is importable at runtime, never from a build
 # argument — same rule as OCR above.
 #
-# Each archive carries the frontend the engines need, unpacked to the layout
-# frontend/release_paths.py expects: engines/<family>/*.plan, config.json,
-# frontend_data/, tn_cache/ (compiled WeText TN FSTs) and nltk_data/ (cmudict +
-# perceptron tagger — shipped precisely so the container never has to call
-# nltk.download() at runtime). Upstream is
-# modelscope.cn/models/Starlight777/VITS2-ZH-EN-Male-16k at revision
-# 14954122c4baf4e80b44436c4b2b167e38db4103; the runtime-required files of that
-# revision were repacked per family and mirrored to COS, so devices pull one
-# 60 MB file from the same host as every other model here. The fp32 ONNX graphs
-# the plans were built from are not included — they are build inputs, not
-# runtime files.
-VITS2_MODEL_BASE = os.environ.get("VITS2_MODEL_BASE_URL", COS_BASE)
+# Keep the existing Liaoqianqian v6 engines and frontend assets byte-for-byte.
+# The public personal release mirrors those original archives; its immutable
+# revision and the archive checksums pin both the voice and the TN graphs.
+# The original archives contain a release-specific top-level directory, plus
+# ONNX build inputs and reference samples that are not loaded for inference.
+# They are intentionally not repacked or confused with the different public
+# Starlight777/COS engine release.
+VITS2_MODEL_REVISION = "e67fccc9fa0c2bd8848dcf93221e18bb3fa4f205"
+VITS2_MODEL_BASE = os.environ.get(
+    "VITS2_MODEL_BASE_URL",
+    "https://www.modelscope.cn/api/v1/models/lanxijiang/TTSV4_Ch_Eng/repo"
+    f"?Revision={VITS2_MODEL_REVISION}&FilePath={{file}}",
+)
 VITS2_MODEL_ARCHIVES = {
     "jp61": {
-        "archive": "vits2-zh-en-male-16k-tensorrt-jp61-trt10.4-orin.tar.gz",
-        "size": 61834952,
-        "sha256": "f04ab439588cd3106ccd245f64af548199ba888d31627827c07ac28368225805",
+        "archive": "lc1_male_v6_frontend_146k_jp6_runtime.tar.gz",
+        "release_root": "lc1_male_v6_frontend_146k_jp6",
+        "size": 160688390,
+        "sha256": "e3a26c913285ba26d30624be50751fa27c8d6ecb8458ac1ad3b0f0d196794b42",
     },
     "jp511": {
-        "archive": "vits2-zh-en-male-16k-tensorrt-jp511-trt8.5-orin.tar.gz",
-        "size": 62994881,
-        "sha256": "01ffce0516f1a68f3fcedce6ff9caff784f428a1d09da2d760fcba599116e8c7",
+        "archive": "lc1_male_v6_frontend_146k_jp5_nocudnn_nojit_runtime.tar.gz",
+        "release_root": "lc1_male_v6_frontend_146k_jp5_nocudnn_nojit",
+        "size": 162677801,
+        "sha256": "4a006ceb74325d11c506f2e054faffbfce6e0ca80946ffaaa8ef5e03fc26f96a",
     },
 }
 
 
+def vits2_release_root(engine_dir: str) -> str:
+    """Resolve frontend/config assets for a supported VITS2 engine layout."""
+    path = os.path.normpath(engine_dir)
+    parent, name = os.path.split(path)
+    if name == "engines":
+        return parent
+    # Retain compatibility with installed main-branch releases and test hosts.
+    if name in VITS2_MODEL_ARCHIVES and os.path.basename(parent) == "engines":
+        return os.path.dirname(parent)
+    raise ValueError(f"Unsupported VITS2 engine directory layout: {engine_dir!r}")
+
+
 def ensure_vits2_model(model_dir: str, family: str | None = None,
-                       progress_cb=None, stage_cb=None) -> str:
+                       progress_cb=None, stage_cb=None, base_url: str | None = None) -> str:
     """Ensure the VITS2 release matching the runtime TensorRT is installed.
 
     Returns the engine directory for this runtime, which is what the adapter
@@ -1098,16 +1113,18 @@ def ensure_vits2_model(model_dir: str, family: str | None = None,
     model_dir = require_models_subpath(model_dir)
     key = select_bundle_family(VITS2_MODEL_ARCHIVES, family)
     entry = VITS2_MODEL_ARCHIVES[key]
+    source_base = VITS2_MODEL_BASE if base_url is None else base_url
     log.info(f"[model_downloader] vits2: using {key} archive")
     ensure_verified_archive(
         f"vits2/{key}",
         model_dir,
-        f"{VITS2_MODEL_BASE.rstrip('/')}/{entry['archive']}",
+        _source_url(source_base, entry["archive"]),
         entry,
         progress_cb=progress_cb,
         stage_cb=stage_cb,
     )
-    return os.path.join(model_dir, "engines", key)
+    release_root = require_models_subpath(os.path.join(model_dir, entry["release_root"]))
+    return os.path.join(release_root, "engines")
 
 
 # The Thai TTS voice: an ONNX export of VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR,

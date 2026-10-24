@@ -104,6 +104,9 @@ plugins:
     speed: 1.0
     warmup: true
     max_chunk_tokens: 256
+    # Prepare and warm the VITS2 adapter during configuration, before speech.
+    # Waiting is bounded; info continues to expose progress during a slow fetch.
+    prepare_on_config: true
     # kokoro-multi only. Japanese does not go through sherpa — it drives the ONNX
     # graph directly with misaki phonemes — and that second session must live in its
     # own process. Two ONNX Runtimes in one process share a single provider bridge

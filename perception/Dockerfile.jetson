@@ -127,9 +127,11 @@ RUN cd /ros_ws && \
 # uninstall. --ignore-installed is a per-invocation flag, which is why this is
 # a separate command rather than an extra argument on the one below — we do not
 # want it applied to everything.
+COPY perception/requirements.txt /tmp/perception-requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --ignore-installed PyYAML && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    websockets webrtcvad "tflite-runtime==2.13.0"
+    websockets webrtcvad "tflite-runtime==2.13.0" -r /tmp/perception-requirements.txt && \
+    rm -f /tmp/perception-requirements.txt
 
 # ── Vision deps (vop detection, visual_depth, OCR, face) ─────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson).
@@ -693,4 +695,4 @@ CMD ["/bin/bash", "-c", \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
      source /etc/dla-fallback.env && \
-     python3 /work/main.py"]
+     exec python3 /deploy/run_perception.py /work/main.py"]

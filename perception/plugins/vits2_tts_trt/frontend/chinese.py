@@ -12,8 +12,11 @@ from .tone_sandhi import ToneSandhi
 
 from .fst_tn import FstTextNormalizer
 
-from .heteronym import custom_dict, jieba_phrases
+from .heteronym import custom_dict, jieba_phrases, robot_phrase_pinyin
 from .release_paths import frontend_data_dir, tn_cache_dir
+from .technical_text import normalize_technical_lexemes
+from .lexicon_rules import apply_lexeme_rules
+from .special_text import normalize_special_text, verbalize_chinese_number
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +32,11 @@ _load_phrase_pinyin_data()
 load_phrases_dict(custom_dict, style="tone2")
 for phrase in jieba_phrases:
     jieba.add_word(phrase)
+load_phrases_dict(robot_phrase_pinyin)
+for phrase in robot_phrase_pinyin:
+    # A default frequency near 1 can still split 请重发消息 into 重/发消息
+    # or 请调高 into 请调/高. Keep existing higher frequencies intact.
+    jieba.add_word(phrase, freq=max(100, jieba.dt.FREQ.get(phrase, 0)))
 
 current_file_path = os.path.dirname(__file__)
 _normalizer = FstTextNormalizer(tn_cache_dir())
@@ -188,6 +196,17 @@ def _get_initials_finals(word):
     return initials, finals
 
 
+def _is_particle_de(segments, index):
+    word, pos = segments[index]
+    if word != "地" or pos != "uv" or index == 0:
+        return False
+    previous, previous_pos = segments[index - 1]
+    # jieba also labels isolated 地 and 一块地's 地 as uv. A preceding
+    # quantifier/demonstrative is not an adverbial modifier; retain dì there.
+    return (previous not in punctuation
+            and not previous_pos.startswith(("m", "q", "r")))
+
+
 def _g2p(segments):
     phones_list = []
     tones_list = []
@@ -199,11 +218,19 @@ def _g2p(segments):
         initials = []
         finals = []
         seg_cut = tone_modifier.pre_merge_for_modify(seg_cut)
-        for word, pos in seg_cut:
+        for index, (word, pos) in enumerate(seg_cut):
             if pos == "eng":
                 continue
             sub_initials, sub_finals = _get_initials_finals(word)
+            particle_de = _is_particle_de(seg_cut, index)
+            final_di = bool(word.endswith("地") and sub_finals and sub_finals[-1] == "i4")
+            if particle_de:
+                sub_finals[-1] = "e5"
             sub_finals = tone_modifier.modified_tone(word, pos, sub_finals)
+            if final_di and not particle_de:
+                # The legacy suffix rule changes every 地 to tone 5, including
+                # 土地/目的地. Keep lexical dì; only the particle above is de5.
+                sub_finals[-1] = "i4"
             initials.append(sub_initials)
             finals.append(sub_finals)
 
@@ -274,13 +301,47 @@ def _g2p(segments):
 
 def _remove_redundant_newlines_after_punctuation(text):
     """Avoid creating duplicate stops from an existing stop plus a newline."""
-    return re.sub(r"([。！？!?；;：:，,.])[\t ]*(?:\r\n|\r|\n)+[\t ]*", r"\1", text)
+    # Preserve a word boundary: AI.\nII. must not become the identifier AI.II.
+    text = re.sub(r"\r\n|[\r\v\f\x85\u2028\u2029]", "\n", text)
+    return re.sub(r"([。！？!?；;：:，,.])[\t ]*\n+[\t ]*", r"\1 ", text)
+
+
+def _special_number(value, language):
+    """Speak a number inside a protected formula/unit, bypassing lexeme rules."""
+    if language == "ZH":
+        return verbalize_chinese_number(value)
+    from .english import normalize_numbers
+    sign = ""
+    if value.startswith(("+", "-")):
+        sign, value = ("plus " if value[0] == "+" else "minus "), value[1:]
+    if "." in value:
+        whole, fraction = value.split(".", 1)
+        digits = "zero one two three four five six seven eight nine".split()
+        return sign + normalize_numbers(whole or "0") + " point " + " ".join(digits[int(c)] for c in fraction)
+    return sign + normalize_numbers(value)
+
+
+def _normalize_ordinary_text(text):
+    # Written entities are handled by normalize_special_text first. Preserve
+    # explicit letter spellings and selected whole words so the FST cannot
+    # change them before the shared English/MIX pronunciation lookup sees them.
+    from .english import normalize_ordinary_latin_text
+    return normalize_ordinary_latin_text(text, _normalizer.normalize)
+
+
+def _normalize_raw_text(text, lexeme_language="MIX"):
+    return normalize_special_text(
+        text, lambda ordinary: _normalize_ordinary_text(
+            apply_lexeme_rules(ordinary, language=lexeme_language)
+        ),
+        _special_number,
+    )
 
 
 def text_normalize(text):
     text = _remove_redundant_newlines_after_punctuation(text)
-    text = _normalizer.normalize(text)
-    text = _post_replace(text)
+    text = _normalize_raw_text(text)
+    text = _post_replace(normalize_technical_lexemes(text))
     text = replace_punctuation(text)
     return text
 
@@ -292,9 +353,26 @@ def mix_normalize(text: str) -> str:
     such as ``AI`` and ``CTO`` into letter-by-letter forms before G2P.
     """
     from .english import replace_punctuation as en_replace_punct
+    from .mixed_context import normalize_mixed_context
     text = _remove_redundant_newlines_after_punctuation(text)
-    text = _normalizer.normalize(text)
-    text = _post_replace(text)
+    # Select lexeme language from the complete input, never a Chinese clause's
+    # isolated Latin name (e.g. Qwen in a Chinese product list).
+    normalize_original = _normalize_raw_text
+    if re.search(r"[A-Za-z]", text) and not re.search(r"[\u4e00-\u9fff]", text):
+        normalize_original = lambda value: _normalize_raw_text(value, lexeme_language="EN")
+    text = normalize_mixed_context(
+        text, normalize_original, _normalize_ordinary_text, _special_number
+    )
+    # English number readers emit e.g. twenty-six/twenty-third. Their
+    # orthographic hyphen is not a pause or subtraction sign. Do not feed it
+    # to the remaining-dash punctuation cleanup or rerun numeric TN.
+    text = re.sub(
+        r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)-"
+        r"(one|two|three|four|five|six|seven|eight|nine|first|second|third|"
+        r"fourth|fifth|sixth|seventh|eighth|ninth)\b",
+        r"\1 \2", text, flags=re.I,
+    )
+    text = _post_replace(normalize_technical_lexemes(text))
     text = en_replace_punct(text)
     return text
 

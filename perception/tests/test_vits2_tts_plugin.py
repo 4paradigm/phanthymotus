@@ -1,7 +1,7 @@
 """
 tests/test_vits2_tts_plugin.py — VITS2 TTS lifecycle tests (host-side).
 
-The point of these: the VITS2 model is a 60 MB download plus three TensorRT
+The point of these: the VITS2 model is a 160 MB download plus three TensorRT
 engines plus a warmup pass, while Agent Core gives a processor tools/call 60 s
 (agent-core/src/mcp_client.py). So `start` must never wait for the model, and
 every path that abandons an utterance must still release its ACP action.
@@ -12,8 +12,12 @@ Run: python -m pytest perception/tests -q
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,7 +88,7 @@ def _installed(plugin):
     return plugin._adapter
 
 
-def _plugin(monkeypatch, *, gated=False, fail=None):
+def _plugin(monkeypatch, *, gated=False, fail=None, cfg=None):
     """Build a plugin whose loader is instrumented instead of touching a GPU.
 
     `gated=True` blocks every load inside the model install until the test calls
@@ -100,12 +104,14 @@ def _plugin(monkeypatch, *, gated=False, fail=None):
     """
     gate = threading.Event()
     state = {
-        "loads": 0, "engine_dirs": [], "adapters": [],
+        "loads": 0, "engine_dirs": [], "adapters": [], "callbacks": [], "base_urls": [],
         "release": gate.set, "entered": threading.Event(),
     }
 
-    def fake_ensure(model_dir, family=None):
+    def fake_ensure(model_dir, family=None, progress_cb=None, stage_cb=None, base_url=None):
         state["loads"] += 1
+        state["base_urls"].append(base_url)
+        state["callbacks"].append((progress_cb, stage_cb))
         state["entered"].set()
         if gated and not gate.wait(10):
             raise RuntimeError("test never released the load gate")
@@ -126,7 +132,8 @@ def _plugin(monkeypatch, *, gated=False, fail=None):
 
     executor = _FakeExecutor()
     plugin = vits2.TTSPlugin(
-        {"model_dir": "/models/vits2", "backend": "trt", "speed": 1.0}, executor
+        {"model_dir": "/models/vits2", "backend": "trt", "speed": 1.0,
+         **(cfg or {})}, executor
     )
     return plugin, executor, state
 
@@ -202,6 +209,89 @@ def test_info_never_triggers_a_load(monkeypatch):
     assert state["loads"] == 0
 
 
+def test_loading_info_reports_download_progress_and_extraction(monkeypatch):
+    plugin, _, state = _plugin(monkeypatch, gated=True)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say",
+                            "instance_id": "a"})
+    try:
+        assert state["entered"].wait(3)
+        progress, stage = state["callbacks"][0]
+        assert callable(progress) and callable(stage)
+        progress(25, 40, 160)
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            info = plugin.dispatch("tts", args)
+            assert info["state"] == "loading"
+            assert "25% (40/160 MB)" in info["desc"]
+        stage("extract")
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            info = plugin.dispatch("tts", args)
+            assert "正在解压模型 'VITS2'" in info["desc"]
+            assert "%" not in info["desc"]
+    finally:
+        state["release"]()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
+def test_loading_info_advances_to_initialization_and_warmup(monkeypatch):
+    # A verified cache hit emits no download callbacks. Slow initialization and
+    # warmup still need observable stages, with info responsive from this thread.
+    plugin, _, _ = _plugin(monkeypatch)
+    build_entered, build_release = threading.Event(), threading.Event()
+    warmup_entered, warmup_release = threading.Event(), threading.Event()
+
+    class GatedAdapter(_FakeAdapter):
+        def warmup(self):
+            warmup_entered.set()
+            if not warmup_release.wait(10):
+                raise RuntimeError("test never released warmup")
+            return super().warmup()
+
+    def build(cfg):
+        build_entered.set()
+        if not build_release.wait(10):
+            raise RuntimeError("test never released initialization")
+        return GatedAdapter()
+
+    monkeypatch.setattr(vits2, "build_adapter", build)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say", "instance_id": "a"})
+    try:
+        assert build_entered.wait(3)
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            assert plugin.dispatch("tts", args)["desc"] == "Initializing the VITS2 TensorRT model..."
+        build_release.set()
+        assert warmup_entered.wait(3)
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            assert plugin.dispatch("tts", args)["desc"] == "Warming up the VITS2 TensorRT model..."
+    finally:
+        build_release.set()
+        warmup_release.set()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
+def test_stale_download_callbacks_cannot_replace_current_status(monkeypatch):
+    plugin, _, state = _plugin(monkeypatch, gated=True)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say", "instance_id": "a"})
+    try:
+        assert state["entered"].wait(3)
+        old_progress, old_stage = state["callbacks"][0]
+        old_progress(80, 128, 160)
+        plugin.dispatch("tts", {"action": "config", "speed": 0.8})
+        assert _wait_until(lambda: len(state["callbacks"]) == 2)
+        progress, _ = state["callbacks"][1]
+        progress(10, 16, 160)
+        old_progress(99, 159, 160)
+        old_stage("extract")
+        assert "10% (16/160 MB)" in plugin.dispatch("tts", {"action": "info"})["desc"]
+    finally:
+        state["release"]()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    progress(100, 160, 160)
+    old_stage("extract")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
 # ── failure and retry ────────────────────────────────────────────────────────
 
 def test_load_failure_surfaces_then_next_start_retries(monkeypatch):
@@ -214,6 +304,10 @@ def test_load_failure_surfaces_then_next_start_retries(monkeypatch):
     )
     info = plugin.dispatch("tts", {"action": "info"})
     assert "release download failed" in info["error"]
+    progress, stage = state["callbacks"][0]
+    progress(50, 80, 160)
+    stage("extract")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == "Model load failed: release download failed"
 
     # A retry is not blocked by the sticky error, and it succeeds.
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
@@ -395,6 +489,252 @@ def test_interrupt_still_drops_utterances_queued_before_it(monkeypatch, completi
 
 # ── config ───────────────────────────────────────────────────────────────────
 
+def test_prepare_config_loads_and_warms_without_starting_a_node(monkeypatch):
+    plugin, executor, state = _plugin(monkeypatch, cfg={"prepare_on_config": True})
+
+    result = plugin.dispatch("tts", {"action": "config"})
+
+    assert result == {"status": "configured", "model_state": "ready"}
+    assert state["loads"] == 1
+    assert _installed(plugin).warmups == 1
+    assert executor.nodes == []
+    started = plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert started["state"] == "running"
+    assert state["loads"] == 1
+
+
+def test_prepare_config_is_bounded_and_concurrent_calls_share_one_loader(monkeypatch):
+    monkeypatch.setattr(vits2, "_CONFIG_PREPARE_WAIT_S", 0.03)
+    plugin, executor, state = _plugin(
+        monkeypatch, gated=True, cfg={"prepare_on_config": True}
+    )
+    results = []
+    began = time.monotonic()
+    callers = [threading.Thread(target=lambda: results.append(
+        plugin.dispatch("tts", {"action": "config"})
+    )) for _ in range(3)]
+    try:
+        for caller in callers:
+            caller.start()
+        assert state["entered"].wait(3)
+        # info stays available while config waits on the loader.
+        assert plugin.dispatch("tts", {"action": "info"})["state"] == "loading"
+        for caller in callers:
+            caller.join(timeout=1)
+        assert all(not caller.is_alive() for caller in callers)
+        assert time.monotonic() - began < 1
+        assert len(results) == 3
+        assert all(r["status"] == "configured" and r["state"] == "loading"
+                   for r in results)
+        assert state["loads"] == 1
+        assert plugin._load_generation == 0
+        assert executor.nodes == []
+    finally:
+        state["release"]()
+        for caller in callers:
+            caller.join(timeout=1)
+    assert _wait_until(lambda: _installed(plugin) is not None)
+
+
+def test_prepare_config_updates_loading_speed_without_reloading(monkeypatch):
+    monkeypatch.setattr(vits2, "_CONFIG_PREPARE_WAIT_S", 0.02)
+    plugin, _, state = _plugin(
+        monkeypatch, gated=True, cfg={"prepare_on_config": True}
+    )
+    try:
+        assert plugin.dispatch("tts", {"action": "config"})["state"] == "loading"
+        result = plugin.dispatch("tts", {"action": "config", "speed": 0.8})
+        assert result["state"] == "loading"
+        assert state["loads"] == 1
+        assert plugin._load_generation == 0
+    finally:
+        state["release"]()
+    assert _wait_until(lambda: _installed(plugin) is not None)
+    assert _installed(plugin).speed == pytest.approx(0.8)
+    for _ in range(3):
+        assert plugin.dispatch("tts", {"action": "config"}) == {
+            "status": "configured", "model_state": "ready"
+        }
+    assert state["loads"] == 1
+    assert _installed(plugin).warmups == 1
+
+
+def test_prepare_config_reports_a_load_error_and_can_retry(monkeypatch):
+    plugin, _, state = _plugin(
+        monkeypatch, fail=1, cfg={"prepare_on_config": True}
+    )
+    failed = plugin.dispatch("tts", {"action": "config"})
+    assert failed["status"] == "error" and failed["state"] == "error"
+    assert "release download failed" in failed["message"]
+    assert plugin.dispatch("tts", {"action": "config"}) == {
+        "status": "configured", "model_state": "ready"
+    }
+    assert state["loads"] == 2
+
+
+def test_prepare_config_does_not_reapply_an_unchanged_resident_speed(monkeypatch):
+    plugin, _, state = _plugin(monkeypatch, cfg={"prepare_on_config": True})
+    plugin.dispatch("tts", {"action": "config"})
+    adapter = _installed(plugin)
+    applied = []
+    original = adapter.set_speed
+
+    def record(speed):
+        applied.append(speed)
+        original(speed)
+
+    monkeypatch.setattr(adapter, "set_speed", record)
+    plugin.dispatch("tts", {"action": "config"})
+    plugin.dispatch("tts", {"action": "config", "speed": 1.0})
+    assert applied == []
+    plugin.dispatch("tts", {"action": "config", "speed": 0.8})
+    assert applied == [0.8], "dispatch preparation must not apply the speed twice"
+    assert plugin._cfg["speed"] == adapter.speed == 0.8
+    assert state["loads"] == 1
+
+
+def test_prepare_config_waiting_for_adapter_keeps_lifecycle_responsive(monkeypatch):
+    plugin, _, _ = _plugin(monkeypatch, cfg={"prepare_on_config": True})
+    plugin.dispatch("tts", {"action": "config"})
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say", "instance_id": "a"})
+    adapter = _installed(plugin)
+    entered, release, lifecycle_done = threading.Event(), threading.Event(), threading.Event()
+    failures, results = [], []
+    original = adapter.set_speed
+
+    def blocked_speed(speed):
+        entered.set()
+        assert release.wait(3), "test did not release the busy adapter"
+        original(speed)
+
+    def configure():
+        try:
+            results.append(plugin.dispatch("tts", {"action": "config", "speed": 0.8}))
+        except BaseException as error:
+            failures.append(error)
+
+    def lifecycle():
+        try:
+            assert plugin.dispatch("tts", {"action": "info"})["state"] == "running"
+            assert plugin.dispatch("tts", {"action": "interrupt", "instance_id": "a"})["status"] == "interrupted"
+            assert plugin.dispatch("tts", {"action": "stop", "instance_id": "a"})["state"] == "idle"
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            lifecycle_done.set()
+
+    monkeypatch.setattr(adapter, "set_speed", blocked_speed)
+    config_thread = threading.Thread(target=configure)
+    lifecycle_thread = threading.Thread(target=lifecycle)
+    try:
+        config_thread.start()
+        assert entered.wait(1)
+        assert plugin._cfg["speed"] == 1.0, "save the speed only after the adapter accepts it"
+        lifecycle_thread.start()
+        assert lifecycle_done.wait(2), "config held the lifecycle lock across adapter work"
+        assert config_thread.is_alive(), "the adapter should still be busy"
+    finally:
+        release.set()
+        config_thread.join(timeout=3)
+        if lifecycle_thread.ident is not None:
+            lifecycle_thread.join(timeout=3)
+    assert failures == []
+    assert not config_thread.is_alive() and not lifecycle_thread.is_alive()
+    assert results == [{"status": "configured", "model_state": "ready"}]
+    assert plugin._cfg["speed"] == adapter.speed == 0.8
+
+
+@pytest.mark.parametrize("resident", [False, True])
+@pytest.mark.parametrize("speed", [0, -1, 4.1, float("nan"), float("inf")])
+def test_prepare_config_invalid_speed_does_not_mutate_or_load(monkeypatch, resident, speed):
+    plugin, _, state = _plugin(monkeypatch, cfg={"prepare_on_config": True})
+    if resident:
+        plugin.dispatch("tts", {"action": "config"})
+    previous = dict(plugin._cfg)
+    loads = state["loads"]
+    with pytest.raises(ValueError, match="speed"):
+        plugin.dispatch("tts", {"action": "config", "speed": speed})
+    assert plugin._cfg == previous
+    assert state["loads"] == loads
+    if resident:
+        assert _installed(plugin).speed == 1.0
+
+
+def test_prepare_config_adapter_rejects_speed_without_saving_it(monkeypatch):
+    plugin, _, _ = _plugin(monkeypatch, cfg={"prepare_on_config": True})
+    plugin.dispatch("tts", {"action": "config"})
+    adapter = _installed(plugin)
+
+    def fail(speed):
+        raise RuntimeError("adapter setting failed")
+
+    monkeypatch.setattr(adapter, "set_speed", fail)
+    with pytest.raises(RuntimeError, match="adapter setting failed"):
+        plugin.dispatch("tts", {"action": "config", "speed": 0.8})
+    assert plugin._cfg["speed"] == adapter.speed == 1.0
+    assert plugin.dispatch("tts", {"action": "config"})["model_state"] == "ready"
+
+
+def test_prepare_config_uses_deployment_source_and_zero_wait(monkeypatch):
+    plugin, _, state = _plugin(monkeypatch, gated=True, cfg={
+        "prepare_on_config": True, "prepare_timeout_s": 0,
+        "model_base_url": "http://deployment-assets.example/vits2/",
+    })
+    try:
+        result = plugin.dispatch("tts", {"action": "config"})
+        assert result["state"] == "loading"
+        assert state["entered"].wait(3)
+        assert state["base_urls"] == ["http://deployment-assets.example/vits2/"]
+    finally:
+        state["release"]()
+    assert _wait_until(lambda: _installed(plugin) is not None)
+
+
+@pytest.mark.parametrize("timeout", [-1, 50.1, float("nan"), float("inf")])
+def test_prepare_config_rejects_unbounded_wait(monkeypatch, timeout):
+    plugin, _, state = _plugin(monkeypatch, cfg={
+        "prepare_on_config": True, "prepare_timeout_s": timeout,
+    })
+    with pytest.raises(ValueError, match="prepare_timeout_s"):
+        plugin.dispatch("tts", {"action": "config"})
+    assert state["loads"] == 0
+
+
+@pytest.mark.parametrize("frame_count", [5, 15])
+def test_ten_frame_prebuffer_preserves_short_and_long_speech(monkeypatch, frame_count):
+    monkeypatch.setattr(vits2, "PREBUFFER_FRAMES", 10)
+    plugin, executor, state = _plugin(monkeypatch)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert _wait_until(lambda: bool(executor.nodes))
+    node = executor.nodes[0]
+    frames = [bytes([index + 1, 0]) * (vits2.CHUNK_BYTES // 2)
+              for index in range(frame_count)]
+    tail = b"\x01\x00" * 8
+    entered, release = threading.Event(), threading.Event()
+
+    def synthesize(text):
+        split = min(frame_count - 1, 9)
+        yield b"".join(frames[:split])
+        entered.set()
+        assert release.wait(3), "test did not release the remaining PCM"
+        yield b"".join(frames[split:]) + tail
+
+    monkeypatch.setattr(_installed(plugin), "synthesize_stream", synthesize)
+    try:
+        node.enqueue("完整播报")
+        assert entered.wait(3)
+        assert node._pub.messages == [], "audio escaped before the prebuffer filled"
+        release.set()
+        assert _wait_until(lambda: node._pub.messages
+                           and bytes(node._pub.messages[-1]) == vits2.AUDIO_EOF_MAGIC)
+        delivered = [bytes(data) for data in node._pub.messages[:-1]]
+        assert b"".join(delivered) == b"".join(frames) + tail
+        assert len(delivered) == frame_count + 1
+    finally:
+        release.set()
+        plugin.dispatch("tts", {"action": "stop"})
+
+
 def test_config_speed_updates_a_resident_model_without_a_reload(monkeypatch):
     plugin, executor, state = _plugin(monkeypatch)
 
@@ -406,7 +746,7 @@ def test_config_speed_updates_a_resident_model_without_a_reload(monkeypatch):
         "status": "configured"
     }
     assert _installed(plugin).speed == pytest.approx(1.4)
-    # A slider change must not cost a 60 MB reload or drop the live node.
+    # A slider change must not cost a 160 MB reload or drop the live node.
     assert state["loads"] == 1
     assert executor.nodes == [node] and node.state == "running"
 
@@ -502,7 +842,7 @@ def test_load_error_keeps_the_underlying_cause(monkeypatch):
 
     import utils.model_downloader as md
 
-    def explode(model_dir, family=None):
+    def explode(model_dir, family=None, progress_cb=None, stage_cb=None):
         try:
             raise ImportError(
                 "libnvdla_compiler.so: cannot open shared object file: "
@@ -550,3 +890,207 @@ def test_info_while_loading_reports_the_pending_output_topic(monkeypatch):
     assert [t["topic"] for t in running["topic_out"]] == [
         "/remote_control/message/tts"
     ]
+
+
+# Use a separate copy of the real plugin for pacing tests. The autouse fixture
+# above deliberately sets the ordinary module's interval to zero for lifecycle
+# tests, which would otherwise hide regressions in live audio delivery.
+def _pacing_plugin(monkeypatch):
+    name = "plugins.vits2_tts_trt._pacing_test"
+    spec = importlib.util.spec_from_file_location(name, Path(vits2.__file__))
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _VirtualPacingClock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._now = 0.0
+        self.on_sleep = None
+
+    def monotonic(self):
+        with self._lock:
+            return self._now
+
+    def advance(self, seconds):
+        with self._lock:
+            self._now += seconds
+
+    def sleep(self, seconds):
+        assert seconds >= 0
+        with self._lock:
+            self._now += seconds
+        if self.on_sleep is not None:
+            self.on_sleep(seconds)
+        # Give the synth and publisher threads a scheduling opportunity.
+        threading.Event().wait(0)
+
+
+class _PacingAdapter(_FakeAdapter):
+    def __init__(self, payloads):
+        super().__init__()
+        self.payloads = payloads
+
+    def synthesize_stream(self, text):
+        self.spoken.append(text)
+        yield self.payloads[text]
+
+
+def _pcm_frame(module, value):
+    return bytes((value, 0)) * (module.CHUNK_BYTES // 2)
+
+
+def _pacing_node(monkeypatch, module, clock, payloads):
+    monkeypatch.setattr(
+        module, "time", SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)
+    )
+    monkeypatch.setattr(module, "SUBSCRIBER_SETTLE_MS", 0)
+    monkeypatch.setattr(module, "FIRST_FRAME_DELAY_MS", 0)
+    monkeypatch.setattr(module, "PREBUFFER_FRAMES", 5)
+    monkeypatch.setattr(module, "MAX_BURST_FRAMES", 20)
+    completions = []
+    monkeypatch.setattr(
+        module, "_complete_action",
+        lambda action_id, text, frames, interrupted: completions.append(
+            (action_id, text, frames, interrupted)
+        ),
+    )
+    node = module._Vits2TTSNode(None, _PacingAdapter(payloads))
+    monkeypatch.setattr(node, "_wait_for_audio_subscriber", lambda *_: (0.0, 0.0, 1))
+    published = []
+    original_publish = node._publish
+
+    def record(pcm):
+        published.append((clock.monotonic(), bytes(pcm)))
+        original_publish(pcm)
+
+    monkeypatch.setattr(node, "_publish", record)
+    node.start()
+    return node, published, completions
+
+
+@pytest.mark.parametrize(
+    ("allow_fast", "requested", "expected"),
+    [
+        (None, None, 100),
+        (None, "70", 100),
+        (None, "0", 100),
+        ("false", "70", 100),
+        ("1", "70", 70),
+        ("1", "0", 0),
+        (None, "150", 150),
+        ("1", "bad", 100),
+        ("1", "-1", 100),
+        (None, "1001", 100),
+    ],
+)
+def test_live_frame_interval_requires_explicit_fast_delivery(
+    monkeypatch, allow_fast, requested, expected
+):
+    for name, value in (
+        ("MIX_VITS_ALLOW_FAST_DELIVERY", allow_fast),
+        ("MIX_VITS_FRAME_INTERVAL_MS", requested),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    module = _pacing_plugin(monkeypatch)
+    assert module.PCM_FRAME_MS == pytest.approx(100)
+    assert module.FRAME_INTERVAL_MS == pytest.approx(expected)
+
+
+def test_live_pacing_preserves_pcm_and_eof_over_long_utterance(monkeypatch):
+    monkeypatch.delenv("MIX_VITS_ALLOW_FAST_DELIVERY", raising=False)
+    monkeypatch.delenv("MIX_VITS_FRAME_INTERVAL_MS", raising=False)
+    module = _pacing_plugin(monkeypatch)
+    clock = _VirtualPacingClock()
+    frames = [_pcm_frame(module, i + 1) for i in range(80)]
+    tail = b"\x01\x02" * 7
+    payload = b"".join(frames) + tail
+    node, published, completions = _pacing_node(
+        monkeypatch, module, clock, {"long": payload}
+    )
+    try:
+        node.enqueue("long", action_id="long-1")
+        assert _wait_until(lambda: len(completions) == 1, timeout=5)
+        assert completions == [("long-1", "long", 81, False)]
+        assert [pcm for _, pcm in published[:-1]] == frames + [tail]
+        assert published[-1][1] == module.AUDIO_EOF_MAGIC
+        times = [at for at, _ in published[:-1]]
+        assert times[:5] == pytest.approx([times[0]] * 5)
+        assert times[5] - times[0] == pytest.approx(0.1)
+        assert times[79] - times[0] == pytest.approx(7.5)
+        assert times[80] - times[0] == pytest.approx(7.6)
+    finally:
+        node.stop()
+
+
+def test_idle_refills_at_most_the_original_prebuffer(monkeypatch):
+    monkeypatch.delenv("MIX_VITS_ALLOW_FAST_DELIVERY", raising=False)
+    monkeypatch.delenv("MIX_VITS_FRAME_INTERVAL_MS", raising=False)
+    module = _pacing_plugin(monkeypatch)
+    clock = _VirtualPacingClock()
+    node, published, completions = _pacing_node(
+        monkeypatch,
+        module,
+        clock,
+        {
+            "first": _pcm_frame(module, 1) * 10,
+            "after-idle": _pcm_frame(module, 2) * 12,
+        },
+    )
+    try:
+        node.enqueue("first", action_id="first-1")
+        assert _wait_until(lambda: len(completions) == 1, timeout=5)
+        clock.advance(10.0)
+        node.enqueue("after-idle", action_id="second-1")
+        assert _wait_until(lambda: len(completions) == 2, timeout=5)
+        assert completions[-1] == ("second-1", "after-idle", 12, False)
+        assert published[-1][1] == module.AUDIO_EOF_MAGIC
+        second_times = [at for at, pcm in published if pcm == _pcm_frame(module, 2)]
+        assert len(second_times) == 12
+        assert sum(abs(at - second_times[0]) < 1e-9 for at in second_times) <= 5
+        assert second_times[5] - second_times[0] == pytest.approx(0.1)
+    finally:
+        node.stop()
+
+
+def test_interrupt_while_pacing_allows_next_utterance(monkeypatch):
+    monkeypatch.delenv("MIX_VITS_ALLOW_FAST_DELIVERY", raising=False)
+    monkeypatch.delenv("MIX_VITS_FRAME_INTERVAL_MS", raising=False)
+    module = _pacing_plugin(monkeypatch)
+    clock = _VirtualPacingClock()
+    first = _pcm_frame(module, 1) * 12
+    second = _pcm_frame(module, 2) * 2
+    node, published, completions = _pacing_node(
+        monkeypatch, module, clock, {"first": first, "second": second}
+    )
+    interrupted = threading.Event()
+
+    def interrupt_once(seconds):
+        if seconds > 0 and not interrupted.is_set():
+            interrupted.set()
+            node.interrupt()
+
+    clock.on_sleep = interrupt_once
+    try:
+        node.enqueue("first", action_id="first-1")
+        assert _wait_until(lambda: len(completions) == 1, timeout=5)
+        assert interrupted.is_set()
+        assert completions[0][0] == "first-1"
+        assert completions[0][3] is True
+        assert [pcm for _, pcm in published].count(module.AUDIO_EOF_MAGIC) == 1
+        clock.on_sleep = None
+        node.enqueue("second", action_id="second-1")
+        assert _wait_until(lambda: len(completions) == 2, timeout=5)
+        assert completions[1] == ("second-1", "second", 2, False)
+        assert [pcm for _, pcm in published][-3:] == [
+            _pcm_frame(module, 2),
+            _pcm_frame(module, 2),
+            module.AUDIO_EOF_MAGIC,
+        ]
+    finally:
+        node.stop()

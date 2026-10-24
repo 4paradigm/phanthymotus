@@ -12,7 +12,7 @@ def clean_text(text, language):
 def normalize_text_mix(text):
     """Normalize the complete MIX input once, before chunking."""
     has_zh = any("\u4e00" <= c <= "\u9fff" for c in text)
-    has_en = any(("a" <= c.lower() <= "z") for c in text)
+    has_en = any(english.is_latin_letter(c) for c in text)
     if has_zh and not has_en:
         return chinese.text_normalize(text)
     if has_en and not has_zh:
@@ -23,7 +23,7 @@ def normalize_text_mix(text):
 def g2p_normalized_text_mix(norm_text):
     """Convert already-normalized MIX text to phones without running TN again."""
     has_zh = any("\u4e00" <= c <= "\u9fff" for c in norm_text)
-    has_en = any(("a" <= c.lower() <= "z") for c in norm_text)
+    has_en = any(english.is_latin_letter(c) for c in norm_text)
     # "No latin letters" is not the same as "the Chinese frontend can say all of
     # it": mix_normalize() ends with the English cleaner, so a chunk can still
     # carry digits or symbols that the Chinese cleaner would strip \u2014 silently

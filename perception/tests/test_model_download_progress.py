@@ -126,6 +126,9 @@ def test_archive_front_doors_forward_both_callbacks(func_name, kwargs, monkeypat
         seen.update(progress_cb=progress_cb, stage_cb=stage_cb)
 
     monkeypatch.setattr(md, "ensure_verified_archive", fake_archive)
+    # VITS2 also installs its pinned Gold lexicon after the cached/new archive.
+    # Keep this forwarding test offline; the resource tests exercise that fetch.
+    monkeypatch.setattr(md, "ensure_verified_bundle", lambda *a, **k: {})
     monkeypatch.setattr(md, "require_models_subpath", lambda path: path)
     monkeypatch.setattr(md, "select_bundle_family", lambda bundles, family=None:
                         sorted(bundles)[0])

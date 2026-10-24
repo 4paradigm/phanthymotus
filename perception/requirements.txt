@@ -1,0 +1,4 @@
+# Shared Perception image dependencies added beyond the existing Dockerfile list.
+# The in-image music schema test imports jsonschema. Keep it independent of the
+# optional VITS2 install; 4.23.0 supports both Python 3.8 (JP5) and 3.10 (JP6).
+jsonschema==4.23.0
