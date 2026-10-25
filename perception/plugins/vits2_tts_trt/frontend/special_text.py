@@ -7,7 +7,11 @@ or exponent. This is deterministic text processing, not model inference.
 import re
 
 from .math_units import find_spans as find_math_unit_spans, _english_quantity
-from .number_context import find_spans as find_number_context_spans
+from .number_context import (
+    find_spans as find_number_context_spans, literal_date_ranges, protected_identifier_ranges,
+)
+from .numeric_formats import malformed_money_ranges, protected_version_ranges
+from .numeric_literal import fold_numeric_width, read_numeric_literal
 
 _EMAIL = r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}"
 _URL = r"(?:https?://|www\.)[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
@@ -138,6 +142,19 @@ def normalize_special_text(text, normalize_plain, verbalize_number, language=Non
             continue
         end = match.start() + len(address)
         spans.append((match.start(), end, _read_address(address, local_language(match.start(), end))))
+    # Unsupported numeric syntax is still speakable. Preserve its exact digits
+    # and separators before ordinary fields/FST can claim a prefix or drop a
+    # currency symbol. Explicit addresses, IDs and versions keep precedence.
+    protected_literals = [(a, b) for a, b, _ in spans]
+    shape_text = fold_numeric_width(text)
+    protected_literals.extend(protected_identifier_ranges(shape_text))
+    protected_literals.extend(protected_version_ranges(shape_text))
+    literal_candidates = list(malformed_money_ranges(shape_text)) + list(literal_date_ranges(shape_text))
+    for start, end in sorted(literal_candidates, key=lambda item: (item[0], -item[1])):
+        if (not any(start < b and end > a for a, b in protected_literals)
+                and not any(start < b and end > a for a, b, _ in spans)):
+            spoken = read_numeric_literal(text[start:end], local_language(start, end))
+            spans.append((start, end, spoken))
     # Context is read from the entire original sentence. Addresses take priority,
     # so an identifier-looking fragment inside a URL/email is always read literally.
     for start, end, spoken in local_spans(find_number_context_spans, text):

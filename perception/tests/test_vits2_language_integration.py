@@ -29,7 +29,7 @@ class _Adapter(Vits2TensorRTAdapter):
     def warmup(self):
         return 16
 
-    def iter_text_chunks(self, text):
+    def iter_text_chunks(self, text, reading_language=None):
         self.prepared.append(text)
         yield text, ((1,), (2,), (3,))
 
@@ -66,7 +66,7 @@ def make_plugin(monkeypatch):
                 raise RuntimeError("controlled download failure")
             return "/models/vits2/engines/jp61"
 
-        def build(cfg):
+        def build(cfg, *, progress_cb=None, stage_cb=None):
             adapter = _Adapter()
             adapter.set_speed(cfg.get("speed", 1.0))
             state.adapter = adapter
@@ -589,8 +589,8 @@ def test_prepared_request_preserves_real_adapter_pcm_rng_lock_and_speed():
     baseline = Vits2TensorRTAdapter(speed=0.95, engine=baseline_engine)
     prepared = Vits2TensorRTAdapter(speed=0.95, engine=prepared_engine)
     baseline_engine.adapter, prepared_engine.adapter = baseline, prepared
-    baseline.iter_text_chunks = lambda text: iter(chunks)
-    prepared.iter_text_chunks = lambda text: pytest.fail("prepared frontend must not rerun")
+    baseline.iter_text_chunks = lambda text, reading_language=None: iter(chunks)
+    prepared.iter_text_chunks = lambda text, reading_language=None: pytest.fail("prepared frontend must not rerun")
     text = "Hello. 你好。"
     expected = list(baseline.synthesize_stream(text))
     view = _PreparedAdapterView(prepared, PreparedSpeech(text, "en", "test-token", chunks))
@@ -688,10 +688,10 @@ def test_interrupt_during_frontend_discards_old_request(make_plugin, monkeypatch
     original = _Adapter.iter_text_chunks
     results, failures = [], []
 
-    def slow_frontend(adapter, text):
+    def slow_frontend(adapter, text, reading_language=None):
         entered.set()
         assert release.wait(3)
-        yield from original(adapter, text)
+        yield from original(adapter, text, reading_language=reading_language)
 
     monkeypatch.setattr(_Adapter, "iter_text_chunks", slow_frontend)
 
@@ -758,7 +758,7 @@ def test_ros_frontend_exception_is_contained_and_reported(make_plugin, monkeypat
     state = make_plugin()
     start(state)
 
-    def broken(text):
+    def broken(text, reading_language=None):
         raise ValueError("protected span cannot fit the engine token limit")
 
     monkeypatch.setattr(state.adapter, "iter_text_chunks", broken)
@@ -768,15 +768,91 @@ def test_ros_frontend_exception_is_contained_and_reported(make_plugin, monkeypat
     assert state.adapter.spoken == []
 
 
+def test_ros_rejection_logs_are_sampled_per_instance_without_losing_error_state(
+    make_plugin, monkeypatch, caplog,
+):
+    state = make_plugin()
+    start(state, "a")
+    start(state, "b")
+    nodes = state.plugin._impl._nodes
+    first, second = nodes["a"], nodes["b"]
+    prepare = first._prepare_topic
+    recorded = []
+    original_record = first._record_request_error
+
+    def record(error, context=None):
+        recorded.append(error.code)
+        original_record(error, context)
+
+    def reject(payload):
+        raise LanguagePolicyError("unsupported_script", "Only Chinese and Latin scripts are supported")
+
+    monkeypatch.setattr(first, "_record_request_error", record)
+    monkeypatch.setattr(first, "_prepare_topic", reject)
+    monkeypatch.setattr(second, "_prepare_topic", reject)
+    caplog.set_level("WARNING", logger="plugins.vits2_tts_language.plugin")
+    message = SimpleNamespace(data='{"text":"PRIVATE_TEST_PAYLOAD"}')
+    for _ in range(250):
+        first._text_callback(message)
+    logs = [r for r in caplog.records if r.name == "plugins.vits2_tts_language.plugin"]
+    assert len(logs) == 3  # first, 100th and 200th
+    assert len(recorded) == 250
+    assert call(state, "info", instance_id="a")["last_language_error"]["code"] == "unsupported_script"
+    assert call(state, "info", instance_id="a")["remembered_language"] is None
+    assert all("PRIVATE_TEST_PAYLOAD" not in r.getMessage() for r in logs)
+    second._text_callback(message)
+    assert len([r for r in caplog.records if r.name == "plugins.vits2_tts_language.plugin"]) == 4
+    # Successful speech still uses the normal enqueue/worker and clears errors.
+    monkeypatch.setattr(first, "_prepare_topic", prepare)
+    first._text_callback(SimpleNamespace(data="Hello."))
+    assert _wait_until(lambda: state.adapter.spoken == ["Hello."])
+    assert call(state, "info", instance_id="a")["last_language_error"] is None
+
+
+def test_ros_unexpected_exception_logs_are_sampled_separately(make_plugin, monkeypatch, caplog):
+    state = make_plugin()
+    start(state)
+    node = state.plugin._impl._nodes["a"]
+    recorded = []
+    original_record = node._record_request_error
+
+    def record(error, context=None):
+        recorded.append(error.code)
+        original_record(error, context)
+
+    def fail(payload):
+        raise RuntimeError("controlled frontend failure")
+
+    caplog.set_level("WARNING", logger="plugins.vits2_tts_language.plugin")
+    monkeypatch.setattr(node, "_record_request_error", record)
+    monkeypatch.setattr(node, "_prepare_topic", fail)
+    for _ in range(250):
+        node._text_callback(SimpleNamespace(data="Hello."))
+    errors = [r for r in caplog.records if r.name == "plugins.vits2_tts_language.plugin"]
+    assert len(errors) == 3
+    assert all(r.exc_info for r in errors)
+    assert recorded == ["speech_error"] * 250
+    assert call(state, "info", instance_id="a")["last_language_error"]["code"] == "speech_error"
+    # The first expected rejection must remain visible after exception sampling.
+    def reject(payload):
+        raise LanguagePolicyError("unsupported_script", "Only Chinese and Latin scripts are supported")
+
+    monkeypatch.setattr(node, "_prepare_topic", reject)
+    node._text_callback(SimpleNamespace(data="Hello."))
+    logs = [r for r in caplog.records if r.name == "plugins.vits2_tts_language.plugin"]
+    assert len(logs) == 4
+    assert logs[-1].exc_info is None
+
+
 def test_speak_response_keeps_request_turn_during_concurrent_language_update(make_plugin, monkeypatch):
     state = make_plugin()
     start(state)
     old = call(state, "language", instance_id="a", text="Hello.")
     original = state.adapter.iter_text_chunks
 
-    def change_turn_during_frontend(text):
+    def change_turn_during_frontend(text, reading_language=None):
         call(state, "language", instance_id="a", text="你好")
-        yield from original(text)
+        yield from original(text, reading_language=reading_language)
 
     monkeypatch.setattr(state.adapter, "iter_text_chunks", change_turn_during_frontend)
     result = call(state, "speak", instance_id="a", text="Hello.", turn_id=old["turn_id"])
@@ -785,7 +861,7 @@ def test_speak_response_keeps_request_turn_during_concurrent_language_update(mak
     assert finished(state, result)[3] is False
 
 
-@pytest.mark.parametrize("invalid", ["呃", "2026-02-30", "...", "🙂"])
+@pytest.mark.parametrize("invalid", ["呃", "...", "🙂"])
 def test_rejected_direct_speech_keeps_last_accepted_language(make_plugin, monkeypatch, invalid):
     state = make_plugin()
     start(state)
@@ -793,9 +869,9 @@ def test_rejected_direct_speech_keeps_last_accepted_language(make_plugin, monkey
     before = call(state, "info", instance_id="a")
     original = state.adapter.iter_text_chunks
 
-    def filtering_frontend(text):
+    def filtering_frontend(text, reading_language=None):
         if text != "呃":
-            yield from original(text)
+            yield from original(text, reading_language=reading_language)
 
     monkeypatch.setattr(state.adapter, "iter_text_chunks", filtering_frontend)
     with pytest.raises(LanguagePolicyError):
@@ -809,13 +885,31 @@ def test_rejected_direct_speech_keeps_last_accepted_language(make_plugin, monkey
     assert "October twenty third" in state.adapter.spoken[-1]
 
 
+@pytest.mark.parametrize("seed,language,spoken", [
+    ("Hello", "en", "two zero two six hyphen zero two hyphen three zero"),
+    ("你好", "zh", "二零二六连字符零二连字符三零"),
+])
+def test_invalid_calendar_is_spoken_literally_in_accepted_auto_language(make_plugin, seed, language, spoken):
+    state = make_plugin()
+    start(state)
+    finished(state, call(state, "speak", instance_id="a", text=seed))
+    result = call(state, "speak", instance_id="a", text="2026-02-30")
+    finished(state, result)
+    assert result["reply_language"] == language
+    assert state.adapter.spoken[-1] == spoken
+    assert call(state, "info", instance_id="a")["remembered_language"] == language
+    follow = call(state, "speak", instance_id="a", text="2026 10/23")
+    finished(state, follow)
+    assert follow["reply_language"] == language
+
+
 def test_loading_fifo_ignores_rejected_history_and_reports_pending_metadata(make_plugin, monkeypatch):
     state = make_plugin(gated=True)
     original = _Adapter.iter_text_chunks
 
-    def filtering_frontend(adapter, text):
+    def filtering_frontend(adapter, text, reading_language=None):
         if text != "呃":
-            yield from original(adapter, text)
+            yield from original(adapter, text, reading_language=reading_language)
 
     monkeypatch.setattr(_Adapter, "iter_text_chunks", filtering_frontend)
     results = [call(state, "speak", instance_id="a", text=text)
@@ -848,11 +942,11 @@ def test_slow_old_direct_cannot_overwrite_newer_state(make_plugin, monkeypatch, 
     entered, release = threading.Event(), threading.Event()
     results, failures = [], []
 
-    def slow_frontend(adapter, text):
+    def slow_frontend(adapter, text, reading_language=None):
         if text == "你好":
             entered.set()
             assert release.wait(3)
-        yield from original(adapter, text)
+        yield from original(adapter, text, reading_language=reading_language)
 
     monkeypatch.setattr(_Adapter, "iter_text_chunks", slow_frontend)
 
@@ -928,7 +1022,8 @@ def test_real_fst_filtered_interjection_cannot_change_auto_history(make_plugin, 
     engine.add_blank = bool(json.loads((root / "config.json").read_text())["data"].get("add_blank", True))
     adapter = Vits2TensorRTAdapter.__new__(Vits2TensorRTAdapter)
     adapter._engine, adapter.max_chunk_tokens = engine, 256
-    monkeypatch.setattr(_Adapter, "iter_text_chunks", lambda self, text: adapter.iter_text_chunks(text))
+    monkeypatch.setattr(_Adapter, "iter_text_chunks", lambda self, text, reading_language=None:
+                        adapter.iter_text_chunks(text, reading_language=reading_language))
     state = make_plugin(gated=loading)
     if loading:
         hello, rejected, date = [call(state, "speak", instance_id="a", text=text)

@@ -47,11 +47,9 @@ class HotwordTests(unittest.TestCase):
         os.environ["VITS2_HOTWORDS_PATH"] = str(self.path)
         self.module.reload_hotwords()
 
-    def test_default_only_reviewed_nonconflicting_terms(self):
-        self.assertEqual(self.module.lookup_hotword("Airbnb"), [["EH1", "R", "B", "IY1", "EH1", "N", "B", "IY1"]])
-        self.assertEqual(self.module.lookup_hotword("AIRBNB"), self.module.lookup_hotword("airbnb"))
-        self.assertEqual(self.module.lookup_hotword("ASML"), [["EY1", "EH1", "S", "EH1", "M", "EH1", "L"]])
-        for token in ("asml", "WEN", "Wen", "car", "CAR", "apps", "APPS", "NVIDIA", "CUDA"):
+    def test_default_has_no_word_specific_inline_overrides(self):
+        for token in ("Airbnb", "airbnb", "AIRBNB", "ASML", "asml", "WEN", "Wen",
+                      "car", "CAR", "apps", "APPS", "NVIDIA", "CUDA"):
             with self.subTest(token=token):
                 self.assertIsNone(self.module.lookup_hotword(token))
 
@@ -61,6 +59,7 @@ class HotwordTests(unittest.TestCase):
                 self.assertIsNone(self.module.lookup_hotword(token))
 
     def test_language_is_token_language_and_cmu_guard(self):
+        self.manifest([entry(text="AIRBNB", case="fold", domain="*", override_cmu=False)])
         self.assertIsNone(self.module.lookup_hotword("Airbnb", language="zh"))
         self.assertIsNotNone(self.module.lookup_hotword("Airbnb", language="en"))
         self.assertIsNone(self.module.lookup_hotword("Airbnb", has_cmu=True))

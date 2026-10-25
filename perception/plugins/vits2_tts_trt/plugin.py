@@ -780,7 +780,23 @@ class TTSPlugin:
             # data and config must come from that same bundle as its engines.
             cfg["model_dir"] = vits2_release_root(cfg["engine_dir"])
             self._set_load_status(generation, "Initializing the VITS2 TensorRT model...")
-            adapter = build_adapter(cfg)
+            lexicon_progress, _ = fetch_status(
+                lambda status: self._set_load_status(generation, status),
+                "VITS2 pronunciation dictionary",
+            )
+            lexicon_stages = {
+                "verify": "Verifying the VITS2 pronunciation dictionary...",
+                "waiting": "Waiting for VITS2 pronunciation resources...",
+                "download": "Downloading the VITS2 pronunciation dictionary...",
+                "compile": "Preparing the VITS2 pronunciation dictionary...",
+                "initialize": "Initializing the VITS2 TensorRT model...",
+            }
+
+            def lexicon_stage(stage):
+                if stage in lexicon_stages:
+                    self._set_load_status(generation, lexicon_stages[stage])
+
+            adapter = build_adapter(cfg, progress_cb=lexicon_progress, stage_cb=lexicon_stage)
             if not isinstance(adapter, Vits2TensorRTAdapter):
                 raise RuntimeError("Unexpected non-TensorRT VITS2 adapter")
             if cfg.get("warmup", True):

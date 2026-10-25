@@ -104,7 +104,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
     def _token_count(self, text: str) -> int:
         return len(self._engine._get_text_ids(text, normalized=True)[0])
 
-    def iter_text_chunks(self, text: str):
+    def iter_text_chunks(self, text: str, reading_language=None):
         """Yield the exact normalized text chunks and IDs used in production."""
         text = text.strip()
         if not text:
@@ -114,9 +114,9 @@ class Vits2TensorRTAdapter(TTSAdapter):
             iter_text_chunks as _frontend_iter_text_chunks,
         )
 
-        for chunk in _frontend_iter_text_chunks(
-            normalize_text_mix(text), self._token_count, self.max_chunk_tokens
-        ):
+        normalized = (normalize_text_mix(text, reading_language=reading_language)
+                      if reading_language else normalize_text_mix(text))
+        for chunk in _frontend_iter_text_chunks(normalized, self._token_count, self.max_chunk_tokens):
             text_ids = self._engine._get_text_ids(chunk, normalized=True)
             yield chunk, text_ids
 
@@ -162,9 +162,11 @@ class Vits2TensorRTAdapter(TTSAdapter):
         return warmup_bytes
 
 
-def _trt_adapter(cfg: dict) -> Vits2TensorRTAdapter:
+def _trt_adapter(cfg: dict, *, progress_cb=None, stage_cb=None) -> Vits2TensorRTAdapter:
     root = Path(cfg.get("model_dir", "/models/vits2"))
-    _configure_frontend_paths(root)
+    _configure_frontend_paths(root, progress_cb=progress_cb, stage_cb=stage_cb)
+    if stage_cb is not None:
+        stage_cb("initialize")
     return Vits2TensorRTAdapter(
         speed=float(cfg.get("speed", 1.0)),
         model_config=str(root / "config.json"),
@@ -173,18 +175,20 @@ def _trt_adapter(cfg: dict) -> Vits2TensorRTAdapter:
     )
 
 
-def _configure_frontend_paths(root: Path) -> None:
+def _configure_frontend_paths(root: Path, *, progress_cb=None, stage_cb=None) -> None:
     """Point inference at the release-controlled frontend data."""
     from .frontend.release_paths import configure_release_paths
+    from .lexicon_resources import ensure_external_lexicon
 
+    ensure_external_lexicon(root, progress_cb=progress_cb, stage_cb=stage_cb)
     configure_release_paths(root)
 
 
-def build_adapter(cfg: dict) -> TTSAdapter:
+def build_adapter(cfg: dict, *, progress_cb=None, stage_cb=None) -> TTSAdapter:
     speaker_id = int(cfg.get("speaker_id", 0))
     if speaker_id != 0:
         raise ValueError("The VITS2 model supports only speaker_id=0")
     backend = str(cfg.get("backend", "trt")).lower()
     if backend != "trt":
         raise ValueError("The JP6 VITS2 plugin supports backend=trt only")
-    return _trt_adapter(cfg)
+    return _trt_adapter(cfg, progress_cb=progress_cb, stage_cb=stage_cb)

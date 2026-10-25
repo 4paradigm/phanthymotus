@@ -6,10 +6,11 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from plugins.vits2_tts_language.neutral_text import normalize_mixed_text, normalize_neutral_text
+from plugins.vits2_tts_language.neutral_text import (
+    is_neutral_text, normalize_mixed_text, normalize_neutral_text,
+)
 from plugins.vits2_tts_trt.frontend.numeric_formats import find_spans
 from plugins.vits2_tts_trt.frontend.special_text import verbalize_chinese_number
-from plugins.vits2_tts_language.neutral_text import is_neutral_text
 from plugins.vits2_tts_language.policy import LanguagePolicy
 
 
@@ -38,6 +39,47 @@ def test_complete_currency_values_preserve_sign_precision_and_minor_units(raw, z
     for mode, expected in (("zh", zh), ("en", en)):
         assert normalize_mixed_text("Price " + raw + " today", mode) == "Price " + expected + " today"
         assert normalize_neutral_text(raw, mode) == expected
+
+
+@pytest.mark.parametrize("raw,zh,en", [
+    ("¥1,299.50", "一千二百九十九点五零元", "one thousand two hundred ninety nine point five zero yuan"),
+    ("￥1,299.50", "一千二百九十九点五零元", "one thousand two hundred ninety nine point five zero yuan"),
+    ("¥1", "一元", "one yuan"),
+    ("¥0.00", "零点零零元", "zero point zero zero yuan"),
+    ("¥.50", "零点五零元", "zero point five zero yuan"),
+    ("¥0.001", "零点零零一元", "zero point zero zero one yuan"),
+    ("-¥12.05", "负十二点零五元", "minus twelve point zero five yuan"),
+    ("￥-12.05", "负十二点零五元", "minus twelve point zero five yuan"),
+    ("+¥2.10", "正二点一零元", "plus two point one zero yuan"),
+])
+def test_yuan_amount_uses_selected_language_and_preserves_written_digits(raw, zh, en):
+    for mode, expected in (("zh", zh), ("en", en)):
+        assert normalize_neutral_text(raw, mode) == expected
+        assert normalize_mixed_text("The price is " + raw + " today", mode) == "The price is " + expected + " today"
+
+
+def test_actual_batch_regression_keeps_english_amount_and_existing_dollars():
+    raw = "The item costs ¥1,299.50, with an additional $8.25 shipping charge."
+    result = normalize_mixed_text(raw, "en")
+    assert "one thousand two hundred ninety nine point five zero yuan" in result
+    assert "eight dollars and twenty five cents" in result
+    assert not any("\u3400" <= char <= "\u9fff" for char in result)
+
+
+@pytest.mark.parametrize("raw", [
+    "¥12,34.50", "￥1,2345", "-¥-1", "¥1.2.3", "¥1_2", "abc¥12", "$¥1",
+    "¥12USD", "RMB12", "CNY12",
+])
+def test_malformed_or_unrecognized_currency_not_partially_claimed(raw):
+    assert find_spans(raw, "EN", lambda value, language: verbalize_chinese_number(value)) == []
+
+
+def test_encoded_currency_in_addresses_is_not_read_as_money():
+    raw = "https://example.com/%C2%A51,299.50 user+demo@example.com"
+    result = normalize_mixed_text(raw, "en")
+    assert "yuan" not in result
+    assert "percent C two percent A five" in result
+    assert "plus D E M O at" in result
 
 
 @pytest.mark.parametrize("raw,zh,en", [
@@ -86,7 +128,9 @@ def test_explicit_id_takes_priority_over_versions_and_math():
     assert "ABC一二三" in zh.replace(" ", "")
     assert "V一点零二点三" in zh.replace(" ", "")
     for raw in ("identity123", "identifier123", "IDLE123", "abc123"):
-        assert normalize_mixed_text(raw, "en") == raw
+        # Unknown names keep their letter run; only their literal digits are
+        # spelled. They must not be promoted to an explicit ID field label.
+        assert normalize_mixed_text(raw, "en") == raw[:-3] + " one two three"
 
 
 def test_addresses_override_currency_versions_and_ordinals():

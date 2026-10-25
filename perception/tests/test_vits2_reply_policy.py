@@ -4,6 +4,13 @@ from dataclasses import FrozenInstanceError
 import threading
 import unittest
 
+import pytest
+
+from plugins.vits2_tts_language.policy import LanguagePolicy, LanguagePolicyError, validate_reply_script
+from plugins.vits2_tts_language.neutral_text import (
+    is_neutral_text, normalize_mixed_text, normalize_neutral_text,
+)
+
 
 class LanguagePolicyTest(unittest.TestCase):
     @classmethod
@@ -629,3 +636,56 @@ class LanguagePolicyTest(unittest.TestCase):
                 self.assertEqual((result.text, result.language, result.turn_id),
                                  ("Hello", "en", first["turn_id"]))
             self.assertEqual(policy.snapshot()["resolved_language"], "zh")
+
+
+# Mathematical script policy stays independent of models and acoustic runtime.
+@pytest.mark.parametrize("mode", ["zh", "en"])
+@pytest.mark.parametrize("text", [
+    "π=3.14", "2π+1", "A=πr²", "圆周率 π=3.14，请读出这个公式。",
+    "Please read π=3.14 and then continue.",
+])
+def test_supported_pi_formula_reaches_existing_language_readers(mode, text):
+    policy = LanguagePolicy(mode)
+    direct = policy.reserve_direct(text)
+    assert policy.preview_direct(direct, text)["reply_language"] == mode
+    turn = policy.begin_turn(text)
+    request = policy.prepare(text, turn["turn_id"])
+    assert request.text == text
+    normalized = (normalize_neutral_text(text, mode) if is_neutral_text(text)
+                  else normalize_mixed_text(text, mode))
+    assert "π" not in normalized
+    assert ("派" if mode == "zh" else "pi") in normalized
+    validate_reply_script(normalized, mode, frontend=True)
+
+
+@pytest.mark.parametrize("text", [
+    "π", "π+", "πfoo+1", "πρόγραμμα", "Θ=1", "π=3.14 πρόγραμμα",
+    "Привет π=3.14", "สวัสดี π=3.14", "こんにちは π=3.14",
+    "https://example.com/π=3.14", "www.example.com/π=3.14", "π=3.14@example.com",
+])
+def test_unrecognized_constants_greek_prose_and_addresses_stay_rejected(text):
+    policy = LanguagePolicy("auto")
+    previous = policy.begin_turn("Hello")
+    snapshot = policy.snapshot()
+    with pytest.raises(LanguagePolicyError, match="Only Chinese and Latin scripts"):
+        policy.reserve_direct(text)
+    with pytest.raises(LanguagePolicyError, match="Only Chinese and Latin scripts"):
+        policy.begin_turn(text)
+    assert policy.snapshot() == snapshot
+    assert policy.prepare("Hello", previous["turn_id"]).language == "en"
+
+
+def test_frontend_output_cannot_keep_an_unconverted_math_constant():
+    validate_reply_script("π=3.14", "en", allow_neutral=True)
+    with pytest.raises(LanguagePolicyError) as error:
+        validate_reply_script("π=3.14", "en", allow_neutral=True, frontend=True)
+    assert error.value.code == "frontend_language_mismatch"
+
+
+def test_auto_pi_formula_inherits_only_its_instance_language():
+    first, second = LanguagePolicy("auto"), LanguagePolicy("auto")
+    first.begin_turn("Hello")
+    assert first.begin_turn("π=3.14")["reply_language"] == "en"
+    assert second.begin_turn("π=3.14")["reply_language"] == "zh"
+    first.begin_turn("你好")
+    assert first.begin_turn("π=3.14")["reply_language"] == "zh"

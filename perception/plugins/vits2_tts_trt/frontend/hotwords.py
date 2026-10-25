@@ -1,4 +1,4 @@
-"""Small reviewed English-token supplement; the source Gold is never loaded.
+"""Optional deployment overrides; base pronunciations live in external data.
 
 Optional local manifest: VITS2_HOTWORDS_PATH, VITS2_HOTWORDS_SHA256 (optional).
 VITS2_HOTWORD_DOMAIN selects a deployment domain, defaulting to ``general``.
@@ -22,14 +22,6 @@ _TOKEN = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*\Z")
 _VOWELS = set("AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW".split())
 _CONSONANTS = set("B CH D DH F G HH JH K L M N NG P R S SH T TH V W Y Z ZH".split())
 _MODEL_PHONES = set(en_symbols)
-_GOLD_SHA = "1fbc44b3a222ff92d9f74082a0236f96dc23d84ef44d3f4e226f7a777abd5ffb"
-
-# Reviewed phone sequences from the pinned source, not new acoustic acceptance.
-# Neither key occurs in the released CMU. No finance/ticker overrides by default.
-_DEFAULTS = (
-    {"text": "Airbnb", "arpa": ["EH1", "R", "B", "IY1", "EH1", "N", "B", "IY1"], "case": "fold"},
-    {"text": "ASML", "arpa": ["EY1", "EH1", "S", "EH1", "M", "EH1", "L"], "case": "exact"},
-)
 
 
 def _entry(row):
@@ -69,12 +61,6 @@ def _entry(row):
     return text, case, tuple(languages), domain, priority, override, tuple(arpa)
 
 
-_BUILTINS = tuple(_entry(dict(row, enabled=True, reviewed=True, languages=["en"],
-                            domain="*", priority=0, override_cmu=False,
-                            source="fanyi/en_gold_pronunciations.json", source_sha256=_GOLD_SHA))
-                  for row in _DEFAULTS)
-
-
 @lru_cache(maxsize=8)
 def _load_external(path, checksum):
     # Read once per explicit configuration, avoiding disk I/O for every token.
@@ -90,8 +76,8 @@ def _load_external(path, checksum):
     if len(data["entries"]) > _MAX_ENTRIES:
         raise ValueError("Hotword manifest exceeds 128 reviewed entries")
     entries = tuple(filter(None, (_entry(row) for row in data["entries"])))
-    for index, left in enumerate(_BUILTINS + entries):
-        for right in (_BUILTINS + entries)[index + 1:]:
+    for index, left in enumerate(entries):
+        for right in entries[index + 1:]:
             shared_case = left[0] == right[0] if left[1] == right[1] == "exact" else left[0].upper() == right[0].upper()
             shared_domain = left[3] == right[3] or "*" in (left[3], right[3])
             if shared_case and shared_domain and set(left[2]) & set(right[2]) and left[4] == right[4]:
@@ -113,7 +99,7 @@ def lookup_hotword(token, *, language="en", domain=None, has_cmu=False):
     if not isinstance(token, str) or not _TOKEN.fullmatch(token):
         return None
     selected_domain = domain if domain is not None else os.environ.get("VITS2_HOTWORD_DOMAIN", "general")
-    entries = _BUILTINS
+    entries = ()
     path = os.environ.get("VITS2_HOTWORDS_PATH", "")
     checksum = os.environ.get("VITS2_HOTWORDS_SHA256", "").strip().lower()
     if checksum and (not path or not re.fullmatch(r"[0-9a-f]{64}", checksum)):

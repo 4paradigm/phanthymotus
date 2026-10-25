@@ -129,6 +129,8 @@ def normalize_mixed_text(text, language):
         # (e.g. a generated Roman-numeral pronunciation). Resolve those narrow
         # name rules here so the fixed request language survives later MIX TN.
         fragment = normalize_numeric_lexemes(fragment, language=selected)
+        from ..vits2_tts_trt.frontend.alphanumeric_text import normalize_unknown_alphanumeric_tokens
+        fragment = normalize_unknown_alphanumeric_tokens(fragment, selected)
         # Do not split numbers inside names/IDs, versions or currency notation.
         # Their existing frontend rules still run after this preprocessing.
         return _PROSE_NUMBER.sub(lambda match: verbalize(match.group(), selected), fragment)
@@ -159,17 +161,16 @@ def normalize_neutral_text(text, language):
     date_text = text[:terminal.start()].rstrip() if terminal else text
     suffix = original[terminal.start():] if terminal else ""
     match = _SPACED_DATE_SHAPE.fullmatch(date_text) or _DATE.fullmatch(date_text)
-    if match is None:
-        prefix = _SPACED_DATE_SHAPE.match(date_text) or _DATE.match(date_text)
-        if prefix and re.match(r"\.\d", date_text[prefix.end():]):
-            raise InvalidDateError("A complete date cannot have a numeric suffix")
     if match:
         year, month, day = (int(match[key]) for key in ("year", "month", "day"))
         try:
             datetime.date(year, month, day)
         except ValueError:
-            raise InvalidDateError("The numeric date is not a valid calendar date") from None
-        text = f"{year:04d}/{month:02d}/{day:02d}" + suffix
+            # Keep invalid calendar input intact for the literal numeric span;
+            # correcting it to another date would change the supplied content.
+            pass
+        else:
+            text = f"{year:04d}/{month:02d}/{day:02d}" + suffix
 
     selected = language.upper()
 

@@ -79,6 +79,37 @@ def _scripts(text):
     return scripts
 
 
+def _input_scripts(text):
+    """Allow π only inside math the existing frontend can actually read.
+
+    Keep the literal script check for prepared output: an unconverted π must
+    not pass final validation. This does not admit Greek prose or identifiers.
+    """
+    scripts = _scripts(text)
+    if "other" not in scripts or "π" not in text:
+        return scripts
+    from ..vits2_tts_trt.frontend.math_units import find_spans
+
+    # Unicode URL/email tokens are not arithmetic expressions even when they
+    # contain '='. The normal address reader supports ASCII forms separately.
+    protected = [match.span() for match in re.finditer(
+        r"(?:https?://|www\.)[^\s，。；！？]+|[^\s，。；！？]+@[^\s，。；！？]+",
+        text, re.IGNORECASE,
+    )]
+    try:
+        spans = find_spans(text, "ZH", lambda value, language: value)
+    except (ValueError, ArithmeticError):
+        return scripts
+    chars = list(text)
+    for start, end, _ in spans:
+        if any(start < b and end > a for a, b in protected):
+            continue
+        for index in range(start, end):
+            if chars[index] == "π":
+                chars[index] = " "
+    return _scripts("".join(chars))
+
+
 def _language_evidence_text(text):
     """Ignore addresses, numbers and embedded citations for language selection.
 
@@ -188,7 +219,7 @@ def validate_reply_script(
     path can explicitly normalize a numeric reply using its resolved language;
     normalized complete speech still has to contain the selected primary script.
     """
-    scripts = _scripts(text)
+    scripts = _scripts(text) if frontend else _input_scripts(text)
     code = "frontend_language_mismatch" if frontend else "reply_language_mismatch"
     if scripts - {"zh", "en"}:
         raise LanguagePolicyError(
@@ -239,7 +270,7 @@ class LanguagePolicy:
     def reserve_direct(self, text):
         """Allocate ordering only. Frontend rejection must not change history."""
         text = _text(text)
-        if "other" in _scripts(text):
+        if "other" in _input_scripts(text):
             raise LanguagePolicyError("unsupported_script", "Only Chinese and Latin scripts are supported")
         with self.lock:
             self._sequence += 1
@@ -313,7 +344,7 @@ class LanguagePolicy:
             raise LanguagePolicyError(
                 "invalid_requested_reply_language", "requested_reply_language must be zh or en"
             )
-        scripts = _scripts(text)
+        scripts = _input_scripts(text)
         if "other" in scripts:
             raise LanguagePolicyError(
                 "unsupported_script", "Only Chinese and Latin scripts are supported"

@@ -9,19 +9,29 @@ import datetime
 import re
 
 from .numeric_formats import find_spans as find_numeric_format_spans
+from .math_units import has_explicit_math_context
 
 
 _DASH = r"\-‐‑‒–−﹣－"
 _DIGITS = {"ZH": tuple("零一二三四五六七八九"),
            "EN": "zero one two three four five six seven eight nine".split()}
-_DATE = re.compile(
+_DATE_BODY = (
     rf"(?<![A-Za-z0-9_])(?P<year>\d{{4}})(?P<sep>[{_DASH}/.])"
-    rf"(?P<month>\d{{1,2}})(?P=sep)(?P<day>\d{{1,2}})(?![A-Za-z0-9_])"
+    rf"(?P<month>\d{{1,2}})(?P=sep)(?P<day>\d{{1,2}})"
 )
-_SPACED_DATE = re.compile(
+_SPACED_DATE_BODY = (
     r"(?<![A-Za-z0-9_])(?P<year>\d{4})[ \t]+"
     r"(?P<month>\d{1,2})[ \t]*/[ \t]*(?P<day>\d{1,2})"
-    r"(?![A-Za-z0-9_]|[./]\d)"
+)
+_DATE_END = rf"(?![A-Za-z0-9_]|[./{_DASH}]\d)"
+_DATE = re.compile(_DATE_BODY + _DATE_END)
+_SPACED_DATE = re.compile(_SPACED_DATE_BODY + _DATE_END)
+_DATE_PREFIXES = tuple(re.compile(body + r"(?!\d)")
+                       for body in (_DATE_BODY, _SPACED_DATE_BODY))
+_DATE_EXTRA_COMPONENT = re.compile(rf"(?:(?:[ \t]*/[ \t]*|[{_DASH}]|\.)\d+)+")
+_DATE_LIKE_RUN = re.compile(
+    rf"(?<![A-Za-z0-9_.])\d{{4}}(?:[{_DASH}/.]\d*){{2,}}"
+    rf"(?![A-Za-z0-9_]|[./{_DASH}][A-Za-z0-9_])"
 )
 _TIME = re.compile(
     r"(?<![A-Za-z0-9_:])(?P<hour>\d{1,2})[:：](?P<minute>\d{2})"
@@ -76,6 +86,16 @@ _ZH_TRAILING_FOUR_DIGITS = re.compile(
     r"(?:最后|末|后)\s*(?:四|4)\s*位\s*(?:是|为)?\s*[:：]?\s*"
     r"(?P<value>\d{4})(?![A-Za-z0-9_]|[.,]\d)"
 )
+# Extend only an immediately adjacent identifier comparison, not the whole
+# sentence: "last four digits are 5690, rather than 4090". The alternative
+# must end its clause; a following unit, address, date or formula is not an ID.
+# Horizontal spacing deliberately cannot carry context across a line break.
+_IDENTIFIER_CONTRAST = re.compile(
+    r"[ \t]*(?:[,，][ \t]*)?"
+    r"(?:不是|而不是|而非|(?i:\b(?:not|but[ \t]+not|rather[ \t]+than|instead[ \t]+of)\b))"
+    r"[ \t]*(?P<value>\d+)(?![A-Za-z0-9_]|[.,]\d)"
+    r"(?=[ \t]*(?:$|[，,;；!?。！？)\]）】”’]|[.](?![A-Za-z0-9_])))"
+)
 _NUMBERED_ID = re.compile(
     r"(?<![A-Za-z0-9_])(?i:NO)\.(?P<value>\d+)(?![A-Za-z0-9_]|\.\d)"
 )
@@ -85,7 +105,7 @@ _GPU_HORIZONTAL_SPACE = r"[\t \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]"
 _GPU_MODEL = re.compile(
     rf"(?<![A-Za-z0-9_])(?P<series>(?i:RTX|GTX))"
     rf"{_GPU_HORIZONTAL_SPACE}*[{_DASH}]?{_GPU_HORIZONTAL_SPACE}*"
-    r"(?P<number>\d{3,4})(?![A-Za-z0-9_]|\.\d)"
+    rf"(?P<number>\d{{3,4}})(?![A-Za-z0-9_]|\.\d|[{_DASH}][A-Za-z0-9_])"
 )
 # Reviewed product-name readings, not a general rule for four-digit numbers.
 # Unknown models and all Chinese readings retain their existing digit form.
@@ -119,6 +139,62 @@ def _identifier(value, language):
     )
 
 
+def protected_identifier_ranges(text):
+    """Reuse explicit field ownership before diagnosing another numeric form."""
+    for pattern in (_ID_CUED, _ID_OWNER_CUED, _NUMBERED_ID,
+                    _TRAILING_FOUR_DIGITS, _ZH_TRAILING_FOUR_DIGITS):
+        for match in pattern.finditer(text):
+            if any(char.isdecimal() for char in match["value"]):
+                yield match.start("value"), match.end("value")
+
+
+def _date_is_math(text, start):
+    return has_explicit_math_context(text, start)
+
+
+def malformed_date_ranges(text):
+    """Find unsupported numeric tails without claiming an ambiguous formula."""
+    for pattern in _DATE_PREFIXES:
+        for match in pattern.finditer(text):
+            extra = _DATE_EXTRA_COMPONENT.match(text, match.end())
+            version_label = re.search(r"(?:\bversion|版本(?:号)?)[ \t:：]*$", text[:match.start()], re.I)
+            if extra is not None and version_label is None and not _date_is_math(text, match.start()):
+                yield match.start(), extra.end()
+
+
+def literal_date_ranges(text):
+    """Unsupported date tails and invalid calendars keep their written form."""
+    yield from malformed_date_ranges(text)
+    # A four-digit year followed by at least two numeric separators is also
+    # date-like when components are missing, repeated or use mixed separators.
+    # A final period remains sentence punctuation rather than an empty field.
+    for match in _DATE_LIKE_RUN.finditer(text):
+        value = match.group().rstrip(".")
+        tail = value[4:]
+        version_label = re.search(r"(?:\bversion|版本(?:号)?)[ \t:：]*$", text[:match.start()], re.I)
+        if (sum(char in _DASH + "/." for char in tail) < 2
+                or not any(char.isdecimal() for char in tail)
+                or version_label is not None or _date_is_math(text, match.start())):
+            continue
+        complete = _DATE.fullmatch(value)
+        if complete is not None:
+            try:
+                datetime.date(*(int(complete[key]) for key in ("year", "month", "day")))
+            except ValueError:
+                pass
+            else:
+                continue
+        yield match.start(), match.start() + len(value)
+    for pattern in (_DATE, _SPACED_DATE):
+        for match in pattern.finditer(text):
+            if _date_is_math(text, match.start()):
+                continue
+            try:
+                datetime.date(*(int(match[key]) for key in ("year", "month", "day")))
+            except ValueError:
+                yield match.start(), match.end()
+
+
 def find_spans(text, language, verbalize_number):
     """Return nonoverlapping (start, end, spoken) spans with contextual readings."""
     language = "ZH" if language.lower().startswith("zh") else "EN"
@@ -132,19 +208,33 @@ def find_spans(text, language, verbalize_number):
     def cardinal(value):
         return verbalize_number(str(int(value)), language)
 
+    def add_identifier_contrast(match):
+        value = match["value"]
+        if not value.isdecimal():
+            return
+        alternative = _IDENTIFIER_CONTRAST.match(text, match.end("value"))
+        # A digit-width change is ambiguous without a repeated field label.
+        if alternative is not None and len(alternative["value"]) == len(value):
+            add(alternative.start("value"), alternative.end("value"),
+                _digits(alternative["value"], language))
+
     # An explicit field label takes priority over date/phone/unit shapes:
     # order ID 12A is an identifier, not twelve amperes.
     for pattern in (_TRAILING_FOUR_DIGITS, _ZH_TRAILING_FOUR_DIGITS):
         for match in pattern.finditer(text):
             add(match.start("value"), match.end("value"), _digits(match["value"], language))
+            add_identifier_contrast(match)
     for match in _ID_CUED.finditer(text):
         if any(c.isdigit() for c in match["value"]):
             add(match.start("value"), match.end("value"), _identifier(match["value"], language))
+            add_identifier_contrast(match)
     for match in _ID_OWNER_CUED.finditer(text):
         if any(c.isdigit() for c in match["value"]):
             add(match.start("value"), match.end("value"), _identifier(match["value"], language))
+            add_identifier_contrast(match)
     for match in _NUMBERED_ID.finditer(text):
         add(match.start(), match.end(), "N O " + _digits(match["value"], language))
+        add_identifier_contrast(match)
 
     for start, end, spoken in find_numeric_format_spans(text, language, verbalize_number):
         add(start, end, spoken)
@@ -155,6 +245,9 @@ def find_spans(text, language, verbalize_number):
         (match for pattern in (_DATE, _SPACED_DATE) for match in pattern.finditer(text)),
         key=lambda match: match.start(),
     ):
+        if (_date_is_math(text, match.start())
+                or _DATE_EXTRA_COMPONENT.match(text, match.end()) is not None):
+            continue
         year, month, day = (int(match[key]) for key in ("year", "month", "day"))
         try:
             datetime.date(year, month, day)

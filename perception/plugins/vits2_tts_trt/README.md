@@ -275,6 +275,20 @@ English standalone fractions use fraction nouns (`one half`, `two thirds`,
 `x=2/3` retains the division reading. Dates and URL paths keep priority over
 fraction parsing.
 
+Date and currency normalization validates complete fields before assigning a
+natural reading. Recognized malformed shapes are still speakable: extra date
+components, invalid calendar dates, incorrect currency grouping and repeated
+decimal points fall back to digit-by-digit and symbol readings in the resolved
+language. For example, `$1,23.45` becomes `美元符号一逗号二三点四五` or
+`dollar sign one comma two three dot four five`. This preserves leading zeros
+and decimal digits instead of guessing a corrected amount or dropping a suffix.
+Addresses, explicit identifiers, labelled versions and explicit arithmetic keep
+their own parsing priority.
+The Chinese tone reader also distinguishes lexical words ending in `额`
+(such as `金额`, `余额` and `巨额`) from interjections using the existing POS
+tags. Lexical words keep the dictionary tone; standalone particles retain
+their existing behavior. This changes frontend tone selection, not the model.
+
 Explicit ranges such as `0.5–1.5A` retain the range relation (`到` / `to`),
 and `KB/s`, `MB/s`, `GB/s` are complete byte-rate units. Unit case matters:
 `MB/s` is not treated as `Mb/s`. An ASCII subtraction sign in a formula keeps
@@ -384,20 +398,61 @@ English and mixed text share the model's original 129,464-entry CMU cache
 and Liaoqianqian's three CUSTOM entries: `CUDA`, `HAMI`, and `IELTS`.
 Two additional targeted corrections for `Agentic` and `NVIDIA` use the
 checked terminology annotations. These corrections are separate from the
-original dictionary; an existing fanyi Gold file is not loaded as an overlay.
+original dictionary. The fanyi source is compiled into a separate external
+dictionary with CMU conflicts repaired; it is not a blanket CMU override.
 The complete uppercase abbreviations `US`, `IT`, `ID`, and `IP` are spelled
 as letters before normalization; ordinary lowercase words keep their readings.
 
-#### Reviewed domain hotwords
+#### External pronunciation dictionary
 
-`frontend/hotwords.py` adds a small optional supplement shared by English and
-mixed speech. Lookup keeps CUSTOM and verified corrections first, then an
-eligible hotword, then CMU and G2P. It never loads the complete Gold dictionary.
-The initial OOV candidates are `Airbnb` (case-insensitive) and `ASML` (exact
-uppercase), taken from fanyi's source SHA256
-`1fbc44b3a222ff92d9f74082a0236f96dc23d84ef44d3f4e226f7a777abd5ffb`.
-Their phone sequences are checked against the source and model inventory;
-device listening acceptance is a separate check.
+The default frontend now uses all **13,083** entries from the pinned fanyi
+source, compiled to `frontend_data/external_lexicon.json` outside Git:
+
+- 225 entries overlapping CMU retain the released CMU reading by default.
+  The original Gold phones remain in the data for auditing.
+- 6,336 letter-spelling entries require exact uppercase spelling; this includes
+  114 entries with separators, reducing unintended changes to ordinary names.
+- 6,522 other OOV entries use case-insensitive matching. Their source phones
+  are retained, not certified as universally correct pronunciations.
+
+English and Chinese-English mixed text share the same lookup. CUSTOM and
+existing verified corrections remain first; ordinary CMU words retain their
+reading. Eligible external whole words precede G2P fallback. Full known
+hyphenated tokens are protected during final punctuation cleanup; structured
+math and addresses keep priority. Ambiguous `M-S` still follows math parsing.
+
+Before frontend startup, the adapter verifies/downloads the existing public
+ModelScope source at revision `e67fccc9fa0c2bd8848dcf93221e18bb3fa4f205`,
+checks its size/SHA256 and canonical content, then compiles against the release
+CMU and `frontend/lexicon_case_policies.json`. The compiler ships inside this
+plugin; no engine rebuild or Dockerfile change is required. Process locks and
+atomic writes protect shared caches. Warm startup reuses a compiled file bound
+to the CMU, compiler, case policy and output hashes.
+
+Deployments can provide a maintained external file with `VITS2_LEXICON_PATH`
+and optionally `VITS2_LEXICON_SHA256`. Missing/corrupt resources or a different
+CMU fail explicitly. The full dictionary has its own 4 MiB / 50,000-entry limit;
+it is not subject to the optional small-manifest limit below. Lookup is cached,
+not reloaded for every word. Use `reload_external_lexicon()` or restart after
+replacing the same path, and update a configured checksum. Do not hand-edit
+the auto-generated default cache; maintain the source/compiled deployment file.
+No large dictionary is committed to Git, and the acoustic model is unchanged.
+
+English startup binds the actual release CMU once. Each newly loaded external
+file, including a manual reload or explicit path, is checked against that
+binding before lookup can use it. Preparation before this binding reports
+`cmu_verified=false`; schema validation alone is not a ready pronunciation
+resource. An incompatible reload raises an error, and lookups of that invalid
+file remain blocked until a valid file and its configured checksum are restored.
+CMU hashing and full validation are cached, not repeated for every word.
+
+#### Optional reviewed domain overrides
+
+`frontend/hotwords.py` retains an optional, explicit deployment override shared
+by English and mixed speech. Airbnb and ASML are no longer hardcoded here;
+they come from the full external dictionary. This small override manifest is
+separate from the full dictionary and is only needed for reviewed domain
+exceptions. Structural/phoneme validation does not replace device listening.
 
 Deployments may supply a local version-1 JSON manifest using
 `VITS2_HOTWORDS_PATH`, optionally pinned by `VITS2_HOTWORDS_SHA256`.
@@ -478,9 +533,10 @@ explicitly rather than treated as interchangeable copies.
 
 The CMU dictionary and its runtime cache are included in the size- and
 SHA256-verified model archive. No separate Gold lexicon download is required.
-Old installations may retain `frontend/en_gold_pronunciations.json`; it is
-ignored and does not affect loading or pronunciation. The installation uses
-the existing `/models` cache and needs no extra volume or image layer.
+The bundled `frontend/en_gold_pronunciations.json` is verified and used as the
+source for compiling `frontend_data/external_lexicon.json`. It is not loaded
+directly as a global CMU override. The installation uses the existing `/models`
+cache and needs no extra volume or image layer.
 The public ModelScope source follows the PR submission procedure; a later
 approved COS mirror can use `VITS2_MODEL_BASE_URL` with the same relative file
 paths and checksums.

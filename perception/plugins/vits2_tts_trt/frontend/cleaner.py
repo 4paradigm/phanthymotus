@@ -9,12 +9,16 @@ def clean_text(text, language):
     return norm_text, phones, tones, word2ph
 
 
-def normalize_text_mix(text):
+def normalize_text_mix(text, reading_language=None):
     """Normalize the complete MIX input once, before chunking."""
+    if reading_language not in (None, "", "zh", "en"):
+        raise ValueError("Reading language must be zh or en")
     has_zh = any("\u4e00" <= c <= "\u9fff" for c in text)
     has_en = any(english.is_latin_letter(c) for c in text)
     if has_zh and not has_en:
         return chinese.text_normalize(text)
+    if reading_language:
+        return chinese.mix_normalize(text, reading_language=reading_language)
     if has_en and not has_zh:
         return chinese.mix_normalize(text)
     return chinese.mix_normalize(text)

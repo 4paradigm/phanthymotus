@@ -12,14 +12,22 @@ from .math_units import _english_cardinals, _english_quantity
 
 _AMOUNT = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+"
 _MONEY = re.compile(
-    rf"(?<![A-Za-z0-9_.$£€,+\-−])(?P<sign>[+\-−]?)(?P<symbol>[$£€])"
+    rf"(?<![A-Za-z0-9_.$£€¥￥,+\-−])(?P<sign>[+\-−]?)(?P<symbol>[$£€¥￥])"
     rf"[ \t]*(?P<inner_sign>[+\-−]?)(?P<amount>{_AMOUNT})"
     r"(?![A-Za-z0-9_]|[.,]\d)"
+)
+_MONEY_SHAPE = re.compile(
+    r"(?<![A-Za-z0-9_.$£€¥￥,+\-−])(?P<sign>[+\-−]?)(?P<symbol>[$£€¥￥])"
+    r"[ \t]*(?P<body>[+\-−\d.,]+)"
 )
 _CURRENCIES = {
     "$": ("美元", "dollar", "dollars", "cent", "cents"),
     "£": ("英镑", "pound", "pounds", "penny", "pence"),
     "€": ("欧元", "euro", "euros", "cent", "cents"),
+    # Keep this frontend's existing yuan interpretation of these symbols.
+    # Read the written decimal in full instead of guessing minor-unit wording.
+    "¥": ("元", "yuan", "yuan", None, None),
+    "￥": ("元", "yuan", "yuan", None, None),
 }
 _ORDINAL = re.compile(
     r"(?<![A-Za-z0-9_./+\-])(?P<number>\d+)(?P<suffix>st|nd|rd|th)"
@@ -54,6 +62,8 @@ def _money(match, language, verbalize_number):
         canonical_sign = sign.replace("−", "-")
         return verbalize_number(canonical_sign + amount, language) + zh_label
     prefix = "minus " if sign in ("-", "−") else "plus " if sign == "+" else ""
+    if minor_one is None:
+        return prefix + _english_number(amount) + " " + plural
     whole, dot, fraction = amount.partition(".")
     units = int(whole or "0")
     if dot and len(fraction) > 2:
@@ -106,6 +116,30 @@ def find_spans(text, language, verbalize_number):
     for match in _VERSION_CUED.finditer(text):
         spans.append((match.start("value"), match.end("value"), _version(match["value"], language, verbalize_number)))
     return sorted(spans)
+
+
+def malformed_money_ranges(text):
+    """Find numeric currency shapes that cannot be read as one amount.
+
+    This is a diagnostic query; ordinary field finders keep returning only
+    valid spans. Callers exclude addresses and identifiers before literal fallback.
+    Trailing sentence punctuation is not part of the monetary amount.
+    """
+    for match in _MONEY_SHAPE.finditer(text):
+        body = match["body"].rstrip(".,")
+        if not any(char.isdecimal() for char in body):
+            continue
+        end = match.start("body") + len(body)
+        complete = _MONEY.fullmatch(text[match.start():end])
+        if complete is None or complete["sign"] and complete["inner_sign"]:
+            yield match.start(), end
+
+
+def protected_version_ranges(text):
+    """Version separators are data, even when their prefix looks like a date."""
+    for pattern in (_VERSION, _VERSION_CUED):
+        for match in pattern.finditer(text):
+            yield match.start(), match.end()
 
 
 def protected_ranges(text):

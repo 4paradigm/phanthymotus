@@ -140,6 +140,139 @@ class TrailingDigitsContextTest(unittest.TestCase):
         self.assertEqual(replacements(text, "ZH"), [("0056", "零零五六")])
 
 
+class IdentifierContrastsTest(unittest.TestCase):
+    def test_reported_chinese_last_four_digits_compare_digit_by_digit(self):
+        text = "请确认最后四位是 5690，不是 4090。"
+        self.assertEqual(replacements(text, "zh"), [
+            ("5690", "五六九零"), ("4090", "四零九零"),
+        ])
+
+    def test_reported_english_last_four_digits_compare_digit_by_digit(self):
+        text = "Please confirm that the last four digits are 5690, rather than 4090."
+        self.assertEqual(replacements(text, "en"), [
+            ("5690", "five six nine zero"), ("4090", "four zero nine zero"),
+        ])
+
+    def test_explicit_chinese_identifier_contrasts_preserve_leading_zeros(self):
+        for text in (
+            "最后4位是0056，而不是0090。",
+            "请核对末四位：0056，而非0090。",
+            "订单ID：0056，不是0090。",
+            "订单编号为0056而不是0090。",
+            "序列号为0056，不是0090。",
+            "编号0056，不是0090。",
+            "NO.0056，不是0090。",
+        ):
+            with self.subTest(text=text):
+                found = replacements(text, "zh")
+                self.assertIn(("0090", "零零九零"), found)
+
+    def test_explicit_english_identifier_contrasts_and_case(self):
+        for text in (
+            "The last four digits of your phone number are 0056, not 0090.",
+            "The final 4 digits are 0056 rather than 0090!",
+            "Order ID: 0056, instead of 0090.",
+            "Serial number is 0056, but not 0090.",
+            "VERIFICATION CODE: 0056, NOT 0090.",
+            "Order ID for Alice is 0056, rather than 0090.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(("0090", "zero zero nine zero"), replacements(text, "en"))
+
+    def test_selected_language_controls_both_values(self):
+        cases = (
+            ("最后四位是5690，不是4090。", "en", "four zero nine zero"),
+            ("Last four digits are 5690, not 4090.", "zh", "四零九零"),
+        )
+        for text, language, spoken in cases:
+            with self.subTest(text=text, language=language):
+                self.assertIn(("4090", spoken), replacements(text, language))
+
+    def test_arbitrary_quantities_and_address_numbers_are_not_identifiers(self):
+        for text in (
+            "There are 5690 samples, rather than 4090.",
+            "The address is 5690, not 4090.",
+            "我们共有5690个样本，不是4090。",
+            "门牌号是5690，不是4090。",
+            "5690, not 4090.",
+            "Last four digits are missing, rather than 4090.",
+        ):
+            for language in ("zh", "en"):
+                with self.subTest(text=text, language=language):
+                    self.assertEqual(replacements(text, language), [])
+
+    def test_comparison_does_not_scan_across_sentences_lines_or_prose(self):
+        for gap in (". ", "。", "; ", "；", "\n", "\r\n", ": ", ", then "):
+            text = "Last four digits are 5690" + gap + "not 4090."
+            with self.subTest(gap=gap):
+                self.assertEqual(replacements(text, "en"), [("5690", "five six nine zero")])
+        for gap in ("。", "；", "\n", "\r", "，随后"):
+            text = "最后四位是5690" + gap + "不是4090。"
+            with self.subTest(gap=gap):
+                self.assertEqual(replacements(text, "zh"), [("5690", "五六九零")])
+
+    def test_following_ordinary_quantities_or_addresses_are_not_captured(self):
+        for ending in (
+            "4090 samples.", "4090 grams.", "4090 Main Street.", "4090 GB.",
+            "4090kg.", "4090个样本。", "4090 元。", "4090路。",
+        ):
+            text = "Order ID is 5690, rather than " + ending
+            with self.subTest(ending=ending):
+                self.assertNotIn("4090", [value for value, _ in replacements(text, "en")])
+
+    def test_different_width_decimal_or_alphanumeric_comparison_is_not_extended(self):
+        for value in ("409", "40900", "4090.5", "4090,5", "4090A", "A4090", "4090_suffix"):
+            text = "Last four digits are 5690, not " + value + "."
+            with self.subTest(value=value):
+                self.assertEqual(replacements(text, "en"), [("5690", "five six nine zero")])
+
+    def test_formula_and_url_targets_are_not_identifier_comparisons(self):
+        for target in (
+            "4090+1", "4090−1", "4090=40", "x=4090", "4090/20", "4090^2",
+            "https://example.com/4090", "4090@example.com", "4090.example.com", "4090/path",
+        ):
+            text = "Last four digits are 5690, rather than " + target + "."
+            with self.subTest(target=target):
+                self.assertEqual(replacements(text, "en"), [("5690", "five six nine zero")])
+
+    def test_date_retains_its_existing_structured_reading(self):
+        text = "Last four digits are 5690, rather than 2026-10-23."
+        found = replacements(text, "en")
+        self.assertEqual(found, [
+            ("5690", "five six nine zero"),
+            ("2026-10-23", "October twenty third, CARDINAL[EN:2026]"),
+        ])
+        self.assertNotIn("2026", [value for value, _ in found])
+
+    def test_following_clause_and_an_independent_call_do_not_inherit_context(self):
+        text = "Last four digits are 5690, not 4090; there are 4090 samples."
+        found = replacements(text, "en")
+        self.assertEqual(found, [("5690", "five six nine zero"), ("4090", "four zero nine zero")])
+        self.assertEqual(replacements("4090 samples.", "en"), [])
+
+    def test_fixed_language_preprocessing_keeps_both_identifier_values(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+        zh = normalize_mixed_text("请确认最后四位是 5690，不是 4090。", "zh")
+        en = normalize_mixed_text(
+            "Please confirm that the last four digits are 5690, rather than 4090.", "en"
+        )
+        self.assertIn("五六九零", zh)
+        self.assertIn("四零九零", zh)
+        self.assertNotIn("四千", zh)
+        self.assertIn("five six nine zero", en)
+        self.assertIn("four zero nine zero", en)
+        self.assertNotIn("thousand", en)
+
+    def test_fixed_language_preprocessing_preserves_next_sentence_quantities(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
+        zh = normalize_mixed_text("最后四位是5690。共有4090个样本。", "zh")
+        en = normalize_mixed_text("Last four digits are 5690. There are 4090 samples.", "en")
+        self.assertIn("四千零九十", zh)
+        self.assertNotIn("四零九零", zh)
+        self.assertIn("four thousand ninety", en)
+        self.assertNotIn("four zero nine zero", en)
+
+
 class GpuModelReadingTest(unittest.TestCase):
     def test_reviewed_model_reading_accepts_spacing_case_and_unicode_hyphens(self):
         for text in ("RTX4090", "RTX 4090", "RTX-4090", "RTX‑4090", "rtx 4090", "RtX−4090",
@@ -242,11 +375,17 @@ class EmbeddedDateTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(replacements(text), [])
 
-    def test_numeric_only_date_with_decimal_suffix_still_rejects(self):
-        from plugins.vits2_tts_language.neutral_text import InvalidDateError, normalize_neutral_text
-        for text in ("2026 10/23.5", "2026-10-23.5"):
-            with self.subTest(text=text), self.assertRaises(InvalidDateError):
-                normalize_neutral_text(text, "zh")
+    def test_date_with_extra_decimal_preserves_digits_and_separators_literally(self):
+        from plugins.vits2_tts_language.neutral_text import normalize_neutral_text
+        for text, zh, en in (
+            ("2026 10/23.5", "二零二六一零斜杠二三点五",
+             "two zero two six one zero slash two three dot five"),
+            ("2026-10-23.5", "二零二六连字符一零连字符二三点五",
+             "two zero two six hyphen one zero hyphen two three dot five"),
+        ):
+            for language, expected in (("zh", zh), ("en", en)):
+                with self.subTest(text=text, language=language):
+                    self.assertEqual(normalize_neutral_text(text, language), expected)
 
 
 class FixedMixedReadingTest(unittest.TestCase):
@@ -255,12 +394,16 @@ class FixedMixedReadingTest(unittest.TestCase):
         self.assertEqual(normalize_mixed_text("AI\n2/3\r\nCAR", "zh"), "AI\n三分之二\r\nCAR")
         self.assertEqual(normalize_mixed_text("AI\n2/3\r\nCAR", "en"), "AI\ntwo thirds\r\nCAR")
 
-    def test_ordinary_words_versions_and_unknown_identifiers_are_not_split(self):
+    def test_unknown_identifier_digits_follow_preference_without_guessing_grouped_values(self):
         from plugins.vits2_tts_language.neutral_text import normalize_mixed_text
         text = "Qwen3 abc123 foo_123_bar 123-ABC 1,234XYZ"
-        for language in ("zh", "en"):
+        expected = {
+            "zh": "Qwen3 abc 一二三 foo 下划线 一二三 下划线 bar 一二三 连字符 ABC 1,234XYZ",
+            "en": "Qwen3 abc one two three foo underscore one two three underscore bar one two three hyphen ABC 1,234XYZ",
+        }
+        for language in expected:
             with self.subTest(language=language):
-                self.assertEqual(normalize_mixed_text(text, language), text)
+                self.assertEqual(normalize_mixed_text(text, language), expected[language])
 
     def test_addresses_keep_literal_digits_and_separators(self):
         from plugins.vits2_tts_language.neutral_text import normalize_mixed_text

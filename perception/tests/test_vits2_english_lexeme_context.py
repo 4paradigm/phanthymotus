@@ -46,6 +46,9 @@ class EnglishLexemeContextTest(unittest.TestCase):
         english.normalize_ordinary_latin_text = (
             lambda value, normalize_plain: normalize_plain(value)
         )
+        english.normalize_preserving_external_tokens = (
+            lambda value, normalize_plain: normalize_plain(value)
+        )
         boundary = patch.dict(sys.modules, {english.__name__: english})
         boundary.start()
         self.addCleanup(boundary.stop)

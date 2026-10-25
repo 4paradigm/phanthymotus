@@ -10,10 +10,15 @@ import logging
 import math
 import threading
 
+from utils.log_sampling import SampledLogGate
+
 from ..vits2_tts_trt.plugin import TTSPlugin as BaseTTSPlugin, _Vits2TTSNode, _node_suffix
 from .policy import LanguagePolicy, LanguagePolicyError, SpeechRequest, _scripts, validate_reply_script
-from .neutral_text import InvalidDateError, is_neutral_text, normalize_mixed_text, normalize_neutral_text
-from .name_text import normalize_standalone_name
+from .neutral_text import (
+    InvalidDateError, is_neutral_text,
+    normalize_mixed_text, normalize_neutral_text,
+)
+from .name_text import normalize_standalone_name, _english_version_names
 
 log = logging.getLogger(__name__)
 _LABELS = {"自动": "auto", "中文": "zh", "English": "en"}
@@ -88,16 +93,22 @@ class PreparedSpeech(SpeechRequest):
 def _prepare_chunks(adapter, request):
     """Freeze frontend output once, before it is handed to the worker."""
     try:
+        reading_language = (request.reading_language if isinstance(request, LiteralSpeechRequest)
+                            else request.language)
         if is_neutral_text(request.text):
             text = normalize_neutral_text(request.text, request.language)
         else:
-            text = normalize_standalone_name(request.text, request.language)
-            reading_language = (request.reading_language if isinstance(request, LiteralSpeechRequest)
-                                else request.language)
+            text = request.text
+            if reading_language == "en":
+                text = _english_version_names(text)
+            elif not reading_language or _scripts(text) == {"en"}:
+                text = normalize_standalone_name(text, reading_language or request.language)
             if reading_language:
                 text = normalize_mixed_text(text, reading_language)
         chunks, parts = [], []
-        for normalized, ids in adapter.iter_text_chunks(text):
+        prepared_chunks = (adapter.iter_text_chunks(text, reading_language=reading_language)
+                           if reading_language else adapter.iter_text_chunks(text))
+        for normalized, ids in prepared_chunks:
             validate_reply_script(normalized, request.language, allow_neutral=True,
                                   frontend=True, require_primary=False)
             chunks.append((normalized, tuple(tuple(values) for values in ids)))
@@ -155,6 +166,9 @@ class _LanguageNode(_Vits2TTSNode):
         self.policy = policy
         self._prepare_topic = prepare_topic
         self._accept_speech = accept_speech
+        self._topic_log_lock = threading.Lock()
+        self._topic_rejection_logs = SampledLogGate(every=100)
+        self._topic_failure_logs = SampledLogGate(every=100)
         super().__init__(input_topic, adapter, suffix)
 
     def enqueue(self, text, action_id="", context=None, generation=None):
@@ -190,6 +204,12 @@ class _LanguageNode(_Vits2TTSNode):
         view = _PreparedAdapterView(self._adapter, context)
         yield from type(self._adapter).synthesize_stream(view, text)
 
+    def _should_log_topic_error(self, gate):
+        # Keep the shared sampler's counters safe under concurrent callbacks.
+        # Fixed outcomes avoid using user text/exception strings as state keys.
+        with self._topic_log_lock:
+            return gate.check("error")[0]
+
     def _text_callback(self, message):
         if self.state != "running":
             return
@@ -208,11 +228,13 @@ class _LanguageNode(_Vits2TTSNode):
             self.enqueue(text, context=context, generation=generation)
         except LanguagePolicyError as error:
             self._record_request_error(error, context)
-            log.warning("[vits2] topic speech rejected: %s", error.code)
+            if self._should_log_topic_error(self._topic_rejection_logs):
+                log.warning("[vits2] topic speech rejected: %s", error.code)
         except Exception:
             self._record_request_error(
                 LanguagePolicyError("speech_error", "TTS could not accept topic speech"), context)
-            log.exception("[vits2] topic speech failed")
+            if self._should_log_topic_error(self._topic_failure_logs):
+                log.exception("[vits2] topic speech failed")
 
     def status(self):
         return {**super().status(), **self.policy.snapshot()}

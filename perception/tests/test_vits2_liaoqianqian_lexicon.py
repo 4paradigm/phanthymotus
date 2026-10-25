@@ -7,6 +7,7 @@ No acoustic inference, network access or full dictionary copy is needed.
 """
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -90,6 +91,24 @@ def load_frontends(cache, gold_state="valid"):
         "D": [["D", "IY1"]],
         "P": [["P", "IY1"]],
     }))
+    # The old raw Gold fixture remains deliberately ignored. The production
+    # dictionary now has a separate, explicitly validated resource contract.
+    cmu = pickle.loads(cache.read_bytes())
+    cmu_sha = hashlib.sha256(json.dumps(cmu, sort_keys=True, separators=(",", ":"),
+                                       ensure_ascii=True).encode("utf-8")).hexdigest()
+    external_entries = {
+        "AIRBNB": {"arpa": ["EH1", "R", "B", "IY1", "EH1", "N", "B", "IY1"], "mode": "fold"},
+        "ASML": {"arpa": ["EY1", "EH1", "S", "EH1", "M", "EH1", "L"], "mode": "exact"},
+        "D-ID": {"arpa": ["D", "IY1", "AY1", "D", "IY1"], "mode": "exact"},
+        "RGB-D": {"arpa": ["AA1", "R", "JH", "IY1", "B", "IY1", "D", "IY1"], "mode": "exact"},
+        "OOV-BRAND": {"arpa": ["B", "R", "AE1", "N", "D"], "mode": "fold"},
+    }
+    (data_dir / "external_lexicon.json").write_text(json.dumps({
+        "format": "vits2-external-pronunciations", "version": 1,
+        "source": {"sha256": "0" * 64, "entries": len(external_entries)},
+        "cmu": {"sha256": cmu_sha, "entries": len(cmu),
+                "canonical_sha256": cmu_sha, "canonical_layout": "nested_syllables"}, "entries": external_entries,
+    }))
 
     def load(module_name):
         spec = importlib.util.spec_from_file_location(
@@ -112,6 +131,9 @@ def load_frontends(cache, gold_state="valid"):
 
 class LiaoqianqianLexiconTest(unittest.TestCase):
     def setUp(self):
+        external_env = patch.dict(os.environ, {"VITS2_LEXICON_PATH": "", "VITS2_LEXICON_SHA256": ""})
+        external_env.start()
+        self.addCleanup(external_env.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
@@ -208,7 +230,7 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                 self.english._g2p.assert_called_with(token)
                 self.mixed._g2p_en.assert_called_with(token)
 
-    def test_reviewed_hotwords_reach_both_g2p_routes_without_whole_gold(self):
+    def test_external_dictionary_entries_reach_both_g2p_routes(self):
         for token, phones, tones in (
             ("Airbnb", ("eh", "r", "b", "iy", "eh", "n", "b", "iy"), (2, 3, 3, 2, 2, 3, 3, 2)),
             ("ASML", ("ey", "eh", "s", "eh", "m", "eh", "l"), (2, 2, 3, 2, 3, 2, 3)),
@@ -218,6 +240,28 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
                 self.assertEqual(self.english.text_normalize_without_numbers(token), token)
                 self.assert_both_routes(token, phones, tones)
         self.english._g2p.assert_not_called()
+
+    def test_external_hyphenated_words_survive_final_punctuation_cleanup(self):
+        cleanup = lambda text: text.replace("-", ",")
+        for word, phones in (("D-ID", ("d", "iy", "ay", "d", "iy")),
+                             ("RGB-D", ("aa", "r", "jh", "iy", "b", "iy", "d", "iy"))):
+            with self.subTest(word=word):
+                original = "请检查" + word + "服务。"
+                protected = self.english.normalize_preserving_external_tokens(original, cleanup)
+                self.assertEqual(protected, original)
+                self.assertEqual(tuple(self.mixed._en_token_to_phones(word)[0]), phones)
+                self.assertEqual(self.english.g2p_token(word)[0], phones)
+        self.assertEqual(self.english.normalize_preserving_external_tokens("oov-brand", cleanup), "oov-brand")
+        self.assertEqual(self.english.normalize_preserving_external_tokens("d-id", cleanup), "d,id")
+
+    def test_external_hyphen_protection_is_whole_word_and_not_a_formula_parser(self):
+        cleanup = lambda text: text.replace("-", ",")
+        for text in ("my_D-ID", "1D-ID", "D-ID2", "éD-ID", "D-IDé", "D-ID\u0301",
+                     "e\u0301D-ID", "D-ID-X", "RGB-Dsuffix", "M-S", "x-y", "X-RAY"):
+            with self.subTest(text=text):
+                normalizer = Mock(side_effect=cleanup)
+                self.assertEqual(self.english.normalize_preserving_external_tokens(text, normalizer), cleanup(text))
+                normalizer.assert_called_once_with(text)
 
     def test_domain_override_never_changes_ordinary_words_or_curated_priority(self):
         def term(text, arpa):

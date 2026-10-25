@@ -11,6 +11,8 @@ import re
 
 import jieba
 
+from .copula_context import find_copula_spans
+
 
 _ZH_NUMBER_UNIT_RE = re.compile(
     r"[零〇一二两三四五六七八九十百千万亿点]+"
@@ -34,12 +36,15 @@ def _language_kind(char: str) -> str | None:
     return None
 
 
-def split_positions(text: str) -> tuple[list[int], list[int], list[int]]:
+def split_positions(text: str, protected_spans=None) -> tuple[list[int], list[int], list[int]]:
     """Return (language, word, fallback) safe split positions using jieba.
 
     ``protected`` spans (e.g. ``2KB``) are never split across.
     """
     protected = [match.span() for match in _ZH_NUMBER_UNIT_RE.finditer(text)]
+    if protected_spans is None:
+        protected_spans = [(span.start, span.end) for span in find_copula_spans(text)]
+    protected.extend(protected_spans)
 
     def is_safe(index: int) -> bool:
         return not any(start < index < end for start, end in protected)
@@ -88,13 +93,24 @@ def iter_text_chunks(
     if max_tokens <= 0:
         raise ValueError("max_tokens must be positive")
 
-    def _iter_unit_chunks(unit):
+    # Resolve on the complete normalized request, before punctuation/language
+    # splitting. Each final chunk retains enough evidence to recompute the
+    # same immutable decision without a request-global pronunciation cache.
+    contexts = find_copula_spans(text)
+    protected = [(span.start, span.end) for span in contexts]
+
+    def _iter_unit_chunks(unit, offset):
+        local = [(start - offset, end - offset) for start, end in protected
+                 if offset <= start and end <= offset + len(unit)]
+        for start, end in local:
+            if token_count(unit[start:end]) > max_tokens:
+                raise ValueError("Protected copula expression exceeds the text token limit")
         if token_count(unit) <= max_tokens:
             yield unit
             return
         if len(unit) <= 1:
             raise ValueError("Unable to split text within the token limit")
-        language_boundaries, word_boundaries, fallback = split_positions(unit)
+        language_boundaries, word_boundaries, fallback = split_positions(unit, protected_spans=local)
 
         def longest_fitting(positions):
             low, high = 0, len(positions) - 1
@@ -119,14 +135,23 @@ def iter_text_chunks(
         left, right = unit[:split_at], unit[split_at:]
         if not left.strip() or not right.strip():
             raise ValueError("Unable to split text within the token limit")
-        yield from _iter_unit_chunks(left)
-        yield from _iter_unit_chunks(right)
+        yield from _iter_unit_chunks(left, offset)
+        yield from _iter_unit_chunks(right, offset + split_at)
 
     # 1) Every natural punctuation unit fits on its own first.
-    units = [_u for _u in split_punctuation_units(text) if _u.strip()]
+    units = []
+    start = 0
+    for match in _PUNCTUATION_UNIT_RE.finditer(text):
+        end = match.end()
+        if any(a < end < b for a, b in protected):
+            continue
+        unit = text[start:end]
+        if unit.strip():
+            units.append((unit, start))
+        start = end
     chunks = []
-    for unit in units:
-        chunks.extend(_iter_unit_chunks(unit))
+    for unit, offset in units:
+        chunks.extend(_iter_unit_chunks(unit, offset))
 
     # 2) Greedy-join already-valid units; never re-split a merged unit.
     pending = ""

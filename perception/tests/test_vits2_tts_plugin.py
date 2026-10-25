@@ -104,7 +104,7 @@ def _plugin(monkeypatch, *, gated=False, fail=None, cfg=None):
     """
     gate = threading.Event()
     state = {
-        "loads": 0, "engine_dirs": [], "adapters": [], "callbacks": [], "base_urls": [],
+        "loads": 0, "engine_dirs": [], "adapters": [], "callbacks": [], "build_callbacks": [], "base_urls": [],
         "release": gate.set, "entered": threading.Event(),
     }
 
@@ -119,7 +119,8 @@ def _plugin(monkeypatch, *, gated=False, fail=None, cfg=None):
             raise RuntimeError("release download failed")
         return f"{model_dir}/engines/jp61"
 
-    def fake_build(cfg):
+    def fake_build(cfg, *, progress_cb=None, stage_cb=None):
+        state["build_callbacks"].append((progress_cb, stage_cb))
         state["engine_dirs"].append(cfg.get("engine_dir"))
         built = _FakeAdapter()
         built.set_speed(float(cfg.get("speed", 1.0)))
@@ -247,7 +248,7 @@ def test_loading_info_advances_to_initialization_and_warmup(monkeypatch):
                 raise RuntimeError("test never released warmup")
             return super().warmup()
 
-    def build(cfg):
+    def build(cfg, *, progress_cb=None, stage_cb=None):
         build_entered.set()
         if not build_release.wait(10):
             raise RuntimeError("test never released initialization")
@@ -289,6 +290,80 @@ def test_stale_download_callbacks_cannot_replace_current_status(monkeypatch):
     assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
     progress(100, 160, 160)
     old_stage("extract")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
+def test_external_lexicon_progress_and_stages_reach_loading_info(monkeypatch):
+    plugin, _, _ = _plugin(monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    callbacks = []
+
+    def build(cfg, *, progress_cb=None, stage_cb=None):
+        callbacks.append((progress_cb, stage_cb))
+        stage_cb("download")
+        entered.set()
+        if not release.wait(10):
+            raise RuntimeError("test never released lexicon preparation")
+        return _FakeAdapter()
+
+    monkeypatch.setattr(vits2, "build_adapter", build)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say", "instance_id": "a"})
+    try:
+        assert entered.wait(3)
+        progress, stage = callbacks[0]
+        progress(50, 0.32, 0.64)
+        for args in ({"action": "info"}, {"action": "info", "instance_id": "a"}):
+            info = plugin.dispatch("tts", args)
+            assert info["state"] == "loading"
+            assert "VITS2 pronunciation dictionary" in info["desc"]
+            assert "50%" in info["desc"] and "MB)" in info["desc"]
+        stage("compile")
+        assert plugin.dispatch("tts", {"action": "info"})["desc"] == "Preparing the VITS2 pronunciation dictionary..."
+        stage("verify")
+        assert plugin.dispatch("tts", {"action": "info"})["desc"] == "Verifying the VITS2 pronunciation dictionary..."
+        stage("initialize")
+        assert plugin.dispatch("tts", {"action": "info"})["desc"] == "Initializing the VITS2 TensorRT model..."
+    finally:
+        release.set()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    progress(100, 0.64, 0.64)
+    stage("compile")
+    assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
+
+
+def test_stale_external_lexicon_callbacks_cannot_replace_new_loading_status(monkeypatch):
+    plugin, _, _ = _plugin(monkeypatch)
+    release = threading.Event()
+    callbacks = []
+
+    def build(cfg, *, progress_cb=None, stage_cb=None):
+        callbacks.append((progress_cb, stage_cb))
+        if not release.wait(10):
+            raise RuntimeError("test never released competing lexicon preparations")
+        return _FakeAdapter()
+
+    monkeypatch.setattr(vits2, "build_adapter", build)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say", "instance_id": "a"})
+    try:
+        assert _wait_until(lambda: len(callbacks) == 1)
+        old_progress, old_stage = callbacks[0]
+        old_progress(75, 0.48, 0.64)
+        plugin.dispatch("tts", {"action": "config", "speed": 0.8})
+        assert _wait_until(lambda: len(callbacks) == 2)
+        progress, stage = callbacks[1]
+        progress(20, 0.13, 0.64)
+        old_progress(99, 0.63, 0.64)
+        old_stage("compile")
+        old_stage("initialize")
+        assert "20%" in plugin.dispatch("tts", {"action": "info"})["desc"]
+        stage("waiting")
+        old_stage("verify")
+        assert plugin.dispatch("tts", {"action": "info"})["desc"] == "Waiting for VITS2 pronunciation resources..."
+    finally:
+        release.set()
+    assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running")
+    old_stage("download")
+    progress(100, 0.64, 0.64)
     assert plugin.dispatch("tts", {"action": "info"})["desc"] == plugin.DESC
 
 

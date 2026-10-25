@@ -84,8 +84,11 @@ _TOKEN = rf"(?:{_ATOM}|<=|>=|!=|[+\-*×/÷^=<>≤≥≠²³()])"
 _CANDIDATE = re.compile(rf"{_TOKEN}(?:\s*{_TOKEN})*")
 _TOKENIZER = re.compile(_TOKEN)
 _PRESERVE = re.compile(
-    rf"(?<![A-Za-z0-9_])\d{{4}}[{_DASH}/]\d{{1,2}}[{_DASH}/]\d{{1,2}}(?![A-Za-z0-9_])|"
+    rf"(?P<calendar>(?<![A-Za-z0-9_])\d{{4}}[{_DASH}/]\d{{1,2}}[{_DASH}/]\d{{1,2}}(?![A-Za-z0-9_]))|"
     r"\b\d[\d-]*-[A-Za-z]{2}[A-Za-z0-9.-]*"
+)
+_HYPHENATED_IDENTIFIER = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)+(?![A-Za-z0-9_])"
 )
 _OPERATORS = {
     "+": ("加", "plus"), "-": ("减", "minus"),
@@ -100,6 +103,19 @@ _OPERATORS = {
     "(": ("左括号", "open parenthesis"), ")": ("右括号", "close parenthesis"),
     "π": ("派", "pi"), "²": ("的平方", "squared"), "³": ("的立方", "cubed"),
 }
+
+
+def has_explicit_math_context(text, start):
+    """Disambiguate a calendar-shaped operand using its immediate clause."""
+    left = re.split(r"[。！？!?，,；;\r\n]", text[:start])[-1][-64:]
+    if re.search(r"(?:日期|日程|日历|(?i:\bdate|calendar))[ \t]*"
+                 r"(?:(?:是|为|(?i:is))[ \t]*)?[:：=]?[ \t]*$", left):
+        return False
+    return bool(
+        re.search(r"[=+*×÷^<>≤≥≠][ \t(]*$|(?:\d|\))[ \t]*/[ \t]*$", left)
+        or re.search(r"计算|算式|公式|除以|除法|比值|比例|"
+                     r"(?i:\b(?:calculate|compute|divide|division|equation|expression|ratio)\b)", left)
+    )
 
 
 @lru_cache(maxsize=1)
@@ -280,7 +296,12 @@ def find_spans(text, language, verbalize_number):
     # Translation is length preserving, so offsets still refer to the input.
     text = text.translate(_NORMALIZE_DASH)
     spans = []
-    preserved = [(match.start(), match.end()) for match in _PRESERVE.finditer(text)]
+    preserved = [(match.start(), match.end()) for match in _PRESERVE.finditer(text)
+                 if match.lastgroup != "calendar" or not has_explicit_math_context(text, match.start())]
+    # A unit-shaped suffix inside an opaque multi-character identifier is not
+    # a measurement. Single-variable arithmetic such as x-5A keeps its route.
+    preserved.extend((match.start(), match.end()) for match in _HYPHENATED_IDENTIFIER.finditer(text)
+                     if any(char.isdecimal() for char in match.group()))
     scientific_cores = [(match.start(), match.end()) for match in _SCIENTIFIC_CORE.finditer(text)]
 
     def overlaps(start, end):

@@ -9,6 +9,7 @@ from pypinyin import lazy_pinyin, Style, load_phrases_dict
 
 from .symbols import punctuation
 from .tone_sandhi import ToneSandhi
+from .copula_context import wei2_positions as _copula_positions
 
 from .fst_tn import FstTextNormalizer
 
@@ -147,7 +148,7 @@ def zh_speakable(text: str) -> bool:
     return len(replace_punctuation(stripped)) == len(stripped)
 
 
-def g2p(text):
+def g2p(text, *, wei2_positions=None):
     # Whitespace is dropped up front, and only whitespace.
     #
     # This function is handed slices of text normalized either by
@@ -163,6 +164,14 @@ def g2p(text):
     # without a trace, so it is reported and the caller (see
     # cleaner.g2p_normalized_text_mix) routes such chunks to the mixed frontend,
     # which can still pronounce digits, latin and symbols.
+    original = text
+    if wei2_positions is not None:
+        # MIX supplies offsets within a contiguous Chinese run. Validate them
+        # rather than silently applying a request's context to another string.
+        wei2_positions = frozenset(wei2_positions)
+        if any(not isinstance(i, int) or i < 0 or i >= len(text) or text[i] != "为"
+               for i in wei2_positions):
+            raise ValueError("Copula context does not match this Chinese run")
     text = _WHITESPACE_RE.sub("", text)
     cleaned = replace_punctuation(text)
     if len(cleaned) != len(text):
@@ -172,9 +181,13 @@ def g2p(text):
             "not in the audio", dropped,
         )
         text = cleaned
+    if wei2_positions is None:
+        wei2_positions = _copula_positions(text)
+    elif original != text and wei2_positions:
+        raise ValueError("Copula offsets require an unchanged Chinese run")
     pattern = r"(?<=[{0}])\s*".format("".join(punctuation))
     sentences = [i for i in re.split(pattern, text) if i.strip() != ""]
-    phones, tones, word2ph = _g2p(sentences)
+    phones, tones, word2ph = _g2p(sentences, wei2_positions=wei2_positions)
     assert sum(word2ph) == len(phones)
     assert len(word2ph) == len(text)
     phones = ["_"] + phones + ["_"]
@@ -207,10 +220,11 @@ def _is_particle_de(segments, index):
             and not previous_pos.startswith(("m", "q", "r")))
 
 
-def _g2p(segments):
+def _g2p(segments, *, wei2_positions=frozenset()):
     phones_list = []
     tones_list = []
     word2ph = []
+    segment_offset = 0
     for seg in segments:
         # Replace all English words in the sentence
         seg = re.sub("[a-zA-Z]+", "", seg)
@@ -218,10 +232,20 @@ def _g2p(segments):
         initials = []
         finals = []
         seg_cut = tone_modifier.pre_merge_for_modify(seg_cut)
+        word_offset = segment_offset
         for index, (word, pos) in enumerate(seg_cut):
+            start = word_offset
+            word_offset += len(word)
             if pos == "eng":
                 continue
             sub_initials, sub_finals = _get_initials_finals(word)
+            for char_index, char in enumerate(word):
+                if start + char_index in wei2_positions:
+                    if char != "为" or char_index >= len(sub_finals):
+                        raise ValueError("Copula alignment changed during segmentation")
+                    # Resolve before 不/一/third-tone sandhi. Changing final
+                    # output tones would leave 不为零 incorrectly as bú wéi.
+                    sub_finals[char_index] = sub_finals[char_index][:-1] + "2"
             particle_de = _is_particle_de(seg_cut, index)
             final_di = bool(word.endswith("地") and sub_finals and sub_finals[-1] == "i4")
             if particle_de:
@@ -234,6 +258,7 @@ def _g2p(segments):
             initials.append(sub_initials)
             finals.append(sub_finals)
 
+        segment_offset += len(seg)
         initials = sum(initials, [])
         finals = sum(finals, [])
         for c, v in zip(initials, finals):
@@ -330,12 +355,15 @@ def _normalize_ordinary_text(text):
 
 
 def _normalize_raw_text(text, lexeme_language="MIX"):
-    return normalize_special_text(
-        text, lambda ordinary: _normalize_ordinary_text(
-            apply_lexeme_rules(ordinary, language=lexeme_language)
-        ),
-        _special_number,
-    )
+    def normalize_plain(ordinary):
+        ordinary = apply_lexeme_rules(ordinary, language=lexeme_language)
+        if lexeme_language == "EN":
+            from .alphanumeric_text import normalize_unknown_alphanumeric_tokens
+            ordinary = normalize_unknown_alphanumeric_tokens(ordinary, "EN")
+        return _normalize_ordinary_text(ordinary)
+
+    selected = lexeme_language if lexeme_language in ("ZH", "EN") else None
+    return normalize_special_text(text, normalize_plain, _special_number, language=selected)
 
 
 def text_normalize(text):
@@ -346,23 +374,31 @@ def text_normalize(text):
     return text
 
 
-def mix_normalize(text: str) -> str:
+def mix_normalize(text: str, reading_language=None) -> str:
     """Normalise text for ZH/EN mixed input.
 
     Keep the complete mixed-language context so WeText can expand acronyms
     such as ``AI`` and ``CTO`` into letter-by-letter forms before G2P.
     """
-    from .english import replace_punctuation as en_replace_punct
+    from .english import (replace_punctuation as en_replace_punct,
+                          normalize_preserving_external_tokens)
     from .mixed_context import normalize_mixed_context
     text = _remove_redundant_newlines_after_punctuation(text)
-    # Select lexeme language from the complete input, never a Chinese clause's
-    # isolated Latin name (e.g. Qwen in a Chinese product list).
-    normalize_original = _normalize_raw_text
-    if re.search(r"[A-Za-z]", text) and not re.search(r"[\u4e00-\u9fff]", text):
-        normalize_original = lambda value: _normalize_raw_text(value, lexeme_language="EN")
-    text = normalize_mixed_context(
-        text, normalize_original, _normalize_ordinary_text, _special_number
-    )
+    if reading_language not in (None, "zh", "en"):
+        raise ValueError("reading_language must be zh, en or None")
+    if reading_language is not None:
+        # A fixed preference applies to supported names/fields throughout the
+        # complete request. Ordinary Chinese/English prose is never translated.
+        text = _normalize_raw_text(text, lexeme_language=reading_language.upper())
+    else:
+        # Auto keeps existing clause-local routing; do not infer a preference
+        # from the Latin name within an otherwise Chinese sentence.
+        normalize_original = _normalize_raw_text
+        if re.search(r"[A-Za-z]", text) and not re.search(r"[\u4e00-\u9fff]", text):
+            normalize_original = lambda value: _normalize_raw_text(value, lexeme_language="EN")
+        text = normalize_mixed_context(
+            text, normalize_original, _normalize_ordinary_text, _special_number
+        )
     # English number readers emit e.g. twenty-six/twenty-third. Their
     # orthographic hyphen is not a pause or subtraction sign. Do not feed it
     # to the remaining-dash punctuation cleanup or rerun numeric TN.
@@ -372,7 +408,8 @@ def mix_normalize(text: str) -> str:
         r"fourth|fifth|sixth|seventh|eighth|ninth)\b",
         r"\1 \2", text, flags=re.I,
     )
-    text = _post_replace(normalize_technical_lexemes(text))
+    text = normalize_preserving_external_tokens(
+        text, lambda value: _post_replace(normalize_technical_lexemes(value)))
     text = en_replace_punct(text)
     return text
 

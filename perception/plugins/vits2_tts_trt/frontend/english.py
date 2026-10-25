@@ -9,6 +9,7 @@ from .symbols import punctuation, symbols
 from .technical_text import normalize_technical_lexemes
 from .release_paths import frontend_data_dir, nltk_data_dir
 from .hotwords import lookup_hotword
+from .external_lexicon import lookup_external_lexicon, bind_external_lexicon_cmu
 
 current_file_path = os.path.dirname(__file__)
 
@@ -306,7 +307,7 @@ def read_dict():
     g2p_dict = {}
     with open(CMU_DICT_PATH, encoding="utf-8") as f:
         for line in f:
-            if not line.strip():
+            if not line.strip() or line.lstrip().startswith("##"):
                 continue
             word_list = line.strip().split("  ")
             if len(word_list) < 2:
@@ -333,6 +334,9 @@ def get_dict():
 
 
 eng_dict = get_dict()
+# Startup verifies the external resource before any request can claim to use
+# the expanded dictionary. A missing/corrupt configured file is not a fallback.
+_external_lexicon_status = bind_external_lexicon_cmu(eng_dict)
 
 
 CUSTOM_EN_PRONUNCIATIONS = {
@@ -353,17 +357,18 @@ VERIFIED_EN_PRONUNCIATIONS = {
 
 
 def english_pronunciation(token):
-    """CUSTOM, verified terms, eligible hotwords, then CMU in both G2P routes.
+    """CUSTOM, verified terms, explicit overrides, CMU, then external OOVs.
 
-    Return None for the caller's G2P fallback. Raw Gold overlays stay disabled;
-    only explicitly reviewed supplements can participate in lookup.
+    Return None for G2P fallback. The optimized external dictionary never
+    overrides ordinary CMU words, and its exact-case rows retain ticker scope.
     """
     word = token.upper()
     if word in CUSTOM_EN_PRONUNCIATIONS:
         return CUSTOM_EN_PRONUNCIATIONS[word]
     if word in VERIFIED_EN_PRONUNCIATIONS:
         return VERIFIED_EN_PRONUNCIATIONS[word]
-    return lookup_hotword(token, has_cmu=word in eng_dict) or eng_dict.get(word)
+    return (lookup_hotword(token, has_cmu=word in eng_dict) or eng_dict.get(word)
+            or lookup_external_lexicon(token, has_cmu=word in eng_dict))
 
 
 _EN_LEXICON_WORD_RE = re.compile(
@@ -404,7 +409,8 @@ def normalize_preserving_english_pronunciations(text, normalize_plain):
                 and (word in CUSTOM_EN_PRONUNCIATIONS
                      or word in VERIFIED_EN_PRONUNCIATIONS
                      or word in _EN_TN_PRESERVED_WORDS
-                     or lookup_hotword(match.group(), has_cmu=word in eng_dict) is not None)):
+                     or lookup_hotword(match.group(), has_cmu=word in eng_dict) is not None
+                     or lookup_external_lexicon(match.group(), has_cmu=word in eng_dict) is not None)):
             protected.append(match)
     if not protected:
         return normalize_plain(text)
@@ -450,6 +456,36 @@ def iter_latin_words(text):
             else:
                 break
         yield start, index
+
+
+def normalize_preserving_external_tokens(text, normalize_plain):
+    """Keep eligible complete hyphenated lexemes through final punctuation TN.
+
+    Structured formulas and addresses are resolved by the caller first. This
+    operates only on remaining known external words, never on substring hits,
+    arbitrary minus signs, or CMU words whose existing behavior is unchanged.
+    """
+    spans = []
+    for start, end in iter_latin_words(text):
+        word = text[start:end]
+        if "-" not in word:
+            continue
+        if (start and text[start - 1].isascii()
+                and (text[start - 1].isalnum() or text[start - 1] == "_")):
+            continue
+        if lookup_external_lexicon(word, has_cmu=word.upper() in eng_dict) is not None:
+            spans.append((start, end))
+    if not spans:
+        return normalize_plain(text)
+    parts, cursor = [], 0
+    for start, end in spans:
+        if cursor < start:
+            parts.append(normalize_plain(text[cursor:start]))
+        parts.append(text[start:end])
+        cursor = end
+    if cursor < len(text):
+        parts.append(normalize_plain(text[cursor:]))
+    return "".join(parts)
 
 
 def normalize_ordinary_latin_text(text, normalize_plain):

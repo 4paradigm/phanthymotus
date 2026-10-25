@@ -28,6 +28,7 @@ import re
 import unicodedata
 
 from .symbols import punctuation
+from .copula_context import wei2_positions
 from .english import english_pronunciation, refine_ph, post_replace_ph, arpa, iter_latin_words
 from .english import _g2p as _g2p_en
 
@@ -269,9 +270,17 @@ def unified_g2p(text: str):
     # Import lazily to avoid the cleaner -> unified_g2p -> chinese cycle.
     from . import chinese
 
+    resolved = wei2_positions(text)
+    offset = 0
     for kind, token in _mixed_tokens(text):
+        start = offset
+        offset += len(token)
         if kind == "ZH":
-            ph_list, tone_list, zh_word2ph = chinese.g2p(token)
+            if "为" in token:
+                local = frozenset(i - start for i in resolved if start <= i < offset)
+                ph_list, tone_list, zh_word2ph = chinese.g2p(token, wei2_positions=local)
+            else:
+                ph_list, tone_list, zh_word2ph = chinese.g2p(token)
             ph_list, tone_list = ph_list[1:-1], tone_list[1:-1]
             zh_word2ph = zh_word2ph[1:-1]
             if ph_list:

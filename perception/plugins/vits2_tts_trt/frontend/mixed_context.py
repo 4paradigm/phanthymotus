@@ -9,6 +9,7 @@ from .lexicon_rules import apply_lexeme_rules, has_chinese_name_reading
 from .special_text import _ADDRESSES, normalize_special_text
 from .number_context import _DATE, _TIME, _PHONE, _NUMBERED_ID, _GPU_MODEL
 from .numeric_formats import protected_ranges as numeric_format_ranges
+from .alphanumeric_text import normalize_unknown_alphanumeric_tokens
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _EN_WORD = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)*")
@@ -218,6 +219,7 @@ def normalize_mixed_context(text, normalize_original, normalize_plain, verbalize
 
     def english_ordinary(ordinary):
         ordinary = apply_lexeme_rules(ordinary, language="EN")
+        ordinary = normalize_unknown_alphanumeric_tokens(ordinary, "EN")
         # The ordinary frontend protects complete Latin words (including
         # accents); splitting ASCII words here would truncate mixed names.
         return normalize_plain(ordinary)
