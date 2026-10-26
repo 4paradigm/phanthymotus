@@ -290,8 +290,8 @@ class _PointCloudNode(Node):
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stereo_queue: queue.Queue = queue.Queue(maxsize=1)
         # 双目左右帧按拍摄时刻（header.stamp，缺省退回到达时刻）配对：
-        # {stamp: frame}，旧于 sync 窗口的直接丢
-        self._left_latest: Optional[tuple[float, np.ndarray]] = None
+        # {stamp: jpeg 字节}（编码态，配对成功才解码），旧于 sync 窗口的直接丢
+        self._left_latest: Optional[tuple[float, bytes]] = None
         self._left_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
@@ -440,30 +440,31 @@ class _PointCloudNode(Node):
         # 视差、发布几何无效的云；同时刻拍的两帧也会因到达差超窗被误丢。
         # stamp 缺失（老驱动不写 header）才退回到达时间。stereo 单位是
         # 两条消息 stamp 之差，同一时钟域即可（ROS stamp 是 epoch 秒）。
-        frame = _decode_jpeg(bytes(msg.data))
-        if frame is None:
-            return
-        # 只存最新左帧；配对在 _right_cb 里做（右帧到达时找时间最近的左帧）。
+        # review 第 19 轮建议：这里存编码字节而不是解码帧——左路 30 Hz
+        # 全量解码只为被下一次到达覆盖，出云 2 fps 时真正配上的才 2 对，
+        # Jetson 上每秒白白解码 ~28 帧。解码挪到 _right_cb 配对成功之后。
         with self._left_lock:
-            self._left_latest = (self._frame_stamp(msg, time.monotonic()), frame)
+            self._left_latest = (
+                self._frame_stamp(msg, time.monotonic()), bytes(msg.data))
 
     def _right_cb(self, msg: CompressedImage):
         # review 第 16 轮建议：节流在解码前——出云 2 fps 时右路 30 Hz 全量
         # JPEG 解码纯属浪费（Jetson CPU 上是双路 60 解码/s 换 2 次配对）。
-        # 左路不能照搬：配对要的是"最新左帧"，节流跳过任何左帧都会让右帧
-        # 无对可配，所以左路保持全量解码、只留最新一帧（解码是最便宜的一
-        # 侧，真正贵的 SGBM 只对配上的对跑）。
+        # 左路存编码字节、配对成功才解码（见 _left_cb），两边都只对配上的
+        # 对付解码钱。
         if self._throttled():
-            return
-        frame = _decode_jpeg(bytes(msg.data))
-        if frame is None:
             return
         stamp = self._frame_stamp(msg, time.monotonic())
         with self._left_lock:
             left = self._left_latest
-            if left is not None and abs(stamp - left[0]) <= _STEREO_SYNC_S:
-                self._drop_stale(self._stereo_queue, (left[1], frame))
             self._left_latest = None
+        if left is None or abs(stamp - left[0]) > _STEREO_SYNC_S:
+            return
+        left_frame = _decode_jpeg(left[1])
+        right_frame = _decode_jpeg(bytes(msg.data))
+        if left_frame is None or right_frame is None:
+            return
+        self._drop_stale(self._stereo_queue, (left_frame, right_frame))
 
     @staticmethod
     def _frame_stamp(msg, arrival: float) -> float:
@@ -548,11 +549,11 @@ class _PointCloudNode(Node):
 
         outputs, meta = model.infer(frame)
         depth_m = decode_depth(outputs, meta)
-        # 站点标定（同 visual_depth：metres**a * e^b）
-        if not (self._cal_a == 1.0 and self._cal_b == 0.0):
-            depth_m = np.nan_to_num(
-                np.power(np.maximum(depth_m, 0.0), self._cal_a) * float(np.exp(self._cal_b)),
-                nan=0.0, posinf=0.0, neginf=0.0)
+        # 站点标定与 visual_depth 同一份实现（review 第 19 轮建议）：恒等
+        # (1.0, 0.0) 有短路、a==1.0 走乘法不走 pow 内核——Orin 上每帧省
+        # 6 ms 且数值位相同，两个用户不各养一份。
+        from plugins.visual_depth import apply_site_calibration
+        depth_m = apply_site_calibration(depth_m, self._cal_a, self._cal_b)
         h, w = depth_m.shape[:2]
         fx, fy, cx, cy = self._pinhole_for(w, h)
         stride = decimation_stride(w, h, self._max_points)

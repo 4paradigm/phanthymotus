@@ -748,7 +748,9 @@ def test_stereo_frame_pairing_requires_sync_window():
 
     node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
     with node._left_lock:
-        node._left_latest = (0.0, np.zeros((6, 8, 3), dtype=np.uint8))
+        # 存的是编码字节（review 第 19 轮：配对成功才解码）——放一段
+        # 假字节即可，窗口校验在解码之前。
+        node._left_latest = (0.0, frame_bytes(8, 6))
     node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
     _wait_until(lambda: False, timeout=0.2)
     assert node._stereo_queue.empty()

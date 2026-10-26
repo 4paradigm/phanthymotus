@@ -207,10 +207,28 @@ class PluginTests(unittest.TestCase):
                          {'list_genres', 'play_music', 'play_sleep_audio', 'next', 'previous',
                           'pause', 'resume', 'stop_music', 'now_playing',
                           'set_volume', 'set_autoplay', 'search_music', 'search_sleep_audio'})
-        # Structural checks only, and deliberately so: jsonschema is not part
-        # of the test environment the PR bot installs (pytest + pytest-asyncio),
-        # and an import here fails 2100 collected tests' sibling with
-        # ModuleNotFoundError — this file's other tests included.
+        # Full validation when jsonschema is importable (it is not a declared
+        # dependency, so the PR bot's environment — pytest + pytest-asyncio
+        # only — and a bare host run both land on the structural fallback).
+        # Whichever path runs, a representative payload of every action must
+        # conform; the structural branch pins the same facts jsonschema would
+        # check, field by field, so a schema regression cannot slip through
+        # just because the library happened to be missing that day.
+        try:
+            import jsonschema
+        except ImportError:
+            jsonschema = None
+        if jsonschema is not None:
+            for payload in (
+                    {'action': 'play_music', 'genre': 'pop'},
+                    {'action': 'play_sleep_audio', 'category': 'bedtime_story'},
+                    {'action': 'next'},
+                    {'action': 'list_genres'},
+                    {'action': 'search_music', 'query': '安静的钢琴曲', 'top_k': 5},
+                    {'action': 'set_volume', 'volume': 40},
+                    {'action': 'set_autoplay', 'autoplay': True},
+                    {'action': 'now_playing'}):
+                jsonschema.validate(payload, schema)
         self.assertEqual(schema['type'], 'object')
         self.assertEqual(schema['required'], ['action'])
         properties = schema['properties']
