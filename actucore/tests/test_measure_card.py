@@ -308,3 +308,13 @@ def test_depth_wire_size_stays_640_even_if_camera_declares_other_resolution():
     assert card._depth_frame == (640, 480)
     assert card._camera.width == 1280
     assert any("640x480" in note for note in card._camera_notes)
+
+
+def test_compact_payload_does_not_include_retained_tracks():
+    card = _payload_card()
+    first = card._payload()
+    assert first["count"] == 1
+    card._objects = {"objects": []}
+    second = card._payload()
+    assert second["count"] == 0
+    assert second["objects"] == []

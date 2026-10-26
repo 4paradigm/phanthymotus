@@ -641,6 +641,11 @@ class MeasurePlugin:
     def _compact_objects(records: list[dict]) -> list[dict]:
         out = []
         for record in records:
+            # Stabilizer keeps a vanished track for track_timeout_ms. Those
+            # records are predictions, not current observations; including them
+            # made `count` reach 20+ on a frame with only a few detections.
+            if record.get("observed") is False:
+                continue
             bbox = record.get("bbox_norm")
             if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
                 continue
