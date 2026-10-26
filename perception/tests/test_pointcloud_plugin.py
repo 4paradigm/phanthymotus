@@ -865,6 +865,49 @@ def test_rectify_pair_raw_tier_takes_baseline_from_T():
         fake.restore()
 
 
+def test_rectify_pair_normalizes_positive_T_before_stereoRectify():
+    """review 第 20 轮 Issue：厂商出厂标定常给正 T[0]，OpenCV 的
+    stereoCalibrate 给负。stereoRectify 的视差约定是 d = -fx·T[0]/Z：
+    正 T → 校正后视差为负，而 SGBM minDisparity=0 / 自建 Q 要 d≥0
+    才有正深度 —— 正 T 的云要么全空要么深度错。修复：正 T 先翻负
+    再进 stereoRectify，出口的基线长度/Q 符号不变。"""
+    fake = _install_fake_stereo_rectify()
+    seen = {}
+    real_rectify = fake._cv2().stereoRectify
+
+    def capturing_rectify(K1, D1, K2, D2, size, R, T, flags=0, alpha=0.0):
+        seen["T"] = np.asarray(T, dtype=np.float64).ravel().copy()
+        seen["P"] = real_rectify(K1, D1, K2, D2, size, R, T, flags=flags, alpha=alpha)
+        return seen["P"]
+
+    fake._cv2().stereoRectify = capturing_rectify
+    try:
+        # 厂商约定的正 T（同样 5 cm 基线）
+        blob = json.loads(json.dumps(RAW_BLOB))
+        blob["T"] = [[0.05], [0], [0]]
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        fx, cx, cy, Tx, _L, _R = pc._rectify_pair(left, right, blob)
+
+        # 进 stereoRectify 的 T 已翻成 OpenCV 负号约定
+        assert seen["T"][0] == pytest.approx(-0.05), \
+            "正 T 必须在 stereoRectify 之前归一成负号"
+        # 假 rectify 与 OpenCV 同式：P2[0,3] = -fx·T[0] → 负 T 得正偏移，
+        # 视差 d = x_L - x_R = fx·|T|/Z ≥ 0，与 SGBM/Q 约定一致
+        R1, R2, P1, P2, Q, _, _ = seen["P"]
+        assert P2[0, 3] > 0, "归一后右相机校正偏移必须产生非负视差"
+        # 出口不变：基线长度、Q 反投影深度为正
+        assert Tx == pytest.approx(-0.05)
+        assert pc.Q_from_baseline(fx, cx, cy, Tx)[3, 2] == pytest.approx(20.0)
+
+        # 负 T（OpenCV 原生）不走翻转，原样通过
+        seen.clear()
+        pc._rectify_pair(left, right, RAW_BLOB)
+        assert seen["T"][0] == pytest.approx(-0.05), "负 T 保持原样"
+    finally:
+        fake.restore()
+
+
 def test_rectify_pair_raw_tier_maps_cached_per_size():
     """review 指出：docstring 说缓存 rectify 映射、代码却每帧重算
     stereoRectify + initUndistortRectifyMap。缓存以帧尺寸为键：同尺寸

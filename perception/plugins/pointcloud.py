@@ -786,6 +786,15 @@ def _rectify_pair(left: np.ndarray, right: np.ndarray, blob: dict,
     entry = cache.get("maps") if (cache is not None and cache.get("size") == size) else None
     if entry is None:
         K1, D1, K2, D2, R, T = _raw_stereo_params(blob)
+        # review 第 20 轮 Issue：blob 里 T[0] 的符号有两种约定——OpenCV
+        # 的 stereoCalibrate 给负（标准左右 rig），部分厂商出厂标定给正。
+        # stereoRectify 原样收 T：正 T 下校正后 x_R > x_L、真实视差为负
+        # （d = -fx·T[0]/Z），而 SGBM 硬编码 minDisparity=0、Q 的
+        # W=Q[3,2]·d 要 d≥0 才有正深度 —— 正 T 的云要么全空要么深度
+        # 错。进 rectify 前统一翻成 OpenCV 负号约定（R 不动：纯平移
+        # rig 的等价重表达对左右互换就是 T 取负）。
+        if float(T[0]) > 0:
+            T = -T
         R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
             K1, D1, K2, D2, size, R, T.reshape(3, 1),
             flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
