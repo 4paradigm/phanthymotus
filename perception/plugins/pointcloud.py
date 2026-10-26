@@ -676,6 +676,11 @@ def _raw_stereo_params(blob: dict) -> tuple:
     D1 = np.asarray(blob.get("D1") or blob.get("D_left") or [0, 0, 0, 0], dtype=np.float64).ravel()
     D2 = np.asarray(blob.get("D2") or blob.get("D_right") or [0, 0, 0, 0], dtype=np.float64).ravel()
     T = np.asarray(blob.get("T") or [-blob.get("Tx", 0.02443), 0, 0], dtype=np.float64).ravel()
+    # review 第 21 轮 Issue：T 的长度以前不查 —— {"T": [[-0.05]]} 过得了
+    # start 预检（T[0] 有限非零），worker 里 T.reshape(3, 1) 每帧炸，卡片
+    # running 却一云不出。平移向量必须恰为 3 元，当场报清楚。
+    if T.size != 3:
+        raise ValueError(f"raw 标定的 T 不是 3 元素平移向量（{T.size} 个元素）")
     # blob 里带标定出来的 R（stereoCalibrate 的第 6 个返回值）。老 blob 没有
     # R 字段时退单位阵 —— R=I 是"两相机已共线"的假设，比拒收宽容，且与
     # 旧行为兼容（此前恒传 I，等价于所有老 blob 都当共线用）。
@@ -739,6 +744,14 @@ def _stereo_blob_from_declarations(left: dict, right: dict) -> tuple:
         "R": peer["R"], "T": peer["T"],
         "source": peer.get("source", "unknown"),
     }
+    # review 第 21 轮建议：peer 的 R/T 只查了非 None，畸形值（如 1 元素的
+    # T）会一路带进 worker 才炸。拼完当场用与配置 blob 同一份解析器全量
+    # 预检（长度/有限值/NaN 全查）—— 坏驱动数据在 start 就报清楚，两条
+    # 入口（用户配置 / 驱动声明）一个标准。
+    try:
+        _raw_stereo_params(blob)
+    except ValueError as error:
+        return None, f"声明的 stereo_peer 标定数据畸形：{error}"
     return blob, None
 
 

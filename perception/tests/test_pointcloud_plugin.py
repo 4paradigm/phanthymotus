@@ -1920,6 +1920,47 @@ def test_declared_calib_peer_id_mismatch_rejects_swapped_inputs():
     assert "接反" in reply["message"] or "不配对" in reply["message"]
 
 
+def test_short_T_in_config_blob_is_rejected_at_start():
+    """review 第 21 轮 Issue：{"T": [[-0.05]]} 以前过得了 start 预检
+    （T[0] 有限非零），worker 里 T.reshape(3, 1) 每帧炸 —— 卡片 running
+    却一云不出。平移向量必须恰为 3 元，start 当场报清楚。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob["T"] = [[-0.05]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": json.dumps(blob)})
+    assert reply["state"] == "error"
+    assert "T 不是 3 元素" in reply["message"]
+
+
+def test_short_T_in_declared_peer_is_rejected_at_start():
+    """review 第 21 轮建议：stereo_peer 只查非 None 不够 —— 声明里 1 元素
+    的 T 会在拼 blob 后带进 worker 每帧炸。拼完当场用与配置 blob 同一份
+    解析器预检，坏驱动数据在 start 报清楚。"""
+    decls = _stereo_declarations()
+    decls[0]["stereo_peer"]["T"] = [[-0.05]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "畸形" in reply["message"] and "T" in reply["message"]
+
+
+def test_nan_in_declared_peer_R_is_rejected_at_start():
+    """同一条预检的有限值面：声明层 peer 的 R 里一个 NaN 以前会带进
+    stereoRectify 输出全 NaN、映射全废、云一帧不出且无报错。"""
+    decls = _stereo_declarations()
+    decls[0]["stereo_peer"]["R"] = [[1, 0, float("nan")], [0, 1, 0], [0, 0, 1]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "畸形" in reply["message"]
+
+
 def test_declared_calib_missing_right_k_reports_the_gap():
     """右目声明没带 K：成套才用、缺件报清楚（unknown is null, never a
     guess —— 拼半套标定与错误标定下游不可区分）。"""
