@@ -284,3 +284,33 @@ def test_session_reset_clears_summary_and_history():
     session.reset(100)
     assert session.history() == []
     assert session.summary(101)["objects"] == []
+
+
+def test_session_does_not_count_a_retained_track_as_a_new_observation():
+    """Stabilizer keeps a vanished object for track_timeout_ms; session must not
+    turn that retained record into another sample."""
+    session = G.Session(only_stable=True)
+    session.reset(0)
+    observed = _session_record(1.7)
+    observed["age_ms"] = 0
+    observed["observed"] = True
+    retained = _session_record(1.7)
+    retained["age_ms"] = 400
+    retained["observed"] = False
+    session.record([observed], 1000)
+    session.record([retained], 1400)
+    item = session.summary(1400)["objects"][0]
+    assert item["samples"] == 1
+    assert item["last_seen_ms"] == 1000
+
+
+def test_session_retains_at_most_max_objects():
+    session = G.Session(max_objects=2, record_interval_ms=0)
+    session.reset(0)
+    for index, name in enumerate(("a", "b", "c")):
+        session.record([{**_session_record(1.7, key=f"{name}#"),
+                         "name": name}], index)
+    summary = session.summary(10)
+    assert len(summary["objects"]) == 2
+    assert session._objects.keys() == {"b#", "c#"}
+    assert session._last_history.keys() == {"b#", "c#"}

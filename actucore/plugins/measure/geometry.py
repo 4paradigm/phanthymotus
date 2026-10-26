@@ -373,6 +373,7 @@ class Stabilizer:
                 str(record.get("color") or record.get("color_name") or ""))
 
     def update(self, measurements: list[dict], now_s: float) -> list[dict]:
+        seen = set()
         for record in measurements:
             center = self._center(record)
             if center is None:
@@ -385,6 +386,7 @@ class Stabilizer:
             track.center = center
             track.last_seen = now_s
             track.samples.append(record)
+            seen.add(key)
             while len(track.samples) > self.window:
                 track.samples.popleft()
 
@@ -412,6 +414,10 @@ class Stabilizer:
                 "method": latest.get("method", "bbox+depth"),
                 "samples": len(track.samples),
                 "stable": len(track.samples) >= self.min_samples,
+                # A retained track is not a new observation. age_ms alone cannot
+                # express that at a 5 Hz tick: two calls can share a monotonic
+                # timestamp closely enough to round to 0 ms.
+                "observed": track.key in seen,
                 "age_ms": int(max(0.0, now_s - track.last_seen) * 1000),
                 "quality": dict(latest.get("quality") or {}),
             }
@@ -497,6 +503,14 @@ class Session:
         for record in measurements:
             if not isinstance(record, dict):
                 continue
+            # Stabilizer.update() keeps a track for track_timeout_ms after the
+            # object disappears. Those retained records have age_ms > 0 and are
+            # predictions, not observations; recording them would advance
+            # last_seen_ms and weight the summary with phantom samples.
+            if record.get("observed") is False:
+                continue
+            if record.get("age_ms", 0) > 0:
+                continue
             if self.only_stable and not record.get("stable"):
                 continue
             height = _number(record.get("visible_height_m"))
@@ -545,7 +559,21 @@ class Session:
                 self._history.append(row)
                 self._last_history[key] = row
                 new_rows.append(row)
+        self._evict()
         return new_rows
+
+    def _evict(self) -> None:
+        """Keep the retained object set bounded, not only the rendered list.
+
+        `summary()` truncates its output, but `_objects` and `_last_history`
+        would otherwise retain every distinct name/colour ever seen. On a
+        long-running card that is unbounded memory, and `summary_max_objects`
+        would be a display limit pretending to be a resource limit.
+        """
+        while len(self._objects) > self.max_objects:
+            oldest = min(self._objects.values(), key=lambda item: item.last_seen_ms)
+            del self._objects[oldest.key]
+            self._last_history.pop(oldest.key, None)
 
     def summary(self, now_ms: int) -> dict:
         objects = sorted(self._objects.values(),

@@ -280,3 +280,14 @@ def test_info_includes_the_session_summary_and_history_count():
     out = card.dispatch("measure", {"action": "info"})
     assert out["session"]["objects"]
     assert out["history_count"] == 1
+
+
+def test_a_vanished_object_is_not_counted_again_by_the_session_summary():
+    card = _payload_card()
+    card._payload()
+    # The stabilizer retains the track for track_timeout_ms; the session must
+    # not treat that retained record as a new observation.
+    card._objects = {"objects": []}
+    payload = card._payload()
+    item = payload["session"]["objects"][0]
+    assert item["samples"] == 1
