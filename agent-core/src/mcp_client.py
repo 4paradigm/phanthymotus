@@ -1179,6 +1179,10 @@ def with_parallel_param(schema: dict, tool_type: str | None) -> dict:
 
 async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
     """Dispatch tool call for internal (agentcore/channel) tools."""
+    if tool_name == 'lottery_draw':
+        import lottery
+        return json.dumps(await lottery.handle(args), ensure_ascii=False)
+
     if tool_name == 'channel_reply':
         action = args.get('action', '')
         if action == 'send':

@@ -9688,3 +9688,109 @@ html, body {
 @media (max-width: 760px) {
   .bm-tl-r { grid-template-columns: 1fr 52px 1fr; gap: 6px; }
 }
+/* Server-authoritative lottery renderer. The animation is decoration; only a
+   backend `result` frame is ever allowed to choose the displayed winner. */
+.renderer-lottery {
+  width: 100%;
+  height: 100%;
+  min-height: 360px;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  padding: 16px;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 50% 38%, color-mix(in srgb, var(--accent) 20%, transparent), transparent 42%),
+    var(--bg);
+}
+
+.lottery-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.lottery-status { color: var(--text-dim); font-size: 13px; }
+
+.lottery-fullscreen {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 12px;
+  color: var(--text);
+  background: var(--bg-card);
+  cursor: pointer;
+}
+
+.lottery-stage {
+  width: min(560px, 82vw);
+  aspect-ratio: 1.35;
+  place-self: center;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 18px;
+  padding: 32px;
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
+  border-radius: 32px;
+  background: color-mix(in srgb, var(--bg-card) 88%, var(--accent));
+  box-shadow: 0 28px 80px rgb(0 0 0 / 22%);
+  overflow: hidden;
+}
+
+.lottery-value {
+  max-width: 100%;
+  font-size: clamp(64px, 12vw, 156px);
+  font-weight: 850;
+  line-height: 1;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.lottery-caption { color: var(--text-dim); font-size: clamp(14px, 2vw, 22px); }
+
+.renderer-lottery.spinning .lottery-value {
+  animation: lottery-spin 160ms infinite alternate cubic-bezier(.2,.8,.4,1);
+}
+
+.renderer-lottery[data-mode="card"].spinning .lottery-value {
+  animation-name: lottery-card-flip;
+  perspective: 800px;
+}
+
+.renderer-lottery.has-result .lottery-value {
+  color: var(--accent);
+  animation: lottery-reveal 650ms cubic-bezier(.16,1.5,.3,1);
+}
+
+.renderer-lottery:fullscreen {
+  min-height: 100vh;
+  padding: 32px;
+}
+
+.renderer-lottery:fullscreen .lottery-stage {
+  width: min(1000px, 86vw);
+}
+
+.renderer-lottery:fullscreen .lottery-value {
+  font-size: clamp(120px, 22vw, 320px);
+}
+
+@keyframes lottery-spin {
+  from { transform: translateY(-8px) scale(.9) rotate(-3deg); filter: blur(1px); }
+  to { transform: translateY(8px) scale(1.07) rotate(3deg); filter: blur(0); }
+}
+
+@keyframes lottery-card-flip {
+  from { transform: rotateY(0deg) scale(.92); }
+  to { transform: rotateY(180deg) scale(1.04); }
+}
+
+@keyframes lottery-reveal {
+  from { transform: scale(.18); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .renderer-lottery.spinning .lottery-value,
+  .renderer-lottery.has-result .lottery-value { animation: none; }
+}
