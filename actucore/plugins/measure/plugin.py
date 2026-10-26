@@ -1,0 +1,652 @@
+"""Generic object measurement from VOP boxes and metric depth.
+
+The card is a **processor**, not an actuator: it reads what perception already
+publishes, turns a detection box into metres, and publishes a JSON observation.
+It never commands a robot.
+
+Why this is not "another navigation card"
+-----------------------------------------
+
+Navigation asks "is the way ahead blocked?". Measurement asks "how wide is this
+thing?". They both use depth, but their failure modes are different: a stale
+navigation corridor can stop a chassis; a stale measurement is merely a number
+that must not be trusted. The card therefore publishes `fresh`/quality fields
+and never turns an unmeasured dimension into zero.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import threading
+import time
+from dataclasses import dataclass
+
+from . import camera as camera_mod
+from . import geometry
+
+log = logging.getLogger(__name__)
+
+SCHEMA = "motus.measure/1"
+PREFIX = "measure"
+DEFAULT_TOPIC = "/actucore/measure/state"
+TOPIC_FORMAT = "data/json"
+
+# VOP's output suffixes. A hardware depth topic may be `/camera/depth` or a
+# namespaced head camera; the same suffix order is used by navi, so a canvas
+# wired for navigation does not need a second naming convention here.
+_OBJECTS_SUFFIX = "/objects"
+_DEPTH_SUFFIXES = ("/visual_depth", "/camera/head/depth", "/camera/depth", "/depth")
+
+
+def _sensor_qos():
+    """BEST_EFFORT, matching VOP and every depth producer in this project.
+
+    A RELIABLE subscriber paired with a BEST_EFFORT publisher silently receives
+    nothing in ROS2. The failure looks like a broken camera, not a QoS mismatch.
+    """
+    from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                           ReliabilityPolicy)
+
+    return QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                      history=HistoryPolicy.KEEP_LAST,
+                      depth=2,
+                      durability=DurabilityPolicy.VOLATILE)
+
+
+@dataclass
+class Config:
+    rate_hz: float = 5.0
+    max_objects: int = 8
+    min_confidence: float = 0.3
+    depth_percentile: float = geometry.DEPTH_PERCENTILE
+    max_depth_m: float = 20.0
+    max_obs_age_ms: int = 500
+    stable_frames: int = 5
+    stable_min: int = 3
+    track_timeout_ms: int = 2000
+    match_distance_norm: float = geometry.DEFAULT_MATCH_DISTANCE
+    half_fov_rad: float | None = None
+    half_fov_v_rad: float | None = None
+
+    @classmethod
+    def from_dict(cls, values: dict | None) -> "Config":
+        values = values or {}
+        config = cls()
+        for key in ("rate_hz", "min_confidence", "depth_percentile",
+                    "max_depth_m", "match_distance_norm", "half_fov_rad",
+                    "half_fov_v_rad"):
+            if key in values and values[key] is not None:
+                setattr(config, key, float(values[key]))
+        for key in ("max_objects", "max_obs_age_ms", "stable_frames",
+                    "stable_min", "track_timeout_ms"):
+            if key in values and values[key] is not None:
+                setattr(config, key, int(values[key]))
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if not 0.5 <= self.rate_hz <= 30:
+            raise ValueError("measure.rate_hz must be in [0.5, 30]")
+        if not 1 <= self.max_objects <= 50:
+            raise ValueError("measure.max_objects must be in [1, 50]")
+        if not 0 <= self.min_confidence <= 1:
+            raise ValueError("measure.min_confidence must be in [0, 1]")
+        if not 1 <= self.depth_percentile <= 99:
+            raise ValueError("measure.depth_percentile must be in [1, 99]")
+        if not 0 < self.max_depth_m <= 100:
+            raise ValueError("measure.max_depth_m must be in (0, 100]")
+        if not 50 <= self.max_obs_age_ms <= 5000:
+            raise ValueError("measure.max_obs_age_ms must be in [50, 5000]")
+        if not 1 <= self.stable_frames <= 50:
+            raise ValueError("measure.stable_frames must be in [1, 50]")
+        if not 1 <= self.stable_min <= self.stable_frames:
+            raise ValueError("measure.stable_min must be in [1, stable_frames]")
+        if not 0 <= self.track_timeout_ms <= 60000:
+            raise ValueError("measure.track_timeout_ms must be in [0, 60000]")
+        if not 0 <= self.match_distance_norm <= 1:
+            raise ValueError("measure.match_distance_norm must be in [0, 1]")
+        for name in ("half_fov_rad", "half_fov_v_rad"):
+            angle = getattr(self, name)
+            if angle is not None and not 0 < angle < math.pi / 2:
+                raise ValueError(f"measure.{name} must be in (0, π/2)")
+
+    def as_dict(self) -> dict:
+        return {
+            "rate_hz": self.rate_hz,
+            "max_objects": self.max_objects,
+            "min_confidence": self.min_confidence,
+            "depth_percentile": self.depth_percentile,
+            "max_depth_m": self.max_depth_m,
+            "max_obs_age_ms": self.max_obs_age_ms,
+            "stable_frames": self.stable_frames,
+            "stable_min": self.stable_min,
+            "track_timeout_ms": self.track_timeout_ms,
+            "match_distance_norm": self.match_distance_norm,
+        }
+
+
+class MeasurePlugin:
+    PREFIX = PREFIX
+
+    def __init__(self, plugin_cfg: dict, executor, namespace: str = ""):
+        self._cfg = dict(plugin_cfg or {})
+        self._executor = executor
+        self._namespace = (namespace or "").strip("/")
+        self._topic = str(self._cfg.get("topic") or DEFAULT_TOPIC)
+        self._config = Config.from_dict(self._cfg)
+
+        self._lock = threading.RLock()
+        self._obs_lock = threading.RLock()
+        self._running = False
+        self._node = None
+        self._publisher = None
+        self._timer = None
+        self._binding = {}
+        self._objects = None
+        self._objects_ms = 0
+        self._depth = None
+        self._depth_ms = 0
+        self._objects_frame = (geometry.WIDTH, geometry.HEIGHT)
+        self._depth_frame = (geometry.WIDTH, geometry.HEIGHT)
+        self._camera = camera_mod.CameraModel()
+        self._camera_notes: list[str] = []
+        self._published = 0
+        self._last = None
+        self._last_error = ""
+        self._stabilizer = self._new_stabilizer()
+
+    # ── tool ─────────────────────────────────────────────────────────────────
+
+    def get_tools(self) -> list:
+        return [{
+            "name": PREFIX,
+            "type": "processor",
+            "multiInstance": False,
+            "description": (
+                "通用物体测量：接 VOP 检测结果和一路米制深度图，输出每个目标的"
+                "距离、可见宽度和可见高度。宽度/高度是当前视角下的可见外廓，"
+                "不是不可见背面的完整三维尺寸；后者需要分割和点云/多视角。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "info", "config"],
+                    },
+                },
+                "required": ["action"],
+                # start/stop are canvas lifecycle, not LLM functions. config is
+                # a gear action; only info is useful to an agent.
+                "x-action-params": {
+                    "info": {"params": [], "description": "返回最近一次测量和降级信息"},
+                    "config": {"params": [], "description": "更新测量阈值"},
+                },
+            },
+            "topic_in": [
+                {"format": "data/json",
+                 "desc": "vop 检测结果（必需，含 bbox）"},
+                {"format": "image/depth-zlib",
+                 "desc": "与检测同一镜头的米制深度图（必需）"},
+            ],
+            "topic_out": [{
+                "topic": self._topic,
+                "format": TOPIC_FORMAT,
+                "desc": "每个目标的距离/可见宽高、质量与降级信息",
+            }],
+            "configSchema": {
+                "type": "object",
+                "properties": {
+                    "rate_hz": {"type": "number", "default": 5.0,
+                                "description": "发布频率，Hz", "scope": "instance"},
+                    "max_objects": {"type": "integer", "default": 8,
+                                    "description": "每帧最多测量几个目标", "scope": "instance"},
+                    "min_confidence": {"type": "number", "default": 0.3,
+                                       "description": "低于此置信度的检测不测", "scope": "instance"},
+                    "depth_percentile": {"type": "number", "default": 25,
+                                         "description": "bbox 内深度的分位数，越小越偏向最近表面",
+                                         "scope": "instance"},
+                    "max_depth_m": {"type": "number", "default": 20.0,
+                                    "description": "超过这个距离不输出尺寸", "scope": "instance"},
+                    "stable_frames": {"type": "integer", "default": 5,
+                                      "description": "平滑窗口帧数", "scope": "instance"},
+                    "stable_min": {"type": "integer", "default": 3,
+                                   "description": "至少多少帧才标记 stable", "scope": "instance"},
+                    "track_timeout_ms": {"type": "integer", "default": 2000,
+                                         "description": "目标丢失后保留平滑结果的时间",
+                                         "scope": "instance"},
+                },
+                "required": [],
+            },
+        }]
+
+    def dispatch(self, name: str, args: dict | None) -> dict | None:
+        args = args or {}
+        action = args.get("action") or name
+        if action == "start":
+            return self._start(args)
+        if action == "stop":
+            return self._stop()
+        if action == "info":
+            return self._info()
+        if action == "config":
+            return self._config_action(args)
+        return None
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        """Bundle lifecycle is inert: a container restart must not start measuring.
+
+        The canvas starts the project and supplies the input topics.
+        """
+
+    def stop(self) -> None:
+        self._stop()
+
+    def _start(self, args: dict) -> dict:
+        if self._executor is None:
+            return self._error("没有 ROS 上下文，无法订阅 VOP/深度")
+
+        inputs = list(args.get("input_topics") or [])
+        single = args.get("input_topic")
+        if single and single not in inputs:
+            inputs.insert(0, single)
+        if not inputs:
+            return self._error("缺少 input_topic —— 请把 VOP 和深度图连到本卡片")
+
+        with self._lock:
+            if self._running:
+                return self._error("already running")
+            self._running = True
+            self._published = 0
+            self._last = None
+            self._last_error = ""
+            self._objects = None
+            self._objects_ms = 0
+            self._depth = None
+            self._depth_ms = 0
+            self._binding = {}
+            self._camera_notes = []
+            self._stabilizer.reset()
+
+        try:
+            self._open_publisher()
+            binding, problem = self._bind_inputs(
+                self._node, inputs, args.get("camera_info"),
+                args.get("input_bindings"))
+        except Exception as error:                            # noqa: BLE001
+            self._unwind()
+            return self._error(f"启动失败：{error}")
+        if problem:
+            self._unwind()
+            return self._error(problem)
+
+        camera_problem = self._adopt_camera(args.get("camera_info"), binding)
+        if camera_problem:
+            self._unwind()
+            return self._error(camera_problem)
+
+        self._binding = binding
+        log.info("measure started: topic=%s %.1f Hz inputs=%s",
+                 self._topic, self._config.rate_hz, binding)
+        return {
+            "state": "running",
+            "topic": self._topic,
+            "rate_hz": self._config.rate_hz,
+            "inputs": binding,
+            "degraded": self._degradations(),
+        }
+
+    def _stop(self) -> dict:
+        with self._lock:
+            if not self._running:
+                return {"state": "idle"}
+            self._running = False
+            node, timer = self._node, self._timer
+            self._node = None
+            self._timer = None
+            self._publisher = None
+        if timer is not None and node is not None:
+            try:
+                node.destroy_timer(timer)
+            except Exception:                                 # noqa: BLE001
+                pass
+        if node is not None:
+            try:
+                if self._executor is not None:
+                    self._executor.remove_node(node)
+            except Exception:                                 # noqa: BLE001
+                pass
+            try:
+                node.destroy_node()
+            except Exception:                                 # noqa: BLE001
+                pass
+        return {"state": "idle"}
+
+    def _unwind(self) -> None:
+        self._stop()
+
+    # ── wiring ───────────────────────────────────────────────────────────────
+
+    def _open_publisher(self) -> None:
+        from rclpy.node import Node
+        from std_msgs.msg import String
+
+        node = Node(f"measure_{abs(hash(self._topic)) % 100000}")
+        self._publisher = node.create_publisher(String, self._topic, 10)
+        self._timer = node.create_timer(1.0 / max(self._config.rate_hz, 0.1),
+                                        self._tick)
+        self._executor.add_node(node)
+        self._node = node
+
+    def _bind_inputs(self, node, topics, declarations=None, input_bindings=None):
+        bound = {"objects": "", "depth": "", "unknown": []}
+        for topic in topics:
+            role = self._role_of(topic)
+            if not role:
+                bound["unknown"].append(topic)
+                continue
+            if not bound[role]:
+                bound[role] = topic
+
+        missing = []
+        if not bound["objects"]:
+            missing.append("VOP 检测结果")
+        if not bound["depth"]:
+            missing.append("深度图")
+        if missing:
+            return bound, ("测量需要的输入没有连上：" + "、".join(missing)
+                           + "。请把 VOP 和深度图接到本卡片。")
+
+        depth_format = self._declared_format(input_bindings, bound["depth"])
+        if depth_format and depth_format != "image/depth-zlib":
+            return bound, (f"深度输入格式是 {depth_format!r}，本卡片需要 "
+                           "image/depth-zlib（640x480 uint16 毫米，zlib 压缩）")
+
+        from sensor_msgs.msg import CompressedImage
+        from std_msgs.msg import String
+
+        qos = _sensor_qos()
+        node.create_subscription(String, bound["objects"], self._on_objects, qos)
+        node.create_subscription(CompressedImage, bound["depth"], self._on_depth, qos)
+        return bound, ""
+
+    def _adopt_camera(self, declarations, binding: dict) -> str:
+        depth_topic = binding.get("depth")
+        objects_topic = binding.get("objects")
+        depth_decl = camera_mod.for_topic(declarations, depth_topic) if depth_topic else {}
+        objects_decl = camera_mod.for_topic(declarations, objects_topic) if objects_topic else {}
+
+        depth_id = camera_mod.camera_id(depth_decl)
+        objects_id = camera_mod.camera_id(objects_decl)
+        if depth_id and objects_id and depth_id != objects_id:
+            return (f"检测结果来自 {objects_id}，深度图来自 {depth_id}。"
+                    "两个不同的镜头不能用同一个相机模型换算尺寸；"
+                    "请把 VOP 和深度接到同一颗相机上")
+
+        object_size = self._declared_size(objects_decl)
+        depth_size = self._declared_size(depth_decl) or object_size
+        if object_size is None:
+            object_size = depth_size or (geometry.WIDTH, geometry.HEIGHT)
+            self._camera_notes.append(
+                "VOP 没有声明相机分辨率，bbox 按深度图尺寸归一化 —— "
+                "如果 VOP 使用另一个分辨率，宽高会偏")
+        if depth_size is None:
+            depth_size = (geometry.WIDTH, geometry.HEIGHT)
+            self._camera_notes.append(
+                "深度输入没有声明分辨率，按 image/depth-zlib 契约使用 640x480")
+
+        camera = camera_mod.from_declaration(
+            depth_decl or objects_decl,
+            fallback_width=depth_size[0],
+            fallback_height=depth_size[1],
+            fallback_half_fov=self._config.half_fov_rad,
+            fallback_half_fov_v=self._config.half_fov_v_rad,
+        )
+        self._objects_frame = object_size
+        self._depth_frame = depth_size
+        self._camera = camera
+        self._camera_notes.extend(camera.notes)
+        if not camera.has_width:
+            self._camera_notes.append(
+                "没有可用的水平相机几何 —— 只输出距离，visible_width_m 为 null")
+        if not camera.has_height:
+            self._camera_notes.append(
+                "没有可用的垂直相机几何 —— 只输出距离，visible_height_m 为 null")
+        return ""
+
+    @staticmethod
+    def _declared_size(declaration: dict):
+        if not isinstance(declaration, dict):
+            return None
+        try:
+            width = int(declaration.get("width") or 0)
+            height = int(declaration.get("height") or 0)
+        except (TypeError, ValueError):
+            return None
+        return (width, height) if width > 0 and height > 0 else None
+
+    @staticmethod
+    def _declared_format(bindings, topic: str) -> str:
+        if isinstance(bindings, dict):
+            entry = bindings.get(topic)
+            if isinstance(entry, str):
+                return entry
+            if isinstance(entry, dict):
+                return str(entry.get("format") or "")
+            entries = bindings.get("bindings") or bindings.get("inputs") or ()
+        else:
+            entries = bindings or ()
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("topic") == topic:
+                return str(entry.get("format") or "")
+        return ""
+
+    @staticmethod
+    def _role_of(topic: str) -> str:
+        if topic.endswith(_OBJECTS_SUFFIX):
+            return "objects"
+        for suffix in _DEPTH_SUFFIXES:
+            if topic.endswith(suffix):
+                return "depth"
+        return ""
+
+    # ── observations ─────────────────────────────────────────────────────────
+
+    def _on_objects(self, message) -> None:
+        try:
+            payload = json.loads(message.data)
+        except Exception:                                     # noqa: BLE001
+            return
+        if not isinstance(payload, dict):
+            return
+        with self._obs_lock:
+            self._objects = payload
+            self._objects_ms = int(time.time() * 1000)
+
+    def _on_depth(self, message) -> None:
+        data = bytes(getattr(message, "data", b"") or b"")
+        if not data:
+            return
+        try:
+            depth = geometry.decode(data, *self._depth_frame)
+        except geometry.DepthError as error:
+            with self._lock:
+                self._last_error = f"深度图解码失败：{error}"
+            return
+        with self._obs_lock:
+            self._depth = depth
+            self._depth_ms = int(time.time() * 1000)
+
+    def _observation(self):
+        now = int(time.time() * 1000)
+        max_age = self._config.max_obs_age_ms
+        with self._obs_lock:
+            objects = (self._objects
+                       if now - self._objects_ms <= max_age else None)
+            depth = self._depth if now - self._depth_ms <= max_age else None
+        return objects, depth
+
+    # ── loop ─────────────────────────────────────────────────────────────────
+
+    def _tick(self) -> None:
+        publisher = self._publisher
+        if publisher is None or not self._running:
+            return
+        try:
+            payload = self._payload()
+        except Exception as error:                            # noqa: BLE001
+            with self._lock:
+                self._last_error = f"{type(error).__name__}: {error}"
+            log.warning("measure tick failed: %s", error)
+            return
+
+        from std_msgs.msg import String
+
+        message = String()
+        message.data = json.dumps(payload, ensure_ascii=False)
+        publisher.publish(message)
+        with self._lock:
+            self._published += 1
+            self._last = payload
+
+    def _payload(self) -> dict:
+        now_ms = int(time.time() * 1000)
+        objects, depth = self._observation()
+        if objects is None or depth is None:
+            missing = []
+            if objects is None:
+                missing.append("VOP")
+            if depth is None:
+                missing.append("depth")
+            return {
+                "schema": SCHEMA,
+                "timestamp_ms": now_ms,
+                "available": False,
+                "fresh": False,
+                "reason": "stale or missing observation: " + ", ".join(missing),
+                "objects": [],
+                "camera": self._camera.as_dict(),
+                "degraded": self._degradations(),
+            }
+
+        measurements = geometry.measure_objects(
+            objects.get("objects"),
+            depth,
+            self._camera,
+            self._objects_frame,
+            min_confidence=self._config.min_confidence,
+            max_objects=self._config.max_objects,
+            depth_percentile=self._config.depth_percentile,
+            max_depth_m=self._config.max_depth_m,
+        )
+        smoothed = self._stabilizer.update(measurements, time.monotonic())
+        return {
+            "schema": SCHEMA,
+            "timestamp_ms": now_ms,
+            "available": True,
+            "fresh": True,
+            "objects": smoothed,
+            "camera": self._camera.as_dict(),
+            "degraded": self._degradations(),
+        }
+
+    def _new_stabilizer(self) -> geometry.Stabilizer:
+        return geometry.Stabilizer(
+            window=self._config.stable_frames,
+            min_samples=self._config.stable_min,
+            timeout_s=self._config.track_timeout_ms / 1000.0,
+            match_distance_norm=self._config.match_distance_norm,
+        )
+
+    # ── info/config ──────────────────────────────────────────────────────────
+
+    def _info(self) -> dict:
+        with self._lock:
+            return {
+                "state": "running" if self._running else "idle",
+                "topic": self._topic,
+                "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT}],
+                "inputs": dict(self._binding),
+                "rate_hz": self._config.rate_hz,
+                "published": self._published,
+                "objects_frame": list(self._objects_frame),
+                "depth_frame": list(self._depth_frame),
+                "camera": self._camera.as_dict(),
+                "degraded": self._degradations(),
+                "last": self._last,
+                "error": self._last_error,
+            }
+
+    def _config_action(self, args: dict) -> dict:
+        allowed = {
+            "rate_hz": float,
+            "max_objects": int,
+            "min_confidence": float,
+            "depth_percentile": float,
+            "max_depth_m": float,
+            "max_obs_age_ms": int,
+            "stable_frames": int,
+            "stable_min": int,
+            "track_timeout_ms": int,
+            "match_distance_norm": float,
+        }
+        changed = {}
+        previous = dict(self._config.__dict__)
+        previous_rate = self._config.rate_hz
+        previous_window = (self._config.stable_frames,
+                           self._config.stable_min,
+                           self._config.track_timeout_ms,
+                           self._config.match_distance_norm)
+        for key, cast in allowed.items():
+            if key not in args or args[key] is None:
+                continue
+            try:
+                value = cast(args[key])
+            except (TypeError, ValueError):
+                self._config.__dict__.update(previous)
+                return {"status": "error", "error": f"{key} 类型不正确"}
+            setattr(self._config, key, value)
+            changed[key] = value
+        try:
+            self._config.validate()
+        except ValueError as error:
+            self._config.__dict__.update(previous)
+            return {"status": "error", "error": str(error)}
+        if changed:
+            self._cfg.update(changed)
+            if previous_window != (self._config.stable_frames,
+                                   self._config.stable_min,
+                                   self._config.track_timeout_ms,
+                                   self._config.match_distance_norm):
+                self._stabilizer = self._new_stabilizer()
+            if self._running and previous_rate != self._config.rate_hz:
+                self._restart_timer()
+        return {"status": "configured", "config": self._config.as_dict(),
+                "changed": changed}
+
+    def _restart_timer(self) -> None:
+        node = self._node
+        if node is None:
+            return
+        try:
+            if self._timer is not None:
+                node.destroy_timer(self._timer)
+            self._timer = node.create_timer(1.0 / max(self._config.rate_hz, 0.1),
+                                            self._tick)
+        except Exception as error:                            # noqa: BLE001
+            self._last_error = f"重启定时器失败：{error}"
+
+    def _degradations(self) -> list[str]:
+        if not self._running:
+            return []
+        return list(dict.fromkeys(self._camera_notes))
+
+    def _error(self, message: str) -> dict:
+        with self._lock:
+            self._last_error = message
+        log.warning("measure: %s", message)
+        return {"state": "error", "message": message}

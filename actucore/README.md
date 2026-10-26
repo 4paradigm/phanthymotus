@@ -395,6 +395,42 @@ range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 rang
 `policy.py` 和 `depth.py` 不碰 ROS 是有意的：这样「目标被人挡住的同时左边还有
 个障碍会怎样」是一条测试，而不是一下午的真机调试。
 
+## `measure` 卡片
+
+通用物体测量：接 VOP 的检测结果和一路米制深度图，输出每个目标的距离、**可见**
+宽度和**可见**高度。
+
+```text
+vop ──(data/json)──────────────┐
+                               ├─ measure ─(data/json)─→ 画布 / skill / LLM
+depth ──(image/depth-zlib)─────┘
+camera_info (motus.camera/1) ──┘
+```
+
+它不控制机器人，也不判断能不能过去。输出里的 `visible_width_m` /
+`visible_height_m` 是当前视角下的外廓：单视角看不到背面，物体旋转也会改变投影
+宽度。真正的三维 L×W×H 需要分割 + 点云/多视角，这张卡不会把 `extent_3d_m`
+填成一个假数（第一版恒为 `null`）。
+
+启动门槛只有两个：VOP 检测结果和深度图必须连上。相机几何从
+`motus.camera/1` 的 `K` 或 `half_fov_rad` / `half_fov_v_rad` 读；没有声明时
+只输出距离，宽高为 `null`，原因写进 `info().degraded`。两路输入来自不同相机
+（`id` 不一致）直接拒绝启动。
+
+输入话题按后缀识别，和 navi 使用同一套命名：
+
+- VOP：`/objects`
+- 深度：`/visual_depth`、`/camera/head/depth`、`/camera/depth`、`/depth`
+
+`info` 返回最近一次测量；`config` 可改 `rate_hz`、`max_objects`、
+`min_confidence`、`depth_percentile`、`max_depth_m`、平滑窗口等。检测框会抖，
+所以输出是最近 `stable_frames` 帧的中位数，`samples` / `stable` / `age_ms`
+告诉调用方这个数有多稳。
+
+`inspect` / `tools/list` 里的端口格式是 `data/json`，输出来自
+`actucore/plugins/measure/geometry.py`，不依赖 ROS，单测在
+`actucore/tests/test_measure_geometry.py`。
+
 ## 构建与运行
 
 只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
