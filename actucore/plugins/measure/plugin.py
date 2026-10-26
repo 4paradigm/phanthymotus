@@ -67,6 +67,11 @@ class Config:
     stable_min: int = 3
     track_timeout_ms: int = 2000
     match_distance_norm: float = geometry.DEFAULT_MATCH_DISTANCE
+    history_size: int = 200
+    record_interval_ms: int = 1000
+    record_min_delta_m: float = 0.01
+    only_stable: bool = True
+    summary_max_objects: int = 20
     half_fov_rad: float | None = None
     half_fov_v_rad: float | None = None
 
@@ -75,14 +80,17 @@ class Config:
         values = values or {}
         config = cls()
         for key in ("rate_hz", "min_confidence", "depth_percentile",
-                    "max_depth_m", "match_distance_norm", "half_fov_rad",
-                    "half_fov_v_rad"):
+                    "max_depth_m", "match_distance_norm", "record_min_delta_m",
+                    "half_fov_rad", "half_fov_v_rad"):
             if key in values and values[key] is not None:
                 setattr(config, key, float(values[key]))
         for key in ("max_objects", "max_obs_age_ms", "stable_frames",
-                    "stable_min", "track_timeout_ms"):
+                    "stable_min", "track_timeout_ms", "history_size",
+                    "record_interval_ms", "summary_max_objects"):
             if key in values and values[key] is not None:
                 setattr(config, key, int(values[key]))
+        if "only_stable" in values:
+            config.only_stable = bool(values["only_stable"])
         config.validate()
         return config
 
@@ -107,6 +115,14 @@ class Config:
             raise ValueError("measure.track_timeout_ms must be in [0, 60000]")
         if not 0 <= self.match_distance_norm <= 1:
             raise ValueError("measure.match_distance_norm must be in [0, 1]")
+        if not 1 <= self.history_size <= 5000:
+            raise ValueError("measure.history_size must be in [1, 5000]")
+        if not 0 <= self.record_interval_ms <= 60000:
+            raise ValueError("measure.record_interval_ms must be in [0, 60000]")
+        if not 0 <= self.record_min_delta_m <= 10:
+            raise ValueError("measure.record_min_delta_m must be in [0, 10]")
+        if not 1 <= self.summary_max_objects <= 100:
+            raise ValueError("measure.summary_max_objects must be in [1, 100]")
         for name in ("half_fov_rad", "half_fov_v_rad"):
             angle = getattr(self, name)
             if angle is not None and not 0 < angle < math.pi / 2:
@@ -124,6 +140,11 @@ class Config:
             "stable_min": self.stable_min,
             "track_timeout_ms": self.track_timeout_ms,
             "match_distance_norm": self.match_distance_norm,
+            "history_size": self.history_size,
+            "record_interval_ms": self.record_interval_ms,
+            "record_min_delta_m": self.record_min_delta_m,
+            "only_stable": self.only_stable,
+            "summary_max_objects": self.summary_max_objects,
         }
 
 
@@ -156,6 +177,7 @@ class MeasurePlugin:
         self._last = None
         self._last_error = ""
         self._stabilizer = self._new_stabilizer()
+        self._session = self._new_session()
 
     # ── tool ─────────────────────────────────────────────────────────────────
 
@@ -174,14 +196,17 @@ class MeasurePlugin:
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["start", "stop", "info", "config"],
+                        "enum": ["start", "stop", "info", "config",
+                                 "history", "reset_session"],
                     },
                 },
                 "required": ["action"],
                 # start/stop are canvas lifecycle, not LLM functions. config is
                 # a gear action; only info is useful to an agent.
                 "x-action-params": {
-                    "info": {"params": [], "description": "返回最近一次测量和降级信息"},
+                    "info": {"params": [], "description": "返回最近一次测量、本次会话摘要和降级信息"},
+                    "history": {"params": [], "description": "返回本次会话最近的记录（有界、按变化/时间节流）"},
+                    "reset_session": {"params": [], "description": "清空本次会话的汇总和历史，不停止测量"},
                     "config": {"params": [], "description": "更新测量阈值"},
                 },
             },
@@ -217,6 +242,21 @@ class MeasurePlugin:
                     "track_timeout_ms": {"type": "integer", "default": 2000,
                                          "description": "目标丢失后保留平滑结果的时间",
                                          "scope": "instance"},
+                    "history_size": {"type": "integer", "default": 200,
+                                     "description": "history 动作保留的最近记录条数",
+                                     "scope": "instance"},
+                    "record_interval_ms": {"type": "integer", "default": 1000,
+                                           "description": "同一目标最少多久记一条历史；0=每帧变化都记",
+                                           "scope": "instance"},
+                    "record_min_delta_m": {"type": "number", "default": 0.01,
+                                           "description": "宽/高变化超过这个值才额外记一条",
+                                           "scope": "instance"},
+                    "only_stable": {"type": "boolean", "default": True,
+                                    "description": "只把 stable 的测量计入会话摘要和历史",
+                                    "scope": "instance"},
+                    "summary_max_objects": {"type": "integer", "default": 20,
+                                            "description": "会话摘要最多保留几个对象",
+                                            "scope": "instance"},
                 },
                 "required": [],
             },
@@ -231,6 +271,10 @@ class MeasurePlugin:
             return self._stop()
         if action == "info":
             return self._info()
+        if action == "history":
+            return self._history()
+        if action == "reset_session":
+            return self._reset_session()
         if action == "config":
             return self._config_action(args)
         return None
@@ -271,6 +315,8 @@ class MeasurePlugin:
             self._binding = {}
             self._camera_notes = []
             self._stabilizer.reset()
+            self._session = self._new_session()
+            self._session.reset(int(time.time() * 1000))
 
         try:
             self._open_publisher()
@@ -529,6 +575,7 @@ class MeasurePlugin:
                 "fresh": False,
                 "reason": "stale or missing observation: " + ", ".join(missing),
                 "objects": [],
+                "session": self._session.summary(now_ms),
                 "camera": self._camera.as_dict(),
                 "degraded": self._degradations(),
             }
@@ -544,12 +591,14 @@ class MeasurePlugin:
             max_depth_m=self._config.max_depth_m,
         )
         smoothed = self._stabilizer.update(measurements, time.monotonic())
+        self._session.record(smoothed, now_ms)
         return {
             "schema": SCHEMA,
             "timestamp_ms": now_ms,
             "available": True,
             "fresh": True,
             "objects": smoothed,
+            "session": self._session.summary(now_ms),
             "camera": self._camera.as_dict(),
             "degraded": self._degradations(),
         }
@@ -561,6 +610,30 @@ class MeasurePlugin:
             timeout_s=self._config.track_timeout_ms / 1000.0,
             match_distance_norm=self._config.match_distance_norm,
         )
+
+    def _new_session(self) -> geometry.Session:
+        return geometry.Session(
+            history_size=self._config.history_size,
+            record_interval_ms=self._config.record_interval_ms,
+            record_min_delta_m=self._config.record_min_delta_m,
+            only_stable=self._config.only_stable,
+            max_objects=self._config.summary_max_objects,
+        )
+
+    def _history(self) -> dict:
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            return {
+                "state": "running" if self._running else "idle",
+                "session": self._session.summary(now_ms),
+                "records": self._session.history(),
+            }
+
+    def _reset_session(self) -> dict:
+        with self._lock:
+            self._session.reset(int(time.time() * 1000))
+            self._last = None
+        return {"state": "reset", "session": self._session.summary(int(time.time() * 1000))}
 
     # ── info/config ──────────────────────────────────────────────────────────
 
@@ -577,6 +650,8 @@ class MeasurePlugin:
                 "depth_frame": list(self._depth_frame),
                 "camera": self._camera.as_dict(),
                 "degraded": self._degradations(),
+                "session": self._session.summary(int(time.time() * 1000)),
+                "history_count": len(self._session.history()),
                 "last": self._last,
                 "error": self._last_error,
             }
@@ -593,6 +668,11 @@ class MeasurePlugin:
             "stable_min": int,
             "track_timeout_ms": int,
             "match_distance_norm": float,
+            "history_size": int,
+            "record_interval_ms": int,
+            "record_min_delta_m": float,
+            "only_stable": bool,
+            "summary_max_objects": int,
         }
         changed = {}
         previous = dict(self._config.__dict__)
@@ -623,10 +703,18 @@ class MeasurePlugin:
                                    self._config.track_timeout_ms,
                                    self._config.match_distance_norm):
                 self._stabilizer = self._new_stabilizer()
+            if self._session_config_changed(changed):
+                self._session = self._new_session()
+                self._session.reset(int(time.time() * 1000))
             if self._running and previous_rate != self._config.rate_hz:
                 self._restart_timer()
         return {"status": "configured", "config": self._config.as_dict(),
                 "changed": changed}
+
+    @staticmethod
+    def _session_config_changed(changed: dict) -> bool:
+        return bool({"history_size", "record_interval_ms", "record_min_delta_m",
+                     "only_stable", "summary_max_objects"} & set(changed))
 
     def _restart_timer(self) -> None:
         node = self._node

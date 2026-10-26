@@ -431,6 +431,33 @@ camera_info (motus.camera/1) ──┘
 `actucore/plugins/measure/geometry.py`，不依赖 ROS，单测在
 `actucore/tests/test_measure_geometry.py`。
 
+### 会话摘要与历史
+
+画布只显示最新一条消息。为了“走开再回来还能看到刚才测到多高”，每次
+`measure` 输出都带一个 `session` 摘要：
+
+```text
+session.objects[]:
+  key / name / color
+  samples / first_seen_ms / last_seen_ms
+  visible_height_m: {min, max, median, latest, samples}
+  visible_width_m:  {min, max, median, latest, samples}
+  distance_m:       {min, max, median, latest, samples}
+  clipped
+```
+
+默认只统计 `stable=true` 的测量，避免把检测抖动的中间帧算进去。摘要按对象
+键保留，重启/`reset_session` 清空。
+
+另外有一个**有界、节流**的 `history` 动作，返回最近 `history_size` 条记录。
+默认同一目标最多每秒一条，宽/高变化超过 `record_min_delta_m` 时额外记一条，
+所以不会把 5 Hz 的每一帧都存下来。需要完整数据时再调 `history`，不需要时
+它就是内存里的一小段环形缓冲；不会写文件，也不要求回退 `docker logs`。
+
+- `info` 返回最新测量 + 当前会话摘要；
+- `history` 返回会话摘要 + 最近记录；
+- `reset_session` 只清摘要/历史，不停止测量。
+
 ## 构建与运行
 
 只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。

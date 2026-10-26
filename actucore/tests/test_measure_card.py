@@ -241,3 +241,42 @@ def test_it_starts_without_opening_a_real_ros_node():
 def test_payload_is_json_serialisable():
     payload = _payload_card()._payload()
     json.dumps(payload)
+
+
+# ── session summary / history ────────────────────────────────────────────────
+
+def test_payload_carries_a_session_summary_after_an_object_is_measured():
+    card = _payload_card()
+    payload = card._payload()
+    assert payload["session"]["objects"]
+    item = payload["session"]["objects"][0]
+    assert item["key"].startswith("box")
+    assert item["samples"] == 1
+    assert item["visible_height_m"]["latest"] == 0.384
+
+
+def test_history_action_returns_the_bounded_records():
+    card = _payload_card()
+    card._payload()
+    out = card.dispatch("measure", {"action": "history"})
+    assert out["state"] == "running"
+    assert len(out["records"]) == 1
+    assert out["records"][0]["visible_height_m"] == 0.384
+    assert out["session"]["objects"]
+
+
+def test_reset_session_clears_summary_without_stopping_the_card():
+    card = _payload_card()
+    card._payload()
+    out = card.dispatch("measure", {"action": "reset_session"})
+    assert out["state"] == "reset"
+    assert out["session"]["objects"] == []
+    assert card._running is True
+
+
+def test_info_includes_the_session_summary_and_history_count():
+    card = _payload_card()
+    card._payload()
+    out = card.dispatch("measure", {"action": "info"})
+    assert out["session"]["objects"]
+    assert out["history_count"] == 1

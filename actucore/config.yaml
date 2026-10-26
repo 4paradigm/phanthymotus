@@ -450,6 +450,13 @@ plugins:
     stable_min: 3
     track_timeout_ms: 2000
     match_distance_norm: 0.15
+    # 会话摘要与有界历史：走开再回来看画布/调 info 就能看到刚才测到的
+    # min/max/median/latest，不用回退 docker logs。
+    history_size: 200
+    record_interval_ms: 1000
+    record_min_delta_m: 0.01
+    only_stable: true
+    summary_max_objects: 20
     # 相机没有声明 motus.camera/1 时的兜底。留空 = 不猜：
     # 只输出距离，宽度/高度为 null，并在 degraded 里说明。
     half_fov_rad: null

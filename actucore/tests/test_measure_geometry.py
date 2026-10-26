@@ -223,3 +223,64 @@ def test_a_lost_track_is_dropped_after_the_timeout():
     stabilizer.update([_record(0.5)], 0.0)
     assert stabilizer.update([], 0.2)
     assert stabilizer.update([], 0.6) == []
+
+
+# ── session summary / bounded history ────────────────────────────────────────
+
+def _session_record(height=1.7, width=0.5, key="person#", stable=True,
+                    clipped=False):
+    return {"key": key, "name": "person", "color": "", "stable": stable,
+            "visible_height_m": height, "visible_width_m": width,
+            "distance_m": 2.0, "clipped": clipped}
+
+
+def test_session_summary_reports_min_max_median_latest():
+    session = G.Session(history_size=10, record_interval_ms=0,
+                        record_min_delta_m=0.0, only_stable=True)
+    session.reset(1000)
+    session.record([_session_record(1.60)], 1000)
+    session.record([_session_record(1.80)], 1100)
+    session.record([_session_record(1.70)], 1200)
+    summary = session.summary(1300)
+    item = summary["objects"][0]
+    assert item["samples"] == 3
+    assert item["visible_height_m"] == {
+        "min": 1.6, "max": 1.8, "median": 1.7, "latest": 1.7, "samples": 3}
+    assert summary["duration_ms"] == 300
+
+
+def test_session_ignores_unstable_measurements_by_default():
+    session = G.Session(only_stable=True)
+    session.reset(0)
+    session.record([_session_record(1.7, stable=False)], 1)
+    assert session.summary(2)["objects"] == []
+
+
+def test_session_can_record_unstable_when_configured():
+    session = G.Session(only_stable=False)
+    session.reset(0)
+    session.record([_session_record(1.7, stable=False)], 1)
+    assert session.summary(2)["objects"][0]["samples"] == 1
+
+
+def test_history_is_rate_limited_but_a_real_change_is_kept():
+    session = G.Session(history_size=10, record_interval_ms=5000,
+                        record_min_delta_m=0.05)
+    session.reset(0)
+    session.record([_session_record(1.70)], 1000)
+    session.record([_session_record(1.70)], 2000)
+    session.record([_session_record(1.76)], 2500)
+    rows = session.history()
+    assert len(rows) == 2
+    assert rows[0]["visible_height_m"] == 1.7
+    assert rows[1]["visible_height_m"] == 1.76
+
+
+def test_session_reset_clears_summary_and_history():
+    session = G.Session()
+    session.reset(0)
+    session.record([_session_record()], 1)
+    assert session.history()
+    session.reset(100)
+    assert session.history() == []
+    assert session.summary(101)["objects"] == []

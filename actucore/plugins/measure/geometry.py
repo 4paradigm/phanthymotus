@@ -432,3 +432,189 @@ class Stabilizer:
                 best = track
                 best_distance = distance
         return best
+
+
+# ── session summary and bounded history ─────────────────────────────────────
+
+
+@dataclass
+class _SessionObject:
+    key: str
+    name: str
+    color: str
+    heights: deque = field(default_factory=deque)
+    widths: deque = field(default_factory=deque)
+    distances: deque = field(default_factory=deque)
+    samples: int = 0
+    first_seen_ms: int = 0
+    last_seen_ms: int = 0
+    clipped: bool = False
+
+
+class Session:
+    """A compact answer to "what did I measure while I was away?".
+
+    The card publishes at a few Hz; keeping every frame in memory or in a log is
+    both noisy and hard to read. This keeps:
+
+    * per-key min/max/median/latest over a bounded recent window;
+    * a bounded, rate-limited history for the values that actually changed.
+
+    It is not an identity tracker. The key is name/colour (and the stabilizer's
+    nearby-box match), so two people with the same label can merge. For a single
+    person walking in front of the robot — the immediate use case — that is
+    enough; multi-person identity is deliberately out of scope.
+    """
+
+    def __init__(self, *, history_size: int = 200,
+                 record_interval_ms: int = 1000,
+                 record_min_delta_m: float = 0.01,
+                 only_stable: bool = True,
+                 max_objects: int = 20,
+                 max_samples_per_object: int = 500):
+        self.history_size = max(1, int(history_size))
+        self.record_interval_ms = max(0, int(record_interval_ms))
+        self.record_min_delta_m = max(0.0, float(record_min_delta_m))
+        self.only_stable = bool(only_stable)
+        self.max_objects = max(1, int(max_objects))
+        self.max_samples_per_object = max(1, int(max_samples_per_object))
+        self._history: deque = deque(maxlen=self.history_size)
+        self._last_history: dict[str, dict] = {}
+        self._objects: dict[str, _SessionObject] = {}
+        self._started_ms = 0
+
+    def reset(self, now_ms: int) -> None:
+        self._history.clear()
+        self._last_history.clear()
+        self._objects.clear()
+        self._started_ms = int(now_ms)
+
+    def record(self, measurements: list[dict], now_ms: int) -> list[dict]:
+        """Add one tick's stable measurements; return any new history rows."""
+        if not self._started_ms:
+            self._started_ms = int(now_ms)
+        new_rows = []
+        for record in measurements:
+            if not isinstance(record, dict):
+                continue
+            if self.only_stable and not record.get("stable"):
+                continue
+            height = _number(record.get("visible_height_m"))
+            width = _number(record.get("visible_width_m"))
+            distance = _number(record.get("distance_m"))
+            if height is None and width is None:
+                # Distance alone is not a size measurement; recording it would
+                # make the summary look like it measured something it did not.
+                continue
+            key = str(record.get("key") or
+                      f"{record.get('name') or ''}#{record.get('color') or ''}")
+            item = self._objects.get(key)
+            if item is None:
+                item = _SessionObject(
+                    key=key, name=str(record.get("name") or ""),
+                    color=str(record.get("color") or ""),
+                    first_seen_ms=int(now_ms))
+                self._objects[key] = item
+            item.samples += 1
+            item.last_seen_ms = int(now_ms)
+            item.clipped = bool(item.clipped or record.get("clipped"))
+            _append(item.heights, height, self.max_samples_per_object)
+            _append(item.widths, width, self.max_samples_per_object)
+            _append(item.distances, distance, self.max_samples_per_object)
+
+            last = self._last_history.get(key)
+            changed = (
+                last is None
+                or self.record_interval_ms == 0
+                or int(now_ms) - int(last["timestamp_ms"]) >= self.record_interval_ms
+                or _changed(height, last.get("visible_height_m"),
+                            self.record_min_delta_m)
+                or _changed(width, last.get("visible_width_m"),
+                            self.record_min_delta_m)
+            )
+            if changed:
+                row = {
+                    "timestamp_ms": int(now_ms),
+                    "key": key,
+                    "name": item.name,
+                    "visible_height_m": height,
+                    "visible_width_m": width,
+                    "distance_m": distance,
+                    "clipped": bool(record.get("clipped")),
+                }
+                self._history.append(row)
+                self._last_history[key] = row
+                new_rows.append(row)
+        return new_rows
+
+    def summary(self, now_ms: int) -> dict:
+        objects = sorted(self._objects.values(),
+                         key=lambda item: item.last_seen_ms,
+                         reverse=True)
+        truncated = max(0, len(objects) - self.max_objects)
+        items = [_summary_item(item) for item in objects[:self.max_objects]]
+        return {
+            "started_ms": self._started_ms or None,
+            "duration_ms": (max(0, int(now_ms) - self._started_ms)
+                            if self._started_ms else 0),
+            "objects": items,
+            "objects_truncated": truncated,
+        }
+
+    def history(self) -> list[dict]:
+        return list(self._history)
+
+
+def _append(target: deque, value, limit: int) -> None:
+    if value is None:
+        return
+    target.append(float(value))
+    while len(target) > limit:
+        target.popleft()
+
+
+def _number(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _changed(current, previous, minimum: float) -> bool:
+    current = _number(current)
+    previous = _number(previous)
+    if current is None or previous is None:
+        return current is not None or previous is not None
+    return abs(current - previous) >= minimum
+
+
+def _stats(values: deque) -> dict:
+    if not values:
+        return {"min": None, "max": None, "median": None,
+                "latest": None, "samples": 0}
+    data = list(values)
+    return {
+        "min": round(min(data), 3),
+        "max": round(max(data), 3),
+        "median": round(float(np.median(data)), 3),
+        "latest": round(data[-1], 3),
+        "samples": len(data),
+    }
+
+
+def _summary_item(item: _SessionObject) -> dict:
+    return {
+        "key": item.key,
+        "name": item.name,
+        "color": item.color,
+        "samples": item.samples,
+        "first_seen_ms": item.first_seen_ms,
+        "last_seen_ms": item.last_seen_ms,
+        "visible_height_m": _stats(item.heights),
+        "visible_width_m": _stats(item.widths),
+        "distance_m": _stats(item.distances),
+        "clipped": bool(item.clipped),
+    }
