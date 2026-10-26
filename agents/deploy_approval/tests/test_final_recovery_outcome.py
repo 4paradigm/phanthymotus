@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,6 +24,10 @@ from ..github_command_watcher import GitHubCommandWatcher
 from ..router_webhook import webhook
 from ..service import DeployController, DeployOutcomeUncertain
 from .conftest import make_config
+
+
+def _post_baseline_timestamp() -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
 
 
 def _component(**overrides) -> dict:
@@ -5624,8 +5629,10 @@ async def test_driver_reactivation_baselines_pending_comments():
     persist_calls.clear()
     controller.on_command.reset_mock()
     # Simulate a new comment (id=9003) appearing after baseline
+    post_baseline = _post_baseline_timestamp()
     newer_comment = {"id": 9003, "body": "/approve_deploy machine=test-machine",
-                     "user": {"id": 111, "login": "bob"}, "created_at": "2026-10-02T00:00:00Z"}
+                     "user": {"id": 111, "login": "bob"},
+                     "created_at": post_baseline, "updated_at": post_baseline}
 
     proxy.get_issue_comments = AsyncMock(return_value=[old_comment, new_comment, newer_comment])
     proxy.get_comment = AsyncMock(return_value=newer_comment)
@@ -6106,8 +6113,10 @@ async def test_driver_reactivation_advances_existing_pr_cursor_before_dispatch()
     # Cycle 2: new comment appears above baseline — IS dispatched
     persist_calls.clear()
     controller.on_command.reset_mock()
+    post_baseline = _post_baseline_timestamp()
     newest = {"id": 9003, "body": "/approve_deploy machine=test-machine",
-              "user": {"id": 111, "login": "bob"}}
+              "user": {"id": 111, "login": "bob"},
+              "created_at": post_baseline, "updated_at": post_baseline}
     comments_holder["list"].append(newest)
     proxy.get_comment = AsyncMock(return_value=newest)
 
@@ -6274,8 +6283,10 @@ async def test_driver_reactivation_retries_failed_baseline_without_replay():
     # Cycle 3: new comment beyond baseline — IS dispatched
     persist_calls.clear()
     controller.on_command.reset_mock()
+    post_baseline = _post_baseline_timestamp()
     new_comment_9100 = {"id": 9100, "body": "/approve_deploy machine=test",
-                        "user": {"id": 111, "login": "bob"}}
+                        "user": {"id": 111, "login": "bob"},
+                        "created_at": post_baseline, "updated_at": post_baseline}
 
     def _make_comments_cycle3(_repo, pr_num):
         # Only PR 42 gets the new comment; PR 43 keeps only its old comment
@@ -6315,6 +6326,7 @@ async def test_driver_reactivation_preserves_business_state_and_visible_history(
     proxy = MagicMock()
     controller = MagicMock()
     controller.on_command = AsyncMock(return_value=True)
+    controller.project_evidence = AsyncMock()
     controller.reconcile_pr = AsyncMock()
 
     github = MagicMock(spec=GitHubClient)
@@ -6378,13 +6390,15 @@ async def test_driver_reactivation_preserves_business_state_and_visible_history(
     proxy.find_trusted_lifecycle_comment = AsyncMock(side_effect=_find_trusted)
     proxy.write_hidden_state = AsyncMock(side_effect=_write_hidden_state)
     proxy.get_issue_comments = AsyncMock(return_value=[{"id": 9001, "body": "/approve_deploy machine=test",
-                                                          "user": {"id": 111, "login": "bob"}}])
+                                                          "user": {"id": 111, "login": "bob"},
+                                                          "created_at": "2026-01-01T00:00:00Z"}])
     proxy.read_hidden_state = AsyncMock(side_effect=_read_state)
     proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 42}] if "driver" in repo else [])
     proxy.get_pr = AsyncMock(return_value=driver_pr)
     proxy.comment_identity = AsyncMock(return_value=("111", "bob"))
     proxy.get_comment = AsyncMock(return_value={"id": 9001, "body": "/approve_deploy machine=test",
-                                                  "user": {"id": 111, "login": "bob"}})
+                                                  "user": {"id": 111, "login": "bob"},
+                                                  "created_at": "2026-01-01T00:00:00Z"})
     proxy.collaborator_permission = AsyncMock(return_value="admin")
     proxy.project_status_label = AsyncMock()
     proxy.is_bot_comment = MagicMock(return_value=False)
@@ -6432,8 +6446,10 @@ async def test_driver_reactivation_preserves_business_state_and_visible_history(
     # Cycle 2: new comment above baseline — IS dispatched
     persist_calls.clear()
     controller.on_command.reset_mock()
+    post_baseline = _post_baseline_timestamp()
     newer_comment = {"id": 9002, "body": "/approve_deploy machine=test",
-                     "user": {"id": 111, "login": "bob"}}
+                     "user": {"id": 111, "login": "bob"},
+                     "created_at": post_baseline, "updated_at": post_baseline}
     proxy.get_issue_comments = AsyncMock(return_value=[
         {"id": 9001, "body": "/approve_deploy machine=test", "user": {"id": 111, "login": "bob"}},
         newer_comment,
@@ -6974,11 +6990,14 @@ async def test_driver_startup_existing_pr_baselines_before_command_dispatch():
     assert core_pr_polls, "Core repo get_open_prs must still be polled"
 
     # Cycle 2: NEW comment appears above baseline — IS dispatched
+    post_baseline = _post_baseline_timestamp()
     comments_holder["list"].append({"id": 8003, "body": "/approve_deploy machine=test-machine",
-                                    "user": {"id": 111, "login": "carol"}})
+                                    "user": {"id": 111, "login": "carol"},
+                                    "created_at": post_baseline, "updated_at": post_baseline})
     controller.on_command.reset_mock()
     proxy.get_comment = AsyncMock(return_value={"id": 8003, "body": "/approve_deploy machine=test-machine",
-                                                 "user": {"id": 111, "login": "carol"}})
+                                                 "user": {"id": 111, "login": "carol"},
+                                                 "created_at": post_baseline, "updated_at": post_baseline})
 
     await watcher._poll_once()
     controller.on_command.assert_called_once()
@@ -7201,9 +7220,11 @@ async def test_driver_auth_refresh_recovery_rebaselines_driver_before_dispatch()
     assert persisted_bodies and persisted_bodies[-1] == 7001
 
     # A NEW comment above baseline should now dispatch
+    post_baseline = _post_baseline_timestamp()
     new_comment_7003 = {
         "id": 7003, "body": "/approve_deploy machine=test-machine",
-        "user": {"id": 111, "login": "carol"}, "created_at": "2026-10-09T02:00:00Z"}
+        "user": {"id": 111, "login": "carol"},
+        "created_at": post_baseline, "updated_at": post_baseline}
     comments_holder["list"].append(new_comment_7003)
     proxy.get_comment = AsyncMock(return_value=new_comment_7003)
     await watcher._refresh_active_repos_if_needed()

@@ -1535,10 +1535,12 @@ async def test_watcher_dynamic_repo_refresh_no_expansion():
     original_deployments = copy.deepcopy(state["deployments"])
     proxy = MagicMock()
     proxy.get_open_prs = AsyncMock(side_effect=lambda repo: [{"number": 1}] if repo == "team/drivers" else [])
-    proxy.get_pr = AsyncMock(return_value={"state": "open"})
+    proxy.get_pr = AsyncMock(return_value={"state": "open", "merged": False,
+                                           "head": {"sha": "a" * 40}})
     proxy.read_hidden_state = AsyncMock(side_effect=lambda *_args: copy.deepcopy(state))
     proxy.get_issue_comments = AsyncMock(return_value=[
-        {"id": 20, "body": "/approve_deploy machine=test-machine"}])
+        {"id": 20, "body": "/approve_deploy machine=test-machine",
+         "created_at": "2026-01-01T00:00:00Z"}])
 
     async def persist(_repo, _pr, cursor):
         state["last_processed_comment_id"] = max(state["last_processed_comment_id"], cursor)
@@ -1547,6 +1549,7 @@ async def test_watcher_dynamic_repo_refresh_no_expansion():
     proxy.persist_cursor = AsyncMock(side_effect=persist)
     controller = MagicMock()
     controller.on_command = AsyncMock()
+    controller.project_evidence = AsyncMock()
     watcher = GitHubCommandWatcher(cfg, proxy, controller, github=github, github_auth=auth)
     await watcher._refresh_active_repos()
     assert cfg.active_repos == ["team/main", "team/drivers"] and cfg.auth_valid
@@ -1580,7 +1583,8 @@ async def test_watcher_dynamic_repo_refresh_no_expansion():
         await watcher._refresh_active_repos()
         assert watcher._pending_baseline_repos == {"team/main", "team/drivers"}
         proxy.get_issue_comments.return_value.append(
-            {"id": 30, "body": "/approve_deploy machine=test-machine"})
+                {"id": 30, "body": "/approve_deploy machine=test-machine",
+                 "created_at": "2026-01-01T00:00:00Z"})
         await watcher._poll_once()
         assert state["last_processed_comment_id"] == 30
         controller.on_command.assert_not_awaited()

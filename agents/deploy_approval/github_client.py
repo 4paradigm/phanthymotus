@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import logging
+import random
+import time
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import httpx
@@ -52,6 +55,26 @@ class GitHubError(Exception):
         self.status_code = status_code
 
 
+class GitHubRateLimitError(GitHubError):
+    """GitHub primary or secondary rate limit; authorization remains valid."""
+
+    def __init__(self, *, status_code: int, retry_after_seconds: float):
+        super().__init__("GitHub API rate limited", status_code=status_code)
+        self.retry_after_seconds = max(0.0, retry_after_seconds)
+
+
+class GitHubPermissionError(GitHubError):
+    """GitHub rejected the installation's authorization."""
+
+
+class GitHubTransientError(GitHubError):
+    """Retryable GitHub 5xx or network failure with bounded backoff."""
+
+    def __init__(self, *, status_code: int | None, retry_after_seconds: float):
+        super().__init__("GitHub API temporarily unavailable", status_code=status_code)
+        self.retry_after_seconds = max(0.0, retry_after_seconds)
+
+
 class GitHubRefConflict(GitHubError):
     """A Git reference changed between read and compare-and-swap update."""
 
@@ -70,6 +93,27 @@ class GitHubClient:
             follow_redirects=False,
             trust_env=False,
         )
+        self._rate_limit_until = 0.0
+        self._rate_limit_failures = 0
+        self._transient_until = 0.0
+        self._transient_failures = 0
+        self._request_count = 0
+        self._request_counts_by_repo: dict[str, int] = {}
+        self._status_counts: dict[str, int] = {}
+        self._recent_rate_limits: list[dict] = []
+        self._recent_api_errors: list[dict] = []
+        self._open_pr_pages: dict[tuple[str, int], dict] = {}
+
+    def diagnostics(self) -> dict:
+        return {
+            "request_count": self._request_count,
+            "request_counts_by_repo": dict(self._request_counts_by_repo),
+            "status_counts": dict(self._status_counts),
+            "recent_rate_limits": [dict(item) for item in self._recent_rate_limits],
+            "recent_api_errors": [dict(item) for item in self._recent_api_errors],
+            "rate_limited": self._rate_limit_until > time.monotonic(),
+            "backing_off": max(self._rate_limit_until, self._transient_until) > time.monotonic(),
+        }
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         """Unified async per-request GitHub API call with fresh installation token.
@@ -81,6 +125,17 @@ class GitHubClient:
         Absolute URLs are passed through verbatim (no double-prefixing).
         """
         url = self._resolve_api_url(path)
+        now = time.monotonic()
+        if self._rate_limit_until > now:
+            raise GitHubRateLimitError(
+                status_code=429,
+                retry_after_seconds=self._rate_limit_until - now,
+            )
+        if self._transient_until > now:
+            raise GitHubTransientError(
+                status_code=None,
+                retry_after_seconds=self._transient_until - now,
+            )
         mutating = method.upper() not in ("GET", "HEAD", "OPTIONS")
         if mutating:
             self._require_write_authorization(url)
@@ -104,12 +159,32 @@ class GitHubClient:
         headers.setdefault("X-GitHub-Api-Version", "2026-03-10")
         require_http_policy(url, self.config, allow_private=self.config.allow_private_http)
         kwargs.setdefault("timeout", self.config.total_timeout)
-        resp = await stream_request(
-            self.http, method, url, self.config.max_response_bytes,
-            headers=headers, **kwargs)
+        self._request_count += 1
+        path_parts = urlparse(url).path.split("/")
+        repo_name = "/".join(path_parts[2:4]) if len(path_parts) >= 5 and path_parts[1] == "repos" else ""
+        if repo_name:
+            self._request_counts_by_repo[repo_name] = self._request_counts_by_repo.get(repo_name, 0) + 1
+        try:
+            resp = await stream_request(
+                self.http, method, url, self.config.max_response_bytes,
+                headers=headers, **kwargs)
+        except (httpx.HTTPError, SecurityError) as exc:
+            is_timeout = isinstance(exc, httpx.TimeoutException) or (
+                isinstance(exc, SecurityError) and "timeout" in str(exc).lower()
+            )
+            if not isinstance(exc, httpx.HTTPError) and not is_timeout:
+                raise GitHubError("GitHub response rejected by transport policy") from exc
+            retry = self._arm_transient_backoff()
+            self._recent_api_errors.append({
+                "status": "transport_error", "repo": repo_name,
+                "retry_after_seconds": round(retry, 1),
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._recent_api_errors = self._recent_api_errors[-20:]
+            raise GitHubTransientError(status_code=None, retry_after_seconds=retry) from exc
+        self._status_counts[str(resp.status_code)] = self._status_counts.get(str(resp.status_code), 0) + 1
         # Label permissions are optional UI projection; a 403 there must not
         # disable the controller. Invalid credentials always close the gate.
-        path_parts = urlparse(url).path.split("/")
         label_projection = len(path_parts) >= 5 and path_parts[1] == "repos" and (
             path_parts[4] == "labels" or (
                 len(path_parts) >= 7 and path_parts[4] == "issues" and path_parts[6] == "labels"))
@@ -120,10 +195,101 @@ class GitHubClient:
                            if part == "repos"), -1)
         git_data_api = (repo_index >= 0 and len(path_parts) > repo_index + 3
                         and path_parts[repo_index + 3] == "git")
-        if resp.status_code == 401 or (
-                resp.status_code == 403 and not label_projection and not git_data_api):
+        error_message = ""
+        if resp.status_code in (403, 429):
+            try:
+                payload = resp.json()
+                if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+                    error_message = payload["message"].lower()
+            except (ValueError, TypeError):
+                pass
+        rate_limited = resp.status_code == 429 or (
+            resp.status_code == 403 and (
+                resp.headers.get("Retry-After") is not None
+                or resp.headers.get("X-RateLimit-Remaining") == "0"
+                or "secondary rate limit" in error_message
+                or "rate limit exceeded" in error_message
+                or "abuse detection" in error_message
+                or "temporarily blocked" in error_message
+            )
+        )
+        if rate_limited:
+            self._rate_limit_failures += 1
+            delay = 0.0
+            server_deadline = False
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                delay = max(0.0, float(retry_after))
+                server_deadline = delay > 0
+            except (TypeError, ValueError):
+                if retry_after:
+                    try:
+                        retry_at = datetime.strptime(
+                            retry_after, "%a, %d %b %Y %H:%M:%S %Z"
+                        ).replace(tzinfo=timezone.utc).timestamp()
+                        delay = max(0.0, retry_at - time.time())
+                        server_deadline = delay > 0
+                    except ValueError:
+                        pass
+            if delay <= 0:
+                reset = resp.headers.get("X-RateLimit-Reset")
+                try:
+                    delay = max(0.0, float(reset) - time.time())
+                    server_deadline = delay > 0
+                except (TypeError, ValueError):
+                    delay = min(900.0, 30.0 * (2 ** min(self._rate_limit_failures - 1, 5)))
+            if not server_deadline:
+                delay = min(900.0, max(delay, 1.0) * random.uniform(0.9, 1.1))
+                delay = min(3600.0, delay)
+            else:
+                delay = max(delay, 1.0)
+            self._rate_limit_until = max(self._rate_limit_until, time.monotonic() + delay)
+            self._recent_rate_limits.append({
+                "status": resp.status_code,
+                "repo": repo_name,
+                "retry_after_seconds": round(delay, 1),
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._recent_rate_limits = self._recent_rate_limits[-20:]
+            raise GitHubRateLimitError(
+                status_code=resp.status_code, retry_after_seconds=delay,
+            )
+        if resp.status_code >= 500:
+            retry = self._arm_transient_backoff()
+            self._recent_api_errors.append({
+                "status": resp.status_code, "repo": repo_name,
+                "retry_after_seconds": round(retry, 1),
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._recent_api_errors = self._recent_api_errors[-20:]
+            raise GitHubTransientError(status_code=resp.status_code, retry_after_seconds=retry)
+        if 200 <= resp.status_code < 300 or resp.status_code == 304:
+            self._rate_limit_failures = 0
+            self._transient_failures = 0
+        if resp.status_code == 401:
             self.config.auth_valid = False
+            self._recent_api_errors.append({
+                "status": 401, "repo": repo_name, "reason": "authentication_rejected",
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._recent_api_errors = self._recent_api_errors[-20:]
+            raise GitHubPermissionError("GitHub authentication rejected", status_code=401)
+        if (resp.status_code == 403 and not label_projection and not git_data_api):
+            self.config.auth_valid = False
+            self._recent_api_errors.append({
+                "status": 403, "repo": repo_name, "reason": "installation_permission_rejected",
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._recent_api_errors = self._recent_api_errors[-20:]
+            raise GitHubPermissionError("GitHub installation permission rejected", status_code=403)
         return resp
+
+    def _arm_transient_backoff(self) -> float:
+        self._transient_failures += 1
+        delay = min(120.0, 2.0 * (2 ** min(self._transient_failures - 1, 6)))
+        delay *= random.uniform(0.8, 1.2)
+        self._transient_until = max(self._transient_until, time.monotonic() + delay)
+        return delay
 
     def _require_write_authorization(self, url: str) -> None:
         pieces = urlparse(url).path.split("/")
@@ -305,6 +471,13 @@ class GitHubClient:
                 url, self.config,
                 allow_private=self.config.allow_private_http
             )
+            cached = self._open_pr_pages.get((repo, page))
+            request_headers = {}
+            if isinstance(cached, dict):
+                if cached.get("etag"):
+                    request_headers["If-None-Match"] = cached["etag"]
+                elif cached.get("last_modified"):
+                    request_headers["If-Modified-Since"] = cached["last_modified"]
             resp = await self._request(
                 "GET", path,
                 params={
@@ -313,12 +486,42 @@ class GitHubClient:
                     "direction": "desc",
                     "per_page": 100,
                     "page": page,
-                }, timeout=self.config.total_timeout)
+                }, headers=request_headers, timeout=self.config.total_timeout)
+            if resp.status_code == 304:
+                if cached is None:
+                    # A 304 without a local page is unusable; retry once without
+                    # validators instead of treating it as an empty PR page.
+                    resp = await self._request(
+                        "GET", path,
+                        params={
+                            "state": "open", "sort": "updated", "direction": "desc",
+                            "per_page": 100, "page": page,
+                        }, timeout=self.config.total_timeout)
+                else:
+                    batch = cached.get("items")
+                    if not isinstance(batch, list):
+                        raise GitHubError("github cached open PR page is malformed")
+                    if not batch:
+                        break
+                    for pr in batch:
+                        if isinstance(pr, dict):
+                            num = pr.get("number")
+                            if isinstance(num, int) and not isinstance(num, bool) and num > 0:
+                                seen[num] = pr
+                    if len(batch) < 100:
+                        break
+                    page += 1
+                    continue
             try:
                 require_2xx(resp.status_code, "github list open PRs")
             except SecurityError as e:
                 raise GitHubError(str(e)) from e
             batch = await self._read_json_list(resp)
+            self._open_pr_pages[(repo, page)] = {
+                "items": batch,
+                "etag": resp.headers.get("ETag", ""),
+                "last_modified": resp.headers.get("Last-Modified", ""),
+            }
             if not batch:
                 break
             for pr in batch:
