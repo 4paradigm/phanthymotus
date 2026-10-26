@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import logging
 import random
+import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -334,6 +335,147 @@ class GitHubClient:
         if not isinstance(data, dict):
             raise GitHubError("github returned a non-object payload")
         return data
+
+    async def get_public_git_data(
+        self, repo: str, path: str, *, params: dict | None = None
+    ) -> dict:
+        """Read a narrowly allowlisted Git Data object without credentials.
+
+        Public Git Notes are a read-only fallback. This deliberately does not
+        use ``_request`` because that method always obtains and sends an App
+        token, and it does not change the behavior of authenticated API calls.
+        """
+        if not isinstance(repo, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo
+        ):
+            raise GitHubError("GitHub public data repository is invalid")
+        try:
+            configured = validate_repository_names(self.config.github_repos)
+        except ValueError as exc:
+            raise GitHubError("GitHub repository configuration is invalid") from exc
+        authorized = {name.lower() for name in configured}
+        active = {name.lower() for name in self.config.active_repos}
+        if repo.lower() not in authorized or repo.lower() not in active:
+            raise GitHubPermissionError(
+                "GitHub public data repository is not authorized", status_code=403
+            )
+
+        api = urlparse(self.config.github_api_url)
+        if (api.scheme != "https" or api.hostname != "api.github.com"
+                or api.port not in (None, 443) or api.username or api.password
+                or api.path not in ("", "/") or api.query or api.fragment):
+            raise GitHubError("GitHub public data requires the official HTTPS API")
+
+        if not isinstance(path, str) or "\\" in path or "%" in path:
+            raise GitHubError("GitHub public data path is invalid")
+        is_note_ref = re.fullmatch(
+            r"git/ref/notes/deploy-approval-evidence-v1/pr-([1-9][0-9]*)", path
+        )
+        is_git_object = re.fullmatch(r"git/(commits|trees|blobs)/[0-9a-f]{40}", path)
+        if not (is_note_ref or is_git_object):
+            raise GitHubError("GitHub public data path is not allowlisted")
+        if params is not None:
+            recursive = params.get("recursive") if isinstance(params, dict) else None
+            valid_recursive = (
+                recursive is True or recursive is False
+                or (type(recursive) is int and recursive in (0, 1))
+                or recursive in ("0", "1")
+            )
+            if (not isinstance(params, dict) or not is_git_object
+                    or is_git_object.group(1) != "trees"
+                    or set(params) != {"recursive"}
+                    or not valid_recursive):
+                raise GitHubError("GitHub public data parameters are invalid")
+            recursive_enabled = (
+                recursive is True or recursive == 1 or recursive == "1"
+            )
+            params = {"recursive": "1" if recursive_enabled else "0"}
+
+        # Do not let an injected client silently attach ambient credentials or
+        # read proxy/TLS settings from the process environment.
+        if (getattr(self.http, "_trust_env", True) is not False
+                or getattr(self.http, "auth", None) is not None
+                or "authorization" in getattr(self.http, "headers", {})
+                or bool(getattr(self.http, "cookies", {}))):
+            raise GitHubError("GitHub public data requires an anonymous HTTP client")
+
+        base = self.config.github_api_url.rstrip("/")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2026-03-10",
+        }
+
+        async def fetch_json(url_path: str, *, query: dict | None = None) -> dict:
+            url = base + url_path
+            try:
+                require_http_policy(url, self.config, allow_private=False)
+                response = await stream_request(
+                    self.http, "GET", url, self.config.max_response_bytes,
+                    headers=headers, params=query,
+                    timeout=self.config.total_timeout,
+                )
+            except (httpx.HTTPError, SecurityError) as exc:
+                is_timeout = isinstance(exc, httpx.TimeoutException) or (
+                    isinstance(exc, SecurityError) and "timeout" in str(exc).lower()
+                )
+                if isinstance(exc, httpx.HTTPError) or is_timeout:
+                    retry = self._arm_transient_backoff()
+                    raise GitHubTransientError(
+                        status_code=None, retry_after_seconds=retry
+                    ) from exc
+                raise GitHubError("GitHub public response rejected by transport policy") from exc
+
+            if response.status_code == 404:
+                raise GitHubError("GitHub public data was not found", status_code=404)
+            if response.status_code in (403, 429):
+                if (response.status_code == 429
+                        or response.headers.get("Retry-After") is not None
+                        or response.headers.get("X-RateLimit-Remaining") == "0"):
+                    retry = self._arm_rate_limit_backoff(response)
+                    raise GitHubRateLimitError(
+                        status_code=response.status_code, retry_after_seconds=retry
+                    )
+                raise GitHubPermissionError(
+                    "GitHub denied anonymous public data access", status_code=403
+                )
+            if response.status_code >= 500:
+                retry = self._arm_transient_backoff()
+                raise GitHubTransientError(
+                    status_code=response.status_code, retry_after_seconds=retry
+                )
+            if response.status_code != 200:
+                raise GitHubError(
+                    "GitHub public data request failed", status_code=response.status_code
+                )
+            return await self._read_json(response)
+
+        metadata = await fetch_json(f"/repos/{repo}")
+        if metadata.get("full_name") != repo or metadata.get("private") is not False:
+            raise GitHubPermissionError(
+                "GitHub repository is not the requested public repository", status_code=403
+            )
+        return await fetch_json(f"/repos/{repo}/{path}", query=params)
+
+    def _arm_rate_limit_backoff(self, response: httpx.Response) -> float:
+        """Apply the existing bounded rate-limit delay for anonymous reads."""
+        retry_after = response.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after else 0.0
+        except (TypeError, ValueError):
+            delay = 0.0
+        if delay <= 0:
+            reset = response.headers.get("X-RateLimit-Reset")
+            try:
+                delay = max(0.0, float(reset) - time.time()) if reset else 0.0
+            except (TypeError, ValueError):
+                delay = 0.0
+        if delay <= 0:
+            self._rate_limit_failures += 1
+            delay = min(900.0, 30.0 * (2 ** min(self._rate_limit_failures - 1, 5)))
+            delay *= random.uniform(0.9, 1.1)
+        delay = min(3600.0, max(1.0, delay))
+        self._rate_limit_until = max(self._rate_limit_until, time.monotonic() + delay)
+        return delay
 
     async def _read_json_list(self, resp: httpx.Response) -> list:
         resp = await enforce_body_size(resp, self.config.max_response_bytes)

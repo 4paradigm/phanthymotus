@@ -3109,7 +3109,16 @@ class DeployController:
         comment = await self.proxy.post_issue_comment(repo, pr_number, body)
         if not isinstance(comment, dict) or not comment.get("id"):
             raise GitHubStateProxyError("History archive write was not confirmed")
-        return {"page": page, "url": comment.get("html_url", "")}
+        # The archive must be visible as a trusted comment before the caller
+        # removes its events from the lifecycle document.
+        readback = await self.proxy.get_issue_comments(repo, pr_number)
+        confirmed = next((row for row in readback if isinstance(row, dict)
+                         and row.get("id") == comment.get("id")
+                         and row.get("body") == body
+                         and self.proxy.is_bot_comment(row)), None)
+        if confirmed is None:
+            raise GitHubStateProxyError("History archive readback failed")
+        return {"page": page, "url": confirmed.get("html_url", comment.get("html_url", ""))}
 
     async def _preflight_archive_for_event(
         self,
@@ -3303,6 +3312,10 @@ class DeployController:
         written = await self.proxy.update_comment(repo, comment_id, final_body)
         if not isinstance(written, dict):
             raise GitHubStateProxyError("preflight archive: lifecycle write was not confirmed")
+        confirmed = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+        if (confirmed is None or confirmed.get("id") != comment_id
+                or confirmed.get("body") != final_body):
+            raise GitHubStateProxyError("preflight archive: lifecycle readback failed")
 
     def _deployment_progress_markdown(self, repo, pr_number, state, machine, components, phase):
         deployed = _component_id_set(state.get("deployments", []))
@@ -3339,11 +3352,38 @@ class DeployController:
                        and r["data"].get("round_id") == rid]
         snapshot = archive_snapshot(repo, pr_number, state, utc_now(), reason)
         snapshot["attachment_records"] = attachments
-        content = {"snapshot": snapshot["snapshot"], "attachment_records": attachments}
+        # Archive identity is the round snapshot and its evidence, not the
+        # wall-clock time of an attempt to archive it. A retry after an
+        # uncertain lifecycle write must resolve to the same immutable record.
+        identity_snapshot = copy.deepcopy(snapshot)
+        identity_snapshot.pop("ended_at", None)
+        identity_snapshot.pop("archived_at", None)
+        content = {"snapshot": identity_snapshot["snapshot"], "attachment_records": attachments}
         import json
         key = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         existing = next((r for r in records if r["kind"] == "round" and r["key"] == key), None)
+        if existing is None:
+            # Reuse records made by the previous timestamp-based key scheme
+            # when they already contain this same snapshot and attachment set.
+            existing = next((r for r in records if r["kind"] == "round"
+                             and r["data"].get("round_id") == rid
+                             and r["data"].get("reason") == reason
+                             and r["data"].get("attachment_records") == attachments
+                             and {k: v for k, v in r["data"].get("snapshot", {}).items()
+                                  if k not in {"ended_at", "archived_at"}}
+                             == identity_snapshot.get("snapshot")), None)
         record = existing or await self.proxy.write_evidence_record(repo, pr_number, "round", key, snapshot)
+        if not isinstance(record, dict) or not isinstance(record.get("sha256"), str):
+            raise GitHubStateProxyError("Round archive write was not confirmed")
+        # Do not let Lifecycle point at an archive until its immutable evidence
+        # record is observable through the public reader with the same digest.
+        verified = await self.proxy.read_evidence_records(repo, pr_number)
+        readback = next((r for r in verified if r["kind"] == "round"
+                         and r["key"] == record.get("key", key)
+                         and r.get("sha256") == record["sha256"]), None)
+        if (readback is None or readback["data"].get("round_id") != rid
+                or readback["data"].get("attachment_records") != attachments):
+            raise GitHubStateProxyError("Round archive readback failed")
         result = {"round_id": rid, "sha256": record["sha256"]}
         if type(record.get("comment_id")) is int and isinstance(record.get("url"), str):
             result.update(comment_id=record["comment_id"], url=record["url"])
