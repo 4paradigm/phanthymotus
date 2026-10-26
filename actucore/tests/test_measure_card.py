@@ -296,3 +296,15 @@ def test_a_vanished_object_is_not_counted_again_by_the_session_summary():
     payload = card._payload()
     item = card.dispatch("measure", {"action": "info"})["session"]["objects"][0]
     assert item["n"] == 1
+
+
+def test_depth_wire_size_stays_640_even_if_camera_declares_other_resolution():
+    card = _card()
+    declaration = _declaration("/cam/visual_depth", width=1280, height=720)
+    out = card._adopt_camera(
+        {"/cam/visual_depth": declaration},
+        {"objects": "/cam/objects", "depth": "/cam/visual_depth"})
+    assert out == ""
+    assert card._depth_frame == (640, 480)
+    assert card._camera.width == 1280
+    assert any("640x480" in note for note in card._camera_notes)

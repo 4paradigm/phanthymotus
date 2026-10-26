@@ -464,21 +464,27 @@ class MeasurePlugin:
                     "请把 VOP 和深度接到同一颗相机上")
 
         object_size = self._declared_size(objects_decl)
-        depth_size = self._declared_size(depth_decl) or object_size
+        declared_depth_size = self._declared_size(depth_decl)
+        # `image/depth-zlib` is a fixed 640x480 uint16 wire format. The camera
+        # declaration can describe a 1280x720 RGB stream; using that size to
+        # decode a 640x480 depth buffer would reject every frame. Keep the
+        # wire size for decode, and use the declaration's geometry for metres.
+        depth_size = (geometry.WIDTH, geometry.HEIGHT)
         if object_size is None:
-            object_size = depth_size or (geometry.WIDTH, geometry.HEIGHT)
+            object_size = depth_size
             self._camera_notes.append(
-                "VOP 没有声明相机分辨率，bbox 按深度图尺寸归一化 —— "
+                "VOP 没有声明相机分辨率，bbox 按 640x480 深度图归一化 —— "
                 "如果 VOP 使用另一个分辨率，宽高会偏")
-        if depth_size is None:
-            depth_size = (geometry.WIDTH, geometry.HEIGHT)
+        if declared_depth_size and declared_depth_size != depth_size:
             self._camera_notes.append(
-                "深度输入没有声明分辨率，按 image/depth-zlib 契约使用 640x480")
+                f"相机声明是 {declared_depth_size[0]}x{declared_depth_size[1]}，"
+                "但 image/depth-zlib 按 640x480 契约解码；尺寸仍按声明的内参换算")
 
+        camera_size = (declared_depth_size or object_size or depth_size)
         camera = camera_mod.from_declaration(
             depth_decl or objects_decl,
-            fallback_width=depth_size[0],
-            fallback_height=depth_size[1],
+            fallback_width=camera_size[0],
+            fallback_height=camera_size[1],
             fallback_half_fov=self._config.half_fov_rad,
             fallback_half_fov_v=self._config.half_fov_v_rad,
         )
