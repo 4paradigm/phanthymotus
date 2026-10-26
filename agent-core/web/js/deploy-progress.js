@@ -530,11 +530,24 @@ async function startDeploy({ driverId, driverName, image = '', kind = 'driver' }
 /**
  * Tail of an agent-core upgrade. The restart helper replaces this very process,
  * so the last thing the stream can report is "容器即将切换" — success is only
- * observable from outside, by reconnecting and finding the new tag. Reporting
- * it on reconnect alone would call a rolled-back upgrade a success.
+ * observable from outside, by finding the new tag. Do not require the browser
+ * to observe an outage first: on a healthy machine the stop/start can fit
+ * entirely between two polling ticks, so there may be no failed request even
+ * though the replacement succeeded.
  */
+function _coreReachedTarget(runningImage, targetImage) {
+    const tag = image => {
+        const value = String(image || '');
+        const slash = value.lastIndexOf('/');
+        const colon = value.lastIndexOf(':');
+        return colon > slash ? value.slice(colon + 1) : '';
+    };
+    const runningTag = tag(runningImage);
+    const targetTag = tag(targetImage);
+    return Boolean(runningTag && targetTag && runningTag === targetTag);
+}
+
 function _watchCoreRestart(driverId, image, ui) {
-    const targetTag = (image || '').split(':').pop();
     let attempts = 0;
     let sawRestart = false;
 
@@ -544,11 +557,13 @@ function _watchCoreRestart(driverId, image, ui) {
 
         try {
             const res = await fetch('/api/drivers');
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const json = await res.json();
+            if (json.code !== 200) throw new Error(json.message || 'status query failed');
             const entry = (json.data || []).find(d => d.id === driverId);
-            const runningTag = (entry?.running_image || '').split(':').pop();
 
-            if (sawRestart && runningTag && targetTag && runningTag === targetTag) {
+            if (_coreReachedTarget(entry?.running_image, image)) {
+                const runningTag = entry.running_image.slice(entry.running_image.lastIndexOf(':') + 1);
                 clearInterval(timer);
                 ui.pushDone({ message: `升级完成：${runningTag}，页面即将刷新` });
                 setTimeout(() => location.reload(), 2500);
@@ -628,4 +643,4 @@ if (document.readyState === 'loading') {
 }
 
 // ES6 module exports
-export { DeployProgressMonitor, DeployProgressUI, startDeploy };
+export { DeployProgressMonitor, DeployProgressUI, startDeploy, _coreReachedTarget };
