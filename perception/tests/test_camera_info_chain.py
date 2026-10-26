@@ -158,6 +158,30 @@ def test_a_foreign_schema_is_not_passed_on_as_ours():
                    stage="s") == []
 
 
+# ── stereo_peer：立体外参随声明走，与图像处理无关 ────────────────────────────
+
+def test_stereo_peer_survives_a_resize_untouched():
+    """R/T 描述两个相机坐标系之间的刚体关系，跟中间处理器把图缩成多大
+    无关 —— K 会逐边缩放，peer 原样透传。左右图分别过各自处理器后，
+    pointcloud 仍能从左目声明里拿到完整的立体外参。"""
+    peer = {"id": "unitree/r1/camera_right",
+            "R": [[0.999, -0.01, 0.0], [0.01, 0.999, 0.0], [0.0, 0.0, 1.0]],
+            "T": [[-0.05], [0.0], [0.0]], "source": "measured"}
+    entry = _depth_entry(stereo_peer=peer)
+    assert entry["stereo_peer"] == peer
+    # K 被缩了而 peer 没有 —— 两者本来就是不同的几何量
+    assert entry["stereo_peer"]["T"] == [[-0.05], [0.0], [0.0]]
+
+
+def test_a_malformed_stereo_peer_is_dropped_not_passed_on():
+    """缺 id/R/T 的 peer 是坏数据不是没数据 —— 宁可不带也不能带半套
+    （下游无法区分"半套"与"错误标定"）。"""
+    for bad in (None, {}, {"id": "x"}, {"id": "x", "R": [[1, 0, 0]] * 3},
+                {"id": "x", "T": [[0.05], [0], [0]]}):
+        entry = _depth_entry(stereo_peer=bad)
+        assert entry["stereo_peer"] is None, bad
+
+
 def test_an_upstream_without_an_id_is_not_passed_on():
     assert inherit(_upstream(id=""), topic="/d", fmt="x", stage="s") == []
 

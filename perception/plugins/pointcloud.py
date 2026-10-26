@@ -20,7 +20,10 @@ plugins/pointcloud.py — PointCloudPerceptionPlugin: 3D 点云，三种输入�
 
 标定：A/B 只需 {fx, fy, cx, cy} 或 hfov（缺省 90°；上游 camera_info 声明
 了 K 时优先用 K，见 _pinhole_for）；C 需 {fx, cx, cy, Tx}（已校正）或完整
-stereoCalibrate blob（未校正，自动 rectify）。`calibrate` action 面向 C：
+stereoCalibrate blob（未校正，自动 rectify）。双目的标定优先级：start 参数
+> 实例 config > 全局配置 > 驱动层声明（两条输入的 motus.camera/1 里带
+stereo_peer + K/D 时自动拼 raw 档 blob，见 _stereo_blob_from_declarations
+—— 型号级出厂标定的零配置路径）。`calibrate` action 面向 C：
 现场棋盘格采样（同一对帧不算新姿态）→ stereoCalibrate → 默认保留完整
 raw blob（运行时 rectify；只有明确 pre_rectified=true 才落快捷档 ——
 rectify 后的 Δy 对任何标定都 ≈ 0，不能拿来分档）→ 落盘
@@ -126,7 +129,7 @@ TOOLS = [
                 },
                 "calibration": {
                     "type": "string",
-                    "description": "标定：JSON 对象或 /models 下的标定文件路径。深度图/单目要 {fx,fy,cx,cy} 或 {hfov}（缺省 90°）；双目要 {fx,cx,cy,Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动 rectify）。双目没标定也可以先 start（只采集不出云），再用 calibrate 现场标定后把 blob 填回来重启",
+                    "description": "标定：JSON 对象或 /models 下的标定文件路径。深度图/单目要 {fx,fy,cx,cy} 或 {hfov}（缺省 90°）；双目要 {fx,cx,cy,Tx}（已校正）或完整 stereoCalibrate blob（未校正，自动 rectify）。双目留空时自动尝试驱动声明的 stereo_peer（型号级出厂标定）。没标定也可以先 start（只采集不出云），再用 calibrate 现场标定后把 blob 填回来重启",
                 },
                 "board_w": {"type": "integer", "description": "calibrate 用：棋盘格内角点列数（默认 9）"},
                 "board_h": {"type": "integer", "description": "calibrate 用：棋盘格内角点行数（默认 6）"},
@@ -691,6 +694,54 @@ def _raw_stereo_params(blob: dict) -> tuple:
     return K1, D1, K2, D2, R, T
 
 
+def _stereo_blob_from_declarations(left: dict, right: dict) -> tuple:
+    """两条输入的 motus.camera/1 声明 → (raw 档 blob, None) 或 (None, 原因)。
+
+    驱动层的型号级出厂标定走这里（review 第 20 轮后的设计：标定不该让
+    使用者做）。左目声明的 `stereo_peer` 携带 {id, R, T}，右目声明提供
+    自己的 K/D —— 左右各自的内参与畸变本来就描述各自的镜头，peer 只
+    补"两镜头之间"的刚体关系。
+
+    成套才用，缺一件整体退回（协议规则：unknown is null, never a guess
+    —— 拼半套标定与错误标定在下游不可区分）。peer 用 `id` 匹配而不是
+    topic：经过处理器后右图的 topic 已经不是相机原始 topic，`id` 在
+    inherit() 里是刻意保活的；匹配不上 = 左右接反或不是一对，拒收并
+    说明，这正好是"接反了"唯一能被发现的地点。
+
+    声明缺失分两档：两条输入都没有声明 → (None, "")，调用方落回
+    capture-only（老契约：无标定 start 合法）；**带了声明但差件套**
+    → (None, 原因)，调用方按错误处理 —— 相机卡片明明声明了双目标定
+    却用不了，静默降级会把"驱动数据坏了"藏成"用户没标定"。
+    """
+    from plugins.camera_info import camera_id
+
+    if not (isinstance(left, dict) and left) and not (isinstance(right, dict) and right):
+        return None, ""
+    peer = left.get("stereo_peer") if isinstance(left, dict) else None
+    if not isinstance(peer, dict):
+        return None, "左目声明的 stereo_peer 缺失或不是对象"
+    if not peer.get("id"):
+        return None, "stereo_peer 缺 id（peer 的相机标识，非话题名）"
+    K1, D1 = left.get("K"), left.get("D")
+    K2, D2 = right.get("K"), right.get("D") if isinstance(right, dict) else None
+    if not (isinstance(K1, (list, tuple)) and len(K1) == 9):
+        return None, "左目声明没有可用的 K（9 元素内参矩阵）"
+    if not (isinstance(K2, (list, tuple)) and len(K2) == 9):
+        return None, "右目声明没有可用的 K（9 元素内参矩阵）"
+    if camera_id(right) != str(peer["id"]):
+        return None, (f"双目输入与声明不配对：左目声明的 peer 是 {peer['id']!r}，"
+                      f"右目声明的 id 是 {camera_id(right)!r} —— 左右接反了？")
+    blob = {
+        "K1": [list(map(float, K1[0:3])), list(map(float, K1[3:6])), list(map(float, K1[6:9]))],
+        "K2": [list(map(float, K2[0:3])), list(map(float, K2[3:6])), list(map(float, K2[6:9]))],
+        "D1": [float(v) for v in D1] if isinstance(D1, (list, tuple)) and D1 else [0, 0, 0, 0],
+        "D2": [float(v) for v in D2] if isinstance(D2, (list, tuple)) and D2 else [0, 0, 0, 0],
+        "R": peer["R"], "T": peer["T"],
+        "source": peer.get("source", "unknown"),
+    }
+    return blob, None
+
+
 def _pinhole_params(blob: dict, w: int, h: int) -> tuple:
     """解析 pinhole 档 blob → (fx, fy, cx, cy)，全部有限、fx/fy>0。
 
@@ -851,7 +902,9 @@ class PointCloudPerceptionPlugin:
         # 上游相机的 motus.camera/1 声明（start 时经 for_topic 按输入话题
         # 挑出）：A/B 模式的内参兜底（_pinhole_for）与 info() 的向下继承
         # 都用它。空声明也记录 —— 重启不带声明时替换旧值，不留过期的镜头。
+        # _upstream_camera_right 只在 stereo 两路时记录（右目自己的声明）。
         self._upstream_camera: dict[str, dict] = {}
+        self._upstream_camera_right: dict[str, dict] = {}
         # calibrate 的采集状态：{(instance_id): {"pairs": [...], "target": N}}
         self._cal_sessions: dict[str, dict] = {}
         self._cal_lock = threading.Lock()
@@ -942,8 +995,8 @@ class PointCloudPerceptionPlugin:
     # ── node 生命周期 ──────────────────────────────────────────────────────
 
     def _resolve_mode(self, args: dict,
-                      instance_id: str = "") -> tuple[str, Optional[str], Optional[str], Optional[dict]]:
-        """→ (mode, left_topic, right_topic, calibration)。auto 按输入判定。
+                      instance_id: str = "") -> tuple[str, Optional[str], Optional[str], Optional[dict], str]:
+        """→ (mode, left_topic, right_topic, calibration, declared_note)。auto 按输入判定。
 
         单话题 auto 不猜话题名（"/camera/image_raw" 也可能载着 z16 深度）：
         按 explicit "depth" 之外一律走 "auto" 节点 —— start 时同时订阅
@@ -962,11 +1015,14 @@ class PointCloudPerceptionPlugin:
             raise ValueError(f"不支持的 mode：{mode!r}（可选 auto / depth / mono / stereo）")
         if len(topics_list) > 2:
             raise ValueError(f"input_topics 最多 2 路（左、右），收到 {len(topics_list)} 路")
-        # 标定优先级（review 第 7 轮）：start 参数 > 实例 config > 全局
-        # plugins.pointcloud.calibration。实例档在 configSchema 里声明为
-        # scope: instance，全局 blob 是兜底不是覆盖 —— 以前全局配了标定，
-        # 卡片自己的实例标定就永远拿不到（falsy 才轮到它），双目会拿错
-        # 内参/基线出歪云。
+        # 标定优先级（review 第 7 轮 + 驱动声明层）：start 参数 > 实例
+        # config > 全局 plugins.pointcloud.calibration > 驱动层型号级出厂
+        # 标定（两条输入的 motus.camera/1 声明里带 stereo_peer + K/D，
+        # start 时由 dispatch 拼成 raw 档 blob）。实例档在 configSchema 里
+        # 声明为 scope: instance，全局 blob 是兜底不是覆盖 —— 以前全局配
+        # 了标定，卡片自己的实例标定就永远拿不到（falsy 才轮到它），双目
+        # 会拿错内参/基线出歪云。声明层排在最后：用户自己标的一定比型号
+        # 常量新鲜（摔过/换过镜头）。
         node_key = instance_id or input_topic or _DEFAULT_INSTANCE
         with self._nodes_lock:
             icalib = load_calibration_blob(
@@ -975,7 +1031,16 @@ class PointCloudPerceptionPlugin:
                        or icalib or self._calibration)
         if mode == "auto":
             mode = "stereo" if right_topic else "auto"
-        return mode, input_topic or None, right_topic, calibration
+        declared_blob, declared_note = None, ""
+        if mode == "stereo" and right_topic and not calibration:
+            from plugins.camera_info import for_topic as _camera_for_topic
+
+            declared_blob, declared_note = _stereo_blob_from_declarations(
+                _camera_for_topic(args.get("camera_info"), input_topic),
+                _camera_for_topic(args.get("camera_info"), right_topic))
+            if declared_blob is not None:
+                calibration = declared_blob
+        return mode, input_topic or None, right_topic, calibration, declared_note
 
     def _camera_info(self, instance_id, input_topic, nodes,
                      cloud_topic: str, summary_topic: str) -> tuple:
@@ -1053,6 +1118,14 @@ class PointCloudPerceptionPlugin:
                     node._upstream_intrinsics = (
                         [float(v) for v in K],
                         upstream.get("width"), upstream.get("height"))
+            if mode == "stereo" and calibration:
+                # 标定来源（info() 报告用）：声明层拼出的 blob 带 source 字段
+                # （驱动出厂标定），用户配置的 blob 没有 —— 区分"型号常量在
+                # 出云"与"用户自己标的在出云"，前者错了要找驱动数据的人。
+                # capture-only（无标定）不标：来源随标定走，没有标定就没有来源。
+                node._calibration_source = calibration.get("source") if (
+                    isinstance(calibration, dict)
+                    and calibration.get("source")) else "configured"
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
@@ -1068,6 +1141,7 @@ class PointCloudPerceptionPlugin:
             # 声明随节点走：留着会让重新接线的卡片拿一个已经不喂它的相机
             # 的光学参数回答 info()（同 visual_depth 的注释）。
             self._upstream_camera.pop(node_key, None)
+            self._upstream_camera_right.pop(node_key, None)
         node.request_stop()
         result = node.stop()
         dispose_node(self._executor, node, label=f"pointcloud/{node_key}")
@@ -1348,6 +1422,9 @@ class PointCloudPerceptionPlugin:
                     "cloud_topic": node._cloud_topic,
                     "summary_topic": node._summary_topic,
                     "frame_count": node._frame_count,
+                    # 标定来源：声明层（驱动型号级出厂标定）还是用户配置 ——
+                    # 出云错了排查方向完全不同。
+                    "calibration_source": getattr(node, "_calibration_source", None),
                 }
                 for key, node in nodes.items()
             }
@@ -1416,8 +1493,8 @@ class PointCloudPerceptionPlugin:
 
         elif action == "start":
             try:
-                mode, input_topic, right_topic, calibration = self._resolve_mode(
-                    args, instance_id)
+                mode, input_topic, right_topic, calibration, declared_note = \
+                    self._resolve_mode(args, instance_id)
             except ValueError as error:
                 return {"state": "error", "message": str(error)}
             if mode == "stereo":
@@ -1425,6 +1502,11 @@ class PointCloudPerceptionPlugin:
                     return {"state": "error",
                             "message": "stereo 模式需要左右两路输入（input_topics[0]=左, [1]=右）"}
                 if not calibration or calibration_tier(calibration) not in ("raw", "rectified"):
+                    if declared_note:
+                        # 声明层想兜底但差了件套：报清楚缺什么，而不是静默
+                        # 落 capture-only 让人以为是没标定。
+                        return {"state": "error",
+                                "message": f"驱动声明的 stereo 标定不完整：{declared_note}"}
                     # review 指出的死锁：calibrate 需要运行中的 stereo 节点，
                     # 而 stereo 又要求先有标定 —— 新卡片永远走不进第一次标定。
                     # 放行无标定启动：节点照常订阅配对存帧（_emit_stereo 的
@@ -1478,12 +1560,18 @@ class PointCloudPerceptionPlugin:
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
             # 先记录再起节点（同 visual_depth）：loading 期间 info() 也能回答；
             # 空声明同样记录 —— 重启不再带声明时要替换旧值而不是留过期镜头。
+            # stereo 两路各记一份：声明层标定（_stereo_blob_from_declarations）
+            # 与 info() 的向下继承都要用右目的。
             if input_topic:
                 from plugins.camera_info import for_topic as _camera_for_topic
 
+                declarations = args.get("camera_info")
                 with self._nodes_lock:
                     self._upstream_camera[node_key] = _camera_for_topic(
-                        args.get("camera_info"), input_topic)
+                        declarations, input_topic)
+                    if right_topic:
+                        self._upstream_camera_right[node_key] = _camera_for_topic(
+                            declarations, right_topic)
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
             if running is None:

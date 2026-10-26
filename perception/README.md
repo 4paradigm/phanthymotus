@@ -2328,6 +2328,20 @@ Depth/mono only need intrinsics — `{fx, fy, cx, cy}` or `{hfov}` (default 90°
 zero-config). Stereo needs either `{fx, cx, cy, Tx}` (already-rectified pair) or
 a full `stereoCalibrate` blob (`K1/K2/D1/D2/R/T`, rectified at runtime).
 
+**Driver-declared stereo (zero-config):** when both input topics carry
+`motus.camera/1` declarations and the left one has a `stereo_peer`
+(`{id, R, T}`) plus per-camera `K`/`D`, the card assembles the raw-tier blob at
+`start` — model-level factory calibration consumed with no user configuration.
+Priority: start param > instance config > global config > driver declaration
+(a user's own re-calibration is always fresher than the model constant). The
+peer is matched by camera `id` (topics change through processors; ids do not),
+so a mismatched pair — stereo inputs swapped, or two unrelated cameras — is
+rejected at start instead of silently producing a wrong cloud. A declaration
+that exists but is incomplete is an error, not a fallback to capture-only;
+no declarations at all keeps the old contract below. `info` reports
+`calibration_source` per instance (`measured`-style source from the declaration
+vs `configured`) so a wrong cloud has a direction to investigate.
+
 **Stereo bootstrap:** a stereo card can be started *without* calibration — it
 subscribes, pairs frames within a 50 ms sync window, and stores the latest pair
 for the `calibrate` action, but publishes no cloud. Hold a checkerboard

@@ -1804,6 +1804,176 @@ def test_global_calibration_still_applies_without_instance_one():
     assert node._calibration["K1"][0][0] == 111
 
 
+# ── 驱动声明层：stereo_peer + 两条输入的 K/D 自动拼标定 ───────────────────────
+
+_STEREO_K = [300.0, 0.0, 160.0, 0.0, 300.0, 120.0, 0.0, 0.0, 1.0]
+
+
+def _decl(topic, cam_id, *, K=None, D=None, stereo_peer=None, **over):
+    out = {"schema": "motus.camera/1", "topic": topic, "format": "image/jpeg",
+           "id": cam_id, "width": 320, "height": 240,
+           "distortion_model": "unknown", "D": D,
+           "K": K, "half_fov_rad": None, "half_fov_v_rad": None,
+           "stereo_peer": stereo_peer, "source": "measured",
+           "measured_on": "factory", "pipeline": [cam_id], "vendor": {}}
+    out.update(over)
+    return out
+
+
+def _stereo_declarations():
+    """左目带 stereo_peer（R/T + 指向右目 id），两路各带 K/D —— 型号级
+    出厂标定在声明里的完整形态。"""
+    return [
+        _decl("/cam/left", "unitree/r1/camera_left", K=_STEREO_K, D=[0.0, 0.0, 0.0, 0.0],
+              stereo_peer={"id": "unitree/r1/camera_right",
+                           "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                           "T": [[-0.05], [0], [0]],
+                           "source": "measured"}),
+        _decl("/cam/right", "unitree/r1/camera_right", K=_STEREO_K, D=[0.0, 0.0, 0.0, 0.0]),
+    ]
+
+
+def test_stereo_start_uses_declared_calibration_without_any_config():
+    """零配置双目：驱动声明了 stereo_peer + K/D，卡片不带任何标定也能出
+    raw 档标定（型号级出厂标定的消费路径）。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration is not None
+    assert pc.calibration_tier(node._calibration) == "raw"
+    assert node._calibration["T"] == [[-0.05], [0], [0]]
+    assert node._calibration["K1"] == [[300.0, 0.0, 160.0],
+                                       [0.0, 300.0, 120.0],
+                                       [0.0, 0.0, 1.0]]
+    assert node._calibration["K2"][0][0] == 300.0
+    # 拼出的 blob 过得了 start 的 raw 预检（_raw_stereo_params 全量校验）
+    K1, _D1, K2, _D2, _R, T = pc._raw_stereo_params(node._calibration)
+    assert float(T[0]) == pytest.approx(-0.05)
+    assert K1[0, 0] == pytest.approx(300.0) and K2[0, 0] == pytest.approx(300.0)
+
+
+def test_declared_calibration_reports_its_source_in_info():
+    """声明层与用户配置的标定在 info() 里可区分 —— 出云错了，一个要找
+    驱动数据的人，一个要找标定的人。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    (inst,) = info["instances"].values()
+    assert inst["calibration_source"] == "measured"
+
+    # 对照：用户配置的标定不带 source 字段 → "configured"
+    plugin2, _ = _plugin(cfg={"fps": 1000,
+                              "calibration": json.dumps(RAW_BLOB)})
+    plugin2.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    info2 = plugin2.dispatch("pointcloud", {"action": "info"})
+    (inst2,) = info2["instances"].values()
+    assert inst2["calibration_source"] == "configured"
+
+
+def test_instance_calibration_beats_the_declared_one():
+    """优先级链：用户/实例标定 > 驱动声明 —— 用户自己标的一定比型号常量
+    新鲜（摔过/换过镜头后重标）。"""
+    instance_blob = json.loads(json.dumps(RAW_BLOB))
+    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left",
+        "calibration": json.dumps(instance_blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 222  # 实例档胜出，声明层没上场
+
+
+def test_declared_calib_missing_peer_falls_back_to_capture_only_with_error():
+    """带了声明但差件套（左目没有 stereo_peer）→ 按错误拒绝而不是静默
+    capture-only：驱动数据坏了不能藏成"用户没标定"。"""
+    decls = _stereo_declarations()
+    decls[0] = _decl("/cam/left", "unitree/r1/camera_left", K=_STEREO_K)
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "stereo_peer" in reply["message"]
+
+
+def test_declared_calib_peer_id_mismatch_rejects_swapped_inputs():
+    """peer 用 id 匹配：右目声明的 id 对不上 peer.id（左右接反/不是一对）
+    必须拒收 —— 这是"双目接反了"唯一能被自动发现的地点。"""
+    decls = _stereo_declarations()
+    # 右目换成第三个相机：id 对不上左目声明的 peer
+    decls[1] = _decl("/cam/right", "unitree/r1/camera_depth", K=_STEREO_K)
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "接反" in reply["message"] or "不配对" in reply["message"]
+
+
+def test_declared_calib_missing_right_k_reports_the_gap():
+    """右目声明没带 K：成套才用、缺件报清楚（unknown is null, never a
+    guess —— 拼半套标定与错误标定下游不可区分）。"""
+    decls = _stereo_declarations()
+    decls[1] = _decl("/cam/right", "unitree/r1/camera_right", K=None)
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "右目" in reply["message"] and "K" in reply["message"]
+
+
+def test_no_declarations_at_all_still_starts_capture_only():
+    """两条输入都没声明（旧驱动）→ 维持老契约：capture-only 启动，
+    calibrate 照常可用。声明层是加分项不是新门槛。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert not node._calibration  # capture-only：unknown 档不出云
+    # 无标定即无来源（info() 里报 None）
+    assert getattr(node, "_calibration_source", None) is None
+
+
+def test_auto_mode_two_inputs_also_uses_declared_calibration():
+    """auto + 两路输入判成 stereo 的路径同样吃声明层标定 —— _resolve_mode
+    里 auto→stereo 的改判先于声明层拼装。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "mode": "auto",
+        "camera_info": _stereo_declarations()})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._mode == "stereo"
+    assert pc.calibration_tier(node._calibration) == "raw"
+
+
+def test_right_declaration_is_recorded_and_retired_with_the_node():
+    """右目声明随节点走（同 _upstream_camera 的契约，按 node_key 记）：
+    重新接线后不留过期镜头。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    node_key = "/cam/left"  # 无 instance_id 时 node_key = 左路话题
+    assert plugin._upstream_camera[node_key]["id"] == "unitree/r1/camera_left"
+    assert plugin._upstream_camera_right[node_key]["id"] == "unitree/r1/camera_right"
+    plugin.dispatch("pointcloud", {"action": "stop"})
+    assert node_key not in plugin._upstream_camera_right
+
+
 # ── review 第 6 轮：每帧日志节流，坏流不淹容器日志 ───────────────────────────
 
 def test_zlib_decode_failure_logs_once_then_samples(caplog):
