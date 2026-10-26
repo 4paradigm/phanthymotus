@@ -181,13 +181,17 @@ class SessionTests(unittest.TestCase):
 class PluginTests(unittest.TestCase):
     def setUp(self):
         self.executor = _FakeExecutor()
-        self.plugin = PhanthyMusicPlugin({}, self.executor)
+        # CI（PR bot 的容器）和本地 sandbox 都没有外网曲库。不写
+        # catalogue_type 时插件默认连 api.phanthy.com——网络一抖，
+        # play_by_id 收到 'unavailable' 而不是 'not_playable'，
+        # test_playing_a_specific_track… 随机挂。这里的测试要的全是
+        # "调用走到哪一步"的桩行为，mock 曲库才是它们注释里写的那个。
+        self.plugin = PhanthyMusicPlugin({'catalogue_type': 'mock'}, self.executor)
 
     def tearDown(self):
         self.plugin.stop()
 
     def test_schema_declares_an_actuator_that_only_emits_music(self):
-        import jsonschema
         tool = self.plugin.get_tools()[0]
         self.assertEqual(tool['name'], 'phanthy_music')
         # An actuator with an output topic and no input: mixing is audio_mixer's
@@ -203,10 +207,54 @@ class PluginTests(unittest.TestCase):
                          {'list_genres', 'play_music', 'play_sleep_audio', 'next', 'previous',
                           'pause', 'resume', 'stop_music', 'now_playing',
                           'set_volume', 'set_autoplay', 'search_music', 'search_sleep_audio'})
-        jsonschema.validate({'action': 'play_music', 'genre': 'pop'}, schema)
-        jsonschema.validate({'action': 'play_sleep_audio', 'category': 'bedtime_story'}, schema)
-        jsonschema.validate({'action': 'next'}, schema)
-        jsonschema.validate({'action': 'list_genres'}, schema)
+        # Full validation when jsonschema is importable (it is not a declared
+        # dependency, so the PR bot's environment — pytest + pytest-asyncio
+        # only — and a bare host run both land on the structural fallback).
+        # Whichever path runs, a representative payload of every action must
+        # conform; the structural branch pins the same facts jsonschema would
+        # check, field by field, so a schema regression cannot slip through
+        # just because the library happened to be missing that day.
+        try:
+            import jsonschema
+        except ImportError:
+            jsonschema = None
+        if jsonschema is not None:
+            for payload in (
+                    {'action': 'play_music', 'genre': 'pop'},
+                    {'action': 'play_sleep_audio', 'category': 'bedtime_story'},
+                    {'action': 'next'},
+                    {'action': 'list_genres'},
+                    {'action': 'search_music', 'query': '安静的钢琴曲', 'top_k': 5},
+                    {'action': 'set_volume', 'volume': 40},
+                    {'action': 'set_autoplay', 'autoplay': True},
+                    {'action': 'now_playing'}):
+                jsonschema.validate(payload, schema)
+        self.assertEqual(schema['type'], 'object')
+        self.assertEqual(schema['required'], ['action'])
+        properties = schema['properties']
+        self.assertEqual(set(properties) -
+                         {'action', 'query', 'genre', 'language', 'vocal',
+                          'tags', 'artist', 'category', 'top_k', 'volume',
+                          'autoplay'},
+                         set(), 'unexpected properties declared in the schema')
+        self.assertEqual(properties['action']['enum'],
+                         ['list_genres', 'play_music', 'play_sleep_audio', 'next', 'previous',
+                          'pause', 'resume', 'stop_music', 'now_playing',
+                          'set_volume', 'set_autoplay', 'search_music',
+                          'search_sleep_audio'])
+        self.assertNotIn('stop', properties['action']['enum'],
+                         'a `stop` next to `stop_music` tears the ROS node down')
+        self.assertNotIn('track_id', properties,
+                         'search-by-id is not speakable; play reaches it via query')
+        for name in ('query', 'genre', 'language', 'vocal', 'tags', 'artist',
+                     'category'):
+            self.assertEqual(properties[name]['type'], 'string')
+        self.assertEqual(properties['top_k'],
+                         {'type': 'integer', 'minimum': 1, 'maximum': 10,
+                          'default': 3})
+        self.assertEqual(properties['volume'],
+                         {'type': 'number', 'minimum': 0, 'maximum': 100})
+        self.assertEqual(properties['autoplay']['type'], 'boolean')
 
     def test_play_only_takes_what_a_person_actually_says(self):
         """Pins the param set against drift back toward the REST shape.
