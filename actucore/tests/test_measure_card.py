@@ -32,6 +32,9 @@ class _FakeNode:
         self.subscriptions.append((msg_type, topic, callback, qos))
         return object()
 
+    def get_topic_names_and_types(self):
+        return []
+
 
 def _bind(**over):
     card = _card()
@@ -52,9 +55,10 @@ def test_the_card_declares_one_processor_with_both_inputs():
     assert tool["name"] == "measure"
     assert tool["type"] == "processor"
     assert tool["multiInstance"] is False
-    assert tool["topic_out"] == [{"topic": measure_plugin.DEFAULT_TOPIC,
-                                  "format": "data/json",
-                                  "desc": tool["topic_out"][0]["desc"]}]
+    assert [port["topic"] for port in tool["topic_out"]] == [
+        measure_plugin.DEFAULT_TOPIC, "/actucore/measure/view"]
+    assert [port["format"] for port in tool["topic_out"]] == [
+        "data/json", "image/jpeg"]
     formats = {port["format"] for port in tool["topic_in"]}
     assert formats == {"data/json", "image/depth-zlib"}
 
@@ -68,8 +72,8 @@ def test_start_and_stop_are_lifecycle_not_model_functions():
 
 def test_info_returns_topic_out_for_the_dashboard():
     out = _card().dispatch("measure", {"action": "info"})
-    assert out["topic_out"] == [{"topic": measure_plugin.DEFAULT_TOPIC,
-                                 "format": "data/json"}]
+    assert [port["topic"] for port in out["topic_out"]] == [
+        measure_plugin.DEFAULT_TOPIC, "/actucore/measure/view"]
 
 
 def test_config_is_bounded_and_reports_the_effective_values():
@@ -111,7 +115,7 @@ def test_both_roles_are_bound_by_suffix():
     assert bound["objects"] == "/cam/objects"
     assert bound["depth"] == "/cam/visual_depth"
     assert {topic for _, topic, _, _ in node.subscriptions} == {
-        "/cam/objects", "/cam/visual_depth"}
+        "/cam/objects", "/cam/visual_depth", "/cam"}
 
 
 def test_a_driver_depth_topic_is_accepted_without_renaming():
@@ -238,7 +242,7 @@ def test_it_starts_without_opening_a_real_ros_node():
     assert out["inputs"]["depth"] == "/cam/visual_depth"
     assert card._camera.has_width
     assert {topic for _, topic, _, _ in node.subscriptions} == {
-        "/cam/objects", "/cam/visual_depth"}
+        "/cam/objects", "/cam/visual_depth", "/cam"}
 
 
 def test_payload_is_json_serialisable():
@@ -318,3 +322,21 @@ def test_compact_payload_does_not_include_retained_tracks():
     second = card._payload()
     assert second["count"] == 0
     assert second["objects"] == []
+
+
+def test_camera_topics_are_derived_from_the_depth_sibling():
+    assert _card()._camera_candidates("/ns/camera/depth") == [
+        "/ns/camera/color", "/ns/camera/rgb"]
+    assert _card()._camera_candidates("/g1/camera/depth") == [
+        "/g1/camera/color", "/g1/camera/rgb"]
+    assert _card()._camera_candidates("/cam/visual_depth") == [
+        "/cam", "/cam/color", "/cam/rgb"]
+    assert _card()._camera_candidates("/camera/head/depth") == [
+        "/camera/head/color", "/camera/head/rgb", "/camera/head"]
+    assert _card()._camera_candidates("/not-a-depth") == []
+
+
+def test_the_card_declares_the_overlay_port():
+    tool = _card().get_tools()[0]
+    assert any(port["topic"] == "/actucore/measure/view"
+               and port["format"] == "image/jpeg" for port in tool["topic_out"])

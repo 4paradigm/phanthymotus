@@ -518,10 +518,23 @@ camera_info (motus.camera/1) ──┘
 
 ### 画布上的框和尺寸
 
-当前输出版本仍然只有 `data/json`：画布会显示上面的 JSON/KV，不会自动把
-`box` 画到 Camera 的 JPEG 上。要做“Camera 上直接标注外接框和 W×H×D”，需要
-再增加一个 `image/jpeg` 的 `view` 输出（参考 `navi/view.py`），订阅相机帧并
-用 OpenCV 画框；这属于下一步，不是当前瘦身版本的范围。
+卡片现在有第二个输出口：
+
+```text
+/<namespace>/actucore/measure/view   image/jpeg
+```
+
+它把 `box`、`name`、`visible_w_cm × visible_h_cm` 和 `distance_cm` 直接画在
+相机 JPEG 上，画布上把这个输出接到 Camera/图像查看节点即可。
+
+**不需要在画布上再连一次 camera**：卡片从 depth 话题推导同一台相机的彩色
+话题（Bumi：`/camera/depth` → `/camera/color`；G1：`/camera/rgb`），也可以
+在 `config.yaml` 里用 `measure.camera_topic` 显式指定。相机流是直接 ROS
+订阅，不占用画布的 camera 节点。
+
+黄色框表示 bbox 贴到了画面边缘，尺寸只是下限；绿色框是正常可见框。
+叠加图默认 5 Hz，`view_hz: 0` 可关闭。叠加图渲染在独立线程里，不阻塞
+5 Hz 的 JSON 测量流。
 
 ## 构建与运行
 

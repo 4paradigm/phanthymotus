@@ -19,12 +19,14 @@ from __future__ import annotations
 import json
 import logging
 import math
+import queue
 import threading
 import time
 from dataclasses import dataclass
 
 from . import camera as camera_mod
 from . import geometry
+from . import view as view_mod
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +188,21 @@ class MeasurePlugin:
         self._executor = executor
         self._namespace = (namespace or "").strip("/")
         self._topic = str(self._cfg.get("topic") or DEFAULT_TOPIC)
+        self._view_topic = str(self._cfg.get("view_topic") or
+                               (self._topic.rsplit("/", 1)[0] + "/view"))
+        self._view_hz = float(self._cfg.get("view_hz", 5.0))
+        if not 0 <= self._view_hz <= 15:
+            raise ValueError("measure.view_hz must be in [0, 15]")
+        self._camera_topic_cfg = str(self._cfg.get("camera_topic") or "").strip()
+        self._camera_topic = ""
+        self._image_jpeg = None
+        self._image_ms = 0
+        self._view_publisher = None
+        self._view_queue = None
+        self._view_thread = None
+        self._view_stop = threading.Event()
+        self._view_next_at = 0.0
+        self._view_failed = False
         self._config = Config.from_dict(self._cfg)
 
         self._lock = threading.RLock()
@@ -218,8 +235,9 @@ class MeasurePlugin:
             "multiInstance": False,
             "description": (
                 "通用物体测量：接 VOP 检测结果和一路米制深度图，输出每个目标的"
-                "距离、可见宽度和可见高度。宽度/高度是当前视角下的可见外廓，"
-                "不是不可见背面的完整三维尺寸；后者需要分割和点云/多视角。"
+                "距离、可见宽度和可见高度，并在可选的 image/jpeg 输出口直接画出"
+                "bbox 和尺寸标签。宽度/高度是当前视角下的可见外廓，不是不可见背面"
+                "的完整三维尺寸；后者需要分割和点云/多视角。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -246,11 +264,15 @@ class MeasurePlugin:
                 {"format": "image/depth-zlib",
                  "desc": "与检测同一镜头的米制深度图（必需）"},
             ],
-            "topic_out": [{
+            "topic_out": ([{
                 "topic": self._topic,
                 "format": TOPIC_FORMAT,
                 "desc": "每个目标的距离/可见宽高、质量与降级信息",
-            }],
+            }] + ([{
+                "topic": self._view_topic,
+                "format": "image/jpeg",
+                "desc": "camera 画面 + 测量 bbox 和 W×H 标签；只给人看",
+            }] if self._view_hz > 0 else [])),
             "configSchema": {
                 "type": "object",
                 "properties": {
@@ -342,6 +364,10 @@ class MeasurePlugin:
             self._objects_ms = 0
             self._depth = None
             self._depth_ms = 0
+            self._image_jpeg = None
+            self._image_ms = 0
+            self._camera_topic = ""
+            self._view_failed = False
             self._binding = {}
             self._camera_notes = []
             self._stabilizer.reset()
@@ -385,6 +411,8 @@ class MeasurePlugin:
             self._node = None
             self._timer = None
             self._publisher = None
+            self._view_publisher = None
+        self._stop_view_thread()
         if timer is not None and node is not None:
             try:
                 node.destroy_timer(timer)
@@ -409,10 +437,19 @@ class MeasurePlugin:
 
     def _open_publisher(self) -> None:
         from rclpy.node import Node
+        from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
         node = Node(f"measure_{abs(hash(self._topic)) % 100000}")
         self._publisher = node.create_publisher(String, self._topic, 10)
+        if self._view_hz > 0:
+            self._view_publisher = node.create_publisher(
+                CompressedImage, self._view_topic, 2)
+            self._view_queue = queue.Queue(maxsize=1)
+            self._view_stop = threading.Event()
+            self._view_thread = threading.Thread(
+                target=self._view_worker, daemon=True, name="measure_view")
+            self._view_thread.start()
         self._timer = node.create_timer(1.0 / max(self._config.rate_hz, 0.1),
                                         self._tick)
         self._executor.add_node(node)
@@ -448,7 +485,132 @@ class MeasurePlugin:
         qos = _sensor_qos()
         node.create_subscription(String, bound["objects"], self._on_objects, qos)
         node.create_subscription(CompressedImage, bound["depth"], self._on_depth, qos)
+        if self._view_hz > 0:
+            self._bind_camera(node, bound["depth"], qos)
         return bound, ""
+
+    def _bind_camera(self, node, depth_topic: str, qos) -> None:
+        """Subscribe to the colour stream that belongs to the depth camera.
+
+        The canvas cannot fan one camera node out to two cards, so this is a
+        direct ROS subscription rather than a fourth canvas input. It is
+        derived from the depth topic (same camera, sibling colour port) and can
+        be overridden with `camera_topic` in config.yaml.
+        """
+        from sensor_msgs.msg import CompressedImage
+
+        topic = self._camera_topic_cfg
+        if not topic:
+            candidates = self._camera_candidates(depth_topic)
+            graph = dict(node.get_topic_names_and_types())
+            for candidate in candidates:
+                types = graph.get(candidate) or []
+                if any(name.endswith("CompressedImage") for name in types):
+                    topic = candidate
+                    break
+            if not topic and candidates:
+                # The producer may not have appeared yet. Subscribe to the most
+                # likely sibling; a late publisher is fine, a wrong one yields
+                # no frames and the overlay simply stays absent.
+                topic = candidates[0]
+        if not topic:
+            self._camera_notes.append(
+                "没有从深度话题推导出相机彩色话题，叠加图关闭；"
+                "可在 config.yaml 设置 measure.camera_topic")
+            return
+        try:
+            node.create_subscription(CompressedImage, topic, self._on_camera, qos)
+        except Exception as error:                            # noqa: BLE001
+            self._camera_notes.append(f"相机叠加订阅失败（{topic}）：{error}")
+            return
+        self._camera_topic = topic
+
+    @staticmethod
+    def _camera_candidates(depth_topic: str) -> list[str]:
+        if depth_topic.endswith("/visual_depth"):
+            base = depth_topic[:-len("/visual_depth")]
+            return [base, base + "/color", base + "/rgb"]
+        if depth_topic.endswith("/camera/head/depth"):
+            base = depth_topic[:-len("/depth")]
+            return [base + "/color", base + "/rgb", base]
+        if depth_topic.endswith("/camera/depth"):
+            base = depth_topic[:-len("/depth")]
+            return [base + "/color", base + "/rgb"]
+        if depth_topic.endswith("/depth"):
+            base = depth_topic[:-len("/depth")]
+            return [base + "/color", base + "/rgb", base]
+        return []
+
+    def _on_camera(self, message) -> None:
+        data = bytes(getattr(message, "data", b"") or b"")
+        if not data:
+            return
+        with self._obs_lock:
+            self._image_jpeg = data
+            self._image_ms = int(time.time() * 1000)
+
+    def _stop_view_thread(self) -> None:
+        self._view_stop.set()
+        thread = self._view_thread
+        self._view_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._view_publisher = None
+        self._view_queue = None
+
+    def _queue_view(self, payload: dict) -> None:
+        if (self._view_queue is None or self._view_hz <= 0
+                or not self._running):
+            return
+        now = time.monotonic()
+        if now < self._view_next_at:
+            return
+        self._view_next_at = now + 1.0 / self._view_hz
+        with self._obs_lock:
+            jpeg = self._image_jpeg
+            image_ms = self._image_ms
+        if not jpeg or int(time.time() * 1000) - image_ms > self._config.max_obs_age_ms:
+            return
+        snapshot = {"jpeg": jpeg, "objects": payload.get("objects") or []}
+        try:
+            self._view_queue.put_nowait(snapshot)
+        except queue.Full:
+            try:
+                self._view_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._view_queue.put_nowait(snapshot)
+            except queue.Full:
+                pass
+
+    def _view_worker(self) -> None:
+        while not self._view_stop.is_set():
+            try:
+                snapshot = self._view_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                jpeg = view_mod.render(snapshot["jpeg"], snapshot["objects"])
+            except Exception as error:                        # noqa: BLE001
+                if not self._view_failed:
+                    self._view_failed = True
+                    log.warning("measure overlay disabled: %s", error)
+                continue
+            publisher = self._view_publisher
+            if publisher is None:
+                continue
+            try:
+                from sensor_msgs.msg import CompressedImage
+
+                message = CompressedImage()
+                message.format = "jpeg"
+                message.data = jpeg
+                publisher.publish(message)
+            except Exception as error:                        # noqa: BLE001
+                if not self._view_failed:
+                    self._view_failed = True
+                    log.warning("measure overlay publish failed: %s", error)
 
     def _adopt_camera(self, declarations, binding: dict) -> str:
         depth_topic = binding.get("depth")
@@ -594,6 +756,7 @@ class MeasurePlugin:
         with self._lock:
             self._published += 1
             self._last = payload
+        self._queue_view(payload)
 
     def _payload(self) -> dict:
         now_ms = int(time.time() * 1000)
@@ -715,8 +878,12 @@ class MeasurePlugin:
         with self._lock:
             out = {
                 "state": "running" if self._running else "idle",
-                "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT}],
+                "topic_out": ([{"topic": self._topic, "format": TOPIC_FORMAT}]
+                              + ([{"topic": self._view_topic, "format": "image/jpeg"}]
+                                 if self._view_hz > 0 else [])),
                 "rate_hz": self._config.rate_hz,
+                "camera_topic": self._camera_topic,
+                "view_hz": self._view_hz,
                 "camera": _compact_camera(self._camera),
                 "session": self._session.summary(int(time.time() * 1000)),
                 "history_count": len(self._session.history()),

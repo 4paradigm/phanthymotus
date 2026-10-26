@@ -439,6 +439,12 @@ plugins:
     # 分割 + 点云/多视角，留给后续版本，不在这张卡里假装能做到。
     enabled: true
     topic: /actucore/measure/state
+    # 叠加图：订阅与 depth 同一台相机的彩色 JPEG，把 bbox 和 W×H 标签
+    # 直接画在画面上。留空 = 由 depth 话题推导（Bumi 的 /camera/depth ->
+    # /camera/color）；摄像头特别命名时在这里指定。
+    view_topic: /actucore/measure/view
+    camera_topic: ""
+    view_hz: 5
     rate_hz: 5
     max_objects: 8
     min_confidence: 0.3
