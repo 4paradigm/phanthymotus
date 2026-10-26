@@ -1504,6 +1504,125 @@ def test_config_rejects_invalid_pinhole_calibration():
     assert plugin._calibration["fx"] == 300.0
 
 
+# ── review 第 17 轮：实例 config 校验 / shutdown / 数值范围 ─────────────────
+
+def test_instance_config_rejects_invalid_calibration_without_retiring():
+    """review 第 17 轮 Issue 1：实例分支以前不校验就落库并撤节点——运行中
+    的卡片被换成 {"fx": 0} 后回复 configured 且节点已停，下次 start 才被
+    预检拒绝：卡片已静默停掉、还留着自己已知不可用的配置。坏标定必须
+    当场拒收：不落库、不撤节点。raw/rectified 档同理。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+    assert len(executor.nodes) == 1
+
+    # pinhole 坏值：拒收、节点还在跑、实例配置没被污染
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps({"fx": 0, "cx": 160})})
+    assert reply["state"] == "error"
+    assert len(executor.nodes) == 1          # 没撤节点
+    assert executor.nodes[0] is node
+    with plugin._nodes_lock:
+        assert "/cam/depth" not in plugin._instance_configs  # 没落库
+
+    # rectified 坏值（Tx=0）：同样拒收
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0})})
+    assert reply["state"] == "error"
+    assert "Tx" in reply["message"]
+
+    # raw 坏值（K2 缺失）：同样拒收
+    blob = json.loads(json.dumps(RAW_BLOB))
+    del blob["K2"]
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps(blob)})
+    assert reply["state"] == "error"
+
+    # 合法实例标定照常：落库 + 撤节点（等重启生效，原契约）
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})})
+    assert reply["status"] == "configured"
+    assert len(executor.nodes) == 0
+    with plugin._nodes_lock:
+        stored = plugin._instance_configs["/cam/depth"]
+    assert stored["calibration"] == json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})
+
+
+@pytest.mark.parametrize("cfg,needle", [
+    ({"min_depth_m": 5.0, "max_depth_m": 3.0}, "深度范围"),   # min > max
+    ({"min_depth_m": 11.0}, "深度范围"),                       # 11 > 默认 max 10
+    ({"max_depth_m": 0.05}, "深度范围"),                       # 0.05 < 默认 min 0.1
+    ({"min_depth_m": -1.0}, "深度范围"),                       # 负距离
+    ({"fps": 0}, "fps"),                                       # 0 fps → 静默钳 0.1
+    ({"fps": -3}, "fps"),
+    ({"fps": "abc"}, "数值异常"),
+])
+def test_config_rejects_invalid_ranges(cfg, needle):
+    """review 第 17 轮 Issue 3：min>=max / 非正 fps 以前照收 configured——
+    filter_cloud 的 z 窗口为空，卡片 running 却一帧云不出；fps<=0 被静默
+    钳到 0.1 fps。实例与全局同一条检查。"""
+    plugin, _ = _plugin()
+    reply = plugin.dispatch("pointcloud", {"action": "config", **cfg})
+    assert reply["state"] == "error", f"{cfg} 应被拒收"
+    assert needle in reply["message"]
+    # 未落库
+    assert plugin._fps == 2
+    assert plugin._min_depth_m == 0.1
+    assert plugin._max_depth_m == 10.0
+
+    # 实例分支同一条检查
+    plugin2, executor2 = _plugin()
+    reply = plugin2.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/x", **cfg})
+    assert reply["state"] == "error"
+    assert executor2.nodes == []
+
+
+def test_config_accepts_valid_ranges_and_stepwise_updates():
+    """预检不误伤：合法范围照常落库；只改一侧、与现值组合仍合法也放行
+    （允许分两步把 (0.1, 10) 改成 (5, 20)）。"""
+    plugin, _ = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "min_depth_m": 5.0})  # 与默认 max=10 组合合法
+    assert reply["status"] == "configured"
+    assert plugin._min_depth_m == 5.0
+
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "max_depth_m": 20.0, "fps": 5})
+    assert reply["status"] == "configured"
+    assert plugin._max_depth_m == 20.0
+    assert plugin._fps == 5
+
+
+def test_plugin_shutdown_retires_all_nodes_and_clears_pending():
+    """review 第 17 轮 Issue 2：插件以前没有 shutdown()——SIGTERM 走到
+    executor/rclpy 关停时订阅、发布和 worker 线程还全活着，worker 还可能
+    对着已关的 ROS context 发布。shutdown 必须撤掉全部节点并清 pending
+    队列（等模型下载的 start 不该在关停中途被 _bg_start 拉起）。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/a", "mode": "depth"})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/b", "mode": "depth"})
+    assert len(executor.nodes) == 2
+    with plugin._pending_lock:
+        plugin._model_pending_starts = [("/cam/pending", "mono", "/cam/p", None, None)]
+
+    plugin.shutdown()
+
+    assert plugin._nodes == {}
+    assert executor.nodes == []
+    with plugin._pending_lock:
+        assert plugin._model_pending_starts == []
+    # 幂等：再调一次不炸
+    plugin.shutdown()
+
+
 # ── review 第 7 轮：标定优先级 start 参数 > 实例 config > 全局 ────────────────
 
 def test_instance_calibration_beats_global_calibration():

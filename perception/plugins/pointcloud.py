@@ -1054,6 +1054,23 @@ class PointCloudPerceptionPlugin:
             self._cal_sessions.pop(node_key, None)
         return result
 
+    def shutdown(self) -> None:
+        """Retire all nodes before ROS/interpreter teardown (review 第 17 轮
+        Issue 2)。
+
+        PerceptionBundle.shutdown() 只调用带 shutdown() 的插件；没有这一
+        份的话，SIGTERM 一路走到 executor.shutdown()/rclpy.shutdown() 时
+        本插件的订阅、发布和 worker 线程还全活着——worker 还可能对着已
+        关闭的 ROS context 发布。清 pending 队列：等共享模型下载的 mono
+        start 不该在关停中途被 _bg_start 拉起。模型本身没有需要 close()
+        的 GPU 资源（TRT 引擎随进程走），不比照 visual_depth 关 backend。"""
+        with self._pending_lock:
+            self._model_pending_starts = []
+        with self._nodes_lock:
+            keys = list(self._nodes)
+        for key in keys:
+            self._retire_node(key)
+
     # ── calibrate（stereo）────────────────────────────────────────────────
 
     def _stereo_pair_for_calibration(self, instance_id: str) -> tuple:
@@ -1219,6 +1236,67 @@ class PointCloudPerceptionPlugin:
 
     def get_tools(self) -> list:
         return TOOLS
+
+    def _validate_calibration(self, raw_value) -> Optional[str]:
+        """校验一份 calibration 配置值（实例或全局 config 共用）。
+
+        返回 None 表示可用（或没带标定/档位 unknown——unknown 照收：stereo
+        无标定启动走 capture-only，calibrate 采完再填回来，这是第 6/10 轮
+        就立下的契约）；返回字符串即拒绝原因。start 的预检在 dispatch 里
+        分档做过了，config 没有模式上下文，这里按 blob 自己的档位挑同一
+        批解析器——两处各写一遍必然漂移（review 第 17 轮 Issue 1）。"""
+        blob = load_calibration_blob(raw_value)
+        if blob is None:
+            return None
+        tier = calibration_tier(blob)
+        try:
+            if tier == "pinhole":
+                _pinhole_params(blob, 640, 480)
+            elif tier == "rectified":
+                _rectified_params(blob)
+            elif tier == "raw":
+                K1, _D1, K2, _D2, _R, T = _raw_stereo_params(blob)
+                tx = float(T[0]) if T.size else 0.0
+                if not np.isfinite(tx) or abs(tx) < 1e-6:
+                    raise ValueError(
+                        f"基线异常（Tx={tx}）：T/Tx 缺失或为 0，Q 反投影必然除零")
+                if not (np.all(np.isfinite(K1)) and np.all(np.isfinite(K2))):
+                    raise ValueError("K1/K2 含非有限值（NaN/inf）")
+        except ValueError as error:
+            if tier == "raw":
+                return f"raw 标定无法使用：{error}"
+            return str(error)
+        return None
+
+    def _validate_ranges(self, cfg: dict) -> Optional[str]:
+        """fps / min_depth_m / max_depth_m 的联合校验（review 第 17 轮
+        Issue 3）。单值合法、组合非法（min >= max）以前照收——filter_cloud
+        的 z 截断窗口为空，卡片 running 却一帧云不出；fps<=0 则被静默钳到
+        0.1 fps。校验组合时未给出的一侧取现值，允许分两步把范围从 (0.1, 10)
+        改到 (5, 20) 这类操作。"""
+        fps = cfg.get("fps")
+        min_d = cfg.get("min_depth_m")
+        max_d = cfg.get("max_depth_m")
+        try:
+            if fps is not None:
+                fps = float(fps)
+                if not np.isfinite(fps) or fps <= 0:
+                    raise ValueError(
+                        f"fps 无效（fps={cfg.get('fps')!r}）：需要正的有限值，"
+                        "否则帧间隔被静默钳到 0.1 fps")
+            if min_d is not None:
+                min_d = float(min_d)
+            if max_d is not None:
+                max_d = float(max_d)
+        except (TypeError, ValueError) as error:
+            return f"配置数值异常：{error}"
+        lo = min_d if min_d is not None else self._min_depth_m
+        hi = max_d if max_d is not None else self._max_depth_m
+        if not (np.isfinite(lo) and np.isfinite(hi)) or not (0.0 <= lo < hi <= 1000.0):
+            return (f"深度范围无效（min_depth_m={cfg.get('min_depth_m')!r}, "
+                    f"max_depth_m={cfg.get('max_depth_m')!r}）：需要 0 <= min < max "
+                    "<= 1000（米），否则 z 截断窗口为空、云一帧不出")
+        return None
 
     def dispatch(self, name: str, args: dict) -> Optional[dict]:
         action = args.get("action", name)
@@ -1425,16 +1503,12 @@ class PointCloudPerceptionPlugin:
         elif action == "stop":
             if instance_id:
                 result = self._retire_node(instance_id)
-                if result is not None:
-                    # review 第 14 轮：stop 必须取消该卡片 pending 的 mono
-                    # 启动——它可能还在等共享模型下载，否则 _bg_start 落完
-                    # 加载后会把已停掉卡片按旧 topic 重新拉起。
-                    with self._pending_lock:
-                        self._model_pending_starts = [
-                            e for e in self._model_pending_starts
-                            if e[0] != instance_id]
-                # 节点尚未落地（还在 pending）时 retire_node 返回 None，
-                # pending 条目仍在——loader 落完加载后仍会把它重新拉起。
+                # review 第 14 轮：stop 必须取消该卡片 pending 的 mono
+                # 启动——它可能还在等共享模型下载，否则 _bg_start 落完
+                # 加载后会把已停掉卡片按旧 topic 重新拉起。节点尚未落地
+                # （还在 pending）时 retire_node 返回 None，pending 条目
+                # 仍在——同一次过滤两条路径都覆盖，不必分两次筛
+                # （review 第 17 轮建议：去掉重复的第二次过滤）。
                 with self._pending_lock:
                     self._model_pending_starts = [
                         e for e in self._model_pending_starts
@@ -1453,6 +1527,14 @@ class PointCloudPerceptionPlugin:
         elif action == "config":
             cfg = {k: v for k, v in args.items()
                    if k not in ("action", "instance_id") and v is not None and v != ""}
+            # review 第 17 轮 Issue 1/3：实例分支以前既不校验标定也不校验
+            # 范围就落库撤节点——运行中的卡片被换成已知不可用的配置后静默
+            # 停掉，下次 start 才发现。全局分支第 16 轮只补了标定的一半。
+            error = self._validate_ranges(cfg)
+            if error is None and "calibration" in cfg:
+                error = self._validate_calibration(cfg["calibration"])
+            if error is not None:
+                return {"state": "error", "message": error}
             if instance_id:
                 with self._nodes_lock:
                     self._instance_configs[instance_id] = cfg
@@ -1469,16 +1551,7 @@ class PointCloudPerceptionPlugin:
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
             if "calibration" in cfg:
-                # review 第 16 轮建议：config 与 start 同一份预检（stereo 的
-                # raw/rectified 档同理）。坏标定当场报清楚，而不是先落库、
-                # 等 start 预检才拒——卡片会以为配置已生效。
-                blob = load_calibration_blob(cfg["calibration"])
-                if calibration_tier(blob) == "pinhole":
-                    try:
-                        _pinhole_params(blob, 640, 480)
-                    except ValueError as error:
-                        return {"state": "error", "message": str(error)}
-                self._calibration = blob
+                self._calibration = load_calibration_blob(cfg["calibration"])
             if any(k in cfg for k in ("cal_a", "cal_b")):
                 self._cal_a = float(cfg.get("cal_a", self._cal_a))
                 self._cal_b = float(cfg.get("cal_b", self._cal_b))
