@@ -1623,6 +1623,86 @@ def test_plugin_shutdown_retires_all_nodes_and_clears_pending():
     plugin.shutdown()
 
 
+# ── review 第 18 轮：实例 config 合并语义 / 有界解压 ─────────────────────────
+
+def test_instance_config_patches_instead_of_replacing():
+    """review 第 18 轮 Issue 1：实例配置是补丁不是替换（OCR 的语义）——
+    存了双目标定后只改 fps，旧实现存成 {"fps": ...} 把标定丢掉，下次
+    stereo start 静默落回 capture-only、一帧云不出。"""
+    plugin, _ = _plugin()
+    calib = json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0.05})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "calibration": calib})
+    # 第二次只改 fps：标定必须还在
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "fps": 5})
+    assert reply["status"] == "configured"
+    with plugin._nodes_lock:
+        stored = plugin._instance_configs["/cam/left"]
+    assert stored["calibration"] == calib, "只改 fps 不得丢掉已存标定"
+    assert stored["fps"] == 5
+    # 回复里带合并后的完整配置，卡片能看到最终生效值
+    assert reply["config"] == stored
+
+    # 端到端：合并后的配置真被下一次 start 用上（stereo 拿到 rectified 档
+    # 而不是 capture-only）
+    plugin2, executor2 = _plugin(cfg={"fps": 1000})
+    plugin2.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "calibration": calib})
+    plugin2.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "max_points": 500})
+    reply = plugin2.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor2.nodes[0]
+    assert node._calibration["Tx"] == 0.05  # 标定活过了第二次 config
+
+
+def test_depth_zlib_decompress_is_bounded():
+    """review 第 18 轮 Issue 2：zlib.decompress 以前无上限——几百 KB 的
+    压缩包能声明几十 MB 的解压产物，在回调里把 perception 进程 OOM。
+    有界解压：正常 614400 B 帧放行，超 1 MiB 上限（解压炸弹）拒收，
+    截断流照旧报错。"""
+    import zlib
+    from plugins.pointcloud import zlib_decompress
+
+    # 正常帧：640x480 uint16 = 614400 B
+    good = zlib.compress(b"\x27\x10" * 307200, 1)
+    assert len(zlib_decompress(good)) == 614400
+
+    # 解压炸弹：40 MB 的零压到几 KB，必须在 1 MiB 处被截停
+    bomb = zlib.compress(b"\x00" * (40 << 20), 9)
+    assert len(bomb) < 100_000  # 压缩端确实很小
+    with pytest.raises(ValueError, match="1 MiB"):
+        zlib_decompress(bomb)
+
+    # 略超上限：1.25 MB —— 同样拒收（unconsumed_tail 非空）
+    over = zlib.compress(b"\x01" * (1 << 20) + b"\x02" * (1 << 18), 1)
+    with pytest.raises(ValueError, match="1 MiB"):
+        zlib_decompress(over)
+
+    # 截断流：解不出来，照旧抛 zlib 的错误（外部有 fail_count 兜底）
+    with pytest.raises(Exception):
+        zlib_decompress(good[:len(good) // 2])
+
+
+def test_depth_zlib_oversized_payload_does_not_reach_worker():
+    """超大压缩帧在解码处被拒（返回 None），不会以任何形式进 worker ——
+    回调侧的防线：坏帧只计数告警，进程不倒。"""
+    import zlib
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    bomb = zlib.compress(b"\x00" * (40 << 20), 9)
+    msg = _FakeCompressedImage(bomb, fmt="16UC1; compressedDepth zlib")
+    # _depth_comp_cb 只节流入队，解码发生在 worker —— 直接调解码入口
+    from plugins.pointcloud import _decode_depth_message
+    depth, enc = _decode_depth_message(msg)
+    assert depth is None, "超限解压必须被拒，不得产出深度图"
+
+
 # ── review 第 7 轮：标定优先级 start 参数 > 实例 config > 全局 ────────────────
 
 def test_instance_calibration_beats_global_calibration():

@@ -235,8 +235,19 @@ def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
 
 
 def zlib_decompress(data: bytes) -> bytes:
+    """有界解压：深度帧是 640x480 uint16 = 614400 B，加余量封顶 1 MiB。
+
+    review 第 18 轮 Issue 2：zlib.decompress 无上限——几百 KB 的压缩包
+    能声明几十 MB 的解压产物，在回调里把 perception 进程直接 OOM。
+    decompressobj.max_length 挡住超限，unconsumed_tail 非空即"还有没解
+    完的"= 超限，连同超出部分一起拒掉。"""
     import zlib
-    return zlib.decompress(data)
+    cap = 1 << 20
+    d = zlib.decompressobj()
+    raw = d.decompress(data, cap)
+    if d.unconsumed_tail or len(raw) > cap or not d.eof:
+        raise ValueError("decompressed output exceeds the 1 MiB depth-frame cap")
+    return raw
 
 
 def _decode_jpeg(data: bytes) -> Optional[np.ndarray]:
@@ -1537,11 +1548,18 @@ class PointCloudPerceptionPlugin:
                 return {"state": "error", "message": error}
             if instance_id:
                 with self._nodes_lock:
-                    self._instance_configs[instance_id] = cfg
+                    # review 第 18 轮 Issue 1：实例配置是补丁不是替换
+                    # （OCR 的语义）——存了双目标定后只改 fps，旧实现存成
+                    # {"fps": ...} 把标定丢掉，下次 stereo start 静默落回
+                    # capture-only、一帧云不出。
+                    previous = self._instance_configs.get(instance_id, {})
+                    merged = {**previous, **cfg}
+                    self._instance_configs[instance_id] = merged
                     running = instance_id in self._nodes
                 if running:
                     self._retire_node(instance_id)
-                return {"status": "configured", "instance_id": instance_id, "config": cfg}
+                return {"status": "configured", "instance_id": instance_id,
+                        "config": merged}
             if "fps" in cfg:
                 self._fps = int(cfg["fps"])
             if "max_points" in cfg:
