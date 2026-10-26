@@ -407,10 +407,9 @@ depth ──(image/depth-zlib)─────┘
 camera_info (motus.camera/1) ──┘
 ```
 
-它不控制机器人，也不判断能不能过去。输出里的 `visible_width_m` /
-`visible_height_m` 是当前视角下的外廓：单视角看不到背面，物体旋转也会改变投影
-宽度。真正的三维 L×W×H 需要分割 + 点云/多视角，这张卡不会把 `extent_3d_m`
-填成一个假数（第一版恒为 `null`）。
+它不控制机器人，也不判断能不能过去。输出里的 `visible_w_cm` /
+`visible_h_cm` 是当前视角下的外廓：单视角看不到背面，物体旋转也会改变投影
+尺寸。真正的三维 L×W×H 需要分割 + 点云/多视角，这张卡不假装能做到。
 
 启动门槛只有两个：VOP 检测结果和深度图必须连上。相机几何从
 `motus.camera/1` 的 `K` 或 `half_fov_rad` / `half_fov_v_rad` 读；没有声明时
@@ -422,41 +421,106 @@ camera_info (motus.camera/1) ──┘
 - VOP：`/objects`
 - 深度：`/visual_depth`、`/camera/head/depth`、`/camera/depth`、`/depth`
 
-`info` 返回最近一次测量；`config` 可改 `rate_hz`、`max_objects`、
-`min_confidence`、`depth_percentile`、`max_depth_m`、平滑窗口等。检测框会抖，
-所以输出是最近 `stable_frames` 帧的中位数，`samples` / `stable` / `age_ms`
-告诉调用方这个数有多稳。
+### 输出（瘦身后的 5 Hz 消息）
 
-`inspect` / `tools/list` 里的端口格式是 `data/json`，输出来自
-`actucore/plugins/measure/geometry.py`，不依赖 ROS，单测在
-`actucore/tests/test_measure_geometry.py`。
+```json
+{
+  "schema": "motus.measure/1",
+  "ts_ms": 1760000000000,
+  "fresh": true,
+  "count": 1,
+  "objects": [
+    {
+      "name": "cup",
+      "box": [0.208, 0.345, 0.259, 0.410],
+      "conf": 0.75,
+      "visible_w_cm": 8.3,
+      "visible_h_cm": 7.8,
+      "distance_cm": 150.8,
+      "stable": true,
+      "n": 5,
+      "label": "cup 8.3x7.8cm @1.51m"
+    }
+  ]
+}
+```
+
+- `box` 是 0..1 归一化 bbox，可直接给画布/前端画框；
+- 尺寸单位改为 **cm**，避免拿米制小数自己换算；
+- `label` 是可直接显示的短句；
+- `clipped` 只在 bbox 被画面边缘裁掉时出现；
+- `degraded` **只在非空时出现**。空的 `degraded` 没有意义，所以健康时直接省略；
+  出现时说明相机几何缺失、输入分辨率回退等具体原因；
+- 5 Hz 消息**不再带 `session` 和 `camera`**。它们只在 `info` / `history` 里出现，
+  避免每条 200 ms 消息重复几十 KB。
+
+检测框会抖，所以单帧数字是最近 `stable_frames` 帧的中位数；`stable` / `n`
+告诉调用方这个数有多稳。
 
 ### 会话摘要与历史
 
-画布只显示最新一条消息。为了“走开再回来还能看到刚才测到多高”，每次
-`measure` 输出都带一个 `session` 摘要：
+画布只显示最新一条消息。为了“走开再回来还能看到刚才测到多高”，`info` 返回
+**紧凑的 session 摘要**：
 
-```text
-session.objects[]:
-  key / name / color
-  samples / first_seen_ms / last_seen_ms
-  visible_height_m: {min, max, median, latest, samples}
-  visible_width_m:  {min, max, median, latest, samples}
-  distance_m:       {min, max, median, latest, samples}
-  clipped
+```json
+{
+  "state": "running",
+  "topic_out": [{"topic": "/actucore/measure/state", "format": "data/json"}],
+  "rate_hz": 5,
+  "camera": {"width": 640, "height": 480, "fx": 603.9, "fy": 603.6,
+             "source": "derived-from-K"},
+  "session": {
+    "started_ms": 1760000000000,
+    "duration_s": 87.4,
+    "objects": [
+      {
+        "key": "cup#bright gray neutral",
+        "name": "cup",
+        "n": 28,
+        "first_ms": 1760000001000,
+        "last_ms": 1760000087000,
+        "visible_w_cm": {"min": 8.1, "max": 8.4, "median": 8.3, "latest": 8.3},
+        "visible_h_cm": {"min": 7.6, "max": 7.9, "median": 7.8, "latest": 7.8},
+        "distance_cm": {"min": 150.1, "max": 151.2, "median": 150.8, "latest": 150.8}
+      }
+    ],
+    "objects_truncated": 0
+  },
+  "history_count": 12
+}
 ```
 
 默认只统计 `stable=true` 的测量，避免把检测抖动的中间帧算进去。摘要按对象
 键保留，重启/`reset_session` 清空。
 
-另外有一个**有界、节流**的 `history` 动作，返回最近 `history_size` 条记录。
-默认同一目标最多每秒一条，宽/高变化超过 `record_min_delta_m` 时额外记一条，
-所以不会把 5 Hz 的每一帧都存下来。需要完整数据时再调 `history`，不需要时
-它就是内存里的一小段环形缓冲；不会写文件，也不要求回退 `docker logs`。
+`history` 返回**有界、节流**的最近记录：
 
-- `info` 返回最新测量 + 当前会话摘要；
-- `history` 返回会话摘要 + 最近记录；
-- `reset_session` 只清摘要/历史，不停止测量。
+```json
+{
+  "state": "running",
+  "session": {"...": "同上"},
+  "records": [
+    {"ts_ms": 1760000087000, "key": "cup#...", "name": "cup",
+     "w_cm": 8.3, "h_cm": 7.8, "d_cm": 150.8}
+  ]
+}
+```
+
+默认同一目标最多每秒一条，宽/高变化超过 `record_min_delta_m` 时额外记一条，
+所以不会把 5 Hz 的每一帧都存下来。不会写文件，也不要求回退 `docker logs`。
+
+- `info`：当前状态 + 紧凑 session 摘要；
+- `history`：session 摘要 + 最近记录；
+- `reset_session`：只清摘要/历史，不停止测量；
+- `config`：改 `rate_hz`、`max_objects`、`min_confidence`、`depth_percentile`、
+  `max_depth_m`、平滑窗口等。
+
+### 画布上的框和尺寸
+
+当前输出版本仍然只有 `data/json`：画布会显示上面的 JSON/KV，不会自动把
+`box` 画到 Camera 的 JPEG 上。要做“Camera 上直接标注外接框和 W×H×D”，需要
+再增加一个 `image/jpeg` 的 `view` 输出（参考 `navi/view.py`），订阅相机帧并
+用 OpenCV 画框；这属于下一步，不是当前瘦身版本的范围。
 
 ## 构建与运行
 

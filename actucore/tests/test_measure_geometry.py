@@ -243,10 +243,10 @@ def test_session_summary_reports_min_max_median_latest():
     session.record([_session_record(1.70)], 1200)
     summary = session.summary(1300)
     item = summary["objects"][0]
-    assert item["samples"] == 3
-    assert item["visible_height_m"] == {
-        "min": 1.6, "max": 1.8, "median": 1.7, "latest": 1.7, "samples": 3}
-    assert summary["duration_ms"] == 300
+    assert item["n"] == 3
+    assert item["visible_h_cm"] == {
+        "min": 160.0, "max": 180.0, "median": 170.0, "latest": 170.0}
+    assert summary["duration_s"] == 0.3
 
 
 def test_session_ignores_unstable_measurements_by_default():
@@ -260,7 +260,7 @@ def test_session_can_record_unstable_when_configured():
     session = G.Session(only_stable=False)
     session.reset(0)
     session.record([_session_record(1.7, stable=False)], 1)
-    assert session.summary(2)["objects"][0]["samples"] == 1
+    assert session.summary(2)["objects"][0]["n"] == 1
 
 
 def test_history_is_rate_limited_but_a_real_change_is_kept():
@@ -272,8 +272,8 @@ def test_history_is_rate_limited_but_a_real_change_is_kept():
     session.record([_session_record(1.76)], 2500)
     rows = session.history()
     assert len(rows) == 2
-    assert rows[0]["visible_height_m"] == 1.7
-    assert rows[1]["visible_height_m"] == 1.76
+    assert rows[0]["h_cm"] == 170.0
+    assert rows[1]["h_cm"] == 176.0
 
 
 def test_session_reset_clears_summary_and_history():
@@ -300,8 +300,8 @@ def test_session_does_not_count_a_retained_track_as_a_new_observation():
     session.record([observed], 1000)
     session.record([retained], 1400)
     item = session.summary(1400)["objects"][0]
-    assert item["samples"] == 1
-    assert item["last_seen_ms"] == 1000
+    assert item["n"] == 1
+    assert item["last_ms"] == 1000
 
 
 def test_session_retains_at_most_max_objects():

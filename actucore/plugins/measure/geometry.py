@@ -583,14 +583,21 @@ class Session:
         items = [_summary_item(item) for item in objects[:self.max_objects]]
         return {
             "started_ms": self._started_ms or None,
-            "duration_ms": (max(0, int(now_ms) - self._started_ms)
-                            if self._started_ms else 0),
+            "duration_s": (round(max(0, int(now_ms) - self._started_ms) / 1000.0, 1)
+                           if self._started_ms else 0),
             "objects": items,
             "objects_truncated": truncated,
         }
 
     def history(self) -> list[dict]:
-        return list(self._history)
+        return [{
+            "ts_ms": row["timestamp_ms"],
+            "key": row["key"],
+            "name": row["name"],
+            "w_cm": _cm(row.get("visible_width_m")),
+            "h_cm": _cm(row.get("visible_height_m")),
+            "d_cm": _cm(row.get("distance_m")),
+        } for row in self._history]
 
 
 def _append(target: deque, value, limit: int) -> None:
@@ -619,30 +626,34 @@ def _changed(current, previous, minimum: float) -> bool:
     return abs(current - previous) >= minimum
 
 
-def _stats(values: deque) -> dict:
+def _cm(value) -> float | None:
+    number = _number(value)
+    return round(number * 100.0, 1) if number is not None else None
+
+
+def _stats_cm(values: deque) -> dict:
     if not values:
-        return {"min": None, "max": None, "median": None,
-                "latest": None, "samples": 0}
-    data = list(values)
+        return {"min": None, "max": None, "median": None, "latest": None}
+    data = [value * 100.0 for value in values]
     return {
-        "min": round(min(data), 3),
-        "max": round(max(data), 3),
-        "median": round(float(np.median(data)), 3),
-        "latest": round(data[-1], 3),
-        "samples": len(data),
+        "min": round(min(data), 1),
+        "max": round(max(data), 1),
+        "median": round(float(np.median(data)), 1),
+        "latest": round(data[-1], 1),
     }
 
 
 def _summary_item(item: _SessionObject) -> dict:
-    return {
+    out = {
         "key": item.key,
         "name": item.name,
-        "color": item.color,
-        "samples": item.samples,
-        "first_seen_ms": item.first_seen_ms,
-        "last_seen_ms": item.last_seen_ms,
-        "visible_height_m": _stats(item.heights),
-        "visible_width_m": _stats(item.widths),
-        "distance_m": _stats(item.distances),
-        "clipped": bool(item.clipped),
+        "n": item.samples,
+        "first_ms": item.first_seen_ms,
+        "last_ms": item.last_seen_ms,
+        "visible_w_cm": _stats_cm(item.widths),
+        "visible_h_cm": _stats_cm(item.heights),
+        "distance_cm": _stats_cm(item.distances),
     }
+    if item.clipped:
+        out["clipped"] = True
+    return out

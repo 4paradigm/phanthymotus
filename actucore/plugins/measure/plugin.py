@@ -148,6 +148,36 @@ class Config:
         }
 
 
+def _cm(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number * 100.0, 1)
+
+
+def _round(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, 2)
+
+
+def _compact_camera(camera) -> dict:
+    return {
+        "width": camera.width,
+        "height": camera.height,
+        "fx": round(camera.fx, 1) if camera.fx else None,
+        "fy": round(camera.fy, 1) if camera.fy else None,
+        "source": camera.source,
+    }
+
+
 class MeasurePlugin:
     PREFIX = PREFIX
 
@@ -570,14 +600,10 @@ class MeasurePlugin:
                 missing.append("depth")
             return {
                 "schema": SCHEMA,
-                "timestamp_ms": now_ms,
-                "available": False,
+                "ts_ms": now_ms,
                 "fresh": False,
-                "reason": "stale or missing observation: " + ", ".join(missing),
+                "reason": "stale: " + "+".join(missing),
                 "objects": [],
-                "session": self._session.summary(now_ms),
-                "camera": self._camera.as_dict(),
-                "degraded": self._degradations(),
             }
 
         measurements = geometry.measure_objects(
@@ -592,16 +618,53 @@ class MeasurePlugin:
         )
         smoothed = self._stabilizer.update(measurements, time.monotonic())
         self._session.record(smoothed, now_ms)
-        return {
+        objects_out = self._compact_objects(smoothed)
+        payload = {
             "schema": SCHEMA,
-            "timestamp_ms": now_ms,
-            "available": True,
+            "ts_ms": now_ms,
             "fresh": True,
-            "objects": smoothed,
-            "session": self._session.summary(now_ms),
-            "camera": self._camera.as_dict(),
-            "degraded": self._degradations(),
+            "count": len(objects_out),
+            "objects": objects_out,
         }
+        degraded = self._degradations()
+        if degraded:
+            payload["degraded"] = degraded
+        return payload
+
+    @staticmethod
+    def _compact_objects(records: list[dict]) -> list[dict]:
+        out = []
+        for record in records:
+            bbox = record.get("bbox_norm")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            width = _cm(record.get("visible_width_m"))
+            height = _cm(record.get("visible_height_m"))
+            distance = _cm(record.get("distance_m"))
+            if width is None and height is None and distance is None:
+                continue
+            name = str(record.get("name") or "")
+            item = {
+                "name": name,
+                "box": [round(float(value), 3) for value in bbox],
+                "conf": _round(record.get("confidence")),
+            }
+            if width is not None:
+                item["visible_w_cm"] = width
+            if height is not None:
+                item["visible_h_cm"] = height
+            if distance is not None:
+                item["distance_cm"] = distance
+            item["stable"] = bool(record.get("stable"))
+            item["n"] = int(record.get("samples") or 0)
+            if record.get("clipped"):
+                item["clipped"] = True
+            label_w = f"{width:.1f}" if width is not None else "?"
+            label_h = f"{height:.1f}" if height is not None else "?"
+            label_d = f"{distance / 100.0:.2f}" if distance is not None else "?"
+            item["label"] = f"{name} {label_w}x{label_h}cm @{label_d}m"
+            out.append(item)
+        return out
 
     def _new_stabilizer(self) -> geometry.Stabilizer:
         return geometry.Stabilizer(
@@ -639,22 +702,20 @@ class MeasurePlugin:
 
     def _info(self) -> dict:
         with self._lock:
-            return {
+            out = {
                 "state": "running" if self._running else "idle",
-                "topic": self._topic,
                 "topic_out": [{"topic": self._topic, "format": TOPIC_FORMAT}],
-                "inputs": dict(self._binding),
                 "rate_hz": self._config.rate_hz,
-                "published": self._published,
-                "objects_frame": list(self._objects_frame),
-                "depth_frame": list(self._depth_frame),
-                "camera": self._camera.as_dict(),
-                "degraded": self._degradations(),
+                "camera": _compact_camera(self._camera),
                 "session": self._session.summary(int(time.time() * 1000)),
                 "history_count": len(self._session.history()),
-                "last": self._last,
-                "error": self._last_error,
             }
+            degraded = self._degradations()
+            if degraded:
+                out["degraded"] = degraded
+            if self._last_error:
+                out["error"] = self._last_error
+            return out
 
     def _config_action(self, args: dict) -> dict:
         allowed = {

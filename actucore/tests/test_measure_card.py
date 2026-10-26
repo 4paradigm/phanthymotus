@@ -198,20 +198,23 @@ def _payload_card():
 def test_payload_contains_distance_visible_extents_and_no_fake_depth():
     payload = _payload_card()._payload()
     assert payload["schema"] == measure_plugin.SCHEMA
-    assert payload["available"] is True
+    assert payload["fresh"] is True
     assert payload["fresh"] is True
     item = payload["objects"][0]
-    assert item["distance_m"] == 2.0
-    assert item["visible_width_m"] == 0.512
-    assert item["visible_height_m"] == 0.384
-    assert item["extent_3d_m"] is None
+    assert item["distance_cm"] == 200.0
+    assert item["visible_w_cm"] == 51.2
+    assert item["visible_h_cm"] == 38.4
+    assert item["label"] == "box 51.2x38.4cm @2.00m"
+    assert "session" not in payload
+    assert "camera" not in payload
+    assert "degraded" not in payload
 
 
 def test_stale_inputs_are_published_as_unavailable_not_as_old_numbers():
     card = _payload_card()
     card._objects_ms = 0
     payload = card._payload()
-    assert payload["available"] is False
+    assert payload["fresh"] is False
     assert payload["fresh"] is False
     assert payload["objects"] == []
 
@@ -245,14 +248,16 @@ def test_payload_is_json_serialisable():
 
 # ── session summary / history ────────────────────────────────────────────────
 
-def test_payload_carries_a_session_summary_after_an_object_is_measured():
+def test_info_carries_a_compact_session_summary_after_an_object_is_measured():
     card = _payload_card()
-    payload = card._payload()
+    card._payload()
+    payload = card.dispatch("measure", {"action": "info"})
     assert payload["session"]["objects"]
     item = payload["session"]["objects"][0]
     assert item["key"].startswith("box")
-    assert item["samples"] == 1
-    assert item["visible_height_m"]["latest"] == 0.384
+    assert item["n"] == 1
+    assert item["visible_h_cm"]["latest"] == 38.4
+    assert "last" not in payload
 
 
 def test_history_action_returns_the_bounded_records():
@@ -261,7 +266,7 @@ def test_history_action_returns_the_bounded_records():
     out = card.dispatch("measure", {"action": "history"})
     assert out["state"] == "running"
     assert len(out["records"]) == 1
-    assert out["records"][0]["visible_height_m"] == 0.384
+    assert out["records"][0]["h_cm"] == 38.4
     assert out["session"]["objects"]
 
 
@@ -289,5 +294,5 @@ def test_a_vanished_object_is_not_counted_again_by_the_session_summary():
     # not treat that retained record as a new observation.
     card._objects = {"objects": []}
     payload = card._payload()
-    item = payload["session"]["objects"][0]
-    assert item["samples"] == 1
+    item = card.dispatch("measure", {"action": "info"})["session"]["objects"][0]
+    assert item["n"] == 1
