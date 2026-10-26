@@ -181,7 +181,12 @@ class SessionTests(unittest.TestCase):
 class PluginTests(unittest.TestCase):
     def setUp(self):
         self.executor = _FakeExecutor()
-        self.plugin = PhanthyMusicPlugin({}, self.executor)
+        # CI（PR bot 的容器）和本地 sandbox 都没有外网曲库。不写
+        # catalogue_type 时插件默认连 api.phanthy.com——网络一抖，
+        # play_by_id 收到 'unavailable' 而不是 'not_playable'，
+        # test_playing_a_specific_track… 随机挂。这里的测试要的全是
+        # "调用走到哪一步"的桩行为，mock 曲库才是它们注释里写的那个。
+        self.plugin = PhanthyMusicPlugin({'catalogue_type': 'mock'}, self.executor)
 
     def tearDown(self):
         self.plugin.stop()
