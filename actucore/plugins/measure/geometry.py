@@ -142,7 +142,7 @@ def _outside(values, width: int | None = None, height: int | None = None) -> boo
     x1, y1, x2, y2 = values
     x2edge = width if width is not None else 1.0
     y2edge = height if height is not None else 1.0
-    return x1 < 0.0 or y1 < 0.0 or x2 > x2edge or y2 > y2edge
+    return x1 <= 0.0 or y1 <= 0.0 or x2 >= x2edge or y2 >= y2edge
 
 
 def _clamp_box(values, *, clipped: bool) -> Box:
@@ -386,7 +386,7 @@ class Stabilizer:
             track.center = center
             track.last_seen = now_s
             track.samples.append(record)
-            seen.add(key)
+            seen.add(id(track))
             while len(track.samples) > self.window:
                 track.samples.popleft()
 
@@ -417,7 +417,7 @@ class Stabilizer:
                 # A retained track is not a new observation. age_ms alone cannot
                 # express that at a 5 Hz tick: two calls can share a monotonic
                 # timestamp closely enough to round to 0 ms.
-                "observed": track.key in seen,
+                "observed": id(track) in seen,
                 "age_ms": int(max(0.0, now_s - track.last_seen) * 1000),
                 "quality": dict(latest.get("quality") or {}),
             }
@@ -648,7 +648,6 @@ def _summary_item(item: _SessionObject) -> dict:
         "key": item.key,
         "name": item.name,
         "n": item.samples,
-        "first_ms": item.first_seen_ms,
         "last_ms": item.last_seen_ms,
         "visible_w_cm": _stats_cm(item.widths),
         "visible_h_cm": _stats_cm(item.heights),

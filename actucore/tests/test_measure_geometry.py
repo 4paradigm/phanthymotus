@@ -314,3 +314,15 @@ def test_session_retains_at_most_max_objects():
     assert len(summary["objects"]) == 2
     assert session._objects.keys() == {"b#", "c#"}
     assert session._last_history.keys() == {"b#", "c#"}
+
+
+def test_a_bbox_touching_the_top_edge_is_clipped():
+    box = G.normalise_bbox({"bbox_norm": [0.1, 0.0, 0.3, 0.4]}, 640, 480)
+    assert box.clipped is True
+
+
+def test_stabilizer_only_marks_the_track_it_updated_this_tick():
+    stabilizer = G.Stabilizer(window=3, min_samples=1, timeout_s=2.0)
+    stabilizer.update([_record(0.5, center=0.2), _record(0.6, center=0.8)], 0.0)
+    out = stabilizer.update([_record(0.5, center=0.2)], 0.1)
+    assert [item["observed"] for item in out] == [True, False]

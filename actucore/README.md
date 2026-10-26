@@ -477,7 +477,6 @@ camera_info (motus.camera/1) ──┘
         "key": "cup#bright gray neutral",
         "name": "cup",
         "n": 28,
-        "first_ms": 1760000001000,
         "last_ms": 1760000087000,
         "visible_w_cm": {"min": 8.1, "max": 8.4, "median": 8.3, "latest": 8.3},
         "visible_h_cm": {"min": 7.6, "max": 7.9, "median": 7.8, "latest": 7.8},
@@ -490,8 +489,10 @@ camera_info (motus.camera/1) ──┘
 }
 ```
 
-默认只统计 `stable=true` 的测量，避免把检测抖动的中间帧算进去。摘要按对象
-键保留，重启/`reset_session` 清空。
+默认只统计 `stable=true` 的测量，避免把检测抖动的中间帧算进去。摘要默认只
+返回最近活跃的 5 个对象（`summary_max_objects`），其余数量由
+`objects_truncated` 说明；完整的有界时间线用 `history`。重启/`reset_session`
+清空摘要。
 
 `history` 返回**有界、节流**的最近记录：
 

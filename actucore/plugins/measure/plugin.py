@@ -71,7 +71,7 @@ class Config:
     record_interval_ms: int = 1000
     record_min_delta_m: float = 0.01
     only_stable: bool = True
-    summary_max_objects: int = 20
+    summary_max_objects: int = 5
     half_fov_rad: float | None = None
     half_fov_v_rad: float | None = None
 
@@ -284,7 +284,7 @@ class MeasurePlugin:
                     "only_stable": {"type": "boolean", "default": True,
                                     "description": "只把 stable 的测量计入会话摘要和历史",
                                     "scope": "instance"},
-                    "summary_max_objects": {"type": "integer", "default": 20,
+                    "summary_max_objects": {"type": "integer", "default": 5,
                                             "description": "会话摘要最多保留几个对象",
                                             "scope": "instance"},
                 },
