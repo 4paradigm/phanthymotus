@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 
 SCHEMA = "motus.measure/1"
 PREFIX = "measure"
-DEFAULT_TOPIC = "/actucore/measure/state"
+DEFAULT_TOPIC = "/perception/measure/state"
 TOPIC_FORMAT = "data/json"
 
 # VOP's output suffixes. A hardware depth topic may be `/camera/depth` or a

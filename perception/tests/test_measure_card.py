@@ -56,7 +56,7 @@ def test_the_card_declares_one_processor_with_both_inputs():
     assert tool["type"] == "processor"
     assert tool["multiInstance"] is False
     assert [port["topic"] for port in tool["topic_out"]] == [
-        measure_plugin.DEFAULT_TOPIC, "/actucore/measure/view"]
+        measure_plugin.DEFAULT_TOPIC, "/perception/measure/view"]
     assert [port["format"] for port in tool["topic_out"]] == [
         "data/json", "image/jpeg"]
     formats = {port["format"] for port in tool["topic_in"]}
@@ -73,7 +73,7 @@ def test_start_and_stop_are_lifecycle_not_model_functions():
 def test_info_returns_topic_out_for_the_dashboard():
     out = _card().dispatch("measure", {"action": "info"})
     assert [port["topic"] for port in out["topic_out"]] == [
-        measure_plugin.DEFAULT_TOPIC, "/actucore/measure/view"]
+        measure_plugin.DEFAULT_TOPIC, "/perception/measure/view"]
 
 
 def test_config_is_bounded_and_reports_the_effective_values():
@@ -338,7 +338,7 @@ def test_camera_topics_are_derived_from_the_depth_sibling():
 
 def test_the_card_declares_the_overlay_port():
     tool = _card().get_tools()[0]
-    assert any(port["topic"] == "/actucore/measure/view"
+    assert any(port["topic"] == "/perception/measure/view"
                and port["format"] == "image/jpeg" for port in tool["topic_out"])
 
 

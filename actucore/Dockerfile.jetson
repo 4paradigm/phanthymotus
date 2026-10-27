@@ -59,7 +59,7 @@ RUN cd /ros_ws && \
 
 # ── Python deps ────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests Pillow
+    pyyaml requests
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work

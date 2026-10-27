@@ -142,11 +142,6 @@ class ActuCoreBundle:
             self._plugins.append(NaviPlugin(plugins_cfg["navi"], executor))
             log.info("NaviPlugin loaded")
 
-        if plugins_cfg.get("measure", {}).get("enabled", False):
-            from plugins.measure import MeasurePlugin
-            self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
-            log.info("MeasurePlugin loaded")
-
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 
