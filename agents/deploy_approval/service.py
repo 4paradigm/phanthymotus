@@ -3720,7 +3720,6 @@ class DeployController:
                              and callable(getattr(store, "dispatch", None)))
             browser_upload_ready = (
                 backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
-                and pr.get("state") == "open" and not pr.get("merged")
                 and not pr.get("draft")
             )
         except Exception:

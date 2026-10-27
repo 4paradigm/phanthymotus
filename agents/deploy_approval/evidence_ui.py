@@ -611,7 +611,9 @@ _JAVASCRIPT = r'''"use strict";
       ? context.round_number : null;
     $("round-title").textContent = (roundNumber ? "第 " + roundNumber + " 轮 · " : "当前轮 · ") + "附件";
     $("summary").textContent = state === "testing" ?
-      "当前轮附件与说明；视频默认显示播放器。" : "本轮附件只读查看。";
+      (writable() ? "当前轮附件与说明；视频默认显示播放器。" :
+        "当前为查看模式。如需上传，请从 PR Summary 的「打开附件页」进入。") :
+      "本轮附件只读查看。";
     const replacement = $("replace").value;
     const replacementGroup = document.createElement("optgroup");
     replacementGroup.id = "replace-targets";

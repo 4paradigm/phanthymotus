@@ -232,6 +232,8 @@ async def _trusted_summary_page_capability(request, repo, pr):
         return None
     pr_head = current_pr.get('head')
     pr_head_sha = pr_head.get('sha') if isinstance(pr_head, dict) else None
+    if pr_head_sha != head:
+        raise HTTPException(409, detail='evidence_pr_context_changed')
     configured_base = urlsplit(config.evidence_public_base_url)
     expected_authorities = {
         configured_base.netloc.casefold(),
@@ -279,6 +281,9 @@ async def _trusted_summary_page_capability(request, repo, pr):
                     or pr_head_sha != head
                     or claims.get('status') != 'testing'):
                 continue
+            # A bare URL may recover only read access. The upload invitation
+            # stays exclusive to the explicitly signed Summary link.
+            continue
         return token
     # If the trusted Summary has no usable invitation, a page-only token may
     # still provide read access. Its purpose is explicit and cannot authorize
@@ -524,17 +529,48 @@ async def page(request: Request, owner: str, repo: str, pr: int):
     try:
         evidence_auth.require_enabled(request)
         canonical = _repo(owner, repo, pr)
+        explicit_capability = 'cap' in request.query_params
+        has_cookie = bool(request.cookies.get(evidence_auth.CAPABILITY_COOKIE)
+                          or request.cookies.get(evidence_auth.UPLOAD_COOKIE))
         summary_capability = None
-        if ('cap' not in request.query_params
-                and not request.cookies.get(evidence_auth.CAPABILITY_COOKIE)
-                and not request.cookies.get(evidence_auth.UPLOAD_COOKIE)):
+        summary_checked = False
+        if not explicit_capability and not has_cookie:
             summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
-        redirect = evidence_auth.bind_page_capability(
-            request, canonical, pr, trusted_summary_capability=summary_capability,
-        )
+            summary_checked = True
+        try:
+            redirect = evidence_auth.bind_page_capability(
+                request, canonical, pr, trusted_summary_capability=summary_capability,
+            )
+        except HTTPException as exc:
+            if explicit_capability or summary_checked or exc.status_code != 403:
+                raise
+            summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
+            summary_checked = True
+            if not summary_capability:
+                raise
+            redirect = evidence_auth.bind_page_capability(
+                request, canonical, pr, trusted_summary_capability=summary_capability,
+            )
         if redirect is not None:
             return redirect
-        result = await _dispatch(request, owner, repo, pr, 'context')
+        try:
+            result = await _dispatch(request, owner, repo, pr, 'context')
+        except HTTPException as exc:
+            # A correctly signed cookie may belong to another PR or an old
+            # HEAD/round. Recover read-only access from the current Summary;
+            # transient GitHub failures remain retryable and do not trigger a
+            # second lookup.
+            if explicit_capability or not has_cookie or exc.status_code not in {401, 403, 409}:
+                raise
+            summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
+            if not summary_capability:
+                raise
+            redirect = evidence_auth.bind_page_capability(
+                request, canonical, pr, trusted_summary_capability=summary_capability,
+            )
+            if redirect is not None:
+                return redirect
+            raise
     except HTTPException as exc:
         # Keep the authorization status and never echo exception detail,
         # capability input, cookies, or backend diagnostics into HTML.

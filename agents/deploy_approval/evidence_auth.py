@@ -265,12 +265,12 @@ def bind_page_capability(request, repo, pr_number, *, trusted_summary_capability
     """Exchange a Summary read or upload capability for an HttpOnly cookie."""
     require_enabled(request)
     token = request.query_params.get('cap')
-    if ('cap' not in request.query_params
-            and not request.cookies.get(CAPABILITY_COOKIE)
-            and not request.cookies.get(UPLOAD_COOKIE)):
-        # The page handler may supply a token recovered from the trusted
-        # lifecycle Summary. Never use this fallback for a user-supplied cap
-        # or to replace an existing cookie.
+    if 'cap' in request.query_params and not token:
+        raise HTTPException(403, detail='invalid_evidence_capability')
+    if 'cap' not in request.query_params and trusted_summary_capability:
+        # The page handler supplies only a read capability recovered from the
+        # trusted lifecycle Summary. It may replace a stale or cross-PR cookie,
+        # but never overrides an explicitly supplied query capability.
         token = trusted_summary_capability
     if token:
         try:
