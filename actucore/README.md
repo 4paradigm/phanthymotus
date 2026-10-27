@@ -510,6 +510,7 @@ camera_info (motus.camera/1) ──┘
 默认同一目标最多每秒一条，宽/高变化超过 `record_min_delta_m` 时额外记一条，
 所以不会把 5 Hz 的每一帧都存下来。不会写文件，也不要求回退 `docker logs`。
 
+- `read`：当前帧的紧凑 objects（可传 `target` 过滤），回答“现在这个多大”用它，不要读 session；
 - `info`：当前状态 + 紧凑 session 摘要；
 - `history`：session 摘要 + 最近记录；
 - `reset_session`：只清摘要/历史，不停止测量；

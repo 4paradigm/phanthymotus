@@ -340,3 +340,15 @@ def test_the_card_declares_the_overlay_port():
     tool = _card().get_tools()[0]
     assert any(port["topic"] == "/actucore/measure/view"
                and port["format"] == "image/jpeg" for port in tool["topic_out"])
+
+
+def test_read_returns_only_the_current_frame_and_filters_target():
+    card = _payload_card()
+    card._payload()
+    out = card.dispatch("measure", {"action": "read"})
+    assert out["state"] == "running"
+    assert out["fresh"] is True
+    assert [item["name"] for item in out["objects"]] == ["box"]
+    filtered = card.dispatch("measure", {"action": "read", "target": "cup"})
+    assert filtered["objects"] == []
+    assert card.dispatch("measure", {"action": "read", "target": "box"})["objects"]

@@ -245,7 +245,11 @@ class MeasurePlugin:
                     "action": {
                         "type": "string",
                         "enum": ["start", "stop", "info", "config",
-                                 "history", "reset_session"],
+                                 "read", "history", "reset_session"],
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "read 的可选名字过滤，例如 laptop / person",
                     },
                 },
                 "required": ["action"],
@@ -255,6 +259,8 @@ class MeasurePlugin:
                     "info": {"params": [], "description": "返回最近一次测量、本次会话摘要和降级信息"},
                     "history": {"params": [], "description": "返回本次会话最近的记录（有界、按变化/时间节流）"},
                     "reset_session": {"params": [], "description": "清空本次会话的汇总和历史，不停止测量"},
+                    "read": {"params": ["target"],
+                             "description": "读取当前帧的测量，可按名字过滤；不读历史"},
                     "config": {"params": [], "description": "更新测量阈值"},
                 },
             },
@@ -323,6 +329,8 @@ class MeasurePlugin:
             return self._stop()
         if action == "info":
             return self._info()
+        if action == "read":
+            return self._read(args)
         if action == "history":
             return self._history()
         if action == "reset_session":
@@ -767,13 +775,16 @@ class MeasurePlugin:
                 missing.append("VOP")
             if depth is None:
                 missing.append("depth")
-            return {
+            payload = {
                 "schema": SCHEMA,
                 "ts_ms": now_ms,
                 "fresh": False,
                 "reason": "stale: " + "+".join(missing),
                 "objects": [],
             }
+            with self._lock:
+                self._last = payload
+            return payload
 
         measurements = geometry.measure_objects(
             objects.get("objects"),
@@ -798,6 +809,8 @@ class MeasurePlugin:
         degraded = self._degradations()
         if degraded:
             payload["degraded"] = degraded
+        with self._lock:
+            self._last = payload
         return payload
 
     @staticmethod
@@ -856,6 +869,24 @@ class MeasurePlugin:
             only_stable=self._config.only_stable,
             max_objects=self._config.summary_max_objects,
         )
+
+    def _read(self, args: dict) -> dict:
+        """The current frame's compact objects, never the session history."""
+        target = str(args.get("target") or "").strip().lower()
+        with self._lock:
+            payload = self._last
+            running = self._running
+        objects = list((payload or {}).get("objects") or [])
+        if target:
+            objects = [obj for obj in objects
+                       if target in str(obj.get("name") or "").lower()
+                       or target in str(obj.get("label") or "").lower()]
+        return {
+            "state": "running" if running else "idle",
+            "fresh": bool((payload or {}).get("fresh")),
+            "ts_ms": (payload or {}).get("ts_ms"),
+            "objects": objects,
+        }
 
     def _history(self) -> dict:
         now_ms = int(time.time() * 1000)
