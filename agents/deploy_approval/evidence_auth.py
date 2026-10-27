@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
 
-from .config import is_stable_public_base_url
+from .config import is_evidence_ingress_url, is_stable_public_base_url
 
 CAPABILITY_COOKIE = 'evidence-capability'
 SESSION_COOKIE = CAPABILITY_COOKIE
@@ -62,7 +62,7 @@ def cos_ready(config):
 
 def public_https_ingress_ready(config):
     base = getattr(config, 'evidence_public_base_url', '')
-    return is_stable_public_base_url(base)
+    return is_evidence_ingress_url(base)
 
 
 def _configured_https_authority(config):
@@ -116,6 +116,9 @@ def readiness(config, evidence_service=None, request=None):
         'COS_READY': storage,
         'EVIDENCE_BACKEND_READY': backend,
         'PUBLIC_HTTPS_INGRESS_READY': ingress,
+        'STABLE_PUBLIC_HTTPS_INGRESS_READY': is_stable_public_base_url(
+            getattr(config, 'evidence_public_base_url', ''),
+        ),
         'LOCAL_SSH_TUNNEL_READY': local_tunnel,
         # A loopback SSH tunnel is useful for local development, but it cannot
         # back Summary links that must remain usable after the tunnel ends.
@@ -248,8 +251,9 @@ def _verify_upload_capability(config, token, repo, pr_number):
 
 
 def _secure(request):
-    base = getattr(request.app.state.config, 'evidence_public_base_url', '')
-    return not _public_base_reason(base) and urlsplit(base).scheme == 'https'
+    config = request.app.state.config
+    base = getattr(config, 'evidence_public_base_url', '')
+    return public_https_ingress_ready(config) and urlsplit(base).scheme == 'https'
 
 
 def _cookie(response, request, name, token, max_age):

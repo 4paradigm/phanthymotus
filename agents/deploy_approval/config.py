@@ -79,6 +79,33 @@ def is_stable_public_base_url(value: str) -> bool:
     except (UnicodeError, TypeError, ValueError):
         return False
 
+
+def is_evidence_ingress_url(value: str) -> bool:
+    """Accept a stable public origin or a configured HTTPS quick-tunnel origin."""
+    if is_stable_public_base_url(value):
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        if (not value or any(ord(char) < 33 or ord(char) == 127 for char in value)
+                or '?' in value or '#' in value):
+            return False
+        parsed = urlsplit(value)
+        if (parsed.scheme.lower() != 'https' or parsed.username is not None
+                or parsed.password is not None or '@' in parsed.netloc
+                or parsed.query or parsed.fragment or parsed.path not in ('', '/')
+                or parsed.port not in (None, 443)):
+            return False
+        host = parsed.hostname.lower() if parsed.hostname else ''
+        suffix = '.trycloudflare.com'
+        if (not host.endswith(suffix)
+                or parsed.netloc.lower() not in {host, host + ':443'}):
+            return False
+        label = host[:-len(suffix)]
+        return bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label))
+    except (UnicodeError, TypeError, ValueError):
+        return False
+
 _OWNER_RE = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
 _REPOSITORY_RE = re.compile(rf"{_OWNER_RE}/[A-Za-z0-9_.-]{{1,100}}")
 _LOGIN_RE = re.compile(rf"{_OWNER_RE}(?:\[bot\])?")
@@ -125,7 +152,7 @@ class Config:
     github_webhook_secret: str = ""
     webhook_enabled: bool = False
     poll_enabled: bool = True
-    poll_interval_seconds: int = 30
+    poll_interval_seconds: int = 10
     github_repos: list[str] = field(
         default_factory=lambda: list(DEFAULT_GITHUB_REPOS)
     )
@@ -390,7 +417,7 @@ def load_config() -> Config:
         github_webhook_secret=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
         webhook_enabled=_env_bool("WEBHOOK_ENABLED", False),
         poll_enabled=_env_bool("POLL_ENABLED", True),
-        poll_interval_seconds=_env_int("POLL_INTERVAL_SECONDS", 30),
+        poll_interval_seconds=_env_int("POLL_INTERVAL_SECONDS", 10),
         github_repos=list(
             DEFAULT_GITHUB_REPOS if os.getenv("GITHUB_REPOS") is None
             else ([] if not os.environ["GITHUB_REPOS"].strip()

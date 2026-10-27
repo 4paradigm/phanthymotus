@@ -189,6 +189,10 @@ class GitHubClient:
         label_projection = len(path_parts) >= 5 and path_parts[1] == "repos" and (
             path_parts[4] == "labels" or (
                 len(path_parts) >= 7 and path_parts[4] == "issues" and path_parts[6] == "labels"))
+        recent_issue_comment_discovery = (
+            method.upper() == "GET"
+            and re.search(r"/repos/[^/]+/[^/]+/issues/comments$", urlparse(url).path) is not None
+        )
         # Git Data API 403s commonly indicate missing repository contents
         # permission. They still fail the operation, but do not invalidate an
         # otherwise usable installation token; 401 remains an auth failure.
@@ -275,7 +279,8 @@ class GitHubClient:
             })
             self._recent_api_errors = self._recent_api_errors[-20:]
             raise GitHubPermissionError("GitHub authentication rejected", status_code=401)
-        if (resp.status_code == 403 and not label_projection and not git_data_api):
+        if (resp.status_code == 403 and not label_projection and not git_data_api
+                and not recent_issue_comment_discovery):
             self.config.auth_valid = False
             self._recent_api_errors.append({
                 "status": 403, "repo": repo_name, "reason": "installation_permission_rejected",
@@ -601,6 +606,35 @@ class GitHubClient:
                 break
             page += 1
         return comments
+
+    async def list_recent_issue_comments(self, repo: str, *, limit: int = 100) -> list[dict]:
+        """Read a bounded repo-wide window of recently-created issue comments.
+
+        Results are discovery hints only. The watcher must re-read the PR and
+        each candidate comment through its existing authorization path before
+        dispatch. A 403/404 on this optional endpoint does not invalidate App
+        authorization for the rest of the client.
+        """
+        if (not isinstance(repo, str) or not re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+                or type(limit) is not int or not 1 <= limit <= 100):
+            raise GitHubError("recent issue comment request is invalid")
+        path = f"/repos/{repo}/issues/comments"
+        resp = await self._request(
+            "GET", path,
+            params={"sort": "created", "direction": "desc", "per_page": limit, "page": 1},
+            timeout=self.config.total_timeout,
+        )
+        if resp.status_code in (403, 404):
+            raise GitHubError(
+                "recent issue comment discovery is unavailable",
+                status_code=resp.status_code,
+            )
+        try:
+            require_2xx(resp.status_code, "github list recent issue comments")
+        except SecurityError as exc:
+            raise GitHubError(str(exc)) from exc
+        return await self._read_json_list(resp)
 
     async def list_open_prs(self, repo: str) -> list[dict]:
         """List all open PRs for a repo, newest-first, with page overlap dedupe."""

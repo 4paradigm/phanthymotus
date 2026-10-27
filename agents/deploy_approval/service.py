@@ -23,8 +23,9 @@ import asyncio
 import logging
 import time
 import copy
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from . import comments as comments_mod
 from .agent_core_client import (
@@ -34,7 +35,8 @@ from .agent_core_client import (
 )
 from .case_runner import CaseRunner
 from .config import (
-    Config, DEFAULT_GITHUB_REPOS, is_stable_public_base_url, validate_repository_names,
+    Config, DEFAULT_GITHUB_REPOS, is_evidence_ingress_url,
+    is_stable_public_base_url, validate_repository_names,
 )
 from .cos_client import CosClient
 from .evidence_builder import EvidenceBuilder
@@ -3669,10 +3671,10 @@ class DeployController:
         # strict schema and must never learn about browser feature config.
         render_state = copy.deepcopy(state)
         pr = {}
+        store = getattr(self.evidence_service, "store", None)
         try:
             from .evidence_auth import readiness
             pr = await self.proxy.get_pr(repo, pr_number)
-            store = getattr(self.evidence_service, "store", None)
             status = readiness(self.config, self.evidence_service)
             backend_ready = (status["EVIDENCE_BACKEND_READY"]
                              and callable(getattr(store, "dispatch", None))
@@ -3681,7 +3683,6 @@ class DeployController:
                              and pr.get("head", {}).get("sha") == state.get("head_sha"))
             browser_upload_ready = (
                 backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
-                and is_stable_public_base_url(self.config.evidence_public_base_url)
             )
         except Exception:
             status = {"status": "EVIDENCE_BACKEND_PENDING",
@@ -3705,7 +3706,17 @@ class DeployController:
             render_state["round_number"] = round_numbers[current_round]
         bundles = []
         seen_rounds = set()
-        from .evidence_auth import DOWNLOAD_PURPOSE, UPLOAD_PURPOSE, issue_capability
+        configured_public_base = getattr(self.config, "evidence_public_base_url", "")
+        public_base_url = (configured_public_base
+                           if is_stable_public_base_url(configured_public_base) else "")
+        upload_public_base_url = (
+            configured_public_base
+            if is_evidence_ingress_url(configured_public_base) else ""
+        )
+        from .evidence_auth import (
+            DOWNLOAD_PURPOSE, UPLOAD_MAX_LIFETIME_SECONDS, UPLOAD_PURPOSE,
+            issue_capability, verify_capability,
+        )
 
         # Reuse only long-lived COS URLs from the previous trusted lifecycle
         # projection. They are matched to their exact decoded object key and
@@ -3827,24 +3838,50 @@ class DeployController:
                 purpose=DOWNLOAD_PURPOSE, resource="page",
             )
             if browser_upload_ready and state.get("status") == "testing":
-                started_at = state.get("round_started_at")
+                upload_capability = ""
+                page_path = comments_mod._evidence_path(repo, pr_number).replace(
+                    "/api/evidence/", "/evidence/", 1,
+                )
                 try:
-                    if not isinstance(started_at, str):
-                        raise ValueError("round start unavailable")
-                    parsed_started_at = datetime.fromisoformat(
-                        started_at.replace("Z", "+00:00"),
-                    )
-                    if parsed_started_at.utcoffset() is None:
-                        raise ValueError("round start timezone unavailable")
-                    upload_expiry = int((parsed_started_at + timedelta(days=30)).timestamp())
-                    if upload_expiry > int(time.time()):
-                        render_state["upload_capability"] = issue_capability(
-                            self.config, repo, pr_number, state["head_sha"], current_round,
-                            purpose=UPLOAD_PURPOSE, expires_at=upload_expiry,
+                    configured_origin = urlsplit(upload_public_base_url)
+                    now = int(time.time())
+                    for match in re.finditer(
+                            r"\[打开附件页\]\(<(?P<url>https://[^<>\s]+)>\)", visible):
+                        candidate = urlsplit(match.group("url"))
+                        if (candidate.scheme != "https"
+                                or candidate.netloc.casefold() != configured_origin.netloc.casefold()
+                                or candidate.path != page_path or candidate.fragment):
+                            continue
+                        query = parse_qs(candidate.query, strict_parsing=True)
+                        values = query.get("cap")
+                        if set(query) != {"cap"} or not isinstance(values, list) or len(values) != 1:
+                            continue
+                        token = values[0]
+                        claims = verify_capability(
+                            self.config, token, repo, pr_number, purpose=UPLOAD_PURPOSE,
                         )
-                except (OverflowError, TypeError, ValueError):
-                    logger.warning("Evidence upload capability unavailable %s#%s: invalid round start time",
-                                   repo, pr_number)
+                        if (claims.get("head") == state.get("head_sha")
+                                and claims.get("round") == current_round
+                                and claims.get("status") == "testing"
+                                and claims.get("expires_at", 0) - now > 7 * 24 * 60 * 60):
+                            upload_capability = token
+                            break
+                except Exception:
+                    # Old, expired or malformed Summary capabilities are never
+                    # trusted; issue a fresh one bound to the current round.
+                    upload_capability = ""
+                if not upload_capability:
+                    try:
+                        upload_capability = issue_capability(
+                            self.config, repo, pr_number, state["head_sha"], current_round,
+                            purpose=UPLOAD_PURPOSE,
+                            expires_at=int(time.time()) + UPLOAD_MAX_LIFETIME_SECONDS,
+                        )
+                    except (OverflowError, TypeError, ValueError):
+                        logger.warning("Evidence upload capability unavailable %s#%s",
+                                       repo, pr_number)
+                if upload_capability:
+                    render_state["upload_capability"] = upload_capability
             render_state["log_capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
                 purpose=DOWNLOAD_PURPOSE, resource="log:" + current_round,
@@ -3876,11 +3913,19 @@ class DeployController:
             bundles.append(bundle)
             if len(bundles) == 3:
                 break
-        configured_public_base = getattr(self.config, "evidence_public_base_url", "")
-        public_base_url = (configured_public_base
-                           if is_stable_public_base_url(configured_public_base) else "")
+        download_url_expiry = getattr(store, "download_url_expiry", None)
+        def validate_cos_download_url(url, *, key, filename, attachment_id):
+            if not callable(download_url_expiry):
+                return None
+            return download_url_expiry(
+                url, key=key, filename=filename, attachment_id=attachment_id,
+            )
         section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, archives[-4:],
-                           public_base_url=public_base_url)
+                           public_base_url=public_base_url,
+                           upload_public_base_url=(
+                               upload_public_base_url if browser_upload_ready else ""
+                           ),
+                           cos_download_url_expiry=validate_cos_download_url)
         if not isinstance(section, str):
             raise GitHubStateProxyError("Evidence renderer must return markdown")
         visible = self._strip_legacy_evidence_blocks(visible)

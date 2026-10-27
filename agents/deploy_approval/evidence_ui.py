@@ -316,43 +316,73 @@ _JAVASCRIPT = r'''"use strict";
       return value;
     } finally { clearTimeout(timeout); active.delete(controller); if (job) job.requests.delete(controller); }
   }
-  function requestRaw(path, blob, job, onProgress) {
+  function trustedCosPartUrl(signed) {
+    if (!signed || signed.method !== "PUT" || typeof signed.url !== "string" || signed.url.length > 8192)
+      throw new Error("COS 未返回有效的分片 PUT 地址。");
+    let target;
+    try { target = new URL(signed.url); } catch (_) { throw new Error("COS 分片地址格式无效。"); }
+    if (target.protocol !== "https:" || target.username || target.password || target.hash ||
+        (target.port && target.port !== "443") ||
+        !/^[a-z0-9][a-z0-9-]{0,62}\.cos\.[a-z0-9-]+\.myqcloud\.com$/i.test(target.hostname))
+      throw new Error("COS 分片地址不是受信任的 HTTPS COS 地址。");
+    return target;
+  }
+  function monitorUploadContext(job) {
+    let monitor = job.contextMonitor;
+    if (!monitor) {
+      monitor = {users: 0, checking: false, timer: null};
+      job.contextMonitor = monitor;
+      monitor.timer = setInterval(async () => {
+        if (!monitor.users || monitor.checking || job.paused || stopped) return;
+        monitor.checking = true;
+        try {
+          const latest = await refresh(job, 5000);
+          if (!job.paused && (!latest || !roundMatches(latest) || latest.pr_state !== "open" ||
+              latest.merged || !writable()))
+            halt("PR 或 HEAD/round 状态已变化，已中止 COS 直传。请刷新当前 PR Summary。");
+        } catch (_) {
+          if (!job.paused && !stopped)
+            halt("上传期间无法确认 PR 与 HEAD/round 状态，已中止 COS 直传。");
+        } finally { monitor.checking = false; }
+      }, 2000);
+    }
+    monitor.users++;
+    return () => {
+      monitor.users = Math.max(0, monitor.users - 1);
+      if (monitor.users === 0) {
+        clearInterval(monitor.timer);
+        if (job.contextMonitor === monitor) job.contextMonitor = null;
+      }
+    };
+  }
+  function uploadCosPart(target, blob, job, onProgress) {
     return new Promise((resolve, reject) => {
       if (!writable()) return reject(new Error("当前轮不可写，请刷新并核对 HEAD/round。"));
-      const target = new URL(api + path, window.location.href);
-      const useProof = proofSecret && !(context && (context.auth_method === "signed_invite" || context.upload_invite === true));
-      const transportAllowed = useProof ? proofTransportAllowed(target) : inviteTransportAllowed(target);
-      if (target.origin !== window.location.origin || !transportAllowed)
-        return reject(new Error("当前链接没有有效上传授权，或请求不是安全的同源 HTTPS 请求。"));
       const xhr = new XMLHttpRequest(); active.add(xhr); job.requests.add(xhr);
+      const stopContextMonitor = monitorUploadContext(job);
       let finished = false;
-      const cleanup = () => { if (finished) return; finished = true; active.delete(xhr); job.requests.delete(xhr); };
-      xhr.open("PUT", target.href); xhr.withCredentials = true; xhr.timeout = 120000;
-      xhr.setRequestHeader("Accept", "application/json");
-      xhr.setRequestHeader("Content-Type", "application/octet-stream");
-      xhr.setRequestHeader("X-Evidence-Client-Key", clientKey);
-      if (useProof) {
-        xhr.setRequestHeader("X-Evidence-Secret", proofSecret);
-        xhr.setRequestHeader("X-Evidence-Nonce", randomHex());
+      const cleanup = () => {
+        if (finished) return;
+        finished = true; active.delete(xhr); job.requests.delete(xhr); stopContextMonitor();
+      };
+      try {
+        xhr.open("PUT", target.href); xhr.withCredentials = false; xhr.timeout = 120000;
+        xhr.setRequestHeader("Content-Type", "application/octet-stream");
+      } catch (error) {
+        cleanup(); reject(new Error("COS 直传请求无法启动；未回退到 Controller 代理。")); return;
       }
       xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(event.loaded); };
       xhr.onload = () => {
         cleanup();
-        let value = {}; try { value = JSON.parse(xhr.responseText || "{}"); } catch (_) {}
         let responseOrigin = ""; try { responseOrigin = new URL(xhr.responseURL).origin; } catch (_) {}
-        if (xhr.status >= 200 && xhr.status < 300 && responseOrigin === target.origin) return resolve(value);
-        const detail = typeof value.detail === "string" ? value.detail : "";
-        if (/invalid_evidence_capability|invalid_evidence|evidence_capability/i.test(detail))
-          return reject(new ApiError(xhr.status, "上传链接无效或已失效。请从当前 PR Summary 重新打开附件页面。", detail));
-        if (xhr.status === 401) clearProof();
-        if (xhr.status === 401) halt("上传链接可能已过期或失效。请刷新 PR Summary 并打开最新上传链接。");
-        if (xhr.status === 403) return reject(new ApiError(403, "权限不足：当前上传者无权执行此操作。", detail));
-        if (xhr.status === 409 && ["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched"].includes(detail))
-          halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新 PR Summary 并打开最新上传链接。");
-        reject(new ApiError(xhr.status, xhr.status + ": " + (detail || "分块上传失败"), detail));
+        if (xhr.status >= 200 && xhr.status < 300 && responseOrigin === target.origin)
+          return resolve({uploaded: true});
+        reject(new ApiError(xhr.status, xhr.status === 403
+          ? "COS 拒绝分片直传；请确认签名有效及 COS CORS 允许当前 HTTPS 来源。"
+          : "COS 分片直传失败（HTTP " + xhr.status + "）。"));
       };
-      xhr.onerror = () => { cleanup(); reject(new Error("网络中断；将先查询 COS 分块状态再决定是否重试。")); };
-      xhr.ontimeout = () => { cleanup(); reject(new Error("分块上传超时；将先查询 COS 分块状态再决定是否重试。")); };
+      xhr.onerror = () => { cleanup(); reject(new Error("COS 直传被浏览器拦截或网络中断；请检查 COS CORS 配置。不会回退到 Controller 代理。")); };
+      xhr.ontimeout = () => { cleanup(); reject(new Error("COS 分片直传超时；将先查询 COS 分块状态再决定是否重试。")); };
       xhr.onabort = () => { cleanup(); reject(new Error("上传已暂停。")); };
       xhr.send(blob);
     });
@@ -641,12 +671,12 @@ _JAVASCRIPT = r'''"use strict";
     if ([...$("replace").options].some(o => o.value === replacement)) $("replace").value = replacement;
     controls();
   }
-  async function refresh(job) {
+  async function refresh(job, timeoutMs = 30000) {
     let next, useProofFallback = false;
     try {
       // Let the browser's HttpOnly upload cookie authenticate first. An old
       // proof is a one-time compatibility fallback only after invite auth fails.
-      next = await request("/context", {job, authMode: "invite"});
+      next = await request("/context", {job, authMode: "invite", timeoutMs});
     } catch (inviteError) {
       if (!proofSecret || ![401, 403].includes(inviteError.status)) throw inviteError;
       useProofFallback = true;
@@ -664,7 +694,7 @@ _JAVASCRIPT = r'''"use strict";
       // HEAD/round or closed-PR responses with a second auth result.
       useProofFallback = true;
     }
-    if (useProofFallback) next = await request("/context", {job, authMode: "proof"});
+    if (useProofFallback) next = await request("/context", {job, authMode: "proof", timeoutMs});
     context = next;
     if (!roundMatches(next)) halt("当前 HEAD/round 已变化，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
     else if (next.pr_state !== "open" || next.merged)
@@ -956,9 +986,12 @@ _JAVASCRIPT = r'''"use strict";
         let complete = false;
         for (let attempt = 0; attempt < 3 && !job.paused && !stopped; attempt++) {
           try {
-            const query = "?head_sha=" + encodeURIComponent(bound.head_sha) + "&round_id=" + encodeURIComponent(bound.round_id);
-            const path = "/uploads/" + id(job.uploadId) + "/parts/" + number + "/data" + query;
-            await requestRaw(path, blob, job, amount => { inflight.set(number, amount); update(); });
+            const signPath = "/uploads/" + id(job.uploadId) + "/parts/" + number + "/url";
+            const signed = await request(signPath, {
+              method: "POST", key: job.uploadId + ":sign:" + number + ":" + attempt, body: {}, job
+            });
+            const target = trustedCosPartUrl(signed);
+            await uploadCosPart(target, blob, job, amount => { inflight.set(number, amount); update(); });
             done.set(number, {part_number: number, size: blob.size}); complete = true;
           } catch (error) {
             inflight.delete(number); update();

@@ -920,7 +920,10 @@ def _trusted_github_attachment_url(item: dict) -> str:
     return value
 
 
-def render_evidence_section(repo, pr_number, state, records, archive_links, *, public_base_url="") -> str:
+def render_evidence_section(
+    repo, pr_number, state, records, archive_links, *, public_base_url="",
+    upload_public_base_url="", cos_download_url_expiry=None,
+) -> str:
     """Render current evidence and three archived rounds without mutating history.
 
     Records may be attachment rows, round bundles, or archive_snapshot entries.
@@ -950,11 +953,17 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     base = _public_base(public_base_url)
     if not base.startswith("https://"):
         base = ""
+    from .config import is_evidence_ingress_url
+    upload_base = (
+        upload_public_base_url.rstrip("/")
+        if is_evidence_ingress_url(upload_public_base_url) else ""
+    )
     enabled = (state.get("evidence_enabled", state.get("enabled", False)) is True
                and state.get("enabled", True) is not False)
     api = _evidence_path(repo, pr_number)
     if not enabled or not api:
         base = ""
+        upload_base = ""
     def attachment_list_matches(items, key):
         return (isinstance(items, list) and all(
             isinstance(item, dict)
@@ -1068,10 +1077,55 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     page_path = api.replace("/api/evidence/", "/evidence/", 1)
 
     def page_url(capability):
-        if not base or not capability or not page_path.startswith("/evidence/"):
+        return page_url_at(capability, base)
+
+    def page_url_at(capability, origin):
+        if not origin or not capability or not page_path.startswith("/evidence/"):
             return ""
-        return (base + page_path + "?cap="
+        return (origin + page_path + "?cap="
                 + urllib.parse.quote(str(capability), safe=""))
+
+    def trusted_cos_download_url(item, key):
+        if (not isinstance(item, dict) or item.get("status") != "ready"
+                or item.get("deleted_at") or item.get("cos_content_verified") is not True
+                or item.get("cos_projection_verified") is not True
+                or item.get("head_sha") != key[0] or item.get("round_id") != key[1]
+                or not isinstance(item.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
+            return ""
+        attachment_id = item.get("attachment_id")
+        filename = item.get("filename")
+        uploaded_at = first_valid_time(item.get("created_at"), item.get("uploaded_at"))
+        object_key = item.get("object_key")
+        size = item.get("size")
+        if (not isinstance(attachment_id, str) or not isinstance(filename, str)
+                or not isinstance(uploaded_at, str) or not isinstance(object_key, str)
+                or isinstance(size, bool) or not isinstance(size, int)
+                or not 1 <= size <= 512 * 1024 * 1024
+                or not callable(cos_download_url_expiry)):
+            return ""
+        try:
+            from .evidence_store import build_attachment_key
+            if object_key != build_attachment_key(
+                    repo, pr_number, key[0], key[1], attachment_id, uploaded_at, filename):
+                return ""
+            value = item.get("cos_download_url")
+            if (not isinstance(value, str) or len(value) > 8192
+                    or any(char in value for char in "\r\n<>\\\"")):
+                return ""
+            parsed = urllib.parse.urlsplit(value)
+            if (parsed.scheme != "https" or parsed.username is not None
+                    or parsed.password is not None or parsed.port is not None
+                    or parsed.fragment
+                    or urllib.parse.unquote(parsed.path.lstrip("/")) != object_key):
+                return ""
+            if cos_download_url_expiry(
+                    value, key=object_key, filename=filename,
+                    attachment_id=attachment_id) is None:
+                return ""
+            return value
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return ""
 
     def latest_attachments(group, key):
         latest_items = {}
@@ -1249,8 +1303,12 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             uploaded_at = summary_time(first_valid_time(item.get("created_at"), item.get("uploaded_at")))
             if deleted:
                 filename = filename + "（已删除）"
-            lines.append("| " + " | ".join(_escape(value) for value in
-                (filename, size, actor, uploaded_at)) + " |")
+            filename_cell = _escape(filename)
+            download_url = "" if deleted else trusted_cos_download_url(item, key)
+            if download_url:
+                filename_cell = f"[{filename_cell}](<{download_url}>)"
+            lines.append("| " + " | ".join((filename_cell, *(
+                _escape(value) for value in (size, actor, uploaded_at)))) + " |")
             note = item.get("note") or (item.get("text") if status == "text" else "")
             if is_internal_test_note(item):
                 note = ""
@@ -1350,7 +1408,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
     )
     if current_context_valid:
         upload_url = (
-            page_url(state.get("upload_capability"))
+            page_url_at(state.get("upload_capability"), upload_base)
             if state.get("status") == "testing"
             and state.get("browser_upload_ready") is True
             else ""
@@ -1362,7 +1420,7 @@ def render_evidence_section(repo, pr_number, state, records, archive_links, *, p
             lines.extend(["", f"[打开附件页](<{read_url}>)"])
     if (current_context_valid and state.get("status") == "testing"
             and state.get("browser_upload_ready") is True
-            and page_url(state.get("upload_capability"))):
+            and page_url_at(state.get("upload_capability"), upload_base)):
         current_items = latest_attachments(groups[(head, current_round)], (head, current_round))
         pending = sum(1 for item in current_items
                       if isinstance(item, dict)
