@@ -245,7 +245,7 @@ _JAVASCRIPT = r'''"use strict";
       context.readiness && context.readiness.COS_READY === true &&
       context.readiness.EVIDENCE_BACKEND_READY === true &&
       context.readiness.BROWSER_UPLOAD_READY === true &&
-      context.pr_state === "open" && !context.merged && !stopped;
+      !stopped;
   }
   function controls() {
     const canWrite = writable();
@@ -337,8 +337,7 @@ _JAVASCRIPT = r'''"use strict";
         monitor.checking = true;
         try {
           const latest = await refresh(job, 5000);
-          if (!job.paused && (!latest || !roundMatches(latest) || latest.pr_state !== "open" ||
-              latest.merged || !writable()))
+          if (!job.paused && (!latest || !roundMatches(latest) || !writable()))
             halt("PR 或 HEAD/round 状态已变化，已中止 COS 直传。请刷新当前 PR Summary。");
         } catch (_) {
           if (!job.paused && !stopped)
