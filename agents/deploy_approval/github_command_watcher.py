@@ -379,8 +379,37 @@ class GitHubCommandWatcher:
         item = self._recent_command_records.get(key) if key is not None else None
         if not isinstance(item, dict):
             return None
-        return {name: value for name, value in item.items()
-                if not name.startswith("_")}
+        metric = {name: value for name, value in item.items()
+                  if not name.startswith("_")}
+        created_to_processing = None
+        discovery_delay = item.get("discovery_delay_seconds")
+        discovery_to_processing = item.get("discovery_to_processing_seconds")
+        if isinstance(discovery_delay, (int, float)):
+            if isinstance(discovery_to_processing, (int, float)):
+                created_to_processing = discovery_delay + discovery_to_processing
+            elif item.get("status") in {"discovered", "retry", "processing"}:
+                discovered_mono = item.get("_discovered_monotonic")
+                if isinstance(discovered_mono, (int, float)):
+                    created_to_processing = discovery_delay + max(
+                        0.0, self._monotonic() - discovered_mono,
+                    )
+        metric["created_to_processing_seconds"] = (
+            round(created_to_processing, 3)
+            if isinstance(created_to_processing, (int, float)) else None
+        )
+        metric["over_60_seconds"] = bool(
+            isinstance(created_to_processing, (int, float))
+            and created_to_processing > 60.0
+        )
+        if metric["over_60_seconds"] and not item.get("_over_60_diagnostic_logged"):
+            item["_over_60_diagnostic_logged"] = True
+            logger.warning(
+                "watcher recent command processing exceeded 60 seconds repo=%s pr=%s comment_id=%s status=%s created_to_processing_seconds=%.3f last_failure_reason=%s",
+                item.get("repo"), item.get("pr_number"), item.get("comment_id"),
+                item.get("status"), created_to_processing,
+                item.get("last_failure_reason"),
+            )
+        return metric
 
     @staticmethod
     def _parse_comment_time(value) -> datetime | None:

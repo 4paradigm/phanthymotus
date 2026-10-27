@@ -39,6 +39,20 @@ class EvidenceService:
         self._used_auth_nonces = {}
         controller.evidence_service = self
 
+    @staticmethod
+    def _require_pr_snapshot(pr, repo):
+        """Distinguish a confirmed PR state from an incomplete/transient read."""
+        if not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}:
+            raise EvidenceError('pr_status_unavailable', 503)
+        if pr.get('draft'):
+            raise EvidenceError('pr_draft', 409)
+        base = pr.get('base')
+        base_repository = base.get('repo') if isinstance(base, dict) else None
+        base_repo = base_repository.get('full_name') if isinstance(base_repository, dict) else None
+        if not isinstance(base_repo, str) or base_repo.casefold() != repo.casefold():
+            raise EvidenceError('pr_repository_mismatch', 409)
+        return pr
+
     async def _authorize(self, repo, principal, state, *, check_machine=True, pr=None):
         if (not self.config.auth_valid or repo not in self.config.github_repos
                 or repo not in self.config.active_repos):
@@ -490,13 +504,10 @@ class EvidenceService:
             raise EvidenceError('repository_not_authorized', 403)
         if repo not in await self.github.list_installation_repositories():
             raise EvidenceError('app_access_revoked', 403)
-        pr = await self.proxy.get_pr(repo, pr_number)
+        pr = self._require_pr_snapshot(await self.proxy.get_pr(repo, pr_number), repo)
         state = await self.proxy.read_hidden_state(repo, pr_number)
-        if (not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}
-                or pr.get('draft')
-                or pr.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo.lower()
-                or not isinstance(state, dict)):
-            raise EvidenceError('pr_closed', 409)
+        if not isinstance(state, dict):
+            raise EvidenceError('state_unavailable', 503)
         author = pr.get('user', {})
         if isinstance(author, dict) and str(author.get('id', '')) == str(actor_id):
             return pr, state, 'pr_author', ''
@@ -794,14 +805,10 @@ class EvidenceService:
         # Operation identities and recovery facts live in Git Notes records;
         # the lifecycle comment remains the sole business-state projection.
         async with self.controller._evidence_lock:
-            pr = await self.proxy.get_pr(repo, pr_number)
+            pr = self._require_pr_snapshot(await self.proxy.get_pr(repo, pr_number), repo)
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
                 raise EvidenceError('state_unavailable', 409)
-            if (not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}
-                    or pr.get('draft')
-                    or pr.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo.lower()):
-                raise EvidenceError('pr_closed', 409)
             records = await self.proxy.read_evidence_records(repo, pr_number)
             active_round = round_id_for_state(state)
             round_numbers = trusted_round_numbers(records, state, repo, pr_number)
@@ -1022,7 +1029,9 @@ class EvidenceService:
 
                 async def current_part():
                     nonlocal nonce_consumed
-                    fresh_pr = await self.proxy.get_pr(repo, pr_number)
+                    fresh_pr = self._require_pr_snapshot(
+                        await self.proxy.get_pr(repo, pr_number), repo,
+                    )
                     fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
                     validate_context(fresh_pr, fresh_state, expected_head, round_id, write=True)
                     fresh_authorized = await self._authorize(repo, principal, fresh_state, pr=fresh_pr)
@@ -1207,13 +1216,12 @@ class EvidenceService:
                 # PR and lifecycle state were read and validated above.
                 # Store may sign ONLY the server-loaded object, never payload key.
                 result = await self._store(action, operation, {})
-                fresh = await self.proxy.get_pr(repo, pr_number)
+                fresh = self._require_pr_snapshot(
+                    await self.proxy.get_pr(repo, pr_number), repo,
+                )
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
-                if (not isinstance(fresh, dict) or fresh.get('state') not in {'open', 'closed'}
-                        or fresh.get('draft')
-                        or fresh.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo
-                        or not isinstance(fresh_state, dict)):
-                    raise EvidenceError('pr_closed', 409)
+                if not isinstance(fresh_state, dict):
+                    raise EvidenceError('state_unavailable', 503)
                 if round_id == active_round:
                     validate_context(fresh, fresh_state, expected_head, round_id, write=False)
                 await self._authorize(repo, principal, selected, pr=fresh)
@@ -1283,7 +1291,9 @@ class EvidenceService:
 
             async def current():
                 nonlocal nonce_consumed
-                fresh_pr = await self.proxy.get_pr(repo, pr_number)
+                fresh_pr = self._require_pr_snapshot(
+                    await self.proxy.get_pr(repo, pr_number), repo,
+                )
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
                 validate_context(fresh_pr, fresh_state, expected_head, round_id, write=True)
                 fresh_authorized = await self._authorize(repo, principal, fresh_state, pr=fresh_pr)

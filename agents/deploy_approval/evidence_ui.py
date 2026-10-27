@@ -308,6 +308,7 @@ _JAVASCRIPT = r'''"use strict";
           throw new ApiError(401, expired, detail);
         }
         if (response.status === 403) throw new ApiError(403, "权限不足：当前上传者无权执行此操作。", detail);
+        if (response.status === 503) throw new ApiError(503, "GitHub 或附件服务暂时不可用；当前操作未确认完成，请稍后重试。", detail);
         if (response.status === 409 && ["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched"].includes(detail))
           halt("HEAD/round 或 PR 状态已变化，已停止所有写入。请刷新 PR Summary 并打开最新上传链接。");
         if (response.status === 413) throw new ApiError(413, "超过服务端大小限制。 " + detail, detail);

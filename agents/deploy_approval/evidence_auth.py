@@ -261,10 +261,17 @@ def _cookie(response, request, name, token, max_age):
                         httponly=True, samesite='lax')
 
 
-def bind_page_capability(request, repo, pr_number):
+def bind_page_capability(request, repo, pr_number, *, trusted_summary_capability=None):
     """Exchange a Summary read or upload capability for an HttpOnly cookie."""
     require_enabled(request)
     token = request.query_params.get('cap')
+    if ('cap' not in request.query_params
+            and not request.cookies.get(CAPABILITY_COOKIE)
+            and not request.cookies.get(UPLOAD_COOKIE)):
+        # The page handler may supply a token recovered from the trusted
+        # lifecycle Summary. Never use this fallback for a user-supplied cap
+        # or to replace an existing cookie.
+        token = trusted_summary_capability
     if token:
         try:
             claims = _verify_upload_capability(request.app.state.config, token, repo, pr_number)
@@ -360,12 +367,24 @@ async def _comment_proof_principal(request, repo, pr_number):
             or not re.fullmatch(r'[0-9a-f]{64}', nonce)):
         raise HTTPException(401, detail='evidence_comment_proof_required')
     proof = hashlib.sha256(bytes.fromhex(secret)).hexdigest()
-    pr = await proxy.get_pr(repo, pr_number)
-    head_sha = (pr.get('head') or {}).get('sha')
-    if (pr.get('state') not in {'open', 'closed'} or pr.get('draft')
-            or not isinstance(head_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', head_sha)
-            or (pr.get('base') or {}).get('repo', {}).get('full_name', '').lower() != repo.lower()):
-        raise HTTPException(409, detail='pr_closed_or_mismatched')
+    try:
+        pr = await proxy.get_pr(repo, pr_number)
+    except Exception as exc:
+        if getattr(exc, 'status_code', None) == 404:
+            raise HTTPException(404, detail='evidence_pr_not_found') from None
+        raise HTTPException(503, detail='evidence_pr_unavailable') from None
+    if not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}:
+        raise HTTPException(503, detail='evidence_pr_status_unavailable')
+    head = pr.get('head')
+    head_sha = head.get('sha') if isinstance(head, dict) else None
+    base = pr.get('base')
+    base_repo = base.get('repo') if isinstance(base, dict) else None
+    if pr.get('draft'):
+        raise HTTPException(409, detail='evidence_pr_draft')
+    if (not isinstance(head_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', head_sha)
+            or not isinstance(base_repo, dict)
+            or base_repo.get('full_name', '').casefold() != repo.casefold()):
+        raise HTTPException(409, detail='evidence_pr_context_mismatch')
     state = await proxy.read_hidden_state(repo, pr_number)
     if not isinstance(state, dict):
         raise HTTPException(409, detail='evidence_state_unavailable')

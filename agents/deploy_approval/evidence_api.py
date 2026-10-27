@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -174,6 +175,126 @@ async def _summary_updated(request, repo, pr, result):
         return expected == visible and '<!-- evidence-projection:start -->' in visible
     except Exception:
         return False
+
+
+async def _trusted_summary_page_capability(request, repo, pr):
+    """Recover only a currently valid page capability from the trusted Summary."""
+    config = request.app.state.config
+    if (not evidence_auth.public_https_ingress_ready(config)
+            or not evidence_auth._configured_https_request(request)):
+        return None
+    proxy = request.app.state.proxy
+    try:
+        comment = await proxy.find_trusted_lifecycle_comment(repo, pr)
+    except Exception:
+        raise HTTPException(503, detail='evidence_pr_unavailable') from None
+    if not isinstance(comment, dict):
+        return None
+    expected_issue_url = (
+        f'{config.github_api_url.rstrip("/")}/repos/{repo}/issues/{pr}'
+    )
+    if comment.get('issue_url') != expected_issue_url:
+        return None
+    body = comment.get('body')
+    if not isinstance(body, str):
+        return None
+    from .github_state_proxy import HIDDEN_STATE_MARKER, _extract_hidden_state, _validate_hidden_state
+    marker_pos = body.find(HIDDEN_STATE_MARKER)
+    if marker_pos < 0:
+        return None
+    try:
+        state = _validate_hidden_state(_extract_hidden_state(body))
+    except Exception:
+        raise HTTPException(503, detail='evidence_state_unavailable') from None
+    if not isinstance(state, dict):
+        raise HTTPException(503, detail='evidence_state_unavailable')
+    try:
+        current_pr = await proxy.get_pr(repo, pr)
+    except Exception as exc:
+        if getattr(exc, 'status_code', None) == 404:
+            raise HTTPException(404, detail='evidence_pr_not_found') from None
+        raise HTTPException(503, detail='evidence_pr_unavailable') from None
+    if not isinstance(current_pr, dict) or current_pr.get('state') not in {'open', 'closed'}:
+        raise HTTPException(503, detail='evidence_pr_status_unavailable')
+    base = current_pr.get('base')
+    base_repository = base.get('repo') if isinstance(base, dict) else None
+    base_name = base_repository.get('full_name') if isinstance(base_repository, dict) else None
+    if current_pr.get('draft') or not isinstance(base_name, str) or base_name.casefold() != repo.casefold():
+        raise HTTPException(409, detail='evidence_pr_context_changed')
+
+    from .evidence_models import round_id_for_state
+    try:
+        head, round_id = state.get('head_sha'), round_id_for_state(state)
+    except Exception:
+        raise HTTPException(503, detail='evidence_state_unavailable') from None
+    if (not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)
+            or state.get('status') not in {'testing', 'succeeded', 'failed'}):
+        return None
+    pr_head = current_pr.get('head')
+    pr_head_sha = pr_head.get('sha') if isinstance(pr_head, dict) else None
+    configured_base = urlsplit(config.evidence_public_base_url)
+    expected_authorities = {
+        configured_base.netloc.casefold(),
+        evidence_auth._configured_https_authority(config).casefold(),
+    }
+    page_path = '/evidence/' + repo + '/pulls/' + str(pr)
+    visible = body[:marker_pos]
+    for match in re.finditer(r'\[打开附件页\]\(<(?P<url>https://[^<>\s]+)>\)', visible):
+        candidate_text = match.group('url')
+        try:
+            candidate = urlsplit(candidate_text)
+            if (candidate.scheme != 'https' or candidate.username or candidate.password
+                    or candidate.fragment or candidate.path != page_path
+                    or candidate.netloc.casefold() not in expected_authorities
+                    or candidate.port not in (None, 443)):
+                continue
+            query = parse_qs(candidate.query, strict_parsing=True)
+            if set(query) != {'cap'} or len(query['cap']) != 1 or not query['cap'][0]:
+                continue
+            token = query['cap'][0]
+        except (ValueError, TypeError):
+            continue
+        claims = None
+        is_upload = False
+        try:
+            claims = evidence_auth.verify_capability(
+                config, token, repo, pr, purpose=evidence_auth.UPLOAD_PURPOSE,
+            )
+            is_upload = True
+        except HTTPException:
+            for purpose, resource in ((evidence_auth.DOWNLOAD_PURPOSE, 'page'),
+                                      (evidence_auth.PURPOSE, None)):
+                try:
+                    claims = evidence_auth.verify_capability(
+                        config, token, repo, pr, purpose=purpose, resource=resource,
+                    )
+                    break
+                except HTTPException:
+                    continue
+        if (not isinstance(claims, dict) or claims.get('head') != head
+                or claims.get('round') != round_id):
+            continue
+        if is_upload:
+            if (state.get('status') != 'testing'
+                    or pr_head_sha != head
+                    or claims.get('status') != 'testing'):
+                continue
+        return token
+    # If the trusted Summary has no usable invitation, a page-only token may
+    # still provide read access. Its purpose is explicit and cannot authorize
+    # any Evidence write.
+    try:
+        token = evidence_auth.issue_capability(
+            config, repo, pr, head, round_id,
+            purpose=evidence_auth.DOWNLOAD_PURPOSE, resource='page',
+        )
+        evidence_auth.verify_capability(
+            config, token, repo, pr,
+            purpose=evidence_auth.DOWNLOAD_PURPOSE, resource='page',
+        )
+        return token
+    except (TypeError, ValueError, HTTPException):
+        return None
 
 
 async def _dispatch(request, owner, repo, pr, action, **path):
@@ -403,7 +524,14 @@ async def page(request: Request, owner: str, repo: str, pr: int):
     try:
         evidence_auth.require_enabled(request)
         canonical = _repo(owner, repo, pr)
-        redirect = evidence_auth.bind_page_capability(request, canonical, pr)
+        summary_capability = None
+        if ('cap' not in request.query_params
+                and not request.cookies.get(evidence_auth.CAPABILITY_COOKIE)
+                and not request.cookies.get(evidence_auth.UPLOAD_COOKIE)):
+            summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
+        redirect = evidence_auth.bind_page_capability(
+            request, canonical, pr, trusted_summary_capability=summary_capability,
+        )
         if redirect is not None:
             return redirect
         result = await _dispatch(request, owner, repo, pr, 'context')
