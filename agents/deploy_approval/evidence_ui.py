@@ -694,8 +694,6 @@ _JAVASCRIPT = r'''"use strict";
     if (useProofFallback) next = await request("/context", {job, authMode: "proof", timeoutMs});
     context = next;
     if (!roundMatches(next)) halt("当前 HEAD/round 已变化，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
-    else if (next.pr_state !== "open" || next.merged)
-      halt("无法确认 PR 仍处于 Open 状态，或 PR 已关闭/合并；已停止写入。请从当前 PR Summary 重新打开。");
     else if (next.auth_method === "signed_invite") clearProof();
     render(); return next;
   }
