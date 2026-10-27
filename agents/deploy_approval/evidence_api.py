@@ -190,15 +190,9 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     principal, _ = await evidence_auth.verified_principal(
         request, canonical, pr, write=request.method in ('POST', 'PUT', 'DELETE'),
         purpose=purpose, resource=resource)
-    # This read is deliberately before dispatch, including historic downloads;
-    # a closed PR must never trigger a lifecycle write or a comment reply.
-    try:
-        snapshot = await request.app.state.github.get_pr(canonical, pr)
-    except Exception:
-        raise HTTPException(503, detail='evidence_pr_unavailable') from None
-    if (snapshot.get('state') != 'open' or snapshot.get('merged') or snapshot.get('draft')
-            or snapshot.get('base', {}).get('repo', {}).get('full_name', '').lower() != canonical):
-        raise HTTPException(409, detail='pr_closed_or_mismatched')
+    # The EvidenceService reads and validates the live PR before any operation.
+    # Do not double-fetch it here: additional GitHub calls delay uploads and
+    # turn transient PR reads into misleading 'evidence_pr_unavailable' errors.
     payload = await _payload(request, action, **path)
     claims = principal.get('capability') or principal.get('upload_invite') or {
         'head': payload.get('head_sha'), 'round': payload.get('round_id')}
@@ -315,13 +309,8 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                   'readiness': evidence_auth.readiness(
                       request.app.state.config, request.app.state.evidence_service, request=request),
                   'attachments': attachments, 'repo': canonical, 'pr_number': pr,
-                  # The browser explicitly gates writes on the PR state. The
-                  # dispatch path already fetched and validated this live PR;
-                  # expose that same snapshot instead of making an open PR look
-                  # unverifiable to the upload UI.
-                  'pr_state': snapshot.get('state'),
-                  'merged': snapshot.get('merged') is True,
-                  'draft': snapshot.get('draft') is True,
+                  # PR state is returned from the EvidenceService's validated
+                  # snapshot; no extra GitHub request is needed here.
                   'max_file_bytes': request.app.state.config.evidence_max_file_bytes,
                   'part_bytes': request.app.state.config.evidence_part_bytes}
         if not {'head_sha', 'round_id', 'status', 'can_write', 'attachments', 'archive_links'} <= result.keys():
