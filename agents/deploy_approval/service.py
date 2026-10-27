@@ -73,12 +73,18 @@ from .image_ref import validate_image_ref, get_deploy_platform
 
 logger = logging.getLogger(__name__)
 
+AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS = 4.0
+
 
 class DeployControllerError(Exception):
     pass
 
 
 class DeployOutcomeUncertain(DeployControllerError):
+    pass
+
+
+class DeployPreflightUnavailable(DeployControllerError):
     pass
 
 
@@ -252,14 +258,18 @@ class DeployController:
 
     # ── Core helpers ──
 
-    async def _core_for_node(self, node_id: str) -> AgentCoreClient:
+    async def _core_for_node(
+        self, node_id: str, *, timeout: float | None = None,
+    ) -> AgentCoreClient:
         if node_id in self._core_clients:
             return self._core_clients[node_id]
-        client = await self._resolve_core_client(node_id)
+        client = await self._resolve_core_client(node_id, timeout=timeout)
         self._core_clients[node_id] = client
         return client
 
-    async def _resolve_core_client(self, node_id: str) -> AgentCoreClient:
+    async def _resolve_core_client(
+        self, node_id: str, *, timeout: float | None = None,
+    ) -> AgentCoreClient:
         if self._agent_core_factory is not None:
             client = self._agent_core_factory(node_id)
             if client is not None:
@@ -286,7 +296,15 @@ class DeployController:
             access_token=token,
         )
         try:
-            await core.verify()
+            if timeout is None:
+                await core.verify()
+            else:
+                await asyncio.wait_for(core.verify(), timeout=timeout)
+        except asyncio.TimeoutError as e:
+            await core.aclose()
+            raise DeployControllerError(
+                f"Agent Core {node_id} verification timed out"
+            ) from e
         except AgentCoreError as e:
             await core.aclose()
             raise DeployControllerError(
@@ -1362,6 +1380,11 @@ class DeployController:
                 )
                 return True
 
+            # Non-core components deploy first; core restarts Agent Core and
+            # therefore remains last. Track only the component whose POST may
+            # be in flight, not every component selected for this approval.
+            ordered_components = self._order_components_for_deploy(selected_components)
+
             # Write executing state only after ALL gates pass.
             # Persist the complete template before any deploy POST.
             state["command"] = {
@@ -1371,8 +1394,7 @@ class DeployController:
                 "args": {
                     "machine": machine_alias,
                     "actor": actor,
-                    # A restart cannot prove which selected POST was sent.
-                    "pending_component_ids": [c["component_id"] for c in selected_components],
+                    "pending_component_ids": [ordered_components[0]["component_id"]],
                 },
             }
             await self._write_lifecycle_with_history(
@@ -1385,6 +1407,7 @@ class DeployController:
             new_deployments = []
             deploy_error = None
             deploy_outcome_uncertain = False
+            deploy_preflight_unavailable = False
             # Pre-flight visible history capacity before unsafe deploy POST
             prospective = comments_mod.deploy_requested(
                 repo, pr_number, pr_head,
@@ -1406,9 +1429,6 @@ class DeployController:
                 reserved_event=deploy_reservation,
             )
 
-            # Order components: non-core first, core last (core restarts agent-core)
-            ordered_components = self._order_components_for_deploy(selected_components)
-
             # Sequential per-component deploy; POST success followed by
             # post-deploy runtime verification before recording as deployed.
             for comp in ordered_components:
@@ -1420,6 +1440,12 @@ class DeployController:
                     deploy_error = f"missing runtime id for {comp_target}"
                     break
 
+                # Persist verified earlier components and narrow restart
+                # recovery to the next POST that may actually be attempted.
+                state["deployments"] = list(existing_deployments) + list(new_deployments)
+                command_args = dict(state["command"].get("args", {}))
+                command_args["pending_component_ids"] = [component_id]
+                state["command"]["args"] = command_args
                 await self._write_lifecycle_with_history(
                     repo, pr_number, state,
                     self._deployment_progress_markdown(
@@ -1439,6 +1465,10 @@ class DeployController:
                         )
                     except DeployOutcomeUncertain as e:
                         deploy_outcome_uncertain = True
+                        deploy_error = str(e)
+                        break
+                    except DeployPreflightUnavailable as e:
+                        deploy_preflight_unavailable = True
                         deploy_error = str(e)
                         break
                     except DeployControllerError as e:
@@ -1499,6 +1529,38 @@ class DeployController:
                         "phase": "deployed",
                     })
 
+            if deploy_preflight_unavailable:
+                state["deployments"] = list(existing_deployments) + list(new_deployments)
+                state["status"] = "deploy-requested"
+                state["command"] = {
+                    "comment_id": comment_id,
+                    "kind": "approve_deploy",
+                    "phase": "completed",
+                    "args": {"machine": machine_alias, "actor": actor},
+                }
+                state["last_processed_comment_id"] = comment_id
+                approve_attempt["outcome"] = "preflight_unavailable"
+                self._record_approve_attempt(state, approve_attempt)
+                markdown = comments_mod.deploy_requested(
+                    repo, pr_number, pr_head, state.get("components", []),
+                    self._get_machine_groups_for_components([
+                        c for c in state.get("components", [])
+                        if c.get("component_id", "") not in _component_id_set(state["deployments"])
+                    ]),
+                    gate_note=[
+                        "Agent Core status could not be confirmed; no POST was sent for the remaining component.",
+                        "Deployment remains pending. Send a NEW approval after status checks recover.",
+                    ],
+                    deployments=self._enrich_deployments_for_render(state["deployments"]),
+                )
+                await self._write_lifecycle_with_history(
+                    repo, pr_number, state, markdown,
+                    event={"event": "Deploy preflight deferred: zero POST for remaining component",
+                           "machine": machine_alias, "timestamp": comments_mod.beijing_now_str()},
+                )
+                await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
+                return True
+
             if deploy_outcome_uncertain:
                 state["deployments"] = list(existing_deployments) + list(new_deployments)
                 state["status"] = "deploy-requested"
@@ -1528,8 +1590,8 @@ class DeployController:
                         "### Restart Recovery",
                         "",
                         "A deploy POST was attempted but its outcome is uncertain.",
-                        f"Send a NEW `/approve_deploy machine={machine_alias}`.",
-                        "No further deploy POSTs are allowed in this cycle.",
+                        "The Controller will periodically verify the target status without repeating the POST.",
+                        "Keep this deployment pending until the exact target is confirmed.",
                     ],
                     deployments=self._enrich_deployments_for_render(state["deployments"]),
                 )
@@ -1546,7 +1608,7 @@ class DeployController:
                 return True
 
             if deploy_error is not None:
-                state["deployments"] = list(state.get("deployments", [])) + list(new_deployments)
+                state["deployments"] = list(existing_deployments) + list(new_deployments)
                 # Deploy failed - persist terminal state FIRST, then upload evidence
                 state["status"] = "failed"
                 state["command"] = {
@@ -2452,9 +2514,19 @@ class DeployController:
         Core components use /api/system/update-check instead of driver Status.
         list_drivers() is only called when there are non-core components.
         """
+        deadline = time.monotonic() + float(self.config.total_timeout)
+
+        def remaining_probe_time() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            return remaining
+
         has_non_core = any(c.get("target") != "core" for c in components)
         if has_non_core:
-            drivers = await core.list_drivers()
+            drivers = await asyncio.wait_for(
+                core.list_drivers(), timeout=remaining_probe_time(),
+            )
             if not isinstance(drivers, list):
                 raise DeployControllerError("Agent Core list_drivers returned an invalid payload")
         else:
@@ -2468,7 +2540,9 @@ class DeployController:
             if comp_target == "core":
                 # Core preflight: use update-check instead of driver status
                 try:
-                    update_info = await core.core_update_check()
+                    update_info = await asyncio.wait_for(
+                        core.core_update_check(), timeout=remaining_probe_time(),
+                    )
                 except AgentCoreError as e:
                     raise DeployControllerError(
                         f"core preflight update-check failed: {e}"
@@ -2524,7 +2598,10 @@ class DeployController:
                 )
             seen_runtime_ids[runtime_id] = component.get("component_id", "")
             if runtime_id not in cached_statuses:
-                status = await core.driver_status(runtime_id)
+                status = await asyncio.wait_for(
+                    core.driver_status(runtime_id),
+                    timeout=remaining_probe_time(),
+                )
                 if not isinstance(status, dict):
                     raise DeployControllerError(
                         f"Agent Core driver_status for {runtime_id} returned invalid data"
@@ -2547,60 +2624,36 @@ class DeployController:
         runtime_id: str,
         target_image_ref: str,
     ) -> tuple[bool, dict]:
-        """Verify that a deployed runtime is actually running the target image.
-
-        Bounded polling using self.config.total_timeout as the verification budget.
-        Success requires BOTH status=="running" AND running_image == target_image_ref
-        (exact string comparison).
-
-        Returns (True, health_evidence_dict) on success.
-        Returns (False, health_evidence_dict) on timeout/mismatch — caller must treat as uncertain.
-        """
-        deadline = time.monotonic() + self.config.total_timeout
-        poll_interval = 2  # seconds between polls
+        """Make one short observation; an unconfirmed POST remains uncertain."""
         last_status = ""
         last_running_image = ""
         last_error: str | None = None
+        try:
+            status_data = await asyncio.wait_for(
+                core.driver_status(runtime_id),
+                timeout=min(float(self.config.total_timeout),
+                            AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS),
+            )
+            if isinstance(status_data, dict):
+                status_val = status_data.get("status", "")
+                running_image = status_data.get("running_image", "")
+                last_status = status_val if isinstance(status_val, str) else ""
+                last_running_image = running_image if isinstance(running_image, str) else ""
+                if last_status == "running" and last_running_image == target_image_ref:
+                    return True, {
+                        "component_id": component_id,
+                        "runtime_id": runtime_id,
+                        "status": "running",
+                        "running_image": target_image_ref,
+                        "target_image": target_image_ref,
+                        "verified": True,
+                    }
+                last_error = "target image not yet observed running"
+            else:
+                last_error = "invalid runtime status response"
+        except (AgentCoreError, asyncio.TimeoutError) as exc:
+            last_error = type(exc).__name__
 
-        while True:
-            if time.monotonic() >= deadline:
-                break
-            try:
-                status_data = await core.driver_status(runtime_id)
-            except AgentCoreError as e:
-                # Transient error — continue polling until deadline
-                last_error = str(e)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(min(poll_interval, remaining))
-                continue
-
-            status_val = status_data.get("status", "")
-            running_image = status_data.get("running_image", "")
-            last_status = status_val if isinstance(status_val, str) else ""
-            last_running_image = running_image if isinstance(running_image, str) else ""
-
-            if (isinstance(status_val, str) and status_val == "running"
-                    and isinstance(running_image, str)
-                    and running_image == target_image_ref):
-                # Success: exact target image observed and running
-                return True, {
-                    "component_id": component_id,
-                    "runtime_id": runtime_id,
-                    "status": "running",
-                    "running_image": target_image_ref,
-                    "target_image": target_image_ref,
-                    "verified": True,
-                }
-
-            # Still polling: status not yet running or image not yet converged
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(poll_interval, remaining))
-
-        # Deadline reached — outcome is uncertain (POST already happened)
         result: dict[str, Any] = {
             "component_id": component_id,
             "runtime_id": runtime_id,
@@ -2609,8 +2662,7 @@ class DeployController:
             "target_image": target_image_ref,
             "verified": False,
         }
-        if last_error:
-            result["error"] = last_error
+        result["error"] = last_error or "runtime status unavailable"
         return False, result
 
     async def _snapshot_terminal_runtime_logs(
@@ -2796,18 +2848,7 @@ class DeployController:
         component_id: str,
         target_image_ref: str,
     ) -> tuple[bool, dict]:
-        """Poll /api/system/update-check until current_tag matches target_tag.
-
-        Success condition: current_tag is a non-empty string AND equals target_tag.
-        up_to_date==True alone is NOT sufficient (Agent Core may return it
-        incorrectly on error paths).
-
-        Connection failures during restart are treated as transient — the
-        bounded polling budget continues until deadline.
-
-        Returns (True, evidence) on verified success.
-        Returns (False, evidence) on timeout/uncertainty.
-        """
+        """Make one short update-check; only exact current_tag confirms success."""
         target_tag = _target_tag_from_image_ref(target_image_ref)
         if not target_tag:
             # No verifiable tag — cannot confirm deployment
@@ -2820,44 +2861,28 @@ class DeployController:
                 "error": "core image has no verifiable tag",
             }
 
-        deadline = time.monotonic() + self.config.total_timeout
-        poll_interval = 2  # seconds between polls
         last_current_tag = ""
         last_error: str | None = None
-
-        while True:
-            if time.monotonic() >= deadline:
-                break
-            try:
-                update_info = await core.core_update_check()
-            except AgentCoreError as e:
-                # Transient (restart in progress) — continue polling
-                last_error = str(e)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(min(poll_interval, remaining))
-                continue
-
-            current_tag = str(update_info.get("current_tag", "") or "")
-            last_current_tag = current_tag
-
-            if current_tag and current_tag == target_tag:
-                # Exact match — deployment confirmed
+        try:
+            update_info = await asyncio.wait_for(
+                core.core_update_check(),
+                timeout=min(float(self.config.total_timeout),
+                            AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS),
+            )
+            current_tag = update_info.get("current_tag", "") if isinstance(update_info, dict) else ""
+            last_current_tag = current_tag if isinstance(current_tag, str) else ""
+            if last_current_tag and last_current_tag == target_tag:
                 return True, {
                     "component_id": component_id,
                     "runtime_id": "core",
-                    "current_tag": current_tag,
+                    "current_tag": last_current_tag,
                     "target_tag": target_tag,
                     "verified": True,
                 }
+            last_error = "target core tag not yet observed"
+        except (AgentCoreError, asyncio.TimeoutError) as exc:
+            last_error = type(exc).__name__
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            await asyncio.sleep(min(poll_interval, remaining))
-
-        # Deadline reached — outcome uncertain (POST already happened)
         result: dict[str, Any] = {
             "component_id": component_id,
             "runtime_id": "core",
@@ -2865,8 +2890,7 @@ class DeployController:
             "target_tag": target_tag,
             "verified": False,
         }
-        if last_error:
-            result["error"] = last_error
+        result["error"] = last_error or "core update status unavailable"
         return False, result
 
     @staticmethod
@@ -2903,9 +2927,12 @@ class DeployController:
 
         # Step 1: fresh already-target check
         try:
-            update_info = await core.core_update_check()
-        except AgentCoreError as e:
-            raise DeployControllerError(
+            update_info = await asyncio.wait_for(
+                core.core_update_check(),
+                timeout=float(self.config.total_timeout),
+            )
+        except (AgentCoreError, asyncio.TimeoutError) as e:
+            raise DeployPreflightUnavailable(
                 f"core already-target check failed: {e}"
             ) from e
 
@@ -4461,10 +4488,16 @@ class DeployController:
         if state is not None:
             cmd = state.get("command", {})
             cmd_phase = cmd.get("phase", "")
-            if cmd_phase == "executing":
+            same_head = current_head == state.get("head_sha", "")
+            if (cmd_phase == "executing" and same_head
+                    and state.get("status") == "deploy-requested"):
                 await self._handle_uncertain_if_needed(repo, pr_number, state)
                 return
-            if cmd_phase == "uncertain":
+            if (cmd_phase == "uncertain" and same_head
+                    and state.get("status") == "deploy-requested"):
+                await self._recover_uncertain_deployment_tick(
+                    repo, pr_number, state, pr_data,
+                )
                 return
 
             if current_head and current_head != state.get("head_sha", ""):
@@ -4741,6 +4774,10 @@ class DeployController:
         markdown = comments_mod.uncertain_comment(
             repo, pr_number, state.get("head_sha", ""),
         )
+        markdown += (
+            "\n\nThe Controller will periodically verify the exact target status. "
+            "It will not repeat the deployment POST."
+        )
         event = {
             "event": "Deploy outcome uncertain",
             "result": "uncertain",
@@ -4756,56 +4793,169 @@ class DeployController:
         )
 
     async def _recover_uncertain_deployments(self, old_state: dict, refreshed_state: dict) -> bool:
-        """Observe possibly attempted components; never repeat their deploy POSTs."""
-        args = old_state.get("command", {}).get("args", {})
+        """Observe attempted components within one short budget; never repost."""
+        old_command = old_state.get("command", {})
+        args = old_command.get("args", {}) if isinstance(old_command, dict) else {}
+        if not isinstance(args, dict):
+            return False
         machine_alias = args.get("machine", "")
+        if not isinstance(machine_alias, str) or not machine_alias:
+            return False
         machine = self.policy.get_machine(machine_alias)
         if machine is None:
             return False
         old_components = old_state.get("components", [])
+        if not isinstance(old_components, list):
+            return False
+        fresh_components = refreshed_state.get("components", [])
+        if not isinstance(fresh_components, list):
+            return False
+        fresh_command = refreshed_state.get("command", {})
+        old_args = args
+        fresh_args = fresh_command.get("args", {}) if isinstance(fresh_command, dict) else {}
+        if (
+            old_state.get("status") != "deploy-requested"
+            or refreshed_state.get("status") != "deploy-requested"
+            or old_state.get("head_sha") != refreshed_state.get("head_sha")
+            or round_id_for_state(old_state) != round_id_for_state(refreshed_state)
+            or old_state.get("round_archive") != refreshed_state.get("round_archive")
+            or old_state.get("deployments") != refreshed_state.get("deployments")
+            or not isinstance(old_command, dict)
+            or not isinstance(fresh_command, dict)
+            or old_command.get("kind") != "approve_deploy"
+            or fresh_command.get("kind") != "approve_deploy"
+            or old_command.get("phase") != "uncertain"
+            or fresh_command.get("phase") not in {"uncertain", "completed"}
+            or old_command.get("comment_id") != fresh_command.get("comment_id")
+            or type(old_command.get("comment_id")) is not int
+            or old_command.get("comment_id", 0) <= 0
+            or type(old_state.get("last_processed_comment_id")) is not int
+            or old_state.get("last_processed_comment_id", 0) < old_command.get("comment_id", 0)
+            or type(refreshed_state.get("last_processed_comment_id")) is not int
+            or refreshed_state.get("last_processed_comment_id", 0) < old_command.get("comment_id", 0)
+            or not isinstance(old_args, dict)
+            or not isinstance(fresh_args, dict)
+            or not isinstance(old_args.get("machine"), str)
+            or not old_args.get("machine")
+            or not isinstance(old_args.get("actor"), str)
+            or not old_args.get("actor")
+            or old_args.get("machine") != fresh_args.get("machine")
+            or old_args.get("actor") != fresh_args.get("actor")
+            or old_args.get("pending_component_ids") != fresh_args.get("pending_component_ids")
+            or self._review_evidence_identity(old_state.get("review_evidence", {}))
+            != self._review_evidence_identity(refreshed_state.get("review_evidence", {}))
+        ):
+            return False
         deployed = _component_id_set(old_state.get("deployments", []))
         pending = args.get("pending_component_ids")
-        if pending is None:
-            # Older executing states have no per-component POST provenance.
-            # Conservatively observe every remaining component for this machine.
-            pending = self._get_component_ids_for_machine(machine_alias, old_components)
+        old_by_id: dict[str, dict] = {}
+        fresh_by_id: dict[str, dict] = {}
+        for components, index in ((old_components, old_by_id), (fresh_components, fresh_by_id)):
+            for component in components:
+                if not isinstance(component, dict):
+                    return False
+                component_id = component.get("component_id")
+                if not isinstance(component_id, str) or not component_id or component_id in index:
+                    return False
+                index[component_id] = component
         if (not isinstance(pending, list) or not pending
                 or any(not isinstance(cid, str) or not cid for cid in pending)
-                or not set(pending).issubset({c.get("component_id") for c in old_components})):
+                or len(set(pending)) != len(pending)
+                or not set(pending).issubset(old_by_id)
+                or not set(pending).issubset(fresh_by_id)
+                or set(pending).intersection(deployed)):
             return False
-        fresh_by_key = {
-            self._component_semantic_key(c): c for c in refreshed_state.get("components", [])
-        }
         recovered = []
+        unresolved = []
+        deadline = time.monotonic() + AGENT_CORE_STATUS_PROBE_TIMEOUT_SECONDS
         try:
-            core = await self._core_for_node(machine.node_id)
-            for old in old_components:
-                if old["component_id"] not in pending or old["component_id"] in deployed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            core = await self._core_for_node(machine.node_id, timeout=remaining)
+            for component_id in dict.fromkeys(pending):
+                if component_id in deployed:
                     continue
-                component = fresh_by_key.get(self._component_semantic_key(old))
-                if component is None:
-                    # A genuinely different artifact is not a retry of this POST.
+                old = old_by_id.get(component_id)
+                component = fresh_by_id.get(component_id)
+                if not isinstance(old, dict) or not isinstance(component, dict):
+                    unresolved.append(component_id)
                     continue
-                if component["component_id"] not in self._get_component_ids_for_machine(machine_alias, [component]):
-                    return False
-                runtime_id = str(old.get("runtime_id") or "")
-                if component.get("target") == "core":
-                    verified, _ = await self._verify_core_update(
-                        core, component["component_id"], old["image_ref"],
-                    )
+                identity_fields = (
+                    "component_id", "target", "driver_path", "variant",
+                    "review_image_tag", "image_ref",
+                )
+                if any(
+                    not isinstance(old.get(field), str)
+                    or old.get(field) != component.get(field)
+                    for field in identity_fields
+                ):
+                    unresolved.append(component_id)
+                    continue
+                if (not old.get("target") or not old.get("review_image_tag")
+                        or not old.get("image_ref")
+                        or component_id not in self._get_component_ids_for_machine(
+                            machine_alias, [component],
+                        )):
+                    unresolved.append(component_id)
+                    continue
+                old_runtime_id = old.get("runtime_id")
+                fresh_runtime_id = component.get("runtime_id")
+                if old.get("target") == "core":
+                    if old_runtime_id != "core" or fresh_runtime_id != "core":
+                        unresolved.append(component_id)
+                        continue
                     runtime_id = "core"
                 else:
-                    if not runtime_id:
-                        preflight = await self._preflight_running_images(core, [old])
-                        runtime_id = preflight[0]["runtime_id"]
-                    verified, _ = await self._verify_deployed_runtime(
-                        core, machine.node_id, component["component_id"], runtime_id, old["image_ref"],
-                    )
-                if not verified:
-                    return False
-                recovered.append((component, old["image_ref"], runtime_id))
-        except Exception as e:
-            logger.warning("uncertain deployment observation unavailable: %s", e)
+                    if not isinstance(old_runtime_id, str) or not old_runtime_id:
+                        unresolved.append(component_id)
+                        continue
+                    if ("runtime_id" in component
+                            and fresh_runtime_id != old_runtime_id):
+                        unresolved.append(component_id)
+                        continue
+                    runtime_id = old_runtime_id
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    unresolved.append(component_id)
+                    continue
+                image_ref = old.get("image_ref")
+                try:
+                    if component.get("target") == "core":
+                        update_info = await asyncio.wait_for(
+                            core.core_update_check(), timeout=remaining,
+                        )
+                        target_tag = _target_tag_from_image_ref(image_ref)
+                        verified = bool(
+                            isinstance(update_info, dict) and target_tag
+                            and update_info.get("current_tag") == target_tag
+                        )
+                        runtime_id = "core"
+                    else:
+                        status = await asyncio.wait_for(
+                            core.driver_status(runtime_id), timeout=remaining,
+                        )
+                        verified = bool(
+                            isinstance(status, dict) and status.get("status") == "running"
+                            and status.get("running_image") == image_ref
+                        )
+                except (AgentCoreError, asyncio.TimeoutError):
+                    verified = False
+                if verified:
+                    recovered.append((component, image_ref, runtime_id))
+                else:
+                    unresolved.append(component_id)
+        except Exception as exc:
+            logger.warning("uncertain deployment observation unavailable: %s", type(exc).__name__)
+            recovered_component_ids = {component["component_id"] for component, _, _ in recovered}
+            unresolved = [
+                cid for cid in pending
+                if cid not in deployed and cid not in recovered_component_ids
+            ]
+        # A stale or empty pending list is not proof that any deployment
+        # completed. Preserve the uncertain command until an exact target
+        # status supplies new deployment evidence.
+        if not recovered:
             return False
         already_deployed = _component_id_set(refreshed_state.get("deployments", []))
         refreshed_state["deployments"] = list(refreshed_state.get("deployments", []))
@@ -4819,10 +4969,99 @@ class DeployController:
                 "component_ids": [component["component_id"]],
                 "phase": "deployed",
             })
+        updated_command = copy.deepcopy(refreshed_state.get("command", old_command))
+        if not isinstance(updated_command, dict):
+            return False
+        updated_args = updated_command.get("args", {})
+        if not isinstance(updated_args, dict):
+            updated_args = {}
+        updated_args = dict(updated_args)
+        updated_args["pending_component_ids"] = unresolved
+        updated_command["args"] = updated_args
+        updated_command["phase"] = "uncertain" if unresolved else "completed"
+        refreshed_state["command"] = updated_command
         all_ids = {c["component_id"] for c in refreshed_state.get("components", [])}
         if all_ids and all_ids == _component_id_set(refreshed_state.get("deployments", [])):
             refreshed_state["status"] = "testing"
-        return True
+        return not unresolved
+
+    async def _recover_uncertain_deployment_tick(
+        self, repo: str, pr_number: int, state: dict, pr_data: dict,
+    ) -> None:
+        """Run one short restart-safe observation tick and persist only changes."""
+        command = state.get("command", {})
+        if (not isinstance(command, dict) or command.get("kind") != "approve_deploy"
+                or command.get("phase") != "uncertain"
+                or state.get("status") != "deploy-requested"
+                or pr_data.get("head", {}).get("sha") != state.get("head_sha")):
+            return
+        refreshed = copy.deepcopy(state)
+        try:
+            await self._recover_uncertain_deployments(state, refreshed)
+        except Exception as exc:
+            logger.warning("uncertain deployment recovery tick %s#%s failed: %s",
+                           repo, pr_number, type(exc).__name__)
+            return
+        if refreshed == state:
+            return
+        refreshed["last_processed_comment_id"] = max(
+            int(state.get("last_processed_comment_id", 0) or 0),
+            int(command.get("comment_id", 0) or 0),
+        )
+        args = command.get("args", {}) if isinstance(command.get("args"), dict) else {}
+        machine_alias = str(args.get("machine", "") or "")
+        recovered_ids = _component_id_set(refreshed.get("deployments", [])) - _component_id_set(
+            state.get("deployments", []),
+        )
+        required_ids = {
+            item.get("component_id") for item in refreshed.get("components", [])
+            if isinstance(item, dict) and isinstance(item.get("component_id"), str)
+        }
+        deployments_complete = bool(required_ids) and required_ids.issubset(
+            _component_id_set(refreshed.get("deployments", [])),
+        )
+        if refreshed.get("status") == "testing":
+            markdown = comments_mod.testing(
+                repo, pr_number, refreshed.get("head_sha", ""), case_result="",
+                deployments=self._enrich_deployments_for_render(refreshed.get("deployments", [])),
+                components=refreshed.get("components", []),
+                deployments_complete=deployments_complete,
+            )
+        else:
+            unresolved = refreshed.get("command", {}).get("args", {}).get(
+                "pending_component_ids", [],
+            )
+            gate_note = ([
+                "### Restart Recovery", "",
+                "A prior deployment is still being verified. No deployment POST will be repeated.",
+            ] if unresolved else [
+                "### Restart Recovery", "",
+                "The attempted component was verified. Remaining components require a NEW approval.",
+            ])
+            markdown = comments_mod.deploy_requested(
+                repo, pr_number, refreshed.get("head_sha", ""),
+                refreshed.get("components", []),
+                self._get_machine_groups_for_components([
+                    item for item in refreshed.get("components", [])
+                    if item.get("component_id") not in _component_id_set(refreshed.get("deployments", []))
+                ]),
+                gate_note=gate_note,
+                deployments=self._enrich_deployments_for_render(refreshed.get("deployments", [])),
+            )
+        event = None
+        if recovered_ids:
+            event = {
+                "event": "Deployment status recovered",
+                "result": "verified",
+                "machine": machine_alias,
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+        written = await self._write_lifecycle_with_history(
+            repo, pr_number, refreshed, markdown, event=event,
+            expected_terminal_state=state,
+        )
+        if written and state.get("status") != refreshed.get("status"):
+            await self.proxy.project_status_label(repo, pr_number, refreshed["status"])
 
     async def _refresh_uncertain_state(
         self, repo: str, pr_number: int, state: dict,
