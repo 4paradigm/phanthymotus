@@ -406,16 +406,28 @@ as letters before normalization; ordinary lowercase words keep their readings.
 #### External pronunciation dictionary
 
 The default frontend combines all **13,083** entries from the pinned fanyi
-source with **114** reviewed supplements: **109** new keys and five identical
-existing keys. The resulting **13,192-entry** dictionary is compiled to
-`frontend_data/lexicon/20261027-v2/external_lexicon.json` outside Git:
+source with **120** reviewed supplements: **115** new keys and five identical
+existing keys. The resulting **13,198-entry** dictionary is compiled to
+`frontend_data/lexicon/20261027-v3/external_lexicon.json` outside Git:
 
 - 225 entries overlapping CMU retain the released CMU reading by default.
   The original Gold phones remain in the data for auditing.
 - 6,266 letter-spelling entries require exact uppercase spelling; this includes
   114 entries with separators, reducing unintended changes to ordinary names.
-- 6,701 other OOV entries use case-insensitive matching. Their source phones
+- 6,707 other OOV entries use case-insensitive matching. Their source phones
   are retained, not certified as universally correct pronunciations.
+
+The v3 update adds six whole-token, case-insensitive product names:
+`ModelSphere` (Model Sphere), `AutoTune` (Auto Tune), `LLMBench` (L L M Bench),
+`SageOne` (Sage One), `SageGPT` (Sage G P T), and `HyperCycle` (Hyper Cycle).
+Name provenance is recorded from the [ModelSphere project](https://github.com/modelsphere/modelsphere),
+[LLM AutoTune](https://github.com/modelsphere/llm-autotune), and Fourth Paradigm's
+[company](https://www.4paradigm.com/about/index.html),
+[computing platform](https://www.4paradigm.com/product/advanced.html), and
+[operations platform](https://www.4paradigm.com/product/cess.html) pages.
+Phones reuse the released CMU component words/letter names; this is not a claim
+of official brand-specific stress or audio approval. All prior 13,192 rows,
+Chinese annotations, ordered normalization rules and acoustic resources are unchanged.
 
 Seventy reviewed technical abbreviations, including `VLLM`, `LLM`, `ASR`,
 `TTS`, `NLP`, `RLHF`, `GPT`, `TCP`, `SSH`, `GRPC`, `CLI`, `LLVM`, and `SQL`,
@@ -433,8 +445,8 @@ hyphenated tokens are protected during final punctuation cleanup; structured
 math and addresses keep priority. Ambiguous `M-S` still follows math parsing.
 
 The public frontend resource is one `external_lexicon.json` in the same
-ModelScope repository as the model, under `frontend/lexicon/20261027-v2/`, pinned to revision
-`217d247ac9c381d9950f31087b2b686d4e94690d`.
+ModelScope repository as the model, under `frontend/lexicon/20261027-v3/`, pinned to revision
+`039e1d00c998d8eeb2908202aa02c28534bf735d`.
 It contains the merged Gold runtime entries and their original annotations,
 matching policies, reviewed business-source records, text replacements,
 ordered frontend rules, Chinese pronunciation annotations and IPA reference data. Vocabulary data is not embedded in generated
@@ -450,7 +462,7 @@ The maintenance compiler lives in `perception/tools/vits2_prepare_external_lexic
 it is not part of the inference plugin.
 
 Before frontend startup, the adapter downloads/verifies this one size/SHA256-
-pinned JSON into `frontend_data/lexicon/20261027-v2/external_lexicon.json`. The existing downloader
+pinned JSON into `frontend_data/lexicon/20261027-v3/external_lexicon.json`. The existing downloader
 provides process locking and atomic installation; valid cached bytes are reused.
 Cache validation and replacement of corrupt downloads use the unchanged mainline
 `ensure_verified_bundle` implementation during resource preparation, not per utterance.
@@ -485,9 +497,9 @@ CMU hashing and full validation are cached, not repeated for every word.
 
 #### Chinese annotations in the shared resource
 
-The published v2 resource adds a `chinese` section to the same JSON, with its
-revision, resource directory, size and SHA256 pinned together. The v1 cache
-remains separate so older code can continue to use its own resource. An old
+The v2 resource introduced a `chinese` section to the same JSON, with its
+revision, resource directory, size and SHA256 pinned together. The older v1/v2 caches
+remain separate so older code can continue to use its own resource. An old
 English-only JSON is insufficient for the new shared-resource loader; missing
 Chinese data raises an initialization error.
 
@@ -647,7 +659,7 @@ explicitly rather than treated as interchangeable copies.
 
 The CMU dictionary and its runtime cache are included in the size- and
 SHA256-verified model archive. The separate, unified frontend JSON described
-above is downloaded into `frontend_data/lexicon/20261027-v2/` and retains the
+above is downloaded into `frontend_data/lexicon/20261027-v3/` and retains the
 CMU priority rules. Older Gold copies inside model archives are not used as
 global CMU overrides. Installation reuses `/models`, with no new volume or
 image layer.

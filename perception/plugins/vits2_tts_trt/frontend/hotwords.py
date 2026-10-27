@@ -28,7 +28,7 @@ _TOKEN = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*\Z")
 _VOWELS = set("AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW".split())
 _CONSONANTS = set("B CH D DH F G HH JH K L M N NG P R S SH T TH V W Y Z ZH".split())
 _MODEL_PHONES = set(en_symbols)
-_BUSINESS_SHA256 = "b3f0cfb2b6771a4a94cd44c8b70670db18d7ed074e00b4d3d49e05874becdbd7"
+_BUSINESS_SHA256 = "b3f20b1692ee107d119bd778690b74b65ae246f8ea80ec541ca932d2d650d6e6"
 
 
 def bundled_hotwords_source():
