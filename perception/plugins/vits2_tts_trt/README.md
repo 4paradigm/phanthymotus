@@ -408,7 +408,7 @@ as letters before normalization; ordinary lowercase words keep their readings.
 The default frontend combines all **13,083** entries from the pinned fanyi
 source with **120** reviewed supplements: **115** new keys and five identical
 existing keys. The resulting **13,198-entry** dictionary is compiled to
-`frontend_data/lexicon/20261027-v3/external_lexicon.json` outside Git:
+`frontend_data/lexicon/20261027-v4-7c0e657e/external_lexicon.json` outside Git:
 
 - 225 entries overlapping CMU retain the released CMU reading by default.
   The original Gold phones remain in the data for auditing.
@@ -445,12 +445,19 @@ hyphenated tokens are protected during final punctuation cleanup; structured
 math and addresses keep priority. Ambiguous `M-S` still follows math parsing.
 
 The public frontend resource is one `external_lexicon.json` in the same
-ModelScope repository as the model, under `frontend/lexicon/20261027-v3/`, pinned to revision
-`039e1d00c998d8eeb2908202aa02c28534bf735d`.
+ModelScope repository as the model, under `frontend/lexicon/20261027-v4-7c0e657e/`, pinned to revision
+`275f343e89d9cef520c829e9fff3e950354b9b12`.
 It contains the merged Gold runtime entries and their original annotations,
 matching policies, reviewed business-source records, text replacements,
 ordered frontend rules, Chinese pronunciation annotations and IPA reference data. Vocabulary data is not embedded in generated
 Python modules or duplicated as separate Git dictionaries.
+
+The v4 resource also records the Chinese reading of `华为` and optional
+isolated-synthesis parts for `CUDA` and `SageAIOS`. The latter are data in
+the unified lexicon, not hardcoded names in the adapter. The original path is
+retained for addresses, file names, identifiers, ambiguous matches, and
+requests with more than one marked occurrence; those cases do not receive the
+isolated-synthesis behavior.
 
 The ordered rules retain their original stages: 80 pre-normalization rules,
 seven post-normalization product spellings and one lexical-number rule.
@@ -459,10 +466,12 @@ accepts literal replacements or the existing, allowlisted Ascend digit handler;
 the downloaded resource is never executed as Python. The original CUSTOM
 pronunciations and the early Qwen/version language handling remain in code.
 The maintenance compiler lives in `perception/tools/vits2_prepare_external_lexicon.py`;
-it is not part of the inference plugin.
+it is not part of the inference plugin. When rebuilding the dictionary, carry
+forward and validate the unified resource's `chinese` and `isolated_synthesis`
+sections; the Gold compiler does not generate those sections itself.
 
 Before frontend startup, the adapter downloads/verifies this one size/SHA256-
-pinned JSON into `frontend_data/lexicon/20261027-v3/external_lexicon.json`. The existing downloader
+pinned JSON into `frontend_data/lexicon/20261027-v4-7c0e657e/external_lexicon.json`. The existing downloader
 provides process locking and atomic installation; valid cached bytes are reused.
 Cache validation and replacement of corrupt downloads use the unchanged mainline
 `ensure_verified_bundle` implementation during resource preparation, not per utterance.
@@ -659,7 +668,7 @@ explicitly rather than treated as interchangeable copies.
 
 The CMU dictionary and its runtime cache are included in the size- and
 SHA256-verified model archive. The separate, unified frontend JSON described
-above is downloaded into `frontend_data/lexicon/20261027-v3/` and retains the
+above is downloaded into `frontend_data/lexicon/20261027-v4-7c0e657e/` and retains the
 CMU priority rules. Older Gold copies inside model archives are not used as
 global CMU overrides. Installation reuses `/models`, with no new volume or
 image layer.

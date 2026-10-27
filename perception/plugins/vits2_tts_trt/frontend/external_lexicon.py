@@ -16,6 +16,9 @@ _MAX_ENTRIES = 50000
 _KEY = re.compile(r"[A-Z]+(?:['-][A-Z]+)*\Z")
 _TOKEN = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
+_ISOLATED_TERM = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:['-][A-Za-z0-9]+)*\Z")
+_ISOLATED_PART = re.compile(r"[A-Za-z0-9]+(?:[ '-][A-Za-z0-9]+)*\Z")
+_MAX_ISOLATED_ENTRIES = 256
 _VOWELS = set("AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW".split())
 _CONSONANTS = set("B CH D DH F G HH JH K L M N NG P R S SH T TH V W Y Z ZH".split())
 _MODEL_PHONES = set(en_symbols)
@@ -74,6 +77,38 @@ def _phones(value):
                 or model_phone not in _MODEL_PHONES):
             raise ValueError("External lexicon phone is incompatible with the model")
     return tuple(value)
+
+
+def _isolated_synthesis(value):
+    """Validate optional term-level synthesis plans without changing words.
+
+    The parts are text to synthesize independently, not phone replacements.
+    Requiring the original spelling to be preserved prevents a malformed
+    resource from silently changing or dropping user-supplied text.
+    """
+    if not isinstance(value, list) or len(value) > _MAX_ISOLATED_ENTRIES:
+        raise ValueError("External lexicon isolated synthesis requires a bounded list")
+    result, seen = [], set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"term", "mode", "parts"}:
+            raise ValueError("External lexicon isolated synthesis entry is invalid")
+        term, mode, parts = item["term"], item["mode"], item["parts"]
+        if (not isinstance(term, str) or len(term) > 64 or not _ISOLATED_TERM.fullmatch(term)
+                or mode not in ("exact", "fold") or not isinstance(parts, list)
+                or not 1 <= len(parts) <= 8):
+            raise ValueError("External lexicon isolated synthesis entry is invalid")
+        if any(not isinstance(part, str) or len(part) > 128
+               or not _ISOLATED_PART.fullmatch(part) for part in parts):
+            raise ValueError("External lexicon isolated synthesis must preserve the term")
+        joined = "".join(part.replace(" ", "") for part in parts)
+        if (joined != term if mode == "exact" else joined.casefold() != term.casefold()):
+            raise ValueError("External lexicon isolated synthesis must preserve the term")
+        folded = term.casefold()
+        if folded in seen:
+            raise ValueError("External lexicon isolated synthesis contains duplicate terms")
+        seen.add(folded)
+        result.append((term, mode, tuple(parts)))
+    return tuple(result)
 
 
 @lru_cache(maxsize=8)
@@ -136,7 +171,8 @@ def _load(path, checksum, binding=None):
               "source_sha256": source["sha256"], "cmu_sha256": cmu["sha256"],
               "cmu_canonical_sha256": cmu["canonical_sha256"],
               "cmu_entries": cmu["entries"], "entry_count": len(parsed),
-              "mode_counts": modes, "cmu_verified": binding is not None}
+              "mode_counts": modes, "cmu_verified": binding is not None,
+              "_isolated_synthesis": _isolated_synthesis(data.get("isolated_synthesis", []))}
     supplements, base_source = data.get("supplements"), data.get("base_source")
     if supplements is not None or base_source is not None or supplement_keys:
         if (not isinstance(supplements, dict) or not isinstance(base_source, dict)
@@ -192,6 +228,20 @@ def external_lexicon_status():
     path, checksum = _configuration()
     _, status = _load(path, checksum, _cmu_binding)
     return _status_copy(status)
+
+
+def isolated_synthesis_entries():
+    """Return validated immutable (term, case mode, parts) plans, if present."""
+    if not os.environ.get("VITS2_LEXICON_PATH", "").strip():
+        from . import release_paths
+        if release_paths._release_root is None:
+            # Injected engines may run without a configured frontend release.
+            # Only this absence disables the optional feature; a configured
+            # missing or corrupt resource must still raise normally.
+            return ()
+    path, checksum = _configuration()
+    _, status = _load(path, checksum, _cmu_binding)
+    return status["_isolated_synthesis"]
 
 
 def validate_external_lexicon_file(path, checksum=""):

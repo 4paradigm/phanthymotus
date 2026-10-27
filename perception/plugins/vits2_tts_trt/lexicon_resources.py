@@ -14,15 +14,15 @@ import re
 
 
 log = logging.getLogger(__name__)
-_RESOURCE_REVISION = "039e1d00c998d8eeb2908202aa02c28534bf735d"
+_RESOURCE_REVISION = "275f343e89d9cef520c829e9fff3e950354b9b12"
 _SOURCE_BASE = (
     "https://www.modelscope.cn/api/v1/models/lanxijiang/TTSV4_Ch_Eng/repo"
-    "?Revision=" + _RESOURCE_REVISION + "&FilePath=frontend/lexicon/20261027-v3/{file}"
+    "?Revision=" + _RESOURCE_REVISION + "&FilePath=frontend/lexicon/20261027-v4-7c0e657e/{file}"
 )
 _SOURCE_FILES = {
     "external_lexicon.json": {
-        "size": 1490008,
-        "sha256": "615938cc69b51c21b136d2c9a2d4154291793b15a044d4c8092abe2eb17ce4ad",
+        "size": 1418015,
+        "sha256": "7c0e657e9b3eae25d3aa12461e2db1c4f0386009d60a32d36f847088addbd68a",
     },
 }
 
@@ -72,7 +72,7 @@ def ensure_external_lexicon(root, *, progress_cb=None, stage_cb=None):
 
     stage("download")
     paths = ensure_verified_bundle(
-        "vits2-frontend-20261027-v3", str(directory),
+        "vits2-frontend-20261027-v4-7c0e657e", str(directory),
         _SOURCE_BASE, _SOURCE_FILES, progress_cb=progress_cb,
     )
     if selected is None:

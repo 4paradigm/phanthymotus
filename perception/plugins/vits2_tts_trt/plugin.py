@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -31,6 +32,22 @@ log = logging.getLogger(__name__)
 
 # End-of-utterance marker used by the public TTS audio protocol.
 AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
+
+
+def _call_with_progress(function, *args, progress_cb=None, stage_cb=None, **kwargs):
+    """Pass optional progress callbacks when the supplied API accepts them."""
+    callbacks = {"progress_cb": progress_cb, "stage_cb": stage_cb}
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        # Preserve the original invocation when a callable is not introspectable.
+        pass
+    else:
+        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+            callbacks = {name: value for name, value in callbacks.items()
+                         if name in parameters and parameters[name].kind in
+                         (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)}
+    return function(*args, **kwargs, **callbacks)
 
 
 def _env_int(name: str, default: int, low: int, high: int) -> int:
@@ -770,11 +787,12 @@ class TTSPlugin:
             # Returns the engine directory of the family that matches the
             # TensorRT actually importable here, so the adapter never has to
             # guess between engines/jp61 and engines/jp511.
-            download_options = {"progress_cb": progress_cb, "stage_cb": stage_cb}
+            download_options = {}
             if "model_base_url" in cfg:
                 download_options["base_url"] = cfg["model_base_url"]
-            cfg["engine_dir"] = ensure_vits2_model(
-                cfg.get("model_dir", "/models/vits2"), **download_options,
+            cfg["engine_dir"] = _call_with_progress(
+                ensure_vits2_model, cfg.get("model_dir", "/models/vits2"),
+                progress_cb=progress_cb, stage_cb=stage_cb, **download_options,
             )
             # The verified archive may have a release-root directory. Frontend
             # data and config must come from that same bundle as its engines.
@@ -796,7 +814,9 @@ class TTSPlugin:
                 if stage in lexicon_stages:
                     self._set_load_status(generation, lexicon_stages[stage])
 
-            adapter = build_adapter(cfg, progress_cb=lexicon_progress, stage_cb=lexicon_stage)
+            adapter = _call_with_progress(
+                build_adapter, cfg, progress_cb=lexicon_progress, stage_cb=lexicon_stage,
+            )
             if not isinstance(adapter, Vits2TensorRTAdapter):
                 raise RuntimeError("Unexpected non-TensorRT VITS2 adapter")
             if cfg.get("warmup", True):

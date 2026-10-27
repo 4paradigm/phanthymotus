@@ -14,6 +14,11 @@ from .trt_cuda_session import CudaRuntime, TensorRTCudaSession
 
 DEFAULT_MAX_ENGINE_BYTES = 64 * 1024 * 1024
 
+
+class SynthesisFrameLimitError(ValueError):
+    """The requested audio exceeds the configured TensorRT frame profile."""
+
+
 def _profile_max(manifest, name, fallback):
     profile = str(manifest.get("profiles", {}).get(name, ""))
     try:
@@ -242,7 +247,8 @@ class TensorRTNumpyTTSEngine:
             start = end
         return np.concatenate(pieces, axis=2)
 
-    def _infer_ids(self, text_ids, noise_scale=0.667, length_scale=1.0):
+    def _infer_ids(self, text_ids, noise_scale=0.667, length_scale=1.0, *,
+                   return_durations=False):
         phone_ids, tone_ids, lang_ids = text_ids
         text_length = len(phone_ids)
         if text_length > self.max_text_tokens:
@@ -267,7 +273,7 @@ class TensorRTNumpyTTSEngine:
         y_lengths = np.maximum(np.sum(duration, axis=(1, 2)), 1).astype(np.int64)
         frame_count = int(y_lengths.max())
         if frame_count > self.max_frames:
-            raise ValueError(
+            raise SynthesisFrameLimitError(
                 f"Audio requires {frame_count} frames; TensorRT profile limit is {self.max_frames}"
             )
         y_mask = _sequence_mask(y_lengths).astype(x_mask.dtype)[:, None, :]
@@ -287,11 +293,25 @@ class TensorRTNumpyTTSEngine:
         phase = math.pi * np.sin(logits[:, split:])
         spectrum = magnitude * np.exp(1j * phase)
         audio = _istft(spectrum, self.n_fft, self.istft_hop)[0]
-        return _soft_clip_and_pcm(audio, self.sr)
+        pcm = _soft_clip_and_pcm(audio, self.sr)
+        if return_durations:
+            return pcm, tuple(int(value) for value in duration[0, 0])
+        return pcm
 
     def synthesize(self, text, text_ids=None, noise_scale=0.667, length_scale=1.0, **_kwargs):
         return self._infer_ids(
             text_ids or self._get_text_ids(text), noise_scale, length_scale
+        )
+
+    def synthesize_with_durations(self, text, text_ids=None, noise_scale=0.667,
+                                  length_scale=1.0):
+        """Return PCM and per-token predicted frame allocations.
+
+        Allocations include blank tokens and are not forced audio alignment.
+        """
+        return self._infer_ids(
+            text_ids or self._get_text_ids(text), noise_scale, length_scale,
+            return_durations=True,
         )
 
     def synthesize_batch(self, batch_text_ids, **kwargs):

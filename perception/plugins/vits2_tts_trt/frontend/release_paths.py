@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 _release_root: Path | None = None
-LEXICON_RESOURCE_DIRECTORY = "lexicon/20261027-v3"
+LEXICON_RESOURCE_DIRECTORY = "lexicon/20261027-v4-7c0e657e"
 
 
 def configure_release_paths(root: Path) -> None:

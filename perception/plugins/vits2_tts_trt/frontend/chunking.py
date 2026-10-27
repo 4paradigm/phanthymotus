@@ -8,6 +8,7 @@ synthesized audio) are identical regardless of backend.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 import jieba
 
@@ -26,6 +27,125 @@ _PUNCTUATION_UNIT_RE = re.compile(
     rf"[{re.escape(_CLOSING_PUNCTUATION)}]*|.+$",
     flags=re.DOTALL,
 )
+
+
+def _connected_identifier_char(char):
+    """Whether an adjacent character can make a match part of an identifier."""
+    if not char:
+        return False
+    if char in "_-'’/@\\‐‑‒–—﹣－−" or unicodedata.category(char).startswith("M"):
+        return True
+    # Chinese directly adjoining an English product name is an ordinary word
+    # boundary. Other letters/digits may be part of the same identifier.
+    return char.isalnum() and not ("\u4e00" <= char <= "\u9fff")
+
+
+def find_isolated_plan(original_text, entries):
+    """Find one unambiguous, ordinary-text occurrence of an optional term.
+
+    Addresses and identifier-shaped terms must be protected *before* text
+    normalization. Ambiguous or repeated occurrences deliberately use the
+    original synthesis path; this function never rewrites input text.
+    """
+    if not isinstance(original_text, str) or not entries:
+        return None
+    from .special_text import _ADDRESSES
+
+    addresses = [match.span() for match in _ADDRESSES.finditer(original_text)]
+    matches = []
+    for term, mode, parts in entries:
+        flags = re.ASCII | (re.IGNORECASE if mode == "fold" else 0)
+        for match in re.finditer(re.escape(term), original_text, flags):
+            start, end = match.span()
+            left = original_text[start - 1] if start else ""
+            right = original_text[end] if end < len(original_text) else ""
+            if (_connected_identifier_char(left) or _connected_identifier_char(right)
+                    or any(start < b and end > a for a, b in addresses)):
+                return None
+            # Distinguish sentence-final punctuation from dotted names such as
+            # a file extension, hostname, or identifier component.
+            if (left == "." and start >= 2 and _connected_identifier_char(original_text[start - 2])):
+                return None
+            if (right == "." and end + 1 < len(original_text)
+                    and _connected_identifier_char(original_text[end + 1])):
+                return None
+            matches.append((term, mode, parts))
+            if len(matches) > 1:
+                return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def map_isolated_term(normalized_chunk, prepared_ids, term, mode, add_blank):
+    """Map a complete normalized token to its left blank in prepared IDs.
+
+    Recompute and compare all model IDs before trusting word2ph. The returned
+    blank marks a predicted model allocation, not a forced audio alignment.
+    """
+    if (not add_blank or not isinstance(normalized_chunk, str)
+            or not isinstance(term, str) or mode not in ("exact", "fold")):
+        return None
+    from . import cleaned_text_to_sequence_mix
+    from .cleaner import g2p_normalized_text_mix
+    from .english import TOKEN_SPLIT_RE, text_to_words
+    from .unified_g2p import _mixed_tokens
+
+    # Construct the exact frontend word2ph units with source offsets. For MIX,
+    # Chinese runs supply one unit per character; whitespace is still a unit.
+    units = []
+    if any("\u4e00" <= c <= "\u9fff" for c in normalized_chunk):
+        offset = 0
+        for kind, token in _mixed_tokens(normalized_chunk):
+            if kind == "ZH":
+                units.extend((offset + i, offset + i + 1, char)
+                             for i, char in enumerate(token))
+            else:
+                units.append((offset, offset + len(token), token))
+            offset += len(token)
+        if offset != len(normalized_chunk):
+            return None
+    else:
+        cursor = 0
+        for match in TOKEN_SPLIT_RE.finditer(normalized_chunk):
+            if normalized_chunk[cursor:match.start()].strip():
+                units.append((cursor, match.start(), normalized_chunk[cursor:match.start()]))
+            if match.group().strip():
+                units.append((match.start(), match.end(), match.group()))
+            cursor = match.end()
+        if normalized_chunk[cursor:].strip():
+            units.append((cursor, len(normalized_chunk), normalized_chunk[cursor:]))
+        if [token for _, _, token in units] != text_to_words(normalized_chunk):
+            return None
+
+    candidates = [i for i, (_, _, token) in enumerate(units)
+                  if (token == term if mode == "exact" else token.casefold() == term.casefold())]
+    if len(candidates) != 1:
+        return None
+    try:
+        phones, tones, langs, word2ph = g2p_normalized_text_mix(normalized_chunk)
+        if len(units) != len(word2ph) - 2 or sum(word2ph) != len(phones):
+            return None
+        sequence = cleaned_text_to_sequence_mix(phones, tones, langs)
+        interspersed = []
+        for values in sequence:
+            padded = [0] * (2 * len(values) + 1)
+            padded[1::2] = values
+            interspersed.append(tuple(padded))
+        if tuple(interspersed) != tuple(tuple(values) for values in prepared_ids):
+            return None
+        index = candidates[0]
+        first = sum(word2ph[:index + 1])
+        last = first + word2ph[index + 1]
+        if first == last or any(lang != "EN" for lang in langs[first:last]):
+            return None
+        left_blank = 2 * first
+        if left_blank >= len(interspersed[0]) or interspersed[0][left_blank] != 0:
+            return None
+        start, end, _ = units[index]
+        return start, end, left_blank
+    except (AssertionError, IndexError, TypeError, ValueError):
+        # The already-prepared request remains valid even if optional mapping
+        # cannot be established. Do not invent a boundary on uncertainty.
+        return None
 
 
 def _language_kind(char: str) -> str | None:
