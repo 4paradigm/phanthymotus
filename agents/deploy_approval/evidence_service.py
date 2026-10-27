@@ -1102,6 +1102,8 @@ class EvidenceService:
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'round_number': round_numbers.get(round_id),
                         'status': selected['status'], 'authenticated': True, 'enabled': True,
+                        'pr_state': pr.get('state'), 'merged': pr.get('merged') is True,
+                        'draft': pr.get('draft') is True,
                         'github_user_authenticated': bool(
                             principal.get('actor_verified') is True
                             and principal.get('github_user_authenticated') is True),
