@@ -1,11 +1,16 @@
 """Address integrity and compatibility with the author's normal lexicon."""
 from pathlib import Path
 import importlib.util
+import json
+import re
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from plugins.vits2_tts_trt.frontend.special_text import normalize_special_text, verbalize_chinese_number
+from plugins.vits2_tts_trt.frontend import lexicon_rules
 from plugins.vits2_tts_trt.frontend.lexicon_rules import apply_lexeme_rules
 
 
@@ -15,6 +20,36 @@ def number(value, language):
 
 
 class SpecialTextTests(unittest.TestCase):
+    def setUp(self):
+        # Exercise the real rule loader with a small offline resource. Tests
+        # must not depend on another test initializing the model release root.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "external_lexicon.json"
+
+        def rule(term, spoken):
+            return {"pattern": r"(?<![A-Za-z0-9_])" + term + r"(?![A-Za-z0-9_])",
+                    "flags": int(re.IGNORECASE | re.UNICODE), "replacement": spoken}
+
+        path.write_text(json.dumps({
+            "text_replacements": {"ModelHub": "Model Hub"},
+            "frontend_rules": {
+                "before_tn": [rule("waic", "W A I C"), rule("qwen", "千问"),
+                              rule(r"tier\s*1", "Tier one"), rule("idc", "I D C"),
+                              rule("cncf", "C.N.C.F"), rule("automl", "Auto M L"),
+                              rule("phanrouter", "Phan Router"),
+                              rule("openmldb", "Open M L D B"),
+                              rule("featinsight", "Feat Insight")],
+                "after_tn": [rule("chatgpt", "chat GPT")],
+                "numeric_names": [rule("StyleTTS2", "style T T S 2")],
+            },
+        }), encoding="utf-8")
+        lexicon_rules._generated_tables.cache_clear()
+        self.addCleanup(lexicon_rules._generated_tables.cache_clear)
+        resource = patch.object(lexicon_rules, "frontend_lexicon_path", return_value=path)
+        resource.start()
+        self.addCleanup(resource.stop)
+
     def normalize(self, text):
         return normalize_special_text(text, apply_lexeme_rules, number)
 
