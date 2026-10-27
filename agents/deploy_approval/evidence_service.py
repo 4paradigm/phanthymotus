@@ -492,8 +492,10 @@ class EvidenceService:
             raise EvidenceError('app_access_revoked', 403)
         pr = await self.proxy.get_pr(repo, pr_number)
         state = await self.proxy.read_hidden_state(repo, pr_number)
-        if (not isinstance(pr, dict) or pr.get('state') != 'open' or pr.get('merged')
-                or pr.get('draft') or not isinstance(state, dict)):
+        if (not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}
+                or pr.get('draft')
+                or pr.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo.lower()
+                or not isinstance(state, dict)):
             raise EvidenceError('pr_closed', 409)
         author = pr.get('user', {})
         if isinstance(author, dict) and str(author.get('id', '')) == str(actor_id):
@@ -796,7 +798,9 @@ class EvidenceService:
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
                 raise EvidenceError('state_unavailable', 409)
-            if pr.get('state') != 'open' or pr.get('merged') or pr.get('draft'):
+            if (not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}
+                    or pr.get('draft')
+                    or pr.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo.lower()):
                 raise EvidenceError('pr_closed', 409)
             records = await self.proxy.read_evidence_records(repo, pr_number)
             active_round = round_id_for_state(state)
@@ -860,8 +864,9 @@ class EvidenceService:
                     and invite.get('status') == 'testing'
                     and type(invite.get('expires_at')) is int
                     and invite['expires_at'] > int(time.time())
-                    and target_pr.get('state') == 'open' and not target_pr.get('merged')
+                    and isinstance(target_pr, dict) and target_pr.get('state') in {'open', 'closed'}
                     and not target_pr.get('draft')
+                    and target_pr.get('base', {}).get('repo', {}).get('full_name', '').lower() == repo.lower()
                     and target_pr.get('head', {}).get('sha') == expected_head
                     and target_state.get('head_sha') == expected_head
                     and target_state.get('status') == 'testing'
@@ -1199,24 +1204,13 @@ class EvidenceService:
                         raise EvidenceError('attachment_deleted', 410)
                     if operation['status'] != 'ready':
                         raise EvidenceError('attachment_not_ready', 409)
-                # Recheck the live PR and hidden state immediately before
-                # verifying/signing. Historical rounds remain readable from
-                # their trusted archived snapshot while the PR itself is open.
-                before_pr = await self.proxy.get_pr(repo, pr_number)
-                before_state = await self.proxy.read_hidden_state(repo, pr_number)
-                if (before_pr.get('state') != 'open' or before_pr.get('merged')
-                        or before_pr.get('draft')
-                        or before_pr.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo):
-                    raise EvidenceError('pr_closed', 409)
-                if not isinstance(before_state, dict):
-                    raise EvidenceError('state_unavailable', 409)
-                if round_id == active_round:
-                    validate_context(before_pr, before_state, expected_head, round_id, write=False)
+                # PR and lifecycle state were read and validated above.
                 # Store may sign ONLY the server-loaded object, never payload key.
                 result = await self._store(action, operation, {})
                 fresh = await self.proxy.get_pr(repo, pr_number)
                 fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
-                if (fresh.get('state') != 'open' or fresh.get('merged') or fresh.get('draft')
+                if (not isinstance(fresh, dict) or fresh.get('state') not in {'open', 'closed'}
+                        or fresh.get('draft')
                         or fresh.get('base', {}).get('repo', {}).get('full_name', '').lower() != repo
                         or not isinstance(fresh_state, dict)):
                     raise EvidenceError('pr_closed', 409)

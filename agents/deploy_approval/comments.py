@@ -1401,8 +1401,7 @@ def render_evidence_section(
         lines.extend(render_round((head, current_round), groups[(head, current_round)]))
     round_pattern = re.escape(str(head)) + r"-[0-9]+"
     current_context_valid = (
-        show_current_round and state.get("pr_state") == "open" and not state.get("merged")
-        and re.fullmatch(r"[0-9a-f]{40}", str(head))
+        show_current_round and re.fullmatch(r"[0-9a-f]{40}", str(head))
         and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
         and state.get("evidence_enabled") is True and bool(api)
     )
@@ -1464,6 +1463,11 @@ def render_evidence_section(
                  if attachment_count else "历史数据不可读取")
                 if group.get("attachment_details_unreadable") else
                 f"{attachment_count} 个附件" if attachment_count else
+                "测试前归档 · 未保存附件"
+                if (not attachment_items and group.get("attachment_details_complete")
+                    and group.get("status") in {
+                        "review-required", "reviewing", "deploy-ready", "deploy-requested",
+                    }) else
                 "该轮未保存附件" if not attachment_items and group.get("attachment_details_complete")
                 else "内部验收备注已隐藏" if only_hidden_internal_notes(group, key)
                 else "附件记录均已删除" if round_items and all(

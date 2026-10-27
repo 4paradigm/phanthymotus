@@ -3670,19 +3670,30 @@ class DeployController:
         # Presentation flags are deliberately ephemeral. Hidden state has a
         # strict schema and must never learn about browser feature config.
         render_state = copy.deepcopy(state)
-        pr = {}
         store = getattr(self.evidence_service, "store", None)
         try:
-            from .evidence_auth import readiness
             pr = await self.proxy.get_pr(repo, pr_number)
+        except Exception as exc:
+            logger.warning("Evidence PR context unavailable %s#%s exception=%s",
+                           repo, pr_number, type(exc).__name__)
+            raise GitHubStateProxyError(
+                "Evidence projection could not verify current PR context",
+            ) from None
+        if (not isinstance(pr, dict) or pr.get("state") not in {"open", "closed"}
+                or not isinstance(pr.get("head"), dict)
+                or pr.get("head", {}).get("sha") != state.get("head_sha")):
+            raise GitHubStateProxyError(
+                "Evidence projection could not verify current PR head",
+            )
+        try:
+            from .evidence_auth import readiness
             status = readiness(self.config, self.evidence_service)
             backend_ready = (status["EVIDENCE_BACKEND_READY"]
-                             and callable(getattr(store, "dispatch", None))
-                             and pr.get("state") == "open" and not pr.get("merged")
-                             and not pr.get("draft")
-                             and pr.get("head", {}).get("sha") == state.get("head_sha"))
+                             and callable(getattr(store, "dispatch", None)))
             browser_upload_ready = (
                 backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
+                and pr.get("state") == "open" and not pr.get("merged")
+                and not pr.get("draft")
             )
         except Exception:
             status = {"status": "EVIDENCE_BACKEND_PENDING",
@@ -3697,8 +3708,8 @@ class DeployController:
             browser_upload_ready=bool(browser_upload_ready),
             evidence_readiness=status,
             enabled=bool(backend_ready and attachment_access_allowed),
-            pr_state=(pr.get("state") if backend_ready else "closed"),
-            merged=(bool(pr.get("merged")) if backend_ready else False),
+            pr_state=pr.get("state"),
+            merged=bool(pr.get("merged")),
             attachments=current_rows,
         )
         round_numbers = trusted_round_numbers(records, state, repo, pr_number)
@@ -3863,7 +3874,7 @@ class DeployController:
                         if (claims.get("head") == state.get("head_sha")
                                 and claims.get("round") == current_round
                                 and claims.get("status") == "testing"
-                                and claims.get("expires_at", 0) - now > 7 * 24 * 60 * 60):
+                                and claims.get("expires_at", 0) > now):
                             upload_capability = token
                             break
                 except Exception:
@@ -3923,7 +3934,8 @@ class DeployController:
         section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, archives[-4:],
                            public_base_url=public_base_url,
                            upload_public_base_url=(
-                               upload_public_base_url if browser_upload_ready else ""
+                               upload_public_base_url
+                               if backend_ready and attachment_access_allowed else ""
                            ),
                            cos_download_url_expiry=validate_cos_download_url)
         if not isinstance(section, str):

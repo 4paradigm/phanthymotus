@@ -422,12 +422,16 @@ class GitHubCommandWatcher:
         if key not in self._recent_command_records:
             record = {
                 "repo": repo, "pr_number": pr_number, "comment_id": comment_id,
+                "created_at": comment.get("created_at"),
                 "comment_created_at": comment.get("created_at"),
                 "discovered_at": datetime.now(timezone.utc).isoformat(),
                 "discovery_delay_seconds": round(max(
                     0.0, (datetime.now(timezone.utc) - created_at).total_seconds(),
                 ), 3),
-                "processing_started_at": None, "discovery_to_processing_seconds": None,
+                "processing_started_at": None, "processing_completed_at": None,
+                "discovery_to_processing_seconds": None,
+                "discovery_to_completion_seconds": None,
+                "processing_duration_seconds": None,
                 "last_failure_reason": None, "status": "discovered",
                 "_discovered_monotonic": self._monotonic(),
                 "_created_sort": created_at.timestamp(),
@@ -464,7 +468,12 @@ class GitHubCommandWatcher:
         elapsed = max(0.0, self._monotonic() - record.get("_discovered_monotonic", self._monotonic()))
         record.update(
             processing_started_at=started_at,
+            processing_completed_at=None,
             discovery_to_processing_seconds=round(elapsed, 3),
+            discovery_to_completion_seconds=None,
+            processing_duration_seconds=None,
+            _processing_started_monotonic=self._monotonic(),
+            _processing_attempt_count=record.get("_processing_attempt_count", 0) + 1,
             status="processing",
         )
         logger.info(
@@ -480,8 +489,18 @@ class GitHubCommandWatcher:
             return
         if failure_reason is not None:
             record["last_failure_reason"] = failure_reason
-        else:
-            record["last_failure_reason"] = None
+        completed_mono = self._monotonic()
+        record["processing_completed_at"] = datetime.now(timezone.utc).isoformat()
+        discovered_mono = record.get("_discovered_monotonic")
+        if isinstance(discovered_mono, (int, float)):
+            record["discovery_to_completion_seconds"] = round(
+                max(0.0, completed_mono - discovered_mono), 3,
+            )
+        started_mono = record.get("_processing_started_monotonic")
+        if isinstance(started_mono, (int, float)):
+            record["processing_duration_seconds"] = round(
+                max(0.0, completed_mono - started_mono), 3,
+            )
         record["status"] = "retry" if failure_reason and retryable else "handled"
         logger.info(
             "watcher recent command finished repo=%s pr=%s comment_id=%s status=%s delay_seconds=%s last_failure_reason=%s",
@@ -498,24 +517,27 @@ class GitHubCommandWatcher:
                     repo, pr_number, comment_id, failure_reason=reason,
                 )
 
-    async def _discover_recent_command_prs(self, repos: list[str]) -> None:
+    async def _discover_recent_command_prs(self, repos: list[str]) -> bool:
         """Queue a small set of PRs referenced by the newest command comments."""
         list_recent = getattr(self._github, "list_recent_issue_comments", None)
         if not callable(list_recent):
-            return
+            return False
+        poll_interval = max(1.0, float(self.config.poll_interval_seconds))
+        discovery_interval = min(10.0, poll_interval)
+        discovery_timeout = min(8.0, max(5.0, poll_interval))
         candidates = {}
         for repo in repos:
             if (not self.config.auth_valid or repo not in self.config.active_repos
                     or repo not in self.config.github_repos):
                 continue
             now = self._monotonic()
-            if now - self._recent_discovery_monotonic.get(repo, float("-inf")) < 30.0:
+            if now - self._recent_discovery_monotonic.get(repo, float("-inf")) < discovery_interval:
                 continue
             self._recent_discovery_monotonic[repo] = now
             self._recent_discovery_at[repo] = datetime.now(timezone.utc).isoformat()
             try:
                 comments = await asyncio.wait_for(
-                    list_recent(repo, limit=100), timeout=2.0,
+                    list_recent(repo, limit=100), timeout=discovery_timeout,
                 )
             except (GitHubRateLimitError, GitHubTransientError) as exc:
                 self._recent_discovery_last_failure[repo] = type(exc).__name__
@@ -586,9 +608,25 @@ class GitHubCommandWatcher:
                     continue
                 candidates[(repo, number)] = (created_at, key)
 
+        # Refresh the order of observed recent hints while leaving webhooks in
+        # their higher-priority prefix. A newly-created comment on an already
+        # queued PR must move that PR ahead of older recent hints.
+        for item in list(candidates):
+            repo, number = item
+            if (item in self._priority_pr_set
+                    and self._priority_pr_sources.get(item) == "webhook"):
+                candidates.pop((repo, number), None)
+                continue
+            if item in self._priority_pr_queue:
+                self._priority_pr_queue.remove(item)
+                self._priority_pr_set.discard(item)
+                self._priority_pr_enqueued_at.pop(item, None)
+                self._priority_pr_sources.pop(item, None)
+
         # Insert oldest first at the fixed position after webhooks; each newer
         # item is then placed ahead of older discovery hints in the final queue.
         ordered = sorted(candidates.items(), key=lambda item: item[1][0])
+        queued_recent = False
         for (repo, number), (_created_at, _key) in ordered:
             item = (repo, number)
             if item in self._priority_pr_set:
@@ -610,6 +648,8 @@ class GitHubCommandWatcher:
             self._priority_pr_set.add(item)
             self._priority_pr_sources[item] = "recent"
             self._priority_pr_enqueued_at[item] = self._monotonic()
+            queued_recent = True
+        return queued_recent
 
     def _record_pr_attempt(
         self, repo: str, pr_number: int, reason: str, duration_seconds: float | None = None,
@@ -1055,6 +1095,14 @@ class GitHubCommandWatcher:
                         self._pr_scan_cursor[repo] = cursor_after[number]
                     if self._github_backing_off():
                         cycle_ok = False
+                        break
+                    # Bound how long the ordinary scan can run without a
+                    # fresh repo-wide command check. If a newer command is
+                    # found, stop this batch so the serial priority tier can
+                    # consume it on the next poll-loop turn.
+                    if await self._discover_recent_command_prs([repo]):
+                        interrupted_for_new_priority = True
+                        self._signal_wakeup()
                         break
 
                 if baseline_all:

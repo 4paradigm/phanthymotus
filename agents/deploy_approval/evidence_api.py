@@ -399,6 +399,7 @@ async def log_download(request: Request, owner: str, repo: str, pr: int, round_i
 async def page(request: Request, owner: str, repo: str, pr: int):
     headers = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
                'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY'}
+    canonical = None
     try:
         evidence_auth.require_enabled(request)
         canonical = _repo(owner, repo, pr)
@@ -416,10 +417,12 @@ async def page(request: Request, owner: str, repo: str, pr: int):
             503: '附件服务暂时不可用，请稍后从当前 PR Summary 重新打开。',
         }
         message = messages.get(exc.status_code, '附件链接暂不可用，请从当前 PR Summary 重新打开。')
+        summary_link = ('<p><a href="https://github.com/' + canonical + '/pull/' + str(pr)
+                        + '">打开当前 PR Summary</a></p>') if canonical else ''
         html = ('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 '<title>附件链接不可用</title><main><h1>附件链接不可用</h1><p>'
-                + message + '</p></main></html>')
+                + message + '</p>' + summary_link + '</main></html>')
         return HTMLResponse(html, status_code=exc.status_code, headers=headers)
     from . import evidence_ui
     page_html = evidence_ui.render_upload_page(

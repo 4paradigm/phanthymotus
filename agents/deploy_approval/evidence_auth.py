@@ -354,7 +354,7 @@ async def _comment_proof_principal(request, repo, pr_number):
     proof = hashlib.sha256(bytes.fromhex(secret)).hexdigest()
     pr = await proxy.get_pr(repo, pr_number)
     head_sha = (pr.get('head') or {}).get('sha')
-    if (pr.get('state') != 'open' or pr.get('merged') or pr.get('draft')
+    if (pr.get('state') not in {'open', 'closed'} or pr.get('draft')
             or not isinstance(head_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', head_sha)
             or (pr.get('base') or {}).get('repo', {}).get('full_name', '').lower() != repo.lower()):
         raise HTTPException(409, detail='pr_closed_or_mismatched')
