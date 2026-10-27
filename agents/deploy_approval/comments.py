@@ -1413,7 +1413,7 @@ def render_evidence_section(
             and state.get("browser_upload_ready") is True
             else ""
         )
-        read_url = page_url(state.get("capability"))
+        read_url = page_url_at(state.get("capability"), upload_base or base)
         if upload_url:
             lines.extend(["", f"[打开附件页](<{upload_url}>)"])
         elif read_url:
