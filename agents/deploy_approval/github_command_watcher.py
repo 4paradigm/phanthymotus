@@ -242,7 +242,7 @@ class GitHubCommandWatcher:
                 # fresh queued pass so the new comment is not hidden by dedupe.
                 self._queue_priority_pr(item, "webhook")
             self._priority_generation += 1
-            self._wakeup is not None and self._wakeup.set()
+            self._signal_wakeup()
             return True
         if len(self._priority_pr_queue) >= 128:
             evicted = self._priority_pr_queue.pop()
@@ -254,7 +254,7 @@ class GitHubCommandWatcher:
         self._priority_pr_sources[item] = "webhook"
         self._priority_pr_enqueued_at[item] = self._monotonic()
         self._priority_generation += 1
-        self._wakeup is not None and self._wakeup.set()
+        self._signal_wakeup()
         return True
 
     def _queue_priority_pr(self, item: tuple[str, int], source: str) -> bool:
@@ -287,6 +287,11 @@ class GitHubCommandWatcher:
         self._priority_pr_sources[item] = source
         self._priority_pr_enqueued_at[item] = self._monotonic()
         return True
+
+    def _signal_wakeup(self) -> None:
+        """Wake a started watcher; preserve queued hints before startup."""
+        if self._wakeup is not None:
+            self._wakeup.set()
 
     def start(self) -> None:
         if self._running:
@@ -921,7 +926,7 @@ class GitHubCommandWatcher:
                 if (self._priority_generation != queue_generation_at_start
                         and has_new_webhook):
                     interrupted_for_new_priority = True
-                    self._wakeup is not None and self._wakeup.set()
+                    self._signal_wakeup()
                     break
                 if (self.config.auth_valid is not True or repo not in self.config.active_repos
                         or repo not in self.config.github_repos):
@@ -1016,7 +1021,7 @@ class GitHubCommandWatcher:
                     if (self._priority_generation != queue_generation_at_start
                             and has_new_webhook):
                         interrupted_for_new_priority = True
-                        self._wakeup is not None and self._wakeup.set()
+                        self._signal_wakeup()
                         break
                     if number in priority_attempted.get(repo, []):
                         if number in priority_done.get(repo, []):
