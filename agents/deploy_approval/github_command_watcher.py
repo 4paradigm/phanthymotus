@@ -130,7 +130,8 @@ class GitHubCommandWatcher:
         self._priority_pr_enqueued_at: dict[tuple[str, int], float] = {}
         self._priority_pr_sources: dict[tuple[str, int], str] = {}
         self._priority_generation = 0
-        self._wakeup = asyncio.Event()
+        # Initialized in start() under the running event loop (Python 3.9 safe).
+        self._wakeup = None
         self._last_successful_cycle = None
         self._last_driver_poll = None
         self._repo_backlog: dict[str, dict] = {}
@@ -241,7 +242,7 @@ class GitHubCommandWatcher:
                 # fresh queued pass so the new comment is not hidden by dedupe.
                 self._queue_priority_pr(item, "webhook")
             self._priority_generation += 1
-            self._wakeup.set()
+            self._wakeup is not None and self._wakeup.set()
             return True
         if len(self._priority_pr_queue) >= 128:
             evicted = self._priority_pr_queue.pop()
@@ -253,7 +254,7 @@ class GitHubCommandWatcher:
         self._priority_pr_sources[item] = "webhook"
         self._priority_pr_enqueued_at[item] = self._monotonic()
         self._priority_generation += 1
-        self._wakeup.set()
+        self._wakeup is not None and self._wakeup.set()
         return True
 
     def _queue_priority_pr(self, item: tuple[str, int], source: str) -> bool:
@@ -290,6 +291,7 @@ class GitHubCommandWatcher:
     def start(self) -> None:
         if self._running:
             return
+        self._wakeup = asyncio.Event()
         self._running = True
         self._task = asyncio.create_task(self._poll_loop())
 
@@ -919,7 +921,7 @@ class GitHubCommandWatcher:
                 if (self._priority_generation != queue_generation_at_start
                         and has_new_webhook):
                     interrupted_for_new_priority = True
-                    self._wakeup.set()
+                    self._wakeup is not None and self._wakeup.set()
                     break
                 if (self.config.auth_valid is not True or repo not in self.config.active_repos
                         or repo not in self.config.github_repos):
@@ -1014,7 +1016,7 @@ class GitHubCommandWatcher:
                     if (self._priority_generation != queue_generation_at_start
                             and has_new_webhook):
                         interrupted_for_new_priority = True
-                        self._wakeup.set()
+                        self._wakeup is not None and self._wakeup.set()
                         break
                     if number in priority_attempted.get(repo, []):
                         if number in priority_done.get(repo, []):
