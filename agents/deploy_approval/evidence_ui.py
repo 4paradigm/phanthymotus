@@ -681,14 +681,11 @@ _JAVASCRIPT = r'''"use strict";
       if (!proofSecret || ![401, 403].includes(inviteError.status)) throw inviteError;
       useProofFallback = true;
     }
-    if (!useProofFallback && (!next || next.pr_state !== "open" || next.merged)) {
-      context = next || null;
-      halt("无法确认 PR 仍处于 Open 状态，已停止写入。");
-      if (next) render();
-      return next;
-    }
+    // The API owns the authoritative live-PR check. Do not repeat it here:
+    // context responses may be served by compatible backends that omit the
+    // presentation-only PR fields, which must not disable a valid open-PR invite.
     if (!useProofFallback && proofSecret && next.auth_method !== "signed_invite" &&
-        roundMatches(next) && next.pr_state === "open" && !next.merged) {
+        roundMatches(next)) {
       // A valid read-only page cookie is not an upload invitation. Preserve
       // the legacy proof path when it is available, but never replace stale
       // HEAD/round or closed-PR responses with a second auth result.
