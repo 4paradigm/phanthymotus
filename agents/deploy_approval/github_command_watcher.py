@@ -432,14 +432,15 @@ class GitHubCommandWatcher:
                 "discovery_to_processing_seconds": None,
                 "discovery_to_completion_seconds": None,
                 "processing_duration_seconds": None,
-                "last_failure_reason": None, "status": "discovered",
+                "failure_reason": None, "last_failure_reason": None,
+                "status": "discovered",
                 "_discovered_monotonic": self._monotonic(),
-                "_created_sort": created_at.timestamp(),
+                "_created_sort": (created_at.timestamp(), comment_id),
             }
             self._recent_command_records[key] = record
             latest_key = self._latest_recent_command_key
             latest = self._recent_command_records.get(latest_key) if latest_key else None
-            if latest is None or record["_created_sort"] >= latest.get("_created_sort", 0):
+            if latest is None or record["_created_sort"] >= latest.get("_created_sort", (0.0, 0)):
                 self._latest_recent_command_key = key
             logger.info(
                 "watcher recent command discovered repo=%s pr=%s comment_id=%s created_at=%s discovered_at=%s delay_seconds=%.3f",
@@ -454,7 +455,7 @@ class GitHubCommandWatcher:
                 if oldest == self._latest_recent_command_key:
                     self._latest_recent_command_key = max(
                         self._recent_command_records,
-                        key=lambda item: self._recent_command_records[item].get("_created_sort", 0.0),
+                        key=lambda item: self._recent_command_records[item].get("_created_sort", (0.0, 0)),
                         default=None,
                     )
         return key
@@ -489,6 +490,7 @@ class GitHubCommandWatcher:
             return
         if failure_reason is not None:
             record["last_failure_reason"] = failure_reason
+        record["failure_reason"] = failure_reason
         completed_mono = self._monotonic()
         record["processing_completed_at"] = datetime.now(timezone.utc).isoformat()
         discovered_mono = record.get("_discovered_monotonic")
@@ -508,13 +510,26 @@ class GitHubCommandWatcher:
             record.get("discovery_to_processing_seconds"), failure_reason,
         )
 
-    def _fail_recent_commands_for_pr(self, repo, pr_number, reason):
+    def _mark_recent_command_already_processed(self, repo, pr_number, comment_id):
+        record = self._recent_command_records.get((repo, pr_number, comment_id))
+        if not isinstance(record, dict):
+            return
+        record.update(
+            status="already_processed", failure_reason=None,
+            processing_started_at=None, processing_completed_at=None,
+            discovery_to_processing_seconds=None,
+            discovery_to_completion_seconds=None,
+            processing_duration_seconds=None,
+        )
+
+    def _fail_recent_commands_for_pr(self, repo, pr_number, reason, *, retryable=True):
         for (observed_repo, observed_pr, comment_id), record in list(
                 self._recent_command_records.items()):
             if (observed_repo == repo and observed_pr == pr_number
-                    and record.get("status") != "handled"):
+                    and record.get("status") not in {"handled", "already_processed"}):
                 self._finish_recent_command(
                     repo, pr_number, comment_id, failure_reason=reason,
+                    retryable=retryable,
                 )
 
     async def _discover_recent_command_prs(self, repos: list[str]) -> bool:
@@ -523,7 +538,7 @@ class GitHubCommandWatcher:
         if not callable(list_recent):
             return False
         poll_interval = max(1.0, float(self.config.poll_interval_seconds))
-        discovery_interval = min(10.0, poll_interval)
+        discovery_interval = max(5.0, min(10.0, poll_interval))
         discovery_timeout = min(8.0, max(5.0, poll_interval))
         candidates = {}
         for repo in repos:
@@ -598,15 +613,14 @@ class GitHubCommandWatcher:
                 if key is None:
                     continue
                 observed = self._recent_command_records[key]
-                if observed.get("status") == "handled":
+                if observed.get("status") in {"handled", "already_processed"}:
                     continue
                 previous = per_pr.get(number)
-                if previous is None or created_at > previous[0]:
-                    per_pr[number] = (created_at, key)
-            for number, (created_at, key) in per_pr.items():
-                if (repo, number) in self._priority_pr_set:
-                    continue
-                candidates[(repo, number)] = (created_at, key)
+                if (previous is None or created_at > previous[0]
+                        or created_at == previous[0] and key[2] > previous[1]):
+                    per_pr[number] = (created_at, key[2], key)
+            for number, (created_at, comment_id, key) in per_pr.items():
+                candidates[(repo, number)] = (created_at, comment_id, key)
 
         # Refresh the order of observed recent hints while leaving webhooks in
         # their higher-priority prefix. A newly-created comment on an already
@@ -614,7 +628,7 @@ class GitHubCommandWatcher:
         for item in list(candidates):
             repo, number = item
             if (item in self._priority_pr_set
-                    and self._priority_pr_sources.get(item) == "webhook"):
+                    and self._priority_pr_sources.get(item, "webhook") == "webhook"):
                 candidates.pop((repo, number), None)
                 continue
             if item in self._priority_pr_queue:
@@ -625,9 +639,9 @@ class GitHubCommandWatcher:
 
         # Insert oldest first at the fixed position after webhooks; each newer
         # item is then placed ahead of older discovery hints in the final queue.
-        ordered = sorted(candidates.items(), key=lambda item: item[1][0])
+        ordered = sorted(candidates.items(), key=lambda item: (item[1][0], item[1][1]))
         queued_recent = False
-        for (repo, number), (_created_at, _key) in ordered:
+        for (repo, number), (_created_at, _comment_id, _key) in ordered:
             item = (repo, number)
             if item in self._priority_pr_set:
                 continue
@@ -842,6 +856,31 @@ class GitHubCommandWatcher:
                 logger.warning("watcher rate limited before priority PR; retry_after=%.1f", exc.retry_after_seconds)
                 cycle_ok = False
                 break
+            except GitHubError as exc:
+                if exc.status_code == 404:
+                    self._fail_recent_commands_for_pr(
+                        queued_repo, pr_number, "pr_not_found", retryable=False,
+                    )
+                    while item in self._priority_pr_queue:
+                        self._priority_pr_queue.remove(item)
+                    self._priority_pr_set.discard(item)
+                    self._priority_pr_enqueued_at.pop(item, None)
+                    self._priority_pr_sources.pop(item, None)
+                    logger.info(
+                        "watcher priority candidate is not an open PR repo=%s number=%s source=%s",
+                        queued_repo, pr_number, source,
+                    )
+                    continue
+                self._queue_priority_pr(item, source)
+                self._fail_recent_commands_for_pr(queued_repo, pr_number, type(exc).__name__)
+                self._record_pr_attempt(queued_repo, pr_number, type(exc).__name__)
+                logger.warning(
+                    "watcher priority PR read %s#%s failed: %s",
+                    queued_repo, pr_number, type(exc).__name__,
+                )
+                cycle_ok = False
+                if self._github_backing_off():
+                    break
             except Exception as exc:
                 self._queue_priority_pr(item, source)
                 self._fail_recent_commands_for_pr(queued_repo, pr_number, type(exc).__name__)
@@ -1584,8 +1623,11 @@ class GitHubCommandWatcher:
         for (observed_repo, observed_pr, observed_comment_id), observed in list(
                 self._recent_command_records.items()):
             if (observed_repo == repo and observed_pr == pr_number
-                    and observed_comment_id <= cursor and observed.get("status") != "handled"):
-                self._finish_recent_command(repo, pr_number, observed_comment_id)
+                    and observed_comment_id <= cursor
+                    and observed.get("status") not in {"handled", "already_processed"}):
+                self._mark_recent_command_already_processed(
+                    repo, pr_number, observed_comment_id,
+                )
 
         # Fetch comments
         try:

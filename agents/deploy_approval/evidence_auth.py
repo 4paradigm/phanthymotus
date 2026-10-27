@@ -280,8 +280,16 @@ def bind_page_capability(request, repo, pr_number):
         if upload:
             _cookie(response, request, UPLOAD_COOKIE, token,
                     max(1, claims['expires_at'] - int(time.time())))
+            response.delete_cookie(
+                CAPABILITY_COOKIE, path='/', secure=_secure(request),
+                httponly=True, samesite='lax',
+            )
         else:
             _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
+            response.delete_cookie(
+                UPLOAD_COOKIE, path='/', secure=_secure(request),
+                httponly=True, samesite='lax',
+            )
         return response
     token = request.cookies.get(CAPABILITY_COOKIE, '')
     if token:

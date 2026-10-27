@@ -1234,6 +1234,15 @@ def render_evidence_section(
                 return value
         return None
 
+    def round_label(group, *, historical=False):
+        if historical and group.get("status") in {
+                "review-required", "reviewing", "deploy-ready", "deploy-requested", "deploying"}:
+            return "测试前归档"
+        round_number = group.get("round_number")
+        if type(round_number) is int and round_number > 0:
+            return f"第 {round_number} 轮"
+        return "历史轮次" if historical else "当前轮"
+
     def render_round(key, group, *, historical=False):
         h, r = key
         items = visible_attachments(group, key)
@@ -1241,11 +1250,7 @@ def render_evidence_section(
             item.get("created_at"), item.get("uploaded_at"))), reverse=True)
         lines = []
         if historical:
-            round_number = group.get("round_number")
-            round_label = (f"第 {round_number} 轮"
-                           if type(round_number) is int and round_number > 0
-                           else "历史轮次")
-            lines.append(f"**轮次：** {_escape(round_label)}")
+            lines.append(f"**轮次：** {_escape(round_label(group, historical=True))}")
             historical_time = first_valid_time(
                 group.get("archived_at"), group.get("ended_at"),
                 group.get("round_started_at"), group.get("started_at"),
@@ -1270,11 +1275,7 @@ def render_evidence_section(
             )
             lines.extend([f"**状态：** {_escape(status_label)}", ""])
         else:
-            round_number = group.get("round_number")
-            round_label = (f"第 {round_number} 轮"
-                           if type(round_number) is int and round_number > 0
-                           else "当前轮")
-            lines.extend([f"### {_escape(round_label)} · 附件", ""])
+            lines.extend([f"### {_escape(round_label(group))} · 附件", ""])
         if historical:
             lines.extend(["### 附件", ""])
         if items:
@@ -1466,7 +1467,7 @@ def render_evidence_section(
                 "测试前归档 · 未保存附件"
                 if (not attachment_items and group.get("attachment_details_complete")
                     and group.get("status") in {
-                        "review-required", "reviewing", "deploy-ready", "deploy-requested",
+                        "review-required", "reviewing", "deploy-ready", "deploy-requested", "deploying",
                     }) else
                 "该轮未保存附件" if not attachment_items and group.get("attachment_details_complete")
                 else "内部验收备注已隐藏" if only_hidden_internal_notes(group, key)
@@ -1478,7 +1479,7 @@ def render_evidence_section(
             )
             date_label = summary_date(timestamp)
             lines.extend(["<details>",
-                          f"<summary>{_escape(group.get('round_number') if type(group.get('round_number')) is int and group.get('round_number') > 0 else '历史轮次')} · {_escape(date_label)} · {_escape(count_label)}</summary>",
+                          f"<summary>{_escape(round_label(group, historical=True))} · {_escape(date_label)} · {_escape(count_label)}</summary>",
                           "", *render_round(key, group, historical=True), "", "</details>", ""])
     linked_index = False
     for url in trusted_archive_urls:

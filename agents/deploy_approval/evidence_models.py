@@ -107,6 +107,7 @@ def trusted_round_numbers(records, state, repo, pr_number) -> dict[str, int]:
         return {}
 
     by_sha = {}
+    by_round = {}
     seen_ids = set()
     seen_keys = set()
     for record in round_records:
@@ -184,6 +185,7 @@ def trusted_round_numbers(records, state, repo, pr_number) -> dict[str, int]:
                 return {}
             nested_seen.add((nested_kind, nested_key))
         by_sha[digest] = data
+        by_round[rid] = data
         seen_ids.add(rid)
         seen_keys.add(key)
 
@@ -213,8 +215,14 @@ def trusted_round_numbers(records, state, repo, pr_number) -> dict[str, int]:
     if (visited_sha != set(by_sha) or current_round in visited_ids
             or other_rounds - visited_ids):
         return {}
-    numbers = {rid: index + 1 for index, rid in enumerate(reversed(newest_first))}
-    numbers[current_round] = len(newest_first) + 1
+    testing_statuses = {'testing', 'succeeded', 'failed'}
+    testing_rounds = [
+        rid for rid in reversed(newest_first)
+        if by_round[rid]['snapshot'].get('status') in testing_statuses
+    ]
+    numbers = {rid: index + 1 for index, rid in enumerate(testing_rounds)}
+    if state.get('status') in testing_statuses:
+        numbers[current_round] = len(testing_rounds) + 1
     return numbers
 
 

@@ -3680,6 +3680,7 @@ class DeployController:
                 "Evidence projection could not verify current PR context",
             ) from None
         if (not isinstance(pr, dict) or pr.get("state") not in {"open", "closed"}
+                or pr.get("base", {}).get("repo", {}).get("full_name", "").lower() != repo.lower()
                 or not isinstance(pr.get("head"), dict)
                 or pr.get("head", {}).get("sha") != state.get("head_sha")):
             raise GitHubStateProxyError(
@@ -3692,7 +3693,6 @@ class DeployController:
                              and callable(getattr(store, "dispatch", None)))
             browser_upload_ready = (
                 backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
-                and pr.get("state") == "open" and not pr.get("merged")
                 and not pr.get("draft")
             )
         except Exception:
@@ -3944,17 +3944,19 @@ class DeployController:
         visible, history = self._extract_visible_history(visible)
         start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
         projection = start + "\n" + section + "\n" + end
-        body = visible.rstrip()
+        body = visible.rstrip() + "\n\n" + projection
         if history:
             body += "\n\n" + history
-        return body + "\n\n" + projection
+        return body
 
     async def project_evidence(self, repo: str, pr_number: int) -> None:
         """Watcher-only projection. HTTP handlers never call this writer."""
         if self.evidence_service is None:
             return
         pr = await self.proxy.get_pr(repo, pr_number)
-        if pr.get("state") != "open" or pr.get("merged") or pr.get("draft"):
+        if (not isinstance(pr, dict) or pr.get("state") not in {"open", "closed"}
+                or pr.get("draft")
+                or pr.get("base", {}).get("repo", {}).get("full_name", "").lower() != repo.lower()):
             return
         comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
         if comment is None:
@@ -4018,9 +4020,22 @@ class DeployController:
                             or pr.get("state") != "open" or pr.get("merged") or pr.get("draft")):
                         return False
                 current_pr = await self.proxy.get_pr(repo, pr_number)
-                if (current_pr.get("state") != "open" or current_pr.get("merged")
-                        or current_pr.get("draft")
-                        or current_pr.get("head", {}).get("sha") != state.get("head_sha")):
+                if evidence_projection_only:
+                    current_pr_valid = (
+                        isinstance(current_pr, dict)
+                        and current_pr.get("state") in {"open", "closed"}
+                        and not current_pr.get("draft")
+                        and current_pr.get("base", {}).get("repo", {}).get("full_name", "").lower()
+                        == repo.lower()
+                        and current_pr.get("head", {}).get("sha") == state.get("head_sha")
+                    )
+                else:
+                    current_pr_valid = (
+                        current_pr.get("state") == "open" and not current_pr.get("merged")
+                        and not current_pr.get("draft")
+                        and current_pr.get("head", {}).get("sha") == state.get("head_sha")
+                    )
+                if not current_pr_valid:
                     raise GitHubStateProxyError("Lifecycle PR context changed before write")
                 current_comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
                 if ((comment is None) != (current_comment is None)
@@ -4035,8 +4050,11 @@ class DeployController:
                             "Lifecycle state changed before evidence projection write",
                         )
                     final_pr = await self.proxy.get_pr(repo, pr_number)
-                    if (final_pr.get("state") != "open" or final_pr.get("merged")
+                    if (not isinstance(final_pr, dict)
+                            or final_pr.get("state") not in {"open", "closed"}
                             or final_pr.get("draft")
+                            or final_pr.get("base", {}).get("repo", {}).get("full_name", "").lower()
+                            != repo.lower()
                             or final_pr.get("head", {}).get("sha") != state.get("head_sha")):
                         raise GitHubStateProxyError(
                             "Lifecycle PR context changed before evidence projection write",

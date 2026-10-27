@@ -551,7 +551,7 @@ class GitHubClient:
         try:
             require_2xx(resp.status_code, "github get PR")
         except SecurityError as e:
-            raise GitHubError(str(e)) from e
+            raise GitHubError(str(e), status_code=resp.status_code) from e
         return await self._read_json(resp)
 
     async def get_issue_comments(self, repo: str, pr_number: int) -> list[dict]:
