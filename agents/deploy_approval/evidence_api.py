@@ -315,6 +315,13 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                   'readiness': evidence_auth.readiness(
                       request.app.state.config, request.app.state.evidence_service, request=request),
                   'attachments': attachments, 'repo': canonical, 'pr_number': pr,
+                  # The browser explicitly gates writes on the PR state. The
+                  # dispatch path already fetched and validated this live PR;
+                  # expose that same snapshot instead of making an open PR look
+                  # unverifiable to the upload UI.
+                  'pr_state': snapshot.get('state'),
+                  'merged': snapshot.get('merged') is True,
+                  'draft': snapshot.get('draft') is True,
                   'max_file_bytes': request.app.state.config.evidence_max_file_bytes,
                   'part_bytes': request.app.state.config.evidence_part_bytes}
         if not {'head_sha', 'round_id', 'status', 'can_write', 'attachments', 'archive_links'} <= result.keys():
