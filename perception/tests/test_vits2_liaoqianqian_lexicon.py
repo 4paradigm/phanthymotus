@@ -65,7 +65,7 @@ def lexical_resource(monkeypatch, tmp_path):
     """Replace the download boundary; exercise the actual external-rule loader."""
     from plugins.vits2_tts_trt.frontend import lexicon_rules
     path = (Path(os.environ.get("VITS2_MODEL_DIR", "/models/vits2"))
-            / "frontend_data/lexicon/20261027-v1/external_lexicon.json")
+            / "frontend_data/lexicon/20261027-v2/external_lexicon.json")
     if not path.is_file():
         path = tmp_path / "frontend-resource.json"
         path.write_text(json.dumps(lexeme_fixture()))
@@ -137,7 +137,7 @@ def load_frontends(cache, gold_state="valid"):
         "RGB-D": {"arpa": ["AA1", "R", "JH", "IY1", "B", "IY1", "D", "IY1"], "mode": "exact"},
         "OOV-BRAND": {"arpa": ["B", "R", "AE1", "N", "D"], "mode": "fold"},
     }
-    resource = data_dir / "lexicon/20261027-v1/external_lexicon.json"
+    resource = data_dir / "lexicon/20261027-v2/external_lexicon.json"
     resource.parent.mkdir(parents=True)
     resource.write_text(json.dumps({
         **lexeme_fixture(),

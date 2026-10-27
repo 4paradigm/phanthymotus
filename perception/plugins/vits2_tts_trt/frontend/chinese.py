@@ -13,7 +13,7 @@ from .copula_context import wei2_positions as _copula_positions
 
 from .fst_tn import FstTextNormalizer
 
-from .heteronym import custom_dict, jieba_phrases, robot_phrase_pinyin
+from .heteronym import load_chinese_lexicon
 from .release_paths import frontend_data_dir, tn_cache_dir
 from .lexicon_rules import normalize_technical_lexemes
 from .lexicon_rules import apply_lexeme_rules
@@ -28,8 +28,9 @@ def _load_phrase_pinyin_data():
         runpy.run_path(str(di_path))["load"]()
 
 
+custom_dict, jieba_phrases, robot_phrase_pinyin = load_chinese_lexicon()
 _load_phrase_pinyin_data()
-# Bundled pronunciation entries load last so they can override the broad dictionary.
+# External annotations retain the same order and styles as the inherited tables.
 load_phrases_dict(custom_dict, style="tone2")
 for phrase in jieba_phrases:
     jieba.add_word(phrase)
@@ -211,6 +212,15 @@ def _get_initials_finals(word):
 
 def _is_particle_de(segments, index):
     word, pos = segments[index]
+    if len(word) == 3 and word[0] == word[1] and word.endswith("地"):
+        # Jieba can keep AA + 地 together (轻轻地/z, 慢慢地/x).
+        # Require a reduplicated modifier; a whole-token "z" tag alone also
+        # occurs on place names such as 木樨地 and is not sufficient evidence.
+        if pos == "z":
+            return True
+        modifier = psg.lcut(word[:-1])
+        return (len(modifier) == 1 and modifier[0].word == word[:-1]
+                and modifier[0].flag in ("a", "ad", "d", "z"))
     if word != "地" or pos != "uv" or index == 0:
         return False
     previous, previous_pos = segments[index - 1]

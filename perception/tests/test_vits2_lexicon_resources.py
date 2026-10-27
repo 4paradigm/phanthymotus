@@ -56,7 +56,9 @@ class ResourceTests(unittest.TestCase):
         self.module._SOURCE_FILES = {self.source.name: {
             "size": self.source.stat().st_size,
             "sha256": hashlib.sha256(self.source.read_bytes()).hexdigest()}}
-        from utils import model_downloader
+        # Other isolated tests restore sys.modules but can leave a stale
+        # package attribute. Patch the module the runtime actually imports.
+        model_downloader = importlib.import_module("utils.model_downloader")
         fetch = patch.object(model_downloader, "_fetch_pinned_file", wraps=model_downloader._fetch_pinned_file)
         self.fetch = fetch.start()
         self.addCleanup(fetch.stop)
@@ -69,7 +71,7 @@ class ResourceTests(unittest.TestCase):
 
     def test_cold_prepare_and_warm_cache_without_download_or_compile(self):
         result = self.module.ensure_external_lexicon(self.root)
-        self.assertEqual(result, self.data / "lexicon/20261027-v1/external_lexicon.json")
+        self.assertEqual(result, self.data / "lexicon/20261027-v2/external_lexicon.json")
         self.assertEqual(result.read_bytes(), self.source.read_bytes())
         self.source.unlink()
         self.assertEqual(self.module.ensure_external_lexicon(self.root), result)
@@ -137,7 +139,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(result, path)
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(self.fetch.call_count, 1)
-        self.assertTrue((self.data / "lexicon/20261027-v1/external_lexicon.json").exists())
+        self.assertTrue((self.data / "lexicon/20261027-v2/external_lexicon.json").exists())
 
     def test_explicit_missing_corrupt_or_bad_hash_never_falls_back(self):
         path = self.explicit()

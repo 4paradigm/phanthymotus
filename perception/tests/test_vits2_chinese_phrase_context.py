@@ -12,6 +12,69 @@ import pytest
 import vision_stubs  # noqa: F401
 
 
+def _chinese_resource():
+    return {
+        "format": "vits2-external-pronunciations", "version": 1,
+        "chinese": {"version": 1,
+                    "custom_dict": {"目的地": [["mu4"], ["di4"], ["di4"]]},
+                    "jieba_phrases": ["慢慢地"],
+                    "robot_phrase_pinyin": {"重试": [["chóng"], ["shì"]]}},
+    }
+
+
+def test_chinese_annotations_use_shared_resource_and_keep_registration_groups(tmp_path, monkeypatch):
+    from plugins.vits2_tts_trt.frontend import heteronym
+
+    path = tmp_path / "external_lexicon.json"
+    data = _chinese_resource()
+    path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(heteronym, "frontend_lexicon_path", lambda: path)
+    # An older explicit English-only dictionary must not replace Chinese data.
+    monkeypatch.setenv("VITS2_LEXICON_PATH", str(tmp_path / "english-only.json"))
+    legacy, phrases, reviewed = heteronym.load_chinese_lexicon()
+    assert legacy == data["chinese"]["custom_dict"]
+    assert phrases == ("慢慢地",)
+    assert reviewed == data["chinese"]["robot_phrase_pinyin"]
+    legacy["目的地"][0][0] = "bad"
+    assert heteronym.load_chinese_lexicon()[0] == data["chinese"]["custom_dict"]
+
+
+@pytest.mark.parametrize("invalid", [
+    "missing", "version", "alignment", "latin_phrase", "bad_pinyin", "flat_pinyin",
+    "wrong_style", "duplicate_segmentation", "missing_segmentation", "duplicate_json",
+])
+def test_invalid_chinese_resource_fails_before_dictionary_registration(tmp_path, invalid):
+    from plugins.vits2_tts_trt.frontend.heteronym import load_chinese_lexicon
+
+    data = _chinese_resource()
+    section = data["chinese"]
+    if invalid == "missing":
+        del data["chinese"]
+    elif invalid == "version":
+        section["version"] = 2
+    elif invalid == "alignment":
+        section["custom_dict"]["目的地"].pop()
+    elif invalid == "latin_phrase":
+        section["custom_dict"] = {"A": [["a1"]]}
+    elif invalid == "bad_pinyin":
+        section["custom_dict"]["目的地"][0] = ["mu9"]
+    elif invalid == "flat_pinyin":
+        section["custom_dict"]["目的地"] = ["mu4", "di4", "di4"]
+    elif invalid == "wrong_style":
+        section["robot_phrase_pinyin"]["重试"] = [["chong2"], ["shi4"]]
+    elif invalid == "duplicate_segmentation":
+        section["jieba_phrases"] *= 2
+    elif invalid == "missing_segmentation":
+        del section["jieba_phrases"]
+    path = tmp_path / "external_lexicon.json"
+    raw = json.dumps(data)
+    if invalid == "duplicate_json":
+        raw = raw[:-1] + ', "chinese": {}}'
+    path.write_text(raw, encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_chinese_lexicon(path)
+
+
 @pytest.fixture(scope="module")
 def frontend():
     root = Path(os.getenv("VITS2_MODEL_DIR", "/models/vits2"))
@@ -97,6 +160,10 @@ def test_reviewed_phrases_do_not_override_other_word_contexts(frontend, text, ch
 @pytest.mark.parametrize("text", [
     "稳定地行走", "安全地行走", "请慢慢地走", "请轻轻地放下", "用力地敲门",
     "满怀信心地行走", "安静地走", "小心地行走", "轻轻地",
+    "慢慢地", "悄悄地走", "静静地等待", "默默地工作", "偷偷地看",
+    "渐渐地靠近", "缓缓地升起", "狠狠地敲", "好好地学习",
+    "高高兴兴地回家", "认认真真地检查", "小心翼翼地走", "不紧不慢地走",
+    "非常认真地检查", "十分轻柔地放下", "迅速地回答",
 ])
 def test_adverbial_particle_de_uses_schwa_and_neutral_tone(frontend, text):
     _check_character(frontend, text, "地", ["d", "e"], 5)
@@ -105,6 +172,11 @@ def test_adverbial_particle_de_uses_schwa_and_neutral_tone(frontend, text):
 @pytest.mark.parametrize("text", [
     "地", "土地", "大地", "天地", "目的地", "地方", "地道", "地铁", "扫地", "遍地",
     "地面", "当地", "地名", "这片地", "一块地", "那块地",
+    "原地", "本地", "各地", "满地", "就地", "落地", "擦地",
+    "平地", "草地", "所在地", "根据地", "不毛之地", "一席之地",
+    "惊天动地", "欢天喜地", "脚踏实地", "设身处地", "开天辟地",
+    "占领高地", "肥沃的土地", "地地道道",
+    "木樨地", "低洼地", "平整土地", "撂荒地", "苍茫大地", "盐硷地",
 ])
 def test_lexical_di_does_not_become_particle_de_or_neutral_tone(frontend, text):
     _check_character(frontend, text, "地", ["d", "i"], 4)
@@ -116,7 +188,10 @@ def test_de_particle_does_not_change_other_de_characters_or_preserved_aa(fronten
     _check_character(frontend, "你好啊", "啊", ["AA", "a"], 5)
 
 
-@pytest.mark.parametrize("phrase", ["长时间", "重发", "调高", "这行代码", "稳定地行走"])
+@pytest.mark.parametrize("phrase", [
+    "长时间", "重发", "调高", "这行代码", "稳定地行走", "慢慢地走",
+    "轻轻地放下", "静静地等待", "目的地", "脚踏实地",
+])
 def test_mixed_chinese_run_uses_same_phrase_reading(frontend, phrase):
     expected, expected_tones, _, _ = frontend.g2p(frontend.normalize(phrase))
     expected, expected_tones = expected[1:-1], expected_tones[1:-1]

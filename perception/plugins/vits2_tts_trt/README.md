@@ -408,7 +408,7 @@ as letters before normalization; ordinary lowercase words keep their readings.
 The default frontend combines all **13,083** entries from the pinned fanyi
 source with **114** reviewed supplements: **109** new keys and five identical
 existing keys. The resulting **13,192-entry** dictionary is compiled to
-`frontend_data/lexicon/20261027-v1/external_lexicon.json` outside Git:
+`frontend_data/lexicon/20261027-v2/external_lexicon.json` outside Git:
 
 - 225 entries overlapping CMU retain the released CMU reading by default.
   The original Gold phones remain in the data for auditing.
@@ -433,11 +433,11 @@ hyphenated tokens are protected during final punctuation cleanup; structured
 math and addresses keep priority. Ambiguous `M-S` still follows math parsing.
 
 The public frontend resource is one `external_lexicon.json` in the same
-ModelScope repository as the model, under `frontend/lexicon/20261027-v1/`, pinned to revision
-`25dc084a26de8673a742b475470ae202751ee33c`.
+ModelScope repository as the model, under `frontend/lexicon/20261027-v2/`, pinned to revision
+`217d247ac9c381d9950f31087b2b686d4e94690d`.
 It contains the merged Gold runtime entries and their original annotations,
 matching policies, reviewed business-source records, text replacements,
-ordered frontend rules and IPA reference annotations. Vocabulary data is not embedded in generated
+ordered frontend rules, Chinese pronunciation annotations and IPA reference data. Vocabulary data is not embedded in generated
 Python modules or duplicated as separate Git dictionaries.
 
 The ordered rules retain their original stages: 80 pre-normalization rules,
@@ -450,7 +450,7 @@ The maintenance compiler lives in `perception/tools/vits2_prepare_external_lexic
 it is not part of the inference plugin.
 
 Before frontend startup, the adapter downloads/verifies this one size/SHA256-
-pinned JSON into `frontend_data/lexicon/20261027-v1/external_lexicon.json`. The existing downloader
+pinned JSON into `frontend_data/lexicon/20261027-v2/external_lexicon.json`. The existing downloader
 provides process locking and atomic installation; valid cached bytes are reused.
 Cache validation and replacement of corrupt downloads use the unchanged mainline
 `ensure_verified_bundle` implementation during resource preparation, not per utterance.
@@ -482,6 +482,43 @@ binding before lookup can use it. Preparation before this binding reports
 resource. An incompatible reload raises an error, and lookups of that invalid
 file remain blocked until a valid file and its configured checksum are restored.
 CMU hashing and full validation are cached, not repeated for every word.
+
+#### Chinese annotations in the shared resource
+
+The published v2 resource adds a `chinese` section to the same JSON, with its
+revision, resource directory, size and SHA256 pinned together. The v1 cache
+remains separate so older code can continue to use its own resource. An old
+English-only JSON is insufficient for the new shared-resource loader; missing
+Chinese data raises an initialization error.
+
+The section has `version: 1` and preserves three existing registration groups:
+
+| Field | Existing data | Representation and registration |
+| --- | --- | --- |
+| `custom_dict` | 105 inherited phrase readings | One pinyin-alternative list per character, numbered tones; original `tone2` loading style |
+| `jieba_phrases` | 10 segmentation phrases | Ordered strings; original default jieba frequency |
+| `robot_phrase_pinyin` | 9 reviewed robot/UI readings | One tone-mark pinyin-alternative list per character; jieba frequency remains at least 100 |
+
+These are the effective Python mappings, including existing last-definition
+behavior for duplicate literals. Migration changes neither annotations nor
+registration order. The model's broad phrase dictionary loads first, then
+`custom_dict`, then the reviewed robot phrases. Existing higher segmentation
+frequencies remain intact. `chinese.source` records the original file, commit
+and SHA256 for provenance.
+
+`frontend/heteronym.py` now loads and validates this section instead of holding
+word data. Reads happen during frontend initialization, never per speech token.
+Chinese data uses the shared release resource; an older explicit English
+`VITS2_LEXICON_PATH` remains an English override and cannot replace this section.
+Restart the frontend after updating Chinese annotations because pypinyin and
+jieba registrations are process-global. Do not use an English-only cache reload
+to apply or remove Chinese phrase entries.
+
+Maintain names and phrase pronunciation exceptions in these data fields.
+Edit the complete maintained JSON and retain its English/rule sections; the
+English-only compiler output is not a replacement for the complete resource.
+Contextual particle handling, tone sandhi, language selection and numeric/text
+normalization remain code. No new acoustic model or TensorRT engine is needed.
 
 #### Reviewed business supplements and optional domain overrides
 
@@ -610,7 +647,7 @@ explicitly rather than treated as interchangeable copies.
 
 The CMU dictionary and its runtime cache are included in the size- and
 SHA256-verified model archive. The separate, unified frontend JSON described
-above is downloaded into `frontend_data/lexicon/20261027-v1/` and retains the
+above is downloaded into `frontend_data/lexicon/20261027-v2/` and retains the
 CMU priority rules. Older Gold copies inside model archives are not used as
 global CMU overrides. Installation reuses `/models`, with no new volume or
 image layer.
