@@ -3,6 +3,8 @@
 Only ROS, model download and the acoustic engine are replaced. These tests
 cover message routing/lifecycle, not GPU performance or audible quality.
 """
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 import json
 import threading
 from types import SimpleNamespace

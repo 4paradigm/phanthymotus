@@ -3,7 +3,7 @@
 import re
 
 from ..vits2_tts_trt.frontend.lexicon_rules import (
-    _QWEN_VERSION_RE, _sub_lexeme, apply_lexeme_rules, has_chinese_name_reading,
+    _QWEN_VERSION_RE, _sub_lexeme, normalize_chinese_name, has_chinese_name_reading,
 )
 from ..vits2_tts_trt.frontend.math_units import _english_quantity
 from ..vits2_tts_trt.frontend.mixed_context import context_diagnostics
@@ -56,7 +56,7 @@ def normalize_standalone_name(text, language):
     terminal = _TERMINAL_PUNCTUATION.search(token)
     core = token[:terminal.start()].rstrip() if terminal else token
     if language == "zh" and has_chinese_name_reading(core):
-        return apply_lexeme_rules(core, language="ZH") + (terminal.group() if terminal else "")
+        return normalize_chinese_name(core) + (terminal.group() if terminal else "")
     if language == "en" and not re.search(r"[\u4e00-\u9fff]", text):
         normalized = _english_version_names(text)
         return normalized.strip() if _QWEN_VERSION_RE.fullmatch(core) else normalized

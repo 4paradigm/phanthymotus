@@ -7,8 +7,9 @@ import os
 from pathlib import Path
 import re
 
-from .release_paths import frontend_data_dir
+from .release_paths import frontend_lexicon_path
 from .symbols import en_symbols
+from .hotwords import bundled_hotwords_source, deployment_configuration_active, lookup_hotword
 
 _MAX_BYTES = 4 * 1024 * 1024
 _MAX_ENTRIES = 50000
@@ -19,6 +20,11 @@ _VOWELS = set("AA AE AH AO AW AY EH ER EY IH IY OW OY UH UW".split())
 _CONSONANTS = set("B CH D DH F G HH JH K L M N NG P R S SH T TH V W Y Z ZH".split())
 _MODEL_PHONES = set(en_symbols)
 _cmu_binding = None
+
+
+def _status_copy(status):
+    return {**{key: value for key, value in status.items() if not key.startswith("_")},
+            "mode_counts": dict(status["mode_counts"])}
 
 
 class _CMUBinding:
@@ -77,7 +83,7 @@ def _resolved_path(value):
 
 def _configuration():
     configured = os.environ.get("VITS2_LEXICON_PATH", "").strip()
-    path = Path(configured).expanduser() if configured else frontend_data_dir() / "external_lexicon.json"
+    path = Path(configured).expanduser() if configured else frontend_lexicon_path()
     checksum = os.environ.get("VITS2_LEXICON_SHA256", "").strip().lower()
     if checksum and not _SHA.fullmatch(checksum):
         raise ValueError("VITS2_LEXICON_SHA256 requires 64 hexadecimal digits")
@@ -110,7 +116,7 @@ def _load(path, checksum, binding=None):
         raise ValueError("External lexicon requires nested CMU canonical provenance")
     if source["entries"] != len(entries):
         raise ValueError("External lexicon source entry count mismatch")
-    parsed, modes = {}, {"cmu": 0, "exact": 0, "fold": 0}
+    parsed, modes, supplement_keys = {}, {"cmu": 0, "exact": 0, "fold": 0}, set()
     for key, row in entries.items():
         if not isinstance(key, str) or not _KEY.fullmatch(key) or not isinstance(row, dict):
             raise ValueError("External lexicon requires complete uppercase Latin keys")
@@ -120,6 +126,10 @@ def _load(path, checksum, binding=None):
         phones = _phones(row.get("arpa"))
         if "original_arpa" in row:
             _phones(row["original_arpa"])
+        if "origin" in row:
+            if row["origin"] != "supplement":
+                raise ValueError("External lexicon has an unsupported entry origin")
+            supplement_keys.add(key)
         parsed[key] = (mode, phones)
         modes[mode] += 1
     status = {"loaded": True, "path": path, "sha256": actual_sha,
@@ -127,6 +137,33 @@ def _load(path, checksum, binding=None):
               "cmu_canonical_sha256": cmu["canonical_sha256"],
               "cmu_entries": cmu["entries"], "entry_count": len(parsed),
               "mode_counts": modes, "cmu_verified": binding is not None}
+    supplements, base_source = data.get("supplements"), data.get("base_source")
+    if supplements is not None or base_source is not None or supplement_keys:
+        if (not isinstance(supplements, dict) or not isinstance(base_source, dict)
+                or not _SHA.fullmatch(str(supplements.get("sha256", "")))
+                or not _SHA.fullmatch(str(base_source.get("canonical_sha256", "")))
+                or not _SHA.fullmatch(str(base_source.get("sha256", "")))
+                or type(base_source.get("entries")) is not int
+                or base_source["entries"] + len(supplement_keys) != len(entries)
+                or type(supplements.get("added_entries")) is not int
+                or supplements["added_entries"] != len(supplement_keys)
+                or not isinstance(supplements.get("added_keys"), list)
+                or len(supplements["added_keys"]) != len(supplement_keys)
+                or any(not isinstance(key, str) for key in supplements["added_keys"])
+                or set(supplements["added_keys"]) != supplement_keys):
+            raise ValueError("Merged lexicon has invalid supplement provenance")
+        maintained = {key: row.get("original_arpa", row["arpa"]) for key, row in entries.items()}
+        base = {key: phones for key, phones in maintained.items() if key not in supplement_keys}
+        canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                             ensure_ascii=True).encode("utf-8")
+        if (hashlib.sha256(canonical(base)).hexdigest() != base_source["canonical_sha256"]
+                or hashlib.sha256(canonical(maintained)).hexdigest() != source.get("canonical_sha256")
+                or hashlib.sha256(canonical(maintained) + b"\n").hexdigest() != source["sha256"]):
+            raise ValueError("Merged lexicon does not match its maintained Gold source")
+        status.update(supplements_sha256=supplements["sha256"],
+                      base_entry_count=base_source["entries"],
+                      supplement_entry_count=len(supplement_keys),
+                      _supplement_keys=frozenset(supplement_keys))
     if binding is not None:
         _check_cmu(parsed, status, binding)
     return parsed, status
@@ -154,7 +191,7 @@ def external_lexicon_status():
     """Validate the configured resource and return caller-owned status metadata."""
     path, checksum = _configuration()
     _, status = _load(path, checksum, _cmu_binding)
-    return {**status, "mode_counts": dict(status["mode_counts"])}
+    return _status_copy(status)
 
 
 def validate_external_lexicon_file(path, checksum=""):
@@ -163,14 +200,14 @@ def validate_external_lexicon_file(path, checksum=""):
     if checksum and not _SHA.fullmatch(checksum):
         raise ValueError("External lexicon SHA256 requires 64 hexadecimal digits")
     _, status = _load(_resolved_path(str(path)), checksum, _cmu_binding)
-    return {**status, "mode_counts": dict(status["mode_counts"])}
+    return _status_copy(status)
 
 
 def validate_external_lexicon_cmu(cmu):
     """Check supplied CMU without changing the active frontend binding."""
     path, checksum = _configuration()
     _, status = _load(path, checksum, _CMUBinding(cmu))
-    return {**status, "mode_counts": dict(status["mode_counts"])}
+    return _status_copy(status)
 
 
 def bind_external_lexicon_cmu(cmu):
@@ -181,7 +218,19 @@ def bind_external_lexicon_cmu(cmu):
     _, status = _load(path, checksum, binding)
     # A failed validation must not replace a previously usable CMU identity.
     _cmu_binding = binding
-    return {**status, "mode_counts": dict(status["mode_counts"])}
+    return _status_copy(status)
+
+
+def _lookup_entry(entries, status, token, has_cmu=False, base_only=False):
+    if has_cmu or base_only and token.upper() in status.get("_supplement_keys", ()):
+        return None
+    row = entries.get(token.upper())
+    if row is None:
+        return None
+    mode, phones = row
+    if mode == "cmu" or mode == "exact" and token != token.upper():
+        return None
+    return [list(phones)]
 
 
 def lookup_external_lexicon(token, *, has_cmu=False):
@@ -189,11 +238,28 @@ def lookup_external_lexicon(token, *, has_cmu=False):
     if not isinstance(token, str) or not _TOKEN.fullmatch(token):
         return None
     path, checksum = _configuration()
-    entries, _ = _load(path, checksum, _cmu_binding)
-    row = entries.get(token.upper())
-    if row is None or has_cmu:
+    entries, status = _load(path, checksum, _cmu_binding)
+    return _lookup_entry(entries, status, token, has_cmu)
+
+
+def lookup_unified_lexicon(token, *, has_cmu=False):
+    """One default Gold index; retain explicit-file/domain override semantics.
+
+    The normal deployment already compiled reviewed additions into Gold. It
+    does not read or scan their maintenance manifest while speaking. Older
+    explicit dictionaries and opt-in domain overrides use indexed candidates,
+    preserving their existing priority and CMU-override contracts.
+    """
+    if not isinstance(token, str) or not _TOKEN.fullmatch(token):
         return None
-    mode, phones = row
-    if mode == "cmu" or mode == "exact" and token != token.upper():
+    special = deployment_configuration_active()
+    if has_cmu and not special:
         return None
-    return [list(phones)]
+    path, checksum = _configuration()
+    entries, status = _load(path, checksum, _cmu_binding)
+    if not special and status.get("supplements_sha256") == bundled_hotwords_source()[1]:
+        return _lookup_entry(entries, status, token, has_cmu)
+    selected = lookup_hotword(token, has_cmu=has_cmu)
+    if selected is not None:
+        return selected
+    return _lookup_entry(entries, status, token, has_cmu, base_only=True)

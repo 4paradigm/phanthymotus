@@ -4,6 +4,8 @@ Number markers deliberately test routing, not number pronunciation. The
 optional real-frontend runner and real-inflect tests validate those separately.
 """
 
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 from pathlib import Path
 import sys
 import unittest

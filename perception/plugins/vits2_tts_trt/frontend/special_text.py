@@ -11,7 +11,6 @@ from .number_context import (
     find_spans as find_number_context_spans, literal_date_ranges, protected_identifier_ranges,
 )
 from .numeric_formats import malformed_money_ranges, protected_version_ranges
-from .numeric_literal import fold_numeric_width, read_numeric_literal
 
 _EMAIL = r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}"
 _URL = r"(?:https?://|www\.)[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+"
@@ -39,6 +38,36 @@ _SYMBOLS = {
            "*": "asterisk", "^": "caret", "`": "backtick", "{": "left brace",
            "}": "right brace", "|": "vertical bar"},
 }
+
+
+_LITERAL_SYMBOLS = {
+    "ZH": {"/": "斜杠", ".": "点", ",": "逗号", "-": "连字符", "+": "加号",
+           "−": "减号", "$": "美元符号", "£": "英镑符号", "€": "欧元符号",
+           "¥": "元符号", "￥": "元符号"},
+    "EN": {"/": "slash", ".": "dot", ",": "comma", "-": "hyphen", "+": "plus sign",
+           "−": "minus sign", "$": "dollar sign", "£": "pound sign", "€": "euro sign",
+           "¥": "yuan sign", "￥": "yuan sign"},
+}
+_LITERAL_WIDTH = {code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)}
+_LITERAL_WIDTH[0x3000] = ord(" ")
+_LITERAL_DASHES = dict.fromkeys(map(ord, "‐‑‒–﹣－"), "-")
+
+
+def fold_numeric_width(text):
+    """Fold ASCII width one-to-one so diagnostic offsets stay unchanged."""
+    return text.translate(_LITERAL_WIDTH)
+
+
+def read_numeric_literal(text, language):
+    """Preserve every written digit and internal separator in the chosen language."""
+    language = "ZH" if language.lower().startswith("zh") else "EN"
+    words = []
+    for char in fold_numeric_width(text).translate(_LITERAL_DASHES):
+        if char.isspace():
+            continue
+        words.append(_DIGITS[language][int(char)] if char.isdecimal()
+                     else _LITERAL_SYMBOLS[language].get(char, char))
+    return ("" if language == "ZH" else " ").join(words)
 
 
 def verbalize_chinese_number(value):

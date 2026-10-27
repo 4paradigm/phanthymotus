@@ -6,10 +6,9 @@ import inflect
 import numpy as np
 
 from .symbols import punctuation, symbols
-from .technical_text import normalize_technical_lexemes
+from .lexicon_rules import normalize_technical_lexemes
 from .release_paths import frontend_data_dir, nltk_data_dir
-from .hotwords import lookup_hotword
-from .external_lexicon import lookup_external_lexicon, bind_external_lexicon_cmu
+from .external_lexicon import lookup_unified_lexicon, bind_external_lexicon_cmu
 
 current_file_path = os.path.dirname(__file__)
 
@@ -346,7 +345,7 @@ CUSTOM_EN_PRONUNCIATIONS = {
 }
 
 
-# Narrow corrections from the IPA retained in lexicon_rules_generated.py.
+# Narrow corrections from the IPA retained in the external lexicon IPA reference section.
 # Keep them separate from Liaoqianqian's original three CUSTOM entries.
 VERIFIED_EN_PRONUNCIATIONS = {
     # wordlist_37, i-wangtianshuo: /əˈdʒɛntɪk/; g2p_en adds a final T.
@@ -357,7 +356,7 @@ VERIFIED_EN_PRONUNCIATIONS = {
 
 
 def english_pronunciation(token):
-    """CUSTOM, verified terms, explicit overrides, CMU, then external OOVs.
+    """CUSTOM/verified terms, protected CMU and the unified Gold index.
 
     Return None for G2P fallback. The optimized external dictionary never
     overrides ordinary CMU words, and its exact-case rows retain ticker scope.
@@ -367,8 +366,7 @@ def english_pronunciation(token):
         return CUSTOM_EN_PRONUNCIATIONS[word]
     if word in VERIFIED_EN_PRONUNCIATIONS:
         return VERIFIED_EN_PRONUNCIATIONS[word]
-    return (lookup_hotword(token, has_cmu=word in eng_dict) or eng_dict.get(word)
-            or lookup_external_lexicon(token, has_cmu=word in eng_dict))
+    return lookup_unified_lexicon(token, has_cmu=word in eng_dict) or eng_dict.get(word)
 
 
 _EN_LEXICON_WORD_RE = re.compile(
@@ -409,8 +407,7 @@ def normalize_preserving_english_pronunciations(text, normalize_plain):
                 and (word in CUSTOM_EN_PRONUNCIATIONS
                      or word in VERIFIED_EN_PRONUNCIATIONS
                      or word in _EN_TN_PRESERVED_WORDS
-                     or lookup_hotword(match.group(), has_cmu=word in eng_dict) is not None
-                     or lookup_external_lexicon(match.group(), has_cmu=word in eng_dict) is not None)):
+                     or lookup_unified_lexicon(match.group(), has_cmu=word in eng_dict) is not None)):
             protected.append(match)
     if not protected:
         return normalize_plain(text)
@@ -473,7 +470,7 @@ def normalize_preserving_external_tokens(text, normalize_plain):
         if (start and text[start - 1].isascii()
                 and (text[start - 1].isalnum() or text[start - 1] == "_")):
             continue
-        if lookup_external_lexicon(word, has_cmu=word.upper() in eng_dict) is not None:
+        if lookup_unified_lexicon(word, has_cmu=word.upper() in eng_dict) is not None:
             spans.append((start, end))
     if not spans:
         return normalize_plain(text)

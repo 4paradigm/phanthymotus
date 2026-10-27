@@ -1,6 +1,8 @@
 """Pure language policy regression, independent of ROS/model synthesis."""
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 import threading
 import unittest
 

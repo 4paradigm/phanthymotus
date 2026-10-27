@@ -15,7 +15,7 @@ from .fst_tn import FstTextNormalizer
 
 from .heteronym import custom_dict, jieba_phrases, robot_phrase_pinyin
 from .release_paths import frontend_data_dir, tn_cache_dir
-from .technical_text import normalize_technical_lexemes
+from .lexicon_rules import normalize_technical_lexemes
 from .lexicon_rules import apply_lexeme_rules
 from .special_text import normalize_special_text, verbalize_chinese_number
 

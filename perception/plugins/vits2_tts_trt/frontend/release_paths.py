@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 _release_root: Path | None = None
+LEXICON_RESOURCE_DIRECTORY = "lexicon/20261027-v1"
 
 
 def configure_release_paths(root: Path) -> None:
@@ -23,6 +24,11 @@ def _root() -> Path:
 def frontend_data_dir() -> Path:
     """Return the verified release frontend-data directory."""
     return _root() / "frontend_data"
+
+
+def frontend_lexicon_path() -> Path:
+    """One versioned external resource; older explicit dictionaries stay intact."""
+    return frontend_data_dir() / LEXICON_RESOURCE_DIRECTORY / "external_lexicon.json"
 
 
 def nltk_data_dir() -> Path:

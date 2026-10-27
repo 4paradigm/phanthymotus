@@ -1,6 +1,8 @@
 """Format reading and boundaries, using real number readers without a model."""
 
 from pathlib import Path
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 import sys
 
 import pytest

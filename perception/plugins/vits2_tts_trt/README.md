@@ -398,22 +398,33 @@ English and mixed text share the model's original 129,464-entry CMU cache
 and Liaoqianqian's three CUSTOM entries: `CUDA`, `HAMI`, and `IELTS`.
 Two additional targeted corrections for `Agentic` and `NVIDIA` use the
 checked terminology annotations. These corrections are separate from the
-original dictionary. The fanyi source is compiled into a separate external
-dictionary with CMU conflicts repaired; it is not a blanket CMU override.
+original dictionary. The fanyi source and reviewed business/computing entries
+are compiled into one Gold dictionary with CMU conflicts repaired.
 The complete uppercase abbreviations `US`, `IT`, `ID`, and `IP` are spelled
 as letters before normalization; ordinary lowercase words keep their readings.
 
 #### External pronunciation dictionary
 
-The default frontend now uses all **13,083** entries from the pinned fanyi
-source, compiled to `frontend_data/external_lexicon.json` outside Git:
+The default frontend combines all **13,083** entries from the pinned fanyi
+source with **114** reviewed supplements: **109** new keys and five identical
+existing keys. The resulting **13,192-entry** dictionary is compiled to
+`frontend_data/lexicon/20261027-v1/external_lexicon.json` outside Git:
 
 - 225 entries overlapping CMU retain the released CMU reading by default.
   The original Gold phones remain in the data for auditing.
-- 6,336 letter-spelling entries require exact uppercase spelling; this includes
+- 6,266 letter-spelling entries require exact uppercase spelling; this includes
   114 entries with separators, reducing unintended changes to ordinary names.
-- 6,522 other OOV entries use case-insensitive matching. Their source phones
+- 6,701 other OOV entries use case-insensitive matching. Their source phones
   are retained, not certified as universally correct pronunciations.
+
+Seventy reviewed technical abbreviations, including `VLLM`, `LLM`, `ASR`,
+`TTS`, `NLP`, `RLHF`, `GPT`, `TCP`, `SSH`, `GRPC`, `CLI`, `LLVM`, and `SQL`,
+match case-insensitively. For example, `vLLM`, `VLLM`, and
+`vllm` use the same source letter-name pronunciation in English and mixed
+speech. This policy does not globally spell uppercase words or change source
+phones. Policy edits belong to the external resource release. Publishing updated data
+requires regenerating and pinning the resource; an explicit
+`VITS2_LEXICON_PATH` remains caller-managed.
 
 English and Chinese-English mixed text share the same lookup. CUSTOM and
 existing verified corrections remain first; ordinary CMU words retain their
@@ -421,13 +432,39 @@ reading. Eligible external whole words precede G2P fallback. Full known
 hyphenated tokens are protected during final punctuation cleanup; structured
 math and addresses keep priority. Ambiguous `M-S` still follows math parsing.
 
-Before frontend startup, the adapter verifies/downloads the existing public
-ModelScope source at revision `e67fccc9fa0c2bd8848dcf93221e18bb3fa4f205`,
-checks its size/SHA256 and canonical content, then compiles against the release
-CMU and `frontend/lexicon_case_policies.json`. The compiler ships inside this
-plugin; no engine rebuild or Dockerfile change is required. Process locks and
-atomic writes protect shared caches. Warm startup reuses a compiled file bound
-to the CMU, compiler, case policy and output hashes.
+The public frontend resource is one `external_lexicon.json` in the same
+ModelScope repository as the model, under `frontend/lexicon/20261027-v1/`, pinned to revision
+`25dc084a26de8673a742b475470ae202751ee33c`.
+It contains the merged Gold runtime entries and their original annotations,
+matching policies, reviewed business-source records, text replacements,
+ordered frontend rules and IPA reference annotations. Vocabulary data is not embedded in generated
+Python modules or duplicated as separate Git dictionaries.
+
+The ordered rules retain their original stages: 80 pre-normalization rules,
+seven post-normalization product spellings and one lexical-number rule.
+Their regex boundaries, flags and order are preserved. The interpreter only
+accepts literal replacements or the existing, allowlisted Ascend digit handler;
+the downloaded resource is never executed as Python. The original CUSTOM
+pronunciations and the early Qwen/version language handling remain in code.
+The maintenance compiler lives in `perception/tools/vits2_prepare_external_lexicon.py`;
+it is not part of the inference plugin.
+
+Before frontend startup, the adapter downloads/verifies this one size/SHA256-
+pinned JSON into `frontend_data/lexicon/20261027-v1/external_lexicon.json`. The existing downloader
+provides process locking and atomic installation; valid cached bytes are reused.
+Cache validation and replacement of corrupt downloads use the unchanged mainline
+`ensure_verified_bundle` implementation during resource preparation, not per utterance.
+The index is compiled when publishing a resource version, rather than on the
+robot. Its CMU source hash must match the model; English startup also checks
+its full nested CMU identity and overlapping pronunciations. IPA remains
+reference data and is not used as runtime phoneme input. The acoustic archives,
+engines, speaker, speed and model weights are unchanged.
+
+Ordinary deployment uses the combined hash index directly; it does not scan
+the supplement list for each token. CMU and original CUSTOM/VERIFIED priority
+remain intact. A configured domain/deployment override or an older explicit
+Gold resource uses indexed compatibility candidates with the original domain,
+priority and CMU guards. File reads and validation remain cached at startup.
 
 Deployments can provide a maintained external file with `VITS2_LEXICON_PATH`
 and optionally `VITS2_LEXICON_SHA256`. Missing/corrupt resources or a different
@@ -446,15 +483,48 @@ resource. An incompatible reload raises an error, and lookups of that invalid
 file remain blocked until a valid file and its configured checksum are restored.
 CMU hashing and full validation are cached, not repeated for every word.
 
-#### Optional reviewed domain overrides
+#### Reviewed business supplements and optional domain overrides
 
-`frontend/hotwords.py` retains an optional, explicit deployment override shared
-by English and mixed speech. Airbnb and ASML are no longer hardcoded here;
-they come from the full external dictionary. This small override manifest is
-separate from the full dictionary and is only needed for reviewed domain
-exceptions. Structural/phoneme validation does not replace device listening.
+The resource's `business_lexicon` section retains the reviewed maintenance
+input for the combined Gold compiler. Its 114 enabled whole-token entries supply 109 missing
+words and preserve five existing Gold
+readings. They do not override released CMU ordinary words, CUSTOM or VERIFIED.
+Examples include Phancy, PhancyCloud, vGPU, AIOS, ModelHub, OpenMLDB and
+HuggingFace. PyPI uses the documented "pie-pea-eye" reading and is distinct
+from PyPy. Airbnb and ASML still come from the full external dictionary.
+Computing additions include HTML, VPN, MVCC, CRDT, OLTP, OLAP, YAML and
+Gunicorn. Gunicorn follows its [author's G + Unicorn reading](https://github.com/benoitc/gunicorn/issues/139);
+YAML follows its [specification's rhyme with camel](https://yaml.org/spec/1.2.2/).
+Unconfirmed project names are not inferred
+from spelling alone.
 
-Deployments may supply a local version-1 JSON manifest using
+The whole token `FOLLOW-UP` reuses the released CMU `FOLLOWUP` pronunciation,
+including its secondary stress on `UP`. Ordinary spaced `follow up` and other
+hyphenated words keep their existing readings. This entry also applies when
+the frontend treats `follow-up` inside a bare filename or path as ordinary text;
+complete URLs and email addresses retain their existing address handling.
+
+The user-confirmed `PhancyGroup` reading is `Phancy Group`, using the same
+phones as the existing Phancy and CMU Group components. Uppercase, lowercase
+and mixed-case forms share that whole-token entry. Other supported fused
+aliases include FourthParadigm, ModelHubXC, TokenFactory and AIStudio; these
+are spelling variants of existing components, not new brand pronunciations.
+
+The manifest retains the complete 148-term company handoff inventory and a
+computing catalog with coverage and source conflicts. Catalog records
+are not active rules. Unconfirmed brand readings (including PhanthyMotus),
+conflicting annotations and unsupported phrases stay disabled. Sources and
+component phones are retained for review; the runtime does not read private
+handoff paths. Existing separated phrases retain their normal component path;
+the specific company name `Frost & Sullivan` also keeps its spoken "and".
+`pending_review` disables only the proposed phoneme override, not speech of
+the word. For example, `Phanthymotus` still uses the existing `Phanthy Motus`
+text expansion. Its two handoff transcriptions disagree on the final vowel
+in Motus (`UW0` versus `AH0`); EngineX differs on its initial vowel (`IH1`
+versus `EH1`). JIT's letter-by-letter versus word reading remains unconfirmed.
+Structural/phoneme validation does not replace device listening.
+
+Deployments may add a local version-1 JSON manifest using
 `VITS2_HOTWORDS_PATH`, optionally pinned by `VITS2_HOTWORDS_SHA256`.
 `VITS2_HOTWORD_DOMAIN` defaults to `general`; selecting a domain is explicit,
 not inferred from a sentence. For example, a reviewed financial ticker may
@@ -466,18 +536,25 @@ Each manifest entry must declare `text`, `arpa` (stressed ARPAbet), `case`
 (`exact`/`fold`), `languages` (`["en"]`), `domain`, integer `priority`,
 `enabled`, `reviewed`, `source`, and `source_sha256`. `override_cmu` defaults
 to false; enabling it requires exact case and a specific non-general domain.
-Higher priority wins between eligible entries; ambiguous equal priorities,
+Higher priority wins between eligible bundled/deployment entries; ambiguous equal priorities,
 invalid phones, checksum errors, and raw Gold files are rejected. The local
-manifest is bounded to 64 KiB / 128 reviewed entries and performs no downloads.
-Changing its configured path/SHA selects a new cached manifest. Editing the
-same file requires `reload_hotwords()` or a service restart; speech does not
+deployment manifest is bounded to 64 KiB. The SHA-pinned bundled business
+manifest has a separate 128 KiB bound for its retained provenance and catalog.
+At most 128 active entries are allowed across both manifests, with no downloads.
+Changing a deployment path/SHA selects a new cached manifest. Editing the
+same deployment file requires `reload_hotwords()` or a service restart; speech does not
 reread the file for each token. This adds no UI, new model, or runtime package
 dependency.
+Changes to the bundled maintenance source require updating its pin and
+rebuilding the combined dictionary before publication. Resource preparation
+only downloads and validates the published JSON; it does not compile vocabulary
+on the robot. Explicit compiled paths remain owner-managed.
 
 The terminology layer retains 3,558 text mappings and 828 IPA reference
 records from jinghong's `frontend_res` collection, whose source fields name
 zhangjinghong and i-wangtianshuo. The generated data matches those annotations;
-577 generated rules are active after filtering unchanged readings, bare
+The resource's `text_replacements` section retains the mapping order; 577
+rules are active after filtering unchanged readings, bare
 numbers and curated overrides. IPA records are reference metadata, not direct
 runtime phoneme overrides. This layer is distinct from the CMU dictionary.
 
@@ -532,11 +609,11 @@ engine and Chinese TN hashes from the former COS bundles; they are pinned
 explicitly rather than treated as interchangeable copies.
 
 The CMU dictionary and its runtime cache are included in the size- and
-SHA256-verified model archive. No separate Gold lexicon download is required.
-The bundled `frontend/en_gold_pronunciations.json` is verified and used as the
-source for compiling `frontend_data/external_lexicon.json`. It is not loaded
-directly as a global CMU override. The installation uses the existing `/models`
-cache and needs no extra volume or image layer.
+SHA256-verified model archive. The separate, unified frontend JSON described
+above is downloaded into `frontend_data/lexicon/20261027-v1/` and retains the
+CMU priority rules. Older Gold copies inside model archives are not used as
+global CMU overrides. Installation reuses `/models`, with no new volume or
+image layer.
 The public ModelScope source follows the PR submission procedure; a later
 approved COS mirror can use `VITS2_MODEL_BASE_URL` with the same relative file
 paths and checksums.

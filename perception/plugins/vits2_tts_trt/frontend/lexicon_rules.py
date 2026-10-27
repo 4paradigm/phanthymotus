@@ -30,9 +30,11 @@ Every entry is deliberately narrow — one release-controlled rewrite per lexeme
 so training and deployed runtime keep producing identical phonemes.
 """
 
+from functools import lru_cache
+import json
 import re
 import unicodedata
-from .lexicon_rules_generated import GENERATED_REPLACEMENTS
+from .release_paths import frontend_lexicon_path
 from .math_units import _english_quantity
 from .special_text import verbalize_chinese_number
 
@@ -54,75 +56,6 @@ def _sub_lexeme(pattern, replacement, text):
     return pattern.sub(replace, text)
 
 
-# 0) Phrase-level rules. These must run before the per-token rules below,
-#    otherwise "Sage AIOS" is already split into letters and never matches.
-_PHRASE_RULES = [
-    # Keep a short pause between the brand and the acronym it introduces.
-    (_edge(r"sage\s+aios"), "Sage, A I O S"),
-]
-
-# 1) Digits that belong to an English phrase must not be verbalized as Chinese.
-_NUMBER_RULES = [
-    (_edge(r"tier\s*1"), "Tier one"),
-]
-
-# 2) Tokens the English TN graph mangles before G2P ever sees them.
-_PROTECTED_TOKENS = [
-    (_edge(r"idc"), "I D C"),
-]
-
-# 3) Acronyms that are read letter by letter. CNCF uses dots: space-separated
-#    letters come out as one continuous block (770 ms, no gap).
-_LETTER_SPELLED = [
-    (re.compile(r"(?<![A-Za-z0-9_])waic(?![A-Za-z0-9_])", re.I), "W A I C"),
-    (_edge(r"aios"), "A I O S"),
-    (_edge(r"dcu"), "D C U"),
-    (_edge(r"mlu"), "M L U"),
-    (_edge(r"cncf"), "C.N.C.F"),
-    (_edge(r"xc"), "X C"),
-    (_edge(r"vgpu"), "V G P U"),
-    (_edge(r"gpu"), "G P U"),
-    (_edge(r"npu"), "N P U"),
-    (_edge(r"api"), "A P I"),
-    (_edge(r"ai"), "A I"),
-]
-
-# 4) Mixed readings: the word part is spelled, the trailing letter is read.
-_MIXED_READINGS = [
-    (_edge(r"automl"), "Auto M L"),
-    (_edge(r"enginex"), "Engine X"),
-]
-
-# 5) Camel-case / fused product names that must become two words.
-_FUSED_NAMES = [
-    # Restore the product readings from the integrated 2026-10-14 release.
-    # Underscores belong to identifiers, so do not rewrite embedded names.
-    (re.compile(r"(?<![A-Za-z0-9_])openmldb(?![A-Za-z0-9_])", re.I), "Open M L D B"),
-    (re.compile(r"(?<![A-Za-z0-9_])featinsight(?![A-Za-z0-9_])", re.I), "Feat Insight"),
-    (_edge(r"modelhub"), "Model Hub"),
-    (_edge(r"phanthymotus"), "Phanthy Motus"),
-    (_edge(r"phanthymovie"), "Phanthy Movie"),
-    (_edge(r"phanthycloud"), "Phanthy Cloud"),
-    (_edge(r"phancycloud"), "Phancy Cloud"),
-    # Split so that "Router" resolves through CMUdict: /ˈruːtər/, not the
-    # g2p_en guess /ˈraʊtər/ the single fused token produced.
-    (_edge(r"phanrouter"), "Phan Router"),
-    (_edge(r"phanclaw"), "Phan Claw"),
-]
-
-
-# 6) Chinese readings: brand names spoken as Chinese, and the digits of
-#    accelerator model numbers read as Chinese numerals (A100 -> A一百,
-#    MI250X -> M I二五零X). Round hundreds keep the natural form (一百/八百),
-#    other three-digit numbers are read digit by digit (九一零/三七零).
-_CN_NAMES = [
-    (_edge(r"qwen"), "千问"),
-    # The generated source contains a literal "+" used as an annotation
-    # separator. Keep its data intact, but never send that sign to TTS.
-    (_edge(r"01\.AI"), "零一 点 A I"),
-]
-
-
 def _ascend_model(match) -> str:
     """Keep model digit readings only with an explicit Ascend/昇腾 prefix."""
     model = match.group("model")
@@ -130,85 +63,10 @@ def _ascend_model(match) -> str:
     return match.group("brand") + " " + digits + model[3:]
 
 
-_CONTEXT_MODEL_DIGITS = [
-    (_edge(r"(?P<brand>Ascend|昇腾)[ \t]*(?:[-‑–—][ \t]*)?"
-           r"(?P<model>310P?|910[ABC]?)"), _ascend_model),
-]
-
-_MODEL_DIGITS = [
-    (_edge(r"MI250X"), "M I二五零X"),
-    (_edge(r"MI300A"), "M I三百A"),
-    (_edge(r"MI300X"), "M I三百X"),
-    (_edge(r"MI325X"), "M I三二五X"),
-    (_edge(r"MI355X"), "M I三五五X"),
-    (_edge(r"MLU100"), "M L U一百"),
-    (_edge(r"MLU270"), "M L U二七零"),
-    (_edge(r"MLU290"), "M L U二九零"),
-    (_edge(r"MLU370"), "M L U三七零"),
-    (_edge(r"MLU590"), "M L U五九零"),
-    (_edge(r"GB200"), "G B二百"),
-    (_edge(r"GB300"), "G B三百"),
-    (_edge(r"MI210"), "M I二一零"),
-    (_edge(r"MI250"), "M I二五零"),
-    (_edge(r"MI350"), "M I三五零"),
-    (_edge(r"950PR"), "九五零PR"),
-    (_edge(r"950DT"), "九五零DT"),
-    (_edge(r"WSE-2"), "W S E二"),
-    (_edge(r"WSE-3"), "W S E三"),
-    (_edge(r"SN40L"), "S N四零L"),
-    (_edge(r"V100"), "V一百"),
-    (_edge(r"A100"), "A一百"),
-    (_edge(r"A800"), "A八百"),
-    (_edge(r"H100"), "H一百"),
-    (_edge(r"H800"), "H八百"),
-    (_edge(r"H200"), "H二百"),
-    (_edge(r"B100"), "B一百"),
-    (_edge(r"B200"), "B二百"),
-    (_edge(r"B300"), "B三百"),
-    (_edge(r"L40S"), "L四零S"),
-    (_edge(r"310P"), "三一零P"),
-    (_edge(r"910A"), "九一零A"),
-    (_edge(r"910B"), "九一零B"),
-    (_edge(r"910C"), "九一零C"),
-    (_edge(r"AI2"), "A I二"),
-    (_edge(r"A3C"), "A三C"),
-    (_edge(r"A2C"), "A二C"),
-    (_edge(r"TD3"), "T D三"),
-    (_edge(r"H20"), "H二零"),
-    (_edge(r"L40"), "L四零"),
-    (_edge(r"v5e"), "v五e"),
-    (_edge(r"v5p"), "v五p"),
-    (_edge(r"v6e"), "v六e"),
-    (_edge(r"C3"), "C三"),
-    (_edge(r"T5"), "T五"),
-    (_edge(r"F1"), "F一"),
-    (_edge(r"L4"), "L四"),
-    (_edge(r"T4"), "T四"),
-    (_edge(r"v4"), "v四"),
-    (_edge(r"v7"), "v七"),
-    (_edge(r"D1"), "D一"),
-]
-
-# Order matters: phrase rules first, then longer alternatives before shorter ones
-# (``aios`` before ``ai``, ``vgpu`` before ``gpu``).
-
-RULES = (
-    _PHRASE_RULES
-    + _CN_NAMES
-    + _CONTEXT_MODEL_DIGITS
-    + _MODEL_DIGITS
-    + _NUMBER_RULES
-    + _PROTECTED_TOKENS
-    + _LETTER_SPELLED
-    + _MIXED_READINGS
-    + _FUSED_NAMES
-)
-
-
-
 
 # 7) Generated lexeme rules from frontend_res. The complete plain-text
-#    mapping is retained in lexicon_rules_generated.py; only entries
+#    mapping is retained in the external lexicon's text_replacements section;
+#    only entries
 #    whose spoken form differs from the source term are compiled.
 def _generated_key(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().casefold()
@@ -253,33 +111,81 @@ def _pattern_literal_key(pattern) -> str:
     return re.sub(r"\s+", " ", source).strip().casefold()
 
 
-_CURATED_KEYS = {_pattern_literal_key(pattern) for pattern, _ in RULES}
-_GENERATED_RULES = []
-for _term, _spoken in GENERATED_REPLACEMENTS.items():
-    _key = _generated_key(_term)
-    # Bare numerals are quantities, dates, identifiers or model numbers only
-    # in context. Leave them to the numeric frontend instead of globally
-    # applying the generated company/name entry "111" -> "one one one".
-    if _term.strip().isdecimal():
-        continue
-    if len(_term.strip()) < 2 or _term.casefold() == _spoken.casefold():
-        continue
-    if _key in _CURATED_KEYS:
-        continue
-    _pattern = re.compile(
-        r"(?<![A-Za-z0-9_])(?:"
-        + _generated_pattern(_term)
-        + r")(?![A-Za-z0-9_])",
-        re.IGNORECASE,
-    )
-    _GENERATED_RULES.append((_pattern, _spoken, len(_term)))
-_GENERATED_RULES.sort(key=lambda item: item[2], reverse=True)
-_GENERATED_RULES = [(pattern, spoken) for pattern, spoken, _ in _GENERATED_RULES]
-_NUMERIC_GENERATED_RULES = [
-    (pattern, spoken) for pattern, spoken in _GENERATED_RULES
-    if _GENERATED_NUMBER.search(spoken)
-]
-_STYLE_TTS_VERSION = _edge(r"StyleTTS2")
+def _compile_rules(rows):
+    """Decode pinned, ordered rules without executing code from the resource."""
+    if not isinstance(rows, list) or not rows or len(rows) > 4096:
+        raise ValueError("VITS2 frontend rules require a nonempty bounded list")
+    result = []
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get("pattern"), str)
+                or not row["pattern"] or type(row.get("flags")) is not int
+                or row["flags"] & ~(re.IGNORECASE | re.UNICODE)):
+            raise ValueError("Invalid VITS2 frontend pattern")
+        if set(row) == {"pattern", "flags", "replacement"} and isinstance(row["replacement"], str):
+            replacement = row["replacement"]
+        elif set(row) == {"pattern", "flags", "handler"} and row["handler"] == "ascend_model":
+            replacement = _ascend_model
+        else:
+            raise ValueError("Invalid VITS2 frontend replacement")
+        result.append((re.compile(row["pattern"], row["flags"]), replacement))
+    return tuple(result)
+
+
+@lru_cache(maxsize=4)
+def _generated_tables(path):
+    """Compile verified external data once, after adapter resource preparation.
+
+    Preserve insertion order for equal-length terms. Importing the language
+    policy never opens a file or starts a network request.
+    """
+    with open(path, "rb") as source:
+        data = source.read(4 * 1024 * 1024 + 1)
+    if len(data) > 4 * 1024 * 1024:
+        raise ValueError("VITS2 frontend resource exceeds 4 MiB")
+    resource = json.loads(data)
+    replacements = resource.get("text_replacements") if isinstance(resource, dict) else None
+    if (not isinstance(replacements, dict) or not replacements
+            or any(not isinstance(term, str) or not isinstance(spoken, str)
+                   for term, spoken in replacements.items())):
+        raise ValueError("VITS2 text replacements require a nonempty string mapping")
+    frontend_rules = resource.get("frontend_rules")
+    if not isinstance(frontend_rules, dict):
+        raise ValueError("VITS2 frontend rules are missing")
+    tables = {name: _compile_rules(frontend_rules.get(name))
+              for name in ("before_tn", "after_tn", "numeric_names")}
+    curated_keys = {_pattern_literal_key(pattern) for pattern, _ in tables["before_tn"]}
+    rules = []
+    for term, spoken in replacements.items():
+        # Bare numbers belong to the contextual numeric frontend.
+        if (term.strip().isdecimal() or len(term.strip()) < 2
+                or term.casefold() == spoken.casefold()
+                or _generated_key(term) in curated_keys):
+            continue
+        pattern = re.compile(r"(?<![A-Za-z0-9_])(?:" + _generated_pattern(term)
+                             + r")(?![A-Za-z0-9_])", re.IGNORECASE)
+        rules.append((pattern, spoken, len(term)))
+    rules.sort(key=lambda item: item[2], reverse=True)
+    generated = tuple((pattern, spoken) for pattern, spoken, _ in rules)
+    numeric = tuple((pattern, spoken) for pattern, spoken in generated
+                    if _GENERATED_NUMBER.search(spoken))
+    tables.update(generated=generated, numeric=numeric)
+    return tables
+
+
+def _frontend_tables():
+    return _generated_tables(str(frontend_lexicon_path()))
+
+
+def _generated_rules():
+    tables = _frontend_tables()
+    return tables["generated"], tables["numeric"]
+
+
+def normalize_technical_lexemes(text: str) -> str:
+    """Apply the release's post-TN product spellings at their original stage."""
+    for pattern, replacement in _frontend_tables()["after_tn"]:
+        text = _sub_lexeme(pattern, replacement, text)
+    return text
 
 
 def normalize_numeric_lexemes(text, language="MIX"):
@@ -289,11 +195,10 @@ def normalize_numeric_lexemes(text, language="MIX"):
     lexeme pass also uses it for automatic EN/MIX context. Fully spoken output
     is idempotent and ordinary quantities/identifiers remain untouched.
     """
-    for pattern, spoken in _NUMERIC_GENERATED_RULES:
+    tables = _frontend_tables()
+    for pattern, spoken in tables["numeric"] + tables["numeric_names"]:
         text = _sub_lexeme(pattern, lambda match: _generated_spoken(spoken, language), text)
-    return _sub_lexeme(
-        _STYLE_TTS_VERSION, lambda match: _generated_spoken("style T T S 2", language), text,
-    )
+    return text
 
 
 _QWEN_VERSION_RE = re.compile(
@@ -323,12 +228,13 @@ def has_chinese_name_reading(token: str) -> bool:
     """
     if _QWEN_VERSION_RE.fullmatch(token):
         return True
-    return any(
-        pattern.fullmatch(token)
-        and re.search(r"[\u4e00-\u9fff]", spoken)
-        and not re.search(r"[A-Za-z]", spoken)
-        for pattern, spoken in _CN_NAMES
-    )
+    return bool(re.fullmatch("qwen", token, re.IGNORECASE))
+
+
+def normalize_chinese_name(token: str) -> str:
+    """Known standalone names used by the language API before model readiness."""
+    token = _sub_lexeme(_QWEN_VERSION_RE, _qwen_version, token)
+    return _sub_lexeme(_edge("qwen"), "千问", token)
 
 
 def apply_lexeme_rules(text: str, language: str = "MIX") -> str:
@@ -345,7 +251,7 @@ def apply_lexeme_rules(text: str, language: str = "MIX") -> str:
     prefix = "\ue000"
     while prefix in text:
         prefix += "\ue000"
-    for pattern, replacement in _GENERATED_RULES:
+    for pattern, replacement in _generated_rules()[0]:
         if language == "EN" and re.search(r"[\u4e00-\u9fff]", replacement):
             continue
         def _protect(match):
@@ -357,7 +263,7 @@ def apply_lexeme_rules(text: str, language: str = "MIX") -> str:
 
     if language != "EN":
         text = _sub_lexeme(_QWEN_VERSION_RE, _qwen_version, text)
-    for pattern, replacement in RULES:
+    for pattern, replacement in _frontend_tables()["before_tn"]:
         if language == "EN":
             def _english_replacement(match):
                 spoken = replacement(match) if callable(replacement) else match.expand(replacement)

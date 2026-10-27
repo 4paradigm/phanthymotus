@@ -1,4 +1,6 @@
 """Numeric names and unknown identifiers retain their explicit reading language."""
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 import os
 from pathlib import Path
 import subprocess

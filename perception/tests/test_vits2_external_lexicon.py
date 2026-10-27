@@ -456,11 +456,15 @@ class CmuBindingTests(_RuntimeCase):
         source = self.directory / "source.json"
         source_data = {"CAR": ["S", "IY1", "EY1", "AA1", "R"], "ACME": ["AE1", "K", "M", "IY0"]}
         source.write_text(json.dumps(source_data))
-        policy = self.directory / "policy.json"
-        policy.write_text("{}")
-        with patch.object(self.resources, "_SOURCE_CANONICAL_SHA", _canonical_sha(source_data)), \
-             patch.object(self.resources, "_POLICY_PATH", policy), \
-             patch.object(self.resources, "_download", return_value=source):
+        payload, _ = builder.compile_lexicon(
+            source, self.cmu, expected_source_canonical_sha256=_canonical_sha(source_data),
+            cmu_source_sha256=hashlib.sha256((root / "frontend_data/cmudict.rep").read_bytes()).hexdigest())
+        source = self.directory / "external_lexicon.json"
+        source.write_bytes(builder.encode_payload(payload))
+        files = {source.name: {"size": source.stat().st_size,
+                              "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}}
+        with patch.object(self.resources, "_SOURCE_BASE", self.directory.as_uri()), \
+             patch.object(self.resources, "_SOURCE_FILES", files):
             output = self.resources.ensure_external_lexicon(root)
         self.assertTrue(self.module.validate_external_lexicon_file(output)["cmu_verified"])
         self.paths.configure_release_paths(root)

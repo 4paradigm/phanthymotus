@@ -4,6 +4,8 @@ Execute the production entry-point functions with an identity FST and the real
 lexeme/context rules. The heavy G2P imports are irrelevant to this regression.
 """
 
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 import ast
 from pathlib import Path
 import re

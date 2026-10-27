@@ -129,7 +129,7 @@ def test_cjk_adjacency_keeps_explicit_ai_letters():
 @pytest.mark.parametrize("text", ["éphanthymotusé", "éRise vGPUé", "foo_phanthymotus_bar",
                                   "prefix_Rise vGPU_suffix", "e\u0301phanthymotus", "phanthymotus\u0301"])
 def test_late_technical_layer_cannot_rewrite_protected_word_boundaries(text):
-    from plugins.vits2_tts_trt.frontend.technical_text import normalize_technical_lexemes
+    from plugins.vits2_tts_trt.frontend.lexicon_rules import normalize_technical_lexemes
 
     assert normalize_technical_lexemes(text) == text
     normalized = normalize_text_mix(text)
@@ -139,7 +139,7 @@ def test_late_technical_layer_cannot_rewrite_protected_word_boundaries(text):
 
 @pytest.mark.parametrize("separator", ["\n", "\r\n", "\r", "\v", "\f", "\x85", "\u2028", "\u2029"])
 def test_late_technical_phrase_never_consumes_line_boundaries(separator):
-    from plugins.vits2_tts_trt.frontend.technical_text import normalize_technical_lexemes
+    from plugins.vits2_tts_trt.frontend.lexicon_rules import normalize_technical_lexemes
 
     text = "rise" + separator + "vgpu"
     assert normalize_technical_lexemes(text) == text

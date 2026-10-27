@@ -1,4 +1,6 @@
 """Unsupported numeric syntax is spoken literally; supported fields keep priority."""
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 import pytest
 
 from plugins.vits2_tts_language.neutral_text import (

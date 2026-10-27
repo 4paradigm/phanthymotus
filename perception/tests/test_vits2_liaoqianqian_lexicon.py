@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy  # Load the extension before temporary sys.modules isolation.
+import pytest
 
 
 FRONTEND = Path(__file__).resolve().parents[1] / "plugins/vits2_tts_trt/frontend"
@@ -36,6 +37,39 @@ VERIFIED_EXPECTED = {
     "AGENTIC": [["AH0", "JH", "EH1", "N", "T", "IH0", "K"]],
     "NVIDIA": [["EH0", "N", "V", "IH1", "D", "IY0", "AH0"]],
 }
+
+
+def lexeme_fixture():
+    """Small offline resource for parser contracts, not a copy of the vocabulary."""
+    def row(term, spoken):
+        return {"pattern": r"(?<![A-Za-z0-9_])" + term + r"(?![A-Za-z0-9_])",
+                "flags": int(re.IGNORECASE | re.UNICODE), "replacement": spoken}
+    return {
+        "text_replacements": {"FACT II Acquisition": "Fact 2 Acquisition",
+                              "X3 Acquisition": "X 3 Acquisition",
+                              "X4 Pharmaceuticals": "X 4 Pharmaceuticals",
+                              "Velo3D": "Velo 3D", "MongoDB": "Mongo DB"},
+        "frontend_rules": {
+            "before_tn": [row("qwen", "千问"), row("waic", "W A I C"), row("ai", "A I"), row("openmldb", "Open M L D B"),
+                          row("featinsight", "Feat Insight"),
+                          row(r"frost[^\S\r\n\v\f\x85\u2028\u2029]*&[^\S\r\n\v\f\x85\u2028\u2029]*sullivan", "Frost and Sullivan")],
+            "after_tn": [row("chatgpt", "chat GPT")],
+            "numeric_names": [row("StyleTTS2", "style T T S 2")],
+        },
+        "business_lexicon": {"version": 1, "sources": {}, "entries": []},
+    }
+
+
+@pytest.fixture(autouse=True)
+def lexical_resource(monkeypatch, tmp_path):
+    """Replace the download boundary; exercise the actual external-rule loader."""
+    from plugins.vits2_tts_trt.frontend import lexicon_rules
+    path = (Path(os.environ.get("VITS2_MODEL_DIR", "/models/vits2"))
+            / "frontend_data/lexicon/20261027-v1/external_lexicon.json")
+    if not path.is_file():
+        path = tmp_path / "frontend-resource.json"
+        path.write_text(json.dumps(lexeme_fixture()))
+    monkeypatch.setattr(lexicon_rules, "frontend_lexicon_path", lambda: path)
 
 
 def load_frontends(cache, gold_state="valid"):
@@ -103,7 +137,10 @@ def load_frontends(cache, gold_state="valid"):
         "RGB-D": {"arpa": ["AA1", "R", "JH", "IY1", "B", "IY1", "D", "IY1"], "mode": "exact"},
         "OOV-BRAND": {"arpa": ["B", "R", "AE1", "N", "D"], "mode": "fold"},
     }
-    (data_dir / "external_lexicon.json").write_text(json.dumps({
+    resource = data_dir / "lexicon/20261027-v1/external_lexicon.json"
+    resource.parent.mkdir(parents=True)
+    resource.write_text(json.dumps({
+        **lexeme_fixture(),
         "format": "vits2-external-pronunciations", "version": 1,
         "source": {"sha256": "0" * 64, "entries": len(external_entries)},
         "cmu": {"sha256": cmu_sha, "entries": len(cmu),
@@ -121,6 +158,9 @@ def load_frontends(cache, gold_state="valid"):
 
     with patch.dict(sys.modules, {name: package, "nltk": nltk, "g2p_en": g2p}):
         load("release_paths").configure_release_paths(release_root)
+        load("hotwords")._BUSINESS_SHA256 = hashlib.sha256((json.dumps(
+            lexeme_fixture()["business_lexicon"], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")) + "\n").encode()).hexdigest()
         english = load("english")
         mixed = load("unified_g2p")
         special = load("special_text")
@@ -427,14 +467,14 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
     def test_generated_replacements_are_opaque_to_curated_lexemes(self):
         rules = [(self.lexicon._edge("ExampleTerm"), "AI platform")]
         for language in ("EN", "MIX", "ZH"):
-            with self.subTest(language=language), patch.object(self.lexicon, "_GENERATED_RULES", rules):
+            with self.subTest(language=language), patch.object(self.lexicon, "_generated_rules", return_value=(rules, ())):
                 self.assertEqual(self.lexicon.apply_lexeme_rules("ExampleTerm AI", language),
                                  "AI platform A I")
 
     def test_literal_old_markers_and_private_use_input_never_collide(self):
         rules = [(self.lexicon._edge("ExampleTerm"), "AI platform")]
         for literal in (r"\x00LEX0\x00", r"\x00LEX1\x00", "\ue000\ue001\ue010\ue002", "\ue000\ue000"):
-            with self.subTest(literal=literal), patch.object(self.lexicon, "_GENERATED_RULES", rules):
+            with self.subTest(literal=literal), patch.object(self.lexicon, "_generated_rules", return_value=(rules, ())):
                 self.assertEqual(self.lexicon.apply_lexeme_rules(literal + " ExampleTerm"),
                                  literal + " AI platform")
 
@@ -455,6 +495,38 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
         self.assertEqual(self.lexicon.apply_lexeme_rules("使用MongoDB数据库"),
                          "使用Mongo DB数据库")
         self.assertEqual(self.lexicon.apply_lexeme_rules("你好Qwen和AI"), "你好千问和A I")
+
+    def test_company_ampersand_retains_and_without_matching_identifiers_or_lines(self):
+        for language in ("EN", "ZH", "MIX"):
+            for raw in ("Frost & Sullivan", "FROST&SULLIVAN", "frost\t&\tsullivan",
+                        "Frost\u00a0&\u3000Sullivan"):
+                with self.subTest(language=language, raw=raw):
+                    self.assertEqual(self.lexicon.apply_lexeme_rules(raw, language),
+                                     "Frost and Sullivan")
+                    self.assertEqual(self.lexicon.apply_lexeme_rules("采用" + raw + "的报告", language),
+                                     "采用Frost and Sullivan的报告")
+            for raw in ("MyFrost&Sullivan", "Frost&Sullivans", "Frost&Sullivan_id",
+                        "Frost\n&Sullivan", "Frost&\nSullivan", "éFrost&Sullivan",
+                        "Frost&Sullivan\u0301", "2026 10/23", "y = 2x-3"):
+                with self.subTest(language=language, raw=raw):
+                    self.assertEqual(self.lexicon.apply_lexeme_rules(raw, language), raw)
+
+    def test_company_ampersand_rule_keeps_addresses_and_formula_fields_literal(self):
+        def normalize(raw):
+            def ordinary(text):
+                return self.english.text_normalize_without_numbers(
+                    self.lexicon.apply_lexeme_rules(text, language="EN"))
+            return self.special.normalize_special_text(
+                raw, ordinary, lambda value, language: self.math_units._english_quantity(value),
+                language="EN")
+
+        tables = self.lexicon._frontend_tables()
+        prior = [rule for rule in tables["before_tn"] if rule[1] != "Frost and Sullivan"]
+        for raw in ("https://example.com/Frost&Sullivan?q=2", "Frost&Sullivan@example.com",
+                    "2026-08-07 14:25", "y = 2x-3", "SNR>=28dB"):
+            actual = normalize(raw)
+            with self.subTest(raw=raw), patch.object(self.lexicon, "_frontend_tables", return_value={**tables, "before_tn": prior}):
+                self.assertEqual(actual, normalize(raw))
 
     def test_generated_phrase_spacing_never_consumes_a_line_boundary(self):
         for separator in ("\n", "\r\n", "\r", "\v", "\f", "\x85", "\u2028", "\u2029"):
@@ -570,13 +642,14 @@ class LiaoqianqianLexiconTest(unittest.TestCase):
 
     def test_curated_product_names_do_not_rewrite_identifiers_or_addresses(self):
         identifier = "foo_OpenMLDB_v2 featinsight_api"
+        tables = self.lexicon._frontend_tables()
         prior_rules = [
-            rule for rule in self.lexicon.RULES
+            rule for rule in tables["before_tn"]
             if rule[1] not in ("Open M L D B", "Feat Insight")
         ]
         for language in ("EN", "MIX"):
             actual = self.lexicon.apply_lexeme_rules(identifier, language=language)
-            with patch.object(self.lexicon, "RULES", prior_rules):
+            with patch.object(self.lexicon, "_frontend_tables", return_value={**tables, "before_tn": prior_rules}):
                 prior = self.lexicon.apply_lexeme_rules(identifier, language=language)
             self.assertEqual(actual, prior)
             # Underscores belong to identifiers for every lexeme rule, so an

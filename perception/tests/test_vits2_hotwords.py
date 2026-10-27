@@ -41,6 +41,10 @@ class HotwordTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "reviewed.json"
+        bundled = Path(self.tmp.name) / "bundled.json"
+        bundled.write_text(json.dumps({"version": 1, "entries": []}))
+        self.module.bundled_hotwords_source = lambda: (
+            str(bundled), hashlib.sha256(bundled.read_bytes()).hexdigest())
 
     def manifest(self, entries):
         self.path.write_text(json.dumps({"version": 1, "entries": entries}), encoding="utf-8")

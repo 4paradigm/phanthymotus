@@ -1,6 +1,8 @@
 """Contextual numeric-field tests, without ROS, FST or acoustic inference."""
 
 from pathlib import Path
+from test_vits2_liaoqianqian_lexicon import lexical_resource
+
 import sys
 import unittest
 
