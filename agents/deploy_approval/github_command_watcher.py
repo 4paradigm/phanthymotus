@@ -33,6 +33,9 @@ from .github_client import (
     GitHubClient, GitHubError, GitHubRateLimitError, GitHubTransientError,
 )
 from .github_state_proxy import HIDDEN_STATE_MARKER, GitHubStateProxy, GitHubStateProxyError
+from .review_comment_parser import (
+    BUILD_HEADING, CODE_REVIEW_HEADING, PR_REVIEW_MARKER,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -443,14 +446,36 @@ class GitHubCommandWatcher:
         except (TypeError, ValueError):
             return None
 
+    def _is_trusted_review_completion(self, comment: dict) -> bool:
+        """Recognize review completion hints without trusting Markdown alone."""
+        user = comment.get("user")
+        if not isinstance(user, dict):
+            return False
+        author_id = str(user.get("id", ""))
+        author_login = user.get("login")
+        if (not self.config.review_comment_author_id
+                or author_id != self.config.review_comment_author_id
+                or author_login != self.config.review_comment_author_login):
+            return False
+        body = comment.get("body")
+        if not isinstance(body, str) or PR_REVIEW_MARKER not in body:
+            return False
+        # Only terminal Build Result / Code Review protocol comments should
+        # accelerate reconciliation. Progress, test output, and arbitrary
+        # comments from the trusted account remain on the ordinary scan path.
+        return ((BUILD_HEADING in body and "Build Result" in body)
+                or (CODE_REVIEW_HEADING in body and "Code Review" in body))
+
     def _observe_recent_command(self, repo, pr_number, comment, created_at):
         comment_id = comment.get("id")
         if type(comment_id) is not int or comment_id <= 0:
             return None
         key = (repo, pr_number, comment_id)
         if key not in self._recent_command_records:
+            is_review_completion = self._is_trusted_review_completion(comment)
             record = {
                 "repo": repo, "pr_number": pr_number, "comment_id": comment_id,
+                "event_type": "review_completion" if is_review_completion else "slash_command",
                 "created_at": comment.get("created_at"),
                 "comment_created_at": comment.get("created_at"),
                 "discovered_at": datetime.now(timezone.utc).isoformat(),
@@ -636,7 +661,11 @@ class GitHubCommandWatcher:
                         or cutoff.tzinfo is None or created_at <= cutoff.astimezone(timezone.utc)):
                     continue
                 body = comment.get("body", "")
-                if not isinstance(body, str) or not commands_mod.parse_command(body).is_command:
+                is_command = (
+                    isinstance(body, str)
+                    and commands_mod.parse_command(body).is_command
+                )
+                if not is_command and not self._is_trusted_review_completion(comment):
                     continue
                 key = self._observe_recent_command(repo, number, comment, created_at)
                 if key is None:
