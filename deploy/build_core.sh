@@ -99,6 +99,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                     {\"name\": \"remote_message\", \"type\": \"sensor\"},
                     {\"name\": \"remote_audio\", \"type\": \"sensor\"},
                     {\"name\": \"remote_image\", \"type\": \"sensor\"},
+                    {\"name\": \"lottery_draw\", \"type\": \"actuator\"},
                     {\"name\": \"channel_request\", \"type\": \"sensor\"},
                     {\"name\": \"channel_reply\", \"type\": \"actuator\"}
                 ]

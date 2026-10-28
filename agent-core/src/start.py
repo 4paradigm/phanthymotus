@@ -254,6 +254,51 @@ def _register_core_mcp(silent=False):
                 },
                 'topic_out': [{'topic': '/remote_control/camera',
                                'format': 'image/jpeg'}],
+            },
+            {
+                'name': 'lottery_draw',
+                'type': 'actuator',
+                'description': (
+                    '可视化抽奖——后端唯一决定中奖结果，向详情面板和全屏视图'
+                    '同步播放骰子、纸牌、数字或自定义选项动画'
+                ),
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'action': {
+                            'type': 'string',
+                            'enum': ['draw', 'info'],
+                            'description': 'draw starts one authoritative lottery draw',
+                        },
+                    },
+                    'required': ['action'],
+                },
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'mode': {
+                            'type': 'string',
+                            'enum': ['dice', 'card', 'number', 'options'],
+                            'default': 'dice',
+                            'title': '展示模式',
+                        },
+                        'options': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                            'default': ['1', '2', '3', '4', '5', '6'],
+                            'title': '抽奖选项',
+                            'description': '逗号分隔，例如：一等奖, 二等奖, 三等奖',
+                        },
+                        'duration_ms': {
+                            'type': 'integer',
+                            'minimum': 500,
+                            'maximum': 30000,
+                            'default': 3000,
+                            'title': '动画时长（毫秒）',
+                        },
+                    },
+                },
+                'topic_out': [{'topic': '/ui/lottery', 'format': 'data/lottery'}],
             }
         ],
         'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}, {'topic': '/remote_control/camera', 'format': 'image/jpeg'}],
@@ -490,6 +535,7 @@ async def lifespan(app):
     # 注册 /decision_core output topic 到 inspection
     from api.inspection import register_topic_internal
     await register_topic_internal('/decision_core', 'data/json', 'agentcore')
+    await register_topic_internal('/ui/lottery', 'data/lottery', 'agentcore')
 
     # 启动时 ping 所有已注册 MCP，填充 tools/topics
     asyncio.create_task(_auto_ping_all_mcps())

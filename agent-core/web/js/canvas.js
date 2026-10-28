@@ -1350,7 +1350,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (!(await _ensureEdit())) return;
-        await _executeCard(el, mcpId, toolName);
+        await _executeCard(el, mcpId, toolName, id);
       });
     }
 

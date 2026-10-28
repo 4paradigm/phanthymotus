@@ -1186,6 +1186,9 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                     return {'code': 200, 'data': {'status': 'sent', 'text': text}}
                 return {'code': 200, 'data': {'error': 'Missing text'}}
             return {'code': 200, 'data': None}
+        if req.tool == 'lottery_draw':
+            import lottery
+            return {'code': 200, 'data': await lottery.handle(req.arguments)}
         if req.tool == 'remote_audio':
             action = req.arguments.get('action', 'start')
             if action == 'start':
