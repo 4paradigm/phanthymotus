@@ -683,7 +683,7 @@ def test_tts_tool_is_not_split_per_action():
     schema = tts.TOOLS[0]["inputSchema"]
     assert "x-action-params" not in schema
     assert schema["properties"]["action"]["enum"] == [
-        "start", "stop", "speak", "info", "config", "interrupt"]
+        "start", "stop", "speak", "info", "config", "interrupt", "support_language"]
     assert "instance_id" not in schema["properties"]
 
 

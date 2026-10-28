@@ -111,8 +111,11 @@ Chinese–English text works on every setting; nothing is translated.
 | `y = 2x-3` | y 等于二乘以 x 减三 | y equals two times x minus three |
 | `精度是5μm` | 精度是五微米 | 精度是 five micrometers |
 
-`speak` also takes an optional `reading_language` for one utterance; empty means
-"use the card setting". Other engines ignore both.
+`speak` also takes an optional `reading_language` for one utterance. Leave it
+empty — auto is right for normal replies; it is for when a user explicitly asks
+for numbers in one language. `action=support_language` returns the live
+engine's language codes (`["zh", "en"]` here) and works on every engine, even
+while one is loading. Other engines ignore `reading_language`.
 
 It is a reading choice, never a gate: text the model cannot fully say (kana,
 Cyrillic, emoji) is spoken with the unsayable characters dropped, as before,

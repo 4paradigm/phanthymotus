@@ -121,6 +121,36 @@ def test_config_schema_exposes_the_engine_selector():
     assert tts.TTSPlugin.PREFIX == "tts"
 
 
+def test_every_engine_declares_its_languages():
+    assert set(tts.ENGINE_LANGUAGES) == set(tts.TTS_ENGINES)
+    assert all(tts.ENGINE_LANGUAGES[e] for e in tts.TTS_ENGINES)
+
+
+@pytest.mark.parametrize("engine,languages", [
+    ("vits2-zh-en", ["zh", "en"]),
+    ("matcha-zh-en", ["zh", "en"]),
+    ("mms-th", ["th"]),
+    ("kokoro-multi", list(tts.KokoroTTSAdapter.LANGUAGES)),
+])
+def test_support_language_reports_the_live_engine(_fake_engines, engine, languages):
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": engine})
+    assert plugin.dispatch("tts", {"action": "support_language"}) == {
+        "engine": engine, "languages": languages}
+
+
+def test_support_language_answers_while_an_engine_is_loading(monkeypatch, _fake_engines):
+    """A property of the engine, not of a loaded model: never forwarded, never waits."""
+    plugin = _plugin()
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
+    # The fake sherpa build takes 0.3 s, so this config returns mid-build.
+    assert plugin.dispatch("tts", {"action": "config",
+                                   "tts_engine": "mms-th"})["state"] == "loading"
+    assert plugin.dispatch("tts", {"action": "support_language"})["languages"] == ["th"]
+    assert all(c.get("action") != "support_language"
+               for impl in _fake_engines.impls.values() for c in impl.calls)
+
+
 def test_default_engine_is_built_at_startup(_fake_engines):
     plugin = _plugin()
     assert _fake_engines.order == ["vits2-zh-en"]
