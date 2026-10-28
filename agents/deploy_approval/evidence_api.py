@@ -241,6 +241,7 @@ async def _trusted_summary_page_capability(request, repo, pr):
     }
     page_path = '/evidence/' + repo + '/pulls/' + str(pr)
     visible = body[:marker_pos]
+    page_capability = None
     for match in re.finditer(r'\[打开附件页\]\(<(?P<url>https://[^<>\s]+)>\)', visible):
         candidate_text = match.group('url')
         try:
@@ -281,10 +282,13 @@ async def _trusted_summary_page_capability(request, repo, pr):
                     or pr_head_sha != head
                     or claims.get('status') != 'testing'):
                 continue
-            # A bare URL may recover only read access. The upload invitation
-            # stays exclusive to the explicitly signed Summary link.
-            continue
-        return token
+            # Reuse the invitation already published by the trusted Summary;
+            # never mint or broaden an upload capability here.
+            return token
+        if page_capability is None:
+            page_capability = token
+    if page_capability:
+        return page_capability
     # If the trusted Summary has no usable invitation, a page-only token may
     # still provide read access. Its purpose is explicit and cannot authorize
     # any Evidence write.
@@ -384,7 +388,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         # Status is a deliberately small public projection. In particular, a
         # COS multipart UploadId and signed URLs are never public state.
         result = {k: result[k] for k in ('status', 'uploaded_parts', 'size', 'filename',
-                                         'head_sha', 'round_id', 'verified') if k in result}
+                                         'head_sha', 'round_id', 'verified', 'sha256') if k in result}
     if action == 'context':
         def scoped(rows):
             from .evidence_auth import issue_capability
@@ -530,13 +534,44 @@ async def page(request: Request, owner: str, repo: str, pr: int):
         evidence_auth.require_enabled(request)
         canonical = _repo(owner, repo, pr)
         explicit_capability = 'cap' in request.query_params
-        has_cookie = bool(request.cookies.get(evidence_auth.CAPABILITY_COOKIE)
-                          or request.cookies.get(evidence_auth.UPLOAD_COOKIE))
+        page_cookie = request.cookies.get(evidence_auth.CAPABILITY_COOKIE, '')
+        upload_cookie = request.cookies.get(evidence_auth.UPLOAD_COOKIE, '')
+        cookie_token = page_cookie or upload_cookie
+        cookie_claims = None
+        if cookie_token:
+            try:
+                cookie_claims = (
+                    evidence_auth._verify_page_capability(
+                        request.app.state.config, page_cookie, canonical, pr,
+                    ) if page_cookie else evidence_auth._verify_upload_capability(
+                        request.app.state.config, upload_cookie, canonical, pr,
+                    )
+                )
+            except HTTPException:
+                pass
         summary_capability = None
         summary_checked = False
-        if not explicit_capability and not has_cookie:
-            summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
+        if not explicit_capability and (cookie_claims is None or bool(page_cookie)):
+            try:
+                summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
+            except HTTPException as exc:
+                if cookie_claims is None or exc.status_code != 503:
+                    raise
             summary_checked = True
+            if cookie_claims and summary_capability:
+                try:
+                    summary_claims = evidence_auth.verify_capability(
+                        request.app.state.config, summary_capability, canonical, pr,
+                    )
+                except HTTPException:
+                    summary_claims = None
+                if (not isinstance(summary_claims, dict)
+                        or (summary_claims.get('purpose') != evidence_auth.UPLOAD_PURPOSE
+                            and summary_claims.get('head') == cookie_claims.get('head')
+                            and summary_claims.get('round') == cookie_claims.get('round'))):
+                    # Keep an already-valid cookie when Summary offers no
+                    # newer upload invite or a different read-only binding.
+                    summary_capability = None
         try:
             redirect = evidence_auth.bind_page_capability(
                 request, canonical, pr, trusted_summary_capability=summary_capability,
@@ -553,24 +588,21 @@ async def page(request: Request, owner: str, repo: str, pr: int):
             )
         if redirect is not None:
             return redirect
-        try:
-            result = await _dispatch(request, owner, repo, pr, 'context')
-        except HTTPException as exc:
-            # A correctly signed cookie may belong to another PR or an old
-            # HEAD/round. Recover read-only access from the current Summary;
-            # transient GitHub failures remain retryable and do not trigger a
-            # second lookup.
-            if explicit_capability or not has_cookie or exc.status_code not in {401, 403, 409}:
-                raise
-            summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
-            if not summary_capability:
-                raise
-            redirect = evidence_auth.bind_page_capability(
-                request, canonical, pr, trusted_summary_capability=summary_capability,
+        cookie_token = request.cookies.get(evidence_auth.CAPABILITY_COOKIE, '')
+        if cookie_token:
+            claims = evidence_auth._verify_page_capability(
+                request.app.state.config, cookie_token, canonical, pr,
             )
-            if redirect is not None:
-                return redirect
-            raise
+        else:
+            cookie_token = request.cookies.get(evidence_auth.UPLOAD_COOKIE, '')
+            claims = evidence_auth._verify_upload_capability(
+                request.app.state.config, cookie_token, canonical, pr,
+            )
+        result = {
+            'repo': canonical,
+            'head_sha': claims['head'],
+            'round_id': claims['round'],
+        }
     except HTTPException as exc:
         # Keep the authorization status and never echo exception detail,
         # capability input, cookies, or backend diagnostics into HTML.
