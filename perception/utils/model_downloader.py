@@ -1062,49 +1062,44 @@ def _merge_tree(source: str, destination: str) -> None:
 # chosen from the TensorRT that is importable at runtime, never from a build
 # argument — same rule as OCR above.
 #
-# Keep the existing Liaoqianqian v6 engines and frontend assets byte-for-byte.
-# The public personal release mirrors those original archives; its immutable
-# revision and the archive checksums pin both the voice and the TN graphs.
-# The original archives contain a release-specific top-level directory, plus
-# ONNX build inputs and reference samples that are not loaded for inference.
-# They are intentionally not repacked or confused with the different public
-# Starlight777/COS engine release.
-VITS2_MODEL_REVISION = "e67fccc9fa0c2bd8848dcf93221e18bb3fa4f205"
-VITS2_MODEL_BASE = os.environ.get(
-    "VITS2_MODEL_BASE_URL",
-    "https://www.modelscope.cn/api/v1/models/lanxijiang/TTSV4_Ch_Eng/repo"
-    f"?Revision={VITS2_MODEL_REVISION}&FilePath={{file}}",
-)
+# Each archive carries the frontend the engines need, unpacked to the layout
+# frontend/release_paths.py expects: engines/<family>/*.plan, config.json,
+# frontend_data/ (including external_lexicon.json, the compiled pronunciation
+# dictionary — see tools/vits2_prepare_external_lexicon.py), tn_cache/
+# (compiled WeText TN FSTs) and nltk_data/ (cmudict + perceptron tagger —
+# shipped precisely so the container never has to call nltk.download() at
+# runtime).
+#
+# The engines are the lc1_male_v6_frontend_146k release (PR #341), whose TN
+# graphs carry the business regression set the frontend's number/unit readers
+# were tuned against. Upstream is modelscope.cn/models/lanxijiang/TTSV4_Ch_Eng
+# at revision e67fccc9fa0c2bd8848dcf93221e18bb3fa4f205 (engines, TN) and
+# 275f343e89d9cef520c829e9fff3e950354b9b12 (dictionary); only the
+# runtime-required files were repacked per family and mirrored to COS, so
+# devices pull one ~60 MB file from the same host as every other model here.
+# The ONNX graphs, reference samples and smoke script in the upstream archives
+# are build inputs, not runtime files.
+#
+# The archive names carry "v6" so they never collide with the earlier
+# Starlight777 release: a robot upgrading from it re-verifies and re-extracts
+# over the same directory, which _merge_tree overwrites file by file.
+VITS2_MODEL_BASE = os.environ.get("VITS2_MODEL_BASE_URL", COS_BASE)
 VITS2_MODEL_ARCHIVES = {
     "jp61": {
-        "archive": "lc1_male_v6_frontend_146k_jp6_runtime.tar.gz",
-        "release_root": "lc1_male_v6_frontend_146k_jp6",
-        "size": 160688390,
-        "sha256": "e3a26c913285ba26d30624be50751fa27c8d6ecb8458ac1ad3b0f0d196794b42",
+        "archive": "vits2-zh-en-male-16k-v6-tensorrt-jp61-trt10.4-orin.tar.gz",
+        "size": 60568382,
+        "sha256": "528c31640bd1ff360341559ee550cbd8057cd527b7ba8140a014e9fe20e639ca",
     },
     "jp511": {
-        "archive": "lc1_male_v6_frontend_146k_jp5_nocudnn_nojit_runtime.tar.gz",
-        "release_root": "lc1_male_v6_frontend_146k_jp5_nocudnn_nojit",
-        "size": 162677801,
-        "sha256": "4a006ceb74325d11c506f2e054faffbfce6e0ca80946ffaaa8ef5e03fc26f96a",
+        "archive": "vits2-zh-en-male-16k-v6-tensorrt-jp511-trt8.5-orin.tar.gz",
+        "size": 62549149,
+        "sha256": "317c108357788e7e9d2c227348a72268866d169d25c9c9ee49eedc47d69ed191",
     },
 }
 
 
-def vits2_release_root(engine_dir: str) -> str:
-    """Resolve frontend/config assets for a supported VITS2 engine layout."""
-    path = os.path.normpath(engine_dir)
-    parent, name = os.path.split(path)
-    if name == "engines":
-        return parent
-    # Retain compatibility with installed main-branch releases and test hosts.
-    if name in VITS2_MODEL_ARCHIVES and os.path.basename(parent) == "engines":
-        return os.path.dirname(parent)
-    raise ValueError(f"Unsupported VITS2 engine directory layout: {engine_dir!r}")
-
-
 def ensure_vits2_model(model_dir: str, family: str | None = None,
-                       progress_cb=None, stage_cb=None, base_url: str | None = None) -> str:
+                       progress_cb=None, stage_cb=None) -> str:
     """Ensure the VITS2 release matching the runtime TensorRT is installed.
 
     Returns the engine directory for this runtime, which is what the adapter
@@ -1113,18 +1108,16 @@ def ensure_vits2_model(model_dir: str, family: str | None = None,
     model_dir = require_models_subpath(model_dir)
     key = select_bundle_family(VITS2_MODEL_ARCHIVES, family)
     entry = VITS2_MODEL_ARCHIVES[key]
-    source_base = VITS2_MODEL_BASE if base_url is None else base_url
     log.info(f"[model_downloader] vits2: using {key} archive")
     ensure_verified_archive(
         f"vits2/{key}",
         model_dir,
-        _source_url(source_base, entry["archive"]),
+        f"{VITS2_MODEL_BASE.rstrip('/')}/{entry['archive']}",
         entry,
         progress_cb=progress_cb,
         stage_cb=stage_cb,
     )
-    release_root = require_models_subpath(os.path.join(model_dir, entry["release_root"]))
-    return os.path.join(release_root, "engines")
+    return os.path.join(model_dir, "engines", key)
 
 
 # The Thai TTS voice: an ONNX export of VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR,
