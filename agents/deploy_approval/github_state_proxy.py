@@ -1414,7 +1414,12 @@ class GitHubStateProxy:
         try:
             ref_data = await self._github.get_git_ref(repo, ref)
         except GitHubError as exc:
-            if getattr(exc, "status_code", None) in {403, 404}:
+            status = getattr(exc, "status_code", None)
+            if status == 404:
+                # This PR has no legacy Git Notes ref. Continue reading its
+                # complete trusted GitHub comment history in the caller.
+                return []
+            if status == 403:
                 return await self._read_public_git_note_records(repo, pr_number, ref, allow_missing=True)
             raise GitHubStateProxyError("Git Notes evidence ref could not be read") from exc
         target = ref_data.get("object") if isinstance(ref_data, dict) else None
