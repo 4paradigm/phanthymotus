@@ -679,3 +679,37 @@ plugins:
     # Detection rate: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
+
+  measure:
+    # 物体可见宽高测量：接 VOP 的 data/json 和一路米制深度图，输出距离、
+    # 可见宽高，并可把 bbox/尺寸画到相机 JPEG 上。
+    #
+    # 这不是驱动卡：它消费 perception 自己的 VOP/深度，跨机器人复用；
+    # 不控制机器人，不判断能不能过去。尺寸是当前视角的可见外廓，不是完整
+    # 三维长宽高；没有测到就输出 null/没有看见。
+    enabled: true
+    topic: /perception/measure/state
+    view_topic: /perception/measure/view
+    # 留空 = 从 depth 话题推导同一台相机的彩色话题：
+    # Bumi: /camera/depth -> /camera/color
+    # G1:   /camera/depth -> /camera/rgb
+    camera_topic: ""
+    view_hz: 5
+    rate_hz: 5
+    max_objects: 8
+    min_confidence: 0.3
+    depth_percentile: 25
+    max_depth_m: 20.0
+    max_obs_age_ms: 500
+    stable_frames: 5
+    stable_min: 3
+    track_timeout_ms: 2000
+    match_distance_norm: 0.15
+    history_size: 200
+    record_interval_ms: 1000
+    record_min_delta_m: 0.01
+    only_stable: true
+    summary_max_objects: 5
+    # 没有 camera_info 时的兜底；留空 = 不猜，只输出距离。
+    half_fov_rad: null
+    half_fov_v_rad: null
