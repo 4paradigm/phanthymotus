@@ -518,8 +518,11 @@ def normalize_ordinary_latin_text(text, normalize_plain):
     pieces, cursor = [], 0
     for start, end in iter_latin_words(text):
         word = text[start:end]
+        # A unit after a micro sign (5μm, 3 µA) belongs to that quantity: split
+        # off, the TN graph sees a bare "5μ" and reads it as a Greek letter.
         if (any(c.isdigit() for c in word)
                 or start and (text[start - 1].isascii() and (text[start - 1].isalnum() or text[start - 1] == "_"))
+                or start and text[start - 1] in "μµ"
                 or any(a <= start < b for a, b in romans)):
             continue
         if cursor < start:

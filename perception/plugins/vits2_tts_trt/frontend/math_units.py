@@ -40,6 +40,17 @@ _UNITS = {
     "kW": ("千瓦", "kilowatt", "kilowatts"),
     "dB": ("分贝", "decibel", "decibels"),
 }
+# Micro units. Both the Greek mu (U+03BC) and the legacy micro sign (U+00B5)
+# appear in real text and look identical, so each is listed under both.
+for _symbol, _readings in {
+    "m": ("微米", "micrometer", "micrometers"),
+    "s": ("微秒", "microsecond", "microseconds"),
+    "A": ("微安", "microampere", "microamperes"),
+    "V": ("微伏", "microvolt", "microvolts"),
+    "W": ("微瓦", "microwatt", "microwatts"),
+    "g": ("微克", "microgram", "micrograms"),
+}.items():
+    _UNITS["μ" + _symbol] = _UNITS["µ" + _symbol] = _readings
 _NUMBER = r"(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
 _DASH = r"\-‐‑−﹣－"
 _NORMALIZE_DASH = str.maketrans({char: "-" for char in "‐‑−﹣－"})

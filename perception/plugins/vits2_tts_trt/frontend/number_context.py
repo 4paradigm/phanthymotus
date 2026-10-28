@@ -278,10 +278,17 @@ def find_spans(text, language, verbalize_number):
             if second is not None:
                 spoken += cardinal(second) + "秒"
         else:
-            spoken = f"{cardinal(hour)} {'hour' if hour == 1 else 'hours'}"
-            spoken += f" {cardinal(minute)} {'minute' if minute == 1 else 'minutes'}"
+            # A clock time, read the way a clock is: "three thirty", "nine oh
+            # five", "ten o'clock" — not as a duration ("three hours thirty
+            # minutes"), which is what a listener would take it for.
+            if minute == 0 and second is None:
+                spoken = f"{cardinal(hour)} o'clock"
+            elif minute < 10:
+                spoken = f"{cardinal(hour)} oh {cardinal(minute)}"
+            else:
+                spoken = f"{cardinal(hour)} {cardinal(minute)}"
             if second is not None:
-                spoken += f" {cardinal(second)} {'second' if second == 1 else 'seconds'}"
+                spoken += f" and {cardinal(second)} {'second' if second == 1 else 'seconds'}"
         add(match.start(), match.end(), spoken)
 
     for match in _PHONE_CUED.finditer(text):
