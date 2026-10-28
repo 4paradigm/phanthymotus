@@ -593,22 +593,23 @@ def test_speak_reads_in_the_language_it_asks_for(monkeypatch, prepared):
     assert _installed(plugin).readings == ["en"]
 
 
-def test_speak_without_a_language_follows_the_card_setting(monkeypatch, prepared):
+def test_speak_without_a_language_reads_by_context(monkeypatch, prepared):
+    """There is no card setting: anything that does not ask for a reading —
+    on_notify, the input topic, an LLM that leaves the argument out — is auto."""
     plugin, executor, state = _plugin(monkeypatch)
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
     assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
 
     plugin.dispatch("tts", {"action": "speak", "text": "一"})
-    assert _wait_until(lambda: len(prepared) == 1)
-    # Changed on a live model: read per utterance, so it must not cost a reload.
-    plugin.dispatch("tts", {"action": "config", "reading_language": "zh"})
-    plugin.dispatch("tts", {"action": "speak", "text": "二"})
     # An empty argument is "not specified", which the canvas sends for a blank field.
-    plugin.dispatch("tts", {"action": "speak", "text": "三", "reading_language": ""})
+    plugin.dispatch("tts", {"action": "speak", "text": "二", "reading_language": ""})
+    # A reading_language left in a saved card config from before is ignored.
+    plugin.dispatch("tts", {"action": "config", "reading_language": "zh"})
+    plugin.dispatch("tts", {"action": "speak", "text": "三"})
 
     assert _wait_until(lambda: len(prepared) == 3)
-    assert [call[1] for call in prepared] == ["auto", "zh", "zh"]
-    assert _installed(plugin).readings == ["", "zh", "zh"]
+    assert [call[1] for call in prepared] == ["auto", "auto", "auto"]
+    assert _installed(plugin).readings == ["", "", ""]
     assert state["loads"] == 1
 
 
@@ -633,8 +634,6 @@ def test_unknown_reading_language_is_refused_before_queueing(monkeypatch, prepar
 
     with pytest.raises(ValueError, match="reading_language"):
         plugin.dispatch("tts", {"action": "speak", "text": "x", "reading_language": "ja"})
-    with pytest.raises(ValueError, match="reading_language"):
-        plugin.dispatch("tts", {"action": "config", "reading_language": "fr"})
     time.sleep(0.2)
     assert prepared == [] and _installed(plugin).spoken == []
 
@@ -669,11 +668,6 @@ def test_speak_before_ready_keeps_its_language(monkeypatch, prepared):
     assert _installed(plugin).readings == ["en"]
 
 
-def test_reading_language_in_plugin_config_is_validated():
-    with pytest.raises(ValueError, match="reading_language"):
-        vits2.TTSPlugin({"backend": "trt", "reading_language": "de"}, _FakeExecutor())
-
-
 # ── the shared tts tool keeps its shape for every engine ─────────────────────
 
 def test_tts_tool_is_not_split_per_action():
@@ -687,12 +681,11 @@ def test_tts_tool_is_not_split_per_action():
     assert "instance_id" not in schema["properties"]
 
 
-def test_reading_language_is_a_vits2_setting_only():
-    config = tts.TOOLS[0]["configSchema"]["properties"]["reading_language"]
-    assert config["x-show-when"] == {"tts_engine": ["vits2-zh-en"]}
-    assert config["enum"] == ["auto", "zh", "en"] and config["default"] == "auto"
-    # Not an enum on speak: the canvas debug panel preselects an enum's first
-    # value, which would silently override the card setting on every test.
+def test_reading_language_is_a_speak_argument_not_a_card_setting():
+    assert "reading_language" not in tts.TOOLS[0]["configSchema"]["properties"]
+    assert "reading_language" not in tts.SHARED_CONFIG_KEYS
+    # Not an enum: the canvas debug panel preselects an enum's first value,
+    # which would force a reading on every test speak instead of auto.
     speak_arg = tts.TOOLS[0]["inputSchema"]["properties"]["reading_language"]
     assert "enum" not in speak_arg
 

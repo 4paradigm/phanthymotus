@@ -656,10 +656,10 @@ def test_an_identical_config_does_not_rebuild_the_session(_sherpa):
     assert _CountingAdapter.builds == 1, "an identical config rebuilt the session"
 
 
-def test_a_vits2_only_setting_does_not_disturb_other_engines(_sherpa):
-    """reading_language is a shared config key, so the dashboard sends it to
-    whichever engine is live. On a sherpa engine it must change nothing: no
-    session rebuild, and a speak carrying it still speaks."""
+def test_a_stray_reading_language_does_not_disturb_other_engines(_sherpa):
+    """A card saved while reading_language was briefly a config field still
+    carries it, and the dashboard replays saved config. On a sherpa engine it
+    must change nothing: no session rebuild, and the engine still speaks."""
     plugin, holder = _sherpa
     for value in ("en", "zh", "auto"):
         result = plugin.dispatch("tts", {"action": "config", "device": "gpu", "speed": 1,

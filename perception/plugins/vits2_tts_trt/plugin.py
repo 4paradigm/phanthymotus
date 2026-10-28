@@ -227,7 +227,6 @@ class _Vits2TTSNode(Node):
         input_topic: Optional[str],
         adapter: TTSAdapter,
         node_suffix: str = "",
-        default_language=lambda: "auto",
     ):
         super().__init__(f"vits2_trt_{node_suffix}" if node_suffix else "vits2_trt")
         self._input_topic = input_topic or ""
@@ -235,8 +234,6 @@ class _Vits2TTSNode(Node):
             f"{input_topic}/tts" if input_topic else "/perception/tts"
         )
         self._adapter = adapter
-        # Called per utterance, so a config change applies to the next one.
-        self._default_language = default_language
         # The previous utterance's resolved zh/en. Only the worker touches it.
         self._last_language = None
         self.state = "idle"
@@ -342,7 +339,7 @@ class _Vits2TTSNode(Node):
         try:
             from .frontend.language import prepare
 
-            preference = language or self._default_language() or "auto"
+            preference = language or "auto"
             frontend_text, reading, resolved = prepare(
                 text, preference, self._last_language
             )
@@ -753,9 +750,6 @@ class TTSPlugin:
             raise ValueError("The VITS2 TTS plugin supports backend=trt only")
         if int(self._cfg.get("speaker_id", 0)) != 0:
             raise ValueError("The VITS2 model supports only speaker_id=0")
-        self._cfg["reading_language"] = (
-            reading_language(self._cfg.get("reading_language")) or "auto"
-        )
         log.info(
             "[vits2_tts_trt] plugin init: model_dir=%s, speed=%s, warmup=%s",
             self._cfg.get("model_dir", "/models/vits2"),
@@ -833,8 +827,7 @@ class TTSPlugin:
                 node_key, input_topic = next(iter(self._pending_starts.items()))
             try:
                 node = _Vits2TTSNode(
-                    input_topic or None, adapter, _node_suffix(node_key),
-                    default_language=self._configured_language,
+                    input_topic or None, adapter, _node_suffix(node_key)
                 )
             except Exception:  # noqa: BLE001 - keep serving the other instances
                 log.exception("[vits2_tts_trt] failed to build instance %r", node_key)
@@ -934,9 +927,6 @@ class TTSPlugin:
         }
         base.update(extra)
         return base
-
-    def _configured_language(self) -> str:
-        return self._cfg.get("reading_language") or "auto"
 
     def _describe(self, state: str) -> str:
         if state == "loading":
@@ -1137,11 +1127,6 @@ class TTSPlugin:
                 "state": "loading"}
 
     def _config(self, args: dict) -> dict:
-        if "reading_language" in args:
-            # Read per utterance by every node, so no reload is needed.
-            self._cfg["reading_language"] = (
-                reading_language(args["reading_language"]) or "auto"
-            )
         if "speaker_id" in args:
             self._cfg["speaker_id"] = int(args["speaker_id"])
         if "speed" in args:
@@ -1198,5 +1183,5 @@ class TTSPlugin:
             )
         from .frontend.language import prepare
 
-        frontend_text, reading, _resolved = prepare(text, self._configured_language())
+        frontend_text, reading, _resolved = prepare(text)
         return adapter.synthesize(frontend_text, reading_language=reading)

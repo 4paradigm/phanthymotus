@@ -91,14 +91,14 @@ utterance, including one abandoned before it reached a node.
 
 ### Reading language
 
-The card setting `reading_language` (shown only for `vits2-zh-en`) decides how
-**notation** is read — numbers, dates, times, units, symbols, model names such
-as `Qwen3`. Words are always spoken in the script they are written in, so mixed
-Chinese–English text works on every setting; nothing is translated.
+Every utterance has a reading language that decides how **notation** is read —
+numbers, dates, times, units, symbols, model names such as `Qwen3`. Words are
+always spoken in the script they are written in, so mixed Chinese–English text
+works either way; nothing is translated.
 
-| Setting | Behavior |
+| Value | Behavior |
 | --- | --- |
-| `auto` (default) | Follow the sentence around the notation. A bare `2026 10/20` with no sentence follows the previous utterance on that card, else Chinese |
+| `auto` (default) | Follow the sentence around the notation. A bare `2026 10/20` with no sentence follows the previous utterance on that instance, else Chinese |
 | `zh` | Read notation in Chinese |
 | `en` | Read notation in English |
 
@@ -111,17 +111,19 @@ Chinese–English text works on every setting; nothing is translated.
 | `y = 2x-3` | y 等于二乘以 x 减三 | y equals two times x minus three |
 | `精度是5μm` | 精度是五微米 | 精度是 five micrometers |
 
-`speak` also takes an optional `reading_language` for one utterance. Leave it
-empty — auto is right for normal replies; it is for when a user explicitly asks
-for numbers in one language. `action=support_language` returns the live
-engine's language codes (`["zh", "en"]` here) and works on every engine, even
-while one is loading. Other engines ignore `reading_language`.
+It is **not** a card setting. The only way to choose is `speak`'s optional
+`reading_language` argument, for one utterance; everything that does not pass
+it — `on_notify`, the input topic, an LLM that leaves it out — reads `auto`,
+which is right for normal replies. Set it only when a user explicitly asks for
+numbers in one language. `action=support_language` returns the live engine's
+language codes (`["zh", "en"]` here) and works on every engine, even while one
+is loading. Other engines ignore `reading_language`.
 
 It is a reading choice, never a gate: text the model cannot fully say (kana,
 Cyrillic, emoji) is spoken with the unsayable characters dropped, as before,
 and if the language step itself fails the plain reading is used. The logic is
 `frontend/language.py`; it is stateless and resolved per utterance on the
-node's worker, so changing the setting needs no model reload.
+node's worker.
 
 ### Pronunciation dictionary
 

@@ -186,7 +186,7 @@ TOOLS = [
                 },
                 # vits2-zh-en only; every other engine ignores it. A plain string,
                 # not an enum: the canvas debug panel preselects an enum's first
-                # value, which would override the card setting on every test speak.
+                # value, which would force a reading on every test speak instead of auto.
                 "reading_language": {
                     "type": "string",
                     "description": "Optional, action=speak, vits2-zh-en only. Leave empty: "
@@ -281,23 +281,6 @@ TOOLS = [
                                    "experimental — may change prosody either way)",
                     "default": False, "scope": "shared",
                     "x-show-when": {"tts_engine": "mms-th"}},
-                # vits2-zh-en only. Words are always spoken in the script they are
-                # written in; this picks the reading of notation that has no
-                # script of its own. Read per utterance, so changing it needs no
-                # model reload. See plugins/vits2_tts_trt/frontend/language.py.
-                "reading_language": {
-                    "type": "string", "title": "Reading language",
-                    "enum": ["auto", "zh", "en"],
-                    "oneOf": [{"const": "auto", "title": "Auto"},
-                              {"const": "zh", "title": "Chinese"},
-                              {"const": "en", "title": "English"}],
-                    "description": "How numbers, dates, units and symbols are read aloud. "
-                                   "Auto follows the sentence around them; Chinese or "
-                                   "English always reads them in that language. Words "
-                                   "are spoken as written either way, so mixed "
-                                   "Chinese-English text still works",
-                    "default": "auto", "scope": "shared",
-                    "x-show-when": {"tts_engine": ["vits2-zh-en"]}},
                 "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
