@@ -198,6 +198,21 @@ TOOLS = [
                 },
             },
             "required": ["action"],
+            # Which fields the canvas card shows per action, and the per-action
+            # tools agent-core presents to the LLM (tts__speak, tts__interrupt,
+            # tts__support_language — the same split G1/R1's tts uses). Nothing
+            # routing-related is listed: instance_id comes from the canvas
+            # binding, and a value the LLM made up would override it.
+            "x-action-params": {
+                "speak": {"params": ["text", "reading_language"], "required": ["text"],
+                          "description": "Say this text"},
+                "interrupt": {"params": [],
+                              "description": "Stop what is being said now and drop "
+                                             "anything queued"},
+                "support_language": {"params": [],
+                                     "description": "List the language codes the "
+                                                    "current engine can speak"},
+            },
             "x-completion": {
                 "actions": ["speak"],
                 "timeout": 60,

@@ -670,15 +670,24 @@ def test_speak_before_ready_keeps_its_language(monkeypatch, prepared):
 
 # ── the shared tts tool keeps its shape for every engine ─────────────────────
 
-def test_tts_tool_is_not_split_per_action():
-    """x-action-params would turn tts into separate LLM tools (tts__speak, ...)
-    for every engine, and expose routing fields such as instance_id for the
-    LLM to fill in, overriding the canvas binding. One tool, as before."""
+def test_each_card_action_shows_only_its_own_fields():
+    """The canvas card shows fields per action from x-action-params, and
+    agent-core presents each action to the LLM as its own tool from the same
+    table. Only speak takes anything; nothing routing-related is offered —
+    instance_id comes from the canvas binding, and a value the LLM made up
+    would override it (agent-core injects it only when absent)."""
     schema = tts.TOOLS[0]["inputSchema"]
-    assert "x-action-params" not in schema
     assert schema["properties"]["action"]["enum"] == [
         "start", "stop", "speak", "info", "config", "interrupt", "support_language"]
-    assert "instance_id" not in schema["properties"]
+    params = {action: spec["params"] for action, spec in schema["x-action-params"].items()}
+    assert params == {"speak": ["text", "reading_language"],
+                      "interrupt": [], "support_language": []}
+    assert schema["x-action-params"]["speak"]["required"] == ["text"]
+    for name in ("instance_id", "turn_id"):
+        assert name not in schema["properties"]
+    # The split must not break the completion barrier or the notify hook.
+    assert schema["x-completion"]["actions"] == ["speak"]
+    assert schema["x-hooks"]["on_notify"] == {"action": "speak"}
 
 
 def test_reading_language_is_a_speak_argument_not_a_card_setting():
