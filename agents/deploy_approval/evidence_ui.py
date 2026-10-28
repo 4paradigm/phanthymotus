@@ -219,7 +219,7 @@ _JAVASCRIPT = r'''"use strict";
   }
   const jobStatusLabel = status => ({
     排队中: "等待上传", 核对中: "校验中", running: "上传中", verifying: "校验中",
-    waiting: "校验中", succeeded: "已完成", failed: "失败", paused: "已暂停"
+    waiting: "等待恢复", succeeded: "已完成", failed: "失败", paused: "已暂停"
   }[status] || "处理中");
   function proofTransportAllowed(target) {
     if (target.origin !== window.location.origin) return false;
@@ -866,6 +866,27 @@ _JAVASCRIPT = r'''"use strict";
     if (value.upload_id && value.upload_id !== job.uploadId) throw new Error("上传标识不匹配");
     job.state = {...job.state, ...value, parts: partsOf(value)}; return job.state;
   }
+  function temporaryNetworkFailure(error) {
+    return error && (error.status === 0 || error.status === 429 ||
+      Number(error.status) >= 500 || error instanceof TypeError ||
+      error.name === "NetworkError" || error.name === "TimeoutError");
+  }
+  async function uploadStateWithRetry(job) {
+    let lastError;
+    for (let attempt = 0; attempt < 4 && !job.paused && !stopped && !pageLeaving; attempt++) {
+      try { return await uploadState(job); }
+      catch (error) {
+        lastError = error;
+        if (!temporaryNetworkFailure(error) || attempt === 3) break;
+        await delay([300, 700, 1400][attempt]);
+      }
+    }
+    if (lastError && temporaryNetworkFailure(lastError)) {
+      lastError.recoveryRetryable = true;
+      lastError.message = "暂时无法查询 COS 分片状态；上传标识和文件指纹已保留，点击“重试 / 继续”会先恢复状态。";
+    }
+    throw lastError || new Error("上传状态查询已暂停；重试时会重新核对 COS 状态。");
+  }
   const terminalReady = value => value && value.status === "ready" && value.verified === true;
   function updateJob(job, text) {
     job.statusNode.textContent = jobStatusLabel(job.status);
@@ -1030,27 +1051,37 @@ _JAVASCRIPT = r'''"use strict";
       "% · " + formatBytes(bytes) + " / " + formatBytes(job.file.size);
   }
   async function waitReady(job, attachmentId = "") {
-    if (!job.isNote) { job.status = "verifying"; updateJob(job, "COS 已接收；等待 SHA256 校验及 Summary 更新。"); }
+    job.status = "verifying";
+    updateJob(job, "COS 已接收；等待服务端 SHA256 校验。");
     for (let count = 0; count < 30 && !stopped && !job.paused; count++) {
-      const status = await uploadState(job), current = await refresh(job);
-      const item = (current.attachments || []).find(row =>
-        (attachmentId && (row.attachment_id === attachmentId || row.id === attachmentId)) ||
-        row.upload_id === job.uploadId);
-      const verifiedSha = item && typeof item.sha256 === "string" && /^[0-9a-f]{64}$/.test(item.sha256);
-      if (terminalReady(status) && current.summary_updated === true && item && item.status === "ready" &&
-          item.cos_content_verified === true && verifiedSha) {
-        if (!job.isNote) {
-          job.progress.value = 100; job.completeUnknown = false; job.status = "succeeded";
-          job.statusText = "成功 · COS ready/verified · SHA256 " + item.sha256 + " · Summary 已更新";
-          const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
-          delete savedUploads[key]; try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
-          updateJob(job, job.statusText);
+      const status = await uploadStateWithRetry(job);
+      const verifiedSha = typeof status.sha256 === "string" && /^[0-9a-f]{64}$/.test(status.sha256);
+      if (terminalReady(status)) {
+        if (!verifiedSha || status.head_sha !== bound.head_sha || status.round_id !== bound.round_id) {
+          job.status = "waiting";
+          updateJob(job, "服务端 ready 状态缺少匹配的 HEAD/round 或合法 SHA256；未标记成功，上传记录已保留。");
+          return false;
         }
+        job.progress.value = 100; job.completeUnknown = false; job.status = "succeeded";
+        job.statusText = "上传成功 · COS 已校验 · SHA256 " + status.sha256;
+        const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
+        delete savedUploads[key]; try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
+        // COS verification is authoritative for file success. Refresh only
+        // once to update the Summary indicator; failures do not undo success.
+        let summaryUpdated = false;
+        try {
+          const current = await refresh(job);
+          summaryUpdated = current.summary_updated === true;
+        } catch (_) {}
+        job.statusText += summaryUpdated ? " · GitHub Summary 已同步" : " · GitHub Summary 同步中";
+        updateJob(job, job.statusText);
         return true;
       }
       await delay(2000);
     }
-    throw new Error("COS ready 与 Summary 更新尚未同时确认；可重试以先查询真实状态。");
+    job.status = "waiting";
+    updateJob(job, "服务端 COS 校验或 SHA256 尚未确认；上传记录已保留，点击“重试 / 继续”会先查询服务端状态。");
+    return false;
   }
   async function startOrRestore(job) {
     job.status = "核对中"; updateJob(job, "正在以 4 MiB 有界分块核对文件指纹。");
@@ -1075,13 +1106,13 @@ _JAVASCRIPT = r'''"use strict";
       id(initialized.upload_id); job.uploadId = initialized.upload_id;
       job.state = {...initialized, parts: partsOf(initialized)}; persist(job);
     }
-    let state = await uploadState(job);
+    let state = await uploadStateWithRetry(job);
     if (state.status === "initializing" || state.initialization_pending === true) {
       const resumed = await request("/uploads/" + id(job.uploadId) + "/resume", {
         method: "POST", key: job.uploadId + ":resume", body: {}, job
       });
       if (resumed.upload_id && resumed.upload_id !== job.uploadId) throw new Error("恢复结果上传标识不匹配");
-      state = await uploadState(job);
+      state = await uploadStateWithRetry(job);
     }
     if (terminalReady(state)) return waitReady(job, state.attachment_id || "");
     if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, state.attachment_id || "");
@@ -1129,7 +1160,7 @@ _JAVASCRIPT = r'''"use strict";
             inflight.delete(number); update();
             if (job.paused || stopped || pageLeaving) break;
             if ([401, 403, 409, 413].includes(error.status)) throw error;
-            const checked = await uploadState(job);
+            const checked = await uploadStateWithRetry(job);
             if (acceptListedPart(checked, number, blob)) complete = true;
             else if (error.fallbackEligible === true) {
               let fallbackError = null;
@@ -1140,7 +1171,7 @@ _JAVASCRIPT = r'''"use strict";
               if (job.paused || stopped || pageLeaving) break;
               // Resolve an uncertain response only through authenticated
               // status, which reflects the COS ListParts result.
-              const afterFallback = await uploadState(job);
+              const afterFallback = await uploadStateWithRetry(job);
               if (acceptListedPart(afterFallback, number, blob)) complete = true;
               else if (fallbackError) {
                 if ([401, 403, 409, 413].includes(fallbackError.status)) throw fallbackError;
@@ -1167,7 +1198,7 @@ _JAVASCRIPT = r'''"use strict";
     return done;
   }
   async function completeUpload(job, attachmentId = "") {
-    let state = await uploadState(job);
+    let state = await uploadStateWithRetry(job);
     if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
     if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
     if (job.completeUnknown && state.status !== "uploading") throw new Error("完成状态仍未明确；未重复提交 complete。");
@@ -1178,13 +1209,13 @@ _JAVASCRIPT = r'''"use strict";
       });
       if (result.attachment_id) attachmentId = result.attachment_id;
       if (terminalReady(result)) return waitReady(job, attachmentId);
-      state = await uploadState(job);
+      state = await uploadStateWithRetry(job);
       if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
       if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
       throw new Error("complete 后 COS 尚未 ready；已先查询状态，没有盲目重试。");
     } catch (error) {
       try {
-        state = await uploadState(job);
+        state = await uploadStateWithRetry(job);
         if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
         if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
       } catch (_) { /* Preserve the uncertain marker for an explicit retry. */ }
@@ -1198,7 +1229,7 @@ _JAVASCRIPT = r'''"use strict";
     if (["failed", "deleted", "aborted", "expired", "invalid"].includes(state.status))
       throw new Error("服务端上传状态不可继续：" + state.status);
     await uploadParts(job, state);
-    const completed = await uploadState(job), partBytes = Number(completed.part_bytes || PART_BYTES);
+    const completed = await uploadStateWithRetry(job), partBytes = Number(completed.part_bytes || PART_BYTES);
     const count = Math.ceil(job.file.size / partBytes);
     if ((completed.parts || []).length < count) throw new Error("COS 尚未确认全部分片；请继续重试。");
     await completeUpload(job, completed.attachment_id || "");
@@ -1209,9 +1240,15 @@ _JAVASCRIPT = r'''"use strict";
     job.status = "running"; updateJob(job, "处理中。"); controls();
     try {
       await uploadOne(job);
-      if (job.status !== "succeeded") { job.status = "waiting"; updateJob(job, "等待 Summary 更新；重试会先查询 COS 状态。"); }
+      if (job.status !== "succeeded" && job.status !== "waiting") {
+        job.status = "waiting"; updateJob(job, "等待恢复；重试会先查询 COS 状态。");
+      }
     } catch (error) {
       if (job.paused) { job.status = "paused"; updateJob(job, job.pauseReason || "已暂停；重试前会查询 COS 状态。"); }
+      else if (!stopped && (error && error.recoveryRetryable || temporaryNetworkFailure(error))) {
+        job.status = "waiting";
+        updateJob(job, (error.message || "网络暂时不可用。") + " upload_id 与文件指纹已保留；点击“重试 / 继续”恢复。");
+      }
       else if (!stopped) { job.status = "failed"; updateJob(job, "失败：" + (error.message || String(error))); }
     } finally { job.running = false; updateJob(job); controls(); }
   }

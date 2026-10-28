@@ -38,6 +38,7 @@ from .review_comment_parser import (
 )
 
 logger = logging.getLogger(__name__)
+PR_RECONCILE_CACHE_SECONDS = 120.0
 
 
 class DeployCommandError(Exception):
@@ -128,6 +129,10 @@ class GitHubCommandWatcher:
         self._repo_poll_cursor = 0
         self._pr_scan_cursor: dict[str, int] = {}
         self._recent_pr_cursor: dict[str, int] = {}
+        # Scheduling hints only. Selected PRs still pass through fresh
+        # authorization, HEAD, cursor, and compare-and-swap checks.
+        self._pr_reconcile_cache: dict[tuple[str, int], dict] = {}
+        self._last_ordinary_pr_skips = 0
         self._priority_pr_queue: deque[tuple[str, int]] = deque()
         self._priority_pr_set: set[tuple[str, int]] = set()
         self._priority_pr_enqueued_at: dict[tuple[str, int], float] = {}
@@ -347,6 +352,17 @@ class GitHubCommandWatcher:
 
     def diagnostics(self) -> dict:
         now = self._monotonic()
+        command_rows = [row for row in self._recent_command_records.values() if isinstance(row, dict)]
+        last_success = max((row for row in command_rows
+                            if row.get("status") == "handled"
+                            and row.get("failure_reason") is None),
+                           key=lambda row: row.get("processing_completed_at") or "", default=None)
+        last_failure = max((row for row in command_rows if row.get("last_failure_reason")),
+                           key=lambda row: row.get("last_failure_at") or "", default=None)
+        pending_age = max((now - row["_discovered_monotonic"] for row in command_rows
+                           if row.get("status") in {"discovered", "retry", "processing"}
+                           and isinstance(row.get("_discovered_monotonic"), (int, float))),
+                          default=0.0)
         oldest_age = max(
             (now - self._priority_pr_enqueued_at.get(item, now)
              for item in self._priority_pr_queue),
@@ -364,6 +380,15 @@ class GitHubCommandWatcher:
             "pr_duration_average_seconds": round(sum(self._pr_durations) / len(self._pr_durations), 1) if self._pr_durations else None,
             "pr_duration_p95_seconds": round(sorted(self._pr_durations)[int((len(self._pr_durations) - 1) * 0.95)], 1) if self._pr_durations else None,
             "recent_command": self._public_recent_command_metric(),
+            "last_command_success": ({key: last_success.get(key) for key in
+                                      ("processing_completed_at", "repo", "pr_number", "comment_id")}
+                                     if last_success else None),
+            "last_command_failure": ({key: last_failure.get(key) for key in
+                                      ("last_failure_at", "repo", "pr_number", "comment_id",
+                                       "last_failure_reason")}
+                                     if last_failure else None),
+            "oldest_pending_command_age_seconds": round(max(0.0, pending_age), 1),
+            "ordinary_prs_skipped_last_cycle": self._last_ordinary_pr_skips,
             "recent_command_discovery_at": dict(self._recent_discovery_at),
             "recent_command_discovery_last_failure": dict(self._recent_discovery_last_failure),
             "pr_442_last_attempt": dict(self._last_pr_attempt.get(("4paradigm/phanthymotus-driver", 442), {})),
@@ -375,7 +400,11 @@ class GitHubCommandWatcher:
         diagnostics = self._github.diagnostics() if callable(
             getattr(self._github, "diagnostics", None)
         ) else None
-        return isinstance(diagnostics, dict) and diagnostics.get("backing_off") is True
+        if not isinstance(diagnostics, dict):
+            return False
+        return diagnostics.get(
+            "authenticated_backing_off", diagnostics.get("backing_off", False),
+        ) is True
 
     def _public_recent_command_metric(self) -> dict | None:
         key = self._latest_recent_command_key
@@ -544,6 +573,7 @@ class GitHubCommandWatcher:
             return
         if failure_reason is not None:
             record["last_failure_reason"] = failure_reason
+            record["last_failure_at"] = datetime.now(timezone.utc).isoformat()
         record["failure_reason"] = failure_reason
         completed_mono = self._monotonic()
         record["processing_completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -824,6 +854,59 @@ class GitHubCommandWatcher:
             )
             self.config.auth_valid = False
 
+    def _ordinary_pr_cache_fresh(self, repo: str, pr_number: int, pr: dict, *, force: bool = False) -> bool:
+        if force:
+            return False
+        updated_at = pr.get("updated_at")
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(updated_at, str) or not updated_at or not isinstance(head_sha, str):
+            return False
+        cached = self._pr_reconcile_cache.get((repo, pr_number))
+        if not isinstance(cached, dict) or cached.get("requires_reconcile") is True:
+            return False
+        if cached.get("updated_at") != updated_at or cached.get("head_sha") != head_sha:
+            return False
+        processed_at = cached.get("processed_at")
+        return (isinstance(processed_at, (int, float))
+                and self._monotonic() - processed_at < PR_RECONCILE_CACHE_SECONDS)
+
+    async def _remember_pr_schedule(self, repo: str, pr_number: int, pr: dict) -> None:
+        updated_at = pr.get("updated_at")
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(updated_at, str) or not isinstance(head_sha, str):
+            self._pr_reconcile_cache.pop((repo, pr_number), None)
+            return
+        state = None
+        try:
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+        except Exception:
+            # Missing state means the hint cannot justify skipping a later
+            # reconciliation; it never changes an authorization decision.
+            pass
+        command = state.get("command") if isinstance(state, dict) else None
+        args = command.get("args") if isinstance(command, dict) else None
+        pending_ids = args.get("pending_component_ids") if isinstance(args, dict) else None
+        requires_reconcile = (
+            not isinstance(state, dict)
+            or state.get("status") in {"deploy-requested", "deploying", "testing"}
+            or isinstance(command, dict) and command.get("phase") in {"executing", "uncertain"}
+            or isinstance(pending_ids, list) and bool(pending_ids)
+        )
+        cursor = state.get("last_processed_comment_id") if isinstance(state, dict) else None
+        key = (repo, pr_number)
+        self._pr_reconcile_cache.pop(key, None)
+        self._pr_reconcile_cache[key] = {
+            "updated_at": updated_at, "head_sha": head_sha,
+            "cursor": cursor if isinstance(cursor, int) and not isinstance(cursor, bool) else None,
+            "status": state.get("status") if isinstance(state, dict) else None,
+            "requires_reconcile": requires_reconcile,
+            "processed_at": self._monotonic(),
+        }
+        while len(self._pr_reconcile_cache) > 4096:
+            self._pr_reconcile_cache.pop(next(iter(self._pr_reconcile_cache)))
+
     async def _process_scheduled_pr(self, repo: str, pr_number: int) -> bool:
         """Run one PR through the existing serial writer and evidence path."""
         baseline_pending = repo in self._pending_baseline_repos
@@ -867,6 +950,12 @@ class GitHubCommandWatcher:
                     self._last_evidence_projection[key] = (projection_version, now)
                     if len(self._last_evidence_projection) > 4096:
                         self._last_evidence_projection.pop(next(iter(self._last_evidence_projection)))
+            if baseline_succeeded:
+                await self._remember_pr_schedule(repo, pr_number, current_pr)
+            else:
+                self._pr_reconcile_cache.pop((repo, pr_number), None)
+        else:
+            self._pr_reconcile_cache.pop((repo, pr_number), None)
         return baseline_succeeded
 
     async def _drain_priority_prs(
@@ -1029,6 +1118,7 @@ class GitHubCommandWatcher:
         cycle_ok = True
         queue_generation_at_start = self._priority_generation
         interrupted_for_new_priority = False
+        ordinary_prs_skipped = 0
 
         # Drain already queued webhook work before awaiting the optional
         # repo-wide discovery endpoint.
@@ -1098,6 +1188,7 @@ class GitHubCommandWatcher:
                         valid_prs.append((number, pr))
                 valid_prs.sort(key=lambda item: item[0])
                 open_numbers = [number for number, _ in valid_prs]
+                pr_by_number = {number: pr for number, pr in valid_prs}
                 baseline_all = repo in self._pending_baseline_repos
                 pr_work_budget, fast_lane_size = 8, 6
                 selected = list(priority_attempted.get(repo, []))
@@ -1119,14 +1210,18 @@ class GitHubCommandWatcher:
                     self._recent_pr_cursor[repo] = (recent_start + 1) % len(rotating)
                 else:
                     fast_lane = list(recent_pool)
+                skipped_numbers: set[int] = set()
                 reserve_ordinary = min(2, max(0, pr_work_budget - len(selected)))
                 recent_budget = min(
                     fast_lane_size, max(0, pr_work_budget - len(selected) - reserve_ordinary),
                 )
-                for number, _ in fast_lane:
+                for number, pr in fast_lane:
                     if len(selected) >= pr_work_budget or recent_budget <= 0:
                         break
                     if number in selected_set:
+                        continue
+                    if self._ordinary_pr_cache_fresh(repo, number, pr, force=baseline_all):
+                        skipped_numbers.add(number)
                         continue
                     selected.append(number)
                     selected_set.add(number)
@@ -1136,16 +1231,26 @@ class GitHubCommandWatcher:
                 ordinary = open_numbers[scan_start:] + open_numbers[:scan_start]
                 ordinary_slots = max(0, pr_work_budget - len(selected))
                 cursor_after = {}
+                ordinary_cursor_after = scan_start
                 scanned = 0
-                for number in ordinary:
-                    scanned += 1
-                    if number in selected_set:
-                        continue
-                    selected.append(number)
-                    selected_set.add(number)
-                    cursor_after[number] = (scan_start + scanned) % len(open_numbers)
-                    if len(selected) >= pr_work_budget or len(cursor_after) >= ordinary_slots:
-                        break
+                if ordinary_slots:
+                    for number in ordinary:
+                        scanned += 1
+                        ordinary_cursor_after = (scan_start + scanned) % len(open_numbers)
+                        if number in selected_set or number in skipped_numbers:
+                            continue
+                        if self._ordinary_pr_cache_fresh(
+                                repo, number, pr_by_number[number], force=baseline_all):
+                            skipped_numbers.add(number)
+                            continue
+                        selected.append(number)
+                        selected_set.add(number)
+                        cursor_after[number] = ordinary_cursor_after
+                        if len(cursor_after) >= ordinary_slots:
+                            break
+                ordinary_prs_skipped += len(skipped_numbers)
+                if not cursor_after and scanned:
+                    self._pr_scan_cursor[repo] = ordinary_cursor_after
 
                 processed = []
                 for number in selected[:pr_work_budget]:
@@ -1212,6 +1317,7 @@ class GitHubCommandWatcher:
                 )
                 self._repo_backlog[repo] = {
                     "open_prs": len(open_numbers), "remaining_baselines": remaining,
+                    "ordinary_prs_skipped": len(skipped_numbers),
                     "queued_prs": sum(1 for queued_repo, _ in self._priority_pr_queue if queued_repo == repo),
                     "oldest_queued_age_seconds": round(max((
                         self._monotonic() - self._priority_pr_enqueued_at.get((queued_repo, number), self._monotonic())
@@ -1221,14 +1327,16 @@ class GitHubCommandWatcher:
                 if repo.endswith("phanthymotus-driver"):
                     self._last_driver_poll = datetime.now(timezone.utc).isoformat()
                 logger.info(
-                    "watcher poll %s selected_prs=%s priority_prs=%s processed_prs=%s remaining_baselines=%s scan_cursor=%s",
+                    "watcher poll %s selected_prs=%s priority_prs=%s processed_prs=%s ordinary_prs_skipped=%s remaining_baselines=%s scan_cursor=%s",
                     repo, selected[:pr_work_budget], priority_attempted.get(repo, []), processed,
+                    len(skipped_numbers),
                     remaining, self._pr_scan_cursor.get(repo, 0),
                 )
                 if interrupted_for_new_priority:
                     break
         if repos:
             self._repo_poll_cursor = (repo_start + 1) % len(repos)
+        self._last_ordinary_pr_skips = ordinary_prs_skipped
         if cycle_ok:
             self._last_successful_cycle = datetime.now(timezone.utc).isoformat()
         self._cycle_durations.append(max(0.0, self._monotonic() - cycle_started))

@@ -8,8 +8,10 @@ checked via the documented API when the approval source needs it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 
 import logging
+import math
 import random
 import re
 import time
@@ -98,6 +100,14 @@ class GitHubClient:
         self._rate_limit_failures = 0
         self._transient_until = 0.0
         self._transient_failures = 0
+        self._anonymous_rate_limit_until = 0.0
+        self._anonymous_rate_limit_failures = 0
+        self._anonymous_transient_until = 0.0
+        self._anonymous_transient_failures = 0
+        self._anonymous_request_count = 0
+        self._anonymous_status_counts: dict[str, int] = {}
+        self._anonymous_last_rate_limit: dict | None = None
+        self._anonymous_last_error: dict | None = None
         self._request_count = 0
         self._request_counts_by_repo: dict[str, int] = {}
         self._status_counts: dict[str, int] = {}
@@ -106,14 +116,35 @@ class GitHubClient:
         self._open_pr_pages: dict[tuple[str, int], dict] = {}
 
     def diagnostics(self) -> dict:
+        now = time.monotonic()
+        authenticated_last_rate_limit = (
+            dict(self._recent_rate_limits[-1]) if self._recent_rate_limits else None
+        )
         return {
             "request_count": self._request_count,
             "request_counts_by_repo": dict(self._request_counts_by_repo),
             "status_counts": dict(self._status_counts),
             "recent_rate_limits": [dict(item) for item in self._recent_rate_limits],
             "recent_api_errors": [dict(item) for item in self._recent_api_errors],
-            "rate_limited": self._rate_limit_until > time.monotonic(),
-            "backing_off": max(self._rate_limit_until, self._transient_until) > time.monotonic(),
+            "rate_limited": self._rate_limit_until > now,
+            # Backward-compatible meaning: this is only the authenticated App
+            # API gate consumed by the command watcher.
+            "backing_off": max(self._rate_limit_until, self._transient_until) > now,
+            "authenticated_backing_off": max(
+                self._rate_limit_until, self._transient_until,
+            ) > now,
+            "anonymous_backing_off": max(
+                self._anonymous_rate_limit_until, self._anonymous_transient_until,
+            ) > now,
+            "authenticated_last_rate_limit": authenticated_last_rate_limit,
+            "anonymous_last_rate_limit": (
+                dict(self._anonymous_last_rate_limit)
+                if self._anonymous_last_rate_limit else None
+            ),
+            "anonymous_last_error": dict(self._anonymous_last_error)
+            if self._anonymous_last_error else None,
+            "anonymous_request_count": self._anonymous_request_count,
+            "anonymous_status_counts": dict(self._anonymous_status_counts),
         }
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
@@ -412,8 +443,20 @@ class GitHubClient:
 
         async def fetch_json(url_path: str, *, query: dict | None = None) -> dict:
             url = base + url_path
+            now = time.monotonic()
+            if self._anonymous_rate_limit_until > now:
+                raise GitHubRateLimitError(
+                    status_code=429,
+                    retry_after_seconds=self._anonymous_rate_limit_until - now,
+                )
+            if self._anonymous_transient_until > now:
+                raise GitHubTransientError(
+                    status_code=None,
+                    retry_after_seconds=self._anonymous_transient_until - now,
+                )
             try:
                 require_http_policy(url, self.config, allow_private=False)
+                self._anonymous_request_count += 1
                 response = await stream_request(
                     self.http, "GET", url, self.config.max_response_bytes,
                     headers=headers, params=query,
@@ -424,31 +467,79 @@ class GitHubClient:
                     isinstance(exc, SecurityError) and "timeout" in str(exc).lower()
                 )
                 if isinstance(exc, httpx.HTTPError) or is_timeout:
-                    retry = self._arm_transient_backoff()
+                    retry = self._arm_anonymous_transient_backoff()
+                    self._anonymous_last_error = {
+                        "repo": repo, "status": "transport_error",
+                        "retry_after_seconds": round(retry, 1),
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
                     raise GitHubTransientError(
                         status_code=None, retry_after_seconds=retry
                     ) from exc
                 raise GitHubError("GitHub public response rejected by transport policy") from exc
 
+            self._anonymous_status_counts[str(response.status_code)] = (
+                self._anonymous_status_counts.get(str(response.status_code), 0) + 1
+            )
             if response.status_code == 404:
+                self._anonymous_last_error = {
+                    "repo": repo, "status": 404,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
                 raise GitHubError("GitHub public data was not found", status_code=404)
             if response.status_code in (403, 429):
-                if (response.status_code == 429
-                        or response.headers.get("Retry-After") is not None
-                        or response.headers.get("X-RateLimit-Remaining") == "0"):
+                error_message = ""
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict) and isinstance(payload.get("message"), str):
+                        error_message = payload["message"].lower()
+                except (ValueError, TypeError):
+                    pass
+                rate_limited = response.status_code == 429 or (
+                    response.status_code == 403 and (
+                        response.headers.get("Retry-After") is not None
+                        or response.headers.get("X-RateLimit-Remaining") == "0"
+                        or "secondary rate limit" in error_message
+                        or "rate limit exceeded" in error_message
+                        or "abuse detection" in error_message
+                        or "temporarily blocked" in error_message
+                    )
+                )
+                if rate_limited:
                     retry = self._arm_rate_limit_backoff(response)
+                    self._anonymous_last_error = {
+                        "repo": repo, "status": response.status_code,
+                        "reason": "rate_limited",
+                        "retry_after_seconds": round(retry, 1),
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
                     raise GitHubRateLimitError(
                         status_code=response.status_code, retry_after_seconds=retry
                     )
+                self._anonymous_last_error = {
+                    "repo": repo, "status": 403,
+                    "reason": "anonymous_permission_denied",
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
                 raise GitHubPermissionError(
                     "GitHub denied anonymous public data access", status_code=403
                 )
             if response.status_code >= 500:
-                retry = self._arm_transient_backoff()
+                retry = self._arm_anonymous_transient_backoff()
+                self._anonymous_last_error = {
+                    "repo": repo, "status": response.status_code,
+                    "retry_after_seconds": round(retry, 1),
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
                 raise GitHubTransientError(
                     status_code=response.status_code, retry_after_seconds=retry
                 )
             if response.status_code != 200:
+                self._anonymous_last_error = {
+                    "repo": repo, "status": response.status_code,
+                    "reason": "unexpected_status",
+                    "at": datetime.now(timezone.utc).isoformat(),
+                }
                 raise GitHubError(
                     "GitHub public data request failed", status_code=response.status_code
                 )
@@ -456,30 +547,67 @@ class GitHubClient:
 
         metadata = await fetch_json(f"/repos/{repo}")
         if metadata.get("full_name") != repo or metadata.get("private") is not False:
+            self._anonymous_last_error = {
+                "repo": repo, "status": "repository_identity_mismatch",
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
             raise GitHubPermissionError(
                 "GitHub repository is not the requested public repository", status_code=403
             )
-        return await fetch_json(f"/repos/{repo}/{path}", query=params)
+        result = await fetch_json(f"/repos/{repo}/{path}", query=params)
+        self._anonymous_rate_limit_failures = 0
+        self._anonymous_transient_failures = 0
+        self._anonymous_last_error = None
+        return result
 
     def _arm_rate_limit_backoff(self, response: httpx.Response) -> float:
-        """Apply the existing bounded rate-limit delay for anonymous reads."""
+        """Respect server backoff for anonymous reads, with bounded fallback."""
         retry_after = response.headers.get("Retry-After")
+        server_deadline = False
         try:
             delay = float(retry_after) if retry_after else 0.0
+            server_deadline = math.isfinite(delay) and delay > 0
         except (TypeError, ValueError):
             delay = 0.0
+            if retry_after:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after).timestamp()
+                    delay = max(0.0, retry_at - time.time())
+                    server_deadline = math.isfinite(delay) and delay > 0
+                except (TypeError, ValueError, OverflowError):
+                    pass
         if delay <= 0:
             reset = response.headers.get("X-RateLimit-Reset")
             try:
                 delay = max(0.0, float(reset) - time.time()) if reset else 0.0
+                server_deadline = math.isfinite(delay) and delay > 0
             except (TypeError, ValueError):
                 delay = 0.0
+        if not math.isfinite(delay) or delay < 0:
+            delay = 0.0
+            server_deadline = False
         if delay <= 0:
-            self._rate_limit_failures += 1
-            delay = min(900.0, 30.0 * (2 ** min(self._rate_limit_failures - 1, 5)))
+            self._anonymous_rate_limit_failures += 1
+            delay = min(900.0, 30.0 * (2 ** min(self._anonymous_rate_limit_failures - 1, 5)))
             delay *= random.uniform(0.9, 1.1)
-        delay = min(3600.0, max(1.0, delay))
-        self._rate_limit_until = max(self._rate_limit_until, time.monotonic() + delay)
+        delay = max(1.0, delay) if server_deadline else min(3600.0, max(1.0, delay))
+        self._anonymous_rate_limit_until = max(
+            self._anonymous_rate_limit_until, time.monotonic() + delay,
+        )
+        self._anonymous_last_rate_limit = {
+            "status": response.status_code,
+            "retry_after_seconds": round(delay, 1),
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        return delay
+
+    def _arm_anonymous_transient_backoff(self) -> float:
+        self._anonymous_transient_failures += 1
+        delay = min(120.0, 2.0 * (2 ** min(self._anonymous_transient_failures - 1, 6)))
+        delay *= random.uniform(0.8, 1.2)
+        self._anonymous_transient_until = max(
+            self._anonymous_transient_until, time.monotonic() + delay,
+        )
         return delay
 
     async def _read_json_list(self, resp: httpx.Response) -> list:
