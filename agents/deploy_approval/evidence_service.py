@@ -871,8 +871,8 @@ class EvidenceService:
                     and invite.get('status') == 'testing'
                     and type(invite.get('expires_at')) is int
                     and invite['expires_at'] > int(time.time())
-                    and isinstance(target_pr, dict) and target_pr.get('state') in {'open', 'closed'}
-                    and not target_pr.get('draft')
+                    and isinstance(target_pr, dict) and target_pr.get('state') == 'open'
+                    and not target_pr.get('merged') and not target_pr.get('draft')
                     and target_pr.get('base', {}).get('repo', {}).get('full_name', '').lower() == repo.lower()
                     and target_pr.get('head', {}).get('sha') == expected_head
                     and target_state.get('head_sha') == expected_head
@@ -882,6 +882,17 @@ class EvidenceService:
 
             invite_allowed = (action in {'context', 'status'} or write) and invite_context_matches(
                 pr, selected, round_id)
+            invite_read_context = bool(
+                action == 'context' and isinstance(invite, dict)
+                and invite.get('purpose') == UPLOAD_PURPOSE
+                and invite.get('repo') == repo and invite.get('pr') == pr_number
+                and invite.get('head') == expected_head and invite.get('round') == round_id
+                and selected.get('head_sha') == expected_head
+                and round_id_for_state(selected) == round_id
+                and (round_id != active_round or selected.get('status') != 'testing'
+                     or pr.get('head', {}).get('sha') != expected_head
+                     or pr.get('state') != 'open' or pr.get('merged'))
+            )
             if write and not (authorized_writer or invite_allowed):
                 raise EvidenceError('evidence_write_permission_required', 403)
             validate_context(pr, selected, expected_head, round_id, write=write)
@@ -901,7 +912,8 @@ class EvidenceService:
                     action == 'context'
                     and (purpose == PURPOSE and 'resource' not in capability
                          or purpose == DOWNLOAD_PURPOSE
-                         and capability.get('resource') == 'page')
+                         and capability.get('resource') == 'page'
+                         or invite_read_context)
                 )
                 scoped_read_capability = (
                     action in {'download', 'preview', 'log_download'}
@@ -913,9 +925,10 @@ class EvidenceService:
                     action == 'status' and purpose == PURPOSE
                     and 'resource' not in capability
                 )
-                if (not invite_allowed and (capability.get('repo') != repo or capability.get('pr') != pr_number
-                        or capability.get('head') != expected_head
-                        or capability.get('round') != round_id
+                access_claims = invite if invite_read_context else capability
+                if (not invite_allowed and (access_claims.get('repo') != repo or access_claims.get('pr') != pr_number
+                        or access_claims.get('head') != expected_head
+                        or access_claims.get('round') != round_id
                         or not (context_capability or scoped_read_capability
                                 or legacy_read_capability))):
                     raise EvidenceError('capability_context_mismatch', 403)
@@ -1068,6 +1081,34 @@ class EvidenceService:
                 return {'uploaded': True, 'part_number': part, 'size': length}
             if action == 'context':
                 note_display_cache = {}
+                def display_deployments(snapshot, *, historical=False):
+                    components = {
+                        component.get('component_id'): component
+                        for component in snapshot.get('components', [])
+                        if isinstance(component, dict) and isinstance(component.get('component_id'), str)
+                    }
+                    deployment_rows = snapshot.get('deployments', [])
+                    enriched = self.controller._enrich_deployments_for_render(
+                        deployment_rows if isinstance(deployment_rows, list) else [],
+                        historical=historical,
+                    )
+                    output = []
+                    for deployment in enriched:
+                        if not isinstance(deployment, dict):
+                            continue
+                        component_ids = deployment.get('component_ids') or [None]
+                        for component_id in component_ids:
+                            component = components.get(component_id, {})
+                            output.append({
+                                'machine': str(deployment.get('machine', '') or ''),
+                                'ip': str(deployment.get('ip', '') or ''),
+                                'component': str(component.get('target', '') or '组件信息不可用'),
+                                'variant_path': str(component.get('variant') or component.get('driver_path') or '—'),
+                                'image': str(component.get('image_ref') or deployment.get('image_ref') or '—'),
+                                'result': str(deployment.get('phase') or deployment.get('result') or '状态未知'),
+                            })
+                    return output
+
                 async def context_attachment(row):
                     public_fields = {
                         'attachment_id', 'filename', 'size', 'sha256', 'note', 'evidence_kind',
@@ -1115,6 +1156,7 @@ class EvidenceService:
 
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'round_number': round_numbers.get(round_id),
+                        'round_started_at': selected.get('round_started_at'),
                         'status': selected['status'], 'authenticated': True, 'enabled': True,
                         'pr_state': pr.get('state'), 'merged': pr.get('merged') is True,
                         'draft': pr.get('draft') is True,
@@ -1122,7 +1164,14 @@ class EvidenceService:
                             principal.get('actor_verified') is True
                             and principal.get('github_user_authenticated') is True),
                         'can_write': bool((authorized_writer or invite_allowed) and selected.get('status') == 'testing'
-                                          and selected.get('head_sha') == pr.get('head', {}).get('sha')),
+                                          and selected.get('head_sha') == pr.get('head', {}).get('sha')
+                                          and pr.get('state') == 'open' and not pr.get('merged')),
+                        'acceptance_pending': bool(
+                            isinstance(selected.get('acceptance_request'), dict)
+                            and selected['acceptance_request'].get('status') == 'pending'
+                            and selected['acceptance_request'].get('head_sha') == selected.get('head_sha')
+                            and selected['acceptance_request'].get('round_id') == round_id),
+                        'display_deployments': display_deployments(selected),
                         'upload_invite': bool(invite_allowed),
                         'upload_identity_label': ('分享链接上传，GitHub 身份未验证'
                                                   if invite_allowed else ''),
@@ -1134,6 +1183,13 @@ class EvidenceService:
                         'attachments': current_attachments,
                         'rounds': [{**r['data']['snapshot'], 'round_id': r['data']['round_id'],
                                     'round_number': round_numbers.get(r['data']['round_id']),
+                                    'acceptance_pending': bool(
+                                        isinstance(r['data']['snapshot'].get('acceptance_request'), dict)
+                                        and r['data']['snapshot']['acceptance_request'].get('status') == 'pending'
+                                        and r['data']['snapshot']['acceptance_request'].get('round_id') == r['data']['round_id']),
+                                    'display_deployments': display_deployments(
+                                        r['data']['snapshot'], historical=True,
+                                    ),
                                     'attachments': round_attachments.get(r['data']['round_id'], [])}
                                    for r in records if r['kind'] == 'round'],
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}

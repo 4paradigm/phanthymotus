@@ -39,6 +39,14 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # Independent acceptance reviewers; missing configuration leaves the
+      # allowlist empty and does not affect service startup or Evidence reads.
+      - type: bind
+        source: "${DEPLOY_APPROVAL_CONFIG_DIR:?config directory required}/test_reviewers.yaml"
+        target: /run/deploy-approval/test_reviewers.yaml
+        read_only: true
+        bind:
+          create_host_path: true
       # GitHub App private key (absolute path supplied via env var)
       - type: bind
         source: "${GITHUB_APP_PRIVATE_KEY_FILE:?GITHUB_APP_PRIVATE_KEY_FILE is required}"

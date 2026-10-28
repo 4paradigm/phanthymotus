@@ -228,7 +228,7 @@ def trusted_round_numbers(records, state, repo, pr_number) -> dict[str, int]:
 
 def validate_context(pr, state, expected_head, round_id, *, write: bool) -> None:
     if (not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}
-            or (write and pr.get('draft'))):
+            or (write and (pr.get('state') != 'open' or pr.get('merged') or pr.get('draft')))):
         raise EvidenceError('pr_closed', 409)
     if not isinstance(expected_head, str) or not re.fullmatch(r'[0-9a-f]{40}', expected_head):
         raise EvidenceError('invalid_head', 400)

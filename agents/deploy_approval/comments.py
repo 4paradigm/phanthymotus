@@ -232,15 +232,12 @@ def _workflow_lines(
 
 
 def _testing_next_action(evidence_complete: bool) -> str:
-    result_guidance = (
-        "测试成功时：`/record_test result=pass summary=\"视频播放和附件校验通过\"`\n\n"
-        "测试失败时：`/record_test result=fail summary=\"视频播放失败，HTTP 403\"`"
-    )
     if evidence_complete:
-        return "**Machine Owner**\n\n" + result_guidance
+        return ("**Machine Owner**\n\n测试完成后，请执行 `/request_acceptance`，"
+                "由名单中的独立验收人记录最终结果。")
     return ("**PR developer and deployed Machine Owner**\n\n"
-            "Upload evidence for this HEAD and round first; after it is archived, "
-            "record one result:\n\n" + result_guidance)
+            "请先为当前 HEAD 和轮次上传附件；完成检查后，由 Machine Owner 执行 "
+            "`/request_acceptance` 请求独立验收。")
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -511,13 +508,21 @@ def testing(
     evidence_complete: bool = False,
     deployments_complete: bool | None = None,
     record_test_complete: bool = False,
+    acceptance_pending: bool = False,
+    acceptance_reviewers_configured: bool = True,
 ) -> str:
+    next_action = (_testing_next_action(evidence_complete)
+                   if not acceptance_pending else (
+                       "等待独立验收人确认。" if acceptance_reviewers_configured
+                       else "独立验收名单待配置；配置前不能记录最终验收结果。"
+                   ))
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
         "### Deploy Approval \u2014 Lifecycle",
         "",
-        "**Status:** `testing`",
+        ("**Status:** `testing` · 测试完成 · 待验收"
+         if acceptance_pending else "**Status:** `testing`"),
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
         "",
@@ -529,7 +534,7 @@ def testing(
         "",
         "### Next action",
         "",
-        *_testing_next_action(evidence_complete).split("\n"),
+        *next_action.split("\n"),
         "",
         "### Current Deployment",
     ]
@@ -809,8 +814,8 @@ def deploy_help_text(topic: str = "") -> str:
             "",
             "用途：记录本轮部署验证结果。",
             "",
-            "执行人：Machine Owner，或有 write/maintain/admin 权限的协作者。",
-            "阶段：部署状态为 testing。",
+            "执行人：deploy-approval/test_reviewers.yaml 中的独立验收人；必须与本轮请求验收的 Machine Owner 不同。",
+            "阶段：Machine Owner 已在 testing 阶段请求独立验收后。",
             "",
             "参数：",
             "- `/record_test result=pass [summary=\"...\"]`",
@@ -832,10 +837,11 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
         "- `/approve_deploy machine=<alias-or-ip>`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段审批指定机器。",
-        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：Machine Owner 或有 write/maintain/admin 权限的协作者，在 testing 阶段记录成功。",
-        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：由同一权限角色在 testing 阶段记录失败。",
+        "- `/request_acceptance`：本轮实际部署机器的 Machine Owner 在 testing 阶段请求独立验收；仅更新待验收标记，不结束 testing。",
+        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：验收名单中的独立验收人在待验收阶段记录成功。",
+        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：验收名单中的独立验收人在待验收阶段记录失败。",
         "- `/deploy_status`：只读查询当前部署状态，可在任意阶段使用。",
-        "- `/deploy_help record_test`：查看测试结果命令说明；可在任意阶段使用。",
+        "- `/deploy_help record_test`：查看独立验收命令说明；可在任意阶段使用。",
         "",
         "结果含义：`pass`=成功；`fail`=失败；`summary`=测试结果说明（可选）。",
         "",
@@ -924,11 +930,11 @@ def render_evidence_section(
     repo, pr_number, state, records, archive_links, *, public_base_url="",
     upload_public_base_url="", cos_download_url_expiry=None,
 ) -> str:
-    """Render current evidence and three archived rounds without mutating history.
+    """Render current evidence and archived rounds without mutating history.
 
     Records may be attachment rows, round bundles, or archive_snapshot entries.
-    Archive links must come from trusted server-side discovery. Summary output
-    exposes only the capability-protected attachment page, never COS signed URLs.
+    Archive links must come from trusted server-side discovery. COS download
+    links are rendered only after the projection and URL signature checks pass.
     The caller supplies evidence_enabled=True in the render state only when
     the configured feature is enabled; absent flags fail closed for API links.
     """
@@ -1086,8 +1092,13 @@ def render_evidence_section(
                 + urllib.parse.quote(str(capability), safe=""))
 
     def trusted_cos_download_url(item, key):
+        verified_content = (
+            item.get("cos_content_verified") is True
+            or item.get("actor_verified") is True
+            and item.get("upload_method") != "signed_invite"
+        ) if isinstance(item, dict) else False
         if (not isinstance(item, dict) or item.get("status") != "ready"
-                or item.get("deleted_at") or item.get("cos_content_verified") is not True
+                or item.get("deleted_at") or not verified_content
                 or item.get("cos_projection_verified") is not True
                 or item.get("head_sha") != key[0] or item.get("round_id") != key[1]
                 or not isinstance(item.get("sha256"), str)
@@ -1243,6 +1254,21 @@ def render_evidence_section(
             return f"第 {round_number} 轮"
         return "历史轮次" if historical else "当前轮"
 
+    def round_status(group, key):
+        request = group.get("acceptance_request")
+        if (group.get("status") == "testing" and (
+                group.get("acceptance_pending") is True
+                or isinstance(request, dict) and request.get("status") == "pending"
+                and request.get("head_sha") == key[0]
+                and request.get("round_id") == key[1])):
+            return "测试完成 · 待验收"
+        return {
+            "testing": "测试中", "succeeded": "已通过", "failed": "未通过",
+            "review-required": "待审查", "reviewing": "审查中",
+            "deploy-ready": "待部署", "deploy-requested": "等待部署审批",
+            "deploying": "正在部署", "deployed": "已部署", "cancelled": "已取消",
+        }.get(group.get("status"), "状态未知")
+
     def render_round(key, group, *, historical=False):
         h, r = key
         items = visible_attachments(group, key)
@@ -1250,36 +1276,17 @@ def render_evidence_section(
             item.get("created_at"), item.get("uploaded_at"))), reverse=True)
         lines = []
         if historical:
-            lines.append(f"**轮次：** {_escape(round_label(group, historical=True))}")
-            historical_time = first_valid_time(
-                group.get("archived_at"), group.get("ended_at"),
-                group.get("round_started_at"), group.get("started_at"),
-                group.get("created_at"),
-            )
-            lines.append(f"**时间：** {_escape(summary_time(historical_time))}")
-            status_labels = {
-                "review-required": "待审查",
-                "reviewing": "审查中",
-                "deploy-ready": "待部署",
-                "deploy-requested": "已请求部署",
-                "deploying": "部署中",
-                "testing": "测试中",
-                "succeeded": "已通过",
-                "failed": "未通过",
-                "cancelled": "已取消",
-            }
-            status = group.get("status")
-            status_label = (
-                status_labels.get(status, "状态未知")
-                if isinstance(status, str) else "状态未知"
-            )
-            lines.extend([f"**状态：** {_escape(status_label)}", ""])
+            lines.append(f"### {_escape(round_label(group, historical=True))}")
         else:
-            lines.extend([f"### {_escape(round_label(group))} · 附件", ""])
-        if historical:
-            lines.extend(["### 附件", ""])
+            lines.append(f"### {_escape(round_label(group))}")
+        lines.extend([
+            "", f"**Commit：** `{_escape(h)}`",
+            f"**状态：** {_escape(round_status(group, key))}",
+            f"**测试时间：** {_escape(summary_time(first_valid_time(group.get('round_started_at'), group.get('started_at'))))}",
+            "", "### 附件", "",
+        ])
         if items:
-            lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
+            lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 | 下载 |", "|---|---:|---|---|---|"])
         notes = []
         for item in items:
             if not isinstance(item, dict):
@@ -1304,12 +1311,12 @@ def render_evidence_section(
             uploaded_at = summary_time(first_valid_time(item.get("created_at"), item.get("uploaded_at")))
             if deleted:
                 filename = filename + "（已删除）"
-            filename_cell = _escape(filename)
             download_url = "" if deleted else trusted_cos_download_url(item, key)
-            if download_url:
-                filename_cell = f"[{filename_cell}](<{download_url}>)"
-            lines.append("| " + " | ".join((filename_cell, *(
-                _escape(value) for value in (size, actor, uploaded_at)))) + " |")
+            download_cell = f"[下载](<{download_url}>)" if download_url else "—"
+            lines.append("| " + " | ".join((
+                _escape(filename), _escape(size), _escape(actor),
+                _escape(uploaded_at), download_cell,
+            )) + " |")
             note = item.get("note") or (item.get("text") if status == "text" else "")
             if is_internal_test_note(item):
                 note = ""
@@ -1361,6 +1368,7 @@ def render_evidence_section(
                 lines.append("本轮暂无附件，上传后会显示")
         if group.get("deployments"):
             lines.extend(["", "### 部署记录", "",
+                          f"**部署镜像对应 Commit：** `{_escape(h)}`", "",
                           _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
         test_result = group.get("test_result")
         if isinstance(test_result, str) and test_result in {"pass", "fail"}:
@@ -1402,7 +1410,7 @@ def render_evidence_section(
         lines.extend(render_round((head, current_round), groups[(head, current_round)]))
     round_pattern = re.escape(str(head)) + r"-[0-9]+"
     current_context_valid = (
-        show_current_round and re.fullmatch(r"[0-9a-f]{40}", str(head))
+        re.fullmatch(r"[0-9a-f]{40}", str(head))
         and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
         and state.get("evidence_enabled") is True and bool(api)
     )
@@ -1441,9 +1449,11 @@ def render_evidence_section(
         lines.extend([
             "上传权限：仅限本轮测试邀请；分享链接上传会标示身份未验证。",
             "可上传视频、图片、文件或文字说明；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
-            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。归档后，成功用 `/record_test result=pass summary=\"视频播放和附件校验通过\"`；失败用 `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`。",
+            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。完成本轮检查后，由 Machine Owner 执行 `/request_acceptance` 请求独立验收。",
         ])
-    old = [(key, group) for key, group in groups.items() if key != (head, current_round)]
+    test_statuses = {"testing", "succeeded", "failed"}
+    old = [(key, group) for key, group in groups.items()
+           if key != (head, current_round) and group.get("status") in test_statuses]
     old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
     if old:
         lines.extend(["", "### 历史轮次", ""])
@@ -1464,11 +1474,6 @@ def render_evidence_section(
                  if attachment_count else "历史数据不可读取")
                 if group.get("attachment_details_unreadable") else
                 f"{attachment_count} 个附件" if attachment_count else
-                "测试前归档 · 未保存附件"
-                if (not attachment_items and group.get("attachment_details_complete")
-                    and group.get("status") in {
-                        "review-required", "reviewing", "deploy-ready", "deploy-requested", "deploying",
-                    }) else
                 "该轮未保存附件" if not attachment_items and group.get("attachment_details_complete")
                 else "内部验收备注已隐藏" if only_hidden_internal_notes(group, key)
                 else "附件记录均已删除" if round_items and all(

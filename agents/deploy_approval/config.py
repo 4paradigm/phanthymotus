@@ -171,6 +171,8 @@ class Config:
     # Machine owners configuration
     machine_owners_file: str = "/run/deploy-approval/machines.yaml"
     secrets_file: str = "/run/deploy-approval/secrets.yaml"
+    test_reviewers_file: str = "/run/deploy-approval/test_reviewers.yaml"
+    test_reviewers: list[str] = field(default_factory=list)
 
     # Security
     allow_private_http: bool = False
@@ -407,8 +409,36 @@ def _load_secrets_config(path: str) -> dict:
     return result
 
 
+def _load_test_reviewers(path: str) -> list[str]:
+    """Load the independent acceptance allowlist; absence always fails closed."""
+    try:
+        data = _load_yaml_mapping(path)
+    except (OSError, ValueError) as exc:
+        logger.warning("independent acceptance reviewer list unavailable (%s)",
+                       type(exc).__name__)
+        return []
+    if not data:
+        return []
+    reviewers = data.get("reviewers")
+    if (set(data) != {"version", "reviewers"}
+            or type(data.get("version")) is not int or data.get("version") != 1
+            or not isinstance(reviewers, list) or not reviewers):
+        logger.warning("independent acceptance reviewer list has an invalid schema")
+        return []
+    normalized = []
+    for login in reviewers:
+        if (not isinstance(login, str) or not _LOGIN_RE.fullmatch(login.strip())
+                or login.strip().lower().endswith("[bot]")
+                or login.strip().lower() in normalized):
+            logger.warning("independent acceptance reviewer list has an invalid entry")
+            return []
+        normalized.append(login.strip().lower())
+    return normalized
+
+
 def load_config() -> Config:
     secrets = _load_secrets_config("/run/deploy-approval/secrets.yaml")
+    test_reviewers_file = "/run/deploy-approval/test_reviewers.yaml"
     cos = secrets.get("cos", {})
     evidence = secrets.get("evidence", {})
     review_trust = secrets.get("review_comment_trust", {})
@@ -427,6 +457,8 @@ def load_config() -> Config:
         review_comment_author_login=review_trust.get("author_login", ""),
         machine_owners_file="/run/deploy-approval/machines.yaml",
         secrets_file="/run/deploy-approval/secrets.yaml",
+        test_reviewers_file=test_reviewers_file,
+        test_reviewers=_load_test_reviewers(test_reviewers_file),
         allow_private_http=False,
         http_allowed_cidrs=[],
         connect_timeout=10.0,
@@ -475,6 +507,11 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(f"APP_PORT must be 1..65535, got {cfg.port}")
     if not isinstance(cfg.host, str):
         raise ValueError("APP_HOST must be a string")
+    if not isinstance(cfg.test_reviewers_file, str) or not isinstance(cfg.test_reviewers, list):
+        raise ValueError("independent acceptance reviewer configuration is invalid")
+    if any(not isinstance(login, str) or not _LOGIN_RE.fullmatch(login)
+           or login.lower().endswith("[bot]") for login in cfg.test_reviewers):
+        raise ValueError("independent acceptance reviewer configuration is invalid")
     if not isinstance(cfg.http_allowed_cidrs, list):
         raise ValueError("HTTP_ALLOWED_CIDRS must be a list")
     _int_fields = {

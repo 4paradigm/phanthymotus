@@ -509,6 +509,7 @@ class DeployController:
         state["approve_attempts_truncated"] = False
         state["case_results"] = {}
         state["test_result"] = ""
+        state.pop("acceptance_request", None)
         state["cos"] = {"object_key": "", "sha256": "", "size": 0}
         state["command"] = {
             "comment_id": int(state.get("last_processed_comment_id", 0) or 0),
@@ -1487,6 +1488,7 @@ class DeployController:
                     # Deploy success verified (or adopted as already deployed): record deployment
                     new_deployments.append({
                         "machine": machine_alias,
+                        "ip": machine.node_host,
                         "component_ids": [component_id],
                         "phase": "deployed",
                     })
@@ -1525,6 +1527,7 @@ class DeployController:
                     # Deploy success verified: record deployment
                     new_deployments.append({
                         "machine": machine_alias,
+                        "ip": machine.node_host,
                         "component_ids": [component_id],
                         "phase": "deployed",
                     })
@@ -1764,6 +1767,7 @@ class DeployController:
 
             # All components deployed -> durable testing state FIRST
             state["status"] = "testing"
+            state.pop("acceptance_request", None)
 
             # Build testing markdown WITHOUT advisory case result
             testing_markdown = comments_mod.testing(
@@ -1868,8 +1872,13 @@ class DeployController:
                 or not expected_comment.get("created_at")
                 or expected_comment.get("updated_at") != expected_comment.get("created_at")):
             return False
+        from .commands import parse_command
+        parsed = parse_command(expected_comment.get("body", ""))
         try:
-            await self._check_record_test_permissions(repo, login, state)
+            await self._check_record_test_permissions(
+                repo, login, state, actor_id=uid, comment_id=cid,
+                result=parsed.result,
+            )
         except PolicyError:
             return False
         fresh_comment = await self.proxy.get_comment(repo, cid)
@@ -2118,6 +2127,127 @@ class DeployController:
             # record_test or prevent subsequent GitHub command processing.
             logger.warning("COS retry failed %s#%s exception=%s", repo, pr_number, type(exc).__name__)
 
+    async def handle_request_acceptance(
+        self, repo: str, pr_number: int, comment_id: int,
+        actor: str, actor_id: str,
+    ) -> bool:
+        """Persist a current-round independent acceptance request from a deployed owner."""
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+            if (not isinstance(pr, dict) or pr.get("state") != "open"
+                    or pr.get("merged") or pr.get("draft")):
+                await self._post_error(
+                    repo, pr_number,
+                    "/request_acceptance 仅适用于开放、未合并且非 Draft 的 PR。",
+                )
+                return True
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            if not isinstance(state, dict):
+                await self._post_error(repo, pr_number, "当前没有可验收的部署记录。")
+                return True
+            state = copy.deepcopy(state)
+            head = pr.get("head", {}).get("sha", "")
+            round_id = round_id_for_state(state)
+            if (state.get("status") != "testing" or state.get("head_sha") != head
+                    or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+                    or not self._all_required_components_deployed(state)):
+                await self._post_command_not_ready(
+                    repo, pr_number, state.get("status", "unknown"),
+                    "所有本轮部署完成并进入 testing 后，Machine Owner 才能请求独立验收。",
+                )
+                return True
+            try:
+                owner_id = int(actor_id)
+            except (TypeError, ValueError):
+                owner_id = 0
+            if (owner_id <= 0 or not isinstance(actor, str)
+                    or not self._is_deployed_machine_owner(actor, state)):
+                await self._post_error(
+                    repo, pr_number,
+                    "只有本轮实际部署机器的 Machine Owner 可以执行 /request_acceptance。",
+                )
+                return True
+            if type(comment_id) is not int or comment_id <= state.get("last_processed_comment_id", 0):
+                return True
+            comment = await self.proxy.get_comment(repo, comment_id)
+            from .commands import parse_command
+            parsed = parse_command(comment.get("body", "") if isinstance(comment, dict) else "")
+            user = comment.get("user", {}) if isinstance(comment, dict) else {}
+            api_base = self.config.github_api_url.rstrip("/")
+            expected_comment_url = f"{api_base}/repos/{repo}/issues/comments/{comment_id}"
+            expected_issue_url = f"{api_base}/repos/{repo}/issues/{pr_number}"
+            if (not isinstance(comment, dict) or comment.get("id") != comment_id
+                    or not isinstance(user, dict)
+                    or parsed.kind != "request_acceptance"
+                    or user.get("login") != actor or str(user.get("id")) != str(owner_id)
+                    or type(user.get("id")) is not int or user["id"] <= 0
+                    or comment.get("url") != expected_comment_url
+                    or comment.get("issue_url") != expected_issue_url
+                    or self.proxy.is_bot_comment(comment)
+                    or not isinstance(comment.get("created_at"), str)
+                    or comment.get("updated_at") != comment.get("created_at")):
+                return False
+
+            existing = state.get("acceptance_request")
+            if (isinstance(existing, dict) and existing.get("status") == "pending"
+                    and existing.get("head_sha") == head and existing.get("round_id") == round_id):
+                await self.proxy.persist_cursor(repo, pr_number, comment_id)
+                return True
+
+            original = copy.deepcopy(state)
+            state["acceptance_request"] = {
+                "head_sha": head,
+                "round_id": round_id,
+                "status": "pending",
+                "requested_by": actor,
+                "requested_by_id": owner_id,
+                "comment_id": comment_id,
+                "requested_at": comment["created_at"],
+            }
+            state["command"] = {
+                "comment_id": comment_id,
+                "kind": "request_acceptance",
+                "phase": "completed",
+                "args": {"actor": actor, "round_id": round_id},
+            }
+            state["last_processed_comment_id"] = comment_id
+            markdown = comments_mod.testing(
+                repo, pr_number, head,
+                deployments=self._enrich_deployments_for_render(state.get("deployments", [])),
+                components=state.get("components", []),
+                deployments_complete=True,
+                acceptance_pending=True,
+                acceptance_reviewers_configured=bool(getattr(self.config, "test_reviewers", [])),
+            )
+            event = {
+                "event": "Independent acceptance requested",
+                "lifecycle": "`testing` · 测试完成 · 待独立验收",
+                "machine": next((d.get("machine", "") for d in state.get("deployments", [])
+                                 if isinstance(d, dict) and d.get("phase") == "deployed"), ""),
+                "timestamp": comments_mod.beijing_now_str(),
+            }
+            await self._preflight_archive_for_event(repo, pr_number, markdown, reserved_event=event)
+            written = await self._write_lifecycle_with_history(
+                repo, pr_number, state, markdown, event=event,
+                expected_acceptance_state=original,
+                expected_acceptance_comment=comment,
+            )
+            if not written:
+                return False
+            try:
+                await self.proxy.project_status_label(repo, pr_number, "acceptance-required")
+            except Exception as exc:
+                logger.warning("acceptance label projection %s#%s exception=%s",
+                               repo, pr_number, type(exc).__name__)
+            return True
+        except PolicyError as exc:
+            await self._post_error(repo, pr_number, str(exc))
+            return True
+        except Exception as exc:
+            logger.error("handle_request_acceptance %s#%s: %s",
+                         repo, pr_number, type(exc).__name__)
+            raise
+
     async def handle_record_test(
         self, repo: str, pr_number: int, comment_id: int,
         result: str, summary: str, actor: str, actor_id: str,
@@ -2165,7 +2295,10 @@ class DeployController:
                         and terminal_command.get("args", {}).get("result") == result):
                     if not self._all_required_components_deployed(state):
                         return False
-                    await self._check_record_test_permissions(repo, actor, state)
+                    await self._check_record_test_permissions(
+                        repo, actor, state, actor_id=actor_id,
+                        comment_id=comment_id, result=result,
+                    )
                     await self._retry_terminal_cos(repo, pr_number, state, refresh_url=True)
                     return True
                 logger.warning(
@@ -2208,6 +2341,11 @@ class DeployController:
                 )
                 return True
 
+            await self._check_record_test_permissions(
+                repo, actor, state, actor_id=actor_id,
+                comment_id=comment_id, result=result,
+            )
+
             original_state = copy.deepcopy(state)
             if _recovery_comment is None:
                 _recovery_comment = await self.proxy.get_comment(repo, comment_id)
@@ -2244,6 +2382,17 @@ class DeployController:
                 "args": {"result": result, "summary": summary, "actor": actor},
             }
             state["last_processed_comment_id"] = comment_id
+            acceptance_request = copy.deepcopy(state.get("acceptance_request", {}))
+            acceptance_request.update({
+                "status": "completed",
+                "accepted_by": actor,
+                "accepted_by_id": int(actor_id),
+                "acceptance_comment_id": comment_id,
+                "accepted_at": utc_now(),
+                "result": result,
+                "summary": summary,
+            })
+            state["acceptance_request"] = acceptance_request
 
             # Write the terminal visible lifecycle comment
             if result == "pass":
@@ -2475,12 +2624,14 @@ class DeployController:
                 })
         return groups
 
-    def _enrich_deployments_for_render(self, deployments: list[dict]) -> list[dict]:
+    def _enrich_deployments_for_render(
+        self, deployments: list[dict], *, historical: bool = False,
+    ) -> list[dict]:
         """Enrich deployment rows with machine IP for render-only display.
 
-        Resolves each deployment's canonical machine alias against the
-        configured policy to obtain node_host. This works even when the
-        machine is no longer among the remaining-compatible machine groups.
+        Prefer the IP captured with a deployment snapshot. Legacy rows without
+        one can still use current policy data for the active round; history
+        keeps the captured value when available.
 
         Hidden-state authoritative identity remains the alias only.
         """
@@ -2490,8 +2641,8 @@ class DeployController:
                 enriched.append(dep)
                 continue
             machine_alias = dep.get("machine", "")
-            ip = ""
-            if machine_alias:
+            ip = dep.get("ip", "")
+            if not ip and not historical and machine_alias:
                 machine_info = self.policy.get_machine(machine_alias)
                 if machine_info is not None:
                     ip = machine_info.node_host or ""
@@ -2754,48 +2905,67 @@ class DeployController:
                 "Write, maintain, or admin access required."
             )
 
-    async def _check_record_test_permissions(
-        self, repo: str, actor: str, state: dict,
-    ) -> None:
-        """Check if actor is authorized to record test result.
-
-        Authorized if:
-        1. Actor has write/maintain/admin GitHub collaborator permission, OR
-        2. Actor is an owner of any machine actually used in deployments.
-
-        Fail closed on permission lookup error.
-        """
-        actor_lower = actor.strip().lower() if actor else ""
-
-        # Check if actor is owner of any deployed machine
-        deployed_machines = set()
+    def _is_deployed_machine_owner(self, actor: str, state: dict) -> bool:
+        actor_lower = actor.strip().casefold() if isinstance(actor, str) else ""
+        if not actor_lower:
+            return False
         for dep in state.get("deployments", []):
-            if dep.get("phase") == "deployed":
-                machine_alias = dep.get("machine", "")
-                if machine_alias:
-                    deployed_machines.add(machine_alias)
+            if not isinstance(dep, dict) or dep.get("phase") != "deployed":
+                continue
+            machine = self.policy.get_machine(dep.get("machine", ""))
+            if machine and any(
+                isinstance(owner, str) and owner.casefold() == actor_lower
+                for owner in (machine.owners or [])
+            ):
+                return True
+        return False
 
-        for machine_alias in deployed_machines:
-            machine = self.policy.get_machine(machine_alias)
-            if machine:
-                owners_lower = [o.lower() for o in (machine.owners or [])]
-                if actor_lower in owners_lower:
-                    return
-
-        # Check collaborator permission
+    async def _check_record_test_permissions(
+        self, repo: str, actor: str, state: dict, *, actor_id=None,
+        comment_id=None, result="",
+    ) -> None:
+        """Authorize only a separately allowlisted reviewer for this round."""
+        reviewers = getattr(self.config, "test_reviewers", None)
+        if not isinstance(reviewers, list) or not reviewers:
+            raise PolicyError(
+                "独立验收名单尚未配置；已拒绝记录测试结果，请配置 "
+                "/run/deploy-approval/test_reviewers.yaml。"
+            )
+        actor_lower = actor.strip().casefold() if isinstance(actor, str) else ""
+        if not actor_lower or actor_lower not in {
+                value.casefold() for value in reviewers if isinstance(value, str)}:
+            raise PolicyError("只有独立验收名单中的 GitHub 用户可以执行 /record_test。")
+        if self._is_deployed_machine_owner(actor, state):
+            raise PolicyError("本轮部署 Machine Owner 不能担任本轮最终验收人。")
+        request = state.get("acceptance_request")
         try:
-            permission = await self.proxy.collaborator_permission(repo, actor)
-        except Exception as e:
-            raise PolicyError(
-                f"Cannot verify collaborator permission for {actor}: {e}"
-            )
-
-        if not Policy.collaborator_can_approve(permission):
-            raise PolicyError(
-                f"Actor {actor} is not a deployed machine owner and has "
-                f"insufficient collaborator permission ({permission}). "
-                "Write, maintain, or admin access required."
-            )
+            expected_round = round_id_for_state(state)
+        except Exception:
+            expected_round = ""
+        if (not isinstance(request, dict)
+                or request.get("head_sha") != state.get("head_sha")
+                or request.get("round_id") != expected_round):
+            raise PolicyError("本轮尚无有效的 Machine Owner 验收请求。")
+        try:
+            numeric_actor_id = int(actor_id)
+        except (TypeError, ValueError):
+            numeric_actor_id = 0
+        if numeric_actor_id <= 0 or type(comment_id) is not int or comment_id <= 0:
+            raise PolicyError("无法验证独立验收人的 GitHub 评论身份。")
+        if request.get("status") == "pending":
+            if (state.get("status") != "testing"
+                    or numeric_actor_id == request.get("requested_by_id")
+                    or actor_lower == str(request.get("requested_by", "")).casefold()):
+                raise PolicyError("验收人必须来自独立名单，并与本轮请求验收的 Machine Owner 不同。")
+            return
+        if (request.get("status") == "completed"
+                and request.get("accepted_by_id") == numeric_actor_id
+                and request.get("acceptance_comment_id") == comment_id
+                and request.get("accepted_by", "").casefold() == actor_lower
+                and request.get("result") == result
+                and state.get("status") == ("succeeded" if result == "pass" else "failed")):
+            return
+        raise PolicyError("本轮独立验收请求已完成或不再有效。")
 
     async def _deploy_component(
         self, core: AgentCoreClient, node_id: str,
@@ -3486,7 +3656,10 @@ class DeployController:
         history = []
         for start, end in merged:
             pieces.append(visible[cursor:start])
-            history.append(visible[start:end])
+            block = visible[start:end]
+            block = re.sub(r"\A[ \t]*#{2,6}[ \t]+(?:history|历史记录)[ \t]*\r?\n+",
+                           "", block, count=1, flags=re.IGNORECASE)
+            history.append(block)
             cursor = end
         pieces.append(visible[cursor:])
         return "".join(pieces), "".join(history)
@@ -3691,7 +3864,15 @@ class DeployController:
             )
             visible = self._replace_markdown_section(
                 visible, "### Next action",
-                comments_mod._testing_next_action(confirmed_current),
+                ("等待独立验收人确认。" if isinstance(state.get("acceptance_request"), dict)
+                 and state["acceptance_request"].get("status") == "pending"
+                 and state["acceptance_request"].get("head_sha") == state.get("head_sha")
+                 and state["acceptance_request"].get("round_id") == current_round
+                 and getattr(self.config, "test_reviewers", [])
+                 else "独立验收名单待配置；配置前不能记录最终验收结果。"
+                 if isinstance(state.get("acceptance_request"), dict)
+                 and state["acceptance_request"].get("status") == "pending"
+                 else comments_mod._testing_next_action(confirmed_current)),
                 "### Current Deployment",
             )
         # Presentation flags are deliberately ephemeral. Hidden state has a
@@ -3720,6 +3901,8 @@ class DeployController:
                              and callable(getattr(store, "dispatch", None)))
             browser_upload_ready = (
                 backend_ready and status["PUBLIC_HTTPS_INGRESS_READY"]
+                and state.get("status") == "testing"
+                and pr.get("state") == "open" and not pr.get("merged")
                 and not pr.get("draft")
             )
         except Exception:
@@ -3727,9 +3910,21 @@ class DeployController:
                       "PUBLIC_HTTPS_INGRESS_READY": False}
             backend_ready = False
             browser_upload_ready = False
-        attachment_access_allowed = state.get("status") in {
-            "testing", "succeeded", "failed",
-        }
+        has_evidence_history = any(
+            isinstance(row, dict) and isinstance(row.get("head_sha"), str)
+            and isinstance(row.get("round_id"), str)
+            and re.fullmatch(re.escape(row["head_sha"]) + r"-[0-9]+", row["round_id"])
+            for row in attachments
+        ) or any(
+            isinstance(archive.get("snapshot"), dict)
+            and isinstance(archive["snapshot"].get("attachments"), list)
+            and bool(archive["snapshot"]["attachments"])
+            for archive in archives if isinstance(archive, dict)
+        )
+        attachment_access_allowed = (
+            state.get("status") in {"testing", "succeeded", "failed"}
+            or has_evidence_history
+        )
         render_state.update(
             evidence_enabled=bool(backend_ready and attachment_access_allowed),
             browser_upload_ready=bool(browser_upload_ready),
@@ -3938,8 +4133,11 @@ class DeployController:
                     self.config, repo, pr_number, snapshot["head_sha"], archive["round_id"],
                     purpose=DOWNLOAD_PURPOSE, resource="log:" + archive["round_id"],
                 )
-            snapshot["deployments"] = self._enrich_deployments_for_render(snapshot.get("deployments", []))
-            snapshot_attachments = [r for r in latest.values() if r["round_id"] == archive["round_id"]][-10:]
+            snapshot["deployments"] = self._enrich_deployments_for_render(
+                snapshot.get("deployments", []), historical=True,
+            )
+            snapshot_attachments = [r for r in latest.values()
+                                    if r["round_id"] == archive["round_id"]]
             snapshot["attachments"] = (await bind_download_capabilities(
                 snapshot_attachments, snapshot["head_sha"], archive["round_id"],
             ) if backend_ready and attachment_access_allowed else snapshot_attachments)
@@ -4011,6 +4209,8 @@ class DeployController:
         expected_record_test_state: dict | None = None,
         expected_terminal_state: dict | None = None,
         expected_record_test_comment: dict | None = None,
+        expected_acceptance_state: dict | None = None,
+        expected_acceptance_comment: dict | None = None,
         evidence_projection_only: bool = False,
     ) -> bool:
         """Write lifecycle comment with automatic history management.
@@ -4038,6 +4238,52 @@ class DeployController:
                         expected_comment=expected_record_test_comment,
                     )
                     if fresh is None:
+                        return False
+                if expected_acceptance_state is not None:
+                    fresh_pr = await self.proxy.get_pr(repo, pr_number)
+                    fresh_state = await self.proxy.read_hidden_state(repo, pr_number)
+                    expected_comment_id = expected_acceptance_comment.get("id")
+                    fresh_command_comment = await self.proxy.get_comment(
+                        repo, expected_comment_id,
+                    )
+                    expected_user = expected_acceptance_comment.get("user", {})
+                    fresh_user = (fresh_command_comment.get("user", {})
+                                  if isinstance(fresh_command_comment, dict) else {})
+                    fresh_base = (fresh_pr.get("base", {})
+                                  if isinstance(fresh_pr, dict) else {})
+                    fresh_base_repo = (fresh_base.get("repo", {})
+                                       if isinstance(fresh_base, dict) else {})
+                    fresh_base_name = (fresh_base_repo.get("full_name", "")
+                                       if isinstance(fresh_base_repo, dict) else "")
+                    from .commands import parse_command
+                    fresh_command = parse_command(
+                        fresh_command_comment.get("body", "")
+                        if isinstance(fresh_command_comment, dict) else ""
+                    )
+                    fresh_pr_head = (fresh_pr.get("head", {}).get("sha", "")
+                                     if isinstance(fresh_pr, dict) else "")
+                    api_base = self.config.github_api_url.rstrip("/")
+                    if (not isinstance(fresh_pr, dict)
+                            or fresh_pr.get("state") != "open"
+                            or fresh_pr.get("merged") or fresh_pr.get("draft")
+                            or not isinstance(fresh_base_name, str)
+                            or fresh_base_name.casefold() != repo.casefold()
+                            or fresh_pr_head != expected_acceptance_state.get("head_sha")
+                            or fresh_state != expected_acceptance_state
+                            or not isinstance(fresh_command_comment, dict)
+                            or not isinstance(fresh_user, dict)
+                            or fresh_command_comment.get("id") != expected_comment_id
+                            or fresh_command_comment.get("url")
+                            != f"{api_base}/repos/{repo}/issues/comments/{expected_comment_id}"
+                            or fresh_command_comment.get("issue_url")
+                            != f"{api_base}/repos/{repo}/issues/{pr_number}"
+                            or fresh_command_comment.get("body") != expected_acceptance_comment.get("body")
+                            or fresh_command_comment.get("created_at") != expected_acceptance_comment.get("created_at")
+                            or fresh_command_comment.get("updated_at") != expected_acceptance_comment.get("updated_at")
+                            or fresh_user.get("id") != expected_user.get("id")
+                            or fresh_user.get("login") != expected_user.get("login")
+                            or fresh_command.kind != "request_acceptance"
+                            or self.proxy.is_bot_comment(fresh_command_comment)):
                         return False
                 if expected_terminal_state is not None:
                     pr = await self.proxy.get_pr(repo, pr_number)
@@ -4128,6 +4374,7 @@ class DeployController:
                 if head_changed or (lost_fields and not round_changed):
                     state["round_id"] = make_round_id(state["head_sha"], state.get("command", {}).get("comment_id", 0))
                     state["round_started_at"] = utc_now()
+                    state.pop("acceptance_request", None)
             if "round_started_at" not in state and old.get("round_started_at") and not head_changed and not round_changed:
                 state["round_started_at"] = old["round_started_at"]
         if comment is None:
@@ -4224,13 +4471,34 @@ class DeployController:
         if incoming:
             new_block = _build_history_block(incoming)
             if history_block:
-                history_block = (new_block[:-len(VISIBLE_HISTORY_END_MARKER)]
-                                 + history_block[len(VISIBLE_HISTORY_START_MARKER):])
+                def event_content(block):
+                    content = block[
+                        len(VISIBLE_HISTORY_START_MARKER):
+                        -len(VISIBLE_HISTORY_END_MARKER)
+                    ].strip("\n")
+                    summary = "<details>\n<summary>History · 历史事件</summary>\n\n"
+                    if content.startswith(summary):
+                        content = content[len(summary):]
+                        closing = "\n\n</details>"
+                        if content.endswith(closing):
+                            content = content[:-len(closing)]
+                    return content
+
+                new_events_body = event_content(new_block).rstrip("\n")
+                old_events_body = event_content(history_block).lstrip("\n")
+                history_block = (
+                    VISIBLE_HISTORY_START_MARKER
+                    + "\n<details>\n<summary>History · 历史事件</summary>\n\n"
+                    + new_events_body
+                    + ("\n\n" + old_events_body if old_events_body else "")
+                    + "\n\n</details>\n"
+                    + VISIBLE_HISTORY_END_MARKER
+                )
             else:
                 history_block = new_block
         final_visible = new_visible_markdown.rstrip()
         if history_block:
-            final_visible += "\n\n### History\n\n" + history_block + "\n"
+            final_visible += "\n\n" + history_block + "\n"
         elif not incoming:
             # Older terminal comments can have an unmarked History section.
             old_history = re.search(r"(?ms)^### History[ \t]*\n.*?(?=^### |\Z)", existing_visible)
@@ -4336,6 +4604,7 @@ class DeployController:
         state["round_id"] = make_round_id(
             new_head, comment_id,
         )
+        state.pop("acceptance_request", None)
         state["round_started_at"] = utc_now()
         state["review_evidence"] = {}
         state["components"] = []
@@ -4400,6 +4669,7 @@ class DeployController:
             state["round_id"] = make_round_id(head_sha, comment_id)
             state["round_started_at"] = utc_now()
             state["round_archive"] = archived
+            state.pop("acceptance_request", None)
         state["review_evidence"] = {}
         state["components"] = []
         state["deployments"] = []
@@ -4559,7 +4829,17 @@ class DeployController:
             # case_results as history, but never launch automated Cases here.
             if state.get("status") == "testing":
                 try:
-                    await self.proxy.project_status_label(repo, pr_number, "testing")
+                    acceptance = state.get("acceptance_request")
+                    pending_acceptance = (
+                        isinstance(acceptance, dict)
+                        and acceptance.get("status") == "pending"
+                        and acceptance.get("head_sha") == state.get("head_sha")
+                        and acceptance.get("round_id") == round_id_for_state(state)
+                    )
+                    await self.proxy.project_status_label(
+                        repo, pr_number,
+                        "acceptance-required" if pending_acceptance else "testing",
+                    )
                 except Exception as e:
                     logger.warning(
                         "reconcile label projection %s#%s: %s", repo, pr_number, e,
@@ -4966,6 +5246,7 @@ class DeployController:
             component["image_ref"] = image_ref
             refreshed_state["deployments"].append({
                 "machine": machine_alias,
+                "ip": machine.node_host,
                 "component_ids": [component["component_id"]],
                 "phase": "deployed",
             })
@@ -4983,6 +5264,7 @@ class DeployController:
         all_ids = {c["component_id"] for c in refreshed_state.get("components", [])}
         if all_ids and all_ids == _component_id_set(refreshed_state.get("deployments", [])):
             refreshed_state["status"] = "testing"
+            refreshed_state.pop("acceptance_request", None)
         return not unresolved
 
     async def _recover_uncertain_deployment_tick(
@@ -5100,6 +5382,7 @@ class DeployController:
             state["status"] = "review-required"
             state["round_id"] = make_round_id(current_head, comment_id)
             state["round_started_at"] = utc_now()
+            state.pop("acceptance_request", None)
             state["review_evidence"] = {}
             state["components"] = []
             state["deployments"] = []
@@ -5369,6 +5652,7 @@ class DeployController:
             build_id = review_evidence_data.get("build_comment_id") or comment_id
             updated_state["round_id"] = make_round_id(current_head, build_id)
             updated_state["round_started_at"] = utc_now()
+            updated_state.pop("acceptance_request", None)
         if not snapshot_reset and not await self._recover_uncertain_deployments(state, updated_state):
             logger.warning("uncertain deployment remains pending; refusing repeated POST %s#%s", repo, pr_number)
             return "uncertain"
@@ -5647,6 +5931,11 @@ class DeployController:
             return await self.handle_record_test(
                 repo, pr_number, comment_id,
                 result, summary, author_login, author_id,
+            )
+
+        if cmd.kind == "request_acceptance":
+            return await self.handle_request_acceptance(
+                repo, pr_number, comment_id, author_login, author_id,
             )
 
         if cmd.kind == "deploy_status":

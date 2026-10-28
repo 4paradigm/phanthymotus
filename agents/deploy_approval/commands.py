@@ -8,6 +8,7 @@ Commands are public:
   - ``/request_deploy`` — PR Author requests a deployment (ZERO parameters)
   - ``/approve_deploy`` — Machine Owner approves a deployment
   - ``/record_test`` — Machine Owner records test result (no machine=)
+  - ``/request_acceptance`` — Machine Owner requests independent acceptance
   - ``/evidence_link`` — Read-only short-lived evidence download link
   - ``/deploy_status`` — Read-only status query
   - ``/deploy_help`` — Help for commands
@@ -27,6 +28,7 @@ CommandKind = Literal[
     "request_deploy",
     "approve_deploy",
     "record_test",
+    "request_acceptance",
     "evidence_link",
     "deploy_status",
     "deploy_help",
@@ -56,6 +58,7 @@ _KNOWN = {
     "request_deploy",
     "approve_deploy",
     "record_test",
+    "request_acceptance",
     "evidence_link",
     "deploy_status",
     "deploy_help",
@@ -90,6 +93,7 @@ _ALLOWED_KV = {
     "request_deploy": frozenset(),        # ZERO parameters
     "approve_deploy": frozenset({"machine"}),
     "record_test": frozenset({"result", "summary"}),
+    "request_acceptance": frozenset(),
     "evidence_link": frozenset({"id"}),
     "deploy_status": frozenset(),
     "deploy_help": frozenset(),
@@ -247,6 +251,10 @@ def parse_command(comment_text: str) -> ParsedCommand:
             if positional:
                 continue
             return ParsedCommand(kind="request_deploy", raw=raw_line.strip())
+        if name == "request_acceptance":
+            if positional or kv:
+                continue
+            return ParsedCommand(kind="request_acceptance", raw=raw_line.strip())
         return _build_command(name, positional, kv, tokens[1:])
     return ParsedCommand(kind="unknown", raw="")
 

@@ -228,7 +228,10 @@ async def _trusted_summary_page_capability(request, repo, pr):
     except Exception:
         raise HTTPException(503, detail='evidence_state_unavailable') from None
     if (not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)
-            or state.get('status') not in {'testing', 'succeeded', 'failed'}):
+            or state.get('status') not in {
+                'review-required', 'reviewing', 'deploy-ready', 'deploy-requested',
+                'deploying', 'testing', 'succeeded', 'failed',
+            }):
         return None
     pr_head = current_pr.get('head')
     pr_head_sha = pr_head.get('sha') if isinstance(pr_head, dict) else None
@@ -278,13 +281,14 @@ async def _trusted_summary_page_capability(request, repo, pr):
                 or claims.get('round') != round_id):
             continue
         if is_upload:
-            if (state.get('status') != 'testing'
-                    or pr_head_sha != head
-                    or claims.get('status') != 'testing'):
+            # A bare URL is never upgraded to the bearer upload invitation.
+            # The explicit Summary URL can bind that invite; URL recovery only
+            # restores read-only history access.
+            if (state.get('status') != 'testing' or pr_head_sha != head
+                    or current_pr.get('state') != 'open' or current_pr.get('merged')
+                    or current_pr.get('draft') or claims.get('status') != 'testing'):
                 continue
-            # Reuse the invitation already published by the trusted Summary;
-            # never mint or broaden an upload capability here.
-            return token
+            continue
         if page_capability is None:
             page_capability = token
     if page_capability:
@@ -326,6 +330,12 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     payload = await _payload(request, action, **path)
     claims = principal.get('capability') or principal.get('upload_invite') or {
         'head': payload.get('head_sha'), 'round': payload.get('round_id')}
+    if action == 'context':
+        # The page capability selects the current round or a specific archived
+        # round. The EvidenceService still validates that binding against the
+        # trusted lifecycle snapshot before returning any records.
+        payload.setdefault('head_sha', claims.get('head'))
+        payload.setdefault('round_id', claims.get('round'))
     if 'upload_id' in payload:
         # The public upload handle is A's durable operation identity, rather
         # than an unauthenticated client-selected COS UploadId.
@@ -397,8 +407,12 @@ async def _dispatch(request, owner, repo, pr, action, **path):
                 item = dict(row)
                 head = item.get('head_sha')
                 round_value = item.get('round_id')
-                if (isinstance(head, str) and isinstance(round_value, str)
-                        and head == round_value.rsplit('-', 1)[0]
+                digest = item.get('sha256')
+                if (item.get('status') == 'ready' and not item.get('deleted_at')
+                        and isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest)
+                        and isinstance(head, str) and re.fullmatch(r'[0-9a-f]{40}', head)
+                        and isinstance(round_value, str)
+                        and re.fullmatch(re.escape(head) + r'-[0-9]+', round_value)
                         and isinstance(item.get('attachment_id'), str)
                         and _ID.fullmatch(item['attachment_id'])):
                     item['download_capability'] = issue_capability(
@@ -413,7 +427,9 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         rounds = []
         for row in result.get('rounds', []):
             round_value = {**{k: v for k, v in row.items() if k in {
-                'head_sha', 'round_id', 'round_number', 'status', 'created_at', 'started_at', 'ended_at', 'archived_at'}},
+                'head_sha', 'round_id', 'round_number', 'status', 'created_at', 'started_at',
+                'round_started_at', 'ended_at', 'archived_at', 'acceptance_pending',
+                'display_deployments'}},
                 'attachments': scoped(row.get('attachments', [])),
                 'log_available': bool(row.get('cos', {}).get('object_key'))}
             head, round_id = round_value.get('head_sha'), round_value.get('round_id')

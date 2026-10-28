@@ -31,6 +31,7 @@ import hashlib
 import logging
 import re
 import time
+from datetime import datetime
 from urllib.parse import parse_qs, urlsplit
 from typing import Any
 
@@ -51,6 +52,7 @@ _ALLOWED_STATUS_LABELS = frozenset({
     "status: deploy-ready",
     "status: deploy-requested",
     "status: testing",
+    "status: acceptance-required",
     "status: succeeded",
     "status: failed",
 })
@@ -247,6 +249,7 @@ def _validate_hidden_state(data: dict) -> dict:
         "approve_attempts_truncated",
         "case_results", "test_result", "cos", "command", "last_processed_comment_id",
         "round_id", "round_started_at", "round_archive",
+        "acceptance_request",
     }
     extra_keys = set(data.keys()) - allowed_keys
     if extra_keys:
@@ -281,6 +284,63 @@ def _validate_hidden_state(data: dict) -> dict:
                 or not re.fullmatch(r"[0-9a-f]{40}-[0-9]+", link["round_id"])
                 or not isinstance(link["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", link["sha256"]))):
             raise MalformedHiddenStateError("invalid round_archive")
+
+    if "acceptance_request" in data:
+        request = data["acceptance_request"]
+        base_fields = {
+            "head_sha", "round_id", "status", "requested_by",
+            "requested_by_id", "comment_id", "requested_at",
+        }
+        completed_fields = base_fields | {
+            "accepted_by", "accepted_by_id", "acceptance_comment_id",
+            "accepted_at", "result", "summary",
+        }
+        if (not isinstance(request, dict)
+                or request.get("status") not in {"pending", "completed"}
+                or set(request) != (base_fields if request.get("status") == "pending"
+                                    else completed_fields)
+                or request.get("head_sha") != data.get("head_sha")
+                or request.get("round_id") != data.get("round_id")
+                or request.get("status") == "pending" and data.get("status") != "testing"
+                or request.get("status") == "completed"
+                and data.get("status") not in {"succeeded", "failed"}):
+            raise MalformedHiddenStateError("invalid acceptance_request")
+
+        def valid_login(value):
+            return (isinstance(value, str)
+                    and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", value)
+                    is not None)
+
+        def valid_timestamp(value):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return isinstance(value, str) and parsed.utcoffset() is not None
+            except (AttributeError, TypeError, ValueError):
+                return False
+
+        if (not valid_login(request.get("requested_by"))
+                or type(request.get("requested_by_id")) is not int
+                or request["requested_by_id"] <= 0
+                or type(request.get("comment_id")) is not int
+                or request["comment_id"] <= 0
+                or not valid_timestamp(request.get("requested_at"))):
+            raise MalformedHiddenStateError("invalid acceptance_request identity")
+        if request.get("status") == "completed":
+            if (not valid_login(request.get("accepted_by"))
+                    or type(request.get("accepted_by_id")) is not int
+                    or request["accepted_by_id"] <= 0
+                    or request["accepted_by_id"] == request["requested_by_id"]
+                    or request["accepted_by"].casefold() == request["requested_by"].casefold()
+                    or type(request.get("acceptance_comment_id")) is not int
+                    or request["acceptance_comment_id"] <= 0
+                    or request["acceptance_comment_id"] <= request["comment_id"]
+                    or not valid_timestamp(request.get("accepted_at"))
+                    or request.get("result") not in {"pass", "fail"}
+                    or request.get("result") != data.get("test_result")
+                    or data.get("status") != ("succeeded" if request.get("result") == "pass" else "failed")
+                    or not isinstance(request.get("summary"), str)
+                    or len(request["summary"]) > 5000):
+                raise MalformedHiddenStateError("invalid acceptance_request completion")
 
     # Explicitly reject unbounded history fields — history must persist
     # in visible markdown only, never in hidden JSON state.
@@ -375,11 +435,18 @@ def _validate_hidden_state(data: dict) -> dict:
     for dep in deployments:
         if not isinstance(dep, dict):
             raise MalformedHiddenStateError("deployment must be a dict")
-        if set(dep.keys()) != {"machine", "component_ids", "phase"}:
+        if set(dep.keys()) not in (
+                {"machine", "component_ids", "phase"},
+                {"machine", "component_ids", "phase", "ip"}):
             raise MalformedHiddenStateError("deployment keys must match the canonical schema")
         machine = dep.get("machine", "")
         if not isinstance(machine, str) or not machine:
             raise MalformedHiddenStateError("deployment must have non-empty machine")
+        if "ip" in dep and (
+                not isinstance(dep["ip"], str) or not dep["ip"]
+                or len(dep["ip"]) > 255
+                or any(ord(char) < 33 or ord(char) == 127 for char in dep["ip"])):
+            raise MalformedHiddenStateError("deployment.ip must be a bounded host value")
         if dep.get("phase") != "deployed":
             raise MalformedHiddenStateError(f"invalid deployment phase: {dep.get('phase')!r}")
         cids = dep.get("component_ids", [])
@@ -594,7 +661,7 @@ def _validate_hidden_state(data: dict) -> dict:
     comment_id = command.get("comment_id", -1)
     if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id < 0:
         raise MalformedHiddenStateError("command.comment_id must be a non-negative int")
-    if command.get("kind", "") not in {"", "request_deploy", "approve_deploy", "record_test", "deploy_status", "deploy_help"}:
+    if command.get("kind", "") not in {"", "request_deploy", "approve_deploy", "request_acceptance", "record_test", "deploy_status", "deploy_help"}:
         raise MalformedHiddenStateError(f"command.kind invalid: {command.get('kind')!r}")
     if command.get("phase") not in {"completed", "executing", "uncertain"}:
         raise MalformedHiddenStateError(f"command.phase invalid: {command.get('phase')!r}")
@@ -611,6 +678,12 @@ def _validate_hidden_state(data: dict) -> dict:
     last_processed = data.get("last_processed_comment_id")
     if isinstance(last_processed, bool) or not isinstance(last_processed, int) or last_processed < 0:
         raise MalformedHiddenStateError("last_processed_comment_id must be a non-negative int")
+    acceptance_request = data.get("acceptance_request")
+    if (isinstance(acceptance_request, dict)
+            and (acceptance_request["comment_id"] > last_processed
+                 or acceptance_request.get("status") == "completed"
+                 and acceptance_request["acceptance_comment_id"] > last_processed)):
+        raise MalformedHiddenStateError("acceptance_request comments exceed the persisted cursor")
 
     if status in {"deploy-ready", "deploy-requested", "testing", "succeeded", "failed"}:
         if not review_evidence:
@@ -720,8 +793,13 @@ def _parse_visible_history(body: str) -> tuple[str, list[dict]]:
 
 
 def _build_history_block(events: list[dict]) -> str:
-    """Build the generated visible history section string."""
-    lines = [VISIBLE_HISTORY_START_MARKER]
+    """Build the generated history block, folded by default in GitHub."""
+    lines = [
+        VISIBLE_HISTORY_START_MARKER,
+        "<details>",
+        "<summary>History · 历史事件</summary>",
+        "",
+    ]
     for evt in events:
         ts = evt.get("timestamp", beijing_now_str())
         title = evt.get("event", "Event")
@@ -751,7 +829,7 @@ def _build_history_block(events: list[dict]) -> str:
             lines.append("")
         lines.append(HISTORY_EVENT_DELIMITER)
         lines.append("")
-    lines.append(VISIBLE_HISTORY_END_MARKER)
+    lines.extend(["</details>", VISIBLE_HISTORY_END_MARKER])
     return "\n".join(lines)
 
 
@@ -769,7 +847,10 @@ def _insert_history_into_visible(visible: str, event: dict) -> str:
         new_events = [event] + existing_events
         new_history = _build_history_block(new_events)
         # Replace existing history section
-        before_history = visible[:start]
+        before_history = re.sub(
+            r"(?:^|\n)#{2,6}[ \t]+History[ \t]*\n[ \t]*$", "\n",
+            visible[:start], flags=re.IGNORECASE,
+        )
         after_history = visible[end + len(VISIBLE_HISTORY_END_MARKER):]
         return before_history + new_history + after_history
     else:
@@ -777,7 +858,7 @@ def _insert_history_into_visible(visible: str, event: dict) -> str:
         existing_events: list[dict] = []
         new_events = [event] + existing_events
         new_history = _build_history_block(new_events)
-        return visible.rstrip() + "\n\n### History\n\n" + new_history + "\n"
+        return visible.rstrip() + "\n\n" + new_history + "\n"
 
 
 

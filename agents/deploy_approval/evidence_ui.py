@@ -90,6 +90,14 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 .history-record{{margin:10px 0;padding:14px;border:1px solid #e5e5ea;border-radius:12px}}
 .history-record summary{{overflow-wrap:anywhere}}
 .history-record ul{{list-style:none;margin:12px 0 0;padding:0}}
+.history-section-summary{{cursor:pointer;font-size:20px;font-weight:600}}
+.round-facts{{margin:8px 0 16px;color:#424245}}
+.round-facts p{{margin:3px 0;overflow-wrap:anywhere}}
+.deployment-table-wrap{{margin:12px 0;overflow-x:auto;border:1px solid #e5e5ea;border-radius:10px}}
+.deployment-table{{width:100%;border-collapse:collapse;font-size:13px}}
+.deployment-table th,.deployment-table td{{padding:8px 10px;border-bottom:1px solid #e5e5ea;text-align:left;vertical-align:top;overflow-wrap:anywhere}}
+.deployment-table th{{background:#f5f5f7;color:#424245;white-space:nowrap}}
+.deployment-table tr:last-child td{{border-bottom:0}}
 .history-links{{margin-top:12px}}
 .history-links a{{color:#06c}}
 [hidden]{{display:none!important}}
@@ -113,6 +121,7 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 <p class="subtitle">{esc(repo)} · PR #{esc(pr_number)}</p></div></header>
 <p id="message" role="status" aria-live="polite"></p>
 <section id="current-section" class="panel" hidden><div class="section-heading"><h2 id="round-title">附件</h2><p id="summary" class="muted">当前轮附件与说明。</p></div>
+<div class="round-facts"><p id="round-head"></p><p id="round-status"></p><p id="round-time"></p></div><div id="current-deployments"></div>
 <fieldset id="writes" disabled hidden><legend>上传附件</legend>
 <label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
 <div class="secondary"><div class="secondary-fields">
@@ -124,7 +133,7 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 <h3 class="list-heading" id="queue-heading" hidden>上传进度</h3><ul id="queue" class="queue" aria-labelledby="queue-heading" aria-live="polite"></ul>
 <h3 class="list-heading" id="attachments-heading">附件</h3><ul id="attachments" class="attachments" aria-labelledby="attachments-heading"></ul>
 </section>
-<section id="history-section" class="panel" hidden><h2>历史轮次</h2><div id="history"></div></section>
+<details id="history-section" class="panel" hidden><summary class="history-section-summary">历史轮次</summary><div id="history"></div></details>
 </main></body></html>'''
 
 
@@ -322,6 +331,10 @@ _JAVASCRIPT = r'''"use strict";
     const write = method !== "GET";
     if (write && !writable()) throw new Error("当前轮不可写，请刷新并核对 HEAD/round。");
     const target = new URL(api + path, window.location.href);
+    if (path === "/context") {
+      target.searchParams.set("head_sha", bound.head_sha);
+      target.searchParams.set("round_id", bound.round_id);
+    }
     if (target.origin !== window.location.origin) throw new Error("拒绝跨站 Evidence 请求。");
     const headers = evidenceRequestHeaders(target, method, authMode);
     if (write) headers["Content-Type"] = "application/json";
@@ -691,7 +704,7 @@ _JAVASCRIPT = r'''"use strict";
       const actions = document.createElement("div");
       actions.className = "attachment-actions";
       const url = deleted ? "" : attachmentDownloadUrl(item);
-      if (url && kind !== "video") {
+      if (url) {
         actions.append(anchor("下载", "/attachments/" + id(item.attachment_id || item.id) +
           "/download?cap=" + encodeURIComponent(item.download_capability)));
       }
@@ -710,19 +723,54 @@ _JAVASCRIPT = r'''"use strict";
       parent.append(li);
     }
   }
+  function deploymentList(rows, parent, headSha) {
+    parent.replaceChildren();
+    if (!Array.isArray(rows) || !rows.length) return;
+    const heading = document.createElement("h3"); heading.className = "list-heading";
+    heading.textContent = headSha
+      ? "部署记录 · 镜像对应 Commit：" + String(headSha)
+      : "部署记录";
+    parent.append(heading);
+    const wrap = document.createElement("div"), table = document.createElement("table");
+    wrap.className = "deployment-table-wrap"; table.className = "deployment-table";
+    const labels = ["Machine", "IP", "Component", "Variant/Path", "Image", "Result"];
+    const thead = document.createElement("thead"), headerRow = document.createElement("tr");
+    for (const label of labels) {
+      const cell = document.createElement("th"); cell.scope = "col";
+      cell.textContent = label; headerRow.append(cell);
+    }
+    thead.append(headerRow); table.append(thead);
+    const body = document.createElement("tbody");
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const tr = document.createElement("tr");
+      for (const value of [row.machine, row.ip, row.component, row.variant_path, row.image, row.result]) {
+        const cell = document.createElement("td");
+        cell.textContent = typeof value === "string" && value ? value : "—";
+        tr.append(cell);
+      }
+      body.append(tr);
+    }
+    table.append(body); wrap.append(table); parent.append(wrap);
+  }
   function render() {
     const state = typeof context.status === "string" ? context.status : "";
     const stageAvailable = ["testing", "succeeded", "failed"].includes(state);
+    const pageAvailable = ["review-required", "reviewing", "deploy-ready", "deploy-requested",
+      "deploying", "testing", "succeeded", "failed", "cancelled", "deployed"].includes(state);
     $("current-section").hidden = !stageAvailable;
     $("history-section").hidden = true;
     $("attachments").replaceChildren(); $("history").replaceChildren();
-    if (!stageAvailable) {
+    $("current-deployments").replaceChildren();
+    if (!pageAvailable) {
       $("writes").hidden = true; $("writes").disabled = true;
-      $("message").textContent = "";
+      $("current-section").hidden = true;
       controls();
       return;
     }
-    const oldRounds = (context.rounds || context.history || []).filter(round => !roundMatches(round));
+    const testStatuses = new Set(["testing", "succeeded", "failed"]);
+    const oldRounds = (context.rounds || context.history || []).filter(round =>
+      !roundMatches(round) && round && testStatuses.has(round.status));
     oldRounds.sort((a, b) => {
       const getTime = round => {
         const value = Date.parse(round && (round.archived_at || round.ended_at || round.round_started_at || round.started_at || round.created_at) || "");
@@ -732,18 +780,26 @@ _JAVASCRIPT = r'''"use strict";
     });
     const roundNumber = Number.isSafeInteger(context.round_number) && context.round_number > 0
       ? context.round_number : null;
-    $("round-title").textContent = (roundNumber ? "第 " + roundNumber + " 轮 · " : "当前轮 · ") + "附件";
-    $("summary").textContent = state === "testing" ?
-      (writable() ? "当前轮附件与说明；视频默认显示播放器。" :
-        "当前为查看模式。如需上传，请从 PR Summary 的「打开附件页」进入。") :
-      "本轮附件只读查看。";
+    if (stageAvailable) {
+      $("round-title").textContent = (roundNumber ? "第 " + roundNumber + " 轮 · " : "当前轮 · ") + "附件";
+      $("summary").textContent = state === "testing" && !writable()
+        ? "当前为查看模式。如需上传，请从 PR Summary 的「打开附件页」进入。"
+        : "本轮附件与说明。";
+      $("round-head").textContent = "Commit：" + String(context.head_sha || "—");
+      $("round-status").textContent = "状态：" +
+        (context.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(state));
+      $("round-time").textContent = "测试时间：" + formatDate(context.round_started_at, true);
+      deploymentList(context.display_deployments, $("current-deployments"), context.head_sha);
+    } else {
+      $("writes").hidden = true; $("writes").disabled = true;
+    }
     const replacement = $("replace").value;
     const replacementGroup = document.createElement("optgroup");
     replacementGroup.id = "replace-targets";
     replacementGroup.label = "替换指定附件（旧记录保留历史）";
     $("replace").replaceChildren(new Option("新增附件（保留已有附件）", ""), replacementGroup);
-    attachmentList(context.attachments || [], $("attachments"), true);
-    if (!$("attachments").childNodes.length) {
+    if (stageAvailable) attachmentList(context.attachments || [], $("attachments"), true);
+    if (stageAvailable && !$("attachments").childNodes.length) {
       const empty = document.createElement("li"); empty.className = "empty-state";
       empty.textContent = "本轮暂无附件；上传完成后会显示在这里。"; $("attachments").append(empty);
     }
@@ -767,7 +823,11 @@ _JAVASCRIPT = r'''"use strict";
       details.append(summary);
       content.className = "history-content";
       const status = document.createElement("p"); status.className = "muted";
-      status.textContent = "阶段：" + lifecycleLabel(round.status); content.append(status);
+      status.textContent = "Commit：" + String(round.head_sha || "—") + " · 状态：" +
+        (round.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(round.status)) +
+        " · 测试时间：" + (roundDate || "时间未知"); content.append(status);
+      const deploymentRows = document.createElement("div");
+      deploymentList(round.display_deployments, deploymentRows, round.head_sha); content.append(deploymentRows);
       if (hasAttachmentDetails) {
         const ul = document.createElement("ul"); attachmentList(round.attachments, ul, false); content.append(ul);
       } else {
