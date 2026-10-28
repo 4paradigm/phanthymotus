@@ -257,10 +257,12 @@ _JAVASCRIPT = r'''"use strict";
       button.disabled = !canWrite || (busy && button.dataset.jobAction !== "pause");
     for (const button of document.querySelectorAll("button[data-delete]")) button.disabled = busy || !canWrite;
   }
-  function abortRequest(request) { try { request.abort(); } catch (_) {} }
+  function abortRequest(request, reason = "stopped") {
+    try { request._evidenceAbortReason = reason; request.abort(); } catch (_) {}
+  }
   function halt(text) {
     stopped = true;
-    for (const request of active) abortRequest(request);
+    for (const request of active) abortRequest(request, "halt");
     controls(); message(text);
   }
   class ApiError extends Error {
@@ -270,7 +272,25 @@ _JAVASCRIPT = r'''"use strict";
     proofSecret = "";
     try { sessionStorage.removeItem(proofKey); } catch (_) {}
   }
-  async function request(path, {method = "GET", body, key, job, timeoutMs = 30000, authMode = "auto"} = {}) {
+  function requestStage(path, method) {
+    if (path === "/context") return "验证 PR 与 HEAD/round";
+    if (path === "/uploads" && method === "POST") return "初始化上传";
+    if (path === "/notes") return "保存备注";
+    if (/\/resume$/.test(path)) return "恢复上传";
+    if (/\/complete$/.test(path)) return "提交 COS 校验";
+    if (/\/parts\/\d+\/url$/.test(path)) return "获取分片签名";
+    if (/\/uploads\/[^/]+$/.test(path)) return "查询 COS 分片状态";
+    return method === "GET" ? "查询附件状态" : "保存附件记录";
+  }
+  function requestTimeout(path, method) {
+    if (path === "/context") return 20000;
+    if (path === "/uploads" && method === "POST" || /\/resume$/.test(path) ||
+        path === "/notes") return 60000;
+    if (/\/complete$/.test(path)) return 120000;
+    if (/\/parts\/\d+\/url$/.test(path)) return 30000;
+    return 20000;
+  }
+  async function request(path, {method = "GET", body, key, job, timeoutMs, authMode = "auto"} = {}) {
     const write = method !== "GET";
     if (write && !writable()) throw new Error("当前轮不可写，请刷新并核对 HEAD/round。");
     const target = new URL(api + path, window.location.href);
@@ -288,8 +308,15 @@ _JAVASCRIPT = r'''"use strict";
       throw new Error("当前链接没有有效上传授权，或请求不是安全的同源 HTTPS 请求。");
     }
     if (write) headers["Content-Type"] = "application/json";
+    const stage = requestStage(path, method), boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? timeoutMs : requestTimeout(path, method);
+    if (job) {
+      job.statusText = stage;
+      job.detailNode.textContent = stage + "…";
+    }
     const controller = new AbortController(); active.add(controller); if (job) job.requests.add(controller);
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, boundedTimeoutMs);
     try {
       const response = await fetch(target.href, {
         method, headers, credentials: "same-origin", redirect: "error", cache: "no-store", signal: controller.signal,
@@ -315,6 +342,22 @@ _JAVASCRIPT = r'''"use strict";
         throw new ApiError(response.status, response.status + ": " + (detail || response.statusText), detail);
       }
       return value;
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      if (job && job.paused || controller._evidenceAbortReason === "paused")
+        throw new Error("已暂停；继续前会先查询服务端上传状态。");
+      if (controller._evidenceAbortReason === "halt")
+        throw new Error("HEAD/round 或权限状态已变化，写入已停止。");
+      const seconds = Math.ceil(boundedTimeoutMs / 1000);
+      if (timedOut)
+        throw new ApiError(0, stage + "超时（" + seconds + " 秒）；" +
+          (write ? "操作结果未知，重试前会先查询服务端状态。" : "尚未取得服务端确认，请稍后重试。"));
+      if (error && error.name === "AbortError")
+        throw new Error("请求已停止；继续前会先查询服务端上传状态。");
+      if (error instanceof TypeError || error && error.name === "NetworkError")
+        throw new ApiError(0, stage + "网络中断；" +
+          (write ? "操作结果未知，重试前会先查询服务端状态。" : "请检查连接后重试。"));
+      throw error;
     } finally { clearTimeout(timeout); active.delete(controller); if (job) job.requests.delete(controller); }
   }
   function trustedCosPartUrl(signed) {
@@ -331,20 +374,29 @@ _JAVASCRIPT = r'''"use strict";
   function monitorUploadContext(job) {
     let monitor = job.contextMonitor;
     if (!monitor) {
-      monitor = {users: 0, checking: false, timer: null};
+      monitor = {users: 0, checking: false, failures: 0, timer: null};
       job.contextMonitor = monitor;
       monitor.timer = setInterval(async () => {
         if (!monitor.users || monitor.checking || job.paused || stopped) return;
         monitor.checking = true;
         try {
-          const latest = await refresh(job, 5000);
+          const latest = await refresh(job, 12000);
+          monitor.failures = 0;
           if (!job.paused && (!latest || !roundMatches(latest) || !writable()))
             halt("PR 或 HEAD/round 状态已变化，已中止 COS 直传。请刷新当前 PR Summary。");
-        } catch (_) {
-          if (!job.paused && !stopped)
-            halt("上传期间无法确认 PR 与 HEAD/round 状态，已中止 COS 直传。");
+        } catch (error) {
+          if (job.paused || stopped) return;
+          monitor.failures++;
+          if (monitor.failures >= 3) {
+            job.paused = true;
+            for (const request of job.requests) abortRequest(request, "paused");
+            job.status = "paused";
+            job.pauseReason = "连续 3 次无法确认 PR 与 HEAD/round（最近失败：" +
+              (error && error.message || "网络暂时不可用") + "）；已安全暂停并保留续传记录。重试会先查询 COS 状态。";
+            updateJob(job, job.pauseReason);
+          }
         } finally { monitor.checking = false; }
-      }, 2000);
+      }, 15000);
     }
     monitor.users++;
     return () => {
@@ -381,9 +433,14 @@ _JAVASCRIPT = r'''"use strict";
           ? "COS 拒绝分片直传；请确认签名有效及 COS CORS 允许当前 HTTPS 来源。"
           : "COS 分片直传失败（HTTP " + xhr.status + "）。"));
       };
-      xhr.onerror = () => { cleanup(); reject(new Error("COS 直传被浏览器拦截或网络中断；请检查 COS CORS 配置。不会回退到 Controller 代理。")); };
-      xhr.ontimeout = () => { cleanup(); reject(new Error("COS 分片直传超时；将先查询 COS 分块状态再决定是否重试。")); };
-      xhr.onabort = () => { cleanup(); reject(new Error("上传已暂停。")); };
+      xhr.onerror = () => { cleanup(); reject(new Error("COS 分片网络中断，结果未知；将先查询 COS 分片状态再决定是否重试。若浏览器拦截请求，请检查 COS CORS。不会回退到 Controller 代理。")); };
+      xhr.ontimeout = () => { cleanup(); reject(new Error("COS 分片上传超时（120 秒），结果未知；将先查询 COS 分片状态再决定是否重试。")); };
+      xhr.onabort = () => {
+        cleanup();
+        reject(new Error(xhr._evidenceAbortReason === "halt"
+          ? "HEAD/round 或权限状态已变化，上传已停止。"
+          : "上传已暂停；继续前会先查询 COS 分片状态。"));
+      };
       xhr.send(blob);
     });
   }
@@ -673,7 +730,7 @@ _JAVASCRIPT = r'''"use strict";
     if ([...$("replace").options].some(o => o.value === replacement)) $("replace").value = replacement;
     controls();
   }
-  async function refresh(job, timeoutMs = 30000) {
+  async function refresh(job, timeoutMs = 20000) {
     let next, useProofFallback = false;
     try {
       // Let the browser's HttpOnly upload cookie authenticate first. An old
@@ -753,7 +810,8 @@ _JAVASCRIPT = r'''"use strict";
     job.actionButton.onclick = () => {
       if (job.running) {
         job.paused = true;
-        for (const request of job.requests) abortRequest(request);
+        job.pauseReason = "已暂停；继续前会重新查询 COS 状态。";
+        for (const request of job.requests) abortRequest(request, "paused");
         updateJob(job, "暂停中；续传前会重新查询 COS 状态。");
       } else if (!busy && job.status !== "succeeded") runSingle(job);
     };
@@ -983,6 +1041,8 @@ _JAVASCRIPT = r'''"use strict";
         let complete = false;
         for (let attempt = 0; attempt < 3 && !job.paused && !stopped; attempt++) {
           try {
+            job.statusText = "上传分片 " + number + "/" + count;
+            job.detailNode.textContent = job.statusText + "…";
             const signPath = "/uploads/" + id(job.uploadId) + "/parts/" + number + "/url";
             const signed = await request(signPath, {
               method: "POST", key: job.uploadId + ":sign:" + number + ":" + attempt, body: {}, job
@@ -1053,14 +1113,15 @@ _JAVASCRIPT = r'''"use strict";
   }
   async function processJob(job) {
     if (job.running || !writable()) return;
-    job.running = true; job.paused = false; job.status = "running"; updateJob(job, "处理中。"); controls();
+    job.running = true; job.paused = false; job.pauseReason = "";
+    job.status = "running"; updateJob(job, "处理中。"); controls();
     try {
       await uploadOne(job);
       if (job.status !== "succeeded") { job.status = "waiting"; updateJob(job, "等待 Summary 更新；重试会先查询 COS 状态。"); }
     } catch (error) {
-      if (job.paused) { job.status = "paused"; updateJob(job, "已暂停；重试前会查询 COS 状态。"); }
+      if (job.paused) { job.status = "paused"; updateJob(job, job.pauseReason || "已暂停；重试前会查询 COS 状态。"); }
       else if (!stopped) { job.status = "failed"; updateJob(job, "失败：" + (error.message || String(error))); }
-    } finally { job.running = false; controls(); }
+    } finally { job.running = false; updateJob(job); controls(); }
   }
   async function runSingle(job) {
     if (busy || stopped) return;
