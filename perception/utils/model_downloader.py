@@ -1064,26 +1064,36 @@ def _merge_tree(source: str, destination: str) -> None:
 #
 # Each archive carries the frontend the engines need, unpacked to the layout
 # frontend/release_paths.py expects: engines/<family>/*.plan, config.json,
-# frontend_data/, tn_cache/ (compiled WeText TN FSTs) and nltk_data/ (cmudict +
-# perceptron tagger — shipped precisely so the container never has to call
-# nltk.download() at runtime). Upstream is
-# modelscope.cn/models/Starlight777/VITS2-ZH-EN-Male-16k at revision
-# 14954122c4baf4e80b44436c4b2b167e38db4103; the runtime-required files of that
-# revision were repacked per family and mirrored to COS, so devices pull one
-# 60 MB file from the same host as every other model here. The fp32 ONNX graphs
-# the plans were built from are not included — they are build inputs, not
-# runtime files.
+# frontend_data/ (including external_lexicon.json, the compiled pronunciation
+# dictionary — see tools/vits2_prepare_external_lexicon.py), tn_cache/
+# (compiled WeText TN FSTs) and nltk_data/ (cmudict + perceptron tagger —
+# shipped precisely so the container never has to call nltk.download() at
+# runtime).
+#
+# The engines are the lc1_male_v6_frontend_146k release (PR #341), whose TN
+# graphs carry the business regression set the frontend's number/unit readers
+# were tuned against. Upstream is modelscope.cn/models/lanxijiang/TTSV4_Ch_Eng
+# at revision e67fccc9fa0c2bd8848dcf93221e18bb3fa4f205 (engines, TN) and
+# 275f343e89d9cef520c829e9fff3e950354b9b12 (dictionary); only the
+# runtime-required files were repacked per family and mirrored to COS, so
+# devices pull one ~60 MB file from the same host as every other model here.
+# The ONNX graphs, reference samples and smoke script in the upstream archives
+# are build inputs, not runtime files.
+#
+# The archive names carry "v6" so they never collide with the earlier
+# Starlight777 release: a robot upgrading from it re-verifies and re-extracts
+# over the same directory, which _merge_tree overwrites file by file.
 VITS2_MODEL_BASE = os.environ.get("VITS2_MODEL_BASE_URL", COS_BASE)
 VITS2_MODEL_ARCHIVES = {
     "jp61": {
-        "archive": "vits2-zh-en-male-16k-tensorrt-jp61-trt10.4-orin.tar.gz",
-        "size": 61834952,
-        "sha256": "f04ab439588cd3106ccd245f64af548199ba888d31627827c07ac28368225805",
+        "archive": "vits2-zh-en-male-16k-v6-tensorrt-jp61-trt10.4-orin.tar.gz",
+        "size": 60568382,
+        "sha256": "528c31640bd1ff360341559ee550cbd8057cd527b7ba8140a014e9fe20e639ca",
     },
     "jp511": {
-        "archive": "vits2-zh-en-male-16k-tensorrt-jp511-trt8.5-orin.tar.gz",
-        "size": 62994881,
-        "sha256": "01ffce0516f1a68f3fcedce6ff9caff784f428a1d09da2d760fcba599116e8c7",
+        "archive": "vits2-zh-en-male-16k-v6-tensorrt-jp511-trt8.5-orin.tar.gz",
+        "size": 62549149,
+        "sha256": "317c108357788e7e9d2c227348a72268866d169d25c9c9ee49eedc47d69ed191",
     },
 }
 

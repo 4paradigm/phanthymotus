@@ -25,6 +25,11 @@ def frontend_data_dir() -> Path:
     return _root() / "frontend_data"
 
 
+def frontend_lexicon_path() -> Path:
+    """The compiled pronunciation dictionary shipped in the release archive."""
+    return frontend_data_dir() / "external_lexicon.json"
+
+
 def nltk_data_dir() -> Path:
     """Return the verified release NLTK-data directory."""
     return _root() / "nltk_data"

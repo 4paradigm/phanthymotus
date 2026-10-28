@@ -477,7 +477,13 @@ class ToneSandhi:
             ):
                 finals[j] = finals[j][:-1] + "5"
         ge_idx = word.find("个")
-        if len(word) >= 1 and word[-1] in "吧呢啊呐噻嘛吖嗨呐哦哒额滴哩哟喽啰耶喔诶":
+        # Lexical 额 in 金额/余额/巨额 keeps its dictionary tone. It is
+        # different from a standalone interjection, which retains the legacy
+        # neutral reading. Use the existing POS rather than a sentence list.
+        lexical_e = (len(word) > 1 and word.endswith("额")
+                     and pos[:1] in {"n", "v", "a", "b", "d"})
+        if (len(word) >= 1 and word[-1] in "吧呢啊呐噻嘛吖嗨呐哦哒额滴哩哟喽啰耶喔诶"
+                and not lexical_e):
             finals[-1] = finals[-1][:-1] + "5"
         elif len(word) >= 1 and word[-1] in "的地得":
             finals[-1] = finals[-1][:-1] + "5"

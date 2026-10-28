@@ -72,15 +72,36 @@ class FstTextNormalizer:
         return kaldifst.TextNormalizer(self._verbalizer_path)
 
     def normalize(self, text: str) -> str:
-        """Normalize text with the release graph pair without fallback rewriting."""
+        """Run the release graphs while retaining literal 啊 character tokens."""
         if not text:
             return text
         tagged = self._tagger(text)
+        segments = []
         with self._token_parser_lock:
             original_escape = token_parser.escape_value
             try:
                 token_parser.escape_value = lambda value: value
-                reordered = token_parser.TokenParser("zh", "tn").reorder(tagged)
+                parser = token_parser.TokenParser("zh", "tn")
+                reordered = parser.reorder(tagged)
+                # The released verbalizer deletes 啊, even in "你好啊". Preserve
+                # only this literal char token after the complete input has been
+                # classified, so dates/numbers keep their original context.
+                # Other interjections and structured tokens retain graph behavior.
+                if "啊" in tagged:
+                    pending = []
+                    for token in parser.tokens:
+                        if token.name == "char" and token.members == {"value": "啊"}:
+                            if pending:
+                                segments.append((False, " ".join(pending)))
+                                pending = []
+                            segments.append((True, "啊"))
+                        else:
+                            pending.append(token.string(parser.orders))
+                    if segments and pending:
+                        segments.append((False, " ".join(pending)))
             finally:
                 token_parser.escape_value = original_escape
+        if segments:
+            return "".join(value if literal else self._verbalizer(value)
+                           for literal, value in segments)
         return self._verbalizer(reordered)

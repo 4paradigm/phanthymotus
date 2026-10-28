@@ -165,13 +165,15 @@ TOOLS = [
         "multiInstance": True,
         "description": "TTS — 把文本说出来（speak），或立即掐断正在说的话（interrupt）。"
                        "注意 stop 是停掉整个插件节点、不是停住这句话；"
-                       "要让机器人别说了用 interrupt。",
+                       "要让机器人别说了用 interrupt。"
+                       "support_language 返回当前引擎支持的语言代号。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "speak", "info", "config", "interrupt"],
+                    "enum": ["start", "stop", "speak", "info", "config", "interrupt",
+                             "support_language"],
                     "description": "Action to perform"
                 },
                 "input_topic": {
@@ -182,8 +184,35 @@ TOOLS = [
                     "type": "string",
                     "description": "Text to synthesize (required for action=speak)"
                 },
+                # vits2-zh-en only; every other engine ignores it. A plain string,
+                # not an enum: the canvas debug panel preselects an enum's first
+                # value, which would force a reading on every test speak instead of auto.
+                "reading_language": {
+                    "type": "string",
+                    "description": "Optional, action=speak, vits2-zh-en only. Leave empty: "
+                                   "the default, auto, reads numbers, dates, units and "
+                                   "symbols to match the sentence around them, which is "
+                                   "right for normal replies. Set zh or en only when the "
+                                   "user explicitly asks for numbers to be read in that "
+                                   "language. Valid codes: action=support_language"
+                },
             },
             "required": ["action"],
+            # Which fields the canvas card shows per action, and the per-action
+            # tools agent-core presents to the LLM (tts__speak, tts__interrupt,
+            # tts__support_language — the same split G1/R1's tts uses). Nothing
+            # routing-related is listed: instance_id comes from the canvas
+            # binding, and a value the LLM made up would override it.
+            "x-action-params": {
+                "speak": {"params": ["text", "reading_language"], "required": ["text"],
+                          "description": "Say this text"},
+                "interrupt": {"params": [],
+                              "description": "Stop what is being said now and drop "
+                                             "anything queued"},
+                "support_language": {"params": [],
+                                     "description": "List the language codes the "
+                                                    "current engine can speak"},
+            },
             "x-completion": {
                 "actions": ["speak"],
                 "timeout": 60,
@@ -2132,6 +2161,17 @@ DEFAULT_TTS_ENGINE = "vits2-zh-en"
 #
 # Language codes, not country codes: `zh`, not `cn`.
 TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi")
+# What each engine can speak, in the codes the rest of this file uses. Answered
+# by action=support_language straight from the facade: it is a property of the
+# engine, not of a loaded model, so it works while an engine is still loading.
+# For vits2-zh-en these are also the values speak's reading_language accepts
+# besides "auto"; kokoro-multi's are its tts_language setting.
+ENGINE_LANGUAGES = {
+    "vits2-zh-en": ("zh", "en"),
+    "matcha-zh-en": ("zh", "en"),
+    "mms-th": ("th",),
+    "kokoro-multi": KokoroTTSAdapter.LANGUAGES,
+}
 # Older spellings, still accepted. `vits2_trt` and `sherpa_onnx` are not
 # decoration: both are already persisted in ConfigDB rows and in config.yaml on
 # every deployed robot, and _select_engine raises on an unknown engine — so
@@ -2354,6 +2394,10 @@ class TTSPlugin:
         action = args.get("action") if name == "tts" else name
         if action == "config":
             return self._config(name, args)
+        if action == "support_language":
+            with self._lock:
+                engine = self._engine
+            return {"engine": engine, "languages": list(ENGINE_LANGUAGES[engine])}
 
         with self._lock:
             impl = self._impl

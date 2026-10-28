@@ -41,6 +41,7 @@ class _FakeAdapter(Vits2TensorRTAdapter):
     def __init__(self):
         self.speed = 1.0
         self.spoken = []
+        self.readings = []
         self.warmups = 0
 
     def set_speed(self, speed: float) -> None:
@@ -50,11 +51,12 @@ class _FakeAdapter(Vits2TensorRTAdapter):
         self.warmups += 1
         return 3200
 
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(self, text: str, reading_language=None) -> bytes:
         return b"".join(self.synthesize_stream(text))
 
-    def synthesize_stream(self, text: str):
+    def synthesize_stream(self, text: str, reading_language=None):
         self.spoken.append(text)
+        self.readings.append(reading_language)
         yield b"\x00\x01" * 8
 
 
@@ -361,7 +363,7 @@ def test_interrupt_still_drops_utterances_queued_before_it(monkeypatch, completi
     started = threading.Event()
     real_stream = adapter.synthesize_stream
 
-    def gated_stream(text):
+    def gated_stream(text, reading_language=None):
         if text == "第一句":
             started.set()
             assert gate.wait(10), "test never released the synthesis gate"
@@ -550,3 +552,159 @@ def test_info_while_loading_reports_the_pending_output_topic(monkeypatch):
     assert [t["topic"] for t in running["topic_out"]] == [
         "/remote_control/message/tts"
     ]
+
+
+# ── reading language ─────────────────────────────────────────────────────────
+#
+# The frontend's real language.prepare needs jieba, WeText and a model release,
+# none of which a laptop has, so these replace the module with a recorder. What
+# is under test is the plumbing: which preference reaches prepare, what it is
+# told about the previous utterance, and what reaches the adapter.
+
+@pytest.fixture
+def prepared(monkeypatch):
+    """Swap frontend.language for a recorder; returns its call log."""
+    import sys
+    import types
+
+    calls = []
+
+    def prepare(text, preference="auto", previous=None):
+        calls.append((text, preference, previous))
+        resolved = preference if preference in ("zh", "en") else "zh"
+        return f"<{text}>", (preference if preference != "auto" else ""), resolved
+
+    module = types.ModuleType("plugins.vits2_tts_trt.frontend.language")
+    module.prepare = prepare
+    monkeypatch.setitem(sys.modules, "plugins.vits2_tts_trt.frontend.language", module)
+    return calls
+
+
+def test_speak_reads_in_the_language_it_asks_for(monkeypatch, prepared):
+    plugin, executor, _ = _plugin(monkeypatch)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
+
+    plugin.dispatch("tts", {"action": "speak", "text": "2026 10/20",
+                            "reading_language": "en"})
+
+    assert _wait_until(lambda: _installed(plugin).spoken == ["<2026 10/20>"])
+    assert prepared[0][:2] == ("2026 10/20", "en")
+    assert _installed(plugin).readings == ["en"]
+
+
+def test_speak_without_a_language_reads_by_context(monkeypatch, prepared):
+    """There is no card setting: anything that does not ask for a reading —
+    on_notify, the input topic, an LLM that leaves the argument out — is auto."""
+    plugin, executor, state = _plugin(monkeypatch)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
+
+    plugin.dispatch("tts", {"action": "speak", "text": "一"})
+    # An empty argument is "not specified", which the canvas sends for a blank field.
+    plugin.dispatch("tts", {"action": "speak", "text": "二", "reading_language": ""})
+    # A reading_language left in a saved card config from before is ignored.
+    plugin.dispatch("tts", {"action": "config", "reading_language": "zh"})
+    plugin.dispatch("tts", {"action": "speak", "text": "三"})
+
+    assert _wait_until(lambda: len(prepared) == 3)
+    assert [call[1] for call in prepared] == ["auto", "auto", "auto"]
+    assert _installed(plugin).readings == ["", "", ""]
+    assert state["loads"] == 1
+
+
+def test_auto_is_told_the_previous_utterances_language(monkeypatch, prepared):
+    """A bare date after an English sentence should be read in English."""
+    plugin, executor, _ = _plugin(monkeypatch)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
+
+    plugin.dispatch("tts", {"action": "speak", "text": "a", "reading_language": "en"})
+    plugin.dispatch("tts", {"action": "speak", "text": "b"})
+
+    assert _wait_until(lambda: len(prepared) == 2)
+    assert prepared[0][2] is None
+    assert prepared[1] == ("b", "auto", "en")
+
+
+def test_unknown_reading_language_is_refused_before_queueing(monkeypatch, prepared):
+    plugin, executor, _ = _plugin(monkeypatch)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
+
+    with pytest.raises(ValueError, match="reading_language"):
+        plugin.dispatch("tts", {"action": "speak", "text": "x", "reading_language": "ja"})
+    time.sleep(0.2)
+    assert prepared == [] and _installed(plugin).spoken == []
+
+
+def test_a_failing_language_step_still_speaks_the_original_text(monkeypatch, prepared):
+    """Falling back to the plain reading is always better than silence."""
+    import sys
+
+    def broken(text, preference="auto", previous=None):
+        raise RuntimeError("frontend exploded")
+
+    monkeypatch.setattr(
+        sys.modules["plugins.vits2_tts_trt.frontend.language"], "prepare", broken
+    )
+    plugin, executor, _ = _plugin(monkeypatch)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
+
+    plugin.dispatch("tts", {"action": "speak", "text": "精度是5μm"})
+
+    assert _wait_until(lambda: _installed(plugin).spoken == ["精度是5μm"])
+    assert _installed(plugin).readings == [""]
+
+
+def test_speak_before_ready_keeps_its_language(monkeypatch, prepared):
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
+    plugin.dispatch("tts", {"action": "speak", "text": "x", "reading_language": "en"})
+    assert state["entered"].wait(3)
+    state["release"]()
+
+    assert _wait_until(lambda: _installed(plugin) and _installed(plugin).spoken == ["<x>"])
+    assert _installed(plugin).readings == ["en"]
+
+
+# ── the shared tts tool keeps its shape for every engine ─────────────────────
+
+def test_each_card_action_shows_only_its_own_fields():
+    """The canvas card shows fields per action from x-action-params, and
+    agent-core presents each action to the LLM as its own tool from the same
+    table. Only speak takes anything; nothing routing-related is offered —
+    instance_id comes from the canvas binding, and a value the LLM made up
+    would override it (agent-core injects it only when absent)."""
+    schema = tts.TOOLS[0]["inputSchema"]
+    assert schema["properties"]["action"]["enum"] == [
+        "start", "stop", "speak", "info", "config", "interrupt", "support_language"]
+    params = {action: spec["params"] for action, spec in schema["x-action-params"].items()}
+    assert params == {"speak": ["text", "reading_language"],
+                      "interrupt": [], "support_language": []}
+    assert schema["x-action-params"]["speak"]["required"] == ["text"]
+    for name in ("instance_id", "turn_id"):
+        assert name not in schema["properties"]
+    # The split must not break the completion barrier or the notify hook.
+    assert schema["x-completion"]["actions"] == ["speak"]
+    assert schema["x-hooks"]["on_notify"] == {"action": "speak"}
+
+
+def test_reading_language_is_a_speak_argument_not_a_card_setting():
+    assert "reading_language" not in tts.TOOLS[0]["configSchema"]["properties"]
+    assert "reading_language" not in tts.SHARED_CONFIG_KEYS
+    # Not an enum: the canvas debug panel preselects an enum's first value,
+    # which would force a reading on every test speak instead of auto.
+    speak_arg = tts.TOOLS[0]["inputSchema"]["properties"]["reading_language"]
+    assert "enum" not in speak_arg
+
+
+def test_the_vits2_release_is_served_from_our_cos():
+    """Models come from the project's own COS, never a personal hub account:
+    a robot's TTS must not depend on somebody else's repository staying up."""
+    import utils.model_downloader as md
+
+    assert md.VITS2_MODEL_BASE == md.COS_BASE
+    for family, entry in md.VITS2_MODEL_ARCHIVES.items():
+        assert family in entry["archive"] and entry["archive"].endswith(".tar.gz")
+        assert len(entry["sha256"]) == 64 and entry["size"] > 0
