@@ -4562,3 +4562,37 @@ difference.
 
 Measured on jp6.1 (Python 3.10.12, pytest 8.3.3): 175 passed / 1 failed with
 autoload on, **176 passed** with it off.
+
+## `measure` 卡片
+
+物体可见尺寸测量。消费 VOP 的 `data/json` 和一路 `image/depth-zlib`，输出：
+
+```text
+/perception/measure/state   data/json   当前对象、距离、可见宽高
+/perception/measure/view    image/jpeg  相机画面 + bbox + W×H 标签
+```
+
+它属于 Perception，不属于驱动：读的是 VOP/深度，不控制电机。相机彩色流由 depth
+话题推导（Bumi：`/camera/color`；G1：`/camera/rgb`），不需要在画布上把同一个 camera
+节点再接一次；需要覆盖时在 `config.yaml` 设置 `measure.camera_topic`。
+
+尺寸是**当前视角的可见外框**，不是完整三维长宽高。`clipped=true` 表示 bbox 贴边，
+数值只是下限；没有有效深度或没有检测到目标时不猜，输出 `null` 或空 `objects`。
+
+常用动作：
+
+- `read`：当前帧对象，可按 `target` 过滤；回答“现在这个多大”用它；
+- `info`：当前状态 + 最近活跃对象的紧凑 session 摘要；
+- `history`：有界、节流的历史记录；
+- `reset_session`：清空摘要/历史；
+- `config`：改 rate、置信度、深度分位、平滑窗口等。
+
+`view` 用 OpenCV 绘制（和这个镜像里现有的相机/姿态卡同一套栈），默认 5 Hz，
+`view_hz: 0` 关闭。`info` 的 `topic_out` 会声明两个输出口；查看图像用画布的
+「查看数据流」或 Monitor，不需要额外的 viewer 卡片。
+
+测试：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_*.py -q
+```

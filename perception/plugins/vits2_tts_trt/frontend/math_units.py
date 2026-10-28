@@ -8,7 +8,7 @@ from functools import lru_cache
 # key: Chinese, singular English, plural English. Long units match first.
 _UNITS = {
     "kg/m³": ("千克每立方米", "kilogram per cubic meter", "kilograms per cubic meter"),
-    "km/h": ("千米每小时", "kilometer per hour", "kilometers per hour"),
+    "km/h": ("公里每小时", "kilometer per hour", "kilometers per hour"),
     "m/s": ("米每秒", "meter per second", "meters per second"),
     "m/s²": ("米每二次方秒", "meter per second squared", "meters per second squared"),
     "m²": ("平方米", "square meter", "square meters"),
@@ -17,7 +17,7 @@ _UNITS = {
     "kg": ("千克", "kilogram", "kilograms"),
     "g": ("克", "gram", "grams"),
     "mg": ("毫克", "milligram", "milligrams"),
-    "km": ("千米", "kilometer", "kilometers"),
+    "km": ("公里", "kilometer", "kilometers"),
     "m": ("米", "meter", "meters"),
     "cm": ("厘米", "centimeter", "centimeters"),
     "mm": ("毫米", "millimeter", "millimeters"),
@@ -38,12 +38,18 @@ _UNITS = {
     "W": ("瓦特", "watt", "watts"),
     "mW": ("毫瓦", "milliwatt", "milliwatts"),
     "kW": ("千瓦", "kilowatt", "kilowatts"),
+    "J": ("焦耳", "joule", "joules"),
+    "mJ": ("毫焦", "millijoule", "millijoules"),
+    "kJ": ("千焦", "kilojoule", "kilojoules"),
+    "MJ": ("兆焦", "megajoule", "megajoules"),
     "dB": ("分贝", "decibel", "decibels"),
 }
+# Explicit numeric-unit aliases only; SI prefixes such as mJ/MJ stay distinct.
+_UNIT_ALIASES = {"KJ": "kJ", "kj": "kJ", "KM": "km"}
 _NUMBER = r"(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
 _DASH = r"\-‐‑−﹣－"
 _NORMALIZE_DASH = str.maketrans({char: "-" for char in "‐‑−﹣－"})
-_UNIT_FORMS = sorted(_UNITS, key=len, reverse=True)
+_UNIT_FORMS = sorted((*_UNITS, *_UNIT_ALIASES), key=len, reverse=True)
 _UNIT_PATTERN = "|".join(re.escape(unit).replace(r"/", r"\s*/\s*") for unit in _UNIT_FORMS)
 _UNIT_EXPR = rf"(?:{_UNIT_PATTERN})|℃|℉|(?i:degrees?\s+(?:Celsius|Fahrenheit))"
 _UNIT_END = r"(?![A-Za-z0-9_/²³^]|\.\d)"
@@ -241,7 +247,7 @@ def _canonical_unit(unit):
     unit = re.sub(r"\s+", "", unit)
     if unit in {"℃", "℉"} or "celsius" in unit.lower() or "fahrenheit" in unit.lower():
         return "°C" if unit == "℃" or "celsius" in unit.lower() else "°F"
-    return unit
+    return _UNIT_ALIASES.get(unit, unit)
 
 
 def _unit_label(unit, value, zh):

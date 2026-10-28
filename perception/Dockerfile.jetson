@@ -185,6 +185,12 @@ RUN . /etc/jetpack.env; \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pillow>=7.1.2" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 
+# Test-suite dependency, not a runtime one. The PR runner installs only pytest
+# inside the image; `test_music.py` validates tool schemas with jsonschema.
+# Without this, the jp5.11 perception suite reports one unrelated failure on
+# every PR that touches perception.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "jsonschema>=4"
+
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 # PyPI ships CPU-only sherpa-onnx, so each JetPack line installs a CUDA-enabled
 # wheel built in-house on an Orin with -DSHERPA_ONNX_ENABLE_GPU=ON.

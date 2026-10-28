@@ -314,7 +314,29 @@ or Chinese in a new instance. Full sentences such as `The order ID is abc123`
 and Chinese labels retain their language evidence. This does not merge labels
 with values across line breaks.
 
+Calendar ranges such as `2026.12.30–1.3` keep both endpoints, including across
+New Year. Yearless dates such as `1/1–1/3` require a nearby calendar label or
+explicit holiday duration; bare fractions and decimals retain their existing
+readings. Calendar validation checks leap years without inventing a spoken end
+year. Parenthesized date fields retain their local context in automatic mode.
+Energy units `J`, `mJ`, `kJ`, `MJ` have Chinese/English readings; numeric `KJ` and
+`kj` are explicit aliases of `kJ`, while `mJ` and `MJ` remain distinct. Numeric
+`km`/`KM` both read 公里 in Chinese and kilometers in English. These aliases do
+not rewrite words, model identifiers, URLs or email addresses.
+
 #### ASR-driven dialogue integration
+
+The configuration panel retains 自动 / 中文 / English. The public tool contract
+also retains `language`, `instance_id`, `turn_id` and ASR input fields so existing
+integrations can discover and validate them. Core binds the instance ID for
+connected cards; ordinary speech does not require a manually supplied turn ID.
+Blank routing fields on ordinary calls are treated as omitted, including when
+caching shared configuration. After an explicit `language` call, speech still
+requires its current turn ID; missing or stale turns remain errors.
+
+Card fields and LLM action parameters share the current Core schema mechanism.
+This update preserves that contract rather than removing API parameters to hide
+card fields. No Core renderer change is included.
 
 The `language` action is an integration API. The dialogue caller must forward
 the **current user utterance's** ASR result, use the returned instruction when

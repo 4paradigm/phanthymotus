@@ -2503,6 +2503,10 @@ class TTSPlugin:
         if target_engine == "vits2-zh-en":
             from plugins.vits2_tts_language.plugin import validate_config
             validate_config(args)
+            # Match the VITS2 dispatch fallback before caching shared settings.
+            instance_id = args.get("instance_id")
+            if instance_id is None or isinstance(instance_id, str) and not instance_id.strip():
+                args = {key: value for key, value in args.items() if key != "instance_id"}
         if "reply_language" in args:
             from plugins.vits2_tts_language.plugin import reply_language_mode
             args = {**args, "reply_language": reply_language_mode(args["reply_language"])}

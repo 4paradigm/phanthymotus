@@ -33,6 +33,30 @@ _DATE_LIKE_RUN = re.compile(
     rf"(?<![A-Za-z0-9_.])\d{{4}}(?:[{_DASH}/.]\d*){{2,}}"
     rf"(?![A-Za-z0-9_]|[./{_DASH}][A-Za-z0-9_])"
 )
+# Yearless month/day is ambiguous with fractions and decimals. Accept it only
+# in a locally labelled calendar field, or as the end of a complete-date range.
+_MONTH_DAY = re.compile(r"(?P<month>\d{1,2})[/.](?P<day>\d{1,2})")
+_CHINESE_DATE_BODY = r"(?:(?P<year>\d{4})[ \t]*年[ \t]*)?(?P<month>\d{1,2})[ \t]*月[ \t]*(?P<day>\d{1,2})(?:[ \t]*[日号])?"
+_CHINESE_DATE = re.compile(_CHINESE_DATE_BODY)
+_CALENDAR_POINT = (
+    rf"(?:\d{{4}}[{_DASH}/.]\d{{1,2}}[{_DASH}/.]\d{{1,2}}|\d{{1,2}}[/.]\d{{1,2}}|"
+    r"(?:\d{4}[ \t]*年[ \t]*)?\d{1,2}[ \t]*月[ \t]*\d{1,2}(?:[ \t]*[日号])?)"
+)
+_CALENDAR_FIELD = re.compile(
+    rf"(?<![A-Za-z0-9_./{_DASH}])(?P<first>{_CALENDAR_POINT})"
+    rf"(?:[ \t]*(?:[{_DASH}—~～]|到|至|(?i:to))[ \t]*(?P<last>{_CALENDAR_POINT}))?"
+    rf"(?![A-Za-z0-9_/]|\.[A-Za-z0-9_]|[{_DASH}]\d)"
+)
+_CALENDAR_CUE = re.compile(
+    r"(?:(?P<date_label>日期|日程|(?i:\bdates?))|假期|放假|休假|假日|行程|时间段|起止时间|"
+    r"(?i:\b(?:holidays?|vacation|schedule)))"
+    r"(?:[ \t:：=（(]|大概率|预计|可能|安排|时间|定于|开始|结束|是|为|从|在|自|"
+    r"(?i:\b(?:is|are|from|on|runs?)\b))*$"
+)
+_CALENDAR_QUANTITY = re.compile(
+    r"[ \t]*(?:天|周(?![一二三四五六日天])|小时|分钟|秒|个月|[%％个成倍]|"
+    r"(?i:(?:days?|hours?|percent)\b))"
+)
 _TIME = re.compile(
     r"(?<![A-Za-z0-9_:])(?P<hour>\d{1,2})[:：](?P<minute>\d{2})"
     r"(?:[:：](?P<second>\d{2}))?(?![A-Za-z0-9_:：])"
@@ -152,6 +176,63 @@ def _date_is_math(text, start):
     return has_explicit_math_context(text, start)
 
 
+def _calendar_fields(text):
+    """Yield contextual dates/ranges; None marks a calendar validation failure.
+
+    An omitted end year is inferred only to validate leap days and rollover;
+    speech retains the written fields rather than inventing a spoken year.
+    """
+    for match in _CALENDAR_FIELD.finditer(text):
+        parts = []
+        for value in (match["first"], match["last"]):
+            if value is None:
+                continue
+            point = _DATE.fullmatch(value) or _CHINESE_DATE.fullmatch(value) or _MONTH_DAY.fullmatch(value)
+            if point is None:
+                break
+            written_year = point.groupdict().get("year")
+            parts.append((int(written_year) if written_year is not None else None,
+                          int(point["month"]), int(point["day"])))
+        else:
+            if len(parts) == 1 and parts[0][0] is not None and "月" not in match["first"]:
+                continue  # Existing full-date handling owns this shape.
+            left = re.split(r"[。！？!?，,；;\r\n]", text[:match.start()])[-1][-64:]
+            right = text[match.end():]
+            if (_date_is_math(text, match.start())
+                    or re.match(rf"[ \t)）]*(?:[=+*×÷^<>≤≥≠/]|[{_DASH}][ \t]*\d)", right)
+                    or _CALENDAR_QUANTITY.match(right)
+                    or re.search(r"(?:版本(?:号)?|(?i:\bversion))[ \t:：]*$", left)):
+                continue
+            if parts[0][0] is None and "月" not in match["first"]:
+                cue = _CALENDAR_CUE.search(left)
+                # A holiday mention alone cannot turn a single fraction into
+                # a date. Only a date label or a complete range disambiguates it.
+                if len(parts) == 1 and (cue is None or cue["date_label"] is None):
+                    continue
+                if ((cue is None or cue["date_label"] is None)
+                        and re.match(r"[ \t]*(?:的|(?i:of\b))", right)):
+                    continue
+                if cue is None and not re.match(r"[ \t]*(?:连休|放假|休假)[ \t]*\d+[ \t]*天", right):
+                    continue
+            known_year = parts[0][0] is not None
+            year = parts[0][0] if known_year else 2000  # February 29 may be valid.
+            try:
+                previous = None
+                for written_year, month, day in parts:
+                    if written_year is not None:
+                        year = written_year
+                        known_year = True
+                    elif previous and (month, day) < (previous.month, previous.day):
+                        year += 1
+                    current = datetime.date(year, month, day)
+                    if previous and current < previous:
+                        raise ValueError("Reversed explicit date range")
+                    previous = current if known_year else None
+            except ValueError:
+                parts = None
+            yield match.start(), match.end(), parts
+
+
 def malformed_date_ranges(text):
     """Find unsupported numeric tails without claiming an ambiguous formula."""
     for pattern in _DATE_PREFIXES:
@@ -164,11 +245,21 @@ def malformed_date_ranges(text):
 
 def literal_date_ranges(text):
     """Unsupported date tails and invalid calendars keep their written form."""
-    yield from malformed_date_ranges(text)
+    calendar = list(_calendar_fields(text))
+    def covered(start, end):
+        return any(start < b and end > a for a, b, _ in calendar)
+    for start, end, parts in calendar:
+        if parts is None:
+            yield start, end
+    for start, end in malformed_date_ranges(text):
+        if not covered(start, end):
+            yield start, end
     # A four-digit year followed by at least two numeric separators is also
     # date-like when components are missing, repeated or use mixed separators.
     # A final period remains sentence punctuation rather than an empty field.
     for match in _DATE_LIKE_RUN.finditer(text):
+        if covered(match.start(), match.end()):
+            continue
         value = match.group().rstrip(".")
         tail = value[4:]
         version_label = re.search(r"(?:\bversion|版本(?:号)?)[ \t:：]*$", text[:match.start()], re.I)
@@ -187,7 +278,7 @@ def literal_date_ranges(text):
         yield match.start(), match.start() + len(value)
     for pattern in (_DATE, _SPACED_DATE):
         for match in pattern.finditer(text):
-            if _date_is_math(text, match.start()):
+            if covered(match.start(), match.end()) or _date_is_math(text, match.start()):
                 continue
             try:
                 datetime.date(*(int(match[key]) for key in ("year", "month", "day")))
@@ -238,6 +329,22 @@ def find_spans(text, language, verbalize_number):
 
     for start, end, spoken in find_numeric_format_spans(text, language, verbalize_number):
         add(start, end, spoken)
+
+    for start, end, parts in _calendar_fields(text):
+        if parts is None:
+            continue
+        readings = []
+        for year, month, day in parts:
+            if zh:
+                reading = cardinal(month) + "月" + cardinal(day) + "日"
+                if year is not None:
+                    reading = _digits(f"{year:04d}", language) + "年" + reading
+            else:
+                reading = f"{_MONTHS[month]} {_DAYS[day]}"
+                if year is not None:
+                    reading += f", {cardinal(year)}"
+            readings.append(reading)
+        add(start, end, ("至" if zh else " to ").join(readings))
 
     # Recognize a date inside prose before math can consume its month/day as a
     # fraction. Horizontal whitespace is intentional: never join separate lines.

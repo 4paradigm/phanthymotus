@@ -7,7 +7,7 @@ retain raw offsets. Pure-language requests keep the released frontend behavior.
 import re
 from .lexicon_rules import apply_lexeme_rules, has_chinese_name_reading
 from .special_text import _ADDRESSES, normalize_special_text
-from .number_context import _DATE, _TIME, _PHONE, _NUMBERED_ID, _GPU_MODEL
+from .number_context import _DATE, _TIME, _PHONE, _NUMBERED_ID, _GPU_MODEL, _calendar_fields
 from .numeric_formats import protected_ranges as numeric_format_ranges
 from .alphanumeric_text import normalize_unknown_alphanumeric_tokens
 
@@ -56,6 +56,15 @@ def protected_spans(text):
         add(match.start(), match.start() + len(_trim_address(match.group())), "address")
     for start, end in numeric_format_ranges(text):
         add(start, end, "numeric-format")
+    for start, end, _ in _calendar_fields(text):
+        if any(start < b and end > a for a, b, _ in found):
+            continue
+        add(start, end, "date")
+        # Keep a bracketed date with its nearby calendar label. Otherwise
+        # AUTO loses "holiday is" before parsing (1/1–1/3) and reads fractions.
+        opening = re.search(r"[(（][ \t(（]*$", text[:start])
+        if opening:
+            add(opening.start(), start, "date-context")
     for kind, pattern in (("date", _DATE), ("time", _TIME), ("phone", _PHONE),
                           ("identifier", _NUMBERED_ID), ("model", _GPU_MODEL),
                           ("measurement", _MEASURE), ("number", _DECIMAL)):

@@ -353,7 +353,17 @@ class TTSPlugin(BaseTTSPlugin):
 
     def dispatch(self, name, args):
         action = args.get("action") if name == "tts" else name
-        if "instance_id" in args and (not isinstance(args["instance_id"], str) or not args["instance_id"].strip()):
+        # Ordinary lifecycle/direct speech keeps the base TTS fallback for an
+        # omitted/blank routing field. Only explicit language turns require
+        # an instance and a matching turn token. Do not mutate caller args.
+        blank_routing = {
+            key for key in ("instance_id", "turn_id")
+            if key in args and (args[key] is None
+                                or isinstance(args[key], str) and not args[key].strip())
+        }
+        if blank_routing:
+            args = {key: value for key, value in args.items() if key not in blank_routing}
+        if "instance_id" in args and not isinstance(args["instance_id"], str):
             raise LanguagePolicyError("instance_required", "instance_id must be a nonempty string")
         if action == "language":
             key = args.get("instance_id")
