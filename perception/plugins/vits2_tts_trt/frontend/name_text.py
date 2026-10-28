@@ -2,13 +2,13 @@
 
 import re
 
-from ..vits2_tts_trt.frontend.lexicon_rules import (
+from .lexicon_rules import (
     _QWEN_VERSION_RE, _sub_lexeme, normalize_chinese_name, has_chinese_name_reading,
 )
-from ..vits2_tts_trt.frontend.math_units import _english_quantity
-from ..vits2_tts_trt.frontend.mixed_context import context_diagnostics
-from ..vits2_tts_trt.frontend.number_context import _ID_CUED, _ID_OWNER_CUED, _NUMBERED_ID
-from ..vits2_tts_trt.frontend.special_text import _ADDRESSES
+from .math_units import _english_quantity
+from .mixed_context import context_diagnostics
+from .number_context import _ID_CUED, _ID_OWNER_CUED, _NUMBERED_ID
+from .special_text import _ADDRESSES
 
 
 _TERMINAL_PUNCTUATION = re.compile(r"[.。!?！？]+$")

@@ -84,11 +84,11 @@ def _join_pcm(left, right):
 
 class TTSAdapter(ABC):
     @abstractmethod
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(self, text: str, reading_language=None) -> bytes:
         raise NotImplementedError
 
-    def synthesize_stream(self, text: str):
-        yield self.synthesize(text)
+    def synthesize_stream(self, text: str, reading_language=None):
+        yield self.synthesize(text, reading_language=reading_language)
 
     def warmup(self) -> int:
         return 0
@@ -154,8 +154,8 @@ class Vits2TensorRTAdapter(TTSAdapter):
             text_ids = self._engine._get_text_ids(chunk, normalized=True)
             yield chunk, text_ids
 
-    def synthesize(self, text: str) -> bytes:
-        return b"".join(self.synthesize_stream(text))
+    def synthesize(self, text: str, reading_language=None) -> bytes:
+        return b"".join(self.synthesize_stream(text, reading_language=reading_language))
 
     def _isolated_pcm(self, chunk, text_ids, span, parts):
         """Synthesize a verified term while retaining its original left context.
@@ -255,7 +255,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
             output = _join_pcm(output, suffix)
         return output.astype('<i2', copy=False).tobytes()
 
-    def synthesize_stream(self, text: str):
+    def synthesize_stream(self, text: str, reading_language=None):
         pause_samples = SAMPLE_RATE * CHUNK_PAUSE_MS // 1000
         silence = b"\x00\x00" * pause_samples
         with self._lock:
@@ -264,7 +264,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
             reset_random_state = getattr(self._engine, "reset_random_state", None)
             if reset_random_state is not None:
                 reset_random_state()
-            prepared = self.iter_text_chunks(text)
+            prepared = self.iter_text_chunks(text, reading_language=reading_language)
             isolation = None
             if (hasattr(self._engine, 'synthesize_with_durations')
                     and hasattr(self._engine, '_rng') and reset_random_state is not None):
@@ -310,11 +310,9 @@ class Vits2TensorRTAdapter(TTSAdapter):
         return warmup_bytes
 
 
-def _trt_adapter(cfg: dict, *, progress_cb=None, stage_cb=None) -> Vits2TensorRTAdapter:
+def _trt_adapter(cfg: dict) -> Vits2TensorRTAdapter:
     root = Path(cfg.get("model_dir", "/models/vits2"))
-    _configure_frontend_paths(root, progress_cb=progress_cb, stage_cb=stage_cb)
-    if stage_cb is not None:
-        stage_cb("initialize")
+    _configure_frontend_paths(root)
     return Vits2TensorRTAdapter(
         speed=float(cfg.get("speed", 1.0)),
         model_config=str(root / "config.json"),
@@ -323,20 +321,20 @@ def _trt_adapter(cfg: dict, *, progress_cb=None, stage_cb=None) -> Vits2TensorRT
     )
 
 
-def _configure_frontend_paths(root: Path, *, progress_cb=None, stage_cb=None) -> None:
+def _configure_frontend_paths(root: Path) -> None:
     """Point inference at the release-controlled frontend data."""
     from .frontend.release_paths import configure_release_paths
-    from .lexicon_resources import ensure_external_lexicon
+    from .lexicon_resources import load_external_lexicon
 
-    ensure_external_lexicon(root, progress_cb=progress_cb, stage_cb=stage_cb)
     configure_release_paths(root)
+    load_external_lexicon(root)
 
 
-def build_adapter(cfg: dict, *, progress_cb=None, stage_cb=None) -> TTSAdapter:
+def build_adapter(cfg: dict) -> TTSAdapter:
     speaker_id = int(cfg.get("speaker_id", 0))
     if speaker_id != 0:
         raise ValueError("The VITS2 model supports only speaker_id=0")
     backend = str(cfg.get("backend", "trt")).lower()
     if backend != "trt":
         raise ValueError("The JP6 VITS2 plugin supports backend=trt only")
-    return _trt_adapter(cfg, progress_cb=progress_cb, stage_cb=stage_cb)
+    return _trt_adapter(cfg)

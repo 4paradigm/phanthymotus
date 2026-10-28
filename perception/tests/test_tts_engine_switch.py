@@ -626,6 +626,20 @@ def test_an_identical_config_does_not_rebuild_the_session(_sherpa):
     assert _CountingAdapter.builds == 1, "an identical config rebuilt the session"
 
 
+def test_a_vits2_only_setting_does_not_disturb_other_engines(_sherpa):
+    """reading_language is a shared config key, so the dashboard sends it to
+    whichever engine is live. On a sherpa engine it must change nothing: no
+    session rebuild, and a speak carrying it still speaks."""
+    plugin, holder = _sherpa
+    for value in ("en", "zh", "auto"):
+        result = plugin.dispatch("tts", {"action": "config", "device": "gpu", "speed": 1,
+                                         "speaker_id": 0, "thai_phrase_spacing": True,
+                                         "reading_language": value})
+        assert result["rebuilt"] is False
+    assert _CountingAdapter.builds == 1
+    assert plugin.synthesize_raw("สวัสดี")
+
+
 def test_changing_speed_alone_updates_the_resident_model(_sherpa):
     """speed is a per-generate() scale, so it must not reload anything."""
     plugin, holder = _sherpa

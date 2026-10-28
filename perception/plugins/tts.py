@@ -165,22 +165,13 @@ TOOLS = [
         "multiInstance": True,
         "description": "TTS — 把文本说出来（speak），或立即掐断正在说的话（interrupt）。"
                        "注意 stop 是停掉整个插件节点、不是停住这句话；"
-                       "要让机器人别说了用 interrupt。"
-                       "VITS2 可在生成对话回复前调用 language，传入当前用户文本或 ASR 的 text/lang，"
-                       "将返回的 instruction 交给对话模型，再用 turn_id 播报其回复。"
-                       "直接播报不要求 language；本工具不翻译或生成回复。",
+                       "要让机器人别说了用 interrupt。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "speak", "info", "config", "interrupt", "language"],
-                    "oneOf": [{"const": value, "title": title} for value, title in [
-                        ("start", "start"), ("stop", "stop"), ("info", "info"),
-                        ("config", "config"), ("speak", "播报（speak）"),
-                        ("interrupt", "打断（interrupt）"),
-                        ("language", "语言策略（接口调试）"),
-                    ]],
+                    "enum": ["start", "stop", "speak", "info", "config", "interrupt"],
                     "description": "Action to perform"
                 },
                 "input_topic": {
@@ -191,44 +182,18 @@ TOOLS = [
                     "type": "string",
                     "description": "Text to synthesize (required for action=speak)"
                 },
-                "instance_id": {"type": "string", "description": "可选：指定 TTS 实例；language 接口调用时必填"},
-                "asr_result": {
-                    "type": "object",
-                    "properties": {"text": {"type": "string"}, "lang": {"type": "string"}},
-                    "required": ["text"],
-                    "description": "API 结构化参数：当前识别的 text/lang；卡片调试请使用 text。ASR 的 language 配置不是识别结果。",
+                # vits2-zh-en only; every other engine ignores it. A plain string,
+                # not an enum: the canvas debug panel preselects an enum's first
+                # value, which would override the card setting on every test speak.
+                "reading_language": {
+                    "type": "string",
+                    "description": "Optional, for action=speak with vits2-zh-en: read the "
+                                   "numbers, dates, units and symbols in this text in "
+                                   "Chinese (zh), English (en) or by context (auto). "
+                                   "Leave empty to use the card setting"
                 },
-                # Optional tags must start empty: this dashboard selects the
-                # first enum value even when the field is optional/hidden.
-                "input_language": {"type": "string", "pattern": "^(zh|en)$",
-                                   "examples": ["zh", "en"],
-                                   "description": "可选：本轮 ASR 识别语种 zh/en；未提供时留空"},
-                "requested_reply_language": {"type": "string", "pattern": "^(zh|en)$",
-                                             "examples": ["zh", "en"],
-                                             "description": "可选：本轮明确要求的回复语种 zh/en；留空遵循面板和自动策略"},
-                "turn_id": {"type": "string",
-                            "description": "直接试听留空；显式调用 language 后填入返回的 turn_id"},
             },
             "required": ["action"],
-            # Existing canvas support: show only fields relevant to the action.
-            # Core also uses these lists for LLM tool schemas, so retain the
-            # optional instance/turn routing fields on speak.
-            "x-action-params": {
-                "speak": {
-                    "params": ["text", "instance_id", "turn_id"],
-                    "required": ["text"],
-                    "description": "播报文本。直接试听无需 turn_id；language 后使用其返回值。",
-                },
-                "interrupt": {
-                    "params": ["instance_id"],
-                    "description": "打断当前播报，保留 TTS 实例。",
-                },
-                "language": {
-                    "params": ["instance_id", "text", "asr_result", "input_language", "requested_reply_language"],
-                    "required": ["instance_id"],
-                    "description": "VITS2 对话接口：提供当前用户 text 或 asr_result，返回回复语言指令与 turn_id。",
-                },
-            },
             "x-completion": {
                 "actions": ["speak"],
                 "timeout": 60,
@@ -312,17 +277,24 @@ TOOLS = [
                                    "experimental — may change prosody either way)",
                     "default": False, "scope": "shared",
                     "x-show-when": {"tts_engine": "mms-th"}},
-                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared"},
-                "reply_language": {
-                    "type": "string", "title": "回复语言",
+                # vits2-zh-en only. Words are always spoken in the script they are
+                # written in; this picks the reading of notation that has no
+                # script of its own. Read per utterance, so changing it needs no
+                # model reload. See plugins/vits2_tts_trt/frontend/language.py.
+                "reading_language": {
+                    "type": "string", "title": "Reading language",
                     "enum": ["auto", "zh", "en"],
-                    "oneOf": [{"const": "auto", "title": "自动"},
-                              {"const": "zh", "title": "中文"},
+                    "oneOf": [{"const": "auto", "title": "Auto"},
+                              {"const": "zh", "title": "Chinese"},
                               {"const": "en", "title": "English"}],
+                    "description": "How numbers, dates, units and symbols are read aloud. "
+                                   "Auto follows the sentence around them; Chinese or "
+                                   "English always reads them in that language. Words "
+                                   "are spoken as written either way, so mixed "
+                                   "Chinese-English text still works",
                     "default": "auto", "scope": "shared",
-                    "x-show-when": {"tts_engine": "vits2-zh-en"},
-                    "description": "VITS2: auto/自动, zh/中文, en/English. Direct speech follows its text; language uses the current ASR tag or user text, defaulting to Chinese when unclear. Mixed speech is allowed. This selects readings and returns a dialogue instruction; it does not translate or generate replies.",
-                },
+                    "x-show-when": {"tts_engine": ["vits2-zh-en"]}},
+                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
             "required": []
@@ -2415,8 +2387,6 @@ class TTSPlugin:
             building = self._building
             error = self._build_error
             engine = self._engine
-        if action == "language" and engine != "vits2-zh-en":
-            raise ValueError("The language action is supported by vits2-zh-en only")
         if impl is not None:
             result = impl.dispatch(name, args)
             if isinstance(result, dict) and action == "info":
@@ -2499,17 +2469,10 @@ class TTSPlugin:
     def _config(self, name: str, args: dict) -> dict:
         """Apply shared config, switching engines when tts_engine changes."""
         requested = args.get("tts_engine") or args.get("engine")
-        target_engine = self._select_engine(requested) if requested else self._engine
-        if target_engine == "vits2-zh-en":
-            from plugins.vits2_tts_language.plugin import validate_config
-            validate_config(args)
-        if "reply_language" in args:
-            from plugins.vits2_tts_language.plugin import reply_language_mode
-            args = {**args, "reply_language": reply_language_mode(args["reply_language"])}
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
         for key in SHARED_CONFIG_KEYS:
-            if key in args and not (key == "reply_language" and args.get("instance_id")):
+            if key in args:
                 self._cfg[key] = args[key]
 
         if requested:

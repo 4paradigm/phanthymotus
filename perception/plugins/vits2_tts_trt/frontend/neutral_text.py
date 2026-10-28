@@ -7,10 +7,10 @@ the released number/date readers, without loading a model or changing MIX rules.
 import datetime
 import re
 
-from ..vits2_tts_trt.frontend.math_units import _english_quantity, find_spans as math_spans
-from ..vits2_tts_trt.frontend.lexicon_rules import normalize_numeric_lexemes
-from ..vits2_tts_trt.frontend.number_context import _DATE, _ID_CUED, find_spans as field_spans
-from ..vits2_tts_trt.frontend.special_text import (
+from .math_units import _english_quantity, find_spans as math_spans
+from .lexicon_rules import normalize_numeric_lexemes
+from .number_context import _DATE, _ID_CUED, find_spans as field_spans
+from .special_text import (
     _ADDRESSES, normalize_special_text, verbalize_chinese_number,
 )
 
@@ -35,10 +35,6 @@ _NEUTRAL_ID_LABEL = re.compile(
     r"[ \t]*(?:ID|order[ \t]+(?:ID|number)|serial[ \t]+number|verification[ \t]+code)"
     r"[ \t]*[:：]?[ \t]*", re.IGNORECASE,
 )
-
-
-class InvalidDateError(ValueError):
-    """A complete numeric date shape contains an invalid calendar date."""
 
 
 def is_neutral_numeric(text):
@@ -129,7 +125,7 @@ def normalize_mixed_text(text, language):
         # (e.g. a generated Roman-numeral pronunciation). Resolve those narrow
         # name rules here so the fixed request language survives later MIX TN.
         fragment = normalize_numeric_lexemes(fragment, language=selected)
-        from ..vits2_tts_trt.frontend.alphanumeric_text import normalize_unknown_alphanumeric_tokens
+        from .alphanumeric_text import normalize_unknown_alphanumeric_tokens
         fragment = normalize_unknown_alphanumeric_tokens(fragment, selected)
         # Do not split numbers inside names/IDs, versions or currency notation.
         # Their existing frontend rules still run after this preprocessing.
