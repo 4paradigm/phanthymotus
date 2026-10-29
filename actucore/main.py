@@ -47,8 +47,6 @@ import rclpy
 import rclpy.executors
 from rclpy._rclpy_pybind11 import InvalidHandle
 
-from utils.security import redact_sensitive
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
@@ -56,24 +54,10 @@ log = logging.getLogger(__name__)
 for _quiet in ('urllib3', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
-# Cap on how much of an MCP argument/result dict reaches the log. Card configs
-# carry whole maps and voxel grids, so an unbounded repr here is how a single log
-# line grows past the point where Docker can frame it — the result side was
-# already capped, the argument side was not.
-_LOG_ARG_CHARS = 500
-
 # How often the register thread says it is still alive when nothing has changed.
 # The heartbeat itself stays at 30s; this only governs how often that fact
 # reaches the log, so "quiet" cannot mean both "healthy" and "thread died".
 REGISTER_ALIVE_INTERVAL_S = 1800.0
-
-
-def _brief(obj) -> str:
-    """One-line, length-capped repr for logging an MCP payload."""
-    text = repr(obj)
-    if len(text) <= _LOG_ARG_CHARS:
-        return text
-    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
 
 
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
@@ -352,31 +336,28 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
-                    # info action is heartbeat probe — log at DEBUG to reduce noise
-                    is_info = (args.get('action') == 'info')
+                    # Only fixed metadata reaches the shared MCP log; neither
+                    # request fields nor plugin results are safe to log.
+                    is_info = args.get('action') == 'info'
                     if not is_info:
-                        log.info(
-                            "[mcp] tools/call: %.200r(%s)",
-                            name,
-                            _brief(redact_sensitive(args)),
-                        )
+                        log.info("[mcp] tools/call received")
                     result = _bundle.dispatch(name, args)
                     if result is None:
+                        if not is_info:
+                            log.info("[mcp] tools/call: unknown tool")
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            safe_result = redact_sensitive(result)
-                            log.info(
-                                "[mcp] tools/call result: %s",
-                                json.dumps(safe_result)[:200],
-                            )
+                            log.info("[mcp] tools/call completed")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
             except BrokenPipeError:
                 log.debug(f"Client disconnected before response")
             except Exception as e:
-                log.error(f"RPC error: {e}", exc_info=True)
+                # Exception messages and tracebacks may contain request or plugin
+                # payloads; preserve the RPC response without logging either.
+                log.error("RPC handler failed")
                 try:
                     err(-32603, str(e))
                 except BrokenPipeError:

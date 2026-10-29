@@ -30,7 +30,6 @@ from plugins.navigation.semantic.ros import (  # noqa: E402
     pose_from_odometry,
 )
 from plugins.navigation.semantic.vlm import Client, _parse_json, validate_configuration  # noqa: E402
-from utils.security import REDACTED, redact_sensitive  # noqa: E402
 
 
 def _pose(x=1.25, y=-0.5, yaw=0.75) -> Pose:
@@ -958,25 +957,6 @@ class PureHelperTests(unittest.TestCase):
                 client.complete_json([])
         self.assertEqual(str(raised.exception), "VLM request failed with HTTP 401")
         self.assertNotIn(secret, str(raised.exception))
-
-    def test_recursive_log_redaction_does_not_mutate_arguments(self):
-        arguments = {
-            "action": "config",
-            "api_key": "top-secret",
-            "nested": [
-                {"Authorization": "Bearer another-secret"},
-                {"client_secret": "third-secret", "keyframe": "keep-this"},
-            ],
-        }
-        safe = redact_sensitive(arguments)
-        serialized = repr(safe)
-
-        self.assertEqual(safe["api_key"], REDACTED)
-        self.assertEqual(safe["nested"][0]["Authorization"], REDACTED)
-        self.assertEqual(safe["nested"][1]["client_secret"], REDACTED)
-        self.assertEqual(safe["nested"][1]["keyframe"], "keep-this")
-        self.assertNotIn("top-secret", serialized)
-        self.assertEqual(arguments["api_key"], "top-secret")
 
     def test_receive_time_sync_tolerates_unproven_source_clock_offset(self):
         bridge = self._bare_ros_bridge("receive_time")
