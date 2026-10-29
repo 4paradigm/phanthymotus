@@ -1082,11 +1082,6 @@ async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
 
 
 async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
-    if config.main.get('core', {}).get('project_running', False):
-        raise fastapi.HTTPException(
-            status_code=409, detail='请先停止智能控制后载入画布方案',
-        )
-
     from api.canvas import (apply_tool_config, delete_all_tool_configs,
                             notify_layout_changed, tool_config_key)
 
@@ -1128,19 +1123,8 @@ async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
     }
     # 方案里的卡片是整套替换的，被换掉的那些卡片的实例不会再有人来停它
     from api.config import stop_removed_cards
-    _, stop_failures = await stop_removed_cards(old_cards, cards)
-    if stop_failures:
-        raise fastapi.HTTPException(
-            status_code=409,
-            detail={
-                'message': (
-                    'Removed card stop was not confirmed; solution was not applied '
-                    'and the project remains stopped'
-                ),
-                'failures': stop_failures,
-            },
-        )
     config.main['canvas_layout'] = new_layout
+    await stop_removed_cards(old_cards, cards)
 
     # 卡片配置：先清空旧的，再写包体里的
     removed = delete_all_tool_configs()

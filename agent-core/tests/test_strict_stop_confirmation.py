@@ -1,20 +1,15 @@
-"""Removed-card cleanup must not confuse terminal evidence with success."""
+"""Optional strict stop confirmation and legacy deletion semantics."""
 import asyncio
-import copy
 import json
 import pathlib
 import sys
-import time
-from unittest.mock import Mock
 
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 
-from api import canvas as canvas_api  # noqa: E402
 from api import config as api_config  # noqa: E402
 from api import mcp_manage  # noqa: E402
-from api import solutions as solutions_api  # noqa: E402
 
 
 CARD = {'id': 'nav', 'mcpId': 'mcp-1', 'toolName': 'navigation'}
@@ -34,6 +29,11 @@ def install_responses(monkeypatch, responses, *, declaration=None):
     monkeypatch.setattr(api_config, 'STOP_CARD_TIMEOUT_S', 0.04)
     monkeypatch.setattr(api_config, '_STOP_POLL_INTERVAL_S', 0.001)
     return calls
+
+
+def strict_stop(cards):
+    results = asyncio.run(api_config._stop_cards(cards, require_confirmation=True))
+    return sum(result['ok'] for result in results), [r for r in results if not r['ok']]
 
 
 @pytest.mark.parametrize('payload', [
@@ -62,7 +62,7 @@ def test_removed_card_rejects_error_or_unconfirmed_result(monkeypatch, payload):
     calls = install_responses(monkeypatch, [{'code': 200, 'data': payload}],
                               declaration={'inputSchema': {'x-stop': {
                                   'failed_states': ['refused']}}})
-    count, failures = asyncio.run(api_config.stop_removed_cards([CARD], []))
+    count, failures = strict_stop([CARD])
     assert count == 0
     assert len(failures) == 1
     assert failures[0]['card_id'] == CARD['id']
@@ -79,7 +79,7 @@ def test_removed_card_rejects_error_or_unconfirmed_result(monkeypatch, payload):
 ])
 def test_removed_card_accepts_uncontradicted_confirmation(monkeypatch, payload):
     calls = install_responses(monkeypatch, [{'code': 200, 'data': payload}])
-    assert asyncio.run(api_config.stop_removed_cards([CARD], [])) == (1, [])
+    assert strict_stop([CARD]) == (1, [])
     assert calls == [('mcp-1', 'stop', 'nav')]
 
 
@@ -95,7 +95,7 @@ def test_pending_takes_precedence_and_polls_info(monkeypatch, pending):
         {'code': 200, 'data': {'state': 'idle', 'authority_released': True}},
     ], declaration={'inputSchema': {'x-stop': {
         'pending_states': ['releasing'], 'pending_flags': {'authority_released': False}}}})
-    assert asyncio.run(api_config.stop_removed_cards([CARD], [])) == (1, [])
+    assert strict_stop([CARD]) == (1, [])
     assert calls == [('mcp-1', 'stop', 'nav'), ('mcp-1', 'info', 'nav')]
 
 
@@ -110,7 +110,7 @@ def test_persistent_pending_times_out_without_resending_stop(monkeypatch):
     monkeypatch.setattr(api_config, 'find_tool', lambda _mid, _tool: {})
     monkeypatch.setattr(api_config, 'STOP_CARD_TIMEOUT_S', 0.02)
     monkeypatch.setattr(api_config, '_STOP_POLL_INTERVAL_S', 0.002)
-    count, failures = asyncio.run(api_config.stop_removed_cards([CARD], []))
+    count, failures = strict_stop([CARD])
     assert count == 0 and failures[0]['card_id'] == CARD['id']
     assert actions[0] == 'stop' and 'info' in actions
     assert actions.count('stop') == 1
@@ -122,7 +122,7 @@ def test_declared_failure_precedes_declared_pending(monkeypatch):
         'terminal_confirmed': True}}], declaration={'inputSchema': {'x-stop': {
             'failed_states': ['handback'], 'pending_states': ['handback'],
             'pending_flags': {'authority_released': False}}}})
-    count, failures = asyncio.run(api_config.stop_removed_cards([CARD], []))
+    count, failures = strict_stop([CARD])
     assert count == 0 and failures[0]['card_id'] == CARD['id']
     assert calls == [('mcp-1', 'stop', 'nav')]
 
@@ -133,7 +133,7 @@ def test_pending_info_failure_cannot_be_overridden_by_terminal(monkeypatch):
         {'code': 200, 'data': {'state': 'idle', 'status': 'error',
                                'terminal_confirmed': True}},
     ])
-    count, failures = asyncio.run(api_config.stop_removed_cards([CARD], []))
+    count, failures = strict_stop([CARD])
     assert count == 0 and failures[0]['card_id'] == CARD['id']
     assert calls == [('mcp-1', 'stop', 'nav'), ('mcp-1', 'info', 'nav')]
 
@@ -145,7 +145,7 @@ def test_malformed_and_mcp_error_responses_are_unconfirmed(monkeypatch):
         {'code': 500, 'message': 'MCP isError', 'data': {'state': 'idle'}},
     ):
         install_responses(monkeypatch, [response])
-        count, failures = asyncio.run(api_config.stop_removed_cards([CARD], []))
+        count, failures = strict_stop([CARD])
         assert count == 0 and failures[0]['card_id'] == CARD['id']
 
 
@@ -160,7 +160,7 @@ def test_one_failed_card_does_not_block_other_stop(monkeypatch):
 
     monkeypatch.setattr(mcp_manage, 'mcp_call_tool', call)
     monkeypatch.setattr(api_config, 'find_tool', lambda _mid, _tool: {})
-    count, failures = asyncio.run(api_config.stop_removed_cards([CARD, OTHER], []))
+    count, failures = strict_stop([CARD, OTHER])
     assert count == 1 and [f['card_id'] for f in failures] == ['nav']
     assert set(seen) == {'nav', 'other'}
 
@@ -179,40 +179,10 @@ def test_bad_metadata_is_isolated_and_other_card_still_stops(monkeypatch):
 
     monkeypatch.setattr(api_config, 'find_tool', find_tool)
     monkeypatch.setattr(mcp_manage, 'mcp_call_tool', call)
-    count, failures = asyncio.run(api_config.stop_removed_cards([CARD, OTHER], []))
+    count, failures = strict_stop([CARD, OTHER])
     assert count == 1 and [f['card_id'] for f in failures] == ['nav']
     assert failures[0]['error'] == 'bad metadata'
     assert seen == ['other']
-
-
-@pytest.mark.parametrize('solution', [False, True])
-def test_failed_confirmation_preserves_saved_layout_and_tool_config(monkeypatch, solution):
-    install_responses(monkeypatch, [{'code': 200, 'data': {
-        'state': 'idle', 'status': 'unknown', 'terminal_confirmed': True}}])
-    state = {'core': {'project_running': False},
-             'canvas_layout': {'cards': [CARD], 'connections': []},
-             'preserved_config': {'value': 1}}
-    before = copy.deepcopy(state)
-    monkeypatch.setattr(api_config.config, 'main', state)
-    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
-    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
-    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
-    notify, delete, apply = Mock(), Mock(), Mock()
-    monkeypatch.setattr(canvas_api, 'notify_layout_changed', notify)
-    monkeypatch.setattr(canvas_api, 'delete_all_tool_configs', delete)
-    monkeypatch.setattr(canvas_api, 'apply_tool_config', apply)
-    if solution:
-        with pytest.raises(solutions_api.fastapi.HTTPException) as error:
-            asyncio.run(solutions_api._apply_canvas({'cards': []}, {}))
-        assert error.value.status_code == 409
-    else:
-        result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
-            cards=[], connections=[], session_id='editor-1')))
-        assert result.status_code == 409
-    assert state == before
-    notify.assert_not_called()
-    delete.assert_not_called()
-    apply.assert_not_called()
 
 
 @pytest.mark.parametrize('payload', [

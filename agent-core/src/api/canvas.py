@@ -353,29 +353,12 @@ async def _save_layout_locked(layout: CanvasLayout):
 
     save_data = layout.dict()
     save_data.pop('session_id', None)
-    old_layout = config.main.get('canvas_layout', {}) or {}
-    old_cards = old_layout.get('cards', [])
-    if config.main.get('core', {}).get('project_running', False):
-        return fastapi.responses.JSONResponse(
-            status_code=409,
-            content={'code': 409, 'message': '请先停止智能控制后修改画布'},
-        )
-    from api.config import stop_removed_cards
-    _, stop_failures = await stop_removed_cards(
-        old_cards, save_data.get('cards', []))
-    if stop_failures:
-        return fastapi.responses.JSONResponse(
-            status_code=409,
-            content={
-                'code': 409,
-                'message': (
-                    'Removed card stop was not confirmed; layout was not saved '
-                    'and the project remains stopped'
-                ),
-                'failures': stop_failures,
-            },
-        )
+    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
     config.main['canvas_layout'] = save_data
+    # Removed instances are no longer reachable by stop-project. Attempt their
+    # cleanup without preventing the layout from being saved if a device fails.
+    from api.config import stop_removed_cards
+    await stop_removed_cards(old_cards, save_data.get('cards', []))
     notify_layout_changed(session_id or '')
     return {'code': 200}
 

@@ -1371,7 +1371,7 @@ async def stop_removed_cards(old_cards, new_cards) -> tuple[int, list[dict]]:
     removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
     if not removed:
         return 0, []
-    results = await _stop_cards(removed, require_confirmation=True)
+    results = await _stop_cards(removed)
     count = sum(1 for r in results if r.get('ok'))
     print(f'[layout] stopped {count}/{len(results)} instance(s) for removed '
           f'card(s): {", ".join(c.get("id", "") for c in removed)}')

@@ -14,12 +14,12 @@ test('a rejected layout save displays the reason and restores the saved layout',
   const context = vm.createContext({
     _isEditor: true, _cards: [], _connections: [], _execConnections: [],
     _zoom: 1, _tx: 0, _ty: 0, _sessionId: 'editor',
-    fetch: async () => ({ status: 409, json: async () => ({ message: '请先停止智能控制后修改画布' }) }),
+    fetch: async () => ({ status: 409, json: async () => ({ message: '画布保存冲突' }) }),
     _showToast: message => events.push(message),
     _reloadLayout: async () => events.push('reload'),
   });
   vm.runInContext(source.slice(start, end), context);
   await context._saveLayout();
-  assert.deepEqual(events, ['请先停止智能控制后修改画布', 'reload']);
+  assert.deepEqual(events, ['画布保存冲突', 'reload']);
   assert.equal(context._isEditor, true);
 });

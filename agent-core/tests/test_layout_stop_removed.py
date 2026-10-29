@@ -130,8 +130,8 @@ def test_a_failing_stop_does_not_block_the_others(monkeypatch, calls):
     assert sorted(seen) == ['card_asr', 'card_mt4rkb752py8']
 
 
-@pytest.mark.parametrize('response', [None, {}, {'state': 'stopping'}, {'status': 'finalizing'}])
-def test_only_an_explicit_terminal_stop_is_confirmed(monkeypatch, calls, response):
+@pytest.mark.parametrize('response', [None, {}, {'state': 'unknown'}, {'status': 'finalizing'}, {'error': 'unknown action: stop'}])
+def test_removed_card_uses_ordinary_stop_confirmation(monkeypatch, calls, response):
     async def _unconfirmed(_mcp_id, _req, timeout_s=None):
         return {'code': 200, 'data': response}
 
@@ -139,8 +139,8 @@ def test_only_an_explicit_terminal_stop_is_confirmed(monkeypatch, calls, respons
     monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _unconfirmed)
     stopped, failures = _run([TTS_OLD], [])
 
-    assert stopped == 0
-    assert failures[0]['card_id'] == TTS_OLD['id']
+    assert stopped == 1
+    assert failures == []
 
 
 def test_none_layouts_are_tolerated(calls):
@@ -224,72 +224,48 @@ def layout_state(monkeypatch):
     return state, routes
 
 
-@pytest.mark.parametrize('remove', [False, True])
-def test_running_layout_write_is_rejected_without_side_effects(layout_state, calls, remove):
-    import copy
-    state, routes = layout_state
-    before = copy.deepcopy(state)
-    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
-        cards=[] if remove else state['canvas_layout']['cards'],
-        connections=[{'fromCardId': ASR['id'], 'toCardId': TTS_OLD['id'],
-                      'fromPortIdx': 0, 'toPortIdx': 0}],
-        session_id='editor-1',
-    )))
-    assert result.status_code == 409
-    assert state == before
-    assert calls == []
-    routes.build_routes.assert_not_called()
-    routes.manager.start.assert_not_called()
-    routes.manager.stop.assert_not_called()
-    canvas_api.notify_layout_changed.assert_not_called()
-
-
 @pytest.mark.parametrize('running', [False, True])
-def test_solution_replacement_requires_stopped_project(layout_state, calls, running):
-    import copy
+@pytest.mark.parametrize('solution', [False, True])
+@pytest.mark.parametrize('failure', [False, True])
+def test_layout_and_solution_save_before_best_effort_stop(
+    monkeypatch, layout_state, calls, running, solution, failure
+):
     state, routes = layout_state
     state['core']['project_running'] = running
-    before = copy.deepcopy(state)
-    payload = {'cards': [{'id': TTS_OLD['id'], 'deviceRef': 'device', 'toolName': 'tts'}],
-               'connections': [], 'toolConfigs': {'device:tts': {'voice': 'new'}}}
-    if running:
-        with pytest.raises(solutions_api.fastapi.HTTPException) as error:
-            asyncio.run(solutions_api._apply_canvas(payload, {'device': 'mcp-1'}))
-        assert error.value.status_code == 409
-        assert state == before
-        assert calls == []
-        canvas_api.delete_all_tool_configs.assert_not_called()
-        canvas_api.apply_tool_config.assert_not_called()
-        canvas_api.notify_layout_changed.assert_not_called()
-    else:
-        result = asyncio.run(solutions_api._apply_canvas(payload, {'device': 'mcp-1'}))
+    seen = []
+
+    async def stop(mid, req, timeout_s=None):
+        seen.append(req.arguments['instance_id'])
+        assert state['canvas_layout']['cards'] == []
+        if failure and req.arguments['instance_id'] == TTS_OLD['id']:
+            raise RuntimeError('connection refused')
+        return {'code': 200, 'data': {'state': 'idle'}}
+
+    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', stop)
+    if solution:
+        result = asyncio.run(solutions_api._apply_canvas(
+            {'cards': [], 'toolConfigs': {'device:tts': {'voice': 'new'}}},
+            {'device': 'mcp-1'},
+        ))
+        assert result['cards'] == 0
         assert result['toolConfigsWritten'] == 1
+        assert state['tool_config:mcp-1:tts'] == {'voice': 'new'}
+        canvas_api.delete_all_tool_configs.assert_called_once()
         canvas_api.apply_tool_config.assert_called_once()
-        assert len(calls) == 1  # removed ASR, retained TTS
+    else:
+        result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
+            cards=[], connections=[], session_id='editor-1')))
+        assert result == {'code': 200}
+    assert set(seen) == {TTS_OLD['id'], ASR['id']}
+    assert state['core']['project_running'] is running
+    canvas_api.notify_layout_changed.assert_called_once()
     routes.manager.start.assert_not_called()
     routes.manager.stop.assert_not_called()
-    assert state['core']['project_running'] is running
-
-
-def test_stopped_layout_can_be_saved(layout_state, calls):
-    state, routes = layout_state
-    state['core']['project_running'] = False
-    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
-        cards=[TTS_NEW], connections=[], session_id='editor-1'
-    )))
-    assert result == {'code': 200}
-    assert state['canvas_layout']['cards'] == [TTS_NEW]
-    assert len(calls) == 2
-    assert state['core']['project_running'] is False
-    routes.manager.start.assert_not_called()
 
 
 @pytest.mark.parametrize('solution', [False, True])
-def test_running_state_is_checked_after_waiting_for_lifecycle_lock(
-    monkeypatch, layout_state, calls, solution
-):
+def test_writes_wait_for_lifecycle_lock(monkeypatch, layout_state, calls, solution):
     state, _ = layout_state
-    state['core']['project_running'] = False
 
     async def run():
         lock = asyncio.Lock()
@@ -301,42 +277,12 @@ def test_running_state_is_checked_after_waiting_for_lifecycle_lock(
             task = asyncio.create_task(operation)
             await asyncio.sleep(0)
             assert not task.done()
-            state['core']['project_running'] = True
-        if solution:
-            with pytest.raises(solutions_api.fastapi.HTTPException) as error:
-                await task
-            assert error.value.status_code == 409
-        else:
-            assert (await task).status_code == 409
+            assert state['canvas_layout']['cards'] == [TTS_OLD, ASR]
+        await task
 
     asyncio.run(run())
-    assert calls == []
-    assert state['canvas_layout']['cards'] == [TTS_OLD, ASR]
-    assert state['core']['project_running'] is True
-
-
-def test_layout_is_not_saved_when_removed_card_stop_is_unconfirmed(
-    monkeypatch, calls
-):
-    async def _pending(_mcp_id, _req, timeout_s=None):
-        return {'code': 200, 'data': {'ok': False, 'state': 'error', 'error': 'stop pending'}}
-
-    monkeypatch.setattr(sys.modules['api.mcp_manage'], 'mcp_call_tool', _pending)
-    original = {'cards': [TTS_OLD], 'connections': []}
-    monkeypatch.setattr(config_api.config, 'main', {
-        'core': {'project_running': False},
-        'canvas_layout': original,
-    })
-    monkeypatch.setattr(canvas_api, '_editor_session', 'editor-1')
-    monkeypatch.setattr(canvas_api, '_editor_last_seen', time.monotonic())
-    monkeypatch.setattr(canvas_api, '_live_sessions', {'editor-1': 1})
-
-    result = asyncio.run(canvas_api.save_layout(canvas_api.CanvasLayout(
-        cards=[], connections=[], session_id='editor-1'
-    )))
-
-    assert result.status_code == 409
-    assert config_api.config.main['canvas_layout'] == original
+    assert state['canvas_layout']['cards'] == []
+    assert len(calls) == 2
 
 
 def test_project_stop_reports_agent_off_and_device_failure_separately(
