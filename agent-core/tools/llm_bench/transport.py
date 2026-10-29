@@ -135,11 +135,19 @@ class Transport:
 
         usage = (data.get('usage') or {}) if isinstance(data, dict) else {}
         details = usage.get('prompt_tokens_details') or {}
+        # 思考 token。它已经算在 completion_tokens 里，所以单看 completion 分不出
+        # 「答得长」和「想得久」——而评测 thinking 档位时要分的恰恰是这两件事。
+        # 字段名各家不同：OpenAI 系在 completion_tokens_details.reasoning_tokens，
+        # 智谱那条线出现过顶层 reasoning_tokens。两处都取，取到哪个算哪个。
+        comp_details = usage.get('completion_tokens_details') or {}
+        reasoning = (comp_details.get('reasoning_tokens')
+                     or usage.get('reasoning_tokens') or 0)
         choices = data.get('choices') or [{}] if isinstance(data, dict) else [{}]
         return {
             'ok': True, 'kind': Kind.OK, 'status': 200, 'elapsed': elapsed,
             'prompt': usage.get('prompt_tokens', 0) or 0,
             'completion': usage.get('completion_tokens', 0) or 0,
+            'reasoning': reasoning,
             'cached': details.get('cached_tokens', 0) or 0,
             'finish': (choices[0] or {}).get('finish_reason'),
             'err': None, 'detail': None,
@@ -153,7 +161,7 @@ class Transport:
         return {
             'ok': False, 'kind': kind or classify(status, text, exc),
             'status': status, 'elapsed': elapsed,
-            'prompt': 0, 'completion': 0, 'cached': 0, 'finish': None,
+            'prompt': 0, 'completion': 0, 'reasoning': 0, 'cached': 0, 'finish': None,
             'err': f'HTTP {status}' if status else type(exc).__name__ if exc else 'error',
             'detail': detail,
         }

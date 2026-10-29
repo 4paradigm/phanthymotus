@@ -140,7 +140,7 @@ def _error_chain(error: BaseException) -> str:
 
 def _release_actions(items) -> None:
     """Cancel ACP actions for utterances that will never be played."""
-    for text, action_id in items:
+    for text, action_id, *_language in items:
         _complete_action(action_id, text, 0, interrupted=True)
 
 
@@ -150,18 +150,30 @@ def _node_suffix(key: str) -> str:
 
 
 def _unpack_utterance(item) -> tuple:
-    """Normalise a queue item to (text, action_id, generation).
+    """Normalise a queue item to (text, action_id, generation, language).
 
     Accepts the older 2-tuple and bare-string shapes so a queue built by other
     code paths still works; those carry no generation, and `None` means "cannot
     be stale" so such an item is always played rather than silently dropped.
+    A missing language means "the instance's configured reading language".
     """
     if isinstance(item, tuple):
         text = str(item[0]) if item else ""
         action_id = item[1] if len(item) >= 2 else ""
         gen = item[2] if len(item) >= 3 else None
-        return text, action_id, gen
-    return str(item), "", None
+        language = item[3] if len(item) >= 4 else None
+        return text, action_id, gen, language
+    return str(item), "", None, None
+
+
+def reading_language(value) -> str:
+    """Validate a reading-language setting; empty means "not specified"."""
+    if value is None:
+        return ""
+    value = value.strip().lower() if isinstance(value, str) else value
+    if value not in ("", "auto", "zh", "en"):
+        raise ValueError("reading_language must be auto, zh or en")
+    return value
 
 
 def _complete_action(
@@ -222,6 +234,8 @@ class _Vits2TTSNode(Node):
             f"{input_topic}/tts" if input_topic else "/perception/tts"
         )
         self._adapter = adapter
+        # The previous utterance's resolved zh/en. Only the worker touches it.
+        self._last_language = None
         self.state = "idle"
         self._text_queue = queue.Queue()
         self._worker_thread = None
@@ -294,16 +308,16 @@ class _Vits2TTSNode(Node):
                 item = self._text_queue.get_nowait()
             except queue.Empty:
                 break
-            text, action_id, _gen = _unpack_utterance(item)
+            text, action_id, _gen, _language = _unpack_utterance(item)
             discarded.append((text, action_id))
         for text, action_id in discarded:
             _complete_action(action_id, text, 0, interrupted=True)
         return len(discarded)
 
-    def enqueue(self, text: str, action_id: str = ""):
+    def enqueue(self, text: str, action_id: str = "", language: str = ""):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        self._text_queue.put((text, action_id, self._current_gen()))
+        self._text_queue.put((text, action_id, self._current_gen(), language or None))
 
     def _text_callback(self, message: String):
         if self.state != "running":
@@ -314,6 +328,26 @@ class _Vits2TTSNode(Node):
             text = message.data.strip()
         if text:
             self._text_queue.put((text, "", self._current_gen()))
+
+    def _prepare_text(self, text: str, language: Optional[str]) -> tuple:
+        """Pick this utterance's reading language and pre-read its notation.
+
+        Never raises: a failure here falls back to the plain frontend reading
+        of the original text, which is what the plugin did before it had
+        reading languages at all — something is always better than silence.
+        """
+        try:
+            from .frontend.language import prepare
+
+            preference = language or "auto"
+            frontend_text, reading, resolved = prepare(
+                text, preference, self._last_language
+            )
+            self._last_language = resolved
+            return frontend_text, reading
+        except Exception:  # noqa: BLE001
+            log.exception("[vits2_tts_trt] reading-language preparation failed")
+            return text, ""
 
     def _publish(self, pcm: bytes):
         message = AudioChunk()
@@ -371,7 +405,7 @@ class _Vits2TTSNode(Node):
                 item = self._text_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            text, action_id, gen = _unpack_utterance(item)
+            text, action_id, gen, language = _unpack_utterance(item)
             # Discard only utterances that predate the latest interrupt. An
             # interrupt that landed while this node was idle must not touch the
             # next speak — that is what used to swallow a whole reply.
@@ -386,6 +420,7 @@ class _Vits2TTSNode(Node):
                 self._publish_eof()
                 _complete_action(action_id, text, 0, interrupted=True)
                 continue
+            frontend_text, reading = self._prepare_text(text, language)
             subscriber_gate_cancel = threading.Event()
             subscriber_gate_done = threading.Event()
             subscriber_gate_result = {}
@@ -549,7 +584,8 @@ class _Vits2TTSNode(Node):
                     """
                     buffer = bytearray()
                     try:
-                        for pcm in self._adapter.synthesize_stream(text):
+                        for pcm in self._adapter.synthesize_stream(
+                                frontend_text, reading_language=reading):
                             buffer.extend(pcm)
                             while len(buffer) >= CHUNK_BYTES:
                                 frame = bytes(buffer[:CHUNK_BYTES])
@@ -702,7 +738,7 @@ class TTSPlugin:
         self._state_lock = threading.RLock()
         self._nodes = {}
         self._pending_starts = {}        # node_key -> input_topic
-        self._pending_speech = {}        # node_key -> [(text, action_id), ...]
+        self._pending_speech = {}        # node_key -> [(text, action_id, language), ...]
         self._adapter = None
         self._adapter_state = "idle"     # idle|loading|ready|error
         self._load_error = None
@@ -842,9 +878,9 @@ class TTSPlugin:
         """Hand a freshly started node the utterances queued while it loaded."""
         with self._state_lock:
             queued = self._pending_speech.pop(node_key, [])
-        for text, action_id in queued:
+        for text, action_id, language in queued:
             try:
-                node.enqueue(text, action_id=action_id)
+                node.enqueue(text, action_id=action_id, language=language)
             except Exception:  # noqa: BLE001
                 log.exception("[vits2_tts_trt] failed to queue deferred utterance")
                 _complete_action(action_id, text, 0, interrupted=True)
@@ -1060,6 +1096,9 @@ class TTSPlugin:
         text = args.get("text", "").strip()
         if not text:
             raise ValueError("text is required")
+        # Validated here, on the request thread, so a typo is an error the
+        # caller sees rather than a silent fallback inside the worker.
+        language = reading_language(args.get("reading_language"))
         import uuid
 
         action_id = f"speak-{uuid.uuid4().hex[:8]}"
@@ -1074,11 +1113,12 @@ class TTSPlugin:
                 if self._adapter_state == "error" and self._load_error:
                     return {"state": "error", "message": self._load_error}
                 self._pending_starts.setdefault(key, args.get("input_topic") or "")
-                self._pending_speech.setdefault(key, []).append((text, action_id))
+                self._pending_speech.setdefault(key, []).append(
+                    (text, action_id, language))
                 self._request_load_locked()
                 adapter = self._adapter
         if node is not None:
-            node.enqueue(text, action_id=action_id)
+            node.enqueue(text, action_id=action_id, language=language)
             return {"status": "queued", "action_id": action_id, "text": text}
         if adapter is not None:
             # Model is resident (a stopped instance, say) — start it now.
@@ -1141,4 +1181,7 @@ class TTSPlugin:
             raise RuntimeError(
                 f"VITS2 model not ready ({state}): {error or 'still loading'}"
             )
-        return adapter.synthesize(text)
+        from .frontend.language import prepare
+
+        frontend_text, reading, _resolved = prepare(text)
+        return adapter.synthesize(frontend_text, reading_language=reading)

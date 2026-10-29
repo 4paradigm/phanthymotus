@@ -133,9 +133,9 @@ def probe(groups, transport: Transport, times: int, interval: float = 2.0,
             if sink:
                 sink.write({'group': g.name, 'payload_idx': i, 'repeat': 0,
                             'phase': Phase.PROBE, 'ts': time.time(),
-                            **{k: r[k] for k in
+                            **{k: r.get(k) for k in
                                ('ok', 'kind', 'status', 'elapsed', 'prompt',
-                                'completion', 'cached', 'finish', 'err', 'detail')}})
+                                'completion', 'reasoning', 'cached', 'finish', 'err', 'detail')}})
             if i < times - 1:
                 time.sleep(interval)
         ok = sum(1 for r in seq if r['ok'])
@@ -187,9 +187,9 @@ def run(groups, payloads, transport: Transport, cfg: dict,
                                 build_payload(g, rec))
         sink.write({'group': g.name, 'payload_idx': idx, 'repeat': rep,
                     'phase': phase, 'ts': time.time(),
-                    **{k: r[k] for k in
+                    **{k: r.get(k) for k in
                        ('ok', 'kind', 'status', 'elapsed', 'prompt',
-                        'completion', 'cached', 'finish', 'err', 'detail')}})
+                        'completion', 'reasoning', 'cached', 'finish', 'err', 'detail')}})
         return r
 
     def report(g, r):
@@ -244,7 +244,7 @@ def run(groups, payloads, transport: Transport, cfg: dict,
                 except Exception as e:  # 兜底：fire 本身不该抛，但绝不能让它中断整轮
                     results[g.name] = {
                         'ok': False, 'kind': 'unknown', 'status': None,
-                        'elapsed': 0.0, 'prompt': 0, 'completion': 0, 'cached': 0,
+                        'elapsed': 0.0, 'prompt': 0, 'completion': 0, 'reasoning': 0, 'cached': 0,
                         'finish': None, 'err': type(e).__name__,
                         'detail': str(e)[:200]}
         # 按固定顺序打印，日志才可读、可比对

@@ -358,7 +358,7 @@ def decode_poses(outputs, meta: LetterboxMeta, conf: float,
 
 # ── depth decoding ───────────────────────────────────────────────────────────
 
-def decode_depth(outputs, meta: LetterboxMeta) -> np.ndarray:
+def decode_depth(outputs, meta: LetterboxMeta | None) -> np.ndarray:
     """Decode a dense depth output and crop the letterbox padding back off.
 
     Like decode_detections, this takes the engine's full output list and picks
@@ -379,6 +379,8 @@ def decode_depth(outputs, meta: LetterboxMeta) -> np.ndarray:
         shapes = [tuple(np.asarray(a).shape) for a in _as_candidates(outputs)]
         raise VisionDecodeError(f"no engine output {shapes} is a 2-D depth map")
 
+    if meta is None:
+        return array
     inner_w = max(1, round(meta.orig_w * meta.scale))
     inner_h = max(1, round(meta.orig_h * meta.scale))
     pad_x, pad_y = int(meta.pad_x), int(meta.pad_y)

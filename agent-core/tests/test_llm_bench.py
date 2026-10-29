@@ -269,6 +269,29 @@ def test_include_current_reads_configdb(tmp_path):
     assert g.extra_body['thinking'] == {'type': 'disabled'}
 
 
+def test_include_current_think_mode_on_uses_min_extra(tmp_path):
+    """think_mode=true 的生产配置不是「什么都不发」，而是最低档那一组。
+
+    评测照抄空集会把「开着思考压到最低」测成「按供应商默认档随它想」，
+    两者是数倍延迟差。
+    """
+    db = tmp_path / 'data.db'
+    conn = sqlite3.connect(db)
+    conn.execute('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)')
+    conn.execute("INSERT INTO config VALUES ('client', ?)", (json.dumps(
+        {'llm': [{'url': 'https://prod/v1', 'key': 'sk-prod-key',
+                  'model': 'glm-5.3', 'think_mode': True}]}),))
+    conn.commit()
+    conn.close()
+
+    cfg = cfgmod.load(None, {'include_current': True})
+    cfg['include_current'] = True
+    g = cfgmod.build_groups(cfg, str(db))[0]
+    assert g.extra_body == cfgmod.THINKING_MIN_EXTRA
+    assert g.extra_body['thinking'] == {'type': 'enabled', 'budget_tokens': 1024}
+    assert g.extra_body['reasoning_effort'] == 'low'
+
+
 def test_configdb_absent_is_not_fatal_when_groups_exist(tmp_path):
     cfg = cfgmod.load(_yaml(tmp_path, """
 include_current: true

@@ -121,6 +121,36 @@ def test_config_schema_exposes_the_engine_selector():
     assert tts.TTSPlugin.PREFIX == "tts"
 
 
+def test_every_engine_declares_its_languages():
+    assert set(tts.ENGINE_LANGUAGES) == set(tts.TTS_ENGINES)
+    assert all(tts.ENGINE_LANGUAGES[e] for e in tts.TTS_ENGINES)
+
+
+@pytest.mark.parametrize("engine,languages", [
+    ("vits2-zh-en", ["zh", "en"]),
+    ("matcha-zh-en", ["zh", "en"]),
+    ("mms-th", ["th"]),
+    ("kokoro-multi", list(tts.KokoroTTSAdapter.LANGUAGES)),
+])
+def test_support_language_reports_the_live_engine(_fake_engines, engine, languages):
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": engine})
+    assert plugin.dispatch("tts", {"action": "support_language"}) == {
+        "engine": engine, "languages": languages}
+
+
+def test_support_language_answers_while_an_engine_is_loading(monkeypatch, _fake_engines):
+    """A property of the engine, not of a loaded model: never forwarded, never waits."""
+    plugin = _plugin()
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
+    # The fake sherpa build takes 0.3 s, so this config returns mid-build.
+    assert plugin.dispatch("tts", {"action": "config",
+                                   "tts_engine": "mms-th"})["state"] == "loading"
+    assert plugin.dispatch("tts", {"action": "support_language"})["languages"] == ["th"]
+    assert all(c.get("action") != "support_language"
+               for impl in _fake_engines.impls.values() for c in impl.calls)
+
+
 def test_default_engine_is_built_at_startup(_fake_engines):
     plugin = _plugin()
     assert _fake_engines.order == ["vits2-zh-en"]
@@ -624,6 +654,20 @@ def test_an_identical_config_does_not_rebuild_the_session(_sherpa):
         assert result["status"] == "configured"
         assert result["rebuilt"] is False
     assert _CountingAdapter.builds == 1, "an identical config rebuilt the session"
+
+
+def test_a_stray_reading_language_does_not_disturb_other_engines(_sherpa):
+    """A card saved while reading_language was briefly a config field still
+    carries it, and the dashboard replays saved config. On a sherpa engine it
+    must change nothing: no session rebuild, and the engine still speaks."""
+    plugin, holder = _sherpa
+    for value in ("en", "zh", "auto"):
+        result = plugin.dispatch("tts", {"action": "config", "device": "gpu", "speed": 1,
+                                         "speaker_id": 0, "thai_phrase_spacing": True,
+                                         "reading_language": value})
+        assert result["rebuilt"] is False
+    assert _CountingAdapter.builds == 1
+    assert plugin.synthesize_raw("สวัสดี")
 
 
 def test_changing_speed_alone_updates_the_resident_model(_sherpa):

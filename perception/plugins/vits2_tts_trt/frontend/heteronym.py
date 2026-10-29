@@ -1,122 +1,63 @@
-custom_dict = {
-    '不得了':[['bu4'],['de2'],['liao3']],
-    '了如指掌':[['liao3'],['ru2'],['zhi3'],['zhang3']],
-    '了却':[['liao3'],['que4']],
-    '重重地':[['zhong4'],['zhong4'],['de']],
-    '重重叹': [['zhong4'], ['zhong4'], ['tan4']],
-    '周长': [['zhou1'], ['chang2']],
-    '圆周长': [['yuan2'], ['zhou1'], ['chang2']],
-    '岑夫子':[['ceng2'], ['fu1'], ['zi3']],
-    '困难重重': [['kun4'], ['nan2'], ['chong2'], ['chong2']],
-    '重重障碍': [['chong2'], ['chong2'], ['zhang4'], ['ai4']],
-    '重重困难': [['chong2'], ['chong2'], ['kun4'], ['nan2']],
-    '谍影重重':[['die2'],['ying3'],['chong2'],['chong2']],
-    '这得':[['zhe4'],['dei3']],
-    '得加钱':[['dei3'],['jia1'],['qian2']],
-    '那得':[['na4'],['dei3']],
-    '得亏':[['dei3'],['kui1']],
-    '要害':[['yao4'],['hai4']],
-    '要塞':[['yao4'],['sai4']],
-    '要求':[['yao1'],['qiu2']],
-    '要挟':[['yao1'],['xie2']],
-    '着实':[['zhuo2'],['shi2']],
-    '穿着':[['chuan1'],['zhuo2']],
-    '衣着':[['yi1'],['zhuo2']],
-    '弹起':[['tan2'],['qi3']],
-    '弹跳':[['tan2'],['tiao4']],
-    '大夫':[['dai4'],['fu']],
-    '尉迟':[['yu4'],['chi2']],
-    '哪吒':[['ne2'],['zha']],
-    '夫差':[['fu1'],['chai1']],
-    '刘禅':[['liu2'],['shan4']],
-    '查良镛':[['zha1'],['liang2'],['yong1']],
-    '曾志伟':[['zeng1'],['zhi4'],['wei3']],
-    '可汗':[['ke4'],['han2']],
-    '单雄信':[['shan4'],['xiong2'],['xin4']],
-    '华山':[['hua4'],['shan1']],
-    '东莞':[['dong1'],['guan3']],
-    '济南':[['ji3'],['nan2']],
-    '东阿':[['dong1'],['e1']],
-    '蚌埠':[['beng4'],['bu4']],
-    '朝歌':[['zhao1'],['ge1']],
-    '六安':[['lu4'],['an1']],
-    '台州':[['tai1'],['zhou1']],
-    '丽水':[['li2'],['shui3']],
-    '阿房宫':[['e1'],['pang2'],['gong1']],
-    '吐蕃':[['tu3'],['bo1']],
-    '藏文':[['zang4'],['wen2']],
-    '藏塔':[['zang4'],['ta3']],
-    '秘鲁':[['bi4'],['lu3']],
-    '柏林':[['bo2'],['lin2']],
-    '将进酒':[['qiang1'],['jin4'],['jiu3']],
-    '君子好逑':[['jun1'],['zi3'],['hao3'],['qiu2']],
-    '吾日三省吾身':[['wu2'],['ri4'],['san1'],['xing3'],['wu2'],['shen1']],
-    '不亦说乎':[['bu2'],['yi4'],['yue4'],['hu1']],
-    '春风拂槛露华浓':[['chun1'],['feng1'],['fu2'],['jian4'],['lu4'],['hua2'],['nong2']],
-    '天姥吟':[['tian1'],['mu3'],['yin2']],
-    '清平乐':[['qing1'],['ping2'],['yue4']],
-    '重重的': [['zhong4'], ['zhong4'], ['de']],
-    '重算': [['chong2'], ['suan4']],
-    '便宜': [['pian2'], ['yi']],
-    '单老师': [['shan4'], ['lao3'], ['shi1']],
-    '还复来': [['huan2'], ['fu4'], ['lai2']],
-    '倒向': [['dao3'], ['xiang4']],
-    '人参观': [['ren2'], ['can1'],['guan1']],
-    '睡不着觉': [['shui4'], ['bu4'], ['zhao2'], ['jiao4']],
-    '盛满': [['cheng2'], ['man3']],
-    '宝宝': [['bao3'],['bao1']],
-    '小宝宝': [['xiao3'], ['bao3'],['bao1']],
-    "量了": [["liang2"], ["le"]],
-    "得好好": [["dei3"], ["hao3"], ["hao3"]],
-    "要还" : [["yao4"], ["huan2"]],
-    "哪吒": [['ne2'], ['zha1']],
-    "传记": [['zhuan4'], ['ji4']],
-    "这道奇数":[['zhe4'],['dao4'],['ji1'],['shu4']],
-    "调了一会琴弦": [['tiao2'], ['le'], ['yi2'], ['hui4'], ['qin2'], ['xian2']],
-    "调了一会儿琴弦": [['tiao2'], ['le'], ['yi2'], ['hui4'], ['er'], ['qin2'], ['xian2']],
-    "调吉他": [['tiao2'], ['ji2'], ['ta']],
-    "得重算":[['dei3'],['chong2'],['suan4']],
-    "应是":[['ying1'],['shi4']],
-    "找到了":[['zhao3'],['dao4'],['le']],
-    "数得不亦乐乎": [['shu3'], ['de'], ['bu4'], ['yi4'], ['le'], ['hu1']],
-    "车行": [['che1'], ['hang2']],
-    "重发":[['chong2'], ['fa1']],
-    "重写一遍":[['chong2'],['xie3'], ['yi1'],['bian4']],
-    "谁知盘中餐":[['shui2'],['zhi1'],['pan2'], ['zhong1'], ['can1']],
-    "赶得上":[['gan3'], ['de'], ['shang4']],
-    "还款":[['huan2'],['kuan3']],
-    "查查":[['cha2'],['cha2']],
-    "撒在田里":[['sa3'], ['zai4'],['tian3'], ['li3']],
-    "调高一点": [["tiao2"], ["gao1"], ["yi4"], ["dian3"]],
-    "没收到": [["mei2"], ["shou1"], ["dao4"]],
-    "清清楚楚": [["qing1"], ["qing1"], ["chu3"], ["chu3"]],
-    "清清楚楚地": [["qing1"], ["qing1"], ["chu3"], ["chu3"], ["de"]],
-    "还清清楚楚地": [["hai2"], ["qing1"], ["qing1"], ["chu3"], ["chu3"], ["de"]],
-    "一目了然": [["yi1"], ["mu4"], ["liao3"], ["ran2"]],
-    "了如指掌": [["liao3"], ["ru2"], ["zhi3"], ["zhang3"]],
-    "伯伯": [["bo2"], ["bo"]],
-    "待会儿": [["dai1"], ["hui4"], ["er"]],
-    "表述为": [["biao3"], ["shu4"], ["wei2"]],
-    "滑倒":[["hua2"], ["dao3"]],
-    "吃一堑长一智": [["chi1"], ["yi1"], ["qian4"], ["zhang3"], ["yi1"], ["zhi4"]],
-    "先帝创业未半而中道崩殂": [["xian1"], ["di4"], ["chuang4"], ["ye4"], ["wei4"], ["ban4"], ["er2"], ["zhong1"], ["dao4"], ["beng1"], ["cu2"]],
-    "小心翼翼地": [["xiao3"], ["xin1"], ["yi4"], ["yi4"], ["de"]],
-    "严丝合缝地": [["yan2"], ["si1"], ["he2"], ["feng4"], ["de"]],
-    "那得要": [["na4"], ["dei3"], ["yao4"]],
-    "框架": [["kuang4"], ["jia4"]],
-    "薄礼": [["bo2"], ["li3"]],
-    "曾国藩": [["zeng1"], ["guo2"], ["fan1"]],
-}
+"""Load Chinese pronunciation annotations from the shared external lexicon.
 
-jieba_phrases = (
-    "藏塔",
-    "一次次地",
-    "不好意思地",
-    "严丝合缝地",
-    "刺骨地",
-    "很耐心地",
-    "慢慢地",
-    "快乐地",
-    "警惕地",
-    "那得要",
-)
+Keep legacy numbered pinyin and reviewed tone-mark pinyin separate: their
+pypinyin loading styles and jieba registration policies are intentionally
+unchanged. This module contains no maintained word lists.
+"""
+import json
+import re
+
+from .external_lexicon import _unique_object
+from .release_paths import frontend_lexicon_path
+
+_MAX_BYTES = 4 * 1024 * 1024
+_PHRASE = re.compile(r"[\u4e00-\u9fff]{1,64}\Z")
+_NUMBERED = re.compile(r"[a-züv]{1,12}[1-5]?\Z")
+_TONE_MARKED = re.compile(r"[a-züāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜńňǹḿ]{1,12}\Z")
+
+
+def _phrase(value):
+    return isinstance(value, str) and _PHRASE.fullmatch(value) is not None
+
+
+def _pronunciations(value, syllable):
+    if not isinstance(value, dict) or len(value) > 50000:
+        raise ValueError("Chinese pronunciations require a bounded phrase mapping")
+    for phrase, reading in value.items():
+        if (not _phrase(phrase) or not isinstance(reading, list)
+                or len(reading) != len(phrase)):
+            raise ValueError("Chinese pinyin must align one syllable list per character")
+        for alternatives in reading:
+            if (not isinstance(alternatives, list) or not 1 <= len(alternatives) <= 8
+                    or any(not isinstance(item, str) or not syllable.fullmatch(item)
+                           for item in alternatives)):
+                raise ValueError("Chinese pinyin has an invalid syllable/tone format")
+    return value
+
+
+def load_chinese_lexicon(path=None):
+    """Read and validate annotations before Chinese frontend initialization.
+
+    Called at startup, never per word. A missing section is a release mismatch,
+    not permission to silently drop pronunciation fixes. Restart the frontend
+    after changing data; pypinyin/jieba registrations are process-global.
+    """
+    with open(frontend_lexicon_path() if path is None else path, "rb") as source:
+        raw = source.read(_MAX_BYTES + 1)
+    if len(raw) > _MAX_BYTES:
+        raise ValueError("External Chinese lexicon exceeds 4 MiB")
+    resource = json.loads(raw, object_pairs_hook=_unique_object)
+    if (not isinstance(resource, dict) or resource.get("version") != 1
+            or resource.get("format") != "vits2-external-pronunciations"):
+        raise ValueError("Chinese lexicon requires the shared VITS2 resource format")
+    data = resource.get("chinese")
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("Chinese lexicon section missing; install the matching bilingual resource")
+    legacy = _pronunciations(data.get("custom_dict"), _NUMBERED)
+    reviewed = _pronunciations(data.get("robot_phrase_pinyin"), _TONE_MARKED)
+    phrases = data.get("jieba_phrases")
+    if (not isinstance(phrases, list) or len(phrases) > 50000
+            or any(not _phrase(phrase) for phrase in phrases)
+            or len(set(phrases)) != len(phrases)):
+        raise ValueError("Chinese segmentation phrases require unique complete phrases")
+    return legacy, tuple(phrases), reviewed

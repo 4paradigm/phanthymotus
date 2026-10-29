@@ -5,10 +5,15 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from copy import deepcopy
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from .runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
+import numpy as np
+
+from .runtime.backends.trt_numpy_tts_engine import (
+    SynthesisFrameLimitError, TensorRTNumpyTTSEngine,
+)
 
 
 log = logging.getLogger(__name__)
@@ -48,13 +53,42 @@ WARMUP_CASES = (
     "The device is ready for a short test."
 )
 
+
+def _quiet_samples(samples, reverse=False):
+    """Count only verified low-energy 5-ms windows, retaining a 10-ms guard."""
+    view = samples[::-1] if reverse else samples
+    window = SAMPLE_RATE // 200
+    quiet = 0
+    for index in range(0, len(view) - window + 1, window):
+        values = view[index:index + window].astype(np.float32)
+        if np.max(np.abs(values)) > 64 or np.sqrt(np.mean(values * values)) > 15:
+            break
+        quiet = index + window
+    return max(0, quiet - SAMPLE_RATE // 100)
+
+
+def _join_pcm(left, right):
+    """Join mono PCM with a two-millisecond overlap, without changing speed."""
+    if not len(left):
+        return right
+    if not len(right):
+        return left
+    overlap = SAMPLE_RATE // 500
+    if len(left) <= overlap or len(right) <= overlap:
+        raise ValueError("TTS segment is too short to join")
+    ramp = np.linspace(0, 1, overlap)
+    mixed = np.rint(left[-overlap:].astype(np.float32) * (1 - ramp)
+                    + right[:overlap].astype(np.float32) * ramp).astype(np.int16)
+    return np.concatenate((left[:-overlap], mixed, right[overlap:]))
+
+
 class TTSAdapter(ABC):
     @abstractmethod
-    def synthesize(self, text: str) -> bytes:
+    def synthesize(self, text: str, reading_language=None) -> bytes:
         raise NotImplementedError
 
-    def synthesize_stream(self, text: str):
-        yield self.synthesize(text)
+    def synthesize_stream(self, text: str, reading_language=None):
+        yield self.synthesize(text, reading_language=reading_language)
 
     def warmup(self) -> int:
         return 0
@@ -104,7 +138,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
     def _token_count(self, text: str) -> int:
         return len(self._engine._get_text_ids(text, normalized=True)[0])
 
-    def iter_text_chunks(self, text: str):
+    def iter_text_chunks(self, text: str, reading_language=None):
         """Yield the exact normalized text chunks and IDs used in production."""
         text = text.strip()
         if not text:
@@ -114,16 +148,114 @@ class Vits2TensorRTAdapter(TTSAdapter):
             iter_text_chunks as _frontend_iter_text_chunks,
         )
 
-        for chunk in _frontend_iter_text_chunks(
-            normalize_text_mix(text), self._token_count, self.max_chunk_tokens
-        ):
+        normalized = (normalize_text_mix(text, reading_language=reading_language)
+                      if reading_language else normalize_text_mix(text))
+        for chunk in _frontend_iter_text_chunks(normalized, self._token_count, self.max_chunk_tokens):
             text_ids = self._engine._get_text_ids(chunk, normalized=True)
             yield chunk, text_ids
 
-    def synthesize(self, text: str) -> bytes:
-        return b"".join(self.synthesize_stream(text))
+    def synthesize(self, text: str, reading_language=None) -> bytes:
+        return b"".join(self.synthesize_stream(text, reading_language=reading_language))
 
-    def synthesize_stream(self, text: str):
+    def _isolated_pcm(self, chunk, text_ids, span, parts):
+        """Synthesize a verified term while retaining its original left context.
+
+        Token durations are estimates, not forced alignment. If their layout
+        cannot be validated, return the unchanged whole-chunk audio.
+        """
+        start, end, blank = span
+        scale = 1.0 / self._speed
+        pcm, durations = self._engine.synthesize_with_durations(
+            chunk, text_ids=text_ids, length_scale=scale,
+        )
+        samples = np.frombuffer(pcm, dtype='<i2')
+        frame_count = sum(durations)
+        if len(durations) != len(text_ids[0]) or frame_count <= 0:
+            return pcm
+        hop = round(len(samples) / frame_count)
+        if not 32 <= hop <= 4096 or abs(len(samples) - hop * frame_count) > 8:
+            return pcm
+        prefix_text, suffix_text = chunk[:start], chunk[end:]
+        if suffix_text.strip() and not any(c.isalnum() for c in suffix_text):
+            # A question/exclamation needs the original sentence prosody.
+            if any(c in suffix_text for c in '?!！？'):
+                return pcm
+            suffix_text = ''
+        if prefix_text.strip():
+            lo = sum(durations[:blank]) * hop
+            hi = lo + durations[blank] * hop
+            window = SAMPLE_RATE // 400
+            if lo < 0 or hi > len(samples) or hi - lo <= 2 * window:
+                return pcm
+            cut = min(range(lo + window, hi - window),
+                      key=lambda i: float(np.mean(samples[i-window:i+window].astype(np.float32) ** 2)))
+            radius = SAMPLE_RATE // 1000
+            crossings = [i for i in range(max(lo, cut-radius), min(hi-1, cut+radius))
+                         if int(samples[i]) * int(samples[i+1]) <= 0]
+            if crossings:
+                cut = min(crossings, key=lambda i: abs(i-cut))
+            prefix = samples[:cut]
+            if len(prefix) <= SAMPLE_RATE // 500:
+                return pcm
+        else:
+            prefix = np.empty(0, dtype=np.int16)
+
+        # A short whole word can expand into many letter-name tokens. Check
+        # each independent text against the engine profile before inference;
+        # if splitting would exceed it, retain the original complete chunk.
+        try:
+            part_ids = [self._engine._get_text_ids(part, normalized=True) for part in parts]
+            suffix_ids = (self._engine._get_text_ids(suffix_text, normalized=True)
+                          if suffix_text.strip() else None)
+        except (AssertionError, ValueError):
+            return pcm
+        engine_limit = int(getattr(self._engine, 'max_text_tokens', self.max_chunk_tokens))
+        if (any(not ids[0] or len(ids[0]) > engine_limit for ids in part_ids)
+                or (suffix_ids is not None
+                    and (not suffix_ids[0] or len(suffix_ids[0]) > engine_limit))):
+            return pcm
+
+        # Isolated word/letter parts use the same request seed as an isolated
+        # utterance. Restore the full-chunk RNG afterwards so later ordinary
+        # chunks retain their original random stream.
+        state = deepcopy(self._engine._rng.bit_generator.state)
+        try:
+            segments = []
+            for part, ids in zip(parts, part_ids):
+                self._engine.reset_random_state()
+                segment = self._engine.synthesize(part, text_ids=ids, length_scale=scale)
+                segments.append(np.frombuffer(segment, dtype='<i2'))
+            suffix = np.empty(0, dtype=np.int16)
+            if suffix_ids is not None:
+                self._engine.reset_random_state()
+                suffix_pcm = self._engine.synthesize(suffix_text, text_ids=suffix_ids, length_scale=scale)
+                suffix = np.frombuffer(suffix_pcm, dtype='<i2')
+        except SynthesisFrameLimitError:
+            # The full chunk already succeeded; if an isolated part expands
+            # beyond the frame profile, preserve that complete original audio.
+            return pcm
+        finally:
+            self._engine._rng.bit_generator.state = state
+        if not segments or any(len(segment) <= SAMPLE_RATE // 250 for segment in segments):
+            return pcm
+        output = prefix
+        for index, segment in enumerate(segments):
+            head = _quiet_samples(segment) if len(output) else 0
+            tail = _quiet_samples(segment, reverse=True) if index + 1 < len(segments) or len(suffix) else 0
+            segment = segment[head:len(segment)-tail if tail else None]
+            if len(segment) <= SAMPLE_RATE // 250:
+                return pcm
+            if len(output) and len(output) <= SAMPLE_RATE // 500:
+                return pcm
+            output = _join_pcm(output, segment)
+        if len(suffix):
+            suffix = suffix[_quiet_samples(suffix):]
+            if len(suffix) <= SAMPLE_RATE // 250:
+                return pcm
+            output = _join_pcm(output, suffix)
+        return output.astype('<i2', copy=False).tobytes()
+
+    def synthesize_stream(self, text: str, reading_language=None):
         pause_samples = SAMPLE_RATE * CHUNK_PAUSE_MS // 1000
         silence = b"\x00\x00" * pause_samples
         with self._lock:
@@ -132,9 +264,24 @@ class Vits2TensorRTAdapter(TTSAdapter):
             reset_random_state = getattr(self._engine, "reset_random_state", None)
             if reset_random_state is not None:
                 reset_random_state()
-            for chunk_index, (chunk, text_ids) in enumerate(
-                self.iter_text_chunks(text)
-            ):
+            prepared = self.iter_text_chunks(text, reading_language=reading_language)
+            isolation = None
+            if (hasattr(self._engine, 'synthesize_with_durations')
+                    and hasattr(self._engine, '_rng') and reset_random_state is not None):
+                from .frontend.chunking import find_isolated_plan, map_isolated_term
+                from .frontend.external_lexicon import isolated_synthesis_entries
+
+                entries = isolated_synthesis_entries()
+                plan = find_isolated_plan(text, entries) if entries else None
+                if plan:
+                    prepared = list(prepared)
+                    term, mode, parts = plan
+                    matches = [(index, span) for index, (chunk, ids) in enumerate(prepared)
+                               if (span := map_isolated_term(
+                                   chunk, ids, term, mode, getattr(self._engine, 'add_blank', False)))]
+                    if len(matches) == 1:
+                        isolation = (matches[0][0], matches[0][1], parts)
+            for chunk_index, (chunk, text_ids) in enumerate(prepared):
                 token_count = len(text_ids[0])
                 log.info(
                     "text redacted: chars=%d chunk=%d tokens=%d",
@@ -144,11 +291,12 @@ class Vits2TensorRTAdapter(TTSAdapter):
                 )
                 if chunk_index and silence:
                     yield silence
-                pcm = self._engine.synthesize(
-                    chunk,
-                    text_ids=text_ids,
-                    length_scale=1.0 / self._speed,
-                )
+                if isolation and chunk_index == isolation[0]:
+                    pcm = self._isolated_pcm(chunk, text_ids, isolation[1], isolation[2])
+                else:
+                    pcm = self._engine.synthesize(
+                        chunk, text_ids=text_ids, length_scale=1.0 / self._speed,
+                    )
                 for offset in range(0, len(pcm), CHUNK_BYTES):
                     yield pcm[offset : offset + CHUNK_BYTES]
 
@@ -176,8 +324,10 @@ def _trt_adapter(cfg: dict) -> Vits2TensorRTAdapter:
 def _configure_frontend_paths(root: Path) -> None:
     """Point inference at the release-controlled frontend data."""
     from .frontend.release_paths import configure_release_paths
+    from .lexicon_resources import load_external_lexicon
 
     configure_release_paths(root)
+    load_external_lexicon(root)
 
 
 def build_adapter(cfg: dict) -> TTSAdapter:

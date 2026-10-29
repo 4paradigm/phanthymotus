@@ -38,6 +38,16 @@ request:
     reasoning:                    # OpenRouter
       enabled: false
     reasoning_effort: none        # OpenAI 风格
+    # think_mode=true 的生产配置发的是另一组：开着思考但压到最低档
+    # （src/client/llm.py 的 THINKING_MIN_EXTRA）。要评测那种配置，把上面
+    # 六个键换成下面这组——不要两组混发，开关会互相顶掉：
+    #   chat_template_kwargs: {enable_thinking: true, thinking_budget: 1024}
+    #   thinking: {type: enabled, budget_tokens: 1024}
+    #   enable_thinking: true
+    #   thinking_budget: 1024
+    #   reasoning: {enabled: true, effort: low}
+    #   reasoning_effort: low
+    # include_current 会按 ConfigDB 里的 think_mode 自动选对应的那一组。
 
 run:
   # 只跑一轮，每条 payload 每组各请求一次。总请求数 = count × 组数。

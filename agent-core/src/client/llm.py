@@ -425,6 +425,133 @@ THINKING_OFF_EXTRA = {
 }
 
 
+# ── think_mode=True：开着思考，但只给最低限度 ─────────────────────────────────
+#
+# 「开 thinking」不等于「随它想多久」。这个 agent 的每一轮都卡在用户面前——
+# 关与不关实测是 4 倍延迟差（见上表），而一轮里真正需要长链推理的只有少数。
+# 所以 think_mode=True 时仍然把档位压到各家支持的最低：留下思考能力，不留
+# 「想 2000 token 再开口」的尾巴。原先这里返回 {}，即完全不带参数，等于每家
+# 网关各按自己的默认档跑——同一个配置在两个供应商上行为不同，且都是最贵的那档。
+#
+# 和关闭那组一样：没有通用参数，所以几种写法全发，多余的字段绝大多数网关忽略，
+# 被 400 点名的由 _create() 逐个撤掉。两组走的是同一条降级路径。
+#
+# 几个取值上的坑：
+#   * `reasoning_effort` 用 "low" 而不是 OpenAI gpt-5 才有的 "minimal"——
+#     "low" 是各家都认的最低档，"minimal" 在别处会 400。
+#   * `thinking.budget_tokens` 必须 >= 1024（Anthropic 兼容层的硬下限，更小
+#     的值直接 400），所以 MIN_BUDGET 取 1024 而不是更激进的数。
+#   * `reasoning` 里只给 effort，不同时给 max_tokens——OpenRouter 要求二选一。
+#   * 智谱那条线只有 `thinking.type` 这一种开关，没有「低档」的说法，所以那边
+#     能做到的就是 type=enabled 加一个它可能忽略的 budget_tokens。
+#
+# ── 实测，以及为什么这组参数的收益测不出来 ──────────────────────────────────
+#
+# 两轮都在 Orin5 上打生产入口 router.phanthy.com，2026-10-22。
+#
+# 第一轮是合成 prompt（一道水池题，baseline 与 MIN 交替采样，判据 completion_tokens
+# 中位）：glm-5.3 各 12 次量到 129 → 100、3.23s → 2.38s；G53 各 25 次量到 128 → 99，
+# 延迟 2.79s → 2.88s（无差别）。
+#
+# **第二轮用 llm_bench 回放本机真实请求日志，这组数字一个都没复现。** 15 条真实
+# payload、8 组、串行轮换、逐条配对（判据是配对差的 95% bootstrap CI + 符号检验）：
+#
+#     组内对比（vs 不发任何字段）      延迟中位差    符号检验      判定
+#     G52  这组六个一起发              +0.11s      p=0.302 (5:10)  不显著
+#     G52  只发上限（不带 enable）     +0.11s      p=0.607 (6:9)   不显著
+#     G52  只发 reasoning_effort:low   +0.51s      p=0.035 (3:12)  **显著更慢**
+#     G53  这组六个一起发              -0.01s      p=0.607 (9:6)   不显著
+#     G53  只发上限                    +0.47s      p=0.607 (6:9)   不显著
+#     G53  只发 reasoning_effort:low   -0.05s      p=1.000 (8:7)   不显著
+#
+# **那一轮全程用的是 router 的别名模型名（G52/G53），而这些参数生效与否是按渠道
+# 而定的——所以它量到的「不显著」是假阴性。** 重测时改成一个模型名一组，并把**思考
+# token** 也记下来（llm_bench 原先只记 completion，而思考 token 已经算在里面，分不出
+# 「答得长」和「想得久」——评测思考档位要分的恰恰是这两件事）。同样 10 条真实 payload
+# 逐条配对：
+#
+#     模型名                参数         延迟 p50  延迟 p90  思考token均值  最大
+#     G53（别名）           不加            5.59s   18.47s        186.6   1006
+#     G53（别名）           effort=low      5.54s   18.25s        194.9    862  ← 无反应
+#     G53（别名）           整组关闭        —— 400「该模型始终思考」，上游拒绝
+#     zhipu/glm-5.3（直名） 不加            1.34s    9.47s        188.6   1401
+#     zhipu/glm-5.3（直名） effort=low      1.12s    1.95s          6.7     58  ← 生效
+#     G52（别名）           不加            1.98s    7.78s         86.8    475
+#     G52（别名）           effort=low      3.08s    6.68s        100.6    388  ← 无反应
+#     G52（别名）           整组关闭        2.24s    3.40s          0.0      0  ← 生效
+#
+# 读法：
+#   * `reasoning_effort: low` 只在 `zhipu/glm-5.3` 这条渠道上生效，把思考 token 压掉
+#     28 倍、p90 压掉 4.9 倍（最极端那条 payload：1401 token / 9.5s → 58 / 1.8s）。
+#   * 同一个参数在 G52 上毫无反应——glm-5.2 这代没有档位的概念，只有开/关。而**整组
+#     关闭参数在 G52 上是生效的**（思考 token 全 0），所以关闭和压档是两件独立的事，
+#     各自在哪条渠道上管用要分别测。
+#   * G53 这个别名既不吃 effort，又比直名慢一个量级（p50 5.59s vs 1.34s）；但它会把
+#     关闭参数转给上游（上游回 400），所以不是「别名把参数吃掉了」那么简单。
+#
+# **收益全在尾部**：10 条里只有 3 条真的触发长推理，所以延迟中位几乎不动而 p90 和
+# 均值差几倍——这件事要按 p90/均值判，看 p50 会得出「没用」。
+#
+# 三条由此而来的纪律：
+#   * **用实际配置的那个模型名测，别用同族的另一个名字。** 生效与否取决于 new-api 侧
+#     那条渠道，而不是模型本身；换个名字结论就变。
+#   * 别把合成 prompt 的收益写成产品收益，也别把某条渠道上的「无差别」写成参数无效。
+#   * 六个字段全发和只发 reasoning_effort 同档（思考 token 8.2 vs 8.6），那三个
+#     enable 字段在这条线上既不抵消也不帮忙——所以全发是安全的。
+#
+# 另外，上游说「没收到 reasoning_effort」和「它生效了」可以同时为真：new-api 很可能
+# 是**翻译**而不是透传，把它转成渠道自己的思考参数，所以上游日志里没有这个字面字段。
+# 判据永远是思考 token，不是上游有没有看见这个键。
+#
+# 顺带量到的、比这组参数重要得多的一件事：同一批 payload 上 G52 比 G53 快 2.2–3.2s
+# （多个组对 p<=0.035，其中一对 15:0）。选模型的收益比调 thinking 参数大一个量级。
+#
+# 另外两个采样上的坑，踩过所以记下来：
+#   * 这个 router 的别名按请求分发到多个上游渠道，逐样本方差极大（同一组参数五次
+#     采样拿到过 2 / 5 / 1227 / 1440 / 1485）。必须交替采样看中位，顺序跑完一组再
+#     跑下一组量到的是时段漂移。
+#   * n 不能小。G53 合成 prompt 各 12 次量到 125 → 138（「这组参数反而更费」），各
+#     25 次量到 128 → 99；回放真实日志 12 条量到 MIN 慢 0.9s，15 条配对后变成无差别。
+#     同机同入口，只是采样数和配对与否不同，结论的符号就反。n<20 且没配对，不要下
+#     结论。
+THINKING_MIN_BUDGET = 1024
+
+THINKING_MIN_EXTRA = {
+    # vLLM / SGLang 托管的 Qwen3、GLM 系列：chat template 里同时认开关和预算
+    "chat_template_kwargs": {"enable_thinking": True,
+                             "thinking_budget": THINKING_MIN_BUDGET},
+    # 智谱 GLM-4.5/4.6/5.x 的 OpenAI 接口、Anthropic 兼容网关
+    "thinking": {"type": "enabled", "budget_tokens": THINKING_MIN_BUDGET},
+    # DashScope 及部分自建网关放在顶层的同名开关
+    "enable_thinking": True,
+    "thinking_budget": THINKING_MIN_BUDGET,
+    # OpenRouter：effort 和 max_tokens 二选一，这里只给 effort
+    "reasoning": {"enabled": True, "effort": "low"},
+    # OpenAI 风格。"low" 是各家通认的最低档，"minimal" 只有 gpt-5 认
+    "reasoning_effort": "low",
+}
+
+
+def _refuses_to_disable_thinking(err: str) -> bool:
+    """400 的文案像不像「这个模型关不掉思考」。
+
+    实测 2026-10-22，router.phanthy.com 的 G53 对整组关闭参数回
+    `{"message":"该模型始终思考，不支持关闭思考；请使用 low、high 或 max。",
+      "type":"upstream_error","param":"","code":"1210"}` —— **param 是空的**，
+    所以按字段名撤的那条路匹配不到任何键，而 `_looks_like_unknown_param` 也不认
+    这句中文（它找的是 parameter/unknown/unsupported 那类词，`"param":""` 里的
+    param 不是 parameter 的子串）。结果是整个调用抛 BadRequestError —— 也就是说
+    `model=G53` 配上 `think_mode=False`（而这是默认值）会让每一次 LLM 调用都失败。
+    """
+    if any(k in err for k in ('不支持关闭思考', '始终思考', '必须思考', '无法关闭思考')):
+        return True
+    low = err.lower()
+    return any(k in low for k in ('always thinks', 'always reasoning',
+                                  'cannot be disabled', "can't be disabled",
+                                  'cannot disable thinking', 'does not support disabling',
+                                  'thinking is always', 'reasoning is always'))
+
+
 def _looks_like_unknown_param(err: str) -> bool:
     """400 的文案像不像「有个参数我不认识」。"""
     low = err.lower()
@@ -472,18 +599,27 @@ class Client():
     ) -> dict:
 
         def _extra(client, think_mode: bool) -> dict:
-            if think_mode:
-                return {}
+            # think_mode 只决定发哪一组：关掉，还是开着但压到最低档。两组共用
+            # 同一条「被 400 点名就撤掉」的降级记账。
+            #
+            # 另一种情况是模型压根关不掉思考（G53 就是），这时它已经被下面的
+            # _create() 记在 client 上，之后直接发最低档那组——既不再白吃一次
+            # 400，也不至于退回「什么都不发」的默认档。
+            if getattr(client, '_thinking_cannot_disable', False):
+                think_mode = True
+            base = THINKING_MIN_EXTRA if think_mode else THINKING_OFF_EXTRA
             # 之前被这个 endpoint 400 掉的字段不再发
             rejected = getattr(client, '_thinking_rejected', ())
-            extra = {k: v for k, v in THINKING_OFF_EXTRA.items() if k not in rejected}
+            extra = {k: v for k, v in base.items() if k not in rejected}
             return {"extra_body": extra} if extra else {}
 
         async def _create(client, model, url, kwargs):
             """发起 create()，并对「网关不认某个字段」逐级降级后重试。
 
-            每一轮都严格减少 kwargs，所以循环必然收敛。
+            每一轮要么严格减少 kwargs，要么走那个只做一次的 OFF→MIN 置换，
+            所以循环必然收敛。
             """
+            swapped_to_min = False
             while True:
                 try:
                     return await client.chat.completions.create(**kwargs)
@@ -496,6 +632,19 @@ class Client():
                         kwargs.pop('stream_options')
                         continue
                     extra = kwargs.get('extra_body') or {}
+                    if extra and not swapped_to_min and _refuses_to_disable_thinking(err):
+                        # 这个模型关不掉思考。退回「什么都不发」会让它按供应商
+                        # 默认档跑（G53 上实测是最贵那档），所以换成最低档那组
+                        # ——它接受的最低值正是报错里点的 low。记在 client 上，
+                        # 这个 endpoint 之后不再试着关了。
+                        swapped_to_min = True
+                        client._thinking_cannot_disable = True
+                        rejected = getattr(client, '_thinking_rejected', ())
+                        kwargs['extra_body'] = {k: v for k, v in THINKING_MIN_EXTRA.items()
+                                                if k not in rejected}
+                        print(f'[llm] {model} @ {url} cannot disable thinking — '
+                              f'retrying at the lowest reasoning setting')
+                        continue
                     # 必须按词边界匹配：`thinking` 是 `thinking_budget` 的前缀，
                     # 子串匹配会因为后者被拒而把前者一起撤掉——而前者正是对智谱
                     # 那条线唯一管用的关法。

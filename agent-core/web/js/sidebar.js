@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 
@@ -310,6 +310,36 @@ function _buildSubgroupLabel(type, count) {
   return label;
 }
 
+/** Does the sidebar still own this tool's configuration?
+ *
+ * Only while the tool has no card on the canvas. Once a card exists that card's
+ * dialog sets everything, tool-level fields included, and a second entry point
+ * is how one card's settings and another's drift apart — the split across two
+ * dialogs is how r1_bj ended up with a YOLO fit selected under DepthART.
+ *
+ * **One function because there were two copies of this test.** The gear on the
+ * chip and the status on the tool card each recomputed it, I gated only the
+ * second, and the chip went on opening the dialog I had just removed. Two
+ * copies of a rule that must agree is the bug, not the symptom.
+ */
+function sidebarOwnsConfig(mcpId, tool) {
+  const schema = typeof tool === 'object' ? tool.configSchema : null;
+  if (!schema) return false;
+  const props = Object.values(schema.properties || {});
+  if (!props.some(def => def.scope !== 'instance')) return false;   // nothing to set here
+
+  // **Only step aside if the card can actually take over.** A card's dialog
+  // exists only when the tool has instance-scope fields (`canvas.js`, the
+  // `hasInstanceFields` test that renders the gear). A tool whose settings are
+  // all shared — `loco_servo`, whose config is `dry_run`, `rotate_only` and
+  // `require_standing` — gets no dialog on its card, so hiding the sidebar
+  // entry for it removed the only way to reach those settings. On R1 that put
+  // `dry_run` out of reach, which is not a cosmetic field on a chassis.
+  if (!props.some(def => def.scope === 'instance')) return true;
+
+  return cardsForTool(mcpId, tool.name).length === 0;
+}
+
 function _buildChip(mcp, tool) {
   const chip = document.createElement('div');
   const toolType = tool.type || '';
@@ -322,7 +352,7 @@ function _buildChip(mcp, tool) {
 
   // Config button for tools with shared fields
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   const configKey = `${mcp.id}:${tool.name}`;
   // 「已配置」只看会产生输入的字段。纯展示字段（二维码）永远不保存任何值，
   // 把它算进来的话，一个只声明了二维码的工具会永久挂着未配置的警告三角。
@@ -432,8 +462,19 @@ function _buildToolCard(mcp, tool) {
 
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const configKey = `${mcp.id}:${tool.name}`;
-  // Only tools with shared (non-instance-scope) fields need sidebar-level configuration
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  // Only tools with shared (non-instance-scope) fields need sidebar-level
+  // configuration — **and only while the tool has no card on the canvas.**
+  //
+  // Once a card exists, that card's dialog sets everything, tool-level fields
+  // included, so keeping this entry would leave two places to change one
+  // setting. That is not merely redundant: per-camera numbers are only
+  // meaningful against the shared model they were measured on, and splitting
+  // the two across dialogs is how r1_bj ended up with a YOLO fit selected
+  // under DepthART.
+  //
+  // It is not removed outright because a tool with no card still has to be
+  // configurable — ASR's url/key has to be set before placing one.
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
   const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
     .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
@@ -991,6 +1032,37 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // **The card's dialog can set everything, so there is never a second place
+  // you have to go.** Tool-level fields render here too, as real inputs, in a
+  // labelled group above the per-camera ones; on save they are split by scope
+  // and written to their own row.
+  //
+  // The split itself is real and stays — `visual_depth`'s `backend` selects one
+  // engine per process while `fps` and the calibration are per camera — but
+  // making the operator visit two dialogs to configure one card was the part
+  // that cost us. It is also not merely inconvenient: `cal_a`/`cal_b` are a fit
+  // measured against a particular depth model, and `backend` says which model
+  // is running, so editing them apart is how r1_bj ended up with a YOLO fit
+  // selected under DepthART — a factor of 2.65 on every distance.
+  //
+  // Labelled loudly because the consequence is unusual: this one group is
+  // shared, so changing it here changes it for every other card on the same
+  // tool. The sidebar keeps its own copy of these fields, which is still the
+  // only way to configure a tool that has no card on the canvas yet.
+  const sharedKeys = Object.keys(props).filter(k => props[k].scope !== 'instance');
+  let sharedHost = null;
+  if (sharedKeys.length) {
+    const box = document.createElement('div');
+    box.className = 'tool-config-shared-group';
+    const heading = document.createElement('div');
+    heading.className = 'tool-config-shared-heading';
+    heading.textContent = '工具级设置 — 改这里会同时影响这个工具的所有卡片';
+    box.appendChild(heading);
+    bodyEl.appendChild(box);
+    sharedHost = box;
+  }
+  const sharedSaved = _toolConfigs[`${mcpId}:${toolName}`] || {};
+
   // Expert settings go in a fold. A card whose every tuning knob is laid out
   // flat is a card nobody can configure: the pose card reached 26 fields, each
   // labelled with its own paragraph of rationale, and finding `fps` in it meant
@@ -1012,8 +1084,10 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
   let hasFields = false;
   for (const [key, def] of Object.entries(props)) {
-    // Only show instance-scope fields
-    if (def.scope !== 'instance') continue;
+    const isShared = def.scope !== 'instance';
+    if (isShared && !sharedHost) continue;
+    // Shared keys live in the tool-level row, not this instance's.
+    const vals = isShared ? sharedSaved : savedValues;
     hasFields = true;
 
     const label = document.createElement('label');
@@ -1037,15 +1111,15 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         const option = document.createElement('option');
         option.value = item.const ?? '';
         option.textContent = item.title || String(item.const);
-        if (String(savedValues[key]) === String(item.const)) option.selected = true;
+        if (String(vals[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key] != null) input.value = savedValues[key];
+      if (vals[key] != null) input.value = vals[key];
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      const effectiveValue = savedValues[key] ?? def.default ?? '';
+      const effectiveValue = vals[key] ?? def.default ?? '';
       if (!effectiveValue) {
         const placeholder = document.createElement('option');
         placeholder.value = '';
@@ -1070,17 +1144,17 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       optFalse.value = 'false'; optFalse.textContent = 'No';
       input.appendChild(optTrue);
       input.appendChild(optFalse);
-      input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+      input.value = (vals[key] != null ? String(vals[key]) : String(def.default ?? 'false'));
     } else if (def.format === 'audio-input-device'
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
-        key, savedValues[key] || '');
+        key, vals[key] || '');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      const saved = savedValues[key] || '';
+      const saved = vals[key] || '';
       const loadingOpt = document.createElement('option');
       loadingOpt.value = '';
       loadingOpt.textContent = 'Loading channels...';
@@ -1111,7 +1185,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
       input = makeQrField(key, def);
     } else if (_isStructuredField(def)) {
-      input = _makeStructuredInput(key, def, savedValues[key]);
+      input = _makeStructuredInput(key, def, vals[key]);
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -1119,7 +1193,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
       if (def.type === 'number' || def.type === 'integer') input.step = 'any';
       input.placeholder = def.default != null ? String(def.default) : '';
-      input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
+      input.value = vals[key] != null ? vals[key] : (def.default != null ? def.default : '');
     }
 
     // Help text, only when there is a separate title to help — otherwise the
@@ -1131,7 +1205,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       help.textContent = def.description;
     }
 
-    const host = def.advanced ? advancedHost() : bodyEl;
+    const host = isShared ? sharedHost : (def.advanced ? advancedHost() : bodyEl);
     host.appendChild(label);
     host.appendChild(input);
     if (help) host.appendChild(help);
@@ -1163,23 +1237,39 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       }
     }
 
-    try {
-      const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(values),
-      });
-      if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
-        return;
-      }
-    } catch (err) {
-      alert('配置保存失败: ' + err.message);
-      console.error('[config] instance save failed:', err);
-      return;
+    // Split by declared scope: each row only ever receives the keys it owns.
+    // A merged payload is rejected outright by plugins that keep one engine per
+    // process — see agent-core/src/tool_config.py, which is the same contract
+    // the start path applies.
+    const instanceValues = {}, sharedValues = {};
+    for (const [key, value] of Object.entries(values)) {
+      ((props[key] && props[key].scope !== 'instance') ? sharedValues : instanceValues)[key] = value;
     }
 
-    _toolConfigs[configKey] = values;
+    const base = `/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`;
+    const writes = [[`${base}/${encodeURIComponent(instanceId)}`, instanceValues, configKey]];
+    // Only when the dialog actually offered shared fields, so a tool without
+    // them cannot have its tool-level row overwritten with {} from here.
+    if (sharedKeys.length) writes.push([base, sharedValues, `${mcpId}:${toolName}`]);
+
+    for (const [url, body, cacheKey] of writes) {
+      try {
+        const resp = await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          alert(`配置保存失败 (HTTP ${resp.status})`);
+          return;
+        }
+      } catch (err) {
+        alert('配置保存失败: ' + err.message);
+        console.error('[config] save failed:', url, err);
+        return;
+      }
+      _toolConfigs[cacheKey] = body;
+    }
     close();
   };
 

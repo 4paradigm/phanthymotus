@@ -219,6 +219,11 @@ def _install_fake_cv2():
     cv2.IMREAD_COLOR = 1
     cv2.INTER_NEAREST = 0
     cv2.INTER_LINEAR = 1
+    # The stub's `resize` ignores the mode, but a missing *constant* is an
+    # AttributeError at the call site — so a plugin that asks for a better
+    # filter fails here and nowhere else. Same trap as `frame_bytes`: a test
+    # that is green only on a host with real OpenCV is green exactly where the
+    # code does not run.
     cv2.INTER_CUBIC = 2
     cv2.INTER_AREA = 3
     cv2.BORDER_REFLECT_101 = 4
@@ -364,6 +369,26 @@ def _install_fake_cv2():
         img[y0:y1, x0:x1] = colour       # a square, not a disc
         return img
 
+    def rectangle(img, pt1, pt2, colour, thickness=1, lineType=0):
+        x1, y1 = int(pt1[0]), int(pt1[1])
+        x2, y2 = int(pt2[0]), int(pt2[1])
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        x1, x2 = max(0, x1), min(img.shape[1] - 1, x2)
+        y1, y2 = max(0, y1), min(img.shape[0] - 1, y2)
+        if thickness < 0:
+            img[y1:y2 + 1, x1:x2 + 1] = colour
+            return img
+        width = max(1, int(thickness))
+        for i in range(width):
+            if y1 + i <= y2:
+                img[y1 + i, x1:x2 + 1] = colour
+                img[y2 - i, x1:x2 + 1] = colour
+            if x1 + i <= x2:
+                img[y1:y2 + 1, x1 + i] = colour
+                img[y1:y2 + 1, x2 - i] = colour
+        return img
+
     def putText(img, text, org, fontFace, fontScale, colour, thickness=1,
                 lineType=0):
         cv2.__text_calls__.append((text, tuple(org)))
@@ -381,6 +406,7 @@ def _install_fake_cv2():
     cv2.__text_calls__ = []
     cv2.line = line
     cv2.circle = circle
+    cv2.rectangle = rectangle
     cv2.putText = putText
     cv2.imencode = imencode
 

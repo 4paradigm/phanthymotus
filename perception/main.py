@@ -9,6 +9,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   phanthy_music    曲库检索与 HTTPS 播放（歌曲 + ASMR 助眠音频）
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
+  measure          物体可见宽高测量（VOP + 深度 + camera_info）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
@@ -227,6 +228,11 @@ class PerceptionBundle:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
                           exc_info=True)
 
+        if plugins_cfg.get("measure", {}).get("enabled", False):
+            from plugins.measure import MeasurePlugin
+            self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
+            log.info("MeasurePlugin loaded")
+
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["pose"].get("namespace", "").strip()
@@ -334,6 +340,16 @@ class PerceptionBundle:
             if getattr(p, 'PREFIX', None) == 'tts':
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
+
+    def shutdown(self) -> None:
+        """Let resource-owning plugins finish before ROS and Python shut down."""
+        for plugin in self._plugins:
+            shutdown = getattr(plugin, "shutdown", None)
+            if shutdown is not None:
+                try:
+                    shutdown()
+                except Exception:
+                    log.exception("plugin shutdown failed: %s", plugin.PREFIX)
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -775,6 +791,7 @@ def main():
     try:
         server.serve_forever()
     finally:
+        _bundle.shutdown()
         executor.shutdown()
         rclpy.shutdown()
 
