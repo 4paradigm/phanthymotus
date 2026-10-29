@@ -86,8 +86,6 @@ class _Fixture(unittest.TestCase):
         skills_mod._notify_override = None
         skills_mod._report_override = None
         self._saved_event = config.main.get('event', {})
-        self._saved_core = config.main.get('core', {})
-        config.main['core'] = {**self._saved_core, 'project_running': True}
         self._saved_mgr = subagent._manager_instance
         self._saved_inst = ell._event_instance
         ell._stop_countdown()
@@ -118,7 +116,6 @@ class _Fixture(unittest.TestCase):
         skills_mod._notify_override = self._saved_notify
         skills_mod._report_override = self._saved_report
         config.main['event'] = self._saved_event
-        config.main['core'] = self._saved_core
         subagent._manager_instance = self._saved_mgr
         ell._event_instance = self._saved_inst
         ell._reported_rounds.clear()
@@ -398,6 +395,7 @@ class TestStateMachine(_Fixture):
         async def go():
             self._speaking('spk-9')
             ell._on_speaking_started()
+            mcp_client._pending_actions['spk-9'].set()
             ok = mcp_client.mark_action_complete('spk-9', {'status': 'completed'})
             return ok, ell._silence_countdown
         ok, timer = asyncio.run(go())
@@ -502,7 +500,6 @@ class TestReportProgress(_Fixture):
         self.inst = ell.Event.__new__(ell.Event)
         self.inst._turns = []
         self.inst._current_turn = []
-        self.inst._current_turn_epoch = collector.project_epoch()
         ell._event_instance = self.inst
 
     def tearDown(self):

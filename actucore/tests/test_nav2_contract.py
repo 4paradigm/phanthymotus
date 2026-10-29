@@ -116,7 +116,7 @@ class Nav2ContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         runtime_dir = companion_root.parent
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
         service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text(
@@ -153,9 +153,8 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("PYTHON_NUMPY_VERSION", service)
         self.assertNotIn("PYTHON_NUMPY_VERSION", source_lock)
         self.assertEqual(goal_schema["properties"]["goal_id"]["pattern"], GOAL_ID_PATTERN)
-        self.assertEqual(
-            tool["inputSchema"]["x-topic-actions"][0]["id_pattern"], GOAL_ID_PATTERN
-        )
+        self.assertEqual(inputs["goal_pose"]["schema"], "phanthy.navigation.goal.v1")
+        self.assertEqual(inputs["goal_pose"]["ros_type"], "std_msgs/msg/String")
         self.assertEqual(goal_schema["properties"]["speed"]["maximum"], 1.0)
         self.assertEqual(goal_schema["properties"]["speed"]["minimum"], 0.30)
         self.assertEqual(goal_schema["properties"]["speed"]["default"], 0.5)
@@ -212,10 +211,15 @@ class Nav2ContractTest(unittest.TestCase):
 
         action_params = tool["inputSchema"]["x-action-params"]
         self.assertIn("mode", action_params["navigate_to_pose"]["params"])
-        topic_action = tool["inputSchema"]["x-topic-actions"][0]
         self.assertNotIn("x-topic-actions", tool)
-        self.assertIn("mode", topic_action["allowed_fields"])
-        self.assertEqual(topic_action["required_fields"], ["x", "y", "yaw"])
+        self.assertEqual(tool["inputSchema"].get("x-topic-actions", []), [])
+        goal_schema_path = (
+            ACTUCORE_ROOT / "plugins/navigation/runtime/protocol/goal-v1.schema.json"
+        )
+        goal_schema = json.loads(goal_schema_path.read_text(encoding="utf-8"))
+        self.assertIn("mode", goal_schema["properties"])
+        self.assertNotIn("mode", goal_schema["required"])
+        self.assertEqual(goal_schema["required"], ["schema", "goal_id", "x", "y", "yaw"])
 
         config = tool["configSchema"]
         self.assertFalse(config["additionalProperties"])

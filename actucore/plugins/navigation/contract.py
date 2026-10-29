@@ -249,9 +249,6 @@ def navigation_tool_definition(namespace: str) -> dict:
             "required": ["action"],
             "additionalProperties": False,
             "x-action-params": deepcopy(NAVIGATION_ACTION_PARAMS),
-            "x-topic-actions": deepcopy(
-                planning["inputSchema"]["x-topic-actions"]
-            ),
             "x-completion": completion,
             # Finish an in-flight start and the bounded 360 s map save before release.
             "x-stop": {"timeout_s": 600},

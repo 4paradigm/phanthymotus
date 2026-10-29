@@ -7,6 +7,7 @@ from pathlib import Path
 from plugins.navigation.contract import navigation_tool_definition
 from plugins.navigation.planning.contract import NAV2_ACTION_PARAMS, nav2_tool_definition
 from plugins.navigation.planning.core import NavigationBackendError, _normalize
+from plugins.navigation.planning.goal_input import _goal
 
 
 class GoalV1ModeTest(unittest.TestCase):
@@ -29,10 +30,19 @@ class GoalV1ModeTest(unittest.TestCase):
             self.assertNotIn("mode", schema.get("required", []))
         for schema in (planning, public):
             self.assertIn("mode", schema["x-action-params"]["navigate_to_pose"]["params"])
-            self.assertIn("mode", schema["x-topic-actions"][0]["allowed_fields"])
-            self.assertNotIn("mode", schema["x-topic-actions"][0]["required_fields"])
+            self.assertEqual(schema.get("x-topic-actions", []), [])
         self.assertIn("mode", NAV2_ACTION_PARAMS["navigate_to_pose"]["params"])
         self.assertFalse(public["additionalProperties"])
+
+    def test_goal_topic_input_validates_optional_zero_mode(self):
+        base = {"schema": "phanthy.navigation.goal.v1", "goal_id": "goal-1",
+                "x": 1, "y": 2, "yaw": 0}
+        self.assertNotIn("mode", _goal(json.dumps(base)))
+        self.assertEqual(_goal(json.dumps({**base, "mode": 0}))["mode"], 0)
+        for value in (False, True, None, "0", 1, -1, 0.0, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _goal(json.dumps({**base, "mode": value}))
 
     def test_planner_integer_and_legacy_rejections(self):
         base = {"x": 1, "y": 2, "yaw": 0}

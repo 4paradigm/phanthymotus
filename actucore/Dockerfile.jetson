@@ -1,113 +1,126 @@
-# ── Jetson GPU variant ──────────────────────────────────────────────
-# Upstream Jetson application image, selected for JP6.1 by build_actucore.sh.
-# JP5.11 navigation builds use Dockerfile.navigation instead.
-#
-# Build context: repo root (phanthymotus/) so we can access both
-# actucore/ and deploy/ros-base/audio_msgs/
-#
-# Usage:
-#   ./deploy/build_actucore.sh --jp-version 6.1 --mirror tuna
-# ────────────────────────────────────────────────────────────────────
-
+# One Jetson application Dockerfile; build_actucore.sh selects the matching base.
+# JP5.11 uses the published ActuCore build base; JP6.1 retains its VLA base.
+# Build context: repository root.
+ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b
+FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
+ARG JP_VERSION=511
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-# Retain the upstream bare-build defaults. The JP6.1 script passes its platform
-# and BASE_IMAGE explicitly; JP5.11 script builds Dockerfile.navigation.
-ARG JP_VERSION=511
-# Upstream bare-build base defaults and platform distinction:
-#
-#   jp5.11  jetson-base            remote providers only. Thin. (default)
-#   jp6.1   jetson-base-actucore   CUDA torch 2.9 + lerobot → local *and* remote
-#                                  providers. ~18.6 GB.
-#
-# That split is forced, not chosen. JetPack 5.11 is CUDA 11.4 and lerobot needs
-# torch >= 2.2.1, and no torch >= 2.2 supports CUDA 11.4 (PyTorch's own matrix
-# floors at 11.8) — so local inference cannot exist there whatever we build.
-# The `smolvla` provider refuses at start on that line with that reason; `mock`
-# and `vla_cloud` are unaffected. See deploy/prepare_actucore_base.sh.
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
-FROM ${BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR
+ARG BUILD_JOBS=4
+SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
 
-# ── APT mirror (conditional) ─────────────────────────────────────
-RUN if [ -n "${APT_MIRROR}" ]; then \
+# JP6.1 retains the upstream ROS setup and local VLA dependencies. The JP5
+# build base already supplies colcon, empy and the locked navigation stack.
+RUN if [ "${JP_VERSION}" = 61 ]; then \
+      if [ -n "${APT_MIRROR}" ]; then \
         sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
-    fi
-
-# ── Switch ROS2 to TUNA mirror + skip expired key (if sources exist) ──
-RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
+      fi; \
+      if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
         sed -i 's|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' /etc/apt/sources.list.d/*.list && \
         sed -i 's|deb \[|deb [trusted=yes |g; s|deb http|deb [trusted=yes] http|g' /etc/apt/sources.list.d/ros2*.list; \
-    fi
+      fi; \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" colcon-common-extensions && \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" 'empy<4' && \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" pyyaml requests; \
+    elif [ "${JP_VERSION}" = 511 ]; then \
+      python3 -c "import yaml, requests; print('PLATFORM_PYTHON_DEPS=PASS PyYAML=' + yaml.__version__ + ' requests=' + requests.__version__)"; \
+    else echo "Unsupported JP_VERSION=${JP_VERSION}" >&2; exit 2; fi
 
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
-
-# ── audio_msgs ROS2 package (Humble already in base) ──────────────
-# Built here so both variants expose the same ROS message set as ros-base does
-# — otherwise a card would work on CPU and fail to import on Jetson.
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
-RUN cd /ros_ws && \
-    . /opt/ros/humble/install/setup.bash && \
-    colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
+COPY actucore/plugins/navigation/runtime/fast_livo2/ /ros_ws/src/fast_livo2/
+COPY actucore/plugins/navigation/runtime/nav2/ /ros_ws/src/nav2/
+COPY actucore/plugins/navigation/runtime/segmented_controller/ /ros_ws/src/segmented_controller/
+RUN source /opt/ros/humble/install/setup.bash && \
+    cd /ros_ws && \
+    if [ "${JP_VERSION}" = 511 ]; then \
+      source /opt/ros_deps_ws/install/setup.bash && \
+      source /opt/nav2_ws/install/setup.bash && \
+      source /opt/fast_livo_ws/install/setup.bash && \
+      MAKEFLAGS="-j${BUILD_JOBS}" colcon build --packages-select audio_msgs fast_livo2 segmented_controller nav2 && \
+      source /ros_ws/install/setup.bash && \
+      ros2 pkg prefix segmented_controller >/dev/null && \
+      NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
+        python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
+      python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
+      ros2 bag record --help | grep -F -- '--no-discovery' >/dev/null; \
+    else \
+      colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release; \
+    fi && \
+    rm -rf /ros_ws/src /ros_ws/build /ros_ws/log
 
-# ── Python deps ────────────────────────────────────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests
-
-# ── Application code ───────────────────────────────────────────────
+COPY actucore/plugins/navigation/runtime/navigation_lio.yaml /config/navigation_lio.yaml
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
 COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
-# JP6.1 lacks the new navigation runtime; retain the upstream navi card.
-RUN python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"
-# Atomic-write stdout guard. The build context is the repo root, so this reuses
-# perception's copy instead of adding a fourth one to keep in sync — see the
-# DUPLICATION note in perception/utils/logsafe.py.
 COPY perception/utils/logsafe.py /work/logsafe.py
-# COS downloader with size/SHA256 pinning, for cards that fetch weights at
-# runtime (plugins/vla's smolvla provider). Same reasoning as logsafe above:
-# reuse perception's copy rather than keeping a second one in sync. It carries
-# the parts that are easy to get wrong — a check file that must not appear
-# until the model behind it is complete, a lock so concurrent starts fetch one
-# copy, archives staged before they are merged.
 COPY perception/utils/model_downloader.py /work/model_downloader.py
-# The status-line helper that turns that downloader's callbacks into the one
-# string a card shows. Same reuse rule again — and it must travel with the
-# downloader: smolvla imports both, so shipping one without the other fails at
-# card start, on a robot, with an ImportError nothing here would have caught.
 COPY perception/utils/model_progress.py /work/model_progress.py
-# Calibration tools. In the image rather than `docker cp`-ed in when needed:
-# a hot-copied file keeps diverging from its image until the next real deploy,
-# and a measurement whose tool is of unknown provenance is worth very little.
-# They are text and they run on demand; nothing imports them at start.
 COPY actucore/tools/      /work/tools/
-# Agent Core reads /deploy/service.yml out of the image to merge the compose
-# fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/
 
+# JP6.1 does not yet ship the new navigation runtime; retain vla and navi.
+RUN if [ "${JP_VERSION}" = 61 ]; then \
+      python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"; \
+    else rm -rf /work/plugins/navigation/runtime; fi
+
 EXPOSE 15730
+RUN find /ros_ws/install /opt/ros/humble/install -name "site-packages" -type d \
+      > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    if [ "${JP_VERSION}" = 511 ]; then \
+      find /opt/nav2_ws/install /opt/ros_deps_ws/install /opt/fast_livo_ws/install -name "site-packages" -type d \
+        >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth; \
+    fi && \
+    echo /work >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    cd / && python3 -c "import logsafe" && \
+    source /opt/ros/humble/install/setup.bash && \
+    if [ "${JP_VERSION}" = 511 ]; then \
+      source /opt/ros_deps_ws/install/setup.bash && \
+      source /opt/nav2_ws/install/setup.bash && \
+      source /opt/fast_livo_ws/install/setup.bash && \
+      source /ros_ws/install/setup.bash && \
+      ros2 pkg prefix fast_livo2 >/dev/null && \
+      ros2 pkg prefix segmented_controller >/dev/null && \
+      ros2 pkg prefix nav2 >/dev/null && \
+      for binary in \
+        /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
+        /opt/nav2_ws/install/lib/nav2_controller/controller_server \
+        /opt/nav2_ws/install/lib/nav2_planner/planner_server \
+        /opt/nav2_ws/install/lib/nav2_smoother/smoother_server \
+        /opt/nav2_ws/install/lib/nav2_behaviors/behavior_server \
+        /opt/nav2_ws/install/lib/nav2_bt_navigator/bt_navigator \
+        /opt/nav2_ws/install/lib/nav2_waypoint_follower/waypoint_follower \
+        /opt/nav2_ws/install/lib/nav2_lifecycle_manager/lifecycle_manager \
+        /ros_ws/install/segmented_controller/lib/libsegmented_controller.so; do \
+        dependencies="$(ldd "${binary}")" || exit 1; \
+        printf '%s\n' "${binary}" "${dependencies}"; \
+        if grep -Fq 'not found' <<< "${dependencies}"; then exit 1; fi; \
+      done && \
+      NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
+        python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
+      cd /work && python3 -c "import main; import numpy, rosbag2_py, yaml, em, cv2; from fast_livo2.camera_rgb_frame import decode; from fast_livo2.camera_depth_frame import decode" && \
+      test ! -e /work/plugins/navigation/runtime; \
+    else \
+      source /ros_ws/install/setup.bash && cd /work && \
+      python3 -c "import main; cfg=main._load_config(); assert cfg['plugins']['navigation']['enabled'] is False; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla', 'navi'}; print('JP61_CARD_INVENTORY=PASS')"; \
+    fi && \
+    ros2 pkg prefix audio_msgs >/dev/null && \
+    python3 -c "from audio_msgs.msg import AudioChunk" && \
+    test ! -e /ros_ws/src && test ! -e /ros_ws/build && test ! -e /ros_ws/log
 
-# 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
-RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth
-
-# ROS2 shared libraries（audio_msgs .so 等）
+# Keep the JP6 base environment unchanged; the JP5 entrypoint sources the
+# navigation workspaces and obtains their actual AMENT and library paths there.
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
-
-ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-ENV ROS_DOMAIN_ID=42
-
-# Check the shipped inventory without starting ROS, HTTP, models or cards.
-RUN . /opt/ros/humble/install/setup.bash && \
-    . /ros_ws/install/setup.bash && \
-    python3 -c "import main; cfg=main._load_config(); assert cfg['plugins']['navigation']['enabled'] is False; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla', 'navi'}; print('JP61_CARD_INVENTORY=PASS')"
-
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=42 RCUTILS_LOGGING_BUFFERED_STREAM=1 ACTUCORE_JP_VERSION=${JP_VERSION}
+LABEL org.opencontainers.image.title="Phanthy Motus ActuCore" \
+      org.opencontainers.image.licenses="Apache-2.0 AND GPL-2.0-only AND GPL-3.0-only" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}"
 CMD ["/bin/bash", "-c", \
-    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
-     source /opt/ros/humble/install/setup.bash && \
-     source /ros_ws/install/setup.bash && \
-     python3 /work/main.py"]
+     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+      source /opt/ros/humble/install/setup.bash && \
+      if [ \"${ACTUCORE_JP_VERSION}\" = 511 ]; then source /opt/ros_deps_ws/install/setup.bash && source /opt/nav2_ws/install/setup.bash && source /opt/fast_livo_ws/install/setup.bash; fi && \
+      source /ros_ws/install/setup.bash && \
+      exec python3 /work/main.py"]

@@ -126,6 +126,14 @@ class NavigationStartIdentityTest(unittest.TestCase):
         self.assertEqual(changed["error_code"], "navigation_wiring_conflict")
         self.assert_owner("a", {port: defaults[port] for port in ("lidar", "imu", "rgb")})
 
+    def test_topic_list_rejects_noncanonical_paths_without_bindings(self):
+        self.make_plugin()
+        result = self.call("start", instance_id="a", input_topics=["/live/lidar", "/live/imu"])
+        self.assertEqual(result["error_code"], "invalid_canvas_wiring")
+        self.assertIn("lidar", result["error"])
+        self.assertIn("imu", result["error"])
+        self.assertFalse(self.runtime.started)
+
     @unittest.skipUnless(importlib.util.find_spec("openai") and importlib.util.find_spec("fastapi"),
                          "Agent Core dependencies are not installed")
     def test_agent_core_start_project_with_real_navigation_plugin(self):
@@ -139,10 +147,9 @@ class NavigationStartIdentityTest(unittest.TestCase):
                 import config
                 import mcp_client
                 from api import config as config_api
-                import topic_actions
-
                 calls = []
-                sources = {"lidar-source": "/live/lidar", "imu-source": "/live/imu"}
+                defaults = {p["port"]: p["topic"] for p in self.plugin.get_tools()[0]["topic_in"]}
+                sources = {"lidar-source": defaults["lidar"], "imu-source": defaults["imu"]}
                 class Request:
                     def __init__(self, tool, arguments):
                         self.tool, self.arguments = tool, arguments
@@ -180,19 +187,17 @@ class NavigationStartIdentityTest(unittest.TestCase):
                            "api.inspection": inspection, "channel.manager": channel}
                 with mock.patch.dict(sys.modules, modules), \
                      mock.patch.object(config, "main", {"canvas_layout": layout, "core": {}, "services": {"mcp": []}}), \
-                     mock.patch.object(mcp_client, "registry", registry), \
-                     mock.patch.object(topic_actions.manager, "start", new=nop):
+                     mock.patch.object(mcp_client, "registry", registry):
                     self.assertTrue(asyncio.run(config_api._do_start_project_impl()))
                     self.assertTrue(asyncio.run(config_api._do_start_project_impl()))
                 starts = [args for tool, args in calls if tool == self.plugin.PREFIX and args["action"] == "start"]
                 self.assertEqual(len(starts), 2)
                 self.assertEqual(starts[0]["instance_id"], "nav-card")
                 self.assertEqual(starts[1], starts[0])
-                self.assertEqual(starts[0]["input_bindings"], [
-                    {"port": "lidar", "topic": "/live/lidar"},
-                    {"port": "imu", "topic": "/live/imu"},
-                ])
-                self.assert_owner("nav-card", {"lidar": "/live/lidar", "imu": "/live/imu"})
+                self.assertEqual(starts[0]["input_topics"], [sources["lidar-source"], sources["imu-source"]])
+                self.assertEqual(starts[0]["input_topic"], sources["lidar-source"])
+                self.assertNotIn("input_bindings", starts[0])
+                self.assert_owner("nav-card", {"lidar": defaults["lidar"], "imu": defaults["imu"]})
         finally:
             sys.path.remove(str(core_src))
 

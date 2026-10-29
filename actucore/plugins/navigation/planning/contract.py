@@ -397,20 +397,6 @@ def nav2_tool_definition(namespace: str) -> dict:
             },
             "required": ["action"],
             "x-action-params": NAV2_PUBLIC_ACTION_PARAMS,
-            "x-topic-actions": [
-                {
-                    "port": "goal_pose",
-                    "action": "navigate_to_pose",
-                    "wait_action": "wait_navigation_done",
-                    "stop_action": "stop_nav",
-                    "schema": "phanthy.navigation.goal.v1",
-                    "id_field": "goal_id",
-                    "id_pattern": GOAL_ID_PATTERN,
-                    "id_argument": "_control_nav_id",
-                    "allowed_fields": ["x", "y", "yaw", "speed", "mode"],
-                    "required_fields": ["x", "y", "yaw"],
-                }
-            ],
             "x-completion": {
                 "actions": ["navigate_to_pose"],
                 "timeout": 3600,

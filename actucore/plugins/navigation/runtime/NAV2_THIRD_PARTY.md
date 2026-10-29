@@ -1,9 +1,10 @@
 # 第三方依赖锁
 
-统一 ActuCore 镜像里的 Nav2 **从源码编译**，版本按 `nav2-source.lock` 中的
-完整 Git SHA 锁定，构建时在 `actucore/Dockerfile.navigation-base` 里逐个校验为 40 位 SHA。
-镜像内同时生成 `/opt/actucore-ros-package-lock.txt`（`ros2 pkg list` 快照）供
-部署审计。Nav2 作为同容器子进程运行，不存在独立 Nav2 service 或 companion image。
+JP5.11 的 Nav2 在 ActuCore 基座中**从源码编译**，版本按 `nav2-source.lock` 中的
+完整 Git SHA 锁定，构建时在 `actucore/Dockerfile.base` 里逐个校验为 40 位 SHA。
+JP5 日常镜像直接继承该基座；`/opt/actucore-ros-package-lock.txt`（`ros2 pkg list`
+快照）供部署审计。Nav2 作为同容器子进程运行，不存在独立 Nav2 service 或
+companion image。JP6.1 日常镜像的新 navigation 默认关闭且尚未验证。
 
 ## 为什么不是 apt
 

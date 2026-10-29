@@ -231,61 +231,6 @@ class TestCall(unittest.IsolatedAsyncioTestCase):
         out, _ = await self._call(resp={'result': None, 'error': 'TTS not running'})
         self.assertIn('TTS not running', out)
 
-    async def test_unknown_completion_is_not_returned_as_queued_success(self):
-        response = {'result': 'queued acknowledgement', 'error': None,
-                    'action_id': 'action-123', 'action_status': 'unknown'}
-        out, _ = await self._call(resp=response)
-        self.assertTrue(out.startswith('Error: completion not confirmed'))
-        self.assertIn('action-123', out)
-        self.assertIn('may have executed', out)
-        self.assertIn('may still be running', out)
-        self.assertIn('do not retry blindly', out)
-        self.assertNotIn('queued acknowledgement', out)
-
-    async def test_unknown_without_action_id_still_warns(self):
-        out, _ = await self._call(resp={'result': 'queued acknowledgement', 'error': None,
-                                       'action_status': 'unknown'})
-        self.assertTrue(out.startswith('Error: completion not confirmed'))
-        self.assertIn('may have executed', out)
-        self.assertIn('may still be running', out)
-        self.assertIn('do not retry blindly', out)
-        self.assertNotIn('action_id=', out)
-        self.assertNotIn('queued acknowledgement', out)
-
-    async def test_error_field_takes_precedence_over_unknown(self):
-        out, _ = await self._call(resp={'result': 'queued', 'error': 'remote rejection',
-                                       'action_id': 'action-123', 'action_status': 'unknown'})
-        self.assertEqual(out, 'Peer reported an error: remote rejection')
-
-    async def test_other_statuses_and_missing_status_preserve_result(self):
-        for status in ('completed', 'sync', 'timeout', 'cancelled', 'no_pending_actions',
-                       'future_status', None):
-            with self.subTest(status=status):
-                out, _ = await self._call(resp={'result': 'unchanged', 'error': None,
-                                               'action_id': 'action-123', 'action_status': status})
-                self.assertEqual(out, 'unchanged')
-        out, _ = await self._call(resp={'result': 'legacy', 'error': None})
-        self.assertEqual(out, 'legacy')
-
-    async def test_unknown_through_call_tool_and_peer_call(self):
-        from peer import delegation
-        response = {'result': 'queued acknowledgement', 'error': None,
-                    'action_id': 'action-123', 'action_status': 'unknown'}
-        with mock.patch('peer.store.list_peers', return_value=[_peer()]), \
-             mock.patch('peer.registry.registry.endpoints_for', return_value=['https://x']), \
-             mock.patch('peer.transport.post_json', new_callable=mock.AsyncMock,
-                        return_value=(response, '')):
-            direct = await mcp_client.call_tool(f'mcp__{self.mcp_id}__tts', {'action': 'speak'})
-            delegated = await delegation.peer_call(peer='Orin6', tool='tts',
-                                                   arguments_json='{"action": "speak"}')
-        self.assertEqual(direct, delegated)
-        self.assertTrue(direct.startswith('Error: completion not confirmed'))
-        self.assertIn('action-123', direct)
-        self.assertIn('may have executed', direct)
-        self.assertIn('may still be running', direct)
-        self.assertIn('do not retry blindly', direct)
-        self.assertNotIn('queued acknowledgement', direct)
-
     async def test_unknown_tool_says_the_list_may_have_changed(self):
         out, _ = await self._call(tool='nope')
         self.assertIn('nope', out)

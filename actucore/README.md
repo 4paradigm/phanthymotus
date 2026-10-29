@@ -406,30 +406,28 @@ range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 rang
 ```bash
 ./deploy/build_actucore.sh                 # JetPack 5.11（默认）
 ./deploy/build_actucore.sh --mirror tuna   # 指定 pip / apt 源
-./deploy/build_actucore.sh --jp-version 6.1 # 上游 VLA 本地推理，不含 navigation
+./deploy/build_actucore.sh --jp-version 6.1 # 保留 VLA 本地推理，新 navigation 未启用
 ```
 
-JetPack 5.11 使用 `Dockerfile.navigation`，默认继承仓库锁定的 `@sha256`
-基础镜像，无需额外环境变量，提供 navigation 与 VLA mock / vla_cloud。
-JetPack 6.1 使用以主线为基底的 `Dockerfile.jetson`，保留上游
-`jetson-base-actucore` 的 torch / lerobot 本地推理、`vla`、`navi` 和工具；
-新 navigation 默认关闭（对应基座尚未发布），不接受 navigation base 覆盖。
-镜像保留主线 ROS 源设置以及 colcon/empy 和 audio_msgs 的构建步骤。
-最终镜像直接构造未启动的 Bundle，检查公开工具为 `vla`、`navi` 且新
-navigation 默认关闭；这不会启动 ROS、HTTP、模型推理或卡片。外部自定义
+两个平台使用同一个 `Dockerfile.jetson`，脚本按 JetPack 选择直接继承的基座。
+JetPack 5.11 默认继承已发布、按 `@sha256` 锁定的 `actucore-navigation-base`，
+提供 navigation 与 VLA `mock` / `vla_cloud`，不提供本地 SmolVLA 推理。
+JetPack 6.1 继承原有 `jetson-base-actucore:jp61-torch`，保留 torch / lerobot
+本地推理、`vla`、`navi` 和工具；新 navigation 默认关闭，尚未验证或提供其运行时，
+不接受 navigation base 覆盖。镜像保留 ROS 源设置以及 colcon/empy 和 audio_msgs
+的构建步骤。JP6 最终镜像构造未启动的 Bundle，检查公开工具为 `vla`、`navi`
+且新 navigation 默认关闭；这不会启动 ROS、HTTP、模型推理或卡片。外部自定义
 配置不受该默认值限制，不应在 JP6.1 上启用尚未提供运行时的新 navigation。
-直接调用 `docker build` 时 `Dockerfile.jetson` 保留主线 JP5 基座默认值；
-推荐通过上述脚本选择平台。
-5.11 的导航基础镜像预编译了锁定版本的 FAST-LIVO2、Nav2
-和系统依赖，仅作为日常构建的 builder。仓库自有 ROS 包使用普通 install
-编译后，最终阶段从同一个干净、锁定 digest 的 Jetson 平台镜像重新开始，
-只复制第三方和自有 ROS install space 及应用代码。源码、build/log 目录和
-navigation base 中额外的编译层不会进入可部署镜像。临时验证另一个基线时
-可显式设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，覆盖值仍必须是精确的
-`@sha256` 引用。`BASE_REGISTRY` 和 `BASE_NAMESPACE` 也可用于选择镜像仓库；
-JP5 的导航基础镜像和运行时父镜像仍使用锁定 digest，因此镜像仓库必须包含对应
-的相同 digest。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
-重新构建并推送基础镜像：
+直接调用 `docker build` 时 `Dockerfile.jetson` 默认使用 JP5 基座；推荐通过上述
+脚本选择平台。
+
+JP5 基座预编译锁定版本的 FAST-LIVO2、Nav2 和系统依赖；日常镜像直接继承它，
+只重编仓库自有 ROS 包。基座包含日常构建所需编译依赖，并非最终镜像仅有
+install space；第三方源码和 build/log 不保留。临时验证另一个 JP5 基线时可显式
+设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，覆盖值仍必须是精确的 `@sha256` 引用。
+`BASE_REGISTRY` 和 `BASE_NAMESPACE` 可选择镜像仓库；JP5 的基座引用固定 digest，
+该仓库必须包含对应 digest。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
+重新构建基础镜像；配置推送时脚本也会推送：
 
 ```bash
 GIT_MIRROR_PREFIX=https://ghfast.top/ \
@@ -444,8 +442,8 @@ BT 插件，并导入 ActuCore 主入口；JP6.1 同样检查主入口导入。�
 navigation base 和日常 ActuCore 的 C++ 编译步骤。
 
 基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时须考虑两个
-平台的 Dockerfile；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈才进入
-`Dockerfile.navigation-base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
+平台的依赖差异；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈才进入
+`Dockerfile.base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
 再次走耗时且容易超时的 x86 QEMU 交叉编译。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
@@ -492,8 +490,6 @@ TOOLS = [
             # "x-completion": {"actions": ["goto"], "timeout": 120},
             # 可选：系统 hook 绑定（打断等）
             # "x-hooks": {"on_interrupt_goto": {"action": "cancel"}},
-            # 可选：Canvas topic 输入转换为同工具 action
-            # "x-topic-actions": [{"port": "goal", "action": "goto", ...}],
         },
         "configSchema": {
             "type": "object",

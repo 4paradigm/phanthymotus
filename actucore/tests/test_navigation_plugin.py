@@ -321,10 +321,10 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(auxiliary["plan"]["format"], "sensor/path")
         self.assertEqual(auxiliary["livo_odom"]["topic"], "/ubuntu/navigation/odom")
         self.assertEqual(auxiliary["livo_odom"]["format"], "sensor/odometry")
-        topic_action = tool["inputSchema"]["x-topic-actions"][0]
         self.assertNotIn("x-topic-actions", tool)
-        self.assertEqual(topic_action["action"], "navigate_to_pose")
-        self.assertEqual(topic_action["port"], "goal_pose")
+        self.assertEqual(tool["inputSchema"].get("x-topic-actions", []), [])
+        self.assertEqual(inputs["goal_pose"]["ros_type"], "std_msgs/msg/String")
+        self.assertFalse(inputs["goal_pose"]["required"])
         self.assertTrue(
             {
                 "livo_odom",
@@ -435,7 +435,7 @@ class NavigationContractTest(unittest.TestCase):
         service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text()
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
-        for manifest in (ACTUCORE_ROOT / "Dockerfile.navigation", ACTUCORE_ROOT / "deploy" / "service.yml"):
+        for manifest in (ACTUCORE_ROOT / "Dockerfile.jetson", ACTUCORE_ROOT / "deploy" / "service.yml"):
             self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS=", manifest.read_text())
 
         for source_lock in (
@@ -458,7 +458,7 @@ class NavigationContractTest(unittest.TestCase):
         torch / opencv-python / ultralytics 属于 perception 的 VOP 卡片。
         以前这两张卡片挤在同一个镜像里，所以旧断言反过来要求"别丢 VOP 依赖"。
         """
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
         for perception_only in (
@@ -472,11 +472,11 @@ class NavigationContractTest(unittest.TestCase):
             "torchaudio",
         ):
             self.assertNotIn(perception_only, dockerfile)
-        self.assertNotIn("pip3 install", dockerfile)
         self.assertNotIn("python3-pip", dockerfile)
+        self.assertIn('if [ "${JP_VERSION}" = 61 ]; then', dockerfile)
+        self.assertIn('pip3 install --no-cache-dir -i "${PYPI_MIRROR}" pyyaml requests', dockerfile)
         self.assertIn("import numpy, rosbag2_py, yaml, em", dockerfile)
-        self.assertNotIn("import requests", dockerfile)
-        self.assertNotIn("deploy/ros-base/audio_msgs", dockerfile)
+        self.assertIn("COPY deploy/ros-base/audio_msgs/", dockerfile)
         self.assertIn("COPY actucore/main.py", dockerfile)
         self.assertIn("COPY actucore/utils/", dockerfile)
         self.assertIn(
@@ -523,11 +523,11 @@ class NavigationContractTest(unittest.TestCase):
 
     def test_navigation_base_owns_locked_third_party_builds(self):
         base_dockerfile = (
-            ACTUCORE_ROOT / "Dockerfile.navigation-base"
+            ACTUCORE_ROOT / "Dockerfile.base"
         ).read_text(
             encoding="utf-8"
         )
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
         build_script = (
@@ -609,44 +609,21 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("jetson-base:jp61-torch@sha256:", build_script)
         self.assertNotIn("FROM ${FAST_LIVO2_BASE_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE=", build_script)
-        self.assertIn(
-            "FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE} AS actucore_ros_builder",
-            dockerfile,
-        )
-        self.assertIn(
-            "FROM ${ACTUCORE_RUNTIME_BASE_IMAGE} AS actucore_runtime",
-            dockerfile,
-        )
-        self.assertIn("ARG ACTUCORE_NAVIGATION_BASE_IMAGE\n", dockerfile)
-        self.assertIn("ARG ACTUCORE_RUNTIME_BASE_IMAGE\n", dockerfile)
+        self.assertIn("FROM ${BASE_IMAGE}", dockerfile)
+        self.assertEqual(sum(line.startswith("FROM ") for line in dockerfile.splitlines()), 1)
         self.assertNotIn("--symlink-install", dockerfile)
-        self.assertIn(
-            "COPY --from=actucore_ros_builder /ros_ws/install/ /ros_ws/install/",
-            dockerfile,
-        )
         for workspace in ("ros_deps_ws", "fast_livo_ws", "nav2_ws"):
-            self.assertIn(
-                f"COPY --from=actucore_ros_builder /opt/{workspace}/install/",
-                dockerfile,
-            )
+            self.assertIn(f"source /opt/{workspace}/install/setup.bash", dockerfile)
         for directory in ("src", "build", "log"):
             self.assertIn(f"test ! -e /ros_ws/{directory}", dockerfile)
-        self.assertIn(
-            "rm -rf /tmp/actucore-plugins/navigation/runtime", dockerfile
-        )
-        self.assertIn(
-            "test ! -e /work/plugins/navigation/runtime", dockerfile
-        )
-        self.assertNotIn("COPY actucore/plugins/    /work/plugins/", dockerfile)
-        self.assertNotIn("actucore-navigation-base@sha256:", dockerfile)
+        self.assertIn("rm -rf /work/plugins/navigation/runtime", dockerfile)
+        self.assertIn("test ! -e /work/plugins/navigation/runtime", dockerfile)
+        self.assertIn("COPY actucore/plugins/    /work/plugins/", dockerfile)
+        self.assertIn("actucore-navigation-base@sha256:", dockerfile)
         self.assertNotIn("missing-digest", dockerfile)
         self.assertIn("--base", build_script)
         self.assertIn("ACTUCORE_NAVIGATION_BASE_IMAGE override", build_script)
-        self.assertIn(
-            '"ACTUCORE_RUNTIME_BASE_IMAGE=${NAVIGATION_PARENT_IMAGE}"',
-            build_script,
-        )
-        self.assertIn("JP${JP_VERSION} navigation base is not published", build_script)
+        self.assertIn('"BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}"', build_script)
         self.assertIn(
             "actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b",
             build_script,
@@ -1333,11 +1310,13 @@ class NavigationPluginTest(unittest.TestCase):
             {"port": item["port"], "topic": item["topic"]}
             for item in navigation_tool_definition("ubuntu")["topic_in"]
         ]
-        started = plugin.dispatch(
-            "ControlledSemanticSpatial",
-            {"action": "start", "input_bindings": all_bindings},
-        )
+        with mock.patch("plugins.navigation.plugin.GoalTopicInput") as goal_input:
+            started = plugin.dispatch(
+                "ControlledSemanticSpatial",
+                {"action": "start", "input_bindings": all_bindings},
+            )
         self.assertEqual(started["state"], "ready")
+        goal_input.assert_called_once()
 
     def test_runtime_start_failure_rolls_back_before_retry(self):
         runtime = FakeRuntime(fail=True)

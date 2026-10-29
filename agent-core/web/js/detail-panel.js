@@ -16,10 +16,9 @@ import { ControlRenderer }  from './renderers/control.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
-import { CostmapRenderer, OdometryRenderer, PathRenderer } from './renderers/navigation.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, CostmapRenderer, OdometryRenderer, PathRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;

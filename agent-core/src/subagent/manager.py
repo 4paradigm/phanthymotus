@@ -15,7 +15,6 @@ import time
 
 import config
 import event_bus
-import mcp_client
 from api.motus_stream import push_event
 from .protocol import (
     SubagentSpec, SubagentResult, SubagentStatus,
@@ -153,9 +152,6 @@ class SubagentManager:
             spec=spec,
             compress_threshold=self._cfg['compress_threshold_chars'],
         )
-        # The queue consumer is a long-lived task with its own ContextVar context.
-        # Preserve the submitter's predicate before the first await.
-        agent.dispatch_admission = mcp_client.dispatch_admission.get()
         agent.status = STATUS_PENDING
         self._agents[agent.id] = agent
         self._queue.push(agent.id, spec.priority)
@@ -223,15 +219,10 @@ class SubagentManager:
         self._queue._notify.set()
         return True
 
-    def accepts_message(self, agent_id: str) -> bool:
-        """Whether this active agent still belongs to its submission lifecycle."""
-        agent = self._agents.get(agent_id)
-        return bool(agent and agent._admitted())
-
     def send_message(self, agent_id: str, text: str) -> bool:
         """Send a message to a running subagent."""
         agent = self._agents.get(agent_id)
-        if not agent or agent.status != STATUS_RUNNING or not agent._admitted():
+        if not agent or agent.status != STATUS_RUNNING:
             return False
         agent.send_message(text)
         return True
@@ -336,7 +327,6 @@ class SubagentManager:
     async def _run_agent(self, agent: Subagent):
         """Execute one subagent's LLM loop."""
         agent_id = agent.id
-        token = mcp_client.dispatch_admission.set(agent.dispatch_admission)
         try:
             result = await agent.run(self._llm_client)
 
@@ -365,7 +355,6 @@ class SubagentManager:
             agent.status = STATUS_FAILED
             self._finalize(agent)
         finally:
-            mcp_client.dispatch_admission.reset(token)
             self._running.pop(agent_id, None)
             self._timeout_tasks.pop(agent_id, None)
 
@@ -513,21 +502,18 @@ class SubagentManager:
                     parts.append(f'已调用: {", ".join(dict.fromkeys(substantive))[:120]}')
                 notify_text += (f'\n⚠ 已经做过的部分，不要重复执行: {"; ".join(parts)}')
 
-        # A delayed completion must not become a trigger for a restarted project.
-        # enqueue captures the event epoch before its first await.
-        if agent._admitted():
-            await event_bus.enqueue(
-                source=f'subagent:{agent.id}',
-                text=notify_text,
-                payload={
-                    'agent_id': agent.id,
-                    'status': result.status,
-                    'output': result.output[:200] if result.output else '',
-                    'error': result.error,
-                    'rounds_used': result.rounds_used,
-                    'priority': agent.spec.priority,
-                },
-            )
+        await event_bus.enqueue(
+            source=f'subagent:{agent.id}',
+            text=notify_text,
+            payload={
+                'agent_id': agent.id,
+                'status': result.status,
+                'output': result.output[:200] if result.output else '',
+                'error': result.error,
+                'rounds_used': result.rounds_used,
+                'priority': agent.spec.priority,
+            },
+        )
 
         await push_event({
             'type': 'subagent_complete',

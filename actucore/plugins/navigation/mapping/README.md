@@ -108,18 +108,10 @@ registered cloud、累计静态图或 Nav2 costmap。`map_view` 最多编码 80,
 障碍点挤出前端上限。地图点主体每秒编码一次并缓存，编码完成后在同一定时
 回调中更新机器人 `x/y/yaw` 的固定 12 字节头部并立即发布，不再用第二个过期
 定时器争抢同一回调组；DDS 只保留最新一帧，避免大帧发布堆积后抢占
-odom/registered cloud 回调。位姿刷新不再重复编码
-整张地图。现有渲染器
-继续按高度显示范围外点为蓝色/粉色。
-Agent Core 在显示层
-把同为 `map` frame 的 Nav2 `/plan` 叠加为绿色路径和橙色终点，不改变
-`map_view` 点数组语义，也不让 FAST-LIVO2 依赖 Nav2。旧图加载后在
-首次重定位失败时只显示明确标记为未确认的最佳候选预览；不发布对应 TF、
-odom/cloud 或规划输入。地图卡片支持三维
-浏览和正上方二维投影切换；二维模式只是同一三维点云的平面显示，不是另存
-一份 occupancy grid。绿色机器人箭头沿 canonical `base_link` 的 `+X` 前向，
-并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
-可重定位地图格式。原始 PCD 分片保存在宿主机
+odom/registered cloud 回调。位姿刷新不再重复编码整张地图。主线 Agent Core 不包含本 PR 原有的高度着色、
+路径叠加和二维/三维切换增强，不应假定这些视图可用。旧图加载后首次重定位失败时，
+不会发布未确认候选对应的 TF、odom/cloud 或规划输入。`map_view` 是监控数据，
+不是可重定位地图格式。原始 PCD 分片保存在宿主机
 `/opt/phanthy-motus/data/navigation/fast_livo2/maps`；`stop_mapping` 还会原子写入
 `maps/static/<map>-*.static.pcd`，保存导航高度带内直接累计的静态点。
 

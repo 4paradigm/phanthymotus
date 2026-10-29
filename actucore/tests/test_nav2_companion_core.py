@@ -561,7 +561,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         package = (PACKAGE_ROOT / "package.xml").read_text(encoding="utf-8")
         dockerfile = (
-            Path(__file__).resolve().parents[1] / "Dockerfile.navigation"
+            Path(__file__).resolve().parents[1] / "Dockerfile.jetson"
         ).read_text(encoding="utf-8")
         service = (
             Path(__file__).resolve().parents[1] / "deploy" / "service.yml"
@@ -603,7 +603,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn(
-            "--packages-select fast_livo2 segmented_controller nav2",
+            "--packages-select audio_msgs fast_livo2 segmented_controller nav2",
             dockerfile,
         )
         self.assertIn("ros2 pkg prefix segmented_controller", dockerfile)

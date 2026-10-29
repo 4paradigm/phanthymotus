@@ -73,21 +73,21 @@ registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz
 }
 ```
 
-Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
-`goal_pose` 端口时激活 `inputSchema.x-topic-actions`。Core 会把通过校验的
-`x/y/yaw/speed` 转为同一张卡片的 `navigate_to_pose` MCP 调用；
-`goal_id` 必须为 1–128 个 ASCII 字符，首字符为字母或数字，其余只允许
-字母、数字、`_`、`.`、`:`、`-`，不做空白裁剪；这只约束 topic 消息，
-不收紧其他内部调用的私有任务 ID。`schema` 不符、ID 不合法、
-缺坐标、夹带未声明字段或重复 `goal_id` 的消息都不会被执行。只有 MCP
-投递成功后 `goal_id` 才进入去重窗口；投递失败可重试同一 ID，但超时或断连时远端执行状态可能未知，不应据此认定此前目标未执行。
+导航卡在启动参数包含 `goal_pose` 绑定时自行订阅对应 topic，不依赖 Agent Core
+的 topic action。主线 Agent Core 不传端口身份，统一卡片只能按声明的标准 topic
+识别输入；单元测试不能视为 ROS 端到端可用。
+`goal_id` 为 1–128 个 ASCII 字符，首字符为字母或数字，其余只允许字母、数字、
+`_`、`.`、`:`、`-`；不裁剪空白。只接受声明字段和有限数值，并使用 goal_id
+作为私有 nav_id。无 ROS 依赖时未连接目标输入可正常使用，连接后订阅失败则启动失败。
 
-此输入由 Core 的通用 ROS bridge 订阅，DDS 请求的 QoS 为上表的
-`BEST_EFFORT + KEEP_LAST(20) + VOLATILE`，兼容 best-effort 和 reliable
-发布者；即使发布者使用 reliable，接收仍不保证可靠交付。Bridge 的 DDS
-队列深度 20 与异步回调队列分离，后者对等待中的目标只保留最新一条；
-因此目标可能丢失或被新目标覆盖，发布者不能把发布成功视为导航已接受。
-停止 Canvas 项目会退订并丢弃尚未投递的目标，再停止卡片；已经在途或延迟到达的请求尚无跨生命周期栅栏，不能据此推断不会在停止后执行。
+订阅 QoS 为 `BEST_EFFORT + KEEP_LAST(20) + VOLATILE`；即使发布者使用
+reliable，也不保证交付。DDS 回调不等待导航，工作线程对等待中的目标只保留
+最新一条。最近 1024 个已尝试 ID 在当前订阅生命周期内去重：执行前即记录，
+包括明确失败和结果未知，避免超时后盲目重复；停止后记录丢失，窗口淘汰后也可
+再次执行。发布不等于接纳，且没有 topic 级接纳回执。停止会退订、丢弃待处理
+目标；已准入的调用由统一卡片的停止栅栏追踪和取消，未确认停止时须重试。
+停止确认失败时订阅仍保持关闭，重新启动前须完成停止。远端在途命令、跨生命周期
+重复和物理停车仍不能由此保证。
 
 ## 输出合同
 
@@ -241,23 +241,16 @@ odom、registered cloud 和 static map 由 `NavigationPlugin` 固定为同容器
 `control_velocity` 或旧的 `motion_sequence`，不要同时连接两个会执行动作的消费者；
 `goal_pose` 仍可作为可选外部输入。格式匹配本身不证明 Driver 已订阅或联调通过。
 
-地图和实时位姿从统一卡片的 `map_view` 查看；`livo_odom` 只作为同容器内部
-定位/规划数据，不再生成 Canvas 公共端口。Agent Core 的地图 renderer 会额外
-只读订阅 Nav2 `/plan`，
-在同一个 `map` frame 中把绿色全局路径和橙色终点叠加到地图上；Nav2 仍不
-复制 `map_view`，因此 Canvas 只有一张权威地图。`/plan` 独立数据流仍保留，
-用于查看路径点数、长度和纯折线。地图右上角可切换 `2D/3D`：2D 是对
-FAST-LIVO2 三维点云的正上方平面投影，与 Nav2 的二维规划坐标直接对齐，
-不是新增的 occupancy grid。
+`map_view` 为统一卡片的公开地图输出，`livo_odom` 只作为同容器内部定位/规划
+数据，不生成 Canvas 公共端口。主线 Agent Core 不提供本 PR 原有的专用路径、
+目标、位姿叠加及 2D/3D 地图渲染增强，不能假定这些数据会在 Dashboard 显示。
 
 统一卡片不再公开 costmap 输出端口。规划器仍使用
 `/global_costmap/costmap`，需要排障时可通过下述 RViz 流程检查。
 
-Canvas 的 odom/path/costmap 监控依赖 Agent Core 按原生 ROS 2 类型订阅
-`nav_msgs/msg/Odometry`、`nav_msgs/msg/Path` 和 `nav_msgs/msg/OccupancyGrid`；不得在同名 topic 上创建
-`std_msgs/msg/String` 订阅，否则 DDS graph 会出现同 topic 多类型且数据流为空。
-Core 镜像因此需要包含 `ros-humble-nav-msgs`；单独重建 ActuCore/Nav2
-镜像不会更新 Canvas 的解码与 renderer。
+主线 Agent Core 不支持本 PR 曾增加的 odom/path/costmap 专用监控转换；排障时应
+使用支持 `nav_msgs/msg/Odometry`、`nav_msgs/msg/Path` 和
+`nav_msgs/msg/OccupancyGrid` 的 ROS 工具。
 
 ## RViz 调试
 
@@ -278,8 +271,10 @@ rviz2 -d actucore/plugins/navigation/runtime/nav2/rviz/nav2.rviz
 
 ## 构建与部署
 
-Nav2 ROS 包随统一 ActuCore 镜像从源码构建，不存在独立 Nav2 service 或镜像。
-从仓库根目录执行 `./deploy/build_actucore.sh --mirror tuna` 生成日常镜像。
+JP5.11 的 Nav2 从锁定源码预编译在 ActuCore 基座中，日常镜像直接继承该基座并
+编译仓库自有 ROS 包；不存在独立 Nav2 service 或运行时镜像。从仓库根目录执行
+`./deploy/build_actucore.sh --mirror tuna` 生成 JP5.11 日常镜像。JP6.1 保留本地
+VLA，但其新 navigation 默认关闭且尚未验证。
 正式 `actucore/deploy/service.yml` 只有一个 service；现场容器编排不在卡片源码中维护。
 
 Canvas 启动时 Nav2 只等待同容器 runtime 的 DDS 控制面，不等待 odom/cloud，避免

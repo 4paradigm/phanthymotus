@@ -95,11 +95,12 @@ for the duration of a motion is the wrong shape.
 
 ## Jetson only
 
-The daily image uses `Dockerfile.jetson`; locked navigation dependencies are
-built separately by `Dockerfile.navigation-base` and consumed through an exact
-`@sha256` base reference. `deploy/build_actucore.sh` takes no `--variant` and
-currently supports the published JP 5.11 navigation base; `--base` rebuilds the
-heavy base only on native ARM64. Build context is the **repo root**, not
+Both platforms use `Dockerfile.jetson` directly from their selected base.
+JP 5.11 uses the published, digest-pinned navigation base built by `Dockerfile.base`;
+it supports navigation and remote VLA, but not local SmolVLA. JP 6.1 uses the
+existing VLA base and retains local VLA, while new navigation is disabled and
+not yet validated. `deploy/build_actucore.sh` takes no `--variant`; `--base`
+rebuilds the heavy base only on native ARM64. Build context is the **repo root**, not
 `actucore/`, because the image also needs `deploy/ros-base/audio_msgs/` — so
 `COPY` paths inside it are `actucore/…`. A PR adding a `COPY` with a path relative
 to `actucore/` will fail the build.

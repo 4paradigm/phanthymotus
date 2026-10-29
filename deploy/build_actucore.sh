@@ -4,8 +4,8 @@
 # 只有 Jetson 版：执行模型多数要 GPU（VLA / 抓取策略 / locomotion），
 # 没有 CPU 变体。navigation 卡片本身不用 GPU，但和它们共用这一个镜像。
 #
-# FAST-LIVO2 与 Nav2 只在 navigation base 中从锁定源码编译；日常镜像用
-# 它编译仓库自有 ROS 包，最终运行阶段回到同一个 digest-pinned 平台基线。
+# FAST-LIVO2 与 Nav2 在 ActuCore base 中从锁定源码编译；JP5.11 日常
+# 镜像直接继承锁定 digest 的基座并编译仓库自有 ROS 包。
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
@@ -92,7 +92,7 @@ elif ${BUILD_BASE}; then
         echo "ERROR=build the navigation base on native ARM64, not through QEMU" >&2
         exit 2
     fi
-    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.navigation-base"
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.base"
     IMAGE_NAME="actucore-navigation-base"
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
@@ -139,30 +139,16 @@ elif ${BUILD_BASE}; then
         "LZ4_COMMIT=${LZ4_COMMIT}"
     )
 else
-    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.navigation"
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
     IMAGE_NAME="actucore"
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-    case "${JP_VERSION}" in
-        5.11)
-            DEFAULT_NAVIGATION_BASE_IMAGE="${BASE_REPOSITORY}/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b"
-            ;;
-        6.1)
-            DEFAULT_NAVIGATION_BASE_IMAGE=""
-            ;;
-    esac
+    DEFAULT_NAVIGATION_BASE_IMAGE="${BASE_REPOSITORY}/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b"
     ACTUCORE_NAVIGATION_BASE_IMAGE="${ACTUCORE_NAVIGATION_BASE_IMAGE:-${DEFAULT_NAVIGATION_BASE_IMAGE}}"
-    if [ -z "${ACTUCORE_NAVIGATION_BASE_IMAGE}" ]; then
-        echo "ERROR=JP${JP_VERSION} navigation base is not published; set ACTUCORE_NAVIGATION_BASE_IMAGE to its exact @sha256 digest" >&2
-        exit 2
-    fi
     if [[ ! "${ACTUCORE_NAVIGATION_BASE_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
         echo "ERROR=ACTUCORE_NAVIGATION_BASE_IMAGE override must use an exact @sha256 digest" >&2
         exit 2
     fi
-    BUILD_ARGS+=(
-        "ACTUCORE_NAVIGATION_BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}"
-        "ACTUCORE_RUNTIME_BASE_IMAGE=${NAVIGATION_PARENT_IMAGE}"
-    )
+    BUILD_ARGS+=("JP_VERSION=${JP_ARG}" "BASE_IMAGE=${ACTUCORE_NAVIGATION_BASE_IMAGE}")
 fi
 
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${TAG}"

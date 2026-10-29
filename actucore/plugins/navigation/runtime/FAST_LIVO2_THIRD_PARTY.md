@@ -1,9 +1,10 @@
 # FAST-LIVO2 第三方依赖锁
 
-统一 ActuCore 镜像基于按 JetPack 版本锁定 digest 的 `jetson-base`，不再继承或拉取
-`phanthy-fast-livo2`。`fast_livo2-source.lock` 锁定 3 个上游仓库 revision
-和三个运行时补丁哈希；`actucore/Dockerfile.navigation-base` 在同一构建中
-校验、应用补丁并从源码编译完整 FAST-LIVO2 工作区。
+JP5.11 ActuCore 镜像直接继承锁定 digest 的导航基座，不再继承或拉取
+`phanthy-fast-livo2`；导航基座本身基于按 JetPack 版本锁定 digest 的 `jetson-base`。
+`fast_livo2-source.lock` 锁定 3 个上游仓库 revision 和三个运行时补丁哈希；
+`actucore/Dockerfile.base` 在基座构建中校验、应用补丁并从源码编译完整
+FAST-LIVO2 工作区。JP6.1 日常镜像沿用 VLA 基座，新 navigation 默认关闭且尚未验证。
 
 - FAST-LIVO2 ROS 2/MID360 fork:
   `Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye@1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea`, GPL-2.0-only.
@@ -21,7 +22,7 @@
 三份补丁存放在 `runtime/patches/`，其 SHA256 与版本锁一致；分别保留已经
 验收过的传感器队列/IMU gap 恢复、PCD checkpoint 和 finalization 行为。
 
-FAST-LIVO2/Vikit 与 Nav2 位于同一个 ActuCore 镜像，不再通过独立基础镜像或
-companion image 隔离。分发该组合镜像时必须同时满足 GPL-2.0-only、
+JP5.11 的 FAST-LIVO2/Vikit 与 Nav2 位于同一个 ActuCore 运行镜像；预构建基座不是
+独立运行服务，也不需要 companion image。分发该组合镜像时必须同时满足 GPL-2.0-only、
 GPL-3.0-only 和 Apache-2.0 的适用义务；镜像标签也必须保留组合许可证和锁定
 revision。运行时只启动同容器子进程，不依赖 Docker socket 或额外容器。

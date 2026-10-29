@@ -1075,13 +1075,6 @@ async def apply(request: fastapi.Request, req: LoadRequest):
 
 async def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     """写画布布局与卡片配置。"""
-    from api.config import layout_lifecycle_lock
-
-    async with layout_lifecycle_lock:
-        return await _apply_canvas_locked(canvas, mapping)
-
-
-async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
     from api.canvas import (apply_tool_config, delete_all_tool_configs,
                             notify_layout_changed, tool_config_key)
 
@@ -1114,7 +1107,7 @@ async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
         exec_connections.append(c)
 
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    new_layout = {
+    config.main['canvas_layout'] = {
         'cards':           cards,
         'connections':     connections,
         'execConnections': exec_connections,
@@ -1122,8 +1115,9 @@ async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
     }
     # 方案里的卡片是整套替换的，被换掉的那些卡片的实例不会再有人来停它
     from api.config import stop_removed_cards
-    config.main['canvas_layout'] = new_layout
     await stop_removed_cards(old_cards, cards)
+    # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
+    notify_layout_changed()
 
     # 卡片配置：先清空旧的，再写包体里的
     removed = delete_all_tool_configs()
@@ -1142,9 +1136,6 @@ async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
         config.main[tool_config_key(mcp_id, tool_name, instance_id)] = value
         apply_tool_config(mcp_id, tool_name, value, instance_id)
         written += 1
-
-    # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
-    notify_layout_changed()
 
     return {'cards': len(cards),
             'connections': len(connections) + len(exec_connections),

@@ -792,8 +792,6 @@ def _needs_barrier(name: str, call_args: dict = None) -> tuple[bool, frozenset |
         return True, None    # 无 meta 默认 barrier 且当全局独占（安全）
     if meta.get('type') in ('sensor', 'resource'):
         return False, None
-    if action_name in (meta.get('completion') or {}).get('passthrough_actions', []):
-        return False, None
     return True, meta.get('resource')
 
 
@@ -1745,15 +1743,6 @@ class Event:
 
     async def _interrupt_active_outputs(self, reason: str = '',
                                         scope: frozenset | None = None):
-        # Safety interrupts are independent of the turn that requested them.
-        token = mcp_client.dispatch_admission.set(None)
-        try:
-            return await self._interrupt_active_outputs_unfenced(reason, scope)
-        finally:
-            mcp_client.dispatch_admission.reset(token)
-
-    async def _interrupt_active_outputs_unfenced(self, reason: str = '',
-                                                 scope: frozenset | None = None):
         """中止正在进行的输出（TTS + 动作）。在 TurnCancelled / 新用户 turn 时调用。
 
         `scope` 是这次打断**有权**碰的物理通道，None = 全部（急停、TurnCancelled）。
@@ -1795,24 +1784,21 @@ class Event:
         # 发过。一个只绑了 on_interrupt_speak 的卡（比如混音卡的 flush_speech）在今天
         # 的代码里永远收不到打断。
         _hook_ids = ('on_interrupt_all', 'on_interrupt_speak')
-        hook_results = []
-        for _hid in _hook_ids:
-            try:
+        try:
+            hook_results = []
+            for _hid in _hook_ids:
                 hook_results += await hooks.fire(_hid) or []
-            except Exception as exc:
-                # One hook failure must not suppress the other hook or fallback.
-                print(f'[decision] {_hid} hook raised: {exc}')
+        except Exception as exc:
+            # 打断路径是最不该抛异常的地方：它跑在 TurnCancelled 处理里，抛出去就
+            # 连兜底一起丢了 —— 而兜底恰恰是这时候唯一还能停住机器人的东西。
+            print(f'[decision] on_interrupt_all hook raised: {exc}')
+            hook_results = []
         # 只有**成功**的绑定才算覆盖到：抛异常的那张卡并没有被叫停，若它恰好也叫
         # tts/loco，兜底该再试一次。非 dict 的条目当成「不知道覆盖了谁」，宁可让
         # 兜底多叫一次（叫停是幂等的），也不要漏。
-        def hook_failed(r):
-            # Also understand legacy/mock wrappers with only an inner failure.
-            return (not isinstance(r, dict) or 'error' in r
-                    or 'result' not in r or hooks.result_failure(r['result']) is not None)
-
         covered = {(r.get('mcp_id'), r.get('tool')) for r in hook_results
-                   if not hook_failed(r)}
-        hook_failures = [r for r in hook_results if hook_failed(r)]
+                   if isinstance(r, dict) and 'error' not in r}
+        hook_failures = [r for r in hook_results if isinstance(r, dict) and 'error' in r]
         tasks = []
 
         # registry[mcp_id]['tools'] holds *bare* plugin names ('tts', 'loco') --
@@ -1864,17 +1850,15 @@ class Event:
             for label, r in zip(labels, results):
                 if isinstance(r, Exception):
                     print(f'[decision] interrupt_active_outputs: {label} raised: {r}')
+                elif isinstance(r, dict) and r.get('error'):
+                    print(f'[decision] interrupt_active_outputs: {label} failed: {r["error"]}')
                 else:
-                    failure = hooks.result_failure(r)
-                    if failure is not None:
-                        print(f'[decision] interrupt_active_outputs: {label} failed: {failure}')
-                    else:
-                        ok += 1
+                    ok += 1
 
-        # Local bookkeeping only, even if every interrupt call failed. Releasing
-        # an ACP event does not confirm remote cancellation or physical stopping.
-        # Previously this only ran with a binding, leaving a local barrier and
-        # silence countdown running through a barge-in on unbound robots.
+        # Unconditionally, on both paths. Previously this ran only when a hook was
+        # bound, so a robot with no binding kept its pending ACP actions blocked —
+        # the barrier never released — and the silence countdown kept running
+        # through a barge-in.
         for aid in mcp_client.cancellable_by(scope):
             if reason:
                 mcp_client._pending_results[aid] = {'status': 'cancelled', 'reason': reason}
@@ -1885,7 +1869,7 @@ class Event:
             print('[decision] interrupt_active_outputs: nothing to interrupt '
                   '(no on_interrupt_all binding, no tts/loco tool)')
             return
-        print(f'[decision] interrupt requests without reported failure: {len(covered)} via hook, {ok}/{len(tasks)} via fallback'
+        print(f'[decision] interrupted: {len(covered)} via hook, {ok}/{len(tasks)} via fallback'
               + (f', {len(hook_failures)} hook binding(s) failed' if hook_failures else ''))
 
 
@@ -1895,14 +1879,7 @@ class Event:
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
         while True:
             ev = await collector.next_trigger()
-            epoch = ev['_project_epoch']
-            def admitted(epoch=epoch):
-                return collector.project_running() and collector.project_epoch() == epoch
-            if not admitted():
-                continue
-            admission_token = mcp_client.dispatch_admission.set(admitted)
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
-            self._current_turn_epoch = epoch
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
@@ -1934,7 +1911,7 @@ class Event:
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                if admitted() and not ev.get('_bot_channel_event'):
+                if not ev.get('_bot_channel_event'):
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
@@ -1944,21 +1921,17 @@ class Event:
                 })
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
-                try:
-                    _cancel_ctx.reset(_cancel_token)
-                    collector.set_cancel_event(None)
-                    collector.set_reconsider_event(None)
-                    collector.set_busy(False)
-                    self._current_turn_epoch = None
-                    # Fire on_idle hook (LED state reset etc.)
-                    if admitted() and not ev.get('_bot_channel_event'):
-                        import hooks as _hooks_idle
-                        asyncio.create_task(_hooks_idle.fire('on_idle'))
-                    # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
-                    if self._current_turn and not ev.get('_bot_channel_event') and admitted():
-                        self._save_current_turn(ev)
-                finally:
-                    mcp_client.dispatch_admission.reset(admission_token)
+                _cancel_ctx.reset(_cancel_token)
+                collector.set_cancel_event(None)
+                collector.set_reconsider_event(None)
+                collector.set_busy(False)
+                # Fire on_idle hook (LED state reset etc.)
+                if not ev.get('_bot_channel_event'):
+                    import hooks as _hooks_idle
+                    asyncio.create_task(_hooks_idle.fire('on_idle'))
+                # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
+                if self._current_turn and not ev.get('_bot_channel_event'):
+                    self._save_current_turn(ev)
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
@@ -2079,9 +2052,6 @@ class Event:
         """
         global _narration_inflight
         import hooks
-        epoch = collector.project_epoch()
-        if not collector.project_running():
-            return
         if _narration_inflight:
             # 另一次汇报正在飞（LLM 调用最长 20 秒，期间完成回调可能又上了一次表）。
             # **必须重新计时**：这个 task 到此就结束了，不重排的话没有任何东西会再触发
@@ -2095,12 +2065,6 @@ class Event:
             return
         work = _active_work_summary()
         turn_alive = _turn_running()
-        if turn_alive and getattr(self, '_current_turn_epoch', None) != epoch:
-            # An old request may still be awaiting its LLM after stop/restart.
-            # Retry while running so independent new work can be narrated once
-            # that turn exits; never read the old turn as new-generation work.
-            _narration_gate('stale busy turn', stop=False)
-            return
         if not work and not turn_alive:
             _narration_gate('no active work', stop=True)   # 活干完了，没什么好报的
             return
@@ -2198,8 +2162,6 @@ class Event:
         finally:
             _narration_inflight = False
 
-        if not collector.project_running() or collector.project_epoch() != epoch:
-            return
         # SKIP 逃生口：传感器轮询那种确实没进展的时段，连说三遍"我还在查看"比沉默更糟。
         if not report or report.upper().startswith('SKIP'):
             _restart_countdown()
@@ -2213,14 +2175,7 @@ class Event:
             return
         report = _trim_narration(report)
 
-        if not collector.project_running() or collector.project_epoch() != epoch:
-            return
-        token = mcp_client.dispatch_admission.set(
-            lambda: collector.project_running() and collector.project_epoch() == epoch)
-        try:
-            results = await hooks.fire('on_notify', {'text': report}, barrier_aware=True)
-        finally:
-            mcp_client.dispatch_admission.reset(token)
+        results = await hooks.fire('on_notify', {'text': report}, barrier_aware=True)
         if not _notify_fire_spoke(results):
             # 竞态：gate 判定时嘴还空着，真要说的时候被占了。LLM 的钱已经花了，退避。
             print(f'[decision] narration: all bindings skipped (busy) → "{report}"')
@@ -2262,11 +2217,6 @@ class Event:
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
-        epoch = trigger_event['_project_epoch']
-        def admitted():
-            return collector.project_running() and collector.project_epoch() == epoch
-        if not admitted():
-            return
         bot_restricted = _bot_channel_restricted(trigger_event)
         viewer_restricted = _viewer_channel_restricted(trigger_event)
         tool_restricted = bot_restricted or viewer_restricted
@@ -2435,8 +2385,6 @@ class Event:
             return True
 
         while True:
-            if not admitted():
-                return
             # ── 绝对上限检查 ──────────────────────────────────────────────
             if total_rounds >= absolute_max:
                 print(f'[decision] absolute max {absolute_max} reached, forcing end')
@@ -2501,8 +2449,6 @@ class Event:
 
             # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────
             # 取消检查点：在耗时的 LLM 调用前检查是否被用户消息中断
-            if not admitted():
-                return
             if cancel_event and cancel_event.is_set():
                 raise TurnCancelled("Interrupted before LLM call")
             if reconsider_event is not None and reconsider_event.is_set():
@@ -2581,8 +2527,6 @@ class Event:
                         raise
                 else:
                     raise
-            if not admitted():
-                return
             turn_messages.append(response)
             self._flush_current_turn(trigger_event)
             _flush_spans()
@@ -2664,9 +2608,7 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if not admitted():
-                    result = 'Error: tool dispatch blocked: project lifecycle ended'
-                elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
+                if tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
@@ -2707,8 +2649,6 @@ class Event:
                             }
                         else:
                             result = _not_dispatched(name, _barrier_result)
-                    elif not admitted():
-                        result = 'Error: tool dispatch blocked: project lifecycle ended'
                     else:
                         result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
@@ -2733,8 +2673,6 @@ class Event:
                         # yet) or just record it as not-dispatched.
                         result = _not_dispatched(name, _barrier_result)
                         _reconsidered = (_barrier_result.get('status') == 'reconsidering')
-                    elif not admitted():
-                        result = 'Error: tool dispatch blocked: project lifecycle ended'
                     else:
                         args['_trace_id'] = _trace_id
                         args['_cancel_event'] = cancel_event

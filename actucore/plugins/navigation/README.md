@@ -42,14 +42,13 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
 - 分段执行的转向和直行预检只在 footprint 命中 Nav2
   `LETHAL_OBSTACLE` 时拒绝；膨胀安全带仅用于代价与规划，不冒充实体碰撞。
 
-`topic_aux` 中的 `plan` 与 `livo_odom` 供 Core inspection 订阅，用于地图路径/位姿叠加；
-它们不属于 Canvas 连线输出。Canvas 从顶层 `topic_out` 选择输出端口，不读取
-`topic_aux` 或 `info.mapping/planning/semantic` 内的诊断元数据。不要为精简公开端口
-删除内部诊断订阅，否则地图叠加会失去数据。
+`topic_aux` 中的 `plan` 与 `livo_odom` 是内部诊断元数据，不属于 Canvas 连线输出。
+主线 Agent Core 不注册这些辅助 topic，也不提供本导航专用的路径、位姿和代价地图渲染；
+不能将这些内部数据视为已在 Dashboard 中显示。
 
 JP5.11 的 PyYAML 与 requests 由固定 digest 的平台父镜像提供，分别为 5.3.1 与
-2.22.0；最终 Docker stage 在复制 ROS 安装空间前验证二者可导入。导航 builder
-不承担这些 Python 包的运行时供应。变更平台 digest 时必须重新通过该检查。
+2.22.0；日常镜像直接继承导航基座，并在构建时验证二者可导入。变更平台或
+导航基座 digest 时必须重新通过该检查。
 
 ## Action 响应与超时
 
@@ -67,7 +66,7 @@ Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在�
 | `imu` | `/ubuntu/navigation/imu` | 是 |
 | `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航，`collection_enabled=true` 时必需 |
 | `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
-| `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由 Agent Core `x-topic-actions` 转换为 `navigate_to_pose`，不生成独立监控卡片 |
+| `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由导航卡片订阅并转换为 `navigate_to_pose` |
 
 Driver 卡片合并后的连线：
 
@@ -80,22 +79,19 @@ Driver 卡片合并后的连线：
 
 原机身 `imu` 保持原用途，不能代替 `lidar_imu`。相机卡片原有 JPEG/深度输出
 不能代替 PSE1 输入。按输出的 topic、ROS 类型与 schema 选端口，不假定它是第一个输出。
-消费端不依赖来源卡片名称；实际 topic 由画布所选输出端口传入 runtime。
-本次以保留上述既有 topic/schema 为适配基线，新 Driver 的实际 `tools/list` 尚待联调核验。
+消费端不依赖来源卡片名称。主线 Agent Core 启动时只传 topic 列表，不提供目标端口身份；
+当前卡片只能以本表中的标准 topic 名识别输入，任意自定义 topic 连线不能保证被正确识别，
+缺少必需输入时会拒绝启动。新 Driver 的实际 `tools/list` 尚待联调核验。
 
 升级旧画布时，先停止智能控制，移除 `navigation_lidar`、`navigation_imu`、
 `camera_rgb_frame`、`camera_depth_frame` 四张旧卡片，添加或刷新上表卡片，
 重新连接对应输出并保存，再启动。不要只改卡片显示名称或沿用旧输出索引。
 
 这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
-`lidar` 和 `imu`。`goal_pose` 是可选的外部 topic action，不是启动时内部连线。
-Agent Core 会把消息里的 `goal_id` 作为私有任务 ID 传给 planner；同一消息在
-投递结果未知后重试时会幂等重放活动或终态回执，不会创建第二个导航任务。
-结果未知时 planner 保留活动 ID 而不再次下发；收到 runtime 的明确拒绝回执时
-则释放 ID，允许修正后重试。同一 ID 携带不同目标会被拒绝。活动及终态幂等
-回执最多保留 1024 个可信 ID，避免长时运行
-无界增长。Nav2 goal response 超时只表示结果未知，runtime 保持 pending 并继续
-接收迟到的 accepted/rejected 回调，不会先发布伪终态再让晚到 goal 独立运行。
+`lidar` 和 `imu`。`goal_pose` 是可选外部 topic 输入；卡片将消息中的 `goal_id`
+作为私有任务 ID 传给 planner。topic 使用 best-effort、单工作线程和有界去重，
+繁忙时只保留最新待处理目标；没有业务投递确认，重启或去重窗口淘汰后也不保证
+跨生命周期去重。Nav2 goal response 超时只表示结果未知，不能视为任务已接受或停止。
 
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。FAST-LIVO2 mapper 从实际进入其 callback 和处理循环的数据中，
@@ -351,12 +347,13 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 该数据由上海 G1 上的 `docker image inspect --format '{{.Size}}'` 实测；增加的是
 磁盘、首次拉取和部署传输成本，不代表同等幅度的运行时 CPU/内存增长。稳定且昂贵的
 第三方依赖因此预编译进可复用、digest-pinned 的 navigation base，日常 PR 构建
-不再重复编译它们。发布该 base 并把精确 digest 写回构建脚本是正式发版前置条件；
-只有 ActuCore 导航镜像继承它，Core、Perception 和不含导航的镜像不会承担这部分
-体积。基础镜像使用 builder/runtime 双阶段；最终阶段只复制三个 ROS install-space
-和包锁，不保留 `/opt/ros_deps_ws`、`/opt/fast_livo_ws`、`/opt/nav2_ws` 的源码、
-build 与 log 目录。上述 `0.82 GiB` 是清理前的历史测量，新的最终体积必须在原生
-ARM64 完整构建后重新记录；镜像压缩层传输大小与上述历史解压后大小不能直接相减。
+不再重复编译它们。JP5 日常镜像直接继承已发布的基座；更新基座时须发布并固定新的
+精确 digest。Core、Perception 和 JP6 日常镜像不继承该导航基座。基座使用
+builder/runtime 双阶段，在运行阶段复制三个 ROS install-space 和包锁，不保留
+`/opt/ros_deps_ws`、`/opt/fast_livo_ws`、`/opt/nav2_ws` 的源码、build 与 log
+目录，但保留日常构建所需的编译依赖，且会被 JP5 最终镜像继承。上述 `0.82 GiB`
+是历史测量，新的最终体积必须在原生 ARM64 完整构建后重新记录；镜像压缩层传输
+大小与上述历史解压后大小不能直接相减。
 该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行
 `colcon build` 并显式导入 `em` / `yaml`，避免把基础镜像的偶然环境冒充成依赖
 契约，并从最终安装的 `nav2_params.yaml` 逐个动态加载全部 BT 插件库，缺库或
@@ -379,13 +376,13 @@ Canvas 外部连线 topic 必须是完整绝对 ROS 名称：以 `/` 开头，�
 ./deploy/build_actucore.sh --mirror tuna
 ```
 
-这是仓库默认的 ActuCore 构建入口，只有 Jetson 一个变体，无需 Navigation
-专用 wrapper。FAST-LIVO2/Nav2 不在日常 PR 镜像中重编，避免 ARM64 QEMU 构建
-超过 review 时限。当前正式构建只支持 JP 5.11，并使用已发布的
-digest-pinned navigation base。JP 6.1 的对应基础镜像尚未发布；必须
-先构建、发布并在仓库中固定匹配的精确 `@sha256` digest，才能恢复
-JP 6.1 支持。构建脚本在此之前会拒绝普通 JP 6.1 构建，不会回退到
-其他 JetPack 的基础镜像。
+这是仓库默认的 ActuCore 构建入口，两个 JetPack 平台均使用同一个
+`actucore/Dockerfile.jetson`，无需 Navigation 专用 wrapper。JP 5.11 日常镜像
+直接继承已发布的 digest-pinned navigation base，FAST-LIVO2/Nav2 不再重编；
+VLA 可使用 `mock` 和 `vla_cloud`，不含本地 SmolVLA。JP 6.1 使用原有 VLA
+基座（`./deploy/build_actucore.sh --jp-version 6.1 --mirror tuna`），保留本地
+VLA 能力，但新 navigation 默认关闭且尚未验证，不接受 navigation base 覆盖。
+脚本不会将 JP5 导航基座用于 JP6。
 只有锁定源码、补丁或系统依赖变化时，维护者才执行：
 
 ```bash

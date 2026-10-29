@@ -122,10 +122,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         source_lock = (runtime / "fast_livo2-source.lock").read_text(
             encoding="utf-8"
         )
-        base_dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation-base").read_text(
+        base_dockerfile = (ACTUCORE_ROOT / "Dockerfile.base").read_text(
             encoding="utf-8"
         )
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
             encoding="utf-8"
         )
         adapter = (

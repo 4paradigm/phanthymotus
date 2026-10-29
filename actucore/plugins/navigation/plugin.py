@@ -22,6 +22,7 @@ from .mapping.plugin import (
     _validated_config as validated_mapping_config,
 )
 from .planning.contract import NAV2_ACTIONS
+from .planning.goal_input import GoalInputCleanupError, GoalTopicInput
 from .planning.plugin import (
     ConfigError as PlanningConfigError,
     Nav2Plugin,
@@ -80,6 +81,8 @@ class NavigationPlugin:
             else None
         )
         self._runtime = runtime or NavigationRuntime()
+        self._executor = executor
+        self._goal_input = None
         self._mapping = mapping_plugin or FastLivo2Plugin(mapping_cfg, executor)
         self._planning = planning_plugin or Nav2Plugin(planning_cfg, executor)
         set_completion_callback = getattr(
@@ -274,6 +277,8 @@ class NavigationPlugin:
             self._wiring_transition_unknown = True
 
         started: list[tuple[str, object]] = []
+        goal_input = None
+        generation = object()
         try:
             self._set_mapping_runtime_active(True)
             started.append(("runtime", self._runtime))
@@ -365,10 +370,17 @@ class NavigationPlugin:
                 )
                 self._require_started("semantic", semantic_result)
                 self._check_start_cancelled()
+            goal_topic = wiring["wired_topics"].get("goal_pose")
+            if goal_topic:
+                goal_input = GoalTopicInput(
+                    goal_topic, self._executor,
+                    lambda goal: self._dispatch_topic_goal(generation, goal),
+                )
             with self._lock:
                 self._check_start_cancelled()
+                self._goal_input = goal_input
                 self._started = True
-                self._generation = object()
+                self._generation = generation
                 self._instance_id = requested_id
                 self._external_wiring = dict(wiring["wired_topics"])
                 self._control_interface = descriptor
@@ -380,7 +392,21 @@ class NavigationPlugin:
                 exc_info=True,
             )
             cancelled = self._stop_requested.is_set()
+            # A failed constructor can still own executor resources when its
+            # initial cleanup failed; retain the handle until close succeeds.
+            if isinstance(exc, GoalInputCleanupError):
+                goal_input = exc.goal_input
+            goal_cleanup_failed = False
+            if goal_input is not None:
+                with self._lock:
+                    self._goal_input = goal_input
+                goal_cleanup_failed = not self._close_goal_input()
             cleanup, cleanup_confirmed = self._stop_started(started)
+            if goal_cleanup_failed:
+                cleanup["goal_input"] = self._error(
+                    "cleanup_failed", "goal subscription close failed"
+                )
+                cleanup_confirmed = False
             if cleanup_confirmed:
                 self._set_mapping_runtime_active(False)
                 with self._lock:
@@ -400,6 +426,35 @@ class NavigationPlugin:
     def _check_start_cancelled(self) -> None:
         if self._stop_requested.is_set():
             raise RuntimeError("navigation start cancelled by stop")
+
+    def _dispatch_topic_goal(self, ticket, goal: dict) -> dict:
+        with self._lock:
+            if (ticket is not self._generation or self._stop_requested.is_set()
+                    or not self._started):
+                return self._error("navigation_stopping", "navigation admission expired")
+        if not self._runtime.info().get("running", False):
+            return self._error(
+                "navigation_runtime_unavailable",
+                "an owned ControlledSemanticSpatial child process is not running; "
+                "stop and restart the card",
+            )
+        return self._dispatch_planning(ticket, goal)
+
+    def _close_goal_input(self) -> bool:
+        # Called under the transition lock, never while holding the state lock.
+        with self._lock:
+            goal_input = self._goal_input
+        if goal_input is None:
+            return True
+        try:
+            goal_input.close()
+        except Exception:
+            log.exception("[ControlledSemanticSpatial] failed to close goal input")
+            return False
+        with self._lock:
+            if self._goal_input is goal_input:
+                self._goal_input = None
+        return True
 
     def _stop(self) -> dict:
         # Signal before taking the transition lock; never tear down a live request.
@@ -427,6 +482,11 @@ class NavigationPlugin:
 
     def _stop_serialized(self) -> dict:
         results = {}
+        if not self._close_goal_input():
+            return self._error(
+                "navigation_stop_pending", "goal subscription close failed; retry stop",
+                retryable=True, canvas_wired=True,
+            )
         # A request admitted before stop may not yet have entered the planner.
         # Stop it promptly, but never tear down until every such call has
         # returned and a *subsequent* planner stop is confirmed.

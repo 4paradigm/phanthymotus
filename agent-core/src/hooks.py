@@ -164,30 +164,6 @@ def get_status() -> dict:
 
 # ── Executor ─────────────────────────────────────────────────────────────────
 
-def result_failure(result: Any) -> str | None:
-    """Identify explicit failure/skip signals without inferring physical state.
-
-    Preserve arbitrary driver results; absence of an error only means that the
-    call returned without an explicit failure, not that motion actually stopped.
-    """
-    if isinstance(result, BaseException):
-        return str(result) or type(result).__name__
-    if not isinstance(result, dict):
-        return None
-    if result.get('error'):
-        return str(result['error'])
-    if result.get('ok') is False:
-        return 'ok=false'
-    for key in ('status', 'state'):
-        if result.get(key) == 'error':
-            return f'{key}=error'
-    if result.get('isError'):
-        return 'isError=true'
-    if 'skipped' in result:
-        return f'skipped: {result["skipped"]}'
-    return None
-
-
 async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: str | None = None,
                barrier_aware: bool = False) -> list[dict]:
     """Fire a hook: execute all bound tool calls, bypassing the LLM.
@@ -234,13 +210,8 @@ async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: s
                            'tool': binding.tool, 'error': str(outcome)})
             print(f'[hooks] {hook_id} → {binding.tool}.{binding.action} FAILED: {outcome}')
         else:
-            entry = {'hook': hook_id, 'mcp_id': binding.mcp_id,
-                     'tool': binding.tool, 'result': outcome}
-            failure = result_failure(outcome)
-            if failure is not None:
-                entry['error'] = failure
-                print(f'[hooks] {hook_id} → {binding.tool}.{binding.action} FAILED: {failure}')
-            results.append(entry)
+            results.append({'hook': hook_id, 'mcp_id': binding.mcp_id,
+                           'tool': binding.tool, 'result': outcome})
 
     if bindings:
         print(f'[hooks] fired {hook_id}: {len(bindings)} binding(s)')

@@ -1,7 +1,24 @@
-"""Mock-based tests for local project-stop ordering and failure reporting.
+"""
+test_stop_project_stages.py — 「停止智能控制」的两段,以及为什么必须是两段。
 
-Closing local admission does not stop existing LLM turns, hooks, remote requests,
-or physical devices. These tests do not establish a remote lifecycle fence.
+原来的顺序是**反的**:先逐卡 `stop`(串行、而且 `mcp_call_tool` 不传 timeout,默认
+不限时),最后才把 `project_running` 翻成 False。于是只要有一张卡片的 MCP 接了连接
+却不回应(被同进程的线程把 GIL 饿死、容器正在重启),停止就永远挂着,而**那段时间里
+agent loop 还活着** —— 还会调 TTS、还会驱动执行器。界面上同时什么也不变,所以操作者
+只会再点一次。
+
+容器内实测:`timeout=None` 对着一个只 accept 不回的端口 25 秒仍未返回;给 5 秒则
+5.3 秒失败。
+
+所以这个文件守住四件事:
+
+* **agent loop 先停,而且在任何一次 MCP 调用之前。** 这是安全属性,不是体验属性。
+* **每张卡片各有死线,而且并行。** 一台坏掉的设备不能挡住别的设备停下来。
+* **部分失败要报出来,而且报的是后果。** 「5/6」不是操作者要知道的事,「还有一台
+  可能在跑」才是。
+* **收尾在飞时再点停止不开第二轮**,否则界面上的逐项进度互相覆盖。
+
+Run: cd agent-core && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_stop_project_stages.py
 """
 
 from __future__ import annotations
@@ -74,9 +91,7 @@ def rig(monkeypatch):
     _install(rec)
     rec.install = _install
     monkeypatch.setattr(api_config, 'STOP_CARD_TIMEOUT_S', 0.2)
-    monkeypatch.setattr(api_config, 'layout_lifecycle_lock', asyncio.Lock())
     monkeypatch.setattr(api_config, '_stop_teardown_task', None, raising=False)
-    monkeypatch.setattr(api_config, '_start_project_task', None, raising=False)
     yield rec
     config_mod.main['canvas_layout'] = {}
 
@@ -87,8 +102,8 @@ def run(coro):
 
 # ── 第 1 段:agent loop ───────────────────────────────────────────────────────
 
-def test_local_state_is_broadcast_before_device_calls(rig):
-    """The state marker is not evidence existing dispatches have stopped."""
+def test_agent_loop_stops_before_any_mcp_call(rig):
+    """这是安全属性:挂住的设备不能让 agent 多活几十秒。"""
     run(api_config._do_stop_project())
     assert rig.events[0]['type'] == 'project_state'
     assert rig.events[0]['payload']['running'] is False
@@ -108,92 +123,6 @@ def test_a_hanging_device_does_not_delay_the_agent_stop(rig):
         await api_config._do_stop_project_teardown()
 
     run(asyncio.wait_for(scenario(), 5))
-
-
-def test_project_stop_does_not_wait_for_inflight_topic_request(rig, monkeypatch):
-    """Mock ordering only: neither HTTP completion nor stop proves physical safety."""
-    import json
-    from dataclasses import replace
-    import topic_actions
-
-    async def scenario():
-        manager = topic_actions.TopicActionManager()
-        callbacks = []
-        unsubscribed = []
-        entered = asyncio.Event()
-        release = asyncio.Event()
-        device_stop = asyncio.Event()
-        calls = []
-        cancelled = False
-        route = topic_actions.TopicActionRoute(
-            key='goal', topic='/goal', fmt='data/json', mcp_id='mcp-1',
-            tool_name='nav2', instance_id='c-nav', port='goal',
-            action='navigate_to_pose', schema='goal-v1', id_field='goal_id',
-            id_argument='_control_nav_id', allowed_fields=('x',),
-            required_fields=('x',), input_schema={'type': 'object'},
-        )
-
-        def subscribe(_key, _topic, _fmt, _loop, callback):
-            callbacks.append(callback)
-
-        async def call_hook(_mcp, _tool, args, **_kwargs):
-            nonlocal cancelled
-            calls.append(args['_control_nav_id'])
-            entered.set()
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                cancelled = True
-                raise
-            return {'status': 'navigating'}
-
-        async def stop_card(_mcp, _req, timeout_s=None):
-            assert not release.is_set()
-            device_stop.set()
-            return {'code': 200, 'data': {'result': {'state': 'idle'}}}
-
-        def unsubscribe(key):
-            unsubscribed.append(key)
-            if key == 'goal':
-                raise RuntimeError('simulated unsubscribe failure')
-
-        monkeypatch.setattr(topic_actions, 'manager', manager)
-        monkeypatch.setattr(topic_actions.ros2_bridge, 'subscribe', subscribe)
-        monkeypatch.setattr(topic_actions.ros2_bridge, 'unsubscribe', unsubscribe)
-        monkeypatch.setattr(topic_actions.mcp_client, 'call_tool_hook', call_hook)
-        monkeypatch.setattr('api.mcp_manage.mcp_call_tool', stop_card)
-        other = replace(route, key='goal-other', topic='/other')
-        manager._activate({route.key: topic_actions.RouteRuntime(route=route),
-                           other.key: topic_actions.RouteRuntime(route=other)})
-        payload = {'schema': 'goal-v1', 'goal_id': 'first', 'x': 1}
-        encode = lambda p: json.dumps(p).encode()
-        first = asyncio.create_task(callbacks[0](encode(payload), 'data/json'))
-        await asyncio.wait_for(entered.wait(), 1)
-        queued = asyncio.create_task(callbacks[0](
-            encode({**payload, 'goal_id': 'queued'}), 'data/json'
-        ))
-        await asyncio.sleep(0)
-        assert queued in manager._inflight
-        try:
-            result = await asyncio.wait_for(api_config.api_stop_project(), 1)
-            assert result['ok'] is True
-            assert unsubscribed == ['goal', 'goal-other']
-            assert config_mod.main['core']['project_running'] is False
-            assert any(e['type'] == 'project_state' and not e['payload']['running']
-                       for e in rig.events)
-            await asyncio.wait_for(device_stop.wait(), 1)
-            assert not first.done() and first in manager._inflight
-            assert not cancelled
-            assert calls == ['first']
-        finally:
-            release.set()
-            await asyncio.wait_for(asyncio.gather(first, queued), 1)
-            if api_config._stop_teardown_task is not None:
-                await asyncio.wait_for(api_config._stop_teardown_task, 1)
-        assert calls == ['first']
-        assert not manager._inflight
-
-    asyncio.run(scenario())
 
 
 # ── 第 2 段:并行 + 死线 ──────────────────────────────────────────────────────
@@ -347,8 +276,7 @@ def test_a_malformed_declaration_falls_back_to_the_generic_rules(declaration):
     """A driver cannot break every card's stop by sending junk in `x-stop`."""
     rules = api_config.stop_rules({'inputSchema': {'x-stop': declaration}})
     assert rules == {'failed': api_config._STOP_FAILED_STATES,
-                     'pending': api_config._STOP_PENDING_STATES, 'flags': {},
-                     'timeout': api_config.STOP_CARD_TIMEOUT_S}
+                     'pending': api_config._STOP_PENDING_STATES, 'flags': {}}
 
 
 def test_a_warning_alongside_a_live_state_is_not_a_failure(rig, monkeypatch):
@@ -421,142 +349,6 @@ def test_a_second_stop_does_not_start_a_second_teardown(rig):
     run(scenario())
 
 
-def test_start_is_rejected_while_stop_broadcast_is_pending(rig, monkeypatch):
-    async def scenario():
-        entered = asyncio.Event()
-        release = asyncio.Event()
-        original_push = rig.push_event
-        started = []
-
-        async def blocked_push(event):
-            if event['type'] == 'project_state':
-                entered.set()
-                await release.wait()
-            await original_push(event)
-
-        async def start_impl():
-            started.append(True)
-            return True
-
-        monkeypatch.setattr('api.motus_stream.push_event', blocked_push)
-        monkeypatch.setattr(api_config, '_do_start_project_impl', start_impl)
-        stop = asyncio.create_task(api_config.api_stop_project())
-        await asyncio.wait_for(entered.wait(), 1)
-        assert config_mod.main['core']['project_running'] is False
-        assert api_config.teardown_running()
-        second = await api_config.api_stop_project()
-        assert second['teardown_running'] is True
-        response = await api_config.api_start_project()
-        assert response.status_code == 409
-        assert await api_config._do_start_project() is False
-        assert not started
-        assert not stop.done()
-        release.set()
-        assert (await asyncio.wait_for(stop, 1))['ok'] is True
-        await asyncio.wait_for(api_config._stop_teardown_task, 1)
-        assert await api_config._do_start_project() is True
-        assert started == [True]
-
-    asyncio.run(scenario())
-
-
-def test_stop_continues_if_request_is_cancelled_during_broadcast(rig, monkeypatch):
-    async def scenario():
-        entered = asyncio.Event()
-        release = asyncio.Event()
-        original_push = rig.push_event
-
-        async def blocked_push(event):
-            if event['type'] == 'project_state':
-                entered.set()
-                await release.wait()
-            await original_push(event)
-
-        monkeypatch.setattr('api.motus_stream.push_event', blocked_push)
-        stop = asyncio.create_task(api_config.api_stop_project())
-        await asyncio.wait_for(entered.wait(), 1)
-        managed = api_config._stop_teardown_task
-        stop.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await stop
-        assert not managed.cancelled() and not managed.done()
-        release.set()
-        await asyncio.wait_for(managed, 1)
-        assert rig.calls
-
-    asyncio.run(scenario())
-
-
-def test_stop_snapshot_survives_layout_replacement_and_includes_current(rig):
-    async def scenario():
-        # Simulate an already-running canvas/solution transaction holding the lock.
-        await api_config.layout_lifecycle_lock.acquire()
-        try:
-            result = await api_config.api_stop_project()
-            assert result['ok'] is True
-            config_mod.main['canvas_layout'] = {'cards': [
-                {'id': 'c-mic', 'mcpId': 'different', 'toolName': 'replacement'},
-                CARDS[1],  # Identical target must not be stopped twice.
-            ]}
-        finally:
-            api_config.layout_lifecycle_lock.release()
-        await asyncio.wait_for(api_config._stop_teardown_task, 1)
-        targets = [(mcp, tool) for mcp, tool, _action, _timeout in rig.calls]
-        assert sorted(targets) == sorted([
-            ('agentcore', 'remote_mic'), ('mcp-1', 'asr'), ('mcp-1', 'tts'),
-            ('different', 'replacement'),
-        ])
-
-    asyncio.run(scenario())
-
-
-def test_project_running_true_is_rejected_during_teardown(rig):
-    async def scenario():
-        rig.install(Recorder(hang_for={'tts'}))
-        await api_config.api_stop_project()
-        response = await api_config.set_project_running(api_config.ProjectRunningRequest(running=True))
-        assert response.status_code == 409
-        assert config_mod.main['core']['project_running'] is False
-        assert await api_config.set_project_running(api_config.ProjectRunningRequest(running=False)) == {'ok': True}
-        task = api_config._stop_teardown_task
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        # Existing behavior allows later restart; cancellation is not a safety confirmation.
-        assert await api_config.set_project_running(api_config.ProjectRunningRequest(running=True)) == {'ok': True}
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize('event_type', ['project_state', 'project_stop_begin'])
-def test_broadcast_exception_does_not_block_device_stop(rig, monkeypatch, event_type):
-    async def scenario():
-        original = rig.push_event
-        async def push(event):
-            if event['type'] == event_type:
-                raise RuntimeError('broadcast failed')
-            await original(event)
-        monkeypatch.setattr('api.motus_stream.push_event', push)
-        await api_config.api_stop_project()
-        await asyncio.wait_for(api_config._stop_teardown_task, 1)
-        assert len(rig.calls) == len(CARDS)
-    asyncio.run(scenario())
-
-
-def test_project_running_false_invalidates_local_epoch_without_device_stop(rig):
-    async def scenario():
-        before = api_config.stop_project_epoch()
-        assert await api_config.set_project_running(api_config.ProjectRunningRequest(running=False)) == {'ok': True}
-        assert api_config.stop_project_epoch() == before + 1
-        assert not rig.calls
-        assert await api_config.set_project_running(api_config.ProjectRunningRequest(running=False)) == {'ok': True}
-        assert api_config.stop_project_epoch() == before + 2
-        assert await api_config.set_project_running(api_config.ProjectRunningRequest(running=True)) == {'ok': True}
-        assert api_config.stop_project_epoch() == before + 2
-
-    asyncio.run(scenario())
-
-
 def test_the_endpoint_returns_before_the_teardown_finishes(rig):
     """响应只等第 1 段 —— 让它等完收尾,就等于让已经为真的「已停止」被一台坏设备拖着。"""
     async def scenario():
@@ -565,9 +357,6 @@ def test_the_endpoint_returns_before_the_teardown_finishes(rig):
         assert result['ok'] is True
         assert config_mod.main['core']['project_running'] is False
         assert api_config.teardown_running() is True
-        task = api_config._stop_teardown_task
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        api_config._stop_teardown_task.cancel()
 
     run(scenario())
