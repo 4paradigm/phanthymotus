@@ -53,7 +53,6 @@ COPY actucore/plugins/navigation/runtime/navigation_lio.yaml /config/navigation_
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
-COPY actucore/utils/      /work/utils/
 COPY actucore/config.yaml /work/config.yaml
 COPY perception/utils/logsafe.py /work/logsafe.py
 COPY perception/utils/model_downloader.py /work/model_downloader.py

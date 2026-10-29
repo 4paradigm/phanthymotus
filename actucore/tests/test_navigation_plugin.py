@@ -478,7 +478,6 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn("import numpy, rosbag2_py, yaml, em", dockerfile)
         self.assertIn("COPY deploy/ros-base/audio_msgs/", dockerfile)
         self.assertIn("COPY actucore/main.py", dockerfile)
-        self.assertIn("COPY actucore/utils/", dockerfile)
         self.assertIn(
             "COPY perception/utils/logsafe.py /work/logsafe.py",
             dockerfile,

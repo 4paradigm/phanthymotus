@@ -78,9 +78,7 @@ def test_platform_build_selection(tmp_path, args, extra, dockerfile):
 def test_final_image_contains_entry_point_dependencies():
     final = (ROOT / 'actucore/Dockerfile.jetson').read_text().rsplit('\nFROM ', 1)[1]
     copies = [line.split() for line in final.splitlines() if line.startswith('COPY ')]
-    for source, destination in [('actucore/main.py', '/work/main.py'),
-                                ('actucore/utils/', '/work/utils/')]:
-        assert ['COPY', source, destination] in copies
+    assert ['COPY', 'actucore/main.py', '/work/main.py'] in copies
     assert 'python3 -c "import main' in final
 
 
