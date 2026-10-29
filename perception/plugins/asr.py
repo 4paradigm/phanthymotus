@@ -598,6 +598,38 @@ def _wake_direction_fields(text: str, char_ends: list, end_pos: int,
             "speaker_direction_window_end_us": max(end for _, _, end in selected)}
 
 
+def _estimated_wake_direction_fields(text, char_ends, end_pos, keyword_phones,
+                                     start_ts, end_ts, pre_roll_bytes, estimates,
+                                     trusted_audio):
+    """Opt-in single-speaker receipt-time experiment, never capture windows."""
+    unknown = {"speaker_direction_state": "unknown"}
+    if not trusted_audio or not math.isfinite(start_ts) or not math.isfinite(end_ts):
+        return unknown
+    # Only a leading wake word: no unverified timing for a wake later in speech.
+    kw_start = end_pos - keyword_phones
+    if kw_start != 0 or end_ts <= start_ts:
+        return unknown
+    onset = start_ts + pre_roll_bytes / 2 / SAMPLE_RATE
+    selected = [(angle, receipt) for angle, receipt in estimates
+                if math.isfinite(angle) and -180 < angle <= 180
+                and onset <= receipt <= min(end_ts, onset + 2.0)]
+    # Require separate native events; heartbeats carry the same receipt timestamp.
+    if len({receipt for _, receipt in selected}) < 2:
+        return unknown
+    x = sum(math.cos(math.radians(a)) for a, _ in selected)
+    y = sum(math.sin(math.radians(a)) for a, _ in selected)
+    angle = math.degrees(math.atan2(y, x))
+    if any(abs((a - angle + 180) % 360 - 180) > 25 for a, _ in selected):
+        return unknown
+    if abs(abs(angle) - 180) < 1e-6:
+        angle = 180
+    angle = round(angle, 2)
+    return {"speaker_direction_state": "estimated",
+            "speaker_direction": f"估计 {angle:g}°, {DIRECTION_ANGLE_CONVENTION}",
+            "speaker_direction_basis": "single_speaker_receipt_time_experiment",
+            "speaker_direction_note": "仅单人实验：估计相对方向，未经采集时间对齐；不能确定多人身份或距离"}
+
+
 def _resolve_asr_inputs(args: dict) -> tuple[str, str]:
     """Pick the audio and direction inputs by topic name.
 
@@ -1592,6 +1624,8 @@ class _ASRNode(Node):
         self._direction_topic = direction_topic
         self._direction_sub = None
         self._direction_windows = deque(maxlen=DIRECTION_HISTORY_MAX_EVENTS)
+        self._direction_estimates = deque(maxlen=DIRECTION_HISTORY_MAX_EVENTS)
+        self._receipt_direction_experiment = os.getenv('U1_ASR_RECEIPT_DIRECTION_EXPERIMENT') == '1'
         self._direction_lock = threading.Lock()
         self._output_topic = f"{input_topic}/asr"
         # 第二条输出：KWS 未触发的话语。独立 topic 而不是同一条带 priority 0，
@@ -1756,6 +1790,7 @@ class _ASRNode(Node):
             self._direction_sub = None
         with self._direction_lock:
             self._direction_windows.clear()
+            self._direction_estimates.clear()
         self.request_stop()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
         for q in (self._pcm_queue, self._utterance_queue):
@@ -1799,6 +1834,19 @@ class _ASRNode(Node):
             return
         if (not isinstance(data, dict) or data.get('state') != 'fresh'
                 or data.get('angle_convention') != DIRECTION_ANGLE_CONVENTION):
+            return
+        if (getattr(self, '_receipt_direction_experiment', False)
+                and data.get('source_backend') == 'native'
+                and data.get('timestamp_basis') == 'receipt_time_only'
+                and data.get('association_state') == 'unknown'):
+            angle, stamp = data.get('angle_deg'), data.get('timestamp_ms')
+            if (type(angle) in (int, float) and math.isfinite(angle) and -180 < angle <= 180
+                    and type(stamp) is int and 0 <= time.time() - stamp / 1000 <= 1.0
+                    and data.get('audio_window_start_us') == 0
+                    and data.get('audio_window_end_us') == 0):
+                with self._direction_lock:
+                    if not self._direction_estimates or self._direction_estimates[-1][1] != stamp / 1000:
+                        self._direction_estimates.append((angle, stamp / 1000))
             return
         begin, end = data.get('audio_window_start_us'), data.get('audio_window_end_us')
         angle = data.get('angle_deg')
@@ -2033,6 +2081,7 @@ class _ASRNode(Node):
                 trusted_audio = bool(item[4]) if len(item) > 4 else False
                 with self._direction_lock:
                     windows = list(self._direction_windows)
+                    estimates = list(self._direction_estimates)
             except Exception:
                 continue
             try:
@@ -2109,6 +2158,11 @@ class _ASRNode(Node):
                         text, text_char_ends, end_pos, len(keyword_ipa),
                         start_ts, pre_roll_bytes, windows,
                         bool(self._direction_topic), trusted_audio, alignment)
+                    if (self._receipt_direction_experiment and self._direction_topic
+                            and direction_fields.get('speaker_direction_state') == 'unknown'):
+                        direction_fields = _estimated_wake_direction_fields(
+                            text, text_char_ends, end_pos, len(keyword_ipa),
+                            start_ts, end_ts, pre_roll_bytes, estimates, trusted_audio)
                     # Extract text after keyword
                     remaining = _text_after_phoneme(text, text_char_ends, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
