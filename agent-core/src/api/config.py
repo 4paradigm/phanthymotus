@@ -1,5 +1,4 @@
 import asyncio
-import json
 import time
 from urllib.parse import urlparse
 from typing import List
@@ -15,33 +14,6 @@ import openai as openai_lib
 router = fastapi.APIRouter(prefix='/config', tags=['config'])
 # ponytail: one project exists per Core process; split the lock only if that changes.
 layout_lifecycle_lock = asyncio.Lock()
-
-
-def _mcp_payload(result) -> dict:
-    """Unwrap an MCP call result without hiding a direct plugin response."""
-    if not isinstance(result, dict):
-        return {}
-    if 'code' not in result:
-        return result
-    if result.get('code') != 200:
-        return {}
-    payload = result.get('data')
-    if isinstance(payload, list) and payload:
-        payload = payload[0].get('text', '{}') if isinstance(payload[0], dict) else {}
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _stop_confirmed(payload: dict) -> bool:
-    return (
-        payload.get('terminal_confirmed') is True
-        or (payload.get('status') or payload.get('state'))
-        in {'idle', 'stopped', 'disabled'}
-    )
 
 
 def _tool_accepts_input_bindings(mcp_id: str, tool_name: str) -> bool:
