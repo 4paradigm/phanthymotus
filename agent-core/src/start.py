@@ -409,7 +409,7 @@ async def _heartbeat_core_mcp():
             print(f'[heartbeat] core re-register failed: {e}')
 
 
-async def _auto_start_project():
+async def _auto_start_project(stop_epoch: int):
     """开机自动启动：等待设备就绪后调用统一的 start-project 函数。"""
     import time as _time
 
@@ -426,7 +426,10 @@ async def _auto_start_project():
         await asyncio.sleep(2)
 
     # 调用统一的启动函数
-    from api.config import _do_start_project
+    from api.config import _do_start_project, stop_project_epoch
+    if stop_project_epoch() != stop_epoch:
+        print('[auto-start] superseded by stop request')
+        return
     await _do_start_project()
     print('[auto-start] done')
 
@@ -543,9 +546,12 @@ async def lifespan(app):
     async with event.llm:
         # Auto-start project if configured, otherwise reset running state
         if config.main.get('core', {}).get('auto_start', False):
+            from api.config import stop_project_epoch
+            auto_start_epoch = stop_project_epoch()
+
             async def _safe_auto_start():
                 try:
-                    await _auto_start_project()
+                    await _auto_start_project(auto_start_epoch)
                 except Exception as e:
                     print(f'[auto-start] ERROR: {e}')
                     import traceback
@@ -709,20 +715,21 @@ async def acp_complete(request: fastapi.Request):
     # 当成新消息唤醒一个 turn。
     silent = mcp_client.completion_is_silent(action_id)
 
-    # 通道1: 解锁 sync() 等待
-    mcp_client.mark_action_complete(action_id, body)
+    disposition = mcp_client.receive_action_completion(action_id, body)
 
-    # 通道2: 进 event_bus → steering 注入 LLM
-    import event_bus
-    _event = {'type': 'action_complete', 'action_id': action_id,
-              'status': status, 'result': result, 'silent': silent}
-    await event_bus.enqueue(
-        source=f'acp:{action_id}',
-        text=json.dumps(_event, ensure_ascii=False),
-        payload=dict(_event),
-    )
+    # Early receipts are delivered after registration, when silent is known.
+    # Rejected or duplicate receipts must not inject misleading steering.
+    if disposition == 'completed':
+        import event_bus
+        _event = {'type': 'action_complete', 'action_id': action_id,
+                  'status': status, 'result': result, 'silent': silent}
+        await event_bus.enqueue(
+            source=f'acp:{action_id}',
+            text=json.dumps(_event, ensure_ascii=False),
+            payload=dict(_event),
+        )
 
-    return {'ok': True, 'action_id': action_id}
+    return {'ok': True, 'action_id': action_id, 'disposition': disposition}
 
 
 # ── System Hooks API ─────────────────────────────────────────────────────────

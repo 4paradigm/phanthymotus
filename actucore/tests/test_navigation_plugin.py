@@ -684,6 +684,317 @@ class NavigationPluginTest(unittest.TestCase):
                 self.assertFalse(runtime.started)
                 self.assertIsNone(runtime.start_kwargs)
 
+    def test_old_goal_ticket_rejected_after_stop_and_restart(self):
+        """A request already received here cannot use the restarted planner."""
+        class PausingRuntime(FakeRuntime):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def info(self):
+                if threading.current_thread().name == "old-navigation-request":
+                    self.entered.set()
+                    if not self.release.wait(3):
+                        raise RuntimeError("test did not release old request")
+                return super().info()
+
+        runtime = PausingRuntime()
+        planning = FakeComponent("planning")
+        plugin = self.make_plugin(runtime=runtime, planning=planning)
+        start = {
+            "action": "start",
+            "instance_id": "same-card",
+            "input_bindings": _external_bindings(),
+        }
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        result = {}
+        thread = threading.Thread(
+            name="old-navigation-request",
+            target=lambda: result.update(plugin.dispatch(plugin.PREFIX, {
+                "action": "navigate_to_pose", "instance_id": "same-card",
+                "x": 1, "y": 2, "yaw": 0,
+            })),
+        )
+        thread.start()
+        try:
+            self.assertTrue(runtime.entered.wait(2))
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "stop"})["state"], "idle")
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        finally:
+            runtime.release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result.get("error_code"), "navigation_stopping", result)
+        self.assertFalse(any(args.get("action") == "navigate_to_pose"
+                             for _, args in planning.calls))
+
+    def test_mapping_inflight_blocks_teardown_and_stale_dispatch(self):
+        class PausingRuntime(FakeRuntime):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+            def info(self):
+                if threading.current_thread().name == "old-mapping-request":
+                    self.entered.set()
+                    if not self.release.wait(3):
+                        raise RuntimeError("test did not release mapping")
+                return super().info()
+
+        runtime = PausingRuntime()
+        mapping = FakeComponent("mapping")
+        planning = FakeComponent("planning")
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping, planning=planning)
+        start = {"action": "start", "input_bindings": _external_bindings()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        result = {}
+        thread = threading.Thread(name="old-mapping-request", target=lambda: result.update(
+            plugin.dispatch(plugin.PREFIX, {"action": "start_mapping", "map_name": "room"})
+        ))
+        thread.start()
+        try:
+            self.assertTrue(runtime.entered.wait(2))
+            self.assertEqual(plugin.stop()["error_code"], "navigation_stop_pending")
+            self.assertTrue(runtime.started)
+            self.assertFalse(any(args.get("action") == "stop" for _, args in mapping.calls))
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
+                             "navigation_start_cancelled")
+        finally:
+            runtime.release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result.get("error_code"), "navigation_stopping")
+        self.assertFalse(any(args.get("action") == "start_mapping" for _, args in mapping.calls))
+        self.assertEqual(plugin.stop()["state"], "idle")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+
+    def test_inflight_planner_requires_cancel_then_later_confirmed_stop(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Planning(FakeComponent):
+            def dispatch(self, prefix, args):
+                if args.get("action") == "navigate_to_pose":
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError("test did not release planner")
+                return super().dispatch(prefix, args)
+
+            def stop_active_only(self):
+                self.calls.append(("nav2", {"action": "stop_active_only"}))
+                return {"status": "stopped", "terminal_confirmed": True}
+
+        planning = Planning("planning")
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(planning=planning, runtime=runtime)
+        start = {"action": "start", "input_bindings": _external_bindings()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(plugin.dispatch(
+            plugin.PREFIX, {"action": "navigate_to_pose", "x": 1, "y": 2, "yaw": 0}
+        )))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            stop = plugin.dispatch(plugin.PREFIX, {"action": "stop"})
+            self.assertEqual(stop["error_code"], "navigation_stop_pending")
+            self.assertTrue(planning.started)
+            self.assertTrue(runtime.started)
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
+                             "navigation_start_cancelled")
+            self.assertFalse(any(args.get("action") == "stop" for _, args in planning.calls))
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result.get("status"), "navigate_to_pose")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "stop"})["state"], "idle")
+        self.assertEqual([args["action"] for _, args in planning.calls
+                          if args.get("action") in {"stop_active_only", "navigate_to_pose", "stop"}],
+                         ["stop_active_only", "navigate_to_pose", "stop"])
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+
+    def test_concurrent_stops_keep_admission_closed_until_last_result(self):
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        release_second = threading.Event()
+        second_registered = threading.Event()
+
+        class ObservedLock:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.pending_at_first_release = None
+            def __enter__(self):
+                if threading.current_thread().name == "second-stop":
+                    second_registered.set()
+                self.lock.acquire()
+                return self
+            def __exit__(self, *_):
+                if threading.current_thread().name == "first-stop":
+                    self.pending_at_first_release = plugin._pending_stops
+                self.lock.release()
+
+        class Planning(FakeComponent):
+            def __init__(self):
+                super().__init__("planning")
+                self.stops = 0
+
+            def dispatch(self, prefix, args):
+                if args.get("action") == "stop":
+                    self.stops += 1
+                    if self.stops == 1:
+                        first_entered.set()
+                        if not release_first.wait(3):
+                            raise RuntimeError("test did not release first stop")
+                    else:
+                        second_entered.set()
+                        if not release_second.wait(3):
+                            raise RuntimeError("test did not release second stop")
+                        return {"status": "error", "error_code": "pending"}
+                return super().dispatch(prefix, args)
+
+        planning = Planning()
+        plugin = self.make_plugin(planning=planning)
+        start = {"action": "start", "input_bindings": _external_bindings()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        plugin._transition_lock = ObservedLock()
+        results = {}
+        first = threading.Thread(name="first-stop", target=lambda: results.update(first=plugin.stop()))
+        second = threading.Thread(name="second-stop", target=lambda: results.update(second=plugin.stop()))
+        first.start()
+        try:
+            self.assertTrue(first_entered.wait(2))
+            second.start()
+            self.assertTrue(second_registered.wait(2))
+            with plugin._lock:
+                self.assertEqual(plugin._pending_stops, 2)
+            release_first.set()
+            self.assertTrue(second_entered.wait(2))
+            self.assertEqual(plugin._transition_lock.pending_at_first_release, 1)
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
+                             "navigation_start_cancelled")
+        finally:
+            release_first.set()
+            release_second.set()
+            first.join(3)
+            if second.ident is not None:
+                second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(results["second"]["error_code"], "navigation_stop_pending")
+        self.assertTrue(plugin._stop_requested.is_set())
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
+                         "navigation_start_cancelled")
+
+    def test_inflight_control_exception_remains_pending_until_retry(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Planning(FakeComponent):
+            def dispatch(self, prefix, args):
+                if args.get("action") == "resume_nav":
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError("test did not release control")
+                    raise RuntimeError("control failed")
+                return super().dispatch(prefix, args)
+
+            def stop_active_only(self):
+                raise RuntimeError("cancel failed")
+
+        planning = Planning("planning")
+        plugin = self.make_plugin(planning=planning)
+        start = {"action": "start", "input_bindings": _external_bindings()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        errors = []
+        def control():
+            try:
+                plugin.dispatch(plugin.PREFIX, {"action": "resume_nav"})
+            except RuntimeError as exc:
+                errors.append(str(exc))
+        thread = threading.Thread(target=control)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            result = plugin.dispatch(plugin.PREFIX, {"action": "stop"})
+            self.assertEqual(result["error_code"], "navigation_stop_pending")
+            self.assertEqual(result["component_results"]["planning"]["error_code"],
+                             "component_stop_failed")
+            self.assertTrue(planning.started)
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, ["control failed"])
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "stop"})["state"], "idle")
+
+    def test_vlm_inflight_does_not_delay_planning_cancel_or_submit_old_goal(self):
+        """Uses the real semantic processor with fake VLM, bridge and planner."""
+        from tests.test_vln import FakeBridgeFactory, FakeClient, _plugin
+
+        entered = threading.Event()
+        release = threading.Event()
+        planning_stopped = threading.Event()
+
+        class Planning(FakeComponent):
+            def stop_active_only(self):
+                planning_stopped.set()
+                self.calls.append(("nav2", {"action": "stop_active_only"}))
+                return {"status": "stopped", "terminal_confirmed": True}
+
+        client = FakeClient([
+            {"scene": "office", "objects": ["desk"], "description": "desk"},
+            None,
+        ])
+        planning = Planning("planning")
+        semantic = _plugin(client, FakeBridgeFactory())
+        plugin = self.make_plugin(planning=planning, semantic=semantic)
+        semantic._processor._goal_handler = plugin._handle_semantic_goal
+        start = {
+            "action": "start",
+            "input_bindings": _external_bindings() + [{"port": "rgb", "topic": "/camera/rgb"}],
+        }
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        captured = plugin.dispatch(plugin.PREFIX, {"action": "capture"})
+        self.assertTrue(captured["ok"])
+        point_id = captured["waypoint"]["point_id"]
+
+        def slow_match(_):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test did not release VLM")
+            return {"point_id": point_id, "confidence": 0.9, "reason": "match"}
+
+        client.responses[0] = slow_match
+        results = {}
+        navigate = threading.Thread(target=lambda: results.update(navigate=plugin.dispatch(
+            plugin.PREFIX, {"action": "navigate", "query": "desk"}
+        )))
+        stop = threading.Thread(target=lambda: results.update(stop=plugin.dispatch(
+            plugin.PREFIX, {"action": "stop"}
+        )))
+        navigate.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            stop.start()
+            self.assertTrue(plugin._stop_requested.wait(2))
+            planning_stop_before_release = planning_stopped.wait(0.1)
+        finally:
+            release.set()
+            navigate.join(3)
+            if stop.ident is not None:
+                stop.join(3)
+        self.assertFalse(navigate.is_alive())
+        self.assertFalse(stop.is_alive())
+        self.assertEqual(results.get("navigate", {}).get("error_code"), "navigation_stopping", results)
+        self.assertEqual(results.get("stop", {}).get("error_code"), "navigation_stop_pending", results)
+        self.assertTrue(planning_stop_before_release, results)
+        self.assertFalse(any(args.get("action") == "navigate_to_pose"
+                             for _, args in planning.calls))
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "stop"})["state"], "idle")
+
     def test_lidar_imu_only_cannot_auto_start_real_semantic_processor(self):
         from plugins.navigation.semantic.plugin import VisionAndLanguageNavigationPlugin
 
@@ -896,7 +1207,87 @@ class NavigationPluginTest(unittest.TestCase):
             1,
         )
 
-    def test_stop_waits_for_inflight_start_instead_of_closing_its_backend(self):
+    def test_stop_cancels_start_before_transient_planner_retry(self):
+        class BlockingTransientPlanner(TransientPlanningComponent):
+            def __init__(self):
+                super().__init__()
+                self.first_entered = threading.Event()
+                self.release_first = threading.Event()
+
+            def dispatch(self, prefix, args):
+                if args.get("action") == "start" and self.start_attempts == 0:
+                    self.first_entered.set()
+                    if not self.release_first.wait(timeout=2.0):
+                        raise RuntimeError("test did not release planner start")
+                return super().dispatch(prefix, args)
+
+        planner = BlockingTransientPlanner()
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime, planning=planner)
+        start_result, stop_result = {}, {}
+        start_thread = threading.Thread(target=lambda: start_result.update(
+            plugin.dispatch(plugin.PREFIX, {
+                "action": "start", "input_bindings": _external_bindings(),
+            })
+        ))
+        stop_thread = threading.Thread(target=lambda: stop_result.update(
+            plugin.dispatch(plugin.PREFIX, {"action": "stop"})
+        ))
+        start_thread.start()
+        try:
+            self.assertTrue(planner.first_entered.wait(timeout=1.0))
+            stop_thread.start()
+            self.assertTrue(plugin._stop_requested.wait(timeout=1.0))
+        finally:
+            planner.release_first.set()
+            start_thread.join(timeout=3.0)
+            if stop_thread.ident is not None:
+                stop_thread.join(timeout=3.0)
+        self.assertFalse(start_thread.is_alive())
+        self.assertFalse(stop_thread.is_alive())
+        self.assertEqual(start_result["error_code"], "navigation_start_cancelled")
+        self.assertEqual(planner.start_attempts, 1)
+        self.assertEqual(stop_result["state"], "idle")
+        self.assertFalse(runtime.started)
+
+    def test_stop_wakes_transient_planner_retry_wait(self):
+        planning = TransientPlanningComponent()
+        plugin = self.make_plugin(planning=planning)
+        entered = threading.Event()
+        original_wait = plugin._stop_requested.wait
+        start_result, stop_result = {}, {}
+
+        def observed_wait(timeout=None):
+            entered.set()
+            return original_wait(timeout=2.0)
+
+        start_thread = threading.Thread(target=lambda: start_result.update(
+            plugin.dispatch(plugin.PREFIX, {
+                "action": "start", "input_bindings": _external_bindings(),
+            })
+        ))
+        stop_thread = threading.Thread(target=lambda: stop_result.update(
+            plugin.dispatch(plugin.PREFIX, {"action": "stop"})
+        ))
+        with mock.patch.object(plugin._stop_requested, "wait", side_effect=observed_wait):
+            start_thread.start()
+            try:
+                self.assertTrue(entered.wait(timeout=1.0))
+                stop_thread.start()
+                start_thread.join(timeout=1.0)
+                stop_thread.join(timeout=1.0)
+                self.assertFalse(start_thread.is_alive())
+                self.assertFalse(stop_thread.is_alive())
+            finally:
+                plugin._stop_requested.set()
+                start_thread.join(timeout=3.0)
+                if stop_thread.ident is not None:
+                    stop_thread.join(timeout=3.0)
+        self.assertEqual(planning.start_attempts, 1)
+        self.assertEqual(start_result["error_code"], "navigation_start_cancelled")
+        self.assertEqual(stop_result["state"], "idle")
+
+    def test_stop_cancels_inflight_start_without_closing_its_backend(self):
         mapping = BlockingStartComponent()
         plugin = self.make_plugin(mapping=mapping)
         start_result = {}
@@ -927,7 +1318,9 @@ class NavigationPluginTest(unittest.TestCase):
 
         self.assertFalse(start_thread.is_alive())
         self.assertFalse(stop_thread.is_alive())
-        self.assertEqual(start_result["state"], "ready")
+        self.assertEqual(start_result["error_code"], "navigation_start_cancelled")
+        self.assertFalse(plugin._started)
+        self.assertFalse(any(args["action"] == "start" for _, args in plugin._planning.calls))
         self.assertEqual(stop_result["state"], "idle")
         self.assertTrue(mapping.stop_entered.is_set())
 
@@ -971,13 +1364,77 @@ class NavigationPluginTest(unittest.TestCase):
         planning = FakeComponent("planning")
         plugin = self.make_plugin(planning=planning)
 
+        plugin.dispatch(plugin.PREFIX, {"action": "start", "input_bindings": _external_bindings()})
         plugin._handle_semantic_goal(
-            {"x": 1.0, "y": -0.5, "yaw": 0.25, "speed": 0.5}
+            {"x": 1.0, "y": -0.5, "yaw": 0.25, "speed": 0.5},
+            admission_ticket=plugin._generation,
         )
 
         request = planning.calls[-1][1]
         self.assertEqual(request["action"], "navigate_to_pose")
         self.assertNotIn("_control_nav_id", request)
+
+    def test_contradictory_component_stop_never_releases_runtime(self):
+        responses = [
+            {"status": "error", "terminal_confirmed": True},
+            {"status": "idle", "ok": False, "terminal_confirmed": True},
+            {"status": "idle", "state": "error", "terminal_confirmed": True},
+            {"terminal_confirmed": True},
+            {"status": "idle", "error_code": "failed", "terminal_confirmed": True},
+        ]
+        for response in responses:
+            with self.subTest(response=response):
+                runtime = FakeRuntime()
+                planning = FakeComponent("planning", stop_result=response)
+                plugin = self.make_plugin(runtime=runtime, planning=planning)
+                self.assertEqual(plugin.dispatch(plugin.PREFIX, {
+                    "action": "start", "input_bindings": _external_bindings(),
+                })["state"], "ready")
+                self.assertEqual(plugin.stop()["error_code"], "navigation_stop_pending")
+                self.assertTrue(runtime.started)
+                self.assertTrue(plugin._stop_requested.is_set())
+
+    def test_failed_start_cleanup_pending_preserves_dependencies_until_retry(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent("mapping")
+        planning = FakeComponent("planning", fail_start=True, stop_result={
+            "state": "error", "status": "error", "error_code": "unconfirmed",
+        })
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping, planning=planning)
+        start = {"action": "start", "input_bindings": _external_bindings()}
+        result = plugin.dispatch(plugin.PREFIX, start)
+        self.assertEqual(result["error_code"], "navigation_start_failed")
+        self.assertFalse(result["cleanup_confirmed"])
+        self.assertEqual(list(result["cleanup"]), ["planning"])
+        self.assertTrue(runtime.started)
+        self.assertTrue(mapping.started)
+        self.assertTrue(plugin._stop_requested.is_set())
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
+                         "navigation_start_cancelled")
+        planning.stop_result = None
+        planning.fail_start = False
+        self.assertEqual(plugin.stop()["state"], "idle")
+        self.assertFalse(runtime.started)
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+
+    def test_start_rollback_retains_terminal_mapping_failure_in_info(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent("mapping", stop_result={
+            "state": "error", "status": "error", "error_code": "map_write_failed",
+            "terminal_confirmed": True, "canvas_wired": False, "retryable": False,
+            "collection_stop_result": {"receipt": {"storage_complete": False}},
+        })
+        planning = FakeComponent("planning", fail_start=True)
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping, planning=planning)
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start", "input_bindings": _external_bindings(),
+        })
+        self.assertTrue(result["cleanup_confirmed"])
+        self.assertEqual(result["error_code"], "navigation_start_failed")
+        self.assertFalse(runtime.started)
+        retained = plugin.dispatch(plugin.PREFIX, {"action": "info"})["last_terminal_stop_error"]
+        self.assertEqual(retained["error_code"], "map_write_failed")
+        self.assertFalse(retained["collection_stop_result"]["receipt"]["storage_complete"])
 
     def test_retryable_mapping_stop_keeps_runtime_and_canvas_lifecycle(self):
         runtime = FakeRuntime()
@@ -1063,6 +1520,66 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertTrue(result["terminal_confirmed"])
         self.assertEqual(runtime.stop_calls, 1)
         self.assertFalse(plugin._started)
+        mapping.stop_result = None
+        self.assertEqual(plugin.stop()["state"], "idle")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "info"})[
+            "last_terminal_stop_error"]["error_code"], "map_write_failed")
+
+    def test_mapping_terminal_error_survives_runtime_pending_retry(self):
+        class PendingOnceRuntime(FakeRuntime):
+            def stop(self):
+                if self.stop_calls == 0:
+                    self.stop_calls += 1
+                    return {"state": "running", "running": True}
+                return super().stop()
+
+        class ErrorOnceMapping(FakeComponent):
+            def dispatch(self, prefix, args):
+                result = super().dispatch(prefix, args)
+                if args.get("action") == "stop":
+                    self.stop_result = None
+                return result
+
+        runtime = PendingOnceRuntime()
+        mapping = ErrorOnceMapping("mapping", stop_result={
+            "state": "error", "status": "error", "error_code": "map_write_failed",
+            "error": "map save failed", "terminal_confirmed": True,
+            "canvas_wired": False, "retryable": False,
+        })
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping)
+        start = {"action": "start", "input_bindings": _external_bindings()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        self.assertEqual(plugin.stop()["error_code"], "navigation_stop_pending")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
+                         "navigation_start_cancelled")
+        final = plugin.stop()
+        self.assertEqual(final["error_code"], "navigation_stop_failed")
+        self.assertTrue(final["terminal_confirmed"])
+        self.assertEqual(final["component_results"]["mapping"]["error_code"], "map_write_failed")
+        self.assertFalse(plugin._stop_requested.is_set())
+        self.assertEqual(plugin.stop()["status"], "idle")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        self.assertEqual(plugin.stop()["status"], "idle")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "info"})[
+            "last_terminal_stop_error"]["error_code"], "map_write_failed")
+
+    def test_runtime_idle_with_live_child_is_not_confirmed(self):
+        class MixedRuntime(FakeRuntime):
+            def stop(self):
+                self.stop_calls += 1
+                return {"state": "idle", "running": False, "children": [
+                    {"name": "first", "running": False},
+                    {"name": "second", "running": True},
+                ]}
+
+        runtime = MixedRuntime()
+        plugin = self.make_plugin(runtime=runtime)
+        start = {"action": "start", "input_bindings": _external_bindings()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        self.assertEqual(plugin.stop()["error_code"], "navigation_stop_pending")
+        self.assertTrue(plugin._started)
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
+                         "navigation_start_cancelled")
 
     def test_runtime_stop_exception_keeps_lifecycle_for_retry(self):
         class FailingStopRuntime(FakeRuntime):

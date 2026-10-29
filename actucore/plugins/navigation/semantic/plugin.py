@@ -55,6 +55,13 @@ class VisionAndLanguageNavigationPlugin:
             f"unknown vln action: {action!r}",
         )
 
+    def navigate_with_ticket(self, args: dict, ticket) -> dict:
+        """Internal unified-card entry; the opaque ticket never comes from JSON."""
+        return self._processor.navigate(
+            args.get("query"), control_nav_id=args.get("_control_nav_id"),
+            admission_ticket=ticket,
+        )
+
     def stop(self) -> dict:
         """Compatibility hook used by ActuCoreBundle shutdown."""
 

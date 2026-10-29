@@ -13,6 +13,9 @@ NAV2_ACTIONS = (
     "stop_nav",
 )
 
+# Matches runtime/protocol/goal-v1.schema.json; use full-match at runtime.
+GOAL_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+
 NAV2_LIFECYCLE_ACTIONS = ("info", "config", "start", "stop")
 NAV2_PUBLIC_ACTIONS = NAV2_LIFECYCLE_ACTIONS + NAV2_ACTIONS
 
@@ -153,7 +156,7 @@ NAV2_CONFIG_SCHEMA = {
 
 NAV2_ACTION_PARAMS = {
     "navigate_to_pose": {
-        "params": ["x", "y", "yaw", "speed"],
+        "params": ["x", "y", "yaw", "speed", "mode"],
         "description": (
             "Navigate to coordinates with obstacle detouring (non-blocking). "
             "MUST be followed by a "
@@ -267,7 +270,7 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "topic": f"{root}/navigation/goal_pose",
                 "format": "data/json",
                 "ros_type": "std_msgs/msg/String",
-                "qos": "RELIABLE + KEEP_LAST(depth=10) + VOLATILE",
+                "qos": "BEST_EFFORT + KEEP_LAST(depth=20) + VOLATILE",
                 "schema": "phanthy.navigation.goal.v1",
                 "required": False,
                 "frame_id": "map",
@@ -275,8 +278,8 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "units": "x/y=m, yaw=rad, speed=m/s",
                 "desc": (
                     "Optional target input. Each JSON message needs a unique "
-                    "goal_id plus x/y/yaw; the planner creates a fresh nav_id "
-                    "for the accepted navigation task."
+                    "goal_id plus x/y/yaw; the goal_id is used as the "
+                    "accepted navigation task's private nav_id."
                 ),
             },
         ],
@@ -355,6 +358,12 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "default": 0.5,
                     "description": "Navigation speed 0.30-1.00 m/s (default 0.50)",
                 },
+                "mode": {
+                    "type": "integer",
+                    "const": 0,
+                    "default": 0,
+                    "description": "Navigation mode: 0 (obstacle detouring)",
+                },
                 "stall_timeout": {
                     "type": "number",
                     "minimum": 1.0,
@@ -396,8 +405,9 @@ def nav2_tool_definition(namespace: str) -> dict:
                     "stop_action": "stop_nav",
                     "schema": "phanthy.navigation.goal.v1",
                     "id_field": "goal_id",
+                    "id_pattern": GOAL_ID_PATTERN,
                     "id_argument": "_control_nav_id",
-                    "allowed_fields": ["x", "y", "yaw", "speed"],
+                    "allowed_fields": ["x", "y", "yaw", "speed", "mode"],
                     "required_fields": ["x", "y", "yaw"],
                 }
             ],

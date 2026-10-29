@@ -228,6 +228,8 @@ def navigation_tool_definition(namespace: str) -> dict:
                 planning["inputSchema"]["x-topic-actions"]
             ),
             "x-completion": completion,
+            # Finish an in-flight start and the bounded 360 s map save before release.
+            "x-stop": {"timeout_s": 600},
             "x-hooks": deepcopy(planning["inputSchema"]["x-hooks"]),
         },
         "configSchema": deepcopy(NAVIGATION_CONFIG_SCHEMA),

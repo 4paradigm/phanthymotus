@@ -220,6 +220,49 @@ class Ros2BridgeNavigationEncodingTest(unittest.TestCase):
 
 
 class Ros2BridgeSubscriptionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_default_subscription_uses_declared_goal_qos(self) -> None:
+        captured = {}
+
+        class FakeNode:
+            def create_subscription(self, _msg_type, _topic, _callback, qos):
+                captured["qos"] = qos
+                return object()
+
+            def destroy_subscription(self, _subscription):
+                pass
+
+        policies = SimpleNamespace(BEST_EFFORT="best_effort")
+        history = SimpleNamespace(KEEP_LAST="keep_last")
+        durability = SimpleNamespace(VOLATILE="volatile")
+        node = FakeNode()
+        with patch.object(ros2_bridge, "_HAS_RCLPY", True), patch.object(
+            ros2_bridge, "_running", True
+        ), patch.object(ros2_bridge, "_node_main", node), patch.object(
+            ros2_bridge, "_executor", None
+        ), patch.object(ros2_bridge, "_subs", {}), patch.object(
+            ros2_bridge, "_resolve_msg_type", return_value=object
+        ), patch.object(
+            ros2_bridge, "QoSProfile", side_effect=lambda **kwargs: kwargs, create=True
+        ), patch.object(
+            ros2_bridge, "ReliabilityPolicy", policies, create=True
+        ), patch.object(
+            ros2_bridge, "HistoryPolicy", history, create=True
+        ), patch.object(
+            ros2_bridge, "DurabilityPolicy", durability, create=True
+        ):
+            self.assertTrue(ros2_bridge.subscribe(
+                "goal", "/goal", "data/json", asyncio.get_running_loop(),
+                unittest.mock.AsyncMock(),
+            ))
+            ros2_bridge.unsubscribe("goal")
+
+        self.assertEqual(captured["qos"], {
+            "reliability": "best_effort",
+            "history": "keep_last",
+            "depth": 20,
+            "durability": "volatile",
+        })
+
     async def test_slow_callback_keeps_only_the_latest_pending_frame(self) -> None:
         class FakeNode:
             callback = None

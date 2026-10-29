@@ -455,6 +455,261 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertTrue(info["canvas_wired"])
         self.assertEqual(info["active_map"], "office")
 
+    def test_unconfirmed_stop_mapping_keeps_core_for_retry(self) -> None:
+        for payload in ({"status": "rejected"}, {"status": "stopping"}, {},
+                        {"status": "saved", "terminal_confirmed": False},
+                        {"status": "saved", "error_code": "map_write_failed"}):
+            with self.subTest(payload=payload):
+                class UnconfirmedBackend(ReadyBackend):
+                    def execute(self, action: str, args: dict) -> dict:
+                        if action == "stop_mapping":
+                            return dict(payload)
+                        return super().execute(action, args)
+
+                backend = UnconfirmedBackend()
+                plugin = FastLivo2Plugin({}, None, backend=backend)
+                plugin.dispatch("fast_livo2", {
+                    "action": "start", "input_bindings": _bindings(plugin),
+                })
+                plugin.dispatch("fast_livo2", {
+                    "action": "start_mapping", "map_name": "office",
+                })
+                result = plugin.dispatch("fast_livo2", {"action": "stop"})
+                self.assertEqual(result["error_code"], "canvas_stop_failed")
+                self.assertTrue(result["retryable"])
+                self.assertFalse(result["terminal_confirmed"])
+                self.assertTrue(result["canvas_wired"])
+                self.assertEqual(backend.stop_calls, 0)
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "info"})[
+                    "active_map"], "office")
+                payload = {"status": "saved"}
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "stop"})[
+                    "status"], "idle")
+                self.assertEqual(backend.stop_calls, 1)
+
+    def test_localization_pending_algorithm_error_survives_adapter_retry(self) -> None:
+        algorithm_error = {"status": "error", "error_code": "algorithm_stop_failed",
+                           "error": "bad exit"}
+
+        class RetryUnloadBackend(ReadyBackend):
+            def __init__(self):
+                super().__init__()
+                self.unload_calls = 0
+
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "unload_map":
+                    self.unload_calls += 1
+                    if self.unload_calls == 1:
+                        raise FastLivo2BackendError(
+                            "adapter_unavailable", "not unloaded",
+                            details={"loaded_map": "office", "runtime_mode": "localization",
+                                     "algorithm_stop_error": algorithm_error})
+                    raise FastLivo2BackendError(
+                        "algorithm_stop_failed", "bad exit",
+                        details={"loaded_map": None, "runtime_mode": "idle",
+                                 "terminal_confirmed": True, "retryable": False})
+                return super().execute(action, args)
+
+        backend = RetryUnloadBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch("fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)})
+        plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+        pending = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertFalse(pending["terminal_confirmed"])
+        self.assertEqual(backend.stop_calls, 0)
+        self.assertEqual(plugin.dispatch("fast_livo2", {"action": "info"})["loaded_map"], "office")
+        final = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertTrue(final["terminal_confirmed"])
+        self.assertEqual(final["status"], "error")
+        self.assertEqual(final["terminal_stop_failures"]["mapping"]["error_code"],
+                         "algorithm_stop_failed")
+        self.assertEqual(backend.stop_calls, 1)
+
+    def test_unconfirmed_localization_stop_retains_loaded_map(self) -> None:
+        for payload in ({"status": "stopping"},
+                        {"status": "unloaded", "terminal_confirmed": False},
+                        {"status": "unloaded", "error_code": "unload_failed"}):
+            with self.subTest(payload=payload):
+                class UnconfirmedUnloadBackend(ReadyBackend):
+                    def execute(self, action: str, args: dict) -> dict:
+                        if action == "unload_map":
+                            return dict(payload)
+                        return super().execute(action, args)
+
+                backend = UnconfirmedUnloadBackend()
+                plugin = FastLivo2Plugin({}, None, backend=backend)
+                plugin.dispatch("fast_livo2", {
+                    "action": "start", "input_bindings": _bindings(plugin),
+                })
+                plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+                result = plugin.dispatch("fast_livo2", {"action": "stop"})
+                self.assertTrue(result["retryable"])
+                self.assertEqual(backend.stop_calls, 0)
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "info"})[
+                    "loaded_map"], "office")
+                payload = {"status": "unloaded"}
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "stop"})[
+                    "status"], "idle")
+                self.assertEqual(backend.stop_calls, 1)
+
+    def test_unconfirmed_collection_stop_retains_core(self) -> None:
+        for payload in ({"status": "stopping"}, {"status": "rejected"}, {},
+                        {"status": "disabled", "terminal_confirmed": False}):
+            with self.subTest(payload=payload):
+                class UnconfirmedCollectionBackend(ReadyBackend):
+                    def __init__(self):
+                        super().__init__()
+                        self.disable_calls = 0
+
+                    def execute(self, action: str, args: dict) -> dict:
+                        if action == "configure_collection" and not args["enabled"]:
+                            self.disable_calls += 1
+                            if self.disable_calls > 1:
+                                return dict(payload)
+                        return super().execute(action, args)
+
+                backend = UnconfirmedCollectionBackend()
+                plugin = FastLivo2Plugin({}, None, backend=backend)
+                plugin.dispatch("fast_livo2", {
+                    "action": "start", "input_bindings": _bindings(plugin),
+                })
+                result = plugin.dispatch("fast_livo2", {"action": "stop"})
+                self.assertEqual(result["error_code"], "canvas_stop_failed")
+                self.assertTrue(result["retryable"])
+                self.assertFalse(result["terminal_confirmed"])
+                self.assertEqual(backend.stop_calls, 0)
+                payload = {"status": "disabled"}
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "stop"})[
+                    "status"], "idle")
+                self.assertEqual(backend.stop_calls, 1)
+
+    def test_confirmed_collection_error_retains_receipt_and_releases_core(self) -> None:
+        class TerminalCollectionError(ReadyBackend):
+            def __init__(self):
+                super().__init__()
+                self.disable_calls = 0
+
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "configure_collection" and not args["enabled"]:
+                    self.disable_calls += 1
+                    if self.disable_calls > 1:
+                        raise FastLivo2BackendError(
+                            "collection_stop_failed", "save failed",
+                            details={"terminal_confirmed": True, "retryable": False,
+                                     "receipt": {"storage_complete": False}},
+                        )
+                return super().execute(action, args)
+
+        backend = TerminalCollectionError()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch("fast_livo2", {
+            "action": "start", "input_bindings": _bindings(plugin),
+        })
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["collection_stop_result"]["receipt"]["storage_complete"])
+        self.assertEqual(backend.stop_calls, 1)
+
+    def test_mapping_stopped_with_algorithm_error_reports_terminal_failure(self) -> None:
+        class AbnormalStopBackend(ReadyBackend):
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "stop_mapping":
+                    return {
+                        "status": "stopped", "terminal_confirmed": True,
+                        "map_saved": False, "warning_code": "static_map_not_ready",
+                        "algorithm_stop_error": {
+                            "status": "error", "error_code": "algorithm_stop_failed",
+                            "error": "FAST-LIVO2 exited abnormally",
+                        },
+                    }
+                return super().execute(action, args)
+
+        backend = AbnormalStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch("fast_livo2", {
+            "action": "start", "input_bindings": _bindings(plugin),
+        })
+        plugin.dispatch("fast_livo2", {"action": "start_mapping", "map_name": "office"})
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["canvas_wired"])
+        self.assertEqual(result["stop_result"]["algorithm_stop_error"]["error_code"],
+                         "algorithm_stop_failed")
+        self.assertEqual(backend.stop_calls, 1)
+
+    def test_terminal_error_survives_other_component_pending_stop(self) -> None:
+        for failed_component in ("mapping", "collection", "localization"):
+            with self.subTest(failed_component=failed_component):
+                class SplitStopBackend(ReadyBackend):
+                    def __init__(self):
+                        super().__init__()
+                        self.collection_calls = 0
+                        self.resource_calls = 0
+
+                    def execute(self, action: str, args: dict) -> dict:
+                        if action == "configure_collection" and not args["enabled"]:
+                            self.collection_calls += 1
+                            if self.collection_calls > 1:
+                                if failed_component == "collection" and self.collection_calls == 2:
+                                    raise FastLivo2BackendError("collection_stop_failed", "save failed",
+                                        details={"terminal_confirmed": True, "receipt": {"storage_complete": False}})
+                                if failed_component != "collection" and self.collection_calls == 2:
+                                    return {"status": "stopping"}
+                        if action in {"stop_mapping", "unload_map"}:
+                            self.resource_calls += 1
+                            if failed_component == "mapping":
+                                return {"status": "stopped", "terminal_confirmed": True,
+                                        "algorithm_stop_error": {"error_code": "algorithm_stop_failed"}}
+                            if failed_component == "localization":
+                                raise FastLivo2BackendError("algorithm_stop_failed", "abnormal exit",
+                                    details={"terminal_confirmed": True, "loaded_map": None})
+                            if self.resource_calls == 1:
+                                return {"status": "stopping"}
+                        return super().execute(action, args)
+
+                backend = SplitStopBackend()
+                plugin = FastLivo2Plugin({}, None, backend=backend)
+                plugin.dispatch("fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)})
+                action = "load_map" if failed_component == "localization" else "start_mapping"
+                plugin.dispatch("fast_livo2", {"action": action, "map_name": "office"})
+                first = plugin.dispatch("fast_livo2", {"action": "stop"})
+                self.assertTrue(first["retryable"])
+                self.assertIn("collection" if failed_component == "collection" else "mapping",
+                              first["terminal_stop_failures"])
+                self.assertEqual(backend.stop_calls, 0)
+                final = plugin.dispatch("fast_livo2", {"action": "stop"})
+                self.assertEqual(final["error_code"], "canvas_stop_failed")
+                self.assertTrue(final["terminal_confirmed"])
+                self.assertFalse(final["retryable"])
+                self.assertIn("collection" if failed_component == "collection" else "mapping",
+                              final["terminal_stop_failures"])
+                self.assertEqual(backend.stop_calls, 1)
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "stop"})["status"], "idle")
+
+    def test_mapping_warning_without_algorithm_error_remains_successful_stop(self) -> None:
+        class WarningBackend(ReadyBackend):
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "stop_mapping":
+                    return {"status": "stopped", "terminal_confirmed": True,
+                            "map_saved": False, "warning_code": "static_map_not_ready",
+                            "algorithm_stop_error": None}
+                return super().execute(action, args)
+
+        backend = WarningBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch("fast_livo2", {
+            "action": "start", "input_bindings": _bindings(plugin),
+        })
+        plugin.dispatch("fast_livo2", {"action": "start_mapping", "map_name": "office"})
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertEqual(result["status"], "idle")
+        self.assertFalse(result["stop_result"]["map_saved"])
+        self.assertEqual(result["stop_result"]["warning_code"], "static_map_not_ready")
+
     def test_confirmed_mapping_stop_failure_releases_card_backend(self) -> None:
         class PermanentStopBackend(ReadyBackend):
             def execute(self, action: str, args: dict) -> dict:

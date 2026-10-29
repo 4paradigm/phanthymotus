@@ -280,14 +280,9 @@ async def _do_start_project(*, _lock_held: bool = False):
     饿死（GIL 争用，accept 队列 Recv-Q 6 > backlog 5），一次 `tts.start` 再没回来，
     整个项目启动就此锁死。撞上的是 TTS，但**任何一个 MCP 服务器变慢都走同一条路**。
 
-    换成任务句柄之后三件事同时成立，而且都不依赖"记得清标志位"：
-
-      * 并发判据变成 `task.done()` —— 一个挂住的任务仍然是任务，而超时/取消都会
-        让它 `done()`，所以这个状态**不可能泄漏**。
-      * `asyncio.wait_for` 给整次启动兜底：不管哪个 `await` 挂住都会被取消。
-        这比"给每一次 MCP 调用加超时"更对 —— 后者要逐个审计调用点，而且对
-        `start` 本来就该不限时。
-      * "取消启动"能真的取消：`_cancel_start_project()` 直接 cancel 这个任务。
+    任务句柄以 `task.done()` 判断本地启动是否结束；`wait_for` 超时及
+    `_cancel_start_project()` 请求合作式取消，但无法抢占同步阻塞或保证取消清理
+    有界。任务可能继续未完成，已发出的远端启动状态也可能未知。
     """
     global _start_project_task
     import asyncio as _aio
@@ -296,6 +291,9 @@ async def _do_start_project(*, _lock_held: bool = False):
     if task is not None and not task.done():
         print('[start-project] already in progress, ignoring concurrent call')
         return None
+    if teardown_running():
+        print('[start-project] device teardown still running; start rejected')
+        return False
 
     async def start_locked():
         if _lock_held:
@@ -306,7 +304,7 @@ async def _do_start_project(*, _lock_held: bool = False):
     task = _aio.ensure_future(start_locked())
     _start_project_task = task
     try:
-        # wait_for 超时会 cancel 掉 task，于是它变成 done —— 下一次点启动就能进来。
+        # wait_for 发出合作式取消并等待清理，可能超过预算。
         return await _aio.wait_for(task, timeout=START_PROJECT_TIMEOUT_S)
     except _aio.TimeoutError:
         print(f'[start-project] timed out after {START_PROJECT_TIMEOUT_S}s — '
@@ -431,7 +429,11 @@ def stop_rules(tool_obj: dict) -> dict:
         return {str(v) for v in value if isinstance(v, str)} if isinstance(value, list) else set()
 
     flags = declared.get('pending_flags')
+    timeout = declared.get('timeout_s', STOP_CARD_TIMEOUT_S)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 900:
+        timeout = STOP_CARD_TIMEOUT_S
     return {
+        'timeout': timeout,
         'failed': _STOP_FAILED_STATES | names('failed_states'),
         'pending': _STOP_PENDING_STATES | names('pending_states'),
         'flags': {k: v for k, v in flags.items() if isinstance(k, str)} if isinstance(flags, dict) else {},
@@ -564,9 +566,12 @@ async def _do_start_project_impl():
     # 那个 `while` 看起来有 15 分钟的超时保护，实际上没有：内层 await 不返回，
     # 循环就永远不会再判一次条件。**循环里的 deadline 挡不住循环内部的挂起。**
     INFO_TIMEOUT_S = 10
+    # This token invalidates watchers after a stop, not after another start.
+    # It cannot revoke a registration already executing across an await.
+    start_epoch = stop_project_epoch()
 
     async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
-                                   info_args: dict) -> dict:
+                                   info_args: dict, *, guard_epoch: int | None = None) -> dict:
         """info() the card, register its topic_out on the bus, return the payload.
 
         info_args carries the input_topic the card was started with: without it a
@@ -579,6 +584,8 @@ async def _do_start_project_impl():
             tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
                                        **info_args},
         ), timeout_s=INFO_TIMEOUT_S)
+        if guard_epoch is not None and guard_epoch != stop_project_epoch():
+            return {}
         data = payload_of(info)
         # Kept whole, not just `topic_out`. A card's `info()` is the only place
         # it describes itself, and a consumer downstream may need more of that
@@ -595,6 +602,8 @@ async def _do_start_project_impl():
                 card['topicOut'] = topic_out
             from api.inspection import register_topic_internal
             for tp in topic_out:
+                if guard_epoch is not None and guard_epoch != stop_project_epoch():
+                    return data
                 if tp.get('topic') and tp.get('format'):
                     await register_topic_internal(tp['topic'], tp['format'], mcp_id)
         return data
@@ -612,6 +621,8 @@ async def _do_start_project_impl():
         last_message = ''
         while time.time() < deadline:
             await _asyncio.sleep(LOADING_POLL_S)
+            if start_epoch != stop_project_epoch():
+                return
             try:
                 info = await mcp_call_tool(mcp_id, MCPCallRequest(
                     tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
@@ -620,6 +631,8 @@ async def _do_start_project_impl():
             except Exception as error:
                 print(f'[start-project] {tool_name} info during load failed: {error}')
                 continue
+            if start_epoch != stop_project_epoch():
+                return
             state, message = tool_state_of(info)
             if state == 'loading' or state is None:
                 # Relay the tool's own phase text as it changes. The card sits
@@ -650,13 +663,18 @@ async def _do_start_project_impl():
             print(f'[start-project] {tool_name} ({mcp_id}) settled: {state}')
             if status == 'ready':
                 try:
-                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args,
+                                                guard_epoch=start_epoch)
                 except Exception as error:
                     print(f'[start-project] {tool_name} topic re-register failed: {error}')
+            if start_epoch != stop_project_epoch():
+                return
             await push_event({'type': 'project_start_item', 'payload': {
                 'tool': tool_name, 'mcp_id': mcp_id, 'status': status,
                 'message': message if status == 'error' else '',
             }})
+            return
+        if start_epoch != stop_project_epoch():
             return
         await push_event({'type': 'project_start_item', 'payload': {
             'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
@@ -1215,13 +1233,9 @@ async def _do_start_project_impl():
     return True
 
 
-# 每张卡片 `stop` 的死线。
-#
-# `start` 合法地可能要几分钟（下载权重、warmup），`stop` 不是：它是取消，正常是
-# 毫秒级。所以它必须有死线，而且要短 —— 真正要防的不是慢，是**无界**：
-# `mcp_call_tool` 的默认是不限时，于是一个 accept 了却不回应的 MCP 服务器（被同
-# 进程的线程把 GIL 饿死、容器正在重启）会让停止永远挂着。容器内实测：
-# `timeout=None` 对着一个只 accept 不回的端口 25 秒仍未返回；给 5 秒则 5.3 秒失败。
+# 每张卡片的协作式 stop 超时预算，不是硬实时死线。
+# wait_for 需要事件循环运行并等待取消清理；清理挂起或同步代码阻塞事件循环时
+# 实际耗时可能超过预算，HTTP 超时也不能证明远端请求已经结束。
 STOP_CARD_TIMEOUT_S = 5.0
 
 
@@ -1232,10 +1246,8 @@ async def _stop_cards(cards, progress: bool = False, *, require_confirmation: bo
     `{"state": "idle"}` — so this is safe to call on cards that were never
     started.
 
-    **并行，而且每张卡片各自有死线。** 以前是串行 `await`，总耗时是各卡之和，
-    而其中任何一张卡片不回应就卡住后面所有卡片 —— 一台设备坏了，于是别的设备都
-    停不下来，这是最不该有的耦合方向。现在总耗时是 max() 而不是 sum()，坏掉的那
-    张卡片只花掉它自己的 5 秒。
+    各卡并行并使用协作式超时预算；取消清理或事件循环受阻可超过预算，不能
+    保证硬实时返回，也不能以本地超时证明远端动作已结束。
 
     `progress=True` 时每张卡片有结果就推一条 `project_stop_item`，给界面逐项显示
     用。removed-card 清理走的是同一个函数但不该推 —— 那不是操作者按下的「停止」。
@@ -1254,14 +1266,15 @@ async def _stop_cards(cards, progress: bool = False, *, require_confirmation: bo
         tool_name = card.get('toolName', '')
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
                  'card_id': card.get('id', ''), 'ok': False, 'error': ''}
-        rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
         try:
+            rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
+            stop_timeout = rules['timeout']
             async def stop_and_confirm():
                 action = 'stop'
                 while True:
                     result = await mcp_call_tool(card.get('mcpId', ''), MCPCallRequest(
                         tool=tool_name, arguments={'action': action, 'instance_id': card.get('id', '')}),
-                        timeout_s=STOP_CARD_TIMEOUT_S)
+                        timeout_s=stop_timeout)
                     if result.get('code') != 200:
                         raise RuntimeError(result.get('message') or '设备拒绝停止请求')
                     payload = payload_of(result)
@@ -1270,31 +1283,57 @@ async def _stop_cards(cards, progress: bool = False, *, require_confirmation: bo
                     # and the driver's own common/lifecycle.py says exactly that.
                     # Reading the decline as a failure is how start-project once
                     # rolled an entire robot back over a dock command.
-                    if is_declined(payload):
+                    if is_declined(payload) and not require_confirmation:
                         return
                     state, reason = tool_state_of(result)
-                    if state in rules['failed']:
-                        raise RuntimeError(reason or str(payload.get('reason') or '')[:200]
-                                           or '设备停止未确认')
-                    if not is_pending(payload, state, rules):
-                        if require_confirmation and not _stop_confirmed(payload):
+                    if require_confirmation:
+                        # A terminal indication is not a successful stop when
+                        # another field says it failed. Check both state names;
+                        # `tool_state_of` intentionally only reads `state` for
+                        # compatibility with ordinary lifecycle calls.
+                        states = (payload.get('state'), payload.get('status'))
+                        if (payload.get('ok') is False or payload.get('error')
+                                or any(isinstance(s, str) and s in rules['failed']
+                                       for s in states)):
+                            raise RuntimeError(reason or str(payload.get('reason') or '')[:200]
+                                               or '设备停止未确认')
+                        if any(field in payload and not isinstance(payload[field], str)
+                               for field in ('state', 'status')):
                             raise RuntimeError('stop was not confirmed')
+                        pending = (is_pending(payload, state, rules)
+                                   or any(isinstance(s, str) and s in rules['pending']
+                                          for s in states))
+                    else:
+                        if state in rules['failed']:
+                            raise RuntimeError(reason or str(payload.get('reason') or '')[:200]
+                                               or '设备停止未确认')
+                        pending = is_pending(payload, state, rules)
+                    if not pending:
+                        if require_confirmation:
+                            # Unknown, empty or malformed explicit states are not
+                            # overridden by an idle field or terminal flag. A
+                            # terminal flag by itself is still accepted.
+                            terminal_states = ('idle', 'stopped', 'disabled')
+                            if (any(field in payload and payload[field] not in terminal_states
+                                    for field in ('state', 'status'))
+                                    or not (payload.get('terminal_confirmed') is True
+                                            or any(s in terminal_states for s in states))):
+                                raise RuntimeError('stop was not confirmed')
                         return
                     # Never resend stop while a device is still releasing. Read
                     # its actual state within the existing per-card deadline --
                     # and never spend the whole budget on one sleep, or a short
                     # deadline gets no read at all.
-                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, STOP_CARD_TIMEOUT_S / 4))
+                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, stop_timeout / 4))
                     action = 'info'
-            # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
-            # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
-            # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
-            await _aio.wait_for(stop_and_confirm(), STOP_CARD_TIMEOUT_S)
+            # HTTP 与整体调用各有协作式预算；wait_for 不能抢占同步阻塞，
+            # 且会等待取消清理，不保证在 timeout 时刻返回或远端请求已结束。
+            await _aio.wait_for(stop_and_confirm(), stop_timeout)
             entry['ok'] = True
         except _aio.TimeoutError:
             # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
             # 下来的卡片意味着那台设备可能还在跑。
-            entry['error'] = f'停止未确认（{STOP_CARD_TIMEOUT_S:g}s 死线）；请检查设备状态'
+            entry['error'] = f'停止未确认（{stop_timeout:g}s 死线）；请检查设备状态'
         except Exception as error:  # noqa: BLE001
             entry['error'] = str(error) or type(error).__name__
         if progress:
@@ -1342,6 +1381,12 @@ async def stop_removed_cards(old_cards, new_cards) -> tuple[int, list[dict]]:
 # 正在进行中的设备收尾。再点一次停止不会并发出第二轮 —— 停止是幂等的，但两轮
 # 并行会让界面上的逐项进度互相覆盖。
 _stop_teardown_task = None
+# Process-local intent generation; this does not fence remote operations.
+_stop_project_epoch = 0
+
+
+def stop_project_epoch() -> int:
+    return _stop_project_epoch
 
 
 def teardown_running() -> bool:
@@ -1353,19 +1398,16 @@ def teardown_running() -> bool:
 async def _do_stop_project(*, _lock_held: bool = False):
     """停止智能控制。**两段，保证不同。**
 
-    第 1 段 —— 关掉 agent loop。本地一个赋值，≤1ms，不可能失败。
+    第 1 段 —— 标记 project_running=False 并关闭 topic action 的本地派发入口。
     第 2 段 —— 设备收尾：逐卡 `stop`，并行、每卡 5s 死线，可能部分失败。
 
-    **顺序以前是反的,而那是个安全问题,不只是体验问题。** 原来先逐卡 stop、最后才
-    把 `project_running` 翻成 False。于是只要有一张卡片的 MCP 不回应（它本来没有
-    死线，见 `_stop_cards`），在那段挂住的时间里 **agent loop 还活着** —— 还会调
-    TTS、还会驱动执行器。操作者按下「停止」要的恰恰是这件事立刻停下来，而界面在
-    那整段时间里没有任何变化,所以他只会再点一次。
-
-    现在第 1 段先做完并立刻广播,界面可以诚实地说「已停止」;第 2 段的结果单独报,
-    因为「agent 不再行动」和「每台设备都已停下」是两件不同的事,合成一个状态必然
-    有一件是假的。
+    第 1 段关闭部分本地准入，不会终止已有 LLM turn、排队中的动作或后台 hook；
+    `project_state` 是 UI 状态标记，不证明所有 agent 派发或设备已停止。已发出的 topic 请求
+    不会因关闭入口而在远端取消,可能在设备 stop 之后到达；本地 HTTP 结束或超时
+    也不证明远端已结算。需要远端生命周期栅栏和可靠确认才能排除此风险。
     """
+    global _stop_project_epoch
+    _stop_project_epoch += 1
     await _do_stop_project_agent()
     results = await _do_stop_project_teardown(_lock_held=_lock_held)
     failures = [r for r in results if not r.get('ok')]
@@ -1373,34 +1415,64 @@ async def _do_stop_project(*, _lock_held: bool = False):
             'failures': failures}
 
 
-async def _do_stop_project_agent() -> None:
-    """第 1 段：关掉 agent loop。一个本地赋值加一次广播,不可能失败。"""
-    from api.motus_stream import push_event
-
+def _deactivate_project_agent() -> None:
+    """Close local admission synchronously, without cancelling in-flight calls."""
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
     from topic_actions import manager as topic_action_mgr
-    await topic_action_mgr.stop()
+    topic_action_mgr.deactivate()
+
+
+async def _broadcast_project_stopped() -> None:
+    from api.motus_stream import push_event
 
     await push_event({'type': 'project_state', 'payload': {'running': False}})
-    print('[stop-project] agent loop stopped')
+    print('[stop-project] local project state marked stopped')
 
 
-async def _do_stop_project_teardown(*, _lock_held: bool = False) -> list[dict]:
+async def _do_stop_project_agent() -> None:
+    """第 1 段：关闭本地派发入口，不等待已发出的 topic 请求。"""
+    _deactivate_project_agent()
+    try:
+        await _broadcast_project_stopped()
+    except Exception as error:  # noqa: BLE001
+        print(f'[stop-project] state broadcast failed: {error}')
+
+
+def _snapshot_stop_cards() -> list[dict]:
+    """Copy target identities without awaiting a concurrent layout mutation."""
+    layout = config.main.get('canvas_layout', {}) or {}
+    return [{key: card.get(key, '') for key in ('id', 'mcpId', 'toolName')}
+            for card in (layout.get('cards', []) or [])
+            if card.get('mcpId') and card.get('toolName')]
+
+
+async def _do_stop_project_teardown(
+    *, _lock_held: bool = False, _snapshot: list[dict] | None = None
+) -> list[dict]:
     """第 2 段：设备收尾。并行、每卡死线、逐项报进度、允许部分失败。"""
     if not _lock_held:
         async with layout_lifecycle_lock:
-            return await _do_stop_project_teardown(_lock_held=True)
+            return await _do_stop_project_teardown(_lock_held=True, _snapshot=_snapshot)
     from api.motus_stream import push_event
 
-    layout = config.main.get('canvas_layout', {})
-    cards = [c for c in (layout.get('cards', []) or [])
-             if c.get('mcpId') and c.get('toolName')]
-    await push_event({'type': 'project_stop_begin', 'payload': {
-        'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', ''),
-                   'card_id': c.get('id', '')} for c in cards],
-    }})
+    # Include both the stop-time targets and the layout after acquiring the lock.
+    # This does not fence an already-sent remove/stop request at the remote end.
+    cards = []
+    seen = set()
+    for card in (_snapshot or []) + _snapshot_stop_cards():
+        target = (card['id'], card['mcpId'], card['toolName'])
+        if target not in seen:
+            seen.add(target)
+            cards.append(card)
+    try:
+        await push_event({'type': 'project_stop_begin', 'payload': {
+            'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', ''),
+                       'card_id': c.get('id', '')} for c in cards],
+        }})
+    except Exception as error:  # noqa: BLE001
+        print(f'[stop-project] begin broadcast failed: {error}')
     results = await _stop_cards(cards, progress=True)
     failed = [r for r in results if not r.get('ok')]
     await push_event({'type': 'project_stop_done', 'payload': {
@@ -1417,6 +1489,11 @@ async def _do_stop_project_teardown(*, _lock_held: bool = False) -> list[dict]:
 
 @router.post('/start-project')
 async def api_start_project():
+    if teardown_running():
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'ok': False, 'detail': '设备停止收尾进行中，请稍候'}
+        )
     task = _start_project_task
     if task is not None and not task.done():
         return fastapi.responses.JSONResponse(
@@ -1434,16 +1511,16 @@ async def api_start_project():
 
 @router.post('/stop-project')
 async def api_stop_project():
-    """停 agent loop,然后在后台收尾设备。
+    """关闭部分本地准入,然后在后台收尾设备。
 
     **这个请求只等第 1 段。** 第 2 段（逐卡 stop）丢进 background task,进度走
-    `project_stop_item` / `project_stop_done`。这样做是因为前端要靠这个响应翻按
-    钮状态:让它等完收尾,就等于让「已停止」这件已经为真的事,被一台坏掉的设备拖
-    着不敢显示 —— 那正是原来点下去什么也不发生的原因。
+    `project_stop_item` / `project_stop_done`。响应和本地状态不证明远端已停车，
+    也不排除已发送的请求迟到；设备停止和跨生命周期的远端栅栏须另行确认。
     """
     import asyncio as _aio
 
-    global _stop_teardown_task
+    global _stop_teardown_task, _stop_project_epoch
+    _stop_project_epoch += 1
 
     # **先取消在飞的那次启动，再停卡片。** 顺序是有意的：反过来的话被停掉的卡片
     # 会被那次仍在继续的启动重新拉起来，而操作者看到的是"停了又自己起来了"。
@@ -1451,19 +1528,35 @@ async def api_stop_project():
 
     if teardown_running():
         # 已经在收尾了。不开第二轮：停止本身是幂等的,但两轮并行会让界面上的逐项
-        # 进度互相覆盖。agent loop 此时已经是停的,所以照常回 ok。
+        # 进度互相覆盖。本地准入已关闭，但不代表既有 dispatch 已终结。
         return {'ok': True, 'cancelled_start': cancelled,
                 'teardown_running': True}
 
-    await _do_stop_project_agent()
+    # Register the entire stop before the first await, so a concurrent start
+    # cannot overtake stage 1 and acquire the lifecycle lock before teardown.
+    _deactivate_project_agent()
+    stop_snapshot = _snapshot_stop_cards()
+    stage1 = _aio.get_running_loop().create_future()
 
     async def _teardown():
         try:
-            await _do_stop_project_teardown()
+            try:
+                await _broadcast_project_stopped()
+            except Exception as error:  # noqa: BLE001
+                print(f'[stop-project] state broadcast failed: {error}')
+            finally:
+                if not stage1.done():
+                    stage1.set_result(None)
+            await _do_stop_project_teardown(_snapshot=stop_snapshot)
+        except _aio.CancelledError:
+            print('[stop-project] teardown cancelled; device state is unknown')
+            raise
         except Exception as error:  # noqa: BLE001
             print(f'[stop-project] teardown failed: {error}')
 
     _stop_teardown_task = _aio.ensure_future(_teardown())
+    # The HTTP caller may disconnect; it must not cancel the managed stop.
+    await _aio.shield(stage1)
     return {'ok': True, 'cancelled_start': cancelled, 'teardown_running': True}
 
 
@@ -1474,6 +1567,16 @@ class ProjectRunningRequest(BaseModel):
 
 @router.put('/project-running')
 async def set_project_running(req: ProjectRunningRequest):
+    global _stop_project_epoch
+    if not req.running:
+        # A local state write invalidates old turns/watchers and pending auto-start.
+        # This endpoint does not send device stop or confirm any remote state.
+        _stop_project_epoch += 1
+    if req.running and teardown_running():
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'ok': False, 'detail': '设备停止收尾进行中，请稍候'}
+        )
     core = config.main.get('core', {})
     core['project_running'] = req.running
     config.main['core'] = core

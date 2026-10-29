@@ -537,12 +537,12 @@ class Processor:
                 count = len(self._points)
 
             log.info(
-                "[vln] captured %s at (%.3f, %.3f, %.3f): %s",
+                "[vln] captured %s at (%.3f, %.3f, %.3f), description_chars=%d",
                 point_id,
                 point.pose.x,
                 point.pose.y,
                 point.pose.yaw,
-                description,
+                len(description),
             )
             return {
                 "ok": True,
@@ -558,7 +558,7 @@ class Processor:
                 "recorded_points": count,
             }
 
-    def navigate(self, query, *, control_nav_id=None) -> dict:
+    def navigate(self, query, *, control_nav_id=None, admission_ticket=None) -> dict:
         if not isinstance(query, str) or not query.strip():
             return self.error("missing_query", "navigate 的 query 不能为空")
         query = query.strip()
@@ -659,10 +659,15 @@ class Processor:
                 "speed": self._navigation_speed,
             }
             if self._goal_handler is not None:
-                planner_result = self._goal_handler(
-                    goal,
-                    control_nav_id=control_nav_id,
-                )
+                if admission_ticket is None:
+                    planner_result = self._goal_handler(
+                        goal, control_nav_id=control_nav_id,
+                    )
+                else:
+                    planner_result = self._goal_handler(
+                        goal, control_nav_id=control_nav_id,
+                        admission_ticket=admission_ticket,
+                    )
                 if not isinstance(planner_result, dict):
                     return self.error(
                         "planner_response_invalid",

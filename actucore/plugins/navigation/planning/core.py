@@ -114,7 +114,7 @@ def _normalize(action: str, args: dict) -> dict:
                 "invalid_argument", "speed must be within [0.30, 1.00] m/s"
             )
         raw_mode = args.get("mode", 0)
-        if isinstance(raw_mode, bool) or not isinstance(raw_mode, int):
+        if isinstance(raw_mode, bool) or not isinstance(raw_mode, (int, float)):
             raise NavigationBackendError(
                 "invalid_argument", "mode must be integer 0"
             )
@@ -123,7 +123,7 @@ def _normalize(action: str, args: dict) -> dict:
                 "invalid_argument", "mode must be 0 (detour)"
             )
         normalized["speed"] = speed
-        normalized["mode"] = raw_mode
+        normalized["mode"] = 0
 
     if action == "wait_navigation_done":
         timeout = _number(args, "stall_timeout", default=90.0)
@@ -162,6 +162,9 @@ class Nav2Core:
         self._completion_callback = completion_callback
         self._lock = threading.Lock()
         self._active_nav_id: str | None = None
+        self._active_start_state: str | None = None
+        self._active_start_token: object | None = None
+        self._trusted_tokens: dict[str, object] = {}
         self._last_terminal_result: dict | None = None
         self._trusted_requests: OrderedDict[str, tuple[tuple[str, object], ...]] = (
             OrderedDict()
@@ -226,6 +229,8 @@ class Nav2Core:
     ) -> dict:
         nav_id = trusted_nav_id or uuid.uuid4().hex
         fingerprint = tuple(sorted(args.items()))
+        # Distinguish a late response from a later reuse of the same trusted ID.
+        start_token = object()
         with self._lock:
             previous = (
                 self._trusted_requests.get(trusted_nav_id)
@@ -237,8 +242,25 @@ class Nav2Core:
                     "control_nav_id_conflict",
                     f"navigation id {trusted_nav_id} was already used for another goal",
                 )
+            if trusted_nav_id and trusted_nav_id in self._terminal_results:
+                result = dict(self._terminal_results[trusted_nav_id])
+                self._terminal_results.move_to_end(trusted_nav_id)
+                result["action"] = action
+                result["idempotent_replay"] = True
+                return result
             if self._active_nav_id:
                 if trusted_nav_id == self._active_nav_id:
+                    if self._active_start_state != "accepted":
+                        state = self._active_start_state or "unknown"
+                        return {
+                            "action": action,
+                            "status": "error",
+                            "error_code": "navigation_start_" + state,
+                            "error": "navigation start is " + state + "; acceptance is not confirmed",
+                            "nav_id": trusted_nav_id,
+                            "action_id": trusted_nav_id,
+                            "idempotent_replay": True,
+                        }
                     return {
                         "action": action,
                         "status": "navigating",
@@ -250,19 +272,17 @@ class Nav2Core:
                     "navigation_active",
                     f"navigation {self._active_nav_id} is already active",
                 )
-            if trusted_nav_id and trusted_nav_id in self._terminal_results:
-                result = dict(self._terminal_results[trusted_nav_id])
-                self._terminal_results.move_to_end(trusted_nav_id)
-                result["action"] = action
-                result["idempotent_replay"] = True
-                return result
             self._active_nav_id = nav_id
+            self._active_start_state = "pending"
+            self._active_start_token = start_token
             self._last_terminal_result = None
             if trusted_nav_id:
+                self._trusted_tokens[trusted_nav_id] = start_token
                 self._trusted_requests[trusted_nav_id] = fingerprint
                 self._trusted_requests.move_to_end(trusted_nav_id)
                 while len(self._trusted_requests) > _MAX_TRUSTED_NAV_IDS:
                     expired_id, _ = self._trusted_requests.popitem(last=False)
+                    self._trusted_tokens.pop(expired_id, None)
                     self._terminal_results.pop(expired_id, None)
         try:
             result = self._result(
@@ -272,31 +292,50 @@ class Nav2Core:
             )
         except NavigationBackendError as exc:
             with self._lock:
-                if trusted_nav_id and exc.outcome_known:
+                terminal = self._terminal_results.get(trusted_nav_id) if trusted_nav_id else None
+                if (trusted_nav_id and exc.outcome_known is True
+                        and self._trusted_tokens.get(trusted_nav_id) is start_token
+                        and (terminal is None or terminal.get("status") == "rejected")):
                     self._trusted_requests.pop(trusted_nav_id, None)
+                    self._trusted_tokens.pop(trusted_nav_id, None)
                     self._terminal_results.pop(trusted_nav_id, None)
-                if (
-                    self._active_nav_id == nav_id
-                    and (
-                        trusted_nav_id is None
-                        or exc.outcome_known
-                    )
-                ):
-                    self._active_nav_id = None
+                if self._active_start_token is start_token:
+                    if exc.outcome_known is True:
+                        self._active_nav_id = None
+                        self._active_start_state = None
+                        self._active_start_token = None
+                    else:
+                        self._active_start_state = "unknown"
             raise
         except Exception:
             with self._lock:
-                if self._active_nav_id == nav_id and trusted_nav_id is None:
-                    self._active_nav_id = None
+                if self._active_start_token is start_token:
+                    self._active_start_state = "unknown"
             raise
         result.setdefault("action_id", nav_id)
+        if result.get("status") == "navigating" and (
+            result.get("nav_id") != nav_id or result.get("action_id") != nav_id
+            or result.get("ok") is False or result.get("error")
+        ):
+            with self._lock:
+                if self._active_start_token is start_token:
+                    self._active_start_state = "unknown"
+            raise NavigationBackendError(
+                "navigation_start_unknown", "inconsistent navigation start response"
+            )
         if result.get("status") in _TERMINAL_STATUSES:
-            self._on_navigation_terminal(result)
+            self._on_navigation_terminal(result, start_token=start_token)
+        with self._lock:
+            if self._active_start_token is start_token and self._active_start_state == "pending":
+                self._active_start_state = (
+                    "accepted" if result.get("status") == "navigating" else "unknown"
+                )
         return result
 
     def _control_navigation(self, action: str, args: dict) -> dict:
         with self._lock:
             nav_id = self._active_nav_id
+            start_token = self._active_start_token
             terminal_result = (
                 dict(self._last_terminal_result)
                 if self._last_terminal_result is not None
@@ -319,16 +358,52 @@ class Nav2Core:
                 "no_active_navigation", f"{action} requires an active navigation"
             )
 
-        result = self._result(
-            action,
-            self._backend.execute(action, args, nav_id=nav_id),
-            nav_id=nav_id,
-        )
+        try:
+            raw = self._backend.execute(action, args, nav_id=nav_id)
+            result = self._result(action, raw, nav_id=nav_id)
+        except Exception:
+            if action == "stop_nav":
+                with self._lock:
+                    if self._active_start_token is start_token:
+                        self._active_start_state = "unknown"
+            raise
+        if action == "stop_nav":
+            status = result.get("status")
+            reliable_terminal = isinstance(status, str) and status in (
+                _TERMINAL_STATUSES - {"error"}
+            )
+            confirmed = (
+                isinstance(raw, dict)
+                and result.get("nav_id") == nav_id
+                and result.get("action_id", nav_id) == nav_id
+                and result.get("action", action) == action
+                and ("ok" not in result or result["ok"] is True)
+                and not result.get("error")
+                and not result.get("error_code")
+                and result.get("already_idle") is not True
+                and ("state" not in result or result["state"] == status)
+                and ("already_terminal" not in result
+                     or result["already_terminal"] == status)
+                and ("terminal_confirmed" not in result
+                     or result["terminal_confirmed"] is True)
+                and (
+                    (status == "stopped" and result.get("terminal_confirmed") is True)
+                    or (reliable_terminal and result.get("already_terminal") == status)
+                )
+            )
+            if not confirmed:
+                with self._lock:
+                    if self._active_start_token is start_token:
+                        self._active_start_state = "unknown"
+                return self._error(
+                    action, "navigation_stop_pending",
+                    "Nav2 did not confirm the active navigation stop; retry stop",
+                )
         if result.get("status") in _TERMINAL_STATUSES:
-            self._on_navigation_terminal(result)
+            self._on_navigation_terminal(result, start_token=start_token)
         return result
 
-    def _on_navigation_terminal(self, raw: dict) -> None:
+    def _on_navigation_terminal(self, raw: dict, *, start_token: object | None = None) -> None:
         """Release only the matching task when Nav2 reports a terminal state."""
 
         result = dict(raw)
@@ -336,13 +411,22 @@ class Nav2Core:
         status = result.get("status") or result.get("state")
         if not isinstance(nav_id, str) or status not in _TERMINAL_STATUSES:
             return
+        if status == "error" and result.get("terminal_confirmed") is not True:
+            with self._lock:
+                if (self._active_nav_id == nav_id
+                        and (start_token is None or self._active_start_token is start_token)):
+                    self._active_start_state = "unknown"
+            return
         callback = None
         with self._lock:
-            if self._active_nav_id != nav_id:
+            if (self._active_nav_id != nav_id
+                    or (start_token is not None and self._active_start_token is not start_token)):
                 return
             result.setdefault("status", status)
             result.setdefault("action_id", nav_id)
             self._active_nav_id = None
+            self._active_start_state = None
+            self._active_start_token = None
             self._last_terminal_result = result
             if nav_id in self._trusted_requests:
                 self._terminal_results[nav_id] = dict(result)

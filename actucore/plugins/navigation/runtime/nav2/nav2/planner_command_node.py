@@ -598,12 +598,20 @@ class PlannerCommandNode(Node):
                     or self._last_published_proposal.get("reason") != reason
                 )
             if publish_safety_zero:
-                self._publish_motion_sequence(
-                    nav_id=nav_id,
-                    navigation_status=status,
-                    velocity=velocity,
-                    reason=reason,
-                )
+                with self._lock:
+                    if not proposal_context_is_publishable(
+                        self._active,
+                        nav_id=nav_id,
+                        attempt=attempt,
+                        status=status,
+                    ):
+                        return
+                    self._publish_motion_sequence(
+                        nav_id=nav_id,
+                        navigation_status=status,
+                        velocity=velocity,
+                        reason=reason,
+                    )
         except ProtocolError as exc:
             self.get_logger().error(
                 f"unsafe Nav2 shadow velocity rejected: {exc.code}: {exc}"
@@ -615,15 +623,11 @@ class PlannerCommandNode(Node):
                     attempt=attempt,
                     status=status,
                 ):
-                    self._active["status"] = "error"
+                    self._active["status"] = "cancel_unconfirmed"
                     self._active["error_code"] = "unsafe_shadow_velocity"
                     self._active["error"] = f"{exc.code}: {exc}"
-                    self._publish_motion_sequence(
-                        nav_id=nav_id,
-                        navigation_status="error",
-                        velocity=Velocity.zero(),
-                        reason=f"unsafe_shadow_velocity:{exc.code}",
-                    )
+                    self._latest_proposal_candidate = None
+                    self._publish_state()
 
     def _on_command(self, message: String) -> None:
         request_id = ""
@@ -676,6 +680,7 @@ class PlannerCommandNode(Node):
                     "status": "error",
                     "error_code": "internal_error",
                     "error": f"{type(exc).__name__}: {exc}",
+                    "outcome_known": False,
                 },
             )
 
@@ -762,22 +767,41 @@ class PlannerCommandNode(Node):
             self._send_active_goal()
         except CommandError as exc:
             with self._lock:
-                if (
-                    exc.outcome_known
-                    and self._active
-                    and self._active.get("nav_id") == nav_id
-                ):
-                    self._active["status"] = "error"
+                if self._active and self._active.get("nav_id") == nav_id:
+                    if exc.outcome_known:
+                        if self._active.get("status") not in _TERMINAL_STATES:
+                            self._active["status"] = "error"
+                    elif self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
+                        self._active["status"] = "cancel_unconfirmed"
+                        self._latest_proposal_candidate = None
             self._publish_state()
             raise
-        except Exception:
+        except Exception as exc:
+            uncertain = True
             with self._lock:
                 if self._active and self._active.get("nav_id") == nav_id:
-                    self._active["status"] = "error"
+                    uncertain = (
+                        self._active.get("goal_response_pending")
+                        or self._active.get("goal_handle") is not None
+                    )
+                    if self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
+                        self._active["status"] = "cancel_unconfirmed" if uncertain else "error"
+                        if uncertain:
+                            self._latest_proposal_candidate = None
             self._publish_state()
-            raise
+            raise CommandError(
+                "goal_request_error", f"{type(exc).__name__}: {exc}",
+                outcome_known=not uncertain,
+            ) from exc
         with self._lock:
             active = self._require_active(nav_id)
+            if active["status"] == "cancel_unconfirmed":
+                raise CommandError(
+                    "goal_result_unconfirmed", "Nav2 goal outcome is unconfirmed",
+                    outcome_known=False,
+                )
+            if active["status"] != "navigating":
+                return {"status": active["status"], "nav_id": nav_id}
             return {
                 "status": "navigating",
                 "nav_id": nav_id,
@@ -815,7 +839,7 @@ class PlannerCommandNode(Node):
             self._active["status"] = "starting"
             self._active["cancel_intent"] = None
             self._active["goal_handle"] = None
-            self._active["goal_response_pending"] = True
+            self._active["goal_response_pending"] = False
 
         self._publish_controller_speed_limit(speed_limit)
         goal = NavigateToPose.Goal()
@@ -829,6 +853,15 @@ class PlannerCommandNode(Node):
 
         accepted = threading.Event()
         outcome: dict = {}
+        with self._lock:
+            if (
+                self._active is None or self._active.get("nav_id") != nav_id
+                or self._active.get("attempt") != attempt
+                or self._active.get("status") != "starting"
+            ):
+                raise CommandError("invalid_navigation_state", "navigation changed before goal send")
+            # From this point a send failure may mean Nav2 accepted the goal.
+            self._active["goal_response_pending"] = True
         future = self._action_client.send_goal_async(
             goal,
             feedback_callback=lambda feedback: self._on_feedback(
@@ -842,18 +875,27 @@ class PlannerCommandNode(Node):
         )
         if not accepted.wait(timeout=self._goal_response_timeout):
             with self._lock:
-                if self._active and self._active.get("nav_id") == nav_id:
-                    self._active["error_code"] = "goal_response_timeout"
-            self._publish_state()
-            raise CommandError(
-                "goal_response_timeout",
-                f"Nav2 did not answer within {self._goal_response_timeout:.1f}s",
-                outcome_known=False,
-            )
+                # Recheck under the response callback's lock: acceptance may
+                # have arrived just as Event.wait timed out.
+                if not accepted.is_set():
+                    if (
+                        self._active and self._active.get("nav_id") == nav_id
+                        and self._active.get("status") not in _TERMINAL_STATES | {"paused"}
+                    ):
+                        self._active["status"] = "cancel_unconfirmed"
+                        self._active["error_code"] = "goal_response_timeout"
+                        self._latest_proposal_candidate = None
+                    self._publish_state()
+                    raise CommandError(
+                        "goal_response_timeout",
+                        f"Nav2 did not answer within {self._goal_response_timeout:.1f}s",
+                        outcome_known=False,
+                    )
         if not outcome.get("accepted"):
             raise CommandError(
                 str(outcome.get("error_code", "goal_rejected")),
                 str(outcome.get("error", "Nav2 rejected the goal")),
+                outcome_known=outcome.get("outcome_known", True),
             )
 
     def _publish_controller_speed_limit(self, speed_limit: float) -> None:
@@ -891,20 +933,26 @@ class PlannerCommandNode(Node):
                     and self._active.get("nav_id") == nav_id
                     and self._active.get("attempt") == attempt
                 ):
-                    self._active["goal_response_pending"] = False
-                    self._active["status"] = "error"
+                    # Losing the response is not evidence of rejection. The
+                    # request may have been accepted but no handle is known.
+                    self._active["goal_response_pending"] = True
+                    self._active["status"] = "cancel_unconfirmed"
+                    self._active["error_code"] = "goal_request_error"
                     self._active["error"] = f"{type(exc).__name__}: {exc}"
-            outcome.update(
-                {
-                    "accepted": False,
-                    "error_code": "goal_request_error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            accepted.set()
-            self._publish_state()
+                    self._latest_proposal_candidate = None
+                outcome.update(
+                    {
+                        "accepted": False,
+                        "outcome_known": False,
+                        "error_code": "goal_request_error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                accepted.set()
+                self._publish_state()
             return
 
+        late_cancel_handle = None
         with self._lock:
             stale = (
                 self._active is None
@@ -913,14 +961,22 @@ class PlannerCommandNode(Node):
             )
             if stale:
                 if goal_handle.accepted:
-                    goal_handle.cancel_goal_async()
-                outcome.update(
-                    {
-                        "accepted": False,
-                        "error_code": "stale_goal_response",
-                        "error": "late goal response was cancelled",
-                    }
-                )
+                    try:
+                        goal_handle.cancel_goal_async()
+                    except Exception as exc:
+                        detail = f"cancel request failed: {type(exc).__name__}: {exc}"
+                    else:
+                        detail = "cancel requested but terminal outcome is unconfirmed"
+                    outcome.update(
+                        accepted=False, outcome_known=False,
+                        error_code="stale_goal_response", error=detail,
+                    )
+                else:
+                    outcome.update(
+                        accepted=False, outcome_known=True,
+                        error_code="stale_goal_response",
+                        error="late goal response was rejected",
+                    )
             elif not goal_handle.accepted:
                 self._active["goal_response_pending"] = False
                 self._active["status"] = "rejected"
@@ -934,13 +990,40 @@ class PlannerCommandNode(Node):
             else:
                 self._active["goal_response_pending"] = False
                 self._active["goal_handle"] = goal_handle
-                self._active["status"] = "navigating"
-                goal_handle.get_result_async().add_done_callback(
-                    lambda completed: self._on_result(nav_id, attempt, completed)
+                # A late acceptance after timeout must not restart output.
+                if self._active.get("status") != "cancel_unconfirmed":
+                    self._active["status"] = "navigating"
+                try:
+                    goal_handle.get_result_async().add_done_callback(
+                        lambda completed: self._on_result(nav_id, attempt, completed)
+                    )
+                except Exception as exc:
+                    self._active["status"] = "cancel_unconfirmed"
+                    self._active["error_code"] = "goal_result_unconfirmed"
+                    self._active["error"] = f"{type(exc).__name__}: {exc}"
+                    self._latest_proposal_candidate = None
+                    outcome.update(
+                        accepted=False, outcome_known=False,
+                        error_code="goal_result_unconfirmed",
+                        error=self._active["error"],
+                    )
+                else:
+                    outcome["accepted"] = True
+                if (self._active.get("cancel_intent")
+                        and self._active.get("status") not in _TERMINAL_STATES | {"paused"}):
+                    late_cancel_handle = goal_handle
+            accepted.set()
+            self._publish_state()
+        if late_cancel_handle is not None:
+            # Do not wait here: this callback may run on the executor needed
+            # to deliver cancellation and result callbacks. A request or ACK
+            # is not terminal evidence; retry stop if cancellation is uncertain.
+            try:
+                late_cancel_handle.cancel_goal_async()
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"late Nav2 cancel request failed: {type(exc).__name__}: {exc}"
                 )
-                outcome["accepted"] = True
-        accepted.set()
-        self._publish_state()
 
     def _on_feedback(self, nav_id: str, attempt: int, wrapper) -> None:
         feedback = wrapper.feedback
@@ -993,21 +1076,29 @@ class PlannerCommandNode(Node):
             ):
                 return
             intent = self._active.get("cancel_intent")
-            if intent == "pause":
-                self._active["status"] = "paused"
-            elif intent == "stop":
-                self._active["status"] = "stopped"
-            elif status_code == GoalStatus.STATUS_SUCCEEDED:
+            if status_code == GoalStatus.STATUS_SUCCEEDED:
                 self._active["status"] = "arrived"
             elif status_code == GoalStatus.STATUS_CANCELED:
-                self._active["status"] = "cancelled"
+                self._active["status"] = (
+                    "paused" if intent == "pause" else
+                    "stopped" if intent == "stop" else "cancelled"
+                )
             elif status_code == GoalStatus.STATUS_ABORTED:
                 self._active["status"] = "aborted"
                 self._active["error"] = "Nav2 aborted the goal"
             else:
-                self._active["status"] = "error"
+                # An exception, UNKNOWN or nonterminal result says nothing
+                # about whether the goal is still executing. Keep ownership and
+                # the handle, and suppress proposals until a real terminal receipt.
+                self._active["status"] = "cancel_unconfirmed"
+                self._active["error_code"] = "cancel_terminal_unconfirmed"
                 self._active["error"] = error or f"unexpected goal status {status_code}"
-            self._active["goal_handle"] = None
+                self._latest_proposal_candidate = None
+            if self._active["status"] != "cancel_unconfirmed":
+                self._active["goal_handle"] = None
+                self._active.pop("error_code", None)
+                if status_code != GoalStatus.STATUS_ABORTED:
+                    self._active.pop("error", None)
             # Publish the terminal zero before stop_nav may return and admit a
             # new nav_id.  The shared proposal publisher then preserves old
             # terminal-zero -> new motion ordering at the Driver.
@@ -1039,21 +1130,43 @@ class PlannerCommandNode(Node):
             self._send_active_goal()
         except CommandError as exc:
             with self._lock:
-                if (
-                    exc.outcome_known
-                    and self._active
-                    and self._active.get("nav_id") == nav_id
-                ):
-                    self._active["status"] = "error"
+                if self._active and self._active.get("nav_id") == nav_id:
+                    if exc.outcome_known:
+                        if self._active.get("status") not in _TERMINAL_STATES:
+                            self._active["status"] = "error"
+                    elif self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
+                        self._active["status"] = "cancel_unconfirmed"
+                        self._latest_proposal_candidate = None
             self._publish_state()
             raise
-        except Exception:
+        except Exception as exc:
+            uncertain = True
             with self._lock:
                 if self._active and self._active.get("nav_id") == nav_id:
-                    self._active["status"] = "error"
+                    uncertain = (
+                        self._active.get("goal_response_pending")
+                        or self._active.get("goal_handle") is not None
+                    )
+                    if self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
+                        self._active["status"] = "cancel_unconfirmed" if uncertain else "error"
+                        if uncertain:
+                            self._latest_proposal_candidate = None
             self._publish_state()
-            raise
-        return {"status": "navigating", "nav_id": nav_id, "resumed": True}
+            raise CommandError(
+                "goal_request_error", f"{type(exc).__name__}: {exc}",
+                outcome_known=not uncertain,
+            ) from exc
+        with self._lock:
+            active = self._require_active(nav_id)
+            if active["status"] == "cancel_unconfirmed":
+                raise CommandError(
+                    "goal_result_unconfirmed", "Nav2 goal outcome is unconfirmed",
+                    outcome_known=False,
+                )
+            return {
+                "status": active["status"], "nav_id": nav_id,
+                "resumed": active["status"] == "navigating",
+            }
 
     def _stop(self, nav_id) -> dict:
         with self._lock:
@@ -1068,9 +1181,15 @@ class PlannerCommandNode(Node):
                 }
             has_goal = active.get("goal_handle") is not None
             if not has_goal and active.get("goal_response_pending"):
+                # The server may accept after this stop returns. Retain the
+                # intent so that a late handle is cancelled as soon as known.
+                active["cancel_intent"] = "stop"
+                active["status"] = "cancel_unconfirmed"
+                self._latest_proposal_candidate = None
+                self._publish_state()
                 raise CommandError(
                     "cancel_terminal_unconfirmed",
-                    "Nav2 goal response is still pending; retry stop after it arrives",
+                    "Nav2 goal response is still pending; cancellation is unconfirmed",
                     outcome_known=False,
                 )
             if not has_goal:
@@ -1084,16 +1203,29 @@ class PlannerCommandNode(Node):
 
     def _cancel_active(self, intent: str) -> None:
         with self._lock:
+            if self._active is not None and self._active.get("status") in _TERMINAL_STATES:
+                raise CommandError(
+                    "cancel_terminal_unconfirmed",
+                    f"Nav2 already reported {self._active['status']}",
+                    outcome_known=True,
+                )
             if self._active is None or self._active.get("goal_handle") is None:
                 raise CommandError(
                     "invalid_navigation_state", "Nav2 goal handle is unavailable"
                 )
             goal_handle = self._active["goal_handle"]
             nav_id = self._active["nav_id"]
+            attempt = self._active["attempt"]
             self._active["cancel_intent"] = intent
+            self._active["status"] = "cancel_unconfirmed"
+            self._active.pop("error_code", None)
+            self._active.pop("error", None)
+            self._latest_proposal_candidate = None
+            # Stop output before attempting cancellation, and retain the goal
+            # lease even when the request or acknowledgement is uncertain.
+            self._publish_state()
         completed = threading.Event()
         outcome: dict = {}
-        future = goal_handle.cancel_goal_async()
 
         def _done(cancel_future) -> None:
             try:
@@ -1103,30 +1235,49 @@ class PlannerCommandNode(Node):
                 outcome["error"] = f"{type(exc).__name__}: {exc}"
             completed.set()
 
-        future.add_done_callback(_done)
-        if not completed.wait(timeout=5.0) or not outcome.get("accepted"):
-            with self._lock:
-                if self._active is not None:
-                    self._active["cancel_intent"] = None
-            raise CommandError(
-                "cancel_failed", outcome.get("error", "Nav2 did not acknowledge cancel")
-            )
+        try:
+            future = goal_handle.cancel_goal_async()
+            future.add_done_callback(_done)
+            acknowledged = completed.wait(timeout=5.0) and outcome.get("accepted")
+        except Exception as exc:
+            acknowledged = False
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+
         expected = "paused" if intent == "pause" else "stopped"
         deadline = time.monotonic() + 5.0
         with self._state_changed:
             while True:
-                if self._active is None or self._active.get("nav_id") != nav_id:
+                if (
+                    self._active is None
+                    or self._active.get("nav_id") != nav_id
+                    or self._active.get("attempt") != attempt
+                ):
                     raise CommandError(
                         "cancel_terminal_unconfirmed",
                         "navigation disappeared before terminal receipt",
+                        outcome_known=False,
                     )
-                if self._active.get("status") == expected:
+                status = self._active.get("status")
+                if status == expected:
                     return
+                if status in _TERMINAL_STATES:
+                    raise CommandError(
+                        "cancel_terminal_unconfirmed",
+                        f"Nav2 reported {status} instead of {expected}",
+                        outcome_known=True,
+                    )
+                if not acknowledged or self._active.get("error_code") == "cancel_terminal_unconfirmed":
+                    raise CommandError(
+                        "cancel_terminal_unconfirmed",
+                        outcome.get("error", "Nav2 did not confirm cancellation"),
+                        outcome_known=False,
+                    )
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CommandError(
                         "cancel_terminal_unconfirmed",
                         f"Nav2 accepted cancel but did not report {expected}",
+                        outcome_known=False,
                     )
                 self._state_changed.wait(timeout=remaining)
 
@@ -1173,7 +1324,10 @@ class PlannerCommandNode(Node):
         with self._lock:
             self._proposal_sequence += 1
             sequence = self._proposal_sequence
-        wire_status = "planning" if navigation_status == "starting" else navigation_status
+        wire_status = (
+            "planning" if navigation_status in {"starting", "cancel_unconfirmed"}
+            else navigation_status
+        )
         payload = build_motion_sequence(
             nav_id=nav_id,
             sequence=sequence,
@@ -1244,12 +1398,14 @@ class PlannerCommandNode(Node):
                 status=status,
             ):
                 return
-        self._publish_motion_sequence(
-            nav_id=str(nav_id),
-            navigation_status=str(status),
-            velocity=velocity,
-            reason=reason,
-        )
+            # Serialize the final context check and publish with state changes;
+            # otherwise a stale nonzero sample can follow the cancel zero.
+            self._publish_motion_sequence(
+                nav_id=str(nav_id),
+                navigation_status=str(status),
+                velocity=velocity,
+                reason=reason,
+            )
 
     def _require_matching_navigation(self, nav_id) -> dict:
         with self._lock:
@@ -1300,7 +1456,7 @@ class PlannerCommandNode(Node):
                     "motion_limits"
                 ].as_dict()
                 payload["event"] = "navigation_status"
-                if payload.get("status") in _IDLE_OR_TERMINAL_STATES:
+                if payload.get("status") in _IDLE_OR_TERMINAL_STATES | {"cancel_unconfirmed"}:
                     stop_proposal = (str(payload["nav_id"]), str(payload["status"]))
             payload.update(
                 {

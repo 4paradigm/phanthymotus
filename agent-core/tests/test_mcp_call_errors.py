@@ -275,23 +275,12 @@ def test_completion_received_before_call_result_still_releases_pending(monkeypat
     monkeypatch.setattr(mcp_client, '_pending_actions', {})
     monkeypatch.setattr(mcp_client, '_pending_tools', {})
     monkeypatch.setattr(mcp_client, '_pending_timeouts', {})
-    monkeypatch.setattr(
-        mcp_client,
-        '_pending_results',
-        mcp_client.OrderedDict([('nav-early', completion)]),
-    )
-    _stub_jrpc(
-        monkeypatch,
-        {
-            'content': [
-                {
-                    'type': 'text',
-                    'text': '{"status":"navigating","action_id":"nav-early"}',
-                }
-            ]
-        },
-        [],
-    )
+    monkeypatch.setattr(mcp_client, '_pending_results', mcp_client.OrderedDict())
+    async def early_jrpc(session, url, method, params, req_id=1):
+        assert mcp_client.receive_action_completion('nav-early', completion) == 'early'
+        return {'content': [{'type': 'text',
+                             'text': '{"status":"navigating","action_id":"nav-early"}'}]}
+    monkeypatch.setattr(mcp_client, '_jrpc', early_jrpc)
 
     asyncio.run(mcp_client.call_tool(NAVIGATE, {}))
 
@@ -302,15 +291,15 @@ def test_completion_received_before_call_result_still_releases_pending(monkeypat
 def test_early_completion_cache_keeps_pending_results_and_notifies_after_registration(monkeypatch):
     monkeypatch.setattr(mcp_client, '_pending_actions', {'active': asyncio.Event()})
     monkeypatch.setattr(mcp_client, '_pending_results', mcp_client.OrderedDict(active={'status': 'done'}))
-    monkeypatch.setattr(mcp_client, '_pending_resources', {'early-2': frozenset({'base'})})
     monkeypatch.setattr(mcp_client, '_MAX_EARLY_COMPLETIONS', 2)
+    monkeypatch.setattr(mcp_client, '_early_dispatches', {})
     settled = []
     monkeypatch.setattr(mcp_client, '_settle_listeners', [lambda aid, resource: settled.append((aid, resource))])
-    for i in range(3):
-        assert mcp_client.mark_action_complete(f'early-{i}', {'status': 'arrived'}) is False
-    assert list(mcp_client._pending_results) == ['active', 'early-1', 'early-2']
+    token = mcp_client._begin_completion_dispatch(MCP_ID)
+    assert mcp_client.receive_action_completion('early-0', {'status': 'arrived'}) == 'early'
+    assert mcp_client.receive_action_completion('early-1', {'status': 'arrived'}) == 'early'
+    assert mcp_client.receive_action_completion('early-2', {'status': 'arrived'}) == 'rejected'
+    assert list(mcp_client._pending_results) == ['active']
     assert settled == []
-    event = mcp_client._pending_actions['early-2'] = asyncio.Event()
-    assert mcp_client.mark_action_complete('early-2', mcp_client._pending_results['early-2'])
-    assert event.is_set()
-    assert settled == [('early-2', frozenset({'base'}))]
+    mcp_client._end_completion_dispatch(token)
+    assert not mcp_client._early_dispatches

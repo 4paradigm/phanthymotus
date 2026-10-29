@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import importlib.util
 import sys
@@ -176,6 +177,46 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routes[0].required_fields, ("x", "y", "yaw"))
         self.assertEqual(routes[0].id_argument, "_control_nav_id")
 
+    def test_declared_id_pattern_matches_navigation_contract(self) -> None:
+        from plugins.navigation.contract import navigation_tool_definition
+
+        tool = navigation_tool_definition("ubuntu")
+        mcp_client.registry["perception"] = {"tool_definitions": [tool]}
+        layout = _layout()
+        layout["cards"][1]["toolName"] = tool["name"]
+        layout["connections"][0]["toPortIdx"] = str(next(
+            index for index, port in enumerate(tool["topic_in"])
+            if port["port"] == "goal_pose"
+        ))
+        route = topic_actions.build_routes(layout)[0]
+        self.assertEqual(route.id_pattern, r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+        payload = {"schema": route.schema, "x": 1, "y": 2, "yaw": 0}
+        for message_id in ("a", "A0_.:-", "z" * 128):
+            with self.subTest(valid=message_id):
+                args, validated_id = self.manager._validate(route, {**payload, "goal_id": message_id})
+                self.assertEqual(validated_id, message_id)
+                self.assertEqual(args["_control_nav_id"], message_id)
+        for message_id in ("", " ", "a b", "a/1", "中文", "a\n", ".a", ":a", "z" * 129):
+            with self.subTest(invalid=message_id), self.assertRaises(ValueError):
+                self.manager._validate(route, {**payload, "goal_id": message_id})
+
+    def test_invalid_id_pattern_declaration_is_rejected(self) -> None:
+        for pattern in (None, False, 1, "", "[", "a{999999999999999999999999999999999999}"):
+            with self.subTest(pattern=pattern):
+                tool = _tool_definition()
+                tool["inputSchema"]["x-topic-actions"][0]["id_pattern"] = pattern
+                mcp_client.registry["perception"] = {"tool_definitions": [tool]}
+                with self.assertRaisesRegex(ValueError, "invalid id_pattern"):
+                    topic_actions.build_routes(_layout())
+
+    def test_undeclared_id_pattern_preserves_generic_route_behavior(self) -> None:
+        route = topic_actions.build_routes(_layout())[0]
+        self.assertIsNone(route.id_pattern)
+        payload = {"schema": route.schema, "goal_id": "中文 / 1", "x": 1, "y": 2, "yaw": 0}
+        args, message_id = self.manager._validate(route, payload)
+        self.assertEqual(message_id, payload["goal_id"])
+        self.assertEqual(args["_control_nav_id"], payload["goal_id"])
+
     def test_live_source_topic_wins_over_stale_connection_cache(self) -> None:
         layout = _layout()
         layout["cards"][0]["topicOut"][0]["topic"] = "/live/goal_pose"
@@ -274,22 +315,16 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         def subscribe(key, topic, fmt, loop, callback):
             callbacks[key] = callback
 
-        async def call_tool(mcp_id, request):
-            dispatched.append((mcp_id, request.tool, request.arguments))
-            return {"code": 200, "data": []}
-
-        class Request:
-            def __init__(self, tool, arguments):
-                self.tool = tool
-                self.arguments = arguments
-
-        fake_api = types.ModuleType("api.mcp_manage")
-        fake_api.MCPCallRequest = Request
-        fake_api.mcp_call_tool = call_tool
+        async def call_tool(mcp_id, tool, arguments, *, barrier_aware, conservative_resources, timeout_s):
+            self.assertTrue(barrier_aware)
+            self.assertTrue(conservative_resources)
+            self.assertEqual(timeout_s, topic_actions._DISPATCH_TIMEOUT_SEC)
+            dispatched.append((mcp_id, tool, arguments))
+            return {"status": "navigating"}
 
         with patch.object(topic_actions.ros2_bridge, "subscribe", side_effect=subscribe), patch.object(
             topic_actions.ros2_bridge, "unsubscribe"
-        ) as unsubscribe, patch.dict(sys.modules, {"api.mcp_manage": fake_api}), patch(
+        ) as unsubscribe, patch.object(mcp_client, "call_tool_hook", call_tool, create=True), patch(
             "builtins.print"
         ) as log:
             await self.manager.start(layout)
@@ -335,6 +370,129 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
 
             await self.manager.stop()
             unsubscribe.assert_called_once_with("__topic_action__#nav2-card#goal_pose")
+
+    async def test_deactivate_retains_inflight_and_restart_waits_for_drain(self) -> None:
+        callbacks = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        cancelled = False
+        calls = []
+
+        def subscribe(key, topic, fmt, loop, callback):
+            callbacks.append(callback)
+
+        async def call_tool(_mcp_id, _tool, arguments, **_kwargs):
+            nonlocal cancelled
+            calls.append(arguments["_control_nav_id"])
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return {"status": "navigating"}
+
+        payload = {
+            "schema": "phanthy.navigation.goal.v1", "goal_id": "first",
+            "x": 1, "y": 2, "yaw": 0,
+        }
+        encode = lambda p: json.dumps(p).encode()
+        with patch.object(topic_actions.ros2_bridge, "subscribe", side_effect=subscribe), patch.object(
+            topic_actions.ros2_bridge, "unsubscribe"
+        ), patch.object(mcp_client, "call_tool_hook", call_tool, create=True):
+            await self.manager.start(_layout())
+            callback = callbacks[0]
+            first = asyncio.create_task(callback(encode(payload), "data/json"))
+            await asyncio.wait_for(entered.wait(), 1)
+            queued = asyncio.create_task(callback(
+                encode({**payload, "goal_id": "queued"}), "data/json"
+            ))
+            # The second callback is blocked on the same runtime dispatch lock.
+            await asyncio.sleep(0)
+            self.assertIn(queued, self.manager._inflight)
+            self.manager.deactivate()
+            self.assertIn(first, self.manager._inflight)
+            self.assertFalse(first.done())
+            await callback(encode({**payload, "goal_id": "late"}), "data/json")
+
+            restarting = asyncio.create_task(self.manager.start(_layout()))
+            await asyncio.sleep(0)
+            self.assertFalse(restarting.done())
+            self.assertEqual(len(callbacks), 1)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(first, queued, restarting), 1)
+            self.assertFalse(cancelled)
+            self.assertEqual(calls, ["first"])
+            self.assertEqual(len(callbacks), 2)
+            self.assertFalse(self.manager._inflight)
+            # Even if an old ROS subscription survives unsubscribe, its
+            # callback cannot bind to a new runtime with the same route key.
+            await callback(encode({**payload, "goal_id": "stale"}), "data/json")
+            self.assertEqual(calls, ["first"])
+            await callbacks[1](encode({**payload, "goal_id": "new"}), "data/json")
+            self.assertEqual(calls, ["first", "new"])
+
+    async def test_cancelled_drain_does_not_cancel_inflight_request(self) -> None:
+        callbacks = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        cancelled = False
+
+        def subscribe(_key, _topic, _fmt, _loop, callback):
+            callbacks.append(callback)
+
+        async def call_tool(_mcp_id, _tool, _arguments, **_kwargs):
+            nonlocal cancelled
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return {"status": "navigating"}
+
+        payload = {"schema": "phanthy.navigation.goal.v1", "goal_id": "first",
+                   "x": 1, "y": 2, "yaw": 0}
+        with patch.object(topic_actions.ros2_bridge, "subscribe", side_effect=subscribe), patch.object(
+            topic_actions.ros2_bridge, "unsubscribe"
+        ), patch.object(mcp_client, "call_tool_hook", call_tool, create=True):
+            await self.manager.start(_layout())
+            first = asyncio.create_task(callbacks[0](json.dumps(payload).encode(), "data/json"))
+            await asyncio.wait_for(entered.wait(), 1)
+            drain = asyncio.create_task(self.manager.stop())
+            await asyncio.sleep(0)
+            drain.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await drain
+            self.assertFalse(cancelled)
+            self.assertIn(first, self.manager._inflight)
+            self.assertFalse(first.done())
+            release.set()
+            await asyncio.wait_for(first, 1)
+            self.assertFalse(self.manager._inflight)
+
+    async def test_deactivate_attempts_all_unsubscribes_after_failure(self) -> None:
+        first = topic_actions.build_routes(_layout())[0]
+        from dataclasses import replace
+        second = replace(first, key="second-route")
+        self.manager._runtimes = {
+            first.key: topic_actions.RouteRuntime(route=first),
+            second.key: topic_actions.RouteRuntime(route=second),
+        }
+        attempted = []
+
+        def unsubscribe(key):
+            attempted.append(key)
+            if key == first.key:
+                raise RuntimeError("unsubscribe failed")
+
+        with patch.object(topic_actions.ros2_bridge, "unsubscribe", side_effect=unsubscribe), patch(
+            "builtins.print"
+        ) as log:
+            self.manager.deactivate()
+        self.assertEqual(attempted, [first.key, second.key])
+        self.assertFalse(self.manager._runtimes)
+        self.assertTrue(any("unsubscribe failed" in str(c) for c in log.call_args_list))
 
     async def test_invalid_messages_never_dispatch(self) -> None:
         callbacks = {}
@@ -382,30 +540,13 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
         def subscribe(key, topic, fmt, loop, callback):
             callbacks[key] = callback
 
-        async def call_tool(mcp_id, request):
-            attempts.append(request.arguments["x"])
+        async def call_tool(mcp_id, tool, arguments, *, barrier_aware, conservative_resources, timeout_s):
+            self.assertTrue(barrier_aware)
+            self.assertTrue(conservative_resources)
+            attempts.append(arguments["x"])
             if len(attempts) == 1:
-                return {
-                    "code": 200,
-                    "data": [{
-                        "type": "text",
-                        "text": json.dumps({
-                            "ok": False,
-                            "status": "error",
-                            "error": "temporary domain failure",
-                        }),
-                    }],
-                }
-            return {"code": 200, "data": []}
-
-        class Request:
-            def __init__(self, tool, arguments):
-                self.tool = tool
-                self.arguments = arguments
-
-        fake_api = types.ModuleType("api.mcp_manage")
-        fake_api.MCPCallRequest = Request
-        fake_api.mcp_call_tool = call_tool
+                return {"ok": False, "status": "error", "error": "temporary domain failure"}
+            return {"status": "navigating"}
         payload = {
             "schema": "phanthy.navigation.goal.v1",
             "goal_id": "retry-001",
@@ -418,8 +559,8 @@ class TopicActionsTest(unittest.IsolatedAsyncioTestCase):
             topic_actions.ros2_bridge, "subscribe", side_effect=subscribe
         ), patch.object(
             topic_actions.ros2_bridge, "unsubscribe"
-        ), patch.dict(
-            sys.modules, {"api.mcp_manage": fake_api}
+        ), patch.object(
+            mcp_client, "call_tool_hook", call_tool, create=True
         ), patch("builtins.print"):
             await self.manager.start(_layout())
             callback = next(iter(callbacks.values()))

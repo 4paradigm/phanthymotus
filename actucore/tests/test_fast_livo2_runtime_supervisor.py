@@ -191,6 +191,73 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             self.assertIsNone(supervisor._collection_partial_dir)
             supervisor._collection_health.stop.assert_called_once_with()
 
+    def test_collection_failed_storage_is_terminal_after_observed_process_exit(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._collection_process = mock.Mock()
+        supervisor._collection_process.poll.return_value = 7
+        supervisor._collection_partial_dir = None
+        supervisor._collection_final_dir = None
+        supervisor._collection_directory = None
+        supervisor._collection_error = None
+        supervisor._collection_last_receipt = None
+        supervisor._collection_sampler = mock.Mock()
+        supervisor._collection_sampler.snapshot.return_value = {}
+        supervisor._collection_health = mock.Mock()
+        supervisor._collection_health.snapshot.return_value = {
+            "enabled": True, "healthy": True, "sources": {},
+            "time_alignment": {}, "missing_sources": [], "failure_reason": None,
+        }
+        result = supervisor._stop_collection()
+        self.assertEqual(result["error_code"], "collection_stop_failed")
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["receipt"]["storage_complete"])
+
+    def test_localization_abnormal_exit_is_terminal_after_adapter_unload(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._process = mock.Mock()
+        supervisor._loaded_map = "office"
+        supervisor._runtime_mode = "localization"
+        supervisor._pending_localization_stop_error = None
+        supervisor._terminate_process = mock.Mock(return_value={
+            "status": "error", "error_code": "algorithm_stop_failed", "error": "bad exit",
+        })
+        supervisor._adapter_execute = mock.Mock(return_value={"status": "unloaded"})
+        result = supervisor._unload_map()
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(result["runtime_mode"], "idle")
+        self.assertEqual(result["error_code"], "algorithm_stop_failed")
+
+    def test_localization_exit_error_survives_adapter_unload_retry(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lock = threading.RLock()
+        supervisor._process = mock.Mock()
+        supervisor._loaded_map = "office"
+        supervisor._runtime_mode = "localization"
+        supervisor._pending_localization_stop_error = None
+        algorithm_error = {"status": "error", "error_code": "algorithm_stop_failed",
+                           "error": "bad exit"}
+        supervisor._terminate_process = mock.Mock(side_effect=[algorithm_error, None, None])
+        supervisor._adapter_execute = mock.Mock(side_effect=[
+            {"status": "error", "error_code": "adapter_unavailable"},
+            {"status": "error", "error_code": "adapter_unavailable"},
+            {"status": "unloaded"},
+        ])
+        for _ in range(2):
+            pending = supervisor._unload_map()
+            self.assertEqual(pending["runtime_mode"], "localization")
+            self.assertNotIn("terminal_confirmed", pending)
+            self.assertEqual(pending["algorithm_stop_error"], algorithm_error)
+        result = supervisor._unload_map()
+        self.assertEqual(result["error_code"], "algorithm_stop_failed")
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertFalse(result["retryable"])
+        self.assertIsNone(supervisor._pending_localization_stop_error)
+        self.assertEqual(supervisor._unload_map()["status"], "idle")
+
     def test_first_odom_discontinuity_triggers_one_delayed_snapshot(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
         supervisor._fault_capture_lock = threading.Lock()

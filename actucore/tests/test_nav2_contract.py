@@ -12,6 +12,7 @@ ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
 from plugins.navigation.planning.contract import (  # noqa: E402
+    GOAL_ID_PATTERN,
     NAV2_ACTIONS,
     NAV2_FULL_CONFIG_SCHEMA,
     NAV2_LIFECYCLE_ACTIONS,
@@ -68,6 +69,10 @@ class Nav2ContractTest(unittest.TestCase):
         )
         self.assertEqual(inputs["static_map"]["frame_id"], "map")
         self.assertFalse(inputs["goal_pose"]["required"])
+        self.assertEqual(
+            inputs["goal_pose"]["qos"],
+            "BEST_EFFORT + KEEP_LAST(depth=20) + VOLATILE",
+        )
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
         self.assertEqual(set(outputs), {"motion_sequence", "plan", "costmap"})
@@ -147,6 +152,10 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("python3-numpy", dockerfile)
         self.assertNotIn("PYTHON_NUMPY_VERSION", service)
         self.assertNotIn("PYTHON_NUMPY_VERSION", source_lock)
+        self.assertEqual(goal_schema["properties"]["goal_id"]["pattern"], GOAL_ID_PATTERN)
+        self.assertEqual(
+            tool["inputSchema"]["x-topic-actions"][0]["id_pattern"], GOAL_ID_PATTERN
+        )
         self.assertEqual(goal_schema["properties"]["speed"]["maximum"], 1.0)
         self.assertEqual(goal_schema["properties"]["speed"]["minimum"], 0.30)
         self.assertEqual(goal_schema["properties"]["speed"]["default"], 0.5)
@@ -180,7 +189,9 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(speed["minimum"], 0.30)
         self.assertEqual(speed["maximum"], 1.0)
         self.assertEqual(speed["default"], 0.5)
-        self.assertNotIn("mode", properties)
+        self.assertEqual(properties["mode"]["type"], "integer")
+        self.assertEqual(properties["mode"]["const"], 0)
+        self.assertEqual(properties["mode"]["default"], 0)
 
         full_config = NAV2_FULL_CONFIG_SCHEMA["properties"]
         self.assertEqual(full_config["min_x_mps"]["default"], 0.30)
@@ -200,10 +211,10 @@ class Nav2ContractTest(unittest.TestCase):
             self.assertNotIn("const", full_config[field])
 
         action_params = tool["inputSchema"]["x-action-params"]
-        self.assertNotIn("mode", action_params["navigate_to_pose"]["params"])
+        self.assertIn("mode", action_params["navigate_to_pose"]["params"])
         topic_action = tool["inputSchema"]["x-topic-actions"][0]
         self.assertNotIn("x-topic-actions", tool)
-        self.assertNotIn("mode", topic_action["allowed_fields"])
+        self.assertIn("mode", topic_action["allowed_fields"])
         self.assertEqual(topic_action["required_fields"], ["x", "y", "yaw"])
 
         config = tool["configSchema"]

@@ -21,14 +21,23 @@ _recent: list[dict]   = []    # 最近 N 条事件，用于 L2 环境快照
 
 
 async def enqueue(source: str, text: str, payload: dict | None = None) -> None:
+    # Capture provenance before a possibly blocking queue.put. A producer that
+    # waited across stop/restart must not become work for the new project.
+    import config
+    from api.config import stop_project_epoch
+    epoch = stop_project_epoch()
+    running = (config.main.get('core') or {}).get('project_running', False)
     event = {
         'source':  source,
         'text':    text,
         'payload': payload or {},
         'ts':      time.time(),
+        '_project_epoch': epoch if running else None,
     }
     await _queue.put(event)
-    _recent.append(event)
+    # Keep lifecycle metadata internal to the queue; snapshots preserve their
+    # historical event shape and do not expose a process-local implementation ID.
+    _recent.append({key: value for key, value in event.items() if key != '_project_epoch'})
     if len(_recent) > 100:
         _recent.pop(0)
 

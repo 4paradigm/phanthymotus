@@ -127,6 +127,7 @@ class FastLivo2Supervisor(Node):
         self._process: subprocess.Popen | None = None
         self._active_map: str | None = None
         self._loaded_map: str | None = None
+        self._pending_localization_stop_error: dict | None = None
         self._runtime_mode = "idle"
         self._started_unix_ms: int | None = None
         self._runtime_session_id: str | None = None
@@ -1101,6 +1102,8 @@ class FastLivo2Supervisor(Node):
                 "error_code": "collection_stop_failed",
                 "error": stop_error or "rosbag did not finish cleanly",
                 "receipt": receipt,
+                "retryable": False,
+                "terminal_confirmed": True,
             }
         return {"status": "collection_saved", "receipt": receipt}
 
@@ -1765,6 +1768,10 @@ class FastLivo2Supervisor(Node):
         if mode != "localization":
             return {"status": "idle", "already_idle": True, "map_name": map_name}
         stop_error = self._terminate_process(process)
+        with self._lock:
+            if stop_error is not None:
+                self._pending_localization_stop_error = dict(stop_error)
+            stop_error = self._pending_localization_stop_error
         adapter_result = self._adapter_execute("unload_map", {})
         if adapter_result.get("status") == "error":
             return {
@@ -1780,11 +1787,14 @@ class FastLivo2Supervisor(Node):
             self._runtime_mode = "idle"
             self._started_unix_ms = None
             self._runtime_session_id = None
+            self._pending_localization_stop_error = None
         if stop_error is not None:
             return {
                 **stop_error,
                 "loaded_map": None,
                 "runtime_mode": "idle",
+                "retryable": False,
+                "terminal_confirmed": True,
             }
         return {
             **adapter_result,

@@ -217,7 +217,9 @@ def layout_state(monkeypatch):
     monkeypatch.setattr(canvas_api, 'apply_tool_config', Mock())
     routes = type(sys)('topic_actions')
     routes.build_routes = Mock()
-    routes.manager = type('Manager', (), {'start': AsyncMock(), 'stop': AsyncMock()})()
+    routes.manager = type('Manager', (), {
+        'start': AsyncMock(), 'stop': AsyncMock(), 'deactivate': Mock(),
+    })()
     monkeypatch.setitem(sys.modules, 'topic_actions', routes)
     return state, routes
 
@@ -355,7 +357,7 @@ def test_project_stop_reports_agent_off_and_device_failure_separately(
         events.append(event)
 
     class _TopicActions:
-        async def stop(self):
+        def deactivate(self):
             return None
 
     motus_stream = type(sys)('api.motus_stream')
@@ -380,3 +382,38 @@ def test_project_stop_reports_agent_off_and_device_failure_separately(
     assert done['stopped'] == 0
     assert done['failed'][0]['card_id'] == TTS_OLD['id']
     assert 'mapping finalization' in done['failed'][0]['message']
+
+
+def test_declared_map_finalization_budget_does_not_delay_other_cards(monkeypatch):
+    from api import mcp_manage
+
+    async def scenario():
+        fast_stopped = asyncio.Event()
+        release_save = asyncio.Event()
+
+        async def call(mid, req, timeout_s=None):
+            if req.tool == 'navigation':
+                assert timeout_s == 0.5
+                await release_save.wait()
+            else:
+                fast_stopped.set()
+            return {'code': 200, 'data': {'state': 'idle'}}
+
+        monkeypatch.setattr(config_api, 'STOP_CARD_TIMEOUT_S', 0.02)
+        monkeypatch.setattr(config_api, 'find_tool', lambda mid, tool: {
+            'inputSchema': {'x-stop': {'timeout_s': 0.5}} if tool == 'navigation' else {}})
+        monkeypatch.setattr(mcp_manage, 'mcp_call_tool', call)
+        nav = dict(TTS_OLD, toolName='navigation')
+        task = asyncio.create_task(config_api.stop_removed_cards([nav, ASR], []))
+        await asyncio.wait_for(fast_stopped.wait(), 0.1)
+        await asyncio.sleep(0.04)
+        assert not task.done()
+        release_save.set()
+        assert await task == (2, [])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('timeout', [True, -1, 0, 901, float('nan'), float('inf'), '600'])
+def test_invalid_declared_stop_budget_keeps_default(timeout):
+    assert config_api.stop_rules({'inputSchema': {'x-stop': {'timeout_s': timeout}}})['timeout'] == config_api.STOP_CARD_TIMEOUT_S

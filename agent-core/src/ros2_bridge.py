@@ -162,6 +162,15 @@ def subscribe(
         'generation': 0,
     }
 
+    error_counts = {'callback': 0, 'decode': 0}
+
+    def _log_error(stage, error):
+        error_counts[stage] += 1
+        count = error_counts[stage]
+        if count == 1 or count % 100 == 0:
+            print(f'[ros2_bridge] {stage} error count={count}: {str(error)[:200]!r}',
+                  file=sys.stderr)
+
     async def _drain_callbacks():
         try:
             while True:
@@ -173,11 +182,9 @@ def subscribe(
                     data, msg_fmt = callback_queue.popleft()
                 try:
                     await cb(data, msg_fmt)
+                    error_counts['callback'] = 0
                 except Exception as e:
-                    print(
-                        f'[ros2_bridge] callback error: {repr(e)}',
-                        file=sys.stderr,
-                    )
+                    _log_error('callback', e)
         except asyncio.CancelledError:
             with callback_lock:
                 callback_state['active'] = False
@@ -189,21 +196,17 @@ def subscribe(
         with callback_lock:
             callback_state['closed'] = True
             callback_queue.clear()
-            future = callback_state['future']
-            callback_state['future'] = None
-        if future is not None:
-            try:
-                future.cancel()
-            except RuntimeError:
-                pass
+        # A dispatched callback may own a device command. Let it settle;
+        # closed + an empty queue prevents every subsequent dispatch.
 
     def _on_msg(msg):
         try:
             data = _encode_message(msg, fmt)
             msg_fmt = getattr(msg, 'format', fmt)
         except Exception as e:
-            print(f'[ros2_bridge] decode error: {repr(e)}', file=sys.stderr)
+            _log_error('decode', e)
             return
+        error_counts['decode'] = 0
         _last_seen[topic] = _time.time()
         with callback_lock:
             if callback_state['closed']:
@@ -226,12 +229,9 @@ def subscribe(
             print(f'[ros2_bridge] callback loop unavailable: {e}', file=sys.stderr)
             return
         with callback_lock:
-            if callback_state['closed']:
-                try:
-                    future.cancel()
-                except RuntimeError:
-                    pass
-            elif (
+            if (
+                not callback_state['closed']
+                and
                 callback_state['active']
                 and callback_state['generation'] == generation
             ):

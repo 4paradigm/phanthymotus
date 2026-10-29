@@ -38,9 +38,25 @@ import event_bus
 # ── 全局注册表 ─────────────────────────────────────────────────────────────────
 registry: dict[str, dict] = {}   # mcp_id → info
 
+# Turn-scoped admission. Unbound management/interrupt calls retain the legacy
+# behavior; bound turns must explicitly remain live at each dispatch boundary.
+dispatch_admission = contextvars.ContextVar('dispatch_admission', default=None)
+_DISPATCH_BLOCKED = 'Error: tool dispatch blocked: project lifecycle ended'
+
+
+def _dispatch_is_admitted() -> bool:
+    predicate = dispatch_admission.get()
+    if predicate is None:
+        return True
+    try:
+        return bool(predicate())
+    except Exception as exc:
+        print(f'[mcp] dispatch admission failed closed: {exc}')
+        return False
+
 # ── ACP: 异步动作完成协议 ──────────────────────────────────────────────────────
 _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
-_pending_results: OrderedDict[str, dict] = OrderedDict()  # includes early SSE results
+_pending_results: OrderedDict[str, dict] = OrderedDict()  # registered actions only
 # action_id → 注册时刻。加它只为一件事：主动播报要说「已经等了多久」。
 #
 # 先前没有任何地方记这个，而播报的 prompt 里也没有「现在几点」—— 模型只能拿过程
@@ -61,6 +77,85 @@ _pending_background: dict[str, bool] = {}
 # action_id → 完成通知要不要进 LLM。播放类动作的「播完了」是个回执，不是新消息；
 # 原先靠 collector 里 action_id 以 'speak-'/'tts-' 开头的字符串判断，驱动一改命名就失效。
 _pending_silent: dict[str, bool] = {}
+# Source is the locally configured SSE subscription, not authenticated identity.
+# Legacy HTTP completions have no device identity and remain accepted by ID.
+_pending_mcp: dict[str, str] = {}
+
+# Each completion-capable dispatch owns its own bounded early-receipt window.
+# All accesses occur on the asyncio event loop and none of the helpers await.
+_early_dispatches: dict[str, dict] = {}
+
+
+def _begin_completion_dispatch(mcp_id: str) -> str:
+    token = uuid.uuid4().hex
+    _early_dispatches[token] = {'mcp_id': mcp_id, 'receipts': OrderedDict()}
+    return token
+
+
+def _end_completion_dispatch(token: str | None) -> None:
+    if token is not None:
+        _early_dispatches.pop(token, None)
+
+
+def _cache_early_completion(action_id: str, payload: dict, source_mcp: str | None) -> str:
+    # An unsourced legacy POST can only be assigned when exactly one ACP
+    # dispatch is in flight. Multiple windows are ambiguous, even if one
+    # happens to return this ID later. An SSE source narrows by subscription.
+    candidates = [window for window in _early_dispatches.values()
+                  if source_mcp is None or window['mcp_id'] == source_mcp]
+    if len(candidates) != 1:
+        reason = 'no matching dispatch' if not candidates else 'ambiguous dispatches'
+        print(f'[acp] early completion {action_id!r} not retained: {reason}; '
+              'a legitimate receipt may be lost and the action may time out')
+        return 'rejected'
+    receipts = candidates[0]['receipts']
+    if action_id in receipts:
+        return 'duplicate'
+    if len(receipts) >= _MAX_EARLY_COMPLETIONS:
+        print(f'[acp] early completion {action_id!r} not retained: window full; '
+              'a legitimate receipt may be lost and the action may time out')
+        return 'rejected'
+    receipts[action_id] = (dict(payload), source_mcp)
+    return 'early'
+
+
+def _consume_early_completion(token: str | None, action_id: str) -> tuple[dict, str | None] | None:
+    window = _early_dispatches.get(token) if token is not None else None
+    return window['receipts'].pop(action_id, None) if window else None
+
+
+def _emit_early_completion(action_id: str, payload: dict, source_mcp: str | None,
+                           silent: bool) -> None:
+    """Deliver an accepted early receipt only after registration and settlement."""
+    if source_mcp is None:
+        event = {'type': 'action_complete', 'action_id': action_id,
+                 'status': payload.get('status', 'completed'),
+                 'result': payload.get('result', {}), 'silent': silent}
+        source = f'acp:{action_id}'
+        event_payload = dict(event)
+        text = json.dumps(event, ensure_ascii=False)
+    else:
+        event = dict(payload)
+        inner = event.get('payload')
+        event_payload = dict(inner) if isinstance(inner, dict) else {}
+        if silent:
+            event['silent'] = True
+            event_payload['silent'] = True
+        source = f'mcp:{source_mcp}'
+        text = event.get('text') or event.get('message') or json.dumps(event, ensure_ascii=False)
+        if silent:
+            text = json.dumps(event, ensure_ascii=False)
+    if not _dispatch_is_admitted():
+        print(f'[acp] early completion {action_id!r} steering dropped: stale turn')
+        return
+    async def deliver():
+        # This task inherits the original turn's context. A delayed response
+        # from an invalidated turn must not enqueue into a restarted project.
+        if not _dispatch_is_admitted():
+            print(f'[acp] early completion {action_id!r} steering dropped: stale turn')
+            return
+        await event_bus.enqueue(source=source, text=text, payload=event_payload)
+    asyncio.create_task(deliver())
 
 # 所有按 action_id 分表的 pending side table。_forget_pending 和测试夹具都遍历它，
 # 这样新增一张表不必在七个地方各补一行 —— 漏掉一处就泄漏到进程结束，而漏在测试夹具
@@ -72,7 +167,7 @@ _pending_silent: dict[str, bool] = {}
 _PENDING_TABLE_NAMES: tuple[str, ...] = (
     '_pending_actions', '_pending_started', '_pending_results', '_pending_timeouts',
     '_pending_tools', '_pending_resources', '_pending_owner',
-    '_pending_background', '_pending_silent',
+    '_pending_background', '_pending_silent', '_pending_mcp',
 )
 
 
@@ -142,24 +237,32 @@ def _notify_settled(action_id: str, resource=None) -> None:
             print(f'[acp] settle listener failed: {e}')
 
 
-def mark_action_complete(action_id: str, payload: dict) -> bool:
-    """把一个 pending 标记为完成：记结果、解锁等待者、通知订阅者。
+def receive_action_completion(action_id: str, payload: dict, *,
+                              source_mcp: str | None = None) -> str:
+    """Accept a completion or return early/duplicate/rejected without settling.
 
-    两处完成入口（HTTP 回调 / WS action_complete 事件）都必须走这里，否则订阅者会漏掉
-    其中一条路上的完成事件。注意**不删** _pending_actions 那一项 —— 晚到的 waiter 还要
-    读 _pending_results，回收是 barrier 的事（见 resource_actually_busy）。
+    SSE has a locally known subscription source; the legacy HTTP callback does
+    not. Neither identifies a particular dispatch incarnation. In particular a
+    delayed same-source/same-ID receipt inside a new window is indistinguishable.
     """
-    if action_id not in _pending_actions:
-        _pending_results.pop(action_id, None)
-        _pending_results[action_id] = payload
-        early = [aid for aid in _pending_results if aid not in _pending_actions]
-        for aid in early[:-_MAX_EARLY_COMPLETIONS]:
-            _pending_results.pop(aid, None)
-        return False
+    event = _pending_actions.get(action_id)
+    if event is None:
+        return _cache_early_completion(action_id, payload, source_mcp)
+    if source_mcp is not None and _pending_mcp.get(action_id) != source_mcp:
+        print(f'[acp] completion {action_id!r} rejected: SSE source mismatch')
+        return 'rejected'
+    if event.is_set():
+        return 'duplicate'
     _pending_results[action_id] = payload
-    _pending_actions[action_id].set()
+    event.set()
     _notify_settled(action_id)
-    return True
+    return 'completed'
+
+
+def mark_action_complete(action_id: str, payload: dict, *,
+                         source_mcp: str | None = None) -> bool:
+    """Compatibility wrapper: true only for a newly completed pending action."""
+    return receive_action_completion(action_id, payload, source_mcp=source_mcp) == 'completed'
 
 
 # ── 次序：谁发起的动作 ────────────────────────────────────────────────────────
@@ -647,24 +750,30 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                         raw = line[5:].strip()
                         try:
                             msg = json.loads(raw)
-                            text    = msg.get('text') or msg.get('message') or raw
-                            payload = msg.get('payload', {})
                         except json.JSONDecodeError:
-                            text    = raw
+                            msg = {}
+                        if not isinstance(msg, dict):
+                            msg = {}
+                        text = msg.get('text') or msg.get('message') or raw
+                        payload = msg.get('payload', {})
+                        if not isinstance(payload, dict):
                             payload = {}
 
-                        # ACP: action_complete 事件 → 解锁 sync() 等待
-                        msg_type = msg.get('type') if isinstance(msg, dict) else None
-                        if msg_type == 'action_complete':
+                        # A rejected/early receipt must not reach the LLM before
+                        # its dispatch is identified (or as a duplicate). Early
+                        # receipts are emitted once, after registration.
+                        if msg.get('type') == 'action_complete':
                             action_id = msg.get('action_id') or payload.get('action_id')
-                            if action_id:
-                                # 和 /api/acp/complete 一样：先问静默，再标记完成。
-                                if completion_is_silent(action_id):
-                                    if isinstance(msg, dict):
-                                        msg['silent'] = True
-                                    if isinstance(payload, dict):
-                                        payload['silent'] = True
-                                mark_action_complete(action_id, msg)
+                            if not action_id:
+                                continue
+                            silent = completion_is_silent(action_id)
+                            disposition = receive_action_completion(action_id, msg, source_mcp=mcp_id)
+                            if disposition != 'completed':
+                                continue
+                            if silent:
+                                msg['silent'] = True
+                                payload['silent'] = True
+                                text = json.dumps(msg, ensure_ascii=False)
 
                         await event_bus.enqueue(
                             source  = f'mcp:{mcp_id}',
@@ -905,6 +1014,8 @@ async def call_tool(full_name: str, args: dict) -> str:
 
     # Internal tools (agentcore) — dispatch locally
     if info.get('transport') == 'internal':
+        if not _dispatch_is_admitted():
+            return _DISPATCH_BLOCKED
         return await _dispatch_internal(mcp_id, tool_name, args)
 
     # A paired peer's tools, reached over its signed link instead of local HTTP.
@@ -912,6 +1023,8 @@ async def call_tool(full_name: str, args: dict) -> str:
     # schema plumbing, same history, same ACP handling. See peer/mcp_bridge.py.
     if info.get('transport') == 'peer':
         from peer import mcp_bridge
+        if not _dispatch_is_admitted():
+            return _DISPATCH_BLOCKED
         return await mcp_bridge.call(mcp_id, tool_name, args)
 
     url     = info['url']
@@ -974,6 +1087,8 @@ async def call_tool(full_name: str, args: dict) -> str:
                 saved_cfg = {**_shared, **_inst}
             if saved_cfg:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
+                    if not _dispatch_is_admitted():
+                        return _DISPATCH_BLOCKED
                     cfg_result = await _jrpc(session, url, 'tools/call', {
                         'name':      tool_name,
                         'arguments': {'action': 'config', **saved_cfg},
@@ -995,16 +1110,48 @@ async def call_tool(full_name: str, args: dict) -> str:
                     return (f'[{tool_name}] 尚未配置：缺少 {"、".join(missing)}，'
                             f'请先在设备面板中填写后再启动。')
 
+    completion_spec = meta.get('completion')
+    dispatch_token = (_begin_completion_dispatch(mcp_id)
+                      if completion_spec and _should_await_completion(completion_spec, action)
+                      else None)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            result = await _jrpc(session, url, 'tools/call', {
-                'name':      tool_name,
-                'arguments': args,
-            })
-    except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
-        msg = f'[{tool_name}] MCP 调用超时（{int(timeout.total)}s），设备可能正在执行耗时操作（如地图上传/定位）。请稍后重试。'
-        print(f'[mcp] {full_name} timeout after {timeout.total}s')
-        return msg
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                if not _dispatch_is_admitted():
+                    return _DISPATCH_BLOCKED
+                result = await _jrpc(session, url, 'tools/call', {
+                    'name':      tool_name,
+                    'arguments': args,
+                })
+        except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
+            msg = f'[{tool_name}] MCP 调用超时（{int(timeout.total)}s），设备可能正在执行耗时操作（如地图上传/定位）。请稍后重试。'
+            print(f'[mcp] {full_name} timeout after {timeout.total}s')
+            return msg
+
+        # No await between the response and registration: close this window even
+        # on malformed results, errors, exceptions, or cancellation.
+        if (dispatch_token is not None and isinstance(result, dict)
+                and JRPC_ERROR_KEY not in result and not result.get('isError')):
+            items = result.get('content') or []
+            parsed_result = None
+            # Preserve the pre-window behavior: image responses return before ACP
+            # registration. Do not suppress errors from registration itself.
+            if isinstance(items, list) and not any(
+                    isinstance(c, dict) and c.get('type') == 'image' for c in items):
+                try:
+                    first_text = next(c.get('text', '') for c in items
+                                      if isinstance(c, dict) and c.get('type') == 'text')
+                    candidate = json.loads(first_text)
+                    if isinstance(candidate, dict):
+                        parsed_result = candidate
+                except (json.JSONDecodeError, StopIteration, TypeError):
+                    pass
+            if parsed_result and parsed_result.get('action_id'):
+                _register_pending(parsed_result['action_id'], tool_name=tool_name, meta=meta,
+                                  args=args or {}, result=parsed_result, mcp_id=mcp_id,
+                                  dispatch_token=dispatch_token)
+    finally:
+        _end_completion_dispatch(dispatch_token)
 
     # The driver answered with a JSON-RPC error. Hand it to the model verbatim —
     # this is the difference between "the model retries correctly" and "the model
@@ -1068,23 +1215,6 @@ async def call_tool(full_name: str, args: dict) -> str:
                             else:
                                 existing.append(t)
         except Exception:
-            pass
-
-    # ── ACP: 异步工具 — 注册 pending，立即返回（barrier 在 _dispatch 层）────────
-    action = args.get('action')
-    meta = info.get('tool_meta', {}).get(full_name, {})
-    completion_spec = meta.get('completion')
-    if completion_spec and _should_await_completion(completion_spec, action):
-        try:
-            parsed_result = json.loads(texts[0]) if texts else {}
-            action_id = parsed_result.get('action_id')
-            if action_id:
-                _register_pending(action_id, tool_name=tool_name, meta=meta,
-                                  args=args or {}, result=parsed_result)
-                # 通知订阅者。放在 try 里面、注册后面是有意的：这一段任何一步抛了，
-                # pending 就没建成，也就没有"动作开始了"这回事可通知。
-                _notify_registered(action_id, tool_name, args or {}, meta.get('resource'))
-        except (json.JSONDecodeError, IndexError):
             pass
 
     return text_result
@@ -1259,7 +1389,8 @@ def _pending_timeout(completion_spec: dict, args: dict, result: dict | None) -> 
 
 
 def _register_pending(action_id: str, *, tool_name: str, meta: dict,
-                      args: dict, result: dict | None, via_hook: bool = False) -> None:
+                      args: dict, result: dict | None, via_hook: bool = False,
+                      mcp_id: str | None = None, dispatch_token: str | None = None) -> None:
     """建立一个 pending 的全部分表记账。
 
     原先这段在 call_tool 和 call_tool_hook 里各写了一份，两份都要算 timeout、都要填
@@ -1279,8 +1410,19 @@ def _register_pending(action_id: str, *, tool_name: str, meta: dict,
     # 复用（测试夹具里尤其如此），留着上一轮的值就是串味。
     _pending_background[action_id] = bool(completion_spec.get('background'))
     _pending_silent[action_id] = bool(completion_spec.get('silent_completion'))
-    if action_id in _pending_results:
-        mark_action_complete(action_id, _pending_results[action_id])
+    if mcp_id is not None:
+        _pending_mcp[action_id] = mcp_id
+    else:
+        _pending_mcp.pop(action_id, None)
+    # A historical result is never a receipt for this registration. Notify
+    # registration listeners first, so an immediately settled action has a start.
+    _pending_results.pop(action_id, None)
+    _notify_registered(action_id, tool_name, args or {}, resource)
+    early = _consume_early_completion(dispatch_token, action_id)
+    if early:
+        payload, source_mcp = early
+        if receive_action_completion(action_id, payload, source_mcp=source_mcp) == 'completed':
+            _emit_early_completion(action_id, payload, source_mcp, _pending_silent[action_id])
 
     _res_txt = ','.join(sorted(resource)) if resource else 'undeclared/exclusive'
     _timeout_txt = 'none' if timeout == float('inf') else f'{timeout:.0f}s'
@@ -1597,7 +1739,7 @@ def get_pending_for_tool(tool_name: str) -> list[str]:
 
 # ── Direct Tool Call (bypass barrier/ACP) ────────────────────────────────────
 
-async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
+async def call_tool_direct(mcp_id: str, tool_name: str, args: dict, *, timeout_s: float = 5) -> dict:
     """Direct MCP tool call — bypasses barrier, ACP, and schema validation.
 
     Used by system hooks for immediate execution (e.g. interrupt, LED effects).
@@ -1608,7 +1750,7 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
         return {"error": f"device {mcp_id} not registered"}
     if not entry.get('online'):
         return {"error": f"device {mcp_id} offline"}
-    url = entry['url']
+    url = entry.get('url')
     if not url:
         # A peer's synthetic entry (peer/mcp_bridge.py) carries no url — its tools
         # reach the remote over the signed /api/peer/tools/call path, not by POSTing
@@ -1626,11 +1768,20 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if not _dispatch_is_admitted():
+                return {'error': _DISPATCH_BLOCKED}
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
                 data = await resp.json()
                 if "error" in data:
                     return {"error": data["error"]}
                 result = data.get("result", {})
+                # MCP errors can contain arbitrary text (including JSON that looks
+                # successful). Never discard isError while unwrapping content.
+                if result.get("isError"):
+                    content = result.get("content", [])
+                    texts = [c.get("text", "") for c in content
+                             if isinstance(c, dict) and c.get("type") == "text"] if isinstance(content, list) else []
+                    return {"error": "\n".join(texts) or "MCP tool returned isError"}
                 # Extract text content from MCP response
                 content = result.get("content", [])
                 if content and isinstance(content, list):
@@ -1641,6 +1792,8 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
                         except (json.JSONDecodeError, IndexError):
                             return {"raw": text_parts[0]}
                 return result
+    except asyncio.TimeoutError:
+        return {"error": f"call_tool_direct timed out after {timeout_s}s"}
     except Exception as e:
         return {"error": f"call_tool_direct failed: {e}"}
 
@@ -1668,7 +1821,8 @@ def resolve_tool_binding(name: str, args: dict) -> tuple[str, str, str | None] |
 
 
 async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
-                          barrier_aware: bool = False) -> dict:
+                          barrier_aware: bool = False, timeout_s: float = 5,
+                          conservative_resources: bool = False) -> dict:
     """Like `call_tool_direct`, with an opt-in barrier-aware mode for hooks that
     must not behave like an interrupt.
 
@@ -1682,7 +1836,10 @@ async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
     x-resource is already held by a pending ACP action, and — if the call
     returns an action_id under a completion spec — register it as pending the
     same way `call_tool`'s normal ACP dispatch does, so it participates in the
-    barrier like any LLM-issued call would.
+    barrier like any LLM-issued call would. By default undeclared resources
+    keep the existing hook behaviour (dispatch regardless of pending actions).
+    `conservative_resources=True` instead treats them as conflicting with every
+    pending resource; callers outside the global hook path must opt in.
     """
     entry = registry.get(mcp_id)
     if not entry:
@@ -1701,21 +1858,30 @@ async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
         resource = meta.get('resource')
         # resource_actually_busy 而不是 conflicting_pending：已完成但还没被 barrier
         # 回收的 action 不算占用，否则一句播报会把嘴"锁"到下一次 barrier 为止。
-        if resource and resource_actually_busy(resource):
+        if (resource or conservative_resources) and resource_actually_busy(resource):
             return {"skipped": "resource busy"}
 
-    result = await call_tool_direct(mcp_id, tool_name, args)
-
-    if barrier_aware and isinstance(result, dict):
-        completion_spec = meta.get('completion')
-        action = args.get('action')
-        if completion_spec and _should_await_completion(completion_spec, action):
+    completion_spec = meta.get('completion')
+    action = args.get('action')
+    dispatch_token = (_begin_completion_dispatch(mcp_id)
+                      if barrier_aware and completion_spec
+                      and _should_await_completion(completion_spec, action) else None)
+    try:
+        result = await call_tool_direct(mcp_id, tool_name, args, timeout_s=timeout_s)
+        failed = (isinstance(result, dict) and (
+            bool(result.get('error')) or result.get('ok') is False
+            or result.get('state') == 'error' or result.get('status') == 'error'
+            or bool(result.get('isError'))
+        ))
+        if dispatch_token is not None and isinstance(result, dict) and not failed:
             action_id = result.get('action_id')
             if action_id:
                 _register_pending(action_id, tool_name=tool_name, meta=meta,
-                                  args=args or {}, result=result, via_hook=True)
-
-    return result
+                                  args=args or {}, result=result, via_hook=True,
+                                  mcp_id=mcp_id, dispatch_token=dispatch_token)
+        return result
+    finally:
+        _end_completion_dispatch(dispatch_token)
 
 
 def cleanup_stale_actions(max_age_s: float = 300):

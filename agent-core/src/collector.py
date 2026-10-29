@@ -237,10 +237,10 @@ async def _push_asr_background(ev: dict) -> None:
 def _pending_has_same_asr_text(asr_text: str) -> bool:
     """检查 steering_queue 或 priority_pending 中是否已有相同 ASR 文本。"""
     for item in list(_steering_queue._queue):
-        if _extract_asr_text_field(item) == asr_text:
+        if _current_event(item) and _extract_asr_text_field(item) == asr_text:
             return True
     for item in _priority_pending:
-        if _extract_asr_text_field(item) == asr_text:
+        if _current_event(item) and _extract_asr_text_field(item) == asr_text:
             return True
     return False
 
@@ -292,12 +292,24 @@ def get_interrupt_mode() -> str:
     return _interrupt_mode
 
 
+def project_epoch() -> int:
+    # Lazy import avoids a startup cycle with the project API.
+    from api.config import stop_project_epoch
+    return stop_project_epoch()
+
+
+def _current_event(ev: dict) -> bool:
+    return project_running() and ev.get('_project_epoch') == project_epoch()
+
+
 async def drain_steering() -> list[dict]:
     """非阻塞地 drain steering_queue 中的所有待处理消息。由 agent loop 在 tool batch 间调用。"""
     items = []
     while not _steering_queue.empty():
         try:
-            items.append(_steering_queue.get_nowait())
+            item = _steering_queue.get_nowait()
+            if _current_event(item):
+                items.append(item)
         except asyncio.QueueEmpty:
             break
     return items
@@ -314,7 +326,8 @@ def has_steering() -> bool:
     曾经有过一个基于本函数的隐式打断（finish barrier 的 barge_in），见
     `event/llm.py::_acp_barrier` 的 docstring —— 那条路已经拆掉。
     """
-    return not _steering_queue.empty() or bool(_priority_pending)
+    return (any(_current_event(ev) for ev in _steering_queue._queue)
+            or any(_current_event(ev) for ev in _priority_pending))
 
 
 def defer_priority(events: list[dict]) -> None:
@@ -324,9 +337,12 @@ def defer_priority(events: list[dict]) -> None:
 
 async def next_trigger() -> dict:
     """阻塞等待下一批 P>0 事件（main agent 消费端）。"""
-    # Fallback: 每次等待前再检查一次 pending 队列，防止遗漏
-    _flush_all_pending()
-    return await _output.get()
+    while True:
+        # Events admitted before stop must not become new turns after restart.
+        _flush_all_pending()
+        ev = await _output.get()
+        if _current_event(ev):
+            return ev
 
 
 def get_source_detail(source: str, limit: int = 20) -> list[dict]:
@@ -481,6 +497,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         },
         'ts': batch[-1]['ts'],
         '_perf_trigger_emit_ts': time.time(),
+        '_project_epoch': batch[0].get('_project_epoch'),
         '_urgent': urgent,
         '_bot_channel_event': bool(bot_payloads),
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
@@ -512,7 +529,7 @@ def _flush_all_pending():
             break
     # 再把 _priority_pending 全部 emit 到 _output
     if _priority_pending:
-        pending = list(_priority_pending)
+        pending = [ev for ev in _priority_pending if _current_event(ev)]
         _priority_pending.clear()
         # 同步放入 _output（非 async，避免 fire-and-forget 丢失）
         for batch in _split_by_bot_trust(pending):
@@ -526,7 +543,7 @@ async def _emit_priority():
     """busy 结束后，立即 emit 暂存的 P>0 事件。"""
     if not _priority_pending:
         return
-    batch = list(_priority_pending)
+    batch = [ev for ev in _priority_pending if _current_event(ev)]
     _priority_pending.clear()
     await _emit_batch(batch, urgent=True)
 
@@ -695,6 +712,11 @@ def _format_bg_batch(events: list[dict]) -> str:
 
 async def _route_to_bg_subagent(batch: list[dict]) -> bool:
     """将 P=0 事件批次路由到 bg subagent。"""
+    if not batch or not all(_current_event(ev) for ev in batch):
+        return False
+    epoch = batch[0]['_project_epoch']
+    def admitted():
+        return project_running() and project_epoch() == epoch
     try:
         from subagent import _manager_instance
     except ImportError:
@@ -735,7 +757,8 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
 
     # 检查是否有活跃的 bg subagent
     active = _manager_instance.list_active()
-    bg_agents = [a for a in active if a.goal.startswith('[bg]')]
+    bg_agents = [a for a in active if a.goal.startswith('[bg]')
+                 and _manager_instance.accepts_message(a.id)]
 
     if bg_agents:
         _manager_instance.send_message(bg_agents[0].id, message)
@@ -777,7 +800,12 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
             # 「只调用了记账类工具」对它是正常完成，不是「报告成功却没干活」。
             deliverable='report',
         )
-        await _manager_instance.spawn(spec)
+        import mcp_client
+        token = mcp_client.dispatch_admission.set(admitted)
+        try:
+            await _manager_instance.spawn(spec)
+        finally:
+            mcp_client.dispatch_admission.reset(token)
 
     return True
 
@@ -862,6 +890,8 @@ async def _drain_loop():
             _note_gated(source)
             _bg_buffer.clear()
             continue
+        if not _current_event(ev):
+            continue
         _note_ungated()
 
         _extract_perf_timestamps(ev)
@@ -878,7 +908,14 @@ async def _drain_loop():
                     payload = {}
             if payload.get('kws_triggered'):
                 import hooks
-                asyncio.create_task(hooks.fire('on_kws_wakeup'))
+                import mcp_client
+                epoch = ev['_project_epoch']
+                token = mcp_client.dispatch_admission.set(
+                    lambda epoch=epoch: project_running() and project_epoch() == epoch)
+                try:
+                    asyncio.create_task(hooks.fire('on_kws_wakeup'))
+                finally:
+                    mcp_client.dispatch_admission.reset(token)
 
         # Ring buffer 始终存储（所有事件，供 raw_input_info 查询）
         if source not in _source_ring:
@@ -912,7 +949,7 @@ async def _drain_loop():
                     if 'scheduler:' in source.lower():
                         _dedup = False
                         for item in list(_steering_queue._queue):
-                            if item.get('source', '') == ev.get('source', ''):
+                            if _current_event(item) and item.get('source', '') == ev.get('source', ''):
                                 _dedup = True
                                 break
                         if _dedup:
@@ -987,7 +1024,7 @@ async def _bg_trigger_loop():
             continue
         if not _bg_buffer:
             continue
-        batch = list(_bg_buffer)
+        batch = [ev for ev in _bg_buffer if _current_event(ev)]
         _bg_buffer.clear()
         # 只在 buffer 含有实质性传感器数据时才路由到 bg subagent
         if not _bg_buffer_has_substance(batch):

@@ -43,7 +43,7 @@ FAST-LIVO2 internal module
 | `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，接收 age 最大 500 ms |
 | `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，接收 age 最大 500 ms |
 | `static_map` | `/ubuntu/navigation/static_map` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | `header.frame_id=map`，直接累计静态图，`-1/0/100` |
-| `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(10)` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
+| `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `BEST_EFFORT + KEEP_LAST(20) + VOLATILE` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
 
 Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
 直接发布 `camera_init` / `aft_mapped` frame 时，Nav2 会返回
@@ -76,10 +76,18 @@ registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz
 Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 `goal_pose` 端口时激活 `inputSchema.x-topic-actions`。Core 会把通过校验的
 `x/y/yaw/speed` 转为同一张卡片的 `navigate_to_pose` MCP 调用；
-`schema` 不符、缺坐标、夹带未声明字段或重复 `goal_id` 的消息
-都不会被执行。只有 MCP 投递成功后 `goal_id` 才进入去重窗口；临时投递失败
-可以用同一 ID 重试。Bridge 对等待中的目标只保留最新一条，停止 Canvas 项目
-会退订并取消尚未投递的目标，再停止卡片。
+`goal_id` 必须为 1–128 个 ASCII 字符，首字符为字母或数字，其余只允许
+字母、数字、`_`、`.`、`:`、`-`，不做空白裁剪；这只约束 topic 消息，
+不收紧其他内部调用的私有任务 ID。`schema` 不符、ID 不合法、
+缺坐标、夹带未声明字段或重复 `goal_id` 的消息都不会被执行。只有 MCP
+投递成功后 `goal_id` 才进入去重窗口；投递失败可重试同一 ID，但超时或断连时远端执行状态可能未知，不应据此认定此前目标未执行。
+
+此输入由 Core 的通用 ROS bridge 订阅，DDS 请求的 QoS 为上表的
+`BEST_EFFORT + KEEP_LAST(20) + VOLATILE`，兼容 best-effort 和 reliable
+发布者；即使发布者使用 reliable，接收仍不保证可靠交付。Bridge 的 DDS
+队列深度 20 与异步回调队列分离，后者对等待中的目标只保留最新一条；
+因此目标可能丢失或被新目标覆盖，发布者不能把发布成功视为导航已接受。
+停止 Canvas 项目会退订并丢弃尚未投递的目标，再停止卡片；已经在途或延迟到达的请求尚无跨生命周期栅栏，不能据此推断不会在停止后执行。
 
 ## 输出合同
 

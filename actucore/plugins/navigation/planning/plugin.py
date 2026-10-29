@@ -175,6 +175,17 @@ class Nav2Plugin:
             )
         return core.dispatch(args)
 
+    def stop_active_only(self) -> dict:
+        """Request cancellation without releasing the current planner core."""
+        with self._lifecycle_lock:
+            core = self._core
+            started = self._canvas_started
+        if not started or core is None:
+            return self._error(
+                "navigation_stop_pending", "planner core is unavailable for cancellation"
+            )
+        return core.dispatch({"action": "stop_nav"})
+
     def stop(self) -> None:
         self._stop_canvas()
 
@@ -353,6 +364,18 @@ class Nav2Plugin:
                 or stop_result.get("ok") is False
                 or stop_result.get("state") == "error"
                 or stop_result.get("status") == "error"
+                or not (
+                    (stop_result.get("status") == "stopped"
+                     and stop_result.get("terminal_confirmed") is True)
+                    or (
+                        stop_result.get("status") in {
+                            "arrived", "succeeded", "cancelled", "stopped",
+                            "timeout", "aborted", "rejected",
+                        }
+                        and stop_result.get("already_terminal")
+                        == stop_result.get("status")
+                    )
+                )
             ):
                 return self._error(
                     "navigation_stop_pending",

@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import re
 import threading
-import time
 
 from .contract import (
     CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
@@ -94,7 +93,15 @@ class NavigationPlugin:
         )
         self._lock = threading.RLock()
         self._transition_lock = threading.Lock()
+        self._stop_requested = threading.Event()
+        self._pending_stops = 0
         self._started = False
+        self._generation = None
+        self._inflight_planning = 0
+        self._inflight_semantic = 0
+        self._inflight_mapping = 0
+        self._last_terminal_stop_error = None
+        self._pending_terminal_stop_error = None
         self._instance_id = ""
         self._external_wiring: dict[str, str] = {}
 
@@ -120,6 +127,8 @@ class NavigationPlugin:
                 "unsupported_action", f"unsupported navigation action: {action!r}"
             )
         with self._lock:
+            if self._stop_requested.is_set():
+                return self._error("navigation_stopping", "wait for stop to finish")
             if not self._started:
                 return self._error(
                     "canvas_not_started",
@@ -132,17 +141,56 @@ class NavigationPlugin:
                     "stop the card, connect the RGB input, then restart before "
                     "using capture or navigate",
                 )
-        if not self._runtime.info().get("running", False):
-            return self._error(
-                "navigation_runtime_unavailable",
-                "an owned ControlledSemanticSpatial child process is not running; "
-                "stop and restart the card",
-            )
-        if action in FAST_LIVO2_ACTIONS:
-            return self._mapping.dispatch("fast_livo2", args)
-        if action in NAV2_ACTIONS:
+            ticket = self._generation
+            semantic_operation = action in SEMANTIC_ACTIONS
+            mapping_operation = action in FAST_LIVO2_ACTIONS
+            if semantic_operation:
+                self._inflight_semantic += 1
+            if mapping_operation:
+                self._inflight_mapping += 1
+        try:
+            if not self._runtime.info().get("running", False):
+                return self._error(
+                    "navigation_runtime_unavailable",
+                    "an owned ControlledSemanticSpatial child process is not running; "
+                    "stop and restart the card",
+                )
+            if mapping_operation:
+                with self._lock:
+                    if (ticket is not self._generation or self._stop_requested.is_set()
+                            or not self._started):
+                        return self._error("navigation_stopping", "navigation admission expired")
+                return self._mapping.dispatch("fast_livo2", args)
+            if action in NAV2_ACTIONS:
+                return self._dispatch_planning(ticket, args)
+            if action == "navigate":
+                navigate = getattr(self._semantic, "navigate_with_ticket", None)
+                if not callable(navigate):
+                    return self._error(
+                        "semantic_admission_unavailable",
+                        "semantic navigation does not support lifecycle tickets",
+                    )
+                return navigate(args, ticket)
+            return self._semantic.dispatch("vln", args)
+        finally:
+            if semantic_operation or mapping_operation:
+                with self._lock:
+                    if semantic_operation:
+                        self._inflight_semantic -= 1
+                    if mapping_operation:
+                        self._inflight_mapping -= 1
+
+    def _dispatch_planning(self, ticket, args: dict) -> dict:
+        with self._lock:
+            if (ticket is None or ticket is not self._generation
+                    or self._stop_requested.is_set() or not self._started):
+                return self._error("navigation_stopping", "navigation admission expired")
+            self._inflight_planning += 1
+        try:
             return self._planning.dispatch("nav2", args)
-        return self._semantic.dispatch("vln", args)
+        finally:
+            with self._lock:
+                self._inflight_planning -= 1
 
     def stop(self) -> dict:
         return self._stop()
@@ -151,11 +199,15 @@ class NavigationPlugin:
         self._stop()
 
     def _start(self, args: dict) -> dict:
+        if self._stop_requested.is_set():
+            return self._error("navigation_start_cancelled", "stop was requested")
         with self._transition_lock:
             return self._start_serialized(args)
 
     def _start_serialized(self, args: dict) -> dict:
         with self._lock:
+            if self._stop_requested.is_set():
+                return self._error("navigation_start_cancelled", "stop was requested")
             if self._started:
                 result = self._info()
                 result["already_started"] = True
@@ -169,14 +221,16 @@ class NavigationPlugin:
         started: list[tuple[str, object]] = []
         try:
             self._set_mapping_runtime_active(True)
+            started.append(("runtime", self._runtime))
             runtime_result = self._runtime.start(
                 namespace=self._namespace,
                 input_topics=wiring["wired_topics"],
             )
             if runtime_result.get("state") != "running":
                 raise RuntimeError("navigation child processes did not stay running")
-            started.append(("runtime", self._runtime))
+            self._check_start_cancelled()
 
+            started.append(("mapping", self._mapping))
             mapping_result = self._mapping.dispatch(
                 "fast_livo2",
                 {
@@ -189,7 +243,7 @@ class NavigationPlugin:
                 },
             )
             self._require_started("mapping", mapping_result)
-            started.append(("mapping", self._mapping))
+            self._check_start_cancelled()
 
             planner_bindings = [
                 {
@@ -210,8 +264,10 @@ class NavigationPlugin:
                 "instance_id": args.get("instance_id"),
                 "input_bindings": planner_bindings,
             }
+            started.append(("planning", self._planning))
             planning_result = self._planning.dispatch("nav2", planning_start)
             if self._is_transient_planning_discovery_failure(planning_result):
+                self._check_start_cancelled()
                 if not self._runtime.info().get("running", False):
                     raise RuntimeError(
                         "planning start failed after a navigation child process exited"
@@ -221,13 +277,17 @@ class NavigationPlugin:
                     "discovered on the first attempt; rebuilding only the planning "
                     "bridge before rollback"
                 )
-                time.sleep(0.25)
+                # Wake promptly for stop and recheck immediately before retry.
+                # A stop racing after this check still requires normal rollback.
+                self._stop_requested.wait(0.25)
+                self._check_start_cancelled()
                 planning_result = self._planning.dispatch("nav2", planning_start)
             self._require_started("planning", planning_result)
-            started.append(("planning", self._planning))
+            self._check_start_cancelled()
 
             rgb_topic = wiring["wired_topics"].get("rgb")
             if rgb_topic:
+                started.append(("semantic", self._semantic))
                 semantic_result = self._semantic.dispatch(
                     "vln",
                     {
@@ -248,46 +308,97 @@ class NavigationPlugin:
                     },
                 )
                 self._require_started("semantic", semantic_result)
-                started.append(("semantic", self._semantic))
+                self._check_start_cancelled()
+            with self._lock:
+                self._check_start_cancelled()
+                self._started = True
+                self._generation = object()
+                self._instance_id = str(args.get("instance_id") or "default").strip()
+                self._external_wiring = dict(wiring["wired_topics"])
         except Exception as exc:
             log.error(
                 "[ControlledSemanticSpatial] start failed: %s",
                 exc,
                 exc_info=True,
             )
-            cleanup = self._stop_started(started)
-            self._set_mapping_runtime_active(False)
+            cancelled = self._stop_requested.is_set()
+            cleanup, cleanup_confirmed = self._stop_started(started)
+            if cleanup_confirmed:
+                self._set_mapping_runtime_active(False)
+            else:
+                with self._lock:
+                    self._stop_requested.set()
             return self._error(
-                "navigation_start_failed",
-                str(exc),
-                cleanup=cleanup,
+                "navigation_start_cancelled" if cancelled else "navigation_start_failed",
+                str(exc), cleanup=cleanup, cleanup_confirmed=cleanup_confirmed,
             )
 
-        with self._lock:
-            self._started = True
-            self._instance_id = str(args.get("instance_id") or "default").strip()
-            self._external_wiring = dict(wiring["wired_topics"])
         result = self._info()
         result.update({"state": "ready", "status": "ready"})
         return result
 
+    def _check_start_cancelled(self) -> None:
+        if self._stop_requested.is_set():
+            raise RuntimeError("navigation start cancelled by stop")
+
     def _stop(self) -> dict:
+        # Signal before taking the transition lock; never tear down a live request.
+        with self._lock:
+            self._pending_stops += 1
+            self._stop_requested.set()
         with self._transition_lock:
-            return self._stop_serialized()
+            confirmed = False
+            try:
+                result = self._stop_serialized()
+                confirmed = self._stop_confirmed(result) or (
+                    isinstance(result, dict)
+                    and result.get("error_code") == "navigation_stop_failed"
+                    and result.get("terminal_confirmed") is True
+                    and result.get("canvas_wired") is False
+                )
+                return result
+            finally:
+                # Keep result accounting inside the transition: a later stop's
+                # pending result must not be cleared by an earlier success.
+                with self._lock:
+                    self._pending_stops -= 1
+                    if confirmed and self._pending_stops == 0:
+                        self._stop_requested.clear()
 
     def _stop_serialized(self) -> dict:
         results = {}
-        # Block new semantic goals and motion before waiting for map persistence.
-        # Both stops are idempotent, so a retry can safely repeat them while the
-        # mapping process stays alive long enough to finish its transaction.
-        for name, plugin, prefix in (
-            ("semantic", self._semantic, "vln"),
-            ("planning", self._planning, "nav2"),
-        ):
-            try:
-                results[name] = plugin.dispatch(prefix, {"action": "stop"})
-            except Exception as exc:
-                results[name] = self._error("component_stop_failed", str(exc))
+        # A request admitted before stop may not yet have entered the planner.
+        # Stop it promptly, but never tear down until every such call has
+        # returned and a *subsequent* planner stop is confirmed.
+        with self._lock:
+            planning_was_inflight = self._inflight_planning > 0
+            semantic_was_inflight = self._inflight_semantic > 0
+            mapping_was_inflight = self._inflight_mapping > 0
+        try:
+            if planning_was_inflight or semantic_was_inflight or mapping_was_inflight:
+                cancel = getattr(self._planning, "stop_active_only", None)
+                if callable(cancel):
+                    results["planning"] = cancel()
+                else:
+                    results["planning"] = self._error(
+                        "navigation_stop_pending",
+                        "planner does not support non-releasing cancellation",
+                    )
+            else:
+                results["planning"] = self._planning.dispatch("nav2", {"action": "stop"})
+        except Exception as exc:
+            results["planning"] = self._error("component_stop_failed", str(exc))
+        with self._lock:
+            planning_inflight = self._inflight_planning > 0
+            semantic_inflight = self._inflight_semantic > 0
+            mapping_inflight = self._inflight_mapping > 0
+        if (planning_was_inflight or semantic_was_inflight or mapping_was_inflight
+                or planning_inflight or semantic_inflight or mapping_inflight):
+            return self._error(
+                "navigation_stop_pending",
+                "navigation requests are still settling; retry stop",
+                component_results=results, retryable=True, canvas_wired=True,
+            )
 
         planning_result = results["planning"]
         if not self._stop_confirmed(planning_result):
@@ -300,6 +411,10 @@ class NavigationPlugin:
                 canvas_wired=True,
             )
 
+        try:
+            results["semantic"] = self._semantic.dispatch("vln", {"action": "stop"})
+        except Exception as exc:
+            results["semantic"] = self._error("component_stop_failed", str(exc))
         semantic_result = results["semantic"]
         if not self._stop_confirmed(semantic_result):
             return self._error(
@@ -321,7 +436,7 @@ class NavigationPlugin:
         except Exception as exc:
             results["mapping"] = self._error("component_stop_failed", str(exc))
         mapping_result = results["mapping"]
-        if not self._stop_confirmed(mapping_result):
+        if not self._mapping_stop_confirmed(mapping_result):
             return self._error(
                 "navigation_stop_pending",
                 "mapping finalization is unconfirmed; retry stop without restarting "
@@ -331,6 +446,11 @@ class NavigationPlugin:
                 canvas_wired=True,
             )
 
+        if (isinstance(mapping_result, dict)
+                and mapping_result.get("status") == "error"):
+            with self._lock:
+                self._last_terminal_stop_error = dict(mapping_result)
+                self._pending_terminal_stop_error = dict(mapping_result)
         try:
             results["runtime"] = self._runtime.stop()
         except Exception as exc:
@@ -343,11 +463,21 @@ class NavigationPlugin:
                 retryable=True,
                 canvas_wired=True,
             )
+        if not self._runtime_stop_confirmed(results["runtime"]):
+            return self._error(
+                "navigation_stop_pending", "runtime shutdown is unconfirmed; retry stop",
+                component_results=results, retryable=True, canvas_wired=True,
+            )
         self._set_mapping_runtime_active(False)
         with self._lock:
             self._started = False
+            self._generation = None
             self._instance_id = ""
             self._external_wiring = {}
+            terminal_mapping_error = self._pending_terminal_stop_error
+            self._pending_terminal_stop_error = None
+        if terminal_mapping_error is not None:
+            results["mapping"] = terminal_mapping_error
         failures = [
             name
             for name, result in results.items()
@@ -371,19 +501,41 @@ class NavigationPlugin:
             "physical_execution": False,
         }
 
+    @classmethod
+    def _runtime_stop_confirmed(cls, result) -> bool:
+        if not cls._stop_confirmed(result):
+            return False
+        children = result.get("children")
+        if children is None:
+            # Compatibility with injected runtimes which expose only a summary.
+            return result.get("running") is False
+        return (isinstance(children, list)
+                and all(isinstance(child, dict) and child.get("running") is False
+                        for child in children))
+
+    @classmethod
+    def _mapping_stop_confirmed(cls, result) -> bool:
+        # Mapping's protocol separately reports a failed map transaction whose
+        # resources have nevertheless reached a confirmed terminal state.
+        return cls._stop_confirmed(result) or (
+            isinstance(result, dict)
+            and result.get("state") == "error"
+            and result.get("status") == "error"
+            and result.get("terminal_confirmed") is True
+            and result.get("canvas_wired") is not True
+            and result.get("retryable") is not True
+        )
+
     @staticmethod
     def _stop_confirmed(result) -> bool:
-        return (
-            isinstance(result, dict)
-            and (
-                result.get("terminal_confirmed") is True
-                or (
-                    result.get("ok") is not False
-                    and (result.get("status") or result.get("state"))
-                    in {"idle", "stopped", "disabled"}
-                )
-            )
-        )
+        if not isinstance(result, dict) or result.get("ok") is False:
+            return False
+        if result.get("error") or result.get("error_code"):
+            return False
+        statuses = [result[key] for key in ("status", "state") if result.get(key) is not None]
+        if not statuses or any(status not in {"idle", "stopped", "disabled"} for status in statuses):
+            return False
+        return result.get("terminal_confirmed") is not False
 
     def _set_mapping_runtime_active(self, active: bool) -> None:
         setter = getattr(self._mapping, "set_runtime_active", None)
@@ -660,7 +812,9 @@ class NavigationPlugin:
             )
         return {"wired_topics": wired}
 
-    def _handle_semantic_goal(self, goal: dict, *, control_nav_id=None) -> dict:
+    def _handle_semantic_goal(
+        self, goal: dict, *, control_nav_id=None, admission_ticket=None
+    ) -> dict:
         request = {
             "action": "navigate_to_pose",
             "x": goal["x"],
@@ -670,10 +824,7 @@ class NavigationPlugin:
         }
         if control_nav_id is not None:
             request["_control_nav_id"] = control_nav_id
-        return self._planning.dispatch(
-            "nav2",
-            request,
-        )
+        return self._dispatch_planning(admission_ticket, request)
 
     def _info(self) -> dict:
         tool = self.get_tools()[0]
@@ -682,10 +833,13 @@ class NavigationPlugin:
             instance_id = self._instance_id
             wired = dict(self._external_wiring)
             config_error = self._config_error
+            last_terminal_stop_error = self._last_terminal_stop_error
         runtime_info = self._runtime.info()
         runtime_failed = started and not runtime_info.get("running", False)
         state = (
-            "error"
+            "stopping"
+            if self._stop_requested.is_set()
+            else "error"
             if config_error or runtime_failed
             else "ready"
             if started
@@ -698,6 +852,7 @@ class NavigationPlugin:
             "status": state,
             "canvas_wired": started,
             "instance_id": instance_id or None,
+            "last_terminal_stop_error": last_terminal_stop_error,
             "runtime": runtime_info,
             "mapping": self._mapping.dispatch("fast_livo2", {"action": "info"}),
             "planning": self._planning.dispatch("nav2", {"action": "info"}),
@@ -726,7 +881,7 @@ class NavigationPlugin:
             "physical_execution": False,
         }
 
-    def _stop_started(self, started: list[tuple[str, object]]) -> dict:
+    def _stop_started(self, started: list[tuple[str, object]]) -> tuple[dict, bool]:
         results = {}
         for name, component in reversed(started):
             try:
@@ -741,7 +896,19 @@ class NavigationPlugin:
                     results[name] = component.dispatch(prefix, {"action": "stop"})
             except Exception as exc:
                 results[name] = self._error("cleanup_failed", str(exc))
-        return results
+            if name == "mapping":
+                confirmed = self._mapping_stop_confirmed(results[name])
+                if (confirmed and isinstance(results[name], dict)
+                        and results[name].get("status") == "error"):
+                    with self._lock:
+                        self._last_terminal_stop_error = dict(results[name])
+            elif name == "runtime":
+                confirmed = self._runtime_stop_confirmed(results[name])
+            else:
+                confirmed = self._stop_confirmed(results[name])
+            if not confirmed:
+                return results, False
+        return results, True
 
     @staticmethod
     def _require_started(name: str, result: dict | None) -> None:

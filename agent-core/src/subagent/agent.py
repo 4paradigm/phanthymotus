@@ -60,6 +60,9 @@ class Subagent:
         self.updated_at: float = time.time()
         self.rounds_completed: int = 0
         self.result: SubagentResult | None = None
+        # Captured by the manager at submission, not by its long-lived scheduler.
+        # None preserves independent (non-project-turn) submissions.
+        self.dispatch_admission = None
 
         # Chat-history mirror. Turns are written as they finish rather than in one
         # batch at completion — a background agent that runs for minutes was
@@ -86,6 +89,16 @@ class Subagent:
         # what lets a delegator tell "spoke the line" from "queued it and the
         # callback never came".
         self._action_ids: list[str] = []
+
+    def _admitted(self) -> bool:
+        predicate = self.dispatch_admission
+        if predicate is None:
+            return True
+        try:
+            return bool(predicate())
+        except Exception as exc:
+            print(f'[subagent:{self.id}] admission failed closed: {exc}')
+            return False
 
     @property
     def context(self) -> SubagentContext:
@@ -339,6 +352,9 @@ class Subagent:
 
         try:
             for round_idx in range(self.spec.max_rounds):
+                # A project-originated run must not resume work in a later epoch.
+                if not self._admitted():
+                    self.cancel('project lifecycle ended')
                 # Check cancel/pause signals
                 if self._cancel_event.is_set():
                     self.result = SubagentResult(
@@ -399,6 +415,12 @@ class Subagent:
                         continue
                     raise
 
+                # The model await can span stop/restart. Do not dispatch its
+                # response, even when the project is running again in a new epoch.
+                if not self._admitted():
+                    self.cancel('project lifecycle ended')
+                    raise RuntimeError('project lifecycle ended')
+
                 # Process response
                 round_messages = []
                 content = response.get('content', '')
@@ -440,6 +462,9 @@ class Subagent:
 
                         # Dispatch
                         result_text = await self._dispatch_tool(fn_name, fn_args)
+                        if not self._admitted():
+                            self.cancel('project lifecycle ended')
+                            break
 
                         # Check for terminal tools
                         if fn_name == 'subagent_finish':
@@ -459,6 +484,10 @@ class Subagent:
                             'name': fn_name,
                             'round': round_idx,
                         })
+
+                if not self._admitted():
+                    self.cancel('project lifecycle ended')
+                    raise RuntimeError('project lifecycle ended')
 
                 # Add round to context
                 self._context.add_turn(round_messages)
@@ -735,6 +764,8 @@ class Subagent:
 
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         """Dispatch a tool call and return result text."""
+        if not self._admitted():
+            return '[not dispatched] project lifecycle ended'
         # Subagent system tools
         if name == 'subagent_finish':
             await self._settle_own_actions()
@@ -788,14 +819,19 @@ class Subagent:
                 #
                 # `self._cancel_event` so a cancelled subagent stops waiting rather
                 # than holding its slot for the full playback.
-                from event.llm import _acp_barrier, _needs_barrier
+                from event.llm import _acp_barrier, _needs_barrier, _not_dispatched
                 _parallel = mcp_client.take_parallel_flag(args)
                 _bar_needed, _bar_want = _needs_barrier(name, args)
                 if _bar_needed:
-                    await _acp_barrier(f'subagent:{self.id}/{name}',
-                                       self._cancel_event,
-                                       want=_bar_want, scoped=True,
-                                       concurrent=_parallel)
+                    _barrier_result = await _acp_barrier(
+                        f'subagent:{self.id}/{name}', self._cancel_event,
+                        want=_bar_want, scoped=True, concurrent=_parallel)
+                    if (_barrier_result is not None and
+                            _barrier_result.get('status') not in ('completed', 'no_pending')):
+                        return json.dumps(_not_dispatched(name, _barrier_result),
+                                          ensure_ascii=False)
+                if not self._admitted():
+                    return '[not dispatched] project lifecycle ended'
                 result = await mcp_client.call_tool(name, args)
                 self._note_action_id(result)
                 if isinstance(result, dict):
@@ -817,10 +853,17 @@ class Subagent:
                 #   16:32:24.343  own pending speak-de3a6c33 (plays to 16:32:40)
                 #   16:32:27.296  peer_call(make Orin5 speak)   <- 2.9s in, no wait
                 # Same shape as the main-loop bug, one layer lower.
-                from event.llm import _acp_barrier, _sys_tool_needs_barrier
+                from event.llm import _acp_barrier, _not_dispatched, _sys_tool_needs_barrier
                 if _sys_tool_needs_barrier(name):
-                    await _acp_barrier(f'subagent:{self.id}/{name}',
-                                       self._cancel_event, scoped=False)
+                    _barrier_result = await _acp_barrier(
+                        f'subagent:{self.id}/{name}', self._cancel_event, scoped=False)
+                    if (_barrier_result is not None and
+                            _barrier_result.get('status') not in ('completed', 'no_pending')):
+                        return json.dumps(_not_dispatched(name, _barrier_result),
+                                          ensure_ascii=False)
+                # The ACP barrier may have waited across a project restart.
+                if not self._admitted():
+                    return '[not dispatched] project lifecycle ended'
                 fn = _event_instance._sys_tools[name]['object']
                 result = await fn(**args)
                 if isinstance(result, list):

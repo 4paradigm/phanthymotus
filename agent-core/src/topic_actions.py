@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -41,6 +42,7 @@ class TopicActionRoute:
     allowed_fields: tuple[str, ...]
     required_fields: tuple[str, ...]
     input_schema: dict[str, Any]
+    id_pattern: str | None = None
 
 
 @dataclass
@@ -182,6 +184,14 @@ def build_routes(layout: dict[str, Any]) -> list[TopicActionRoute]:
         schema = declaration.get("schema")
         id_field = declaration.get("id_field")
         id_argument = declaration.get("id_argument")
+        id_pattern = declaration.get("id_pattern")
+        if "id_pattern" in declaration:
+            if not isinstance(id_pattern, str) or not id_pattern:
+                raise ValueError(f"invalid id_pattern for x-topic-actions port {port!r}")
+            try:
+                re.compile(id_pattern)
+            except (re.error, OverflowError, RecursionError) as exc:
+                raise ValueError(f"invalid id_pattern for x-topic-actions port {port!r}") from exc
         allowed_fields = declaration.get("allowed_fields")
         required_fields = declaration.get("required_fields", [])
         if not all(isinstance(value, str) and value for value in (action, schema, id_field)):
@@ -220,6 +230,7 @@ def build_routes(layout: dict[str, Any]) -> list[TopicActionRoute]:
                 allowed_fields=tuple(allowed_fields),
                 required_fields=tuple(required_fields),
                 input_schema=input_schema,
+                id_pattern=id_pattern,
             )
         )
 
@@ -247,8 +258,10 @@ class TopicActionManager:
         for runtime in runtimes.values():
             route = runtime.route
 
-            async def _callback(data: bytes, _fmt: str, *, key: str = route.key) -> None:
-                await self._handle(key, data)
+            async def _callback(
+                data: bytes, _fmt: str, *, expected: RouteRuntime = runtime
+            ) -> None:
+                await self._handle(expected, data)
 
             if ros2_bridge.subscribe(
                 route.key, route.topic, route.fmt, loop, _callback
@@ -260,25 +273,39 @@ class TopicActionManager:
                 f"target={route.mcp_id}/{route.tool_name}:{route.action}"
             )
 
-    async def stop(self) -> None:
+    def deactivate(self) -> None:
+        """Close local admission without cancelling requests already in flight.
+
+        This does not cancel or confirm any remote action.  The manager keeps
+        tracking callbacks until they finish; start/stop still drain them.
+        """
         runtimes = list(self._runtimes.values())
         self._runtimes.clear()
         for runtime in runtimes:
-            ros2_bridge.unsubscribe(runtime.route.key)
+            try:
+                ros2_bridge.unsubscribe(runtime.route.key)
+            except Exception as exc:
+                print(f"[topic-actions] unsubscribe failed for "
+                      f"{runtime.route.key}: {exc}")
+        if runtimes:
+            print(f"[topic-actions] deactivated {len(runtimes)} route(s)")
+
+    async def stop(self) -> None:
+        self.deactivate()
         current = asyncio.current_task()
         inflight = [task for task in self._inflight if task is not current]
         if inflight:
-            await asyncio.gather(*inflight, return_exceptions=True)
-        if runtimes:
-            print(f"[topic-actions] stopped {len(runtimes)} route(s)")
+            # A cancelled caller must not cancel callbacks whose remote outcome
+            # may be unknown.  _inflight retains ownership until each finishes.
+            await asyncio.shield(asyncio.gather(*inflight, return_exceptions=True))
 
-    async def _handle(self, key: str, data: bytes) -> None:
+    async def _handle(self, runtime: RouteRuntime, data: bytes) -> None:
         task = asyncio.current_task()
         if task is not None:
             self._inflight.add(task)
         try:
-            runtime = self._runtimes.get(key)
-            if runtime is None:
+            key = runtime.route.key
+            if self._runtimes.get(key) is not runtime:
                 return
             runtime.received += 1
 
@@ -306,16 +333,16 @@ class TopicActionManager:
                     runtime.duplicates += 1
                     return
                 try:
-                    from api.mcp_manage import MCPCallRequest, mcp_call_tool
-
                     result = await asyncio.wait_for(
-                        mcp_call_tool(
-                            runtime.route.mcp_id,
-                            MCPCallRequest(tool=runtime.route.tool_name, arguments=args),
+                        mcp_client.call_tool_hook(
+                            runtime.route.mcp_id, runtime.route.tool_name, args,
+                            barrier_aware=True, conservative_resources=True,
+                            timeout_s=_DISPATCH_TIMEOUT_SEC,
                         ),
                         timeout=_DISPATCH_TIMEOUT_SEC,
                     )
-                    error = _mcp_error(result)
+                    error = (result.get("error") or result.get("skipped")
+                             or _mcp_error({"code": 200, "data": result}))
                     if error:
                         raise RuntimeError(error)
                     runtime.dispatched += 1
@@ -349,6 +376,8 @@ class TopicActionManager:
             raise ValueError(f"{route.id_field} must be a non-empty string")
         if len(message_id) > 256:
             raise ValueError(f"{route.id_field} exceeds 256 characters")
+        if route.id_pattern is not None and re.fullmatch(route.id_pattern, message_id) is None:
+            raise ValueError(f"{route.id_field} does not match the declared pattern")
 
         permitted = {"schema", route.id_field, *route.allowed_fields}
         unknown = sorted(set(payload) - permitted)

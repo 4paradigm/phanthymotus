@@ -502,6 +502,17 @@ class ProcessorTests(unittest.TestCase):
         self.assertIsNotNone(factory.instances[0].wait_args["after_monotonic"])
         self.assertEqual(len(factory.instances[0].published), 0)
 
+    def test_capture_does_not_log_remote_description(self):
+        description = "REMOTE\n\x1b[31m" + "x" * 10000
+        plugin = _plugin(FakeClient([{"description": description}]), FakeBridgeFactory())
+        with self.assertLogs("plugins.navigation.semantic.processor", level="INFO") as captured:
+            result = plugin.dispatch("vln", {"action": "capture"})
+        self.assertTrue(result["ok"])
+        text = "\n".join(captured.output)
+        self.assertNotIn("REMOTE", text)
+        self.assertIn("description_chars=", text)
+        self.assertLess(len(text), 500)
+
     def test_capture_timeout_does_not_create_partial_point(self):
         factory = FakeBridgeFactory(snapshot=None)
         plugin = _plugin(FakeClient([]), factory)

@@ -163,7 +163,9 @@ class FastLivo2Core:
                     {"status": "stopped", "already_idle": True, "map_name": None},
                 )
             result = dict(self._backend.execute(action, {"map_name": active_map}))
-            if result.get("status") in {"stopped", "saved", "idle"}:
+            if (result.get("status") in {"stopped", "saved", "idle"}
+                    and result.get("terminal_confirmed") is not False
+                    and not result.get("error") and not result.get("error_code")):
                 with self._lock:
                     self._active_map = None
             return self._result(action, result)
@@ -204,21 +206,26 @@ class FastLivo2Core:
             result = dict(
                 self._backend.execute("unload_map", {"map_name": loaded_map})
             )
-            if result.get("status") not in {"unloaded", "stopped", "idle"}:
+            if (result.get("status") not in {"unloaded", "stopped", "idle"}
+                    or result.get("terminal_confirmed") is False
+                    or result.get("error") or result.get("error_code")):
                 return self._error(
                     "stop_localization",
                     "localization_stop_unconfirmed",
                     f"failed to stop localization for map {loaded_map}",
                 )
         except FastLivo2BackendError as exc:
-            if "loaded_map" in exc.details:
+            if ("loaded_map" in exc.details
+                    and (isinstance(exc.details["loaded_map"], str)
+                         or exc.details.get("terminal_confirmed") is True)):
                 with self._lock:
                     restored = exc.details.get("loaded_map")
                     self._loaded_map = (
                         str(restored) if isinstance(restored, str) else None
                     )
             error = self._error("stop_localization", exc.code, str(exc))
-            for key in ("loaded_map", "runtime_mode", "retryable"):
+            for key in ("loaded_map", "runtime_mode", "retryable", "terminal_confirmed",
+                        "algorithm_stop_error"):
                 if key in exc.details:
                     error[key] = exc.details[key]
             return error
@@ -239,8 +246,9 @@ class FastLivo2Core:
                 return dict(self._backend.execute("configure_collection", dict(config)))
             except FastLivo2BackendError as exc:
                 error = self._error("configure_collection", exc.code, str(exc))
-                if "retryable" in exc.details:
-                    error["retryable"] = exc.details["retryable"]
+                for key in ("retryable", "terminal_confirmed", "receipt"):
+                    if key in exc.details:
+                        error[key] = exc.details[key]
                 return error
             except Exception as exc:
                 return self._error(

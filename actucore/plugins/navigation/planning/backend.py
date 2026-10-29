@@ -22,6 +22,13 @@ _TERMINAL = {
     "rejected",
 }
 
+def _is_confirmed_terminal(payload: dict) -> bool:
+    status = payload.get("status") or payload.get("state")
+    return status in _TERMINAL and (
+        status != "error" or payload.get("terminal_confirmed") is True
+    )
+
+
 _VELOCITY_LIMIT_FIELDS = (
     "min_x_mps",
     "max_x_mps",
@@ -109,6 +116,9 @@ class RosTopicNavigationBackend:
         self._condition = threading.Condition()
         self._responses: dict[str, dict] = {}
         self._navigation: dict[str, dict] = {}
+        # Per-call entries exist only until the request exits; this is not a
+        # lifecycle tombstone and does not fence future calls using the same ID.
+        self._pending_goal_commands: dict[object, tuple[str | None, bool]] = {}
         self._last_status: dict = {
             "state": "waiting_for_nav2_runtime",
             "shadow_only": True,
@@ -179,7 +189,11 @@ class RosTopicNavigationBackend:
             if payload.get("event") == "response" and isinstance(request_id, str):
                 self._responses[request_id] = payload
             nav_id = payload.get("nav_id")
-            if isinstance(nav_id, str) and nav_id:
+            if (
+                payload.get("event") in ("navigation_status", "heartbeat")
+                and isinstance(nav_id, str)
+                and nav_id
+            ):
                 previous = self._navigation.get(nav_id, {})
                 progress_seq = payload.get("progress_seq")
                 if progress_seq != previous.get("progress_seq"):
@@ -189,8 +203,7 @@ class RosTopicNavigationBackend:
                         "progress_received_at", time.monotonic()
                     )
                 self._navigation[nav_id] = dict(payload)
-                status = payload.get("status") or payload.get("state")
-                if status in _TERMINAL and self._terminal_callback is not None:
+                if _is_confirmed_terminal(payload) and self._terminal_callback is not None:
                     terminal_callback = self._terminal_callback
                     terminal_payload = dict(payload)
             self._condition.notify_all()
@@ -213,32 +226,57 @@ class RosTopicNavigationBackend:
             time.sleep(0.05)
 
     def _request(self, action: str, args: dict, *, nav_id: str | None) -> dict:
-        self._wait_for_bridge()
-        request_id = uuid.uuid4().hex
-        payload = _build_command_payload(
-            request_id=request_id,
-            nav_id=nav_id,
-            action=action,
-            args=args,
-            velocity_limits=self._velocity_limits,
-        )
-        message = self._String()
-        message.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        token = None
         with self._condition:
-            self._command_pub.publish(message)
-            deadline = time.monotonic() + self._request_timeout
-            while request_id not in self._responses:
+            if action in ("navigate_to_pose", "resume_nav"):
+                token = object()
+                self._pending_goal_commands[token] = (nav_id, False)
+            elif action == "stop_nav" and isinstance(nav_id, str) and nav_id:
+                # Fence already-registered calls before discovery or stop publish.
+                for pending, (pending_nav_id, blocked) in self._pending_goal_commands.items():
+                    if pending_nav_id == nav_id and not blocked:
+                        self._pending_goal_commands[pending] = (pending_nav_id, True)
+        try:
+            self._wait_for_bridge()
+            request_id = uuid.uuid4().hex
+            payload = _build_command_payload(
+                request_id=request_id,
+                nav_id=nav_id,
+                action=action,
+                args=args,
+                velocity_limits=self._velocity_limits,
+            )
+            message = self._String()
+            message.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            with self._condition:
                 if self._closed:
-                    raise NavigationBackendError("backend_closed", "backend is closed")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
                     raise NavigationBackendError(
-                        "nav2_response_timeout",
-                        f"Nav2 runtime did not answer {action} within "
-                        f"{self._request_timeout:.1f}s",
+                        "backend_closed", "backend is closed", outcome_known=True
                     )
-                self._condition.wait(timeout=remaining)
-            return self._responses.pop(request_id)
+                if token is not None and self._pending_goal_commands[token][1]:
+                    raise NavigationBackendError(
+                        "navigation_command_stopped",
+                        "navigation command was fenced before publish by stop_nav",
+                        outcome_known=True,
+                    )
+                self._command_pub.publish(message)
+                deadline = time.monotonic() + self._request_timeout
+                while request_id not in self._responses:
+                    if self._closed:
+                        raise NavigationBackendError("backend_closed", "backend is closed")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise NavigationBackendError(
+                            "nav2_response_timeout",
+                            f"Nav2 runtime did not answer {action} within "
+                            f"{self._request_timeout:.1f}s",
+                        )
+                    self._condition.wait(timeout=remaining)
+                return self._responses.pop(request_id)
+        finally:
+            if token is not None:
+                with self._condition:
+                    self._pending_goal_commands.pop(token, None)
 
     def _wait_navigation(self, nav_id: str, stall_timeout: float) -> dict:
         with self._condition:
@@ -250,7 +288,7 @@ class RosTopicNavigationBackend:
                 state = self._navigation.get(nav_id)
                 if state:
                     status = state.get("status") or state.get("state")
-                    if status in _TERMINAL:
+                    if _is_confirmed_terminal(state):
                         return dict(state)
                     if status == "paused":
                         return dict(state)
@@ -264,7 +302,7 @@ class RosTopicNavigationBackend:
 
         stop_result = self._request("stop_nav", {}, nav_id=nav_id)
         stop_status = stop_result.get("status")
-        terminal_confirmed = bool(stop_result.get("terminal_confirmed"))
+        terminal_confirmed = stop_result.get("terminal_confirmed") is True
         if stop_status not in {"stopped", "cancelled"} or not terminal_confirmed:
             raise NavigationBackendError(
                 "navigation_stalled_stop_unconfirmed",

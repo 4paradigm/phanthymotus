@@ -15,6 +15,7 @@ sys.path.insert(0, str(ACTUCORE_ROOT))
 from plugins.navigation.planning.core import (  # noqa: E402
     Nav2Core,
     NavigationBackendError,
+    _trusted_nav_id,
 )
 from plugins.navigation.planning.backend import (  # noqa: E402
     RosTopicNavigationBackend,
@@ -58,6 +59,18 @@ class Nav2CoreTest(unittest.TestCase):
         self.core = Nav2Core(
             self.backend, completion_callback=self.completions.append
         )
+
+    def test_trusted_nav_id_preserves_private_caller_compatibility(self) -> None:
+        # Private in-process callers are not limited to the topic goal schema.
+        for value, expected in ((" a/b ", "a/b"), ("é", "é"), ("a" * 128, "a" * 128)):
+            with self.subTest(value=value):
+                self.assertEqual(_trusted_nav_id({"_control_nav_id": value}), expected)
+        for value in ("", " ", "a b", "a" * 129, 1):
+            with self.subTest(value=value):
+                with self.assertRaises(NavigationBackendError) as error:
+                    _trusted_nav_id({"_control_nav_id": value})
+                self.assertEqual(error.exception.code, "invalid_control_nav_id")
+        self.assertIsNone(_trusted_nav_id({}))
 
     def test_navigation_uses_trusted_id_and_safe_default_speed(self) -> None:
         result = self.core.dispatch(
@@ -178,7 +191,8 @@ class Nav2CoreTest(unittest.TestCase):
             replay = self.core.dispatch(request)
 
         self.assertEqual(failed["error_code"], "backend_error")
-        self.assertEqual(replay["status"], "navigating")
+        self.assertEqual(replay["status"], "error")
+        self.assertEqual(replay["error_code"], "navigation_start_unknown")
         self.assertTrue(replay["idempotent_replay"])
         self.assertEqual(len(self.backend.calls), 1)
 

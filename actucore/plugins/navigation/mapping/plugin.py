@@ -122,6 +122,7 @@ class FastLivo2Plugin:
         self._lock = threading.RLock()
         self._core: FastLivo2Core | None = None
         self._canvas_started = False
+        self._terminal_stop_failures: dict[str, dict] = {}
         self._instance_id = ""
         self._wired_topics: dict[str, str] = {}
         self._config_error: str | None = None
@@ -322,11 +323,14 @@ class FastLivo2Plugin:
         with self._lock:
             core = self._core
         stop_result = None
+        map_stop_attempted = False
         if core is not None:
             info = core.info()
             if info.get("active_map"):
+                map_stop_attempted = True
                 stop_result = core.dispatch({"action": "stop_mapping"})
             elif info.get("loaded_map"):
+                map_stop_attempted = True
                 stop_result = core.stop_localization()
             collection_stop_result = core.configure_collection(
                 {
@@ -341,26 +345,52 @@ class FastLivo2Plugin:
             self._collection_controller.enqueue_receipt(
                 collection_stop_result.get("receipt")
             )
+        # A transitional, rejected, malformed, or contradictory response is
+        # not evidence that the associated resource is stopped. Only the
+        # runtime's known terminal statuses (or an explicitly terminal business
+        # error) permit releasing the core.
+        checks = []
+        if map_stop_attempted:
+            checks.append(("mapping", stop_result, {"stopped", "saved", "idle", "unloaded"}))
+        if core is not None:
+            checks.append(("collection", collection_stop_result, {"disabled", "collection_saved"}))
         failures = [
-            result
-            for result in (stop_result, collection_stop_result)
-            if isinstance(result, dict) and result.get("status") == "error"
+            (name, result) for name, result, statuses in checks
+            if not isinstance(result, dict)
+            or result.get("status") not in statuses
+            or result.get("terminal_confirmed") is False
+            or result.get("error") or result.get("error_code")
+            or result.get("algorithm_stop_error")
         ]
-        if failures:
-            terminal_confirmed = all(
-                result.get("terminal_confirmed") is True for result in failures
-            )
+        unconfirmed = []
+        for name, result in failures:
+            if (isinstance(result, dict)
+                    and result.get("terminal_confirmed") is True
+                    and (result.get("status") == "error"
+                         or bool(result.get("algorithm_stop_error")))):
+                self._terminal_stop_failures[name] = dict(result)
+            else:
+                unconfirmed.append(result)
+        if failures or self._terminal_stop_failures:
+            terminal_confirmed = not unconfirmed
+            terminal_failures = dict(self._terminal_stop_failures)
             if terminal_confirmed:
                 self._release_core()
                 self._collection_controller.set_runtime_active(False)
+                self._terminal_stop_failures.clear()
+            reported_failures = unconfirmed + list(terminal_failures.values())
             return {
                 "state": "error",
                 "status": "error",
                 "error_code": "canvas_stop_failed",
                 "error": "; ".join(
-                    str(result.get("error", result.get("error_code", "stop failed")))
-                    for result in failures
+                    str(result.get("error") or result.get("error_code")
+                        or result.get("algorithm_stop_error")
+                        or "stop outcome is unconfirmed")
+                    if isinstance(result, dict) else "invalid stop response"
+                    for result in reported_failures
                 ),
+                "terminal_stop_failures": terminal_failures,
                 "canvas_wired": not terminal_confirmed,
                 "stop_result": stop_result,
                 "collection_stop_result": collection_stop_result,

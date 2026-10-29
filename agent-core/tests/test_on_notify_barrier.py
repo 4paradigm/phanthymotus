@@ -196,7 +196,7 @@ class TestCallToolHookBarrierAware(_RegistryFixture):
         mcp_client._pending_resources['speak-1'] = frozenset({'mouth'})
 
         called = []
-        async def _direct(mcp_id, tool_name, args):
+        async def _direct(mcp_id, tool_name, args, *, timeout_s=5):
             called.append((mcp_id, tool_name, args))
             return {"state": "speaking", "action_id": "should-not-happen"}
 
@@ -214,7 +214,7 @@ class TestCallToolHookBarrierAware(_RegistryFixture):
     def test_registers_pending_when_it_dispatches(self):
         mcp_client.registry.update(_split_tts_registry())
 
-        async def _direct(mcp_id, tool_name, args):
+        async def _direct(mcp_id, tool_name, args, *, timeout_s=5):
             return {"state": "speaking", "action_id": "notify-1"}
 
         orig = mcp_client.call_tool_direct
@@ -232,6 +232,38 @@ class TestCallToolHookBarrierAware(_RegistryFixture):
         # A subsequent barrier-respecting call for the same resource must now see it.
         self.assertEqual(mcp_client.conflicting_pending(frozenset({'mouth'})), ['notify-1'])
 
+    def test_undeclared_resource_keeps_global_hook_semantics(self):
+        mcp_client.registry.update(_unsplit_tts_registry())
+        mcp_client.registry['dev2']['tool_meta']['mcp__dev2__tts']['resource'] = None
+        mcp_client._pending_actions['other'] = asyncio.Event()
+        mcp_client._pending_resources['other'] = frozenset({'base'})
+        hooks.register('dev2', 'tts', {'on_notify': {'action': 'speak'}})
+        self.assertFalse(hooks.notify_resource_busy())
+        called = []
+
+        async def _direct(mcp_id, tool_name, args, *, timeout_s=5):
+            called.append(args)
+            return {'state': 'speaking'}
+
+        orig = mcp_client.call_tool_direct
+        mcp_client.call_tool_direct = _direct
+        try:
+            out = asyncio.run(hooks.fire('on_notify', barrier_aware=True))
+        finally:
+            mcp_client.call_tool_direct = orig
+        self.assertEqual(len(called), 1)
+        self.assertEqual(out[0]['result'], {'state': 'speaking'})
+
+    def test_conservative_opt_in_skips_undeclared_resource(self):
+        mcp_client.registry.update(_unsplit_tts_registry())
+        mcp_client.registry['dev2']['tool_meta']['mcp__dev2__tts']['resource'] = None
+        mcp_client._pending_actions['other'] = asyncio.Event()
+        mcp_client._pending_resources['other'] = frozenset({'base'})
+        out = asyncio.run(mcp_client.call_tool_hook(
+            'dev2', 'tts', {'action': 'speak'}, barrier_aware=True,
+            conservative_resources=True))
+        self.assertEqual(out, {'skipped': 'resource busy'})
+
     def test_non_barrier_aware_bypasses_everything_unchanged(self):
         """Existing on_interrupt_* call sites must keep their old behaviour."""
         mcp_client.registry.update(_split_tts_registry())
@@ -240,7 +272,7 @@ class TestCallToolHookBarrierAware(_RegistryFixture):
         mcp_client._pending_resources['speak-1'] = frozenset({'mouth'})
 
         called = []
-        async def _direct(mcp_id, tool_name, args):
+        async def _direct(mcp_id, tool_name, args, *, timeout_s=5):
             called.append((mcp_id, tool_name, args))
             return {"state": "interrupted"}
 
@@ -285,7 +317,7 @@ class TestHooksFireBarrierAware(_RegistryFixture):
         hooks.register('dev1', 'tts', {'on_interrupt_speak': {'action': 'interrupt'}})
 
         called = []
-        async def _direct(mcp_id, tool_name, args):
+        async def _direct(mcp_id, tool_name, args, *, timeout_s=5):
             called.append((mcp_id, tool_name, args))
             return {"state": "interrupted"}
 
