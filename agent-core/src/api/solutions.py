@@ -1113,8 +1113,7 @@ async def _apply_canvas_locked(canvas: dict, mapping: dict) -> dict:
             c['toMcpId'] = target['mcpId']
         exec_connections.append(c)
 
-    old_layout = config.main.get('canvas_layout', {}) or {}
-    old_cards = old_layout.get('cards', [])
+    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
     new_layout = {
         'cards':           cards,
         'connections':     connections,
