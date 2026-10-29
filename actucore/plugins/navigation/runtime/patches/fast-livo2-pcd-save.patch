@@ -86,14 +86,14 @@
 +  return true;
 +}
 +}
- 
+
  using namespace Sophus;
  LIVMapper::LIVMapper(rclcpp::Node::SharedPtr &node, std::string node_name, const rclcpp::NodeOptions & options)
 @@ -653,12 +734,17 @@
- 
- void LIVMapper::savePCD() 
+
+ void LIVMapper::savePCD()
  {
--  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
+-  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0)
 +  if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0))
    {
 -    std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
@@ -101,7 +101,7 @@
 +    std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/" + raw_points_name;
      std::string downsampled_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_downsampled_points.pcd";
      pcl::PCDWriter pcd_writer;
- 
+
 +    RCLCPP_WARN(this->node->get_logger(),
 +      "PCD finalization started: rgb_points=%zu intensity_points=%zu interval=%d",
 +      pcl_wait_save->points.size(), pcl_wait_save_intensity->points.size(), pcd_save_interval);
@@ -113,9 +113,9 @@
        }
      }
      else
--    {      
+-    {
 -      pcd_writer.writeBinary(raw_points_dir, *pcl_wait_save_intensity);
--      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir 
+-      std::cout << GREEN << "Raw point cloud data saved to: " << raw_points_dir
 -                << " with point count: " << pcl_wait_save_intensity->points.size() << RESET << std::endl;
 +    {
 +      std::size_t written_points = 0;
@@ -131,10 +131,10 @@
  }
 @@ -1401,19 +1492,36 @@
        string all_points_dir(string(string(ROOT_DIR) + "Log/pcd/") + ss_time.str() + string(".pcd"));
- 
+
        pcl::PCDWriter pcd_writer;
 +      bool saved = true;
- 
+
        cout << "current scan saved to " << all_points_dir << endl;
        if (pcl_wait_save->points.size() > 0)
        {
@@ -169,5 +169,5 @@
        }
 -      scan_wait_num = 0;
      }
-     
+
      if(LidarMeasures.lio_vio_flg == LIO || LidarMeasures.lio_vio_flg == LO)

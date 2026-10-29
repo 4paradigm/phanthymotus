@@ -133,8 +133,9 @@ mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale
 继续发送旧格式的有界速度提案，保留 5 Hz 和原 TTL；新输出使用 Navi 相同的
 `control/velocity`、`std_msgs/msg/String` 和 `motus.control/1` 消息格式，
 两种格式不可互换。升级画布需刷新卡片定义，并按下游实际支持的格式选择连线；
-不要把两个输出同时接到会各自执行的控制卡片。格式一致不代表已有消费者或已完成联调；
-当前 G1 底座已有接收路径使用旧格式，尚未确认具备新格式的底座接收端。
+不要把两个输出同时接到会各自执行的控制卡片。配套 Driver 工作树中的 R1、Bumi
+和 AS2W bundle 已有 `control/velocity` 底座接收卡片；实际使用仍须连线并验证。
+G1 的现有底座接收路径使用旧格式的 `motion_sequence`，不是 `motus.control/1` 接收端。
 新输出沿用 Navi 的固定 source 与启动后 seq 从 1 递增的约定；若下游保留同 source
 旧序号而不随之重置，单独重启上游后消息（包括零速）可能被丢弃，需在联调中验证生命周期。
 

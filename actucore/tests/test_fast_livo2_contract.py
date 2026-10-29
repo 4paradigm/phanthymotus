@@ -145,11 +145,11 @@ class FastLivo2ContractTest(unittest.TestCase):
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d",
+            "FAST_LIVO2_RUNTIME_PATCH_SHA256=e3f4ab3cb4b9de98a7d30b402e4c0d53666abf77538eb3516ddb7e70c993e42a",
             source_lock,
         )
         self.assertIn(
-            "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb",
+            "FAST_LIVO2_PCD_SAVE_PATCH_SHA256=048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe",
             source_lock,
         )
         self.assertIn(
@@ -245,11 +245,11 @@ class FastLivo2ContractTest(unittest.TestCase):
         )
         self.assertEqual(
             hashlib.sha256(runtime_patch.read_bytes()).hexdigest(),
-            "f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d",
+            "e3f4ab3cb4b9de98a7d30b402e4c0d53666abf77538eb3516ddb7e70c993e42a",
         )
         self.assertEqual(
             hashlib.sha256(pcd_patch.read_bytes()).hexdigest(),
-            "c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb",
+            "048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe",
         )
         self.assertEqual(
             hashlib.sha256(flush_patch.read_bytes()).hexdigest(),
@@ -271,16 +271,14 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertIn("FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE}", base_dockerfile)
         self.assertNotIn("FAST_LIVO2_BASE_IMAGE", base_dockerfile)
         self.assertIn("git fetch --depth 1 origin", base_dockerfile)
-        self.assertIn(
-            "git apply --check /tmp/fast-livo2-runtime.patch", base_dockerfile
-        )
-        self.assertIn(
-            "patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1",
-            base_dockerfile,
-        )
-        self.assertIn(
-            "git apply --check /tmp/fast-livo2-pcd-save.patch", base_dockerfile
-        )
+        for patch_name in ("runtime", "pcd-save", "pcd-flush"):
+            patch_path = f"/tmp/fast-livo2-{patch_name}.patch"
+            for dry_run in ("--dry-run ", ""):
+                self.assertIn(
+                    f"patch {dry_run}--batch --fuzz=0 --ignore-whitespace -p1 "
+                    f"\\\n      -i {patch_path}",
+                    base_dockerfile,
+                )
         self.assertIn(
             "--packages-select livox_ros_driver2 vikit_common vikit_ros",
             base_dockerfile,

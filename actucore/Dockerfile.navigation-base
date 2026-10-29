@@ -35,8 +35,8 @@ ARG BUILD_JOBS=4
 ARG GIT_MIRROR_PREFIX=
 ARG FAST_LIVO2_REPO=https://github.com/Rhymer-Lcy/FAST-LIVO2-ROS2-MID360-Fisheye.git
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
-ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d
-ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=e3f4ab3cb4b9de98a7d30b402e4c0d53666abf77538eb3516ddb7e70c993e42a
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe
 ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
 ARG RPG_VIKIT_REPO=https://github.com/Rhymer-Lcy/rpg_vikit_ros2_fisheye.git
 ARG RPG_VIKIT_COMMIT=0b5548d9adab58128f3a59a507e96a83acfa8fdf
@@ -350,10 +350,14 @@ RUN [[ "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
       "${FAST_LIVO2_PCD_FLUSH_PATCH_SHA256}" \
       /tmp/fast-livo2-pcd-flush.patch | sha256sum -c - && \
     cd /opt/fast_livo_ws/src/fast_livo && \
-    git apply --check /tmp/fast-livo2-runtime.patch && \
-    git apply /tmp/fast-livo2-runtime.patch && \
-    git apply --check /tmp/fast-livo2-pcd-save.patch && \
-    git apply /tmp/fast-livo2-pcd-save.patch && \
+    patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-runtime.patch && \
+    patch --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-runtime.patch && \
+    patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-pcd-save.patch && \
+    patch --batch --fuzz=0 --ignore-whitespace -p1 \
+      -i /tmp/fast-livo2-pcd-save.patch && \
     patch --dry-run --batch --fuzz=0 --ignore-whitespace -p1 \
       -i /tmp/fast-livo2-pcd-flush.patch && \
     patch --batch --fuzz=0 --ignore-whitespace -p1 \
@@ -523,8 +527,8 @@ RUN source /opt/ros/humble/install/setup.bash && \
 FROM ${ACTUCORE_NAVIGATION_PARENT_IMAGE} AS navigation_runtime
 ARG APT_MIRROR
 ARG FAST_LIVO2_COMMIT=1fcd0d05cadaeb25ca59fd87cda95aaaee41e3ea
-ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=f73a248416e0848135a82f543b2e5c1237fe9c530a15435151275c4ab005be9d
-ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=c35dcb128b56180db8ef2280f36516e436abce5acfeb74bd7e1b90c737c775cb
+ARG FAST_LIVO2_RUNTIME_PATCH_SHA256=e3f4ab3cb4b9de98a7d30b402e4c0d53666abf77538eb3516ddb7e70c993e42a
+ARG FAST_LIVO2_PCD_SAVE_PATCH_SHA256=048d9f9f24b423cc354e7ad1d4f0eefc5b90c74d020419c3b6acbb526b202efe
 ARG FAST_LIVO2_PCD_FLUSH_PATCH_SHA256=9e39a108f8ca0ee8019c42aa3b04edb8bc72e381d0b2a55ee1778f63baaec51c
 ARG NAVIGATION2_COMMIT=a097086719c88f781aa59788eca29ac6ca5e56db
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

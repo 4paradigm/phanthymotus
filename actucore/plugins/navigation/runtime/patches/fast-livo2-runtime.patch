@@ -25,7 +25,7 @@ index 17f07c2..7791b11 100644
 @@ -13,6 +13,12 @@ which is included as part of this source code package.
  #ifndef LIV_MAPPER_H
  #define LIV_MAPPER_H
- 
+
 +#include <algorithm>
 +#include <chrono>
 +#include <iomanip>
@@ -40,7 +40,7 @@ index 17f07c2..7791b11 100644
    void savePCD();
    void processImu();
 +  void publishRuntimeDiagnostics();
-   
+
    bool sync_packages(LidarMeasureGroup &meas);
    void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr);
 @@ -98,6 +105,8 @@ public:
@@ -51,7 +51,7 @@ index 17f07c2..7791b11 100644
 +  rclcpp::TimerBase::SharedPtr runtime_diagnostics_timer;
    double imu_time_offset = 0.0;
    double lidar_time_offset = 0.0;
- 
+
 @@ -125,6 +134,24 @@ public:
    deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
    deque<cv::Mat> img_buffer;
@@ -131,7 +131,7 @@ index 4b92dfe..4fa153e 100755
 @@ -340,6 +359,81 @@ void LIVMapper::initializeSubscribersAndPublishers(rclcpp::Node::SharedPtr &node
    voxelmap_manager->voxel_map_pub_= this->node->create_publisher<visualization_msgs::msg::MarkerArray>("/planes", 10000);
  }
- 
+
 +void LIVMapper::publishRuntimeDiagnostics()
 +{
 +  size_t lidar_buffer_size = 0;
@@ -213,12 +213,12 @@ index 4b92dfe..4fa153e 100755
 @@ -709,11 +803,32 @@ void LIVMapper::run(rclcpp::Node::SharedPtr &node)
      }
      handleFirstFrame();
- 
+
 +    const auto processing_started = std::chrono::steady_clock::now();
      processImu();
- 
+
      // if (!p_imu->imu_time_init) continue;
- 
+
      stateEstimationAndMapping();
 +    processed_lidar_count++;
 +    last_processed_source_stamp_sec = LidarMeasures.lidar_frame_end_time;
@@ -249,7 +249,7 @@ index 4b92dfe..4fa153e 100755
    if (!lidar_en) return;
 +  lidar_callback_count++;
    mtx_buffer.lock();
- 
+
    double cur_head_time = stamp2Sec(msg->header.stamp) + lidar_time_offset;
 @@ -881,7 +997,14 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShare
    p_pre->process(msg, ptr);
@@ -263,7 +263,7 @@ index 4b92dfe..4fa153e 100755
 +      max_lidar_buffer_span_sec,
 +      lid_header_time_buffer.back() - lid_header_time_buffer.front());
 +  }
- 
+
    mtx_buffer.unlock();
    sig_buffer.notify_all();
 @@ -890,6 +1013,7 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::ConstShare
@@ -275,7 +275,7 @@ index 4b92dfe..4fa153e 100755
    livox_ros_driver2::msg::CustomMsg::SharedPtr msg(new livox_ros_driver2::msg::CustomMsg(*msg_in));
    if (abs(last_timestamp_imu - stamp2Sec(msg->header.stamp)) > 1.0 && !imu_buffer.empty())
 @@ -918,7 +1042,14 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstShar
- 
+
    lid_raw_data_buffer.push_back(ptr);
    lid_header_time_buffer.push_back(cur_head_time);
 +  last_lidar_frame = msg->header.frame_id;
@@ -286,7 +286,7 @@ index 4b92dfe..4fa153e 100755
 +      max_lidar_buffer_span_sec,
 +      lid_header_time_buffer.back() - lid_header_time_buffer.front());
 +  }
- 
+
    mtx_buffer.unlock();
    sig_buffer.notify_all();
 @@ -927,16 +1058,19 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::ConstShar
@@ -294,13 +294,13 @@ index 4b92dfe..4fa153e 100755
  {
    if (!imu_en) return;
 +  imu_callback_count++;
- 
+
    if (last_timestamp_lidar < 0.0) return;
 -  RCLCPP_INFO(this->node->get_logger(), "get imu at time: %.6f", stamp2Sec(msg_in->header.stamp));
    sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
    msg->header.stamp = sec2Stamp(stamp2Sec(msg->header.stamp) - imu_time_offset);
    double timestamp = stamp2Sec(msg->header.stamp);
- 
+
    if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
    {
 -    RCLCPP_WARN(this->node->get_logger(), "IMU and LiDAR not synced! delta time: %lf .\n", last_timestamp_lidar - timestamp);
@@ -309,10 +309,10 @@ index 4b92dfe..4fa153e 100755
 +      "IMU and LiDAR not synced! delta time: %lf .",
 +      last_timestamp_lidar - timestamp);
    }
- 
+
    if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);
 @@ -954,16 +1088,26 @@ void LIVMapper::imu_cbk(const sensor_msgs::msg::Imu::ConstSharedPtr &msg_in)
- 
+
    if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
    {
 -    RCLCPP_WARN(this->node->get_logger(), "imu time stamp Jumps %0.4lf seconds \n", timestamp - last_timestamp_imu);
@@ -327,9 +327,9 @@ index 4b92dfe..4fa153e 100755
 +      "IMU gap is %0.4lf seconds; accepting current sample to resynchronize",
 +      timestamp - last_timestamp_imu);
    }
- 
+
    last_timestamp_imu = timestamp;
- 
+
    imu_buffer.push_back(msg);
 -  cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
 +  last_imu_frame = msg->header.frame_id;
@@ -354,9 +354,9 @@ index 4b92dfe..4fa153e 100755
        return false;
      }
 +    waiting_for_imu = false;
- 
+
      struct MeasureGroup m; // standard method to keep imu message.
- 
+
 @@ -1516,4 +1665,4 @@ void LIVMapper::publish_path(const rclcpp::Publisher<nav_msgs::msg::Path>::Share
    msg_body_pose.header.frame_id = "camera_init";
    path.poses.push_back(msg_body_pose);
