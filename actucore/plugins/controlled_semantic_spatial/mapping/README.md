@@ -44,8 +44,30 @@ Driver navigation_sensors
 | `lidar` | `/ubuntu/navigation/lidar` | `sensor_msgs/msg/PointCloud2`; `RELIABLE + KEEP_LAST(2)` | REP-103 `sensor_frame`，ROS system time，逐点 `timestamp=float64` 绝对纳秒 |
 | `imu` | `/ubuntu/navigation/imu` | `sensor_msgs/msg/Imu`; `RELIABLE + KEEP_LAST(200)` | 与点云同 `sensor_frame`、同一源时钟域，约 200 Hz |
 
-这两路输入来自既有 Driver `navigation_sensors` sensor cards。缺失、过期或
-frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
+两路输入可来自既有 Driver `navigation_sensors` sensor cards；也可来自同一雷达卡的
+两个输出口，但前提是 Driver 实际提供符合上表的两路独立 ROS topic。点云必须是
+标准 `PointCloud2` 并满足逐点时间契约，IMU 必须是与雷达同源、同 frame 和时钟域的
+`Imu`；旧 `/ubuntu/lidar/cloud` envelope 或机身 IMU 不能替代。格式标签相同不代表
+ROS 类型、QoS、时间或标定已验证；本仓测试不证明 Driver 已实现该双输出。
+
+Canvas 数据结构支持同一源卡的两个输出口分别连接 `lidar` 和 `imu`，按两条边解析
+源端口 topic，依赖排序将源卡排在导航卡之前。但当前 Agent Core 项目启动只向卡片传
+无端口标签的 `input_topics`，导航卡只能按上表默认 topic 精确匹配，不能据此映射
+任意自定义 topic 到目标端口；画线本身不保证自定义双路可启动。直接调用导航工具时
+可以显式提供 `input_bindings`，例如：
+
+```json
+{"action":"start","input_bindings":[
+  {"port":"lidar","topic":"/robot/lidar/cloud"},
+  {"port":"imu","topic":"/robot/lidar/imu"}
+]}
+```
+
+这只说明接口映射，不代表绕过画布的设备操作已获授权或真实传感器已联通。保留默认
+`/ubuntu/navigation/lidar`、`/ubuntu/navigation/imu` 的既有无标签列表接线；若要在
+Canvas 使用任意非默认 topic，需要上游按目标端口传递绑定并另行验证完整启动链。
+
+缺失、过期或 frame 不符时同容器 adapter 不发布伪造的 canonical odom/cloud。
 FAST-LIVO2 内部订阅队列默认保留最新 `2` 帧 LiDAR 和 `400` 帧 IMU；可在
 Canvas 停止卡片后通过 `lidar_qos_depth`（1..32）与 `imu_qos_depth`
 （1..4000）调整，下次启动卡片生效。该参数在启动算法子进程前传入 ROS，
@@ -298,7 +320,7 @@ FAST-LIVO2 adapter 在拒绝 LiDAR、IMU、odom 或 registered cloud 时发布
 ## 统一卡片连线与构建
 
 Canvas 把 Driver `lidar_cloud` 的标准 PointCloud2、`lidar_imu` 和
-`camera_rgb` 的 RGB PSE1 输出接到公开
+`camera_rgb` 的标准 JPEG CompressedImage 输出接到公开
 `controlled_semantic_spatial` 卡片；RGB 用于语义导航。原机身 `imu` 不能替代 `lidar_imu`。
 `livo_odom`、registered cloud、obstacle map 都在同一容器内
 交给 planning/semantic 模块。机器诊断由内部 topic 提供，

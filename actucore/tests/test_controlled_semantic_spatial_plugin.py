@@ -200,7 +200,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         schema = controlled_semantic_spatial_tool_definition("ubuntu")["inputSchema"]
         topics = [
             "/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
-            "/ubuntu/camera/rgb_frame",
+            "/ubuntu/camera/rgb",
         ]
         # Upstream _upstream_camera_info copies Driver declarations by topic.
         rgb = {
@@ -266,13 +266,11 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(
             inputs["rgb"]["topic"],
-            "/ubuntu/camera/rgb_frame",
+            "/ubuntu/camera/rgb",
         )
-        self.assertEqual(
-            inputs["rgb"]["format"],
-            "application/vnd.phanthy.sensor-envelope.v1",
-        )
-        self.assertEqual(inputs["rgb"]["schema"], "phanthy.sensor.camera_rgb_frame.v1")
+        self.assertEqual(inputs["rgb"]["format"], "image/jpeg")
+        self.assertEqual(inputs["rgb"]["ros_type"], "sensor_msgs/msg/CompressedImage")
+        self.assertNotIn("schema", inputs["rgb"])
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
             [item["port"] for item in tool["topic_out"]],
@@ -682,7 +680,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         plugin = self.make_plugin()
         topics = [
             "/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
-            "/ubuntu/camera/rgb_frame",
+            "/ubuntu/camera/rgb",
         ]
         start = {
             "action": "start", "instance_id": "card-1",
@@ -693,11 +691,31 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             },
         }
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        semantic_start = next(
+            args for _, args in plugin._semantic.calls if args["action"] == "start"
+        )
+        self.assertEqual(
+            {item["port"]: item["topic"] for item in semantic_start["input_bindings"]}["rgb"],
+            "/ubuntu/camera/rgb",
+        )
         info = plugin.dispatch(plugin.PREFIX, {
             "action": "info", "instance_id": "card-1",
             "input_topics": topics, "input_topic": topics[0],
         })
         self.assertEqual(info["state"], "ready")
+
+    def test_old_unlabelled_pse1_topic_does_not_enable_semantics(self):
+        semantic = FakeComponent("semantic")
+        plugin = self.make_plugin(semantic=semantic)
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start",
+            "input_topics": ["/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
+                             "/ubuntu/camera/rgb_frame"],
+        })
+        self.assertEqual(result["state"], "ready")
+        self.assertFalse(any(args["action"] == "start" for _, args in semantic.calls))
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "capture"})["error_code"],
+                         "rgb_not_connected")
 
     def test_start_negotiates_descriptor_and_preserves_it_for_runtime(self):
         runtime = FakeRuntime()
@@ -1225,8 +1243,47 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             {"rgb", "livo_odom", "livo_status"},
         )
 
+    def test_same_lidar_card_two_output_topics_reach_runtime_and_mapping(self):
+        # These are hypothetical topics from two outputs of one source card.
+        # Port-aware bindings are needed because neither is a default topic.
+        runtime = FakeRuntime()
+        mapping = FakeComponent("mapping")
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping)
+        topics = {"lidar": "/robot/lidar/cloud", "imu": "/robot/lidar/imu"}
+        bindings = [{"port": port, "topic": topic} for port, topic in topics.items()]
+
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start", "instance_id": "navigation", "input_bindings": bindings,
+        })
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["input_topics"], topics)
+        mapping_start = next(args for _, args in mapping.calls if args["action"] == "start")
+        self.assertEqual(
+            {item["port"]: item["topic"] for item in mapping_start["input_bindings"]},
+            topics,
+        )
+        launch = ControlledSemanticSpatialRuntime._launch_arguments("ubuntu", topics)["fast_livo2"]
+        self.assertIn("lidar_topic:=/robot/lidar/cloud", launch)
+        self.assertIn("imu_topic:=/robot/lidar/imu", launch)
+
+    def test_unlabelled_inputs_keep_default_topic_compatibility_only(self):
+        plugin = self.make_plugin()
+        defaults = ["/ubuntu/navigation/imu", "/ubuntu/navigation/lidar"]
+        self.assertEqual(plugin._validate_external_wiring({"input_topics": defaults}), {
+            "wired_topics": {
+                "lidar": "/ubuntu/navigation/lidar", "imu": "/ubuntu/navigation/imu",
+            },
+        })
+        # The current Agent Core start path sends an unlabeled list. It cannot
+        # map arbitrary source topic names back to destination input ports.
+        rejected = plugin._validate_external_wiring({"input_topics": [
+            "/robot/lidar/cloud", "/robot/lidar/imu",
+        ]})
+        self.assertEqual(rejected["error_code"], "invalid_canvas_wiring")
+
     def test_start_rejects_legacy_goal_topic_config(self):
-        for key in ("goal_topic", "subscriber_timeout_sec"):
+        for key in ("goal_topic", "subscriber_timeout_sec", "sensor_sync_mode"):
             with self.subTest(key=key):
                 runtime = FakeRuntime()
                 plugin = ControlledSemanticSpatialPlugin(

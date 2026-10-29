@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-DEFAULT_CAMERA_TOPIC = "/ubuntu/camera/rgb_frame"
+DEFAULT_CAMERA_TOPIC = "/ubuntu/camera/rgb"
 DEFAULT_ODOMETRY_TOPIC = "/ubuntu/navigation/odom"
 DEFAULT_STATUS_TOPIC = "/ubuntu/navigation/fast_livo2/status"
 DEFAULT_VLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
@@ -101,17 +101,13 @@ _MANIFEST = {
         {
             "port": "rgb",
             "topic": DEFAULT_CAMERA_TOPIC,
-            "format": "application/vnd.phanthy.sensor-envelope.v1",
-            "ros_type": "std_msgs/msg/UInt8MultiArray",
-            "schema": "phanthy.sensor.camera_rgb_frame.v1",
-            "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
-            "timestamp": (
-                "header.stamp_ns / timing.source_stamp_ns in the PSE1 envelope"
-            ),
+            "format": "image/jpeg",
+            "ros_type": "sensor_msgs/msg/CompressedImage",
+            "qos": "BEST_EFFORT + KEEP_LAST(depth=1) + VOLATILE",
+            "timestamp": "local monotonic receive time (not capture synchronization)",
             "desc": (
-                "Connect the RGB PSE1 output of Driver camera_rgb, not its plain JPEG output. "
-                "Requires source time, calibration and LiDAR-to-camera "
-                "extrinsics for semantic navigation"
+                "Connect the standard JPEG output of Driver camera_rgb. Image and "
+                "pose are paired by local receive time, not by capture time."
             ),
         },
         {

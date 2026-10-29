@@ -21,7 +21,7 @@
 
 | 数据 | topic | 来源 |
 | --- | --- | --- |
-| RGB | `/ubuntu/camera/rgb_frame` | Canvas 唯一 RGB 外部输入；语义导航直接解码 PSE1 内的 JPEG |
+| RGB | `/ubuntu/camera/rgb` | Canvas 唯一 RGB 外部输入；标准 `sensor_msgs/msg/CompressedImage` JPEG |
 | odom | `/ubuntu/navigation/odom` | 同卡片 FAST-LIVO2 模块 |
 | map status | `/ubuntu/navigation/fast_livo2/status` | 同卡片 FAST-LIVO2 模块 |
 
@@ -34,7 +34,9 @@
   状态。FAST-LIVO2 每次启动建图或定位运行时都会发布稳定的
   `map_session_id`；短暂心跳 stale、传感器未就绪只会暂停使用，恢复后不会
   误清空同一会话的坐标。运行时重启、换图或 bridge 重启仍会阻止复用旧坐标。
-- 默认按 ROS 接收时间配对传感器；只有确认上游共享 header 时钟域后才使用
-  `source_timestamp`。
+- 新鲜度和图像/位姿近似配对仅使用本地单调接收时间，不说明采集时间同步；
+  不依赖相机 header、PSE1 时间、标定或外参。旧 `sensor_sync_mode=source_timestamp`
+  配置不再受支持，须移除或改为 `receive_time`。JPEG 格式和标记无效时拒绝该帧；
+  标记检查并不保证 JPEG 可完整解码。
 - VLM 匹配成功不等于物理执行；标准速度输出的接收、TTL、急停、障碍和
   物理停车等安全行为须由下游独立验证。标准速度消息不携带导航任务 ID。

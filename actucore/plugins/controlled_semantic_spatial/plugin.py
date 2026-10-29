@@ -82,6 +82,13 @@ class ControlledSemanticSpatialPlugin:
         legacy_semantic_options = sorted(
             {"goal_topic", "subscriber_timeout_sec"}.intersection(semantic_cfg)
         )
+        if (
+            str(semantic_cfg.get("sensor_sync_mode", "receive_time")).strip()
+            != "receive_time"
+        ):
+            legacy_semantic_options.append("sensor_sync_mode")
+            # Keep plugin construction available so start can return the config error.
+            semantic_cfg["sensor_sync_mode"] = "receive_time"
         if legacy_semantic_options:
             legacy_error = (
                 "unsupported semantic config options: "

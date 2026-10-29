@@ -60,7 +60,7 @@ Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在�
 | --- | --- | --- |
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
-| `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航 |
+| `rgb` | `/ubuntu/camera/rgb` | 否；连接时启用语义导航 |
 
 Driver 卡片合并后的连线：
 
@@ -68,19 +68,18 @@ Driver 卡片合并后的连线：
 | --- | --- | --- |
 | `lidar_cloud` | 带逐点时间戳的标准 `sensor_msgs/msg/PointCloud2` | `lidar` |
 | `lidar_imu` | 与 LiDAR 同时钟、同传感器坐标系的 `sensor_msgs/msg/Imu` | `imu` |
-| `camera_rgb` | RGB PSE1 自描述帧，`phanthy.sensor.camera_rgb_frame.v1` | `rgb` |
+| `camera_rgb` | 标准 JPEG，`sensor_msgs/msg/CompressedImage`，`image/jpeg` | `rgb` |
 
-原机身 `imu` 保持原用途，不能代替 `lidar_imu`。相机卡片原有 JPEG 输出
-不能代替 RGB PSE1 输入。按输出的 topic、ROS 类型与 schema 选端口，不假定它是第一个输出。
+原机身 `imu` 保持原用途，不能代替 `lidar_imu`。语义模块使用标准 JPEG，
+以本地单调接收时间检查新鲜度和近似配对，不依赖相机标定、外参或 PSE1 时间，
+也不代表图像和位姿的采集时钟同步。Driver 原有 PSE1 输出保持独立，不是此端口的输入。
 消费端不依赖来源卡片名称。主线 Agent Core 启动时只传 topic 列表，不提供目标端口身份；
 当前卡片只能以本表中的标准 topic 名识别输入，任意自定义 topic 连线不能保证被正确识别，
-缺少必需输入时会拒绝启动。新 Driver 的实际 `tools/list` 尚待联调核验。
+缺少必需输入时会拒绝启动。Driver 的实际 `tools/list` 和端到端连线尚待联调核验。
 
-升级旧画布时，先停止智能控制，移除 `navigation_lidar`、`navigation_imu`、
-`camera_rgb_frame`、`camera_depth_frame` 四张旧卡片，添加或刷新上表卡片，
-重新连接对应输出并保存，再启动。已有 Driver `camera_depth` 和
-`camera_distance` 卡片及其独立深度输出不在此移除范围。不要只改卡片显示名称
-或沿用旧输出索引。
+升级旧画布时先停止智能控制、刷新卡片定义并人工核对连线；原 RGB PSE1 连线
+需移除并改接标准 JPEG 输出，不假定旧连线或端口索引自动迁移。已有 Driver
+`camera_depth` 和 `camera_distance` 卡片及其独立深度输出不在此移除范围。
 
 这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
 `lidar` 和 `imu`。旧版 `goal_pose` 外部输入及对应协议、订阅已删除；升级时须先

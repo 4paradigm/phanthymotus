@@ -1,4 +1,4 @@
-"""ROS2 bridge for synchronized camera and FAST-LIVO2 snapshots.
+"""ROS2 bridge for receive-time-paired camera and FAST-LIVO2 snapshots.
 
 ROS imports are deliberately lazy. This keeps the vln logic unit-testable
 on a development machine without ROS while still using explicit message types on
@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
+_MAX_JPEG_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -172,8 +173,8 @@ class RosBridge:
         status_stale_after_sec: float = 3.5,
         synchronization_mode: str = "receive_time",
     ):
-        from fast_livo2.camera_rgb_frame import decode as decode_camera_rgb_frame
         from nav_msgs.msg import Odometry
+        from sensor_msgs.msg import CompressedImage
         from rclpy.node import Node
         from rclpy.qos import (
             DurabilityPolicy,
@@ -181,7 +182,7 @@ class RosBridge:
             QoSProfile,
             ReliabilityPolicy,
         )
-        from std_msgs.msg import String, UInt8MultiArray
+        from std_msgs.msg import String
 
         suffix = re.sub(
             r"[^a-zA-Z0-9_]",
@@ -196,10 +197,8 @@ class RosBridge:
         self._status_restart_gap_sec = max(1.0, float(status_restart_gap_sec))
         self._status_stale_after_sec = max(1.0, float(status_stale_after_sec))
         self.synchronization_mode = str(synchronization_mode).strip()
-        if self.synchronization_mode not in {"receive_time", "source_timestamp"}:
-            raise ValueError(
-                "synchronization_mode must be receive_time or source_timestamp"
-            )
+        if self.synchronization_mode != "receive_time":
+            raise ValueError("synchronization_mode must be receive_time")
         self._executor = executor
         self._node = Node(f"vln_snapshot_{suffix[-40:] or 'bridge'}")
         self._condition = threading.Condition()
@@ -207,7 +206,6 @@ class RosBridge:
         self._latest_pose: _PoseSample | None = None
         self._closed = False
         self._rejection_counts: dict[str, int] = {}
-        self._decode_camera_rgb_frame = decode_camera_rgb_frame
         self._status_state = ""
         self._status_map_name = ""
         self._status_session_id = ""
@@ -241,7 +239,7 @@ class RosBridge:
 
         try:
             self._image_subscription = self._node.create_subscription(
-                UInt8MultiArray,
+                CompressedImage,
                 camera_topic,
                 self._on_image,
                 image_qos,
@@ -266,19 +264,35 @@ class RosBridge:
             raise
 
     def _on_image(self, message) -> None:
+        received_monotonic = time.monotonic()
+        received_at = time.time()
         try:
-            metadata, jpeg = self._decode_camera_rgb_frame(bytes(message.data))
+            image_format = str(message.format).strip().lower()
+            raw_data = message.data
+            if not 4 <= len(raw_data) <= _MAX_JPEG_BYTES:
+                raise ValueError("camera JPEG size is out of bounds")
+            data = bytes(raw_data)
+            # compressed_image_transport permits "jpeg" or
+            # "rgb8; jpeg compressed bgr8". Only JPEG is advertised by this port.
+            codec = image_format.split(";", 1)[-1].strip().split()
+            if not codec or codec[0] not in {"jpeg", "jpg"}:
+                raise ValueError("camera image is not JPEG")
+            if (
+                len(data) < 4
+                or not data.startswith(b"\xff\xd8")
+                or not data.endswith(b"\xff\xd9")
+            ):
+                raise ValueError("camera JPEG has invalid markers")
         except (AttributeError, TypeError, ValueError) as exc:
             self._warn_rejected("camera RGB frame", exc)
             return
         self._mark_valid("camera RGB frame")
-        received_at = time.time()
-        received_monotonic = time.monotonic()
         sample = _ImageSample(
-            data=jpeg,
+            data=data,
             image_format="jpeg",
             mime_type="image/jpeg",
-            source_timestamp=int(metadata["source_stamp_ns"]) / 1_000_000_000.0,
+            # The existing Driver header is not a proven capture timestamp.
+            source_timestamp=None,
             received_at=received_at,
             received_monotonic=received_monotonic,
         )
@@ -289,6 +303,7 @@ class RosBridge:
             self._condition.notify_all()
 
     def _on_odometry(self, message) -> None:
+        received_monotonic = time.monotonic()
         received_at = time.time()
         try:
             pose = pose_from_odometry(message, self.odometry_topic, received_at)
@@ -312,7 +327,7 @@ class RosBridge:
             )
             return
         self._mark_valid("FAST-LIVO2 odometry")
-        sample = _PoseSample(pose=pose, received_monotonic=time.monotonic())
+        sample = _PoseSample(pose=pose, received_monotonic=received_monotonic)
         with self._condition:
             if self._closed:
                 return
@@ -409,7 +424,7 @@ class RosBridge:
         max_skew: float,
         after_monotonic: float | None = None,
     ) -> Snapshot | None:
-        """Wait for a fresh, approximately synchronized image/pose pair."""
+        """Wait for a fresh image/pose pair with close local receive times."""
 
         deadline = time.monotonic() + timeout
         after = after_monotonic if after_monotonic is not None else float("-inf")
@@ -422,24 +437,10 @@ class RosBridge:
                     receive_skew = abs(
                         image.received_monotonic - pose_sample.received_monotonic
                     )
+                    # Receive-time proximity is not capture-clock synchronization.
                     source_skew = None
-                    if (
-                        image.source_timestamp is not None
-                        and pose_sample.pose.source_timestamp is not None
-                    ):
-                        source_skew = abs(
-                            image.source_timestamp
-                            - pose_sample.pose.source_timestamp
-                        )
-                    synchronization_basis = self.synchronization_mode
-                    if self.synchronization_mode == "source_timestamp":
-                        # Source-time mode is opt-in because the two upstream
-                        # cards do not currently guarantee the same clock domain.
-                        pair_skew = (
-                            source_skew if source_skew is not None else float("inf")
-                        )
-                    else:
-                        pair_skew = receive_skew
+                    synchronization_basis = "receive_time"
+                    pair_skew = receive_skew
                     fresh = (
                         now - image.received_monotonic <= max_age
                         and now - pose_sample.received_monotonic <= max_age

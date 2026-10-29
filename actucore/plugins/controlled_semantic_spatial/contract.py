@@ -34,7 +34,7 @@ def _config_properties() -> dict:
     mapping = fast_livo2_tool_definition("ubuntu")["configSchema"]["properties"]
     planning = nav2_tool_definition("ubuntu")["configSchema"]["properties"]
     semantic = build_manifest(
-        "/ubuntu/camera/rgb_frame",
+        "/ubuntu/camera/rgb",
         "/ubuntu/navigation/odom",
     )["configSchema"]["properties"]
     result = {
@@ -87,7 +87,7 @@ def _action_properties() -> dict:
     mapping = fast_livo2_tool_definition("ubuntu")["inputSchema"]["properties"]
     planning = nav2_tool_definition("ubuntu")["inputSchema"]["properties"]
     semantic = build_manifest(
-        "/ubuntu/camera/rgb_frame",
+        "/ubuntu/camera/rgb",
         "/ubuntu/navigation/odom",
     )["inputSchema"]["properties"]
     result = {"action": {"type": "string", "enum": list(CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_ACTIONS)}}
@@ -158,7 +158,7 @@ def controlled_semantic_spatial_tool_definition(namespace: str) -> dict:
     mapping = fast_livo2_tool_definition(namespace)
     planning = nav2_tool_definition(namespace)
     semantic = build_manifest(
-        f"/{namespace.strip('/')}/camera/rgb_frame",
+        f"/{namespace.strip('/')}/camera/rgb",
         f"/{namespace.strip('/')}/navigation/odom",
         status_topic=f"/{namespace.strip('/')}/navigation/fast_livo2/status",
     )

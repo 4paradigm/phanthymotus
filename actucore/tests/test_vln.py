@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from unittest import mock
 from urllib.error import HTTPError
 
+import yaml
+
 
 ACTUCORE_DIR = Path(__file__).resolve().parents[1]
 if str(ACTUCORE_DIR) not in sys.path:
@@ -175,8 +177,9 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn("default", properties["api_key"])
 
     def test_ros_contract_is_explicit(self):
-        self.assertEqual(MANIFEST["topic_in"][0]["ros_type"], "std_msgs/msg/UInt8MultiArray")
-        self.assertEqual(MANIFEST["topic_in"][0]["schema"], "phanthy.sensor.camera_rgb_frame.v1")
+        self.assertEqual(MANIFEST["topic_in"][0]["ros_type"], "sensor_msgs/msg/CompressedImage")
+        self.assertEqual(MANIFEST["topic_in"][0]["format"], "image/jpeg")
+        self.assertEqual(MANIFEST["topic_in"][0]["topic"], "/ubuntu/camera/rgb")
         self.assertEqual(MANIFEST["topic_in"][1]["format"], "sensor/odometry")
         self.assertEqual(MANIFEST["topic_in"][1]["ros_type"], "nav_msgs/msg/Odometry")
         self.assertEqual(
@@ -188,6 +191,24 @@ class ManifestTests(unittest.TestCase):
 
 
 class ProcessorTests(unittest.TestCase):
+    def test_shipped_configs_use_manifest_rgb_topic_for_standalone_start(self):
+        configs = (
+            yaml.safe_load((ACTUCORE_DIR / "config.yaml").read_text(encoding="utf-8"))
+            ["plugins"]["controlled_semantic_spatial"]["semantic"],
+            json.loads((ACTUCORE_DIR / "plugins/controlled_semantic_spatial/config.example.json")
+                       .read_text(encoding="utf-8"))["semantic"],
+        )
+        for config in configs:
+            with self.subTest(config_camera_topic=config["camera_topic"]):
+                self.assertEqual(config["camera_topic"], MANIFEST["topic_in"][0]["topic"])
+                factory = FakeBridgeFactory()
+                plugin = _plugin(FakeClient([]), factory, **config)
+                self.assertEqual(plugin.dispatch("vln", {"action": "start"})["state"], "running")
+                self.assertEqual(factory.calls[0]["camera_topic"], "/ubuntu/camera/rgb")
+                self.assertEqual(plugin.get_tools()[0]["topic_in"][0]["ros_type"],
+                                 "sensor_msgs/msg/CompressedImage")
+                plugin.stop()
+
     def test_valid_gear_config_atomically_replaces_vlm_without_echoing_key(self):
         secret = "unit-test-vlm-credential"
         plugin = _plugin(FakeClient([]), FakeBridgeFactory())
@@ -379,14 +400,14 @@ class ProcessorTests(unittest.TestCase):
                 "action": "start",
                 "input_topics": [
                     "/ubuntu/navigation/odom",
-                    "/ubuntu/camera/rgb_frame",
+                    "/ubuntu/camera/rgb",
                 ],
             },
         )
         self.assertEqual(result["state"], "running")
         self.assertEqual(
             factory.calls[0]["camera_topic"],
-            "/ubuntu/camera/rgb_frame",
+            "/ubuntu/camera/rgb",
         )
         self.assertEqual(factory.calls[0]["odometry_topic"], "/ubuntu/navigation/odom")
         self.assertEqual(
@@ -404,7 +425,7 @@ class ProcessorTests(unittest.TestCase):
                 "action": "start",
                 "input_bindings": {
                     "livo_odom": {"topic": "/robot/navigation/odom"},
-                    "rgb": {"topic": "/robot/camera/rgb_frame"},
+                    "rgb": {"topic": "/robot/camera/rgb"},
                     "livo_status": {"topic": "/robot/fast_livo2/status"},
                 },
             },
@@ -412,7 +433,7 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result["state"], "running")
         self.assertEqual(
             factory.calls[0]["camera_topic"],
-            "/robot/camera/rgb_frame",
+            "/robot/camera/rgb",
         )
         self.assertEqual(factory.calls[0]["odometry_topic"], "/robot/navigation/odom")
         self.assertEqual(factory.calls[0]["status_topic"], "/robot/fast_livo2/status")
@@ -427,7 +448,7 @@ class ProcessorTests(unittest.TestCase):
                 "input_topics": [
                     "/robot/fast_livo2/status",
                     "/ubuntu/navigation/odom",
-                    "/ubuntu/camera/rgb_frame",
+                    "/ubuntu/camera/rgb",
                 ],
             },
         )
@@ -439,10 +460,10 @@ class ProcessorTests(unittest.TestCase):
             {"input_bindings": "bad"},
             {"input_bindings": {"unexpected": "/bad/topic"}},
             {"input_bindings": {}},
-            {"input_topics": ["/ubuntu/camera/rgb_frame"]},
+            {"input_topics": ["/ubuntu/camera/rgb"]},
             {
                 "input_topics": [
-                    "/ubuntu/camera/rgb_frame",
+                    "/ubuntu/camera/rgb",
                     "/ubuntu/navigation/odom",
                     "/unexpected/topic",
                 ]
@@ -814,15 +835,84 @@ class PureHelperTests(unittest.TestCase):
         self.assertAlmostEqual(pose.yaw, math.pi / 2)
         self.assertEqual(pose.source_timestamp, 12.5)
 
-    def test_rgb_frame_is_decoded_for_semantic_snapshot(self):
-        bridge = self._bare_ros_bridge()
-        bridge._decode_camera_rgb_frame = mock.Mock(
-            return_value=({"source_stamp_ns": 12_500_000_000}, b"jpeg-frame")
-        )
-        bridge._on_image(SimpleNamespace(data=b"PSE1-frame"))
+    def test_bridge_subscribes_to_standard_compressed_image(self):
+        class Node:
+            def __init__(self, name):
+                self.subscriptions = []
 
-        self.assertEqual(bridge._latest_image.data, b"jpeg-frame")
-        self.assertEqual(bridge._latest_image.source_timestamp, 12.5)
+            def create_subscription(self, message_type, topic, callback, qos):
+                self.subscriptions.append((message_type, topic, callback, qos))
+                return object()
+
+        class QoS:
+            def __init__(self, **kwargs):
+                self.options = kwargs
+
+        compressed_image = type("CompressedImage", (), {})
+        odometry = type("Odometry", (), {})
+        string = type("String", (), {})
+        policies = SimpleNamespace(KEEP_LAST=1, BEST_EFFORT=2, RELIABLE=3,
+                                   VOLATILE=4, TRANSIENT_LOCAL=5)
+        modules = {
+            "nav_msgs": SimpleNamespace(),
+            "nav_msgs.msg": SimpleNamespace(Odometry=odometry),
+            "sensor_msgs": SimpleNamespace(),
+            "sensor_msgs.msg": SimpleNamespace(CompressedImage=compressed_image),
+            "std_msgs": SimpleNamespace(),
+            "std_msgs.msg": SimpleNamespace(String=string),
+            "rclpy": SimpleNamespace(),
+            "rclpy.node": SimpleNamespace(Node=Node),
+            "rclpy.qos": SimpleNamespace(QoSProfile=QoS, HistoryPolicy=policies,
+                                          ReliabilityPolicy=policies, DurabilityPolicy=policies),
+        }
+        with mock.patch.dict(sys.modules, modules):
+            bridge = RosBridge(camera_topic="/ubuntu/camera/rgb",
+                               odometry_topic="/ubuntu/navigation/odom",
+                               executor=SimpleNamespace(add_node=lambda node: None))
+        image_sub = bridge._node.subscriptions[0]
+        self.assertIs(image_sub[0], compressed_image)
+        self.assertEqual(image_sub[1], "/ubuntu/camera/rgb")
+        self.assertEqual(image_sub[3].options["reliability"], policies.BEST_EFFORT)
+
+    def test_compressed_jpeg_is_received_without_relying_on_header(self):
+        bridge = self._bare_ros_bridge()
+        for image_format in ("jpeg", "rgb8; jpeg compressed bgr8"):
+            with self.subTest(image_format=image_format):
+                bridge._on_image(SimpleNamespace(
+                    format=image_format, data=b"\xff\xd8jpeg-frame\xff\xd9",
+                    header=SimpleNamespace(stamp=SimpleNamespace(sec=12, nanosec=0)),
+                ))
+                self.assertEqual(bridge._latest_image.data, b"\xff\xd8jpeg-frame\xff\xd9")
+                self.assertIsNone(bridge._latest_image.source_timestamp)
+                self.assertEqual(bridge._latest_image.mime_type, "image/jpeg")
+
+    def test_rejects_unsupported_or_malformed_compressed_images(self):
+        bridge = self._bare_ros_bridge()
+        previous = bridge._latest_image
+        for message in (
+            SimpleNamespace(format="png", data=b"\xff\xd8x\xff\xd9"),
+            SimpleNamespace(format="jpeg", data=b""),
+            SimpleNamespace(format="jpeg", data=b"PSE1-frame"),
+            SimpleNamespace(format="jpeg", data=b"\xff\xd8truncated"),
+            SimpleNamespace(data=b"\xff\xd8x\xff\xd9"),
+        ):
+            with self.subTest(message=message):
+                bridge._on_image(message)
+                self.assertIs(bridge._latest_image, previous)
+
+    def test_rejects_oversized_jpeg_before_copy(self):
+        class OversizedData:
+            def __len__(self):
+                return 32 * 1024 * 1024 + 1
+
+            def __bytes__(self):
+                raise AssertionError("oversized image must not be copied")
+
+        bridge = self._bare_ros_bridge()
+        previous = bridge._latest_image
+        bridge._on_image(SimpleNamespace(format="jpeg", data=OversizedData()))
+        self.assertIs(bridge._latest_image, previous)
+        self.assertEqual(bridge._rejection_counts["camera RGB frame"], 1)
 
     def test_rejected_sensor_logs_are_sampled_and_recovery_is_reported(self):
         bridge = self._bare_ros_bridge()
@@ -912,16 +1002,22 @@ class PureHelperTests(unittest.TestCase):
         )
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot.synchronization_basis, "receive_time")
-        self.assertAlmostEqual(snapshot.source_skew_sec, 99.25)
+        self.assertIsNone(snapshot.source_skew_sec)
 
-    def test_source_time_sync_is_opt_in_and_rejects_large_offset(self):
-        bridge = self._bare_ros_bridge("source_timestamp")
-        snapshot = bridge.wait_for_snapshot(
-            timeout=0.01,
-            max_age=1.0,
-            max_skew=0.35,
+    def test_source_time_sync_configuration_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "sensor_sync_mode must be receive_time"):
+            _plugin(FakeClient([]), FakeBridgeFactory(), sensor_sync_mode="source_timestamp")
+
+    def test_stale_or_receive_time_skewed_pair_is_rejected(self):
+        bridge = self._bare_ros_bridge()
+        old = bridge._latest_image
+        bridge._latest_image = _ImageSample(
+            data=old.data, image_format=old.image_format, mime_type=old.mime_type,
+            source_timestamp=old.source_timestamp, received_at=old.received_at,
+            received_monotonic=time.monotonic() - 2.0,
         )
-        self.assertIsNone(snapshot)
+        self.assertIsNone(bridge.wait_for_snapshot(timeout=0.01, max_age=1.0, max_skew=3.0))
+        self.assertIsNone(bridge.wait_for_snapshot(timeout=0.01, max_age=3.0, max_skew=0.35))
 
     def test_snapshot_pair_must_arrive_after_capture_invocation(self):
         bridge = self._bare_ros_bridge("receive_time")

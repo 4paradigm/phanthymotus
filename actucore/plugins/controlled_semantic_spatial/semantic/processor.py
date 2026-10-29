@@ -136,8 +136,8 @@ class Processor:
         self._sensor_sync_mode = str(
             self._config.get("sensor_sync_mode", "receive_time")
         ).strip()
-        if self._sensor_sync_mode not in {"receive_time", "source_timestamp"}:
-            self._sensor_sync_mode = "receive_time"
+        if self._sensor_sync_mode != "receive_time":
+            raise ValueError("sensor_sync_mode must be receive_time for compressed RGB")
         self._match_threshold = _bounded_float(
             self._config.get("match_threshold"), 0.55, 0.0, 1.0
         )
@@ -393,9 +393,8 @@ class Processor:
                 {
                     "port": "rgb",
                     "topic": camera_topic,
-                    "format": "application/vnd.phanthy.sensor-envelope.v1",
-                    "ros_type": "std_msgs/msg/UInt8MultiArray",
-                    "schema": "phanthy.sensor.camera_rgb_frame.v1",
+                    "format": "image/jpeg",
+                    "ros_type": "sensor_msgs/msg/CompressedImage",
                 },
                 {
                     "port": "livo_odom",

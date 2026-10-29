@@ -28,7 +28,7 @@
     "max_yaw_rps": 0.3
   },
   "semantic": {
-    "camera_topic": "/ubuntu/camera/rgb_frame",
+    "camera_topic": "/ubuntu/camera/rgb",
     "odometry_topic": "/ubuntu/navigation/odom",
     "fast_livo2_status_topic": "/ubuntu/navigation/fast_livo2/status",
     "required_frame_id": "map",
