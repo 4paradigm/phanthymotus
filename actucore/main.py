@@ -8,8 +8,9 @@ whole-body control）以卡片（插件）的形式挂在这里，聚合成一�
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
 当前挂载的卡片：`controlled_semantic_spatial`（配置键和公开工具名一致）——
-FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者作为子进程跑在本容器内，
-对外只发布 bounded motion sequence；同时注册上游 `vla` 卡片。
+FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2
+作为子进程跑在本容器内，对外提供 map_view、motion_sequence 和 control_velocity；
+同时注册上游 `vla` 卡片。
 新增卡片的完整步骤见 README.md。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}；工具名等于 PREFIX 时不加前缀
