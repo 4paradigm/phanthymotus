@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[2]
     ([], {}, 'Dockerfile.navigation'),
     (['--jp-version', '6.1'], {}, 'Dockerfile.jetson'),
     (['--base'], {}, 'Dockerfile.navigation-base'),
+    ([], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'Dockerfile.navigation'),
+    (['--base'], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'Dockerfile.navigation-base'),
+    (['--jp-version', '6.1'], {'BASE_REGISTRY': 'mirror.example', 'BASE_NAMESPACE': 'robot'}, 'Dockerfile.jetson'),
     ([], {'BUILD_JOBS': '0'}, None),
     ([], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image:latest'}, None),
     (['--jp-version', '6.1'], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image@sha256:' + 'a' * 64}, None),
@@ -58,6 +61,19 @@ def test_platform_build_selection(tmp_path, args, extra, dockerfile):
         assert not any(arg.startswith('ACTUCORE_RUNTIME_BASE_IMAGE=') for arg in call)
     elif dockerfile == 'Dockerfile.navigation':
         assert any(arg.startswith('ACTUCORE_NAVIGATION_BASE_IMAGE=') and '@sha256:' in arg for arg in call)
+    if 'BASE_REGISTRY' in extra:
+        prefix = 'mirror.example/robot/'
+        if dockerfile == 'Dockerfile.navigation':
+            image_args = ('ACTUCORE_NAVIGATION_BASE_IMAGE=', 'ACTUCORE_RUNTIME_BASE_IMAGE=')
+        elif dockerfile == 'Dockerfile.navigation-base':
+            image_args = ('ACTUCORE_NAVIGATION_PARENT_IMAGE=',)
+        else:
+            image_args = ('BASE_IMAGE=',)
+        for key in image_args:
+            value = next(arg[len(key):] for arg in call if arg.startswith(key))
+            assert value.startswith(prefix)
+            if dockerfile != 'Dockerfile.jetson':
+                assert '@sha256:' in value
 
 
 @pytest.mark.parametrize('name', ['Dockerfile.navigation', 'Dockerfile.jetson'])

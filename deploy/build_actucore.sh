@@ -68,9 +68,10 @@ jetpack_vars "${JP_VERSION}" || exit 1
 
 # Dockerfile.jetson 基于 L4T base image —— 只有 arm64
 CPU_ARCH="arm64"
+BASE_REPOSITORY="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}/${BASE_NAMESPACE:-phanthy-motus}"
 case "${JP_VERSION}" in
-    5.11) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
-    6.1) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
+    5.11) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp511-torch@sha256:92c4c12a1dc5d4a4e8cb479a69164260578b4c3b022ef3b94c6f0fc20f2462d6" ;;
+    6.1) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
 esac
 
 CARDS_JSON='[{"name":"ControlledSemanticSpatial","type":"processor"},{"name":"vla","type":"processor"},{"name":"navi","type":"processor"}]'
@@ -143,7 +144,7 @@ else
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
     case "${JP_VERSION}" in
         5.11)
-            DEFAULT_NAVIGATION_BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b"
+            DEFAULT_NAVIGATION_BASE_IMAGE="${BASE_REPOSITORY}/actucore-navigation-base@sha256:14550b74bfce5c0ede5908e6081da375148b67695a134f102f025c535f702e4b"
             ;;
         6.1)
             DEFAULT_NAVIGATION_BASE_IMAGE=""

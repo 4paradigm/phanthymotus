@@ -426,7 +426,9 @@ navigation 默认关闭；这不会启动 ROS、HTTP、模型推理或卡片。�
 只复制第三方和自有 ROS install space 及应用代码。源码、build/log 目录和
 navigation base 中额外的编译层不会进入可部署镜像。临时验证另一个基线时
 可显式设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，覆盖值仍必须是精确的
-`@sha256` 引用。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
+`@sha256` 引用。`BASE_REGISTRY` 和 `BASE_NAMESPACE` 也可用于选择镜像仓库；
+JP5 的导航基础镜像和运行时父镜像仍使用锁定 digest，因此镜像仓库必须包含对应
+的相同 digest。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
 重新构建并推送基础镜像：
 
 ```bash
