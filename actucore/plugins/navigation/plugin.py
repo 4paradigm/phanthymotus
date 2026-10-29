@@ -866,11 +866,7 @@ class NavigationPlugin:
             "planning": self._planning.dispatch("nav2", {"action": "info"}),
             "semantic": self._semantic.dispatch("vln", {"action": "info"}),
             "topic_in": [
-                {
-                    **item,
-                    "topic": wired.get(item["port"], ""),
-                    "connected": bool(wired.get(item["port"])),
-                }
+                {**item, "connected": bool(wired.get(item["port"]))}
                 for item in tool["topic_in"]
             ],
             "topic_out": tool["topic_out"],

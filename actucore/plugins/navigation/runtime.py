@@ -93,9 +93,7 @@ class NavigationRuntime:
 
             started: list[_Child] = []
             try:
-                launch_arguments = self._launch_arguments(
-                    namespace, input_topics or {}
-                )
+                launch_arguments = self._launch_arguments(namespace, input_topics)
                 for child in self._children:
                     command = [
                         *child.command,
@@ -130,15 +128,17 @@ class NavigationRuntime:
 
     @staticmethod
     def _launch_arguments(
-        namespace: str, input_topics: dict[str, str]
+        namespace: str, input_topics: dict[str, str] | None
     ) -> dict[str, tuple[str, ...]]:
+        use_legacy_camera_defaults = input_topics is None
+        input_topics = input_topics if input_topics is not None else {}
         root = "/" + str(namespace or "ubuntu").strip("/")
         navigation = f"{root}/navigation"
         fast_livo2 = f"{navigation}/fast_livo2"
         nav2 = f"{navigation}/nav2"
 
         def topic(port: str, default: str) -> str:
-            return str(input_topics.get(port) or default).strip()
+            return str(input_topics.get(port) or "").strip() or default
 
         fast_values = {
             "lidar_topic": topic("lidar", f"{navigation}/lidar"),
@@ -147,6 +147,13 @@ class NavigationRuntime:
             "depth_topic": topic(
                 "depth_frame", f"{root}/camera/depth_frame"
             ),
+            "rgb_enabled": str(
+                use_legacy_camera_defaults or bool(str(input_topics.get("rgb") or "").strip())
+            ).lower(),
+            "depth_enabled": str(
+                use_legacy_camera_defaults
+                or bool(str(input_topics.get("depth_frame") or "").strip())
+            ).lower(),
             "raw_odom_topic": f"{fast_livo2}/raw/odom",
             "raw_cloud_topic": f"{fast_livo2}/raw/cloud_registered",
             "odom_topic": f"{navigation}/odom",

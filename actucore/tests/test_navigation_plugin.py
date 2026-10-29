@@ -741,36 +741,6 @@ class NavigationPluginTest(unittest.TestCase):
         })
         self.assertEqual(info["state"], "ready")
 
-    def test_info_reports_actual_topics_not_unwired_defaults(self):
-        plugin = self.make_plugin()
-
-        def input_info():
-            info = plugin.dispatch(plugin.PREFIX, {"action": "info"})
-            return {item["port"]: item for item in info["topic_in"]}
-
-        self.assertTrue(all(not item["topic"] and not item["connected"]
-                            for item in input_info().values()))
-        bindings = [
-            {"port": "lidar", "topic": "/custom/cloud"},
-            {"port": "imu", "topic": "/custom/imu"},
-        ]
-        result = plugin.dispatch(plugin.PREFIX, {
-            "action": "start", "input_bindings": bindings,
-        })
-        self.assertEqual(result["state"], "ready")
-        inputs = input_info()
-        for binding in bindings:
-            item = inputs[binding["port"]]
-            self.assertEqual(item["topic"], binding["topic"])
-            self.assertTrue(item["connected"])
-        for port in ("rgb", "depth_frame", "goal_pose"):
-            self.assertEqual(inputs[port]["topic"], "")
-            self.assertFalse(inputs[port]["connected"])
-
-        plugin.dispatch(plugin.PREFIX, {"action": "stop"})
-        self.assertTrue(all(not item["topic"] and not item["connected"]
-                            for item in input_info().values()))
-
     def test_direct_start_rejects_unsupported_control_negotiation(self):
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
@@ -2000,6 +1970,9 @@ class NavigationRuntimeTest(unittest.TestCase):
         self.assertIn("lidar_topic:=/sensors/lidar", fast_command)
         self.assertIn("imu_topic:=/sensors/imu", fast_command)
         self.assertIn("rgb_topic:=/camera/rgb", fast_command)
+        self.assertIn("rgb_enabled:=true", fast_command)
+        self.assertIn("depth_enabled:=false", fast_command)
+        self.assertIn("depth_topic:=/robot/camera/depth_frame", fast_command)
         self.assertIn("odom_topic:=/robot/navigation/odom", fast_command)
         self.assertIn("odom_topic:=/robot/navigation/odom", nav2_command)
         self.assertIn(
@@ -2010,6 +1983,24 @@ class NavigationRuntimeTest(unittest.TestCase):
             stopped = runtime.stop()
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(killpg.call_count, 2)
+
+    def test_optional_camera_launch_flags_preserve_legacy_defaults(self):
+        cases = (
+            (None, ("true", "true")),
+            ({}, ("false", "false")),
+            ({"lidar": "/lidar", "imu": "/imu"}, ("false", "false")),
+            ({"rgb": "/custom/rgb"}, ("true", "false")),
+            ({"depth_frame": "/custom/depth"}, ("false", "true")),
+            ({"rgb": "/custom/rgb", "depth_frame": "/custom/depth"}, ("true", "true")),
+            ({"rgb": "  ", "depth_frame": ""}, ("false", "false")),
+        )
+        for mapping, flags in cases:
+            with self.subTest(mapping=mapping):
+                args = NavigationRuntime._launch_arguments("robot", mapping)["fast_livo2"]
+                values = dict(arg.split(":=", 1) for arg in args)
+                self.assertEqual((values["rgb_enabled"], values["depth_enabled"]), flags)
+                self.assertTrue(values["rgb_topic"].startswith("/"))
+                self.assertTrue(values["depth_topic"].startswith("/"))
 
     def test_runtime_signals_owned_nested_session_groups_before_launch_group(self):
         def factory(command, **kwargs):

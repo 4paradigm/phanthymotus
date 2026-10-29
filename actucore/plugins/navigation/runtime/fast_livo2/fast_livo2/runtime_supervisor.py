@@ -106,6 +106,8 @@ class FastLivo2Supervisor(Node):
         self.declare_parameter("imu_topic", "/ubuntu/navigation/imu")
         self.declare_parameter("rgb_topic", "/ubuntu/camera/rgb_frame")
         self.declare_parameter("depth_topic", "/ubuntu/camera/depth_frame")
+        self.declare_parameter("rgb_enabled", True)
+        self.declare_parameter("depth_enabled", True)
         self.declare_parameter("odom_topic", "/ubuntu/navigation/odom")
         self.declare_parameter(
             "raw_odom_topic", "/ubuntu/navigation/fast_livo2/raw/odom"
@@ -164,6 +166,10 @@ class FastLivo2Supervisor(Node):
             "rgb_frame": str(self.get_parameter("rgb_topic").value),
             "depth_frame": str(self.get_parameter("depth_topic").value),
             "odom": str(self.get_parameter("odom_topic").value),
+        }
+        self._collection_camera_enabled = {
+            "rgb_frame": self.get_parameter("rgb_enabled").value,
+            "depth_frame": self.get_parameter("depth_enabled").value,
         }
         self._condition = threading.Condition(self._lock)
         self._map_root = Path(str(self.get_parameter("map_root").value))
@@ -271,6 +277,12 @@ class FastLivo2Supervisor(Node):
         subscriptions = []
         for item in COLLECTION_SOURCES:
             port = item["port"]
+            if port in self._collection_camera_enabled:
+                enabled = self._collection_camera_enabled[port]
+                if not isinstance(enabled, bool):
+                    raise ValueError(f"{port} enable parameter must be boolean")
+                if not enabled:
+                    continue
             subscriptions.append(
                 self.create_subscription(
                     message_types[port],

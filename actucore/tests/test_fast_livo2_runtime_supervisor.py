@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 import struct
 import sys
@@ -520,6 +522,82 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             ["FAST-LIVO2 cloud recovered after 101 rejected samples"],
         )
         self.assertEqual(adapter._rejection_counts, {})
+
+    def test_launch_uses_python_38_compatible_syntax_and_no_dict_union(self) -> None:
+        path = PACKAGE_ROOT / "launch" / "fast_livo2.launch.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), feature_version=(3, 8))
+        self.assertFalse(any(
+            isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
+            for node in ast.walk(tree)
+        ))
+
+    def test_direct_launch_defaults_enable_cameras_with_typed_boolean_parameters(self) -> None:
+        class Record:
+            def __init__(self, *args, **kwargs):
+                self.args, self.kwargs = args, kwargs
+
+        launch = types.ModuleType("launch")
+        launch.LaunchDescription = Record
+        actions = types.ModuleType("launch.actions")
+        actions.DeclareLaunchArgument = Record
+        substitutions = types.ModuleType("launch.substitutions")
+        substitutions.LaunchConfiguration = Record
+        ros_actions = types.ModuleType("launch_ros.actions")
+        ros_actions.Node = Record
+        descriptions = types.ModuleType("launch_ros.parameter_descriptions")
+        descriptions.ParameterValue = Record
+        modules = {
+            "launch": launch, "launch.actions": actions,
+            "launch.substitutions": substitutions,
+            "launch_ros": types.ModuleType("launch_ros"),
+            "launch_ros.actions": ros_actions,
+            "launch_ros.parameter_descriptions": descriptions,
+        }
+        path = PACKAGE_ROOT / "launch" / "fast_livo2.launch.py"
+        spec = importlib.util.spec_from_file_location("test_fast_livo2_launch", path)
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, modules):
+            spec.loader.exec_module(module)
+            entries = module.generate_launch_description().args[0]
+        defaults = {
+            entry.args[0]: entry.kwargs["default_value"] for entry in entries
+            if entry.args and "default_value" in entry.kwargs
+        }
+        self.assertEqual(defaults["rgb_enabled"], "true")
+        self.assertEqual(defaults["depth_enabled"], "true")
+        self.assertEqual(defaults["rgb_topic"], "/ubuntu/camera/rgb_frame")
+        self.assertEqual(defaults["depth_topic"], "/ubuntu/camera/depth_frame")
+        supervisor = next(entry for entry in entries
+                          if entry.kwargs.get("executable") == "runtime_supervisor")
+        parameters = supervisor.kwargs["parameters"][0]
+        for key in ("rgb_enabled", "depth_enabled"):
+            self.assertIs(parameters[key].kwargs["value_type"], bool)
+            self.assertEqual(parameters[key].args[0].args[0], key)
+
+    def test_camera_subscription_enable_flags(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._collection_input_topics = {
+            "lidar": "/lidar", "imu": "/imu", "rgb_frame": "/rgb",
+            "depth_frame": "/depth", "odom": "/odom",
+        }
+        for rgb, depth in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(rgb=rgb, depth=depth):
+                supervisor._collection_camera_enabled = {"rgb_frame": rgb, "depth_frame": depth}
+                supervisor.create_subscription = mock.Mock(side_effect=lambda *args: args)
+                subscriptions = supervisor._create_collection_subscriptions()
+                topics = {item[1] for item in subscriptions}
+                expected = {"/lidar", "/imu", "/odom"}
+                if rgb:
+                    expected.add("/rgb")
+                if depth:
+                    expected.add("/depth")
+                self.assertEqual(topics, expected)
+                self.assertTrue(all(topic for topic in topics))
+        for bad in ("false", 0, None):
+            with self.subTest(invalid=bad):
+                supervisor._collection_camera_enabled = {"rgb_frame": bad, "depth_frame": False}
+                with self.assertRaises(ValueError):
+                    supervisor._create_collection_subscriptions()
 
     def test_collection_subscriptions_drop_backlog_instead_of_replaying_it(self) -> None:
         source = (
