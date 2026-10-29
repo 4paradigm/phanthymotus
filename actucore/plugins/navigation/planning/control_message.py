@@ -39,7 +39,6 @@ def build_navigation_control_message(
     ttl_ms: int,
     priority: int,
     max_obs_age_ms: int,
-    max_future_skew_ms: int,
     vx: float,
     vy: float,
     wz: float,
@@ -49,11 +48,11 @@ def build_navigation_control_message(
     ``stamp_ms`` is command generation time; ``obs_stamp_ms`` is the capture
     time of the actual trusted observation used to generate the command. Both
     must share a verified Unix clock domain. Observation age is checked at
-    generation against explicit caller-selected bounds; both bounds are
-    inclusive, and a small future skew is permitted only when explicitly given.
+    generation against an explicit caller-selected bound, inclusive. An
+    observation later than the command cannot have produced it and is rejected.
     The sink must independently check freshness at receipt.
 
-    Positive timestamps and TTL are mandatory; seq and the two age bounds may
+    Positive timestamps and TTL are mandatory; seq and the age bound may
     be zero. Signed and zero velocities are representable. This function does not
     establish provenance or clamp/validate velocities against robot limits.
     """
@@ -62,7 +61,6 @@ def build_navigation_control_message(
     _integer("obs_stamp_ms", obs_stamp_ms, minimum=1)
     _integer("ttl_ms", ttl_ms, minimum=1)
     _integer("max_obs_age_ms", max_obs_age_ms, minimum=0)
-    _integer("max_future_skew_ms", max_future_skew_ms, minimum=0)
     if isinstance(priority, bool) or not isinstance(priority, int):
         raise ValueError("priority must be an integer")
     if not isinstance(source, str) or not source or source != source.strip():
@@ -71,8 +69,8 @@ def build_navigation_control_message(
     age_ms = stamp_ms - obs_stamp_ms
     if age_ms > max_obs_age_ms:
         raise ValueError("observation is older than max_obs_age_ms")
-    if age_ms < -max_future_skew_ms:
-        raise ValueError("observation exceeds max_future_skew_ms")
+    if age_ms < 0:
+        raise ValueError("observation is later than command generation")
 
     return build_control_message(
         seq=seq,

@@ -24,7 +24,6 @@ def _args(**changes):
         "ttl_ms": 100,
         "priority": 37,
         "max_obs_age_ms": 100,
-        "max_future_skew_ms": 10,
         "vx": 0.3,
         "vy": -0.1,
         "wz": -0.2,
@@ -66,7 +65,7 @@ def test_delegates_wire_construction_to_shared_builder():
 def test_zero_command_and_zero_seq_are_valid():
     message = build_navigation_control_message(
         **_args(seq=0, vx=0, vy=0, wz=0, max_obs_age_ms=0,
-                obs_stamp_ms=1_700_000_000_100, max_future_skew_ms=0)
+                obs_stamp_ms=1_700_000_000_100)
     )
     assert message["values"] == [0.0] * 6
     assert message["seq"] == 0
@@ -86,7 +85,6 @@ def test_invalid_velocity_is_rejected(field, value):
      ("obs_stamp_ms", 0), ("obs_stamp_ms", -1), ("obs_stamp_ms", None),
      ("ttl_ms", 0), ("ttl_ms", -1), ("ttl_ms", float("inf")),
      ("max_obs_age_ms", -1), ("max_obs_age_ms", True),
-     ("max_future_skew_ms", -1), ("max_future_skew_ms", 1.0),
      ("priority", True), ("priority", float("nan"))],
 )
 def test_invalid_integer_fields_are_rejected(field, value):
@@ -107,18 +105,16 @@ def test_observation_age_bound_is_inclusive():
         build_navigation_control_message(**{**args, "obs_stamp_ms": 899})
 
 
-def test_observation_future_skew_bound_is_inclusive():
-    args = _args(stamp_ms=1000, obs_stamp_ms=1010, max_future_skew_ms=10)
-    assert build_navigation_control_message(**args)["obs_stamp_ms"] == 1010
-    with pytest.raises(ValueError, match="future"):
-        build_navigation_control_message(**{**args, "obs_stamp_ms": 1011})
-    with pytest.raises(ValueError, match="future"):
-        build_navigation_control_message(**{**args, "max_future_skew_ms": 0})
+def test_observation_must_not_postdate_command():
+    args = _args(stamp_ms=1000, obs_stamp_ms=1000)
+    assert build_navigation_control_message(**args)["obs_stamp_ms"] == 1000
+    with pytest.raises(ValueError, match="later"):
+        build_navigation_control_message(**{**args, "obs_stamp_ms": 1001})
 
 
 @pytest.mark.parametrize(
     "missing", ["seq", "source", "stamp_ms", "obs_stamp_ms", "ttl_ms", "priority",
-                "max_obs_age_ms", "max_future_skew_ms", "vx", "vy", "wz"]
+                "max_obs_age_ms", "vx", "vy", "wz"]
 )
 def test_required_fields_are_not_defaulted(missing):
     args = _args()
