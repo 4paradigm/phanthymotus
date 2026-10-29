@@ -107,7 +107,7 @@ LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一�
 每次 ActuCore 运行会话使用 rosbag2 snapshot 在内存中保留最近约 5 秒
 的全频 LiDAR、IMU、FAST-LIVO2 raw odom 和 IMU 传播 odom；首次
 `raw_odom_discontinuity` 后再采 5 秒，仅落盘一份 MCAP 到
-`/opt/phanthy-motus/data/fast_livo2/recordings/faults/`。`status.fault_capture`
+`/opt/phanthy-motus/data/navigation/fast_livo2/recordings/faults/`。`status.fault_capture`
 显示 `armed/post_trigger/saved/error`、触发原因、产物目录和
 `diagnostic_summary.json`；摘要会对齐 Driver 发布、FAST-LIVO2 实际
 callback/处理和 adapter 输出计数，因此旧录包中的低帧率不再被直接误判为
@@ -350,9 +350,7 @@ smac、mppi、constrained_smoother、route、rviz_plugins 刻意不编；它们�
 体积。基础镜像使用 builder/runtime 双阶段；最终阶段只复制三个 ROS install-space
 和包锁，不保留 `/opt/ros_deps_ws`、`/opt/fast_livo_ws`、`/opt/nav2_ws` 的源码、
 build 与 log 目录。上述 `0.82 GiB` 是清理前的历史测量，新的最终体积必须在原生
-ARM64 完整构建后重新记录。2026-09-18 当前镜像的 registry 压缩层测量见
-[镜像体积证据](../../../docs/plans/controlled-semantic-spatial-image-size-evidence.md)，
-该口径不能与上述历史解压后大小相减。
+ARM64 完整构建后重新记录；镜像压缩层传输大小与上述历史解压后大小不能直接相减。
 该固定 base 同时提供 `colcon` / `empy` 和 PyYAML；日常镜像构建会实际执行
 `colcon build` 并显式导入 `em` / `yaml`，避免把基础镜像的偶然环境冒充成依赖
 契约，并从最终安装的 `nav2_params.yaml` 逐个动态加载全部 BT 插件库，缺库或
@@ -406,9 +404,15 @@ digest。它不是运行时 service，也不注册 Resource Center。日常构�
 
 ```bash
 sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 \
-  /opt/phanthy-motus/data/fast_livo2/maps \
-  /opt/phanthy-motus/data/fast_livo2/recordings
+  /opt/phanthy-motus/data/navigation/fast_livo2/maps \
+  /opt/phanthy-motus/data/navigation/fast_livo2/recordings
 ```
+
+升级时不会自动迁移旧目录 `/opt/phanthy-motus/data/fast_livo2/{maps,recordings}`。
+现场操作者应先停卡并备份，核对新目录是否已有数据和同名文件，再将旧地图及
+录制数据迁移至上述对应新目录并核对权限；不要直接覆盖已有数据。自定义的旧
+`collection_directory` 也需更新到新容器目录或其子目录，否则配置校验会拒绝。
+地图容器内路径仍为 `/opt/fast_livo_ws/src/fast_livo/Log/pcd`。
 
 数采默认关闭。两类目录都不会自动清理：单次地图会话仍受 512 MiB 安全上限，
 但总历史和录制数据会持续占用磁盘，操作者需在停卡后自行归档或删除旧目录。

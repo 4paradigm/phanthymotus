@@ -28,7 +28,7 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "map_view_enabled": True,
     "fault_capture_enabled": True,
     "collection_enabled": False,
-    "collection_directory": "/opt/phanthy-motus/data/fast_livo2/recordings",
+    "collection_directory": "/opt/phanthy-motus/data/navigation/fast_livo2/recordings",
 }
 
 FAST_LIVO2_CONFIG_SCHEMA = {
@@ -124,7 +124,7 @@ FAST_LIVO2_CONFIG_SCHEMA = {
         },
         "collection_directory": {
             "type": "string",
-            "default": "/opt/phanthy-motus/data/fast_livo2/recordings",
+            "default": "/opt/phanthy-motus/data/navigation/fast_livo2/recordings",
             "description": (
                 "Persistent in-container directory; it must remain under the "
                 "mounted FAST-LIVO2 recordings root"

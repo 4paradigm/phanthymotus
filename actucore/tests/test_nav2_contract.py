@@ -116,7 +116,7 @@ class Nav2ContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         runtime_dir = companion_root.parent
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
             encoding="utf-8"
         )
         service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text(

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import unittest
 from pathlib import Path
+
+import yaml
 
 
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
@@ -83,10 +86,36 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertFalse(config["collection_enabled"]["default"])
         self.assertEqual(
             config["collection_directory"]["default"],
-            "/opt/phanthy-motus/data/fast_livo2/recordings",
+            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings",
         )
         self.assertNotIn("start_recording", actions)
         self.assertNotIn("stop_recording", actions)
+
+    def test_collection_defaults_agree_with_runtime_and_examples(self) -> None:
+        from plugins.navigation.mapping.contract import FAST_LIVO2_CONFIG_DEFAULTS
+        from plugins.navigation.mapping.plugin import _COLLECTION_ROOT
+
+        runtime = ACTUCORE_ROOT / "plugins/navigation/runtime/fast_livo2"
+        sys.path.insert(0, str(runtime))
+        try:
+            from fast_livo2.collection_core import COLLECTION_ROOT
+        finally:
+            sys.path.remove(str(runtime))
+
+        root = "/opt/phanthy-motus/data/navigation/fast_livo2/recordings"
+        config = yaml.safe_load((ACTUCORE_ROOT / "config.yaml").read_text())
+        navigation = json.loads(
+            (ACTUCORE_ROOT / "plugins/navigation/config.example.json").read_text()
+        )
+        mapping = json.loads(
+            (ACTUCORE_ROOT / "plugins/navigation/mapping/config.example.json").read_text()
+        )
+        self.assertEqual(config["plugins"]["navigation"]["mapping"]["collection_directory"], root)
+        self.assertEqual(navigation["mapping"]["collection_directory"], root)
+        self.assertEqual(mapping["collection_directory"], root)
+        self.assertEqual(FAST_LIVO2_CONFIG_DEFAULTS["collection_directory"], root)
+        self.assertEqual(str(_COLLECTION_ROOT), root)
+        self.assertEqual(str(COLLECTION_ROOT), root)
 
     def test_runtime_is_locked_in_navigation_base_and_actucore_image(self) -> None:
         runtime = ACTUCORE_ROOT / "plugins" / "navigation" / "runtime"
@@ -96,7 +125,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         base_dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation-base").read_text(
             encoding="utf-8"
         )
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
             encoding="utf-8"
         )
         adapter = (
@@ -266,9 +295,13 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("container_name: embodied-perception-fast-livo2", service)
         self.assertNotIn("container_name: embodied-perception-nav2", service)
         self.assertEqual(service.count("container_name:"), 1)
-        self.assertIn("/opt/phanthy-motus/data/fast_livo2/maps", service)
         self.assertIn(
-            "/opt/phanthy-motus/data/fast_livo2/recordings", service
+            "/opt/phanthy-motus/data/navigation/fast_livo2/maps:"
+            "/opt/fast_livo_ws/src/fast_livo/Log/pcd:rw", service
+        )
+        self.assertIn(
+            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings:"
+            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings:rw", service
         )
         # 录包用 mcap，它由 base（dustynv 的 rosinstall 列表里带）提供，
         # 卡片侧只声明 exec_depend；镜像必须留下可核对的 ROS 包清单。

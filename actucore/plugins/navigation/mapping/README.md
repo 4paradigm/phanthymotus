@@ -120,7 +120,7 @@ odom/cloud 或规划输入。地图卡片支持三维
 一份 occupancy grid。绿色机器人箭头沿 canonical `base_link` 的 `+X` 前向，
 并保持 ROS `map` frame 的 yaw 正方向。它是监控视图，不是
 可重定位地图格式。原始 PCD 分片保存在宿主机
-`/opt/phanthy-motus/data/fast_livo2/maps`；`stop_mapping` 还会原子写入
+`/opt/phanthy-motus/data/navigation/fast_livo2/maps`；`stop_mapping` 还会原子写入
 `maps/static/<map>-*.static.pcd`，保存导航高度带内直接累计的静态点。
 
 live PointCloud2 在复制数据区前同时检查 `width * height <= 200,000` 和
@@ -279,7 +279,7 @@ fail closed。
 | 配置 | 默认值 | 语义 |
 | --- | --- | --- |
 | `collection_enabled` | `false` | Canvas 启动该卡片时自动开始采集，停止卡片时自动收口 |
-| `collection_directory` | `/opt/phanthy-motus/data/fast_livo2/recordings` | ActuCore 容器内持久化根目录；只能配置为该挂载目录或其子目录 |
+| `collection_directory` | `/opt/phanthy-motus/data/navigation/fast_livo2/recordings` | ActuCore 容器内持久化根目录；只能配置为该挂载目录或其子目录 |
 
 启用后，同容器 adapter 从以下 Driver/卡片输入中选择每秒一组时间戳对齐的
 多模态快照，再通过内部 `collection/*` topic 交给 ROS 2 原生 rosbag2 MCAP

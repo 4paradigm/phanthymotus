@@ -142,7 +142,7 @@ class ReceiptBackend(ReadyBackend):
                     "state": "complete",
                     "storage_complete": True,
                     "directory": (
-                        "/opt/phanthy-motus/data/fast_livo2/recordings/"
+                        "/opt/phanthy-motus/data/navigation/fast_livo2/recordings/"
                         "ubuntu/2026-08-21/session-a"
                     ),
                 },
@@ -284,7 +284,7 @@ class FastLivo2PluginTest(unittest.TestCase):
             {
                 "collection_enabled": True,
                 "collection_directory": (
-                    "/opt/phanthy-motus/data/fast_livo2/recordings/acceptance"
+                    "/opt/phanthy-motus/data/navigation/fast_livo2/recordings/acceptance"
                 ),
             },
             None,
@@ -306,7 +306,7 @@ class FastLivo2PluginTest(unittest.TestCase):
             {
                 "enabled": True,
                 "directory": (
-                    "/opt/phanthy-motus/data/fast_livo2/recordings/acceptance"
+                    "/opt/phanthy-motus/data/navigation/fast_livo2/recordings/acceptance"
                 ),
                 "namespace": "ubuntu",
             },
@@ -362,7 +362,10 @@ class FastLivo2PluginTest(unittest.TestCase):
         self.assertTrue(controller.receipts[0]["storage_complete"])
 
     def test_collection_directory_is_confined_to_mounted_root(self) -> None:
-        for directory in ("relative", "/tmp/recordings", "/opt/../tmp"):
+        for directory in (
+            "relative", "/tmp/recordings", "/opt/../tmp",
+            "/opt/phanthy-motus/data/fast_livo2/recordings",
+        ):
             with self.subTest(directory=directory):
                 plugin = FastLivo2Plugin(
                     {

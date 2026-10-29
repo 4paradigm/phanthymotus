@@ -14,7 +14,7 @@
     "map_view_enabled": true,
     "fault_capture_enabled": true,
     "collection_enabled": false,
-    "collection_directory": "/opt/phanthy-motus/data/fast_livo2/recordings"
+    "collection_directory": "/opt/phanthy-motus/data/navigation/fast_livo2/recordings"
   },
   "planning": {
     "backend": "ros_topic",

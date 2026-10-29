@@ -12,7 +12,7 @@ import yaml
 
 
 COLLECTION_ROOT = PurePosixPath(
-    "/opt/phanthy-motus/data/fast_livo2/recordings"
+    "/opt/phanthy-motus/data/navigation/fast_livo2/recordings"
 )
 COLLECTION_SOURCES = (
     {

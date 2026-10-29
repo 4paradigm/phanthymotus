@@ -409,17 +409,17 @@ range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 rang
 ./deploy/build_actucore.sh --jp-version 6.1 # 上游 VLA 本地推理，不含 navigation
 ```
 
-JetPack 5.11 默认继承仓库锁定的 `@sha256` 基础镜像，无需额外
-环境变量，提供 navigation 与 VLA mock / vla_cloud。JetPack 6.1 保留上游
-`jetson-base-actucore` 的 torch / lerobot 本地推理，通过 `Dockerfile.vla` 构建；
-该镜像禁用 navigation（对应基座尚未发布），不接受 navigation base 覆盖。
-`Dockerfile.vla` 保留上游 `bdeec4e` 原 `Dockerfile.jetson` 的 JP6.1 路径：
-colcon/empy 和 audio_msgs 的构建步骤是原有层，不是导航新增依赖。独立文件让
-JP6.1 继续使用 torch/lerobot 平台基线，避免进入 JP5.11 的导航多阶段构建。
-该文件没有 APT 消费者，因此不修改继承的 APT 源或签名校验。
-JP6.1 只复制 VLA 插件，构建产物从共用配置生成 navigation-disabled 变体；
-最终镜像直接构造未启动的 Bundle，断言其公开工具仅为 `vla`、navigation 配置
-关闭且插件不可导入。构建检查不启动 ROS、HTTP、模型推理或卡片。
+JetPack 5.11 使用 `Dockerfile.navigation`，默认继承仓库锁定的 `@sha256`
+基础镜像，无需额外环境变量，提供 navigation 与 VLA mock / vla_cloud。
+JetPack 6.1 使用以主线为基底的 `Dockerfile.jetson`，保留上游
+`jetson-base-actucore` 的 torch / lerobot 本地推理、`vla`、`navi` 和工具；
+新 navigation 默认关闭（对应基座尚未发布），不接受 navigation base 覆盖。
+镜像保留主线 ROS 源设置以及 colcon/empy 和 audio_msgs 的构建步骤。
+最终镜像直接构造未启动的 Bundle，检查公开工具为 `vla`、`navi` 且新
+navigation 默认关闭；这不会启动 ROS、HTTP、模型推理或卡片。外部自定义
+配置不受该默认值限制，不应在 JP6.1 上启用尚未提供运行时的新 navigation。
+直接调用 `docker build` 时 `Dockerfile.jetson` 保留主线 JP5 基座默认值；
+推荐通过上述脚本选择平台。
 5.11 的导航基础镜像预编译了锁定版本的 FAST-LIVO2、Nav2
 和系统依赖，仅作为日常构建的 builder。仓库自有 ROS 包使用普通 install
 编译后，最终阶段从同一个干净、锁定 digest 的 Jetson 平台镜像重新开始，
@@ -441,13 +441,10 @@ BT 插件，并导入 ActuCore 主入口；JP6.1 同样检查主入口导入。�
 在 8 GB 等小内存 ARM64 构建机上可设置 `BUILD_JOBS=2`；该值会同时传给
 navigation base 和日常 ActuCore 的 C++ 编译步骤。
 
-基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时仍把普通依赖
-放在 `Dockerfile.jetson`；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈
-才进入 `Dockerfile.navigation-base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
+基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时须考虑两个
+平台的 Dockerfile；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈才进入
+`Dockerfile.navigation-base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
 再次走耗时且容易超时的 x86 QEMU 交叉编译。
-
-当前镜像与固定导航基线的按 digest 体积测量、依赖增量及测量口径见
-[导航镜像体积证据](../docs/plans/controlled-semantic-spatial-image-size-evidence.md)。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 

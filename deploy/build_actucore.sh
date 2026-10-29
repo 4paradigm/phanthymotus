@@ -9,7 +9,7 @@
 #
 # Usage:
 #   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
-#   ./build_actucore.sh --jp-version 6.1         # VLA-only，保留上游本地推理
+#   ./build_actucore.sh --jp-version 6.1         # VLA / navi，保留上游本地推理
 #   ./build_actucore.sh --mirror tuna
 #   ./build_actucore.sh --base --mirror tuna     # 依赖变化时才构建 navigation base
 #   BUILD_JOBS=2 ./build_actucore.sh --base --mirror tuna  # 小内存 ARM64 主机
@@ -73,18 +73,18 @@ case "${JP_VERSION}" in
     6.1) NAVIGATION_PARENT_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
 esac
 
-CARDS_JSON='[{"name":"ControlledSemanticSpatial","type":"processor"},{"name":"vla","type":"processor"}]'
+CARDS_JSON='[{"name":"ControlledSemanticSpatial","type":"processor"},{"name":"vla","type":"processor"},{"name":"navi","type":"processor"}]'
 if ! ${BUILD_BASE} && [ "${JP_VERSION}" = "6.1" ]; then
     if [ -n "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" ]; then
         echo "ERROR=JP6.1 navigation runtime is not supported; build VLA without a navigation override" >&2
         exit 2
     fi
-    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.vla"
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
     IMAGE_NAME="actucore"
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
     BASE_IMAGE="${BASE_REGISTRY:-bj-warehouse.tencentcloudcr.com}/${BASE_NAMESPACE:-phanthy-motus}/jetson-base-actucore:jp${JP_ARG}-torch"
     BUILD_ARGS+=("JP_VERSION=${JP_ARG}" "BASE_IMAGE=${BASE_IMAGE}")
-    CARDS_JSON='[{"name":"vla","type":"processor"}]'
+    CARDS_JSON='[{"name":"vla","type":"processor"},{"name":"navi","type":"processor"}]'
     echo "[info] JP6.1: VLA providers enabled; navigation is unavailable on this image."
 elif ${BUILD_BASE}; then
     if ! ${IS_ARM64}; then
@@ -138,7 +138,7 @@ elif ${BUILD_BASE}; then
         "LZ4_COMMIT=${LZ4_COMMIT}"
     )
 else
-    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
+    DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.navigation"
     IMAGE_NAME="actucore"
     TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
     case "${JP_VERSION}" in

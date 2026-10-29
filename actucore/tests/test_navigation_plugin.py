@@ -361,7 +361,7 @@ class NavigationContractTest(unittest.TestCase):
         service = (ACTUCORE_ROOT / "deploy" / "service.yml").read_text()
         self.assertIn("FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml", service)
         self.assertIn("/opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro", service)
-        for manifest in (ACTUCORE_ROOT / "Dockerfile.jetson", ACTUCORE_ROOT / "deploy" / "service.yml"):
+        for manifest in (ACTUCORE_ROOT / "Dockerfile.navigation", ACTUCORE_ROOT / "deploy" / "service.yml"):
             self.assertNotIn("FASTDDS_BUILTIN_TRANSPORTS=", manifest.read_text())
 
         for source_lock in (
@@ -384,7 +384,7 @@ class NavigationContractTest(unittest.TestCase):
         torch / opencv-python / ultralytics 属于 perception 的 VOP 卡片。
         以前这两张卡片挤在同一个镜像里，所以旧断言反过来要求"别丢 VOP 依赖"。
         """
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
             encoding="utf-8"
         )
         for perception_only in (
@@ -453,7 +453,7 @@ class NavigationContractTest(unittest.TestCase):
         ).read_text(
             encoding="utf-8"
         )
-        dockerfile = (ACTUCORE_ROOT / "Dockerfile.jetson").read_text(
+        dockerfile = (ACTUCORE_ROOT / "Dockerfile.navigation").read_text(
             encoding="utf-8"
         )
         build_script = (

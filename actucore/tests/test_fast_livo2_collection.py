@@ -31,13 +31,16 @@ from fast_livo2.collection_core import (  # noqa: E402
 class FastLivo2CollectionTest(unittest.TestCase):
     def test_directory_and_rosbag_command_are_bounded(self) -> None:
         directory = normalize_collection_directory(
-            "/opt/phanthy-motus/data/fast_livo2/recordings/room-a"
+            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings/room-a"
         )
         self.assertEqual(
             directory,
-            "/opt/phanthy-motus/data/fast_livo2/recordings/room-a",
+            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings/room-a",
         )
-        for invalid in ("relative", "/tmp/recordings", "/opt/../tmp"):
+        for invalid in (
+            "relative", "/tmp/recordings", "/opt/../tmp",
+            "/opt/phanthy-motus/data/fast_livo2/recordings",
+        ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     normalize_collection_directory(invalid)

@@ -6,13 +6,14 @@ import subprocess
 import sys
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize('args,extra,dockerfile', [
-    ([], {}, 'Dockerfile.jetson'),
-    (['--jp-version', '6.1'], {}, 'Dockerfile.vla'),
+    ([], {}, 'Dockerfile.navigation'),
+    (['--jp-version', '6.1'], {}, 'Dockerfile.jetson'),
     (['--base'], {}, 'Dockerfile.navigation-base'),
     ([], {'BUILD_JOBS': '0'}, None),
     ([], {'ACTUCORE_NAVIGATION_BASE_IMAGE': 'image:latest'}, None),
@@ -51,15 +52,15 @@ def test_platform_build_selection(tmp_path, args, extra, dockerfile):
     assert len(calls) == 1 and calls[0][0] == 'build'
     call = calls[0]
     assert Path(call[call.index('--file') + 1]).name == dockerfile
-    if dockerfile == 'Dockerfile.vla':
+    if dockerfile == 'Dockerfile.jetson':
         assert 'JP_VERSION=61' in call
         assert any(arg.endswith('/jetson-base-actucore:jp61-torch') for arg in call)
         assert not any(arg.startswith('ACTUCORE_RUNTIME_BASE_IMAGE=') for arg in call)
-    elif dockerfile == 'Dockerfile.jetson':
+    elif dockerfile == 'Dockerfile.navigation':
         assert any(arg.startswith('ACTUCORE_NAVIGATION_BASE_IMAGE=') and '@sha256:' in arg for arg in call)
 
 
-@pytest.mark.parametrize('name', ['Dockerfile.jetson', 'Dockerfile.vla'])
+@pytest.mark.parametrize('name', ['Dockerfile.navigation', 'Dockerfile.jetson'])
 def test_final_image_contains_entry_point_dependencies(name):
     final = (ROOT / 'actucore' / name).read_text().rsplit('\nFROM ', 1)[1]
     copies = [line.split() for line in final.splitlines() if line.startswith('COPY ')]
@@ -75,7 +76,7 @@ def test_final_image_contains_entry_point_dependencies(name):
     ('not a dynamic executable', 1, False),
 ])
 def test_final_native_check_fails_closed(tmp_path, output, status, success):
-    final = (ROOT / 'actucore/Dockerfile.jetson').read_text().rsplit('\nFROM ', 1)[1]
+    final = (ROOT / 'actucore/Dockerfile.navigation').read_text().rsplit('\nFROM ', 1)[1]
     check = 'for binary in ' + final.split('for binary in ', 1)[1].split('done &&', 1)[0] + 'done'
     assert 'fastlivo_mapping' in check and 'controller_server' in check
     assert 'libsegmented_controller.so' in check
@@ -90,7 +91,7 @@ def test_final_native_check_fails_closed(tmp_path, output, status, success):
 
 
 def test_jp61_copied_plugins_can_import_without_source_tree(tmp_path):
-    final = (ROOT / 'actucore/Dockerfile.vla').read_text()
+    final = (ROOT / 'actucore/Dockerfile.jetson').read_text()
     for line in final.splitlines():
         if not line.startswith('COPY ') or '/work/' not in line:
             continue
@@ -106,6 +107,13 @@ def test_jp61_copied_plugins_can_import_without_source_tree(tmp_path):
     config_code = config_command.split('"', 1)[1].rsplit('"', 1)[0]
     subprocess.run([sys.executable, '-c', config_code.replace('/work/', f'{tmp_path}/')],
                    check=True, timeout=10)
+    original = yaml.safe_load((ROOT / 'actucore/config.yaml').read_text())
+    shipped = yaml.safe_load((tmp_path / 'config.yaml').read_text())
+    original['plugins']['navigation']['enabled'] = False
+    assert shipped == original
+    assert (tmp_path / 'plugins/navi/plugin.py').is_file()
+    assert (tmp_path / 'tools/measure_fov.py').is_file()
+    assert 'COPY deploy/ros-base/audio_msgs/' in final
     entry_code = """
 import sys, types
 for name in ('rclpy', 'rclpy.executors', 'rclpy._rclpy_pybind11'):
@@ -113,7 +121,8 @@ for name in ('rclpy', 'rclpy.executors', 'rclpy._rclpy_pybind11'):
 sys.modules['rclpy._rclpy_pybind11'].InvalidHandle = type('InvalidHandle', (Exception,), {})
 import main
 bundle = main.ActuCoreBundle(main._load_config(), None)
-assert [tool['name'] for tool in bundle.get_all_tools()] == ['vla']
+assert {tool['name'] for tool in bundle.get_all_tools()} == {'vla', 'navi'}
+assert main._load_config()['plugins']['navigation']['enabled'] is False
 """
     result = subprocess.run(
         [sys.executable, '-c', entry_code],

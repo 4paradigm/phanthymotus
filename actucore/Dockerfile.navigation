@@ -1,0 +1,139 @@
+# ── Jetson ActuCore runtime ─────────────────────────────────────────
+# The digest-pinned navigation image is a build input only. Repository-owned ROS
+# packages are installed normally here, then only install spaces cross into runtime.
+ARG ACTUCORE_NAVIGATION_BASE_IMAGE
+ARG ACTUCORE_RUNTIME_BASE_IMAGE
+FROM ${ACTUCORE_NAVIGATION_BASE_IMAGE} AS actucore_ros_builder
+ARG ACTUCORE_NAVIGATION_BASE_IMAGE
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG BUILD_JOBS=4
+
+COPY actucore/plugins/navigation/runtime/fast_livo2/ /ros_ws/src/fast_livo2/
+COPY actucore/plugins/navigation/runtime/nav2/ /ros_ws/src/nav2/
+COPY actucore/plugins/navigation/runtime/segmented_controller/ /ros_ws/src/segmented_controller/
+RUN source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/nav2_ws/install/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    cd /ros_ws && \
+    MAKEFLAGS="-j${BUILD_JOBS}" colcon build \
+      --packages-select fast_livo2 segmented_controller nav2 && \
+    source /ros_ws/install/setup.bash && \
+    ros2 pkg prefix segmented_controller >/dev/null && \
+    NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
+      python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
+    python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
+    ros2 bag record --help | grep -F -- '--no-discovery' >/dev/null
+
+COPY actucore/plugins/ /tmp/actucore-plugins/
+RUN rm -rf /tmp/actucore-plugins/navigation/runtime
+
+# The navigation image is a build input only. Restart from the clean platform
+# parent and copy install spaces, leaving source, build and log trees behind.
+FROM ${ACTUCORE_RUNTIME_BASE_IMAGE} AS actucore_runtime
+ARG ACTUCORE_NAVIGATION_BASE_IMAGE
+ARG ACTUCORE_RUNTIME_BASE_IMAGE
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Python dependencies are owned by the digest-pinned platform parent, not by
+# the navigation builder. Verify them in the clean stage before copying anything.
+RUN python3 -c "import yaml, requests; print('PLATFORM_PYTHON_DEPS=PASS PyYAML=' + yaml.__version__ + ' requests=' + requests.__version__)"
+
+COPY --from=actucore_ros_builder /opt/ros_deps_ws/install/ /opt/ros_deps_ws/install/
+COPY --from=actucore_ros_builder /opt/fast_livo_ws/install/ /opt/fast_livo_ws/install/
+COPY --from=actucore_ros_builder /opt/nav2_ws/install/ /opt/nav2_ws/install/
+COPY --from=actucore_ros_builder /opt/actucore-ros-package-lock.txt /opt/actucore-ros-package-lock.txt
+COPY --from=actucore_ros_builder /ros_ws/install/ /ros_ws/install/
+
+COPY actucore/plugins/navigation/runtime/navigation_lio.yaml /config/navigation_lio.yaml
+
+WORKDIR /work
+COPY actucore/main.py     /work/main.py
+COPY --from=actucore_ros_builder /tmp/actucore-plugins/ /work/plugins/
+COPY actucore/utils/      /work/utils/
+COPY actucore/config.yaml /work/config.yaml
+# Atomic-write stdout guard. The build context is the repo root, so this reuses
+# perception's copy instead of adding a fourth one to keep in sync — see the
+# DUPLICATION note in perception/utils/logsafe.py.
+COPY perception/utils/logsafe.py /work/logsafe.py
+# COS downloader with size/SHA256 pinning, for cards that fetch weights at
+# runtime (plugins/vla's smolvla provider). Same reasoning as logsafe above:
+# reuse perception's copy rather than keeping a second one in sync. It carries
+# the parts that are easy to get wrong — a check file that must not appear
+# until the model behind it is complete, a lock so concurrent starts fetch one
+# copy, archives staged before they are merged.
+COPY perception/utils/model_downloader.py /work/model_downloader.py
+# The status-line helper that turns that downloader's callbacks into the one
+# string a card shows. Same reuse rule again — and it must travel with the
+# downloader: smolvla imports both, so shipping one without the other fails at
+# card start, on a robot, with an ImportError nothing here would have caught.
+COPY perception/utils/model_progress.py /work/model_progress.py
+# Calibration tools. In the image rather than `docker cp`-ed in when needed:
+# a hot-copied file keeps diverging from its image until the next real deploy,
+# and a measurement whose tool is of unknown provenance is worth very little.
+# They are text and they run on demand; nothing imports them at start.
+COPY actucore/tools/      /work/tools/
+# Agent Core reads /deploy/service.yml out of the image to merge the compose
+# fragment — dropping this COPY silently falls back to the legacy docker-run path.
+COPY actucore/deploy/     /deploy/
+
+EXPOSE 15730
+
+RUN find /ros_ws/install /opt/nav2_ws/install /opt/ros_deps_ws/install \
+      /opt/fast_livo_ws/install -name "site-packages" -type d \
+      > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    find /opt/ros/humble/install -name "site-packages" -type d \
+      >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    echo /work \
+      >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    cd / && python3 -c "import logsafe" && \
+    source /opt/ros/humble/install/setup.bash && \
+    source /opt/ros_deps_ws/install/setup.bash && \
+    source /opt/nav2_ws/install/setup.bash && \
+    source /opt/fast_livo_ws/install/setup.bash && \
+    source /ros_ws/install/setup.bash && \
+    ros2 pkg prefix fast_livo2 >/dev/null && \
+    ros2 pkg prefix segmented_controller >/dev/null && \
+    ros2 pkg prefix nav2 >/dev/null && \
+    for binary in \
+      /opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping \
+      /opt/nav2_ws/install/lib/nav2_controller/controller_server \
+      /opt/nav2_ws/install/lib/nav2_planner/planner_server \
+      /opt/nav2_ws/install/lib/nav2_smoother/smoother_server \
+      /opt/nav2_ws/install/lib/nav2_behaviors/behavior_server \
+      /opt/nav2_ws/install/lib/nav2_bt_navigator/bt_navigator \
+      /opt/nav2_ws/install/lib/nav2_waypoint_follower/waypoint_follower \
+      /opt/nav2_ws/install/lib/nav2_lifecycle_manager/lifecycle_manager \
+      /ros_ws/install/segmented_controller/lib/libsegmented_controller.so; do \
+      dependencies="$(ldd "${binary}")" || exit 1; \
+      printf '%s\n' "${binary}" "${dependencies}"; \
+      if grep -Fq 'not found' <<< "${dependencies}"; then exit 1; fi; \
+    done && \
+    NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
+      python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
+    cd /work && python3 -c "import main; import numpy, rosbag2_py, yaml, em, cv2; from fast_livo2.camera_rgb_frame import decode; from fast_livo2.camera_depth_frame import decode" && \
+    test ! -e /ros_ws/src && test ! -e /ros_ws/build && test ! -e /ros_ws/log && \
+    test ! -e /work/plugins/navigation/runtime
+
+ENV LD_LIBRARY_PATH="/opt/fast_livo_ws/install/fast_livo/lib:/opt/fast_livo_ws/install/livox_ros_driver2/lib:/opt/fast_livo_ws/install/vikit_common/lib:/opt/fast_livo_ws/install/vikit_ros/lib:/opt/nav2_ws/install/lib:/opt/ros_deps_ws/install/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV AMENT_PREFIX_PATH="/ros_ws/install/fast_livo2:/ros_ws/install/segmented_controller:/ros_ws/install/nav2:/opt/nav2_ws/install:/opt/ros_deps_ws/install:/opt/ros/humble/install"
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV ROS_DOMAIN_ID=42
+ENV RCUTILS_LOGGING_BUFFERED_STREAM=1
+
+LABEL org.opencontainers.image.title="Phanthy Motus ActuCore" \
+      org.opencontainers.image.description="执行模型层 — navigation 卡片（FAST-LIVO2 + Nav2 + 语义航点）" \
+      org.opencontainers.image.licenses="Apache-2.0 AND GPL-2.0-only AND GPL-3.0-only" \
+      org.opencontainers.image.base.name="${ACTUCORE_RUNTIME_BASE_IMAGE}" \
+      org.opencontainers.image.navigation-build-base="${ACTUCORE_NAVIGATION_BASE_IMAGE}"
+
+CMD ["/bin/bash", "-c", \
+    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
+     source /opt/ros/humble/install/setup.bash && \
+     source /opt/ros_deps_ws/install/setup.bash && \
+     source /opt/nav2_ws/install/setup.bash && \
+     source /opt/fast_livo_ws/install/setup.bash && \
+     source /ros_ws/install/setup.bash && \
+     exec python3 /work/main.py"]

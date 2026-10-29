@@ -561,7 +561,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         package = (PACKAGE_ROOT / "package.xml").read_text(encoding="utf-8")
         dockerfile = (
-            Path(__file__).resolve().parents[1] / "Dockerfile.jetson"
+            Path(__file__).resolve().parents[1] / "Dockerfile.navigation"
         ).read_text(encoding="utf-8")
         service = (
             Path(__file__).resolve().parents[1] / "deploy" / "service.yml"

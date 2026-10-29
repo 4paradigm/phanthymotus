@@ -544,7 +544,7 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
     done && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# This is intentionally a build-only input for Dockerfile.jetson, so it carries
+# This is intentionally a build-only input for Dockerfile.navigation, so it carries
 # the headers and compiler used for the three repository-owned ROS packages.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

@@ -22,7 +22,7 @@ from .core import FastLivo2Core, UnavailableFastLivo2Backend
 log = logging.getLogger(__name__)
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
 _COLLECTION_ROOT = Path(
-    "/opt/phanthy-motus/data/fast_livo2/recordings"
+    "/opt/phanthy-motus/data/navigation/fast_livo2/recordings"
 )
 
 
