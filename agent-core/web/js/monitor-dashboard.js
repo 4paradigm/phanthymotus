@@ -15,11 +15,12 @@ import { PointCloudRenderer } from './renderers/pointcloud.js';
 import { MappingRenderer }   from './renderers/mapping.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
+import { TactileRenderer }  from './renderers/tactile.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 // Column count by viewport width. Desktop used to be a flat 5 whatever the
 // window was, which is only right near 1080p: at 1280 a column is 237px and a

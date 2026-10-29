@@ -2507,9 +2507,21 @@ async function _fetchTopicsFromDriver(card, inputTopics) {
     // be told apart from a still-correct one — see _revalidateDerivedTopics.
     card.topicOutFrom = want;
     if (topicOut?.some(t => t.topic)) {
-      card.topicOut = topicOut;
       const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-      topicOut.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      const shapeChanged = outPorts.length !== topicOut.length || topicOut.some((t, i) =>
+        outPorts[i]?.dataset.format !== (t.format || ''));
+      card.topicOut = topicOut;
+      if (shapeChanged) {
+        const newEl = _buildCardEl({ id: card.id, mcpId: card.mcpId, toolName: card.toolName,
+          driverName: card.driverName, x: card.x, y: card.y,
+          topicIn: card.topicIn, topicOut });
+        card.el.replaceWith(newEl);
+        card.el = newEl;
+        _makeDraggable(newEl, card);
+        _syncGeometryObservers();
+      } else {
+        topicOut.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
+      }
       // A resolved topic is some downstream card's input, so the graph below this
       // one has to be re-walked — otherwise a chain (mic → asr → tts) only ever
       // resolves its first hop.
