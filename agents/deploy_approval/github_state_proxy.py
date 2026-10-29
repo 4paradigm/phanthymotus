@@ -25,6 +25,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import base64
 import hashlib
@@ -984,6 +985,10 @@ class GitHubStateProxy:
         self.config = config
         self._github = github
         self._github_app_id = github_app_id
+        # Status labels are an optional projection. Cache successful checks
+        # briefly and back off failed projections so a missing label cannot
+        # generate an API request on every watcher pass.
+        self._status_label_projection: dict[tuple[str, int], dict[str, Any]] = {}
 
     # ── GitHub API passthrough ──
 
@@ -2144,79 +2149,129 @@ class GitHubStateProxy:
         touched.
         """
         desired_label = f"{STATUS_PREFIX} {hidden_status}"
-        if desired_label not in _ALLOWED_STATUS_LABELS:
+        desired_fold = desired_label.casefold()
+        allowed_folds = {name.casefold() for name in _ALLOWED_STATUS_LABELS}
+        if desired_fold not in allowed_folds:
             logger.warning("unknown status label for %s: %s", hidden_status, desired_label)
             return
-        try:
-            # 1. Fresh read of current labels
-            current_labels: list[str] = []
-            try:
-                current_labels = await self.get_issue_labels(repo, issue_number)
-            except Exception as read_exc:
-                logger.warning(
-                    "label fresh read failed for %s#%s: %s (best-effort continuing)",
-                    repo, issue_number, read_exc,
-                )
+        key = (repo, issue_number)
+        now = time.monotonic()
+        cached = self._status_label_projection.get(key)
+        if (cached and cached.get("label") == desired_fold
+                and now < float(cached.get("retry_at", 0.0))):
+            return
+        if cached and cached.get("label") != desired_fold:
+            self._status_label_projection.pop(key, None)
+        projection_deadline = now + 4.0
 
-            # 2. If desired already exists → skip create/add
-            if desired_label in current_labels:
-                # 3. Remove only OTHER canonical status:* labels that actually exist
-                for label in _ALLOWED_STATUS_LABELS:
-                    if label != desired_label and label in current_labels:
-                        try:
-                            await self.remove_issue_label(repo, issue_number, label)
-                        except Exception as rem_exc:
-                            logger.warning(
-                                "label remove failed for %s#%s %s: %s (best-effort, next reconcile will heal)",
-                                repo, issue_number, label, rem_exc,
-                            )
-                return
+        async def bounded(awaitable):
+            remaining = projection_deadline - time.monotonic()
+            if remaining <= 0:
+                close = getattr(awaitable, "close", None)
+                if callable(close):
+                    close()
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(awaitable, timeout=remaining)
 
-            # 4. Desired missing → best-effort ensure + add
-            try:
-                await self._ensure_label_exists(repo, desired_label)
-            except Exception as create_exc:
-                logger.warning(
-                    "label ensure/create failed for %s#%s %s: %s (continuing)",
-                    repo, issue_number, desired_label, create_exc,
-                )
-
-            try:
-                await self.add_issue_label(repo, issue_number, desired_label)
-            except Exception as add_exc:
-                logger.warning(
-                    "label add failed for %s#%s %s: %s (continuing)",
-                    repo, issue_number, desired_label, add_exc,
-                )
-
-            # 5. Remove only OTHER canonical status:* labels that actually exist
-            for label in _ALLOWED_STATUS_LABELS:
-                if label != desired_label and label in current_labels:
-                    try:
-                        await self.remove_issue_label(repo, issue_number, label)
-                    except Exception as rem_exc:
-                        logger.warning(
-                            "label remove failed for %s#%s %s: %s (best-effort, next reconcile will heal)",
-                            repo, issue_number, label, rem_exc,
-                        )
-        except Exception as e:
+        def remember_failure(reason: str) -> None:
+            previous = self._status_label_projection.get(key, {})
+            failures = min(8, int(previous.get("failures", 0)) + 1) \
+                if previous.get("label") == desired_fold else 1
+            delay = min(600.0, 15.0 * (2 ** (failures - 1)))
+            self._status_label_projection.pop(key, None)
+            self._status_label_projection[key] = {
+                "label": desired_fold,
+                "failures": failures,
+                "retry_at": time.monotonic() + delay,
+            }
+            while len(self._status_label_projection) > 4096:
+                self._status_label_projection.pop(next(iter(self._status_label_projection)))
             logger.warning(
-                "label projection failed for %s#%s: %s",
-                repo, issue_number, e,
+                "status label projection deferred repo=%s pr=%s label=%s reason=%s retry_seconds=%.0f",
+                repo, issue_number, desired_label, reason, delay,
             )
 
-    async def _ensure_label_exists(self, repo: str, label: str) -> None:
-        """Best-effort create a repository label if it does not exist.
-
-        409 Conflict (already exists) is treated as success.
-        """
         try:
-            await self._github.create_repository_label(
-                repo, label, "6cc2dc", "Deploy Approval lifecycle status",
-            )
-        except GitHubError as exc:
-            # 409 Conflict means the label already exists
-            msg = str(exc)
-            if "409" in msg or "Already exists" in msg or "already_exists" in msg:
+            current_labels = await bounded(self.get_issue_labels(repo, issue_number))
+            if (not isinstance(current_labels, list)
+                    or any(not isinstance(label, str) for label in current_labels)):
+                remember_failure("invalid_issue_labels_response")
                 return
-            raise
+        except Exception as exc:
+            remember_failure(f"read_{type(exc).__name__}")
+            return
+
+        desired_existing = next(
+            (label for label in current_labels if label.casefold() == desired_fold),
+            None,
+        )
+        if desired_existing is None:
+            try:
+                repository_label = await bounded(
+                    self._ensure_label_exists(repo, desired_label),
+                )
+                await bounded(self.add_issue_label(
+                    repo, issue_number, repository_label,
+                ))
+                desired_existing = repository_label
+                current_labels = [*current_labels, repository_label]
+            except Exception as add_exc:
+                # Do not issue a second API request after rate limit/transient
+                # failure. The bounded retry begins with a fresh label read, so
+                # an add that succeeded before a lost response remains idempotent.
+                remember_failure(f"add_{type(add_exc).__name__}")
+                return
+
+        # The new status label is now confirmed present. Remove only other
+        # Deploy Approval lifecycle labels, using GitHub's actual spelling;
+        # arbitrary user labels, including other `status:*` labels, survive.
+        removal_failed = False
+        for label in current_labels:
+            folded = label.casefold()
+            if folded in allowed_folds and folded != desired_fold:
+                try:
+                    await bounded(self.remove_issue_label(
+                        repo, issue_number, label,
+                    ))
+                except Exception as exc:
+                    removal_failed = True
+                    logger.warning(
+                        "status label removal deferred repo=%s pr=%s label=%s reason=%s",
+                        repo, issue_number, label, type(exc).__name__,
+                    )
+        if removal_failed:
+            remember_failure("remove_failed")
+            return
+
+        self._status_label_projection.pop(key, None)
+        self._status_label_projection[key] = {
+            "label": desired_fold,
+            "failures": 0,
+            "retry_at": time.monotonic() + 60.0,
+        }
+        while len(self._status_label_projection) > 4096:
+            self._status_label_projection.pop(next(iter(self._status_label_projection)))
+
+    async def _ensure_label_exists(self, repo: str, label: str) -> str:
+        """Return the existing case-insensitive label name or create it."""
+        def equivalent_name(labels) -> str | None:
+            if not isinstance(labels, list):
+                return None
+            for item in labels:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if isinstance(name, str) and name.casefold() == label.casefold():
+                    return name
+            return None
+
+        names = await self._github.list_repository_labels(repo)
+        existing = equivalent_name(names)
+        if existing is not None:
+            return existing
+        # Failure is retried in the bounded projection window; that attempt
+        # first reads and reuses any label created before the response was lost.
+        await self._github.create_repository_label(
+            repo, label, "6cc2dc", "Deploy Approval lifecycle status",
+        )
+        return label

@@ -25,7 +25,8 @@ import time
 import copy
 from datetime import datetime
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
+from zoneinfo import ZoneInfo
 
 from . import comments as comments_mod
 from .agent_core_client import (
@@ -3601,6 +3602,52 @@ class DeployController:
         return markdown[:content_start] + "\n\n" + content.rstrip() + "\n\n" + markdown[end:]
 
     @staticmethod
+    def _unwrap_history_details(history_content: str) -> str:
+        """Remove one generated outer History wrapper without touching its body."""
+        if not isinstance(history_content, str):
+            return ""
+        opening = re.match(r"\A\s*<details\b[^>]*>", history_content, re.IGNORECASE)
+        if opening is None:
+            return history_content
+        summary_open = re.match(
+            r"\s*<summary\b[^>]*>", history_content[opening.end():], re.IGNORECASE,
+        )
+        if summary_open is None:
+            return history_content
+        summary_start = opening.end() + summary_open.end()
+        summary_close = re.search(r"</summary\s*>", history_content[summary_start:], re.IGNORECASE)
+        if summary_close is None:
+            return history_content
+        summary_end = summary_start + summary_close.start()
+        title = history_content[summary_start:summary_end].strip()
+        if title.casefold() != "history · 历史事件":
+            return history_content
+        body_start = summary_start + summary_close.end()
+        outer_close = re.search(r"</details\s*>\s*\Z", history_content, re.IGNORECASE)
+        if outer_close is None or outer_close.start() < body_start:
+            return history_content
+        return history_content[body_start:outer_close.start()]
+
+    @staticmethod
+    def _fold_history_content(history_content: str) -> str:
+        """Normalize only the outer History block; preserve nested event markup."""
+        if not isinstance(history_content, str) or not history_content.strip():
+            return ""
+        content = history_content
+        while True:
+            unwrapped = DeployController._unwrap_history_details(content)
+            if unwrapped == content:
+                break
+            content = unwrapped
+        header = "<details>\n<summary>History · 历史事件</summary>"
+        if content and not content.startswith("\n"):
+            header += "\n\n"
+        closing_separator = "" if not content or content.endswith("\n") else "\n"
+        return (
+            header + content + closing_separator + "</details>"
+        )
+
+    @staticmethod
     def _extract_visible_history(visible):
         """Remove recognized History sections for safe repositioning verbatim."""
         if not isinstance(visible, str):
@@ -3653,16 +3700,33 @@ class DeployController:
                 merged.append((start, end))
         pieces = []
         cursor = 0
-        history = []
+        history_blocks = []
         for start, end in merged:
             pieces.append(visible[cursor:start])
             block = visible[start:end]
             block = re.sub(r"\A[ \t]*#{2,6}[ \t]+(?:history|历史记录)[ \t]*\r?\n+",
                            "", block, count=1, flags=re.IGNORECASE)
-            history.append(block)
+            if block.strip():
+                # Collapse any pre-existing generated marker pair before
+                # joining sections so the final Summary contains one marker
+                # pair and one History details block, never nested wrappers.
+                block = block.replace(history_start, "").replace(history_end, "")
+                block = DeployController._unwrap_history_details(block)
+                if block.strip():
+                    history_blocks.append(block)
             cursor = end
         pieces.append(visible[cursor:])
-        return "".join(pieces), "".join(history)
+        if not history_blocks:
+            return "".join(pieces), ""
+        history_content = "\n\n".join(history_blocks)
+        history_content = DeployController._fold_history_content(history_content)
+        if not history_content.endswith("\n"):
+            history_content += "\n"
+        history = (
+            VISIBLE_HISTORY_START_MARKER + "\n" + history_content
+            + VISIBLE_HISTORY_END_MARKER
+        )
+        return "".join(pieces), history
 
     @classmethod
     def _strip_legacy_evidence_blocks(cls, visible):
@@ -4007,7 +4071,9 @@ class DeployController:
                 return cached[1]
             return ""
 
-        async def bind_download_capabilities(rows, head_sha, round_id):
+        async def bind_download_capabilities(
+            rows, head_sha, round_id, *, include_cos_urls=True,
+        ):
             bound = []
             for row in rows:
                 item = copy.deepcopy(row)
@@ -4038,10 +4104,16 @@ class DeployController:
                         self.config, repo, pr_number, head_sha, round_id,
                         purpose=DOWNLOAD_PURPOSE, resource="attachment:" + attachment_id,
                     )
-                    item["cos_download_url"] = await stable_cos_url(
-                        expected_key, item.get("filename", ""),
-                        attachment_id=attachment_id,
-                    )
+                    if include_cos_urls:
+                        item["cos_download_url"] = await stable_cos_url(
+                            expected_key, item.get("filename", ""),
+                            attachment_id=attachment_id,
+                        )
+                    else:
+                        # Historical downloads resolve through the existing
+                        # attachment-scoped API when clicked; do not sign every
+                        # archived COS object on each Summary projection.
+                        item.pop("cos_download_url", None)
                 else:
                     item.pop("download_capability", None)
                     item.pop("cos_download_url", None)
@@ -4123,7 +4195,37 @@ class DeployController:
             current_rows = await bind_download_capabilities(current_rows, state["head_sha"], current_round)
             render_state["attachments"] = current_rows
             await bind_log_url(render_state, state["head_sha"], current_round)
-        for archive in reversed(archives):
+        trusted_archives = []
+        testing_statuses = {"testing", "succeeded", "failed"}
+        for archive in archives:
+            if not isinstance(archive, dict):
+                continue
+            archive_round = archive.get("round_id")
+            if not isinstance(archive_round, str):
+                continue
+            archive_head = archive.get("head_sha")
+            snapshot_value = archive.get("snapshot")
+            round_number = round_numbers.get(archive_round)
+            if (type(round_number) is not int or round_number <= 0
+                    or not isinstance(archive_head, str)
+                    or not isinstance(snapshot_value, dict)
+                    or snapshot_value.get("head_sha") != archive_head
+                    or snapshot_value.get("status") not in testing_statuses
+                    or archive_round == current_round):
+                continue
+            try:
+                snapshot_round = round_id_for_state(snapshot_value)
+            except Exception:
+                continue
+            if (snapshot_round != archive_round
+                    or not archive_round.startswith(archive_head + "-")
+                    or archive.get("repo") != repo
+                    or type(archive.get("pr_number")) is not int
+                    or archive.get("pr_number") != pr_number):
+                continue
+            trusted_archives.append(archive)
+
+        for archive in trusted_archives:
             if archive["round_id"] in seen_rounds or archive["round_id"] == current_round:
                 continue
             seen_rounds.add(archive["round_id"])
@@ -4140,15 +4242,12 @@ class DeployController:
                                     if r["round_id"] == archive["round_id"]]
             snapshot["attachments"] = (await bind_download_capabilities(
                 snapshot_attachments, snapshot["head_sha"], archive["round_id"],
+                include_cos_urls=False,
             ) if backend_ready and attachment_access_allowed else snapshot_attachments)
-            if backend_ready and attachment_access_allowed:
-                await bind_log_url(snapshot, snapshot["head_sha"], archive["round_id"])
             bundle = {**archive, "snapshot": snapshot}
             if archive.get("round_id") in round_numbers:
                 bundle["round_number"] = round_numbers[archive["round_id"]]
             bundles.append(bundle)
-            if len(bundles) == 3:
-                break
         download_url_expiry = getattr(store, "download_url_expiry", None)
         def validate_cos_download_url(url, *, key, filename, attachment_id):
             if not callable(download_url_expiry):
@@ -4156,7 +4255,7 @@ class DeployController:
             return download_url_expiry(
                 url, key=key, filename=filename, attachment_id=attachment_id,
             )
-        section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, archives[-4:],
+        section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, trusted_archives,
                            public_base_url=public_base_url,
                            upload_public_base_url=(
                                upload_public_base_url
@@ -4168,10 +4267,221 @@ class DeployController:
         visible = self._strip_legacy_evidence_blocks(visible)
         visible, history = self._extract_visible_history(visible)
         start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
-        projection = start + "\n" + section + "\n" + end
-        body = visible.rstrip() + "\n\n" + projection
-        if history:
-            body += "\n\n" + history
+        def projection_body(rendered_section):
+            projection = start + "\n" + rendered_section + "\n" + end
+            result = visible.rstrip() + "\n\n" + projection
+            if history:
+                result += "\n\n" + history
+            return result
+
+        body = projection_body(section)
+        if _count_visible_bytes(body) > _MAX_VISIBLE_LIFECYCLE_BYTES:
+            # Keep every trusted test round addressable while reducing repeated
+            # attachment notes, deployment tables, and COS links. The existing
+            # read-only page reconstructs the full round from immutable records.
+            compact_current_rows = []
+            for row in current_rows[-20:]:
+                item = copy.deepcopy(row)
+                for field in (
+                    "note", "text", "display_note", "display_note_complete",
+                    "evidence_kind", "cos_download_url",
+                ):
+                    item.pop(field, None)
+                compact_current_rows.append(item)
+            compact_state = copy.deepcopy(render_state)
+            compact_state["attachments"] = compact_current_rows
+            compact_state["deployments"] = []
+            compact_state["components"] = []
+            compact_state["machine_groups"] = []
+            compact_state["case_results"] = {}
+            compact_section = renderer(
+                repo, pr_number, compact_state, compact_current_rows, [],
+                public_base_url=public_base_url,
+                upload_public_base_url=(
+                    upload_public_base_url
+                    if backend_ready and attachment_access_allowed else ""
+                ),
+                cos_download_url_expiry=validate_cos_download_url,
+            )
+            if not isinstance(compact_section, str):
+                raise GitHubStateProxyError(
+                    "Compact Evidence renderer must return markdown",
+                )
+            evidence_end = "<!-- deploy-approval-evidence:end -->"
+            end_pos = compact_section.rfind(evidence_end)
+            if end_pos < 0:
+                raise GitHubStateProxyError(
+                    "Compact Evidence renderer omitted its end marker",
+                )
+
+            def archive_time(archive):
+                snapshot_value = archive.get("snapshot", {})
+                for value in (
+                    snapshot_value.get("round_started_at"),
+                    archive.get("started_at"), snapshot_value.get("started_at"),
+                    archive.get("archived_at"), archive.get("ended_at"),
+                ):
+                    if not isinstance(value, str):
+                        continue
+                    try:
+                        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                        return parsed
+                return None
+
+            def archive_time_label(parsed):
+                if parsed is None:
+                    return "时间未知"
+                return parsed.astimezone(ZoneInfo("Asia/Shanghai")).strftime(
+                    "%Y-%m-%d %H:%M（北京时间）",
+                )
+
+            def archive_sort_key(archive):
+                parsed = archive_time(archive)
+                timestamp = parsed.timestamp() if parsed is not None else float("-inf")
+                return timestamp, round_numbers[archive["round_id"]]
+
+            compact_archives = sorted(
+                trusted_archives, key=archive_sort_key, reverse=True,
+            )
+            page_path = comments_mod._evidence_path(repo, pr_number).replace(
+                "/api/evidence/", "/evidence/", 1,
+            )
+            read_origin = (public_base_url or upload_public_base_url).rstrip("/")
+            if not read_origin or not page_path.startswith("/evidence/"):
+                raise GitHubStateProxyError(
+                    "Evidence projection cannot compact details without a trusted read page",
+                )
+            compact_history = ["", "### 历史轮次", ""] if compact_archives else []
+            current_round_url = ""
+            if read_origin and page_path.startswith("/evidence/"):
+                current_round_url = read_origin + page_path + "?" + urlencode({
+                    "view": "read", "head_sha": state["head_sha"],
+                    "round_id": current_round,
+                })
+
+            def ensure_read_page_entry(rendered):
+                if not current_round_url or "[打开附件页]" in rendered:
+                    return rendered
+                current_end = "<!-- deploy-approval-evidence:end -->"
+                current_end_pos = rendered.rfind(current_end)
+                if current_end_pos >= 0:
+                    return (
+                        rendered[:current_end_pos].rstrip()
+                        + "\n[查看附件页](<"
+                        + current_round_url + ">)\n"
+                        + rendered[current_end_pos:]
+                    )
+                return rendered
+
+            compact_section = ensure_read_page_entry(compact_section)
+            display_status = {
+                "testing": "测试中", "succeeded": "已通过", "failed": "未通过",
+            }
+            for archive in compact_archives:
+                archive_round = archive["round_id"]
+                archive_head = archive["head_sha"]
+                snapshot_value = archive["snapshot"]
+                round_number = round_numbers[archive_round]
+                parsed_time = archive_time(archive)
+                read_url = ""
+                if read_origin and page_path.startswith("/evidence/"):
+                    read_url = read_origin + page_path + "?" + urlencode({
+                        "view": "read", "head_sha": archive_head,
+                        "round_id": archive_round,
+                    })
+                title = (
+                    f"第 {round_number} 轮 · "
+                    f"{archive_time_label(parsed_time)} · "
+                    f"{display_status[snapshot_value['status']]}"
+                )
+                compact_history.extend([
+                    "<details>",
+                    f"<summary>{comments_mod._escape(title)}</summary>",
+                    "",
+                    f"**Commit：** `{comments_mod._escape(archive_head)}`",
+                ])
+                if read_url:
+                    compact_history.append(
+                        f"[查看本轮附件、备注和部署记录](<{read_url}>)",
+                    )
+                else:
+                    compact_history.append(
+                        "本轮附件、备注和部署记录仍保存在可信归档中。",
+                    )
+                archive_url = comments_mod._trusted_archive_url(
+                    archive.get("url", ""), repo, pr_number, public_base_url,
+                )
+                if archive_url:
+                    compact_history.append(
+                        f"[查看原始归档](<{archive_url}>)",
+                    )
+                compact_history.extend(["", "</details>", ""])
+            end_pos = compact_section.rfind(evidence_end)
+            if end_pos < 0:
+                raise GitHubStateProxyError(
+                    "Compact Evidence renderer omitted its end marker after trimming",
+                )
+            compact_section = (
+                compact_section[:end_pos].rstrip()
+                + ("\n" + "\n".join(compact_history) if compact_history else "")
+                + "\n" + compact_section[end_pos:]
+            )
+            body = projection_body(compact_section)
+            if _count_visible_bytes(body) > _MAX_VISIBLE_LIFECYCLE_BYTES:
+                # If even the per-round index is too large, keep an explicit
+                # count and a link to the read-only page, whose context includes
+                # every trusted round and its attachment/deployment records.
+                minimal_state = copy.deepcopy(compact_state)
+                minimal_state["attachments"] = []
+                minimal_section = renderer(
+                    repo, pr_number, minimal_state, [], [],
+                    public_base_url=public_base_url,
+                    upload_public_base_url=(
+                        upload_public_base_url
+                        if backend_ready and attachment_access_allowed else ""
+                    ),
+                    cos_download_url_expiry=validate_cos_download_url,
+                )
+                if not isinstance(minimal_section, str):
+                    raise GitHubStateProxyError(
+                        "Minimal Evidence renderer must return markdown",
+                    )
+                for empty_label in (
+                    "本轮暂无附件，上传后会显示",
+                    "本轮未保存附件",
+                    "该轮未保存附件",
+                ):
+                    minimal_section = minimal_section.replace(
+                        empty_label, "附件和部署明细已精简，请打开附件页查看。",
+                    )
+                minimal_section = ensure_read_page_entry(minimal_section)
+                minimal_end = minimal_section.rfind(evidence_end)
+                if minimal_end < 0:
+                    raise GitHubStateProxyError(
+                        "Minimal Evidence renderer omitted its end marker",
+                    )
+                minimal_lines = [""]
+                if compact_archives:
+                    minimal_lines.extend([
+                        "",
+                        f"可信历史测试轮次：{len(compact_archives)} 个。",
+                        "完整轮次编号、HEAD、附件身份和部署记录均保留在附件页。",
+                    ])
+                minimal_section = (
+                    minimal_section[:minimal_end].rstrip()
+                    + "\n" + "\n".join(minimal_lines)
+                    + "\n" + minimal_section[minimal_end:]
+                )
+                minimal_section = ensure_read_page_entry(minimal_section)
+                body = projection_body(minimal_section)
+                if _count_visible_bytes(body) > _MAX_VISIBLE_LIFECYCLE_BYTES:
+                    raise GitHubStateProxyError(
+                        "Evidence projection cannot fit the 48 KiB visible comment budget; "
+                        "trusted round data was not omitted",
+                    )
         return body
 
     async def project_evidence(self, repo: str, pr_number: int) -> None:
@@ -4460,13 +4770,25 @@ class DeployController:
                 raise GitHubStateProxyError("Cannot safely preserve malformed History markers")
             history_block = existing_visible[h_start:h_end + len(VISIBLE_HISTORY_END_MARKER)]
         elif event is not None or events:
-            # Only wrap unmarked legacy events when appending. COS-only refresh
-            # retains the original unmarked History section verbatim below.
+            # Wrap unmarked legacy events when appending new History.
             old_history = re.search(r"(?ms)^### History[ \t]*\n.*?(?=^### |\Z)", existing_visible)
             if old_history:
                 history_block = (VISIBLE_HISTORY_START_MARKER
                                  + old_history.group(0).partition("\n")[2]
                                  + VISIBLE_HISTORY_END_MARKER)
+        else:
+            # Projection-only rewrites also normalize a legacy unmarked History
+            # section. Keep its original event text intact inside the wrapper.
+            old_history = re.search(r"(?ms)^### History[ \t]*\n.*?(?=^### |\Z)", existing_visible)
+            if old_history:
+                folded = self._fold_history_content(
+                    old_history.group(0).partition("\n")[2],
+                )
+                if folded:
+                    history_block = (
+                        VISIBLE_HISTORY_START_MARKER + "\n" + folded + "\n"
+                        + VISIBLE_HISTORY_END_MARKER
+                    )
         incoming = list(events) if events is not None else ([event] if event is not None else [])
         if incoming:
             new_block = _build_history_block(incoming)
@@ -4476,13 +4798,7 @@ class DeployController:
                         len(VISIBLE_HISTORY_START_MARKER):
                         -len(VISIBLE_HISTORY_END_MARKER)
                     ].strip("\n")
-                    summary = "<details>\n<summary>History · 历史事件</summary>\n\n"
-                    if content.startswith(summary):
-                        content = content[len(summary):]
-                        closing = "\n\n</details>"
-                        if content.endswith(closing):
-                            content = content[:-len(closing)]
-                    return content
+                    return self._unwrap_history_details(content)
 
                 new_events_body = event_content(new_block).rstrip("\n")
                 old_events_body = event_content(history_block).lstrip("\n")
@@ -4500,10 +4816,34 @@ class DeployController:
         if history_block:
             final_visible += "\n\n" + history_block + "\n"
         elif not incoming:
-            # Older terminal comments can have an unmarked History section.
+            # Retain an unmarked History section only when no marked block was
+            # available to relocate above.
             old_history = re.search(r"(?ms)^### History[ \t]*\n.*?(?=^### |\Z)", existing_visible)
             if old_history:
-                final_visible += "\n\n" + old_history.group(0)
+                folded = self._fold_history_content(
+                    old_history.group(0).partition("\n")[2],
+                )
+                if folded:
+                    final_visible += (
+                        "\n\n" + VISIBLE_HISTORY_START_MARKER + "\n"
+                        + folded + "\n" + VISIBLE_HISTORY_END_MARKER
+                    )
+
+        if history_block:
+            history_start = VISIBLE_HISTORY_START_MARKER
+            history_end = VISIBLE_HISTORY_END_MARKER
+            if (history_block.count(history_start) != 1
+                    or history_block.count(history_end) != 1
+                    or history_block.find(history_end) < history_block.find(history_start)):
+                raise GitHubStateProxyError("Cannot safely normalize malformed History markers")
+            history_body = history_block[
+                history_block.find(history_start) + len(history_start):
+                history_block.find(history_end)
+            ]
+            folded_history = self._fold_history_content(history_body)
+            history_block = (
+                history_start + "\n" + folded_history + "\n" + history_end
+            )
 
         # Keep published archive links even if fresh discovery is unavailable.
         old_archives = re.search(r"(?ms)^### Archived history[ \t]*\n.*?(?=^### |\Z)", existing_visible)
@@ -4750,7 +5090,66 @@ class DeployController:
         pr_merged = pr_data.get("merged", False)
         current_head = str(pr_data.get("head", {}).get("sha", "") or "")
 
+        if pr_state == "open" and pr_data.get("draft") is True:
+            # Draft PRs need an explicit status label, but they are not
+            # lifecycle evidence. Never initialize or advance review status
+            # from comments until GitHub marks the PR ready for review.
+            label_status = "review-required"
+            if (isinstance(state, dict)
+                    and re.fullmatch(r"[0-9a-f]{40}", current_head)
+                    and state.get("head_sha") == current_head):
+                label_status = state.get("status", "review-required")
+                acceptance = state.get("acceptance_request")
+                if (label_status == "testing"
+                        and isinstance(acceptance, dict)
+                        and acceptance.get("status") == "pending"
+                        and acceptance.get("head_sha") == current_head
+                        and acceptance.get("round_id") == round_id_for_state(state)):
+                    label_status = "acceptance-required"
+            if label_status in {
+                "review-required", "reviewing", "deploy-ready",
+                "deploy-requested", "testing", "acceptance-required",
+                "succeeded", "failed",
+            }:
+                try:
+                    await self.proxy.project_status_label(
+                        repo, pr_number, label_status,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "reconcile draft PR label projection %s#%s exception=%s",
+                        repo, pr_number, type(exc).__name__,
+                    )
+            return
+
         if pr_state != "open" or pr_merged or pr_data.get("draft"):
+            # Label repair is a presentation-only projection of trusted state.
+            # It never rewrites Lifecycle or replays commands for a closed PR.
+            if (isinstance(state, dict)
+                    and re.fullmatch(r"[0-9a-f]{40}", current_head)
+                    and state.get("head_sha") == current_head):
+                try:
+                    label_status = state.get("status", "")
+                    acceptance = state.get("acceptance_request")
+                    if (label_status == "testing"
+                            and isinstance(acceptance, dict)
+                            and acceptance.get("status") == "pending"
+                            and acceptance.get("head_sha") == current_head
+                            and acceptance.get("round_id") == round_id_for_state(state)):
+                        label_status = "acceptance-required"
+                    if label_status in {
+                        "review-required", "reviewing", "deploy-ready",
+                        "deploy-requested", "testing", "acceptance-required",
+                        "succeeded", "failed",
+                    }:
+                        await self.proxy.project_status_label(
+                            repo, pr_number, label_status,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "reconcile closed PR label projection %s#%s exception=%s",
+                        repo, pr_number, type(exc).__name__,
+                    )
             return
         if not re.fullmatch(r"[0-9a-f]{40}", current_head):
             return
@@ -4865,7 +5264,9 @@ class DeployController:
         try:
             comments = await self.github.get_issue_comments(repo, pr_number)
             if not isinstance(comments, list):
-                comments = []
+                raise GitHubStateProxyError(
+                    "GitHub PR comments response was not a list",
+                )
 
             from .review_comment_parser import extract_latest_review_job_anchor
 
@@ -4931,9 +5332,35 @@ class DeployController:
                 "reconcile comment evidence %s#%s head=%s: %s",
                 repo, pr_number, current_head, e,
             )
-            desired_status = "review-required"
-            review_evidence_data: dict = {}
-            build_infos = []
+            # An incomplete/transient comment read is not evidence that prior
+            # review approval disappeared. Never initialize from an unknown
+            # response, nor clear a trusted current-HEAD deployment or result.
+            # A label repair may still reflect the verified hidden-state value.
+            if (isinstance(state, dict)
+                    and state.get("head_sha") == current_head):
+                try:
+                    label_status = state.get("status", "")
+                    acceptance = state.get("acceptance_request")
+                    if (label_status == "testing"
+                            and isinstance(acceptance, dict)
+                            and acceptance.get("status") == "pending"
+                            and acceptance.get("head_sha") == current_head
+                            and acceptance.get("round_id") == round_id_for_state(state)):
+                        label_status = "acceptance-required"
+                    if label_status in {
+                        "review-required", "reviewing", "deploy-ready",
+                        "deploy-requested", "testing", "acceptance-required",
+                        "succeeded", "failed",
+                    }:
+                        await self.proxy.project_status_label(
+                            repo, pr_number, label_status,
+                        )
+                except Exception as label_exc:
+                    logger.warning(
+                        "reconcile fallback label projection %s#%s exception=%s",
+                        repo, pr_number, type(label_exc).__name__,
+                    )
+            return
 
         state_was_none = state is None
         if state is None:

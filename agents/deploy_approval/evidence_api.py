@@ -4,8 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from urllib.parse import parse_qs, urlsplit
-
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
@@ -125,6 +123,7 @@ async def _payload(request, action, **path):
     else:
         payload = dict(request.query_params)
         payload.pop('cap', None)
+        payload.pop('read_view', None)
         if action == 'put_part' and payload.keys() - {'head_sha', 'round_id'}:
             raise HTTPException(400, detail='invalid_evidence_payload')
     if not isinstance(payload, dict) or any(field in payload for field in path):
@@ -177,11 +176,20 @@ async def _summary_updated(request, repo, pr, result):
         return False
 
 
-async def _trusted_summary_page_capability(request, repo, pr):
-    """Recover only a currently valid page capability from the trusted Summary."""
+async def _trusted_summary_page_capability(request, repo, pr, *, target_head=None,
+                                           target_round=None):
+    """Mint a page-only read capability for a trusted current or archived round."""
     config = request.app.state.config
     if (not evidence_auth.public_https_ingress_ready(config)
             or not evidence_auth._configured_https_request(request)):
+        return None
+    if (target_head is None) != (target_round is None):
+        return None
+    if (target_head is not None
+            and (not isinstance(target_head, str)
+                 or not re.fullmatch(r'[0-9a-f]{40}', target_head)
+                 or not isinstance(target_round, str)
+                 or not re.fullmatch(re.escape(target_head) + r'-[0-9]+', target_round))):
         return None
     proxy = request.app.state.proxy
     try:
@@ -219,83 +227,56 @@ async def _trusted_summary_page_capability(request, repo, pr):
     base = current_pr.get('base')
     base_repository = base.get('repo') if isinstance(base, dict) else None
     base_name = base_repository.get('full_name') if isinstance(base_repository, dict) else None
-    if current_pr.get('draft') or not isinstance(base_name, str) or base_name.casefold() != repo.casefold():
+    if not isinstance(base_name, str) or base_name.casefold() != repo.casefold():
         raise HTTPException(409, detail='evidence_pr_context_changed')
-
-    from .evidence_models import round_id_for_state
-    try:
-        head, round_id = state.get('head_sha'), round_id_for_state(state)
-    except Exception:
-        raise HTTPException(503, detail='evidence_state_unavailable') from None
-    if (not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)
-            or state.get('status') not in {
-                'review-required', 'reviewing', 'deploy-ready', 'deploy-requested',
-                'deploying', 'testing', 'succeeded', 'failed',
-            }):
-        return None
     pr_head = current_pr.get('head')
     pr_head_sha = pr_head.get('sha') if isinstance(pr_head, dict) else None
-    if pr_head_sha != head:
-        raise HTTPException(409, detail='evidence_pr_context_changed')
-    configured_base = urlsplit(config.evidence_public_base_url)
-    expected_authorities = {
-        configured_base.netloc.casefold(),
-        evidence_auth._configured_https_authority(config).casefold(),
-    }
-    page_path = '/evidence/' + repo + '/pulls/' + str(pr)
-    visible = body[:marker_pos]
-    page_capability = None
-    for match in re.finditer(r'\[打开附件页\]\(<(?P<url>https://[^<>\s]+)>\)', visible):
-        candidate_text = match.group('url')
+    if not isinstance(pr_head_sha, str) or not re.fullmatch(r'[0-9a-f]{40}', pr_head_sha):
+        raise HTTPException(503, detail='evidence_pr_status_unavailable')
+
+    from .evidence_models import round_id_for_state, trusted_round_numbers
+    try:
+        current_head = state.get('head_sha')
+        current_round = round_id_for_state(state)
+    except Exception:
+        raise HTTPException(503, detail='evidence_state_unavailable') from None
+    if (not isinstance(current_head, str) or not re.fullmatch(r'[0-9a-f]{40}', current_head)
+            or not isinstance(state.get('status'), str) or not state['status']):
+        return None
+    head, round_id = target_head, target_round
+    if head is None:
+        head, round_id = current_head, current_round
+    is_current_round = (
+        (head, round_id) == (current_head, current_round)
+        and pr_head_sha == current_head
+    )
+    if not is_current_round:
         try:
-            candidate = urlsplit(candidate_text)
-            if (candidate.scheme != 'https' or candidate.username or candidate.password
-                    or candidate.fragment or candidate.path != page_path
-                    or candidate.netloc.casefold() not in expected_authorities
-                    or candidate.port not in (None, 443)):
-                continue
-            query = parse_qs(candidate.query, strict_parsing=True)
-            if set(query) != {'cap'} or len(query['cap']) != 1 or not query['cap'][0]:
-                continue
-            token = query['cap'][0]
-        except (ValueError, TypeError):
-            continue
-        claims = None
-        is_upload = False
-        try:
-            claims = evidence_auth.verify_capability(
-                config, token, repo, pr, purpose=evidence_auth.UPLOAD_PURPOSE,
-            )
-            is_upload = True
-        except HTTPException:
-            for purpose, resource in ((evidence_auth.DOWNLOAD_PURPOSE, 'page'),
-                                      (evidence_auth.PURPOSE, None)):
-                try:
-                    claims = evidence_auth.verify_capability(
-                        config, token, repo, pr, purpose=purpose, resource=resource,
-                    )
-                    break
-                except HTTPException:
-                    continue
-        if (not isinstance(claims, dict) or claims.get('head') != head
-                or claims.get('round') != round_id):
-            continue
-        if is_upload:
-            # A bare URL is never upgraded to the bearer upload invitation.
-            # The explicit Summary URL can bind that invite; URL recovery only
-            # restores read-only history access.
-            if (state.get('status') != 'testing' or pr_head_sha != head
-                    or current_pr.get('state') != 'open' or current_pr.get('merged')
-                    or current_pr.get('draft') or claims.get('status') != 'testing'):
-                continue
-            continue
-        if page_capability is None:
-            page_capability = token
-    if page_capability:
-        return page_capability
-    # If the trusted Summary has no usable invitation, a page-only token may
-    # still provide read access. Its purpose is explicit and cannot authorize
-    # any Evidence write.
+            records = await proxy.read_evidence_records(repo, pr)
+        except Exception:
+            raise HTTPException(503, detail='evidence_history_unavailable') from None
+        if not isinstance(records, (list, tuple)):
+            raise HTTPException(503, detail='evidence_history_unavailable')
+        round_numbers = trusted_round_numbers(records, state, repo, pr)
+        if round_id not in round_numbers:
+            return None
+        archive_matches = any(
+            isinstance(record, dict) and record.get('kind') == 'round'
+            and isinstance(record.get('data'), dict)
+            and record['data'].get('repo') == repo
+            and record['data'].get('pr_number') == pr
+            and record['data'].get('head_sha') == head
+            and record['data'].get('round_id') == round_id
+            and isinstance(record['data'].get('snapshot'), dict)
+            and record['data']['snapshot'].get('head_sha') == head
+            and (record['data']['snapshot'].get('repo') is None
+                 or record['data']['snapshot'].get('repo') == repo)
+            and (record['data']['snapshot'].get('pr_number') is None
+                 or record['data']['snapshot'].get('pr_number') == pr)
+            for record in records
+        )
+        if not archive_matches:
+            return None
     try:
         token = evidence_auth.issue_capability(
             config, repo, pr, head, round_id,
@@ -343,7 +324,9 @@ async def _dispatch(request, owner, repo, pr, action, **path):
     if action in {'download', 'preview'} and 'round_id' not in payload:
         records = await request.app.state.proxy.read_evidence_records(canonical, pr)
         candidates = [r['data'] for r in records if r['kind'] == 'attachment'
-                      and r['data'].get('attachment_id') == payload['attachment_id']]
+                      and r['data'].get('attachment_id') == payload['attachment_id']
+                      and r['data'].get('head_sha') == claims.get('head')
+                      and r['data'].get('round_id') == claims.get('round')]
         if candidates:
             row = candidates[-1]
             payload.update(head_sha=row['head_sha'], round_id=row['round_id'])
@@ -546,74 +529,150 @@ async def page(request: Request, owner: str, repo: str, pr: int):
     headers = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
                'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY'}
     canonical = None
+    read_only_view = False
     try:
         evidence_auth.require_enabled(request)
         canonical = _repo(owner, repo, pr)
         explicit_capability = 'cap' in request.query_params
+        read_view = 'read' in request.query_params.getlist('view')
         page_cookie = request.cookies.get(evidence_auth.CAPABILITY_COOKIE, '')
         upload_cookie = request.cookies.get(evidence_auth.UPLOAD_COOKIE, '')
-        cookie_token = page_cookie or upload_cookie
-        cookie_claims = None
-        if cookie_token:
+        page_claims = None
+        if page_cookie:
             try:
-                cookie_claims = (
-                    evidence_auth._verify_page_capability(
-                        request.app.state.config, page_cookie, canonical, pr,
-                    ) if page_cookie else evidence_auth._verify_upload_capability(
-                        request.app.state.config, upload_cookie, canonical, pr,
-                    )
+                page_claims = evidence_auth._verify_page_capability(
+                    request.app.state.config, page_cookie, canonical, pr,
                 )
             except HTTPException:
                 pass
-        summary_capability = None
-        summary_checked = False
-        if not explicit_capability and (cookie_claims is None or bool(page_cookie)):
+        upload_claims = None
+        if upload_cookie:
             try:
-                summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
-            except HTTPException as exc:
-                if cookie_claims is None or exc.status_code != 503:
-                    raise
-            summary_checked = True
-            if cookie_claims and summary_capability:
-                try:
-                    summary_claims = evidence_auth.verify_capability(
-                        request.app.state.config, summary_capability, canonical, pr,
-                    )
-                except HTTPException:
-                    summary_claims = None
-                if (not isinstance(summary_claims, dict)
-                        or (summary_claims.get('purpose') != evidence_auth.UPLOAD_PURPOSE
-                            and summary_claims.get('head') == cookie_claims.get('head')
-                            and summary_claims.get('round') == cookie_claims.get('round'))):
-                    # Keep an already-valid cookie when Summary offers no
-                    # newer upload invite or a different read-only binding.
-                    summary_capability = None
-        try:
-            redirect = evidence_auth.bind_page_capability(
-                request, canonical, pr, trusted_summary_capability=summary_capability,
+                upload_claims = evidence_auth._verify_upload_capability(
+                    request.app.state.config, upload_cookie, canonical, pr,
+                )
+            except HTTPException:
+                pass
+        requested_target = _requested_read_target(request)
+        if read_view:
+            # Cookies and request parameters select a possible round only;
+            # each target is revalidated against current Lifecycle or archives.
+            target = requested_target
+            explicit_token = request.query_params.get('cap')
+            if target is None and explicit_capability:
+                hint = evidence_auth.capability_lookup_target(
+                    explicit_token, canonical, pr,
+                )
+                if hint is None:
+                    raise HTTPException(403, detail='invalid_evidence_capability')
+                target = (hint['head'], hint['round'])
+            elif target is None and page_claims is not None:
+                target = (page_claims['head'], page_claims['round'])
+            elif target is None and page_cookie:
+                hint = evidence_auth.capability_lookup_target(page_cookie, canonical, pr)
+                if hint is not None:
+                    target = (hint['head'], hint['round'])
+            read_capability = await _trusted_summary_page_capability(
+                request, canonical, pr,
+                target_head=target[0] if target else None,
+                target_round=target[1] if target else None,
             )
-        except HTTPException as exc:
-            if explicit_capability or summary_checked or exc.status_code != 403:
-                raise
-            summary_capability = await _trusted_summary_page_capability(request, canonical, pr)
-            summary_checked = True
-            if not summary_capability:
-                raise
+            if not read_capability:
+                raise HTTPException(403, detail='invalid_evidence_capability')
             redirect = evidence_auth.bind_page_capability(
-                request, canonical, pr, trusted_summary_capability=summary_capability,
+                request, canonical, pr,
+                trusted_summary_capability=read_capability, read_only=True,
             )
-        if redirect is not None:
-            return redirect
-        cookie_token = request.cookies.get(evidence_auth.CAPABILITY_COOKIE, '')
-        if cookie_token:
+            if redirect is not None:
+                return redirect
             claims = evidence_auth._verify_page_capability(
-                request.app.state.config, cookie_token, canonical, pr,
+                request.app.state.config, read_capability, canonical, pr,
             )
+            read_only_view = True
+        elif explicit_capability:
+            explicit_token = request.query_params.get('cap')
+            upload_claims = None
+            try:
+                upload_claims = evidence_auth._verify_upload_capability(
+                    request.app.state.config, explicit_token, canonical, pr,
+                )
+            except HTTPException:
+                pass
+            if upload_claims is not None:
+                redirect = evidence_auth.bind_page_capability(request, canonical, pr)
+                if redirect is not None:
+                    return redirect
+                claims = upload_claims
+            else:
+                # A page capability, including an expired one, is only a round
+                # lookup hint. A target explicitly supplied by the stable URL
+                # takes precedence; otherwise validate the token's hint.
+                target = requested_target
+                if target is None:
+                    hint = evidence_auth.capability_lookup_target(
+                        explicit_token, canonical, pr,
+                    )
+                    if hint is None:
+                        raise HTTPException(403, detail='invalid_evidence_capability')
+                    target = (hint['head'], hint['round'])
+                read_capability = await _trusted_summary_page_capability(
+                    request, canonical, pr, target_head=target[0],
+                    target_round=target[1],
+                )
+                if not read_capability:
+                    raise HTTPException(403, detail='invalid_evidence_capability')
+                redirect = evidence_auth.bind_page_capability(
+                    request, canonical, pr,
+                    trusted_summary_capability=read_capability, read_only=True,
+                )
+                if redirect is not None:
+                    return redirect
+                claims = evidence_auth._verify_page_capability(
+                    request.app.state.config, read_capability, canonical, pr,
+                )
+                read_only_view = True
+        elif upload_claims is not None:
+            # Signature and expiry establish the page invitation. The service
+            # makes the live PR/HEAD/round/permission decision before any write.
+            redirect = evidence_auth.bind_page_capability(request, canonical, pr)
+            if redirect is not None:
+                return redirect
+            claims = upload_claims
         else:
-            cookie_token = request.cookies.get(evidence_auth.UPLOAD_COOKIE, '')
-            claims = evidence_auth._verify_upload_capability(
-                request.app.state.config, cookie_token, canonical, pr,
-            )
+            if page_claims is not None:
+                target = (page_claims['head'], page_claims['round'])
+                read_capability = await _trusted_summary_page_capability(
+                    request, canonical, pr,
+                    target_head=target[0], target_round=target[1],
+                )
+                if not read_capability:
+                    raise HTTPException(403, detail='invalid_evidence_capability')
+                redirect = evidence_auth.bind_page_capability(
+                    request, canonical, pr,
+                    trusted_summary_capability=read_capability, read_only=True,
+                )
+                if redirect is not None:
+                    return redirect
+                claims = evidence_auth._verify_page_capability(
+                    request.app.state.config, read_capability, canonical, pr,
+                )
+                read_only_view = True
+            else:
+                summary_capability = await _trusted_summary_page_capability(
+                    request, canonical, pr,
+                )
+                if not summary_capability:
+                    raise HTTPException(403, detail='invalid_evidence_capability')
+                redirect = evidence_auth.bind_page_capability(
+                    request, canonical, pr,
+                    trusted_summary_capability=summary_capability, read_only=True,
+                )
+                if redirect is not None:
+                    return redirect
+                claims = evidence_auth._verify_page_capability(
+                    request.app.state.config, summary_capability, canonical, pr,
+                )
+                read_only_view = True
         result = {
             'repo': canonical,
             'head_sha': claims['head'],
@@ -638,8 +697,22 @@ async def page(request: Request, owner: str, repo: str, pr: int):
         return HTMLResponse(html, status_code=exc.status_code, headers=headers)
     from . import evidence_ui
     page_html = evidence_ui.render_upload_page(
-        result['repo'], pr, result['head_sha'], result['round_id'])
+        result['repo'], pr, result['head_sha'], result['round_id'],
+        read_only=read_only_view,
+    )
     return HTMLResponse(page_html, headers=headers)
+
+
+def _requested_read_target(request):
+    head_values = request.query_params.getlist('head_sha')
+    round_values = request.query_params.getlist('round_id')
+    if not head_values and not round_values:
+        return None
+    if (len(head_values) != 1 or len(round_values) != 1
+            or not re.fullmatch(r'[0-9a-f]{40}', head_values[0])
+            or not re.fullmatch(re.escape(head_values[0]) + r'-[0-9]+', round_values[0])):
+        raise HTTPException(400, detail='invalid_evidence_round')
+    return head_values[0], round_values[0]
 
 
 @router.get('/evidence/assets/app.js')

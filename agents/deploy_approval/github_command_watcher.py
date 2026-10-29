@@ -1168,14 +1168,21 @@ class GitHubCommandWatcher:
                 if self._github_backing_off():
                     break
                 continue
+            draft_pr = (
+                isinstance(current_pr, dict)
+                and current_pr.get("state") == "open"
+                and not current_pr.get("merged")
+                and current_pr.get("draft") is True
+            )
             if (not isinstance(current_pr, dict) or current_pr.get("state") != "open"
                     or current_pr.get("merged") or current_pr.get("draft")):
+                failure_reason = "pr_is_draft" if draft_pr else "pr_not_open"
                 for observed_repo, observed_pr, observed_comment_id in list(
                         self._recent_command_records):
                     if observed_repo == queued_repo and observed_pr == pr_number:
                         self._finish_recent_command(
                             queued_repo, pr_number, observed_comment_id,
-                            failure_reason="pr_not_open", retryable=False,
+                            failure_reason=failure_reason, retryable=False,
                         )
                 priority_attempted[queued_repo].remove(pr_number)
                 while item in self._priority_pr_queue:
@@ -1266,7 +1273,7 @@ class GitHubCommandWatcher:
         cycle_ok = True
         interrupted_for_new_priority = False
         ordinary_prs_skipped = 0
-        normal_prs_processed = 0
+        normal_prs_processed: dict[str, int] = {repo: 0 for repo in repos}
 
         # Discovery is read-only and runs independently; this remains the
         # single serial worker for every Lifecycle or evidence write.
@@ -1278,12 +1285,22 @@ class GitHubCommandWatcher:
         priority_generation_after_drain = self._priority_generation
         if self._priority_pr_queue:
             self._priority_cycles_since_ordinary += 1
-            normal_pr_budget = 1 if self._priority_cycles_since_ordinary >= 4 else 0
-            if normal_pr_budget:
-                self._priority_cycles_since_ordinary = 0
-        else:
-            normal_pr_budget = 2
+            # Keep one fair ordinary slot even under a continuous priority
+            # backlog. Priority work still runs first and can interrupt at PR
+            # boundaries, while a large open-PR set cannot be starved.
+            normal_pr_budget = 1
             self._priority_cycles_since_ordinary = 0
+        else:
+            # Bound normal work for the whole cycle, then distribute it over
+            # the rotated repository order. A large first repo must not consume
+            # every slot and starve later repositories.
+            normal_pr_budget = 8
+            self._priority_cycles_since_ordinary = 0
+        normal_budget_by_repo = {repo: 0 for repo in repos}
+        if repos and normal_pr_budget:
+            per_repo, remainder = divmod(normal_pr_budget, len(repos))
+            for index, repo in enumerate(repos):
+                normal_budget_by_repo[repo] = per_repo + (1 if index < remainder else 0)
         if self.config.auth_valid is not True:
             cycle_ok = False
             self._scan_failure_reasons.append("authorization_gate_closed")
@@ -1295,8 +1312,9 @@ class GitHubCommandWatcher:
             self._scan_failure_reasons.append("authenticated_github_backoff")
         else:
             for repo in repos:
-                if normal_prs_processed >= normal_pr_budget:
-                    break
+                repo_normal_budget = normal_budget_by_repo.get(repo, 0)
+                if repo_normal_budget <= 0:
+                    continue
                 if interrupted_for_new_priority:
                     break
                 if (self._priority_generation != priority_generation_after_drain
@@ -1355,7 +1373,7 @@ class GitHubCommandWatcher:
                     except (TypeError, ValueError):
                         continue
                     if (number > 0 and pr.get("state", "open") == "open"
-                            and not pr.get("merged") and not pr.get("draft")):
+                            and not pr.get("merged")):
                         valid_prs.append((number, pr))
                 valid_prs.sort(key=lambda item: item[0])
                 open_numbers = [number for number, _ in valid_prs]
@@ -1363,9 +1381,11 @@ class GitHubCommandWatcher:
                 baseline_all = repo in self._pending_baseline_repos
                 selected = list(priority_attempted.get(repo, []))
                 priority_count = len(selected)
-                remaining_normal = max(0, normal_pr_budget - normal_prs_processed)
+                remaining_normal = max(
+                    0, repo_normal_budget - normal_prs_processed.get(repo, 0),
+                )
                 pr_work_budget = priority_count + remaining_normal
-                fast_lane_size = 1
+                fast_lane_size = 6
                 selected_set = set(selected)
                 selected_set.update(
                     queued_number for queued_repo, queued_number in self._priority_pr_queue
@@ -1441,12 +1461,40 @@ class GitHubCommandWatcher:
                     if (self.config.auth_valid is not True or repo not in self.config.active_repos
                             or repo not in self.config.github_repos):
                         break
-                    normal_prs_processed += 1
+                    normal_prs_processed[repo] = normal_prs_processed.get(repo, 0) + 1
                     attempt_started = self._monotonic()
                     self._current_scan_stage = "ordinary_pr_processing"
                     self._current_scan_repo = repo
                     self._current_scan_pr = number
                     try:
+                        if pr_by_number[number].get("draft") is True:
+                            # Drafts share the single serial scan, but never
+                            # enter baseline dispatch, reconciliation of review
+                            # evidence, or command handling. Only the trusted
+                            # status-label projection runs.
+                            await self.controller.reconcile_pr(repo, number)
+                            self._fail_recent_commands_for_pr(
+                                repo, number, "pr_is_draft", retryable=False,
+                            )
+                            await self._remember_pr_schedule(
+                                repo, number, pr_by_number[number],
+                            )
+                            processed.append(number)
+                            self._record_pr_attempt(
+                                repo, number, "draft_status_projected",
+                                self._monotonic() - attempt_started,
+                            )
+                            if number in cursor_after:
+                                self._pr_scan_cursor[repo] = cursor_after[number]
+                            if self._github_backing_off():
+                                cycle_ok = False
+                                break
+                            if (self._priority_generation != priority_generation_after_drain
+                                    and self._priority_pr_queue):
+                                interrupted_for_new_priority = True
+                                self._signal_wakeup()
+                                break
+                            continue
                         succeeded = await self._process_scheduled_pr(repo, number)
                         processed.append(number)
                         self._record_pr_attempt(

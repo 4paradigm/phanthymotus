@@ -44,8 +44,6 @@ class EvidenceService:
         """Distinguish a confirmed PR state from an incomplete/transient read."""
         if not isinstance(pr, dict) or pr.get('state') not in {'open', 'closed'}:
             raise EvidenceError('pr_status_unavailable', 503)
-        if pr.get('draft'):
-            raise EvidenceError('pr_draft', 409)
         base = pr.get('base')
         base_repository = base.get('repo') if isinstance(base, dict) else None
         base_repo = base_repository.get('full_name') if isinstance(base_repository, dict) else None
@@ -845,6 +843,8 @@ class EvidenceService:
                     round_id = targets[-1]['round_id']
             selected = state
             if round_id != active_round:
+                if round_id not in round_numbers:
+                    raise EvidenceError('round_not_found', 404)
                 archives = [r['data'] for r in records if r['kind'] == 'round' and r['data'].get('round_id') == round_id
                             and r['data'].get('repo') == repo and r['data'].get('pr_number') == pr_number]
                 if not archives:
@@ -1147,7 +1147,7 @@ class EvidenceService:
                                        if r['round_id'] == round_id]
                 round_attachments = {}
                 for row in records:
-                    if row['kind'] != 'round':
+                    if row['kind'] != 'round' or row['data'].get('round_id') not in round_numbers:
                         continue
                     row_round = row['data']['round_id']
                     round_attachments[row_round] = [
@@ -1165,7 +1165,8 @@ class EvidenceService:
                             and principal.get('github_user_authenticated') is True),
                         'can_write': bool((authorized_writer or invite_allowed) and selected.get('status') == 'testing'
                                           and selected.get('head_sha') == pr.get('head', {}).get('sha')
-                                          and pr.get('state') == 'open' and not pr.get('merged')),
+                                          and pr.get('state') == 'open' and not pr.get('merged')
+                                          and not pr.get('draft')),
                         'acceptance_pending': bool(
                             isinstance(selected.get('acceptance_request'), dict)
                             and selected['acceptance_request'].get('status') == 'pending'
@@ -1191,7 +1192,8 @@ class EvidenceService:
                                         r['data']['snapshot'], historical=True,
                                     ),
                                     'attachments': round_attachments.get(r['data']['round_id'], [])}
-                                   for r in records if r['kind'] == 'round'],
+                                   for r in records if r['kind'] == 'round'
+                                   and r['data'].get('round_id') in round_numbers],
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
                                        for r in operations.values() if not r.get('auth_nonce_marker')
                                        and not r.get('native_attachment')

@@ -10,7 +10,7 @@ import html
 from .comments import _evidence_path
 
 
-def render_upload_page(repo, pr_number, head_sha, round_id) -> str:
+def render_upload_page(repo, pr_number, head_sha, round_id, *, read_only=False) -> str:
     api = _evidence_path(repo, pr_number)
     if not api:
         raise ValueError("invalid repository or PR")
@@ -116,7 +116,7 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 }}
 </style><script src="/evidence/assets/app.js" defer></script></head>
 <body>
-<main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}">
+<main id="app" data-api="{esc(api)}" data-repo="{esc(repo)}" data-pr="{esc(pr_number)}" data-head="{esc(head_sha)}" data-round="{esc(round_id)}" data-read-only="{str(bool(read_only)).lower()}">
 <header class="page-header"><div><p class="eyebrow">部署验证</p><h1>附件</h1>
 <p class="subtitle">{esc(repo)} · PR #{esc(pr_number)}</p></div></header>
 <p id="message" role="status" aria-live="polite"></p>
@@ -334,6 +334,7 @@ _JAVASCRIPT = r'''"use strict";
     if (path === "/context") {
       target.searchParams.set("head_sha", bound.head_sha);
       target.searchParams.set("round_id", bound.round_id);
+      if (app.dataset.readOnly === "true") target.searchParams.set("read_view", "1");
     }
     if (target.origin !== window.location.origin) throw new Error("拒绝跨站 Evidence 请求。");
     const headers = evidenceRequestHeaders(target, method, authMode);
@@ -755,9 +756,10 @@ _JAVASCRIPT = r'''"use strict";
   }
   function render() {
     const state = typeof context.status === "string" ? context.status : "";
-    const stageAvailable = ["testing", "succeeded", "failed"].includes(state);
-    const pageAvailable = ["review-required", "reviewing", "deploy-ready", "deploy-requested",
-      "deploying", "testing", "succeeded", "failed", "cancelled", "deployed"].includes(state);
+    const pageAvailable = !!context && typeof state === "string" && !!state;
+    // Lifecycle labels control writes; trusted current and archived evidence
+    // remain readable throughout every supported phase.
+    const stageAvailable = pageAvailable;
     $("current-section").hidden = !stageAvailable;
     $("history-section").hidden = true;
     $("attachments").replaceChildren(); $("history").replaceChildren();
@@ -1375,7 +1377,7 @@ _JAVASCRIPT = r'''"use strict";
     const detail = String(error && error.message || "");
     $("current-section").hidden = true; $("history-section").hidden = true;
     if ([401, 403].includes(status) || /invalid_evidence_capability|invalid_evidence/i.test(detail))
-      message("此附件链接当前不可用。请从 PR Summary 重新打开；附件只在测试阶段开放。");
+      message("此附件链接当前不可用。请从可信 PR Summary 重新打开或刷新链接。");
     else message("暂时无法读取附件，请稍后从 PR Summary 重新打开。");
   });
 })();

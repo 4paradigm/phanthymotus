@@ -10,7 +10,7 @@ import json
 import re
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -238,6 +238,34 @@ def verify_capability(config, token, repo, pr_number, *, purpose=None, resource=
         raise HTTPException(403, detail='invalid_evidence_capability') from None
 
 
+def capability_lookup_target(token, repo, pr_number):
+    """Read only a bounded, unverified capability payload as a lookup hint.
+
+    The returned values are never authorization. Callers must match them to a
+    trusted lifecycle state or verified round archive before minting a new
+    read capability.
+    """
+    try:
+        if not isinstance(token, str) or len(token) > 2048:
+            return None
+        body, _signature = token.split('.', 1)
+        raw = base64.urlsafe_b64decode(body + '=' * (-len(body) % 4))
+        claims = json.loads(raw)
+        if not isinstance(claims, dict):
+            return None
+        head, round_id = claims.get('head'), claims.get('round')
+        if (claims.get('repo') != repo
+                or type(claims.get('pr')) is not int or claims['pr'] != pr_number
+                or claims.get('purpose') not in _PURPOSES
+                or not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)
+                or not isinstance(round_id, str)
+                or not re.fullmatch(re.escape(head) + r'-[0-9]+', round_id)):
+            return None
+        return {'head': head, 'round': round_id}
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, binascii.Error):
+        return None
+
+
 def _verify_page_capability(config, token, repo, pr_number):
     try:
         return verify_capability(config, token, repo, pr_number, purpose=PURPOSE)
@@ -261,16 +289,47 @@ def _cookie(response, request, name, token, max_age):
                         httponly=True, samesite='lax')
 
 
-def bind_page_capability(request, repo, pr_number, *, trusted_summary_capability=None):
+def bind_page_capability(request, repo, pr_number, *, trusted_summary_capability=None,
+                         read_only=False):
     """Exchange a Summary read or upload capability for an HttpOnly cookie."""
     require_enabled(request)
+    if read_only:
+        # view=read is an explicit read-only mode. Never inspect the query cap
+        # or upload cookie here; only a page-scoped read capability can bind it.
+        token = trusted_summary_capability or request.cookies.get(CAPABILITY_COOKIE, '')
+        if not token:
+            raise HTTPException(403, detail='invalid_evidence_capability')
+        claims = _verify_page_capability(request.app.state.config, token, repo, pr_number)
+        requested_head = request.query_params.get('head_sha')
+        requested_round = request.query_params.get('round_id')
+        if ((requested_head and requested_head != claims.get('head'))
+                or (requested_round and requested_round != claims.get('round'))):
+            raise HTTPException(403, detail='invalid_evidence_capability')
+        target_query = urlencode({'view': 'read', 'head_sha': claims['head'],
+                                  'round_id': claims['round']})
+        expected_query = {'view': 'read', 'head_sha': claims['head'],
+                          'round_id': claims['round']}
+        response = None
+        if (dict(request.query_params) != expected_query or 'cap' in request.query_params):
+            response = RedirectResponse(
+                request.url.path + '?' + target_query, status_code=303,
+                headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
+            )
+        elif token != request.cookies.get(CAPABILITY_COOKIE, ''):
+            response = RedirectResponse(
+                request.url.path + '?' + target_query, status_code=303,
+                headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
+            )
+        if response is not None and token != request.cookies.get(CAPABILITY_COOKIE, ''):
+            _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
+        return response
     token = request.query_params.get('cap')
     if 'cap' in request.query_params and not token:
         raise HTTPException(403, detail='invalid_evidence_capability')
     if 'cap' not in request.query_params and trusted_summary_capability:
-        # The page handler supplies only a read capability recovered from the
-        # trusted lifecycle Summary. It may replace a stale or cross-PR cookie,
-        # but never overrides an explicitly supplied query capability.
+        # The page handler supplies a read capability recovered from the
+        # trusted Summary or a verified upload cookie; neither overrides an
+        # explicitly supplied query capability.
         token = trusted_summary_capability
     if token:
         try:
@@ -282,7 +341,8 @@ def bind_page_capability(request, repo, pr_number, *, trusted_summary_capability
         if upload:
             if not _configured_https_request(request):
                 raise HTTPException(403, detail='evidence_origin_failed')
-        response = RedirectResponse(request.url.path, status_code=303,
+        target_path = request.url.path if upload else request.url.path + '?view=read'
+        response = RedirectResponse(target_path, status_code=303,
                                     headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
         if upload:
             _cookie(response, request, UPLOAD_COOKIE, token,
@@ -293,21 +353,23 @@ def bind_page_capability(request, repo, pr_number, *, trusted_summary_capability
             )
         else:
             _cookie(response, request, CAPABILITY_COOKIE, token, SESSION_SECONDS)
-            response.delete_cookie(
-                UPLOAD_COOKIE, path='/', secure=_secure(request),
-                httponly=True, samesite='lax',
-            )
         return response
     token = request.cookies.get(CAPABILITY_COOKIE, '')
     if token:
-        _verify_page_capability(request.app.state.config, token, repo, pr_number)
-        return None
+        try:
+            _verify_page_capability(request.app.state.config, token, repo, pr_number)
+            return None
+        except HTTPException:
+            pass
     token = request.cookies.get(UPLOAD_COOKIE, '')
     if token:
-        _verify_upload_capability(request.app.state.config, token, repo, pr_number)
-        if not _configured_https_request(request):
-            raise HTTPException(403, detail='evidence_origin_failed')
-        return None
+        try:
+            _verify_upload_capability(request.app.state.config, token, repo, pr_number)
+            if not _configured_https_request(request):
+                raise HTTPException(403, detail='evidence_origin_failed')
+            return None
+        except HTTPException:
+            pass
     raise HTTPException(403, detail='invalid_evidence_capability')
 
 
@@ -439,6 +501,35 @@ async def _comment_proof_principal(request, repo, pr_number):
 async def verified_principal(request: Request, repo: str, pr_number: int, *, write=False,
                              purpose=PURPOSE, resource=None):
     require_enabled(request)
+    if (not write and request.method == 'GET'
+            and request.url.path.endswith('/context')
+            and '1' in request.query_params.getlist('read_view')):
+        page_token = request.cookies.get(CAPABILITY_COOKIE, '')
+        if page_token:
+            try:
+                claims = _verify_page_capability(
+                    request.app.state.config, page_token, repo, pr_number,
+                )
+            except HTTPException:
+                claims = None
+            requested_head = request.query_params.get('head_sha')
+            requested_round = request.query_params.get('round_id')
+            if (claims is not None
+                    and requested_head == claims.get('head')
+                    and requested_round == claims.get('round')):
+                actor_id = int.from_bytes(
+                    hashlib.sha256(page_token.encode()).digest()[:8], 'big',
+                ) or 1
+                return ({
+                    'id': actor_id, 'login': 'evidence-capability',
+                    'actor': 'evidence-capability', 'capability': claims,
+                    'capability_token': page_token, 'auth_method': 'capability',
+                    'actor_verified': False, 'github_user_authenticated': False,
+                }, '')
+        # An explicit read_view request may not fall through to an upload
+        # invitation or comment proof when its read capability is absent,
+        # expired, or bound to another round.
+        raise HTTPException(403, detail='invalid_evidence_capability')
     if request.headers.get(PROOF_HEADER):
         if write and request.method not in ('POST', 'PUT', 'DELETE'):
             raise HTTPException(405, detail='evidence_write_method_required')
@@ -451,6 +542,13 @@ async def verified_principal(request: Request, repo: str, pr_number: int, *, wri
             claims = _verify_upload_capability(request.app.state.config, invite_token, repo, pr_number)
         except HTTPException:
             claims = None
+        if (claims is not None and not write and request.method == 'GET'
+                and request.url.path.endswith('/context')):
+            requested_head = request.query_params.get('head_sha')
+            requested_round = request.query_params.get('round_id')
+            if ((requested_head and requested_head != claims.get('head'))
+                    or (requested_round and requested_round != claims.get('round'))):
+                claims = None
         if claims is not None:
             if write:
                 if request.method not in ('POST', 'PUT', 'DELETE'):
@@ -475,6 +573,32 @@ async def verified_principal(request: Request, repo: str, pr_number: int, *, wri
                     'upload_invite': claims, 'upload_method': 'signed_invite',
                     'auth_method': 'signed_invite', 'actor_verified': False,
                     'github_user_authenticated': False}, ''
+    if (not write and request.method == 'GET'
+            and request.url.path.endswith('/context')):
+        page_token = request.cookies.get(CAPABILITY_COOKIE, '')
+        if page_token:
+            try:
+                claims = _verify_page_capability(
+                    request.app.state.config, page_token, repo, pr_number,
+                )
+            except HTTPException:
+                pass
+            else:
+                requested_head = request.query_params.get('head_sha')
+                requested_round = request.query_params.get('round_id')
+                if ((requested_head and requested_head != claims.get('head'))
+                        or (requested_round and requested_round != claims.get('round'))):
+                    page_token = ''
+                else:
+                    actor_id = int.from_bytes(
+                        hashlib.sha256(page_token.encode()).digest()[:8], 'big',
+                    ) or 1
+                    return ({
+                        'id': actor_id, 'login': 'evidence-capability',
+                        'actor': 'evidence-capability', 'capability': claims,
+                        'capability_token': page_token, 'auth_method': 'capability',
+                        'actor_verified': False, 'github_user_authenticated': False,
+                    }, '')
     if write:
         if purpose == UPLOAD_PURPOSE:
             _trusted_upload_origin(request)
@@ -496,6 +620,13 @@ async def verified_principal(request: Request, repo: str, pr_number: int, *, wri
     else:
         claims = verify_capability(config, token, repo, pr_number,
                                    purpose=purpose, resource=resource)
+    if (purpose in {PURPOSE, UPLOAD_PURPOSE} and request.method == 'GET'
+            and request.url.path.endswith('/context')
+            and ((request.query_params.get('head_sha')
+                  and request.query_params.get('head_sha') != claims.get('head'))
+                 or (request.query_params.get('round_id')
+                     and request.query_params.get('round_id') != claims.get('round')))):
+        raise HTTPException(403, detail='invalid_evidence_capability')
     actor_id = int.from_bytes(hashlib.sha256(token.encode()).digest()[:8], 'big') or 1
     return {'id': actor_id, 'login': 'evidence-capability', 'actor': 'evidence-capability',
             'capability': claims, 'capability_token': token,

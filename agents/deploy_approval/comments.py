@@ -1022,6 +1022,11 @@ def render_evidence_section(
         if not valid_round_binding(h, r):
             continue
         key = (h, r)
+        trusted_archive_round_number = (
+            envelope.get("round_number")
+            if isinstance(envelope, dict) and isinstance(envelope.get("snapshot"), dict)
+            else None
+        )
         group = groups.setdefault(key, {
             "attachments": [], "attachment_details_complete": False,
             "attachment_details_unreadable": False,
@@ -1031,8 +1036,12 @@ def render_evidence_section(
             details_complete = group.get("attachment_details_complete") is True
             if key != (head, current_round):
                 capability = group.get("capability")
-                group.update(snapshot)
-                group.update({k: v for k, v in row.items() if k != "snapshot"})
+                group.update({k: v for k, v in snapshot.items() if k != "round_number"})
+                group.update({k: v for k, v in row.items()
+                              if k not in {"snapshot", "round_number"}})
+                if (type(trusted_archive_round_number) is int
+                        and trusted_archive_round_number > 0):
+                    group["round_number"] = trusted_archive_round_number
                 if not group.get("capability") and capability:
                     group["capability"] = capability
             snapshot_attachments = snapshot.get("attachments")
@@ -1090,6 +1099,44 @@ def render_evidence_section(
             return ""
         return (origin + page_path + "?cap="
                 + urllib.parse.quote(str(capability), safe=""))
+
+    def stable_read_page_url(key, origin):
+        if (not origin or not page_path.startswith("/evidence/")
+                or not isinstance(key, tuple) or len(key) != 2
+                or not valid_round_binding(key[0], key[1])):
+            return ""
+        query = urllib.parse.urlencode({
+            "view": "read", "head_sha": key[0], "round_id": key[1],
+        })
+        return origin + page_path + "?" + query
+
+    def stable_attachment_download_url(item, key, origin):
+        if (not isinstance(item, dict) or not origin or not api
+                or item.get("status") != "ready" or item.get("deleted_at")
+                or item.get("cos_projection_verified") is not True
+                or item.get("head_sha") != key[0] or item.get("round_id") != key[1]
+                or not isinstance(item.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
+            return ""
+        verified_content = (
+            item.get("cos_content_verified") is True
+            or item.get("actor_verified") is True
+            and item.get("upload_method") != "signed_invite"
+        )
+        attachment_id = item.get("attachment_id")
+        capability = item.get("download_capability")
+        size = item.get("size")
+        if (not verified_content
+                or not isinstance(attachment_id, str)
+                or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id) is None
+                or not isinstance(capability, str) or not capability
+                or len(capability) > 2048
+                or isinstance(size, bool) or not isinstance(size, int)
+                or not 1 <= size <= 512 * 1024 * 1024
+                or any(char.isspace() or ord(char) < 32 for char in capability)):
+            return ""
+        path = api + "/attachments/" + urllib.parse.quote(attachment_id, safe="") + "/download"
+        return origin + path + "?" + urllib.parse.urlencode({"cap": capability})
 
     def trusted_cos_download_url(item, key):
         verified_content = (
@@ -1231,14 +1278,6 @@ def render_evidence_section(
             return (2, parsed.astimezone(_dt.timezone.utc).timestamp())
         return (1, parsed.isoformat())
 
-    def summary_date(value):
-        parsed = parsed_timestamp(value)
-        if parsed is None:
-            return "时间未知"
-        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
-            parsed = parsed.astimezone(_BEIJING)
-        return parsed.date().isoformat()
-
     def first_valid_time(*values):
         for value in values:
             if parsed_timestamp(value) is not None:
@@ -1246,9 +1285,6 @@ def render_evidence_section(
         return None
 
     def round_label(group, *, historical=False):
-        if historical and group.get("status") in {
-                "review-required", "reviewing", "deploy-ready", "deploy-requested", "deploying"}:
-            return "测试前归档"
         round_number = group.get("round_number")
         if type(round_number) is int and round_number > 0:
             return f"第 {round_number} 轮"
@@ -1256,11 +1292,10 @@ def render_evidence_section(
 
     def round_status(group, key):
         request = group.get("acceptance_request")
-        if (group.get("status") == "testing" and (
-                group.get("acceptance_pending") is True
-                or isinstance(request, dict) and request.get("status") == "pending"
+        if (group.get("status") == "testing" and isinstance(request, dict)
+                and request.get("status") == "pending"
                 and request.get("head_sha") == key[0]
-                and request.get("round_id") == key[1])):
+                and request.get("round_id") == key[1]):
             return "测试完成 · 待验收"
         return {
             "testing": "测试中", "succeeded": "已通过", "failed": "未通过",
@@ -1271,14 +1306,12 @@ def render_evidence_section(
 
     def render_round(key, group, *, historical=False):
         h, r = key
+        remaining_note_chars = 900
+        notes_truncated = False
         items = visible_attachments(group, key)
         items.sort(key=lambda item: sortable_time(first_valid_time(
             item.get("created_at"), item.get("uploaded_at"))), reverse=True)
         lines = []
-        if historical:
-            lines.append(f"### {_escape(round_label(group, historical=True))}")
-        else:
-            lines.append(f"### {_escape(round_label(group))}")
         lines.extend([
             "", f"**Commit：** `{_escape(h)}`",
             f"**状态：** {_escape(round_status(group, key))}",
@@ -1286,8 +1319,9 @@ def render_evidence_section(
             "", "### 附件", "",
         ])
         if items:
-            lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 | 下载 |", "|---|---:|---|---|---|"])
+            lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
         notes = []
+        seen_notes = set()
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1311,11 +1345,19 @@ def render_evidence_section(
             uploaded_at = summary_time(first_valid_time(item.get("created_at"), item.get("uploaded_at")))
             if deleted:
                 filename = filename + "（已删除）"
-            download_url = "" if deleted else trusted_cos_download_url(item, key)
-            download_cell = f"[下载](<{download_url}>)" if download_url else "—"
+            download_url = ("" if deleted else
+                            stable_attachment_download_url(item, key, base or upload_base))
+            if not download_url and not deleted:
+                download_url = trusted_cos_download_url(item, key)
+            filename_cell = _escape(filename)
+            if download_url:
+                filename_cell = f"[{filename_cell}](<{download_url}>)"
+            elif not deleted:
+                attachment_page = stable_read_page_url(key, base or upload_base)
+                if attachment_page:
+                    filename_cell = f"[{filename_cell}](<{attachment_page}>)"
             lines.append("| " + " | ".join((
-                _escape(filename), _escape(size), _escape(actor),
-                _escape(uploaded_at), download_cell,
+                filename_cell, _escape(size), _escape(actor), _escape(uploaded_at),
             )) + " |")
             note = item.get("note") or (item.get("text") if status == "text" else "")
             if is_internal_test_note(item):
@@ -1339,9 +1381,27 @@ def render_evidence_section(
                     note = ((note.rstrip() + "\n\n") if isinstance(note, str) and note.strip() else "") + \
                         "[摘要中仅保留备注摘要，完整内容请在附件页查看；内容不完整]"
             if isinstance(note, str) and note.strip():
-                notes.append(f"- **{_escape(filename)}：** {_escape(safe_note_text(note.strip()))}")
+                rendered_note = safe_note_text(note.strip())
+                note_identity = item.get("attachment_id") or item.get("id")
+                if not isinstance(note_identity, (str, int)):
+                    note_identity = filename.casefold()
+                note_key = (note_identity, rendered_note)
+                if note_key not in seen_notes:
+                    seen_notes.add(note_key)
+                    if remaining_note_chars <= 0:
+                        notes_truncated = True
+                        continue
+                    if len(rendered_note) > remaining_note_chars:
+                        rendered_note = rendered_note[:remaining_note_chars] + "…（摘要已截短；完整说明保留在附件记录中）"
+                        notes_truncated = True
+                    remaining_note_chars -= min(len(rendered_note), remaining_note_chars)
+                    notes.append(f"- **{_escape(filename)}：** {_escape(rendered_note)}")
         if notes:
             lines.extend(["", "<details>", "<summary>附件说明</summary>", "", *notes, "", "</details>"])
+        if notes_truncated:
+            attachment_page = stable_read_page_url(key, base or upload_base)
+            if attachment_page:
+                lines.extend(["", f"[备注摘要已精简；完整说明请打开附件页](<{attachment_page}>)"])
         if historical and items and group.get("attachment_details_unreadable"):
             lines.append("部分历史附件明细无法读取或校验；此处仅显示通过校验的记录。")
         if not items:
@@ -1401,13 +1461,28 @@ def render_evidence_section(
             lines.extend(["", f"历史事件：{history_count} 条（详情保留在归档记录中）"])
         return lines
 
+    def round_summary(key, group):
+        timestamp = first_valid_time(
+            group.get("round_started_at"), group.get("started_at"),
+        )
+        return (f"<summary>{_escape(round_label(group, historical=key != (head, current_round)))}"
+                f" · {_escape(round_status(group, key))} · {_escape(summary_time(timestamp))}</summary>")
+
     def round_sort_time(key):
         group = groups[key]
+        round_number = group.get("round_number")
         value = first_valid_time(group.get("round_started_at"), group.get("started_at"), group.get("created_at"), group.get("archived_at"), group.get("ended_at"))
-        return sortable_time(value)
+        trusted_number = round_number if type(round_number) is int and round_number > 0 else 0
+        return (sortable_time(value), trusted_number)
     lines = ["<!-- deploy-approval-evidence:start -->"]
     if show_current_round:
-        lines.extend(render_round((head, current_round), groups[(head, current_round)]))
+        current_key = (head, current_round)
+        current_group = groups[current_key]
+        lines.extend([
+            "<details open>",
+            round_summary(current_key, current_group),
+            "", *render_round(current_key, current_group), "", "</details>",
+        ])
     round_pattern = re.escape(str(head)) + r"-[0-9]+"
     current_context_valid = (
         re.fullmatch(r"[0-9a-f]{40}", str(head))
@@ -1421,7 +1496,9 @@ def render_evidence_section(
             and state.get("browser_upload_ready") is True
             else ""
         )
-        read_url = page_url_at(state.get("capability"), upload_base or base)
+        # Keep read access on the stable public origin when one is configured;
+        # the temporary ingress is only a fallback for deployments without it.
+        read_url = page_url_at(state.get("capability"), base or upload_base)
         if upload_url:
             lines.extend(["", f"[打开附件页](<{upload_url}>)"])
         elif read_url:
@@ -1449,50 +1526,27 @@ def render_evidence_section(
         lines.extend([
             "上传权限：仅限本轮测试邀请；分享链接上传会标示身份未验证。",
             "可上传视频、图片、文件或文字说明；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
-            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。完成本轮检查后，由 Machine Owner 执行 `/request_acceptance` 请求独立验收。",
+            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。",
         ])
+        acceptance_request = state.get("acceptance_request")
+        if (isinstance(acceptance_request, dict)
+                and acceptance_request.get("status") == "pending"
+                and acceptance_request.get("head_sha") == head
+                and acceptance_request.get("round_id") == current_round):
+            lines.append("独立验收人请执行 `/record_test result=pass` 表示通过，或 `/record_test result=fail` 表示失败。")
+        else:
+            lines.append("Machine Owner 完成本轮测试后执行 `/request_acceptance`；待验收后由独立验收人执行 `/record_test result=pass` 或 `/record_test result=fail`。")
     test_statuses = {"testing", "succeeded", "failed"}
     old = [(key, group) for key, group in groups.items()
            if key != (head, current_round) and group.get("status") in test_statuses]
     old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
     if old:
         lines.extend(["", "### 历史轮次", ""])
-        for key, group in old[:3]:
-            timestamp = first_valid_time(
-                group.get("archived_at"), group.get("ended_at"),
-                group.get("round_started_at"), group.get("started_at"),
-                group.get("created_at"),
-            )
-            attachment_items = latest_attachments(group, key)
-            round_items = visible_attachments(group, key)
-            attachment_count = sum(
-                1 for item in round_items
-                if not (item.get("deleted_at") or item.get("status") == "deleted")
-            )
-            count_label = (
-                (f"{attachment_count} 个附件；部分明细不可读取"
-                 if attachment_count else "历史数据不可读取")
-                if group.get("attachment_details_unreadable") else
-                f"{attachment_count} 个附件" if attachment_count else
-                "该轮未保存附件" if not attachment_items and group.get("attachment_details_complete")
-                else "内部验收备注已隐藏" if only_hidden_internal_notes(group, key)
-                else "附件记录均已删除" if round_items and all(
-                    item.get("deleted_at") or item.get("status") == "deleted"
-                    for item in round_items
-                )
-                else "历史快照未包含附件明细"
-            )
-            date_label = summary_date(timestamp)
+        for key, group in old:
             lines.extend(["<details>",
-                          f"<summary>{_escape(round_label(group, historical=True))} · {_escape(date_label)} · {_escape(count_label)}</summary>",
+                          round_summary(key, group),
                           "", *render_round(key, group, historical=True), "", "</details>", ""])
-    linked_index = False
     for url in trusted_archive_urls:
         lines.append(f"[查看原始归档](<{url}>)")
-        linked_index = True
-    if len(old) > 3:
-        lines.append(f"其余 {len(old) - 3} 轮历史仍保留。" +
-                     ("可通过可信历史索引查看更多。" if linked_index else
-                      "可信历史索引暂不可用。"))
     lines.append("<!-- deploy-approval-evidence:end -->")
     return "\n".join(lines)

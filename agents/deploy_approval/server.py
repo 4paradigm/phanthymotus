@@ -74,6 +74,11 @@ _STATUS_LABEL_SPECS = (
         "Deploy Approval: deployment complete; human testing required",
     ),
     (
+        "status: acceptance-required",
+        "FBCA04",
+        "Deploy Approval: testing complete; independent acceptance required",
+    ),
+    (
         "status: succeeded",
         "0E8A16",
         "Deploy Approval: human validation passed",
@@ -90,7 +95,6 @@ def _validate_label_namespace(repo: str, labels: list[dict]) -> dict[str, dict]:
     if not isinstance(labels, list):
         raise ValueError(f"repository {repo}: labels response must be a list")
     exact: dict[str, dict] = {}
-    casefold_seen: dict[str, str] = {}
     for label in labels:
         if not isinstance(label, dict):
             raise ValueError(f"repository {repo}: label record must be an object")
@@ -98,19 +102,14 @@ def _validate_label_namespace(repo: str, labels: list[dict]) -> dict[str, dict]:
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"repository {repo}: label name must be a non-empty string")
         name = name.strip()
-        lowered = name.casefold()
         if name in exact:
             raise ValueError(
                 f"repository {repo}: duplicate label record {name!r}"
             )
-        existing = casefold_seen.get(lowered)
-        if existing is not None and existing != name:
-            raise ValueError(
-                f"repository {repo}: existing conflicting label {existing!r} "
-                f"conflicts with required exact label {name!r}"
-            )
         exact[name] = label
-        casefold_seen[lowered] = name
+        # GitHub label names are case-insensitive. Keep the first spelling as
+        # the preferred existing name instead of aborting bootstrap when an
+        # older deployment created, for example, "Status: reviewing".
     return exact
 
 
@@ -120,6 +119,7 @@ _LABEL_SPECS: dict[str, tuple[str, str]] = {
     "status: deploy-ready": ("0E8A16", "Deploy Approval: reviewed HEAD is ready for deploy request"),
     "status: deploy-requested": ("FBCA04", "Deploy Approval: Machine Owner action required"),
     "status: testing": ("1D76DB", "Deploy Approval: deployment complete; human testing required"),
+    "status: acceptance-required": ("FBCA04", "Deploy Approval: testing complete; independent acceptance required"),
     "status: succeeded": ("0E8A16", "Deploy Approval: human validation passed"),
     "status: failed": ("B60205", "Deploy Approval: deployment or validation failed"),
 }
@@ -164,19 +164,21 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
             continue
 
         repo_summary["available"] = list(exact.keys())
-        lower_names = {name.casefold(): name for name in exact}
+        lower_names = {}
+        for name in exact:
+            lower_names.setdefault(name.casefold(), name)
 
         # Attempt to create any missing labels.
         for name, (color, description) in _LABEL_SPECS.items():
             if name in exact:
                 continue
             conflicting = lower_names.get(name.casefold())
-            if conflicting is not None and conflicting != name:
-                logger.warning(
-                    "repository %s: skipping label %s due to conflict %s",
-                    repo, name, conflicting,
+            if conflicting is not None:
+                logger.info(
+                    "repository %s: reusing case-insensitive status label %s for %s",
+                    repo, conflicting, name,
                 )
-                repo_summary["missing"].append(name)
+                repo_summary["available"].append(conflicting)
                 continue
             try:
                 await github.create_repository_label(repo, name, color, description)
@@ -186,8 +188,12 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
                 try:
                     fresh_labels = await github.list_repository_labels(repo)
                     fresh_exact = _validate_label_namespace(repo, fresh_labels)
-                    if name in fresh_exact:
-                        repo_summary["available"].append(name)
+                    fresh_equivalent = next(
+                        (existing_name for existing_name in fresh_exact
+                         if existing_name.casefold() == name.casefold()), None,
+                    )
+                    if fresh_equivalent is not None:
+                        repo_summary["available"].append(fresh_equivalent)
                         continue
                 except Exception:
                     pass
@@ -198,8 +204,10 @@ async def _bootstrap_status_labels(github: GitHubClient, repos: list[str] | None
                 repo_summary["errors"].append(name)
 
         # Final check -- missing labels are WARNING only, never raise.
+        known_folds = {name.casefold() for name in exact}
+        known_folds.update(name.casefold() for name in repo_summary["available"])
         for name in _ALLOWED_STATUS_LABELS:
-            if name not in exact and name not in repo_summary["available"]:
+            if name.casefold() not in known_folds:
                 if name not in repo_summary["missing"]:
                     repo_summary["missing"].append(name)
                 logger.warning(
