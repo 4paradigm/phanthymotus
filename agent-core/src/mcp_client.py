@@ -1654,9 +1654,10 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
                cancel_event: asyncio.Event | None = None) -> dict:
     """等待指定异步动作完成。不指定 ids 则等待所有 pending actions。
 
-    返回: {"status": "completed"|"timeout"|"cancelled", "results": {...}}
+    返回 completed、timeout、cancelled 或 no_pending_actions；等待期间身份丢失时，
+    成功路径返回 unknown，超时路径在原 timeout 结果中附带 unknown ID 列表。
     """
-    targets = action_ids or list(_pending_actions.keys())
+    targets = list(dict.fromkeys(action_ids or _pending_actions.keys()))
     if not targets:
         return {"status": "no_pending_actions"}
 
@@ -1689,16 +1690,34 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         # _pending_results 和 _pending_actions，把 _pending_timeouts / _pending_tools
         # 永久留在进程里；Phase 3 的 peer 回调正是走这条路，每次委派都会漏一份。
         results = {}
-        for aid, _ in events:
-            results[aid] = _pending_results.pop(aid, {"status": "completed"})
-        _forget_pending((aid for aid, _ in events), 'completed')
+        unknown = []
+        for aid, ev in events:
+            if _pending_actions.get(aid) is not ev:
+                unknown.append(aid)
+            else:
+                results[aid] = _pending_results.pop(aid, {"status": "completed"})
+        # No await between the identity check, result reads, and cleanup.
+        _forget_pending(results, 'completed')
+        if unknown:
+            return {"status": "unknown", "results": results, "unknown": unknown}
         return {"status": "completed", "results": results}
     except asyncio.TimeoutError:
-        completed = {aid: _pending_results.pop(aid, {}) for aid, ev in events if ev.is_set()}
-        still_pending = [aid for aid, ev in events if not ev.is_set()]
+        completed = {}
+        still_pending = []
+        unknown = []
+        for aid, ev in events:
+            if _pending_actions.get(aid) is not ev:
+                unknown.append(aid)
+            elif ev.is_set():
+                completed[aid] = _pending_results.pop(aid, {})
+            else:
+                still_pending.append(aid)
         # 只清理已完成的；还在飞的留着，它们的 barrier 语义没变
         _forget_pending(completed, 'completed')
-        return {"status": "timeout", "completed": completed, "pending": still_pending}
+        result = {"status": "timeout", "completed": completed, "pending": still_pending}
+        if unknown:
+            result['unknown'] = unknown
+        return result
     except asyncio.CancelledError:
         return {"status": "cancelled", "pending": [aid for aid, _ in events]}
 
