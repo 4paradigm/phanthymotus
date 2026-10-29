@@ -234,6 +234,11 @@ async def call(mcp_id: str, tool_name: str, args: dict) -> str:
         return f'Error calling {tool_name} on peer: {reason}'
     if resp.get('error'):
         return f'Peer reported an error: {resp["error"]}'
+    if resp.get('action_status') == 'unknown':
+        action_id = resp.get('action_id')
+        action = f' (action_id={action_id})' if action_id else ''
+        return (f'Error: completion not confirmed{action}. The action may have '
+                'executed or may still be running; do not retry blindly.')
     return str(resp.get('result', ''))
 
 
