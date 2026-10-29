@@ -28,7 +28,6 @@ _NUMBER_RANGES = {
 }
 _INTEGER_RANGES = {
     "input_max_age_ms": (100, 2000),
-    "proposal_ttl_ms": (50, 250),
 }
 _LEGACY_NOOP_CONFIG_FIELDS = {"runtime_switch_timeout_sec"}
 
@@ -95,7 +94,6 @@ def _validated_config(base: dict, updates: dict) -> dict:
 
     fixed = {
         "input_max_age_ms": 500,
-        "proposal_ttl_ms": 250,
     }
     for key, expected in fixed.items():
         if result[key] != expected:

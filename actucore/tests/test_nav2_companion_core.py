@@ -28,13 +28,10 @@ from nav2.execution_protocol import (  # noqa: E402
     MotionLimits,
     ProtocolError,
     Velocity,
-    MotionSequence,
-    apply_motion_floor,
     apply_motion_limits,
-    build_motion_sequence,
     limit_forward_velocity,
-    proposal_context_is_current,
-    proposal_context_is_publishable,
+    shadow_context_is_current,
+    shadow_context_is_publishable,
 )
 from nav2.readiness import (  # noqa: E402
     control_odom_motion_blocker,
@@ -43,34 +40,11 @@ from nav2.readiness import (  # noqa: E402
 )
 
 
+def apply_default_motion_limits(velocity):
+    return apply_motion_limits(velocity, limits=MotionLimits(), max_forward_mps=1.0)
+
+
 class Nav2CompanionCoreTest(unittest.TestCase):
-    def test_motion_sequence_contract_and_terminal_zero(self) -> None:
-        payload = build_motion_sequence(
-            nav_id="nav-001",
-            sequence=1,
-            ttl_ms=250,
-            navigation_status="navigating",
-            velocity=Velocity(x=1.0, y=0.0, yaw=2.0),
-            issued_at_unix_ms=1,
-        )
-        self.assertEqual(MotionSequence.from_payload(payload).nav_id, "nav-001")
-        self.assertEqual(payload["schema"], "phanthy.navigation.motion_sequence.v1")
-        with self.assertRaises(ProtocolError):
-            MotionSequence.from_payload({**payload, "schema": "unknown.schema.v1"})
-
-        with self.assertRaises(ProtocolError):
-            build_motion_sequence(
-                nav_id="nav-001",
-                sequence=2,
-                ttl_ms=250,
-                navigation_status="navigating",
-                velocity=Velocity(x=0.10, y=1.01, yaw=0.0),
-                issued_at_unix_ms=2,
-            )
-        payload["nav_status"] = "arrived"
-        with self.assertRaises(ProtocolError):
-            MotionSequence.from_payload(payload)
-
     def test_requested_speed_is_enforced_on_forward_proposals(self) -> None:
         limited = limit_forward_velocity(
             Velocity(x=0.50, y=0.0, yaw=0.2),
@@ -84,36 +58,36 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertEqual(reverse, Velocity.zero())
 
     def test_motion_policy_is_axis_exclusive_without_amplification(self) -> None:
-        self.assertEqual(apply_motion_floor(Velocity.zero()), Velocity.zero())
+        self.assertEqual(apply_default_motion_limits(Velocity.zero()), Velocity.zero())
         self.assertEqual(
-            apply_motion_floor(Velocity(x=0.01, y=0.0, yaw=0.0)),
+            apply_default_motion_limits(Velocity(x=0.01, y=0.0, yaw=0.0)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_motion_floor(Velocity(x=0.0, y=0.0, yaw=-0.02)),
+            apply_default_motion_limits(Velocity(x=0.0, y=0.0, yaw=-0.02)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_motion_floor(Velocity(x=0.01, y=0.0, yaw=-0.19)),
+            apply_default_motion_limits(Velocity(x=0.01, y=0.0, yaw=-0.19)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_motion_floor(Velocity(x=-0.05, y=0.0, yaw=0.20)),
+            apply_default_motion_limits(Velocity(x=-0.05, y=0.0, yaw=0.20)),
             Velocity.zero(),
         )
         self.assertEqual(
-            apply_motion_floor(Velocity(x=0.35, y=0.0, yaw=0.0)),
+            apply_default_motion_limits(Velocity(x=0.35, y=0.0, yaw=0.0)),
             Velocity(x=0.35, y=0.0, yaw=0.0),
         )
         self.assertEqual(
-            apply_motion_floor(Velocity(x=0.50, y=0.0, yaw=-2.0)),
+            apply_default_motion_limits(Velocity(x=0.50, y=0.0, yaw=-2.0)),
             Velocity(x=0.0, y=0.0, yaw=-2.0),
         )
 
     def test_stale_async_proposal_context_is_rejected(self) -> None:
         active = {"nav_id": "nav-1", "attempt": 2, "status": "navigating"}
         self.assertTrue(
-            proposal_context_is_current(
+            shadow_context_is_current(
                 active, nav_id="nav-1", attempt=2, status="navigating"
             )
         )
@@ -124,7 +98,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         ):
             with self.subTest(nav_id=nav_id, attempt=attempt, status=status):
                 self.assertFalse(
-                    proposal_context_is_current(
+                    shadow_context_is_current(
                         active, nav_id=nav_id, attempt=attempt, status=status
                     )
                 )
@@ -132,7 +106,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
     def test_terminal_context_cannot_keep_periodic_proposals_alive(self) -> None:
         navigating = {"nav_id": "nav-1", "attempt": 2, "status": "navigating"}
         self.assertTrue(
-            proposal_context_is_publishable(
+            shadow_context_is_publishable(
                 navigating, nav_id="nav-1", attempt=2, status="navigating"
             )
         )
@@ -149,7 +123,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             with self.subTest(status=status):
                 active = {"nav_id": "nav-1", "attempt": 2, "status": status}
                 self.assertFalse(
-                    proposal_context_is_publishable(
+                    shadow_context_is_publishable(
                         active, nav_id="nav-1", attempt=2, status=status
                     )
                 )
@@ -170,7 +144,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             on_result.index("self._state_changed.notify_all()"),
         )
         self.assertLess(
-            publish_state.index("self._publish_motion_sequence("),
+            publish_state.index("self._publish_control_velocity("),
             publish_state.index("self._emit(payload)"),
         )
 
@@ -765,7 +739,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("controller_frequency: 20.0", params)
         self.assertIn("bt_loop_duration: 50", params)
         self.assertNotIn("smoothing_frequency:", params)
-        self.assertIn('self.declare_parameter("proposal_frequency_hz", 5.0)', command)
+        self.assertNotIn('proposal_frequency_hz', command)
         self.assertIn('"shadow_topic": cmd_vel_raw_topic', launch)
         self.assertNotIn('endpoint.node_name == "velocity_smoother"', command)
         lifecycle_defaults = command.split(
@@ -773,7 +747,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )[1].split(")\n", 1)[0]
         self.assertNotIn("velocity_smoother", lifecycle_defaults)
         self.assertIn("depth=1", command)
-        self.assertIn("proposal_context_is_publishable", command)
+        self.assertIn("shadow_context_is_publishable", command)
         self.assertIn('payload.get("velocity_limits")', command)
         self.assertIn("goal.pose.header.frame_id = self._global_frame", command)
         send_goal = command.split("    def _send_active_goal", 1)[1].split(

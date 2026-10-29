@@ -43,8 +43,7 @@ from .execution_protocol import (
     ProtocolError,
     Velocity,
     apply_motion_limits,
-    build_motion_sequence,
-    proposal_context_is_publishable,
+    shadow_context_is_publishable,
 )
 from .costmap_validation import (
     CostmapError,
@@ -64,6 +63,7 @@ _TERMINAL_STATES = {
     "rejected",
 }
 _IDLE_OR_TERMINAL_STATES = _TERMINAL_STATES | {"paused"}
+_SHADOW_MAX_AGE_NS = 250_000_000
 
 
 class CommandError(RuntimeError):
@@ -93,9 +93,6 @@ class PlannerCommandNode(Node):
         self.declare_parameter(
             "shadow_topic", "/ubuntu/navigation/nav2/cmd_vel_shadow"
         )
-        self.declare_parameter(
-            "motion_sequence_topic", "/ubuntu/navigation/motion_sequence"
-        )
         self.declare_parameter("control_velocity_topic", "/actucore/navi/cmd")
         self.declare_parameter("control_interface_json", "{}")
         self.declare_parameter(
@@ -103,8 +100,6 @@ class PlannerCommandNode(Node):
         )
         self.declare_parameter("speed_limit_timeout", 3.0)
         self.declare_parameter("behavior_tree_path", "")
-        self.declare_parameter("proposal_ttl_ms", 250)
-        self.declare_parameter("proposal_frequency_hz", 5.0)
         self.declare_parameter("enforce_shadow_isolation", True)
         self.declare_parameter("max_shadow_speed", 1.0)
         self.declare_parameter("supported_mode", 0)
@@ -137,7 +132,6 @@ class PlannerCommandNode(Node):
         )
         self._action_name = str(self.get_parameter("action_name").value)
         self._shadow_topic = str(self.get_parameter("shadow_topic").value)
-        self._motion_sequence_topic = str(self.get_parameter("motion_sequence_topic").value)
         self._control_velocity_topic = str(self.get_parameter("control_velocity_topic").value)
         (self._control_descriptor, self._control_rate_hz, self._control_ttl_ms,
          self._control_max_obs_age_ms, self._control_bounds, self._control_floors) = (
@@ -151,10 +145,6 @@ class PlannerCommandNode(Node):
         )
         self._behavior_tree_path = str(
             self.get_parameter("behavior_tree_path").value
-        )
-        self._proposal_ttl_ms = int(self.get_parameter("proposal_ttl_ms").value)
-        self._proposal_frequency_hz = float(
-            self.get_parameter("proposal_frequency_hz").value
         )
         self._enforce_shadow_isolation = bool(
             self.get_parameter("enforce_shadow_isolation").value
@@ -197,12 +187,6 @@ class PlannerCommandNode(Node):
 
         if not 0.0 < self._max_shadow_speed <= 1.0:
             raise ValueError("max_shadow_speed must be within (0, 1.0]")
-        if not 50 <= self._proposal_ttl_ms <= 250:
-            raise ValueError("proposal_ttl_ms must be within [50, 250]")
-        if not math.isfinite(self._proposal_frequency_hz) or not (
-            1.0 <= self._proposal_frequency_hz <= 20.0
-        ):
-            raise ValueError("proposal_frequency_hz must be within [1, 20]")
         if self._supported_mode != 0:
             raise ValueError("supported_mode must be 0 until another mode is implemented")
         if self._goal_response_timeout <= 0 or self._speed_limit_timeout <= 0:
@@ -265,9 +249,6 @@ class PlannerCommandNode(Node):
         )
         self._status_pub = self.create_publisher(
             String, self._status_topic, status_qos
-        )
-        self._proposal_pub = self.create_publisher(
-            String, self._motion_sequence_topic, latest_command_qos
         )
         self._control_pub = self.create_publisher(
             String, self._control_velocity_topic, latest_command_qos
@@ -347,11 +328,6 @@ class PlannerCommandNode(Node):
         self._lifecycle_timer = self.create_timer(
             1.0, self._refresh_lifecycle_states, callback_group=self._callbacks
         )
-        self._proposal_timer = self.create_timer(
-            1.0 / self._proposal_frequency_hz,
-            self._publish_latest_motion_sequence,
-            callback_group=self._callbacks,
-        )
         self._control_timer = self.create_timer(
             1.0 / self._control_rate_hz,
             self._publish_latest_control_velocity,
@@ -362,10 +338,8 @@ class PlannerCommandNode(Node):
         self._state_changed = threading.Condition(self._lock)
         self._command_lock = threading.Lock()
         self._active: dict | None = None
-        self._proposal_sequence = 0
         self._control_sequence = 0
-        self._latest_proposal_candidate: dict | None = None
-        self._last_published_proposal: dict | None = None
+        self._latest_shadow_candidate: dict | None = None
         self._last_odom_monotonic: float | None = None
         self._last_odom_source_stamp_ns: int | None = None
         self._last_odom_frame_ready = False
@@ -608,14 +582,14 @@ class PlannerCommandNode(Node):
                     max_forward_mps=forward_speed_limit,
                 )
             with self._lock:
-                if not proposal_context_is_publishable(
+                if not shadow_context_is_publishable(
                     self._active,
                     nav_id=nav_id,
                     attempt=attempt,
                     status=status,
                 ):
                     return
-                previous = self._latest_proposal_candidate
+                previous = self._latest_shadow_candidate
                 if (
                     previous is not None
                     and previous.get("nav_id") == nav_id
@@ -638,32 +612,16 @@ class PlannerCommandNode(Node):
                     "received_monotonic_ns": received_monotonic_ns,
                     "sensor_snapshot": sensor_snapshot,
                 }
-                self._latest_proposal_candidate = candidate
-                publish_safety_zero = velocity == Velocity.zero() and (
-                    self._last_published_proposal is None
-                    or self._last_published_proposal.get("nav_id") != nav_id
-                    or self._last_published_proposal.get("velocity")
-                    != Velocity.zero()
-                    or self._last_published_proposal.get("reason") != reason
-                )
+                self._latest_shadow_candidate = candidate
                 if velocity == Velocity.zero():
                     # This lock also serializes against the control timer.
                     self._publish_control_velocity(Velocity.zero(), stop=True)
-                if publish_safety_zero:
-                    # Publish a safety zero before any later candidate can be
-                    # installed; do not let an older periodic snapshot follow it.
-                    self._publish_motion_sequence(
-                        nav_id=nav_id,
-                        navigation_status=status,
-                        velocity=velocity,
-                        reason=reason,
-                    )
         except ProtocolError as exc:
             self.get_logger().error(
                 f"unsafe Nav2 shadow velocity rejected: {exc.code}: {exc}"
             )
             with self._lock:
-                if proposal_context_is_publishable(
+                if shadow_context_is_publishable(
                     self._active,
                     nav_id=nav_id,
                     attempt=attempt,
@@ -672,7 +630,7 @@ class PlannerCommandNode(Node):
                     self._active["status"] = "cancel_unconfirmed"
                     self._active["error_code"] = "unsafe_shadow_velocity"
                     self._active["error"] = f"{exc.code}: {exc}"
-                    self._latest_proposal_candidate = None
+                    self._latest_shadow_candidate = None
                     self._publish_state()
 
     def _on_command(self, message: String) -> None:
@@ -807,8 +765,7 @@ class PlannerCommandNode(Node):
                 "last_pose": None,
                 "last_feedback_publish": 0.0,
             }
-            self._latest_proposal_candidate = None
-            self._last_published_proposal = None
+            self._latest_shadow_candidate = None
         try:
             self._send_active_goal()
         except CommandError as exc:
@@ -819,7 +776,7 @@ class PlannerCommandNode(Node):
                             self._active["status"] = "error"
                     elif self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
                         self._active["status"] = "cancel_unconfirmed"
-                        self._latest_proposal_candidate = None
+                        self._latest_shadow_candidate = None
             self._publish_state()
             raise
         except Exception as exc:
@@ -833,7 +790,7 @@ class PlannerCommandNode(Node):
                     if self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
                         self._active["status"] = "cancel_unconfirmed" if uncertain else "error"
                         if uncertain:
-                            self._latest_proposal_candidate = None
+                            self._latest_shadow_candidate = None
             self._publish_state()
             raise CommandError(
                 "goal_request_error", f"{type(exc).__name__}: {exc}",
@@ -930,7 +887,7 @@ class PlannerCommandNode(Node):
                     ):
                         self._active["status"] = "cancel_unconfirmed"
                         self._active["error_code"] = "goal_response_timeout"
-                        self._latest_proposal_candidate = None
+                        self._latest_shadow_candidate = None
                     self._publish_state()
                     raise CommandError(
                         "goal_response_timeout",
@@ -985,7 +942,7 @@ class PlannerCommandNode(Node):
                     self._active["status"] = "cancel_unconfirmed"
                     self._active["error_code"] = "goal_request_error"
                     self._active["error"] = f"{type(exc).__name__}: {exc}"
-                    self._latest_proposal_candidate = None
+                    self._latest_shadow_candidate = None
                 outcome.update(
                     {
                         "accepted": False,
@@ -1047,7 +1004,7 @@ class PlannerCommandNode(Node):
                     self._active["status"] = "cancel_unconfirmed"
                     self._active["error_code"] = "goal_result_unconfirmed"
                     self._active["error"] = f"{type(exc).__name__}: {exc}"
-                    self._latest_proposal_candidate = None
+                    self._latest_shadow_candidate = None
                     outcome.update(
                         accepted=False, outcome_known=False,
                         error_code="goal_result_unconfirmed",
@@ -1135,18 +1092,18 @@ class PlannerCommandNode(Node):
             else:
                 # An exception, UNKNOWN or nonterminal result says nothing
                 # about whether the goal is still executing. Keep ownership and
-                # the handle, and suppress proposals until a real terminal receipt.
+                # the handle, and suppress output until a real terminal receipt.
                 self._active["status"] = "cancel_unconfirmed"
                 self._active["error_code"] = "cancel_terminal_unconfirmed"
                 self._active["error"] = error or f"unexpected goal status {status_code}"
-                self._latest_proposal_candidate = None
+                self._latest_shadow_candidate = None
             if self._active["status"] != "cancel_unconfirmed":
                 self._active["goal_handle"] = None
                 self._active.pop("error_code", None)
                 if status_code != GoalStatus.STATUS_ABORTED:
                     self._active.pop("error", None)
             # Publish the terminal zero before stop_nav may return and admit a
-            # new nav_id.  The shared proposal publisher then preserves old
+            # new nav_id.  The shared control publisher then preserves old
             # terminal-zero -> new motion ordering at the Driver.
             self._publish_state()
             self._state_changed.notify_all()
@@ -1182,7 +1139,7 @@ class PlannerCommandNode(Node):
                             self._active["status"] = "error"
                     elif self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
                         self._active["status"] = "cancel_unconfirmed"
-                        self._latest_proposal_candidate = None
+                        self._latest_shadow_candidate = None
             self._publish_state()
             raise
         except Exception as exc:
@@ -1196,7 +1153,7 @@ class PlannerCommandNode(Node):
                     if self._active.get("status") not in _TERMINAL_STATES | {"paused"}:
                         self._active["status"] = "cancel_unconfirmed" if uncertain else "error"
                         if uncertain:
-                            self._latest_proposal_candidate = None
+                            self._latest_shadow_candidate = None
             self._publish_state()
             raise CommandError(
                 "goal_request_error", f"{type(exc).__name__}: {exc}",
@@ -1231,7 +1188,7 @@ class PlannerCommandNode(Node):
                 # intent so that a late handle is cancelled as soon as known.
                 active["cancel_intent"] = "stop"
                 active["status"] = "cancel_unconfirmed"
-                self._latest_proposal_candidate = None
+                self._latest_shadow_candidate = None
                 self._publish_state()
                 raise CommandError(
                     "cancel_terminal_unconfirmed",
@@ -1266,7 +1223,7 @@ class PlannerCommandNode(Node):
             self._active["status"] = "cancel_unconfirmed"
             self._active.pop("error_code", None)
             self._active.pop("error", None)
-            self._latest_proposal_candidate = None
+            self._latest_shadow_candidate = None
             # Stop output before attempting cancellation, and retain the goal
             # lease even when the request or acknowledgement is uncertain.
             self._publish_state()
@@ -1359,116 +1316,9 @@ class PlannerCommandNode(Node):
                 "raw shadow output has foreign subscribers: " + ",".join(names),
             )
 
-    def _publish_motion_sequence(
-        self,
-        *,
-        nav_id: str,
-        navigation_status: str,
-        velocity: Velocity,
-        reason: str | None = None,
-    ) -> None:
-        with self._lock:
-            self._proposal_sequence += 1
-            sequence = self._proposal_sequence
-        wire_status = (
-            "planning" if navigation_status in {"starting", "cancel_unconfirmed"}
-            else navigation_status
-        )
-        payload = build_motion_sequence(
-            nav_id=nav_id,
-            sequence=sequence,
-            ttl_ms=self._proposal_ttl_ms,
-            navigation_status=wire_status,
-            velocity=velocity,
-            reason=reason,
-        )
-        message = String()
-        message.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        self._proposal_pub.publish(message)
-        with self._lock:
-            self._last_published_proposal = {
-                "nav_id": nav_id,
-                "navigation_status": navigation_status,
-                "velocity": velocity,
-                "reason": reason,
-            }
-
-    def _publish_latest_motion_sequence(self) -> None:
-        """Publish only the newest Nav2 sample at the configured execution cadence."""
-        with self._lock:
-            # Candidates are replaced, never mutated; keep their identity so
-            # the final locked check can reject a superseded snapshot.
-            candidate = self._latest_proposal_candidate
-            active = dict(self._active) if self._active is not None else None
-        if candidate is None or active is None:
-            return
-
-        nav_id = candidate.get("nav_id")
-        attempt = candidate.get("attempt")
-        status = candidate.get("navigation_status")
-        if not proposal_context_is_publishable(
-            active,
-            nav_id=nav_id,
-            attempt=attempt,
-            status=status,
-        ):
-            return
-
-        velocity = candidate.get("velocity")
-        reason = candidate.get("reason")
-        if not isinstance(velocity, Velocity):
-            return
-        received_ns = candidate.get("received_monotonic_ns")
-        age_ns = (
-            time.monotonic_ns() - received_ns
-            if isinstance(received_ns, int) and not isinstance(received_ns, bool)
-            else -1
-        )
-        if age_ns < 0 or age_ns > self._proposal_ttl_ms * 1_000_000:
-            velocity = Velocity.zero()
-            reason = "shadow_velocity_stale"
-        else:
-            blocker = control_odom_motion_blocker(
-                self._readiness(),
-                receive_max_age_sec=self._control_odom_max_age_sec,
-                source_max_age_sec=self._control_odom_source_max_age_sec,
-            )
-            if blocker is not None:
-                velocity = Velocity.zero()
-                reason = blocker
-
-        with self._lock:
-            if (
-                self._latest_proposal_candidate is not candidate
-                or not proposal_context_is_publishable(
-                    self._active,
-                    nav_id=nav_id,
-                    attempt=attempt,
-                    status=status,
-                )
-            ):
-                return
-            received_ns = candidate.get("received_monotonic_ns")
-            age_ns = (
-                time.monotonic_ns() - received_ns
-                if isinstance(received_ns, int) and not isinstance(received_ns, bool)
-                else -1
-            )
-            if age_ns < 0 or age_ns > self._proposal_ttl_ms * 1_000_000:
-                velocity = Velocity.zero()
-                reason = "shadow_velocity_stale"
-            # Serialize identity, freshness and context checks with publication;
-            # an obsolete nonzero must not follow a newer or cancellation zero.
-            self._publish_motion_sequence(
-                nav_id=str(nav_id),
-                navigation_status=str(status),
-                velocity=velocity,
-                reason=reason,
-            )
-
     def _publish_control_velocity(self, velocity: Velocity, *, stop: bool = False,
                                   sensor_snapshot=None) -> None:
-        """Isolate the new output from legacy proposal and status publication."""
+        """Keep control output failures from breaking navigation status publication."""
         try:
             self._publish_control_velocity_impl(
                 velocity, stop=stop, sensor_snapshot=sensor_snapshot
@@ -1542,13 +1392,13 @@ class PlannerCommandNode(Node):
 
     def _publish_latest_control_velocity(self) -> None:
         with self._lock:
-            candidate = self._latest_proposal_candidate
+            candidate = self._latest_shadow_candidate
             active = dict(self._active) if self._active is not None else None
         if candidate is None or active is None:
             return
         nav_id, attempt, status = (candidate.get("nav_id"), candidate.get("attempt"),
                                    candidate.get("navigation_status"))
-        if not proposal_context_is_publishable(active, nav_id=nav_id, attempt=attempt, status=status):
+        if not shadow_context_is_publishable(active, nav_id=nav_id, attempt=attempt, status=status):
             return
         velocity = candidate.get("velocity")
         if not isinstance(velocity, Velocity):
@@ -1556,7 +1406,7 @@ class PlannerCommandNode(Node):
         received_ns = candidate.get("received_monotonic_ns")
         age_ns = (time.monotonic_ns() - received_ns
                   if isinstance(received_ns, int) and not isinstance(received_ns, bool) else -1)
-        if age_ns < 0 or age_ns > self._proposal_ttl_ms * 1_000_000:
+        if age_ns < 0 or age_ns > _SHADOW_MAX_AGE_NS:
             velocity = Velocity.zero()
         elif control_odom_motion_blocker(
             self._readiness(), receive_max_age_sec=self._control_odom_max_age_sec,
@@ -1564,13 +1414,13 @@ class PlannerCommandNode(Node):
         ) is not None:
             velocity = Velocity.zero()
         with self._lock:
-            if (self._latest_proposal_candidate is not candidate or
-                not proposal_context_is_publishable(self._active, nav_id=nav_id,
+            if (self._latest_shadow_candidate is not candidate or
+                not shadow_context_is_publishable(self._active, nav_id=nav_id,
                                                      attempt=attempt, status=status)):
                 return
             age_ns = (time.monotonic_ns() - received_ns
                       if isinstance(received_ns, int) and not isinstance(received_ns, bool) else -1)
-            if age_ns < 0 or age_ns > self._proposal_ttl_ms * 1_000_000:
+            if age_ns < 0 or age_ns > _SHADOW_MAX_AGE_NS:
                 velocity = Velocity.zero()
             self._publish_control_velocity(
                 velocity, stop=velocity == Velocity.zero(),
@@ -1605,7 +1455,6 @@ class PlannerCommandNode(Node):
         )
 
     def _publish_state(self) -> None:
-        stop_proposal = None
         with self._lock:
             if self._active is None:
                 payload = {"event": "navigation_status", "status": "idle"}
@@ -1627,7 +1476,6 @@ class PlannerCommandNode(Node):
                 ].as_dict()
                 payload["event"] = "navigation_status"
                 if payload.get("status") in _IDLE_OR_TERMINAL_STATES | {"cancel_unconfirmed"}:
-                    stop_proposal = (str(payload["nav_id"]), str(payload["status"]))
                     self._publish_control_velocity(Velocity.zero(), stop=True)
             payload.update(
                 {
@@ -1640,14 +1488,6 @@ class PlannerCommandNode(Node):
         payload.update(readiness)
         payload["execution"] = self._execution_status(readiness)
         payload["global_costmap"] = self._global_costmap_diagnostics()
-        if stop_proposal is not None:
-            nav_id, status = stop_proposal
-            self._publish_motion_sequence(
-                nav_id=nav_id,
-                navigation_status=status,
-                velocity=Velocity.zero(),
-                reason=f"navigation_{status}",
-            )
         self._emit(payload)
 
     def _publish_heartbeat(self) -> None:
@@ -1666,11 +1506,6 @@ class PlannerCommandNode(Node):
                 "runtime_mode": "planning",
                 "localization_backend": "fast_livo2",
                 "global_frame": self._global_frame,
-                "n5_protocol_ready": True,
-                "motion_sequence_topic": self._motion_sequence_topic,
-                "proposal_ttl_ms": self._proposal_ttl_ms,
-                "proposal_frequency_hz": self._proposal_frequency_hz,
-                "proposal_subscribers": self._proposal_pub.get_subscription_count(),
                 "controller_speed_limit_topic": self._controller_speed_limit_topic,
                 "controller_speed_limit_subscribers": (
                     self._speed_limit_pub.get_subscription_count()

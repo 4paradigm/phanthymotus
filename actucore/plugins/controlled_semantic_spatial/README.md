@@ -18,8 +18,7 @@ optional RGB ────────────────┴─> semantic na
                             ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
                                       |
-                                      ├─ control_velocity -> 兼容的控制卡片
-                                      └─ motion_sequence -> 旧协议消费者（保留）
+                                      └─ control_velocity -> 兼容的控制卡片
 ```
 
 - `ControlledSemanticSpatialPlugin` 是唯一 MCP/Canvas 生命周期所有者。
@@ -29,15 +28,14 @@ optional RGB ────────────────┴─> semantic na
   状态与 costmap 保留为内部 ROS topic，分别承担命令回执和导航目标校验。
 - VLN 命中地点后直接调用同卡片 planner；无论是 Canvas 还是 VLN 入口，
   planner 都为每个新任务生成独立
-  `nav_id`。到达或手动停止时先发布一次终态零速 proposal，再确认
-  终态并允许下一个任务；已结束任务不会继续以 5 Hz 刷新，终态结果
+  `nav_id`。到达或手动停止时先发布一次终态零速，再确认
+  终态并允许下一个任务；已结束任务不会继续周期刷新，终态结果
   本身仍可查询和幂等重放。
-- Nav2 保留 `phanthy.navigation.motion_sequence.v1` 输出，并增加与 Navi 卡片
-  同格式的 `motus.control/1` 速度输出。输出可能被下游控制卡片用于驱动硬件；
+- Nav2 使用与 Navi 卡片同格式的 `motus.control/1` 速度输出。输出可能被下游控制卡片用于驱动硬件；
   发送零速或收到回执并不证明机器人已物理停止。
 - Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为分段
   `停稳 -> 原地转向 -> 直行 -> 停稳复查`。控制和位姿检查为
-  20 Hz，非零 proposal 仍为 5 Hz，零速立即发布。
+  20 Hz，标准速度输出频率由下游接口协商，零速立即发布。
 - 分段执行的转向和直行预检只在 footprint 命中 Nav2
   `LETHAL_OBSTACLE` 时拒绝；膨胀安全带仅用于代价与规划，不冒充实体碰撞。
 
@@ -53,8 +51,7 @@ JP5.11 的 PyYAML 与 requests 由固定 digest 的平台父镜像提供，分�
 
 Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在多线程 executor
 中提前消费目标、取消或结果响应。用户回调与 Future 等待不持该锁。
-`shadow_velocity_stale` 仍表示速度候选超过有效期，继续输出零速；不能仅凭此
-判断 topic 断线。若同时出现 `Ignoring unexpected goal response`、目标已经结束但
+速度候选超过内部 250 ms 新鲜度上限时输出零速；不能仅凭零速判断 topic 断线。若同时出现 `Ignoring unexpected goal response`、目标已经结束但
 桥接状态仍为 `starting`，应检查 action 响应是否丢失。修复不会补回旧进程已丢失的响应。
 
 ## 外部输入
@@ -125,22 +122,25 @@ mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale
 
 ## 公共输出
 
-原有两个输出的位置保持不变，并追加 `control_velocity`。`motion_sequence`
-继续发送旧格式的有界速度提案，保留 5 Hz 和原 TTL；新输出使用 Navi 相同的
-`control/velocity`、`std_msgs/msg/String` 和 `motus.control/1` 消息格式，
-两种格式不可互换。`control_velocity` 使用与 Navi 相同的固定 topic，二者不得
-同时发布以免控制冲突。升级画布需刷新卡片定义，并按下游实际支持的格式选择连线；
-不要把两个输出同时接到会各自执行的控制卡片。配套 Driver 工作树中的 R1、Bumi
-和 AS2W bundle 已有 `control/velocity` 底座接收卡片；实际使用仍须连线并验证。
-G1 独立 `loco_servo` 使用 `control/velocity` 格式，默认 dry-run；实际连线、watchdog
-与物理停车必须分别验证。旧 `loco` 不承诺消费 `motion_sequence`。
-新输出沿用 Navi 的固定 source 与启动后 seq 从 1 递增的约定；若下游保留同 source
-旧序号而不随之重置，单独重启上游后消息（包括零速）可能被丢弃，需在联调中验证生命周期。
+公开输出只有 `map_view` 和 `control_velocity`。后者采用 Navi 相同的
+`control/velocity`、`std_msgs/msg/String` 和 `motus.control/1` 六维速度格式，
+固定 topic `/actucore/navi/cmd` 不随 namespace 改变。**本卡片与 Navi 不得同时
+向该 topic 发布**；这是操作约束，并非已实现的互斥或仲裁。升级画布须刷新卡片
+定义、移除旧 `motion_sequence` 连线，再按下游支持的格式连接 `control_velocity`。
+R1、Bumi 和 AS2W 的兼容控制卡片与 G1 独立 `loco_servo` 的实际订阅、watchdog
+和物理停车都须独立验证；`loco_servo` 默认 dry-run。
+
+本卡片消息 source 为 `mcp__actucore__controlled_semantic_spatial`，Navi 的 source
+为 `mcp__actucore__navi`；本次部署将本卡片旧 source
+`mcp__actucore__navigation` 更正为新卡片身份，控制端按 source 配置或去重时须同步迁移验证。
+各自启动后 seq 从 1 递增；若下游保留同 source 旧序号而不随之重置，单独重启
+上游后消息（包括零速）可能被丢弃，需联调验证生命周期。
+旧静态或持久化 planning 配置需移除 `proposal_ttl_ms` 和 `proposal_frequency_hz`，
+否则严格 schema 会拒绝未知字段；这不删除任何既有数据。
 
 | port | topic | 用途 |
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
-| `motion_sequence` | `/ubuntu/navigation/motion_sequence` | 原有速度提案格式，供兼容的旧消费者使用 |
 | `control_velocity` | `/actucore/navi/cmd` | 与 Navi 相同格式的六维速度输出，供兼容的控制卡片使用 |
 
 `livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
@@ -282,11 +282,11 @@ ACP barrier 沿用上游的物理资源与调用顺序规则；本卡片尚未�
 系统打断则通过 `on_interrupt_navigation` 调用 `stop_nav`。
 
 Canvas 手动执行 `navigate_to_pose` 时，Agent Core 只透明转发 MCP
-请求。planner 接受目标后生成新 `nav_id`，并在整个任务的
-motion sequence 中保持该 ID。Nav2 上报匹配的终态后，卡片释放
+请求。planner 接受目标后生成新 `nav_id`，用于内部任务状态和速度候选栅栏；
+标准速度消息不携带该任务 ID。Nav2 上报匹配的终态后，卡片释放
 活动任务；下一次点击因此会获得另一个 ID，无需重启
-Canvas、Core 或 Driver。下游消费者是否支持该 proposal 格式、任务接纳
-和停车确认必须独立核验。Core 不另外维护 authorize/revoke 状态。
+Canvas、Core 或 Driver。下游消费者是否支持该控制格式、接收和停车确认
+必须独立核验。Core 不另外维护 authorize/revoke 状态。
 
 `start` 按 runtime → mapping → planning → semantic 顺序获取资源；任一步
 失败会按相反顺序回滚。`stop_mapping` 和 `load_map` 的 backend 等待预算分别

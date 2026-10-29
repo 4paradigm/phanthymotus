@@ -32,8 +32,6 @@ NAV2_CONFIG_DEFAULTS = {
     "max_y_mps": 0.0,
     "min_yaw_rps": 0.3,
     "max_yaw_rps": 0.3,
-    "proposal_ttl_ms": 250,
-    "proposal_frequency_hz": 5.0,
 }
 
 NAV2_FULL_CONFIG_SCHEMA = {
@@ -54,7 +52,7 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "type": "boolean",
             "const": True,
             "default": True,
-            "description": "Nav2 only emits proposals; Driver owns execution",
+            "description": "Nav2 shadow commands require a downstream control consumer",
         },
         "request_timeout_sec": {
             "type": "number",
@@ -116,19 +114,6 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "maximum": 2.0,
             "default": 0.3,
             "description": "Maximum magnitude of a yaw proposal; zero disables rotation",
-        },
-        "proposal_ttl_ms": {
-            "type": "integer",
-            "const": 250,
-            "minimum": 50,
-            "maximum": 250,
-            "default": 250,
-        },
-        "proposal_frequency_hz": {
-            "type": "number",
-            "const": 5.0,
-            "default": 5.0,
-            "description": "Latest-only motion sequence cadence",
         },
     },
     "additionalProperties": False,
@@ -209,9 +194,8 @@ def nav2_tool_definition(namespace: str) -> dict:
         "description": (
             "Nav2 planner and controller consuming FAST-LIVO2 localization and "
             "directly accumulated static occupancy plus live clearing "
-            "obstacles. This "
-            "ActuCore card only emits "
-            "bounded motion sequences with a fresh task ID. Physical execution "
+            "obstacles. The unified card emits bounded standard control velocity. "
+            "Physical execution "
             "requires a compatible downstream consumer and independent safety validation."
         ),
         "topic_in": [
@@ -284,24 +268,6 @@ def nav2_tool_definition(namespace: str) -> dict:
             },
         ],
         "topic_out": [
-            {
-                "port": "motion_sequence",
-                "topic": f"{root}/navigation/motion_sequence",
-                "format": "data/json",
-                "ros_type": "std_msgs/msg/String",
-                "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
-                "schema": "phanthy.navigation.motion_sequence.v1",
-                "rate_hz": 5,
-                "timestamp": "issued_at_unix_ms; proposal includes ttl_ms",
-                "frame_id": "base_link",
-                "axes": "ROS REP-103: x forward, y left, yaw counter-clockwise",
-                "units": "linear=m/s, angular=rad/s",
-                "max_age_ms": 250,
-                "desc": (
-                    "Structured Nav2 proposal for compatible consumers; "
-                    "downstream execution and safety behavior must be verified"
-                ),
-            },
             {
                 "port": "plan",
                 "topic": "/plan",

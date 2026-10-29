@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前卡片及配置键：`controlled_semantic_spatial`**，公开工具名相同 —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2 由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket）。公开输出为 `map_view`、旧格式 `motion_sequence` 和 Navi 格式 `control_velocity`；不要同时连接两个会执行动作的消费者，物理执行仍由下游负责。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/controlled_semantic_spatial/README.md](plugins/controlled_semantic_spatial/README.md)。
+**当前卡片及配置键：`controlled_semantic_spatial`**，公开工具名相同 —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2 由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket）。公开输出为 `map_view` 和 Navi 格式 `control_velocity`；本卡片与 Navi 不得同时向相同 topic 发布，物理执行仍由下游负责。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/controlled_semantic_spatial/README.md](plugins/controlled_semantic_spatial/README.md)。
 
 该卡片的公开契约可复用于不同机器人；当前 runtime adapter 使用兼容性
 `ubuntu` namespace，各本体由 Driver 提供符合契约的 topic、frame、标定和执行器。

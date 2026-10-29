@@ -150,7 +150,7 @@ def build(*, seq, stamp_ms, obs_stamp_ms, ttl_ms, velocity, descriptor, stop_fal
     payload = {
         "schema": SCHEMA, "seq": seq, "stamp_ms": stamp_ms,
         "obs_stamp_ms": obs_stamp_ms, "ttl_ms": ttl_ms,
-        "source": "mcp__actucore__navigation", "priority": 50,
+        "source": "mcp__actucore__controlled_semantic_spatial", "priority": 50,
         "mode": "twist", "dof": 6,
         "values": [velocity.x, velocity.y, 0.0, 0.0, 0.0, velocity.yaw],
         "obs_stamp_kind": ("bridge_stop_generated" if stop_fallback else

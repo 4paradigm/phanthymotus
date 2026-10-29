@@ -46,7 +46,7 @@ def test_launch_wires_json_as_string(monkeypatch):
     assert params['control_velocity_topic'].args == ('control_velocity_topic',)
     assert params['control_interface_json'].kwargs['value_type'] is str
     assert params['control_interface_json'].args[0].args == ('control_interface_json',)
-    assert params['proposal_frequency_hz'] == 5.0 and params['proposal_ttl_ms'] == 250
+    assert 'proposal_frequency_hz' not in params and 'proposal_ttl_ms' not in params
 
 
 def test_planner_constructs_real_string_publisher_on_navi_topic(planner_module, monkeypatch):
@@ -78,7 +78,8 @@ def test_planner_constructs_real_string_publisher_on_navi_topic(planner_module, 
     assert len(control) == 1
     assert control[0][0] is planner_module.String
     assert node._control_pub is control[0][2]
-    assert parameters['motion_sequence_topic'] != DEFAULT_TOPIC
+    assert 'motion_sequence_topic' not in parameters
+    assert all('motion_sequence' not in topic for _, topic, _ in publishers)
 
 
 def descriptor():
@@ -125,7 +126,7 @@ def test_wire_and_rate_match_navi_helpers(planner_module):
     payload = helper.build(seq=1, stamp_ms=1000, obs_stamp_ms=800, ttl_ms=ttl,
                            velocity=velocity, descriptor=desc)
     expected = shared_message.build(seq=1, values=[.5, 0, 0, 0, 0, .7], mode='twist',
-                                    dof=6, source='mcp__actucore__navigation',
+                                    dof=6, source='mcp__actucore__controlled_semantic_spatial',
                                     stamp_ms=1000, obs_stamp_ms=800, ttl_ms=ttl)
     assert {k: payload[k] for k in expected} == expected
     assert payload['control_interface'] == desc
@@ -243,7 +244,6 @@ def test_nonzero_uses_older_input_header(planner_module, monkeypatch):
     assert latest(node)['values'] == [.5, 0, 0, 0, 0, 0]
     assert latest(node)['obs_stamp_ms'] == node._last_obstacle_source_stamp_ns // 1_000_000
     assert latest(node)['obs_stamp_kind'] == 'earliest_readiness_input_header'
-    assert node._proposal_pub.publish.call_count == 0
 
 
 def test_new_sensor_inputs_do_not_refresh_old_candidate(planner_module, monkeypatch):
@@ -286,7 +286,6 @@ def test_safety_zero_fallback_is_stop_generation_time(planner_module, monkeypatc
     assert payload['values'] == [0] * 6
     assert payload['obs_stamp_ms'] == payload['stamp_ms']
     assert payload['obs_stamp_kind'] == 'bridge_stop_generated'
-    assert node._proposal_pub.publish.call_count == 1
 
 
 def test_expired_candidate_stops_instead_of_republishing(planner_module, monkeypatch):
@@ -294,7 +293,7 @@ def test_expired_candidate_stops_instead_of_republishing(planner_module, monkeyp
     setup_control(node, planner_module)
     monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
     node._on_shadow_velocity(shadow_twist(.5))
-    node._latest_proposal_candidate['received_monotonic_ns'] -= 1_000_000_000
+    node._latest_shadow_candidate['received_monotonic_ns'] -= 1_000_000_000
     node._publish_latest_control_velocity()
     assert latest(node)['values'] == [0] * 6
 
@@ -333,7 +332,7 @@ def inject_control_failure(node, module, monkeypatch, failure):
     elif failure == 'build':
         monkeypatch.setattr(module.control_velocity, 'build', fail)
     elif failure == 'json':
-        # Fail serialization of control messages only, not legacy proposals.
+        # Fail serialization of control messages only.
         real_dumps = json.dumps
         def dumps(payload, *args, **kwargs):
             if payload.get('schema') == 'motus.control/1':
@@ -351,7 +350,7 @@ def inject_control_failure(node, module, monkeypatch, failure):
 
 @pytest.mark.parametrize('failure', ['limit', 'build', 'json', 'clock', 'publish'])
 @pytest.mark.parametrize('path', ['shadow_zero', 'terminal'])
-def test_control_failure_does_not_hide_legacy_zero_or_terminal(
+def test_control_failure_does_not_hide_terminal_status(
         planner_module, monkeypatch, failure, path):
     node = make_node(planner_module)
     setup_control(node, planner_module)
@@ -362,8 +361,6 @@ def test_control_failure_does_not_hide_legacy_zero_or_terminal(
     else:
         node._on_result('nav-1', 1, result_future(5))
         assert node._emit.call_args.args[0]['status'] == 'stopped'
-    proposal = json.loads(node._proposal_pub.publish.call_args.args[0].data)
-    assert proposal['velocity'] == {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
     node.get_logger.return_value.error.assert_called_once()
     assert 'control velocity output failed' in node.get_logger.return_value.error.call_args.args[0]
 
@@ -382,13 +379,3 @@ def test_timer_control_failure_is_isolated_and_recoverable(planner_module, monke
         node._control_pub.publish.side_effect = None
     node._publish_latest_control_velocity()
     assert latest(node)['values'][0] == .5
-
-
-def test_control_exception_boundary_does_not_swallow_legacy_publish_errors(planner_module, monkeypatch):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    inject_control_failure(node, planner_module, monkeypatch, 'build')
-    node._proposal_pub.publish.side_effect = RuntimeError('legacy publish failed')
-    with pytest.raises(RuntimeError, match='legacy publish failed'):
-        node._on_shadow_velocity(shadow_twist(0))

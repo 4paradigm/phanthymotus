@@ -25,7 +25,6 @@ def generate_launch_description() -> LaunchDescription:
     odom_topic = LaunchConfiguration("odom_topic")
     obstacle_cloud_topic = LaunchConfiguration("obstacle_cloud_topic")
     cmd_vel_raw_topic = LaunchConfiguration("cmd_vel_raw_topic")
-    motion_sequence_topic = LaunchConfiguration("motion_sequence_topic")
     control_velocity_topic = LaunchConfiguration("control_velocity_topic")
     control_interface_json = LaunchConfiguration("control_interface_json")
     command_topic = LaunchConfiguration("command_topic")
@@ -51,10 +50,6 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "cmd_vel_raw_topic",
                 default_value="/ubuntu/navigation/nav2/cmd_vel_raw",
-            ),
-            DeclareLaunchArgument(
-                "motion_sequence_topic",
-                default_value="/ubuntu/navigation/motion_sequence",
             ),
             DeclareLaunchArgument(
                 "control_velocity_topic",
@@ -108,12 +103,8 @@ def generate_launch_description() -> LaunchDescription:
                         "status_topic": status_topic,
                         "segment_status_topic": segment_status_topic,
                         "action_name": "/navigate_to_pose",
-                        # The actuator consumes discrete 5 Hz proposals. Feeding the
-                        # bridge from the OPEN_LOOP smoother adds a second,
-                        # unobserved motion model and delays crossing the
-                        # actuator's effective velocity deadbands.
+                        # Use raw controller output, without an extra smoother motion model.
                         "shadow_topic": cmd_vel_raw_topic,
-                        "motion_sequence_topic": motion_sequence_topic,
                         "control_velocity_topic": control_velocity_topic,
                         "control_interface_json": ParameterValue(control_interface_json, value_type=str),
                         "controller_speed_limit_topic": speed_limit_topic,
@@ -123,8 +114,6 @@ def generate_launch_description() -> LaunchDescription:
                             "behavior_trees",
                             "navigate_to_pose_w_replanning_and_recovery.xml",
                         ),
-                        "proposal_ttl_ms": 250,
-                        "proposal_frequency_hz": 5.0,
                         "enforce_shadow_isolation": True,
                         "max_shadow_speed": 1.0,
                         "supported_mode": 0,

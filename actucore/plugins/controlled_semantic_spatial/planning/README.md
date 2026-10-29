@@ -22,7 +22,7 @@ FAST-LIVO2 internal module
       Nav2 internal module
               |-- planner + rolling costmaps + controller
               |-- /plan                                  nav_msgs/Path
-              `-- /ubuntu/navigation/motion_sequence
+              `-- /actucore/navi/cmd
                                       |
                                       v
                               兼容的下游消费者（需独立验证）
@@ -57,8 +57,8 @@ registered cloud。Nav2 readiness 直接检查该 cloud 时间点的
 配对结果阻塞导航。静态图累计和 1 Hz Canvas/OccupancyGrid 编码不在该发布
 快路径执行；它们使用独立 latest-only 后台任务和锁，因此不会周期性把
 registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz，
-可以用最新位姿在每个控制周期检查过点、转向和障碍；非零
-`motion_sequence` 仍仅以 5 Hz 刷新，停车零速不等待下一个 5 Hz 周期。
+可以用最新位姿在每个控制周期检查过点、转向和障碍；标准输出频率由下游接口
+协商，停车零速不等待下一次周期发布。
 
 `goal_pose` 最小样例：
 
@@ -93,14 +93,14 @@ reliable，也不保证交付。DDS 回调不等待导航，工作线程对等�
 
 | port | topic | type / QoS | 语义 |
 | --- | --- | --- | --- |
-| `motion_sequence` | `/ubuntu/navigation/motion_sequence` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.motion_sequence.v1`，非零动作最多 5 Hz，零速立即发布，只保留最新值，`base_link`，TTL 最大 250 ms |
 | `control_velocity` | `/actucore/navi/cmd` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `motus.control/1` 的六维 twist，消息格式与 Navi 相同 |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
 | `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
-速度提案至少包含 `nav_id`、递增 `sequence`、`issued_at_unix_ms`、
-`ttl_ms`、`nav_status` 和 `velocity{x,y,yaw}`。终态立即发布一次零速，随后停止该
-`nav_id` 的周期 proposal；终态回执仍保留供查询和幂等重放。
+桥接器内部缓存最新的 shadow 速度候选，超过 250 ms 或任务上下文不匹配时
+不再发布其非零速度。终态立即发布一次标准零速，随后停止该任务的周期输出；
+终态回执仍保留供查询和幂等重放。此 250 ms 是内部候选新鲜度上限，不是
+Driver 的 TTL 保证。
 卡片自身不直接操作底盘，但 `control_velocity` 可被兼容的下游控制卡片执行；
 不能将它视为隔离的 shadow 输出，也不能仅凭消息发布或回执断言物理动作或停止。
 非零控制消息的 `obs_stamp_ms` 取速度候选产生时快照的里程计与障碍点云中
@@ -201,14 +201,13 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   `OPEN_LOOP velocity_smoother`。执行器的可执行死区已在 proposal 出口处理；
   再叠加一个以“上次命令”作为反馈的平滑器会推迟首个可执行动作。
   构建时用校验过 hash 的最小上游补丁移除该节点，镜像也不编译对应包。
-- 任一 readiness blocker 会把非零 shadow velocity 改为带 reason 的零速提案。
+- 任一 readiness blocker 会抑制非零 shadow velocity 并输出标准零速。
 - 直线段因实时代价地图进入 `BLOCKED` 后保持零速；下一条全局路径
   到来时丢弃旧线段并重新选择可通直线段，不会在障碍清除或规划绕行后
   永久停留在上一次 `segment_blocked`。
-- 非零 proposal 以 5 Hz 发送，而不是 20 Hz 重复发布；
-  切段、障碍、readiness blocker、协议错误和任务终态的首个零速
-  直接发布，不等待 5 Hz 定时器。proposal topic 使用
-  `KEEP_LAST(1)`，限制 topic 队列深度，但不证明下游不会执行过期命令。
+- 标准速度按下游接口协商的频率发布（默认 10 Hz）；切段、障碍、readiness
+  blocker、协议错误和任务终态的首个零速直接发布，不等待周期定时器。
+  topic 使用 `KEEP_LAST(1)`，限制队列深度，但不证明下游不会执行过期命令。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
   proposal bridge 始终检查真正的根 `/cmd_vel`，发现外部发布者仍会拒绝导航。
 
@@ -229,16 +228,16 @@ ASCII token 布局和数据行必须与声明精确一致。`load_map` 会在
 status 的 `execution`，不新增 Canvas 连线点。
 
 shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互斥区内
-二次校验 `nav_id/attempt/status`；5 Hz 发布定时器在真正发布前再次校验任务
+二次校验 `nav_id/attempt/status`；标准速度发布定时器在真正发布前再次校验任务
 上下文和 readiness。Nav2 action result、pause/resume 或新任务已使样本过期时，
-该样本不发布；因此终态零速不会被旧回调用更高 `sequence` 覆盖。当前自动证据覆盖纯函数和源码
+该样本不发布；因此终态零速不会被旧回调用更高 `seq` 覆盖。当前自动证据覆盖纯函数和源码
 合同；终点不徘徊及真机时序仍需目标本体验收。
 
 ## 统一卡片连线
 
 odom、registered cloud 和 static map 由 `ControlledSemanticSpatialPlugin` 固定为同容器
-内部 topic，不需要 Canvas 连线。刷新卡片定义后，按下游实际支持的格式选择
-`control_velocity` 或旧的 `motion_sequence`，不要同时连接两个会执行动作的消费者；
+内部 topic，不需要 Canvas 连线。刷新卡片定义后移除旧端口连线并连接
+`control_velocity`；
 `goal_pose` 仍可作为可选外部输入。格式匹配本身不证明 Driver 已订阅或联调通过。该 topic 与 Navi 共用，
 两张卡片不得同时向其发布；G1 `loco_servo` 默认 dry-run，实际停止与 watchdog
 行为尚须独立验证。

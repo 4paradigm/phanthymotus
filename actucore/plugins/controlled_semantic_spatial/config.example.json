@@ -25,8 +25,7 @@
     "min_y_mps": 0.0,
     "max_y_mps": 0.0,
     "min_yaw_rps": 0.3,
-    "max_yaw_rps": 0.3,
-    "proposal_ttl_ms": 250
+    "max_yaw_rps": 0.3
   },
   "semantic": {
     "camera_topic": "/ubuntu/camera/rgb_frame",

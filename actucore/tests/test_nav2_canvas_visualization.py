@@ -68,7 +68,7 @@ class Nav2VisualizationContractTest(unittest.TestCase):
         planning_outputs = _by_port(planning["topic_out"])
         mapping_outputs = _by_port(mapping["topic_out"])
 
-        self.assertEqual(set(outputs), {"map_view", "motion_sequence", "control_velocity"})
+        self.assertEqual(set(outputs), {"map_view", "control_velocity"})
         self.assertEqual(set(auxiliary), {"plan", "livo_odom"})
         self.assertEqual(auxiliary["plan"], planning_outputs["plan"])
         self.assertEqual(auxiliary["livo_odom"], planning_inputs["livo_odom"])

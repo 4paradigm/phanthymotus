@@ -163,7 +163,6 @@ class ControlledSemanticSpatialRuntime:
             "odom_topic": f"{navigation}/odom",
             "obstacle_cloud_topic": f"{navigation}/cloud_registered",
             "cmd_vel_raw_topic": f"{nav2}/cmd_vel_raw",
-            "motion_sequence_topic": f"{navigation}/motion_sequence",
             "control_velocity_topic": "/actucore/navi/cmd",
             "control_interface_json": json.dumps(
                 control_interface or {}, ensure_ascii=False, separators=(",", ":"), allow_nan=False

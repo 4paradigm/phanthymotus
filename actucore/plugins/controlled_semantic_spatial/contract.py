@@ -26,7 +26,6 @@ CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_ACTIONS = (
 CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME = "controlled_semantic_spatial"
 CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_OUTPUT_PORTS = (
     "map_view",
-    "motion_sequence",
     "control_velocity",
 )
 

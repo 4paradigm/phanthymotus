@@ -9,7 +9,7 @@ whole-body control）以卡片（插件）的形式挂在这里，聚合成一�
 
 当前挂载的卡片：`controlled_semantic_spatial`（配置键和公开工具名一致）——
 FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2
-作为子进程跑在本容器内，对外提供 map_view、motion_sequence 和 control_velocity；
+作为子进程跑在本容器内，对外提供 map_view 和 control_velocity；
 同时注册上游 `vla` 卡片。
 新增卡片的完整步骤见 README.md。
 

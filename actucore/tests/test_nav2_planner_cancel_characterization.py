@@ -1,4 +1,4 @@
-"""Exercise planner cancellation and proposal ordering without ROS or hardware."""
+"""Exercise planner cancellation and shadow command ordering without ROS or hardware."""
 from concurrent.futures import Future
 import importlib
 import json
@@ -74,11 +74,21 @@ def make_node(module):
     node._command_lock = threading.Lock()
     node._global_frame = 'map'
     node._supported_mode = 0
-    node._proposal_ttl_ms = 250
-    node._proposal_sequence = 0
-    node._latest_proposal_candidate = None
-    node._last_published_proposal = None
-    node._proposal_pub = Mock()
+    node._latest_shadow_candidate = None
+    node._control_pub = Mock()
+    (node._control_descriptor, node._control_rate_hz, node._control_ttl_ms,
+     node._control_max_obs_age_ms, node._control_bounds, node._control_floors) = module.control_velocity.configure('{}')
+    node._control_sequence = 0
+    node._sensor_source_max_age_sec = 1.0
+    node._sensor_max_age_sec = 0.8
+    node._control_odom_max_age_sec = 1.0
+    node._control_odom_source_max_age_sec = 1.0
+    node._last_odom_source_stamp_ns = node._last_obstacle_source_stamp_ns = time.time_ns()
+    node._last_odom_monotonic = node._last_obstacle_monotonic = time.monotonic()
+    node._last_odom_frame_ready = node._last_obstacle_frame_ready = True
+    node.get_clock = Mock(return_value=types.SimpleNamespace(now=lambda: types.SimpleNamespace(nanoseconds=time.time_ns())))
+    node.get_parameter = Mock(return_value=types.SimpleNamespace(value=False))
+    node.get_logger = Mock(return_value=Mock())
     node._emit = Mock()
     node._readiness = Mock(return_value={})
     node._execution_status = Mock(return_value={})
@@ -103,8 +113,8 @@ def result_future(status=None, *, exception=None):
     return future
 
 
-def last_proposal(node):
-    return json.loads(node._proposal_pub.publish.call_args.args[0].data)
+def last_control(node):
+    return json.loads(node._control_pub.publish.call_args.args[0].data)
 
 
 @pytest.mark.parametrize('intent', ['stop', 'pause', None])
@@ -113,7 +123,7 @@ def test_unconfirmed_result_preserves_ownership_and_emits_zero(planner_module, i
     node = make_node(planner_module)
     node._active['cancel_intent'] = intent
     handle = node._active['goal_handle']
-    node._latest_proposal_candidate = {'unsafe_old_candidate': True}
+    node._latest_shadow_candidate = {'unsafe_old_candidate': True}
     status = {'unknown': 0, 'executing': 2}.get(result_kind)
     future = result_future(status, exception=RuntimeError('result failed') if result_kind == 'exception' else None)
 
@@ -123,15 +133,9 @@ def test_unconfirmed_result_preserves_ownership_and_emits_zero(planner_module, i
     assert node._active['goal_handle'] is handle
     assert node._active['cancel_intent'] == intent
     assert node._active['error_code'] == 'cancel_terminal_unconfirmed'
-    assert node._latest_proposal_candidate is None
+    assert node._latest_shadow_candidate is None
     assert node._emit.call_args.args[0]['status'] == 'cancel_unconfirmed'
-    proposal = last_proposal(node)
-    assert proposal['nav_status'] == 'planning'
-    assert proposal['velocity'] == {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
-    planner_module.build_motion_sequence(
-        nav_id='nav-1', sequence=1, ttl_ms=250, navigation_status='planning',
-        velocity=planner_module.Velocity.zero(),
-    )
+    assert last_control(node)['values'] == [0.0] * 6
     with pytest.raises(planner_module.CommandError) as resume:
         node._resume('nav-1')
     assert resume.value.code == 'invalid_navigation_state'
@@ -152,8 +156,7 @@ def test_known_result_obeys_real_terminal_status(planner_module, intent, code, e
     node._on_result('nav-1', 1, result_future(code))
     assert node._active['status'] == expected
     assert node._active['goal_handle'] is None
-    assert last_proposal(node)['nav_status'] == expected
-    assert last_proposal(node)['velocity'] == {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+    assert last_control(node)['values'] == [0.0] * 6
 
 
 def test_late_stale_result_does_not_mutate_or_publish(planner_module):
@@ -163,7 +166,7 @@ def test_late_stale_result_does_not_mutate_or_publish(planner_module):
     node._on_result('other', 1, result_future(5))
     assert node._active == before
     node._emit.assert_not_called()
-    node._proposal_pub.publish.assert_not_called()
+    node._control_pub.publish.assert_not_called()
 
 
 @pytest.mark.parametrize('result_kind', ['unknown', 'exception', 'canceled', 'succeeded'])
@@ -222,7 +225,7 @@ def test_goal_response_exception_retains_unknown_ownership_without_handle(planne
     assert outcome['outcome_known'] is False
     assert node._active['status'] == 'cancel_unconfirmed'
     assert node._active['goal_response_pending'] is True
-    assert last_proposal(node)['nav_status'] == 'planning'
+    assert last_control(node)['values'] == [0.0] * 6
     for _ in range(2):
         with pytest.raises(planner_module.CommandError) as exc:
             node._stop('nav-1')
@@ -246,7 +249,7 @@ def test_late_goal_acceptance_after_timeout_preserves_fail_closed_state(planner_
     assert node._active['goal_handle'] is handle
     assert node._active['status'] == 'cancel_unconfirmed'
     assert outcome['accepted'] is True
-    assert last_proposal(node)['nav_status'] == 'planning'
+    assert last_control(node)['values'] == [0.0] * 6
     def cancel():
         node._on_result('nav-1', 1, result_future(5))
         return result_future_object(types.SimpleNamespace(goals_canceling=[object()]))
@@ -298,7 +301,7 @@ def test_result_registration_exception_retains_handle_and_blocks_output(planner_
     assert outcome['outcome_known'] is False
     assert node._active['status'] == 'cancel_unconfirmed'
     assert node._active['goal_handle'] is handle
-    assert last_proposal(node)['nav_status'] == 'planning'
+    assert last_control(node)['values'] == [0.0] * 6
 
 
 def test_unsafe_shadow_velocity_does_not_retire_goal(planner_module):
@@ -326,7 +329,7 @@ def test_unsafe_shadow_velocity_does_not_retire_goal(planner_module):
     assert node._active['status'] == 'cancel_unconfirmed'
     assert node._active['error_code'] == 'unsafe_shadow_velocity'
     assert node._active['goal_handle'] is handle
-    assert last_proposal(node)['nav_status'] == 'planning'
+    assert last_control(node)['values'] == [0.0] * 6
     with pytest.raises(planner_module.CommandError):
         node._resume('nav-1')
     def cancel():
@@ -381,10 +384,12 @@ def test_speed_limit_failure_before_send_has_no_pending_goal(planner_module):
 
 def test_pending_periodic_publish_cannot_follow_cancel_zero(planner_module):
     node = make_node(planner_module)
-    node._latest_proposal_candidate = {
+    node._latest_shadow_candidate = {
         'nav_id': 'nav-1', 'attempt': 1, 'navigation_status': 'navigating',
         'velocity': planner_module.Velocity(x=0.5), 'reason': None,
         'received_monotonic_ns': time.monotonic_ns(),
+        'sensor_snapshot': (node._last_odom_source_stamp_ns, node._last_obstacle_source_stamp_ns,
+                            node._last_odom_monotonic, node._last_obstacle_monotonic, True, True),
     }
     node._control_odom_max_age_sec = 1
     node._control_odom_source_max_age_sec = 1
@@ -396,7 +401,7 @@ def test_pending_periodic_publish_cannot_follow_cancel_zero(planner_module):
         return None
     original = planner_module.control_odom_motion_blocker
     planner_module.control_odom_motion_blocker = blocker
-    thread = threading.Thread(target=node._publish_latest_motion_sequence, daemon=True)
+    thread = threading.Thread(target=node._publish_latest_control_velocity, daemon=True)
     try:
         thread.start()
         assert checking.wait(2)
@@ -404,8 +409,8 @@ def test_pending_periodic_publish_cannot_follow_cancel_zero(planner_module):
         release.set()
         thread.join(2)
         assert not thread.is_alive()
-        assert node._proposal_pub.publish.call_count == 1
-        assert last_proposal(node)['velocity'] == {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        assert node._control_pub.publish.call_count == 1
+        assert last_control(node)['values'] == [0.0] * 6
     finally:
         release.set()
         thread.join(2)
@@ -414,10 +419,12 @@ def test_pending_periodic_publish_cannot_follow_cancel_zero(planner_module):
 
 def test_inflight_nonzero_publish_finishes_before_cancel_zero(planner_module):
     node = make_node(planner_module)
-    node._latest_proposal_candidate = {
+    node._latest_shadow_candidate = {
         'nav_id': 'nav-1', 'attempt': 1, 'navigation_status': 'navigating',
         'velocity': planner_module.Velocity(x=0.5), 'reason': None,
         'received_monotonic_ns': time.monotonic_ns(),
+        'sensor_snapshot': (node._last_odom_source_stamp_ns, node._last_obstacle_source_stamp_ns,
+                            node._last_odom_monotonic, node._last_obstacle_monotonic, True, True),
     }
     node._control_odom_max_age_sec = 1
     node._control_odom_source_max_age_sec = 1
@@ -426,14 +433,14 @@ def test_inflight_nonzero_publish_finishes_before_cancel_zero(planner_module):
     outputs = []
     def publish(message):
         payload = json.loads(message.data)
-        if payload['velocity']['x'] != 0:
+        if payload['values'][0] != 0:
             entered.set()
             assert release.wait(2)
         outputs.append(payload)
-    node._proposal_pub.publish.side_effect = publish
+    node._control_pub.publish.side_effect = publish
     original = planner_module.control_odom_motion_blocker
     planner_module.control_odom_motion_blocker = lambda *args, **kwargs: None
-    publisher = threading.Thread(target=node._publish_latest_motion_sequence, daemon=True)
+    publisher = threading.Thread(target=node._publish_latest_control_velocity, daemon=True)
     result = threading.Thread(target=lambda: node._on_result('nav-1', 1, result_future(0)), daemon=True)
     try:
         publisher.start()
@@ -443,9 +450,8 @@ def test_inflight_nonzero_publish_finishes_before_cancel_zero(planner_module):
         publisher.join(2)
         result.join(2)
         assert not publisher.is_alive() and not result.is_alive()
-        assert [payload['velocity']['x'] for payload in outputs] == [0.5, 0.0]
-        assert [payload['sequence'] for payload in outputs] == [1, 2]
-        assert outputs[-1]['nav_status'] == 'planning'
+        assert [payload['values'][0] for payload in outputs] == [0.5, 0.0]
+        assert [payload['seq'] for payload in outputs] == [1, 2]
     finally:
         release.set()
         publisher.join(2)
@@ -481,17 +487,17 @@ def test_new_safety_zero_fences_inflight_periodic_candidate(planner_module, monk
         return {}
 
     node._readiness = readiness
-    periodic = threading.Thread(target=node._publish_latest_motion_sequence, name='periodic', daemon=True)
+    periodic = threading.Thread(target=node._publish_latest_control_velocity, name='periodic', daemon=True)
     try:
         periodic.start()
         assert entered.wait(2)
         node._on_shadow_velocity(shadow_twist(0.0))
-        assert node._proposal_pub.publish.call_count == 1
+        assert node._control_pub.publish.call_count == 1
         release.set()
         periodic.join(2)
         assert not periodic.is_alive()
-        assert node._proposal_pub.publish.call_count == 1
-        assert last_proposal(node)['velocity']['x'] == 0.0
+        assert node._control_pub.publish.call_count == 1
+        assert last_control(node)['values'][0] == 0.0
     finally:
         release.set()
         periodic.join(2)
@@ -525,10 +531,10 @@ def test_older_callback_cannot_overwrite_newer_safety_zero(planner_module, monke
         release.set()
         old.join(2)
         assert not old.is_alive()
-        assert node._latest_proposal_candidate['velocity'] == planner_module.Velocity.zero()
-        assert node._latest_proposal_candidate['received_monotonic_ns'] == stamps['new']
-        assert node._proposal_pub.publish.call_count == 1
-        assert last_proposal(node)['velocity']['x'] == 0.0
+        assert node._latest_shadow_candidate['velocity'] == planner_module.Velocity.zero()
+        assert node._latest_shadow_candidate['received_monotonic_ns'] == stamps['new']
+        assert node._control_pub.publish.call_count == 1
+        assert last_control(node)['values'][0] == 0.0
     finally:
         release.set()
         old.join(2)
@@ -542,9 +548,9 @@ def test_equal_timestamp_safety_zero_supersedes_nonzero(planner_module, monkeypa
     monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
     node._on_shadow_velocity(shadow_twist(0.5))
     node._on_shadow_velocity(shadow_twist(0.0))
-    assert node._latest_proposal_candidate['velocity'] == planner_module.Velocity.zero()
-    assert node._proposal_pub.publish.call_count == 1
-    assert last_proposal(node)['velocity']['x'] == 0.0
+    assert node._latest_shadow_candidate['velocity'] == planner_module.Velocity.zero()
+    assert node._control_pub.publish.call_count == 1
+    assert last_control(node)['values'][0] == 0.0
 
 
 @pytest.mark.parametrize('now_ns, expected_x', [
@@ -558,8 +564,11 @@ def test_final_locked_ttl_check_uses_original_entry_time(planner_module, monkeyp
     clock = {'now': 1_000_000_000}
     monkeypatch.setattr(planner_module.time, 'monotonic_ns', lambda: clock['now'])
     monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+    node._control_ttl_ms = 1000  # Keep observation freshness independent of candidate age.
+    node._last_odom_monotonic = node._last_obstacle_monotonic = 1.0
+    monkeypatch.setattr(planner_module.time, 'monotonic', lambda: clock['now'] / 1_000_000_000)
     node._on_shadow_velocity(shadow_twist(0.5))
-    assert node._latest_proposal_candidate['received_monotonic_ns'] == 1_000_000_000
+    assert node._latest_shadow_candidate['received_monotonic_ns'] == 1_000_000_000
 
     # The sample can expire while readiness is being evaluated, after an
     # earlier TTL check would have passed.
@@ -568,10 +577,8 @@ def test_final_locked_ttl_check_uses_original_entry_time(planner_module, monkeyp
         return {}
 
     node._readiness = readiness
-    node._publish_latest_motion_sequence()
-    assert last_proposal(node)['velocity']['x'] == expected_x
-    if expected_x == 0.0:
-        assert last_proposal(node)['reason'] == 'shadow_velocity_stale'
+    node._publish_latest_control_velocity()
+    assert last_control(node)['values'][0] == expected_x
 
 
 def test_stale_candidate_publishes_zero_without_readiness(planner_module, monkeypatch):
@@ -584,11 +591,10 @@ def test_stale_candidate_publishes_zero_without_readiness(planner_module, monkey
     clock['now'] = 1_250_000_001
     node._readiness = Mock(side_effect=RuntimeError('readiness unavailable'))
 
-    node._publish_latest_motion_sequence()
+    node._publish_latest_control_velocity()
 
     node._readiness.assert_not_called()
-    assert last_proposal(node)['velocity']['x'] == 0.0
-    assert last_proposal(node)['reason'] == 'shadow_velocity_stale'
+    assert last_control(node)['values'][0] == 0.0
 
 
 def test_final_ttl_check_runs_after_waiting_for_lock(planner_module, monkeypatch):
@@ -607,7 +613,7 @@ def test_final_ttl_check_runs_after_waiting_for_lock(planner_module, monkeypatch
     monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
     node._on_shadow_velocity(shadow_twist(0.5))
     monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', blocker)
-    periodic = threading.Thread(target=node._publish_latest_motion_sequence, daemon=True)
+    periodic = threading.Thread(target=node._publish_latest_control_velocity, daemon=True)
     try:
         periodic.start()
         assert checked.wait(2)
@@ -616,8 +622,7 @@ def test_final_ttl_check_runs_after_waiting_for_lock(planner_module, monkeypatch
             clock['now'] = 1_300_000_000
         periodic.join(2)
         assert not periodic.is_alive()
-        assert last_proposal(node)['velocity']['x'] == 0.0
-        assert last_proposal(node)['reason'] == 'shadow_velocity_stale'
+        assert last_control(node)['values'][0] == 0.0
     finally:
         proceed.set()
         periodic.join(2)
@@ -636,7 +641,6 @@ def test_callback_delay_does_not_refresh_candidate_ttl(planner_module, monkeypat
 
     node._readiness = readiness
     node._on_shadow_velocity(shadow_twist(0.5))
-    assert node._latest_proposal_candidate['received_monotonic_ns'] == 1_000_000_000
-    node._publish_latest_motion_sequence()
-    assert last_proposal(node)['velocity']['x'] == 0.0
-    assert last_proposal(node)['reason'] == 'shadow_velocity_stale'
+    assert node._latest_shadow_candidate['received_monotonic_ns'] == 1_000_000_000
+    node._publish_latest_control_velocity()
+    assert last_control(node)['values'][0] == 0.0

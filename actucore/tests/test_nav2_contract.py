@@ -77,16 +77,7 @@ class Nav2ContractTest(unittest.TestCase):
         )
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
-        self.assertEqual(set(outputs), {"motion_sequence", "plan", "costmap"})
-        self.assertEqual(tool["topic_out"][0]["port"], "motion_sequence")
-        proposal = outputs["motion_sequence"]
-        self.assertEqual(proposal["schema"], "phanthy.navigation.motion_sequence.v1")
-        self.assertEqual(proposal["max_age_ms"], 250)
-        self.assertEqual(proposal["rate_hz"], 5)
-        self.assertEqual(
-            proposal["qos"],
-            "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
-        )
+        self.assertEqual(set(outputs), {"plan", "costmap"})
         plan = outputs["plan"]
         self.assertEqual(plan["topic"], "/plan")
         self.assertEqual(plan["format"], "sensor/path")
@@ -134,20 +125,10 @@ class Nav2ContractTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        proposal_schema = json.loads(
-            (
-                runtime_dir
-                / "protocol"
-                / "motion-sequence-v1.schema.json"
-            ).read_text(encoding="utf-8")
-        )
-        self.assertIn('default_value="/ubuntu/navigation/motion_sequence"', launch)
-        self.assertIn('"motion_sequence_topic": motion_sequence_topic', launch)
-        self.assertIn('self.get_parameter("motion_sequence_topic")', planner_bridge)
-        self.assertEqual(
-            proposal_schema["properties"]["schema"]["const"],
-            "phanthy.navigation.motion_sequence.v1",
-        )
+        self.assertNotIn("motion_sequence_topic", launch)
+        self.assertNotIn("motion_sequence_topic", planner_bridge)
+        self.assertFalse((runtime_dir / "protocol" / "motion-sequence-v1.schema.json").exists())
+        self.assertFalse((runtime_dir / "protocol" / "motion-sequence-v1.example.json").exists())
         self.assertIn('default_value="/ubuntu/navigation/odom"', launch)
         self.assertIn('default_value="/ubuntu/navigation/cloud_registered"', launch)
         self.assertIn("from nav_msgs.msg import Odometry", planner_bridge)
@@ -162,15 +143,6 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(goal_schema["properties"]["speed"]["maximum"], 1.0)
         self.assertEqual(goal_schema["properties"]["speed"]["minimum"], 0.30)
         self.assertEqual(goal_schema["properties"]["speed"]["default"], 0.5)
-        self.assertEqual(
-            proposal_schema["properties"]["velocity"]["properties"]["x"],
-            {"type": "number", "minimum": -1.0, "maximum": 1.0},
-        )
-        self.assertEqual(
-            proposal_schema["properties"]["velocity"]["properties"]["y"],
-            {"type": "number", "minimum": -1.0, "maximum": 1.0},
-        )
-
         params = yaml.safe_load(
             (companion_root / "config" / "nav2_params.yaml").read_text(
                 encoding="utf-8"

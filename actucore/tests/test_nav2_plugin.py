@@ -237,8 +237,9 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
     def test_config_validation_and_active_stop(self) -> None:
         backend = ReadyBackend()
         plugin = Nav2Plugin({}, None, backend=backend)
-        bad = plugin.dispatch("nav2", {"action": "config", "proposal_ttl_ms": 100})
-        self.assertEqual(bad["error_code"], "invalid_config")
+        for obsolete_key in ("proposal_ttl_ms", "proposal_frequency_hz"):
+            bad = plugin.dispatch("nav2", {"action": "config", obsolete_key: 100})
+            self.assertEqual(bad["error_code"], "invalid_config")
         inverted = plugin.dispatch(
             "nav2",
             {"action": "config", "min_x_mps": 0.7, "max_x_mps": 0.6},

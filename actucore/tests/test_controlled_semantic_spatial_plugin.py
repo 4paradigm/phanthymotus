@@ -281,13 +281,12 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
             [item["port"] for item in tool["topic_out"]],
             [
                 "map_view",
-                "motion_sequence",
                 "control_velocity",
             ],
         )
         from plugins.navi.plugin import DEFAULT_TOPIC, TOPIC_FORMAT
 
-        control = tool["topic_out"][2]
+        control = tool["topic_out"][1]
         self.assertEqual(control["topic"], DEFAULT_TOPIC)
         self.assertEqual(control["format"], TOPIC_FORMAT)
         self.assertEqual(control["ros_type"], "std_msgs/msg/String")
@@ -296,7 +295,6 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         other_control = next(item for item in other["topic_out"]
                              if item["port"] == "control_velocity")
         self.assertEqual(other_control["topic"], DEFAULT_TOPIC)
-        self.assertEqual(tool["topic_out"][1]["topic"], "/ubuntu/navigation/motion_sequence")
         auxiliary = {item["port"]: item for item in tool["topic_aux"]}
         self.assertEqual(set(auxiliary), {"plan", "livo_odom"})
         self.assertEqual(auxiliary["plan"]["topic"], "/plan")
@@ -325,23 +323,6 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         ):
             self.assertIn(action, actions)
         self.assertNotIn("x-execution-control", tool)
-
-    def test_motion_sequence_uses_consistent_public_and_runtime_contract(self):
-        from plugins.controlled_semantic_spatial.planning.contract import nav2_tool_definition
-
-        for namespace in ("ubuntu", "robot"):
-            with self.subTest(namespace=namespace):
-                tool = controlled_semantic_spatial_tool_definition(namespace)
-                motion = tool["topic_out"][1]
-                proposal = next(
-                    item for item in nav2_tool_definition(namespace)["topic_out"]
-                    if item["port"] == "motion_sequence"
-                )
-                self.assertEqual(motion, proposal)
-                self.assertEqual(
-                    motion["topic"], f"/{namespace}/navigation/motion_sequence"
-                )
-                self.assertEqual(motion["schema"], "phanthy.navigation.motion_sequence.v1")
 
     def test_unified_action_schema_only_exposes_supported_fields(self):
         tool = controlled_semantic_spatial_tool_definition("ubuntu")
@@ -1988,7 +1969,7 @@ class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
     def test_launch_arguments_without_descriptor_preserve_legacy_and_default_control(self):
         arguments = dict(value.split(":=", 1) for value in
                          ControlledSemanticSpatialRuntime._launch_arguments("/other/", {})["nav2"])
-        self.assertEqual(arguments["motion_sequence_topic"], "/other/navigation/motion_sequence")
+        self.assertNotIn("motion_sequence_topic", arguments)
         self.assertEqual(arguments["control_velocity_topic"], "/actucore/navi/cmd")
         self.assertEqual(json.loads(arguments["control_interface_json"]), {})
 
@@ -2047,10 +2028,7 @@ class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
         self.assertIn("imu_topic:=/sensors/imu", fast_command)
         self.assertIn("odom_topic:=/robot/navigation/odom", fast_command)
         self.assertIn("odom_topic:=/robot/navigation/odom", nav2_command)
-        self.assertIn(
-            "motion_sequence_topic:=/robot/navigation/motion_sequence",
-            nav2_command,
-        )
+        self.assertFalse(any("motion_sequence_topic:=" in arg for arg in nav2_command))
         self.assertIn("control_velocity_topic:=/actucore/navi/cmd", nav2_command)
         arguments = dict(arg.split(":=", 1) for arg in nav2_command[4:])
         self.assertEqual(json.loads(arguments["control_interface_json"]), _control_descriptor())

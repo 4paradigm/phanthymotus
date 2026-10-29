@@ -279,7 +279,7 @@ Canvas 把 Driver `lidar_cloud` 的标准 PointCloud2、`lidar_imu` 和
 `controlled_semantic_spatial` 卡片；RGB 用于语义导航。原机身 `imu` 不能替代 `lidar_imu`。
 `livo_odom`、registered cloud、obstacle map 都在同一容器内
 交给 planning/semantic 模块。机器诊断由内部 topic 提供，
-统一卡片公开 `map_view`、旧格式 `motion_sequence` 和 Navi 格式 `control_velocity`。
+统一卡片公开 `map_view` 和 Navi 格式 `control_velocity`。
 
 本模块随统一镜像构建，版本和许可证见
 [`../runtime/FAST_LIVO2_THIRD_PARTY.md`](../runtime/FAST_LIVO2_THIRD_PARTY.md)。
