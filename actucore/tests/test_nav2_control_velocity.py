@@ -154,8 +154,10 @@ def test_minimal_descriptor(planner_module):
 
 
 def test_restart_sequence_is_dropped_by_actual_sink(planner_module, monkeypatch):
-    driver_root = Path(__file__).resolve().parents[4] / 'phanthymotus-driver'
-    if not (driver_root / 'common/control/sink.py').exists():
+    driver_root = next((parent / 'phanthymotus-driver'
+                        for parent in Path(__file__).resolve().parents
+                        if (parent / 'phanthymotus-driver/common/control/sink.py').is_file()), None)
+    if driver_root is None:
         pytest.skip('sibling phanthymotus-driver checkout unavailable')
     monkeypatch.syspath_prepend(str(driver_root))
     from common.control import ControlSink, Verdict

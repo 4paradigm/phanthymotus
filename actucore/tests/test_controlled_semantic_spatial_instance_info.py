@@ -7,6 +7,7 @@ import asyncio
 import json
 import sys
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -209,14 +210,15 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
 
     def test_heartbeat_uses_real_core_ping_and_preserves_all_ports(self):
         # Real consumer code; only the MCP HTTP transport is replaced by an in-process fake.
-        import aiohttp
-
-        manage_path = Path(__file__).resolve().parents[2] / "agent-core" / "src" / "api" / "mcp_manage.py"
+        manage_path = ACTUCORE_ROOT.parent / "agent-core" / "src" / "api" / "mcp_manage.py"
+        if not manage_path.is_file():
+            self.skipTest("Agent Core source unavailable for real heartbeat contract")
         tree = ast.parse(manage_path.read_text(encoding="utf-8"), filename=str(manage_path))
         ping_node = next(node for node in tree.body
                          if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ping_mcp_http")
         # Compile the actual consumer function, without importing Agent Core's unrelated
         # database/config dependencies or requiring an HTTP listener.
+        aiohttp = types.SimpleNamespace(ClientTimeout=lambda **kwargs: None, ClientSession=None)
         namespace = {"aiohttp": aiohttp, "asyncio": asyncio, "json": json}
         exec(compile(ast.Module(body=[ping_node], type_ignores=[]), str(manage_path), "exec"), namespace)
         planning = FakeComponent("planning")
