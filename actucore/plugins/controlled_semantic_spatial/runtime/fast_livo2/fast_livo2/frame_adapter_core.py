@@ -204,6 +204,224 @@ class OdomHealthMonitor:
         return False
 
 
+# Canonical odom twist reliability contract. A reliable twist has six finite
+# components and a positive finite covariance diagonal. An unavailable twist is
+# never published as zero: all six components are NaN and the covariance
+# diagonal is TWIST_UNAVAILABLE_VARIANCE, so consumers that require finite
+# values (or covariance[0] >= 0) cannot mistake it for "stopped".
+TWIST_UNAVAILABLE_VARIANCE = -1.0
+
+
+@dataclass(frozen=True)
+class BodyTwist:
+    """base_link-frame twist from two source-stamped base_link poses."""
+
+    linear: tuple[float, float, float]
+    angular: tuple[float, float, float]
+    interval_sec: float
+
+
+class BodyTwistEstimator:
+    """Differentiate source-stamped base_link poses into a body-frame twist.
+
+    Poses must be expressed in one fixed parent frame between resets; a fixed
+    left transform (for example map_from_session) does not change the body
+    twist, so session-local poses are preferred. Every untrusted case returns
+    None with ``reason`` set instead of a zero twist.
+    """
+
+    # Samples not newer than the latest accepted one; callers must drop them
+    # entirely (pose included) rather than publish an older state.
+    STALE_SAMPLE_REASONS = frozenset({"duplicate_stamp", "out_of_order"})
+
+    def __init__(
+        self,
+        *,
+        min_interval_sec: float = 0.02,
+        max_interval_sec: float = 0.35,
+        position_noise_m: float = 0.01,
+        orientation_noise_rad: float = 0.005,
+        history_size: int = 512,
+    ) -> None:
+        values = (
+            float(min_interval_sec),
+            float(max_interval_sec),
+            float(position_noise_m),
+            float(orientation_noise_rad),
+        )
+        if (
+            not all(math.isfinite(value) and value > 0 for value in values)
+            or values[0] >= values[1]
+            or int(history_size) < 2
+        ):
+            raise ValueError("body twist estimator limits are invalid")
+        self._min_interval_ns = int(values[0] * 1_000_000_000)
+        self._max_interval_ns = int(values[1] * 1_000_000_000)
+        self.position_noise_m = values[2]
+        self.orientation_noise_rad = values[3]
+        self._history_size = int(history_size)
+        self._history: list[tuple[int, Pose3]] = []
+        self._frame_key = None
+        self.reliable_count = 0
+        self.unavailable_counts: dict[str, int] = {}
+        # Incremented on every reset so callers can discard samples that
+        # straddled one.
+        self.epoch = 0
+        self.reset("reset")
+
+    def reset(self, reason: str = "reset") -> None:
+        self.epoch += 1
+        self._history = []
+        self._frame_key = None
+        self.reason: str | None = str(reason)
+        self.detail: str | None = None
+
+    def diagnostics(self) -> dict:
+        return {
+            "reliable": self.reason is None,
+            "reason": self.reason,
+            "detail": self.detail,
+            "reliable_count": self.reliable_count,
+            "unavailable_counts": dict(self.unavailable_counts),
+            "min_interval_sec": self._min_interval_ns / 1_000_000_000.0,
+            "max_interval_sec": self._max_interval_ns / 1_000_000_000.0,
+        }
+
+    def observe(self, stamp_ns: int, pose: Pose3, *, frame_key=None) -> BodyTwist | None:
+        try:
+            stamp_ns = int(stamp_ns)
+            position = (float(pose.x), float(pose.y), float(pose.z))
+            if stamp_ns <= 0:
+                raise InvalidFastLivo2Frame("source stamp must be positive")
+            if not all(math.isfinite(value) for value in position):
+                raise InvalidFastLivo2Frame("position must be finite")
+            sample = Pose3(*position, normalize_quaternion(pose.q))
+        except (InvalidFastLivo2Frame, TypeError, ValueError, OverflowError) as exc:
+            self.reset()
+            return self._unavailable("invalid_sample", str(exc))
+
+        if self._history:
+            latest_stamp = self._history[-1][0]
+            if stamp_ns == latest_stamp:
+                return self._unavailable("duplicate_stamp")
+            if stamp_ns < latest_stamp:
+                return self._unavailable(
+                    "out_of_order",
+                    f"stamp is {(latest_stamp - stamp_ns) / 1e9:.3f}s older than the latest sample",
+                )
+        if not self._history or frame_key != self._frame_key:
+            reason = "first_sample" if not self._history else "frame_changed"
+            self._history = [(stamp_ns, sample)]
+            self._frame_key = frame_key
+            return self._unavailable(reason)
+        latest_stamp = self._history[-1][0]
+        if stamp_ns - latest_stamp > self._max_interval_ns:
+            self._history = [(stamp_ns, sample)]
+            return self._unavailable(
+                "interval_too_large",
+                f"source gap {(stamp_ns - latest_stamp) / 1e9:.3f}s",
+            )
+
+        reference = None
+        for candidate in reversed(self._history):
+            if stamp_ns - candidate[0] >= self._min_interval_ns:
+                reference = candidate
+                break
+        self._history.append((stamp_ns, sample))
+        self._history = [
+            item
+            for item in self._history[-self._history_size:]
+            if stamp_ns - item[0] <= self._max_interval_ns
+        ]
+        if reference is None or stamp_ns - reference[0] > self._max_interval_ns:
+            return self._unavailable("interval_too_small")
+
+        interval_sec = (stamp_ns - reference[0]) / 1_000_000_000.0
+        try:
+            linear, angular = _se3_log(compose_pose(inverse_pose(reference[1]), sample))
+        except (InvalidFastLivo2Frame, ValueError, OverflowError) as exc:
+            self.reset()
+            return self._unavailable("non_finite_result", str(exc))
+        twist = BodyTwist(
+            tuple(value / interval_sec for value in linear),
+            tuple(value / interval_sec for value in angular),
+            interval_sec,
+        )
+        if not all(math.isfinite(value) for value in twist.linear + twist.angular):
+            self.reset()
+            return self._unavailable("non_finite_result")
+        self.reason = None
+        self.detail = None
+        self.reliable_count += 1
+        return twist
+
+    def odometry_twist_fields(
+        self,
+        twist: BodyTwist | None,
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """Return (linear+angular, 36-element covariance) for nav_msgs/Odometry."""
+
+        covariance = [0.0] * 36
+        if twist is None:
+            for index in range(6):
+                covariance[index * 7] = TWIST_UNAVAILABLE_VARIANCE
+            return (math.nan,) * 6, tuple(covariance)
+        # Nominal differencing noise from assumed pose jitter, not a calibration.
+        linear_variance = 2.0 * (self.position_noise_m / twist.interval_sec) ** 2
+        angular_variance = 2.0 * (self.orientation_noise_rad / twist.interval_sec) ** 2
+        for index in range(3):
+            covariance[index * 7] = linear_variance
+            covariance[(index + 3) * 7] = angular_variance
+        return twist.linear + twist.angular, tuple(covariance)
+
+    def _unavailable(self, reason: str, detail: str | None = None) -> None:
+        self.reason = reason
+        self.detail = detail
+        self.unavailable_counts[reason] = self.unavailable_counts.get(reason, 0) + 1
+        return None
+
+
+def _se3_log(
+    pose: Pose3,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return (rho, phi) with exp([rho, phi]) == pose, both in the start frame."""
+
+    q = normalize_quaternion(pose.q)
+    if q.w < 0:
+        q = Quaternion(-q.x, -q.y, -q.z, -q.w)
+    sin_half = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z)
+    theta = 2.0 * math.atan2(sin_half, q.w)
+    if sin_half < 1e-12:
+        phi = (2.0 * q.x, 2.0 * q.y, 2.0 * q.z)
+    else:
+        scale = theta / sin_half
+        phi = (q.x * scale, q.y * scale, q.z * scale)
+    t = (float(pose.x), float(pose.y), float(pose.z))
+    cross = _cross(phi, t)
+    cross2 = _cross(phi, cross)
+    if theta < 1e-2:
+        coefficient = 1.0 / 12.0 + theta * theta / 720.0
+    else:
+        coefficient = (
+            1.0 - theta * math.sin(theta) / (2.0 * (1.0 - math.cos(theta)))
+        ) / (theta * theta)
+    rho = tuple(
+        t[index] - 0.5 * cross[index] + coefficient * cross2[index]
+        for index in range(3)
+    )
+    if not all(math.isfinite(value) for value in rho + phi):
+        raise InvalidFastLivo2Frame("pose logarithm is not finite")
+    return rho, phi
+
+
+def _cross(left: Sequence[float], right: Sequence[float]) -> tuple[float, float, float]:
+    return (
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    )
+
+
 @dataclass(frozen=True)
 class RelocalizationResult:
     map_from_session: Pose3

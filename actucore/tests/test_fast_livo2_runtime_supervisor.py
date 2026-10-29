@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import math
 import struct
 import sys
 import tempfile
@@ -473,6 +474,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._sensor_frame = None
         adapter._sensor_tf_error = None
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_twist = ADAPTER_MODULE.BodyTwistEstimator()
         adapter._tf_buffer = mock.Mock()
         adapter._tf_buffer.lookup_transform.return_value = SimpleNamespace(
             transform=SimpleNamespace(
@@ -525,6 +527,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._sensor_frame = None
         adapter._sensor_tf_error = None
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_twist = ADAPTER_MODULE.BodyTwistEstimator()
         adapter._tf_buffer = mock.Mock()
         adapter._tf_buffer.lookup_transform.return_value = SimpleNamespace(
             transform=SimpleNamespace(
@@ -580,6 +583,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             Quaternion(0.0, 0.0, 0.0, 1.0),
         )
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_twist = ADAPTER_MODULE.BodyTwistEstimator()
         adapter._latest_session_pose = None
         adapter._last_odom_monotonic = None
         adapter._last_odom_source_age = None
@@ -633,6 +637,127 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         self.assertEqual(len(adapter._latest_session_points), 1)
         self.assertIsNotNone(adapter._last_cloud_monotonic)
 
+    def test_canonical_odom_twist_is_estimated_and_fail_closed(self) -> None:
+        def vector():
+            return SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        def odometry():
+            return SimpleNamespace(
+                header=SimpleNamespace(stamp=None, frame_id=""),
+                child_frame_id="",
+                pose=SimpleNamespace(
+                    pose=SimpleNamespace(
+                        position=vector(),
+                        orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+                    ),
+                    covariance=[0.0] * 36,
+                ),
+                twist=SimpleNamespace(
+                    twist=SimpleNamespace(linear=vector(), angular=vector()),
+                    covariance=[0.0] * 36,
+                ),
+            )
+
+        def transform():
+            return SimpleNamespace(
+                header=None,
+                child_frame_id="",
+                transform=SimpleNamespace(translation=vector(), rotation=None),
+            )
+
+        adapter = object.__new__(FastLivo2Adapter)
+        adapter._lock = threading.RLock()
+        adapter._source_age = lambda _stamp: 0.0
+        adapter._source_max_age = 0.5
+        adapter._source_age_tolerance = 0.05
+        adapter._invalid_odom = 0
+        adapter._rejection_counts = {}
+        adapter._sensor_frame = "sensor_frame"
+        adapter._base_to_sensor_tf_ready = True
+        # Sensor mounted 0.2 m ahead of base_link: base twist must differ
+        # from the sensor's own linear velocity while rotating.
+        adapter._base_to_sensor = Pose3(0.2, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0))
+        adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_twist = ADAPTER_MODULE.BodyTwistEstimator()
+        adapter._latest_session_pose = None
+        adapter._last_odom_monotonic = None
+        adapter._last_odom_source_age = None
+        adapter._latest_pose = None
+        adapter._pose_history = []
+        adapter._map_from_session = Pose3(5.0, 1.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0))
+        adapter._observe_pipeline_event = lambda _name: None
+        adapter._mark_valid = lambda _name: None
+        adapter._warn_rejected = lambda *_args, **_kwargs: None
+        adapter._drain_pending_cloud = lambda: None
+        adapter._odom_pub = _CapturePublisher()
+        adapter._tf = SimpleNamespace(sendTransform=lambda _transform: None)
+
+        def raw(sec, nanosec, x, yaw, *, raw_twist=1.5):
+            # Raw sensor pose for a base that rotates in place at yaw.
+            return SimpleNamespace(
+                header=SimpleNamespace(
+                    frame_id="camera_init",
+                    stamp=SimpleNamespace(sec=sec, nanosec=nanosec),
+                ),
+                child_frame_id="aft_mapped",
+                pose=SimpleNamespace(
+                    pose=SimpleNamespace(
+                        position=SimpleNamespace(
+                            x=x + 0.2 * math.cos(yaw),
+                            y=0.2 * math.sin(yaw),
+                            z=0.0,
+                        ),
+                        orientation=SimpleNamespace(
+                            x=0.0, y=0.0, z=math.sin(yaw / 2), w=math.cos(yaw / 2)
+                        ),
+                    ),
+                    covariance=[0.0] * 36,
+                ),
+                # Raw twist is garbage and must never be forwarded.
+                twist=SimpleNamespace(
+                    twist=SimpleNamespace(
+                        linear=SimpleNamespace(x=raw_twist, y=0.0, z=0.0),
+                        angular=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                    ),
+                    covariance=[0.0] * 36,
+                ),
+            )
+
+        def published(index):
+            twist = adapter._odom_pub.messages[index].twist
+            values = (
+                twist.twist.linear.x, twist.twist.linear.y, twist.twist.linear.z,
+                twist.twist.angular.x, twist.twist.angular.y, twist.twist.angular.z,
+            )
+            return values, twist.covariance
+
+        with mock.patch.object(ADAPTER_MODULE, "Odometry", odometry), mock.patch.object(
+            ADAPTER_MODULE, "TransformStamped", transform
+        ):
+            adapter._on_odom(raw(1, 0, 0.0, 0.0))
+            adapter._on_odom(raw(1, 100_000_000, 0.0, 0.05))
+            # Duplicate stamp faults odom health; the next two samples are
+            # still recovering, so nothing is published and the estimator
+            # restarts on every rejection.
+            for index in range(1, 6):
+                adapter._on_odom(raw(1, index * 100_000_000, 0.0, 0.05 * index))
+
+        self.assertEqual(len(adapter._odom_pub.messages), 4)
+        first, first_cov = published(0)
+        self.assertTrue(all(math.isnan(value) for value in first))
+        self.assertEqual([first_cov[i * 7] for i in range(6)], [-1.0] * 6)
+        second, second_cov = published(1)
+        for got, want in zip(second, (0.0, 0.0, 0.0, 0.0, 0.0, 0.5)):
+            self.assertAlmostEqual(got, want, places=6)
+        self.assertTrue(all(second_cov[i * 7] > 0 for i in range(6)))
+        third, _ = published(2)
+        self.assertTrue(all(math.isnan(value) for value in third))
+        self.assertEqual(adapter._invalid_odom, 3)
+        fourth, _ = published(3)
+        self.assertAlmostEqual(fourth[5], 0.5, places=6)
+        self.assertAlmostEqual(fourth[0], 0.0, places=6)
+        self.assertEqual(adapter._odom_twist.diagnostics()["reliable_count"], 2)
+
     def test_sensor_contract_reports_frame_mismatch_and_missing_tf(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
         adapter._lock = threading.RLock()
@@ -648,6 +773,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._sensor_frame = None
         adapter._sensor_tf_error = None
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_twist = ADAPTER_MODULE.BodyTwistEstimator()
         adapter._tf_buffer = mock.Mock()
 
         adapter._refresh_sensor_contract()
@@ -696,6 +822,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         adapter._map_view_cache = b"old-cache"
         adapter._map_view_cache_monotonic = time.monotonic()
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_twist = ADAPTER_MODULE.BodyTwistEstimator()
         map_from_session = Pose3(
             1.0,
             2.0,
@@ -983,6 +1110,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             Quaternion(0.0, 0.0, 0.0, 1.0),
         )
         adapter._odom_health = ADAPTER_MODULE.OdomHealthMonitor()
+        adapter._odom_twist = ADAPTER_MODULE.BodyTwistEstimator()
         adapter._odom_health.observe(
             1_000_000_000,
             Pose3(0.0, 0.0, 0.0, Quaternion(0.0, 0.0, 0.0, 1.0)),

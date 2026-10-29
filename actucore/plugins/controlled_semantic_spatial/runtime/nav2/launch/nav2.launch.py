@@ -77,6 +77,10 @@ def generate_launch_description() -> LaunchDescription:
                 actions=[
                     SetRemap(src="/cmd_vel", dst=cmd_vel_raw_topic),
                     SetRemap(src="cmd_vel", dst=cmd_vel_raw_topic),
+                    # Nav2's controller server subscribes to the relative default
+                    # "odom"; bt_navigator's odom_topic parameter is separate.
+                    SetRemap(src="/odom", dst=odom_topic),
+                    SetRemap(src="odom", dst=odom_topic),
                     IncludeLaunchDescription(
                         PythonLaunchDescriptionSource(
                             os.path.join(

@@ -101,6 +101,8 @@ controller_server:
       stop_linear_mps: 0.05
       stop_yaw_rps: 0.10
       stop_cycles_required: 2
+      stop_min_duration_sec: 0.30
+      odom_max_age_sec: 0.60
       preserve_endpoint_m: 0.25
       status_topic: /ubuntu/navigation/nav2/segment_status
 

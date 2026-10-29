@@ -39,6 +39,7 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformL
 
 from .fault_diagnostics import SENSOR_REJECTION_TOPIC
 from .frame_adapter_core import (
+    BodyTwistEstimator,
     InvalidFastLivo2Frame,
     OdomHealthMonitor,
     Pose3,
@@ -112,6 +113,8 @@ class FastLivo2Adapter(Node):
         self.declare_parameter("static_pose_match_tolerance_sec", 0.05)
         self.declare_parameter("obstacle_min_height_m", -0.30)
         self.declare_parameter("obstacle_max_height_m", 0.30)
+        self.declare_parameter("odom_twist_min_interval_sec", 0.02)
+        self.declare_parameter("odom_twist_max_interval_sec", 0.35)
 
         self._source_max_age = float(self.get_parameter("source_max_age_sec").value)
         self._mapper_runtime_max_age = float(
@@ -154,6 +157,16 @@ class FastLivo2Adapter(Node):
         self._base_to_sensor_tf_ready = False
         self._sensor_tf_error: str | None = None
         self._odom_health = OdomHealthMonitor()
+        # Raw FAST-LIVO2 twist is not trustworthy (zero on the robot), so the
+        # canonical twist is differentiated from source-stamped base_link poses.
+        self._odom_twist = BodyTwistEstimator(
+            min_interval_sec=float(
+                self.get_parameter("odom_twist_min_interval_sec").value
+            ),
+            max_interval_sec=float(
+                self.get_parameter("odom_twist_max_interval_sec").value
+            ),
+        )
         map_voxel_size = float(self.get_parameter("map_voxel_size_m").value)
         self._map_view_voxel_size = max(map_voxel_size, 0.20)
         self._map_view_context = VoxelMap(self._map_view_voxel_size)
@@ -594,6 +607,7 @@ class FastLivo2Adapter(Node):
                 lidar_frame != self._lidar_frame
                 or imu_frame != self._imu_frame
             ):
+                self._odom_twist.reset("sensor_geometry_changed")
                 self._base_to_sensor = None
                 self._base_to_sensor_tf_ready = False
             self._lidar_frame = lidar_frame or None
@@ -619,6 +633,8 @@ class FastLivo2Adapter(Node):
             lidar_frame = self._lidar_frame
             imu_frame = self._imu_frame
             if not lidar_frame or lidar_frame != imu_frame:
+                if self._base_to_sensor_tf_ready or self._base_to_sensor is not None:
+                    self._odom_twist.reset("sensor_geometry_changed")
                 self._sensor_frame = None
                 self._base_to_sensor = None
                 self._base_to_sensor_tf_ready = False
@@ -651,6 +667,8 @@ class FastLivo2Adapter(Node):
             canonical_base_pose(base_to_sensor, base_to_sensor)
         except (TransformException, InvalidFastLivo2Frame, TypeError, ValueError) as exc:
             with self._lock:
+                if self._base_to_sensor_tf_ready or self._base_to_sensor is not None:
+                    self._odom_twist.reset("sensor_geometry_changed")
                 self._sensor_frame = sensor_frame
                 self._base_to_sensor = None
                 self._base_to_sensor_tf_ready = False
@@ -658,6 +676,12 @@ class FastLivo2Adapter(Node):
             return
         with self._lock:
             if self._lidar_frame == self._imu_frame == sensor_frame:
+                if (
+                    self._sensor_frame != sensor_frame
+                    or not self._base_to_sensor_tf_ready
+                    or self._base_to_sensor != base_to_sensor
+                ):
+                    self._odom_twist.reset("sensor_geometry_changed")
                 self._sensor_frame = sensor_frame
                 self._base_to_sensor = base_to_sensor
                 self._base_to_sensor_tf_ready = True
@@ -709,6 +733,9 @@ class FastLivo2Adapter(Node):
     def _on_odom(self, message: Odometry) -> None:
         self._observe_pipeline_event("raw_odom_received")
         error_code = None
+        rejection_recorded = False
+        with self._lock:
+            callback_epoch = self._odom_twist.epoch
         try:
             if message.header.frame_id.strip() != "camera_init" or message.child_frame_id.strip() != "aft_mapped":
                 raise InvalidFastLivo2Frame("raw odom must be camera_init -> aft_mapped")
@@ -733,21 +760,37 @@ class FastLivo2Adapter(Node):
             )
             source_stamp_ns = _stamp_ns(message.header.stamp)
             with self._lock:
+                if self._odom_twist.epoch != callback_epoch:
+                    return
                 if not self._sensor_geometry_ready_locked():
+                    self._odom_twist.reset("raw_odom_rejected")
+                    rejection_recorded = True
                     raise InvalidFastLivo2Frame(
                         "navigation sensor geometry is not ready"
                     )
                 if not self._odom_health.observe(source_stamp_ns, raw_sensor_pose):
                     error_code = self._odom_health.reason
+                    # Invalidate in the same critical section as the health
+                    # fault, before any concurrent older callback can publish.
+                    self._odom_twist.reset("raw_odom_rejected")
+                    rejection_recorded = True
                     raise InvalidFastLivo2Frame(
                         self._odom_health.detail or "raw odom is unhealthy"
                     )
                 base_to_sensor = self._base_to_sensor
+                # Any reset/rejection while this sample is converted outside
+                # the lock invalidates it.
+                twist_epoch = self._odom_twist.epoch
             session_pose = canonical_base_pose(
                 raw_sensor_pose,
                 base_to_sensor,
             )
         except (InvalidFastLivo2Frame, ValueError, TypeError) as exc:
+            with self._lock:
+                # Do not let a delayed rejection invalidate a newer session.
+                # Health faults above already advanced the epoch atomically.
+                if not rejection_recorded and self._odom_twist.epoch == callback_epoch:
+                    self._odom_twist.reset("raw_odom_rejected")
             self._invalid_odom += 1
             self._warn_rejected(
                 "FAST-LIVO2 odom",
@@ -758,44 +801,70 @@ class FastLivo2Adapter(Node):
             return
         self._mark_valid("FAST-LIVO2 odom")
 
+        # Callbacks are reentrant: estimation, state updates and publication
+        # happen in one critical section so a reset or a newer sample can
+        # never be followed by an older pose/twist/TF.
         with self._lock:
+            if (
+                self._odom_twist.epoch != twist_epoch
+                or not self._sensor_geometry_ready_locked()
+                or self._base_to_sensor != base_to_sensor
+            ):
+                return
+            body_twist = self._odom_twist.observe(
+                source_stamp_ns,
+                session_pose,
+                frame_key=base_to_sensor,
+            )
+            if self._odom_twist.reason in BodyTwistEstimator.STALE_SAMPLE_REASONS:
+                return
+            twist_values, twist_covariance = self._odom_twist.odometry_twist_fields(
+                body_twist
+            )
             self._latest_session_pose = session_pose
             self._last_odom_monotonic = time.monotonic()
             self._last_odom_source_age = source_age
             map_from_session = self._map_from_session
-        if map_from_session is None:
-            return
-        canonical = compose_pose(map_from_session, session_pose)
-        with self._lock:
-            if self._map_from_session != map_from_session:
+            if map_from_session is None:
                 return
+            canonical = compose_pose(map_from_session, session_pose)
             self._latest_pose = canonical
             self._pose_history.append((source_stamp_ns, canonical))
 
-        output = Odometry()
-        output.header.stamp = message.header.stamp
-        output.header.frame_id = "map"
-        output.child_frame_id = "base_link"
-        output.pose.pose.position.x = canonical.x
-        output.pose.pose.position.y = canonical.y
-        output.pose.pose.position.z = canonical.z
-        output.pose.pose.orientation.x = canonical.q.x
-        output.pose.pose.orientation.y = canonical.q.y
-        output.pose.pose.orientation.z = canonical.q.z
-        output.pose.pose.orientation.w = canonical.q.w
-        output.pose.covariance = message.pose.covariance
-        output.twist = message.twist
-        self._odom_pub.publish(output)
-        self._observe_pipeline_event("canonical_odom_published")
+            output = Odometry()
+            output.header.stamp = message.header.stamp
+            output.header.frame_id = "map"
+            output.child_frame_id = "base_link"
+            output.pose.pose.position.x = canonical.x
+            output.pose.pose.position.y = canonical.y
+            output.pose.pose.position.z = canonical.z
+            output.pose.pose.orientation.x = canonical.q.x
+            output.pose.pose.orientation.y = canonical.q.y
+            output.pose.pose.orientation.z = canonical.q.z
+            output.pose.pose.orientation.w = canonical.q.w
+            output.pose.covariance = message.pose.covariance
+            # base_link body twist; NaN plus -1 covariance means "unavailable".
+            twist = output.twist.twist
+            (
+                twist.linear.x,
+                twist.linear.y,
+                twist.linear.z,
+                twist.angular.x,
+                twist.angular.y,
+                twist.angular.z,
+            ) = twist_values
+            output.twist.covariance = list(twist_covariance)
+            self._odom_pub.publish(output)
 
-        transform = TransformStamped()
-        transform.header = output.header
-        transform.child_frame_id = "base_link"
-        transform.transform.translation.x = canonical.x
-        transform.transform.translation.y = canonical.y
-        transform.transform.translation.z = canonical.z
-        transform.transform.rotation = output.pose.pose.orientation
-        self._tf.sendTransform(transform)
+            transform = TransformStamped()
+            transform.header = output.header
+            transform.child_frame_id = "base_link"
+            transform.transform.translation.x = canonical.x
+            transform.transform.translation.y = canonical.y
+            transform.transform.translation.z = canonical.z
+            transform.transform.rotation = output.pose.pose.orientation
+            self._tf.sendTransform(transform)
+        self._observe_pipeline_event("canonical_odom_published")
         self._drain_pending_cloud()
 
     def _on_cloud(self, message: PointCloud2) -> None:
@@ -1004,6 +1073,7 @@ class FastLivo2Adapter(Node):
     def _on_reset(self, message: String) -> None:
         with self._lock:
             self._odom_health.reset()
+            self._odom_twist.reset("localization_reset")
             self._invalidate_mapping_work_locked()
             with self._static_lock:
                 cleared = self._static_map.cleared_snapshot()
@@ -1390,6 +1460,7 @@ class FastLivo2Adapter(Node):
             self._static_map_load_time = self.get_clock().now().to_msg()
             self._reference_points = static_loaded.points
             self._odom_health.reset(require_near_origin=False)
+            self._odom_twist.reset("localization_reset")
             self._session_name = map_name
             self._mode = "awaiting_relocalization"
             self._map_from_session = None
@@ -1523,6 +1594,7 @@ class FastLivo2Adapter(Node):
         with self._lock:
             self._map_from_session = result.map_from_session
             self._odom_health.reset(require_near_origin=False)
+            self._odom_twist.reset("localization_reset")
             self._latest_pose = result.map_base_pose
             self._relocalization_preview_pose = None
             self._relocalization_preview_points = ()
@@ -1574,6 +1646,7 @@ class FastLivo2Adapter(Node):
             self._static_map_load_time = self.get_clock().now().to_msg()
             self._session_name = None
             self._odom_health.reset(require_near_origin=False)
+            self._odom_twist.reset("localization_reset")
             self._mode = "idle"
             self._map_from_session = None
             self._latest_pose = None
@@ -1727,6 +1800,7 @@ class FastLivo2Adapter(Node):
                 "sensor_tf_error": self._sensor_tf_error,
                 "point_time_span_ms": self._point_time_span_ms,
                 "odom_health": self._odom_health.diagnostics(),
+                "odom_twist": self._odom_twist.diagnostics(),
                 "readiness_blockers": self._readiness_blockers_locked(),
                 "map_view_enabled": self._map_view_enabled,
                 "pipeline_counters": dict(self._pipeline_counters),
@@ -1864,6 +1938,7 @@ class FastLivo2Adapter(Node):
             "sensor_tf_error": state["sensor_tf_error"],
             "point_time_span_ms": state["point_time_span_ms"],
             "odom_health": state["odom_health"],
+            "odom_twist": state["odom_twist"],
             "readiness_blockers": state["readiness_blockers"],
         }
         if static_grid is not None:

@@ -225,7 +225,12 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "frame_id": "map -> base_link",
                 "units": "position=m; velocity=m/s; angular=rad/s",
                 "max_age_ms": 500,
-                "desc": "Canonical base pose derived from Driver-owned base_link to sensor_frame TF",
+                "desc": (
+                    "Canonical base pose derived from Driver-owned base_link to "
+                    "sensor_frame TF; twist is the base_link body twist "
+                    "differentiated from source-stamped poses, and an unavailable "
+                    "twist is all-NaN with covariance diagonal -1, never zero"
+                ),
             },
             {
                 "port": "registered_cloud",

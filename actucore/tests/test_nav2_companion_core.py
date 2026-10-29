@@ -256,6 +256,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             odom_received_at=9.8,
             odom_source_age_sec=0.2,
             odom_frame_ready=True,
+            odom_velocity_valid=True,
             obstacle_received_at=9.8,
             obstacle_source_age_sec=0.2,
             obstacle_frame_ready=True,
@@ -273,6 +274,14 @@ class Nav2CompanionCoreTest(unittest.TestCase):
                 receive_max_age_sec=0.60,
                 source_max_age_sec=0.80,
             )
+        )
+
+        missing_velocity = dict(ready)
+        missing_velocity.pop("odom_velocity_valid")
+        self.assertEqual(
+            control_odom_motion_blocker(missing_velocity, receive_max_age_sec=0.6,
+                                        source_max_age_sec=0.8),
+            "navigation_not_ready:control_odom_velocity_invalid",
         )
 
         scheduling_spike = dict(ready)
