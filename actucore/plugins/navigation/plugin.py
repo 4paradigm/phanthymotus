@@ -104,6 +104,8 @@ class NavigationPlugin:
         self._pending_terminal_stop_error = None
         self._instance_id = ""
         self._external_wiring: dict[str, str] = {}
+        # A start may leave partially acquired resources until rollback succeeds.
+        self._wiring_transition_unknown = False
 
     def get_tools(self) -> list:
         return [navigation_tool_definition(self._namespace)]
@@ -123,7 +125,7 @@ class NavigationPlugin:
                     "only an empty object is accepted",
                 )
         if action == "info":
-            return self._info()
+            return self._info(args.get("instance_id"))
         if action == "config":
             return self._configure(args)
         if action == "start":
@@ -217,7 +219,7 @@ class NavigationPlugin:
             if self._stop_requested.is_set():
                 return self._error("navigation_start_cancelled", "stop was requested")
             if self._started:
-                result = self._info()
+                result = self._info(self._instance_id)
                 result["already_started"] = True
                 return result
             if self._config_error:
@@ -227,6 +229,8 @@ class NavigationPlugin:
             return wiring
 
         started: list[tuple[str, object]] = []
+        with self._lock:
+            self._wiring_transition_unknown = True
         try:
             self._set_mapping_runtime_active(True)
             started.append(("runtime", self._runtime))
@@ -321,8 +325,9 @@ class NavigationPlugin:
                 self._check_start_cancelled()
                 self._started = True
                 self._generation = object()
-                self._instance_id = str(args.get("instance_id") or "default").strip()
+                self._instance_id = str(args.get("instance_id") or "default").strip() or "default"
                 self._external_wiring = dict(wiring["wired_topics"])
+                self._wiring_transition_unknown = False
         except Exception as exc:
             log.error(
                 "[ControlledSemanticSpatial] start failed: %s",
@@ -333,6 +338,8 @@ class NavigationPlugin:
             cleanup, cleanup_confirmed = self._stop_started(started)
             if cleanup_confirmed:
                 self._set_mapping_runtime_active(False)
+                with self._lock:
+                    self._wiring_transition_unknown = False
             else:
                 with self._lock:
                     self._stop_requested.set()
@@ -341,7 +348,7 @@ class NavigationPlugin:
                 str(exc), cleanup=cleanup, cleanup_confirmed=cleanup_confirmed,
             )
 
-        result = self._info()
+        result = self._info(self._instance_id)
         result.update({"state": "ready", "status": "ready"})
         return result
 
@@ -482,6 +489,7 @@ class NavigationPlugin:
             self._generation = None
             self._instance_id = ""
             self._external_wiring = {}
+            self._wiring_transition_unknown = False
             terminal_mapping_error = self._pending_terminal_stop_error
             self._pending_terminal_stop_error = None
         if terminal_mapping_error is not None:
@@ -834,14 +842,43 @@ class NavigationPlugin:
             request["_control_nav_id"] = control_nav_id
         return self._dispatch_planning(admission_ticket, request)
 
-    def _info(self) -> dict:
+    def _info(self, requested_instance_id=None) -> dict:
         tool = self.get_tools()[0]
         with self._lock:
             started = self._started
             instance_id = self._instance_id
             wired = dict(self._external_wiring)
+            wiring_unknown = self._wiring_transition_unknown
             config_error = self._config_error
             last_terminal_stop_error = self._last_terminal_stop_error
+        discovery = requested_instance_id is None or requested_instance_id == ""
+        instance_match = bool(started and instance_id and requested_instance_id == instance_id)
+        if discovery:
+            # Agent Core heartbeat back-fills tool definitions from this view.
+            # Keep every declared topic even if the corresponding port is idle.
+            topic_in = [
+                {
+                    **item,
+                    "connected": (
+                        None if wiring_unknown else bool(wired.get(item["port"]))
+                    ),
+                }
+                for item in tool["topic_in"]
+            ]
+        else:
+            # Uncommitted startup/rollback cannot prove a port is disconnected.
+            # Do not trust bindings supplied by the info request itself.
+            topic_in = [
+                {
+                    **item,
+                    "topic": wired.get(item["port"], "") if instance_match else "",
+                    "connected": (
+                        bool(wired.get(item["port"])) if instance_match
+                        else None if wiring_unknown else False
+                    ),
+                }
+                for item in tool["topic_in"]
+            ]
         runtime_info = self._runtime.info()
         runtime_failed = started and not runtime_info.get("running", False)
         state = (
@@ -860,15 +897,19 @@ class NavigationPlugin:
             "status": state,
             "canvas_wired": started,
             "instance_id": instance_id or None,
+            "instance_match": None if discovery else instance_match,
+            "topic_in_scope": "declaration" if discovery else "instance",
+            "topic_in_binding_state": (
+                "unknown" if wiring_unknown
+                else "known" if instance_match or (discovery and started)
+                else "none"
+            ),
             "last_terminal_stop_error": last_terminal_stop_error,
             "runtime": runtime_info,
             "mapping": self._mapping.dispatch("fast_livo2", {"action": "info"}),
             "planning": self._planning.dispatch("nav2", {"action": "info"}),
             "semantic": self._semantic.dispatch("vln", {"action": "info"}),
-            "topic_in": [
-                {**item, "connected": bool(wired.get(item["port"]))}
-                for item in tool["topic_in"]
-            ],
+            "topic_in": topic_in,
             "topic_out": tool["topic_out"],
             "container_model": "single_actucore_container",
             "docker_runtime_dependency": False,
