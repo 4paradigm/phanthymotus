@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 
 import pytest
 import yaml
@@ -80,6 +81,11 @@ def test_final_image_contains_entry_point_dependencies():
     copies = [line.split() for line in final.splitlines() if line.startswith('COPY ')]
     assert ['COPY', 'actucore/main.py', '/work/main.py'] in copies
     assert 'python3 -c "import main' in final
+
+
+def test_audio_msgs_declares_ament_build_type():
+    manifest = ET.parse(ROOT / 'deploy/ros-base/audio_msgs/package.xml').getroot()
+    assert [node.text for node in manifest.findall('./export/build_type')] == ['ament_cmake']
 
 
 def test_platform_ros_build_and_jp61_environment():
