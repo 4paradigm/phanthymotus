@@ -41,7 +41,21 @@ logger = logging.getLogger(__name__)
 PR_RECONCILE_CACHE_SECONDS = 120.0
 PRIORITY_BASELINE_RETRY_BASE_SECONDS = 30.0
 PRIORITY_BASELINE_RETRY_MAX_SECONDS = 300.0
-EVIDENCE_PROJECTION_PRIORITY_INTERVAL = 3
+CANONICAL_STATUS_LABELS = frozenset({
+    "status: review-required",
+    "status: reviewing",
+    "status: deploy-ready",
+    "status: deploy-requested",
+    "status: testing",
+    "status: acceptance-required",
+    "status: succeeded",
+    "status: failed",
+})
+ACTIVE_PROJECTION_STATUS_LABELS = frozenset({
+    "status: deploy-requested",
+    "status: testing",
+    "status: acceptance-required",
+})
 
 
 class DeployCommandError(Exception):
@@ -125,6 +139,9 @@ class GitHubCommandWatcher:
         # Fixed UTC boundary for each active authorization generation. A slow
         # baseline must not move the boundary forward and absorb new commands.
         self._repo_baseline_cutoff_utc: dict[str, datetime] = {}
+        # Ready-for-review webhook times are transient scheduling boundaries;
+        # successful baselining consumes them without adding persistent state.
+        self._ready_for_review_at: dict[tuple[str, int], datetime] = {}
         # Per-repo set of PRs already baselined in the current
         # pending-generation. Prevents rebaselining PRs that
         # already succeeded this generation.
@@ -134,6 +151,11 @@ class GitHubCommandWatcher:
         self._repo_poll_cursor = 0
         self._pr_scan_cursor: dict[str, int] = {}
         self._recent_pr_cursor: dict[str, int] = {}
+        self._active_pr_cursor: dict[str, int] = {}
+        self._draft_pr_cursor: dict[str, int] = {}
+        self._normal_pr_lane_cursor: dict[str, int] = {}
+        self._draft_label_attempts: dict[tuple[str, int], int] = {}
+        self._draft_label_retry_after: dict[tuple[str, int], float] = {}
         # Scheduling hints only. Selected PRs still pass through fresh
         # authorization, HEAD, cursor, and compare-and-swap checks.
         self._pr_reconcile_cache: dict[tuple[str, int], dict] = {}
@@ -146,8 +168,6 @@ class GitHubCommandWatcher:
         self._priority_baseline_failures: dict[tuple[str, int], int] = {}
         self._priority_pr_retry_after: dict[tuple[str, int], float] = {}
         self._priority_baseline_webhook_bypassed: set[tuple[str, int]] = set()
-        self._priority_cycles_since_evidence = 0
-        self._evidence_projection_fairness_due = False
         # Initialized in start() under the running event loop (Python 3.9 safe).
         self._wakeup = None
         self._last_successful_cycle = None
@@ -248,8 +268,10 @@ class GitHubCommandWatcher:
                     break
         return valid
 
-    def enqueue_pr(self, repo: str, pr_number: int) -> bool:
-        """Prioritize an authorized PR after a webhook observes a new comment."""
+    def enqueue_pr(
+        self, repo: str, pr_number: int, *, action=None, event_updated_at=None,
+    ) -> bool:
+        """Prioritize an authorized PR using only validated webhook hints."""
         if (not isinstance(repo, str)
                 or not getattr(self.config, "auth_valid", False)
                 or repo not in self.config.active_repos
@@ -258,6 +280,31 @@ class GitHubCommandWatcher:
                 or pr_number <= 0):
             return False
         item = (repo, pr_number)
+        if action == "ready_for_review":
+            ready_at = self._parse_comment_time(event_updated_at)
+            if ready_at is None:
+                reason = (
+                    "missing" if event_updated_at is None
+                    or isinstance(event_updated_at, str) and not event_updated_at.strip()
+                    else "invalid"
+                )
+                ready_at = datetime.now(timezone.utc)
+                logger.warning(
+                    "watcher ready_for_review timestamp fallback reason=%s",
+                    reason,
+                )
+            previous_ready_at = self._ready_for_review_at.get(item)
+            if previous_ready_at is None or ready_at > previous_ready_at:
+                self._ready_for_review_at[item] = ready_at
+            while len(self._ready_for_review_at) > 4096:
+                oldest = min(
+                    self._ready_for_review_at,
+                    key=self._ready_for_review_at.get,
+                )
+                self._ready_for_review_at.pop(oldest, None)
+        elif action == "converted_to_draft":
+            self._ready_for_review_at.pop(item, None)
+            self._baseline_progress.get(repo, set()).discard(pr_number)
         self._priority_generation += 1
         self._prioritize_new_webhook_baseline_retry(item)
         if item in self._priority_pr_set:
@@ -575,6 +622,41 @@ class GitHubCommandWatcher:
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             return None
         return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _comment_cursor_through_cutoff(
+        comments: list[dict], cutoff: datetime, lower_bound: int = 0,
+    ) -> int | None:
+        """Advance through the ordered comment prefix no newer than cutoff."""
+        if (not isinstance(comments, list)
+                or not isinstance(cutoff, datetime)
+                or cutoff.tzinfo is None or cutoff.utcoffset() is None
+                or not isinstance(lower_bound, int) or isinstance(lower_bound, bool)
+                or lower_bound < 0
+                or any(not isinstance(comment, dict) for comment in comments)):
+            return None
+        try:
+            ordered_comments = sorted(comments, key=lambda comment: comment.get("id"))
+        except (TypeError, ValueError):
+            return None
+        cursor = lower_bound
+        cutoff_utc = cutoff.astimezone(timezone.utc)
+        for comment in ordered_comments:
+            comment_id = comment.get("id")
+            if (not isinstance(comment_id, int) or isinstance(comment_id, bool)
+                    or comment_id < 0):
+                return None
+            if comment_id <= cursor:
+                continue
+            created_at = GitHubCommandWatcher._parse_comment_time(
+                comment.get("created_at")
+            )
+            if created_at is None:
+                return None
+            if created_at > cutoff_utc:
+                break
+            cursor = comment_id
+        return cursor
 
     def _recent_comment_pr_number(self, repo: str, comment: dict) -> int | None:
         issue_url = comment.get("issue_url")
@@ -992,8 +1074,107 @@ class GitHubCommandWatcher:
             )
             self.config.auth_valid = False
 
+    @staticmethod
+    def _pr_status_labels(pr: dict) -> set[str]:
+        labels = pr.get("labels")
+        if not isinstance(labels, list):
+            return set()
+        names = set()
+        for label in labels:
+            name = label if isinstance(label, str) else (
+                label.get("name") if isinstance(label, dict) else None
+            )
+            if isinstance(name, str) and name.casefold() in CANONICAL_STATUS_LABELS:
+                names.add(name.casefold())
+        return names
+
+    @staticmethod
+    def _pr_labels_are_valid(pr: dict) -> bool:
+        labels = pr.get("labels")
+        return isinstance(labels, list) and all(
+            (isinstance(label, str) and bool(label.strip()))
+            or (isinstance(label, dict)
+                and isinstance(label.get("name"), str)
+                and bool(label["name"].strip()))
+            for label in labels
+        )
+
+    def _authorization_baseline_required(self, repo: str, pr_number: int) -> bool:
+        """Keep per-PR authorization baselines active after repo discovery ends."""
+        if (repo, pr_number) in self._ready_for_review_at:
+            return True
+        generation_active = (
+            repo in self._pending_baseline_repos
+            or repo in self._repo_baseline_cutoff_utc
+        )
+        return (generation_active
+                and pr_number not in self._baseline_progress.get(repo, set()))
+
+    @staticmethod
+    def _next_rotating_pr(
+        repo: str, candidates: list[int], cursor: dict[str, int], excluded: set[int],
+    ) -> int | None:
+        if not candidates:
+            return None
+        start = cursor.get(repo, 0) % len(candidates)
+        for offset in range(len(candidates)):
+            index = (start + offset) % len(candidates)
+            number = candidates[index]
+            if number in excluded:
+                continue
+            cursor[repo] = (index + 1) % len(candidates)
+            return number
+        return None
+
+    def _record_draft_label_attempt(self, repo: str, pr_number: int) -> None:
+        key = (repo, pr_number)
+        attempts = min(8, self._draft_label_attempts.get(key, 0) + 1)
+        self._draft_label_attempts[key] = attempts
+        base = max(PRIORITY_BASELINE_RETRY_BASE_SECONDS,
+                   float(self.config.poll_interval_seconds))
+        delay = min(PRIORITY_BASELINE_RETRY_MAX_SECONDS,
+                    base * (2 ** min(attempts - 1, 8)))
+        self._draft_label_retry_after[key] = self._monotonic() + delay
+        while len(self._draft_label_retry_after) > 4096:
+            oldest = next(iter(self._draft_label_retry_after))
+            self._draft_label_retry_after.pop(oldest, None)
+            self._draft_label_attempts.pop(oldest, None)
+        logger.info(
+            "watcher draft status label retry scheduled repo=%s pr=%s reason=label_missing_in_open_pr_snapshot attempts=%s retry_seconds=%.1f",
+            repo, pr_number, attempts, delay,
+        )
+
+    def _draft_label_retry_ready(self, repo: str, pr_number: int) -> bool:
+        key = (repo, pr_number)
+        retry_after = self._draft_label_retry_after.get(key, 0.0)
+        projection_cache = getattr(self.proxy, "_status_label_projection", None)
+        cached_projection = (
+            projection_cache.get(key) if isinstance(projection_cache, dict) else None
+        )
+        if isinstance(cached_projection, dict):
+            proxy_retry_after = cached_projection.get("retry_at")
+            if isinstance(proxy_retry_after, (int, float)):
+                retry_after = max(retry_after, proxy_retry_after)
+        return self._monotonic() >= retry_after
+
+    def _log_draft_label_retry_state(self, repo: str, pr_number: int) -> None:
+        projection_cache = getattr(self.proxy, "_status_label_projection", None)
+        cached_projection = (
+            projection_cache.get((repo, pr_number))
+            if isinstance(projection_cache, dict) else None
+        )
+        if not isinstance(cached_projection, dict) or not cached_projection.get("failures"):
+            return
+        retry_after = cached_projection.get("retry_at", 0.0)
+        retry_seconds = max(0.0, retry_after - self._monotonic()) \
+            if isinstance(retry_after, (int, float)) else 0.0
+        logger.warning(
+            "watcher draft status label projection deferred repo=%s pr=%s reason=proxy_label_retry failures=%s retry_seconds=%.1f",
+            repo, pr_number, cached_projection.get("failures"), retry_seconds,
+        )
+
     def _ordinary_pr_cache_fresh(self, repo: str, pr_number: int, pr: dict, *, force: bool = False) -> bool:
-        if force:
+        if force or self._authorization_baseline_required(repo, pr_number):
             return False
         updated_at = pr.get("updated_at")
         head = pr.get("head")
@@ -1005,6 +1186,13 @@ class GitHubCommandWatcher:
             return False
         if cached.get("updated_at") != updated_at or cached.get("head_sha") != head_sha:
             return False
+        expected_label = cached.get("projected_label")
+        if self._pr_labels_are_valid(pr):
+            observed_labels = self._pr_status_labels(pr)
+            if (not isinstance(expected_label, str)
+                    or expected_label not in observed_labels
+                    or any(label != expected_label for label in observed_labels)):
+                return False
         processed_at = cached.get("processed_at")
         return (isinstance(processed_at, (int, float))
                 and self._monotonic() - processed_at < PR_RECONCILE_CACHE_SECONDS)
@@ -1026,8 +1214,28 @@ class GitHubCommandWatcher:
         command = state.get("command") if isinstance(state, dict) else None
         args = command.get("args") if isinstance(command, dict) else None
         pending_ids = args.get("pending_component_ids") if isinstance(args, dict) else None
+        projected_label = None
+        same_head = isinstance(state, dict) and state.get("head_sha") == head_sha
+        if same_head:
+            status = state.get("status")
+            if isinstance(status, str):
+                candidate_label = f"status: {status}".casefold()
+                if candidate_label in CANONICAL_STATUS_LABELS:
+                    projected_label = candidate_label
+            acceptance = state.get("acceptance_request")
+            if (status == "testing" and isinstance(acceptance, dict)
+                    and acceptance.get("status") == "pending"
+                    and acceptance.get("head_sha") == head_sha):
+                try:
+                    from .evidence_models import round_id_for_state
+                    if acceptance.get("round_id") == round_id_for_state(state):
+                        projected_label = "status: acceptance-required"
+                except (TypeError, ValueError):
+                    pass
         requires_reconcile = (
             not isinstance(state, dict)
+            or not same_head
+            or projected_label is None
             or state.get("status") in {"deploy-requested", "deploying", "testing"}
             or isinstance(command, dict) and command.get("phase") in {"executing", "uncertain"}
             or isinstance(pending_ids, list) and bool(pending_ids)
@@ -1039,6 +1247,7 @@ class GitHubCommandWatcher:
             "updated_at": updated_at, "head_sha": head_sha,
             "cursor": cursor if isinstance(cursor, int) and not isinstance(cursor, bool) else None,
             "status": state.get("status") if isinstance(state, dict) else None,
+            "projected_label": projected_label,
             "requires_reconcile": requires_reconcile,
             "processed_at": self._monotonic(),
         }
@@ -1048,15 +1257,8 @@ class GitHubCommandWatcher:
     def _defer_evidence_projection_for_priority(
         self, repo: str, pr_number: int, *, priority_path: bool = False,
     ) -> bool:
-        """Yield before starting another Summary write when priority work arrived."""
-        ordinary_projection_due = (
-            self._evidence_projection_fairness_due and not priority_path
-        )
-        if priority_path and self._evidence_projection_fairness_due:
-            should_defer = True
-        else:
-            should_defer = bool(self._priority_pr_queue) and not ordinary_projection_due
-        if not should_defer:
+        """Let ordinary work project; priority work yields to queued hints."""
+        if not priority_path or not self._priority_pr_queue:
             return False
         self._last_evidence_projection.pop((repo, pr_number), None)
         self._current_scan_stage = "priority_wait_before_evidence_projection"
@@ -1070,10 +1272,12 @@ class GitHubCommandWatcher:
         self, repo: str, pr_number: int, *, priority_path: bool = False,
     ) -> bool:
         """Run one PR through the existing serial writer and evidence path."""
-        baseline_pending = repo in self._pending_baseline_repos
         baseline_done = self._baseline_progress.setdefault(repo, set())
+        baseline_required = self._authorization_baseline_required(repo, pr_number)
+        baseline_ran = False
         baseline_succeeded = True
-        if baseline_pending and pr_number not in baseline_done:
+        if baseline_required:
+            baseline_ran = True
             self._current_scan_stage = "comment_baseline"
             if await self._baseline_pr(repo, pr_number):
                 baseline_done.add(pr_number)
@@ -1109,9 +1313,6 @@ class GitHubCommandWatcher:
             if changed or refresh_due:
                 self._current_scan_stage = "evidence_projection"
                 await self.controller.project_evidence(repo, pr_number)
-                if not priority_path:
-                    self._priority_cycles_since_evidence = 0
-                    self._evidence_projection_fairness_due = False
                 self._current_scan_stage = "visible_archive_migration"
                 await self.proxy.ensure_visible_evidence_archive_comments(
                     repo, pr_number, limit=2,
@@ -1126,7 +1327,7 @@ class GitHubCommandWatcher:
                     self._last_evidence_projection[key] = (projection_version, now)
                     if len(self._last_evidence_projection) > 4096:
                         self._last_evidence_projection.pop(next(iter(self._last_evidence_projection)))
-            if baseline_succeeded:
+            if baseline_succeeded and not baseline_ran:
                 await self._remember_pr_schedule(repo, pr_number, current_pr)
             else:
                 self._pr_reconcile_cache.pop((repo, pr_number), None)
@@ -1240,11 +1441,21 @@ class GitHubCommandWatcher:
                 and not current_pr.get("merged")
                 and current_pr.get("draft") is True
             )
-            if draft_pr:
+            draft_labels_valid = (
+                self._pr_labels_are_valid(current_pr) if draft_pr else False
+            )
+            draft_has_status = bool(
+                self._pr_status_labels(current_pr)
+                if draft_pr and draft_labels_valid else set()
+            )
+            if (draft_pr and draft_labels_valid and not draft_has_status
+                    and self._draft_label_retry_ready(queued_repo, pr_number)):
                 try:
+                    self._record_draft_label_attempt(queued_repo, pr_number)
                     # The controller's draft-only path projects the trusted
                     # status label without creating or advancing lifecycle.
                     await self.controller.reconcile_pr(queued_repo, pr_number)
+                    self._log_draft_label_retry_state(queued_repo, pr_number)
                 except Exception as exc:
                     self._priority_pr_set.discard(item)
                     self._priority_pr_enqueued_at.pop(item, None)
@@ -1259,7 +1470,12 @@ class GitHubCommandWatcher:
                         "watcher draft status label projection %s#%s failed: %s",
                         queued_repo, pr_number, type(exc).__name__,
                     )
+                    if self._github_backing_off():
+                        break
                     continue
+            elif draft_pr and draft_has_status:
+                self._draft_label_retry_after.pop((queued_repo, pr_number), None)
+                self._draft_label_attempts.pop((queued_repo, pr_number), None)
             if (not isinstance(current_pr, dict) or current_pr.get("state") != "open"
                     or current_pr.get("merged") or current_pr.get("draft")):
                 failure_reason = "pr_is_draft" if draft_pr else "pr_not_open"
@@ -1277,14 +1493,16 @@ class GitHubCommandWatcher:
                 self._priority_pr_enqueued_at.pop(item, None)
                 self._priority_pr_sources.pop(item, None)
                 self._clear_priority_baseline_retry(item)
+                if self._github_backing_off():
+                    cycle_ok = False
+                    break
                 continue
             if item not in self._priority_pr_queue:
                 self._priority_pr_set.discard(item)
                 self._priority_pr_enqueued_at.pop(item, None)
                 self._priority_pr_sources.pop(item, None)
             baseline_only = (
-                queued_repo in self._pending_baseline_repos
-                and pr_number not in self._baseline_progress.get(queued_repo, set())
+                self._authorization_baseline_required(queued_repo, pr_number)
             )
             attempt_started = self._monotonic()
             self._current_scan_stage = "priority_pr_processing"
@@ -1367,13 +1585,6 @@ class GitHubCommandWatcher:
 
         # Discovery is read-only and runs independently; this remains the
         # single serial worker for every Lifecycle or evidence write.
-        priority_backlog_for_cycle = bool(self._priority_pr_queue)
-        if priority_backlog_for_cycle:
-            self._priority_cycles_since_evidence += 1
-            if self._priority_cycles_since_evidence >= EVIDENCE_PROJECTION_PRIORITY_INTERVAL:
-                self._evidence_projection_fairness_due = True
-        elif not self._evidence_projection_fairness_due:
-            self._priority_cycles_since_evidence = 0
         self._current_scan_stage = "priority_queue"
         cycle_ok = await self._drain_priority_prs(
             priority_done, priority_attempted, recent_attempted,
@@ -1476,6 +1687,29 @@ class GitHubCommandWatcher:
                 valid_prs.sort(key=lambda item: item[0])
                 open_numbers = [number for number, _ in valid_prs]
                 pr_by_number = {number: pr for number, pr in valid_prs}
+                baseline_numbers = [
+                    number for number, pr in valid_prs if pr.get("draft") is not True
+                ]
+                active_pr_numbers = []
+                draft_missing_label_numbers = []
+                for number, pr in valid_prs:
+                    labels_valid = self._pr_labels_are_valid(pr)
+                    if not labels_valid:
+                        continue
+                    status_labels = self._pr_status_labels(pr)
+                    if pr.get("draft") is True:
+                        draft_key = (repo, number)
+                        if status_labels:
+                            self._draft_label_retry_after.pop(draft_key, None)
+                            self._draft_label_attempts.pop(draft_key, None)
+                        elif self._draft_label_retry_ready(repo, number):
+                            draft_missing_label_numbers.append(number)
+                        continue
+                    self._draft_label_retry_after.pop((repo, number), None)
+                    self._draft_label_attempts.pop((repo, number), None)
+                    if (not status_labels
+                            or status_labels.intersection(ACTIVE_PROJECTION_STATUS_LABELS)):
+                        active_pr_numbers.append(number)
                 baseline_all = repo in self._pending_baseline_repos
                 selected = list(priority_attempted.get(repo, []))
                 priority_count = len(selected)
@@ -1489,8 +1723,60 @@ class GitHubCommandWatcher:
                     queued_number for queued_repo, queued_number in self._priority_pr_queue
                     if queued_repo == repo
                 )
+                reserve_ordinary = min(1, remaining_normal)
+                active_selected = 0
+                draft_selected = 0
+
+                def select_rotating_lane(
+                    candidates: list[int], cursor: dict[str, int],
+                ) -> bool:
+                    number = self._next_rotating_pr(repo, candidates, cursor, selected_set)
+                    if number is None:
+                        return False
+                    selected.append(number)
+                    selected_set.add(number)
+                    return True
+
+                if remaining_normal == 1:
+                    lane_start = self._normal_pr_lane_cursor.get(repo, 0) % 3
+                    for offset in range(3):
+                        lane = (lane_start + offset) % 3
+                        if lane == 0 and select_rotating_lane(
+                                active_pr_numbers, self._active_pr_cursor):
+                            active_selected = 1
+                            self._normal_pr_lane_cursor[repo] = 1
+                            break
+                        if lane == 1 and select_rotating_lane(
+                                draft_missing_label_numbers, self._draft_pr_cursor):
+                            draft_selected = 1
+                            self._normal_pr_lane_cursor[repo] = 2
+                            break
+                        if lane == 2:
+                            self._normal_pr_lane_cursor[repo] = 0
+                            break
+                elif remaining_normal > 1:
+                    special_budget = remaining_normal - reserve_ordinary
+                    if special_budget >= 2:
+                        active_selected = int(select_rotating_lane(
+                            active_pr_numbers, self._active_pr_cursor,
+                        ))
+                        draft_selected = int(select_rotating_lane(
+                            draft_missing_label_numbers, self._draft_pr_cursor,
+                        ))
+                    elif special_budget == 1:
+                        lane_start = self._normal_pr_lane_cursor.get(repo, 0) % 2
+                        for offset in range(2):
+                            lane = (lane_start + offset) % 2
+                            candidates = active_pr_numbers if lane == 0 else draft_missing_label_numbers
+                            cursor = self._active_pr_cursor if lane == 0 else self._draft_pr_cursor
+                            if select_rotating_lane(candidates, cursor):
+                                active_selected = int(lane == 0)
+                                draft_selected = int(lane == 1)
+                                self._normal_pr_lane_cursor[repo] = (lane + 1) % 2
+                                break
                 recent_pool = sorted(
-                    valid_prs,
+                    [(number, pr) for number, pr in valid_prs
+                     if pr.get("draft") is not True and number not in active_pr_numbers],
                     key=lambda item: str(item[1].get("updated_at") or ""),
                     reverse=True,
                 )[:12]
@@ -1503,9 +1789,10 @@ class GitHubCommandWatcher:
                 else:
                     fast_lane = list(recent_pool)
                 skipped_numbers: set[int] = set()
-                reserve_ordinary = min(1, remaining_normal)
                 recent_budget = min(
-                    fast_lane_size, max(0, remaining_normal - reserve_ordinary),
+                    fast_lane_size,
+                    max(0, remaining_normal - reserve_ordinary
+                        - active_selected - draft_selected),
                 )
                 for number, pr in fast_lane:
                     if len(selected) >= pr_work_budget or recent_budget <= 0:
@@ -1531,6 +1818,9 @@ class GitHubCommandWatcher:
                         scanned += 1
                         ordinary_cursor_after = (scan_start + scanned) % len(open_numbers)
                         if number in selected_set or number in skipped_numbers:
+                            continue
+                        if (pr_by_number[number].get("draft") is True
+                                or number in active_pr_numbers):
                             continue
                         if self._ordinary_pr_cache_fresh(
                                 repo, number, pr_by_number[number], force=baseline_all):
@@ -1567,12 +1857,11 @@ class GitHubCommandWatcher:
                             # enter baseline dispatch, reconciliation of review
                             # evidence, or command handling. Only the trusted
                             # status-label projection runs.
+                            self._record_draft_label_attempt(repo, number)
                             await self.controller.reconcile_pr(repo, number)
+                            self._log_draft_label_retry_state(repo, number)
                             self._fail_recent_commands_for_pr(
                                 repo, number, "pr_is_draft", retryable=False,
-                            )
-                            await self._remember_pr_schedule(
-                                repo, number, pr_by_number[number],
                             )
                             processed.append(number)
                             self._record_pr_attempt(
@@ -1625,10 +1914,10 @@ class GitHubCommandWatcher:
 
                 if baseline_all:
                     progress = self._baseline_progress.setdefault(repo, set())
-                    if all(number in progress for number in open_numbers):
+                    if all(number in progress for number in baseline_numbers):
                         self._pending_baseline_repos.discard(repo)
                 remaining = (
-                    sum(number not in self._baseline_progress.get(repo, set()) for number in open_numbers)
+                    sum(number not in self._baseline_progress.get(repo, set()) for number in baseline_numbers)
                     if repo in self._pending_baseline_repos else 0
                 )
                 self._repo_backlog[repo] = {
@@ -1700,17 +1989,52 @@ class GitHubCommandWatcher:
         """Baseline old commands without replaying historical business commands.
 
         Used on first observation AND when a repo is newly (re)activated by an
-        authorization refresh: the cursor is advanced to the maximum comment
-        id observed on GitHub so preexisting comments never execute as fresh
-        approvals. Commands posted AFTER the baseline persist are processed
-        normally by subsequent cycles. Historical commands are never replayed.
+        authorization refresh or a Ready-for-Review event. Advance only
+        through comments at or before the effective cutoff; later comments
+        remain eligible for subsequent cycles after the cursor is persisted.
 
         For PRs that already have a baselined cursor (existing lifecycle state
-        from a previous authorized period), advance the cursor to the maximum
-        observed comment id using ``persist_cursor`` so that any commands
-        posted while the repo was unauthorized are skipped on reactivation.
+        from a previous authorized period), preserve that cursor as a lower
+        bound while advancing through eligible comments.
         """
         from .evidence_models import EvidenceError, round_id_for_state
+
+        key = (repo, pr_number)
+        authorization_cutoff = self._repo_baseline_cutoff_utc.get(repo)
+        ready_cutoff = self._ready_for_review_at.get(key)
+        if (authorization_cutoff is not None
+                and (not isinstance(authorization_cutoff, datetime)
+                     or authorization_cutoff.tzinfo is None
+                     or authorization_cutoff.utcoffset() is None)):
+            logger.warning("watcher baseline authorization cutoff invalid %s#%s", repo, pr_number)
+            return False
+        if repo in self._pending_baseline_repos and authorization_cutoff is None:
+            logger.warning("watcher baseline authorization cutoff missing %s#%s", repo, pr_number)
+            return False
+        if (ready_cutoff is not None
+                and (not isinstance(ready_cutoff, datetime)
+                     or ready_cutoff.tzinfo is None or ready_cutoff.utcoffset() is None)):
+            logger.warning("watcher ready baseline cutoff invalid %s#%s", repo, pr_number)
+            return False
+        cutoffs = [cutoff.astimezone(timezone.utc)
+                   for cutoff in (authorization_cutoff, ready_cutoff)
+                   if isinstance(cutoff, datetime)]
+        effective_cutoff = max(cutoffs) if cutoffs else None
+
+        def baseline_boundary_current() -> bool:
+            if (not self.config.auth_valid or repo not in self.config.active_repos
+                    or repo not in self.config.github_repos
+                    or self._repo_baseline_cutoff_utc.get(repo) != authorization_cutoff):
+                return False
+            current_ready_cutoff = self._ready_for_review_at.get(key)
+            if current_ready_cutoff is None:
+                return True
+            if (not isinstance(current_ready_cutoff, datetime)
+                    or current_ready_cutoff.tzinfo is None
+                    or current_ready_cutoff.utcoffset() is None):
+                return False
+            return (effective_cutoff is not None
+                    and current_ready_cutoff <= effective_cutoff)
 
         initial_state = await self.proxy.read_hidden_state(repo, pr_number)
         expected_state = initial_state
@@ -1719,7 +2043,8 @@ class GitHubCommandWatcher:
         if _needs_initial_comment_baseline(initial_state):
             # --- First-observation / baseline-incomplete path ---
             pr_info = await self.proxy.get_pr(repo, pr_number)
-            if not pr_info or pr_info.get("state") != "open":
+            if (not pr_info or pr_info.get("state") != "open"
+                    or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
                     await self.controller.reconcile_pr(repo, pr_number)
                 return False
@@ -1732,6 +2057,9 @@ class GitHubCommandWatcher:
                     "watcher baseline snapshot-before %s#%s: %s \u2014 fail closed",
                     repo, pr_number, e,
                 )
+                return False
+            if (not isinstance(comments_before, list)
+                    or any(not isinstance(comment, dict) for comment in comments_before)):
                 return False
 
             max_cid_before = 0
@@ -1765,20 +2093,41 @@ class GitHubCommandWatcher:
                     repo, pr_number, e,
                 )
                 return False
+            if (not isinstance(comments_after, list)
+                    or any(not isinstance(comment, dict) for comment in comments_after)):
+                return False
 
-            max_cid_after = 0
-            for c in comments_after:
-                cid = c.get("id")
-                if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_after:
-                    max_cid_after = cid
-
-            baseline_id = max(max_cid_before, max_cid_after)
+            old_cursor = 0
+            if isinstance(initial_state, dict):
+                old_cursor = initial_state.get("last_processed_comment_id", 0)
+                if (not isinstance(old_cursor, int) or isinstance(old_cursor, bool)
+                        or old_cursor < 0):
+                    return False
+            if effective_cutoff is not None:
+                baseline_id = self._comment_cursor_through_cutoff(
+                    comments_before + comments_after, effective_cutoff,
+                    lower_bound=old_cursor,
+                )
+                if baseline_id is None:
+                    logger.warning(
+                        "watcher baseline comment cutoff invalid %s#%s \u2014 fail closed",
+                        repo, pr_number,
+                    )
+                    return False
+            else:
+                max_cid_after = 0
+                for c in comments_after:
+                    cid = c.get("id")
+                    if isinstance(cid, int) and not isinstance(cid, bool) and cid > max_cid_after:
+                        max_cid_after = cid
+                baseline_id = max(old_cursor, max_cid_before, max_cid_after)
         else:
             # --- Existing baselined PR \u2014 reactivation cursor advance ---
             # The PR has a real cursor state. Advance cursor to max(old, observed)
             # without resetting business fields.
             pr_info = await self.proxy.get_pr(repo, pr_number)
-            if not pr_info or pr_info.get("state") != "open":
+            if (not pr_info or pr_info.get("state") != "open"
+                    or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
                     await self.controller.reconcile_pr(repo, pr_number)
                 return False
@@ -1791,39 +2140,29 @@ class GitHubCommandWatcher:
                     repo, pr_number, e,
                 )
                 return False
+            if (not isinstance(comments, list)
+                    or any(not isinstance(comment, dict) for comment in comments)):
+                return False
 
             old_cursor = initial_state.get("last_processed_comment_id", 0)
             if (not isinstance(old_cursor, int) or isinstance(old_cursor, bool)
                     or old_cursor < 0):
                 return False
-            cutoff = self._repo_baseline_cutoff_utc.get(repo)
-            if not isinstance(cutoff, datetime) or cutoff.tzinfo is None:
+            if effective_cutoff is None:
                 logger.warning("watcher baseline cutoff missing %s#%s — fail closed", repo, pr_number)
                 return False
-            baseline_id = old_cursor
             try:
-                ordered_comments = sorted(comments, key=lambda c: c["id"])
-                for comment in ordered_comments:
-                    cid = comment.get("id")
-                    if not isinstance(cid, int) or isinstance(cid, bool) or cid < 0:
-                        return False
-                    if cid <= old_cursor:
-                        continue
-                    created_at = comment.get("created_at")
-                    if not isinstance(created_at, str) or not created_at.strip():
-                        break
-                    try:
-                        created_utc = datetime.fromisoformat(
-                            created_at.strip().replace("Z", "+00:00")
-                        )
-                    except ValueError:
-                        break
-                    if created_utc.tzinfo is None or created_utc.utcoffset() is None:
-                        break
-                    if created_utc.astimezone(timezone.utc) > cutoff.astimezone(timezone.utc):
-                        break
-                    baseline_id = cid
-            except (TypeError, KeyError):
+                ordered_comments = sorted(comments, key=lambda comment: comment["id"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            baseline_id = self._comment_cursor_through_cutoff(
+                ordered_comments, effective_cutoff, lower_bound=old_cursor,
+            )
+            if baseline_id is None:
+                logger.warning(
+                    "watcher baseline comment cutoff invalid %s#%s \u2014 fail closed",
+                    repo, pr_number,
+                )
                 return False
 
             # A restart/authorization baseline must not jump over unarchived
@@ -1865,8 +2204,10 @@ class GitHubCommandWatcher:
                             str(candidate.get("created_at", "")).replace("Z", "+00:00")
                         )
                     except ValueError:
-                        continue
-                    if created.tzinfo is None or created <= round_started:
+                        return False
+                    if (created.tzinfo is None or created.utcoffset() is None):
+                        return False
+                    if created <= round_started:
                         continue
                     if evidence_service is None:
                         return False
@@ -1967,11 +2308,17 @@ class GitHubCommandWatcher:
         expected_head = expected_state.get("head_sha") if isinstance(expected_state, dict) else None
         expected_status = expected_state.get("status") if isinstance(expected_state, dict) else None
         if (not isinstance(latest_pr, dict) or latest_pr.get("state") != "open"
-                or latest_pr.get("merged")
+                or latest_pr.get("merged") or latest_pr.get("draft")
                 or (latest_pr.get("head") or {}).get("sha") != expected_head
                 or not isinstance(latest_state, dict)
                 or latest_state.get("head_sha") != expected_head
                 or latest_state.get("status") != expected_status):
+            return False
+        if not baseline_boundary_current():
+            logger.warning(
+                "watcher baseline boundary changed %s#%s \u2014 fail closed",
+                repo, pr_number,
+            )
             return False
 
         # Persist baseline cursor (shared by both paths).
@@ -2003,6 +2350,16 @@ class GitHubCommandWatcher:
                 repo, pr_number, persisted_cid, baseline_id,
             )
             return False
+        if not baseline_boundary_current():
+            logger.warning(
+                "watcher baseline boundary changed after cursor write %s#%s \u2014 retry required",
+                repo, pr_number,
+            )
+            return False
+        latest_ready_cutoff = self._ready_for_review_at.get(key)
+        if (latest_ready_cutoff is not None and effective_cutoff is not None
+                and latest_ready_cutoff <= effective_cutoff):
+            self._ready_for_review_at.pop(key, None)
         return True
 
     async def _process_pr(self, repo: str, pr_number: int) -> None:
@@ -2158,6 +2515,13 @@ class GitHubCommandWatcher:
 
         for c in new_comments:
             comment_id = c["id"]
+            recent_command = self._recent_command_records.get(
+                (repo, pr_number, comment_id),
+            )
+            if (isinstance(recent_command, dict)
+                    and recent_command.get("failure_reason") == "pr_is_draft"):
+                await self._consume_comment_cursor(repo, pr_number, comment_id)
+                continue
 
             # Skip bot's own lifecycle comments — fresh-read body to avoid stale-body TOCTOU
             try:

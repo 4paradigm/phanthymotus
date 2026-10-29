@@ -124,7 +124,14 @@ async def webhook(request: Request):
         if delivery_id in delivery_set:
             return {"status": "duplicate"}
     try:
-        enqueued = request.app.state.watcher.enqueue_pr(repo, pr_number)
+        if x_github_event == "pull_request":
+            enqueued = request.app.state.watcher.enqueue_pr(
+                repo, pr_number,
+                action=action,
+                event_updated_at=pull_request.get("updated_at"),
+            )
+        else:
+            enqueued = request.app.state.watcher.enqueue_pr(repo, pr_number)
     except Exception as exc:
         logger.warning(
             "webhook enqueue failed repo=%s pr=%s exception=%s",
