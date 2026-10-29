@@ -48,6 +48,8 @@ class Nav2ContractTest(unittest.TestCase):
             {"livo_odom", "registered_cloud", "static_map", "goal_pose"},
         )
         self.assertEqual(inputs["livo_odom"]["topic"], "/ubuntu/navigation/odom")
+        self.assertEqual(inputs["livo_odom"]["format"], "sensor/odometry")
+        self.assertEqual(inputs["livo_odom"]["ros_type"], "nav_msgs/msg/Odometry")
         self.assertEqual(
             inputs["registered_cloud"]["topic"],
             "/ubuntu/navigation/cloud_registered",
@@ -90,11 +92,13 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertEqual(plan["format"], "sensor/path")
         self.assertEqual(plan["ros_type"], "nav_msgs/msg/Path")
         self.assertEqual(plan["schema"], "phanthy.navigation.path.v1")
+        self.assertEqual(plan["frame_id"], "map")
         costmap = outputs["costmap"]
         self.assertEqual(costmap["topic"], "/global_costmap/costmap")
         self.assertEqual(costmap["format"], "sensor/costmap")
         self.assertEqual(costmap["ros_type"], "nav_msgs/msg/OccupancyGrid")
         self.assertEqual(costmap["schema"], "phanthy.navigation.costmap.v1")
+        self.assertEqual(costmap["frame_id"], "map")
         self.assertTrue(costmap["default_preview"])
 
         self.assertNotIn("x-execution-control", tool)

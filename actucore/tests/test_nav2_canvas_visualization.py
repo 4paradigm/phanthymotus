@@ -58,26 +58,6 @@ class Nav2VisualizationContractTest(unittest.TestCase):
                 self.assertEqual(receipt["collision"], collision)
                 self.assertEqual(receipt["unknown"], unknown)
 
-    def test_planning_topics_declare_native_navigation_messages(self) -> None:
-        planning = nav2_tool_definition("robot")
-        inputs = _by_port(planning["topic_in"])
-        outputs = _by_port(planning["topic_out"])
-        expected = {
-            "livo_odom": (inputs, "/robot/navigation/odom", "sensor/odometry", "nav_msgs/msg/Odometry"),
-            "plan": (outputs, "/plan", "sensor/path", "nav_msgs/msg/Path"),
-            "costmap": (outputs, "/global_costmap/costmap", "sensor/costmap", "nav_msgs/msg/OccupancyGrid"),
-        }
-        for port, (topics, topic, fmt, ros_type) in expected.items():
-            with self.subTest(port=port):
-                self.assertEqual(topics[port]["topic"], topic)
-                self.assertEqual(topics[port]["format"], fmt)
-                self.assertEqual(topics[port]["ros_type"], ros_type)
-        self.assertEqual(outputs["plan"]["schema"], "phanthy.navigation.path.v1")
-        self.assertEqual(outputs["plan"]["frame_id"], "map")
-        self.assertEqual(outputs["costmap"]["schema"], "phanthy.navigation.costmap.v1")
-        self.assertEqual(outputs["costmap"]["frame_id"], "map")
-        self.assertTrue(outputs["costmap"]["default_preview"])
-
     def test_unified_card_keeps_auxiliary_topics_out_of_canvas_outputs(self) -> None:
         tool = navigation_tool_definition("robot")
         planning = nav2_tool_definition("robot")
