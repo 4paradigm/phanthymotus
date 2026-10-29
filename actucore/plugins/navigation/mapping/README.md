@@ -62,8 +62,11 @@ adapter 对 FAST-LIVO2 原始 odom/cloud 使用
 仍 fail closed，不会因为缓存的旧 age 伪装成新鲜数据。live
 PointCloud2 的 XYZ 解码、刚体变换、高度过滤和 float32 输出打包走 NumPy
 批处理；边界、字段、有限值、点数和字节上限仍在发布前 fail closed。
-每帧还必须包含单调 `timestamp`，且点时间位于 header 后 `200 ms` 内并具有
-非零跨度。adapter 只从 TF2 获取 `base_link -> sensor_frame`，不再保存本体
+输入方必须保证每帧 `timestamp` 单调、点时间位于 header 后 `200 ms` 内且具有
+非零跨度。mapper 的运行诊断和 adapter 只检查实际处理的扫描跨度及 frame，
+不会逐点验证时间戳的单调性或其相对 header 的范围；独立的
+`absolute_point_time_span_ms` 辅助函数不在运行路径中，不能把它的单元测试当成
+输入校验的运行证据。adapter 只从 TF2 获取 `base_link -> sensor_frame`，不再保存本体
 专用六自由度外参。首个 raw odom 离会话原点超过 `2 m`、相邻线速度超过
 `10 m/s` 或角速度超过 `4π rad/s` 时进入 `raw_odom_discontinuity`，并在当前
 地图会话内锁存；仅 reset、新建/加载地图或成功重定位会解除。重复时间戳等

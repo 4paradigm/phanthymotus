@@ -96,9 +96,10 @@ Driver 卡片合并后的连线：
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。FAST-LIVO2 mapper 从实际进入其 callback 和处理循环的数据中，
 以 1 Hz 报告 LiDAR/IMU frame、源时间戳和实际扫描跨度；adapter 不再重复订阅
-原始高频 LiDAR/IMU，也不再复制整帧点云做旁路校验。adapter 只消费 mapper
-运行统计和 FAST-LIVO2 raw odom/cloud，负责 TF、坐标归一化与地图生成。状态会
-显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
+原始高频 LiDAR/IMU，也不再复制整帧点云做旁路校验。运行统计检查实际扫描跨度，
+不逐点验证时间单调性或点时间相对 header 的范围；这些仍由输入方保证。
+adapter 只消费 mapper 运行统计和 FAST-LIVO2 raw odom/cloud，负责 TF、坐标
+归一化与地图生成。状态会显示 `sensor_frame`、TF、点时间跨度和 `odom_health`；
 几何契约不满足时返回 `sensor_frame_mismatch`、`sensor_tf_unavailable` 或
 `raw_odom_discontinuity`，不会继续生成伪正常地图；几何跳变会在当前
 地图会话内锁存，需要重置或切换地图会话才能恢复。

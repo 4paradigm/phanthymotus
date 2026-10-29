@@ -87,12 +87,39 @@ def test_platform_ros_build_and_jp61_environment():
     assert 'COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/' in dockerfile
     assert '--packages-select audio_msgs fast_livo2 segmented_controller nav2' in dockerfile
     assert '--packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release' in dockerfile
+    assert 'AUDIO_MSGS_INDEX=present' in dockerfile
+    assert 'AUDIO_MSGS_PREFIX=present' in dockerfile
+    assert '/ros_ws/install/audio_msgs/share/ament_index/resource_index/packages/audio_msgs' in dockerfile
     assert 'ros2 pkg prefix audio_msgs >/dev/null' in dockerfile
     assert 'from audio_msgs.msg import AudioChunk' in dockerfile
     assert 'ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"' in dockerfile
     assert 'ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"' in dockerfile
     assert 'ACTUCORE_JP_VERSION=${JP_VERSION}' in dockerfile
     assert 'if [ \\"${ACTUCORE_JP_VERSION}\\" = 511 ]; then source /opt/ros_deps_ws/install/setup.bash' in dockerfile
+
+
+@pytest.mark.parametrize('index_exists,prefix_present', [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_audio_index_diagnostic_checks_real_shell_environment(tmp_path, index_exists, prefix_present):
+    final = (ROOT / 'actucore/Dockerfile.jetson').read_text().rsplit('\nFROM ', 1)[1]
+    check = final.split('    if [ -f /ros_ws/install/audio_msgs/share/', 1)[1]
+    check = ('if [ -f /ros_ws/install/audio_msgs/share/' +
+             check.split('    ros2 pkg prefix audio_msgs', 1)[0])
+    index = tmp_path / 'audio_msgs/share/ament_index/resource_index/packages/audio_msgs'
+    if index_exists:
+        index.parent.mkdir(parents=True)
+        index.touch()
+    check = check.replace('/ros_ws/install/audio_msgs', str(tmp_path / 'audio_msgs'))
+    check = check.replace('\\\n', '\n') + 'true\n'
+    prefix = str(tmp_path / 'audio_msgs') if prefix_present else str(tmp_path / 'other')
+    result = subprocess.run(['bash', '-e', '-c', check],
+                            env={'AMENT_PREFIX_PATH': prefix}, capture_output=True, text=True)
+    assert (result.returncode == 0) is index_exists
+    assert ('AUDIO_MSGS_INDEX=present' in result.stdout) is index_exists
+    if index_exists:
+        assert ('AUDIO_MSGS_PREFIX=present' in result.stdout) is prefix_present
+        assert ('AUDIO_MSGS_PREFIX=missing' in result.stderr) is not prefix_present
 
 
 @pytest.mark.parametrize('output,status,success', [

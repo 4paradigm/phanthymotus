@@ -105,6 +105,13 @@ RUN find /ros_ws/install /opt/ros/humble/install -name "site-packages" -type d \
       source /ros_ws/install/setup.bash && cd /work && \
       python3 -c "import main; cfg=main._load_config(); assert cfg['plugins']['controlled_semantic_spatial']['enabled'] is False; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla', 'navi'}; print('JP61_CARD_INVENTORY=PASS')"; \
     fi && \
+    if [ -f /ros_ws/install/audio_msgs/share/ament_index/resource_index/packages/audio_msgs ]; then \
+      echo 'AUDIO_MSGS_INDEX=present'; \
+    else echo 'AUDIO_MSGS_INDEX=missing' >&2; exit 1; fi && \
+    case ":${AMENT_PREFIX_PATH-}:" in \
+      *:/ros_ws/install/audio_msgs:*) echo 'AUDIO_MSGS_PREFIX=present' ;; \
+      *) echo 'AUDIO_MSGS_PREFIX=missing' >&2 ;; \
+    esac && \
     ros2 pkg prefix audio_msgs >/dev/null && \
     python3 -c "from audio_msgs.msg import AudioChunk" && \
     test ! -e /ros_ws/src && test ! -e /ros_ws/build && test ! -e /ros_ws/log
