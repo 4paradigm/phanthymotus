@@ -11,6 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None
+
 
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
@@ -187,6 +192,49 @@ def _external_bindings():
 
 
 class NavigationContractTest(unittest.TestCase):
+    @unittest.skipIf(jsonschema is None, "Agent Core jsonschema dependency is unavailable")
+    def test_mainline_lifecycle_payloads_pass_strict_schema(self):
+        schema = navigation_tool_definition("ubuntu")["inputSchema"]
+        topics = [
+            "/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
+            "/ubuntu/camera/rgb_frame", "/ubuntu/camera/depth_frame",
+        ]
+        # Upstream _upstream_camera_info copies Driver declarations by topic.
+        rgb = {
+            "schema": "motus.camera/1", "topic": topics[2],
+            "id": "vendor/model/rgb", "format": "sensor/image",
+            "width": 640, "height": 480, "distortion_model": "pinhole",
+            "D": None, "K": None, "half_fov_rad": None,
+            "half_fov_v_rad": None, "source": "unknown", "measured_on": "",
+            "pipeline": [], "vendor": {},
+        }
+        depth = {**rgb, "topic": topics[3], "id": "vendor/model/depth"}
+        start = {
+            "action": "start", "instance_id": "card-1", "input_topics": topics,
+            "input_topic": topics[0],
+            "camera_info": {topics[2]: rgb, topics[3]: depth},
+        }
+        info = {
+            "action": "info", "instance_id": "card-1", "input_topics": topics,
+            "input_topic": topics[0],
+        }
+        for args in (start, info, {"action": "info", "instance_id": "card-1"},
+                     {"action": "start", "instance_id": "card-1",
+                      "input_topic": topics[0]},
+                     {"action": "start", "control_interface": {}}):
+            with self.subTest(args=args):
+                jsonschema.validate(instance=args, schema=schema)
+        for value in ({"schema": "motus.control/1"}, None, [], "descriptor"):
+            with self.subTest(control_interface=value):
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(
+                        instance={"action": "start", "control_interface": value},
+                        schema=schema,
+                    )
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(instance={"action": "info", "unexpected": True},
+                                schema=schema)
+
     def test_one_public_card_hides_internal_ros_edges(self):
         tool = navigation_tool_definition("ubuntu")
         self.assertEqual(tool["name"], "ControlledSemanticSpatial")
@@ -669,6 +717,52 @@ class NavigationPluginTest(unittest.TestCase):
             planning_plugin=planning or FakeComponent("planning"),
             semantic_plugin=semantic or FakeComponent("semantic"),
         )
+
+    def test_mainline_start_and_info_with_camera_metadata(self):
+        plugin = self.make_plugin()
+        topics = [
+            "/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
+            "/ubuntu/camera/rgb_frame", "/ubuntu/camera/depth_frame",
+        ]
+        start = {
+            "action": "start", "instance_id": "card-1",
+            "input_topics": topics, "input_topic": topics[0],
+            "camera_info": {
+                topics[2]: {"schema": "motus.camera/1", "topic": topics[2],
+                            "id": "vendor/model/rgb", "source": "unknown"},
+                topics[3]: {"schema": "motus.camera/1", "topic": topics[3],
+                            "id": "vendor/model/depth", "source": "unknown"},
+            },
+        }
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
+        info = plugin.dispatch(plugin.PREFIX, {
+            "action": "info", "instance_id": "card-1",
+            "input_topics": topics, "input_topic": topics[0],
+        })
+        self.assertEqual(info["state"], "ready")
+
+    def test_direct_start_rejects_unsupported_control_negotiation(self):
+        runtime = FakeRuntime()
+        mapping = FakeComponent("mapping")
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping)
+        for descriptor in ({"schema": "motus.control/1"}, None, [], "descriptor"):
+            with self.subTest(descriptor=descriptor):
+                result = plugin.dispatch(plugin.PREFIX, {
+                    "action": "start", "input_bindings": _external_bindings(),
+                    "control_interface": descriptor,
+                })
+                self.assertEqual(result["error_code"], "unsupported_control_interface")
+                self.assertFalse(runtime.started)
+                self.assertEqual(mapping.calls, [])
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start", "input_bindings": _external_bindings(),
+            "control_interface": {},
+        })
+        self.assertEqual(result["state"], "ready")
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start", "control_interface": {"schema": "motus.control/1"},
+        })
+        self.assertEqual(result["error_code"], "unsupported_control_interface")
 
     def test_all_operational_actions_reject_idle_before_component_dispatch(self):
         runtime = FakeRuntime()

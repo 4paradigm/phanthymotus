@@ -109,6 +109,22 @@ def _action_properties() -> dict:
                 result.setdefault(key, deepcopy(value))
     for key, value in NAVIGATION_CONFIG_SCHEMA["properties"].items():
         result[key] = deepcopy(value)
+    result["camera_info"] = {
+        "type": "object",
+        "description": (
+            "Upstream camera declarations keyed by topic; accepted for mainline "
+            "compatibility but not adopted as navigation calibration."
+        ),
+        "additionalProperties": {"type": "object"},
+    }
+    result["control_interface"] = {
+        "type": "object",
+        "maxProperties": 0,
+        "description": (
+            "Control-interface negotiation is unsupported; non-empty descriptors "
+            "are rejected. The navigation output uses data/json."
+        ),
+    }
     return result
 
 

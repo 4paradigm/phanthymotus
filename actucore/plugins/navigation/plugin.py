@@ -114,6 +114,14 @@ class NavigationPlugin:
         if not isinstance(args, dict):
             return self._error("invalid_argument", "arguments must be an object")
         action = args.get("action")
+        if action == "start" and "control_interface" in args:
+            descriptor = args["control_interface"]
+            if not isinstance(descriptor, dict) or descriptor:
+                return self._error(
+                    "unsupported_control_interface",
+                    "control_interface negotiation is unsupported; "
+                    "only an empty object is accepted",
+                )
         if action == "info":
             return self._info()
         if action == "config":
