@@ -25,9 +25,8 @@
 | odom | `/ubuntu/navigation/odom` | 同卡片 FAST-LIVO2 模块 |
 | map status | `/ubuntu/navigation/fast_livo2/status` | 同卡片 FAST-LIVO2 模块 |
 
-`goal_pose` topic 仅保留为兼容的可选外部控制入口。语义 `navigate` 的正常路径
-不再 publish 后等待另一个卡片订阅，而是使用进程内 planner handler，以免
-Canvas 自连线缺失导致目标丢失。
+语义 `navigate` 使用进程内 planner handler；不再提供 `goal_pose` 外部 topic
+入口，也不再向其发布。未接入 planner 时明确返回 `planner_unavailable`。
 
 ## 限制
 

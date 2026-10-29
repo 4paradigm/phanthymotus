@@ -243,8 +243,8 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertEqual(tool["name"], "controlled_semantic_spatial")
         self.assertEqual(tool["displayName"], "controlled_semantic_spatial")
         self.assertEqual(
-            {item["port"] for item in tool["topic_in"]},
-            {"lidar", "imu", "rgb", "goal_pose"},
+            [item["port"] for item in tool["topic_in"]],
+            ["lidar", "imu", "rgb"],
         )
         optional_inputs = {
             item["port"]
@@ -253,7 +253,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         }
         self.assertEqual(
             optional_inputs,
-            {"rgb", "goal_pose"},
+            {"rgb"},
         )
         self.assertEqual(
             {
@@ -273,9 +273,6 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
             "application/vnd.phanthy.sensor-envelope.v1",
         )
         self.assertEqual(inputs["rgb"]["schema"], "phanthy.sensor.camera_rgb_frame.v1")
-        self.assertEqual(inputs["goal_pose"]["topic"], "/ubuntu/navigation/goal_pose")
-        self.assertEqual(inputs["goal_pose"]["schema"], "phanthy.navigation.goal.v1")
-        self.assertFalse(inputs["goal_pose"]["monitor"])
         self.assertNotIn("livo_odom", {item["port"] for item in tool["topic_in"]})
         self.assertEqual(
             [item["port"] for item in tool["topic_out"]],
@@ -303,8 +300,6 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertEqual(auxiliary["livo_odom"]["format"], "sensor/odometry")
         self.assertNotIn("x-topic-actions", tool)
         self.assertEqual(tool["inputSchema"].get("x-topic-actions", []), [])
-        self.assertEqual(inputs["goal_pose"]["ros_type"], "std_msgs/msg/String")
-        self.assertFalse(inputs["goal_pose"]["required"])
         self.assertTrue(
             {
                 "livo_odom",
@@ -1229,6 +1224,35 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             {item["port"] for item in semantic_start["input_bindings"]},
             {"rgb", "livo_odom", "livo_status"},
         )
+
+    def test_start_rejects_legacy_goal_topic_config(self):
+        for key in ("goal_topic", "subscriber_timeout_sec"):
+            with self.subTest(key=key):
+                runtime = FakeRuntime()
+                plugin = ControlledSemanticSpatialPlugin(
+                    {"semantic": {key: "legacy"}}, "ubuntu", None,
+                    runtime=runtime, mapping_plugin=FakeComponent("mapping"),
+                    planning_plugin=FakeComponent("planning"),
+                    semantic_plugin=FakeComponent("semantic"),
+                )
+                result = plugin.dispatch(plugin.PREFIX, {
+                    "action": "start", "input_bindings": _external_bindings(),
+                })
+                self.assertEqual(result["error_code"], "invalid_config")
+                self.assertIn(key, result["error"])
+                self.assertFalse(runtime.started)
+
+    def test_start_rejects_legacy_goal_pose_binding(self):
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime)
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start",
+            "input_bindings": _external_bindings() + [
+                {"port": "goal_pose", "topic": "/ubuntu/navigation/goal_pose"},
+            ],
+        })
+        self.assertEqual(result["error_code"], "invalid_canvas_wiring")
+        self.assertFalse(runtime.started)
 
     def test_start_rejects_invalid_external_topic_names(self):
         for topic in (

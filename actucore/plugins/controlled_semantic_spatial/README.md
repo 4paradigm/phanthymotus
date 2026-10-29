@@ -61,7 +61,6 @@ Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在�
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
 | `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航 |
-| `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由导航卡片订阅并转换为 `navigate_to_pose` |
 
 Driver 卡片合并后的连线：
 
@@ -84,10 +83,10 @@ Driver 卡片合并后的连线：
 或沿用旧输出索引。
 
 这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
-`lidar` 和 `imu`。`goal_pose` 是可选外部 topic 输入；卡片将消息中的 `goal_id`
-作为私有任务 ID 传给 planner。topic 使用 best-effort、单工作线程和有界去重，
-繁忙时只保留最新待处理目标；没有业务投递确认，重启或去重窗口淘汰后也不保证
-跨生命周期去重。Nav2 goal response 超时只表示结果未知，不能视为任务已接受或停止。
+`lidar` 和 `imu`。旧版 `goal_pose` 外部输入及对应协议、订阅已删除；升级时须先
+停止卡片，删除已有该端口连线，刷新卡片定义并保存画布。旧配置中的语义模块
+`goal_topic` 和 `subscriber_timeout_sec` 也须移除，否则卡片拒绝启动。坐标导航继续通过 MCP
+`navigate_to_pose`，语义导航通过同进程 planner 执行。Nav2 goal response 超时只表示结果未知，不能视为任务已接受或停止。
 
 LiDAR 每点 `timestamp` 必须是 `float64` 绝对纳秒，时间单调且一帧跨度位于
 `(0, 200] ms`。FAST-LIVO2 mapper 从实际进入其 callback 和处理循环的数据中，

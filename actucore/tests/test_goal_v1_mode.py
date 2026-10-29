@@ -1,28 +1,20 @@
-"""Goal v1 mode agreement across protocol and navigation tool contracts."""
+"""Mode agreement across MCP navigation tool contracts."""
 
-import json
 import unittest
-from pathlib import Path
 
 from plugins.controlled_semantic_spatial.contract import controlled_semantic_spatial_tool_definition
 from plugins.controlled_semantic_spatial.planning.contract import NAV2_ACTION_PARAMS, nav2_tool_definition
 from plugins.controlled_semantic_spatial.planning.core import NavigationBackendError, _normalize
-from plugins.controlled_semantic_spatial.planning.goal_input import _goal
 
 
 class GoalV1ModeTest(unittest.TestCase):
-    def test_protocol_and_mcp_define_optional_zero_mode(self):
-        protocol_path = (
-            Path(__file__).resolve().parents[1]
-            / "plugins/controlled_semantic_spatial/runtime/protocol/goal-v1.schema.json"
-        )
-        goal_schema = json.loads(protocol_path.read_text(encoding="utf-8"))
+    def test_mcp_defines_optional_zero_mode(self):
         planning = nav2_tool_definition("ubuntu")["inputSchema"]
         public = controlled_semantic_spatial_tool_definition("ubuntu")["inputSchema"]
         # Assert the actual schema contract rather than reimplementing a JSON
         # Schema validator; the planner's value handling is tested below.
         expected = {"type": "integer", "const": 0, "default": 0}
-        for schema in (goal_schema, planning, public):
+        for schema in (planning, public):
             mode = schema["properties"]["mode"]
             self.assertEqual({k: v for k, v in mode.items() if k != "description"}, expected)
             self.assertIs(type(mode["const"]), int)
@@ -33,16 +25,6 @@ class GoalV1ModeTest(unittest.TestCase):
             self.assertEqual(schema.get("x-topic-actions", []), [])
         self.assertIn("mode", NAV2_ACTION_PARAMS["navigate_to_pose"]["params"])
         self.assertFalse(public["additionalProperties"])
-
-    def test_goal_topic_input_validates_optional_zero_mode(self):
-        base = {"schema": "phanthy.navigation.goal.v1", "goal_id": "goal-1",
-                "x": 1, "y": 2, "yaw": 0}
-        self.assertNotIn("mode", _goal(json.dumps(base)))
-        self.assertEqual(_goal(json.dumps({**base, "mode": 0}))["mode"], 0)
-        for value in (False, True, None, "0", 1, -1, 0.0, [], {}):
-            with self.subTest(value=value):
-                with self.assertRaises(ValueError):
-                    _goal(json.dumps({**base, "mode": value}))
 
     def test_planner_integer_and_legacy_rejections(self):
         base = {"x": 1, "y": 2, "yaw": 0}

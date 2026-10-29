@@ -1,4 +1,4 @@
-"""Vision-and-language waypoint capture, matching, and Nav2 goal publishing."""
+"""Vision-and-language waypoint capture, matching, and in-process navigation."""
 
 from __future__ import annotations
 
@@ -13,12 +13,11 @@ from dataclasses import dataclass
 
 from .manifest import (
     DEFAULT_CAMERA_TOPIC,
-    DEFAULT_GOAL_TOPIC,
     DEFAULT_ODOMETRY_TOPIC,
     DEFAULT_STATUS_TOPIC,
     build_manifest,
 )
-from .ros import MapSessionChangedError, Pose, RosBridge
+from .ros import Pose, RosBridge
 from .vlm import BASE_URL, MODEL, TIMEOUT_SEC, Client, validate_configuration
 
 
@@ -113,9 +112,6 @@ class Processor:
                 DEFAULT_STATUS_TOPIC,
             )
         ).strip()
-        self._goal_topic = str(
-            self._config.get("goal_topic", DEFAULT_GOAL_TOPIC)
-        ).strip()
         self._required_frame_id = str(
             self._config.get("required_frame_id", "map")
         ).strip()
@@ -147,9 +143,6 @@ class Processor:
         )
         self._navigation_speed = _bounded_float(
             self._config.get("navigation_speed"), 0.30, 0.30, 1.0
-        )
-        self._subscriber_timeout = _positive_float(
-            self._config.get("subscriber_timeout_sec"), 2.0
         )
         self._auto_start = bool(self._config.get("auto_start_on_action", True))
 
@@ -194,7 +187,6 @@ class Processor:
         self.manifest = build_manifest(
             self._camera_topic,
             self._odometry_topic,
-            self._goal_topic,
             self._status_topic,
         )
         self._bridge = None
@@ -241,7 +233,6 @@ class Processor:
             bridge = self._bridge_factory(
                 camera_topic=camera_topic,
                 odometry_topic=odometry_topic,
-                goal_topic=self._goal_topic,
                 status_topic=status_topic,
                 executor=self._executor,
                 required_frame_id=self._required_frame_id,
@@ -266,7 +257,6 @@ class Processor:
             self.manifest = build_manifest(
                 camera_topic,
                 odometry_topic,
-                self._goal_topic,
                 status_topic,
             )
         log.info(
@@ -399,9 +389,6 @@ class Processor:
             "vlm_timeout_sec": float(
                 getattr(self._client, "timeout_sec", TIMEOUT_SEC)
             ),
-            "output_subscribers": (
-                int(getattr(bridge, "goal_subscribers", 0)) if bridge else 0
-            ),
             "topic_in": [
                 {
                     "port": "rgb",
@@ -425,15 +412,7 @@ class Processor:
                     "required": False,
                 },
             ],
-            "topic_out": [
-                {
-                    "port": "goal_pose",
-                    "topic": self._goal_topic,
-                    "format": "data/json",
-                    "ros_type": "std_msgs/msg/String",
-                    "schema": "phanthy.navigation.goal.v1",
-                }
-            ],
+            "topic_out": [],
             "last_error": last_error,
         }
 
@@ -581,7 +560,7 @@ class Processor:
                 return self.error(
                     "map_session_unavailable",
                     "FAST-LIVO2 尚未处于心跳正常的 mapping 状态，"
-                    "未向 Nav2 发布 session-local 坐标。",
+                    "未向 Nav2 提交 session-local 坐标。",
                     action="navigate",
                     navigation_requested=False,
                     map_session_issue=_bridge_map_session_issue(bridge),
@@ -623,7 +602,7 @@ class Processor:
             if not isinstance(match, dict):
                 return self.error(
                     "vlm_response_invalid",
-                    "VLM 地点匹配结果不是 JSON 对象，未发布导航目标。",
+                    "VLM 地点匹配结果不是 JSON 对象，未提交导航目标。",
                     action="navigate",
                 )
 
@@ -651,7 +630,6 @@ class Processor:
                 )
 
             goal = {
-                "schema": "phanthy.navigation.goal.v1",
                 "goal_id": f"vln-{uuid.uuid4().hex}",
                 "x": point.pose.x,
                 "y": point.pose.y,
@@ -710,76 +688,13 @@ class Processor:
                     },
                     "message": "已匹配导航点并直接交给同卡片 Nav2 planner。",
                 }
-            subscriber_ready = bridge.wait_for_goal_subscriber(
-                self._subscriber_timeout
+            return self.error(
+                "planner_unavailable",
+                "同卡片 Nav2 planner 不可用，未请求导航。",
+                action="navigate",
+                matched=True,
+                navigation_requested=False,
             )
-            if not _bridge_map_session_ready(bridge):
-                return self._session_changed(
-                    "FAST-LIVO2 地图会话在目标发布前不再可用，"
-                    "已取消这次导航；请重新 capture。",
-                    action="navigate",
-                    query=query,
-                )
-            try:
-                bridge.publish_goal(
-                    goal,
-                    expected_map_session_token=current_session_token,
-                )
-            except MapSessionChangedError:
-                return self._session_changed(
-                    "FAST-LIVO2 地图会话在目标发布前发生变化，"
-                    "已原子取消这次导航；请重新 capture。",
-                    action="navigate",
-                    query=query,
-                )
-            except Exception as exc:
-                log.error("[vln] failed to publish Nav2 ROS2 goal: %s", exc, exc_info=True)
-                return self.error(
-                    "publish_error",
-                    str(exc),
-                    action="navigate",
-                    matched=True,
-                    navigation_requested=False,
-                )
-            log.info(
-                "[vln] published %s -> %s (%.3f, %.3f, %.3f, speed=%.2f)",
-                goal["goal_id"],
-                self._goal_topic,
-                goal["x"],
-                goal["y"],
-                goal["yaw"],
-                goal["speed"],
-            )
-            message = "已匹配导航点并将目标通过 ROS2 发送给下游 Nav2。"
-            if not subscriber_ready:
-                message = (
-                    f"目标已发布到 {self._goal_topic}，但发布时未发现下游"
-                    "订阅者；请检查 Navigation 的外部 goal_pose 订阅链路。"
-                )
-            return {
-                "ok": True,
-                "action": "navigate",
-                "status": "navigation_requested",
-                "matched": True,
-                "navigation_requested": True,
-                "goal_published": True,
-                "downstream_subscriber_ready": subscriber_ready,
-                "downstream_subscribers": int(
-                    getattr(bridge, "goal_subscribers", 0)
-                ),
-                "query": query,
-                "point_id": point.point_id,
-                "description": point.description,
-                "confidence": confidence,
-                "reason": reason,
-                "goal_topic": self._goal_topic,
-                "goal_pose": {
-                    **goal,
-                    "frame_id": point.pose.frame_id,
-                    "map_session_id": point.map_session_id,
-                },
-                "message": message,
-            }
 
     def _running_bridge_locked(self):
         with self._state_lock:
@@ -983,7 +898,7 @@ class Processor:
             "candidates_checked": candidates,
             "message": (
                 f"没有找到与“{query}”匹配的已录制地点。"
-                "未向下游 Nav2 发布目标，请告知用户先在该地点执行 capture。"
+                "未向下游 Nav2 提交目标，请告知用户先在该地点执行 capture。"
             ),
         }
 

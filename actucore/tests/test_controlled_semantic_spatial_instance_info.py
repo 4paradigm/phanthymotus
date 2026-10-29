@@ -55,9 +55,7 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
             item = actual[binding["port"]]
             self.assertEqual(item["topic"], binding["topic"])
             self.assertIs(item["connected"], True)
-        for port in ("goal_pose",):
-            self.assertEqual(actual[port]["topic"], "")
-            self.assertIs(actual[port]["connected"], False)
+        self.assertEqual(set(actual), {"lidar", "imu", "rgb"})
 
     def assert_unmatched(self, info, state):
         self.assertEqual(info["state"], state)

@@ -88,10 +88,6 @@ class _PoseSample:
     received_monotonic: float
 
 
-class MapSessionChangedError(RuntimeError):
-    """Raised when a map-local goal would cross a FAST-LIVO2 session boundary."""
-
-
 def _stamp_to_seconds(stamp) -> float | None:
     """Convert a builtin_interfaces/Time-like value to seconds."""
 
@@ -168,7 +164,6 @@ class RosBridge:
         *,
         camera_topic: str,
         odometry_topic: str,
-        goal_topic: str,
         status_topic: str = "",
         executor,
         required_frame_id: str = "map",
@@ -195,7 +190,6 @@ class RosBridge:
         ).strip("_")
         self.camera_topic = camera_topic
         self.odometry_topic = odometry_topic
-        self.goal_topic = goal_topic
         self.status_topic = status_topic
         self.required_frame_id = required_frame_id.strip()
         self.required_child_frame_id = required_child_frame_id.strip()
@@ -213,7 +207,6 @@ class RosBridge:
         self._latest_pose: _PoseSample | None = None
         self._closed = False
         self._rejection_counts: dict[str, int] = {}
-        self._String = String
         self._decode_camera_rgb_frame = decode_camera_rgb_frame
         self._status_state = ""
         self._status_map_name = ""
@@ -239,12 +232,6 @@ class RosBridge:
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
-        goal_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
         status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -264,11 +251,6 @@ class RosBridge:
                 odometry_topic,
                 self._on_odometry,
                 odometry_qos,
-            )
-            self._goal_publisher = self._node.create_publisher(
-                String,
-                goal_topic,
-                goal_qos,
             )
             self._status_subscription = None
             if status_topic:
@@ -575,48 +557,6 @@ class RosBridge:
         ):
             return "not_mapping"
         return "ready"
-
-    @property
-    def goal_subscribers(self) -> int:
-        return self._goal_publisher.get_subscription_count()
-
-    def wait_for_goal_subscriber(self, timeout: float) -> bool:
-        deadline = time.monotonic() + timeout
-        while not self._closed:
-            if self.goal_subscribers > 0:
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(0.05, remaining))
-        return False
-
-    def publish_goal(
-        self,
-        payload: dict,
-        *,
-        expected_map_session_token: str | None = None,
-    ) -> None:
-        message = self._String()
-        message.data = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        # Status callbacks use the same condition lock. Checking the token and
-        # publishing inside one critical section closes the last A->B race.
-        with self._condition:
-            if self._closed:
-                raise RuntimeError("ROS bridge is closed")
-            if (
-                expected_map_session_token is not None
-                and self._map_session_token_locked() != expected_map_session_token
-            ):
-                raise MapSessionChangedError(
-                    "FAST-LIVO2 map session changed before goal publication"
-                )
-            self._goal_publisher.publish(message)
 
     def close(self) -> None:
         with self._condition:

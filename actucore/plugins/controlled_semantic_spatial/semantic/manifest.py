@@ -8,7 +8,6 @@ from copy import deepcopy
 DEFAULT_CAMERA_TOPIC = "/ubuntu/camera/rgb_frame"
 DEFAULT_ODOMETRY_TOPIC = "/ubuntu/navigation/odom"
 DEFAULT_STATUS_TOPIC = "/ubuntu/navigation/fast_livo2/status"
-DEFAULT_GOAL_TOPIC = "/ubuntu/navigation/goal_pose"
 DEFAULT_VLM_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_VLM_MODEL = "doubao-seed-2-1-pro-260628"
 DEFAULT_VLM_TIMEOUT_SEC = 18.0
@@ -22,9 +21,8 @@ _MANIFEST = {
         "Vision-and-language navigation. capture records the current JPEG image and "
         "FAST-LIVO2 map pose as a visual waypoint. navigate matches "
         "a natural-language destination against every recorded waypoint. When a "
-        "match is found, it publishes phanthy.navigation.goal.v1 to the downstream "
-        "Nav2 ROS2 goal topic; when not_found, it publishes nothing and tells the "
-        "caller that this place has not been recorded."
+        "match is found, it sends the recorded pose to the in-process Nav2 planner; "
+        "when not_found, it tells the caller that this place has not been recorded."
     ),
     "inputSchema": {
         "type": "object",
@@ -55,8 +53,8 @@ _MANIFEST = {
                 "params": ["query"],
                 "description": (
                     "Match the requested destination against all recorded points. "
-                    "If matched, publish the recorded map pose to the downstream "
-                    "Nav2 card over ROS2. If not_found, publish nothing and tell "
+                    "If matched, send the recorded map pose to the in-process "
+                    "Nav2 planner. If not_found, start nothing and tell "
                     "the user that the place has not been recorded."
                 ),
             },
@@ -133,23 +131,13 @@ _MANIFEST = {
             "desc": "FAST-LIVO2 mapping/session heartbeat used as a safety guard",
         },
     ],
-    "topic_out": [
-        {
-            "port": "goal_pose",
-            "topic": DEFAULT_GOAL_TOPIC,
-            "format": "data/json",
-            "ros_type": "std_msgs/msg/String",
-            "schema": "phanthy.navigation.goal.v1",
-            "desc": "Matched map-frame goal for the downstream Nav2 card",
-        }
-    ],
+    "topic_out": [],
 }
 
 
 def build_manifest(
     camera_topic: str,
     odometry_topic: str,
-    goal_topic: str = DEFAULT_GOAL_TOPIC,
     status_topic: str = DEFAULT_STATUS_TOPIC,
 ) -> dict:
     """Return an isolated manifest containing the configured input topics."""
@@ -158,7 +146,6 @@ def build_manifest(
     manifest["topic_in"][0]["topic"] = camera_topic
     manifest["topic_in"][1]["topic"] = odometry_topic
     manifest["topic_in"][2]["topic"] = status_topic
-    manifest["topic_out"][0]["topic"] = goal_topic
     return manifest
 
 

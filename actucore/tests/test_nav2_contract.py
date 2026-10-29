@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 from pathlib import Path
@@ -12,7 +11,6 @@ ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
 from plugins.controlled_semantic_spatial.planning.contract import (  # noqa: E402
-    GOAL_ID_PATTERN,
     NAV2_ACTIONS,
     NAV2_FULL_CONFIG_SCHEMA,
     NAV2_LIFECYCLE_ACTIONS,
@@ -45,7 +43,7 @@ class Nav2ContractTest(unittest.TestCase):
         inputs = {item["port"]: item for item in tool["topic_in"]}
         self.assertEqual(
             set(inputs),
-            {"livo_odom", "registered_cloud", "static_map", "goal_pose"},
+            {"livo_odom", "registered_cloud", "static_map"},
         )
         self.assertEqual(inputs["livo_odom"]["topic"], "/ubuntu/navigation/odom")
         self.assertEqual(inputs["livo_odom"]["format"], "sensor/odometry")
@@ -70,11 +68,6 @@ class Nav2ContractTest(unittest.TestCase):
             "RELIABLE + KEEP_LAST(depth=1) + TRANSIENT_LOCAL",
         )
         self.assertEqual(inputs["static_map"]["frame_id"], "map")
-        self.assertFalse(inputs["goal_pose"]["required"])
-        self.assertEqual(
-            inputs["goal_pose"]["qos"],
-            "BEST_EFFORT + KEEP_LAST(depth=20) + VOLATILE",
-        )
 
         outputs = {item["port"]: item for item in tool["topic_out"]}
         self.assertEqual(set(outputs), {"plan", "costmap"})
@@ -120,11 +113,7 @@ class Nav2ContractTest(unittest.TestCase):
         source_lock = (runtime_dir / "nav2-source.lock").read_text(
             encoding="utf-8"
         )
-        goal_schema = json.loads(
-            (runtime_dir / "protocol" / "goal-v1.schema.json").read_text(
-                encoding="utf-8"
-            )
-        )
+        self.assertFalse((runtime_dir / "protocol" / "goal-v1.schema.json").exists())
         self.assertNotIn("motion_sequence_topic", launch)
         self.assertNotIn("motion_sequence_topic", planner_bridge)
         self.assertFalse((runtime_dir / "protocol" / "motion-sequence-v1.schema.json").exists())
@@ -137,12 +126,6 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("python3-numpy", dockerfile)
         self.assertNotIn("PYTHON_NUMPY_VERSION", service)
         self.assertNotIn("PYTHON_NUMPY_VERSION", source_lock)
-        self.assertEqual(goal_schema["properties"]["goal_id"]["pattern"], GOAL_ID_PATTERN)
-        self.assertEqual(inputs["goal_pose"]["schema"], "phanthy.navigation.goal.v1")
-        self.assertEqual(inputs["goal_pose"]["ros_type"], "std_msgs/msg/String")
-        self.assertEqual(goal_schema["properties"]["speed"]["maximum"], 1.0)
-        self.assertEqual(goal_schema["properties"]["speed"]["minimum"], 0.30)
-        self.assertEqual(goal_schema["properties"]["speed"]["default"], 0.5)
         params = yaml.safe_load(
             (companion_root / "config" / "nav2_params.yaml").read_text(
                 encoding="utf-8"
@@ -189,14 +172,6 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertIn("mode", action_params["navigate_to_pose"]["params"])
         self.assertNotIn("x-topic-actions", tool)
         self.assertEqual(tool["inputSchema"].get("x-topic-actions", []), [])
-        goal_schema_path = (
-            ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/runtime/protocol/goal-v1.schema.json"
-        )
-        goal_schema = json.loads(goal_schema_path.read_text(encoding="utf-8"))
-        self.assertIn("mode", goal_schema["properties"])
-        self.assertNotIn("mode", goal_schema["required"])
-        self.assertEqual(goal_schema["required"], ["schema", "goal_id", "x", "y", "yaw"])
-
         config = tool["configSchema"]
         self.assertFalse(config["additionalProperties"])
         self.assertEqual(

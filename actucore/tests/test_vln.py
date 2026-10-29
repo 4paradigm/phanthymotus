@@ -21,7 +21,6 @@ if str(ACTUCORE_DIR) not in sys.path:
 from plugins.controlled_semantic_spatial.semantic.manifest import MANIFEST  # noqa: E402
 from plugins.controlled_semantic_spatial.semantic.plugin import VisionAndLanguageNavigationPlugin  # noqa: E402
 from plugins.controlled_semantic_spatial.semantic.ros import (  # noqa: E402
-    MapSessionChangedError,
     Pose,
     RosBridge,
     Snapshot,
@@ -91,9 +90,7 @@ class FakeBridge:
         self,
         *,
         snapshot=None,
-        subscribers=1,
         session_id="demo#local-1",
-        on_wait_for_subscriber=None,
         on_wait_for_snapshot=None,
         map_session_ready=True,
         map_session_issue="ready",
@@ -101,18 +98,14 @@ class FakeBridge:
     ):
         self.camera_topic = kwargs["camera_topic"]
         self.odometry_topic = kwargs["odometry_topic"]
-        self.goal_topic = kwargs["goal_topic"]
         self.status_topic = kwargs.get("status_topic", "")
         self.snapshot = snapshot or _snapshot()
-        self.goal_subscribers = subscribers
         self.current_map_session_id = session_id
         self._instance_token = f"fake-bridge-{id(self)}"
         self.map_session_ready = map_session_ready
         self.map_session_issue = map_session_issue
-        self.published = []
         self.closed = False
         self.wait_args = None
-        self.on_wait_for_subscriber = on_wait_for_subscriber
         self.on_wait_for_snapshot = on_wait_for_snapshot
 
     def wait_for_snapshot(self, **kwargs):
@@ -121,25 +114,12 @@ class FakeBridge:
             self.on_wait_for_snapshot(self)
         return self.snapshot
 
-    def wait_for_goal_subscriber(self, timeout):
-        if self.on_wait_for_subscriber:
-            self.on_wait_for_subscriber(self)
-        return self.goal_subscribers > 0
-
     def wait_for_map_session(self, timeout):
         return self.map_session_ready
 
     @property
     def current_map_session_token(self):
         return f"{self._instance_token}:{self.current_map_session_id or 'unknown'}"
-
-    def publish_goal(self, payload, *, expected_map_session_token=None):
-        if (
-            expected_map_session_token is not None
-            and expected_map_session_token != self.current_map_session_token
-        ):
-            raise MapSessionChangedError("fake session changed")
-        self.published.append(json.loads(json.dumps(payload)))
 
     def close(self):
         self.closed = True
@@ -161,7 +141,6 @@ class FakeBridgeFactory:
 def _plugin(client, factory, *, goal_handler=None, **config):
     cfg = {
         "sensor_timeout_sec": 0.1,
-        "subscriber_timeout_sec": 0.1,
         **config,
     }
     return VisionAndLanguageNavigationPlugin(
@@ -205,8 +184,7 @@ class ManifestTests(unittest.TestCase):
             "/ubuntu/navigation/fast_livo2/status",
         )
         self.assertFalse(MANIFEST["topic_in"][2]["required"])
-        self.assertEqual(MANIFEST["topic_out"][0]["topic"], "/ubuntu/navigation/goal_pose")
-        self.assertEqual(MANIFEST["topic_out"][0]["schema"], "phanthy.navigation.goal.v1")
+        self.assertEqual(MANIFEST["topic_out"], [])
 
 
 class ProcessorTests(unittest.TestCase):
@@ -415,7 +393,7 @@ class ProcessorTests(unittest.TestCase):
             factory.calls[0]["status_topic"],
             "/ubuntu/navigation/fast_livo2/status",
         )
-        self.assertEqual(factory.calls[0]["goal_topic"], "/ubuntu/navigation/goal_pose")
+        self.assertNotIn("goal_topic", factory.calls[0])
 
     def test_start_supports_port_aware_input_bindings(self):
         factory = FakeBridgeFactory()
@@ -499,7 +477,6 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result["waypoint"]["objects"], ["白板", "蓝色沙发"])
         self.assertEqual(result["waypoint"]["pose"]["frame_id"], "map")
         self.assertIsNotNone(factory.instances[0].wait_args["after_monotonic"])
-        self.assertEqual(len(factory.instances[0].published), 0)
 
     def test_capture_does_not_log_remote_description(self):
         description = "REMOTE\n\x1b[31m" + "x" * 10000
@@ -523,16 +500,15 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "sensor_timeout")
         self.assertEqual(plugin.dispatch("vln", {"action": "info"})["recorded_points"], 0)
 
-    def test_navigate_no_points_never_publishes(self):
+    def test_navigate_no_points_never_dispatches(self):
         factory = FakeBridgeFactory()
         plugin = _plugin(FakeClient([]), factory)
         result = plugin.dispatch("vln", {"action": "navigate", "query": "白板旁边"})
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "not_found")
         self.assertFalse(result["navigation_requested"])
-        self.assertEqual(factory.instances[0].published, [])
 
-    def test_low_confidence_match_never_publishes(self):
+    def test_low_confidence_match_never_dispatches(self):
         client = FakeClient(
             [
                 {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
@@ -544,9 +520,8 @@ class ProcessorTests(unittest.TestCase):
         plugin.dispatch("vln", {"action": "capture"})
         result = plugin.dispatch("vln", {"action": "navigate", "query": "去白板"})
         self.assertEqual(result["status"], "not_found")
-        self.assertEqual(factory.instances[0].published, [])
 
-    def test_hallucinated_point_id_never_publishes(self):
+    def test_hallucinated_point_id_never_dispatches(self):
         client = FakeClient(
             [
                 {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
@@ -558,9 +533,8 @@ class ProcessorTests(unittest.TestCase):
         plugin.dispatch("vln", {"action": "capture"})
         result = plugin.dispatch("vln", {"action": "navigate", "query": "去白板"})
         self.assertEqual(result["status"], "not_found")
-        self.assertEqual(factory.instances[0].published, [])
 
-    def test_boolean_confidence_never_publishes(self):
+    def test_boolean_confidence_never_dispatches(self):
         client = FakeClient(
             [
                 {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
@@ -572,9 +546,8 @@ class ProcessorTests(unittest.TestCase):
         plugin.dispatch("vln", {"action": "capture"})
         result = plugin.dispatch("vln", {"action": "navigate", "query": "去白板"})
         self.assertEqual(result["status"], "not_found")
-        self.assertEqual(factory.instances[0].published, [])
 
-    def test_invalid_confidence_never_publishes_at_zero_threshold(self):
+    def test_invalid_confidence_never_dispatches_at_zero_threshold(self):
         for invalid_confidence in (True, None, "0.9", float("nan"), -0.1, 0.0, 1.1):
             with self.subTest(confidence=invalid_confidence):
                 client = FakeClient(
@@ -594,30 +567,6 @@ class ProcessorTests(unittest.TestCase):
                     "vln", {"action": "navigate", "query": "去白板"}
                 )
                 self.assertEqual(result["status"], "not_found")
-                self.assertEqual(factory.instances[0].published, [])
-
-    def test_match_publishes_exact_ros_goal_contract_once(self):
-        client = FakeClient(
-            [
-                {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
-                {"point_id": "vln_point_0001", "confidence": 0.91, "reason": "白板明确匹配"},
-            ]
-        )
-        factory = FakeBridgeFactory(subscribers=1)
-        plugin = _plugin(client, factory, navigation_speed=0.5)
-        plugin.dispatch("vln", {"action": "capture"})
-        result = plugin.dispatch("vln", {"action": "navigate", "query": "去白板办公室"})
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["status"], "navigation_requested")
-        self.assertTrue(result["goal_published"])
-        self.assertEqual(len(factory.instances[0].published), 1)
-        goal = factory.instances[0].published[0]
-        self.assertEqual(set(goal), {"schema", "goal_id", "x", "y", "yaw", "speed"})
-        self.assertEqual(goal["schema"], "phanthy.navigation.goal.v1")
-        self.assertTrue(goal["goal_id"].startswith("vln-"))
-        self.assertEqual((goal["x"], goal["y"], goal["yaw"]), (1.25, -0.5, 0.75))
-        self.assertEqual(goal["speed"], 0.5)
 
     def test_unified_card_delivers_match_directly_to_planner_with_same_lease(self):
         client = FakeClient(
@@ -626,7 +575,7 @@ class ProcessorTests(unittest.TestCase):
                 {"point_id": "vln_point_0001", "confidence": 0.91, "reason": "匹配"},
             ]
         )
-        factory = FakeBridgeFactory(subscribers=0)
+        factory = FakeBridgeFactory()
         calls = []
 
         def handle(goal, *, control_nav_id=None):
@@ -655,23 +604,23 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result["action_id"], "lease-unified-1")
         self.assertEqual(calls[0][1], "lease-unified-1")
         self.assertEqual(calls[0][0]["speed"], 0.5)
-        self.assertEqual(factory.instances[0].published, [])
+        self.assertEqual((calls[0][0]["x"], calls[0][0]["y"], calls[0][0]["yaw"]), (1.25, -0.5, 0.75))
+        self.assertEqual(len(calls), 1)
 
-    def test_no_subscriber_still_publishes_and_reports_delivery_warning(self):
+    def test_missing_planner_fails_without_requesting_navigation(self):
         client = FakeClient(
             [
                 {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
                 {"point_id": "vln_point_0001", "confidence": 0.9, "reason": "匹配"},
             ]
         )
-        factory = FakeBridgeFactory(subscribers=0)
+        factory = FakeBridgeFactory()
         plugin = _plugin(client, factory)
         plugin.dispatch("vln", {"action": "capture"})
         result = plugin.dispatch("vln", {"action": "navigate", "query": "办公室"})
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["goal_published"])
-        self.assertFalse(result["downstream_subscriber_ready"])
-        self.assertEqual(len(factory.instances[0].published), 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "planner_unavailable")
+        self.assertFalse(result["navigation_requested"])
 
     def test_session_change_blocks_old_coordinate(self):
         client = FakeClient(
@@ -684,7 +633,6 @@ class ProcessorTests(unittest.TestCase):
         result = plugin.dispatch("vln", {"action": "navigate", "query": "办公室"})
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "map_session_mismatch")
-        self.assertEqual(factory.instances[0].published, [])
 
     def test_capture_rejects_session_change_during_vlm(self):
         factory = FakeBridgeFactory(session_id="map-a#local-1")
@@ -711,26 +659,24 @@ class ProcessorTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "map_session_changed")
         self.assertEqual(plugin.dispatch("vln", {"action": "info"})["recorded_points"], 0)
 
-    def test_session_change_during_subscriber_wait_never_publishes(self):
-        def change_session(bridge):
-            bridge.current_map_session_id = "map-b#local-2"
+    def test_session_change_during_match_never_dispatches(self):
+        factory = FakeBridgeFactory(session_id="map-a#local-1")
+        calls = []
 
-        client = FakeClient(
-            [
-                {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
-                {"point_id": "vln_point_0001", "confidence": 0.9, "reason": "匹配"},
-            ]
-        )
-        factory = FakeBridgeFactory(
-            session_id="map-a#local-1",
-            on_wait_for_subscriber=change_session,
-        )
-        plugin = _plugin(client, factory)
+        def change_session(_messages):
+            factory.instances[0].current_map_session_id = "map-b#local-2"
+            return {"point_id": "vln_point_0001", "confidence": 0.9, "reason": "匹配"}
+
+        client = FakeClient([
+            {"scene": "办公室", "objects": ["白板"], "description": "白板办公室"},
+            change_session,
+        ])
+        plugin = _plugin(client, factory, goal_handler=lambda *args, **kwargs: calls.append(args))
         plugin.dispatch("vln", {"action": "capture"})
         result = plugin.dispatch("vln", {"action": "navigate", "query": "办公室"})
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "map_session_changed")
-        self.assertEqual(factory.instances[0].published, [])
+        self.assertEqual(calls, [])
 
     def test_bridge_restart_invalidates_previous_bridge_coordinates(self):
         client = FakeClient(
@@ -744,7 +690,6 @@ class ProcessorTests(unittest.TestCase):
         result = plugin.dispatch("vln", {"action": "navigate", "query": "办公室"})
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "map_session_mismatch")
-        self.assertEqual(factory.instances[1].published, [])
 
     def test_missing_fast_livo_status_blocks_capture(self):
         factory = FakeBridgeFactory(
@@ -1070,38 +1015,6 @@ class PureHelperTests(unittest.TestCase):
         heartbeat["diagnostics"] = {"map_alignment_confirmed": False}
         bridge._on_status(SimpleNamespace(data=json.dumps(heartbeat)))
         self.assertFalse(bridge.map_session_ready)
-
-    def test_ros_goal_publish_checks_session_and_serializes_exact_json(self):
-        bridge = self._bare_ros_bridge()
-
-        class FakeString:
-            data = ""
-
-        class FakePublisher:
-            def __init__(self):
-                self.messages = []
-
-            def publish(self, message):
-                self.messages.append(message.data)
-
-        bridge._String = FakeString
-        bridge._goal_publisher = FakePublisher()
-        token = bridge.current_map_session_token
-        goal = {
-            "schema": "phanthy.navigation.goal.v1",
-            "goal_id": "vln-test",
-            "x": 1.0,
-            "y": 2.0,
-            "yaw": 0.5,
-            "speed": 0.3,
-        }
-        bridge.publish_goal(goal, expected_map_session_token=token)
-        self.assertEqual(json.loads(bridge._goal_publisher.messages[0]), goal)
-
-        bridge._status_state = "changed"
-        with self.assertRaises(MapSessionChangedError):
-            bridge.publish_goal(goal, expected_map_session_token=token)
-        self.assertEqual(len(bridge._goal_publisher.messages), 1)
 
 
 if __name__ == "__main__":

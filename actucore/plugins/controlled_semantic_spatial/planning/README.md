@@ -43,7 +43,6 @@ FAST-LIVO2 internal module
 | `livo_odom` | `/ubuntu/navigation/odom` | `nav_msgs/msg/Odometry`; `BEST_EFFORT + KEEP_LAST(5)` | `header.frame_id=map`，`child_frame_id=base_link`，ROS system time，接收 age 最大 500 ms |
 | `registered_cloud` | `/ubuntu/navigation/cloud_registered` | `sensor_msgs/msg/PointCloud2`; `BEST_EFFORT + KEEP_LAST(1)` | `header.frame_id=map`，已运动去畸变，ROS system time，接收 age 最大 500 ms |
 | `static_map` | `/ubuntu/navigation/static_map` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | `header.frame_id=map`，直接累计静态图，`-1/0/100` |
-| `goal_pose`（可选） | `/ubuntu/navigation/goal_pose` | `std_msgs/msg/String`; `BEST_EFFORT + KEEP_LAST(20) + VOLATILE` | `phanthy.navigation.goal.v1`，`map` frame，每条唯一 `goal_id` |
 
 Odometry 和 registered cloud 的 source stamp 必须同时可用。当 FAST-LIVO2 还在
 直接发布 `camera_init` / `aft_mapped` frame 时，Nav2 会返回
@@ -60,34 +59,10 @@ registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz
 可以用最新位姿在每个控制周期检查过点、转向和障碍；标准输出频率由下游接口
 协商，停车零速不等待下一次周期发布。
 
-`goal_pose` 最小样例：
-
-```json
-{
-  "schema": "phanthy.navigation.goal.v1",
-  "goal_id": "room-a-001",
-  "x": 1.2,
-  "y": -0.8,
-  "yaw": 0.0,
-  "speed": 0.5
-}
-```
-
-导航卡在启动参数包含 `goal_pose` 绑定时自行订阅对应 topic，不依赖 Agent Core
-的 topic action。主线 Agent Core 不传端口身份，统一卡片只能按声明的标准 topic
-识别输入；单元测试不能视为 ROS 端到端可用。
-`goal_id` 为 1–128 个 ASCII 字符，首字符为字母或数字，其余只允许字母、数字、
-`_`、`.`、`:`、`-`；不裁剪空白。只接受声明字段和有限数值，并使用 goal_id
-作为私有 nav_id。无 ROS 依赖时未连接目标输入可正常使用，连接后订阅失败则启动失败。
-
-订阅 QoS 为 `BEST_EFFORT + KEEP_LAST(20) + VOLATILE`；即使发布者使用
-reliable，也不保证交付。DDS 回调不等待导航，工作线程对等待中的目标只保留
-最新一条。最近 1024 个已尝试 ID 在当前订阅生命周期内去重：执行前即记录，
-包括明确失败和结果未知，避免超时后盲目重复；停止后记录丢失，窗口淘汰后也可
-再次执行。发布不等于接纳，且没有 topic 级接纳回执。停止会退订、丢弃待处理
-目标；已准入的调用由统一卡片的停止栅栏追踪和取消，未确认停止时须重试。
-停止确认失败时订阅仍保持关闭，重新启动前须完成停止。远端在途命令、跨生命周期
-重复和物理停车仍不能由此保证。
+坐标目标通过 MCP `navigate_to_pose` 提交，语义目标由同卡片进程内 planner
+接收；不再提供 `goal_pose` 外部 topic 输入。升级时需移除画布中该端口旧连线，
+刷新卡片定义并保存。已准入调用仍由统一卡片的停止栅栏追踪和取消；未确认停止时须重试。
+单元测试不能视为 ROS 端到端可用或物理停车保证。
 
 ## 输出合同
 
@@ -237,8 +212,7 @@ shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互
 
 odom、registered cloud 和 static map 由 `ControlledSemanticSpatialPlugin` 固定为同容器
 内部 topic，不需要 Canvas 连线。刷新卡片定义后移除旧端口连线并连接
-`control_velocity`；
-`goal_pose` 仍可作为可选外部输入。格式匹配本身不证明 Driver 已订阅或联调通过。该 topic 与 Navi 共用，
+`control_velocity`。格式匹配本身不证明 Driver 已订阅或联调通过。该 topic 与 Navi 共用，
 两张卡片不得同时向其发布；G1 `loco_servo` 默认 dry-run，实际停止与 watchdog
 行为尚须独立验证。
 

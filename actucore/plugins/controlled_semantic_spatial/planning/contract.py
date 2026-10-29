@@ -13,9 +13,6 @@ NAV2_ACTIONS = (
     "stop_nav",
 )
 
-# Matches runtime/protocol/goal-v1.schema.json; use full-match at runtime.
-GOAL_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
-
 NAV2_LIFECYCLE_ACTIONS = ("info", "config", "start", "stop")
 NAV2_PUBLIC_ACTIONS = NAV2_LIFECYCLE_ACTIONS + NAV2_ACTIONS
 
@@ -247,23 +244,6 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "desc": (
                     "Directly accumulated static occupancy source for "
                     "the Nav2 global StaticLayer"
-                ),
-            },
-            {
-                "port": "goal_pose",
-                "topic": f"{root}/navigation/goal_pose",
-                "format": "data/json",
-                "ros_type": "std_msgs/msg/String",
-                "qos": "BEST_EFFORT + KEEP_LAST(depth=20) + VOLATILE",
-                "schema": "phanthy.navigation.goal.v1",
-                "required": False,
-                "frame_id": "map",
-                "axes": "ROS REP-103 right-handed: x forward, y left",
-                "units": "x/y=m, yaw=rad, speed=m/s",
-                "desc": (
-                    "Optional target input. Each JSON message needs a unique "
-                    "goal_id plus x/y/yaw; the goal_id is used as the "
-                    "accepted navigation task's private nav_id."
                 ),
             },
         ],
