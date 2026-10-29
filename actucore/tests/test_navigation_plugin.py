@@ -423,11 +423,11 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn("depends_on:", service)
         self.assertNotIn("embodied-perception-fast-livo2", service)
         self.assertNotIn("embodied-perception-nav2", service)
-        self.assertIn('plugins_cfg.get("navigation"', main)
+        self.assertIn('plugins_cfg.get("controlled_semantic_spatial"', main)
         self.assertNotIn('plugins_cfg.get("fast_livo2"', main)
         self.assertNotIn('plugins_cfg.get("nav2"', main)
         self.assertNotIn('plugins_cfg.get("vln"', main)
-        self.assertIn("plugins.navigation.namespace must be a string", main)
+        self.assertIn("plugins.controlled_semantic_spatial.namespace must be a string", main)
         self.assertIn("requires namespace=ubuntu", main)
         self.assertNotIn("socket.gethostname()", main)
 

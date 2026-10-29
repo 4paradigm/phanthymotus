@@ -42,6 +42,81 @@ def _load_main_module():
     return module
 
 
+class BundleConfigurationTest(unittest.TestCase):
+    def test_shipped_config_loads_enabled_card(self):
+        module = _load_main_module()
+        with mock.patch.dict("os.environ", {}, clear=True):
+            cfg = module._load_config()
+        card_cfg = cfg["plugins"]["controlled_semantic_spatial"]
+        self.assertTrue(card_cfg["enabled"])
+        self.assertNotIn("navigation", cfg["plugins"])
+        # Isolate this card while using the actual shipped configuration.
+        cfg["plugins"] = {"controlled_semantic_spatial": card_cfg}
+        executor = object()
+        with mock.patch("plugins.navigation.NavigationPlugin") as plugin:
+            bundle = module.ActuCoreBundle(cfg, executor)
+        plugin.assert_called_once_with(
+            card_cfg, "ubuntu", executor, completion_callback=module.sse_push
+        )
+        self.assertEqual(bundle._plugins, [plugin.return_value])
+
+    def test_disabled_or_missing_card_is_not_loaded(self):
+        module = _load_main_module()
+        for plugins in (
+            {"controlled_semantic_spatial": {"enabled": False}},
+            {},
+        ):
+            with self.subTest(plugins=plugins), mock.patch(
+                "plugins.navigation.NavigationPlugin"
+            ) as plugin:
+                bundle = module.ActuCoreBundle({"plugins": plugins}, object())
+                self.assertEqual(bundle._plugins, [])
+                plugin.assert_not_called()
+
+    def test_legacy_key_is_rejected(self):
+        module = _load_main_module()
+        with mock.patch("plugins.navigation.NavigationPlugin") as plugin:
+            with self.assertRaisesRegex(ValueError, r"plugins\.navigation was renamed to plugins\.controlled_semantic_spatial"):
+                module.ActuCoreBundle({"plugins": {"navigation": {"enabled": True}}}, None)
+            plugin.assert_not_called()
+
+    def test_invalid_card_config_is_rejected(self):
+        module = _load_main_module()
+        for value in (None, [], "enabled"):
+            with self.subTest(value=value), mock.patch("plugins.navigation.NavigationPlugin") as plugin:
+                with self.assertRaisesRegex(
+                    ValueError, r"plugins\.controlled_semantic_spatial must be an object"
+                ):
+                    module.ActuCoreBundle({"plugins": {"controlled_semantic_spatial": value}}, None)
+                plugin.assert_not_called()
+
+    def test_namespace_validation_and_normalization(self):
+        module = _load_main_module()
+        key = "controlled_semantic_spatial"
+        for namespace in (None, 42, ["ubuntu"]):
+            with self.subTest(namespace=namespace), mock.patch(
+                "plugins.navigation.NavigationPlugin"
+            ) as plugin:
+                with self.assertRaisesRegex(
+                    ValueError, r"plugins\.controlled_semantic_spatial\.namespace must be a string"
+                ):
+                    module.ActuCoreBundle({"plugins": {key: {"enabled": True, "namespace": namespace}}}, None)
+                plugin.assert_not_called()
+        for namespace in ("", "other", "/other/"):
+            with self.subTest(namespace=namespace), mock.patch(
+                "plugins.navigation.NavigationPlugin"
+            ) as plugin:
+                with self.assertRaisesRegex(ValueError, "requires namespace=ubuntu"):
+                    module.ActuCoreBundle({"plugins": {key: {"enabled": True, "namespace": namespace}}}, None)
+                plugin.assert_not_called()
+        for settings in ({"enabled": True}, {"enabled": True, "namespace": " /ubuntu/ "}):
+            with self.subTest(settings=settings), mock.patch(
+                "plugins.navigation.NavigationPlugin"
+            ) as plugin:
+                module.ActuCoreBundle({"plugins": {key: settings}}, None)
+                plugin.assert_called_once_with(settings, "ubuntu", None, completion_callback=module.sse_push)
+
+
 class BundleDispatchTest(unittest.TestCase):
     def test_longest_prefix_and_self_named_tools(self):
         module = _load_main_module()

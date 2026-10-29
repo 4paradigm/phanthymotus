@@ -7,7 +7,7 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前挂载的卡片：`navigation`（公开工具名 `controlled_semantic_spatial`）——
+当前挂载的卡片：`controlled_semantic_spatial`（配置键和公开工具名一致）——
 FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者作为子进程跑在本容器内，
 对外只发布 bounded motion sequence；同时注册上游 `vla` 卡片。
 新增卡片的完整步骤见 README.md。
@@ -132,13 +132,15 @@ class ActuCoreBundle:
         # 卡片契约（action.enum 必须含 "info" 等）见 README.md。
         # ──────────────────────────────────────────────────────────────────
 
-        navigation_cfg = plugins_cfg.get("navigation", {})
+        if "navigation" in plugins_cfg:
+            raise ValueError("plugins.navigation was renamed to plugins.controlled_semantic_spatial; update the configuration")
+        navigation_cfg = plugins_cfg.get("controlled_semantic_spatial", {})
         if not isinstance(navigation_cfg, dict):
-            raise ValueError("plugins.navigation must be an object")
+            raise ValueError("plugins.controlled_semantic_spatial must be an object")
         if navigation_cfg.get("enabled", False):
             namespace = navigation_cfg.get("namespace", "ubuntu")
             if not isinstance(namespace, str):
-                raise ValueError("plugins.navigation.namespace must be a string")
+                raise ValueError("plugins.controlled_semantic_spatial.namespace must be a string")
             namespace = namespace.strip().strip("/")
             if namespace != "ubuntu":
                 raise ValueError(

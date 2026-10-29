@@ -7,7 +7,7 @@
 mcp_port: 15730
 
 plugins:
-  navigation:
+  controlled_semantic_spatial:
     enabled: true
     namespace: ubuntu
     mapping:
@@ -59,7 +59,7 @@ plugins:
         timeout_sec: 18.0
   vla:
     # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。
-    # 关闭后只隐藏 VLA；navigation 的启用状态独立配置。
+    # 关闭后只隐藏 VLA；controlled_semantic_spatial 的启用状态独立配置。
     #
     # 真正的门槛都在别处：
     #   1. 必须在画布上把它的输出连到一张驱动命令卡片（control/* 端口），

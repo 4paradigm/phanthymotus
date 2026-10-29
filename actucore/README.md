@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前卡片：`navigation`**，公开工具名 `controlled_semantic_spatial` —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket），公开输出仅 `map_view` 与 `motion_sequence`；后者沿用 bounded motion sequence 消息协议，物理执行仍归 Driver。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/navigation/README.md](plugins/navigation/README.md)。
+**当前卡片及配置键：`controlled_semantic_spatial`**，公开工具名相同 —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket），公开输出仅 `map_view` 与 `motion_sequence`；后者沿用 bounded motion sequence 消息协议，物理执行仍归 Driver。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/navigation/README.md](plugins/navigation/README.md)。
 
 该卡片的公开契约可复用于不同机器人；当前 runtime adapter 使用兼容性
 `ubuntu` namespace，各本体由 Driver 提供符合契约的 topic、frame、标定和执行器。
@@ -401,7 +401,7 @@ range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 rang
 
 ## 构建与运行
 
-只有 Jetson 版 —— 执行模型多数要 GPU（VLA、抓取策略、locomotion），没有 CPU 变体。`navigation` 卡片本身不用 GPU，但和它们共用这一个镜像。
+只有 Jetson 版 —— 执行模型多数要 GPU（VLA、抓取策略、locomotion），没有 CPU 变体。`controlled_semantic_spatial` 卡片本身不用 GPU，但和它们共用这一个镜像。
 
 ```bash
 ./deploy/build_actucore.sh                 # JetPack 5.11（默认）

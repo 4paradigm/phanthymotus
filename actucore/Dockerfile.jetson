@@ -63,7 +63,7 @@ COPY actucore/deploy/     /deploy/
 
 # JP6.1 does not yet ship the new navigation runtime; retain vla and navi.
 RUN if [ "${JP_VERSION}" = 61 ]; then \
-      python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['navigation']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"; \
+      python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['controlled_semantic_spatial']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"; \
     else rm -rf /work/plugins/navigation/runtime; fi
 
 EXPOSE 15730
@@ -104,7 +104,7 @@ RUN find /ros_ws/install /opt/ros/humble/install -name "site-packages" -type d \
       test ! -e /work/plugins/navigation/runtime; \
     else \
       source /ros_ws/install/setup.bash && cd /work && \
-      python3 -c "import main; cfg=main._load_config(); assert cfg['plugins']['navigation']['enabled'] is False; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla', 'navi'}; print('JP61_CARD_INVENTORY=PASS')"; \
+      python3 -c "import main; cfg=main._load_config(); assert cfg['plugins']['controlled_semantic_spatial']['enabled'] is False; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla', 'navi'}; print('JP61_CARD_INVENTORY=PASS')"; \
     fi && \
     ros2 pkg prefix audio_msgs >/dev/null && \
     python3 -c "from audio_msgs.msg import AudioChunk" && \

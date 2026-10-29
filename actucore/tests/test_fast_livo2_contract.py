@@ -110,7 +110,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         mapping = json.loads(
             (ACTUCORE_ROOT / "plugins/navigation/mapping/config.example.json").read_text()
         )
-        self.assertEqual(config["plugins"]["navigation"]["mapping"]["collection_directory"], root)
+        self.assertEqual(config["plugins"]["controlled_semantic_spatial"]["mapping"]["collection_directory"], root)
         self.assertEqual(navigation["mapping"]["collection_directory"], root)
         self.assertEqual(mapping["collection_directory"], root)
         self.assertEqual(FAST_LIVO2_CONFIG_DEFAULTS["collection_directory"], root)
@@ -313,7 +313,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertEqual(
             CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME, "controlled_semantic_spatial"
         )
-        self.assertIn('plugins_cfg.get("navigation"', main)
+        self.assertIn('plugins_cfg.get("controlled_semantic_spatial"', main)
 
     def test_contract_exposes_bounded_relocalization_not_navigation(self) -> None:
         tool = fast_livo2_tool_definition("ubuntu")

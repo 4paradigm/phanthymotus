@@ -137,7 +137,7 @@ def test_jp61_copied_plugins_can_import_without_source_tree(tmp_path):
                    check=True, timeout=10)
     original = yaml.safe_load((ROOT / 'actucore/config.yaml').read_text())
     shipped = yaml.safe_load((tmp_path / 'config.yaml').read_text())
-    original['plugins']['navigation']['enabled'] = False
+    original['plugins']['controlled_semantic_spatial']['enabled'] = False
     assert shipped == original
     assert (tmp_path / 'plugins/navi/plugin.py').is_file()
     assert (tmp_path / 'tools/measure_fov.py').is_file()
@@ -150,7 +150,7 @@ sys.modules['rclpy._rclpy_pybind11'].InvalidHandle = type('InvalidHandle', (Exce
 import main
 bundle = main.ActuCoreBundle(main._load_config(), None)
 assert {tool['name'] for tool in bundle.get_all_tools()} == {'vla', 'navi'}
-assert main._load_config()['plugins']['navigation']['enabled'] is False
+assert main._load_config()['plugins']['controlled_semantic_spatial']['enabled'] is False
 """
     result = subprocess.run(
         [sys.executable, '-c', entry_code],
