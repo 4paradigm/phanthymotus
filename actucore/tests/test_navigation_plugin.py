@@ -252,8 +252,8 @@ class NavigationContractTest(unittest.TestCase):
 
     def test_one_public_card_hides_internal_ros_edges(self):
         tool = navigation_tool_definition("ubuntu")
-        self.assertEqual(tool["name"], "ControlledSemanticSpatial")
-        self.assertEqual(tool["displayName"], "ControlledSemanticSpatial")
+        self.assertEqual(tool["name"], "controlled_semantic_spatial")
+        self.assertEqual(tool["displayName"], "controlled_semantic_spatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
             {"lidar", "imu", "rgb", "depth_frame", "goal_pose"},
@@ -704,7 +704,7 @@ class NavigationContractTest(unittest.TestCase):
         ):
             self.assertNotIn(removed, build_script)
         self.assertIn("ACTUCORE_BUILD_DURATION_SEC=", build_script)
-        self.assertIn('"name":"ControlledSemanticSpatial"', build_script)
+        self.assertIn('"name":"controlled_semantic_spatial"', build_script)
         self.assertIn('"name":"vla"', build_script)
         self.assertIn('CARDS_JSON', build_script)
 
@@ -830,7 +830,7 @@ class NavigationPluginTest(unittest.TestCase):
         before = [list(component.calls) for component in components]
         for action in set(NAVIGATION_ACTIONS) - {"info", "config", "start", "stop"}:
             with self.subTest(action=action):
-                result = plugin.dispatch("ControlledSemanticSpatial", {"action": action})
+                result = plugin.dispatch("controlled_semantic_spatial", {"action": action})
                 self.assertEqual(result["error_code"], "canvas_not_started")
                 self.assertEqual([component.calls for component in components], before)
                 self.assertFalse(runtime.started)
@@ -1160,31 +1160,31 @@ class NavigationPluginTest(unittest.TestCase):
                 )
                 planning = FakeComponent("planning")
                 plugin = self.make_plugin(semantic=semantic, planning=planning)
-                started = plugin.dispatch("ControlledSemanticSpatial", {
+                started = plugin.dispatch("controlled_semantic_spatial", {
                     "action": "start", "input_bindings": _external_bindings(),
                 })
                 self.assertEqual(started["state"], "ready")
-                result = plugin.dispatch("ControlledSemanticSpatial", {
+                result = plugin.dispatch("controlled_semantic_spatial", {
                     "action": action, "query": "desk",
                 })
                 self.assertEqual(result["error_code"], "rgb_not_connected")
                 bridge_factory.assert_not_called()
                 client.complete_json.assert_not_called()
-                coordinate = plugin.dispatch("ControlledSemanticSpatial", {
+                coordinate = plugin.dispatch("controlled_semantic_spatial", {
                     "action": "navigate_to_pose", "x": 1, "y": 2, "yaw": 0,
                 })
                 self.assertEqual(coordinate["component"], "planning")
 
-    def test_only_ControlledSemanticSpatial_is_a_public_dispatch_name(self):
+    def test_only_controlled_semantic_spatial_is_a_public_dispatch_name(self):
         plugin = self.make_plugin()
 
-        self.assertEqual(plugin.PREFIX, "ControlledSemanticSpatial")
+        self.assertEqual(plugin.PREFIX, "controlled_semantic_spatial")
         self.assertIsNone(plugin.dispatch("navigation", {"action": "info"}))
         self.assertEqual(
-            plugin.dispatch("ControlledSemanticSpatial", {"action": "info"})[
+            plugin.dispatch("controlled_semantic_spatial", {"action": "info"})[
                 "name"
             ],
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
         )
 
     def test_single_start_owns_runtime_and_internal_wiring(self):
@@ -1200,7 +1200,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
         result = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {
                 "action": "start",
                 "instance_id": "canvas-navigation",
@@ -1234,7 +1234,7 @@ class NavigationPluginTest(unittest.TestCase):
             "/ubuntu/navigation/static_map",
         )
         self.assertFalse(any(args["action"] == "start" for _, args in semantic.calls))
-        stopped = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        stopped = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(runtime.stop_calls, 1)
 
@@ -1256,7 +1256,7 @@ class NavigationPluginTest(unittest.TestCase):
             binding["topic"] = custom[binding["port"]]
 
         result = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": bindings},
         )
 
@@ -1287,7 +1287,7 @@ class NavigationPluginTest(unittest.TestCase):
                 ] = topic
 
                 result = plugin.dispatch(
-                    "ControlledSemanticSpatial",
+                    "controlled_semantic_spatial",
                     {"action": "start", "input_bindings": bindings},
                 )
 
@@ -1299,7 +1299,7 @@ class NavigationPluginTest(unittest.TestCase):
         plugin = self.make_plugin(mapping=mapping)
 
         missing = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
         self.assertEqual(missing["error_code"], "invalid_canvas_wiring")
@@ -1312,7 +1312,7 @@ class NavigationPluginTest(unittest.TestCase):
         ]
         with mock.patch("plugins.navigation.plugin.GoalTopicInput") as goal_input:
             started = plugin.dispatch(
-                "ControlledSemanticSpatial",
+                "controlled_semantic_spatial",
                 {"action": "start", "input_bindings": all_bindings},
             )
         self.assertEqual(started["state"], "ready")
@@ -1347,7 +1347,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
         result = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings(),
              "control_interface": _control_descriptor()},
         )
@@ -1376,7 +1376,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
         result = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
@@ -1477,7 +1477,7 @@ class NavigationPluginTest(unittest.TestCase):
         start_thread = threading.Thread(
             target=lambda: start_result.update(
                 plugin.dispatch(
-                    "ControlledSemanticSpatial",
+                    "controlled_semantic_spatial",
                     {"action": "start", "input_bindings": _external_bindings()},
                 )
             )
@@ -1487,7 +1487,7 @@ class NavigationPluginTest(unittest.TestCase):
 
         stop_thread = threading.Thread(
             target=lambda: stop_result.update(
-                plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+                plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
             )
         )
         stop_thread.start()
@@ -1515,27 +1515,27 @@ class NavigationPluginTest(unittest.TestCase):
             semantic=semantic,
         )
         plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings() + [
                 {"port": "rgb", "topic": "/robot/camera/rgb"}
             ]},
         )
         self.assertEqual(
             plugin.dispatch(
-                "ControlledSemanticSpatial",
+                "controlled_semantic_spatial",
                 {"action": "start_mapping", "map_name": "room"},
             )["component"],
             "mapping",
         )
         self.assertEqual(
             plugin.dispatch(
-                "ControlledSemanticSpatial",
+                "controlled_semantic_spatial",
                 {"action": "navigate_to_pose", "x": 1, "y": 2, "yaw": 0},
             )["component"],
             "planning",
         )
         self.assertEqual(
-            plugin.dispatch("ControlledSemanticSpatial", {"action": "capture"})[
+            plugin.dispatch("controlled_semantic_spatial", {"action": "capture"})[
                 "component"
             ],
             "semantic",
@@ -1638,11 +1638,11 @@ class NavigationPluginTest(unittest.TestCase):
             semantic=semantic,
         )
         plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
-        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "navigation_stop_pending")
         self.assertTrue(result["retryable"])
@@ -1665,11 +1665,11 @@ class NavigationPluginTest(unittest.TestCase):
         )
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
         plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
-        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "navigation_stop_pending")
         self.assertTrue(result["retryable"])
@@ -1691,11 +1691,11 @@ class NavigationPluginTest(unittest.TestCase):
         )
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
         plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
-        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "navigation_stop_failed")
         self.assertTrue(result["terminal_confirmed"])
@@ -1771,11 +1771,11 @@ class NavigationPluginTest(unittest.TestCase):
         runtime = FailingStopRuntime()
         plugin = self.make_plugin(runtime=runtime)
         plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
-        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "navigation_stop_pending")
         self.assertTrue(result["retryable"])
@@ -1801,11 +1801,11 @@ class NavigationPluginTest(unittest.TestCase):
             planning=planning,
         )
         plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
-        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "navigation_stop_pending")
         self.assertTrue(result["retryable"])
@@ -1832,11 +1832,11 @@ class NavigationPluginTest(unittest.TestCase):
             planning=planning,
         )
         plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
 
-        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "navigation_stop_pending")
         self.assertTrue(result["retryable"])
@@ -1857,17 +1857,17 @@ class NavigationPluginTest(unittest.TestCase):
             semantic=semantic,
         )
         started = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start", "input_bindings": _external_bindings()},
         )
         self.assertEqual(started["state"], "ready")
         mapping_started = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "start_mapping", "map_name": "office"},
         )
         self.assertEqual(mapping_started["status"], "mapping")
 
-        result = plugin.dispatch("ControlledSemanticSpatial", {"action": "stop"})
+        result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
 
         self.assertEqual(result["error_code"], "navigation_stop_pending")
         self.assertTrue(result["retryable"])
@@ -1885,14 +1885,14 @@ class NavigationPluginTest(unittest.TestCase):
         plugin = self.make_plugin()
 
         unknown = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "config", "legacy_companion": True},
         )
         self.assertEqual(unknown["error_code"], "invalid_config")
         self.assertIn("legacy_companion", unknown["error"])
 
         partial = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {"action": "config", "vlm_base_url": "https://vlm.example.test"},
         )
         self.assertEqual(partial["state"], "configured")
@@ -1905,7 +1905,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
         configured = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {
                 "action": "config",
                 "obstacle_min_height_m": -0.8,
@@ -1958,7 +1958,7 @@ class NavigationPluginTest(unittest.TestCase):
         ]
 
         result = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {
                 "action": "config",
                 "mapping_request_timeout_sec": 77.0,
@@ -1988,7 +1988,7 @@ class NavigationPluginTest(unittest.TestCase):
         ]
 
         result = plugin.dispatch(
-            "ControlledSemanticSpatial",
+            "controlled_semantic_spatial",
             {
                 "action": "config",
                 "mapping_request_timeout_sec": 77.0,

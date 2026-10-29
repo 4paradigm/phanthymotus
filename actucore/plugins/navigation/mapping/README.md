@@ -1,6 +1,6 @@
 # Navigation 内部 FAST-LIVO2 模块
 
-该模块负责统一 `ControlledSemanticSpatial` 卡片内的会话级 LiDAR-Inertial 建图、里程计、
+该模块负责统一 `controlled_semantic_spatial` 卡片内的会话级 LiDAR-Inertial 建图、里程计、
 运动补偿点云、标准 TF 和 Canvas 地图可视化。它不再单独注册 MCP 卡片，
 FAST-LIVO2 及 adapter 由同一个 ActuCore 容器内的 `NavigationRuntime`
 托管；Driver 只提供已冻结的标准传感器输入。
@@ -265,7 +265,7 @@ fail closed。
 
 ## 自动数据采集
 
-数据采集属于统一 `ControlledSemanticSpatial` 卡片，不增加单独卡片，也不增加
+数据采集属于统一 `controlled_semantic_spatial` 卡片，不增加单独卡片，也不增加
 `start_recording` / `stop_recording` 等公开 action。创建卡片时配置：
 
 | 配置 | 默认值 | 语义 |
@@ -434,7 +434,7 @@ MCAP/ROS 工具再手工解包：
 
 Canvas 把 Driver `lidar_cloud` 的标准 PointCloud2、`lidar_imu` 和
 `camera_rgb` 的 RGB PSE1 输出接到公开
-`ControlledSemanticSpatial` 卡片；语义导航和数采共用这一路 RGB，启用完整数采时再连接可选的
+`controlled_semantic_spatial` 卡片；语义导航和数采共用这一路 RGB，启用完整数采时再连接可选的
 `camera_depth` 的 Depth PSE1 输出到 `depth_frame`。原机身 `imu` 不能替代 `lidar_imu`。
 `livo_odom`、registered cloud、obstacle map 都在同一容器内
 交给 planning/semantic 模块。数采预览已停发，机器诊断仍由内部 topic 提供，

@@ -7,13 +7,13 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前挂载的卡片：`navigation`（公开工具名 `ControlledSemanticSpatial`）——
+当前挂载的卡片：`navigation`（公开工具名 `controlled_semantic_spatial`）——
 FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点，三者作为子进程跑在本容器内，
 对外只发布 bounded motion sequence；同时注册上游 `vla` 卡片。
 新增卡片的完整步骤见 README.md。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}；工具名等于 PREFIX 时不加前缀
-  例：vla_info、vla_start、ControlledSemanticSpatial
+  例：vla_info、vla_start、controlled_semantic_spatial
 
 MCP server 端口: config.mcp_port（默认 15730）
 """
@@ -129,7 +129,7 @@ class ActuCoreBundle:
         #
         # 需要 ROS 命名空间的卡片必须在自己的注册块里校验运行时支持范围。
         #
-        # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。
+        # 卡片契约（action.enum 必须含 "info" 等）见 README.md。
         # ──────────────────────────────────────────────────────────────────
 
         navigation_cfg = plugins_cfg.get("navigation", {})
@@ -197,12 +197,15 @@ class ActuCoreBundle:
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
-        prefix, sep, tool_name = full_name.partition("_")
-        name = tool_name if sep else prefix
-        for p in self._plugins:
-            if p.PREFIX == prefix:
-                return p.dispatch(name, args)
-        return None
+        matches = (
+            p for p in self._plugins
+            if full_name == p.PREFIX or full_name.startswith(p.PREFIX + "_")
+        )
+        plugin = max(matches, key=lambda p: len(p.PREFIX), default=None)
+        if plugin is None:
+            return None
+        name = full_name if full_name == plugin.PREFIX else full_name[len(plugin.PREFIX) + 1:]
+        return plugin.dispatch(name, args)
 
     def stop(self) -> bool:
         """Best-effort release for every card that owns runtime resources.

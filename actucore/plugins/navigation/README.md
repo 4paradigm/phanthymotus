@@ -1,6 +1,6 @@
-# ControlledSemanticSpatial ActuCore 卡片
+# controlled_semantic_spatial ActuCore 卡片
 
-`ControlledSemanticSpatial` 是 FAST-LIVO2、Nav2 和 VLN 的统一公开卡片，属于
+`controlled_semantic_spatial` 是 FAST-LIVO2、Nav2 和 VLN 的统一公开卡片，属于
 **ActuCore（执行模型层）**：把意图/目标变成运动指令。Canvas 只看到这一张
 `processor` 卡片，正式部署只运行一个 ActuCore 容器。
 
@@ -12,7 +12,7 @@ LiDAR/IMU 转为同一个 REP-103 `sensor_frame`，提供
 ## 运行边界
 
 ```text
-Driver lidar + imu ──────────> ControlledSemanticSpatial card (ActuCore container)
+Driver lidar + imu ──────────> controlled_semantic_spatial card (ActuCore container)
 optional RGB + depth frame ──┴─> semantic navigation / data collection
                             ├─ FAST-LIVO2 mapping/localization child process
                             ├─ Nav2 planner/controller child process

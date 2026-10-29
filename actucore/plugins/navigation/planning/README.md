@@ -1,6 +1,6 @@
 # Navigation 内部 Nav2 模块
 
-该模块在统一 `ControlledSemanticSpatial` 卡片内负责目标导航、路径规划、
+该模块在统一 `controlled_semantic_spatial` 卡片内负责目标导航、路径规划、
 局部避障和有时效的速度提案。建图、定位、点云去畸变、地图存储和
 地图可视化由同卡片 FAST-LIVO2 模块负责。它不再单独注册 MCP 卡片，
 不订阅 Driver 原始点云，也不再

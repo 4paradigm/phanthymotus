@@ -310,11 +310,9 @@ class FastLivo2ContractTest(unittest.TestCase):
             "grep -Fqx nav2_bringup /opt/actucore-ros-package-lock.txt",
             base_dockerfile,
         )
-        # 工具名不含下划线，所以 ActuCoreBundle 上游那套朴素的
-        # partition("_") 路由就够用了 —— 不需要给宿主打 exact-match 补丁。
-        self.assertNotIn("_", CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME)
-        self.assertIn('prefix, sep, tool_name = full_name.partition("_")', main)
-        self.assertIn("name = tool_name if sep else prefix", main)
+        self.assertEqual(
+            CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME, "controlled_semantic_spatial"
+        )
         self.assertIn('plugins_cfg.get("navigation"', main)
 
     def test_contract_exposes_bounded_relocalization_not_navigation(self) -> None:

@@ -141,7 +141,7 @@ class NavigationPlugin:
                 return self._error(
                     "canvas_not_started",
                     "connect LiDAR and IMU, then start the "
-                    "ControlledSemanticSpatial card",
+                    "controlled_semantic_spatial card",
                 )
             if action in SEMANTIC_ACTIONS and not self._external_wiring.get("rgb"):
                 return self._error(
@@ -160,7 +160,7 @@ class NavigationPlugin:
             if not self._runtime.info().get("running", False):
                 return self._error(
                     "navigation_runtime_unavailable",
-                    "an owned ControlledSemanticSpatial child process is not running; "
+                    "an owned controlled_semantic_spatial child process is not running; "
                     "stop and restart the card",
                 )
             if mapping_operation:
@@ -334,7 +334,7 @@ class NavigationPlugin:
                         "planning start failed after a navigation child process exited"
                     )
                 log.warning(
-                    "[ControlledSemanticSpatial] Nav2 command subscriber was not "
+                    "[controlled_semantic_spatial] Nav2 command subscriber was not "
                     "discovered on the first attempt; rebuilding only the planning "
                     "bridge before rollback"
                 )
@@ -387,7 +387,7 @@ class NavigationPlugin:
                 self._wiring_transition_unknown = False
         except Exception as exc:
             log.error(
-                "[ControlledSemanticSpatial] start failed: %s",
+                "[controlled_semantic_spatial] start failed: %s",
                 exc,
                 exc_info=True,
             )
@@ -435,7 +435,7 @@ class NavigationPlugin:
         if not self._runtime.info().get("running", False):
             return self._error(
                 "navigation_runtime_unavailable",
-                "an owned ControlledSemanticSpatial child process is not running; "
+                "an owned controlled_semantic_spatial child process is not running; "
                 "stop and restart the card",
             )
         return self._dispatch_planning(ticket, goal)
@@ -449,7 +449,7 @@ class NavigationPlugin:
         try:
             goal_input.close()
         except Exception:
-            log.exception("[ControlledSemanticSpatial] failed to close goal input")
+            log.exception("[controlled_semantic_spatial] failed to close goal input")
             return False
         with self._lock:
             if self._goal_input is goal_input:
@@ -525,7 +525,7 @@ class NavigationPlugin:
             return self._error(
                 "navigation_stop_pending",
                 "active navigation stop is unconfirmed; retry stop without "
-                "restarting ControlledSemanticSpatial",
+                "restarting controlled_semantic_spatial",
                 component_results=results,
                 retryable=True,
                 canvas_wired=True,
@@ -540,7 +540,7 @@ class NavigationPlugin:
             return self._error(
                 "semantic_stop_pending",
                 "semantic navigation stop is unconfirmed; retry stop without "
-                "restarting ControlledSemanticSpatial",
+                "restarting controlled_semantic_spatial",
                 component_results=results,
                 retryable=True,
                 canvas_wired=True,
@@ -560,7 +560,7 @@ class NavigationPlugin:
             return self._error(
                 "navigation_stop_pending",
                 "mapping finalization is unconfirmed; retry stop without restarting "
-                "ControlledSemanticSpatial",
+                "controlled_semantic_spatial",
                 component_results=results,
                 retryable=True,
                 canvas_wired=True,
@@ -578,7 +578,7 @@ class NavigationPlugin:
             return self._error(
                 "navigation_stop_pending",
                 "runtime shutdown is unconfirmed; retry stop without restarting "
-                "ControlledSemanticSpatial",
+                "controlled_semantic_spatial",
                 component_results=results,
                 retryable=True,
                 canvas_wired=True,
@@ -688,7 +688,7 @@ class NavigationPlugin:
             if self._started:
                 return self._error(
                     "config_while_running",
-                    "stop ControlledSemanticSpatial before changing config",
+                    "stop controlled_semantic_spatial before changing config",
                 )
         updates = {
             key: value
@@ -935,7 +935,7 @@ class NavigationPlugin:
                 details.append("unexpected=" + ",".join(unknown))
             return self._error(
                 "invalid_canvas_wiring",
-                "ControlledSemanticSpatial requires port-aware external bindings ("
+                "controlled_semantic_spatial requires port-aware external bindings ("
                 + "; ".join(details)
                 + ")",
             )
@@ -1035,7 +1035,7 @@ class NavigationPlugin:
                 else None
             ),
             "error": config_error or (
-                "an owned ControlledSemanticSpatial child process exited"
+                "an owned controlled_semantic_spatial child process exited"
                 if runtime_failed
                 else None
             ),

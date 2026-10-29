@@ -42,6 +42,46 @@ def _load_main_module():
     return module
 
 
+class BundleDispatchTest(unittest.TestCase):
+    def test_longest_prefix_and_self_named_tools(self):
+        module = _load_main_module()
+        short = mock.Mock(PREFIX="controlled")
+        spatial = mock.Mock(PREFIX="controlled_semantic_spatial")
+        short.dispatch.return_value = {"plugin": "short"}
+        spatial.dispatch.return_value = {"plugin": "spatial"}
+        bundle = module.ActuCoreBundle.__new__(module.ActuCoreBundle)
+        bundle._plugins = [short, spatial]
+        args = {"action": "info"}
+
+        self.assertEqual(bundle.dispatch("controlled_semantic_spatial", args), {"plugin": "spatial"})
+        spatial.dispatch.assert_called_once_with("controlled_semantic_spatial", args)
+        self.assertEqual(bundle.dispatch("controlled_semantic_spatial_get_map", args), {"plugin": "spatial"})
+        spatial.dispatch.assert_called_with("get_map", args)
+        short.dispatch.assert_not_called()
+        self.assertEqual(bundle.dispatch("controlled_other", args), {"plugin": "short"})
+        short.dispatch.assert_called_once_with("other", args)
+        self.assertIsNone(bundle.dispatch("controlledsemantic", args))
+        self.assertIsNone(bundle.dispatch("unknown_tool", args))
+
+    def test_legacy_prefixes_route_unchanged(self):
+        module = _load_main_module()
+        vla = mock.Mock(PREFIX="vla")
+        navi = mock.Mock(PREFIX="navi")
+        bundle = module.ActuCoreBundle.__new__(module.ActuCoreBundle)
+        bundle._plugins = [vla, navi]
+        args = {"action": "info"}
+
+        for plugin, full_name, expected in (
+            (vla, "vla_info", "info"),
+            (vla, "vla", "vla"),
+            (navi, "navi_navigate_to", "navigate_to"),
+            (navi, "navi", "navi"),
+        ):
+            with self.subTest(full_name=full_name):
+                bundle.dispatch(full_name, args)
+                plugin.dispatch.assert_called_with(expected, args)
+
+
 class SpinExecutorTest(unittest.TestCase):
     def test_invalid_handle_during_node_teardown_does_not_kill_executor(self):
         module = _load_main_module()

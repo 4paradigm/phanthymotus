@@ -7,7 +7,7 @@ streams into semantics, ActuCore turns intent into motion commands. Execution
 models (VLA policies, navigation, grasp policies, locomotion, whole-body
 control) attach as cards.
 
-It currently ships the `ControlledSemanticSpatial` navigation card as a
+It currently ships the `controlled_semantic_spatial` navigation card as a
 `processor`. Judge host and card changes differently: a host change affects
 every card, while a navigation-card change should remain self-contained.
 

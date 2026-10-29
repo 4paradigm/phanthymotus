@@ -74,7 +74,7 @@ case "${JP_VERSION}" in
     6.1) NAVIGATION_PARENT_IMAGE="${BASE_REPOSITORY}/jetson-base:jp61-torch@sha256:2f5d5e4046bc0d6c676e6b82ae13eab37f96db4dcd6b9a3f632ba0aa774ef03e" ;;
 esac
 
-CARDS_JSON='[{"name":"ControlledSemanticSpatial","type":"processor"},{"name":"vla","type":"processor"},{"name":"navi","type":"processor"}]'
+CARDS_JSON='[{"name":"controlled_semantic_spatial","type":"processor"},{"name":"vla","type":"processor"},{"name":"navi","type":"processor"}]'
 if ! ${BUILD_BASE} && [ "${JP_VERSION}" = "6.1" ]; then
     if [ -n "${ACTUCORE_NAVIGATION_BASE_IMAGE:-}" ]; then
         echo "ERROR=JP6.1 navigation runtime is not supported; build VLA without a navigation override" >&2

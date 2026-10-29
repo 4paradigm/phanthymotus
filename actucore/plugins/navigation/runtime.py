@@ -1,6 +1,6 @@
 """Own the ROS navigation runtime inside the ActuCore container.
 
-The public ControlledSemanticSpatial card is the only lifecycle owner.
+The public controlled_semantic_spatial card is the only lifecycle owner.
 FAST-LIVO2 adapters and Nav2 are regular child process groups in the same
 container; Docker is not used or required at runtime.
 """

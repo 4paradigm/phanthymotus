@@ -1,4 +1,4 @@
-"""Internal FAST-LIVO2 contract owned by ControlledSemanticSpatial."""
+"""Internal FAST-LIVO2 contract owned by controlled_semantic_spatial."""
 
 from __future__ import annotations
 
