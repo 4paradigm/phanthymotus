@@ -49,3 +49,8 @@ def test_callback_is_opt_in_and_deduplicates_heartbeats(monkeypatch):
     payload['timestamp_ms']-=5000
     node._direction_cb(SimpleNamespace(data=json.dumps(payload)))
     assert len(node._direction_estimates)==1
+
+
+def test_estimated_angle_rounding_keeps_public_rear_and_zero_convention():
+    assert fields([(-179.999,1700000000.8),(-179.999,1700000001.3)])['speaker_direction'].startswith('估计 180°')
+    assert fields([(-.001,1700000000.8),(-.001,1700000001.3)])['speaker_direction'].startswith('估计 0°')

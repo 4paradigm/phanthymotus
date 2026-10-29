@@ -624,6 +624,10 @@ def _estimated_wake_direction_fields(text, char_ends, end_pos, keyword_phones,
     if abs(abs(angle) - 180) < 1e-6:
         angle = 180
     angle = round(angle, 2)
+    if angle == -180:
+        angle = 180
+    if angle == 0:
+        angle = 0
     return {"speaker_direction_state": "estimated",
             "speaker_direction": f"估计 {angle:g}°, {DIRECTION_ANGLE_CONVENTION}",
             "speaker_direction_basis": "single_speaker_receipt_time_experiment",
