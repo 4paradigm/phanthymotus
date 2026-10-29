@@ -384,7 +384,7 @@ def test_pending_periodic_publish_cannot_follow_cancel_zero(planner_module):
     node._latest_proposal_candidate = {
         'nav_id': 'nav-1', 'attempt': 1, 'navigation_status': 'navigating',
         'velocity': planner_module.Velocity(x=0.5), 'reason': None,
-        'received_monotonic': time.monotonic(),
+        'received_monotonic_ns': time.monotonic_ns(),
     }
     node._control_odom_max_age_sec = 1
     node._control_odom_source_max_age_sec = 1
@@ -417,7 +417,7 @@ def test_inflight_nonzero_publish_finishes_before_cancel_zero(planner_module):
     node._latest_proposal_candidate = {
         'nav_id': 'nav-1', 'attempt': 1, 'navigation_status': 'navigating',
         'velocity': planner_module.Velocity(x=0.5), 'reason': None,
-        'received_monotonic': time.monotonic(),
+        'received_monotonic_ns': time.monotonic_ns(),
     }
     node._control_odom_max_age_sec = 1
     node._control_odom_source_max_age_sec = 1
@@ -451,3 +451,192 @@ def test_inflight_nonzero_publish_finishes_before_cancel_zero(planner_module):
         publisher.join(2)
         result.join(2)
         planner_module.control_odom_motion_blocker = original
+
+
+def shadow_twist(x):
+    return types.SimpleNamespace(
+        linear=types.SimpleNamespace(x=x, y=0.0),
+        angular=types.SimpleNamespace(z=0.0),
+    )
+
+
+def configure_shadow_node(node):
+    node._control_odom_max_age_sec = 1
+    node._control_odom_source_max_age_sec = 1
+    node._active['effective_speed_limit'] = 1.0
+
+
+def test_new_safety_zero_fences_inflight_periodic_candidate(planner_module, monkeypatch):
+    node = make_node(planner_module)
+    configure_shadow_node(node)
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+    node._on_shadow_velocity(shadow_twist(0.5))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def readiness():
+        if threading.current_thread().name == 'periodic':
+            entered.set()
+            assert release.wait(2)
+        return {}
+
+    node._readiness = readiness
+    periodic = threading.Thread(target=node._publish_latest_motion_sequence, name='periodic', daemon=True)
+    try:
+        periodic.start()
+        assert entered.wait(2)
+        node._on_shadow_velocity(shadow_twist(0.0))
+        assert node._proposal_pub.publish.call_count == 1
+        release.set()
+        periodic.join(2)
+        assert not periodic.is_alive()
+        assert node._proposal_pub.publish.call_count == 1
+        assert last_proposal(node)['velocity']['x'] == 0.0
+    finally:
+        release.set()
+        periodic.join(2)
+
+
+@pytest.mark.parametrize('new_stamp', [1_100_000_000, 1_000_000_000])
+def test_older_callback_cannot_overwrite_newer_safety_zero(planner_module, monkeypatch, new_stamp):
+    node = make_node(planner_module)
+    configure_shadow_node(node)
+    entered = threading.Event()
+    release = threading.Event()
+    stamps = {'old': 1_000_000_000, 'new': new_stamp}
+    monkeypatch.setattr(planner_module.time, 'monotonic_ns', lambda: stamps[threading.current_thread().name])
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+
+    def readiness():
+        if threading.current_thread().name == 'old':
+            entered.set()
+            assert release.wait(2)
+        return {}
+
+    node._readiness = readiness
+    old = threading.Thread(target=lambda: node._on_shadow_velocity(shadow_twist(0.5)), name='old', daemon=True)
+    new = threading.Thread(target=lambda: node._on_shadow_velocity(shadow_twist(0.0)), name='new', daemon=True)
+    try:
+        old.start()
+        assert entered.wait(2)
+        new.start()
+        new.join(2)
+        assert not new.is_alive()
+        release.set()
+        old.join(2)
+        assert not old.is_alive()
+        assert node._latest_proposal_candidate['velocity'] == planner_module.Velocity.zero()
+        assert node._latest_proposal_candidate['received_monotonic_ns'] == stamps['new']
+        assert node._proposal_pub.publish.call_count == 1
+        assert last_proposal(node)['velocity']['x'] == 0.0
+    finally:
+        release.set()
+        old.join(2)
+        new.join(2)
+
+
+def test_equal_timestamp_safety_zero_supersedes_nonzero(planner_module, monkeypatch):
+    node = make_node(planner_module)
+    configure_shadow_node(node)
+    monkeypatch.setattr(planner_module.time, 'monotonic_ns', lambda: 1_000_000_000)
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+    node._on_shadow_velocity(shadow_twist(0.5))
+    node._on_shadow_velocity(shadow_twist(0.0))
+    assert node._latest_proposal_candidate['velocity'] == planner_module.Velocity.zero()
+    assert node._proposal_pub.publish.call_count == 1
+    assert last_proposal(node)['velocity']['x'] == 0.0
+
+
+@pytest.mark.parametrize('now_ns, expected_x', [
+    (1_250_000_000, 0.5),
+    (1_250_000_001, 0.0),
+    (999_999_999, 0.0),
+])
+def test_final_locked_ttl_check_uses_original_entry_time(planner_module, monkeypatch, now_ns, expected_x):
+    node = make_node(planner_module)
+    configure_shadow_node(node)
+    clock = {'now': 1_000_000_000}
+    monkeypatch.setattr(planner_module.time, 'monotonic_ns', lambda: clock['now'])
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+    node._on_shadow_velocity(shadow_twist(0.5))
+    assert node._latest_proposal_candidate['received_monotonic_ns'] == 1_000_000_000
+
+    # The sample can expire while readiness is being evaluated, after an
+    # earlier TTL check would have passed.
+    def readiness():
+        clock['now'] = now_ns
+        return {}
+
+    node._readiness = readiness
+    node._publish_latest_motion_sequence()
+    assert last_proposal(node)['velocity']['x'] == expected_x
+    if expected_x == 0.0:
+        assert last_proposal(node)['reason'] == 'shadow_velocity_stale'
+
+
+def test_stale_candidate_publishes_zero_without_readiness(planner_module, monkeypatch):
+    node = make_node(planner_module)
+    configure_shadow_node(node)
+    clock = {'now': 1_000_000_000}
+    monkeypatch.setattr(planner_module.time, 'monotonic_ns', lambda: clock['now'])
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+    node._on_shadow_velocity(shadow_twist(0.5))
+    clock['now'] = 1_250_000_001
+    node._readiness = Mock(side_effect=RuntimeError('readiness unavailable'))
+
+    node._publish_latest_motion_sequence()
+
+    node._readiness.assert_not_called()
+    assert last_proposal(node)['velocity']['x'] == 0.0
+    assert last_proposal(node)['reason'] == 'shadow_velocity_stale'
+
+
+def test_final_ttl_check_runs_after_waiting_for_lock(planner_module, monkeypatch):
+    node = make_node(planner_module)
+    configure_shadow_node(node)
+    clock = {'now': 1_000_000_000}
+    checked = threading.Event()
+    proceed = threading.Event()
+    monkeypatch.setattr(planner_module.time, 'monotonic_ns', lambda: clock['now'])
+
+    def blocker(*args, **kwargs):
+        checked.set()
+        assert proceed.wait(2)
+        return None
+
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+    node._on_shadow_velocity(shadow_twist(0.5))
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', blocker)
+    periodic = threading.Thread(target=node._publish_latest_motion_sequence, daemon=True)
+    try:
+        periodic.start()
+        assert checked.wait(2)
+        with node._lock:
+            proceed.set()
+            clock['now'] = 1_300_000_000
+        periodic.join(2)
+        assert not periodic.is_alive()
+        assert last_proposal(node)['velocity']['x'] == 0.0
+        assert last_proposal(node)['reason'] == 'shadow_velocity_stale'
+    finally:
+        proceed.set()
+        periodic.join(2)
+
+
+def test_callback_delay_does_not_refresh_candidate_ttl(planner_module, monkeypatch):
+    node = make_node(planner_module)
+    configure_shadow_node(node)
+    clock = {'now': 1_000_000_000}
+    monkeypatch.setattr(planner_module.time, 'monotonic_ns', lambda: clock['now'])
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *args, **kwargs: None)
+
+    def readiness():
+        clock['now'] = 1_300_000_000
+        return {}
+
+    node._readiness = readiness
+    node._on_shadow_velocity(shadow_twist(0.5))
+    assert node._latest_proposal_candidate['received_monotonic_ns'] == 1_000_000_000
+    node._publish_latest_motion_sequence()
+    assert last_proposal(node)['velocity']['x'] == 0.0
+    assert last_proposal(node)['reason'] == 'shadow_velocity_stale'

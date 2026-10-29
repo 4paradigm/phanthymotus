@@ -537,6 +537,7 @@ class PlannerCommandNode(Node):
             )
 
     def _on_shadow_velocity(self, message: Twist) -> None:
+        received_monotonic_ns = time.monotonic_ns()
         with self._lock:
             if self._active is None:
                 return
@@ -582,14 +583,29 @@ class PlannerCommandNode(Node):
                     status=status,
                 ):
                     return
-                self._latest_proposal_candidate = {
+                previous = self._latest_proposal_candidate
+                if (
+                    previous is not None
+                    and previous.get("nav_id") == nav_id
+                    and previous.get("attempt") == attempt
+                    and previous.get("navigation_status") == status
+                ):
+                    previous_ns = previous.get("received_monotonic_ns")
+                    if not isinstance(previous_ns, int) or received_monotonic_ns < previous_ns:
+                        return
+                    if received_monotonic_ns == previous_ns and velocity != Velocity.zero():
+                        # An indistinguishable later nonzero cannot supersede a
+                        # candidate; an equal-time zero may safely suppress it.
+                        return
+                candidate = {
                     "nav_id": nav_id,
                     "attempt": attempt,
                     "navigation_status": status,
                     "velocity": velocity,
                     "reason": reason,
-                    "received_monotonic": time.monotonic(),
+                    "received_monotonic_ns": received_monotonic_ns,
                 }
+                self._latest_proposal_candidate = candidate
                 publish_safety_zero = velocity == Velocity.zero() and (
                     self._last_published_proposal is None
                     or self._last_published_proposal.get("nav_id") != nav_id
@@ -597,15 +613,9 @@ class PlannerCommandNode(Node):
                     != Velocity.zero()
                     or self._last_published_proposal.get("reason") != reason
                 )
-            if publish_safety_zero:
-                with self._lock:
-                    if not proposal_context_is_publishable(
-                        self._active,
-                        nav_id=nav_id,
-                        attempt=attempt,
-                        status=status,
-                    ):
-                        return
+                if publish_safety_zero:
+                    # Publish a safety zero before any later candidate can be
+                    # installed; do not let an older periodic snapshot follow it.
                     self._publish_motion_sequence(
                         nav_id=nav_id,
                         navigation_status=status,
@@ -1350,11 +1360,9 @@ class PlannerCommandNode(Node):
     def _publish_latest_motion_sequence(self) -> None:
         """Publish only the newest Nav2 sample at the configured execution cadence."""
         with self._lock:
-            candidate = (
-                dict(self._latest_proposal_candidate)
-                if self._latest_proposal_candidate is not None
-                else None
-            )
+            # Candidates are replaced, never mutated; keep their identity so
+            # the final locked check can reject a superseded snapshot.
+            candidate = self._latest_proposal_candidate
             active = dict(self._active) if self._active is not None else None
         if candidate is None or active is None:
             return
@@ -1374,10 +1382,13 @@ class PlannerCommandNode(Node):
         reason = candidate.get("reason")
         if not isinstance(velocity, Velocity):
             return
-        candidate_age = time.monotonic() - float(
-            candidate.get("received_monotonic", 0.0)
+        received_ns = candidate.get("received_monotonic_ns")
+        age_ns = (
+            time.monotonic_ns() - received_ns
+            if isinstance(received_ns, int) and not isinstance(received_ns, bool)
+            else -1
         )
-        if candidate_age > self._proposal_ttl_ms / 1000.0:
+        if age_ns < 0 or age_ns > self._proposal_ttl_ms * 1_000_000:
             velocity = Velocity.zero()
             reason = "shadow_velocity_stale"
         else:
@@ -1391,15 +1402,27 @@ class PlannerCommandNode(Node):
                 reason = blocker
 
         with self._lock:
-            if not proposal_context_is_publishable(
-                self._active,
-                nav_id=nav_id,
-                attempt=attempt,
-                status=status,
+            if (
+                self._latest_proposal_candidate is not candidate
+                or not proposal_context_is_publishable(
+                    self._active,
+                    nav_id=nav_id,
+                    attempt=attempt,
+                    status=status,
+                )
             ):
                 return
-            # Serialize the final context check and publish with state changes;
-            # otherwise a stale nonzero sample can follow the cancel zero.
+            received_ns = candidate.get("received_monotonic_ns")
+            age_ns = (
+                time.monotonic_ns() - received_ns
+                if isinstance(received_ns, int) and not isinstance(received_ns, bool)
+                else -1
+            )
+            if age_ns < 0 or age_ns > self._proposal_ttl_ms * 1_000_000:
+                velocity = Velocity.zero()
+                reason = "shadow_velocity_stale"
+            # Serialize identity, freshness and context checks with publication;
+            # an obsolete nonzero must not follow a newer or cancellation zero.
             self._publish_motion_sequence(
                 nav_id=str(nav_id),
                 navigation_status=str(status),
