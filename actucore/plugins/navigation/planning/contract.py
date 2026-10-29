@@ -422,6 +422,7 @@ def nav2_tool_definition(namespace: str) -> dict:
                 ],
             },
             "x-hooks": {
+                "on_interrupt_all": {"action": "stop_nav"},
                 "on_interrupt_navigation": {"action": "stop_nav"},
             },
         },
