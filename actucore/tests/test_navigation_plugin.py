@@ -741,6 +741,36 @@ class NavigationPluginTest(unittest.TestCase):
         })
         self.assertEqual(info["state"], "ready")
 
+    def test_info_reports_actual_topics_not_unwired_defaults(self):
+        plugin = self.make_plugin()
+
+        def input_info():
+            info = plugin.dispatch(plugin.PREFIX, {"action": "info"})
+            return {item["port"]: item for item in info["topic_in"]}
+
+        self.assertTrue(all(not item["topic"] and not item["connected"]
+                            for item in input_info().values()))
+        bindings = [
+            {"port": "lidar", "topic": "/custom/cloud"},
+            {"port": "imu", "topic": "/custom/imu"},
+        ]
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start", "input_bindings": bindings,
+        })
+        self.assertEqual(result["state"], "ready")
+        inputs = input_info()
+        for binding in bindings:
+            item = inputs[binding["port"]]
+            self.assertEqual(item["topic"], binding["topic"])
+            self.assertTrue(item["connected"])
+        for port in ("rgb", "depth_frame", "goal_pose"):
+            self.assertEqual(inputs[port]["topic"], "")
+            self.assertFalse(inputs[port]["connected"])
+
+        plugin.dispatch(plugin.PREFIX, {"action": "stop"})
+        self.assertTrue(all(not item["topic"] and not item["connected"]
+                            for item in input_info().values()))
+
     def test_direct_start_rejects_unsupported_control_negotiation(self):
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
