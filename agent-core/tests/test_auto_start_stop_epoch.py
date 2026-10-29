@@ -131,8 +131,13 @@ def test_loading_watcher_discards_info_returning_after_stop(monkeypatch, stop_mo
         cards = [{'id': 'a', 'mcpId': 'mcp', 'toolName': 'loading'}]
         if stop_mode == 'rollback':
             cards.append({'id': 'b', 'mcpId': 'mcp', 'toolName': 'fails'})
-        monkeypatch.setitem(config_mod.main, 'canvas_layout', {'cards': cards, 'connections': []})
-        monkeypatch.setitem(config_mod.main, 'core', {'project_running': False})
+        # ConfigDB is not a MutableMapping: it has no __delitem__. Patching a
+        # missing key on it makes monkeypatch teardown fail and leaks module
+        # stubs into later tests. Use an isolated mapping for this mock test.
+        monkeypatch.setattr(config_mod, 'main', {
+            'canvas_layout': {'cards': cards, 'connections': []},
+            'core': {'project_running': False},
+        })
         if stop_mode == 'explicit':
             async def start_topics(_layout):
                 pass
