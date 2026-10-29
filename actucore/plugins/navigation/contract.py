@@ -25,6 +25,7 @@ CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME = "ControlledSemanticSpatial"
 NAVIGATION_PUBLIC_OUTPUT_PORTS = (
     "map_view",
     "motion_sequence",
+    "control_velocity",
 )
 
 
@@ -119,10 +120,9 @@ def _action_properties() -> dict:
     }
     result["control_interface"] = {
         "type": "object",
-        "maxProperties": 0,
         "description": (
-            "Control-interface negotiation is unsupported; non-empty descriptors "
-            "are rejected. The navigation output uses data/json."
+            "Optional downstream motus.control/1 descriptor for the velocity "
+            "output; absent when no control consumer is connected."
         ),
     }
     return result
@@ -145,7 +145,7 @@ NAVIGATION_ACTION_PARAMS = {
         "description": "Configure mapping, planning and semantic navigation",
     },
     "start": {
-        "params": ["instance_id", "input_topics", "input_bindings"],
+        "params": ["instance_id", "input_topics", "input_bindings", "control_interface"],
         "description": "Start the in-container runtime and acquire card resources",
     },
     "stop": {
@@ -200,6 +200,15 @@ def navigation_tool_definition(namespace: str) -> dict:
         str(item.get("port", "")): item
         for item in [*mapping["topic_out"], *planning["topic_out"]]
         if item.get("port")
+    }
+    root = "/" + str(namespace or "ubuntu").strip("/")
+    component_outputs["control_velocity"] = {
+        "port": "control_velocity",
+        "topic": f"{root}/navigation/control_velocity",
+        "format": "control/velocity",
+        "ros_type": "std_msgs/msg/String",
+        "schema": "motus.control/1",
+        "desc": "Nav2 planar twist [vx, vy, vz, wx, wy, wz]",
     }
     outputs = [
         deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS

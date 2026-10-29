@@ -18,7 +18,8 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
                             ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
                                       |
-                                      `─ motion_sequence -> Driver loco
+                                      ├─ control_velocity -> 兼容的控制卡片
+                                      └─ motion_sequence -> 旧协议消费者（保留）
 ```
 
 - `NavigationPlugin` 是唯一 MCP/Canvas 生命周期所有者。
@@ -32,8 +33,9 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
   `nav_id`。到达或手动停止时先发布一次终态零速 proposal，再确认
   终态并允许下一个任务；已结束任务不会继续以 5 Hz 刷新，终态结果
   本身仍可查询和幂等重放。
-- Nav2 仍只发布 `phanthy.navigation.motion_sequence.v1`，Driver 继续负责
-  物理执行、TTL、急停、二次限幅和停车确认。
+- Nav2 保留 `phanthy.navigation.motion_sequence.v1` 输出，并增加与 Navi 卡片
+  同格式的 `motus.control/1` 速度输出。输出可能被下游控制卡片用于驱动硬件；
+  发送零速或收到回执并不证明机器人已物理停止。
 - Nav2 保留 NavFn、rolling costmap 和重规划，局部执行改为分段
   `停稳 -> 原地转向 -> 直行 -> 停稳复查`。控制和位姿检查为
   20 Hz，非零 proposal 仍为 5 Hz，零速立即发布。
@@ -127,17 +129,20 @@ mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale
 
 ## 公共输出
 
-卡片只保留以下两个输出，顺序固定。`motion_sequence` 是公开端口名，
-其 ROS topic 与消息 schema 同步使用 `motion_sequence`；5 Hz 频率和 TTL 不变；
-它仍发送有界速度提案，不是新的批量轨迹协议。升级已有画布时，先停止智能控制，
-刷新卡片定义，再把原第 4 个输出的连线重接到第 2 个 `motion_sequence`，
-连接同步升级后的 Driver `loco.motion_sequence`；删除已移除输出的旧连线后再启动。
-旧 Driver 不接受新的 schema，因此必须两端同步升级，不能单独部署本版 ActuCore。
+原有两个输出的位置保持不变，并追加 `control_velocity`。`motion_sequence`
+继续发送旧格式的有界速度提案，保留 5 Hz 和原 TTL；新输出使用 Navi 相同的
+`control/velocity`、`std_msgs/msg/String` 和 `motus.control/1` 消息格式，
+两种格式不可互换。升级画布需刷新卡片定义，并按下游实际支持的格式选择连线；
+不要把两个输出同时接到会各自执行的控制卡片。格式一致不代表已有消费者或已完成联调；
+当前 G1 底座已有接收路径使用旧格式，尚未确认具备新格式的底座接收端。
+新输出沿用 Navi 的固定 source 与启动后 seq 从 1 递增的约定；若下游保留同 source
+旧序号而不随之重置，单独重启上游后消息（包括零速）可能被丢弃，需在联调中验证生命周期。
 
 | port | topic | 用途 |
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
-| `motion_sequence` | `/ubuntu/navigation/motion_sequence` | 连接 Driver `loco` 执行器 |
+| `motion_sequence` | `/ubuntu/navigation/motion_sequence` | 原有速度提案格式，供兼容的旧消费者使用 |
+| `control_velocity` | `/ubuntu/navigation/control_velocity` | 与 Navi 相同格式的六维速度输出，供兼容的控制卡片使用 |
 
 `livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
 同容器内的定位、规划和语义逻辑消费，不生成 Canvas 右侧连线端口。

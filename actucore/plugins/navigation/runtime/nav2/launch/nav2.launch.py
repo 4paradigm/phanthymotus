@@ -14,6 +14,7 @@ from launch.actions import (
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -25,6 +26,8 @@ def generate_launch_description() -> LaunchDescription:
     obstacle_cloud_topic = LaunchConfiguration("obstacle_cloud_topic")
     cmd_vel_raw_topic = LaunchConfiguration("cmd_vel_raw_topic")
     motion_sequence_topic = LaunchConfiguration("motion_sequence_topic")
+    control_velocity_topic = LaunchConfiguration("control_velocity_topic")
+    control_interface_json = LaunchConfiguration("control_interface_json")
     command_topic = LaunchConfiguration("command_topic")
     status_topic = LaunchConfiguration("status_topic")
     segment_status_topic = LaunchConfiguration("segment_status_topic")
@@ -53,6 +56,11 @@ def generate_launch_description() -> LaunchDescription:
                 "motion_sequence_topic",
                 default_value="/ubuntu/navigation/motion_sequence",
             ),
+            DeclareLaunchArgument(
+                "control_velocity_topic",
+                default_value="/ubuntu/navigation/control_velocity",
+            ),
+            DeclareLaunchArgument("control_interface_json", default_value="{}"),
             DeclareLaunchArgument(
                 "command_topic",
                 default_value="/ubuntu/navigation/nav2/command",
@@ -106,6 +114,8 @@ def generate_launch_description() -> LaunchDescription:
                         # actuator's effective velocity deadbands.
                         "shadow_topic": cmd_vel_raw_topic,
                         "motion_sequence_topic": motion_sequence_topic,
+                        "control_velocity_topic": control_velocity_topic,
+                        "control_interface_json": ParameterValue(control_interface_json, value_type=str),
                         "controller_speed_limit_topic": speed_limit_topic,
                         "speed_limit_timeout": 3.0,
                         "behavior_tree_path": os.path.join(

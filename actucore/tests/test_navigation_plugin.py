@@ -183,6 +183,20 @@ class RetryableMappingBackend:
         self.stop_calls += 1
 
 
+def _control_descriptor(**overrides):
+    descriptor = {
+        "control_interface": "motus.control/1",
+        "mode": "twist",
+        "dof": 6,
+        "joint_names": ["vx", "vy", "vz", "wx", "wy", "wz"],
+        "limits": {"lower": [-1.0] * 6, "upper": [1.0] * 6},
+        "rate": {"max_hz": 20, "expected_hz": 8, "watchdog_ms": 300},
+        "vendor": {"note": "round trip"},
+    }
+    descriptor.update(overrides)
+    return descriptor
+
+
 def _external_bindings():
     return [
         {"port": item["port"], "topic": item["topic"]}
@@ -221,10 +235,11 @@ class NavigationContractTest(unittest.TestCase):
         for args in (start, info, {"action": "info", "instance_id": "card-1"},
                      {"action": "start", "instance_id": "card-1",
                       "input_topic": topics[0]},
-                     {"action": "start", "control_interface": {}}):
+                     {"action": "start", "control_interface": {}},
+                     {"action": "start", "control_interface": _control_descriptor()}):
             with self.subTest(args=args):
                 jsonschema.validate(instance=args, schema=schema)
-        for value in ({"schema": "motus.control/1"}, None, [], "descriptor"):
+        for value in (None, [], "descriptor"):
             with self.subTest(control_interface=value):
                 with self.assertRaises(jsonschema.ValidationError):
                     jsonschema.validate(
@@ -287,8 +302,19 @@ class NavigationContractTest(unittest.TestCase):
             [
                 "map_view",
                 "motion_sequence",
+                "control_velocity",
             ],
         )
+        control = tool["topic_out"][2]
+        self.assertEqual(control["topic"], "/ubuntu/navigation/control_velocity")
+        self.assertEqual(control["format"], "control/velocity")
+        self.assertEqual(control["ros_type"], "std_msgs/msg/String")
+        self.assertEqual(control["schema"], "motus.control/1")
+        other = navigation_tool_definition("/robot_alpha/")
+        other_control = next(item for item in other["topic_out"]
+                             if item["port"] == "control_velocity")
+        self.assertEqual(other_control["topic"], "/robot_alpha/navigation/control_velocity")
+        self.assertEqual(tool["topic_out"][1]["topic"], "/ubuntu/navigation/motion_sequence")
         auxiliary = {item["port"]: item for item in tool["topic_aux"]}
         self.assertEqual(set(auxiliary), {"plan", "livo_odom"})
         self.assertEqual(auxiliary["plan"]["topic"], "/plan")
@@ -741,17 +767,75 @@ class NavigationPluginTest(unittest.TestCase):
         })
         self.assertEqual(info["state"], "ready")
 
-    def test_direct_start_rejects_unsupported_control_negotiation(self):
+    def test_start_negotiates_descriptor_and_preserves_it_for_runtime(self):
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime)
+        descriptor = _control_descriptor()
+        request = {"action": "start", "input_bindings": _external_bindings(),
+                   "control_interface": descriptor}
+        started = plugin.dispatch(plugin.PREFIX, request)
+        self.assertEqual(started["state"], "ready")
+        self.assertFalse(started["shadow_only"])
+        self.assertTrue(started["control_output_can_drive_hardware"])
+        self.assertEqual(runtime.start_kwargs["control_interface"], descriptor)
+        self.assertIsNot(runtime.start_kwargs["control_interface"], descriptor)
+        info = plugin.dispatch(plugin.PREFIX, {"action": "info"})
+        self.assertEqual(info["state"], "ready")
+        output = next(item for item in info["topic_out"] if item["port"] == "control_velocity")
+        self.assertEqual(output["topic"], "/ubuntu/navigation/control_velocity")
+        self.assertEqual(output["format"], "control/velocity")
+        self.assertEqual(output["schema"], "motus.control/1")
+        self.assertTrue(plugin.dispatch(plugin.PREFIX, request)["already_started"])
+        changed = _control_descriptor(rate={"max_hz": 20, "expected_hz": 5})
+        result = plugin.dispatch(plugin.PREFIX, {**request, "control_interface": changed})
+        self.assertEqual(result["error_code"], "navigation_control_interface_conflict")
+        result = plugin.dispatch(plugin.PREFIX, {**request, "control_interface": {}})
+        self.assertEqual(result["error_code"], "navigation_control_interface_conflict")
+        self.assertEqual(runtime.start_kwargs["control_interface"], descriptor)
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "stop"})["state"], "idle")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {
+            **request, "control_interface": changed,
+        })["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["control_interface"], changed)
+
+    def test_start_accepts_navi_minimal_descriptor_and_short_watchdog(self):
+        for descriptor in (
+            {"control_interface": "motus.control/1", "mode": "twist"},
+            {"control_interface": "motus.control/1", "mode": "twist", "dof": 6,
+             "rate": {"expected_hz": 8, "watchdog_ms": 50}},
+        ):
+            with self.subTest(descriptor=descriptor):
+                runtime = FakeRuntime()
+                plugin = self.make_plugin(runtime=runtime)
+                result = plugin.dispatch(plugin.PREFIX, {
+                    "action": "start", "input_bindings": _external_bindings(),
+                    "control_interface": descriptor,
+                })
+                self.assertEqual(result["state"], "ready")
+                self.assertEqual(runtime.start_kwargs["control_interface"], descriptor)
+
+    def test_start_rejects_incompatible_control_before_runtime(self):
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
-        for descriptor in ({"schema": "motus.control/1"}, None, [], "descriptor"):
+        cases = [
+            ({"schema": "motus.control/1"}, "incompatible_control_interface"),
+            (_control_descriptor(mode="joint_position"), "incompatible_control_interface"),
+            (_control_descriptor(mode=""), "incompatible_control_interface"),
+            (_control_descriptor(dof=4), "incompatible_control_interface"),
+            (_control_descriptor(rate={"max_hz": 5}), "incompatible_control_interface"),
+            (None, "invalid_control_interface"), ([], "invalid_control_interface"),
+            ("descriptor", "invalid_control_interface"),
+            (_control_descriptor(dof="invalid"), "invalid_control_interface"),
+            (_control_descriptor(rate="invalid"), "invalid_control_interface"),
+        ]
+        for descriptor, code in cases:
             with self.subTest(descriptor=descriptor):
                 result = plugin.dispatch(plugin.PREFIX, {
                     "action": "start", "input_bindings": _external_bindings(),
                     "control_interface": descriptor,
                 })
-                self.assertEqual(result["error_code"], "unsupported_control_interface")
+                self.assertEqual(result["error_code"], code)
                 self.assertFalse(runtime.started)
                 self.assertEqual(mapping.calls, [])
         result = plugin.dispatch(plugin.PREFIX, {
@@ -759,10 +843,7 @@ class NavigationPluginTest(unittest.TestCase):
             "control_interface": {},
         })
         self.assertEqual(result["state"], "ready")
-        result = plugin.dispatch(plugin.PREFIX, {
-            "action": "start", "control_interface": {"schema": "motus.control/1"},
-        })
-        self.assertEqual(result["error_code"], "unsupported_control_interface")
+        self.assertEqual(runtime.start_kwargs["control_interface"], {})
 
     def test_all_operational_actions_reject_idle_before_component_dispatch(self):
         runtime = FakeRuntime()
@@ -1258,6 +1339,24 @@ class NavigationPluginTest(unittest.TestCase):
         )
         self.assertEqual(started["state"], "ready")
 
+    def test_runtime_start_failure_rolls_back_before_retry(self):
+        runtime = FakeRuntime(fail=True)
+        mapping = FakeComponent("mapping")
+        plugin = self.make_plugin(runtime=runtime, mapping=mapping)
+        request = {"action": "start", "input_bindings": _external_bindings(),
+                   "control_interface": _control_descriptor()}
+        failed = plugin.dispatch(plugin.PREFIX, request)
+        self.assertEqual(failed["error_code"], "navigation_start_failed")
+        self.assertEqual(runtime.stop_calls, 1)
+        self.assertFalse(runtime.started)
+        self.assertFalse(any(args["action"] == "start" for _, args in mapping.calls))
+        runtime.fail = False
+        minimal = {"control_interface": "motus.control/1", "mode": "twist"}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {
+            **request, "control_interface": minimal,
+        })["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["control_interface"], minimal)
+
     def test_start_failure_releases_every_acquired_resource(self):
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
@@ -1270,13 +1369,22 @@ class NavigationPluginTest(unittest.TestCase):
 
         result = plugin.dispatch(
             "ControlledSemanticSpatial",
-            {"action": "start", "input_bindings": _external_bindings()},
+            {"action": "start", "input_bindings": _external_bindings(),
+             "control_interface": _control_descriptor()},
         )
 
         self.assertEqual(result["error_code"], "navigation_start_failed")
         self.assertFalse(runtime.started)
         self.assertEqual(runtime.stop_calls, 1)
         self.assertTrue(any(args["action"] == "stop" for _, args in mapping.calls))
+        planning.fail_start = False
+        minimal = {"control_interface": "motus.control/1", "mode": "twist"}
+        retry = plugin.dispatch(plugin.PREFIX, {
+            "action": "start", "input_bindings": _external_bindings(),
+            "control_interface": minimal,
+        })
+        self.assertEqual(retry["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["control_interface"], minimal)
 
     def test_transient_planning_discovery_retries_without_runtime_rollback(self):
         runtime = FakeRuntime()
@@ -1944,6 +2052,40 @@ class NavigationRuntimeTest(unittest.TestCase):
             self.return_code = 0
             return 0
 
+    def test_launch_arguments_without_descriptor_preserve_legacy_and_default_control(self):
+        arguments = dict(value.split(":=", 1) for value in
+                         NavigationRuntime._launch_arguments("/other/", {})["nav2"])
+        self.assertEqual(arguments["motion_sequence_topic"], "/other/navigation/motion_sequence")
+        self.assertEqual(arguments["control_velocity_topic"], "/other/navigation/control_velocity")
+        self.assertEqual(json.loads(arguments["control_interface_json"]), {})
+
+    def test_minimal_descriptor_round_trips_into_bridge_configuration(self):
+        # Load the ROS-free helper through its independent package path, just as
+        # the subprocess does, without relying on a ROS installation.
+        import importlib
+        from plugins.control_stream import negotiate
+
+        nav2_path = str(ACTUCORE_ROOT / "plugins/navigation/runtime/nav2")
+        descriptors = [
+            {},
+            {"control_interface": "motus.control/1", "mode": "twist"},
+            {"control_interface": "motus.control/1", "mode": "twist", "dof": 6,
+             "rate": {"expected_hz": 8, "watchdog_ms": 50}},
+            _control_descriptor(),
+        ]
+        with mock.patch.object(sys, "path", [nav2_path, *sys.path]):
+            helper = importlib.import_module("nav2.control_velocity")
+            for descriptor in descriptors:
+                with self.subTest(descriptor=descriptor):
+                    args = dict(value.split(":=", 1) for value in
+                                NavigationRuntime._launch_arguments(
+                                    "robot", {}, descriptor)["nav2"])
+                    received, hz, ttl, *_ = helper.configure(args["control_interface_json"])
+                    self.assertEqual(received, descriptor)
+                    self.assertEqual(hz, negotiate.effective_rate(
+                        {"control_hz": 10}, descriptor, 10))
+                    self.assertEqual(ttl, negotiate.ttl_ms(hz, descriptor))
+
     def test_runtime_launches_ros_process_groups_without_docker(self):
         commands = []
 
@@ -1959,6 +2101,7 @@ class NavigationRuntimeTest(unittest.TestCase):
                 "imu": "/sensors/imu",
                 "rgb": "/camera/rgb",
             },
+            control_interface=_control_descriptor(),
         )
         self.assertEqual(started["state"], "running")
         self.assertEqual([item[0][2] for item in commands], ["fast_livo2", "nav2"])
@@ -1979,6 +2122,12 @@ class NavigationRuntimeTest(unittest.TestCase):
             "motion_sequence_topic:=/robot/navigation/motion_sequence",
             nav2_command,
         )
+        self.assertIn("control_velocity_topic:=/robot/navigation/control_velocity", nav2_command)
+        arguments = dict(arg.split(":=", 1) for arg in nav2_command[4:])
+        self.assertEqual(json.loads(arguments["control_interface_json"]), _control_descriptor())
+        self.assertEqual(arguments["control_interface_json"], json.dumps(
+            _control_descriptor(), ensure_ascii=False, separators=(",", ":")
+        ))
         with mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
             stopped = runtime.stop()
         self.assertEqual(stopped["state"], "idle")

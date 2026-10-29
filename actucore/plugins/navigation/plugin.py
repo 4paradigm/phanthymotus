@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from copy import deepcopy
 
+from ..control_stream import negotiate
 from .contract import (
     CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
     NAVIGATION_ACTIONS,
@@ -104,6 +106,7 @@ class NavigationPlugin:
         self._pending_terminal_stop_error = None
         self._instance_id = ""
         self._external_wiring: dict[str, str] = {}
+        self._control_interface: dict = {}
         # A start may leave partially acquired resources until rollback succeeds.
         self._wiring_transition_unknown = False
 
@@ -116,14 +119,6 @@ class NavigationPlugin:
         if not isinstance(args, dict):
             return self._error("invalid_argument", "arguments must be an object")
         action = args.get("action")
-        if action == "start" and "control_interface" in args:
-            descriptor = args["control_interface"]
-            if not isinstance(descriptor, dict) or descriptor:
-                return self._error(
-                    "unsupported_control_interface",
-                    "control_interface negotiation is unsupported; "
-                    "only an empty object is accepted",
-                )
         if action == "info":
             return self._info(args.get("instance_id"))
         if action == "config":
@@ -219,6 +214,23 @@ class NavigationPlugin:
         # explicit default ID refers to that same owner, but omission never
         # aliases a different card. A retry must repeat its actual wiring.
         requested_id = str(args.get("instance_id") or "default").strip() or "default"
+        descriptor = args.get("control_interface", {})
+        if not isinstance(descriptor, dict):
+            return self._error("invalid_control_interface", "control_interface must be an object")
+        descriptor = deepcopy(descriptor)
+        if descriptor:
+            capabilities = {
+                "control_mode": "twist", "action_dim": 6,
+                "control_hz": 10.0, "chunk_size": 1,
+            }
+            try:
+                problems = negotiate.check(capabilities, descriptor, label="导航")
+            except (TypeError, ValueError, OverflowError, AttributeError) as error:
+                return self._error("invalid_control_interface", str(error))
+            if descriptor.get("mode") != "twist":
+                problems.append("下游 mode 必须是 twist")
+            if problems:
+                return self._error("incompatible_control_interface", "；".join(problems))
         with self._lock:
             if self._stop_requested.is_set():
                 return self._error("navigation_start_cancelled", "stop was requested")
@@ -241,6 +253,13 @@ class NavigationPlugin:
             if wiring.get("status") == "error":
                 return wiring
             if already_started:
+                if descriptor != self._control_interface:
+                    return self._error(
+                        "navigation_control_interface_conflict",
+                        "navigation is already started with a different control "
+                        "interface; stop it before reconnecting the output",
+                        instance_id=self._instance_id,
+                    )
                 if wiring["wired_topics"] != self._external_wiring:
                     return self._error(
                         "navigation_wiring_conflict",
@@ -261,6 +280,7 @@ class NavigationPlugin:
             runtime_result = self._runtime.start(
                 namespace=self._namespace,
                 input_topics=wiring["wired_topics"],
+                control_interface=descriptor,
             )
             if runtime_result.get("state") != "running":
                 raise RuntimeError("navigation child processes did not stay running")
@@ -351,6 +371,7 @@ class NavigationPlugin:
                 self._generation = object()
                 self._instance_id = requested_id
                 self._external_wiring = dict(wiring["wired_topics"])
+                self._control_interface = descriptor
                 self._wiring_transition_unknown = False
         except Exception as exc:
             log.error(
@@ -513,6 +534,7 @@ class NavigationPlugin:
             self._generation = None
             self._instance_id = ""
             self._external_wiring = {}
+            self._control_interface = {}
             self._wiring_transition_unknown = False
             terminal_mapping_error = self._pending_terminal_stop_error
             self._pending_terminal_stop_error = None
@@ -537,8 +559,9 @@ class NavigationPlugin:
             "status": "idle",
             "canvas_wired": False,
             "component_results": results,
-            "shadow_only": True,
+            "shadow_only": False,
             "physical_execution": False,
+            "control_output_can_drive_hardware": True,
         }
 
     @classmethod
@@ -764,8 +787,9 @@ class NavigationPlugin:
             "status": "configured",
             "component_results": results,
             "takes_effect": "next_start",
-            "shadow_only": True,
+            "shadow_only": False,
             "physical_execution": False,
+            "control_output_can_drive_hardware": True,
         }
 
     def _validate_external_wiring(self, args: dict) -> dict:
@@ -955,8 +979,9 @@ class NavigationPlugin:
                 if runtime_failed
                 else None
             ),
-            "shadow_only": True,
+            "shadow_only": False,
             "physical_execution": False,
+            "control_output_can_drive_hardware": True,
         }
 
     def _stop_started(self, started: list[tuple[str, object]]) -> tuple[dict, bool]:
@@ -1016,8 +1041,9 @@ class NavigationPlugin:
             "error_code": code,
             "error": message,
             "message": message,
-            "shadow_only": True,
+            "shadow_only": False,
             "physical_execution": False,
+            "control_output_can_drive_hardware": True,
         }
 
 

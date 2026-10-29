@@ -94,13 +94,19 @@ Agent Core 仅在 Canvas 项目处于运行状态、且上游 topic 实际连到
 | port | topic | type / QoS | 语义 |
 | --- | --- | --- | --- |
 | `motion_sequence` | `/ubuntu/navigation/motion_sequence` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.motion_sequence.v1`，非零动作最多 5 Hz，零速立即发布，只保留最新值，`base_link`，TTL 最大 250 ms |
+| `control_velocity` | `/ubuntu/navigation/control_velocity` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `motus.control/1` 的六维 twist，消息格式与 Navi 相同 |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
 | `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
 速度提案至少包含 `nav_id`、递增 `sequence`、`issued_at_unix_ms`、
 `ttl_ms`、`nav_status` 和 `velocity{x,y,yaw}`。终态立即发布一次零速，随后停止该
 `nav_id` 的周期 proposal；终态回执仍保留供查询和幂等重放。
-卡片始终为 proposal-only；`shadow_only=true` 不代表 Driver 一定执行。
+卡片自身不直接操作底盘，但 `control_velocity` 可被兼容的下游控制卡片执行；
+不能将它视为隔离的 shadow 输出，也不能仅凭消息发布或回执断言物理动作或停止。
+非零控制消息的 `obs_stamp_ms` 取速度候选产生时快照的里程计与障碍点云中
+较早的源时间；时间域或新鲜度检查不通过时该输出转为零速。这些就绪输入
+时间并不能证明 Nav2 控制器实际消费了对应样本。桥接器主动生成的零速在
+缺少可用源时间时使用零速生成时间，并以 `obs_stamp_kind` 明示，而非传感器采集时间。
 
 速度限制：
 
@@ -231,8 +237,9 @@ shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互
 ## 统一卡片连线
 
 odom、registered cloud 和 static map 由 `NavigationPlugin` 固定为同容器
-内部 topic，不需要 Canvas 连线。Canvas 只需把公开 `motion_sequence`
-输出接到 Driver `loco.motion_sequence`；可选 `goal_pose` 仍可作为外部输入。
+内部 topic，不需要 Canvas 连线。刷新卡片定义后，按下游实际支持的格式选择
+`control_velocity` 或旧的 `motion_sequence`，不要同时连接两个会执行动作的消费者；
+`goal_pose` 仍可作为可选外部输入。格式匹配本身不证明 Driver 已订阅或联调通过。
 
 地图和实时位姿从统一卡片的 `map_view` 查看；`livo_odom` 只作为同容器内部
 定位/规划数据，不再生成 Canvas 公共端口。Agent Core 的地图 renderer 会额外

@@ -7,6 +7,7 @@ container; Docker is not used or required at runtime.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -83,6 +84,7 @@ class NavigationRuntime:
         *,
         namespace: str = "ubuntu",
         input_topics: dict[str, str] | None = None,
+        control_interface: dict | None = None,
     ) -> dict:
         with self._lock:
             running = [child for child in self._children if self._is_running(child)]
@@ -93,7 +95,7 @@ class NavigationRuntime:
 
             started: list[_Child] = []
             try:
-                launch_arguments = self._launch_arguments(namespace, input_topics)
+                launch_arguments = self._launch_arguments(namespace, input_topics, control_interface)
                 for child in self._children:
                     command = [
                         *child.command,
@@ -128,7 +130,8 @@ class NavigationRuntime:
 
     @staticmethod
     def _launch_arguments(
-        namespace: str, input_topics: dict[str, str] | None
+        namespace: str, input_topics: dict[str, str] | None,
+        control_interface: dict | None = None,
     ) -> dict[str, tuple[str, ...]]:
         use_legacy_camera_defaults = input_topics is None
         input_topics = input_topics if input_topics is not None else {}
@@ -174,6 +177,10 @@ class NavigationRuntime:
             "obstacle_cloud_topic": f"{navigation}/cloud_registered",
             "cmd_vel_raw_topic": f"{nav2}/cmd_vel_raw",
             "motion_sequence_topic": f"{navigation}/motion_sequence",
+            "control_velocity_topic": f"{navigation}/control_velocity",
+            "control_interface_json": json.dumps(
+                control_interface or {}, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            ),
             "command_topic": f"{nav2}/command",
             "status_topic": f"{nav2}/status",
             "segment_status_topic": f"{nav2}/segment_status",
