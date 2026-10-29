@@ -35,15 +35,11 @@ from fast_livo2.camera_rgb_frame import (  # noqa: E402
     encode,
 )
 from plugins.navigation.mapping.collection_postprocess import (  # noqa: E402
-    CollectionPreviewWorker,
     RosCollectionController,
     CollectionPostprocessManager,
-    LiveCollectionSynchronizer,
     OfflineAnnotationProcessor,
     SessionTracker,
     annotate_frame,
-    collection_public_mode,
-    render_collection_progress,
 )
 
 
@@ -351,68 +347,6 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
         self.assertGreaterEqual(obstacle["image_pixel"]["y"], 0)
         self.assertLess(obstacle["image_pixel"]["y"], metadata()["height"])
 
-    def test_live_preview_reassembles_sampled_topics_and_renders_in_background(self) -> None:
-        stamp = metadata()["source_stamp_ns"]
-        synchronizer = LiveCollectionSynchronizer()
-        synchronizer.update_session("session-a")
-        records = [
-            {
-                "kind": "lidar",
-                "stamp_ns": stamp + 10_000_000,
-                "points": synthetic_points(),
-            },
-            {
-                "kind": "imu",
-                "stamp_ns": stamp + 11_000_000,
-                "gravity": np.asarray((0.0, 0.0, -9.81)),
-            },
-            {
-                "kind": "depth_frame",
-                "stamp_ns": stamp + 20_000_000,
-                "metadata": {"source_stamp_ns": stamp + 20_000_000},
-                "depth": b"depth",
-            },
-            {"kind": "odom", "stamp_ns": stamp, "t_map_base": np.eye(4)},
-            {
-                "kind": "rgb_frame",
-                "stamp_ns": stamp,
-                "metadata": metadata(stamp),
-                "jpeg": b"jpeg",
-            },
-        ]
-        ready = None
-        for record in records:
-            ready = synchronizer.observe(record) or ready
-        self.assertIsNotNone(ready)
-        frame_number, bundle = ready
-        self.assertEqual(frame_number, 1)
-        self.assertEqual(set(bundle), {"rgb_frame", "depth_frame", "lidar", "imu", "odom"})
-
-        def fake_renderer(value, number, tracker):
-            self.assertIs(value, bundle)
-            self.assertEqual(number, 1)
-            self.assertIsInstance(tracker, SessionTracker)
-            return b"\xff\xd8preview\xff\xd9", {
-                "status": "valid",
-                "obstacles": [{"distance_m": 1.25}],
-            }
-
-        worker = CollectionPreviewWorker(fake_renderer)
-        worker.submit(frame_number, bundle)
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            if worker.snapshot()["frame_number"] == 1:
-                break
-            time.sleep(0.01)
-        preview = worker.snapshot()
-        self.assertEqual(preview["jpeg"], b"\xff\xd8preview\xff\xd9")
-        self.assertEqual(preview["annotation_status"], "valid")
-        self.assertEqual(preview["obstacle_count"], 1)
-        self.assertIsNone(preview["failure_reason"])
-
-        synchronizer.update_session("session-b")
-        self.assertEqual(synchronizer.session_id, "session-b")
-
     @unittest.skipUnless(importlib.util.find_spec("cv2"), "opencv is unavailable")
     def test_processor_writes_one_json_per_image_and_atomic_manifest(self) -> None:
         import cv2
@@ -533,57 +467,6 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
             processor = OfflineAnnotationProcessor(lambda _: FakeReader([]))
             with self.assertRaisesRegex(RuntimeError, "no_rgb_frame_images"):
                 processor.process_session(session, lambda *args: None, lambda: None)
-
-    def test_public_status_switches_to_export_progress_after_stop(self) -> None:
-        class FakeCv2:
-            FONT_HERSHEY_SIMPLEX = 0
-            LINE_AA = 0
-            IMWRITE_JPEG_QUALITY = 1
-
-            def __init__(self):
-                self.text = []
-
-            def putText(self, image, text, *args):
-                self.text.append(str(text))
-                return image
-
-            @staticmethod
-            def rectangle(image, *args):
-                return image
-
-            @staticmethod
-            def imencode(extension, image, parameters):
-                return True, np.frombuffer(
-                    b"\xff\xd8progress\xff\xd9", dtype=np.uint8
-                )
-
-        running = {
-            "enabled": True,
-            "postprocess": {"state": "processing"},
-        }
-        stopped = {
-            "enabled": False,
-            "postprocess": {
-                "state": "processing",
-                "stage": "processing",
-                "session_id": "session-a",
-                "processed_images": 8,
-                "total_images": 20,
-                "generated_depth_frames": 7,
-                "generated_lidar_frames": 8,
-                "percent": 40.0,
-            },
-        }
-        self.assertEqual(collection_public_mode(running), "preview")
-        self.assertEqual(collection_public_mode(stopped), "progress")
-        fake_cv2 = FakeCv2()
-        payload = render_collection_progress(
-            stopped["postprocess"], cv2_module=fake_cv2
-        )
-        self.assertEqual(payload, b"\xff\xd8progress\xff\xd9")
-        self.assertIn("Frames: 8 / 20", fake_cv2.text)
-        self.assertIn("40.0%", fake_cv2.text)
-        self.assertTrue(any("Depth: 7" in value for value in fake_cv2.text))
 
     def test_manager_pauses_for_runtime_and_resumes_after_stop(self) -> None:
         class FakeProcessor:
@@ -745,9 +628,6 @@ class CollectionControllerTrafficTest(unittest.TestCase):
         with patch.dict(sys.modules, modules), patch(
             "plugins.navigation.mapping.collection_postprocess.CollectionPostprocessManager",
             return_value=manager,
-        ), patch(
-            "plugins.navigation.mapping.collection_postprocess.CollectionPreviewWorker",
-            side_effect=AssertionError("preview worker must not start"),
         ):
             controller = RosCollectionController("unused", "robot", executor)
             self.assertEqual(node.create_publisher.call_count, 1)
