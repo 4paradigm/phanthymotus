@@ -1091,9 +1091,6 @@ def render_evidence_section(
 
     page_path = api.replace("/api/evidence/", "/evidence/", 1)
 
-    def page_url(capability):
-        return page_url_at(capability, base)
-
     def page_url_at(capability, origin):
         if not origin or not capability or not page_path.startswith("/evidence/"):
             return ""
@@ -1308,6 +1305,63 @@ def render_evidence_section(
         h, r = key
         remaining_note_chars = 900
         notes_truncated = False
+        test_result = group.get("test_result")
+        result_labels = {"pass": "通过", "fail": "失败"}
+        component_by_id = {
+            component.get("component_id"): component
+            for component in group.get("components", [])
+            if isinstance(component, dict)
+            and isinstance(component.get("component_id"), str)
+        }
+        case_labels = {
+            "running": "运行中", "pass": "通过", "fail": "失败", "n/a": "不适用",
+        }
+        case_lines = []
+        case_results = group.get("case_results")
+        if isinstance(case_results, dict):
+            for component_id, result in case_results.items():
+                if (not isinstance(component_id, str) or not isinstance(result, str)
+                        or result not in case_labels):
+                    continue
+                component = component_by_id.get(component_id, {})
+                target = component.get("target")
+                if target == "driver" and component.get("driver_path"):
+                    label = f"driver {component['driver_path']}"
+                elif target and component.get("variant"):
+                    label = f"{target} {component['variant']}"
+                else:
+                    label = target or component_id
+                case_lines.append(f"- {_escape(label)}：{case_labels[result]}")
+
+        test_summary = ""
+        command = group.get("command")
+        command_args = command.get("args") if isinstance(command, dict) else None
+        request = group.get("acceptance_request")
+        if (isinstance(test_result, str) and test_result in result_labels
+                and isinstance(request, dict) and request.get("status") == "completed"
+                and request.get("head_sha") == key[0]
+                and request.get("round_id") == key[1]
+                and request.get("result") == test_result
+                and isinstance(request.get("summary"), str)):
+            test_summary = request["summary"].strip()
+        elif (isinstance(test_result, str) and test_result in result_labels
+              and isinstance(command, dict) and command.get("kind") == "record_test"
+              and command.get("phase") == "completed"
+              and isinstance(command_args, dict)
+              and command_args.get("result") == test_result
+              and isinstance(command_args.get("summary"), str)):
+            test_summary = command_args["summary"].strip()
+        if test_summary:
+            try:
+                json.loads(test_summary)
+                test_summary = ""
+            except (TypeError, ValueError):
+                test_summary = safe_note_text(test_summary[:500])
+        test_details = []
+        if case_lines:
+            test_details.extend(case_lines)
+        if test_summary:
+            test_details.append(f"- **测试摘要：** {_escape(test_summary)}")
         items = visible_attachments(group, key)
         items.sort(key=lambda item: sortable_time(first_valid_time(
             item.get("created_at"), item.get("uploaded_at"))), reverse=True)
@@ -1316,8 +1370,13 @@ def render_evidence_section(
             "", f"**Commit：** `{_escape(h)}`",
             f"**状态：** {_escape(round_status(group, key))}",
             f"**测试时间：** {_escape(summary_time(first_valid_time(group.get('round_started_at'), group.get('started_at'))))}",
-            "", "### 附件", "",
         ])
+        if isinstance(test_result, str) and test_result in result_labels:
+            lines.extend(["", f"**验收结果：** {result_labels[test_result]}"])
+        if test_details:
+            lines.extend(["", "<details>", "<summary>测试详情</summary>", "",
+                          *test_details, "", "</details>"])
+        lines.extend(["", "### 附件", ""])
         if items:
             lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
         notes = []
@@ -1352,10 +1411,6 @@ def render_evidence_section(
             filename_cell = _escape(filename)
             if download_url:
                 filename_cell = f"[{filename_cell}](<{download_url}>)"
-            elif not deleted:
-                attachment_page = stable_read_page_url(key, base or upload_base)
-                if attachment_page:
-                    filename_cell = f"[{filename_cell}](<{attachment_page}>)"
             lines.append("| " + " | ".join((
                 filename_cell, _escape(size), _escape(actor), _escape(uploaded_at),
             )) + " |")
@@ -1399,9 +1454,7 @@ def render_evidence_section(
         if notes:
             lines.extend(["", "<details>", "<summary>附件说明</summary>", "", *notes, "", "</details>"])
         if notes_truncated:
-            attachment_page = stable_read_page_url(key, base or upload_base)
-            if attachment_page:
-                lines.extend(["", f"[备注摘要已精简；完整说明请打开附件页](<{attachment_page}>)"])
+            lines.extend(["", "备注摘要已精简；可打开本轮附件页查看完整内容。"])
         if historical and items and group.get("attachment_details_unreadable"):
             lines.append("部分历史附件明细无法读取或校验；此处仅显示通过校验的记录。")
         if not items:
@@ -1428,44 +1481,25 @@ def render_evidence_section(
                 lines.append("本轮暂无附件，上传后会显示")
         if group.get("deployments"):
             lines.extend(["", "### 部署记录", "",
-                          f"**部署镜像对应 Commit：** `{_escape(h)}`", "",
-                          _deployment_table(group["deployments"], group.get("components"), group.get("machine_groups"))])
-        test_result = group.get("test_result")
-        if isinstance(test_result, str) and test_result in {"pass", "fail"}:
-            lines.extend(["", "**测试结果：** " + ("通过" if test_result == "pass" else "未通过")])
-        case_results = group.get("case_results")
-        if isinstance(case_results, dict) and case_results:
-            labels = {"pass": "通过", "fail": "失败", "running": "运行中", "n/a": "不适用"}
-            counts = {}
-            for value in case_results.values():
-                if not isinstance(value, str) or value not in labels:
-                    continue
-                label = labels[value]
-                counts[label] = counts.get(label, 0) + 1
-            if counts:
-                lines.extend(["", "**自动用例：** " + " · ".join(
-                    f"{_escape(label)} {count}" for label, count in counts.items())])
-        summary = group.get("summary")
-        if isinstance(summary, str) and summary.strip():
-            summary_text = summary.strip()
-            try:
-                json.loads(summary_text)
-                summary_text = ""
-            except (TypeError, ValueError):
-                pass
-            if summary_text:
-                lines.extend(["", "**摘要：** " + _escape(summary_text[:500])])
-        history = group.get("history")
-        if isinstance(history, (list, dict)) and history:
-            history_count = len(history)
-            lines.extend(["", f"历史事件：{history_count} 条（详情保留在归档记录中）"])
+                          _deployment_table(group["deployments"], group.get("components"),
+                                            group.get("machine_groups"))])
+        attachment_page = round_attachment_page_url(key, group)
+        if attachment_page:
+            lines.extend(["", f"[打开附件页](<{attachment_page}>)"])
         return lines
 
     def round_summary(key, group):
         timestamp = first_valid_time(
             group.get("round_started_at"), group.get("started_at"),
         )
-        return (f"<summary>{_escape(round_label(group, historical=key != (head, current_round)))}"
+        current = key == (head, current_round)
+        label = round_label(group, historical=not current)
+        if current:
+            round_number = group.get("round_number")
+            label = (f"第 {round_number} 轮（当前轮次）"
+                     if type(round_number) is int and round_number > 0
+                     else "当前轮（当前轮次）")
+        return (f"<summary>{_escape(label)}"
                 f" · {_escape(round_status(group, key))} · {_escape(summary_time(timestamp))}</summary>")
 
     def round_sort_time(key):
@@ -1473,7 +1507,26 @@ def render_evidence_section(
         round_number = group.get("round_number")
         value = first_valid_time(group.get("round_started_at"), group.get("started_at"), group.get("created_at"), group.get("archived_at"), group.get("ended_at"))
         trusted_number = round_number if type(round_number) is int and round_number > 0 else 0
-        return (sortable_time(value), trusted_number)
+        return (trusted_number, sortable_time(value))
+    round_pattern = re.escape(str(head)) + r"-[0-9]+"
+    round_read_context_valid = (
+        re.fullmatch(r"[0-9a-f]{40}", str(head))
+        and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
+        and state.get("evidence_enabled") is True and bool(api)
+    )
+
+    def round_attachment_page_url(key, group):
+        if not round_read_context_valid:
+            return ""
+        origin = base or upload_base
+        if key == (head, current_round):
+            if state.get("status") == "testing" and state.get("browser_upload_ready") is True:
+                upload_url = page_url_at(state.get("upload_capability"), upload_base)
+                if upload_url:
+                    return upload_url
+            return page_url_at(group.get("capability"), origin)
+        return stable_read_page_url(key, origin)
+
     lines = ["<!-- deploy-approval-evidence:start -->"]
     if show_current_round:
         current_key = (head, current_round)
@@ -1483,65 +1536,12 @@ def render_evidence_section(
             round_summary(current_key, current_group),
             "", *render_round(current_key, current_group), "", "</details>",
         ])
-    round_pattern = re.escape(str(head)) + r"-[0-9]+"
-    current_context_valid = (
-        re.fullmatch(r"[0-9a-f]{40}", str(head))
-        and isinstance(current_round, str) and re.fullmatch(round_pattern, current_round)
-        and state.get("evidence_enabled") is True and bool(api)
-    )
-    if current_context_valid:
-        upload_url = (
-            page_url_at(state.get("upload_capability"), upload_base)
-            if state.get("status") == "testing"
-            and state.get("browser_upload_ready") is True
-            else ""
-        )
-        # Keep read access on the stable public origin when one is configured;
-        # the temporary ingress is only a fallback for deployments without it.
-        read_url = page_url_at(state.get("capability"), base or upload_base)
-        if upload_url:
-            lines.extend(["", f"[打开附件页](<{upload_url}>)"])
-        elif read_url:
-            lines.extend(["", f"[打开附件页](<{read_url}>)"])
-    if (current_context_valid and state.get("status") == "testing"
-            and state.get("browser_upload_ready") is True
-            and page_url_at(state.get("upload_capability"), upload_base)):
-        current_items = latest_attachments(groups[(head, current_round)], (head, current_round))
-        pending = sum(1 for item in current_items
-                      if isinstance(item, dict)
-                      and item.get("status") not in {"ready", "text", "deleted", "invalid"})
-        archived = sum(1 for item in current_items
-                       if isinstance(item, dict) and item.get("status") == "ready"
-                       and item.get("cos_projection_verified") is True
-                       and item.get("object_key") and isinstance(item.get("sha256"), str)
-                       and re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
-                       and item.get("head_sha") == head and item.get("round_id") == current_round
-                       and ((item.get("actor_verified") is True
-                             and item.get("upload_method") != "signed_invite")
-                            or item.get("upload_method") == "signed_invite"
-                            and item.get("upload_link_authorized") is True
-                            and item.get("actor_verified") is False
-                            and item.get("github_user_authenticated") is False
-                            and item.get("cos_content_verified") is True))
-        lines.extend([
-            "上传权限：仅限本轮测试邀请；分享链接上传会标示身份未验证。",
-            "可上传视频、图片、文件或文字说明；单文件 512 MiB；本轮最多 20 个文件、总计 10 GiB。",
-            f"当前状态：{pending} 个待处理 · {archived} 个已归档并完成 COS SHA256 校验。",
-        ])
-        acceptance_request = state.get("acceptance_request")
-        if (isinstance(acceptance_request, dict)
-                and acceptance_request.get("status") == "pending"
-                and acceptance_request.get("head_sha") == head
-                and acceptance_request.get("round_id") == current_round):
-            lines.append("独立验收人请执行 `/record_test result=pass` 表示通过，或 `/record_test result=fail` 表示失败。")
-        else:
-            lines.append("Machine Owner 完成本轮测试后执行 `/request_acceptance`；待验收后由独立验收人执行 `/record_test result=pass` 或 `/record_test result=fail`。")
     test_statuses = {"testing", "succeeded", "failed"}
     old = [(key, group) for key, group in groups.items()
            if key != (head, current_round) and group.get("status") in test_statuses]
     old.sort(key=lambda pair: round_sort_time(pair[0]), reverse=True)
     if old:
-        lines.extend(["", "### 历史轮次", ""])
+        lines.append("")
         for key, group in old:
             lines.extend(["<details>",
                           round_summary(key, group),

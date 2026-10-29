@@ -2627,15 +2627,34 @@ class DeployController:
 
     def _enrich_deployments_for_render(
         self, deployments: list[dict], *, historical: bool = False,
+        historical_machine_groups: list[dict] | None = None,
     ) -> list[dict]:
         """Enrich deployment rows with machine IP for render-only display.
 
         Prefer the IP captured with a deployment snapshot. Legacy rows without
-        one can still use current policy data for the active round; history
-        keeps the captured value when available.
+        one can still use current policy data for the active round. Historical
+        rows may use only a unique IP captured in that archive's machine groups.
 
         Hidden-state authoritative identity remains the alias only.
         """
+        historical_ips: dict[str, set[str]] = {}
+        historical_deployment_ips: dict[str, set[str]] = {}
+        if historical and isinstance(historical_machine_groups, list):
+            for group in historical_machine_groups:
+                if not isinstance(group, dict):
+                    continue
+                alias, ip = group.get("alias"), group.get("ip")
+                if (isinstance(alias, str) and alias.strip()
+                        and isinstance(ip, str) and ip.strip()):
+                    historical_ips.setdefault(alias, set()).add(ip.strip())
+        if historical:
+            for deployment in deployments:
+                if not isinstance(deployment, dict):
+                    continue
+                alias, ip = deployment.get("machine"), deployment.get("ip")
+                if (isinstance(alias, str) and alias.strip()
+                        and isinstance(ip, str) and ip.strip()):
+                    historical_deployment_ips.setdefault(alias, set()).add(ip.strip())
         enriched: list[dict] = []
         for dep in deployments:
             if not isinstance(dep, dict):
@@ -2643,7 +2662,18 @@ class DeployController:
                 continue
             machine_alias = dep.get("machine", "")
             ip = dep.get("ip", "")
-            if not ip and not historical and machine_alias:
+            if historical:
+                alias = machine_alias if isinstance(machine_alias, str) else ""
+                deployment_matches = historical_deployment_ips.get(alias, set())
+                if len(deployment_matches) == 1:
+                    ip = next(iter(deployment_matches))
+                elif len(deployment_matches) > 1:
+                    ip = "历史未记录"
+                else:
+                    group_matches = historical_ips.get(alias, set())
+                    ip = next(iter(group_matches)) if len(group_matches) == 1 else "历史未记录"
+            elif (not historical and not (isinstance(ip, str) and ip.strip())
+                  and isinstance(machine_alias, str) and machine_alias):
                 machine_info = self.policy.get_machine(machine_alias)
                 if machine_info is not None:
                     ip = machine_info.node_host or ""
@@ -3592,14 +3622,24 @@ class DeployController:
     @staticmethod
     def _replace_markdown_section(markdown, heading, content, next_heading):
         """Replace one heading-delimited lifecycle section idempotently."""
-        start = markdown.find(heading)
-        if start < 0 or markdown.find(heading, start + len(heading)) >= 0:
+        heading_re = re.compile(r"(?m)^" + re.escape(heading) + r"[ \t]*$")
+        matches = list(heading_re.finditer(markdown))
+        if len(matches) != 1:
             return markdown
-        content_start = start + len(heading)
-        end = markdown.find(next_heading, content_start)
-        if end < 0:
-            return markdown
-        return markdown[:content_start] + "\n\n" + content.rstrip() + "\n\n" + markdown[end:]
+        content_start = matches[0].end()
+        next_match = None
+        if isinstance(next_heading, str) and next_heading:
+            next_re = re.compile(r"(?m)^" + re.escape(next_heading) + r"[ \t]*$")
+            next_match = next_re.search(markdown, content_start)
+            if next_match is None:
+                return markdown
+        end = next_match.start() if next_match is not None else len(markdown)
+        replacement = markdown[:content_start] + "\n\n" + content.rstrip()
+        if end < len(markdown):
+            return replacement + "\n\n" + markdown[end:]
+        if markdown.endswith(("\n", "\r")):
+            replacement += "\n"
+        return replacement
 
     @staticmethod
     def _unwrap_history_details(history_content: str) -> str:
@@ -3844,21 +3884,172 @@ class DeployController:
         visible = "".join(result).rstrip()
         return visible
 
+    @staticmethod
+    def _strip_legacy_lifecycle_display_fields(
+        visible, *, remove_current_deployment=False,
+    ):
+        """Remove recognized top-level legacy display fields only."""
+        if not isinstance(visible, str):
+            return visible
+        lines = visible.splitlines()
+        result = []
+        index = 0
+        details_depth = 0
+        code_fence = None
+        deployment_heading = re.compile(r"^### Current Deployment[ \t]*$")
+        table_rule = re.compile(r"^\s*\|(?:\s*:?-+:?\s*\|)+\s*$")
+        last_event = re.compile(
+            r"^\s*(?:\*\*)?Last lifecycle event:(?:\*\*)?(?:\s+.*)?$",
+        )
+        known_empty_deployment = {
+            "Deployment records exist; details unavailable.",
+            "No deployment has been performed yet.",
+            "No deployment record is available for this round yet.",
+            "Deployment completed; deployment records unavailable.",
+        }
+
+        def update_details_depth(line):
+            nonlocal details_depth
+            details_depth += len(re.findall(r"<details\b[^>]*>", line, re.IGNORECASE))
+            details_depth -= len(re.findall(r"</details\s*>", line, re.IGNORECASE))
+            details_depth = max(0, details_depth)
+
+        while index < len(lines):
+            fence_match = re.match(r"^\s*(`{3,}|~{3,})", lines[index])
+            if code_fence is not None:
+                result.append(lines[index])
+                if (fence_match and fence_match.group(1)[0] == code_fence[0]
+                        and len(fence_match.group(1)) >= code_fence[1]):
+                    code_fence = None
+                index += 1
+                continue
+            if fence_match:
+                result.append(lines[index])
+                code_fence = (fence_match.group(1)[0], len(fence_match.group(1)))
+                index += 1
+                continue
+            if details_depth == 0 and last_event.fullmatch(lines[index]):
+                index += 1
+                continue
+            if (remove_current_deployment and details_depth == 0
+                    and deployment_heading.fullmatch(lines[index])):
+                following = index + 1
+                while following < len(lines) and not lines[following].strip():
+                    following += 1
+                end = None
+                if following < len(lines) and lines[following].lstrip().startswith("|"):
+                    cells = [cell.strip() for cell in lines[following].strip().strip("|").split("|")]
+                    if (len(cells) >= 2 and cells[0].casefold() == "machine"
+                            and cells[1].casefold() == "ip"
+                            and following + 1 < len(lines)
+                            and table_rule.fullmatch(lines[following + 1])):
+                        end = following + 2
+                        while end < len(lines) and lines[end].lstrip().startswith("|"):
+                            end += 1
+                elif (following < len(lines)
+                      and lines[following].strip() in known_empty_deployment):
+                    end = following + 1
+                if end is None:
+                    logger.warning(
+                        "Unrecognized top-level Current Deployment section; preserving it",
+                    )
+                else:
+                    index = end
+                    while index < len(lines) and not lines[index].strip():
+                        index += 1
+                    if result and index < len(lines):
+                        result.append("")
+                    continue
+            result.append(lines[index])
+            update_details_depth(lines[index])
+            index += 1
+        return "\n".join(result).strip()
+
     async def _render_evidence_projection(self, repo, pr_number, state, visible):
         renderer = getattr(comments_mod, "render_evidence_section", None)
         if renderer is None:
-            return visible
+            visible, history = self._extract_visible_history(visible)
+            visible = self._strip_legacy_lifecycle_display_fields(visible)
+            return visible.rstrip() + ("\n\n" + history if history else "")
+        previous_visible = visible
         records = await self.proxy.read_evidence_records(repo, pr_number)
         archives = [r["data"] for r in records if r["kind"] == "round"]
         attachments = [r["data"] for r in records if r["kind"] == "attachment"]
-        latest = {r["attachment_id"]: r for r in attachments}
-        current_round = round_id_for_state(state)
-        current_rows = [r for r in latest.values()
-                        if r.get("round_id") == current_round
-                        and r.get("head_sha") == state.get("head_sha")]
+        trusted_records_by_key = {
+            (record.get("kind"), record.get("key")): record
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("key"), str)
+        }
+        latest_by_identity = {}
+        deleted_by_identity = {}
+        attachment_id_identities: dict[str, set[tuple[str, int, str, str, str]]] = {}
 
-        def verified_evidence_row(row, head_sha, round_id):
+        def attachment_is_deleted(row):
+            return bool(row.get("deleted_at")) or row.get("status") == "deleted"
+
+        for row in attachments:
+            attachment_id = row.get("attachment_id") if isinstance(row, dict) else None
+            if isinstance(attachment_id, str):
+                # read_evidence_records is chronologically ordered; this is
+                # the same Latest rule used by EvidenceService.
+                identity = (
+                    row.get("repo"), row.get("pr_number"), row.get("head_sha"),
+                    row.get("round_id"), attachment_id,
+                )
+                attachment_id_identities.setdefault(attachment_id, set()).add(identity)
+                latest_by_identity[identity] = row
+                if attachment_is_deleted(row):
+                    # The download API treats an attachment ID as permanently
+                    # deleted once a trusted tombstone exists for that identity.
+                    deleted_by_identity[identity] = row
+        current_round = round_id_for_state(state)
+        current_rows = []
+        for identity, row in latest_by_identity.items():
+            record_repo, record_pr, head_sha, round_id, attachment_id = identity
+            if ((record_repo, record_pr, head_sha, round_id)
+                    != (repo, pr_number, state.get("head_sha"), current_round)):
+                continue
+            current_rows.append(deleted_by_identity.get(identity, row))
+
+        def attachment_key_inputs(row):
+            object_key = row.get("object_key")
+            filename = row.get("filename")
+            if not isinstance(filename, str) or not filename.strip():
+                filename = (object_key.rsplit("/", 1)[-1]
+                            if isinstance(object_key, str) else "")
+            uploaded_at = None
+            for field in ("created_at", "uploaded_at"):
+                value = row.get(field)
+                if not isinstance(value, str):
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                    uploaded_at = value
+                    break
+            display_uploaded_at = uploaded_at
+            if uploaded_at is None and isinstance(object_key, str):
+                parts = object_key.split("/")
+                if len(parts) == 10 and parts[0] == "phanthymotus_pr":
+                    try:
+                        # This date-only fallback is used solely to verify the
+                        # canonical object path; it is never exposed as upload time.
+                        uploaded_at = datetime.fromisoformat(
+                            parts[3] + "T00:00:00+08:00",
+                        ).isoformat()
+                    except ValueError:
+                        pass
+            return uploaded_at, filename, display_uploaded_at
+
+        def verified_evidence_row(
+            row, head_sha, round_id, *, archived_invite_provenance=False,
+        ):
             if not isinstance(row, dict):
+                return False
+            if (row.get("repo") != repo or type(row.get("pr_number")) is not int
+                    or row.get("pr_number") != pr_number):
                 return False
             invitation_upload = (
                 row.get("upload_method") == "signed_invite"
@@ -3867,6 +4058,12 @@ class DeployController:
                 and row.get("github_user_authenticated") is False
                 and row.get("cos_content_verified") is True
             )
+            archived_invitation_upload = (
+                archived_invite_provenance
+                and row.get("upload_method") == "signed_invite"
+                and row.get("actor") == "shared-link"
+            )
+            invitation_upload = invitation_upload or archived_invitation_upload
             if row.get("upload_method") == "signed_invite" and not invitation_upload:
                 return False
             if (row.get("head_sha") != head_sha
@@ -3882,7 +4079,9 @@ class DeployController:
                 return (type(source_id) is int and source_id > 0
                         and isinstance(digest, str)
                         and re.fullmatch(r"[0-9a-f]{64}", digest) is not None)
-            if row.get("status") != "ready":
+            if (row.get("status") != "ready" or row.get("deleted_at")
+                    or type(row.get("size")) is not int
+                    or not 1 <= row["size"] <= 512 * 1024 * 1024):
                 return False
             digest = row.get("sha256")
             source_id = row.get("source_comment_id")
@@ -3891,13 +4090,18 @@ class DeployController:
             if (not isinstance(digest, str)
                     or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
                 return False
-            if invitation_upload and row.get("cos_content_verified") is not True:
+            if (row.get("upload_method") == "signed_invite"
+                    and not archived_invite_provenance
+                    and row.get("cos_content_verified") is not True):
+                return False
+            uploaded_at, filename, _ = attachment_key_inputs(row)
+            if not isinstance(uploaded_at, str) or not isinstance(filename, str) or not filename:
                 return False
             try:
                 from .evidence_store import build_attachment_key
                 expected_key = build_attachment_key(
                     repo, pr_number, head_sha, round_id, row.get("attachment_id", ""),
-                    row.get("created_at", ""), row.get("filename", ""),
+                    uploaded_at, filename,
                 )
             except (ValueError, TypeError, AttributeError):
                 return False
@@ -3926,6 +4130,27 @@ class DeployController:
             visible = self._replace_markdown_section(
                 visible, "### Workflow", workflow, "### Next action",
             )
+            next_action_start = visible.find("### Next action")
+            action_content_start = (next_action_start + len("### Next action")
+                                    if next_action_start >= 0 else -1)
+            next_heading = "### Current Deployment"
+            if (action_content_start >= 0
+                    and visible.find(next_heading, action_content_start) < 0):
+                candidates = [
+                    match.start() + action_content_start
+                    for match in re.finditer(r"(?m)^#{1,6}[ \t]+[^\r\n]+", visible[action_content_start:])
+                ]
+                candidates.extend(
+                    position for marker in (
+                        "<!-- evidence-projection:start -->",
+                        VISIBLE_HISTORY_START_MARKER,
+                    )
+                    if (position := visible.find(marker, action_content_start)) >= 0
+                )
+                next_heading = (
+                    visible[min(candidates):].splitlines()[0]
+                    if candidates else None
+                )
             visible = self._replace_markdown_section(
                 visible, "### Next action",
                 ("等待独立验收人确认。" if isinstance(state.get("acceptance_request"), dict)
@@ -3937,7 +4162,7 @@ class DeployController:
                  if isinstance(state.get("acceptance_request"), dict)
                  and state["acceptance_request"].get("status") == "pending"
                  else comments_mod._testing_next_action(confirmed_current)),
-                "### Current Deployment",
+                next_heading,
             )
         # Presentation flags are deliberately ephemeral. Hidden state has a
         # strict schema and must never learn about browser feature config.
@@ -3984,6 +4209,21 @@ class DeployController:
             and isinstance(archive["snapshot"].get("attachments"), list)
             and bool(archive["snapshot"]["attachments"])
             for archive in archives if isinstance(archive, dict)
+        ) or any(
+            isinstance(archive, dict)
+            and isinstance(archive.get("attachment_records"), list)
+            and any(
+                isinstance(wrapper, dict)
+                and wrapper.get("kind") == "attachment"
+                and isinstance(wrapper.get("data"), dict)
+                and wrapper["data"].get("repo") == repo
+                and type(wrapper["data"].get("pr_number")) is int
+                and wrapper["data"].get("pr_number") == pr_number
+                and wrapper["data"].get("head_sha") == archive.get("head_sha")
+                and wrapper["data"].get("round_id") == archive.get("round_id")
+                for wrapper in archive["attachment_records"]
+            )
+            for archive in archives
         )
         attachment_access_allowed = (
             state.get("status") in {"testing", "succeeded", "failed"}
@@ -3999,6 +4239,16 @@ class DeployController:
             attachments=current_rows,
         )
         round_numbers = trusted_round_numbers(records, state, repo, pr_number)
+        verified_current_round = (
+            state.get("status") in {"testing", "succeeded", "failed"}
+            and current_round in round_numbers
+        )
+        if verified_current_round:
+            # This display-only copy may use current authorized machine data
+            # when a legacy current-round deployment row has no captured IP.
+            render_state["deployments"] = self._enrich_deployments_for_render(
+                state.get("deployments", []),
+            )
         if current_round in round_numbers:
             render_state["round_number"] = round_numbers[current_round]
         bundles = []
@@ -4010,6 +4260,7 @@ class DeployController:
             configured_public_base
             if is_evidence_ingress_url(configured_public_base) else ""
         )
+        historical_cos_sign_budget = [24]
         from .evidence_auth import (
             DOWNLOAD_PURPOSE, UPLOAD_MAX_LIFETIME_SECONDS, UPLOAD_PURPOSE,
             issue_capability, verify_capability,
@@ -4022,8 +4273,9 @@ class DeployController:
         # into hidden state or evidence records.
         store = getattr(self.evidence_service, "store", None)
         cached_cos_urls = {}
+        inferred_cos_download_urls = set()
         if backend_ready and store is not None:
-            for match in re.finditer(r"<(?P<url>https://[^<>\s]+)>", visible):
+            for match in re.finditer(r"<(?P<url>https://[^<>\s]+)>", previous_visible):
                 candidate = match.group("url")
                 try:
                     from urllib.parse import unquote, urlsplit
@@ -4034,7 +4286,9 @@ class DeployController:
                 if expiry is not None and expiry > cached_cos_urls.get(object_key, (0, ""))[0]:
                     cached_cos_urls[object_key] = (expiry, candidate)
 
-        async def stable_cos_url(object_key, filename, *, attachment_id=None):
+        async def stable_cos_url(
+            object_key, filename, *, attachment_id=None, sign_budget=None,
+        ):
             if not backend_ready or store is None:
                 return ""
             cached = cached_cos_urls.get(object_key)
@@ -4051,6 +4305,10 @@ class DeployController:
                         return cached[1]
                 else:
                     cached = None
+            if sign_budget is not None and sign_budget[0] <= 0:
+                return cached[1] if cached and cached[0] > now else ""
+            if sign_budget is not None:
+                sign_budget[0] -= 1
             try:
                 candidate = await store._io(
                     store.issue_download_url, key=object_key, filename=filename,
@@ -4073,13 +4331,36 @@ class DeployController:
 
         async def bind_download_capabilities(
             rows, head_sha, round_id, *, include_cos_urls=True,
+            cos_sign_budget=None, legacy_signed_invite_identities=None,
         ):
             bound = []
+            legacy_signed_invite_identities = legacy_signed_invite_identities or set()
             for row in rows:
                 item = copy.deepcopy(row)
+                for time_field in ("created_at", "uploaded_at"):
+                    value = item.get(time_field)
+                    if value is None:
+                        continue
+                    try:
+                        parsed_time = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    except (AttributeError, TypeError, ValueError):
+                        item.pop(time_field, None)
+                        continue
+                    if parsed_time.tzinfo is None or parsed_time.utcoffset() is None:
+                        item.pop(time_field, None)
+                _, _, trusted_display_time = attachment_key_inputs(item)
+                if trusted_display_time is None:
+                    item.pop("created_at", None)
+                    item.pop("uploaded_at", None)
                 attachment_id = item.get("attachment_id")
+                identity = (repo, pr_number, head_sha, round_id, attachment_id)
                 valid_row = (
-                    verified_evidence_row(item, head_sha, round_id)
+                    verified_evidence_row(
+                        item, head_sha, round_id,
+                        archived_invite_provenance=(
+                            identity in legacy_signed_invite_identities
+                        ),
+                    )
                     and item.get("head_sha") == head_sha
                     and item.get("round_id") == round_id
                     and item.get("status") == "ready"
@@ -4087,28 +4368,80 @@ class DeployController:
                     and re.fullmatch(r"[0-9a-f]{64}", item.get("sha256", "")) is not None
                 )
                 if valid_row:
+                    uploaded_at, filename, display_uploaded_at = attachment_key_inputs(item)
                     try:
                         from .evidence_store import build_attachment_key
                         expected_key = build_attachment_key(
                             repo, pr_number, head_sha, round_id, attachment_id,
-                            item.get("created_at", ""), item.get("filename", ""),
+                            uploaded_at, filename,
                         )
                     except (ValueError, TypeError, AttributeError):
                         valid_row = False
                     else:
                         valid_row = item.get("object_key") == expected_key
+                        if valid_row:
+                            if (not isinstance(item.get("filename"), str)
+                                    or not item["filename"].strip()):
+                                item["filename"] = filename
+                            if display_uploaded_at is None:
+                                # These fields are presentation timestamps; a
+                                # path-derived date must never be presented as
+                                # the real upload time.
+                                item.pop("created_at", None)
+                                item.pop("uploaded_at", None)
                 item["cos_projection_verified"] = bool(valid_row)
+                if valid_row and identity in legacy_signed_invite_identities:
+                    # Render-only evidence from the paired trusted archive
+                    # operation authorizes this compatibility projection.
+                    item["cos_content_verified"] = True
                 if (valid_row and isinstance(attachment_id, str)
                         and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id)):
-                    item["download_capability"] = issue_capability(
-                        self.config, repo, pr_number, head_sha, round_id,
-                        purpose=DOWNLOAD_PURPOSE, resource="attachment:" + attachment_id,
-                    )
-                    if include_cos_urls:
-                        item["cos_download_url"] = await stable_cos_url(
+                    controller_download_compatible = False
+                    created_at = item.get("created_at")
+                    if (len(attachment_id_identities.get(attachment_id, set())) == 1
+                            and isinstance(created_at, str)):
+                        try:
+                            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                            if created.tzinfo is not None and created.utcoffset() is not None:
+                                from .evidence_store import build_attachment_key
+                                controller_download_compatible = (
+                                    build_attachment_key(
+                                        repo, pr_number, head_sha, round_id,
+                                        attachment_id, created_at, filename,
+                                    ) == expected_key
+                                )
+                        except (ValueError, TypeError, AttributeError):
+                            controller_download_compatible = False
+                    if controller_download_compatible:
+                        item["download_capability"] = issue_capability(
+                            self.config, repo, pr_number, head_sha, round_id,
+                            purpose=DOWNLOAD_PURPOSE,
+                            resource="attachment:" + attachment_id,
+                        )
+                    else:
+                        # The Controller download API reconstructs object keys
+                        # from created_at. For older records without that
+                        # trusted timestamp, use the verified object key below.
+                        item.pop("download_capability", None)
+                    if include_cos_urls or not controller_download_compatible:
+                        cos_url = await stable_cos_url(
                             expected_key, item.get("filename", ""),
                             attachment_id=attachment_id,
+                            sign_budget=cos_sign_budget,
                         )
+                        if cos_url:
+                            item["cos_download_url"] = cos_url
+                            if not controller_download_compatible:
+                                item["_projection_cos_fallback"] = True
+                            if display_uploaded_at is None:
+                                # The renderer needs a timestamp to reproduce
+                                # the dated key. This render-only date is
+                                # removed from the visible upload-time cell.
+                                item["created_at"] = uploaded_at
+                                item["_projection_date_only"] = True
+                                inferred_cos_download_urls.add(cos_url)
+                        else:
+                            item.pop("cos_download_url", None)
                     else:
                         # Historical downloads resolve through the existing
                         # attachment-scoped API when clicked; do not sign every
@@ -4137,6 +4470,25 @@ class DeployController:
             else:
                 target.pop("cos_log_download_url", None)
 
+        def remove_attachment_page_download_links(rendered):
+            """Keep read-page links and inferred upload dates out of file rows."""
+            if not isinstance(rendered, str):
+                return rendered
+            page_link = re.compile(
+                r"\[([^\]]+)\]\(<https?://[^<>]*[?&]view=read(?:[&#][^<>]*)?>\)",
+            )
+            lines = []
+            for line in rendered.split("\n"):
+                if line.lstrip().startswith("|"):
+                    if any(url in line for url in inferred_cos_download_urls):
+                        cells = line.split("|")
+                        if len(cells) >= 5:
+                            cells[-2] = " 时间未记录 "
+                            line = "|".join(cells)
+                    line = page_link.sub(r"\1", line)
+                lines.append(line)
+            return "\n".join(lines)
+
         if backend_ready and attachment_access_allowed:
             render_state["capability"] = issue_capability(
                 self.config, repo, pr_number, state["head_sha"], current_round,
@@ -4151,7 +4503,7 @@ class DeployController:
                     configured_origin = urlsplit(upload_public_base_url)
                     now = int(time.time())
                     for match in re.finditer(
-                            r"\[打开附件页\]\(<(?P<url>https://[^<>\s]+)>\)", visible):
+                            r"\[打开附件页\]\(<(?P<url>https://[^<>\s]+)>\)", previous_visible):
                         candidate = urlsplit(match.group("url"))
                         if (candidate.scheme != "https"
                                 or candidate.netloc.casefold() != configured_origin.netloc.casefold()
@@ -4237,14 +4589,140 @@ class DeployController:
                 )
             snapshot["deployments"] = self._enrich_deployments_for_render(
                 snapshot.get("deployments", []), historical=True,
+                historical_machine_groups=snapshot.get("machine_groups"),
             )
-            snapshot_attachments = [r for r in latest.values()
-                                    if r["round_id"] == archive["round_id"]]
+            archive_head = archive["head_sha"]
+            archive_round = archive["round_id"]
+            archive_attachment_rows = {}
+            archive_deleted_rows = {}
+            archive_attachment_wrappers = {}
+            archive_operation_rows = {}
+            archive_operation_wrappers = {}
+            for wrapper in archive.get("attachment_records", []):
+                if (not isinstance(wrapper, dict)
+                        or wrapper.get("kind") not in {"attachment", "operation"}):
+                    continue
+                data = wrapper.get("data")
+                if not isinstance(data, dict):
+                    continue
+                record_kind = wrapper["kind"]
+                attachment_id = data.get("attachment_id")
+                if (not isinstance(attachment_id, str)
+                        or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", attachment_id) is None
+                        or not isinstance(wrapper.get("key"), str)
+                        or not isinstance(wrapper.get("sha256"), str)
+                        or re.fullmatch(r"[0-9a-f]{64}", wrapper["sha256"]) is None
+                        or data.get("repo") != repo
+                        or type(data.get("pr_number")) is not int
+                        or data.get("pr_number") != pr_number
+                        or data.get("head_sha") != archive_head
+                        or data.get("round_id") != archive_round):
+                    continue
+                identity = (repo, pr_number, archive_head, archive_round, attachment_id)
+                if record_kind == "attachment":
+                    # Archive wrappers were captured in read_evidence_records
+                    # order, so overwriting mirrors EvidenceService Latest.
+                    archive_attachment_rows[identity] = data
+                    archive_attachment_wrappers[identity] = wrapper
+                    if attachment_is_deleted(data):
+                        archive_deleted_rows[identity] = data
+                else:
+                    archive_operation_rows[identity] = data
+                    archive_operation_wrappers[identity] = wrapper
+
+            def wrapper_matches_trusted_record(wrapper, kind):
+                if not isinstance(wrapper, dict):
+                    return False
+                record = trusted_records_by_key.get((kind, wrapper.get("key")))
+                return bool(
+                    record is not None
+                    and record.get("sha256") == wrapper.get("sha256")
+                    and record.get("data") == wrapper.get("data")
+                )
+
+            def archived_invite_proof(identity, attachment_row):
+                """Require paired, integrity-bound archive records for legacy invite rows."""
+                attachment_wrapper = archive_attachment_wrappers.get(identity)
+                operation_wrapper = archive_operation_wrappers.get(identity)
+                operation = archive_operation_rows.get(identity)
+                if (not wrapper_matches_trusted_record(attachment_wrapper, "attachment")
+                        or not wrapper_matches_trusted_record(operation_wrapper, "operation")
+                        or not isinstance(operation, dict)
+                        or operation.get("status") != "ready"
+                        or operation.get("upload_method") != "signed_invite"
+                        or operation.get("upload_link_authorized") is not True
+                        or operation.get("actor_verified") is not False
+                        or operation.get("github_user_authenticated") is not False
+                        or operation.get("actor") != "shared-link"
+                        or operation.get("cos_content_verified") is not True
+                        or attachment_row.get("upload_method") != "signed_invite"
+                        or attachment_row.get("actor") != "shared-link"):
+                    return False
+                # Missing legacy fields are supplied only by the paired,
+                # trusted operation record. Any present contradiction rejects
+                # the compatibility path; absence itself is never a grant.
+                for field, expected in (
+                    ("upload_link_authorized", True),
+                    ("actor_verified", False),
+                    ("github_user_authenticated", False),
+                    ("cos_content_verified", True),
+                ):
+                    if field in attachment_row and attachment_row[field] is not expected:
+                        return False
+                _, filename, _ = attachment_key_inputs(attachment_row)
+                return all(
+                    operation.get(field) == value
+                    for field, value in (
+                        ("repo", repo), ("pr_number", pr_number),
+                        ("head_sha", identity[2]), ("round_id", identity[3]),
+                        ("attachment_id", identity[4]),
+                        ("object_key", attachment_row.get("object_key")),
+                        ("filename", filename), ("size", attachment_row.get("size")),
+                        ("sha256", attachment_row.get("sha256")),
+                    )
+                )
+
+            snapshot_attachment_map = {}
+            legacy_signed_invite_identities = set()
+            identities = list(archive_attachment_rows)
+            identities.extend(
+                identity for identity in latest_by_identity
+                if identity[:4] == (repo, pr_number, archive_head, archive_round)
+            )
+            identities = dict.fromkeys(identities)
+            for identity in identities:
+                archived_row = archive_attachment_rows.get(identity)
+                selected = (
+                    deleted_by_identity.get(identity)
+                    or archive_deleted_rows.get(identity)
+                    or latest_by_identity.get(identity)
+                    or archived_row
+                )
+                if selected is None:
+                    continue
+                attachment_id = identity[4]
+                snapshot_attachment_map[identity] = copy.deepcopy(selected)
+                if (archived_row is not None and selected == archived_row
+                        and archived_invite_proof(identity, selected)):
+                    legacy_signed_invite_identities.add(identity)
+            snapshot_attachments = list(snapshot_attachment_map.values())
             snapshot["attachments"] = (await bind_download_capabilities(
                 snapshot_attachments, snapshot["head_sha"], archive["round_id"],
-                include_cos_urls=False,
+                # Prefer the scoped Controller download. Signed COS links are
+                # a bounded fallback when no stable HTTPS Controller origin is
+                # available for historical attachment downloads.
+                include_cos_urls=not bool(public_base_url or upload_public_base_url),
+                cos_sign_budget=historical_cos_sign_budget,
+                legacy_signed_invite_identities=legacy_signed_invite_identities,
             ) if backend_ready and attachment_access_allowed else snapshot_attachments)
-            bundle = {**archive, "snapshot": snapshot}
+            # The archive's nested wrappers were reconciled with current
+            # Latest records into this render-only snapshot. Do not let the
+            # renderer append stale immutable revisions a second time.
+            bundle = {
+                key: value for key, value in archive.items()
+                if key != "attachment_records"
+            }
+            bundle["snapshot"] = snapshot
             if archive.get("round_id") in round_numbers:
                 bundle["round_number"] = round_numbers[archive["round_id"]]
             bundles.append(bundle)
@@ -4255,7 +4733,7 @@ class DeployController:
             return download_url_expiry(
                 url, key=key, filename=filename, attachment_id=attachment_id,
             )
-        section = renderer(repo, pr_number, render_state, current_rows[-20:] + bundles, trusted_archives,
+        section = renderer(repo, pr_number, render_state, current_rows[-20:], bundles,
                            public_base_url=public_base_url,
                            upload_public_base_url=(
                                upload_public_base_url
@@ -4264,8 +4742,16 @@ class DeployController:
                            cos_download_url_expiry=validate_cos_download_url)
         if not isinstance(section, str):
             raise GitHubStateProxyError("Evidence renderer must return markdown")
+        section = remove_attachment_page_download_links(section)
+        # Refresh existing sections before removing duplicate top-level
+        # presentation blocks. History and the old projection marker provide
+        # safe boundaries for older Summaries whose deployment table is gone.
         visible = self._strip_legacy_evidence_blocks(visible)
         visible, history = self._extract_visible_history(visible)
+        visible = self._strip_legacy_lifecycle_display_fields(
+            visible,
+            remove_current_deployment=verified_current_round or bool(trusted_archives),
+        )
         start, end = "<!-- evidence-projection:start -->", "<!-- evidence-projection:end -->"
         def projection_body(rendered_section):
             projection = start + "\n" + rendered_section + "\n" + end
@@ -4282,6 +4768,9 @@ class DeployController:
             compact_current_rows = []
             for row in current_rows[-20:]:
                 item = copy.deepcopy(row)
+                if item.pop("_projection_date_only", False):
+                    item.pop("created_at", None)
+                    item.pop("uploaded_at", None)
                 for field in (
                     "note", "text", "display_note", "display_note_complete",
                     "evidence_kind", "cos_download_url",
@@ -4294,6 +4783,9 @@ class DeployController:
             compact_state["components"] = []
             compact_state["machine_groups"] = []
             compact_state["case_results"] = {}
+            # The compact current card names its role first; retain the real
+            # ordinal explicitly in the Summary immediately below it.
+            compact_state.pop("round_number", None)
             compact_section = renderer(
                 repo, pr_number, compact_state, compact_current_rows, [],
                 public_base_url=public_base_url,
@@ -4306,6 +4798,14 @@ class DeployController:
             if not isinstance(compact_section, str):
                 raise GitHubStateProxyError(
                     "Compact Evidence renderer must return markdown",
+                )
+            compact_section = remove_attachment_page_download_links(compact_section)
+            compact_round_number = round_numbers.get(current_round)
+            if type(compact_round_number) is int and compact_round_number > 0:
+                compact_section = compact_section.replace(
+                    "<summary>当前轮（当前轮次） ·",
+                    f"<summary>当前轮次（第 {compact_round_number} 轮） ·",
+                    1,
                 )
             evidence_end = "<!-- deploy-approval-evidence:end -->"
             end_pos = compact_section.rfind(evidence_end)
@@ -4346,6 +4846,64 @@ class DeployController:
             compact_archives = sorted(
                 trusted_archives, key=archive_sort_key, reverse=True,
             )
+            compatibility_downloads_by_round = {}
+
+            def compatibility_download_lines(rows, round_label):
+                output = []
+                seen = set()
+                for row in rows:
+                    if (not isinstance(row, dict)
+                            or row.get("_projection_cos_fallback") is not True
+                            or row.get("status") != "ready"
+                            or row.get("deleted_at")
+                            or row.get("cos_projection_verified") is not True
+                            or (row.get("cos_content_verified") is not True
+                                and not (row.get("actor_verified") is True
+                                         and row.get("upload_method") != "signed_invite"))
+                            or not isinstance(row.get("sha256"), str)
+                            or re.fullmatch(r"[0-9a-f]{64}", row.get("sha256", "")) is None
+                            or type(row.get("size")) is not int
+                            or not 1 <= row["size"] <= 512 * 1024 * 1024):
+                        continue
+                    attachment_id = row.get("attachment_id")
+                    filename = row.get("filename")
+                    object_key = row.get("object_key")
+                    url = row.get("cos_download_url")
+                    if (not isinstance(attachment_id, str)
+                            or not isinstance(filename, str)
+                            or not isinstance(object_key, str)
+                            or not isinstance(url, str)
+                            or validate_cos_download_url(
+                                url, key=object_key, filename=filename,
+                                attachment_id=attachment_id,
+                            ) is None):
+                        continue
+                    identity = (row.get("repo"), row.get("pr_number"),
+                                row.get("head_sha"), row.get("round_id"), attachment_id)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    label = comments_mod._escape(filename)
+                    label = re.sub(r"([\\\[\]])", r"\\\1", label)
+                    output.append(
+                        f"- {round_label}：[{label}](<{url}>)",
+                    )
+                return output
+
+            compatibility_downloads_by_round[current_round] = compatibility_download_lines(
+                current_rows,
+                (f"第 {round_numbers[current_round]} 轮"
+                 if current_round in round_numbers else "当前轮"),
+            )
+            for bundle in bundles:
+                bundle_round = bundle.get("round_id")
+                bundle_snapshot = bundle.get("snapshot")
+                if not isinstance(bundle_snapshot, dict):
+                    continue
+                compatibility_downloads_by_round[bundle_round] = compatibility_download_lines(
+                    bundle_snapshot.get("attachments", []),
+                    f"第 {round_numbers[bundle_round]} 轮",
+                )
             page_path = comments_mod._evidence_path(repo, pr_number).replace(
                 "/api/evidence/", "/evidence/", 1,
             )
@@ -4354,7 +4912,7 @@ class DeployController:
                 raise GitHubStateProxyError(
                     "Evidence projection cannot compact details without a trusted read page",
                 )
-            compact_history = ["", "### 历史轮次", ""] if compact_archives else []
+            compact_history = [""] if compact_archives else []
             current_round_url = ""
             if read_origin and page_path.startswith("/evidence/"):
                 current_round_url = read_origin + page_path + "?" + urlencode({
@@ -4418,14 +4976,25 @@ class DeployController:
                     compact_history.append(
                         f"[查看原始归档](<{archive_url}>)",
                     )
+                compact_history.extend(
+                    compatibility_downloads_by_round.get(archive_round, []),
+                )
                 compact_history.extend(["", "</details>", ""])
             end_pos = compact_section.rfind(evidence_end)
             if end_pos < 0:
                 raise GitHubStateProxyError(
                     "Compact Evidence renderer omitted its end marker after trimming",
                 )
+            current_fallback_lines = compatibility_downloads_by_round.get(current_round, [])
+            current_fallback_block = (
+                ["", "<details>", "<summary>当前轮兼容下载链接</summary>", "",
+                 *current_fallback_lines, "", "</details>", ""]
+                if current_fallback_lines else []
+            )
             compact_section = (
                 compact_section[:end_pos].rstrip()
+                + ("\n" + "\n".join(current_fallback_block)
+                   if current_fallback_block else "")
                 + ("\n" + "\n".join(compact_history) if compact_history else "")
                 + "\n" + compact_section[end_pos:]
             )
@@ -4449,6 +5018,13 @@ class DeployController:
                     raise GitHubStateProxyError(
                         "Minimal Evidence renderer must return markdown",
                     )
+                minimal_section = remove_attachment_page_download_links(minimal_section)
+                if type(compact_round_number) is int and compact_round_number > 0:
+                    minimal_section = minimal_section.replace(
+                        "<summary>当前轮（当前轮次） ·",
+                        f"<summary>当前轮次（第 {compact_round_number} 轮） ·",
+                        1,
+                    )
                 for empty_label in (
                     "本轮暂无附件，上传后会显示",
                     "本轮未保存附件",
@@ -4469,6 +5045,18 @@ class DeployController:
                         "",
                         f"可信历史测试轮次：{len(compact_archives)} 个。",
                         "完整轮次编号、HEAD、附件身份和部署记录均保留在附件页。",
+                    ])
+                all_compatibility_downloads = [
+                    line for archive in compact_archives
+                    for line in compatibility_downloads_by_round.get(
+                        archive["round_id"], [],
+                    )
+                ]
+                all_compatibility_downloads.extend(current_fallback_lines)
+                if all_compatibility_downloads:
+                    minimal_lines.extend([
+                        "", "<details>", "<summary>历史附件兼容下载链接</summary>", "",
+                        *all_compatibility_downloads, "", "</details>",
                     ])
                 minimal_section = (
                     minimal_section[:minimal_end].rstrip()
