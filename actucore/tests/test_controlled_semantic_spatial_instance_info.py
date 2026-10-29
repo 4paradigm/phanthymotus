@@ -55,7 +55,7 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
             item = actual[binding["port"]]
             self.assertEqual(item["topic"], binding["topic"])
             self.assertIs(item["connected"], True)
-        for port in ("depth_frame", "goal_pose"):
+        for port in ("goal_pose",):
             self.assertEqual(actual[port]["topic"], "")
             self.assertIs(actual[port]["connected"], False)
 
@@ -110,20 +110,6 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
         restarted = self.call(plugin, "start", instance_id="card-b", input_bindings=self.bindings())
         self.assert_actual(restarted)
         self.assert_unmatched(self.call(plugin, "info", instance_id="card-a"), "ready")
-
-    def test_same_format_port_bindings_are_not_swapped(self):
-        plugin = self.make_plugin()
-        bindings = self.bindings() + [{"port": "depth_frame", "topic": "/custom/depth"}]
-        for item in bindings:
-            if item["port"] == "rgb":
-                item["topic"] = "/custom/depth"
-            elif item["port"] == "depth_frame":
-                item["topic"] = "/custom/rgb"
-        self.call(plugin, "start", instance_id="card-a", input_bindings=bindings)
-        info = self.call(plugin, "info", instance_id="card-a")
-        actual = {p["port"]: p["topic"] for p in info["topic_in"]}
-        self.assertEqual(actual["rgb"], "/custom/depth")
-        self.assertEqual(actual["depth_frame"], "/custom/rgb")
 
     def test_direct_start_without_id_uses_default_instance(self):
         plugin = self.make_plugin()

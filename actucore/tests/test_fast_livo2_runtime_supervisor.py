@@ -146,75 +146,7 @@ def _prepare_adapter_concurrency(adapter) -> None:
 
 
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
-    def test_collection_finalize_failure_keeps_session_retryable(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            partial = Path(directory) / "capture.partial"
-            final = Path(directory) / "capture"
-            partial.mkdir()
-            supervisor = object.__new__(FastLivo2Supervisor)
-            supervisor._lock = threading.RLock()
-            supervisor._collection_process = mock.Mock()
-            supervisor._collection_process.poll.return_value = 0
-            supervisor._collection_partial_dir = partial
-            supervisor._collection_final_dir = final
-            supervisor._collection_directory = Path(directory)
-            supervisor._collection_error = None
-            supervisor._collection_last_receipt = None
-            supervisor._collection_sampler = mock.Mock()
-            supervisor._collection_sampler.snapshot.return_value = {}
-            supervisor._collection_health = mock.Mock()
-            supervisor._collection_health.snapshot.return_value = {
-                "enabled": True,
-                "healthy": True,
-                "sources": {},
-                "time_alignment": {},
-                "missing_sources": [],
-                "failure_reason": None,
-            }
 
-            complete = {"state": "complete", "storage_complete": True}
-            with mock.patch.object(
-                SUPERVISOR_MODULE,
-                "read_rosbag_recording_summary",
-                return_value={"healthy": True, "failure_reasons": [], "topics": {}},
-            ), mock.patch.object(
-                SUPERVISOR_MODULE,
-                "finalize_collection_session",
-                side_effect=[OSError("disk busy"), complete],
-            ):
-                failed = supervisor._stop_collection()
-                self.assertTrue(failed["retryable"])
-                self.assertEqual(supervisor._collection_partial_dir, partial)
-                supervisor._collection_health.stop.assert_not_called()
-
-                saved = supervisor._stop_collection()
-
-            self.assertEqual(saved["status"], "collection_saved")
-            self.assertIsNone(supervisor._collection_partial_dir)
-            supervisor._collection_health.stop.assert_called_once_with()
-
-    def test_collection_failed_storage_is_terminal_after_observed_process_exit(self) -> None:
-        supervisor = object.__new__(FastLivo2Supervisor)
-        supervisor._lock = threading.RLock()
-        supervisor._collection_process = mock.Mock()
-        supervisor._collection_process.poll.return_value = 7
-        supervisor._collection_partial_dir = None
-        supervisor._collection_final_dir = None
-        supervisor._collection_directory = None
-        supervisor._collection_error = None
-        supervisor._collection_last_receipt = None
-        supervisor._collection_sampler = mock.Mock()
-        supervisor._collection_sampler.snapshot.return_value = {}
-        supervisor._collection_health = mock.Mock()
-        supervisor._collection_health.snapshot.return_value = {
-            "enabled": True, "healthy": True, "sources": {},
-            "time_alignment": {}, "missing_sources": [], "failure_reason": None,
-        }
-        result = supervisor._stop_collection()
-        self.assertEqual(result["error_code"], "collection_stop_failed")
-        self.assertTrue(result["terminal_confirmed"])
-        self.assertFalse(result["retryable"])
-        self.assertFalse(result["receipt"]["storage_complete"])
 
     def test_localization_abnormal_exit_is_terminal_after_adapter_unload(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
@@ -383,93 +315,7 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         process.send_signal.assert_called_once_with(SUPERVISOR_MODULE.signal.SIGINT)
         process.kill.assert_not_called()
 
-    def test_permanent_collection_finalize_failure_confirms_terminal_stop(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            partial = Path(directory) / "capture.partial"
-            final = Path(directory) / "capture"
-            partial.mkdir()
-            supervisor = object.__new__(FastLivo2Supervisor)
-            supervisor._lock = threading.RLock()
-            supervisor._collection_process = mock.Mock()
-            supervisor._collection_process.poll.return_value = 0
-            supervisor._collection_partial_dir = partial
-            supervisor._collection_final_dir = final
-            supervisor._collection_directory = Path(directory)
-            supervisor._collection_error = None
-            supervisor._collection_last_receipt = None
-            supervisor._collection_sampler = mock.Mock()
-            supervisor._collection_sampler.snapshot.return_value = {}
-            supervisor._collection_health = mock.Mock()
-            supervisor._collection_health.snapshot.return_value = {
-                "enabled": True,
-                "healthy": True,
-                "sources": {},
-                "time_alignment": {},
-                "missing_sources": [],
-                "failure_reason": None,
-            }
 
-            with mock.patch.object(
-                SUPERVISOR_MODULE,
-                "read_rosbag_recording_summary",
-                return_value={"healthy": True, "failure_reasons": [], "topics": {}},
-            ), mock.patch.object(
-                SUPERVISOR_MODULE,
-                "finalize_collection_session",
-                side_effect=FileExistsError("already exists"),
-            ):
-                failed = supervisor._stop_collection()
-
-            self.assertFalse(failed["retryable"])
-            self.assertTrue(failed["terminal_confirmed"])
-            self.assertEqual(failed["receipt"]["partial_directory"], str(partial))
-            self.assertIsNone(supervisor._collection_partial_dir)
-            supervisor._collection_health.stop.assert_called_once_with()
-
-    def test_collection_stop_reuses_an_already_finalized_receipt(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            partial = Path(directory) / "capture.partial"
-            final = Path(directory) / "capture"
-            final.mkdir()
-            complete = {"state": "complete", "storage_complete": True}
-            (final / "collection.json").write_text(
-                json.dumps(complete), encoding="utf-8"
-            )
-            supervisor = object.__new__(FastLivo2Supervisor)
-            supervisor._lock = threading.RLock()
-            supervisor._collection_process = mock.Mock()
-            supervisor._collection_process.poll.return_value = 0
-            supervisor._collection_partial_dir = partial
-            supervisor._collection_final_dir = final
-            supervisor._collection_directory = Path(directory)
-            supervisor._collection_error = None
-            supervisor._collection_last_receipt = None
-            supervisor._collection_sampler = mock.Mock()
-            supervisor._collection_sampler.snapshot.return_value = {}
-            supervisor._collection_health = mock.Mock()
-            supervisor._collection_health.snapshot.return_value = {
-                "enabled": True,
-                "healthy": True,
-                "sources": {},
-                "time_alignment": {},
-                "missing_sources": [],
-                "failure_reason": None,
-            }
-
-            with mock.patch.object(
-                SUPERVISOR_MODULE,
-                "read_rosbag_recording_summary",
-                return_value={"healthy": True, "failure_reasons": [], "topics": {}},
-            ), mock.patch.object(
-                SUPERVISOR_MODULE,
-                "finalize_collection_session",
-                side_effect=AssertionError("already finalized session was renamed again"),
-            ):
-                saved = supervisor._stop_collection()
-
-            self.assertEqual(saved, {"status": "collection_saved", "receipt": complete})
-            self.assertIsNone(supervisor._collection_partial_dir)
-            supervisor._collection_health.stop.assert_called_once_with()
 
     def test_adapter_rejection_logs_are_sampled_and_recovery_is_reported(self) -> None:
         adapter = object.__new__(FastLivo2Adapter)
@@ -531,88 +377,8 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
             for node in ast.walk(tree)
         ))
 
-    def test_direct_launch_defaults_enable_cameras_with_typed_boolean_parameters(self) -> None:
-        class Record:
-            def __init__(self, *args, **kwargs):
-                self.args, self.kwargs = args, kwargs
 
-        launch = types.ModuleType("launch")
-        launch.LaunchDescription = Record
-        actions = types.ModuleType("launch.actions")
-        actions.DeclareLaunchArgument = Record
-        substitutions = types.ModuleType("launch.substitutions")
-        substitutions.LaunchConfiguration = Record
-        ros_actions = types.ModuleType("launch_ros.actions")
-        ros_actions.Node = Record
-        descriptions = types.ModuleType("launch_ros.parameter_descriptions")
-        descriptions.ParameterValue = Record
-        modules = {
-            "launch": launch, "launch.actions": actions,
-            "launch.substitutions": substitutions,
-            "launch_ros": types.ModuleType("launch_ros"),
-            "launch_ros.actions": ros_actions,
-            "launch_ros.parameter_descriptions": descriptions,
-        }
-        path = PACKAGE_ROOT / "launch" / "fast_livo2.launch.py"
-        spec = importlib.util.spec_from_file_location("test_fast_livo2_launch", path)
-        module = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(sys.modules, modules):
-            spec.loader.exec_module(module)
-            entries = module.generate_launch_description().args[0]
-        defaults = {
-            entry.args[0]: entry.kwargs["default_value"] for entry in entries
-            if entry.args and "default_value" in entry.kwargs
-        }
-        self.assertEqual(defaults["rgb_enabled"], "true")
-        self.assertEqual(defaults["depth_enabled"], "true")
-        self.assertEqual(defaults["rgb_topic"], "/ubuntu/camera/rgb_frame")
-        self.assertEqual(defaults["depth_topic"], "/ubuntu/camera/depth_frame")
-        supervisor = next(entry for entry in entries
-                          if entry.kwargs.get("executable") == "runtime_supervisor")
-        parameters = supervisor.kwargs["parameters"][0]
-        for key in ("rgb_enabled", "depth_enabled"):
-            self.assertIs(parameters[key].kwargs["value_type"], bool)
-            self.assertEqual(parameters[key].args[0].args[0], key)
 
-    def test_camera_subscription_enable_flags(self) -> None:
-        supervisor = object.__new__(FastLivo2Supervisor)
-        supervisor._collection_input_topics = {
-            "lidar": "/lidar", "imu": "/imu", "rgb_frame": "/rgb",
-            "depth_frame": "/depth", "odom": "/odom",
-        }
-        for rgb, depth in ((True, True), (True, False), (False, True), (False, False)):
-            with self.subTest(rgb=rgb, depth=depth):
-                supervisor._collection_camera_enabled = {"rgb_frame": rgb, "depth_frame": depth}
-                supervisor.create_subscription = mock.Mock(side_effect=lambda *args: args)
-                subscriptions = supervisor._create_collection_subscriptions()
-                topics = {item[1] for item in subscriptions}
-                expected = {"/lidar", "/imu", "/odom"}
-                if rgb:
-                    expected.add("/rgb")
-                if depth:
-                    expected.add("/depth")
-                self.assertEqual(topics, expected)
-                self.assertTrue(all(topic for topic in topics))
-        for bad in ("false", 0, None):
-            with self.subTest(invalid=bad):
-                supervisor._collection_camera_enabled = {"rgb_frame": bad, "depth_frame": False}
-                with self.assertRaises(ValueError):
-                    supervisor._create_collection_subscriptions()
-
-    def test_collection_subscriptions_drop_backlog_instead_of_replaying_it(self) -> None:
-        source = (
-            PACKAGE_ROOT
-            / "fast_livo2"
-            / "runtime_supervisor.py"
-        ).read_text(encoding="utf-8")
-        method = source.split(
-            "    def _create_collection_subscriptions", 1
-        )[1].split("    def _on_collection_sample", 1)[0]
-
-        self.assertIn("depth=4", method)
-        self.assertIn("ReliabilityPolicy.BEST_EFFORT", method)
-        self.assertNotIn("ReliabilityPolicy.RELIABLE", method)
-        self.assertNotIn("depth=200", method)
 
     def test_heartbeat_keeps_runtime_session_id_across_readiness_changes(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)
@@ -626,8 +392,6 @@ class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
         supervisor._lidar_qos_depth = 2
         supervisor._imu_qos_depth = 400
         supervisor._diagnostics = {"ready": True}
-        supervisor._collection_snapshot = lambda: {}
-        supervisor._collection_status_pub = _CapturePublisher()
         payloads = []
         supervisor._publish = payloads.append
 

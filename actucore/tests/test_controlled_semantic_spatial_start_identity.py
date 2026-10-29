@@ -36,7 +36,6 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
             {"port": "lidar", "topic": "/source/lidar"},
             {"port": "imu", "topic": "/source/imu"},
             {"port": "rgb", "topic": "/camera/color"},
-            {"port": "depth_frame", "topic": "/camera/depth"},
         ]
         return self.plugin
 
@@ -61,7 +60,7 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
         self.assertTrue(retry["already_started"])
         self.assert_owner("card-a", expected)
         swaps = [dict(b) for b in self.bindings]
-        swaps[2]["topic"], swaps[3]["topic"] = swaps[3]["topic"], swaps[2]["topic"]
+        swaps[0]["topic"], swaps[1]["topic"] = swaps[1]["topic"], swaps[0]["topic"]
         error = self.call("start", instance_id="card-a", input_bindings=swaps)
         self.assertEqual(error["error_code"], "navigation_wiring_conflict")
         self.assertIn("stop", error["error"])
@@ -229,19 +228,17 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
     def test_stop_signal_during_retry_validation_prevents_idempotent_success(self):
         entered, release = threading.Event(), threading.Event()
 
-        class BlockingMapping(FakeComponent):
-            block = False
-            def dispatch(self, prefix, args):
-                if self.block and args.get("action") == "info":
-                    entered.set()
-                    if not release.wait(3):
-                        raise RuntimeError("test timeout")
-                return super().dispatch(prefix, args)
-
-        mapping = BlockingMapping("mapping")
-        self.make_plugin(mapping=mapping)
+        self.make_plugin()
         self.call("start", instance_id="a", input_bindings=self.bindings)
-        mapping.block = True
+        validate = self.plugin._validate_external_wiring
+
+        def blocking_validate(args):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("test timeout")
+            return validate(args)
+
+        self.plugin._validate_external_wiring = blocking_validate
         results = {}
         retry = threading.Thread(target=lambda: results.update(retry=self.call("start", instance_id="a", input_bindings=self.bindings)))
         stop = threading.Thread(target=lambda: results.update(stop=self.call("stop")))

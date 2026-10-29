@@ -211,8 +211,8 @@ def nav2_tool_definition(namespace: str) -> dict:
             "directly accumulated static occupancy plus live clearing "
             "obstacles. This "
             "ActuCore card only emits "
-            "bounded motion sequences with a fresh task ID; the Driver loco "
-            "actuator owns any physical execution and task adoption."
+            "bounded motion sequences with a fresh task ID. Physical execution "
+            "requires a compatible downstream consumer and independent safety validation."
         ),
         "topic_in": [
             {
@@ -292,14 +292,14 @@ def nav2_tool_definition(namespace: str) -> dict:
                 "qos": "RELIABLE + KEEP_LAST(depth=1) + VOLATILE",
                 "schema": "phanthy.navigation.motion_sequence.v1",
                 "rate_hz": 5,
-                "timestamp": "issued_at_unix_ms; TTL uses Driver receive monotonic time",
+                "timestamp": "issued_at_unix_ms; proposal includes ttl_ms",
                 "frame_id": "base_link",
                 "axes": "ROS REP-103: x forward, y left, yaw counter-clockwise",
                 "units": "linear=m/s, angular=rad/s",
                 "max_age_ms": 250,
                 "desc": (
-                    "Structured Nav2 proposal for the existing Driver loco "
-                    "actuator; never a physical command by itself"
+                    "Structured Nav2 proposal for compatible consumers; "
+                    "downstream execution and safety behavior must be verified"
                 ),
             },
             {

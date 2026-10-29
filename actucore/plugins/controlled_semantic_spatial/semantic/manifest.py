@@ -113,7 +113,7 @@ _MANIFEST = {
             "desc": (
                 "Connect the RGB PSE1 output of Driver camera_rgb, not its plain JPEG output. "
                 "Requires source time, calibration and LiDAR-to-camera "
-                "extrinsics; shared by semantic navigation and data collection"
+                "extrinsics for semantic navigation"
             ),
         },
         {

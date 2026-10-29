@@ -58,7 +58,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "control_velocity_topic",
-                default_value="/ubuntu/navigation/control_velocity",
+                default_value="/actucore/navi/cmd",
             ),
             DeclareLaunchArgument("control_interface_json", default_value="{}"),
             DeclareLaunchArgument(

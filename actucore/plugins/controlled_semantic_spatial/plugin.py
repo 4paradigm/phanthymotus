@@ -280,7 +280,6 @@ class ControlledSemanticSpatialPlugin:
         goal_input = None
         generation = object()
         try:
-            self._set_mapping_runtime_active(True)
             started.append(("runtime", self._runtime))
             runtime_result = self._runtime.start(
                 namespace=self._namespace,
@@ -408,7 +407,6 @@ class ControlledSemanticSpatialPlugin:
                 )
                 cleanup_confirmed = False
             if cleanup_confirmed:
-                self._set_mapping_runtime_active(False)
                 with self._lock:
                     self._wiring_transition_unknown = False
             else:
@@ -588,7 +586,6 @@ class ControlledSemanticSpatialPlugin:
                 "navigation_stop_pending", "runtime shutdown is unconfirmed; retry stop",
                 component_results=results, retryable=True, canvas_wired=True,
             )
-        self._set_mapping_runtime_active(False)
         with self._lock:
             self._started = False
             self._generation = None
@@ -660,11 +657,6 @@ class ControlledSemanticSpatialPlugin:
             return False
         return result.get("terminal_confirmed") is not False
 
-    def _set_mapping_runtime_active(self, active: bool) -> None:
-        setter = getattr(self._mapping, "set_runtime_active", None)
-        if callable(setter):
-            setter(active)
-
     def _configure(self, args: dict) -> dict:
         with self._transition_lock:
             return self._configure_serialized(args)
@@ -717,8 +709,6 @@ class ControlledSemanticSpatialPlugin:
                     ("obstacle_max_height_m", "obstacle_max_height_m"),
                     ("map_view_enabled", "map_view_enabled"),
                     ("fault_capture_enabled", "fault_capture_enabled"),
-                    ("collection_enabled", "collection_enabled"),
-                    ("collection_directory", "collection_directory"),
                 )
                 if source in updates
             },
@@ -860,14 +850,6 @@ class ControlledSemanticSpatialPlugin:
             for item in tool["topic_in"]
             if item["required"]
         }
-        mapping_info = self._mapping.dispatch("fast_livo2", {"action": "info"})
-        collection_enabled = (
-            isinstance(mapping_info, dict)
-            and isinstance(mapping_info.get("config"), dict)
-            and mapping_info["config"].get("collection_enabled") is True
-        )
-        if collection_enabled:
-            required.update(("rgb", "depth_frame"))
         bindings = args.get("input_bindings") or []
         raw_topics = args.get("input_topics") or []
         if isinstance(raw_topics, str):

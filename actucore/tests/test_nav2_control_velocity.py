@@ -38,7 +38,8 @@ def test_launch_wires_json_as_string(monkeypatch):
     spec.loader.exec_module(launch)
     items = launch.generate_launch_description().args[0]
     declarations = {item.args[0]: item.kwargs.get('default_value') for item in items if item.args and isinstance(item.args[0], str)}
-    assert declarations['control_velocity_topic'] == '/ubuntu/navigation/control_velocity'
+    from plugins.navi.plugin import DEFAULT_TOPIC
+    assert declarations['control_velocity_topic'] == DEFAULT_TOPIC == '/actucore/navi/cmd'
     assert declarations['control_interface_json'] == '{}'
     node = next(item for item in items if item.kwargs.get('executable') == 'planner_command_bridge')
     params = node.kwargs['parameters'][0]
@@ -46,6 +47,38 @@ def test_launch_wires_json_as_string(monkeypatch):
     assert params['control_interface_json'].kwargs['value_type'] is str
     assert params['control_interface_json'].args[0].args == ('control_interface_json',)
     assert params['proposal_frequency_hz'] == 5.0 and params['proposal_ttl_ms'] == 250
+
+
+def test_planner_constructs_real_string_publisher_on_navi_topic(planner_module, monkeypatch):
+    from plugins.navi.plugin import DEFAULT_TOPIC
+
+    node_class = planner_module.PlannerCommandNode
+    base = node_class.__bases__[0]
+    parameters = {'behavior_tree_path': __file__}
+    publishers = []
+    monkeypatch.setattr(base, '__init__', lambda self, name: None, raising=False)
+    monkeypatch.setattr(base, 'declare_parameter',
+                        lambda self, name, default: parameters.setdefault(name, default), raising=False)
+    monkeypatch.setattr(base, 'get_parameter',
+                        lambda self, name: types.SimpleNamespace(value=parameters[name]), raising=False)
+    def create_publisher(self, msg_type, topic, qos):
+        publisher = Mock()
+        publishers.append((msg_type, topic, publisher))
+        return publisher
+    monkeypatch.setattr(base, 'create_publisher', create_publisher, raising=False)
+    for name in ('create_subscription', 'create_client', 'create_timer'):
+        monkeypatch.setattr(base, name, lambda *args, **kwargs: Mock(), raising=False)
+    monkeypatch.setattr(planner_module, 'RaceSafeActionClient', Mock())
+    monkeypatch.setattr(planner_module, 'Duration', Mock())
+    monkeypatch.setattr(planner_module, 'Buffer', Mock())
+    monkeypatch.setattr(planner_module, 'TransformListener', Mock())
+    monkeypatch.setattr(node_class, '_publish_heartbeat', lambda self: None)
+    node = node_class()
+    control = [entry for entry in publishers if entry[1] == DEFAULT_TOPIC]
+    assert len(control) == 1
+    assert control[0][0] is planner_module.String
+    assert node._control_pub is control[0][2]
+    assert parameters['motion_sequence_topic'] != DEFAULT_TOPIC
 
 
 def descriptor():

@@ -266,181 +266,19 @@ fail closed。
 按有界 `SIGINT` grace、`SIGTERM` 2 s、`SIGKILL` 2 s 阶梯回收；非 Linux
 环境没有 `/proc` 时只执行常规 launch 进程组清理。
 
-## 自动数据采集
+## 运行诊断
 
-数据采集属于统一 `controlled_semantic_spatial` 卡片，不增加单独卡片，也不增加
-`start_recording` / `stop_recording` 等公开 action。创建卡片时配置：
-
-| 配置 | 默认值 | 语义 |
-| --- | --- | --- |
-| `collection_enabled` | `false` | Canvas 启动该卡片时自动开始采集，停止卡片时自动收口 |
-| `collection_directory` | `/opt/phanthy-motus/data/navigation/fast_livo2/recordings` | ActuCore 容器内持久化根目录；只能配置为该挂载目录或其子目录 |
-
-启用后，同容器 adapter 从以下 Driver/卡片输入中选择每秒一组时间戳对齐的
-多模态快照，再通过内部 `collection/*` topic 交给 ROS 2 原生 rosbag2 MCAP
-后端。FAST-LIVO2 和 Nav2 仍按原始频率消费输入；1 Hz 只限制数采旁路，不会
-降低定位或避障频率。数采旁路对五路输入统一使用
-`BEST_EFFORT + KEEP_LAST(4)`；CPU 拥堵时丢弃过时样本，不回放高频 IMU/LiDAR
-积压。每条被选消息保留原始 CDR payload 和源时间戳：
-每次以 RGB frame 为快照锚点，先选取最近的 Depth frame、LiDAR 和 Odom，
-再以已选 LiDAR 的时间戳选取最近 IMU。因此 `20 ms` 门槛限制的是
-LiDAR/IMU 运动对齐，不会错误要求高频 IMU 同时贴近 RGB 锚点。
-
-| 数据 | topic | ROS type / QoS |
-| --- | --- | --- |
-| LiDAR | `/ubuntu/navigation/lidar` | `PointCloud2` |
-| IMU | `/ubuntu/navigation/imu` | `Imu` |
-| RGB frame | `/ubuntu/camera/rgb_frame` | `UInt8MultiArray`; `phanthy.sensor.camera_rgb_frame.v1` |
-| Depth frame | `/ubuntu/camera/depth_frame` | `UInt8MultiArray`; `phanthy.sensor.camera_depth_frame.v1` |
-| Odom | `/ubuntu/navigation/odom` | `Odometry` |
-
-启用数采时 RGB frame 和 Depth frame 都是条件必需输入。Depth frame 的 PSE1 元数据已
-包含 Z16 编码、zlib level-1 无损压缩、压缩/解压字节数、
-`depth_scale_m`、`unit=realsense_depth_unit`、
-`depth_scale_semantics=meters_per_realsense_depth_unit`、深度/RGB 内参、
-`depth_to_rgb` 和
-LiDAR-to-camera 外参，因此不再需要单独的 `CameraInfo` topic。任一 PSE1
-封装、尺寸、压缩流、解压后大小、尺度、标定或时间戳校验失败，
-该帧不会进入对齐快照。ActuCore 按元数据声明的原始大小有界解压，
-不接受超长输出、拼接流或带额外尾部的 zlib payload。
-
-RGB frame 直接沿用 Driver 已发布的
-`PSE1 + uint32_le(metadata_size) + uint32_le(payload_size) + JSON + JPEG`
-封装（`application/vnd.phanthy.sensor-envelope.v1`），不引入卡片私有
-wire format。JSON 必须逐帧携带 `header.stamp_ns`、
-`timing.source_stamp_ns`、`timing.driver_receive_stamp_ns`、尺寸、
-`frame_id`、`calibration_id`、内参/畸变以及 Driver 标定的
-LiDAR-to-camera 外参。该外参矩阵为 row-major 4x4 齐次变换，
-按 `target_from_source` 把 LiDAR 点变换到相机 optical frame。
-
-Driver 必须在 RGB PSE1 的 `calibration.base_to_camera` 中逐帧提供
-row-major 4x4 `target_from_source` 变换，把 camera optical frame 变换到
-`base_link`；RGB 与 Depth 应使用相同 `calibration_id`。设备型号相关的
-外参预设和校准属于 Driver，ActuCore 不再内置或推断任何本体安装参数。
-缺少该变换时，原始 RGB、Depth、LiDAR 和 JSON 仍会导出，但障碍物
-三维标注明确记为 `calibration_unavailable:base_to_camera`。
-畸变模型接受 `none`、`plumb_bob` / `brown_conrady`、
-`rational_polynomial` 和 Driver 实际发布的
-`realsense_inverse_brown_conrady`；逆 Brown 模型按 RealSense 语义迭代求
-投影坐标，不会忽略畸变继续投影。
-因此不再依赖独立 `CameraInfo` topic，也不在 ActuCore 伪造或推断
-标定。同一 `/ubuntu/camera/rgb_frame` PSE1 输入也由语义模块
-解码 JPEG 使用，Canvas 不再需要第二路 RGB 连线。
-
-MCAP 只保存通过对齐门槛的 1 Hz 快照。在线状态不会改写或伪造时间戳，而是
-基于原始 source stamp 做有界的软件对齐诊断：检查每路时间戳覆盖率和单调性，
-并计算 RGB/Depth、LiDAR/IMU、RGB/LiDAR、RGB/Odom、
-Depth/LiDAR 的最近邻时间偏差。P95 门槛分别是 `150 / 20 / 60 / 120 /
-60 ms`，对应当前已验收数据的 10 Hz RGB、5 Hz Depth、10 Hz LiDAR、高频 IMU 和约
-5 Hz Odom 的异步采样上限；它们是数据健康门槛，不是硬件同步声明。超限、
-时间戳缺失或倒序会令状态进入 `degraded`，但不会中断导航。这是 ROS
-system-time 时钟域的软件对齐证据，不等同于 PTP、外部触发或硬件帧同步。
-
-FAST-LIVO2 adapter 另外只在拒绝 LiDAR、IMU、odom 或 registered cloud
-时发布 `/ubuntu/navigation/fast_livo2/sensor_rejection`。每条 JSON 证据包含
-接收时刻、源时间戳、当时最新 LiDAR/IMU 时间戳、配对差值、最近有效
-配对年龄与拒绝原因；正常帧不发布该 topic。`collection_enabled=true`
-时 rosbag2 将该低频事件 topic 一并写入 MCAP，但不把“本次没有拒绝事件”
-当作录制失败。
-
-LiDAR/IMU 最近有效配对允许最多 `3.0 s` 的短时断流；超时后才令
-sensor contract 失效。该容错不放宽实际用于控制的 odom 和 registered
-cloud，二者仍各自按 `0.5 s` source age 拒绝过期输出。
-
-录制目录按 `ubuntu/YYYY-MM-DD/<session_id>` 分层。录制期间目录名带
-`.partial`；Canvas 正常停止、rosbag2 完成 flush 且 receipt 写入后才原子改为
-最终目录。异常退出会保留 `.partial`，不会冒充完整数据。
-
-已停止发布 `/ubuntu/navigation/fast_livo2/collection_preview`。数采控制器不再
-创建 JPEG publisher、五路预览订阅或后台预览渲染线程，也不再生成导出进度图片。
-录制采样与 MCAP 写入由 runtime supervisor 继续负责；停止后 receipt 仍交给
-离线导出管理器处理，导出结果和失败原因通过 `info` 与内部 JSON 诊断读取。
-
-完整机器诊断继续保留在卡片原有
-`/ubuntu/navigation/fast_livo2/status` 的 `collection` 字段，并额外发布到内部
-`/ubuntu/navigation/fast_livo2/collection_status_json`，包含：
-
-- 录制 `state`: `disabled | starting | recording | degraded | error`；
-- 当前 session、落盘目录和 rosbag PID；
-- 每路 topic 的原始到达 `count`、1 Hz 对齐快照 `sampled_count`、
-  最近接收年龄、源时间戳和 publisher 数量；
-- `missing_sources`、`stale_sources` 与 `failure_reason`；
-- `sampling.emitted_count`、`sampling.rejections` 和
-  `sampling.last_rejection_reason`，用于区分缺源与具体时间对齐失败；
-- `time_alignment.alignment_ready`、每路时间戳覆盖率/单调性，以及五组
-  `nearest_skew_ms` 的 P50、P95、最大值和阈值；
-- 上一次停止时的 receipt 和最终目录；
-- receipt 中每路 `sampled_count` / `recorded_count` /
-  `recording_coverage`，用于直接暴露 rosbag 实际落盘数量与卡片发出的
-  快照数量是否一致；即使 MCAP 只包含 `sensor_rejection` 事件而五路
-  快照数都为 0，也会以
-  `recording_empty` 明确标记为不健康；
-- `postprocess.state/stage`: `queued` / `scanning` / `processing` / `paused` /
-  `finalizing` / `complete` / `degraded` / `error`；
-- `processed_images`、`total_images`、`generated_lidar_frames`、
-  `generated_depth_frames`、`percent`、`paused_reason` 与 `failure_reason`。
-
-Canvas `stop` 只有在算法和采集都确认停止后才返回
-`state/status=idle`；任一收口失败时返回顶层
-`error_code=canvas_stop_failed`并保留卡片控制对象以便重试。仍必须同时检查
-`collection_stop_result.status`、`receipt.storage_complete` 和 `receipt.state`：
-只有 `storage_complete=true` 才会将 `.partial` 改名为最终目录；
-`state=degraded` 表示存储完整但存在缺失/过期源，仍应按降级验收。
-已经原子落盘的 receipt 会立即交给后台处理器，即使同一次 Canvas `stop`
-还因地图 manifest 等独立问题返回失败，也不会阻断数据集生成。
-采集启停在内部串行；rosbag 启动早退时会保留 `.partial`
-并写入 `state=failed/storage_complete=false` receipt，不会冒充完整 session。
-
-完整标注依赖 Driver 发布上述 RGB frame 与 Depth frame topic。缺失或封装校验失败时，
-原始 MCAP 仍按实际收到的数据收口，但状态明确显示
-`missing_sources` 或解码失败；不会回退到无标定的旧 RGB/Depth。
-
-停止 receipt 保存 `time_alignment`。MCAP 完成并原子收口后，ActuCore
-父进程的后台 worker 直接在机器人本体生成可交付的 `derived/`，用户不需要安装
-MCAP/ROS 工具再手工解包：
-
-- `rgb/frame-XXXXXXXX.jpg`：原始 JPEG；
-- `depth/depth-<source_stamp_ns>.png`：与 RGB 最近邻匹配的 16-bit 灰度
-  Z16 深度图；像素保留 Driver 原始无符号整数，米制距离为
-  `pixel * frame.depth_parameters.depth_scale_m`，同一 Depth 帧按源
-  时间戳去重；
-- `lidar/lidar-<source_stamp_ns>.pcd`：与图片配对的 binary PCD，XYZ 为
-  little-endian float32 米；同一雷达帧被多张图片复用时只保存一份；
-- `frames/frame-XXXXXXXX.json`：逐图记录图片 ID/路径、Depth ID/路径与
-  `depth_scale_m`、雷达 ID/路径、各路
-  source timestamp、相机宽高与 `fx/fy/cx/cy`、像素单位等效焦距
-  `sqrt(fx*fy)`、畸变参数、障碍物 ID、相机光学坐标系最近 LiDAR 三维点、
-  LiDAR 距离真值与失败原因；
-- `tracks.json`：session 内稳定的 `obs-XXXXXX` 轨迹 ID；
-- `manifest.json`：总图片/Depth/雷达帧数、有效/无效帧数、产物格式与
-  最终状态；
-- `postprocess.json`：可读回的任务进度/错误日志。
-
-这里的“等效焦距”明确使用像素单位；没有传感器物理尺寸时不会伪造毫米焦距。
-“距离真值”来自配对 LiDAR 中投影到该图片且属于障碍物的最近可见三维点，
-不是单目估计值。原始 MCAP 继续保留完整 ROS 消息，作为可追溯源数据。
-
-流程使用 IMU 重力方向移除地面、LiDAR 点云做几何聚类，再通过
-标定外参投影到每张 RGB；Depth frame 同时保留在原始 MCAP 和可直接查看的
-16-bit PNG 产物中，当前尚不参与
-障碍物最近点真值计算。卡片或
-导航 runtime 活跃时 worker 自动暂停，卡片停止后继续，避免与定位/
-规划抢占机载 CPU。ActuCore 重启后会重新发现已完成但尚无
-`derived/manifest.json` 的 session 并继续生成。最终目录只在 manifest
-写入后由 `derived.partial` 原子改名。
-
-需求依据见飞书文档
-[机器人数据采集方案](https://my.feishu.cn/wiki/EWN2wVk5miId63kQ9zScxQMqnAg)。
-本阶段不包含自动清理、容量配额、语义分类或 Canvas 数据浏览。
+FAST-LIVO2 adapter 在拒绝 LiDAR、IMU、odom 或 registered cloud 时发布
+`/ubuntu/navigation/fast_livo2/sensor_rejection`。故障快照录制独立于
+已移除的数据采集功能。
 
 ## 统一卡片连线与构建
 
 Canvas 把 Driver `lidar_cloud` 的标准 PointCloud2、`lidar_imu` 和
 `camera_rgb` 的 RGB PSE1 输出接到公开
-`controlled_semantic_spatial` 卡片；语义导航和数采共用这一路 RGB，启用完整数采时再连接可选的
-`camera_depth` 的 Depth PSE1 输出到 `depth_frame`。原机身 `imu` 不能替代 `lidar_imu`。
+`controlled_semantic_spatial` 卡片；RGB 用于语义导航。原机身 `imu` 不能替代 `lidar_imu`。
 `livo_odom`、registered cloud、obstacle map 都在同一容器内
-交给 planning/semantic 模块。数采预览已停发，机器诊断仍由内部 topic 提供，
+交给 planning/semantic 模块。机器诊断由内部 topic 提供，
 统一卡片公开 `map_view`、旧格式 `motion_sequence` 和 Navi 格式 `control_velocity`。
 
 本模块随统一镜像构建，版本和许可证见

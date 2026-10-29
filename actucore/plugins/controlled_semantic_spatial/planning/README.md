@@ -25,7 +25,7 @@ FAST-LIVO2 internal module
               `-- /ubuntu/navigation/motion_sequence
                                       |
                                       v
-                              Driver loco actuator
+                              兼容的下游消费者（需独立验证）
 ```
 
 - FAST-LIVO2 负责把原始 `camera_init -> aft_mapped` 输出归一化为下表的
@@ -34,7 +34,7 @@ FAST-LIVO2 internal module
   输入过期、frame 不符或 `map -> base_link` 不可用时 fail closed。
 - Agent Core 负责 Canvas 生命周期和 MCP 请求转发；Nav2 planner
   在接受每个新目标时生成独立 `nav_id`。
-- Driver `loco` 负责物理执行、二次限幅、急停、TTL 和停车确认。
+- 物理执行、限幅、急停、TTL 和停车确认须由下游独立验证；旧 Driver `loco` 不承诺消费该格式。
 
 ## 输入合同
 
@@ -94,7 +94,7 @@ reliable，也不保证交付。DDS 回调不等待导航，工作线程对等�
 | port | topic | type / QoS | 语义 |
 | --- | --- | --- | --- |
 | `motion_sequence` | `/ubuntu/navigation/motion_sequence` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `phanthy.navigation.motion_sequence.v1`，非零动作最多 5 Hz，零速立即发布，只保留最新值，`base_link`，TTL 最大 250 ms |
-| `control_velocity` | `/ubuntu/navigation/control_velocity` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `motus.control/1` 的六维 twist，消息格式与 Navi 相同 |
+| `control_velocity` | `/actucore/navi/cmd` | `std_msgs/msg/String`; `RELIABLE + KEEP_LAST(1)` | `motus.control/1` 的六维 twist，消息格式与 Navi 相同 |
 | `plan` | `/plan` | `nav_msgs/msg/Path`; `RELIABLE + KEEP_LAST(1)` | Nav2 原生 `map` 全局路径，Canvas 显示起点、终点、路径长度和折线 |
 | `costmap` | `/global_costmap/costmap` | `nav_msgs/msg/OccupancyGrid`; `RELIABLE + KEEP_LAST(1) + TRANSIENT_LOCAL` | Nav2 实时二维全局代价地图，作为卡片默认预览，叠加路径、位姿、终点和膨胀障碍 |
 
@@ -132,7 +132,7 @@ reliable，也不保证交付。DDS 回调不等待导航，工作线程对等�
 - Nav2 Humble 固定创建 pose 与 through-poses 两个内部 navigator；卡片为二者
   显式加载无 BackUp 的恢复树，只使用清除代价地图、原地转向和等待。公开动作
   仍只有 `navigate_to_pose`；
-- Driver 仍负责二次限幅、TTL、急停和停车确认。
+- 下游是否提供二次限幅、TTL、急停和停车确认须独立验证。
 
 ## Actions
 
@@ -205,10 +205,10 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
 - 直线段因实时代价地图进入 `BLOCKED` 后保持零速；下一条全局路径
   到来时丢弃旧线段并重新选择可通直线段，不会在障碍清除或规划绕行后
   永久停留在上一次 `segment_blocked`。
-- 非零 proposal 以 5 Hz 发送，因此 Driver 不会被 20 Hz 重复动作淹没；
+- 非零 proposal 以 5 Hz 发送，而不是 20 Hz 重复发布；
   切段、障碍、readiness blocker、协议错误和任务终态的首个零速
   直接发布，不等待 5 Hz 定时器。proposal topic 使用
-  `KEEP_LAST(1)`，避免 Driver 排队执行过期轨迹。
+  `KEEP_LAST(1)`，限制 topic 队列深度，但不证明下游不会执行过期命令。
 - Nav2 bringup 的 `/cmd_vel` remap 限定在 scoped launch group 内；
   proposal bridge 始终检查真正的根 `/cmd_vel`，发现外部发布者仍会拒绝导航。
 
@@ -239,7 +239,9 @@ shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互
 odom、registered cloud 和 static map 由 `ControlledSemanticSpatialPlugin` 固定为同容器
 内部 topic，不需要 Canvas 连线。刷新卡片定义后，按下游实际支持的格式选择
 `control_velocity` 或旧的 `motion_sequence`，不要同时连接两个会执行动作的消费者；
-`goal_pose` 仍可作为可选外部输入。格式匹配本身不证明 Driver 已订阅或联调通过。
+`goal_pose` 仍可作为可选外部输入。格式匹配本身不证明 Driver 已订阅或联调通过。该 topic 与 Navi 共用，
+两张卡片不得同时向其发布；G1 `loco_servo` 默认 dry-run，实际停止与 watchdog
+行为尚须独立验证。
 
 `map_view` 为统一卡片的公开地图输出，`livo_odom` 只作为同容器内部定位/规划
 数据，不生成 Canvas 公共端口。主线 Agent Core 不提供本 PR 原有的专用路径、
@@ -294,7 +296,6 @@ Runtime 对 launch 根进程及其独立 Linux 后代进程组执行有界信号
 完整真机导航还必须同时满足：
 
 1. 同卡片 FAST-LIVO2 模块已发布上述 canonical topic 和 `map -> base_link` TF；
-2. planner 已为目标生成 `nav_id`，Driver 在空闲时接纳该任务
-   的首条新鲜、合法、非零 proposal；
-3. Driver 返回提案执行和停车确认；
+2. planner 已为目标生成 `nav_id`，并有已验证的兼容下游消费对应格式；
+3. 下游的执行、超时和物理停车机制经独立验收；
 4. owner 持有遥控器/急停并显式授权真机运动。

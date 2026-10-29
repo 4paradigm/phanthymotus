@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import logging
 import math
-from pathlib import Path
 import re
 import threading
 import time
 
 from .backend import RosTopicFastLivo2Backend
-from .collection_postprocess import build_collection_controller
 from .contract import (
     FAST_LIVO2_ACTIONS,
     FAST_LIVO2_CONFIG_DEFAULTS,
@@ -21,9 +19,6 @@ from .core import FastLivo2Core, UnavailableFastLivo2Backend
 
 log = logging.getLogger(__name__)
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
-_COLLECTION_ROOT = Path(
-    "/opt/phanthy-motus/data/navigation/fast_livo2/recordings"
-)
 
 
 class ConfigError(ValueError):
@@ -82,25 +77,9 @@ def _validated_config(base: dict, updates: dict) -> dict:
     for key in (
         "map_view_enabled",
         "fault_capture_enabled",
-        "collection_enabled",
     ):
         if not isinstance(result.get(key), bool):
             raise ConfigError(f"{key} must be a boolean")
-    raw_directory = result.get("collection_directory")
-    if not isinstance(raw_directory, str) or not raw_directory.strip():
-        raise ConfigError("collection_directory must be a non-empty absolute path")
-    directory = Path(raw_directory.strip())
-    if not directory.is_absolute() or ".." in directory.parts:
-        raise ConfigError("collection_directory must be a safe absolute path")
-    root = _COLLECTION_ROOT.resolve(strict=False)
-    directory = directory.resolve(strict=False)
-    try:
-        directory.relative_to(root)
-    except ValueError as exc:
-        raise ConfigError(
-            f"collection_directory must be within {root}"
-        ) from exc
-    result["collection_directory"] = str(directory)
     return result
 
 
@@ -113,7 +92,6 @@ class FastLivo2Plugin:
         executor,
         *,
         backend=None,
-        collection_controller=None,
     ):
         raw_cfg = dict(plugin_cfg or {})
         raw_cfg.pop("enabled", None)
@@ -131,15 +109,6 @@ class FastLivo2Plugin:
         except ConfigError as exc:
             self._cfg = dict(FAST_LIVO2_CONFIG_DEFAULTS)
             self._config_error = str(exc)
-        self._collection_controller = (
-            collection_controller
-            if collection_controller is not None
-            else build_collection_controller(
-                self._cfg["collection_directory"],
-                self._cfg["namespace"],
-                executor,
-            )
-        )
 
     def get_tools(self) -> list:
         return [fast_livo2_tool_definition(self._cfg["namespace"])]
@@ -172,11 +141,6 @@ class FastLivo2Plugin:
     def stop(self) -> None:
         self._stop_canvas()
 
-    def set_runtime_active(self, active: bool) -> None:
-        """Pause offline work while any owned navigation child is active."""
-
-        self._collection_controller.set_runtime_active(active)
-
     @staticmethod
     def _error(code: str, message: str) -> dict:
         return {
@@ -202,9 +166,6 @@ class FastLivo2Plugin:
                 self._config_error = str(exc)
                 return self._error("invalid_config", str(exc))
             self._config_error = None
-            self._collection_controller.update_root(
-                self._cfg["collection_directory"]
-            )
             return {"state": "configured", "config": dict(self._cfg), "physical_execution": False}
 
     def _start_canvas(self, args: dict) -> dict:
@@ -218,7 +179,6 @@ class FastLivo2Plugin:
         wiring = self._validate_wiring(args)
         if "error_code" in wiring:
             return wiring
-        self._collection_controller.set_runtime_active(True)
         core = self._ensure_core()
         deadline = time.monotonic() + self._cfg["discovery_timeout_sec"]
         while True:
@@ -229,7 +189,6 @@ class FastLivo2Plugin:
                 break
             if time.monotonic() >= deadline:
                 self._release_core()
-                self._collection_controller.set_runtime_active(False)
                 return self._error(
                     "fast_livo2_runtime_unavailable",
                     "in-container FAST-LIVO2 runtime is not subscribed to the command topic",
@@ -237,7 +196,6 @@ class FastLivo2Plugin:
             time.sleep(0.05)
         if info.get("state") in {"unavailable", "error"}:
             self._release_core()
-            self._collection_controller.set_runtime_active(False)
             return self._error("backend_not_ready", str(info.get("reason", info["state"])))
         obstacle_result = core.configure_obstacle_filter(
             {
@@ -251,7 +209,6 @@ class FastLivo2Plugin:
         )
         if obstacle_result.get("status") == "error":
             self._release_core()
-            self._collection_controller.set_runtime_active(False)
             return self._error(
                 str(obstacle_result.get("error_code", "obstacle_filter_failed")),
                 str(
@@ -259,20 +216,6 @@ class FastLivo2Plugin:
                         "error", "obstacle filter could not be configured"
                     )
                 ),
-            )
-        collection_result = core.configure_collection(
-            {
-                "enabled": self._cfg["collection_enabled"],
-                "directory": self._cfg["collection_directory"],
-                "namespace": self._cfg["namespace"],
-            }
-        )
-        if collection_result.get("status") == "error":
-            self._release_core()
-            self._collection_controller.set_runtime_active(False)
-            return self._error(
-                str(collection_result.get("error_code", "collection_start_failed")),
-                str(collection_result.get("error", "data collection could not start")),
             )
         with self._lock:
             self._canvas_started = True
@@ -332,19 +275,6 @@ class FastLivo2Plugin:
             elif info.get("loaded_map"):
                 map_stop_attempted = True
                 stop_result = core.stop_localization()
-            collection_stop_result = core.configure_collection(
-                {
-                    "enabled": False,
-                    "directory": self._cfg["collection_directory"],
-                    "namespace": self._cfg["namespace"],
-                }
-            )
-        else:
-            collection_stop_result = None
-        if isinstance(collection_stop_result, dict):
-            self._collection_controller.enqueue_receipt(
-                collection_stop_result.get("receipt")
-            )
         # A transitional, rejected, malformed, or contradictory response is
         # not evidence that the associated resource is stopped. Only the
         # runtime's known terminal statuses (or an explicitly terminal business
@@ -352,8 +282,6 @@ class FastLivo2Plugin:
         checks = []
         if map_stop_attempted:
             checks.append(("mapping", stop_result, {"stopped", "saved", "idle", "unloaded"}))
-        if core is not None:
-            checks.append(("collection", collection_stop_result, {"disabled", "collection_saved"}))
         failures = [
             (name, result) for name, result, statuses in checks
             if not isinstance(result, dict)
@@ -376,7 +304,6 @@ class FastLivo2Plugin:
             terminal_failures = dict(self._terminal_stop_failures)
             if terminal_confirmed:
                 self._release_core()
-                self._collection_controller.set_runtime_active(False)
                 self._terminal_stop_failures.clear()
             reported_failures = unconfirmed + list(terminal_failures.values())
             return {
@@ -393,7 +320,6 @@ class FastLivo2Plugin:
                 "terminal_stop_failures": terminal_failures,
                 "canvas_wired": not terminal_confirmed,
                 "stop_result": stop_result,
-                "collection_stop_result": collection_stop_result,
                 "retryable": not terminal_confirmed,
                 "terminal_confirmed": terminal_confirmed,
                 "physical_execution": False,
@@ -404,7 +330,6 @@ class FastLivo2Plugin:
             "status": "idle",
             "canvas_wired": False,
             "stop_result": stop_result,
-            "collection_stop_result": collection_stop_result,
             "physical_execution": False,
         }
 
@@ -460,7 +385,6 @@ class FastLivo2Plugin:
         }
         if config_error:
             result.update({"error_code": "invalid_config", "error": config_error})
-        result["collection"] = self._collection_controller.snapshot()
         result.update(
             {
                 "name": "FAST-LIVO2",

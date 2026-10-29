@@ -96,7 +96,7 @@ class PlannerCommandNode(Node):
         self.declare_parameter(
             "motion_sequence_topic", "/ubuntu/navigation/motion_sequence"
         )
-        self.declare_parameter("control_velocity_topic", "/ubuntu/navigation/control_velocity")
+        self.declare_parameter("control_velocity_topic", "/actucore/navi/cmd")
         self.declare_parameter("control_interface_json", "{}")
         self.declare_parameter(
             "controller_speed_limit_topic", "/ubuntu/navigation/nav2/speed_limit"

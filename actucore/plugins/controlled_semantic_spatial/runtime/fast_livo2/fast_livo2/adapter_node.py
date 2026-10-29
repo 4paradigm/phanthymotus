@@ -37,7 +37,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
-from .collection_core import COLLECTION_EVENT_TOPICS
+from .fault_diagnostics import SENSOR_REJECTION_TOPIC
 from .frame_adapter_core import (
     InvalidFastLivo2Frame,
     OdomHealthMonitor,
@@ -275,7 +275,7 @@ class FastLivo2Adapter(Node):
         self._diagnostics_pub = self.create_publisher(String, str(self.get_parameter("diagnostics_topic").value), 10)
         self._sensor_rejection_pub = self.create_publisher(
             String,
-            COLLECTION_EVENT_TOPICS[0]["topic"],
+            SENSOR_REJECTION_TOPIC,
             10,
         )
         self._map_control_status_pub = self.create_publisher(

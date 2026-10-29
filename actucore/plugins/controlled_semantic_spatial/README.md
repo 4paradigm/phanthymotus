@@ -13,7 +13,7 @@ LiDAR/IMU 转为同一个 REP-103 `sensor_frame`，提供
 
 ```text
 Driver lidar + imu ──────────> controlled_semantic_spatial card (ActuCore container)
-optional RGB + depth frame ──┴─> semantic navigation / data collection
+optional RGB ────────────────┴─> semantic navigation
                             ├─ FAST-LIVO2 mapping/localization child process
                             ├─ Nav2 planner/controller child process
                             └─ semantic waypoint processor
@@ -27,7 +27,6 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
   启停；运行时不调用 Docker，也不需要 Docker socket。
 - odom、registered cloud 和 obstacle map 是卡片内部 ROS 边；
   状态与 costmap 保留为内部 ROS topic，分别承担命令回执和导航目标校验。
-  数采预览 `collection_preview` 已停发，预览订阅和渲染也已移除；录制与离线导出保留。
 - VLN 命中地点后直接调用同卡片 planner；无论是 Canvas 还是 VLN 入口，
   planner 都为每个新任务生成独立
   `nav_id`。到达或手动停止时先发布一次终态零速 proposal，再确认
@@ -64,8 +63,7 @@ Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在�
 | --- | --- | --- |
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
-| `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航，`collection_enabled=true` 时必需 |
-| `depth_frame` | `/ubuntu/camera/depth_frame` | 平时否；`collection_enabled=true` 时必须连接，沿用 Driver `PSE1` 封装中的深度尺度、标定与源时间戳 |
+| `rgb` | `/ubuntu/camera/rgb_frame` | 否；连接时启用语义导航 |
 | `goal_pose` | `/ubuntu/navigation/goal_pose` | 否；连线后由导航卡片订阅并转换为 `navigate_to_pose` |
 
 Driver 卡片合并后的连线：
@@ -75,17 +73,18 @@ Driver 卡片合并后的连线：
 | `lidar_cloud` | 带逐点时间戳的标准 `sensor_msgs/msg/PointCloud2` | `lidar` |
 | `lidar_imu` | 与 LiDAR 同时钟、同传感器坐标系的 `sensor_msgs/msg/Imu` | `imu` |
 | `camera_rgb` | RGB PSE1 自描述帧，`phanthy.sensor.camera_rgb_frame.v1` | `rgb` |
-| `camera_depth` | Depth PSE1 自描述帧，`phanthy.sensor.camera_depth_frame.v1` | `depth_frame` |
 
-原机身 `imu` 保持原用途，不能代替 `lidar_imu`。相机卡片原有 JPEG/深度输出
-不能代替 PSE1 输入。按输出的 topic、ROS 类型与 schema 选端口，不假定它是第一个输出。
+原机身 `imu` 保持原用途，不能代替 `lidar_imu`。相机卡片原有 JPEG 输出
+不能代替 RGB PSE1 输入。按输出的 topic、ROS 类型与 schema 选端口，不假定它是第一个输出。
 消费端不依赖来源卡片名称。主线 Agent Core 启动时只传 topic 列表，不提供目标端口身份；
 当前卡片只能以本表中的标准 topic 名识别输入，任意自定义 topic 连线不能保证被正确识别，
 缺少必需输入时会拒绝启动。新 Driver 的实际 `tools/list` 尚待联调核验。
 
 升级旧画布时，先停止智能控制，移除 `navigation_lidar`、`navigation_imu`、
 `camera_rgb_frame`、`camera_depth_frame` 四张旧卡片，添加或刷新上表卡片，
-重新连接对应输出并保存，再启动。不要只改卡片显示名称或沿用旧输出索引。
+重新连接对应输出并保存，再启动。已有 Driver `camera_depth` 和
+`camera_distance` 卡片及其独立深度输出不在此移除范围。不要只改卡片显示名称
+或沿用旧输出索引。
 
 这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
 `lidar` 和 `imu`。`goal_pose` 是可选外部 topic 输入；卡片将消息中的 `goal_id`
@@ -129,10 +128,12 @@ mapper 运行统计超过 3 秒未更新时，状态会把 `mapper_runtime_stale
 原有两个输出的位置保持不变，并追加 `control_velocity`。`motion_sequence`
 继续发送旧格式的有界速度提案，保留 5 Hz 和原 TTL；新输出使用 Navi 相同的
 `control/velocity`、`std_msgs/msg/String` 和 `motus.control/1` 消息格式，
-两种格式不可互换。升级画布需刷新卡片定义，并按下游实际支持的格式选择连线；
+两种格式不可互换。`control_velocity` 使用与 Navi 相同的固定 topic，二者不得
+同时发布以免控制冲突。升级画布需刷新卡片定义，并按下游实际支持的格式选择连线；
 不要把两个输出同时接到会各自执行的控制卡片。配套 Driver 工作树中的 R1、Bumi
 和 AS2W bundle 已有 `control/velocity` 底座接收卡片；实际使用仍须连线并验证。
-G1 的现有底座接收路径使用旧格式的 `motion_sequence`，不是 `motus.control/1` 接收端。
+G1 独立 `loco_servo` 使用 `control/velocity` 格式，默认 dry-run；实际连线、watchdog
+与物理停车必须分别验证。旧 `loco` 不承诺消费 `motion_sequence`。
 新输出沿用 Navi 的固定 source 与启动后 seq 从 1 递增的约定；若下游保留同 source
 旧序号而不随之重置，单独重启上游后消息（包括零速）可能被丢弃，需在联调中验证生命周期。
 
@@ -140,25 +141,22 @@ G1 的现有底座接收路径使用旧格式的 `motion_sequence`，不是 `mot
 | --- | --- | --- |
 | `map_view` | `/ubuntu/navigation/fast_livo2/map_view` | Canvas 地图与机器人位姿 |
 | `motion_sequence` | `/ubuntu/navigation/motion_sequence` | 原有速度提案格式，供兼容的旧消费者使用 |
-| `control_velocity` | `/ubuntu/navigation/control_velocity` | 与 Navi 相同格式的六维速度输出，供兼容的控制卡片使用 |
+| `control_velocity` | `/actucore/navi/cmd` | 与 Navi 相同格式的六维速度输出，供兼容的控制卡片使用 |
 
 `livo_odom`、registered cloud、confirmed static map 和 obstacle map 仍只由
 同容器内的定位、规划和语义逻辑消费，不生成 Canvas 右侧连线端口。
 `/plan` 和 `/ubuntu/navigation/odom` 注册为隐藏辅助流，只供 `map_view`
 叠加路径和位姿，不生成独立监控卡片。详细
-frame、QoS、freshness、数采和速度约束见内部实现说明：
+frame、QoS、freshness 和速度约束见内部实现说明：
 
 - [mapping/README.md](mapping/README.md)
 - [planning/README.md](planning/README.md)
 - [semantic/README.md](semantic/README.md)
 
-RGB 和 depth 均为可选端口：只连 LiDAR + IMU 即可启动建图、定位与
+RGB 为可选端口：只连 LiDAR + IMU 即可启动建图、定位与
 Nav2 规划控制；连接 RGB 后才启动语义导航。未连 RGB 时，`capture` 和
 `navigate` 返回 `rgb_not_connected`，不会自动订阅默认相机。先停卡、连接 RGB，
-再启动卡片后重试。Canvas 的静态卡片规格无法随
-`collection_enabled` 动态改变端口外观，因此统一卡片在启动时执行条件
-校验：启用数采时 RGB 和 depth 都必须连接，否则返回明确的
-`invalid_canvas_wiring`，而不是启动一份不完整的数据集。
+再启动卡片后重试。
 
 完整的静态插件配置样例见 [config.example.json](config.example.json)，内容放在
 ActuCore 配置的 `plugins.controlled_semantic_spatial` 下。旧键 `plugins.navigation`
@@ -287,9 +285,8 @@ Canvas 手动执行 `navigate_to_pose` 时，Agent Core 只透明转发 MCP
 请求。planner 接受目标后生成新 `nav_id`，并在整个任务的
 motion sequence 中保持该 ID。Nav2 上报匹配的终态后，卡片释放
 活动任务；下一次点击因此会获得另一个 ID，无需重启
-Canvas、Core 或 Driver。Driver 在空闲订阅状态接纳首条新鲜、合法、
-非零且非终态 proposal 的 `nav_id`，活动任务期间拒绝 ID 切换，并在
-终态零速后退役该 ID。Core 不另外维护 authorize/revoke 状态。
+Canvas、Core 或 Driver。下游消费者是否支持该 proposal 格式、任务接纳
+和停车确认必须独立核验。Core 不另外维护 authorize/revoke 状态。
 
 `start` 按 runtime → mapping → planning → semantic 顺序获取资源；任一步
 失败会按相反顺序回滚。`stop_mapping` 和 `load_map` 的 backend 等待预算分别
@@ -297,9 +294,6 @@ Canvas、Core 或 Driver。Driver 在空闲订阅状态接纳首条新鲜、合�
 `finalizing` 事务，下一次 `stop`/`stop_mapping` 从原事务继续；只有明确终态
 才会释放 mapping 控制对象并继续回收其他模块和运行时。已完成的同名
 `stop_mapping` 终态可幂等重放原保存回执，避免迟到重试制造第二份成功结果。
-数采目录收口遇到暂时性 I/O 错误时保留原 `.partial` 路径供下一次 stop 重试；
-路径已丢失、目标目录冲突等不可恢复错误会保留路径证据并返回明确终态，避免
-Canvas 永久卡在 retryable stop。
 卡片级 `start`/`stop`/`config` 转换串行执行，不允许 Canvas 的迟到请求在
 前一次启动中途关闭 backend。若 Nav2 command bridge 子进程仍存活，但
 Fast DDS 在首个发现窗口内暂未报告 command subscriber，只重建一次
@@ -415,18 +409,13 @@ sudo install -d -o "$(id -u)" -g "$(id -g)" -m 0755 \
 
 升级时不会自动迁移旧目录 `/opt/phanthy-motus/data/fast_livo2/{maps,recordings}`。
 现场操作者应先停卡并备份，核对新目录是否已有数据和同名文件，再将旧地图及
-录制数据迁移至上述对应新目录并核对权限；不要直接覆盖已有数据。自定义的旧
-`collection_directory` 也需更新到新容器目录或其子目录，否则配置校验会拒绝。
+录制数据迁移至上述对应新目录并核对权限；不要直接覆盖已有数据。旧数采数据
+不会自动导出；请在升级前备份并使用旧版本处理。移除静态或已保存卡片配置中的
+`collection_enabled` 和 `collection_directory`，严格 schema 不再接受这些键。
 地图容器内路径仍为 `/opt/fast_livo_ws/src/fast_livo/Log/pcd`。
 
-数采默认关闭。两类目录都不会自动清理：单次地图会话仍受 512 MiB 安全上限，
-但总历史和录制数据会持续占用磁盘，操作者需在停卡后自行归档或删除旧目录。
-导出时若磁盘重命名失败，保留原 `.partial` 目录和会话路径并返回可重试错误；
-后续 `stop` 从同一会话继续导出，不会丢失未完成录制。
-离线标注遇到临时异常会在 1 秒后自动重试一次；再次失败时保留原始会话和
-错误状态，等待后续回执或进程恢复重新入队。
-离线标注的完成状态仅在 `postprocess.json` 原子写入成功后对外发布；日志写入
-失败会进入上述错误/重试流程，不会先显示完成再退回错误。
+地图与故障录制目录不会自动清理；单次地图会话受 512 MiB 安全上限，历史
+地图及故障快照仍占用磁盘，操作者应在停卡后按需归档或删除。
 
 ## 第三方与验收边界
 

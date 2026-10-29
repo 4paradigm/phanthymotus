@@ -48,8 +48,6 @@ def _config_properties() -> dict:
         "obstacle_max_height_m": deepcopy(mapping["obstacle_max_height_m"]),
         "map_view_enabled": deepcopy(mapping["map_view_enabled"]),
         "fault_capture_enabled": deepcopy(mapping["fault_capture_enabled"]),
-        "collection_enabled": deepcopy(mapping["collection_enabled"]),
-        "collection_directory": deepcopy(mapping["collection_directory"]),
         "planning_request_timeout_sec": deepcopy(planning["request_timeout_sec"]),
         "planning_discovery_timeout_sec": deepcopy(planning["discovery_timeout_sec"]),
     }
@@ -171,27 +169,6 @@ def controlled_semantic_spatial_tool_definition(namespace: str) -> dict:
     rgb_input = deepcopy(semantic["topic_in"][0])
     rgb_input["required"] = False
     external_inputs.append(rgb_input)
-    external_inputs.extend(
-        [
-            {
-                "port": "depth_frame",
-                "topic": f"/{namespace.strip('/')}/camera/depth_frame",
-                "format": "application/vnd.phanthy.sensor-envelope.v1",
-                "ros_type": "std_msgs/msg/UInt8MultiArray",
-                "qos": "BEST_EFFORT + KEEP_LAST(depth=4) + VOLATILE",
-                "required": False,
-                "schema": "phanthy.sensor.camera_depth_frame.v1",
-                "timestamp": (
-                    "header.stamp_ns / timing.source_stamp_ns in the PSE1 envelope"
-                ),
-                "desc": (
-                    "Connect the Depth PSE1 output of Driver camera_depth. "
-                    "Requires Z16 depth with scale, calibration, RGB alignment metadata, "
-                    "and source time; required when collection_enabled=true"
-                ),
-            },
-        ]
-    )
     goal_input = deepcopy(
         next(item for item in planning["topic_in"] if item["port"] == "goal_pose")
     )
@@ -203,10 +180,9 @@ def controlled_semantic_spatial_tool_definition(namespace: str) -> dict:
         for item in [*mapping["topic_out"], *planning["topic_out"]]
         if item.get("port")
     }
-    root = "/" + str(namespace or "ubuntu").strip("/")
     component_outputs["control_velocity"] = {
         "port": "control_velocity",
-        "topic": f"{root}/navigation/control_velocity",
+        "topic": "/actucore/navi/cmd",
         "format": "control/velocity",
         "ros_type": "std_msgs/msg/String",
         "schema": "motus.control/1",

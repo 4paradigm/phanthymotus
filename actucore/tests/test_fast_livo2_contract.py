@@ -83,39 +83,11 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertEqual(config["obstacle_max_height_m"]["default"], 0.30)
         self.assertTrue(config["map_view_enabled"]["default"])
         self.assertTrue(config["fault_capture_enabled"]["default"])
-        self.assertFalse(config["collection_enabled"]["default"])
-        self.assertEqual(
-            config["collection_directory"]["default"],
-            "/opt/phanthy-motus/data/navigation/fast_livo2/recordings",
-        )
+        self.assertNotIn("collection_enabled", config)
+        self.assertNotIn("collection_directory", config)
         self.assertNotIn("start_recording", actions)
         self.assertNotIn("stop_recording", actions)
 
-    def test_collection_defaults_agree_with_runtime_and_examples(self) -> None:
-        from plugins.controlled_semantic_spatial.mapping.contract import FAST_LIVO2_CONFIG_DEFAULTS
-        from plugins.controlled_semantic_spatial.mapping.plugin import _COLLECTION_ROOT
-
-        runtime = ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/runtime/fast_livo2"
-        sys.path.insert(0, str(runtime))
-        try:
-            from fast_livo2.collection_core import COLLECTION_ROOT
-        finally:
-            sys.path.remove(str(runtime))
-
-        root = "/opt/phanthy-motus/data/navigation/fast_livo2/recordings"
-        config = yaml.safe_load((ACTUCORE_ROOT / "config.yaml").read_text())
-        navigation = json.loads(
-            (ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/config.example.json").read_text()
-        )
-        mapping = json.loads(
-            (ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/mapping/config.example.json").read_text()
-        )
-        self.assertEqual(config["plugins"]["controlled_semantic_spatial"]["mapping"]["collection_directory"], root)
-        self.assertEqual(navigation["mapping"]["collection_directory"], root)
-        self.assertEqual(mapping["collection_directory"], root)
-        self.assertEqual(FAST_LIVO2_CONFIG_DEFAULTS["collection_directory"], root)
-        self.assertEqual(str(_COLLECTION_ROOT), root)
-        self.assertEqual(str(COLLECTION_ROOT), root)
 
     def test_runtime_is_locked_in_navigation_base_and_actucore_image(self) -> None:
         runtime = ACTUCORE_ROOT / "plugins" / "controlled_semantic_spatial" / "runtime"
@@ -203,11 +175,8 @@ class FastLivo2ContractTest(unittest.TestCase):
             "from fast_livo2.camera_rgb_frame import decode as decode_rgb",
             dockerfile,
         )
-        self.assertIn(
-            "from fast_livo2.camera_depth_frame import decode as decode_depth",
-            dockerfile,
-        )
-        self.assertIn("assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'", dockerfile)
+        self.assertNotIn("fast_livo2.camera_depth_frame", dockerfile)
+        self.assertIn("assert RGB_MAGIC == b'PSE1'", dockerfile)
         self.assertTrue((runtime / "navigation_lio.yaml").is_file())
         self.assertIn("/config/navigation_lio.yaml", dockerfile)
         self.assertNotIn("base_to_sensor_x", adapter)
@@ -349,9 +318,9 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("lidar_fast_livo", supervisor)
         self.assertIn('self._adapter_execute("unload_map", {})', supervisor)
         self.assertIn("self._runtime_lifecycle_lock = threading.Lock()", supervisor)
-        self.assertIn("self._collection_lifecycle_lock = threading.Lock()", supervisor)
+        self.assertNotIn("self._collection_lifecycle_lock", supervisor)
         self.assertIn('"rollback_status"', supervisor)
-        self.assertIn("finalize_collection_session(", supervisor)
+        self.assertNotIn("finalize_collection_session(", supervisor)
         self.assertIn("self._reference_points = static_loaded.points", adapter)
         self.assertIn("reference = self._reference_points", adapter)
         self.assertIn('"obstacle_min_height_m", -0.30', adapter)

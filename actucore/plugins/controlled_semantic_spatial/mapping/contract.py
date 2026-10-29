@@ -27,8 +27,6 @@ FAST_LIVO2_CONFIG_DEFAULTS = {
     "obstacle_max_height_m": 0.30,
     "map_view_enabled": True,
     "fault_capture_enabled": True,
-    "collection_enabled": False,
-    "collection_directory": "/opt/phanthy-motus/data/navigation/fast_livo2/recordings",
 }
 
 FAST_LIVO2_CONFIG_SCHEMA = {
@@ -111,23 +109,6 @@ FAST_LIVO2_CONFIG_SCHEMA = {
             "description": (
                 "Keep a short full-rate ring buffer and save it only on the "
                 "first raw odometry discontinuity"
-            ),
-        },
-        "collection_enabled": {
-            "type": "boolean",
-            "default": False,
-            "description": (
-                "Automatically record LiDAR, IMU, versioned RGB, depth and odom "
-                "while this Canvas card is running, then generate obstacle "
-                "annotations in the background"
-            ),
-        },
-        "collection_directory": {
-            "type": "string",
-            "default": "/opt/phanthy-motus/data/navigation/fast_livo2/recordings",
-            "description": (
-                "Persistent in-container directory; it must remain under the "
-                "mounted FAST-LIVO2 recordings root"
             ),
         },
     },

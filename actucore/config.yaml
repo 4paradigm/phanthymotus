@@ -20,8 +20,6 @@ plugins:
       map_voxel_size_m: 0.10
       obstacle_min_height_m: -0.30
       obstacle_max_height_m: 0.30
-      collection_enabled: false
-      collection_directory: /opt/phanthy-motus/data/navigation/fast_livo2/recordings
     planning:
       backend: ros_topic
       shadow_only: true

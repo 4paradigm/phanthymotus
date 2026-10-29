@@ -42,7 +42,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
       ros2 pkg prefix segmented_controller >/dev/null && \
       NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
         python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
-      python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; from fast_livo2.camera_depth_frame import decode as decode_depth, MAGIC as DEPTH_MAGIC; assert RGB_MAGIC == DEPTH_MAGIC == b'PSE1'" && \
+      python3 -c "import numpy, rosbag2_py, yaml, em; import cv2; from fast_livo2.camera_rgb_frame import decode as decode_rgb, MAGIC as RGB_MAGIC; assert RGB_MAGIC == b'PSE1'" && \
       ros2 bag record --help | grep -F -- '--no-discovery' >/dev/null; \
     else \
       colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release; \
@@ -99,7 +99,7 @@ RUN find /ros_ws/install /opt/ros/humble/install -name "site-packages" -type d \
       done && \
       NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
         python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
-      cd /work && python3 -c "import main; import numpy, rosbag2_py, yaml, em, cv2; from fast_livo2.camera_rgb_frame import decode; from fast_livo2.camera_depth_frame import decode" && \
+      cd /work && python3 -c "import main; import numpy, rosbag2_py, yaml, em, cv2; from fast_livo2.camera_rgb_frame import decode" && \
       test ! -e /work/plugins/controlled_semantic_spatial/runtime; \
     else \
       source /ros_ws/install/setup.bash && cd /work && \

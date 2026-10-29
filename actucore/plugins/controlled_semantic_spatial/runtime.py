@@ -133,7 +133,6 @@ class ControlledSemanticSpatialRuntime:
         namespace: str, input_topics: dict[str, str] | None,
         control_interface: dict | None = None,
     ) -> dict[str, tuple[str, ...]]:
-        use_legacy_camera_defaults = input_topics is None
         input_topics = input_topics if input_topics is not None else {}
         root = "/" + str(namespace or "ubuntu").strip("/")
         navigation = f"{root}/navigation"
@@ -146,17 +145,6 @@ class ControlledSemanticSpatialRuntime:
         fast_values = {
             "lidar_topic": topic("lidar", f"{navigation}/lidar"),
             "imu_topic": topic("imu", f"{navigation}/imu"),
-            "rgb_topic": topic("rgb", f"{root}/camera/rgb_frame"),
-            "depth_topic": topic(
-                "depth_frame", f"{root}/camera/depth_frame"
-            ),
-            "rgb_enabled": str(
-                use_legacy_camera_defaults or bool(str(input_topics.get("rgb") or "").strip())
-            ).lower(),
-            "depth_enabled": str(
-                use_legacy_camera_defaults
-                or bool(str(input_topics.get("depth_frame") or "").strip())
-            ).lower(),
             "raw_odom_topic": f"{fast_livo2}/raw/odom",
             "raw_cloud_topic": f"{fast_livo2}/raw/cloud_registered",
             "odom_topic": f"{navigation}/odom",
@@ -170,14 +158,13 @@ class ControlledSemanticSpatialRuntime:
             "map_control_status_topic": f"{fast_livo2}/map_control_status",
             "command_topic": f"{fast_livo2}/command",
             "status_topic": f"{fast_livo2}/status",
-            "collection_status_topic": f"{fast_livo2}/collection_status_raw",
         }
         nav2_values = {
             "odom_topic": f"{navigation}/odom",
             "obstacle_cloud_topic": f"{navigation}/cloud_registered",
             "cmd_vel_raw_topic": f"{nav2}/cmd_vel_raw",
             "motion_sequence_topic": f"{navigation}/motion_sequence",
-            "control_velocity_topic": f"{navigation}/control_velocity",
+            "control_velocity_topic": "/actucore/navi/cmd",
             "control_interface_json": json.dumps(
                 control_interface or {}, ensure_ascii=False, separators=(",", ":"), allow_nan=False
             ),

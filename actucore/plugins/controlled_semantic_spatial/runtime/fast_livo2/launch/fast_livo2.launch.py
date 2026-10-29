@@ -2,17 +2,12 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
     defaults = {
         "lidar_topic": "/ubuntu/navigation/lidar",
         "imu_topic": "/ubuntu/navigation/imu",
-        "rgb_topic": "/ubuntu/camera/rgb_frame",
-        "depth_topic": "/ubuntu/camera/depth_frame",
-        "rgb_enabled": "true",
-        "depth_enabled": "true",
         "raw_odom_topic": "/ubuntu/navigation/fast_livo2/raw/odom",
         "raw_cloud_topic": "/ubuntu/navigation/fast_livo2/raw/cloud_registered",
         "odom_topic": "/ubuntu/navigation/odom",
@@ -30,9 +25,6 @@ def generate_launch_description() -> LaunchDescription:
         ),
         "command_topic": "/ubuntu/navigation/fast_livo2/command",
         "status_topic": "/ubuntu/navigation/fast_livo2/status",
-        "collection_status_topic": (
-            "/ubuntu/navigation/fast_livo2/collection_status_raw"
-        ),
     }
     topics = {name: LaunchConfiguration(name) for name in defaults}
     return LaunchDescription(
@@ -78,8 +70,6 @@ def generate_launch_description() -> LaunchDescription:
                             for key in (
                                 "lidar_topic",
                                 "imu_topic",
-                                "rgb_topic",
-                                "depth_topic",
                                 "odom_topic",
                                 "raw_odom_topic",
                                 "raw_cloud_topic",
@@ -91,12 +81,7 @@ def generate_launch_description() -> LaunchDescription:
                                 "map_control_status_topic",
                                 "command_topic",
                                 "status_topic",
-                                "collection_status_topic",
                             )
-                        },
-                        **{
-                            key: ParameterValue(topics[key], value_type=bool)
-                            for key in ("rgb_enabled", "depth_enabled")
                         },
                     }
                 ],

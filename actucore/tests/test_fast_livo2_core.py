@@ -178,7 +178,7 @@ class FastLivo2CoreTest(unittest.TestCase):
             ],
         )
 
-    def test_runtime_and_collection_lifecycles_are_serialized(self) -> None:
+    def test_runtime_lifecycles_are_serialized(self) -> None:
         backend = BlockingBackend()
         core = FastLivo2Core(backend)
         results = []
@@ -201,25 +201,6 @@ class FastLivo2CoreTest(unittest.TestCase):
         second.join(timeout=2.0)
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual({result["status"] for result in results}, {"mapping", "error"})
-
-        collection_backend = BlockingBackend()
-        collection_core = FastLivo2Core(collection_backend)
-        first = threading.Thread(
-            target=lambda: collection_core.configure_collection({"enabled": True})
-        )
-        second = threading.Thread(
-            target=lambda: collection_core.configure_collection({"enabled": False})
-        )
-        first.start()
-        self.assertTrue(collection_backend.entered.wait(timeout=1.0))
-        second.start()
-        collection_backend.release.set()
-        first.join(timeout=2.0)
-        second.join(timeout=2.0)
-        self.assertEqual(
-            [call[1]["enabled"] for call in collection_backend.calls],
-            [True, False],
-        )
 
         filter_backend = FakeBackend()
         filter_core = FastLivo2Core(filter_backend)

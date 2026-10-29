@@ -97,15 +97,6 @@ class FailingConfigComponent(FakeComponent):
         return super().dispatch(prefix, args)
 
 
-class CollectionMappingComponent(FakeComponent):
-    def dispatch(self, prefix, args):
-        if args.get("action") == "info":
-            self.calls.append((prefix, dict(args)))
-            return {
-                "state": "ready" if self.started else "idle",
-                "config": {"collection_enabled": True},
-            }
-        return super().dispatch(prefix, args)
 
 
 class TransientPlanningComponent(FakeComponent):
@@ -167,8 +158,6 @@ class RetryableMappingBackend:
     def execute(self, action, args):
         if action == "configure_obstacle_filter":
             return {"status": "configured"}
-        if action == "configure_collection":
-            return {"status": "recording" if args["enabled"] else "disabled"}
         if action == "start_mapping":
             return {"status": "mapping", "map_name": args["map_name"]}
         if action == "stop_mapping":
@@ -211,7 +200,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         schema = controlled_semantic_spatial_tool_definition("ubuntu")["inputSchema"]
         topics = [
             "/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
-            "/ubuntu/camera/rgb_frame", "/ubuntu/camera/depth_frame",
+            "/ubuntu/camera/rgb_frame",
         ]
         # Upstream _upstream_camera_info copies Driver declarations by topic.
         rgb = {
@@ -222,11 +211,10 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
             "half_fov_v_rad": None, "source": "unknown", "measured_on": "",
             "pipeline": [], "vendor": {},
         }
-        depth = {**rgb, "topic": topics[3], "id": "vendor/model/depth"}
         start = {
             "action": "start", "instance_id": "card-1", "input_topics": topics,
             "input_topic": topics[0],
-            "camera_info": {topics[2]: rgb, topics[3]: depth},
+            "camera_info": {topics[2]: rgb},
         }
         info = {
             "action": "info", "instance_id": "card-1", "input_topics": topics,
@@ -256,7 +244,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "controlled_semantic_spatial")
         self.assertEqual(
             {item["port"] for item in tool["topic_in"]},
-            {"lidar", "imu", "rgb", "depth_frame", "goal_pose"},
+            {"lidar", "imu", "rgb", "goal_pose"},
         )
         optional_inputs = {
             item["port"]
@@ -265,7 +253,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         }
         self.assertEqual(
             optional_inputs,
-            {"rgb", "depth_frame", "goal_pose"},
+            {"rgb", "goal_pose"},
         )
         self.assertEqual(
             {
@@ -285,14 +273,6 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
             "application/vnd.phanthy.sensor-envelope.v1",
         )
         self.assertEqual(inputs["rgb"]["schema"], "phanthy.sensor.camera_rgb_frame.v1")
-        self.assertEqual(
-            inputs["depth_frame"]["topic"],
-            "/ubuntu/camera/depth_frame",
-        )
-        self.assertEqual(
-            inputs["depth_frame"]["schema"],
-            "phanthy.sensor.camera_depth_frame.v1",
-        )
         self.assertEqual(inputs["goal_pose"]["topic"], "/ubuntu/navigation/goal_pose")
         self.assertEqual(inputs["goal_pose"]["schema"], "phanthy.navigation.goal.v1")
         self.assertFalse(inputs["goal_pose"]["monitor"])
@@ -305,15 +285,17 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
                 "control_velocity",
             ],
         )
+        from plugins.navi.plugin import DEFAULT_TOPIC, TOPIC_FORMAT
+
         control = tool["topic_out"][2]
-        self.assertEqual(control["topic"], "/ubuntu/navigation/control_velocity")
-        self.assertEqual(control["format"], "control/velocity")
+        self.assertEqual(control["topic"], DEFAULT_TOPIC)
+        self.assertEqual(control["format"], TOPIC_FORMAT)
         self.assertEqual(control["ros_type"], "std_msgs/msg/String")
         self.assertEqual(control["schema"], "motus.control/1")
         other = controlled_semantic_spatial_tool_definition("/robot_alpha/")
         other_control = next(item for item in other["topic_out"]
                              if item["port"] == "control_velocity")
-        self.assertEqual(other_control["topic"], "/robot_alpha/navigation/control_velocity")
+        self.assertEqual(other_control["topic"], DEFAULT_TOPIC)
         self.assertEqual(tool["topic_out"][1]["topic"], "/ubuntu/navigation/motion_sequence")
         auxiliary = {item["port"]: item for item in tool["topic_aux"]}
         self.assertEqual(set(auxiliary), {"plan", "livo_odom"})
@@ -724,7 +706,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         plugin = self.make_plugin()
         topics = [
             "/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
-            "/ubuntu/camera/rgb_frame", "/ubuntu/camera/depth_frame",
+            "/ubuntu/camera/rgb_frame",
         ]
         start = {
             "action": "start", "instance_id": "card-1",
@@ -732,8 +714,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             "camera_info": {
                 topics[2]: {"schema": "motus.camera/1", "topic": topics[2],
                             "id": "vendor/model/rgb", "source": "unknown"},
-                topics[3]: {"schema": "motus.camera/1", "topic": topics[3],
-                            "id": "vendor/model/depth", "source": "unknown"},
             },
         }
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
@@ -758,7 +738,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         info = plugin.dispatch(plugin.PREFIX, {"action": "info"})
         self.assertEqual(info["state"], "ready")
         output = next(item for item in info["topic_out"] if item["port"] == "control_velocity")
-        self.assertEqual(output["topic"], "/ubuntu/navigation/control_velocity")
+        self.assertEqual(output["topic"], "/actucore/navi/cmd")
         self.assertEqual(output["format"], "control/velocity")
         self.assertEqual(output["schema"], "motus.control/1")
         self.assertTrue(plugin.dispatch(plugin.PREFIX, request)["already_started"])
@@ -1293,29 +1273,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                 self.assertEqual(result["error_code"], "invalid_canvas_wiring")
                 self.assertFalse(runtime.started)
 
-    def test_collection_reuses_rgb_and_requires_depth_binding(self):
-        mapping = CollectionMappingComponent("mapping")
-        plugin = self.make_plugin(mapping=mapping)
-
-        missing = plugin.dispatch(
-            "controlled_semantic_spatial",
-            {"action": "start", "input_bindings": _external_bindings()},
-        )
-        self.assertEqual(missing["error_code"], "invalid_canvas_wiring")
-        self.assertIn("rgb", missing["error"])
-        self.assertIn("depth_frame", missing["error"])
-
-        all_bindings = [
-            {"port": item["port"], "topic": item["topic"]}
-            for item in controlled_semantic_spatial_tool_definition("ubuntu")["topic_in"]
-        ]
-        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput") as goal_input:
-            started = plugin.dispatch(
-                "controlled_semantic_spatial",
-                {"action": "start", "input_bindings": all_bindings},
-            )
-        self.assertEqual(started["state"], "ready")
-        goal_input.assert_called_once()
 
     def test_runtime_start_failure_rolls_back_before_retry(self):
         runtime = FakeRuntime(fail=True)
@@ -1602,7 +1559,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         mapping = FakeComponent("mapping", stop_result={
             "state": "error", "status": "error", "error_code": "map_write_failed",
             "terminal_confirmed": True, "canvas_wired": False, "retryable": False,
-            "collection_stop_result": {"receipt": {"storage_complete": False}},
         })
         planning = FakeComponent("planning", fail_start=True)
         plugin = self.make_plugin(runtime=runtime, mapping=mapping, planning=planning)
@@ -1614,7 +1570,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         self.assertFalse(runtime.started)
         retained = plugin.dispatch(plugin.PREFIX, {"action": "info"})["last_terminal_stop_error"]
         self.assertEqual(retained["error_code"], "map_write_failed")
-        self.assertFalse(retained["collection_stop_result"]["receipt"]["storage_complete"])
 
     def test_retryable_mapping_stop_keeps_runtime_and_canvas_lifecycle(self):
         runtime = FakeRuntime()
@@ -2034,7 +1989,7 @@ class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
         arguments = dict(value.split(":=", 1) for value in
                          ControlledSemanticSpatialRuntime._launch_arguments("/other/", {})["nav2"])
         self.assertEqual(arguments["motion_sequence_topic"], "/other/navigation/motion_sequence")
-        self.assertEqual(arguments["control_velocity_topic"], "/other/navigation/control_velocity")
+        self.assertEqual(arguments["control_velocity_topic"], "/actucore/navi/cmd")
         self.assertEqual(json.loads(arguments["control_interface_json"]), {})
 
     def test_minimal_descriptor_round_trips_into_bridge_configuration(self):
@@ -2090,17 +2045,13 @@ class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
         nav2_command = commands[1][0]
         self.assertIn("lidar_topic:=/sensors/lidar", fast_command)
         self.assertIn("imu_topic:=/sensors/imu", fast_command)
-        self.assertIn("rgb_topic:=/camera/rgb", fast_command)
-        self.assertIn("rgb_enabled:=true", fast_command)
-        self.assertIn("depth_enabled:=false", fast_command)
-        self.assertIn("depth_topic:=/robot/camera/depth_frame", fast_command)
         self.assertIn("odom_topic:=/robot/navigation/odom", fast_command)
         self.assertIn("odom_topic:=/robot/navigation/odom", nav2_command)
         self.assertIn(
             "motion_sequence_topic:=/robot/navigation/motion_sequence",
             nav2_command,
         )
-        self.assertIn("control_velocity_topic:=/robot/navigation/control_velocity", nav2_command)
+        self.assertIn("control_velocity_topic:=/actucore/navi/cmd", nav2_command)
         arguments = dict(arg.split(":=", 1) for arg in nav2_command[4:])
         self.assertEqual(json.loads(arguments["control_interface_json"]), _control_descriptor())
         self.assertEqual(arguments["control_interface_json"], json.dumps(
@@ -2111,23 +2062,6 @@ class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(killpg.call_count, 2)
 
-    def test_optional_camera_launch_flags_preserve_legacy_defaults(self):
-        cases = (
-            (None, ("true", "true")),
-            ({}, ("false", "false")),
-            ({"lidar": "/lidar", "imu": "/imu"}, ("false", "false")),
-            ({"rgb": "/custom/rgb"}, ("true", "false")),
-            ({"depth_frame": "/custom/depth"}, ("false", "true")),
-            ({"rgb": "/custom/rgb", "depth_frame": "/custom/depth"}, ("true", "true")),
-            ({"rgb": "  ", "depth_frame": ""}, ("false", "false")),
-        )
-        for mapping, flags in cases:
-            with self.subTest(mapping=mapping):
-                args = ControlledSemanticSpatialRuntime._launch_arguments("robot", mapping)["fast_livo2"]
-                values = dict(arg.split(":=", 1) for arg in args)
-                self.assertEqual((values["rgb_enabled"], values["depth_enabled"]), flags)
-                self.assertTrue(values["rgb_topic"].startswith("/"))
-                self.assertTrue(values["depth_topic"].startswith("/"))
 
     def test_runtime_signals_owned_nested_session_groups_before_launch_group(self):
         def factory(command, **kwargs):
