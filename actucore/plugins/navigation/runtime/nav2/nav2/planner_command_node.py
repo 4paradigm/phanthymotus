@@ -1468,6 +1468,18 @@ class PlannerCommandNode(Node):
 
     def _publish_control_velocity(self, velocity: Velocity, *, stop: bool = False,
                                   sensor_snapshot=None) -> None:
+        """Isolate the new output from legacy proposal and status publication."""
+        try:
+            self._publish_control_velocity_impl(
+                velocity, stop=stop, sensor_snapshot=sensor_snapshot
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f"control velocity output failed: {type(exc).__name__}: {exc}"
+            )
+
+    def _publish_control_velocity_impl(self, velocity: Velocity, *, stop: bool = False,
+                                       sensor_snapshot=None) -> None:
         """Called under _lock; nonzero uses the candidate's bound input snapshot.
 
         These are the earlier of the bridge's ready input headers, not proof of
@@ -1526,12 +1538,7 @@ class PlannerCommandNode(Node):
         )
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        try:
-            self._control_pub.publish(message)
-        except Exception as exc:
-            # The legacy output remains independent; a failed control message
-            # must not prevent publication of an existing safety stop.
-            self.get_logger().error(f"control velocity publish failed: {exc}")
+        self._control_pub.publish(message)
 
     def _publish_latest_control_velocity(self) -> None:
         with self._lock:

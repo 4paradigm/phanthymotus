@@ -290,11 +290,70 @@ def test_pending_control_nonzero_cannot_follow_cancel_zero(planner_module, monke
         thread.join(2)
 
 
-def test_control_publish_failure_does_not_hide_legacy_stop(planner_module, monkeypatch):
+def inject_control_failure(node, module, monkeypatch, failure):
+    def fail(*args, **kwargs):
+        raise RuntimeError('injected control failure')
+    if failure == 'limit':
+        monkeypatch.setattr(module.control_velocity, 'limit_velocity', fail)
+    elif failure == 'build':
+        monkeypatch.setattr(module.control_velocity, 'build', fail)
+    elif failure == 'json':
+        # Fail serialization of control messages only, not legacy proposals.
+        real_dumps = json.dumps
+        def dumps(payload, *args, **kwargs):
+            if payload.get('schema') == 'motus.control/1':
+                fail()
+            return real_dumps(payload, *args, **kwargs)
+        monkeypatch.setattr(module, 'json', types.SimpleNamespace(dumps=dumps))
+    elif failure == 'clock':
+        # Fail the bridge's time reference without replacing the shared time module.
+        monkeypatch.setattr(module, 'time', types.SimpleNamespace(
+            time_ns=fail, monotonic_ns=time.monotonic_ns,
+            monotonic=time.monotonic, time=time.time))
+    elif failure == 'publish':
+        node._control_pub.publish.side_effect = RuntimeError('injected control failure')
+
+
+@pytest.mark.parametrize('failure', ['limit', 'build', 'json', 'clock', 'publish'])
+@pytest.mark.parametrize('path', ['shadow_zero', 'terminal'])
+def test_control_failure_does_not_hide_legacy_zero_or_terminal(
+        planner_module, monkeypatch, failure, path):
     node = make_node(planner_module)
     setup_control(node, planner_module)
     monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    node._control_pub.publish.side_effect = RuntimeError('lost transport')
-    node._on_shadow_velocity(shadow_twist(0))
-    assert node._proposal_pub.publish.call_count == 1
+    inject_control_failure(node, planner_module, monkeypatch, failure)
+    if path == 'shadow_zero':
+        node._on_shadow_velocity(shadow_twist(0))
+    else:
+        node._on_result('nav-1', 1, result_future(5))
+        assert node._emit.call_args.args[0]['status'] == 'stopped'
+    proposal = json.loads(node._proposal_pub.publish.call_args.args[0].data)
+    assert proposal['velocity'] == {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
     node.get_logger.return_value.error.assert_called_once()
+    assert 'control velocity output failed' in node.get_logger.return_value.error.call_args.args[0]
+
+
+@pytest.mark.parametrize('failure', ['limit', 'build', 'json', 'clock', 'publish'])
+def test_timer_control_failure_is_isolated_and_recoverable(planner_module, monkeypatch, failure):
+    node = make_node(planner_module)
+    setup_control(node, planner_module)
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
+    node._on_shadow_velocity(shadow_twist(.5))
+    with monkeypatch.context() as injected:
+        inject_control_failure(node, planner_module, injected, failure)
+        node._publish_latest_control_velocity()
+        node.get_logger.return_value.error.assert_called_once()
+    if failure == 'publish':
+        node._control_pub.publish.side_effect = None
+    node._publish_latest_control_velocity()
+    assert latest(node)['values'][0] == .5
+
+
+def test_control_exception_boundary_does_not_swallow_legacy_publish_errors(planner_module, monkeypatch):
+    node = make_node(planner_module)
+    setup_control(node, planner_module)
+    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
+    inject_control_failure(node, planner_module, monkeypatch, 'build')
+    node._proposal_pub.publish.side_effect = RuntimeError('legacy publish failed')
+    with pytest.raises(RuntimeError, match='legacy publish failed'):
+        node._on_shadow_velocity(shadow_twist(0))
