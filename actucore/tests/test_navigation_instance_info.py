@@ -84,15 +84,14 @@ class NavigationInstanceInfoTest(unittest.TestCase):
         already = self.call(plugin, "start", instance_id="card-a", input_bindings=self.bindings())
         self.assertIs(already["already_started"], True)
         self.assert_actual(already)
-        # Existing semantics do not gate an already-started call from a new ID
-        # or changed wiring. Its response must still identify the actual owner.
+        # A different card may not claim the existing running instance.
         stale = self.call(plugin, "start", instance_id="card-b", input_bindings=[
             {"port": "lidar", "topic": "/different/lidar"},
             {"port": "imu", "topic": "/different/imu"},
         ])
-        self.assertIs(stale["already_started"], True)
+        self.assertEqual(stale["error_code"], "navigation_instance_conflict")
         self.assertEqual(stale["instance_id"], "card-a")
-        self.assert_actual(stale)
+        self.assert_actual(self.call(plugin, "info", instance_id="card-a"))
         for args in ({}, {"instance_id": ""}, {"instance_id": None}):
             info = self.call(plugin, "info", **args)
             self.assertEqual(info["state"], "ready")

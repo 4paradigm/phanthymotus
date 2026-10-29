@@ -215,22 +215,46 @@ class NavigationPlugin:
             return self._start_serialized(args)
 
     def _start_serialized(self, args: dict) -> dict:
+        # Legacy calls without an ID own the reserved default instance. An
+        # explicit default ID refers to that same owner, but omission never
+        # aliases a different card. A retry must repeat its actual wiring.
+        requested_id = str(args.get("instance_id") or "default").strip() or "default"
         with self._lock:
             if self._stop_requested.is_set():
                 return self._error("navigation_start_cancelled", "stop was requested")
-            if self._started:
+            already_started = self._started
+            if already_started and requested_id != self._instance_id:
+                return self._error(
+                    "navigation_instance_conflict",
+                    "navigation is owned by another instance; stop it before starting "
+                    "a different instance",
+                    instance_id=self._instance_id,
+                )
+            if self._config_error and not already_started:
+                return self._error("invalid_config", self._config_error)
+        wiring = self._validate_external_wiring(args)
+        with self._lock:
+            # Stop signals before acquiring the transition lock, including
+            # while validation is inspecting the mapping configuration.
+            if self._stop_requested.is_set():
+                return self._error("navigation_start_cancelled", "stop was requested")
+            if wiring.get("status") == "error":
+                return wiring
+            if already_started:
+                if wiring["wired_topics"] != self._external_wiring:
+                    return self._error(
+                        "navigation_wiring_conflict",
+                        "navigation is already started with different wiring; "
+                        "stop it before reconnecting inputs",
+                        instance_id=self._instance_id,
+                    )
                 result = self._info(self._instance_id)
                 result["already_started"] = True
                 return result
-            if self._config_error:
-                return self._error("invalid_config", self._config_error)
-        wiring = self._validate_external_wiring(args)
-        if wiring.get("status") == "error":
-            return wiring
+            # Mark the acquisition before letting stop/info observe it.
+            self._wiring_transition_unknown = True
 
         started: list[tuple[str, object]] = []
-        with self._lock:
-            self._wiring_transition_unknown = True
         try:
             self._set_mapping_runtime_active(True)
             started.append(("runtime", self._runtime))
@@ -325,7 +349,7 @@ class NavigationPlugin:
                 self._check_start_cancelled()
                 self._started = True
                 self._generation = object()
-                self._instance_id = str(args.get("instance_id") or "default").strip() or "default"
+                self._instance_id = requested_id
                 self._external_wiring = dict(wiring["wired_topics"])
                 self._wiring_transition_unknown = False
         except Exception as exc:
@@ -764,8 +788,6 @@ class NavigationPlugin:
         raw_topics = args.get("input_topics") or []
         if isinstance(raw_topics, str):
             raw_topics = [raw_topics]
-        if args.get("input_topic"):
-            raw_topics = [*raw_topics, args["input_topic"]]
         if bindings:
             if not isinstance(bindings, list) or any(
                 not isinstance(item, dict) for item in bindings
@@ -789,6 +811,13 @@ class NavigationPlugin:
                 return self._error(
                     "invalid_canvas_wiring", "input_topics must be an array"
                 )
+            input_topic = args.get("input_topic")
+            if input_topic:
+                if not isinstance(input_topic, str):
+                    return self._error(
+                        "invalid_canvas_wiring", "input_topic must be a string"
+                    )
+                raw_topics = [*raw_topics, input_topic]
             selected = {topic.strip() for topic in raw_topics}
             wired = {
                 port: topic for port, topic in expected.items() if topic in selected
