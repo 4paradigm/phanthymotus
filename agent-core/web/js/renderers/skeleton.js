@@ -214,7 +214,8 @@ export const SkeletonRenderer = {
         jointGroup.position.set(j.origin.x, j.origin.y, j.origin.z);
 
         // Apply base RPY rotation (static offset)
-        const euler = new THREE.Euler(j.rpy.x, j.rpy.y, j.rpy.z, 'XYZ');
+        // URDF fixed-axis roll/pitch/yaw composes as Rz(yaw) Ry(pitch) Rx(roll).
+        const euler = new THREE.Euler(j.rpy.x, j.rpy.y, j.rpy.z, 'ZYX');
         jointGroup.rotation.copy(euler);
 
         parentObj.add(jointGroup);
