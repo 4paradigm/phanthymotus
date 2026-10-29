@@ -1565,9 +1565,16 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
     if not aids:
         return {"status": "no_pending"}
 
-    events = [_pending_actions[aid] for aid in aids if aid in _pending_actions]
+    events = {aid: _pending_actions[aid] for aid in aids if aid in _pending_actions}
     if not events:
         return {"status": "no_pending"}
+
+    def forget_waited(outcome: str) -> None:
+        # Another waiter may have cleared an action and a later dispatch may
+        # already have reused its ID. Never clear or settle that new Event.
+        # The identity check and cleanup have no await between them.
+        _forget_pending([aid for aid, event in events.items()
+                         if _pending_actions.get(aid) is event], outcome)
 
     effective_timeout = _barrier_budget(aids, timeout)
     _scope_txt = ''
@@ -1581,7 +1588,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
           f'{_scope_txt} (timeout={effective_timeout:.0f}s)')
 
     async def _wait_all():
-        await asyncio.gather(*[ev.wait() for ev in events])
+        await asyncio.gather(*[ev.wait() for ev in events.values()])
 
     try:
         if cancel_event or reconsider_event:
@@ -1609,7 +1616,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                 await cancel_and_reap(tasks)
             if cancel_task and cancel_task in done:
                 # 用户打断：只清本次等待的那些，不连带抹掉不相干的 pending
-                _forget_pending(aids, 'cancelled')
+                forget_waited('cancelled')
                 return {"status": "cancelled"}
             if reconsider_task and reconsider_task in done:
                 # 跟上面不一样：这次等的东西仍然合法地在别处跑着（比如还在导航的
@@ -1634,11 +1641,11 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的
-        _forget_pending(aids, 'completed')
+        forget_waited('completed')
         print(f'[acp] barrier cleared: {aids}')
         return {"status": "completed", "actions": aids}
     except asyncio.TimeoutError:
-        _forget_pending(aids, 'timeout')
+        forget_waited('timeout')
         print(f'[acp] barrier timeout: {aids}')
         return {"status": "timeout", "actions": aids}
 
