@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from plugins.navigation.planning.backend import RosTopicNavigationBackend  # noqa: E402
-from plugins.navigation.planning.core import Nav2Core, NavigationBackendError  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.backend import RosTopicNavigationBackend  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.core import Nav2Core, NavigationBackendError  # noqa: E402
 
 
 def make_backend():

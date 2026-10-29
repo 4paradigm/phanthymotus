@@ -12,10 +12,10 @@ import yaml
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.contract import (  # noqa: E402
+from plugins.controlled_semantic_spatial.contract import (  # noqa: E402
     CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
 )
-from plugins.navigation.mapping.contract import (  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.contract import (  # noqa: E402
     FAST_LIVO2_ACTIONS,
     FAST_LIVO2_LIFECYCLE_ACTIONS,
     fast_livo2_tool_definition,
@@ -92,10 +92,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("stop_recording", actions)
 
     def test_collection_defaults_agree_with_runtime_and_examples(self) -> None:
-        from plugins.navigation.mapping.contract import FAST_LIVO2_CONFIG_DEFAULTS
-        from plugins.navigation.mapping.plugin import _COLLECTION_ROOT
+        from plugins.controlled_semantic_spatial.mapping.contract import FAST_LIVO2_CONFIG_DEFAULTS
+        from plugins.controlled_semantic_spatial.mapping.plugin import _COLLECTION_ROOT
 
-        runtime = ACTUCORE_ROOT / "plugins/navigation/runtime/fast_livo2"
+        runtime = ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/runtime/fast_livo2"
         sys.path.insert(0, str(runtime))
         try:
             from fast_livo2.collection_core import COLLECTION_ROOT
@@ -105,10 +105,10 @@ class FastLivo2ContractTest(unittest.TestCase):
         root = "/opt/phanthy-motus/data/navigation/fast_livo2/recordings"
         config = yaml.safe_load((ACTUCORE_ROOT / "config.yaml").read_text())
         navigation = json.loads(
-            (ACTUCORE_ROOT / "plugins/navigation/config.example.json").read_text()
+            (ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/config.example.json").read_text()
         )
         mapping = json.loads(
-            (ACTUCORE_ROOT / "plugins/navigation/mapping/config.example.json").read_text()
+            (ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/mapping/config.example.json").read_text()
         )
         self.assertEqual(config["plugins"]["controlled_semantic_spatial"]["mapping"]["collection_directory"], root)
         self.assertEqual(navigation["mapping"]["collection_directory"], root)
@@ -118,7 +118,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertEqual(str(COLLECTION_ROOT), root)
 
     def test_runtime_is_locked_in_navigation_base_and_actucore_image(self) -> None:
-        runtime = ACTUCORE_ROOT / "plugins" / "navigation" / "runtime"
+        runtime = ACTUCORE_ROOT / "plugins" / "controlled_semantic_spatial" / "runtime"
         source_lock = (runtime / "fast_livo2-source.lock").read_text(
             encoding="utf-8"
         )
@@ -236,7 +236,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertTrue((livox_messages / "msg" / "CustomMsg.msg").is_file())
         self.assertTrue((livox_messages / "msg" / "CustomPoint.msg").is_file())
         self.assertIn(
-            "COPY actucore/plugins/navigation/runtime/livox_ros_driver2_msgs/",
+            "COPY actucore/plugins/controlled_semantic_spatial/runtime/livox_ros_driver2_msgs/",
             base_dockerfile,
         )
         self.assertIn(
@@ -331,7 +331,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         runtime_package = (
             ACTUCORE_ROOT
             / "plugins"
-            / "navigation"
+            / "controlled_semantic_spatial"
             / "runtime"
             / "fast_livo2"
             / "fast_livo2"
@@ -439,7 +439,7 @@ class FastLivo2ContractTest(unittest.TestCase):
         self.assertNotIn("payload = stream.read()", frame_adapter)
         self.assertIn("stream.seek(payload_offset + point_index * byte_offset)", frame_adapter)
         mapping_backend = (
-            ACTUCORE_ROOT / "plugins" / "navigation" / "mapping" / "backend.py"
+            ACTUCORE_ROOT / "plugins" / "controlled_semantic_spatial" / "mapping" / "backend.py"
         ).read_text(encoding="utf-8")
         self.assertIn('if action == "stop_mapping"', mapping_backend)
 

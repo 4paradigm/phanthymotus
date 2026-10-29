@@ -28,9 +28,9 @@ RUN if [ "${JP_VERSION}" = 61 ]; then \
     else echo "Unsupported JP_VERSION=${JP_VERSION}" >&2; exit 2; fi
 
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
-COPY actucore/plugins/navigation/runtime/fast_livo2/ /ros_ws/src/fast_livo2/
-COPY actucore/plugins/navigation/runtime/nav2/ /ros_ws/src/nav2/
-COPY actucore/plugins/navigation/runtime/segmented_controller/ /ros_ws/src/segmented_controller/
+COPY actucore/plugins/controlled_semantic_spatial/runtime/fast_livo2/ /ros_ws/src/fast_livo2/
+COPY actucore/plugins/controlled_semantic_spatial/runtime/nav2/ /ros_ws/src/nav2/
+COPY actucore/plugins/controlled_semantic_spatial/runtime/segmented_controller/ /ros_ws/src/segmented_controller/
 RUN source /opt/ros/humble/install/setup.bash && \
     cd /ros_ws && \
     if [ "${JP_VERSION}" = 511 ]; then \
@@ -49,7 +49,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
     fi && \
     rm -rf /ros_ws/src /ros_ws/build /ros_ws/log
 
-COPY actucore/plugins/navigation/runtime/navigation_lio.yaml /config/navigation_lio.yaml
+COPY actucore/plugins/controlled_semantic_spatial/runtime/navigation_lio.yaml /config/navigation_lio.yaml
 WORKDIR /work
 COPY actucore/main.py     /work/main.py
 COPY actucore/plugins/    /work/plugins/
@@ -63,7 +63,7 @@ COPY actucore/deploy/     /deploy/
 # JP6.1 does not yet ship the new navigation runtime; retain vla and navi.
 RUN if [ "${JP_VERSION}" = 61 ]; then \
       python3 -c "import yaml; p='/work/config.yaml'; c=yaml.safe_load(open(p)); c['plugins']['controlled_semantic_spatial']['enabled']=False; yaml.safe_dump(c, open(p, 'w'))"; \
-    else rm -rf /work/plugins/navigation/runtime; fi
+    else rm -rf /work/plugins/controlled_semantic_spatial/runtime; fi
 
 EXPOSE 15730
 RUN find /ros_ws/install /opt/ros/humble/install -name "site-packages" -type d \
@@ -100,7 +100,7 @@ RUN find /ros_ws/install /opt/ros/humble/install -name "site-packages" -type d \
       NAV2_PARAMS="$(ros2 pkg prefix nav2)/share/nav2/config/nav2_params.yaml" \
         python3 -c "import ctypes, os, yaml; data=yaml.safe_load(open(os.environ['NAV2_PARAMS'], encoding='utf-8')); libs=data['bt_navigator']['ros__parameters']['plugin_lib_names']; assert libs; [ctypes.CDLL(f'lib{name}.so') for name in libs]; print(f'NAV2_BT_PLUGIN_LIBS=PASS count={len(libs)}')" && \
       cd /work && python3 -c "import main; import numpy, rosbag2_py, yaml, em, cv2; from fast_livo2.camera_rgb_frame import decode; from fast_livo2.camera_depth_frame import decode" && \
-      test ! -e /work/plugins/navigation/runtime; \
+      test ! -e /work/plugins/controlled_semantic_spatial/runtime; \
     else \
       source /ros_ws/install/setup.bash && cd /work && \
       python3 -c "import main; cfg=main._load_config(); assert cfg['plugins']['controlled_semantic_spatial']['enabled'] is False; bundle=main.ActuCoreBundle(cfg, None); assert {t['name'] for t in bundle.get_all_tools()} == {'vla', 'navi'}; print('JP61_CARD_INVENTORY=PASS')"; \

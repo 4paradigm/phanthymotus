@@ -30,7 +30,7 @@ def test_platform_build_selection(tmp_path, args, extra, dockerfile):
     deploy.mkdir()
     for name in ('build_actucore.sh', 'build_common.sh'):
         shutil.copyfile(ROOT / 'deploy' / name, deploy / name)
-    locks = Path('actucore/plugins/navigation/runtime')
+    locks = Path('actucore/plugins/controlled_semantic_spatial/runtime')
     (tmp_path / locks).mkdir(parents=True)
     for name in ('fast_livo2-source.lock', 'nav2-source.lock'):
         shutil.copyfile(ROOT / locks / name, tmp_path / locks / name)
@@ -146,6 +146,15 @@ def test_final_native_check_fails_closed(tmp_path, output, status, success):
                             env={'PATH': f'{tmp_path}:/usr/bin:/bin'},
                             capture_output=True, text=True, timeout=5)
     assert (result.returncode == 0) is success, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('dockerfile', ['Dockerfile.base', 'Dockerfile.jetson'])
+def test_card_runtime_copy_sources_exist(dockerfile):
+    lines = (ROOT / 'actucore' / dockerfile).read_text().splitlines()
+    prefix = 'COPY actucore/plugins/controlled_semantic_spatial/runtime/'
+    sources = [line.split()[1] for line in lines if line.startswith(prefix)]
+    assert sources
+    assert all((ROOT / source).exists() for source in sources)
 
 
 def test_jp61_copied_plugins_can_import_without_source_tree(tmp_path):

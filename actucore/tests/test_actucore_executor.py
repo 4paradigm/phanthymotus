@@ -53,7 +53,7 @@ class BundleConfigurationTest(unittest.TestCase):
         # Isolate this card while using the actual shipped configuration.
         cfg["plugins"] = {"controlled_semantic_spatial": card_cfg}
         executor = object()
-        with mock.patch("plugins.navigation.NavigationPlugin") as plugin:
+        with mock.patch("plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin") as plugin:
             bundle = module.ActuCoreBundle(cfg, executor)
         plugin.assert_called_once_with(
             card_cfg, "ubuntu", executor, completion_callback=module.sse_push
@@ -67,7 +67,7 @@ class BundleConfigurationTest(unittest.TestCase):
             {},
         ):
             with self.subTest(plugins=plugins), mock.patch(
-                "plugins.navigation.NavigationPlugin"
+                "plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin"
             ) as plugin:
                 bundle = module.ActuCoreBundle({"plugins": plugins}, object())
                 self.assertEqual(bundle._plugins, [])
@@ -75,7 +75,7 @@ class BundleConfigurationTest(unittest.TestCase):
 
     def test_legacy_key_is_rejected(self):
         module = _load_main_module()
-        with mock.patch("plugins.navigation.NavigationPlugin") as plugin:
+        with mock.patch("plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin") as plugin:
             with self.assertRaisesRegex(ValueError, r"plugins\.navigation was renamed to plugins\.controlled_semantic_spatial"):
                 module.ActuCoreBundle({"plugins": {"navigation": {"enabled": True}}}, None)
             plugin.assert_not_called()
@@ -83,7 +83,7 @@ class BundleConfigurationTest(unittest.TestCase):
     def test_invalid_card_config_is_rejected(self):
         module = _load_main_module()
         for value in (None, [], "enabled"):
-            with self.subTest(value=value), mock.patch("plugins.navigation.NavigationPlugin") as plugin:
+            with self.subTest(value=value), mock.patch("plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin") as plugin:
                 with self.assertRaisesRegex(
                     ValueError, r"plugins\.controlled_semantic_spatial must be an object"
                 ):
@@ -95,7 +95,7 @@ class BundleConfigurationTest(unittest.TestCase):
         key = "controlled_semantic_spatial"
         for namespace in (None, 42, ["ubuntu"]):
             with self.subTest(namespace=namespace), mock.patch(
-                "plugins.navigation.NavigationPlugin"
+                "plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin"
             ) as plugin:
                 with self.assertRaisesRegex(
                     ValueError, r"plugins\.controlled_semantic_spatial\.namespace must be a string"
@@ -104,14 +104,14 @@ class BundleConfigurationTest(unittest.TestCase):
                 plugin.assert_not_called()
         for namespace in ("", "other", "/other/"):
             with self.subTest(namespace=namespace), mock.patch(
-                "plugins.navigation.NavigationPlugin"
+                "plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin"
             ) as plugin:
                 with self.assertRaisesRegex(ValueError, "requires namespace=ubuntu"):
                     module.ActuCoreBundle({"plugins": {key: {"enabled": True, "namespace": namespace}}}, None)
                 plugin.assert_not_called()
         for settings in ({"enabled": True}, {"enabled": True, "namespace": " /ubuntu/ "}):
             with self.subTest(settings=settings), mock.patch(
-                "plugins.navigation.NavigationPlugin"
+                "plugins.controlled_semantic_spatial.ControlledSemanticSpatialPlugin"
             ) as plugin:
                 module.ActuCoreBundle({"plugins": {key: settings}}, None)
                 plugin.assert_called_once_with(settings, "ubuntu", None, completion_callback=module.sse_push)
@@ -222,7 +222,7 @@ class SpinExecutorTest(unittest.TestCase):
         module = _load_main_module()
 
         class Plugin:
-            PREFIX = "navigation"
+            PREFIX = "controlled_semantic_spatial"
 
             def __init__(self):
                 self.calls = 0
@@ -248,7 +248,7 @@ class SpinExecutorTest(unittest.TestCase):
         module = _load_main_module()
 
         class Plugin:
-            PREFIX = "navigation"
+            PREFIX = "controlled_semantic_spatial"
 
             def __init__(self):
                 self.calls = 0
@@ -273,7 +273,7 @@ class SpinExecutorTest(unittest.TestCase):
 
         for result in (None, {}, {"state": "stopping"}, {"status": "finalizing"}):
             with self.subTest(result=result):
-                plugin = mock.Mock(PREFIX="navigation")
+                plugin = mock.Mock(PREFIX="controlled_semantic_spatial")
                 plugin.stop.return_value = result
                 bundle = module.ActuCoreBundle.__new__(module.ActuCoreBundle)
                 bundle._plugins = [plugin]

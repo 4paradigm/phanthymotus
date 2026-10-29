@@ -4,21 +4,21 @@ import json
 import unittest
 from pathlib import Path
 
-from plugins.navigation.contract import navigation_tool_definition
-from plugins.navigation.planning.contract import NAV2_ACTION_PARAMS, nav2_tool_definition
-from plugins.navigation.planning.core import NavigationBackendError, _normalize
-from plugins.navigation.planning.goal_input import _goal
+from plugins.controlled_semantic_spatial.contract import controlled_semantic_spatial_tool_definition
+from plugins.controlled_semantic_spatial.planning.contract import NAV2_ACTION_PARAMS, nav2_tool_definition
+from plugins.controlled_semantic_spatial.planning.core import NavigationBackendError, _normalize
+from plugins.controlled_semantic_spatial.planning.goal_input import _goal
 
 
 class GoalV1ModeTest(unittest.TestCase):
     def test_protocol_and_mcp_define_optional_zero_mode(self):
         protocol_path = (
             Path(__file__).resolve().parents[1]
-            / "plugins/navigation/runtime/protocol/goal-v1.schema.json"
+            / "plugins/controlled_semantic_spatial/runtime/protocol/goal-v1.schema.json"
         )
         goal_schema = json.loads(protocol_path.read_text(encoding="utf-8"))
         planning = nav2_tool_definition("ubuntu")["inputSchema"]
-        public = navigation_tool_definition("ubuntu")["inputSchema"]
+        public = controlled_semantic_spatial_tool_definition("ubuntu")["inputSchema"]
         # Assert the actual schema contract rather than reimplementing a JSON
         # Schema validator; the planner's value handling is tested below.
         expected = {"type": "integer", "const": 0, "default": 0}

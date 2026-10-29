@@ -6,8 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from plugins.navigation.planning.backend import RosTopicNavigationBackend
-from plugins.navigation.planning.core import NavigationBackendError
+from plugins.controlled_semantic_spatial.planning.backend import RosTopicNavigationBackend
+from plugins.controlled_semantic_spatial.planning.core import NavigationBackendError
 
 
 def backend_fixture():

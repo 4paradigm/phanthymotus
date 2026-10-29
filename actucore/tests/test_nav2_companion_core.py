@@ -10,7 +10,7 @@ from pathlib import Path
 PACKAGE_ROOT = (
     Path(__file__).resolve().parents[1]
     / "plugins"
-    / "navigation"
+    / "controlled_semantic_spatial"
     / "runtime"
     / "nav2"
 )
@@ -599,7 +599,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertIn("pluginlib_export_plugin_description_file", segmented_cmake)
         self.assertIn("segmented_controller::SegmentedController", segmented_plugin)
         self.assertIn(
-            "COPY actucore/plugins/navigation/runtime/segmented_controller/",
+            "COPY actucore/plugins/controlled_semantic_spatial/runtime/segmented_controller/",
             dockerfile,
         )
         self.assertIn(

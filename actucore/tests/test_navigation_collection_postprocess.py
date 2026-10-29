@@ -17,7 +17,7 @@ ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_PACKAGE = (
     ACTUCORE_ROOT
     / "plugins"
-    / "navigation"
+    / "controlled_semantic_spatial"
     / "runtime"
     / "fast_livo2"
 )
@@ -34,7 +34,7 @@ from fast_livo2.camera_rgb_frame import (  # noqa: E402
     decode,
     encode,
 )
-from plugins.navigation.mapping.collection_postprocess import (  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.collection_postprocess import (  # noqa: E402
     RosCollectionController,
     CollectionPostprocessManager,
     OfflineAnnotationProcessor,
@@ -560,7 +560,7 @@ class NavigationCollectionPostprocessTest(unittest.TestCase):
                 session.mkdir()
                 manager = ObservedManager(temporary, processor_factory=FakeProcessor)
                 # Keep a failed write's scheduled retry inside this test's lifetime.
-                with patch("plugins.navigation.mapping.collection_postprocess.threading.Timer"):
+                with patch("plugins.controlled_semantic_spatial.mapping.collection_postprocess.threading.Timer"):
                     self.assertTrue(manager.enqueue(session))
                     manager._jobs.join()
                 self.assertEqual(observed, ["processing"])
@@ -626,7 +626,7 @@ class CollectionControllerTrafficTest(unittest.TestCase):
             "std_msgs.msg": SimpleNamespace(String=SimpleNamespace),
         }
         with patch.dict(sys.modules, modules), patch(
-            "plugins.navigation.mapping.collection_postprocess.CollectionPostprocessManager",
+            "plugins.controlled_semantic_spatial.mapping.collection_postprocess.CollectionPostprocessManager",
             return_value=manager,
         ):
             controller = RosCollectionController("unused", "robot", executor)

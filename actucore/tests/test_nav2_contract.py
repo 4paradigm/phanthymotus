@@ -11,7 +11,7 @@ import yaml
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.planning.contract import (  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.contract import (  # noqa: E402
     GOAL_ID_PATTERN,
     NAV2_ACTIONS,
     NAV2_FULL_CONFIG_SCHEMA,
@@ -106,7 +106,7 @@ class Nav2ContractTest(unittest.TestCase):
         companion_root = (
             ACTUCORE_ROOT
             / "plugins"
-            / "navigation"
+            / "controlled_semantic_spatial"
             / "runtime"
             / "nav2"
         )
@@ -218,7 +218,7 @@ class Nav2ContractTest(unittest.TestCase):
         self.assertNotIn("x-topic-actions", tool)
         self.assertEqual(tool["inputSchema"].get("x-topic-actions", []), [])
         goal_schema_path = (
-            ACTUCORE_ROOT / "plugins/navigation/runtime/protocol/goal-v1.schema.json"
+            ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/runtime/protocol/goal-v1.schema.json"
         )
         goal_schema = json.loads(goal_schema_path.read_text(encoding="utf-8"))
         self.assertIn("mode", goal_schema["properties"])

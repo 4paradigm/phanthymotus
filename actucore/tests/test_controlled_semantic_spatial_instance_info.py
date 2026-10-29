@@ -19,13 +19,13 @@ for directory in (ACTUCORE_ROOT, TESTS_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-from test_navigation_plugin import FakeComponent, FakeRuntime  # noqa: E402
-from plugins.navigation.plugin import NavigationPlugin  # noqa: E402
+from test_controlled_semantic_spatial_plugin import FakeComponent, FakeRuntime  # noqa: E402
+from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
 
 
-class NavigationInstanceInfoTest(unittest.TestCase):
+class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
     def make_plugin(self, *, runtime=None, mapping=None, planning=None, semantic=None):
-        return NavigationPlugin(
+        return ControlledSemanticSpatialPlugin(
             {"namespace": "ubuntu"}, "ubuntu", None,
             runtime=runtime or FakeRuntime(),
             mapping_plugin=mapping or FakeComponent("mapping"),

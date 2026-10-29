@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from plugins.navigation.planning.goal_input import GoalInputCleanupError, GoalTopicInput, _goal
+from plugins.controlled_semantic_spatial.planning.goal_input import GoalInputCleanupError, GoalTopicInput, _goal
 
 
 def payload(**changes):

@@ -10,7 +10,7 @@ from unittest.mock import patch
 RUNTIME_PACKAGE = (
     Path(__file__).resolve().parents[1]
     / "plugins"
-    / "navigation"
+    / "controlled_semantic_spatial"
     / "runtime"
     / "fast_livo2"
 )

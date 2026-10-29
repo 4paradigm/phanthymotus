@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前卡片及配置键：`controlled_semantic_spatial`**，公开工具名相同 —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2 由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket）。公开输出为 `map_view`、旧格式 `motion_sequence` 和 Navi 格式 `control_velocity`；不要同时连接两个会执行动作的消费者，物理执行仍由下游负责。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/navigation/README.md](plugins/navigation/README.md)。
+**当前卡片及配置键：`controlled_semantic_spatial`**，公开工具名相同 —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2 由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket）。公开输出为 `map_view`、旧格式 `motion_sequence` 和 Navi 格式 `control_velocity`；不要同时连接两个会执行动作的消费者，物理执行仍由下游负责。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/controlled_semantic_spatial/README.md](plugins/controlled_semantic_spatial/README.md)。
 
 该卡片的公开契约可复用于不同机器人；当前 runtime adapter 使用兼容性
 `ubuntu` namespace，各本体由 Driver 提供符合契约的 topic、frame、标定和执行器。
@@ -528,7 +528,7 @@ TOOLS = [
 需要 ROS 命名空间的卡片（topic 里要带机器人名）必须在注册块中校验类型和该
 runtime adapter 的支持范围；不要用 hostname 猜测机器人 namespace。
 
-本层最完整的范例是 `plugins/navigation/`：一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/vop.py`。
+本层最完整的范例是 `plugins/controlled_semantic_spatial/`：一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/vop.py`。
 
 ### 要发 `motus.control/1` 指令流的卡片
 

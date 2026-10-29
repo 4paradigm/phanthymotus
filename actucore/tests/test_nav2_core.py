@@ -12,12 +12,12 @@ from unittest import mock
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.planning.core import (  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.core import (  # noqa: E402
     Nav2Core,
     NavigationBackendError,
     _trusted_nav_id,
 )
-from plugins.navigation.planning.backend import (  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.backend import (  # noqa: E402
     RosTopicNavigationBackend,
 )
 

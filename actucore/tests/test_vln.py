@@ -18,9 +18,9 @@ ACTUCORE_DIR = Path(__file__).resolve().parents[1]
 if str(ACTUCORE_DIR) not in sys.path:
     sys.path.insert(0, str(ACTUCORE_DIR))
 
-from plugins.navigation.semantic.manifest import MANIFEST  # noqa: E402
-from plugins.navigation.semantic.plugin import VisionAndLanguageNavigationPlugin  # noqa: E402
-from plugins.navigation.semantic.ros import (  # noqa: E402
+from plugins.controlled_semantic_spatial.semantic.manifest import MANIFEST  # noqa: E402
+from plugins.controlled_semantic_spatial.semantic.plugin import VisionAndLanguageNavigationPlugin  # noqa: E402
+from plugins.controlled_semantic_spatial.semantic.ros import (  # noqa: E402
     MapSessionChangedError,
     Pose,
     RosBridge,
@@ -29,7 +29,7 @@ from plugins.navigation.semantic.ros import (  # noqa: E402
     _PoseSample,
     pose_from_odometry,
 )
-from plugins.navigation.semantic.vlm import Client, _parse_json, validate_configuration  # noqa: E402
+from plugins.controlled_semantic_spatial.semantic.vlm import Client, _parse_json, validate_configuration  # noqa: E402
 
 
 def _pose(x=1.25, y=-0.5, yaw=0.75) -> Pose:
@@ -504,7 +504,7 @@ class ProcessorTests(unittest.TestCase):
     def test_capture_does_not_log_remote_description(self):
         description = "REMOTE\n\x1b[31m" + "x" * 10000
         plugin = _plugin(FakeClient([{"description": description}]), FakeBridgeFactory())
-        with self.assertLogs("plugins.navigation.semantic.processor", level="INFO") as captured:
+        with self.assertLogs("plugins.controlled_semantic_spatial.semantic.processor", level="INFO") as captured:
             result = plugin.dispatch("vln", {"action": "capture"})
         self.assertTrue(result["ok"])
         text = "\n".join(captured.output)
@@ -881,7 +881,7 @@ class PureHelperTests(unittest.TestCase):
 
     def test_rejected_sensor_logs_are_sampled_and_recovery_is_reported(self):
         bridge = self._bare_ros_bridge()
-        with mock.patch("plugins.navigation.semantic.ros.log") as logger:
+        with mock.patch("plugins.controlled_semantic_spatial.semantic.ros.log") as logger:
             for _ in range(101):
                 bridge._warn_rejected("camera RGB frame", "bad\nframe")
             self.assertEqual(logger.warning.call_count, 2)
@@ -950,7 +950,7 @@ class PureHelperTests(unittest.TestCase):
             io.BytesIO(secret.encode()),
         )
         with mock.patch(
-            "plugins.navigation.semantic.vlm.urlopen",
+            "plugins.controlled_semantic_spatial.semantic.vlm.urlopen",
             side_effect=upstream_error,
         ):
             with self.assertRaises(RuntimeError) as raised:

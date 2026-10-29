@@ -22,8 +22,8 @@ optional RGB + depth frame ──┴─> semantic navigation / data collection
                                       └─ motion_sequence -> 旧协议消费者（保留）
 ```
 
-- `NavigationPlugin` 是唯一 MCP/Canvas 生命周期所有者。
-- FAST-LIVO2 和 Nav2 ROS launch 由 `NavigationRuntime` 作为同容器子进程组
+- `ControlledSemanticSpatialPlugin` 是唯一 MCP/Canvas 生命周期所有者。
+- FAST-LIVO2 和 Nav2 ROS launch 由 `ControlledSemanticSpatialRuntime` 作为同容器子进程组
   启停；运行时不调用 Docker，也不需要 Docker socket。
 - odom、registered cloud 和 obstacle map 是卡片内部 ROS 边；
   状态与 costmap 保留为内部 ROS topic，分别承担命令回执和导航目标校验。

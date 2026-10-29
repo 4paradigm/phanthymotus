@@ -1,8 +1,8 @@
-# Navigation 内部 FAST-LIVO2 模块
+# controlled_semantic_spatial 内部 FAST-LIVO2 模块
 
 该模块负责统一 `controlled_semantic_spatial` 卡片内的会话级 LiDAR-Inertial 建图、里程计、
 运动补偿点云、标准 TF 和 Canvas 地图可视化。它不再单独注册 MCP 卡片，
-FAST-LIVO2 及 adapter 由同一个 ActuCore 容器内的 `NavigationRuntime`
+FAST-LIVO2 及 adapter 由同一个 ActuCore 容器内的 `ControlledSemanticSpatialRuntime`
 托管；Driver 只提供已冻结的标准传感器输入。
 
 ## 边界

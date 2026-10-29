@@ -17,7 +17,7 @@ def planner_module(monkeypatch):
     # Reuse conftest's lightweight QoS/ROS message stubs. Add only the imports
     # needed to load the actual planner module, and remove them after each case.
     monkeypatch.syspath_prepend(str(
-        Path(__file__).resolve().parents[1] / 'plugins/navigation/runtime/nav2'
+        Path(__file__).resolve().parents[1] / 'plugins/controlled_semantic_spatial/runtime/nav2'
     ))
 
     def provide(module_name, **members):

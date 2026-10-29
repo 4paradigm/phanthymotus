@@ -312,7 +312,7 @@ WORKDIR /opt/fast_livo_ws/src
 # 当前输入契约是标准 PointCloud2（lidar_type=7），不会启动 Livox Driver。
 # FAST-LIVO2 上游仍编译引用两条 CustomMsg 类型，因此只保留 message-only 接口，
 # 不再拉取或编译 Livox SDK2/Driver 实现。
-COPY actucore/plugins/navigation/runtime/livox_ros_driver2_msgs/ \
+COPY actucore/plugins/controlled_semantic_spatial/runtime/livox_ros_driver2_msgs/ \
      /opt/fast_livo_ws/src/livox_ros_driver2/
 
 RUN git init rpg_vikit_ros2_fisheye && \
@@ -329,13 +329,13 @@ RUN git init fast_livo && \
     git checkout --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${FAST_LIVO2_COMMIT}"
 
-COPY actucore/plugins/navigation/runtime/patches/fast-livo2-runtime.patch \
+COPY actucore/plugins/controlled_semantic_spatial/runtime/patches/fast-livo2-runtime.patch \
      /tmp/fast-livo2-runtime.patch
-COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-save.patch \
+COPY actucore/plugins/controlled_semantic_spatial/runtime/patches/fast-livo2-pcd-save.patch \
      /tmp/fast-livo2-pcd-save.patch
-COPY actucore/plugins/navigation/runtime/patches/fast-livo2-pcd-flush.patch \
+COPY actucore/plugins/controlled_semantic_spatial/runtime/patches/fast-livo2-pcd-flush.patch \
      /tmp/fast-livo2-pcd-flush.patch
-COPY actucore/plugins/navigation/runtime/navigation_lio.yaml \
+COPY actucore/plugins/controlled_semantic_spatial/runtime/navigation_lio.yaml \
      /tmp/navigation_lio.yaml
 RUN [[ "${FAST_LIVO2_RUNTIME_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
     [[ "${FAST_LIVO2_PCD_SAVE_PATCH_SHA256}" =~ ^[0-9a-f]{64}$ ]] && \
@@ -422,7 +422,7 @@ RUN source /opt/ros/humble/install/setup.bash && \
 # test_depend 去要它们（nav2_rotation_shim_controller test-depend 了 RPP），
 # 而它们会把 ompl、ceres、xtensor、Qt5 拖进镜像。
 WORKDIR /opt/nav2_ws/src
-COPY actucore/plugins/navigation/runtime/patches/nav2-without-velocity-smoother.patch \
+COPY actucore/plugins/controlled_semantic_spatial/runtime/patches/nav2-without-velocity-smoother.patch \
      /tmp/nav2-without-velocity-smoother.patch
 RUN git init navigation2 && \
     cd navigation2 && \

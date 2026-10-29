@@ -10,8 +10,8 @@ from unittest.mock import patch
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.mapping.core import FastLivo2BackendError  # noqa: E402
-from plugins.navigation.mapping.plugin import FastLivo2Plugin  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.core import FastLivo2BackendError  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.plugin import FastLivo2Plugin  # noqa: E402
 
 
 class ReadyBackend:
@@ -387,7 +387,7 @@ class FastLivo2PluginTest(unittest.TestCase):
             (root / "escape").symlink_to(outside, target_is_directory=True)
 
             with patch(
-                "plugins.navigation.mapping.plugin._COLLECTION_ROOT", root
+                "plugins.controlled_semantic_spatial.mapping.plugin._COLLECTION_ROOT", root
             ):
                 plugin = FastLivo2Plugin(
                     {

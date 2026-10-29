@@ -1,4 +1,4 @@
-"""Single public Navigation card owning mapping, planning and semantic runtime."""
+"""The controlled_semantic_spatial card owns mapping, planning and semantic runtime."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from copy import deepcopy
 from ..control_stream import negotiate
 from .contract import (
     CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME,
-    NAVIGATION_ACTIONS,
-    NAVIGATION_CONFIG_SCHEMA,
+    CONTROLLED_SEMANTIC_SPATIAL_ACTIONS,
+    CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA,
     SEMANTIC_ACTIONS,
-    navigation_tool_definition,
+    controlled_semantic_spatial_tool_definition,
 )
 from .mapping.contract import FAST_LIVO2_ACTIONS
 from .mapping.plugin import (
@@ -28,7 +28,7 @@ from .planning.plugin import (
     Nav2Plugin,
     _validated_config as validated_planning_config,
 )
-from .runtime import NavigationRuntime
+from .runtime import ControlledSemanticSpatialRuntime
 from .semantic.plugin import VisionAndLanguageNavigationPlugin
 
 
@@ -38,7 +38,7 @@ _ABSOLUTE_ROS_TOPIC_RE = re.compile(
 )
 
 
-class NavigationPlugin:
+class ControlledSemanticSpatialPlugin:
     """Expose one Canvas card and one lifecycle for the whole navigation stack."""
 
     PREFIX = CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME
@@ -80,7 +80,7 @@ class NavigationPlugin:
             if raw_cfg
             else None
         )
-        self._runtime = runtime or NavigationRuntime()
+        self._runtime = runtime or ControlledSemanticSpatialRuntime()
         self._executor = executor
         self._goal_input = None
         self._mapping = mapping_plugin or FastLivo2Plugin(mapping_cfg, executor)
@@ -114,7 +114,7 @@ class NavigationPlugin:
         self._wiring_transition_unknown = False
 
     def get_tools(self) -> list:
-        return [navigation_tool_definition(self._namespace)]
+        return [controlled_semantic_spatial_tool_definition(self._namespace)]
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         if name != self.PREFIX:
@@ -130,7 +130,7 @@ class NavigationPlugin:
             return self._start(args)
         if action == "stop":
             return self._stop()
-        if action not in NAVIGATION_ACTIONS:
+        if action not in CONTROLLED_SEMANTIC_SPATIAL_ACTIONS:
             return self._error(
                 "unsupported_action", f"unsupported navigation action: {action!r}"
             )
@@ -696,7 +696,7 @@ class NavigationPlugin:
             if key not in {"action", "instance_id"}
         }
         unknown = sorted(
-            set(updates) - set(NAVIGATION_CONFIG_SCHEMA["properties"])
+            set(updates) - set(CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA["properties"])
         )
         if unknown:
             return self._error(
@@ -1107,4 +1107,4 @@ class NavigationPlugin:
         }
 
 
-__all__ = ["NavigationPlugin"]
+__all__ = ["ControlledSemanticSpatialPlugin"]

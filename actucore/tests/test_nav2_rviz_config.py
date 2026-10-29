@@ -6,7 +6,7 @@ from pathlib import Path
 
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = (
-    ACTUCORE_ROOT / "plugins" / "navigation" / "runtime" / "nav2"
+    ACTUCORE_ROOT / "plugins" / "controlled_semantic_spatial" / "runtime" / "nav2"
 )
 
 

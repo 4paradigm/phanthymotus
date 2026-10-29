@@ -1,4 +1,4 @@
-# Navigation 内部 Nav2 模块
+# controlled_semantic_spatial 内部 Nav2 模块
 
 该模块在统一 `controlled_semantic_spatial` 卡片内负责目标导航、路径规划、
 局部避障和有时效的速度提案。建图、定位、点云去畸变、地图存储和
@@ -236,7 +236,7 @@ shadow velocity 回调在计算后、写入 latest-only 缓存前会在同一互
 
 ## 统一卡片连线
 
-odom、registered cloud 和 static map 由 `NavigationPlugin` 固定为同容器
+odom、registered cloud 和 static map 由 `ControlledSemanticSpatialPlugin` 固定为同容器
 内部 topic，不需要 Canvas 连线。刷新卡片定义后，按下游实际支持的格式选择
 `control_velocity` 或旧的 `motion_sequence`，不要同时连接两个会执行动作的消费者；
 `goal_pose` 仍可作为可选外部输入。格式匹配本身不证明 Driver 已订阅或联调通过。
@@ -266,7 +266,7 @@ export FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
 
 ros2 topic info /ubuntu/navigation/odom -v
 ros2 topic info /ubuntu/navigation/cloud_registered -v
-rviz2 -d actucore/plugins/navigation/runtime/nav2/rviz/nav2.rviz
+rviz2 -d actucore/plugins/controlled_semantic_spatial/runtime/nav2/rviz/nav2.rviz
 ```
 
 ## 构建与部署

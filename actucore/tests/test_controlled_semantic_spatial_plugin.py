@@ -20,13 +20,13 @@ except ImportError:
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.contract import NAVIGATION_ACTIONS, navigation_tool_definition  # noqa: E402
-from plugins.navigation.mapping.backend import RosTopicFastLivo2Backend  # noqa: E402
-from plugins.navigation.mapping.core import FastLivo2BackendError  # noqa: E402
-from plugins.navigation.mapping.plugin import FastLivo2Plugin  # noqa: E402
-from plugins.navigation.plugin import NavigationPlugin  # noqa: E402
-from plugins.navigation.runtime import (  # noqa: E402
-    NavigationRuntime,
+from plugins.controlled_semantic_spatial.contract import CONTROLLED_SEMANTIC_SPATIAL_ACTIONS, controlled_semantic_spatial_tool_definition  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.backend import RosTopicFastLivo2Backend  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.core import FastLivo2BackendError  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.plugin import FastLivo2Plugin  # noqa: E402
+from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
+from plugins.controlled_semantic_spatial.runtime import (  # noqa: E402
+    ControlledSemanticSpatialRuntime,
     _OwnedProcessGroup,
 )
 
@@ -200,15 +200,15 @@ def _control_descriptor(**overrides):
 def _external_bindings():
     return [
         {"port": item["port"], "topic": item["topic"]}
-        for item in navigation_tool_definition("ubuntu")["topic_in"]
+        for item in controlled_semantic_spatial_tool_definition("ubuntu")["topic_in"]
         if item["required"]
     ]
 
 
-class NavigationContractTest(unittest.TestCase):
+class ControlledSemanticSpatialContractTest(unittest.TestCase):
     @unittest.skipIf(jsonschema is None, "Agent Core jsonschema dependency is unavailable")
     def test_mainline_lifecycle_payloads_pass_strict_schema(self):
-        schema = navigation_tool_definition("ubuntu")["inputSchema"]
+        schema = controlled_semantic_spatial_tool_definition("ubuntu")["inputSchema"]
         topics = [
             "/ubuntu/navigation/lidar", "/ubuntu/navigation/imu",
             "/ubuntu/camera/rgb_frame", "/ubuntu/camera/depth_frame",
@@ -251,7 +251,7 @@ class NavigationContractTest(unittest.TestCase):
                                 schema=schema)
 
     def test_one_public_card_hides_internal_ros_edges(self):
-        tool = navigation_tool_definition("ubuntu")
+        tool = controlled_semantic_spatial_tool_definition("ubuntu")
         self.assertEqual(tool["name"], "controlled_semantic_spatial")
         self.assertEqual(tool["displayName"], "controlled_semantic_spatial")
         self.assertEqual(
@@ -310,7 +310,7 @@ class NavigationContractTest(unittest.TestCase):
         self.assertEqual(control["format"], "control/velocity")
         self.assertEqual(control["ros_type"], "std_msgs/msg/String")
         self.assertEqual(control["schema"], "motus.control/1")
-        other = navigation_tool_definition("/robot_alpha/")
+        other = controlled_semantic_spatial_tool_definition("/robot_alpha/")
         other_control = next(item for item in other["topic_out"]
                              if item["port"] == "control_velocity")
         self.assertEqual(other_control["topic"], "/robot_alpha/navigation/control_velocity")
@@ -345,11 +345,11 @@ class NavigationContractTest(unittest.TestCase):
         self.assertNotIn("x-execution-control", tool)
 
     def test_motion_sequence_uses_consistent_public_and_runtime_contract(self):
-        from plugins.navigation.planning.contract import nav2_tool_definition
+        from plugins.controlled_semantic_spatial.planning.contract import nav2_tool_definition
 
         for namespace in ("ubuntu", "robot"):
             with self.subTest(namespace=namespace):
-                tool = navigation_tool_definition(namespace)
+                tool = controlled_semantic_spatial_tool_definition(namespace)
                 motion = tool["topic_out"][1]
                 proposal = next(
                     item for item in nav2_tool_definition(namespace)["topic_out"]
@@ -362,7 +362,7 @@ class NavigationContractTest(unittest.TestCase):
                 self.assertEqual(motion["schema"], "phanthy.navigation.motion_sequence.v1")
 
     def test_unified_action_schema_only_exposes_supported_fields(self):
-        tool = navigation_tool_definition("ubuntu")
+        tool = controlled_semantic_spatial_tool_definition("ubuntu")
         properties = tool["inputSchema"]["properties"]
         action_params = tool["inputSchema"]["x-action-params"]
         config_fields = list(tool["configSchema"]["properties"])
@@ -399,7 +399,7 @@ class NavigationContractTest(unittest.TestCase):
             self.assertTrue(set(action["params"]) <= set(properties))
 
     def test_long_running_navigation_declares_scoped_acp_completion(self):
-        tool = navigation_tool_definition("ubuntu")
+        tool = controlled_semantic_spatial_tool_definition("ubuntu")
         completion = tool["inputSchema"]["x-completion"]
         self.assertEqual(completion["actions"], ["navigate_to_pose", "navigate"])
         self.assertEqual(
@@ -445,7 +445,7 @@ class NavigationContractTest(unittest.TestCase):
             content = (
                 ACTUCORE_ROOT
                 / "plugins"
-                / "navigation"
+                / "controlled_semantic_spatial"
                 / "runtime"
                 / source_lock
             ).read_text(encoding="utf-8")
@@ -491,21 +491,21 @@ class NavigationContractTest(unittest.TestCase):
             ACTUCORE_ROOT / "main.py",
             ACTUCORE_ROOT
             / "plugins"
-            / "navigation"
+            / "controlled_semantic_spatial"
             / "runtime"
             / "fast_livo2"
             / "fast_livo2"
             / "adapter_node.py",
             ACTUCORE_ROOT
             / "plugins"
-            / "navigation"
+            / "controlled_semantic_spatial"
             / "runtime"
             / "fast_livo2"
             / "fast_livo2"
             / "runtime_supervisor.py",
             ACTUCORE_ROOT
             / "plugins"
-            / "navigation"
+            / "controlled_semantic_spatial"
             / "runtime"
             / "nav2"
             / "nav2"
@@ -536,7 +536,7 @@ class NavigationContractTest(unittest.TestCase):
             (
                 ACTUCORE_ROOT
                 / "plugins"
-                / "navigation"
+                / "controlled_semantic_spatial"
                 / "runtime"
                 / name
             ).read_text(encoding="utf-8")
@@ -615,8 +615,8 @@ class NavigationContractTest(unittest.TestCase):
             self.assertIn(f"source /opt/{workspace}/install/setup.bash", dockerfile)
         for directory in ("src", "build", "log"):
             self.assertIn(f"test ! -e /ros_ws/{directory}", dockerfile)
-        self.assertIn("rm -rf /work/plugins/navigation/runtime", dockerfile)
-        self.assertIn("test ! -e /work/plugins/navigation/runtime", dockerfile)
+        self.assertIn("rm -rf /work/plugins/controlled_semantic_spatial/runtime", dockerfile)
+        self.assertIn("test ! -e /work/plugins/controlled_semantic_spatial/runtime", dockerfile)
         self.assertIn("COPY actucore/plugins/    /work/plugins/", dockerfile)
         self.assertIn("actucore-navigation-base@sha256:", dockerfile)
         self.assertNotIn("missing-digest", dockerfile)
@@ -708,9 +708,9 @@ class NavigationContractTest(unittest.TestCase):
         self.assertIn('CARDS_JSON', build_script)
 
 
-class NavigationPluginTest(unittest.TestCase):
+class ControlledSemanticSpatialPluginTest(unittest.TestCase):
     def make_plugin(self, *, runtime=None, mapping=None, planning=None, semantic=None):
-        return NavigationPlugin(
+        return ControlledSemanticSpatialPlugin(
             {"namespace": "ubuntu"},
             "ubuntu",
             executor=None,
@@ -827,7 +827,7 @@ class NavigationPluginTest(unittest.TestCase):
         plugin = self.make_plugin(runtime=runtime, mapping=components[0],
                                   planning=components[1], semantic=components[2])
         before = [list(component.calls) for component in components]
-        for action in set(NAVIGATION_ACTIONS) - {"info", "config", "start", "stop"}:
+        for action in set(CONTROLLED_SEMANTIC_SPATIAL_ACTIONS) - {"info", "config", "start", "stop"}:
             with self.subTest(action=action):
                 result = plugin.dispatch("controlled_semantic_spatial", {"action": action})
                 self.assertEqual(result["error_code"], "canvas_not_started")
@@ -1147,7 +1147,7 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "stop"})["state"], "idle")
 
     def test_lidar_imu_only_cannot_auto_start_real_semantic_processor(self):
-        from plugins.navigation.semantic.plugin import VisionAndLanguageNavigationPlugin
+        from plugins.controlled_semantic_spatial.semantic.plugin import VisionAndLanguageNavigationPlugin
 
         for action in ("capture", "navigate"):
             with self.subTest(action=action):
@@ -1243,7 +1243,7 @@ class NavigationPluginTest(unittest.TestCase):
         plugin = self.make_plugin(runtime=runtime, semantic=semantic)
         bindings = [
             {"port": item["port"], "topic": item["topic"]}
-            for item in navigation_tool_definition("ubuntu")["topic_in"]
+            for item in controlled_semantic_spatial_tool_definition("ubuntu")["topic_in"]
             if item["port"] in {"lidar", "imu", "rgb"}
         ]
         custom = {
@@ -1307,9 +1307,9 @@ class NavigationPluginTest(unittest.TestCase):
 
         all_bindings = [
             {"port": item["port"], "topic": item["topic"]}
-            for item in navigation_tool_definition("ubuntu")["topic_in"]
+            for item in controlled_semantic_spatial_tool_definition("ubuntu")["topic_in"]
         ]
-        with mock.patch("plugins.navigation.plugin.GoalTopicInput") as goal_input:
+        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput") as goal_input:
             started = plugin.dispatch(
                 "controlled_semantic_spatial",
                 {"action": "start", "input_bindings": all_bindings},
@@ -1945,7 +1945,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
     def test_unified_config_validates_all_components_before_mutating_any(self):
-        plugin = NavigationPlugin(
+        plugin = ControlledSemanticSpatialPlugin(
             {"namespace": "ubuntu"},
             "ubuntu",
             executor=None,
@@ -1972,7 +1972,7 @@ class NavigationPluginTest(unittest.TestCase):
         self.assertEqual(after, before)
 
     def test_unified_config_rolls_back_if_last_component_rejects(self):
-        plugin = NavigationPlugin(
+        plugin = ControlledSemanticSpatialPlugin(
             {"namespace": "ubuntu"},
             "ubuntu",
             executor=None,
@@ -2012,7 +2012,7 @@ class NavigationPluginTest(unittest.TestCase):
         )
 
 
-class NavigationRuntimeTest(unittest.TestCase):
+class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
     class Process:
         next_pid = 100
 
@@ -2032,7 +2032,7 @@ class NavigationRuntimeTest(unittest.TestCase):
 
     def test_launch_arguments_without_descriptor_preserve_legacy_and_default_control(self):
         arguments = dict(value.split(":=", 1) for value in
-                         NavigationRuntime._launch_arguments("/other/", {})["nav2"])
+                         ControlledSemanticSpatialRuntime._launch_arguments("/other/", {})["nav2"])
         self.assertEqual(arguments["motion_sequence_topic"], "/other/navigation/motion_sequence")
         self.assertEqual(arguments["control_velocity_topic"], "/other/navigation/control_velocity")
         self.assertEqual(json.loads(arguments["control_interface_json"]), {})
@@ -2043,7 +2043,7 @@ class NavigationRuntimeTest(unittest.TestCase):
         import importlib
         from plugins.control_stream import negotiate
 
-        nav2_path = str(ACTUCORE_ROOT / "plugins/navigation/runtime/nav2")
+        nav2_path = str(ACTUCORE_ROOT / "plugins/controlled_semantic_spatial/runtime/nav2")
         descriptors = [
             {},
             {"control_interface": "motus.control/1", "mode": "twist"},
@@ -2056,7 +2056,7 @@ class NavigationRuntimeTest(unittest.TestCase):
             for descriptor in descriptors:
                 with self.subTest(descriptor=descriptor):
                     args = dict(value.split(":=", 1) for value in
-                                NavigationRuntime._launch_arguments(
+                                ControlledSemanticSpatialRuntime._launch_arguments(
                                     "robot", {}, descriptor)["nav2"])
                     received, hz, ttl, *_ = helper.configure(args["control_interface_json"])
                     self.assertEqual(received, descriptor)
@@ -2071,7 +2071,7 @@ class NavigationRuntimeTest(unittest.TestCase):
             commands.append((list(command), dict(kwargs)))
             return self.Process(command)
 
-        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime = ControlledSemanticSpatialRuntime(popen_factory=factory, startup_grace_sec=0)
         started = runtime.start(
             namespace="robot",
             input_topics={
@@ -2106,7 +2106,7 @@ class NavigationRuntimeTest(unittest.TestCase):
         self.assertEqual(arguments["control_interface_json"], json.dumps(
             _control_descriptor(), ensure_ascii=False, separators=(",", ":")
         ))
-        with mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+        with mock.patch("plugins.controlled_semantic_spatial.runtime.os.killpg") as killpg:
             stopped = runtime.stop()
         self.assertEqual(stopped["state"], "idle")
         self.assertEqual(killpg.call_count, 2)
@@ -2123,7 +2123,7 @@ class NavigationRuntimeTest(unittest.TestCase):
         )
         for mapping, flags in cases:
             with self.subTest(mapping=mapping):
-                args = NavigationRuntime._launch_arguments("robot", mapping)["fast_livo2"]
+                args = ControlledSemanticSpatialRuntime._launch_arguments("robot", mapping)["fast_livo2"]
                 values = dict(arg.split(":=", 1) for arg in args)
                 self.assertEqual((values["rgb_enabled"], values["depth_enabled"]), flags)
                 self.assertTrue(values["rgb_topic"].startswith("/"))
@@ -2134,7 +2134,7 @@ class NavigationRuntimeTest(unittest.TestCase):
             del kwargs
             return self.Process(command)
 
-        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime = ControlledSemanticSpatialRuntime(popen_factory=factory, startup_grace_sec=0)
         started = runtime.start()
         root_groups = {
             child["pid"]
@@ -2146,18 +2146,18 @@ class NavigationRuntimeTest(unittest.TestCase):
             for pid in root_groups
         }
         with mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_independent_descendant_process_groups",
             side_effect=lambda pid: (nested_groups[pid],),
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_remaining_process_groups",
             side_effect=lambda groups: groups,
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_wait_for_process_groups",
             return_value=(),
-        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+        ), mock.patch("plugins.controlled_semantic_spatial.runtime.os.killpg") as killpg:
             stopped = runtime.stop()
 
         self.assertEqual(stopped["state"], "idle")
@@ -2174,25 +2174,25 @@ class NavigationRuntimeTest(unittest.TestCase):
             del kwargs
             return self.Process(command)
 
-        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime = ControlledSemanticSpatialRuntime(popen_factory=factory, startup_grace_sec=0)
         runtime._children = runtime._children[:1]
         started = runtime.start()
         root_pid = started["children"][0]["pid"]
         nested_group = _OwnedProcessGroup(root_pid + 1000, "owned-start")
 
         with mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_independent_descendant_process_groups",
             return_value=(nested_group,),
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_remaining_process_groups",
             side_effect=lambda groups: groups,
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_wait_for_process_groups",
             side_effect=[(nested_group,), (nested_group,), ()],
-        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+        ), mock.patch("plugins.controlled_semantic_spatial.runtime.os.killpg") as killpg:
             stopped = runtime.stop()
 
         self.assertEqual(stopped["state"], "idle")
@@ -2209,13 +2209,13 @@ class NavigationRuntimeTest(unittest.TestCase):
     def test_runtime_drops_reused_descendant_group_identity(self):
         owned_group = _OwnedProcessGroup(1234, "original-start")
         with mock.patch(
-            "plugins.navigation.runtime.os.getpgid", return_value=1234
+            "plugins.controlled_semantic_spatial.runtime.os.getpgid", return_value=1234
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_process_start_time",
             return_value="replacement-start",
         ):
-            remaining = NavigationRuntime._remaining_process_groups(
+            remaining = ControlledSemanticSpatialRuntime._remaining_process_groups(
                 (owned_group,)
             )
 
@@ -2226,7 +2226,7 @@ class NavigationRuntimeTest(unittest.TestCase):
             del kwargs
             return self.Process(command)
 
-        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime = ControlledSemanticSpatialRuntime(popen_factory=factory, startup_grace_sec=0)
         runtime._children = runtime._children[:1]
         runtime.start()
         child = runtime._children[0]
@@ -2236,18 +2236,18 @@ class NavigationRuntimeTest(unittest.TestCase):
         child.process.return_code = 0
 
         with mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_independent_descendant_process_groups",
             return_value=(),
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_remaining_process_groups",
             side_effect=lambda groups: groups,
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_wait_for_process_groups",
             side_effect=[(nested_group,), ()],
-        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+        ), mock.patch("plugins.controlled_semantic_spatial.runtime.os.killpg") as killpg:
             stopped = runtime.stop()
 
         self.assertEqual(stopped["state"], "idle")
@@ -2264,7 +2264,7 @@ class NavigationRuntimeTest(unittest.TestCase):
             del kwargs
             return self.Process(command)
 
-        runtime = NavigationRuntime(popen_factory=factory, startup_grace_sec=0)
+        runtime = ControlledSemanticSpatialRuntime(popen_factory=factory, startup_grace_sec=0)
         runtime._children = runtime._children[:1]
         runtime.start()
         child = runtime._children[0]
@@ -2274,14 +2274,14 @@ class NavigationRuntimeTest(unittest.TestCase):
         child.process.return_code = 0
 
         with mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_independent_descendant_process_groups",
             return_value=(),
         ), mock.patch.object(
-            NavigationRuntime,
+            ControlledSemanticSpatialRuntime,
             "_remaining_process_groups",
             return_value=(),
-        ), mock.patch("plugins.navigation.runtime.os.killpg") as killpg:
+        ), mock.patch("plugins.controlled_semantic_spatial.runtime.os.killpg") as killpg:
             stopped = runtime.stop()
 
         self.assertEqual(stopped["state"], "idle")
@@ -2333,7 +2333,7 @@ class NavigationRuntimeTest(unittest.TestCase):
             fields = raw_stat[command_end + 1 :].split()
             return bool(fields) and fields[0] != "Z"
 
-        runtime = NavigationRuntime(
+        runtime = ControlledSemanticSpatialRuntime(
             popen_factory=factory,
             startup_grace_sec=0,
             stop_timeout_sec=0.5,

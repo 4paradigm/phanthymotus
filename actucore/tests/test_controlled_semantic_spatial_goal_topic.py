@@ -9,9 +9,9 @@ from unittest import mock
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.planning.goal_input import GoalInputCleanupError  # noqa: E402
-from plugins.navigation.plugin import NavigationPlugin  # noqa: E402
-from tests.test_navigation_plugin import FakeComponent, FakeRuntime  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.goal_input import GoalInputCleanupError  # noqa: E402
+from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
+from tests.test_controlled_semantic_spatial_plugin import FakeComponent, FakeRuntime  # noqa: E402
 
 
 class FakeGoalInput:
@@ -28,17 +28,17 @@ class FakeGoalInput:
         self.closed = True
 
 
-class NavigationGoalTopicTest(unittest.TestCase):
+class ControlledSemanticSpatialGoalTopicTest(unittest.TestCase):
     def setUp(self):
         FakeGoalInput.instances = []
         self.factory = mock.patch(
-            "plugins.navigation.plugin.GoalTopicInput", FakeGoalInput
+            "plugins.controlled_semantic_spatial.plugin.GoalTopicInput", FakeGoalInput
         )
         self.factory.start()
         self.addCleanup(self.factory.stop)
         self.runtime = FakeRuntime()
         self.planning = FakeComponent("planning")
-        self.plugin = NavigationPlugin(
+        self.plugin = ControlledSemanticSpatialPlugin(
             {}, "ubuntu", executor=object(), runtime=self.runtime,
             mapping_plugin=FakeComponent("mapping"), planning_plugin=self.planning,
             semantic_plugin=FakeComponent("semantic"),
@@ -130,7 +130,7 @@ class NavigationGoalTopicTest(unittest.TestCase):
         self.assertEqual(len(self.planning.calls), count)
 
     def test_constructor_failure_rolls_back(self):
-        with mock.patch("plugins.navigation.plugin.GoalTopicInput", side_effect=RuntimeError("boom")):
+        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput", side_effect=RuntimeError("boom")):
             result = self.call(self.request)
         self.assertEqual(result["error_code"], "navigation_start_failed")
         self.assertTrue(result["cleanup_confirmed"])
@@ -150,7 +150,7 @@ class NavigationGoalTopicTest(unittest.TestCase):
 
         handle = CleanupHandle()
         failure = GoalInputCleanupError(handle, RuntimeError("construction failed"))
-        with mock.patch("plugins.navigation.plugin.GoalTopicInput", side_effect=failure):
+        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput", side_effect=failure):
             result = self.call(self.request)
         self.assertEqual(result["error_code"], "navigation_start_failed")
         self.assertFalse(result["cleanup_confirmed"])
@@ -171,7 +171,7 @@ class NavigationGoalTopicTest(unittest.TestCase):
     def test_constructor_cleanup_handle_immediately_retries_successfully(self):
         handle = mock.Mock()
         failure = GoalInputCleanupError(handle, RuntimeError("construction failed"))
-        with mock.patch("plugins.navigation.plugin.GoalTopicInput", side_effect=failure):
+        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput", side_effect=failure):
             result = self.call(self.request)
         self.assertEqual(result["error_code"], "navigation_start_failed")
         self.assertTrue(result["cleanup_confirmed"])
@@ -195,7 +195,7 @@ class NavigationGoalTopicTest(unittest.TestCase):
 
         self_goal = self.goal
         result = {}
-        with mock.patch("plugins.navigation.plugin.GoalTopicInput", BlockingInput):
+        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput", BlockingInput):
             starter = threading.Thread(target=lambda: result.setdefault("start", self.call(self.request)))
             starter.start()
             self.assertTrue(entered.wait(5))
@@ -261,7 +261,7 @@ class NavigationGoalTopicTest(unittest.TestCase):
                     raise RuntimeError("close failed")
 
         result = {}
-        with mock.patch("plugins.navigation.plugin.GoalTopicInput", FailingCloseInput):
+        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput", FailingCloseInput):
             starter = threading.Thread(target=lambda: result.setdefault("start", self.call(self.request)))
             starter.start()
             self.assertTrue(entered.wait(5))
@@ -285,7 +285,7 @@ class NavigationGoalTopicTest(unittest.TestCase):
                     self.closed = True
                     raise RuntimeError("close failed")
 
-        with mock.patch("plugins.navigation.plugin.GoalTopicInput", FailingCloseInput):
+        with mock.patch("plugins.controlled_semantic_spatial.plugin.GoalTopicInput", FailingCloseInput):
             self.assertEqual(self.call(self.request)["state"], "ready")
         sub = FakeGoalInput.instances[-1]
         self.assertEqual(self.call({"action": "stop"})["error_code"], "navigation_stop_pending")

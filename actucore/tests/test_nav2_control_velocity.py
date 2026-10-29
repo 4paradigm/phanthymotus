@@ -32,7 +32,7 @@ def test_launch_wires_json_as_string(monkeypatch):
     module('launch.substitutions', LaunchConfiguration=Capture)
     module('launch_ros.actions', Node=Capture, SetRemap=Capture)
     module('launch_ros.parameter_descriptions', ParameterValue=Capture)
-    path = Path(__file__).resolve().parents[1] / 'plugins/navigation/runtime/nav2/launch/nav2.launch.py'
+    path = Path(__file__).resolve().parents[1] / 'plugins/controlled_semantic_spatial/runtime/nav2/launch/nav2.launch.py'
     spec = importlib.util.spec_from_file_location('test_control_launch', path)
     launch = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(launch)

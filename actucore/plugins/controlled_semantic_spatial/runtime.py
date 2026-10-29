@@ -49,7 +49,7 @@ class _OwnedProcessGroup:
     leader_start_time: str
 
 
-class NavigationRuntime:
+class ControlledSemanticSpatialRuntime:
     """Start and stop the in-container FAST-LIVO2 and Nav2 ROS launch files."""
 
     def __init__(
@@ -348,7 +348,7 @@ class NavigationRuntime:
             except OSError:
                 continue
             if group_id in descendants and group_id != root_pid:
-                start_time = NavigationRuntime._process_start_time(group_id)
+                start_time = ControlledSemanticSpatialRuntime._process_start_time(group_id)
                 if start_time is not None:
                     groups[group_id] = _OwnedProcessGroup(
                         group_id=group_id,
@@ -480,4 +480,4 @@ class NavigationRuntime:
         return False
 
 
-__all__ = ["NavigationRuntime"]
+__all__ = ["ControlledSemanticSpatialRuntime"]

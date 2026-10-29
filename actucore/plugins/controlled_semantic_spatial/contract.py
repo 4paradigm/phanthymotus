@@ -17,12 +17,14 @@ from .planning.contract import (
 from .semantic.manifest import build_manifest
 
 
-NAVIGATION_LIFECYCLE_ACTIONS = ("info", "config", "start", "stop")
+CONTROLLED_SEMANTIC_SPATIAL_LIFECYCLE_ACTIONS = ("info", "config", "start", "stop")
 SEMANTIC_ACTIONS = ("capture", "navigate")
-NAVIGATION_ACTIONS = FAST_LIVO2_ACTIONS + NAV2_ACTIONS + SEMANTIC_ACTIONS
-NAVIGATION_PUBLIC_ACTIONS = NAVIGATION_LIFECYCLE_ACTIONS + NAVIGATION_ACTIONS
+CONTROLLED_SEMANTIC_SPATIAL_ACTIONS = FAST_LIVO2_ACTIONS + NAV2_ACTIONS + SEMANTIC_ACTIONS
+CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_ACTIONS = (
+    CONTROLLED_SEMANTIC_SPATIAL_LIFECYCLE_ACTIONS + CONTROLLED_SEMANTIC_SPATIAL_ACTIONS
+)
 CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME = "controlled_semantic_spatial"
-NAVIGATION_PUBLIC_OUTPUT_PORTS = (
+CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_OUTPUT_PORTS = (
     "map_view",
     "motion_sequence",
     "control_velocity",
@@ -76,7 +78,7 @@ def _config_properties() -> dict:
     return result
 
 
-NAVIGATION_CONFIG_SCHEMA = {
+CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA = {
     "type": "object",
     "properties": _config_properties(),
     "required": [],
@@ -91,7 +93,7 @@ def _action_properties() -> dict:
         "/ubuntu/camera/rgb_frame",
         "/ubuntu/navigation/odom",
     )["inputSchema"]["properties"]
-    result = {"action": {"type": "string", "enum": list(NAVIGATION_PUBLIC_ACTIONS)}}
+    result = {"action": {"type": "string", "enum": list(CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_ACTIONS)}}
     business_params = {
         param
         for action in FAST_LIVO2_ACTIONS
@@ -108,7 +110,7 @@ def _action_properties() -> dict:
         for key, value in source.items():
             if key in business_params or key in lifecycle_params:
                 result.setdefault(key, deepcopy(value))
-    for key, value in NAVIGATION_CONFIG_SCHEMA["properties"].items():
+    for key, value in CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA["properties"].items():
         result[key] = deepcopy(value)
     result["camera_info"] = {
         "type": "object",
@@ -128,7 +130,7 @@ def _action_properties() -> dict:
     return result
 
 
-NAVIGATION_ACTION_PARAMS = {
+CONTROLLED_SEMANTIC_SPATIAL_ACTION_PARAMS = {
     **deepcopy(FAST_LIVO2_ACTION_PARAMS),
     **deepcopy(NAV2_ACTION_PARAMS),
     "capture": {
@@ -141,7 +143,7 @@ NAVIGATION_ACTION_PARAMS = {
     },
     "info": {"params": [], "description": "Read the unified navigation state"},
     "config": {
-        "params": list(NAVIGATION_CONFIG_SCHEMA["properties"]),
+        "params": list(CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA["properties"]),
         "description": "Configure mapping, planning and semantic navigation",
     },
     "start": {
@@ -155,7 +157,7 @@ NAVIGATION_ACTION_PARAMS = {
 }
 
 
-def navigation_tool_definition(namespace: str) -> dict:
+def controlled_semantic_spatial_tool_definition(namespace: str) -> dict:
     mapping = fast_livo2_tool_definition(namespace)
     planning = nav2_tool_definition(namespace)
     semantic = build_manifest(
@@ -211,7 +213,7 @@ def navigation_tool_definition(namespace: str) -> dict:
         "desc": "Nav2 planar twist [vx, vy, vz, wx, wy, wz]",
     }
     outputs = [
-        deepcopy(component_outputs[port]) for port in NAVIGATION_PUBLIC_OUTPUT_PORTS
+        deepcopy(component_outputs[port]) for port in CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_OUTPUT_PORTS
     ]
     auxiliary_topics = [
         deepcopy(
@@ -248,22 +250,22 @@ def navigation_tool_definition(namespace: str) -> dict:
             "properties": _action_properties(),
             "required": ["action"],
             "additionalProperties": False,
-            "x-action-params": deepcopy(NAVIGATION_ACTION_PARAMS),
+            "x-action-params": deepcopy(CONTROLLED_SEMANTIC_SPATIAL_ACTION_PARAMS),
             "x-completion": completion,
             # Finish an in-flight start and the bounded 360 s map save before release.
             "x-stop": {"timeout_s": 600},
             "x-hooks": deepcopy(planning["inputSchema"]["x-hooks"]),
         },
-        "configSchema": deepcopy(NAVIGATION_CONFIG_SCHEMA),
+        "configSchema": deepcopy(CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA),
     }
 
 
 __all__ = [
     "CONTROLLED_SEMANTIC_SPATIAL_TOOL_NAME",
-    "NAVIGATION_ACTIONS",
-    "NAVIGATION_ACTION_PARAMS",
-    "NAVIGATION_CONFIG_SCHEMA",
-    "NAVIGATION_PUBLIC_OUTPUT_PORTS",
-    "NAVIGATION_PUBLIC_ACTIONS",
-    "navigation_tool_definition",
+    "CONTROLLED_SEMANTIC_SPATIAL_ACTIONS",
+    "CONTROLLED_SEMANTIC_SPATIAL_ACTION_PARAMS",
+    "CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA",
+    "CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_OUTPUT_PORTS",
+    "CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_ACTIONS",
+    "controlled_semantic_spatial_tool_definition",
 ]

@@ -6,13 +6,13 @@ from pathlib import Path
 
 
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
-NAV2_ROOT = ACTUCORE_ROOT / "plugins" / "navigation" / "runtime" / "nav2"
+NAV2_ROOT = ACTUCORE_ROOT / "plugins" / "controlled_semantic_spatial" / "runtime" / "nav2"
 sys.path.insert(0, str(ACTUCORE_ROOT))
 sys.path.insert(0, str(NAV2_ROOT))
 
-from plugins.navigation.contract import navigation_tool_definition  # noqa: E402
-from plugins.navigation.mapping.contract import fast_livo2_tool_definition  # noqa: E402
-from plugins.navigation.planning.contract import nav2_tool_definition  # noqa: E402
+from plugins.controlled_semantic_spatial.contract import controlled_semantic_spatial_tool_definition  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.contract import fast_livo2_tool_definition  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.contract import nav2_tool_definition  # noqa: E402
 from nav2.costmap_validation import (  # noqa: E402
     CostmapSnapshot,
     goal_cell_receipt,
@@ -59,7 +59,7 @@ class Nav2VisualizationContractTest(unittest.TestCase):
                 self.assertEqual(receipt["unknown"], unknown)
 
     def test_unified_card_keeps_auxiliary_topics_out_of_canvas_outputs(self) -> None:
-        tool = navigation_tool_definition("robot")
+        tool = controlled_semantic_spatial_tool_definition("robot")
         planning = nav2_tool_definition("robot")
         mapping = fast_livo2_tool_definition("robot")
         outputs = _by_port(tool["topic_out"])

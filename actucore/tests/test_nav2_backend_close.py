@@ -5,8 +5,8 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from plugins.navigation.planning.backend import RosTopicNavigationBackend
-from plugins.navigation.planning.core import NavigationBackendError
+from plugins.controlled_semantic_spatial.planning.backend import RosTopicNavigationBackend
+from plugins.controlled_semantic_spatial.planning.core import NavigationBackendError
 
 
 class _String:

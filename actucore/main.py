@@ -131,8 +131,8 @@ class ActuCoreBundle:
                 raise ValueError(
                     "built-in navigation runtime currently requires namespace=ubuntu"
                 )
-            from plugins.navigation import NavigationPlugin
-            plugin = NavigationPlugin(
+            from plugins.controlled_semantic_spatial import ControlledSemanticSpatialPlugin
+            plugin = ControlledSemanticSpatialPlugin(
                 navigation_cfg,
                 namespace,
                 executor,
@@ -140,7 +140,7 @@ class ActuCoreBundle:
             )
             self._plugins.append(plugin)
             log.info(
-                "NavigationPlugin loaded (single-container runtime, namespace=%s)",
+                "ControlledSemanticSpatialPlugin loaded (single-container runtime, namespace=%s)",
                 namespace,
             )
         if plugins_cfg.get("vla", {}).get("enabled", False):

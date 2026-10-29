@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'plugins/navigation/runtime/nav2'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'plugins/controlled_semantic_spatial/runtime/nav2'))
 try:
     import rclpy
     from action_msgs.msg import GoalStatus

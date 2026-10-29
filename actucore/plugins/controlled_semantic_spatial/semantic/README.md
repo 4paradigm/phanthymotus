@@ -1,4 +1,4 @@
-# Navigation 内部视觉语言导航模块
+# controlled_semantic_spatial 内部视觉语言导航模块
 
 该模块属于统一 `controlled_semantic_spatial` 卡片，不再注册独立 `vln` 卡片。
 

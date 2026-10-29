@@ -9,7 +9,7 @@ from pathlib import Path
 ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ACTUCORE_ROOT))
 
-from plugins.navigation.mapping.core import (  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.core import (  # noqa: E402
     FastLivo2BackendError,
     FastLivo2Core,
 )

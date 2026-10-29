@@ -7,10 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from plugins.navigation.contract import navigation_tool_definition  # noqa: E402
-from plugins.navigation.planning.contract import nav2_tool_definition  # noqa: E402
-from plugins.navigation.planning.plugin import Nav2Plugin  # noqa: E402
-from plugins.navigation.plugin import NavigationPlugin  # noqa: E402
+from plugins.controlled_semantic_spatial.contract import controlled_semantic_spatial_tool_definition  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.contract import nav2_tool_definition  # noqa: E402
+from plugins.controlled_semantic_spatial.planning.plugin import Nav2Plugin  # noqa: E402
+from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
 
 
 class FakeBackend:
@@ -57,7 +57,7 @@ def _started_planner(backend, completions):
 
 def test_both_cards_expose_same_standard_hook_and_keep_navigation_hook():
     planning = nav2_tool_definition("ubuntu")["inputSchema"]["x-hooks"]
-    unified = navigation_tool_definition("ubuntu")["inputSchema"]["x-hooks"]
+    unified = controlled_semantic_spatial_tool_definition("ubuntu")["inputSchema"]["x-hooks"]
     assert planning["on_interrupt_all"] == {"action": "stop_nav"}
     assert planning["on_interrupt_navigation"] == {"action": "stop_nav"}
     assert unified == planning
@@ -103,7 +103,7 @@ def test_unified_dispatch_routes_hook_through_generation_fenced_planner():
             return {"status": "stopped", "terminal_confirmed": True}
 
     planner = Planner()
-    plugin = NavigationPlugin({}, "ubuntu", None, runtime=Runtime(),
+    plugin = ControlledSemanticSpatialPlugin({}, "ubuntu", None, runtime=Runtime(),
                               planning_plugin=planner)
     plugin._started = True
     plugin._generation = object()
