@@ -39,6 +39,9 @@ from .review_comment_parser import (
 
 logger = logging.getLogger(__name__)
 PR_RECONCILE_CACHE_SECONDS = 120.0
+PRIORITY_BASELINE_RETRY_BASE_SECONDS = 30.0
+PRIORITY_BASELINE_RETRY_MAX_SECONDS = 300.0
+EVIDENCE_PROJECTION_PRIORITY_INTERVAL = 3
 
 
 class DeployCommandError(Exception):
@@ -140,7 +143,11 @@ class GitHubCommandWatcher:
         self._priority_pr_enqueued_at: dict[tuple[str, int], float] = {}
         self._priority_pr_sources: dict[tuple[str, int], str] = {}
         self._priority_generation = 0
-        self._priority_cycles_since_ordinary = 0
+        self._priority_baseline_failures: dict[tuple[str, int], int] = {}
+        self._priority_pr_retry_after: dict[tuple[str, int], float] = {}
+        self._priority_baseline_webhook_bypassed: set[tuple[str, int]] = set()
+        self._priority_cycles_since_evidence = 0
+        self._evidence_projection_fairness_due = False
         # Initialized in start() under the running event loop (Python 3.9 safe).
         self._wakeup = None
         self._last_successful_cycle = None
@@ -251,6 +258,8 @@ class GitHubCommandWatcher:
                 or pr_number <= 0):
             return False
         item = (repo, pr_number)
+        self._priority_generation += 1
+        self._prioritize_new_webhook_baseline_retry(item)
         if item in self._priority_pr_set:
             if item in self._priority_pr_queue:
                 self._priority_pr_queue.remove(item)
@@ -261,7 +270,6 @@ class GitHubCommandWatcher:
                 # A webhook can arrive while the same PR is being read. Keep a
                 # fresh queued pass so the new comment is not hidden by dedupe.
                 self._queue_priority_pr(item, "webhook")
-            self._priority_generation += 1
             self._signal_wakeup()
             return True
         if len(self._priority_pr_queue) >= 128:
@@ -269,11 +277,11 @@ class GitHubCommandWatcher:
             self._priority_pr_set.discard(evicted)
             self._priority_pr_enqueued_at.pop(evicted, None)
             self._priority_pr_sources.pop(evicted, None)
+            self._clear_priority_baseline_retry(evicted)
         self._priority_pr_queue.appendleft(item)
         self._priority_pr_set.add(item)
         self._priority_pr_sources[item] = "webhook"
         self._priority_pr_enqueued_at[item] = self._monotonic()
-        self._priority_generation += 1
         self._signal_wakeup()
         return True
 
@@ -287,6 +295,7 @@ class GitHubCommandWatcher:
                 self._priority_pr_set.discard(evicted)
                 self._priority_pr_enqueued_at.pop(evicted, None)
                 self._priority_pr_sources.pop(evicted, None)
+                self._clear_priority_baseline_retry(evicted)
             else:
                 evicted = next((queued for queued in reversed(self._priority_pr_queue)
                                 if self._priority_pr_sources.get(queued) == "recent"), None)
@@ -294,11 +303,13 @@ class GitHubCommandWatcher:
                     self._priority_pr_set.discard(item)
                     self._priority_pr_enqueued_at.pop(item, None)
                     self._priority_pr_sources.pop(item, None)
+                    self._clear_priority_baseline_retry(item)
                     return False
                 self._priority_pr_queue.remove(evicted)
                 self._priority_pr_set.discard(evicted)
                 self._priority_pr_enqueued_at.pop(evicted, None)
                 self._priority_pr_sources.pop(evicted, None)
+                self._clear_priority_baseline_retry(evicted)
         if source == "webhook":
             self._priority_pr_queue.appendleft(item)
         else:
@@ -307,6 +318,41 @@ class GitHubCommandWatcher:
         self._priority_pr_sources[item] = source
         self._priority_pr_enqueued_at[item] = self._monotonic()
         return True
+
+    def _retry_priority_baseline(self, item: tuple[str, int], source: str) -> None:
+        """Back off an incomplete baseline without dropping its priority hint."""
+        failures = self._priority_baseline_failures.get(item, 0) + 1
+        self._priority_baseline_failures[item] = failures
+        base = max(PRIORITY_BASELINE_RETRY_BASE_SECONDS,
+                   float(self.config.poll_interval_seconds))
+        delay = min(PRIORITY_BASELINE_RETRY_MAX_SECONDS,
+                    base * (2 ** min(failures - 1, 8)))
+        self._priority_pr_retry_after[item] = self._monotonic() + delay
+        if not self._queue_priority_pr(item, source):
+            self._clear_priority_baseline_retry(item)
+        logger.info(
+            "watcher baseline retry deferred repo=%s pr=%s failures=%s delay_seconds=%.1f",
+            item[0], item[1], failures, delay,
+        )
+
+    def _clear_priority_baseline_retry(self, item: tuple[str, int]) -> None:
+        self._priority_baseline_failures.pop(item, None)
+        self._priority_pr_retry_after.pop(item, None)
+        self._priority_baseline_webhook_bypassed.discard(item)
+
+    def _prioritize_new_webhook_baseline_retry(self, item: tuple[str, int]) -> None:
+        """Let one new webhook bypass a retry delay in an incomplete baseline episode.
+
+        Internal retry hints use _queue_priority_pr and keep their deadline.
+        The webhook route deduplicates repeated delivery IDs before enqueue_pr;
+        this per-episode latch also prevents repeated enqueue calls from
+        continually clearing a backoff while the same baseline keeps failing.
+        """
+        if (self._monotonic() < self._priority_pr_retry_after.get(item, 0.0)
+                and item not in self._priority_baseline_webhook_bypassed):
+            self._priority_baseline_webhook_bypassed.add(item)
+            self._priority_baseline_failures.pop(item, None)
+            self._priority_pr_retry_after.pop(item, None)
 
     def _signal_wakeup(self) -> None:
         """Wake a started watcher; preserve queued hints before startup."""
@@ -822,6 +868,7 @@ class GitHubCommandWatcher:
                 self._priority_pr_set.discard(oldest_recent)
                 self._priority_pr_enqueued_at.pop(oldest_recent, None)
                 self._priority_pr_sources.pop(oldest_recent, None)
+                self._clear_priority_baseline_retry(oldest_recent)
             webhook_count = sum(
                 self._priority_pr_sources.get(queued) == "webhook"
                 for queued in self._priority_pr_queue
@@ -837,7 +884,6 @@ class GitHubCommandWatcher:
             if prior_enqueued_at is None:
                 queued_recent = True
         if queued_recent:
-            self._priority_generation += 1
             self._signal_wakeup()
         return queued_recent
 
@@ -999,9 +1045,18 @@ class GitHubCommandWatcher:
         while len(self._pr_reconcile_cache) > 4096:
             self._pr_reconcile_cache.pop(next(iter(self._pr_reconcile_cache)))
 
-    def _defer_evidence_projection_for_priority(self, repo: str, pr_number: int) -> bool:
+    def _defer_evidence_projection_for_priority(
+        self, repo: str, pr_number: int, *, priority_path: bool = False,
+    ) -> bool:
         """Yield before starting another Summary write when priority work arrived."""
-        if not self._priority_pr_queue:
+        ordinary_projection_due = (
+            self._evidence_projection_fairness_due and not priority_path
+        )
+        if priority_path and self._evidence_projection_fairness_due:
+            should_defer = True
+        else:
+            should_defer = bool(self._priority_pr_queue) and not ordinary_projection_due
+        if not should_defer:
             return False
         self._last_evidence_projection.pop((repo, pr_number), None)
         self._current_scan_stage = "priority_wait_before_evidence_projection"
@@ -1011,7 +1066,9 @@ class GitHubCommandWatcher:
         )
         return True
 
-    async def _process_scheduled_pr(self, repo: str, pr_number: int) -> bool:
+    async def _process_scheduled_pr(
+        self, repo: str, pr_number: int, *, priority_path: bool = False,
+    ) -> bool:
         """Run one PR through the existing serial writer and evidence path."""
         baseline_pending = repo in self._pending_baseline_repos
         baseline_done = self._baseline_progress.setdefault(repo, set())
@@ -1028,11 +1085,13 @@ class GitHubCommandWatcher:
         if (self.config.auth_valid is not True or repo not in self.config.active_repos
                 or repo not in self.config.github_repos):
             return False
-        if self._defer_evidence_projection_for_priority(repo, pr_number):
+        if self._defer_evidence_projection_for_priority(
+                repo, pr_number, priority_path=priority_path):
             return baseline_succeeded
         self._current_scan_stage = "post_command_pr_validation"
         current_pr = await self.proxy.get_pr(repo, pr_number)
-        if self._defer_evidence_projection_for_priority(repo, pr_number):
+        if self._defer_evidence_projection_for_priority(
+                repo, pr_number, priority_path=priority_path):
             return baseline_succeeded
         if (isinstance(current_pr, dict) and current_pr.get("state") == "open"
                 and not current_pr.get("merged") and not current_pr.get("draft")):
@@ -1050,6 +1109,9 @@ class GitHubCommandWatcher:
             if changed or refresh_due:
                 self._current_scan_stage = "evidence_projection"
                 await self.controller.project_evidence(repo, pr_number)
+                if not priority_path:
+                    self._priority_cycles_since_evidence = 0
+                    self._evidence_projection_fairness_due = False
                 self._current_scan_stage = "visible_archive_migration"
                 await self.proxy.ensure_visible_evidence_archive_comments(
                     repo, pr_number, limit=2,
@@ -1086,6 +1148,8 @@ class GitHubCommandWatcher:
                 break
             if item not in self._priority_pr_queue:
                 continue
+            if self._monotonic() < self._priority_pr_retry_after.get(item, 0.0):
+                continue
             self._priority_pr_queue.remove(item)
             processed_items += 1
             queued_repo, pr_number = item
@@ -1099,6 +1163,7 @@ class GitHubCommandWatcher:
                 self._priority_pr_set.discard(item)
                 self._priority_pr_enqueued_at.pop(item, None)
                 self._priority_pr_sources.pop(item, None)
+                self._clear_priority_baseline_retry(item)
                 continue
             if pr_number in priority_attempted.setdefault(queued_repo, []):
                 self._queue_priority_pr(item, source)
@@ -1137,6 +1202,7 @@ class GitHubCommandWatcher:
                     self._priority_pr_set.discard(item)
                     self._priority_pr_enqueued_at.pop(item, None)
                     self._priority_pr_sources.pop(item, None)
+                    self._clear_priority_baseline_retry(item)
                     logger.info(
                         "watcher priority candidate is not an open PR repo=%s number=%s source=%s",
                         queued_repo, pr_number, source,
@@ -1174,6 +1240,26 @@ class GitHubCommandWatcher:
                 and not current_pr.get("merged")
                 and current_pr.get("draft") is True
             )
+            if draft_pr:
+                try:
+                    # The controller's draft-only path projects the trusted
+                    # status label without creating or advancing lifecycle.
+                    await self.controller.reconcile_pr(queued_repo, pr_number)
+                except Exception as exc:
+                    self._priority_pr_set.discard(item)
+                    self._priority_pr_enqueued_at.pop(item, None)
+                    self._priority_pr_sources.pop(item, None)
+                    self._clear_priority_baseline_retry(item)
+                    self._record_pr_attempt(queued_repo, pr_number, type(exc).__name__)
+                    self._scan_failure_reasons.append(
+                        f"draft_label:{queued_repo}#{pr_number}:{type(exc).__name__}",
+                    )
+                    cycle_ok = False
+                    logger.warning(
+                        "watcher draft status label projection %s#%s failed: %s",
+                        queued_repo, pr_number, type(exc).__name__,
+                    )
+                    continue
             if (not isinstance(current_pr, dict) or current_pr.get("state") != "open"
                     or current_pr.get("merged") or current_pr.get("draft")):
                 failure_reason = "pr_is_draft" if draft_pr else "pr_not_open"
@@ -1190,6 +1276,7 @@ class GitHubCommandWatcher:
                 self._priority_pr_set.discard(item)
                 self._priority_pr_enqueued_at.pop(item, None)
                 self._priority_pr_sources.pop(item, None)
+                self._clear_priority_baseline_retry(item)
                 continue
             if item not in self._priority_pr_queue:
                 self._priority_pr_set.discard(item)
@@ -1204,10 +1291,12 @@ class GitHubCommandWatcher:
             self._current_scan_repo = queued_repo
             self._current_scan_pr = pr_number
             try:
-                succeeded = await self._process_scheduled_pr(queued_repo, pr_number)
+                succeeded = await self._process_scheduled_pr(
+                    queued_repo, pr_number, priority_path=True,
+                )
                 if not succeeded:
                     self._fail_recent_commands_for_pr(queued_repo, pr_number, "baseline_incomplete")
-                    self._queue_priority_pr(item, source)
+                    self._retry_priority_baseline(item, source)
                     self._record_pr_attempt(
                         queued_repo, pr_number, "baseline_retry",
                         self._monotonic() - attempt_started,
@@ -1218,9 +1307,11 @@ class GitHubCommandWatcher:
                     cycle_ok = False
                     continue
                 priority_done[queued_repo].append(pr_number)
+                self._clear_priority_baseline_retry(item)
                 if (baseline_only
                         and pr_number in self._baseline_progress.get(queued_repo, set())):
-                    self.enqueue_pr(queued_repo, pr_number)
+                    if self._queue_priority_pr(item, "webhook"):
+                        self._signal_wakeup()
                 if queued_repo.endswith("phanthymotus-driver"):
                     self._last_driver_poll = datetime.now(timezone.utc).isoformat()
                 self._record_pr_attempt(
@@ -1271,31 +1362,43 @@ class GitHubCommandWatcher:
         priority_attempted: dict[str, list[int]] = {repo: [] for repo in repos}
         recent_attempted: dict[str, list[int]] = {repo: [] for repo in repos}
         cycle_ok = True
-        interrupted_for_new_priority = False
         ordinary_prs_skipped = 0
         normal_prs_processed: dict[str, int] = {repo: 0 for repo in repos}
 
         # Discovery is read-only and runs independently; this remains the
         # single serial worker for every Lifecycle or evidence write.
+        priority_backlog_for_cycle = bool(self._priority_pr_queue)
+        if priority_backlog_for_cycle:
+            self._priority_cycles_since_evidence += 1
+            if self._priority_cycles_since_evidence >= EVIDENCE_PROJECTION_PRIORITY_INTERVAL:
+                self._evidence_projection_fairness_due = True
+        elif not self._evidence_projection_fairness_due:
+            self._priority_cycles_since_evidence = 0
         self._current_scan_stage = "priority_queue"
         cycle_ok = await self._drain_priority_prs(
             priority_done, priority_attempted, recent_attempted,
             allowed_sources={"webhook", "recent"}, max_items=1,
         ) and cycle_ok
         priority_generation_after_drain = self._priority_generation
+        interrupted_for_new_priority = False
+
+        def interrupt_ordinary_scan_for_new_priority() -> bool:
+            nonlocal interrupted_for_new_priority
+            if (self._priority_generation != priority_generation_after_drain
+                    and self._priority_pr_queue):
+                interrupted_for_new_priority = True
+                self._signal_wakeup()
+                return True
+            return False
+
         if self._priority_pr_queue:
-            self._priority_cycles_since_ordinary += 1
-            # Keep one fair ordinary slot even under a continuous priority
-            # backlog. Priority work still runs first and can interrupt at PR
-            # boundaries, while a large open-PR set cannot be starved.
+            # Keep one ordinary slot even under a continuous priority backlog.
             normal_pr_budget = 1
-            self._priority_cycles_since_ordinary = 0
         else:
             # Bound normal work for the whole cycle, then distribute it over
             # the rotated repository order. A large first repo must not consume
             # every slot and starve later repositories.
             normal_pr_budget = 8
-            self._priority_cycles_since_ordinary = 0
         normal_budget_by_repo = {repo: 0 for repo in repos}
         if repos and normal_pr_budget:
             per_repo, remainder = divmod(normal_pr_budget, len(repos))
@@ -1312,16 +1415,11 @@ class GitHubCommandWatcher:
             self._scan_failure_reasons.append("authenticated_github_backoff")
         else:
             for repo in repos:
+                if interrupt_ordinary_scan_for_new_priority():
+                    break
                 repo_normal_budget = normal_budget_by_repo.get(repo, 0)
                 if repo_normal_budget <= 0:
                     continue
-                if interrupted_for_new_priority:
-                    break
-                if (self._priority_generation != priority_generation_after_drain
-                        and self._priority_pr_queue):
-                    interrupted_for_new_priority = True
-                    self._signal_wakeup()
-                    break
                 if (self.config.auth_valid is not True or repo not in self.config.active_repos
                         or repo not in self.config.github_repos):
                     continue
@@ -1449,15 +1547,12 @@ class GitHubCommandWatcher:
 
                 processed = []
                 for number in selected[:pr_work_budget]:
-                    if (self._priority_generation != priority_generation_after_drain
-                            and self._priority_pr_queue):
-                        interrupted_for_new_priority = True
-                        self._signal_wakeup()
-                        break
                     if number in priority_attempted.get(repo, []):
                         if number in priority_done.get(repo, []):
                             processed.append(number)
                         continue
+                    if interrupt_ordinary_scan_for_new_priority():
+                        break
                     if (self.config.auth_valid is not True or repo not in self.config.active_repos
                             or repo not in self.config.github_repos):
                         break
@@ -1489,10 +1584,7 @@ class GitHubCommandWatcher:
                             if self._github_backing_off():
                                 cycle_ok = False
                                 break
-                            if (self._priority_generation != priority_generation_after_drain
-                                    and self._priority_pr_queue):
-                                interrupted_for_new_priority = True
-                                self._signal_wakeup()
+                            if interrupt_ordinary_scan_for_new_priority():
                                 break
                             continue
                         succeeded = await self._process_scheduled_pr(repo, number)
@@ -1528,12 +1620,7 @@ class GitHubCommandWatcher:
                     if self._github_backing_off():
                         cycle_ok = False
                         break
-                    # Discovery is independent. Yield at this PR boundary if
-                    # a new hint arrived; never cancel a state write midway.
-                    if (self._priority_generation != priority_generation_after_drain
-                            and self._priority_pr_queue):
-                        interrupted_for_new_priority = True
-                        self._signal_wakeup()
+                    if interrupt_ordinary_scan_for_new_priority():
                         break
 
                 if baseline_all:
@@ -1591,7 +1678,9 @@ class GitHubCommandWatcher:
         self._current_scan_stage = None
         self._current_scan_repo = None
         self._current_scan_pr = None
-        if self._priority_pr_queue and cycle_ok and not self._github_backing_off():
+        if (self._priority_pr_queue and cycle_ok and not self._github_backing_off()
+                and any(self._monotonic() >= self._priority_pr_retry_after.get(item, 0.0)
+                        for item in self._priority_pr_queue)):
             self._signal_wakeup()
         metrics = self.diagnostics()
         logger.info(
