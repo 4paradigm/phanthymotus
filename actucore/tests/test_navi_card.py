@@ -684,16 +684,52 @@ def test_a_lost_target_tells_the_caller_to_look_before_retrying():
     assert "类别并不稳定" in text
 
 
-# ── the config dialog is three knobs, and its defaults are load-bearing ──────
+# ── operator tuning fields and startup defaults ─────────────────────────────
 
-def test_the_dialog_offers_only_what_an_operator_can_judge():
-    """Twenty-two fields, most of them things like `release_frac` and
-    `bearingless_std_factor`, gave an operator no way to judge an answer and
-    buried the three that matter. The rest live in config.yaml with the
-    paragraph of explanation they need, and stay reachable via the `config`
-    action."""
+def test_the_dialog_exposes_follow_gains_search_and_velocity_limits():
     keys = set(_tool()["configSchema"]["properties"])
-    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m"}
+    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m",
+                    "k_yaw", "k_fwd", "search_rate", "vx_max", "vy_max",
+                    "wz_max", "use_lateral"}
+
+
+def test_tuning_fields_are_available_to_the_config_action_with_the_same_schema():
+    tool = _tool()
+    params = tool["inputSchema"]["x-action-params"]["config"]["params"]
+    assert set(params) == {"k_yaw", "k_fwd", "search_rate", "vx_max", "vy_max",
+                           "wz_max", "use_lateral"}
+    for key in params:
+        dialog = tool["configSchema"]["properties"][key]
+        assert dialog["scope"] == "instance"
+        assert tool["inputSchema"]["properties"][key] == {
+            name: value for name, value in dialog.items() if name != "scope"}
+
+
+def test_tuning_defaults_follow_yaml_not_effective_chassis_limits():
+    configured = {"k_yaw": 0.8, "k_fwd": 0.4, "search_rate": 0.3,
+                  "vx_max": 0.2, "vy_max": 0.0, "wz_max": 0.6,
+                  "use_lateral": False}
+    card = _card(**configured)
+    # adopt_limits changes this effective Config when a chassis is connected.
+    card._config.wz_max = 0.1
+    schema = card.get_tools()[0]["configSchema"]["properties"]
+    assert {key: schema[key]["default"] for key in configured} == configured
+
+
+def test_all_exposed_tuning_fields_update_and_can_be_read_back():
+    card = _card()
+    configured = {"k_yaw": 0.7, "k_fwd": 0.3, "search_rate": 0.2,
+                  "vx_max": 0.1, "vy_max": 0, "wz_max": 0.5,
+                  "use_lateral": False}
+    result = card.dispatch("navi", {"action": "config", **configured})
+    assert result["config"] == configured
+    assert card._info()["config"] == configured
+    schema = card.get_tools()[0]["configSchema"]["properties"]
+    assert {key: schema[key]["default"] for key in configured} == configured
+    from plugins.navi import policy
+    restored = policy.Config(**{key: value for key, value in card._cfg.items()
+                                if key in policy.Config.__dataclass_fields__})
+    assert {key: getattr(restored, key) for key in configured} == configured
 
 
 def test_every_schema_default_matches_the_file_default():

@@ -70,6 +70,12 @@ _DEPTH_TYPE_WAIT_S = 5.0
 # them joint1..joint6.
 TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 
+# These policy fields are shared by the operator's config dialog and the
+# config action. Defaults come from startup configuration, before a particular
+# downstream chassis adopts/clamps the effective policy limits.
+_TUNING_FIELDS = ("k_yaw", "k_fwd", "search_rate", "vx_max", "vy_max",
+                  "wz_max", "use_lateral")
+
 
 def _sensor_qos():
     """BEST_EFFORT, to match what every producer this card reads actually uses.
@@ -187,6 +193,41 @@ class NaviPlugin:
     # ── tool ─────────────────────────────────────────────────────────────────
 
     def get_tools(self) -> list:
+        tuning_properties = {
+            "k_yaw": {"type": "number", "minimum": 0,
+                      "title": "转向增益 k_yaw",
+                      "description": "目标偏离画面中心时的转向响应。越大纠正越快，"
+                                     "过大可能左右摆动；最终角速度仍受 wz_max 限制"},
+            "k_fwd": {"type": "number", "minimum": 0,
+                      "title": "前进增益 k_fwd",
+                      "description": "按目标距离误差计算前进速度的比例（1/s）。"
+                                     "越大接近越快；最终速度仍受 vx_max、避障和"
+                                     "下游底盘限制"},
+            "search_rate": {"type": "number", "minimum": 0,
+                            "title": "搜索转速 search_rate（rad/s）",
+                            "description": "目标不在视野时原地搜索的角速度幅值；"
+                                           "0 表示不转身搜索。启动时会按下游"
+                                           "允许的双向转速和死区调整"},
+            "vx_max": {"type": "number", "minimum": 0,
+                       "title": "前进速度上限 vx_max（m/s）",
+                       "description": "导航前进速度上限，启动时会按下游底盘的"
+                                      "允许范围和最小可执行速度调整"},
+            "vy_max": {"type": "number", "minimum": 0,
+                       "title": "横移速度上限 vy_max（m/s）",
+                       "description": "导航横移速度上限；底盘不支持横移时该轴"
+                                      "自动停用"},
+            "wz_max": {"type": "number", "minimum": 0,
+                       "title": "转向速度上限 wz_max（rad/s）",
+                       "description": "跟随和避障的角速度上限。参数名是 wz_max；"
+                                      "启动时会按下游底盘的允许范围和死区调整"},
+            "use_lateral": {"type": "boolean", "title": "允许横移 use_lateral",
+                            "description": "允许支持横移的底盘边转向边横移；"
+                                           "天轶轮式底盘应关闭，且始终以下游"
+                                           "声明的自由度为准"},
+        }
+        for key, spec in tuning_properties.items():
+            spec["default"] = self._cfg.get(
+                key, policy_mod.Config.__dataclass_fields__[key].default)
         return [{
             "name": "navi",
             "type": "processor",
@@ -207,6 +248,7 @@ class NaviPlugin:
                                               "也接受纯名字，但同名多个时挑哪一个不保证"},
                     "stop_distance_m": {"type": "number",
                                         "description": "在目标前多远停下，默认 1.2 m"},
+                    **{key: dict(spec) for key, spec in tuning_properties.items()},
                     # Handed over by agent-core from the card wired downstream.
                     # Not operator-editable: it is a reading of another card,
                     # and a hand-typed copy is a copy that goes stale.
@@ -249,6 +291,14 @@ class NaviPlugin:
                                         "description": "停止导航，放弃当前目标"},
                     "pause": {"params": [], "description": "暂停，保留目标"},
                     "resume": {"params": [], "description": "继续"},
+                    "config": {
+                        "params": list(_TUNING_FIELDS),
+                        "description": "配置跟随增益、搜索转速、速度上限和横移。"
+                                       "只更新填写的参数；配置保留到本进程后续"
+                                       "启动，容器重启后需由画布配置或 YAML 恢复。"
+                                       "速度上限与搜索转速修改后应停止并重新启动"
+                                       "卡片，让它重新协商下游底盘限制",
+                    },
                 },
                 # Unlike the vla card, this one finishes: arriving is an answer.
                 "x-completion": {"actions": ["navigate_to"], "timeout": 300},
@@ -257,23 +307,9 @@ class NaviPlugin:
                 "x-is-dangerous": True,
                 "x-resource": ["base"],
             },
-            # **Three knobs, not twenty-two.**
-            #
-            # Everything else lives in `actucore/config.yaml`, where it has the
-            # paragraph of explanation it needs, and stays reachable through the
-            # `config` action for anyone tuning. What it must not be is a form
-            # field: an operator asked to pick `release_frac` or
-            # `bearingless_std_factor` has no way to judge the answer, and the
-            # dialog's length hides the three that actually matter.
-            #
-            # There is a second, sharper reason. **agent-core sends every field
-            # in this schema on every config call, defaults included** — so a
-            # key here silently overrides the same key in config.yaml. On r1_sz
-            # the file said `vx_max: 0.6` and the card reported 0.4, because the
-            # schema default won. Every field removed from here is one fewer
-            # place for the file to be quietly ignored; every field kept has to
-            # carry the same default the file does, which `test_navi_card.py`
-            # now checks.
+            # agent-core submits schema defaults along with dialog values.
+            # Tuning defaults must therefore reflect this card's startup YAML,
+            # rather than overwrite it or copy a previous chassis's limits.
             "configSchema": {
                 "type": "object",
                 "properties": {
@@ -289,6 +325,8 @@ class NaviPlugin:
                                                        "stop_distance_m，否则机器人会"
                                                        "被它正要走向的目标挡停",
                                         "scope": "instance"},
+                    **{key: {**spec, "scope": "instance"}
+                       for key, spec in tuning_properties.items()},
                 },
                 "required": [],
             },
@@ -726,6 +764,8 @@ class NaviPlugin:
                                "format": "image/jpeg"}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
+                "config": {key: getattr(self._config, key)
+                           for key in _TUNING_FIELDS},
                 "published": self._published,
                 # (width, height) of the frame vop's boxes are in. (0, 0) means
                 # no declaration arrived and boxes cannot be used — see
