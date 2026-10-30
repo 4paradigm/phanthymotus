@@ -2377,7 +2377,7 @@ def test_already_reviewed_noop_with_different_requested_build_matrix_fails_close
                       updated_at="2026-10-30T03:56:00Z"),
         _make_comment(_CODE_REVIEW_BODY, cid=9002,
                       created_at="2026-10-30T03:57:00Z",
-                      updated_at="2026-09-30T03:57:00Z"),
+                      updated_at="2026-10-30T03:57:00Z"),
         _make_comment("/request_bot_review core", cid=9003,
                       created_at="2026-10-30T03:58:00Z",
                       updated_at="2026-10-30T03:58:00Z",

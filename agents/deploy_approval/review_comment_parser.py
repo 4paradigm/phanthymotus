@@ -431,6 +431,8 @@ def _is_noop_review_request(
     }
     if (
         not previous_builds
+        or len(previous_build_keys) != len(previous_builds)
+        or any(not build.success for build in previous_builds)
         or (
             command["expected"] is not None
             and previous_build_keys != command["expected"]
@@ -452,7 +454,10 @@ def _is_noop_review_request(
         position = _comment_position(comment)
         if position is None:
             return False
-        if not (position[0] >= previous_updated and previous_position < position < request_position):
+        if not (
+            position[0] >= previous_updated
+            and previous_position < position < request_position
+        ):
             continue
         if comment.get("updated_at") != comment.get("created_at"):
             return False
