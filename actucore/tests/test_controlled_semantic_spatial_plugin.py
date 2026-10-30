@@ -731,7 +731,8 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                    "control_interface": descriptor}
         started = plugin.dispatch(plugin.PREFIX, request)
         self.assertEqual(started["state"], "ready")
-        self.assertFalse(started["shadow_only"])
+        self.assertNotIn("shadow_only", started)
+        self.assertNotIn("physical_execution", started)
         self.assertTrue(started["control_output_can_drive_hardware"])
         self.assertEqual(runtime.start_kwargs["control_interface"], descriptor)
         self.assertIsNot(runtime.start_kwargs["control_interface"], descriptor)

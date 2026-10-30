@@ -68,7 +68,6 @@ class RosTopicFastLivo2Backend:
                 "command_topic": self._command_topic,
                 "status_topic": self._status_topic,
                 "bridge_subscribers": self._publisher.get_subscription_count(),
-                "physical_execution": False,
             }
         )
         return result
@@ -157,6 +156,8 @@ class RosTopicFastLivo2Backend:
             return
         if not isinstance(payload, dict):
             return
+        payload.pop("physical_execution", None)
+        payload.pop("shadow_only", None)
         with self._condition:
             self._last_status = dict(payload)
             request_id = payload.get("request_id")

@@ -577,8 +577,6 @@ class ControlledSemanticSpatialPlugin:
             "status": "idle",
             "canvas_wired": False,
             "component_results": results,
-            "shadow_only": False,
-            "physical_execution": False,
             "control_output_can_drive_hardware": True,
         }
 
@@ -812,8 +810,6 @@ class ControlledSemanticSpatialPlugin:
             "component_results": results,
             "topic_config": dict(self._topic_config),
             "takes_effect": "next_start",
-            "shadow_only": False,
-            "physical_execution": False,
             "control_output_can_drive_hardware": True,
         }
 
@@ -960,8 +956,6 @@ class ControlledSemanticSpatialPlugin:
                 if runtime_failed
                 else None
             ),
-            "shadow_only": False,
-            "physical_execution": False,
             "control_output_can_drive_hardware": True,
         }
 
@@ -1022,8 +1016,6 @@ class ControlledSemanticSpatialPlugin:
             "error_code": code,
             "error": message,
             "message": message,
-            "shadow_only": False,
-            "physical_execution": False,
             "control_output_can_drive_hardware": True,
         }
 

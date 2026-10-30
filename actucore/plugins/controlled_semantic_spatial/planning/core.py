@@ -45,8 +45,6 @@ class UnavailableNavigationBackend:
         return {
             "state": "unavailable",
             "backend": "disabled",
-            "shadow_only": True,
-            "physical_execution": False,
             "reason": self._reason,
         }
 

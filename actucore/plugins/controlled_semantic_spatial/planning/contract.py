@@ -45,12 +45,6 @@ NAV2_FULL_CONFIG_SCHEMA = {
             "enum": ["ros_topic", "disabled"],
             "default": "ros_topic",
         },
-        "shadow_only": {
-            "type": "boolean",
-            "const": True,
-            "default": True,
-            "description": "Nav2 shadow commands require a downstream control consumer",
-        },
         "request_timeout_sec": {
             "type": "number",
             "minimum": 1.0,

@@ -121,8 +121,6 @@ class RosTopicNavigationBackend:
         self._pending_goal_commands: dict[object, tuple[str | None, bool]] = {}
         self._last_status: dict = {
             "state": "waiting_for_nav2_runtime",
-            "shadow_only": True,
-            "physical_execution": False,
         }
         self._terminal_callback = None
         self._closed = False
@@ -142,8 +140,6 @@ class RosTopicNavigationBackend:
                     "command_topic": self._command_topic,
                     "status_topic": self._status_topic,
                     "bridge_subscribers": self._command_pub.get_subscription_count(),
-                    "shadow_only": True,
-                    "physical_execution": False,
                 }
             )
             return result
@@ -181,6 +177,10 @@ class RosTopicNavigationBackend:
             return
         if not isinstance(payload, dict):
             return
+        # Older companion versions described their own boundary as execution mode.
+        # Those flags cannot establish whether a downstream actuator moved.
+        payload.pop("shadow_only", None)
+        payload.pop("physical_execution", None)
         terminal_callback = None
         terminal_payload = None
         with self._condition:

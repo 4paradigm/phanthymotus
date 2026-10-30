@@ -148,7 +148,6 @@ class FastLivo2Plugin:
             "status": "error",
             "error_code": code,
             "error": message,
-            "physical_execution": False,
         }
 
     def _configure(self, args: dict) -> dict:
@@ -166,7 +165,7 @@ class FastLivo2Plugin:
                 self._config_error = str(exc)
                 return self._error("invalid_config", str(exc))
             self._config_error = None
-            return {"state": "configured", "config": dict(self._cfg), "physical_execution": False}
+            return {"state": "configured", "config": dict(self._cfg)}
 
     def _start_canvas(self, args: dict) -> dict:
         with self._lock:
@@ -322,7 +321,6 @@ class FastLivo2Plugin:
                 "stop_result": stop_result,
                 "retryable": not terminal_confirmed,
                 "terminal_confirmed": terminal_confirmed,
-                "physical_execution": False,
             }
         self._release_core()
         return {
@@ -330,7 +328,6 @@ class FastLivo2Plugin:
             "status": "idle",
             "canvas_wired": False,
             "stop_result": stop_result,
-            "physical_execution": False,
         }
 
     def _ensure_core(self) -> FastLivo2Core:
@@ -381,7 +378,6 @@ class FastLivo2Plugin:
             "active_map": None,
             "loaded_map": None,
             "actions": list(FAST_LIVO2_ACTIONS),
-            "physical_execution": False,
         }
         if config_error:
             result.update({"error_code": "invalid_config", "error": config_error})

@@ -33,6 +33,19 @@ def deliver(backend, payload):
 
 
 class Nav2BackendStatusEventsTest(unittest.TestCase):
+    def test_legacy_execution_flags_do_not_leak_to_status_or_callbacks(self):
+        backend = make_backend()
+        received = []
+        backend.set_terminal_callback(received.append)
+        legacy = {"shadow_only": True, "physical_execution": False}
+        deliver(backend, {"event": "response", "request_id": "r", "status": "ok", **legacy})
+        deliver(backend, {"event": "navigation_status", "nav_id": "n",
+                          "status": "arrived", **legacy})
+        for result in (backend._responses["r"], backend.info(), backend._navigation["n"], received[0]):
+            self.assertNotIn("shadow_only", result)
+            self.assertNotIn("physical_execution", result)
+        self.assertEqual(received[0]["status"], "arrived")
+
     def test_response_error_retains_active_and_is_available_to_request(self):
         for trusted in (False, True):
             with self.subTest(trusted=trusted):

@@ -180,6 +180,15 @@ class Nav2PluginLifecycleTest(unittest.TestCase):
         self.assertEqual(stopped_again["state"], "idle")
         self.assertEqual(backend.stop_calls, 2)
 
+    def test_status_does_not_claim_physical_execution_mode(self) -> None:
+        plugin = Nav2Plugin({}, None, backend=ReadyBackend())
+        for result in (plugin.dispatch("nav2", {"action": "info"}),
+                       plugin.dispatch("nav2", {"action": "config"}),
+                       plugin.dispatch("nav2", {"action": "invalid"})):
+            self.assertNotIn("shadow_only", result)
+            self.assertNotIn("physical_execution", result)
+            self.assertNotIn("shadow_only", result.get("config", {}))
+
     def test_invalid_configuration_and_missing_runtime_fail_closed(self) -> None:
         invalid = Nav2Plugin({"shadow_only": False}, None, backend=ReadyBackend())
         info = invalid.dispatch("nav2", {"action": "info"})

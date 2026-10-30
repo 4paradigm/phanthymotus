@@ -196,8 +196,6 @@ class Nav2Plugin:
             "error_code": code,
             "error": message,
             "message": message,
-            "shadow_only": True,
-            "physical_execution": False,
         }
 
     def _configure(self, args: dict) -> dict:
@@ -220,10 +218,8 @@ class Nav2Plugin:
             self._config_error = None
             return {
                 "state": "configured",
-                "config": dict(self._cfg),
+                "config": {key: value for key, value in self._cfg.items() if key != "shadow_only"},
                 "takes_effect": "next_start",
-                "shadow_only": True,
-                "physical_execution": False,
             }
 
     def _start_canvas(self, args: dict) -> dict:
@@ -388,8 +384,6 @@ class Nav2Plugin:
             "status": "idle",
             "canvas_wired": False,
             "stop_result": stop_result,
-            "shadow_only": True,
-            "physical_execution": False,
         }
 
     def _ensure_core(self) -> Nav2Core:
@@ -449,8 +443,6 @@ class Nav2Plugin:
                 "backend": "not_started",
                 "active_nav_id": None,
                 "actions": list(NAV2_ACTIONS),
-                "shadow_only": True,
-                "physical_execution": False,
             }
             if config_error:
                 result.update(
@@ -464,7 +456,7 @@ class Nav2Plugin:
                 "type": "processor",
                 "canvas_wired": canvas_started,
                 "instance_id": instance_id or None,
-                "config": dict(self._cfg),
+                "config": {key: value for key, value in self._cfg.items() if key != "shadow_only"},
                 "topic_in": [
                     {
                         **item,

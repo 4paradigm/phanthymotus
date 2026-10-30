@@ -817,7 +817,6 @@ class PlannerCommandNode(Node):
                 "velocity_limits": active["motion_limits"].as_dict(),
                 "mode": active["mode"],
                 "goal_cell": dict(active["goal_cell"]),
-                "shadow_only": True,
             }
 
     def _send_active_goal(self) -> None:
@@ -1448,8 +1447,6 @@ class PlannerCommandNode(Node):
                 "request_id": request_id,
                 "action": action,
                 "nav_id": nav_id,
-                "shadow_only": True,
-                "physical_execution": False,
                 **result,
             }
         )
@@ -1541,8 +1538,6 @@ class PlannerCommandNode(Node):
             {
                 **payload,
                 "timestamp": time.time(),
-                "shadow_only": True,
-                "physical_execution": False,
             },
             ensure_ascii=False,
             separators=(",", ":"),
