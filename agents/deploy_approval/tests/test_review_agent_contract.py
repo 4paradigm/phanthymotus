@@ -2064,3 +2064,189 @@ def test_already_reviewed_noop_request_does_not_poison_next_review_run(
     assert evidence.code_review_comment_id == 1007
     assert evidence.request_comment["id"] == 1005
     assert evidence.run_binding_valid is expected_run_binding
+
+
+def _already_reviewed_body_for_test(commit):
+    return textwrap.dedent(f"""\
+    <!-- pr-review-agent -->
+
+    ## PR Review Agent — Already reviewed
+
+    {commit} was already reviewed on 2026-10-30 10:54 UTC (result: review_done). This request
+    was skipped rather than rebuilding an unchanged commit.
+    """)
+
+
+def test_already_reviewed_noop_after_latest_completed_run_is_ignored():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    comments = [
+        _make_comment(
+            "/request_bot_review", cid=2000,
+            created_at="2026-10-30T03:54:00Z",
+            updated_at="2026-10-30T03:54:00Z",
+            author_id="184792454", author_login="Haohao-end",
+        ),
+        _make_comment(
+            build, cid=2001,
+            created_at="2026-10-30T03:55:00Z",
+            updated_at="2026-10-30T03:56:00Z",
+        ),
+        _make_comment(
+            _CODE_REVIEW_BODY, cid=2002,
+            created_at="2026-10-30T03:57:00Z",
+            updated_at="2026-10-30T03:57:00Z",
+        ),
+        _make_comment(
+            "/request_bot_review", cid=2003,
+            created_at="2026-10-30T03:58:00Z",
+            updated_at="2026-10-30T03:58:00Z",
+            author_id="184792454", author_login="Haohao-end",
+        ),
+        _make_comment(
+            _already_reviewed_body_for_test("59a83a0"), cid=2004,
+            created_at="2026-10-30T03:59:00Z",
+            updated_at="2026-10-30T03:59:00Z",
+        ),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is True
+    assert evidence.request_comment["id"] == 2000
+
+
+def test_already_reviewed_response_after_new_run_anchor_is_not_noop():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    comments = [
+        _make_comment(
+            old_build, cid=3001,
+            created_at="2026-10-30T03:55:00Z",
+            updated_at="2026-10-30T03:56:00Z",
+        ),
+        _make_comment(
+            _CODE_REVIEW_BODY, cid=3002,
+            created_at="2026-10-30T03:57:00Z",
+            updated_at="2026-10-30T03:57:00Z",
+        ),
+        _make_comment(
+            "/request_bot_review", cid=3003,
+            created_at="2026-10-30T03:58:00Z",
+            updated_at="2026-10-30T03:58:00Z",
+            author_id="184792454", author_login="Haohao-end",
+        ),
+        _make_comment(
+            new_build, cid=3004,
+            created_at="2026-10-30T03:59:00Z",
+            updated_at="2026-10-30T04:00:00Z",
+        ),
+        _make_comment(
+            _already_reviewed_body_for_test("ed171d8"), cid=3005,
+            created_at="2026-10-30T04:01:00Z",
+            updated_at="2026-10-30T04:01:00Z",
+        ),
+        _make_comment(
+            _CODE_REVIEW_BODY, cid=3006,
+            created_at="2026-10-30T04:02:00Z",
+            updated_at="2026-10-30T04:02:00Z",
+        ),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is True
+    assert evidence.request_comment["id"] == 3003
+
+
+def test_duplicate_already_reviewed_responses_fail_closed():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    comments = [
+        _make_comment(old_build, cid=4001,
+                      created_at="2026-10-30T03:55:00Z",
+                      updated_at="2026-10-30T03:56:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=4002,
+                      created_at="2026-10-30T03:57:00Z",
+                      updated_at="2026-10-30T03:57:00Z"),
+        _make_comment("/request_bot_review", cid=4003,
+                      created_at="2026-10-30T03:58:00Z",
+                      updated_at="2026-10-30T03:58:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(_already_reviewed_body_for_test("ed171d8"), cid=4004,
+                      created_at="2026-10-30T03:59:00Z",
+                      updated_at="2026-10-30T03:59:00Z"),
+        _make_comment(_already_reviewed_body_for_test("ed171d8"), cid=4005,
+                      created_at="2026-10-30T03:59:30Z",
+                      updated_at="2026-10-30T03:59:30Z"),
+        _make_comment("/request_bot_review", cid=4006,
+                      created_at="2026-10-30T04:00:00Z",
+                      updated_at="2026-10-30T04:00:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(new_build, cid=4007,
+                      created_at="2026-10-30T04:01:00Z",
+                      updated_at="2026-10-30T04:02:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=4008,
+                      created_at="2026-10-30T04:03:00Z",
+                      updated_at="2026-10-30T04:03:00Z"),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is False
+
+
+def test_malformed_already_reviewed_response_fails_closed():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    malformed = textwrap.dedent("""\
+    <!-- pr-review-agent -->
+
+    ## PR Review Agent — Already reviewed
+
+    ed171d8 was already reviewed.
+    """)
+    comments = [
+        _make_comment(old_build, cid=5001,
+                      created_at="2026-10-30T03:55:00Z",
+                      updated_at="2026-10-30T03:56:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=5002,
+                      created_at="2026-10-30T03:57:00Z",
+                      updated_at="2026-10-30T03:57:00Z"),
+        _make_comment("/request_bot_review", cid=5003,
+                      created_at="2026-10-30T03:58:00Z",
+                      updated_at="2026-10-30T03:58:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(malformed, cid=5004,
+                      created_at="2026-10-30T03:59:00Z",
+                      updated_at="2026-10-30T03:59:00Z"),
+        _make_comment("/request_bot_review", cid=5005,
+                      created_at="2026-10-30T04:00:00Z",
+                      updated_at="2026-10-30T04:00:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(new_build, cid=5006,
+                      created_at="2026-10-30T04:01:00Z",
+                      updated_at="2026-10-30T04:02:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=5007,
+                      created_at="2026-10-30T04:03:00Z",
+                      updated_at="2026-10-30T04:03:00Z"),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is False

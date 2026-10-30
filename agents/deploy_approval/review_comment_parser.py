@@ -358,22 +358,22 @@ def _same_commit(value: str, expected: str) -> bool:
 
 
 def _already_reviewed_response_commit(body: str) -> str:
-    """Return the commit named by an explicit Review Agent no-op response.
+    """Return a trusted-protocol Already reviewed response's commit prefix.
 
-    An ordinary review result, progress message, or free-text mention is not
-    sufficient. The exact protocol marker, heading, skip explanation and one
-    unambiguous commit prefix are all required.
+    Empty means this is not an Already reviewed response. "!ambiguous" means
+    the heading is present but its protocol metadata is malformed.
     """
+    if not isinstance(body, str) or _ALREADY_REVIEWED_HEADING not in body:
+        return ""
     if (
-        not isinstance(body, str)
-        or body.count(PR_REVIEW_MARKER) != 1
+        body.count(PR_REVIEW_MARKER) != 1
         or body.count(_ALREADY_REVIEWED_HEADING) != 1
         or not _ALREADY_REVIEWED_SKIP_RE.search(body)
         or any(heading in body for heading in (
             BUILD_HEADING, TEST_HEADING, CODE_REVIEW_HEADING, ERROR_HEADING,
         ))
     ):
-        return ""
+        return "!ambiguous"
     prefixes = _ALREADY_REVIEWED_COMMIT_RE.findall(body)
     if len(prefixes) != 1 or not _SHORT_SHA_RE.fullmatch(prefixes[0]):
         return "!ambiguous"
@@ -385,49 +385,110 @@ def _is_noop_review_request(
     request_position: tuple[datetime, int],
     request_positions: list[tuple[datetime, int]],
     trusted_comments: list[dict],
-    review_run_positions: list[tuple[datetime, int]],
-    previous_run_commit: str,
+    review_run_entries: list[tuple[tuple[datetime, int], ReviewJobAnchor]],
 ) -> bool:
-    """Ignore only a request explicitly answered as skipped without a new run.
+    """Ignore only a duplicate request explicitly skipped for a completed prior run.
 
-    The response must be the sole Already reviewed response after this request
-    and before the next review request, must name the immediately preceding
-    completed review run's commit, and must not have
-    a review-run anchor between the request and response. Edited or ambiguous
-    comments remain blocking; real new runs are never hidden by this rule.
+    The bot response must name the latest completed run before this request.
+    That run must have a successful build and exactly one completed Code Review
+    before the request. A new run between the request and response, an edited
+    comment, malformed response, wrong SHA, or ambiguous response fails closed.
     """
     if request.get("updated_at") != request.get("created_at"):
+        return False
+
+    command = _parse_review_request(str(request.get("body", "") or ""))
+    if command is None or not command.get("valid"):
+        return False
+    user = request.get("user")
+    if (
+        not isinstance(user, dict)
+        or isinstance(user.get("id"), bool)
+        or not str(user.get("id", "")).isdigit()
+        or int(user.get("id", 0)) <= 0
+        or not isinstance(user.get("login"), str)
+        or not user.get("login")
+    ):
+        return False
+
+    preceding_runs = [
+        entry for entry in review_run_entries
+        if entry[0] < request_position
+    ]
+    if not preceding_runs:
+        return False
+    previous_position, previous_anchor = max(preceding_runs, key=lambda entry: entry[0])
+    previous_commit = previous_anchor.commit_prefix
+    if (
+        previous_anchor.state != "build-succeeded"
+        or not _SHORT_SHA_RE.fullmatch(previous_commit)
+    ):
+        return False
+
+    # The run being referenced must already have a complete, unambiguous Code
+    # Review before this request. A delayed Code Review cannot retroactively
+    # turn a request made during an active run into a no-op.
+    prior_code_reviews = []
+    previous_updated = datetime.fromisoformat(
+        previous_anchor.updated_at.replace("Z", "+00:00")
+    )
+    for comment in trusted_comments:
+        body = str(comment.get("body", "") or "")
+        if CODE_REVIEW_HEADING not in body:
+            continue
+        position = _comment_position(comment)
+        if position is None:
+            return False
+        if not (position[0] >= previous_updated and previous_position < position < request_position):
+            continue
+        if comment.get("updated_at") != comment.get("created_at"):
+            return False
+        review_text = parse_code_review(body)
+        if review_text is None:
+            return False
+        explicit_commit = _extract_review_job_commit_prefix(body)
+        if explicit_commit and not _same_commit(explicit_commit, previous_commit):
+            return False
+        explicit_run = _run_id(body)
+        previous_run = _run_id(previous_anchor.body)
+        if explicit_run and (not previous_run or explicit_run != previous_run):
+            return False
+        prior_code_reviews.append(comment)
+    if len(prior_code_reviews) != 1:
         return False
 
     next_request = min(
         (position for position in request_positions if position > request_position),
         default=None,
     )
+    next_run = min(
+        (position for position, _ in review_run_entries if position > request_position),
+        default=None,
+    )
+    upper_bounds = [p for p in (next_request, next_run) if p is not None]
+    upper_bound = min(upper_bounds) if upper_bounds else None
+
     responses = []
     for comment in trusted_comments:
-        commit_prefix = _already_reviewed_response_commit(
-            str(comment.get("body", "") or "")
-        )
-        if not commit_prefix:
+        body = str(comment.get("body", "") or "")
+        if _ALREADY_REVIEWED_HEADING not in body:
             continue
         position = _comment_position(comment)
         if position is None or position <= request_position:
             continue
-        if next_request is not None and position >= next_request:
+        if upper_bound is not None and position >= upper_bound:
+            continue
+        response_commit = _already_reviewed_response_commit(body)
+        if not response_commit:
             continue
         if comment.get("updated_at") != comment.get("created_at"):
-            continue
-        if any(request_position < run_position < position
-               for run_position in review_run_positions):
-            continue
-        responses.append((commit_prefix, position))
+            response_commit = "!ambiguous"
+        responses.append(response_commit)
 
     return (
         len(responses) == 1
-        and bool(previous_run_commit)
-        and _same_commit(responses[0][0], previous_run_commit)
+        and _same_commit(responses[0], previous_commit)
     )
-
 
 def _run_id(body: str) -> str:
     # Optional explicit Markdown metadata, not an invented GitHub API field.
@@ -937,11 +998,24 @@ def extract_review_evidence(
         request_positions.append(position)
         request_entries.append((c, position))
 
-    review_run_positions = [anchor_position, *prior_positions]
+    review_run_entries = []
+    for run_comment in [*other_anchors, anchor_comment]:
+        run_position = _comment_position(run_comment)
+        if run_position is None:
+            run_valid = False
+            continue
+        parsed_run = extract_latest_review_job_anchor(
+            [run_comment], trusted_author_id, trusted_author_login,
+        )
+        if parsed_run is None:
+            run_valid = False
+            continue
+        review_run_entries.append((run_position, parsed_run))
+
     for c, position in request_entries:
         if _is_noop_review_request(
             c, position, request_positions, trusted_comments,
-            review_run_positions, previous_run_commit,
+            review_run_entries,
         ):
             continue
         if previous_position is not None and position <= previous_position:
