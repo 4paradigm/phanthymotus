@@ -265,16 +265,17 @@ class ControlledSemanticSpatialPlugin:
             if self._config_error and not already_started:
                 return self._error("invalid_config", self._config_error)
         wiring = self._validate_external_wiring(args)
-        planning_info = self._planning.dispatch("nav2", {"action": "info"})
-        if self._config_failed(planning_info):
-            return self._error(
-                "invalid_config", str(planning_info.get("error") or "invalid planning config")
-                if isinstance(planning_info, dict) else "invalid planning config"
-            )
-        try:
-            planning_config = validated_planning_config(planning_info.get("config", {}), {})
-        except (PlanningConfigError, TypeError, ValueError) as exc:
-            return self._error("invalid_config", str(exc))
+        if not already_started:
+            planning_info = self._planning.dispatch("nav2", {"action": "info"})
+            if self._config_failed(planning_info):
+                return self._error(
+                    "invalid_config", str(planning_info.get("error") or "invalid planning config")
+                    if isinstance(planning_info, dict) else "invalid planning config"
+                )
+            try:
+                planning_config = validated_planning_config(planning_info.get("config", {}), {})
+            except (PlanningConfigError, TypeError, ValueError) as exc:
+                return self._error("invalid_config", str(exc))
         with self._lock:
             # Stop signals before acquiring the transition lock, including
             # while validation is inspecting the mapping configuration.

@@ -684,6 +684,21 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             semantic_plugin=semantic or FakeComponent("semantic"),
         )
 
+    def test_repeat_start_after_navigation_error_is_not_config_error(self):
+        class PlanningWithLastError(FakeComponent):
+            def dispatch(self, prefix, args):
+                if args.get("action") == "info" and self.started:
+                    return {"state": "error", "status": "error", "error_code": "navigation_failed"}
+                return super().dispatch(prefix, args)
+
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime, planning=PlanningWithLastError("planning"))
+        request = {"action": "start", "input_bindings": _external_bindings_for_start()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, request)["state"], "ready")
+        again = plugin.dispatch(plugin.PREFIX, request)
+        self.assertTrue(again["already_started"])
+        self.assertNotEqual(again.get("error_code"), "invalid_config")
+
     def test_invalid_planning_config_does_not_start_runtime(self):
         class InvalidPlanning(FakeComponent):
             def dispatch(self, prefix, args):
