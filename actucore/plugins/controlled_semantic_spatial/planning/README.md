@@ -152,10 +152,12 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   独立错误，不再进入长时间恢复流程。成功回执包含 `goal_cell`。Canvas 代价图
   只把同一拒绝阈值 `>=99` 的格子标红；`1..98` 的软 inflation 仍由 Nav2 用于
   路径评分，但不再渲染成类似不可通行区域。
-- global/local costmap 都是 rolling window。global 插件顺序固定为
-  `StaticLayer -> live ObstacleLayer -> InflationLayer`：StaticLayer 消费完整的
-  `/ubuntu/navigation/static_map`，live layer 与 local costmap 一样消费实时
-  `/ubuntu/navigation/cloud_registered` 并开启 marking/raytrace clearing。
+- global/local costmap 都是 rolling window，插件顺序均为
+  `StaticLayer -> live ObstacleLayer -> InflationLayer`：两张图的 StaticLayer 消费
+  `/ubuntu/navigation/static_map`，live layer 消费实时
+  `/ubuntu/navigation/cloud_registered` 并开启 marking/raytrace clearing。局部图
+  显式以 maximum 合并 live layer，避免实时清空抹除静态障碍；这只能覆盖已发布且
+  正确定位的静态图，不能保证未知、漏建或高度带之外障碍安全。
   live layer 表达当前动态环境并依靠 raytrace clearing 更新。FAST-LIVO2
   adapter 的静态图则恢复为直接累计：同一扫描按 `0.10 m` 体素去重，有效
   高度带内的体素首次出现即写入 StaticLayer，不等待多帧确认、不做动态分量
