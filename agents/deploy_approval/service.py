@@ -2208,20 +2208,13 @@ class DeployController:
                 }
 
             configured_reviewers = getattr(self.config, "test_reviewers", [])
-            requester = (
-                existing.get("requested_by") if refresh_pending_request
-                and isinstance(existing.get("requested_by"), str) else actor
-            )
-            requester_key = requester.strip().casefold()
             eligible_reviewers = []
             seen_reviewers = set()
             if isinstance(configured_reviewers, list):
                 for reviewer in configured_reviewers:
                     if (not isinstance(reviewer, str)
                             or not _LOGIN_RE.fullmatch(reviewer.strip())
-                            or reviewer.strip().casefold().endswith("[bot]")
-                            or reviewer.strip().casefold() == requester_key
-                            or self._is_deployed_machine_owner(reviewer, state)):
+                            or reviewer.strip().casefold().endswith("[bot]")):
                         continue
                     reviewer_key = reviewer.strip().casefold()
                     if reviewer_key in seen_reviewers:
@@ -2982,19 +2975,17 @@ class DeployController:
         self, repo: str, actor: str, state: dict, *, actor_id=None,
         comment_id=None, result="",
     ) -> None:
-        """Authorize only a separately allowlisted reviewer for this round."""
+        """Authorize a configured allowlisted GitHub user for this round."""
         reviewers = getattr(self.config, "test_reviewers", None)
         if not isinstance(reviewers, list) or not reviewers:
             raise PolicyError(
-                "独立验收名单尚未配置；已拒绝记录测试结果，请配置 "
+                "验收人白名单尚未配置；已拒绝记录测试结果，请配置 "
                 "/run/deploy-approval/test_reviewers.yaml。"
             )
         actor_lower = actor.strip().casefold() if isinstance(actor, str) else ""
         if not actor_lower or actor_lower not in {
                 value.casefold() for value in reviewers if isinstance(value, str)}:
-            raise PolicyError("只有独立验收名单中的 GitHub 用户可以执行 /record_test。")
-        if self._is_deployed_machine_owner(actor, state):
-            raise PolicyError("本轮部署 Machine Owner 不能担任本轮最终验收人。")
+            raise PolicyError("只有 `test_reviewers.yaml` 验收人白名单中的 GitHub 用户可以执行 /record_test。")
         request = state.get("acceptance_request")
         try:
             expected_round = round_id_for_state(state)
@@ -3003,18 +2994,16 @@ class DeployController:
         if (not isinstance(request, dict)
                 or request.get("head_sha") != state.get("head_sha")
                 or request.get("round_id") != expected_round):
-            raise PolicyError("本轮尚无有效的 Machine Owner 验收请求。")
+            raise PolicyError("本轮尚无有效的验收请求。")
         try:
             numeric_actor_id = int(actor_id)
         except (TypeError, ValueError):
             numeric_actor_id = 0
         if numeric_actor_id <= 0 or type(comment_id) is not int or comment_id <= 0:
-            raise PolicyError("无法验证独立验收人的 GitHub 评论身份。")
+            raise PolicyError("无法验证验收人的 GitHub 评论身份。")
         if request.get("status") == "pending":
-            if (state.get("status") != "testing"
-                    or numeric_actor_id == request.get("requested_by_id")
-                    or actor_lower == str(request.get("requested_by", "")).casefold()):
-                raise PolicyError("验收人必须来自独立名单，并与本轮请求验收的 Machine Owner 不同。")
+            if state.get("status") != "testing":
+                raise PolicyError("当前轮次尚未处于可记录验收结果的 testing 状态。")
             return
         if (request.get("status") == "completed"
                 and request.get("accepted_by_id") == numeric_actor_id
@@ -3023,7 +3012,7 @@ class DeployController:
                 and request.get("result") == result
                 and state.get("status") == ("succeeded" if result == "pass" else "failed")):
             return
-        raise PolicyError("本轮独立验收请求已完成或不再有效。")
+        raise PolicyError("本轮验收请求已完成或不再有效。")
 
     async def _deploy_component(
         self, core: AgentCoreClient, node_id: str,

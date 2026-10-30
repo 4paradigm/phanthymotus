@@ -220,9 +220,9 @@ def _workflow_lines(
 def _testing_next_action(evidence_complete: bool) -> str:
     if evidence_complete:
         return ("**Machine Owner**\n\n测试完成后，请执行 `/request_acceptance`，"
-                "由名单中的独立验收人记录最终结果。")
+                "之后由 `test_reviewers.yaml` 白名单中的验收人记录最终结果。")
     return ("**PR developer and deployed Machine Owner**\n\n"
-            "完成本轮验证后，由 Machine Owner 执行 `/request_acceptance` 请求独立验收。")
+            "完成本轮验证后，由 Machine Owner 执行 `/request_acceptance` 请求验收。")
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -487,30 +487,29 @@ def testing(
     if acceptance_pending:
         reviewers = [name for name in acceptance_reviewers or []
                      if isinstance(name, str) and name.strip()]
-        next_action = ["### 独立验收人", ""]
+        next_action = ["### 验收人", ""]
         if reviewers:
             next_action.extend([
                 "本轮可验收的 GitHub 用户："
                 + "、".join(f"`@{_escape(name.strip())}`" for name in reviewers),
             ])
             acceptance_instruction = (
-                "请名单中的任意一位独立验收人，在当前 PR 的 Conversation 新建一条评论，"
+                "请名单中的任意一位验收人，在当前 PR 的 Conversation 新建一条评论，"
                 "以下两条命令二选一。"
             )
         else:
             if not acceptance_reviewers_configured:
                 reason = (
                     "现有 `test_reviewers.yaml` 名单未加载或为空。请管理员修复现有名单；"
-                    "当前没有可执行独立验收的人选。"
+                    "当前没有可执行验收的人选。"
                 )
             else:
                 reason = (
-                    "现有名单中的候选人均为本轮验收请求发起者或已部署机器的 Machine Owner，"
-                    "没有符合独立验收条件的人选。请管理员检查现有 `test_reviewers.yaml` 名单和本轮 Machine Owner 配置。"
+                    "现有 `test_reviewers.yaml` 中没有可用的有效验收人。请管理员检查现有名单配置。"
                 )
             next_action.extend([reason])
             acceptance_instruction = (
-                "名单恢复可用前，暂不能执行验收命令。之后请名单中的任意一位独立验收人，"
+                "名单恢复可用前，暂不能执行验收命令。之后请名单中的任意一位验收人，"
                 "在当前 PR 的 Conversation 新建一条评论，以下两条命令二选一。"
             )
         next_action.extend([
@@ -519,12 +518,14 @@ def testing(
             "",
             acceptance_instruction,
             "",
+            "只有现有 `test_reviewers.yaml` 白名单决定谁可以执行 `/record_test`。",
+            "",
             "- 验收成功：`/record_test result=pass`",
             "- 验收失败：`/record_test result=fail`",
             "",
             "只需执行其中一条。`summary` 是可选参数，用于补充验收说明。"
             "将命令作为评论正文从第一列开始输入；不要加引用前缀，也不要放进 Markdown 代码块。",
-            "Machine Owner 不得执行 `/record_test`；GitHub Review 的 Approve 按钮不能替代此业务命令。",
+            "GitHub Review 的 Approve 按钮不能替代此业务命令。",
             "",
             "### 结果说明",
             "",
@@ -805,8 +806,8 @@ def deploy_help_text(topic: str = "") -> str:
             "",
             "用途：记录本轮部署验证结果。",
             "",
-            "执行人：deploy-approval/test_reviewers.yaml 中的独立验收人；必须与本轮请求验收的 Machine Owner 不同。",
-            "阶段：Machine Owner 已在 testing 阶段请求独立验收后。",
+            "执行人：`deploy-approval/test_reviewers.yaml` 白名单中的 GitHub 用户；该白名单是执行 `/record_test` 的唯一人员资格条件。",
+            "阶段：本轮已在 testing 阶段请求验收后。",
             "",
             "参数：",
             "- `/record_test result=pass [summary=\"...\"]`",
@@ -828,11 +829,11 @@ def deploy_help_text(topic: str = "") -> str:
         "- `/request_bot_review`：触发当前 HEAD 代码审查；PR 作者在开放 PR 的 review-required 阶段执行。",
         "- `/request_deploy`：PR 作者在开放 PR 的 deploy-ready 阶段发起部署请求。",
         "- `/approve_deploy machine=<alias-or-ip>`：对应 Machine Owner 或有 write/maintain/admin 权限的协作者，在 deploy-requested 阶段审批指定机器。",
-        "- `/request_acceptance`：本轮实际部署机器的 Machine Owner 在 testing 阶段请求独立验收；仅更新待验收标记，不结束 testing。",
-        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：验收名单中的独立验收人在待验收阶段记录成功。",
-        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：验收名单中的独立验收人在待验收阶段记录失败。",
+        "- `/request_acceptance`：本轮实际部署机器的 Machine Owner 在 testing 阶段请求验收；仅更新待验收标记，不结束 testing。",
+        "- `/record_test result=pass summary=\"视频播放和附件校验通过\"`：`test_reviewers.yaml` 白名单中的用户在待验收阶段记录成功。",
+        "- `/record_test result=fail summary=\"视频播放失败，HTTP 403\"`：`test_reviewers.yaml` 白名单中的用户在待验收阶段记录失败。",
         "- `/deploy_status`：只读查询当前部署状态，可在任意阶段使用。",
-        "- `/deploy_help record_test`：查看独立验收命令说明；可在任意阶段使用。",
+        "- `/deploy_help record_test`：查看验收命令说明；可在任意阶段使用。",
         "",
         "结果含义：`pass`=成功；`fail`=失败；`summary`=测试结果说明（可选）。",
         "",
