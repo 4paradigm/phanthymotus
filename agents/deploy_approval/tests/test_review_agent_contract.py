@@ -2062,8 +2062,15 @@ def test_already_reviewed_noop_request_does_not_poison_next_review_run(
     assert evidence is not None
     assert evidence.build_comment_id == 1006
     assert evidence.code_review_comment_id == 1007
-    assert evidence.request_comment["id"] == 1005
-    assert evidence.run_binding_valid is expected_run_binding
+    if expected_run_binding:
+        assert evidence.request_comment is not None
+        assert evidence.request_comment["id"] == 1005
+        assert evidence.run_binding_valid is True
+    else:
+        # A wrong SHA must not suppress the duplicate request. Both requests
+        # remain effective, so evidence is returned only as explicitly unbound.
+        assert evidence.request_comment is None
+        assert evidence.run_binding_valid is False
 
 
 def _already_reviewed_body_for_test(commit):
