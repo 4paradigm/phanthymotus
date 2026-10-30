@@ -3,9 +3,9 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 
-const canvas = readFileSync(new URL('../web/js/canvas.js', import.meta.url), 'utf8');
-const skeleton = readFileSync(new URL('../web/js/renderers/skeleton.js', import.meta.url), 'utf8');
-const detailPanel = readFileSync(new URL('../web/js/detail-panel.js', import.meta.url), 'utf8');
+const canvas = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
+const skeleton = readFileSync(new URL('./renderers/skeleton.js', import.meta.url), 'utf8');
+const detailPanel = readFileSync(new URL('./detail-panel.js', import.meta.url), 'utf8');
 
 function realTopicDetailHandoff() {
   const mounts = [], connections = [];
