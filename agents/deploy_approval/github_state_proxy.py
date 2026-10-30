@@ -330,8 +330,6 @@ def _validate_hidden_state(data: dict) -> dict:
             if (not valid_login(request.get("accepted_by"))
                     or type(request.get("accepted_by_id")) is not int
                     or request["accepted_by_id"] <= 0
-                    or request["accepted_by_id"] == request["requested_by_id"]
-                    or request["accepted_by"].casefold() == request["requested_by"].casefold()
                     or type(request.get("acceptance_comment_id")) is not int
                     or request["acceptance_comment_id"] <= 0
                     or request["acceptance_comment_id"] <= request["comment_id"]
