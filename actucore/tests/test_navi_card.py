@@ -688,7 +688,7 @@ def test_a_lost_target_tells_the_caller_to_look_before_retrying():
 
 def test_the_dialog_exposes_follow_gains_search_and_velocity_limits():
     keys = set(_tool()["configSchema"]["properties"])
-    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m",
+    assert keys == {"rate_hz", "stop_distance_m", "stop_tolerance_m", "obstacle_stop_m",
                     "k_yaw", "k_fwd", "search_rate", "vx_max", "vy_max",
                     "wz_max", "use_lateral"}
 
@@ -696,7 +696,7 @@ def test_the_dialog_exposes_follow_gains_search_and_velocity_limits():
 def test_tuning_fields_are_available_to_the_config_action_with_the_same_schema():
     tool = _tool()
     params = tool["inputSchema"]["x-action-params"]["config"]["params"]
-    assert set(params) == {"k_yaw", "k_fwd", "search_rate", "vx_max", "vy_max",
+    assert set(params) == {"stop_distance_m", "stop_tolerance_m", "k_yaw", "k_fwd", "search_rate", "vx_max", "vy_max",
                            "wz_max", "use_lateral"}
     for key in params:
         dialog = tool["configSchema"]["properties"][key]
@@ -723,7 +723,8 @@ def test_all_exposed_tuning_fields_update_and_can_be_read_back():
                   "use_lateral": False}
     result = card.dispatch("navi", {"action": "config", **configured})
     assert result["config"] == configured
-    assert card._info()["config"] == configured
+    assert card._info()["config"] == {**configured, "stop_distance_m": 0.8,
+                                      "stop_tolerance_m": 0.0, "arrival_distance_m": 0.8}
     schema = card.get_tools()[0]["configSchema"]["properties"]
     assert {key: schema[key]["default"] for key in configured} == configured
     from plugins.navi import policy
@@ -802,7 +803,8 @@ def test_live_search_can_be_disabled_and_deadbands_are_still_adopted():
     card._stop()
 
 
-@pytest.mark.parametrize("key", ["k_yaw", "k_fwd", "search_rate", "vx_max",
+@pytest.mark.parametrize("key", ["stop_distance_m", "stop_tolerance_m",
+                                "k_yaw", "k_fwd", "search_rate", "vx_max",
                                 "vy_max", "wz_max"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, True, "bad"])
 def test_invalid_tuning_rejects_the_entire_request_atomically(key, value):
@@ -832,6 +834,81 @@ def test_stopped_tuning_accepts_numeric_strings_without_using_an_old_chassis():
     assert result["config"] == result["effective_config"] == {
         "vx_max": 0.8, "search_rate": 1.2,
     }
+
+
+def test_stop_tolerance_is_exposed_with_unchanged_zero_default():
+    tool = _tool()
+    spec = tool["configSchema"]["properties"]["stop_tolerance_m"]
+    assert spec["type"] == "number" and spec["minimum"] == 0
+    assert spec["default"] == 0.0 and spec["scope"] == "instance"
+    assert tool["inputSchema"]["x-action-params"]["navigate_to"]["params"] == [
+        "target", "stop_distance_m", "stop_tolerance_m"]
+    card = _card(stop_distance_m=1.2, stop_tolerance_m=0.1)
+    schema = card.get_tools()[0]["configSchema"]["properties"]
+    assert schema["stop_distance_m"]["default"] == 1.2
+    assert schema["stop_tolerance_m"]["default"] == 0.1
+    assert card._info()["config"]["arrival_distance_m"] == pytest.approx(1.3)
+
+
+def test_stop_tolerance_config_updates_requested_and_effective_readback():
+    card = _running_tuning_card()
+    requested = {"stop_distance_m": 1.2, "stop_tolerance_m": 0.1}
+    result = card._config_action(requested)
+    assert result["status"] == "configured"
+    assert result["config"] == result["effective_config"] == requested
+    assert {key: card._info()["config"][key] for key in requested} == requested
+    assert card._info()["config"]["arrival_distance_m"] == pytest.approx(1.3)
+    assert {key: card._cfg[key] for key in requested} == requested
+    card._stop()
+
+
+def test_navigation_distance_override_is_atomic_and_omission_keeps_current_tolerance():
+    card = _running_tuning_card(stop_distance_m=0.8, stop_tolerance_m=0.05)
+    result = card._navigate_to({"target": "person", "stop_distance_m": 1.2,
+                                "stop_tolerance_m": 0.1})
+    assert result["state"] == "running"
+    assert result["stop_distance_m"] == 1.2 and result["stop_tolerance_m"] == 0.1
+    assert result["arrival_distance_m"] == pytest.approx(1.3)
+    # Per-navigation overrides do not rewrite the persistent requested config.
+    assert card._cfg["stop_distance_m"] == 0.8 and card._cfg["stop_tolerance_m"] == 0.05
+    card._config_action({"k_yaw": 0.8})
+    second = card._navigate_to({"target": "chair"})
+    assert second["stop_distance_m"] == 1.2 and second["stop_tolerance_m"] == 0.1
+    assert second["arrival_distance_m"] == pytest.approx(1.3)
+    assert card._info()["config"]["arrival_distance_m"] == pytest.approx(1.3)
+    card._stop()
+
+
+@pytest.mark.parametrize("key", ["stop_distance_m", "stop_tolerance_m"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, True, "bad"])
+def test_invalid_navigation_distance_preserves_current_action_and_pause(key, value):
+    card = _running_tuning_card()
+    card._navigate_to({"target": "person", "stop_distance_m": 1.2,
+                       "stop_tolerance_m": 0.1})
+    card._paused = True
+    state, config, action_id = card._state, card._config, card._acp_action_id
+    requested = card._cfg.copy()
+    args = {"target": "chair", "stop_distance_m": 2.0, "stop_tolerance_m": 0.2,
+            key: value}
+    result = card._navigate_to(args)
+    assert result["state"] == "error" and key in result["message"]
+    assert card._state is state and state.target == "person"
+    assert card._config is config and card._cfg == requested
+    assert card._acp_action_id == action_id and card._paused is True
+    card._stop()
+
+
+@pytest.mark.parametrize("action", ["config", "navigate_to"])
+def test_distance_threshold_overflow_does_not_apply_any_configuration(action):
+    card = _running_tuning_card()
+    state, config, action_id = card._state, card._config, card._acp_action_id
+    requested = card._cfg.copy()
+    result = card.dispatch("navi", {"action": action, "target": "chair",
+                                    "stop_distance_m": 1e308, "stop_tolerance_m": 1e308})
+    assert result["state"] == "error"
+    assert card._state is state and card._config is config and card._cfg == requested
+    assert card._acp_action_id == action_id
+    card._stop()
 
 
 def test_every_schema_default_matches_the_file_default():
