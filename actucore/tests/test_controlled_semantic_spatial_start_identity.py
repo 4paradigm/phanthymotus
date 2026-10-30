@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import os
 import sys
@@ -17,7 +18,7 @@ for directory in (TESTS_DIR.parent, TESTS_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-from test_controlled_semantic_spatial_plugin import FakeComponent, FakeRuntime  # noqa: E402
+from test_controlled_semantic_spatial_plugin import FakeComponent, FakeRuntime, _input_descriptors  # noqa: E402
 from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
 
 
@@ -34,10 +35,13 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
         )
         self.bindings = [
             {"port": "lidar", "topic": "/source/lidar"},
-            {"port": "imu", "topic": "/source/imu"},
             {"port": "rgb", "topic": "/camera/color"},
         ]
+        self.descriptors = _input_descriptors(self.bindings, "/source/imu")
         return self.plugin
+
+    def expected(self, bindings=None, imu="/source/imu"):
+        return {**{b["port"]: b["topic"] for b in (self.bindings if bindings is None else bindings)}, "imu": imu}
 
     def call(self, action, **args):
         return self.plugin.dispatch(self.plugin.PREFIX, {"action": action, **args})
@@ -47,97 +51,102 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
         self.assertEqual(info["instance_id"], owner)
         self.assertTrue(info["instance_match"])
         self.assertEqual(info["state"], "ready")
-        self.assertEqual({p["port"]: p["topic"] for p in info["topic_in"] if p["connected"]}, expected)
+        self.assertEqual({p["port"]: p["topic"] for p in info["topic_in"] if p["connected"]},
+                         {port: topic for port, topic in expected.items() if port != "imu"})
         self.assertTrue(self.runtime.started)
 
     def test_multiple_bindings_same_mapping_is_idempotent_not_sorted_assignment(self):
         self.make_plugin()
-        start = self.call("start", instance_id="card-a", input_bindings=self.bindings)
+        start = self.call("start", instance_id="card-a", input_descriptors=self.descriptors)
         self.assertEqual(start["state"], "ready")
-        expected = {b["port"]: b["topic"] for b in self.bindings}
+        expected = self.expected()
         self.assertEqual(self.runtime.start_kwargs["input_topics"], expected)
-        retry = self.call("start", instance_id="card-a", input_bindings=list(reversed(self.bindings)))
+        retry = self.call("start", instance_id="card-a", input_descriptors=list(reversed(self.descriptors)))
         self.assertTrue(retry["already_started"])
         self.assert_owner("card-a", expected)
-        swaps = [dict(b) for b in self.bindings]
-        swaps[0]["topic"], swaps[1]["topic"] = swaps[1]["topic"], swaps[0]["topic"]
-        error = self.call("start", instance_id="card-a", input_bindings=swaps)
-        self.assertEqual(error["error_code"], "navigation_wiring_conflict")
-        self.assertIn("stop", error["error"])
-        self.assert_owner("card-a", expected)
+        # Both valid external port reassignment and changing the hidden IMU are conflicts.
+        swaps = _input_descriptors([
+            {"port": "lidar", "topic": "/camera/color"},
+            {"port": "rgb", "topic": "/source/lidar"},
+        ], "/source/imu")
+        changed_imu = copy.deepcopy(self.descriptors)
+        changed_imu[0]["descriptor"]["associated_imu"]["topic"] = "/other/imu"
+        for descriptors in (swaps, changed_imu):
+            error = self.call("start", instance_id="card-a", input_descriptors=descriptors)
+            self.assertEqual(error["error_code"], "navigation_wiring_conflict")
+            self.assertIn("stop", error["error"])
+            self.assert_owner("card-a", expected)
         self.assertEqual(self.runtime.stop_calls, 0)
 
     def test_missing_empty_invalid_and_changed_inputs_never_reuse_wiring(self):
         self.make_plugin()
-        self.call("start", instance_id="a", input_bindings=self.bindings)
-        expected = {b["port"]: b["topic"] for b in self.bindings}
+        self.assertEqual(self.call("start", instance_id="a", input_descriptors=self.descriptors)["state"], "ready")
+        expected = self.expected()
+        bad_imu = copy.deepcopy(self.descriptors)
+        del bad_imu[0]["descriptor"]["associated_imu"]
         for args in ({}, {"input_bindings": []}, {"input_topics": []},
-                     {"input_bindings": [{"port": "lidar", "topic": "/source/lidar"}]},
-                     {"input_bindings": [{"port": "lidar", "topic": ""}]},
-                     {"input_bindings": "invalid"},
-                     {"input_topics": 1, "input_topic": "/source/imu"},
-                     {"input_topic": 1}):
+                     {"input_bindings": self.bindings},
+                     {"input_descriptors": []}, {"input_descriptors": "invalid"},
+                     {"input_descriptors": bad_imu},
+                     {"input_descriptors": self.descriptors, "input_bindings": []},
+                     {"input_descriptors": self.descriptors, "input_topics": 1},
+                     {"input_descriptors": self.descriptors, "input_topic": 1}):
             with self.subTest(args=args):
                 error = self.call("start", instance_id="a", **args)
                 self.assertEqual(error["error_code"], "invalid_canvas_wiring")
                 self.assert_owner("a", expected)
-        changed = self.bindings[:2]
-        error = self.call("start", instance_id="a", input_bindings=changed)
+        changed = self.descriptors[:1]  # RGB is optional, but changes identity.
+        error = self.call("start", instance_id="a", input_descriptors=changed)
         self.assertEqual(error["error_code"], "navigation_wiring_conflict")
         self.assert_owner("a", expected)
 
     def test_different_id_and_legacy_default_owner(self):
         self.make_plugin()
-        self.assertEqual(self.call("start", input_bindings=self.bindings)["instance_id"], "default")
+        self.assertEqual(self.call("start", input_descriptors=self.descriptors)["instance_id"], "default")
         for value in (None, "", "default"):
-            args = {"input_bindings": self.bindings}
+            args = {"input_descriptors": self.descriptors}
             if value is not None:
                 args["instance_id"] = value
             self.assertTrue(self.call("start", **args)["already_started"])
-        conflict = self.call("start", instance_id="a", input_bindings=self.bindings)
+        conflict = self.call("start", instance_id="a", input_descriptors=self.descriptors)
         self.assertEqual(conflict["error_code"], "navigation_instance_conflict")
         self.assertIn("stop", conflict["error"])
-        self.assert_owner("default", {b["port"]: b["topic"] for b in self.bindings})
+        self.assert_owner("default", self.expected())
         self.assertEqual(self.call("stop")["state"], "idle")
-        self.assertEqual(self.call("start", instance_id="a", input_bindings=self.bindings)["state"], "ready")
-        self.assertEqual(self.call("start", input_bindings=self.bindings)["error_code"], "navigation_instance_conflict")
-        self.assert_owner("a", {b["port"]: b["topic"] for b in self.bindings})
+        self.assertEqual(self.call("start", instance_id="a", input_descriptors=self.descriptors)["state"], "ready")
+        self.assertEqual(self.call("start", input_descriptors=self.descriptors)["error_code"], "navigation_instance_conflict")
+        self.assert_owner("a", self.expected())
 
     def test_null_and_whitespace_ids_share_legacy_default(self):
         self.make_plugin()
-        self.assertEqual(self.call("start", instance_id=None, input_bindings=self.bindings)["instance_id"], "default")
+        self.assertEqual(self.call("start", instance_id=None, input_descriptors=self.descriptors)["instance_id"], "default")
         for value in (None, "", "   ", "default"):
-            self.assertTrue(self.call("start", instance_id=value, input_bindings=self.bindings)["already_started"])
+            self.assertTrue(self.call("start", instance_id=value, input_descriptors=self.descriptors)["already_started"])
 
-    def test_topic_list_order_is_irrelevant_but_changed_selection_is_not(self):
+    def test_topic_only_starts_require_live_descriptors(self):
         self.make_plugin()
-        defaults = {p["port"]: p["topic"] for p in self.plugin.get_tools()[0]["topic_in"]}
-        topics = [defaults["lidar"], defaults["imu"], defaults["rgb"]]
-        start = self.call("start", instance_id="a", input_topics=topics, input_topic=topics[0])
+        topics = [b["topic"] for b in self.bindings]
+        for args in ({"input_topics": topics}, {"input_topic": topics[0]},
+                     {"input_bindings": self.bindings}):
+            with self.subTest(args=args):
+                result = self.call("start", instance_id="a", **args)
+                self.assertEqual(result["error_code"], "invalid_canvas_wiring")
+                self.assertIn("descriptor", result["error"])
+                self.assertFalse(self.runtime.started)
+        start = self.call("start", instance_id="a", input_descriptors=self.descriptors,
+                          input_topics=topics, input_topic=topics[0])
         self.assertEqual(start["state"], "ready")
-        self.assertEqual(self.runtime.start_kwargs["input_topics"],
-                         {port: defaults[port] for port in ("lidar", "imu", "rgb")})
-        self.assertTrue(self.call("start", instance_id="a", input_topics=list(reversed(topics)))["already_started"])
-        # Bindings have precedence and express the same accepted mapping.
-        equivalent = [{"port": port, "topic": defaults[port]} for port in ("rgb", "imu", "lidar")]
-        self.assertTrue(self.call("start", instance_id="a", input_bindings=equivalent)["already_started"])
-        changed = self.call("start", instance_id="a", input_topics=topics[:2])
-        self.assertEqual(changed["error_code"], "navigation_wiring_conflict")
-        self.assert_owner("a", {port: defaults[port] for port in ("lidar", "imu", "rgb")})
-
-    def test_topic_list_rejects_noncanonical_paths_without_bindings(self):
-        self.make_plugin()
-        result = self.call("start", instance_id="a", input_topics=["/live/lidar", "/live/imu"])
-        self.assertEqual(result["error_code"], "invalid_canvas_wiring")
-        self.assertIn("lidar", result["error"])
-        self.assertIn("imu", result["error"])
-        self.assertFalse(self.runtime.started)
+        self.assertTrue(self.call("start", instance_id="a", input_descriptors=list(reversed(self.descriptors)),
+                                  input_topics=list(reversed(topics)), input_bindings=list(reversed(self.bindings)))["already_started"])
+        error = self.call("start", instance_id="a", input_descriptors=self.descriptors, input_topics=topics[:1])
+        self.assertEqual(error["error_code"], "invalid_canvas_wiring")
+        self.assert_owner("a", self.expected())
 
     @unittest.skipUnless(importlib.util.find_spec("openai") and importlib.util.find_spec("fastapi"),
                          "Agent Core dependencies are not installed")
     def test_agent_core_start_project_with_real_navigation_plugin(self):
         # Exercise the actual Core startup orchestration with a fake MCP
-        # transport, including two upstream sources and their live topics.
+        # transport, including the LiDAR source's live associated IMU descriptor.
         self.make_plugin()
         core_src = TESTS_DIR.parent.parent / "agent-core" / "src"
         sys.path.insert(0, str(core_src))
@@ -148,7 +157,9 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
                 from api import config as config_api
                 calls = []
                 defaults = {p["port"]: p["topic"] for p in self.plugin.get_tools()[0]["topic_in"]}
-                sources = {"lidar-source": defaults["lidar"], "imu-source": defaults["imu"]}
+                sources = {"lidar-source": defaults["lidar"]}
+                source_descriptor = _input_descriptors([{"port": "lidar", "topic": sources["lidar-source"]}], "/source/imu")[0]["descriptor"]
+                source_descriptor["port"] = "navigation_lidar"
                 class Request:
                     def __init__(self, tool, arguments):
                         self.tool, self.arguments = tool, arguments
@@ -158,8 +169,7 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
                     calls.append((req.tool, args))
                     if req.tool == self.plugin.PREFIX:
                         return {"code": 200, "data": self.plugin.dispatch(req.tool, args)}
-                    return {"code": 200, "data": {"state": "ready", "topic_out": [
-                        {"topic": sources[args["instance_id"]], "format": "data/json"}]}}
+                    return {"code": 200, "data": {"state": "ready", "topic_out": [source_descriptor]}}
 
                 async def nop(*args, **kwargs):
                     return None
@@ -174,18 +184,17 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
                 channel.manager = types.SimpleNamespace(sync_from_canvas=lambda: None, _adapters={})
                 channel._get_channel_configs = lambda: []
                 layout = {"cards": [
-                    {"id": "nav-card", "toolName": self.plugin.PREFIX, "mcpId": "nav", "topicIn": [{"port": "lidar"}, {"port": "imu"}]},
+                    {"id": "nav-card", "toolName": self.plugin.PREFIX, "mcpId": "nav", "topicIn": [{"port": "lidar"}]},
                     {"id": "lidar-source", "toolName": "lidar", "mcpId": "source"},
-                    {"id": "imu-source", "toolName": "imu", "mcpId": "source"},
                 ], "connections": [
-                    {"fromCardId": "lidar-source", "toCardId": "nav-card", "fromPortIdx": 0, "toPortIdx": 0},
-                    {"fromCardId": "imu-source", "toCardId": "nav-card", "fromPortIdx": 0, "toPortIdx": 1},
+                    {"fromCardId": "lidar-source", "toCardId": "nav-card", "fromPortIdx": 0, "toPortIdx": 0,
+                     "fromPort": "navigation_lidar", "toPort": "lidar", "format": source_descriptor["format"]},
                 ]}
                 registry = {"nav": {"tool_definitions": [self.plugin.get_tools()[0]]}}
                 modules = {"api.mcp_manage": mcp, "api.motus_stream": stream,
                            "api.inspection": inspection, "channel.manager": channel}
                 with mock.patch.dict(sys.modules, modules), \
-                     mock.patch.object(config, "main", {"canvas_layout": layout, "core": {}, "services": {"mcp": []}}), \
+                     mock.patch.object(config, "main", {"canvas_layout": layout, "core": {}, "services": {"mcp": [{"id": "nav", "tools": [self.plugin.get_tools()[0]]}]}}), \
                      mock.patch.object(mcp_client, "registry", registry):
                     self.assertTrue(asyncio.run(config_api._do_start_project_impl()))
                     self.assertTrue(asyncio.run(config_api._do_start_project_impl()))
@@ -193,43 +202,45 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
                 self.assertEqual(len(starts), 2)
                 self.assertEqual(starts[0]["instance_id"], "nav-card")
                 self.assertEqual(starts[1], starts[0])
-                self.assertEqual(starts[0]["input_topics"], [sources["lidar-source"], sources["imu-source"]])
+                self.assertNotIn("input_topics", starts[0])
                 self.assertEqual(starts[0]["input_topic"], sources["lidar-source"])
                 self.assertNotIn("input_bindings", starts[0])
-                self.assert_owner("nav-card", {"lidar": defaults["lidar"], "imu": defaults["imu"]})
+                self.assertEqual(starts[0]["input_descriptors"], [{"port": "lidar", "topic": sources["lidar-source"], "descriptor": source_descriptor}])
+                self.assertEqual(self.runtime.start_kwargs["input_topics"], {"lidar": defaults["lidar"], "imu": "/source/imu"})
+                self.assert_owner("nav-card", {"lidar": defaults["lidar"], "imu": "/source/imu"})
         finally:
             sys.path.remove(str(core_src))
 
     def test_stop_pending_refuses_start_and_retains_owner(self):
         self.make_plugin()
-        self.call("start", instance_id="a", input_bindings=self.bindings)
+        self.call("start", instance_id="a", input_descriptors=self.descriptors)
         self.planning.stop_result = {"state": "error", "status": "error"}
         self.assertEqual(self.call("stop")["error_code"], "navigation_stop_pending")
-        self.assertEqual(self.call("start", instance_id="a", input_bindings=self.bindings)["error_code"], "navigation_start_cancelled")
+        self.assertEqual(self.call("start", instance_id="a", input_descriptors=self.descriptors)["error_code"], "navigation_start_cancelled")
         info = self.call("info", instance_id="a")
         self.assertEqual(info["state"], "stopping")
         self.assertEqual(info["instance_id"], "a")
         self.assertTrue(info["instance_match"])
         self.planning.stop_result = None
         self.assertEqual(self.call("stop")["state"], "idle")
-        self.assertEqual(self.call("start", instance_id="b", input_bindings=self.bindings)["state"], "ready")
+        self.assertEqual(self.call("start", instance_id="b", input_descriptors=self.descriptors)["state"], "ready")
 
     def test_confirmed_stop_then_new_owner_and_new_wiring(self):
         self.make_plugin()
-        self.call("start", instance_id="a", input_bindings=self.bindings)
+        self.call("start", instance_id="a", input_descriptors=self.descriptors)
         changed = [dict(b) for b in self.bindings]
         changed[0]["topic"] = "/new/lidar"
-        self.assertEqual(self.call("start", instance_id="b", input_bindings=changed)["error_code"], "navigation_instance_conflict")
+        self.assertEqual(self.call("start", instance_id="b", input_descriptors=_input_descriptors(changed, "/source/imu"))["error_code"], "navigation_instance_conflict")
         self.assertEqual(self.call("stop")["state"], "idle")
-        new = self.call("start", instance_id="b", input_bindings=changed)
+        new = self.call("start", instance_id="b", input_descriptors=_input_descriptors(changed, "/source/imu"))
         self.assertEqual(new["state"], "ready")
-        self.assert_owner("b", {b["port"]: b["topic"] for b in changed})
+        self.assert_owner("b", self.expected(changed))
 
     def test_stop_signal_during_retry_validation_prevents_idempotent_success(self):
         entered, release = threading.Event(), threading.Event()
 
         self.make_plugin()
-        self.call("start", instance_id="a", input_bindings=self.bindings)
+        self.call("start", instance_id="a", input_descriptors=self.descriptors)
         validate = self.plugin._validate_external_wiring
 
         def blocking_validate(args):
@@ -240,7 +251,7 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
 
         self.plugin._validate_external_wiring = blocking_validate
         results = {}
-        retry = threading.Thread(target=lambda: results.update(retry=self.call("start", instance_id="a", input_bindings=self.bindings)))
+        retry = threading.Thread(target=lambda: results.update(retry=self.call("start", instance_id="a", input_descriptors=self.descriptors)))
         stop = threading.Thread(target=lambda: results.update(stop=self.call("stop")))
         retry.start()
         try:
@@ -270,8 +281,8 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
 
         self.make_plugin(runtime=BlockingRuntime())
         results = {}
-        first = threading.Thread(target=lambda: results.update(first=self.call("start", instance_id="a", input_bindings=self.bindings)))
-        second = threading.Thread(target=lambda: results.update(second=self.call("start", instance_id="b", input_bindings=self.bindings)))
+        first = threading.Thread(target=lambda: results.update(first=self.call("start", instance_id="a", input_descriptors=self.descriptors)))
+        second = threading.Thread(target=lambda: results.update(second=self.call("start", instance_id="b", input_descriptors=self.descriptors)))
         first.start()
         try:
             self.assertTrue(entered.wait(2))
@@ -285,7 +296,7 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertEqual(results["first"]["state"], "ready")
         self.assertEqual(results["second"]["error_code"], "navigation_instance_conflict")
-        self.assert_owner("a", {b["port"]: b["topic"] for b in self.bindings})
+        self.assert_owner("a", self.expected())
 
 
 if __name__ == "__main__":

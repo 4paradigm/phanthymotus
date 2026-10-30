@@ -20,7 +20,9 @@ for directory in (ACTUCORE_ROOT, TESTS_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-from test_controlled_semantic_spatial_plugin import FakeComponent, FakeRuntime  # noqa: E402
+from test_controlled_semantic_spatial_plugin import (  # noqa: E402
+    FakeComponent, FakeRuntime, _input_descriptors,
+)
 from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
 
 
@@ -36,13 +38,16 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
 
     @staticmethod
     def call(plugin, action, **args):
+        if action == "start" and "input_bindings" in args:
+            args["input_descriptors"] = _input_descriptors(
+                args["input_bindings"], imu_topic="/custom/imu"
+            )
         return plugin.dispatch(plugin.PREFIX, {"action": action, **args})
 
     @staticmethod
     def bindings():
         return [
             {"port": "lidar", "topic": "/custom/lidar"},
-            {"port": "imu", "topic": "/custom/imu"},
             {"port": "rgb", "topic": "/custom/rgb"},
         ]
 
@@ -55,7 +60,7 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
             item = actual[binding["port"]]
             self.assertEqual(item["topic"], binding["topic"])
             self.assertIs(item["connected"], True)
-        self.assertEqual(set(actual), {"lidar", "imu", "rgb"})
+        self.assertEqual(set(actual), {"lidar", "rgb"})
 
     def assert_unmatched(self, info, state):
         self.assertEqual(info["state"], state)
@@ -67,13 +72,17 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
         self.assertTrue(info["topic_out"])
 
     def test_discovery_runtime_wrong_id_stop_and_restart(self):
-        plugin = self.make_plugin()
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime)
         declared = plugin.get_tools()[0]["topic_in"]
         pre = self.call(plugin, "info", instance_id="card-a")
         self.assert_unmatched(pre, "idle")
         self.assertIsNone(pre["instance_id"])
         start = self.call(plugin, "start", instance_id="card-a", input_bindings=self.bindings())
         self.assert_actual(start)
+        self.assertEqual(runtime.start_kwargs["input_topics"], {
+            "lidar": "/custom/lidar", "imu": "/custom/imu", "rgb": "/custom/rgb",
+        })
         self.assertEqual(start["state"], "ready")
         self.assertEqual(start["instance_id"], "card-a")
         self.assert_actual(self.call(
@@ -86,7 +95,6 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
         # A different card may not claim the existing running instance.
         stale = self.call(plugin, "start", instance_id="card-b", input_bindings=[
             {"port": "lidar", "topic": "/different/lidar"},
-            {"port": "imu", "topic": "/different/imu"},
         ])
         self.assertEqual(stale["error_code"], "navigation_instance_conflict")
         self.assertEqual(stale["instance_id"], "card-a")
