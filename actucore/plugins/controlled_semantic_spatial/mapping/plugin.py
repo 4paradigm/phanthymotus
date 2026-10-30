@@ -393,7 +393,8 @@ class FastLivo2Plugin:
                 "instance_id": instance_id or None,
                 "config": dict(self._cfg),
                 "topic_in": [
-                    {**item, "connected": bool(wired.get(item["port"]))}
+                    {**item, "topic": wired.get(item["port"], item["topic"]),
+                     "connected": bool(wired.get(item["port"]))}
                     for item in tool["topic_in"]
                 ],
                 "topic_out": tool["topic_out"],

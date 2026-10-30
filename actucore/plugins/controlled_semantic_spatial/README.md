@@ -13,7 +13,7 @@ LiDAR/IMU 转为同一个 REP-103 `sensor_frame`，提供
 
 ```text
 Driver navigation_lidar ──────> controlled_semantic_spatial card (ActuCore container)
-  └─ associated_imu metadata ──> internal MID360 IMU subscription
+Driver navigation_imu ────────> required IMU input
 optional RGB ────────────────┴─> semantic navigation
                             ├─ FAST-LIVO2 mapping/localization child process
                             ├─ Nav2 planner/controller child process
@@ -61,29 +61,49 @@ Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在�
 | --- | --- | --- |
 | `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `rgb` | `/ubuntu/camera/rgb` | 否；连接时启用语义导航 |
+| `imu` | `/ubuntu/navigation/imu` | 是 |
 
 Driver 卡片合并后的连线：
 
 | Driver 卡片 | 选择的输出能力 | 本卡片输入 |
 | --- | --- | --- |
 | 合并的 LiDAR 卡片 | `navigation_lidar`：带逐点时间戳的标准 `sensor_msgs/msg/PointCloud2` | `lidar` |
+| 合并的 LiDAR 卡片 | `navigation_imu`：标准 `sensor_msgs/msg/Imu` | `imu` |
 | 合并的相机卡片 | 标准 JPEG，`sensor_msgs/msg/CompressedImage`，`image/jpeg` | `rgb` |
 
-选择 `navigation_lidar`，不要选择旧点云输出；其实时描述符中的 `associated_imu`
-指定同雷达的 `sensor_msgs/msg/Imu` topic，由内部订阅，无独立 IMU 画布连线。
-Agent Core 在启动时校验绘线保存的源、目标端口身份与实时描述符，再传递实际
-连线的实时描述符；支持 Driver 的自定义绝对 topic。每个所连来源（包括 RGB）
-必须在画布输出和 live `info().topic_out` 中提供同一非空且同源唯一的稳定 `port`，
-格式也须一致；无 `port` 的通用 JPEG 输出不能直接接此卡片，须由来源适配后重连。
-缺少或冲突时拒绝启动，不猜测 IMU 名称。
-直接调用 `start` 同样必须提供完整 `input_descriptors`。原机身 `imu` 保持原用途。
+务必选择 `navigation_lidar` 标准 PointCloud2，**不要选择 legacy 压缩雷达输出**：
+旧输出可能被画布的格式匹配接受，但不是 FAST-LIVO2 需要的带逐点时间戳的
+`sensor_msgs/msg/PointCloud2`。仅凭 topic 名或连线不能验证 ROS 类型和内容。
 
-此身份校验仅在启动时执行，并非持续证明数据源身份。G1 的 cloud/IMU topic 可在
-Driver 配置中自定义，Driver 重建或重新配置可能改变它们；导航运行期间不会自动
-重查或重绑定关联 IMU。项目运行期间不得更换输入配置或生产者；上游重启、配置
-变更或数据来源变化前，用户必须先停止项目；若端口定义变化，删除并重新添加受影响
-卡片及其连线，再启动项目重新校验。旧 IMU 不保证一定被检测为 stale，已有 FAST-LIVO2 输出
-新鲜度检查不能证明 IMU 所属发布者身份，也不能替代此操作。
+本卡无需 Core 修改，也不要求 live `input_descriptors`。原版 Core 传单个
+`input_topic`，多输入时传 `input_topics`（以及其中一个 `input_topic`）；卡片
+按配置中的 topic 对照识别端口，不按输入顺序推测。以下配置在卡片 `config`
+中设置，空字符串恢复 namespace 默认；均须为空或合法 ROS 绝对 topic：
+
+| 配置 | 空值默认（namespace 为 `ubuntu`） | 用途 |
+| --- | --- | --- |
+| `lidar_topic` | `/ubuntu/navigation/lidar` | topic-only 输入的雷达对照 |
+| `rgb_topic` | `/ubuntu/camera/rgb` | topic-only 输入的可选 RGB 对照 |
+| `imu_topic` | `/ubuntu/navigation/imu` | topic-only 输入的 IMU 对照 |
+
+例如自定义设备先配置 `lidar_topic=/robot/lidar/cloud`、
+`rgb_topic=/robot/camera/jpeg`（有 RGB 时）、`imu_topic=/robot/lidar/imu`，
+然后分别连接雷达和 IMU 两条线并启动。topic-only 集合必须匹配已配置的雷达、
+IMU 和可选 RGB；未知、重复或冲突的 topic、缺雷达或 IMU 均拒绝启动。直接调用可用
+`input_bindings=[{"port":"lidar","topic":"/robot/lidar/cloud"},
+{"port":"imu","topic":"/robot/lidar/imu"}]`，不依赖顺序；若同时传 topic
+参数，集合必须一致。直调绑定显式指定端口。配置只能在停止时改变；配置不自动
+发现任意 IMU，默认值也只是假设，其他设备必须由操作者核对并配置正确的 topic。
+Core 传给卡片的是去重后的 topic 集合，不包含目标端口身份，且可能回退到保存的
+来源 topic；因此本卡只能校验收到的集合，不能独立证明每根线的目标端口、
+来源当前在线或去重前没有重复。请在画布核对两根线并验证实际 ROS 数据。
+
+**安全边界：**这些检查只核对配置和输入字符串，不能证明 LiDAR 与 IMU 的
+真实关联、消息类型、内容或生产者身份。错误配置可能连接错误传感器并造成
+错误定位或运动；上游重启、配置变化或数据源变化前必须先停止项目，核对
+话题、类型、frame、时间戳和来源后重新启动。运行中不自动重查或重新绑定；
+旧 IMU 不一定被检测为 stale，已有新鲜度检查不能证明生产者身份。原机身
+`imu` 保持原用途，不应未经验证替代导航 IMU。
 
 语义模块使用标准 JPEG，以本地单调接收时间检查新鲜度和近似配对，不依赖相机
 标定、外参或 PSE1 时间，也不代表图像和位姿的采集时钟同步。Driver 原有 PSE1
@@ -91,12 +111,12 @@ Driver 配置中自定义，Driver 重建或重新配置可能改变它们；导
 
 升级旧画布时先停止项目，删除旧导航卡片以及相关旧 LiDAR、相机源卡片，刷新卡片
 定义后重新添加所需卡片、接线并保存；仅删除旧线后重连不足以保证旧卡的端口已更新。
-旧连接缺少源或目标端口身份，会拒绝启动而不会自动迁移。原 RGB PSE1 连线
+旧连接不会自动迁移或验证生产者身份。原 RGB PSE1 连线
 需移除并改接标准 JPEG 输出，不假定旧连线或端口索引自动迁移。已有 Driver
 `camera_depth` 和 `camera_distance` 卡片及其独立深度输出不在此移除范围。
 
-这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动只要
-`lidar`（其描述符须包含关联 IMU）。旧版 `goal_pose` 外部输入及对应协议、订阅已删除；升级时须先
+这是完整的外部输入集合；各端口的 `required` 都显式声明，正常启动须连接
+`lidar` 和 `imu`。旧版 `goal_pose` 外部输入及对应协议、订阅已删除；升级时须先
 停止项目，删除旧导航卡片并按上面的迁移步骤重建和保存画布。旧配置中的语义模块
 `goal_topic` 和 `subscriber_timeout_sec` 也须移除，否则卡片拒绝启动。坐标导航继续通过 MCP
 `navigate_to_pose`，语义导航通过同进程 planner 执行。Nav2 goal response 超时只表示结果未知，不能视为任务已接受或停止。

@@ -38,6 +38,9 @@ def _config_properties() -> dict:
         "/ubuntu/navigation/odom",
     )["configSchema"]["properties"]
     result = {
+        "lidar_topic": {"type": "string", "default": "", "description": "Expected LiDAR topic for topic-only Canvas input; empty uses the namespace default"},
+        "rgb_topic": {"type": "string", "default": "", "description": "Expected RGB topic for topic-only Canvas input; empty uses the namespace default"},
+        "imu_topic": {"type": "string", "default": "", "description": "Expected IMU topic for topic-only Canvas input; empty uses /<namespace>/navigation/imu"},
         "mapping_request_timeout_sec": deepcopy(mapping["request_timeout_sec"]),
         "mapping_discovery_timeout_sec": deepcopy(mapping["discovery_timeout_sec"]),
         "lidar_qos_depth": deepcopy(mapping["lidar_qos_depth"]),
@@ -117,20 +120,6 @@ def _action_properties() -> dict:
         ),
         "additionalProperties": {"type": "object"},
     }
-    result["input_descriptors"] = {
-        "type": "array",
-        "description": "Live upstream descriptors for explicitly connected input ports",
-        "items": {
-            "type": "object",
-            "properties": {
-                "port": {"type": "string"},
-                "topic": {"type": "string"},
-                "descriptor": {"type": "object"},
-            },
-            "required": ["port", "topic", "descriptor"],
-            "additionalProperties": False,
-        },
-    }
     result["control_interface"] = {
         "type": "object",
         "description": (
@@ -158,7 +147,7 @@ CONTROLLED_SEMANTIC_SPATIAL_ACTION_PARAMS = {
         "description": "Configure mapping, planning and semantic navigation",
     },
     "start": {
-        "params": ["instance_id", "input_topics", "input_bindings", "input_descriptors", "control_interface"],
+        "params": ["instance_id", "input_topic", "input_topics", "input_bindings", "control_interface"],
         "description": "Start the in-container runtime and acquire card resources",
     },
     "stop": {
@@ -182,6 +171,9 @@ def controlled_semantic_spatial_tool_definition(namespace: str) -> dict:
     rgb_input = deepcopy(semantic["topic_in"][0])
     rgb_input["required"] = False
     external_inputs.append(rgb_input)
+    imu_input = deepcopy(next(item for item in mapping["topic_in"] if item["port"] == "imu"))
+    imu_input["required"] = True
+    external_inputs.append(imu_input)
     component_outputs = {
         str(item.get("port", "")): item
         for item in [*mapping["topic_out"], *planning["topic_out"]]

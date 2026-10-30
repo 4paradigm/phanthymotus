@@ -110,6 +110,16 @@ def _bindings(plugin: FastLivo2Plugin) -> list[dict]:
 
 
 class FastLivo2PluginTest(unittest.TestCase):
+    def test_info_reports_actual_bound_sensor_topics(self) -> None:
+        plugin = FastLivo2Plugin({}, None, backend=ReadyBackend())
+        topics = {"lidar": "/robot/cloud", "imu": "/robot/imu"}
+        result = plugin.dispatch("fast_livo2", {
+            "action": "start",
+            "input_bindings": [{"port": port, "topic": topic} for port, topic in topics.items()],
+        })
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual({item["port"]: item["topic"] for item in result["topic_in"] if item["connected"]}, topics)
+
     def test_info_is_lazy_and_start_requires_exact_wiring(self) -> None:
         backend = ReadyBackend()
         plugin = FastLivo2Plugin({}, None, backend=backend)

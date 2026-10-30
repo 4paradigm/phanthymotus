@@ -661,8 +661,7 @@ async def _do_start_project_impl():
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
                                  control_interface: dict = None,
-                                 camera_info: dict = None,
-                                 input_descriptors: list = None):
+                                 camera_info: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -701,11 +700,6 @@ async def _do_start_project_impl():
             wanted = [input_topic]
             args['input_topic'] = input_topic
             info_args['input_topic'] = input_topic
-
-        if input_descriptors is not None:
-            # Only opted-in consumers receive descriptors; legacy tools keep
-            # their existing argument shape even with strict input schemas.
-            args['input_descriptors'] = input_descriptors
 
         if control_interface:
             # The action space of the card this one drives. Sent on `start` so a
@@ -926,55 +920,6 @@ async def _do_start_project_impl():
             return topics[0], [], unresolved
         return '', [], unresolved
 
-    def _input_descriptors(card: dict) -> tuple[list | None, str]:
-        """Resolve opt-in bindings from live source info, never from snapshots.
-
-        The saved connection identity is captured when the user draws the line;
-        card.topicIn alone can have been overwritten by a later heartbeat.
-        """
-        tool = find_tool(card.get('mcpId', ''), card.get('toolName', ''))
-        properties = ((tool.get('inputSchema') or {}).get('properties') or {})
-        if 'input_descriptors' not in properties:
-            return None, ''
-        ports = tool.get('topic_in') or []
-        result, seen_ports, seen_topics = [], set(), set()
-        for conn in (c for c in connections if c.get('toCardId') == card.get('id')):
-            try:
-                def index(value):
-                    if isinstance(value, bool) or not isinstance(value, (int, str)):
-                        raise ValueError
-                    if isinstance(value, str) and (not value.isascii() or not value.isdigit()):
-                        raise ValueError
-                    return int(value)
-                src_idx = index(conn['fromPortIdx'])
-                dst_idx = index(conn['toPortIdx'])
-                source = (resolved_info.get(conn.get('fromCardId')) or {}).get('topic_out')
-                if not isinstance(source, list) or not isinstance(ports, list) or src_idx < 0 or dst_idx < 0:
-                    raise ValueError
-                descriptor, target = source[src_idx], ports[dst_idx]
-                if not isinstance(descriptor, dict) or not isinstance(target, dict):
-                    raise ValueError
-                port, fmt = target.get('port'), target.get('format')
-                source_port = descriptor.get('port')
-                topic = _topic_of_connection(conn)
-                if (not isinstance(port, str) or not port or not isinstance(fmt, str) or not fmt
-                        or not isinstance(source_port, str) or not source_port
-                        or conn.get('fromPort') != source_port
-                        or conn.get('toPort') != port or conn.get('format') != fmt
-                        or descriptor.get('format') != fmt or not isinstance(topic, str)
-                        or not topic or descriptor.get('topic') != topic
-                        or sum(isinstance(p, dict) and p.get('port') == port for p in ports) != 1
-                        or sum(isinstance(p, dict) and p.get('port') == source_port for p in source) != 1
-                        or sum(isinstance(p, dict) and p.get('topic') == topic for p in source) != 1
-                        or port in seen_ports or topic in seen_topics):
-                    raise ValueError
-            except (KeyError, TypeError, ValueError, IndexError):
-                return None, '输入端口身份或实时输出描述缺失/冲突，请删除旧连线后重新连接'
-            seen_ports.add(port)
-            seen_topics.add(topic)
-            result.append({'port': port, 'topic': topic, 'descriptor': descriptor})
-        return result, ''
-
     def _upstream_camera_info(card_id: str) -> dict:
         """What this card's sources say about the optics behind each input.
 
@@ -1129,16 +1074,6 @@ async def _do_start_project_impl():
             errors.append(tool_name)
             continue
 
-        input_descriptors, input_descriptor_error = _input_descriptors(card)
-        if input_descriptor_error:
-            tool_name = card.get('toolName', '')
-            await push_event({'type': 'project_start_item', 'payload': {
-                'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
-                'status': 'error', 'message': input_descriptor_error,
-            }})
-            errors.append(tool_name)
-            continue
-
         descriptor, descriptor_error = await _downstream_descriptor(card.get('id', ''))
         if descriptor_error:
             tool_name = card.get('toolName', '')
@@ -1152,8 +1087,7 @@ async def _do_start_project_impl():
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
                                  control_interface=descriptor,
-                                 camera_info=_upstream_camera_info(card.get('id', '')),
-                                 input_descriptors=input_descriptors)
+                                 camera_info=_upstream_camera_info(card.get('id', '')))
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:

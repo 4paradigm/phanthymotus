@@ -21,7 +21,7 @@ for directory in (ACTUCORE_ROOT, TESTS_DIR):
         sys.path.insert(0, str(directory))
 
 from test_controlled_semantic_spatial_plugin import (  # noqa: E402
-    FakeComponent, FakeRuntime, _input_descriptors,
+    FakeComponent, FakeRuntime,
 )
 from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
 
@@ -38,10 +38,6 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
 
     @staticmethod
     def call(plugin, action, **args):
-        if action == "start" and "input_bindings" in args:
-            args["input_descriptors"] = _input_descriptors(
-                args["input_bindings"], imu_topic="/custom/imu"
-            )
         return plugin.dispatch(plugin.PREFIX, {"action": action, **args})
 
     @staticmethod
@@ -49,6 +45,7 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
         return [
             {"port": "lidar", "topic": "/custom/lidar"},
             {"port": "rgb", "topic": "/custom/rgb"},
+            {"port": "imu", "topic": "/custom/imu"},
         ]
 
     def assert_actual(self, info):
@@ -60,7 +57,7 @@ class ControlledSemanticSpatialInstanceInfoTest(unittest.TestCase):
             item = actual[binding["port"]]
             self.assertEqual(item["topic"], binding["topic"])
             self.assertIs(item["connected"], True)
-        self.assertEqual(set(actual), {"lidar", "rgb"})
+        self.assertEqual(set(actual), {"lidar", "rgb", "imu"})
 
     def assert_unmatched(self, info, state):
         self.assertEqual(info["state"], state)

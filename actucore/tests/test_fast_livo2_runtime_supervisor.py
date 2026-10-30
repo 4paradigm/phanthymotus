@@ -148,6 +148,24 @@ def _prepare_adapter_concurrency(adapter) -> None:
 
 class FastLivo2RuntimeSupervisorTest(unittest.TestCase):
 
+    def test_algorithm_command_remaps_both_external_sensor_topics(self) -> None:
+        supervisor = object.__new__(FastLivo2Supervisor)
+        supervisor._lidar_qos_depth = 2
+        supervisor._imu_qos_depth = 200
+        values = {
+            "pcd_save_interval": -1,
+            "config_path": "/tmp/fast-livo.yaml",
+            "mapper_runtime_topic": "/navigation/diagnostics",
+            "lidar_topic": "/robot/lidar/cloud",
+            "imu_topic": "/robot/lidar/imu",
+            "raw_cloud_topic": "/navigation/raw/cloud",
+            "raw_odom_topic": "/navigation/raw/odom",
+        }
+        supervisor.get_parameter = lambda name: SimpleNamespace(value=values[name])
+        command = supervisor._algorithm_command()
+        self.assertEqual(command[0], "/opt/fast_livo_ws/install/fast_livo/lib/fast_livo/fastlivo_mapping")
+        self.assertIn("/livox/lidar:=/robot/lidar/cloud", command)
+        self.assertIn("/livox/imu:=/robot/lidar/imu", command)
 
     def test_localization_abnormal_exit_is_terminal_after_adapter_unload(self) -> None:
         supervisor = object.__new__(FastLivo2Supervisor)

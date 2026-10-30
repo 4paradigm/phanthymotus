@@ -186,19 +186,8 @@ def _control_descriptor(**overrides):
     return descriptor
 
 
-def _input_descriptors(bindings, imu_topic="/ubuntu/navigation/imu"):
-    formats = {item["port"]: item["format"] for item in
-               controlled_semantic_spatial_tool_definition("ubuntu")["topic_in"]}
-    result = []
-    for binding in bindings:
-        port, topic = binding["port"], binding["topic"]
-        descriptor = {"topic": topic, "format": formats.get(port, "unknown")}
-        if port == "lidar":
-            descriptor.update({"ros_type": "sensor_msgs/msg/PointCloud2",
-                               "associated_imu": {"topic": imu_topic, "format": "sensor/imu",
-                                                  "ros_type": "sensor_msgs/msg/Imu"}})
-        result.append({"port": port, "topic": topic, "descriptor": descriptor})
-    return result
+def _input_bindings(bindings):
+    return [dict(item) for item in bindings]
 
 
 def _external_bindings():
@@ -207,8 +196,8 @@ def _external_bindings():
             if item["required"]]
 
 
-def _external_descriptors():
-    return _input_descriptors(_external_bindings())
+def _external_bindings_for_start():
+    return _input_bindings(_external_bindings())
 
 
 class ControlledSemanticSpatialContractTest(unittest.TestCase):
@@ -261,7 +250,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "controlled_semantic_spatial")
         self.assertEqual(
             [item["port"] for item in tool["topic_in"]],
-            ["lidar", "rgb"],
+            ["lidar", "rgb", "imu"],
         )
         optional_inputs = {
             item["port"]
@@ -278,9 +267,11 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
                 for item in tool["topic_in"]
                 if item["required"]
             },
-            {"lidar"},
+            {"lidar", "imu"},
         )
         inputs = {item["port"]: item for item in tool["topic_in"]}
+        self.assertEqual(inputs["imu"]["format"], "sensor/imu")
+        self.assertEqual(inputs["imu"]["ros_type"], "sensor_msgs/msg/Imu")
         self.assertEqual(
             inputs["rgb"]["topic"],
             "/ubuntu/camera/rgb",
@@ -695,12 +686,13 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
     def test_mainline_start_and_info_with_camera_metadata(self):
         plugin = self.make_plugin()
-        topics = ["/ubuntu/navigation/lidar", "/ubuntu/camera/rgb"]
+        topics = ["/ubuntu/navigation/lidar", "/ubuntu/camera/rgb", "/ubuntu/navigation/imu"]
         start = {
             "action": "start", "instance_id": "card-1",
             "input_topics": topics, "input_topic": topics[0],
-            "input_descriptors": _input_descriptors([
-                {"port": "lidar", "topic": topics[0]}, {"port": "rgb", "topic": topics[1]}]),
+            "input_bindings": _input_bindings([
+                {"port": "lidar", "topic": topics[0]}, {"port": "rgb", "topic": topics[1]},
+                {"port": "imu", "topic": topics[2]}]),
             "camera_info": {
                 topics[1]: {"schema": "motus.camera/1", "topic": topics[1],
                             "id": "vendor/model/rgb", "source": "unknown"},
@@ -735,7 +727,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         runtime = FakeRuntime()
         plugin = self.make_plugin(runtime=runtime)
         descriptor = _control_descriptor()
-        request = {"action": "start", "input_descriptors": _external_descriptors(),
+        request = {"action": "start", "input_bindings": _external_bindings_for_start(),
                    "control_interface": descriptor}
         started = plugin.dispatch(plugin.PREFIX, request)
         self.assertEqual(started["state"], "ready")
@@ -772,7 +764,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                 runtime = FakeRuntime()
                 plugin = self.make_plugin(runtime=runtime)
                 result = plugin.dispatch(plugin.PREFIX, {
-                    "action": "start", "input_descriptors": _external_descriptors(),
+                    "action": "start", "input_bindings": _external_bindings_for_start(),
                     "control_interface": descriptor,
                 })
                 self.assertEqual(result["state"], "ready")
@@ -796,14 +788,14 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         for descriptor, code in cases:
             with self.subTest(descriptor=descriptor):
                 result = plugin.dispatch(plugin.PREFIX, {
-                    "action": "start", "input_descriptors": _external_descriptors(),
+                    "action": "start", "input_bindings": _external_bindings_for_start(),
                     "control_interface": descriptor,
                 })
                 self.assertEqual(result["error_code"], code)
                 self.assertFalse(runtime.started)
                 self.assertEqual(mapping.calls, [])
         result = plugin.dispatch(plugin.PREFIX, {
-            "action": "start", "input_descriptors": _external_descriptors(),
+            "action": "start", "input_bindings": _external_bindings_for_start(),
             "control_interface": {},
         })
         self.assertEqual(result["state"], "ready")
@@ -844,7 +836,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         start = {
             "action": "start",
             "instance_id": "same-card",
-            "input_descriptors": _external_descriptors(),
+            "input_bindings": _external_bindings_for_start(),
         }
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         result = {}
@@ -885,7 +877,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         mapping = FakeComponent("mapping")
         planning = FakeComponent("planning")
         plugin = self.make_plugin(runtime=runtime, mapping=mapping, planning=planning)
-        start = {"action": "start", "input_descriptors": _external_descriptors()}
+        start = {"action": "start", "input_bindings": _external_bindings_for_start()}
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         result = {}
         thread = threading.Thread(name="old-mapping-request", target=lambda: result.update(
@@ -927,7 +919,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         planning = Planning("planning")
         runtime = FakeRuntime()
         plugin = self.make_plugin(planning=planning, runtime=runtime)
-        start = {"action": "start", "input_descriptors": _external_descriptors()}
+        start = {"action": "start", "input_bindings": _external_bindings_for_start()}
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         result = {}
         thread = threading.Thread(target=lambda: result.update(plugin.dispatch(
@@ -996,7 +988,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
         planning = Planning()
         plugin = self.make_plugin(planning=planning)
-        start = {"action": "start", "input_descriptors": _external_descriptors()}
+        start = {"action": "start", "input_bindings": _external_bindings_for_start()}
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         plugin._transition_lock = ObservedLock()
         results = {}
@@ -1045,7 +1037,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
         planning = Planning("planning")
         plugin = self.make_plugin(planning=planning)
-        start = {"action": "start", "input_descriptors": _external_descriptors()}
+        start = {"action": "start", "input_bindings": _external_bindings_for_start()}
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         errors = []
         def control():
@@ -1093,7 +1085,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         semantic._processor._goal_handler = plugin._handle_semantic_goal
         start = {
             "action": "start",
-            "input_descriptors": _input_descriptors(_external_bindings() + [{"port": "rgb", "topic": "/camera/rgb"}]),
+            "input_bindings": _input_bindings(_external_bindings() + [{"port": "rgb", "topic": "/camera/rgb"}]),
         }
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         captured = plugin.dispatch(plugin.PREFIX, {"action": "capture"})
@@ -1148,7 +1140,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                 planning = FakeComponent("planning")
                 plugin = self.make_plugin(semantic=semantic, planning=planning)
                 started = plugin.dispatch("controlled_semantic_spatial", {
-                    "action": "start", "input_descriptors": _external_descriptors(),
+                    "action": "start", "input_bindings": _external_bindings_for_start(),
                 })
                 self.assertEqual(started["state"], "ready")
                 result = plugin.dispatch("controlled_semantic_spatial", {
@@ -1191,7 +1183,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             {
                 "action": "start",
                 "instance_id": "canvas-navigation",
-                "input_descriptors": _external_descriptors(),
+                "input_bindings": _external_bindings_for_start(),
             },
         )
 
@@ -1242,9 +1234,10 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         for binding in bindings:
             binding["topic"] = custom[binding["port"]]
 
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": custom["imu"]})["state"], "configured")
         result = plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _input_descriptors(bindings, custom["imu"])},
+            {"action": "start", "input_bindings": _input_bindings(bindings)},
         )
 
         self.assertEqual(result["state"], "ready")
@@ -1257,17 +1250,18 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             {"rgb", "livo_odom", "livo_status"},
         )
 
-    def test_lidar_associated_imu_reaches_runtime_and_mapping(self):
-        # One public connection carries a custom cloud and its associated IMU.
+    def test_configured_imu_reaches_runtime_and_mapping(self):
+        # Both externally connected topics must reach the runtime and mapper.
         runtime = FakeRuntime()
         mapping = FakeComponent("mapping")
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
         topics = {"lidar": "/robot/lidar/cloud", "imu": "/robot/lidar/imu"}
-        bindings = [{"port": "lidar", "topic": topics["lidar"]}]
+        bindings = [{"port": port, "topic": topic} for port, topic in topics.items()]
 
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": topics["imu"]})["state"], "configured")
         result = plugin.dispatch(plugin.PREFIX, {
             "action": "start", "instance_id": "navigation",
-            "input_descriptors": _input_descriptors(bindings, topics["imu"]),
+            "input_bindings": _input_bindings(bindings),
         })
 
         self.assertEqual(result["state"], "ready")
@@ -1281,40 +1275,37 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         self.assertIn("lidar_topic:=/robot/lidar/cloud", launch)
         self.assertIn("imu_topic:=/robot/lidar/imu", launch)
 
-    def test_unlabelled_inputs_cannot_guess_imu(self):
+    def test_topic_only_and_binding_validation(self):
         plugin = self.make_plugin()
-        for topics in (["/ubuntu/navigation/lidar"], ["/robot/lidar/cloud", "/robot/lidar/imu"]):
-            rejected = plugin._validate_external_wiring({"input_topics": topics})
-            self.assertEqual(rejected["error_code"], "invalid_canvas_wiring")
+        default = "/ubuntu/navigation/lidar"
+        self.assertEqual(plugin._validate_external_wiring({"input_topics": [default, "/ubuntu/navigation/imu"]})["wired_topics"],
+                         {"lidar": default, "imu": "/ubuntu/navigation/imu"})
+        for args in ({}, {"input_topic": default}, {"input_topics": ["/robot/lidar/cloud"]},
+                     {"input_topics": [default, default]}, {"input_topics": None},
+                     {"input_topic": []}, {"input_bindings": None},
+                     {"input_bindings": [{"port": [], "topic": "/bad"}]},
+                     {"input_bindings": [{"port": "lidar", "topic": default}] * 2},
+                     {"input_bindings": [{"port": "imu", "topic": "/other"}]},
+                     {"input_bindings": [{"port": "lidar", "topic": default}], "input_topic": "/other"}):
+            with self.subTest(args=args):
+                self.assertEqual(plugin._validate_external_wiring(args)["error_code"], "invalid_canvas_wiring")
 
-    def test_descriptor_rejections_fail_before_runtime(self):
-        import copy
-        valid = _external_descriptors()
-        cases = []
-        for key, value in (("associated_imu", None), ("ros_type", "bad")):
-            item = copy.deepcopy(valid)
-            item[0]["descriptor"][key] = value
-            cases.append(item)
-        for key, value in (("topic", "relative/imu"), ("topic", valid[0]["topic"]),
-                           ("format", "bad"), ("ros_type", "bad")):
-            item = copy.deepcopy(valid)
-            item[0]["descriptor"]["associated_imu"][key] = value
-            cases.append(item)
-        cases.extend([valid + copy.deepcopy(valid), [], [{**valid[0], "topic": "/conflict"}]])
-        for descriptors in cases:
-            with self.subTest(descriptors=descriptors):
-                runtime = FakeRuntime()
-                plugin = self.make_plugin(runtime=runtime)
-                result = plugin.dispatch(plugin.PREFIX, {"action": "start", "input_descriptors": descriptors})
-                self.assertEqual(result["error_code"], "invalid_canvas_wiring")
-                self.assertFalse(runtime.started)
-        plugin = self.make_plugin()
-        for extra in ({"input_topics": ["/other"]}, {"input_topics": None},
-                      {"input_topics": [valid[0]["topic"], valid[0]["topic"]]},
-                      {"input_bindings": [{"port": [], "topic": "/bad"}]},
-                      {"input_bindings": None}, {"input_topic": []}):
-            result = plugin._validate_external_wiring({"input_descriptors": valid, **extra})
-            self.assertEqual(result["error_code"], "invalid_canvas_wiring")
+    def test_topic_config_validation_and_namespace_defaults(self):
+        runtime = FakeRuntime()
+        plugin = ControlledSemanticSpatialPlugin({}, "robot", None, runtime=runtime,
+            mapping_plugin=FakeComponent("mapping"), planning_plugin=FakeComponent("planning"),
+            semantic_plugin=FakeComponent("semantic"))
+        for updates in ({"imu_topic": "relative"}, {"imu_topic": None},
+                        {"lidar_topic": "/robot/navigation/imu"},
+                        {"rgb_topic": "/same", "imu_topic": "/same"}):
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", **updates})["error_code"], "invalid_config")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "start", "input_topics": ["/robot/navigation/lidar", "/robot/navigation/imu"]})["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["input_topics"], {"lidar": "/robot/navigation/lidar", "imu": "/robot/navigation/imu"})
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": "/other"})["error_code"], "config_while_running")
+        plugin.dispatch(plugin.PREFIX, {"action": "stop"})
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": "/other/imu"})["state"], "configured")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "start", "input_topics": ["/robot/navigation/lidar", "/other/imu"]})["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["input_topics"]["imu"], "/other/imu")
 
     def test_start_rejects_legacy_goal_topic_config(self):
         for key in ("goal_topic", "subscriber_timeout_sec", "sensor_sync_mode"):
@@ -1327,7 +1318,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                     semantic_plugin=FakeComponent("semantic"),
                 )
                 result = plugin.dispatch(plugin.PREFIX, {
-                    "action": "start", "input_descriptors": _external_descriptors(),
+                    "action": "start", "input_bindings": _external_bindings_for_start(),
                 })
                 self.assertEqual(result["error_code"], "invalid_config")
                 self.assertIn(key, result["error"])
@@ -1338,7 +1329,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         plugin = self.make_plugin(runtime=runtime)
         result = plugin.dispatch(plugin.PREFIX, {
             "action": "start",
-            "input_descriptors": _input_descriptors(_external_bindings() + [
+            "input_bindings": _input_bindings(_external_bindings() + [
                 {"port": "goal_pose", "topic": "/ubuntu/navigation/goal_pose"},
             ]),
         })
@@ -1363,7 +1354,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
                 result = plugin.dispatch(
                     "controlled_semantic_spatial",
-                    {"action": "start", "input_descriptors": _input_descriptors(bindings)},
+                    {"action": "start", "input_bindings": _input_bindings(bindings)},
                 )
 
                 self.assertEqual(result["error_code"], "invalid_canvas_wiring")
@@ -1374,7 +1365,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         runtime = FakeRuntime(fail=True)
         mapping = FakeComponent("mapping")
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
-        request = {"action": "start", "input_descriptors": _external_descriptors(),
+        request = {"action": "start", "input_bindings": _external_bindings_for_start(),
                    "control_interface": _control_descriptor()}
         failed = plugin.dispatch(plugin.PREFIX, request)
         self.assertEqual(failed["error_code"], "navigation_start_failed")
@@ -1400,7 +1391,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
         result = plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors(),
+            {"action": "start", "input_bindings": _external_bindings_for_start(),
              "control_interface": _control_descriptor()},
         )
 
@@ -1411,7 +1402,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         planning.fail_start = False
         minimal = {"control_interface": "motus.control/1", "mode": "twist"}
         retry = plugin.dispatch(plugin.PREFIX, {
-            "action": "start", "input_descriptors": _external_descriptors(),
+            "action": "start", "input_bindings": _external_bindings_for_start(),
             "control_interface": minimal,
         })
         self.assertEqual(retry["state"], "ready")
@@ -1429,7 +1420,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
         result = plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
 
         self.assertEqual(result["state"], "ready")
@@ -1460,7 +1451,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         start_result, stop_result = {}, {}
         start_thread = threading.Thread(target=lambda: start_result.update(
             plugin.dispatch(plugin.PREFIX, {
-                "action": "start", "input_descriptors": _external_descriptors(),
+                "action": "start", "input_bindings": _external_bindings_for_start(),
             })
         ))
         stop_thread = threading.Thread(target=lambda: stop_result.update(
@@ -1496,7 +1487,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
         start_thread = threading.Thread(target=lambda: start_result.update(
             plugin.dispatch(plugin.PREFIX, {
-                "action": "start", "input_descriptors": _external_descriptors(),
+                "action": "start", "input_bindings": _external_bindings_for_start(),
             })
         ))
         stop_thread = threading.Thread(target=lambda: stop_result.update(
@@ -1530,7 +1521,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             target=lambda: start_result.update(
                 plugin.dispatch(
                     "controlled_semantic_spatial",
-                    {"action": "start", "input_descriptors": _external_descriptors()},
+                    {"action": "start", "input_bindings": _external_bindings_for_start()},
                 )
             )
         )
@@ -1568,7 +1559,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         )
         plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _input_descriptors(_external_bindings() + [
+            {"action": "start", "input_bindings": _input_bindings(_external_bindings() + [
                 {"port": "rgb", "topic": "/robot/camera/rgb"}
             ])},
         )
@@ -1597,7 +1588,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         planning = FakeComponent("planning")
         plugin = self.make_plugin(planning=planning)
 
-        plugin.dispatch(plugin.PREFIX, {"action": "start", "input_descriptors": _external_descriptors()})
+        plugin.dispatch(plugin.PREFIX, {"action": "start", "input_bindings": _external_bindings_for_start()})
         plugin._handle_semantic_goal(
             {"x": 1.0, "y": -0.5, "yaw": 0.25, "speed": 0.5},
             admission_ticket=plugin._generation,
@@ -1621,7 +1612,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                 planning = FakeComponent("planning", stop_result=response)
                 plugin = self.make_plugin(runtime=runtime, planning=planning)
                 self.assertEqual(plugin.dispatch(plugin.PREFIX, {
-                    "action": "start", "input_descriptors": _external_descriptors(),
+                    "action": "start", "input_bindings": _external_bindings_for_start(),
                 })["state"], "ready")
                 self.assertEqual(plugin.stop()["error_code"], "navigation_stop_pending")
                 self.assertTrue(runtime.started)
@@ -1634,7 +1625,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             "state": "error", "status": "error", "error_code": "unconfirmed",
         })
         plugin = self.make_plugin(runtime=runtime, mapping=mapping, planning=planning)
-        start = {"action": "start", "input_descriptors": _external_descriptors()}
+        start = {"action": "start", "input_bindings": _external_bindings_for_start()}
         result = plugin.dispatch(plugin.PREFIX, start)
         self.assertEqual(result["error_code"], "navigation_start_failed")
         self.assertFalse(result["cleanup_confirmed"])
@@ -1659,7 +1650,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         planning = FakeComponent("planning", fail_start=True)
         plugin = self.make_plugin(runtime=runtime, mapping=mapping, planning=planning)
         result = plugin.dispatch(plugin.PREFIX, {
-            "action": "start", "input_descriptors": _external_descriptors(),
+            "action": "start", "input_bindings": _external_bindings_for_start(),
         })
         self.assertTrue(result["cleanup_confirmed"])
         self.assertEqual(result["error_code"], "navigation_start_failed")
@@ -1689,7 +1680,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         )
         plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
 
         result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
@@ -1716,7 +1707,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
         plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
 
         result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
@@ -1742,7 +1733,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
         plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
 
         result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
@@ -1778,7 +1769,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             "canvas_wired": False, "retryable": False,
         })
         plugin = self.make_plugin(runtime=runtime, mapping=mapping)
-        start = {"action": "start", "input_descriptors": _external_descriptors()}
+        start = {"action": "start", "input_bindings": _external_bindings_for_start()}
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         self.assertEqual(plugin.stop()["error_code"], "navigation_stop_pending")
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["error_code"],
@@ -1805,7 +1796,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
 
         runtime = MixedRuntime()
         plugin = self.make_plugin(runtime=runtime)
-        start = {"action": "start", "input_descriptors": _external_descriptors()}
+        start = {"action": "start", "input_bindings": _external_bindings_for_start()}
         self.assertEqual(plugin.dispatch(plugin.PREFIX, start)["state"], "ready")
         self.assertEqual(plugin.stop()["error_code"], "navigation_stop_pending")
         self.assertTrue(plugin._started)
@@ -1822,7 +1813,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         plugin = self.make_plugin(runtime=runtime)
         plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
 
         result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
@@ -1852,7 +1843,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         )
         plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
 
         result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
@@ -1883,7 +1874,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         )
         plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
 
         result = plugin.dispatch("controlled_semantic_spatial", {"action": "stop"})
@@ -1908,7 +1899,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         )
         started = plugin.dispatch(
             "controlled_semantic_spatial",
-            {"action": "start", "input_descriptors": _external_descriptors()},
+            {"action": "start", "input_bindings": _external_bindings_for_start()},
         )
         self.assertEqual(started["state"], "ready")
         mapping_started = plugin.dispatch(

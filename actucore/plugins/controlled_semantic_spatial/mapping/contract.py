@@ -208,7 +208,7 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "units": "linear_acceleration=m/s^2; angular_velocity=rad/s",
                 "max_age_ms": 500,
                 "desc": (
-                    "Connect Driver lidar_imu, aligned with the LiDAR stream; "
+                    "Connect Driver lidar_cloud's navigation_imu output, aligned with the LiDAR stream; "
                     "the body imu card is not a substitute"
                 ),
             },

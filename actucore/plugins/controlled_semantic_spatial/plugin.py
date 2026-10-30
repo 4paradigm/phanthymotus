@@ -112,6 +112,7 @@ class ControlledSemanticSpatialPlugin:
             executor,
             goal_handler=self._handle_semantic_goal,
         )
+        self._topic_config = {"lidar_topic": "", "rgb_topic": "", "imu_topic": ""}
         self._lock = threading.RLock()
         self._transition_lock = threading.Lock()
         self._stop_requested = threading.Event()
@@ -655,6 +656,17 @@ class ControlledSemanticSpatialPlugin:
                 "invalid_config",
                 "unsupported navigation config fields: " + ",".join(unknown),
             )
+        topic_config = {**self._topic_config, **{key: updates[key] for key in self._topic_config if key in updates}}
+        for key, value in topic_config.items():
+            if not isinstance(value, str) or (value and (len(value) > 255 or not _ABSOLUTE_ROS_TOPIC_RE.fullmatch(value))):
+                return self._error("invalid_config", f"{key} must be empty or an absolute ROS topic")
+        resolved = [topic_config[key] or default for key, default in (
+            ("lidar_topic", f"/{self._namespace}/navigation/lidar"),
+            ("rgb_topic", f"/{self._namespace}/camera/rgb"),
+            ("imu_topic", f"/{self._namespace}/navigation/imu"),
+        )]
+        if len(set(resolved)) != len(resolved):
+            return self._error("invalid_config", "lidar, rgb and imu topics must be distinct")
         mapping_updates = {
             "action": "config",
             **{
@@ -792,10 +804,13 @@ class ControlledSemanticSpatialPlugin:
                     rollback_component_results=rollback_results,
                 )
             applied.append((name, component, prefix, request, previous))
+        with self._lock:
+            self._topic_config = topic_config
         return {
             "state": "configured",
             "status": "configured",
             "component_results": results,
+            "topic_config": dict(self._topic_config),
             "takes_effect": "next_start",
             "shadow_only": False,
             "physical_execution": False,
@@ -803,64 +818,46 @@ class ControlledSemanticSpatialPlugin:
         }
 
     def _validate_external_wiring(self, args: dict) -> dict:
-        tool = self.get_tools()[0]
-        expected = {item["port"]: item["topic"] for item in tool["topic_in"]}
-        required = {
-            item["port"]
-            for item in tool["topic_in"]
-            if item["required"]
-        }
-        descriptors = args.get("input_descriptors")
-        if not isinstance(descriptors, list):
-            return self._error("invalid_canvas_wiring", "live input_descriptors are required; reconnect inputs")
-        wired = {}
-        for binding in descriptors:
-            if not isinstance(binding, dict):
-                return self._error("invalid_canvas_wiring", "invalid input descriptor")
-            port, topic, descriptor = binding.get("port"), binding.get("topic"), binding.get("descriptor")
-            if (not isinstance(port, str) or port not in expected or port in wired
-                    or not isinstance(topic, str) or not isinstance(descriptor, dict)
-                    or descriptor.get("topic") != topic
-                    or descriptor.get("format") != next(item["format"] for item in tool["topic_in"] if item["port"] == port)):
-                return self._error("invalid_canvas_wiring", "conflicting input descriptor")
-            wired[port] = topic
-            if port == "lidar":
-                imu = descriptor.get("associated_imu")
-                if (descriptor.get("ros_type") != "sensor_msgs/msg/PointCloud2"
-                        or not isinstance(imu, dict)
-                        or imu.get("format") != "sensor/imu"
-                        or imu.get("ros_type") != "sensor_msgs/msg/Imu"
-                        or not isinstance(imu.get("topic"), str)
-                        or imu.get("topic") == topic):
-                    return self._error("invalid_canvas_wiring", "lidar descriptor requires associated MID360 IMU")
-                wired["imu"] = imu["topic"]
-        missing = sorted(port for port in required if not wired.get(port))
-        invalid = sorted(port for port, topic in wired.items()
-                         if not isinstance(topic, str) or len(topic) > 255
-                         or _ABSOLUTE_ROS_TOPIC_RE.fullmatch(topic) is None)
-        supplied_topics = args.get("input_topics", [])
-        if (not isinstance(supplied_topics, list)
-                or any(not isinstance(t, str) for t in supplied_topics)
-                or len(set(supplied_topics)) != len(supplied_topics)):
-            return self._error("invalid_canvas_wiring", "input_topics must be a unique array of strings")
-        if "input_topic" in args:
-            if not isinstance(args["input_topic"], str):
-                return self._error("invalid_canvas_wiring", "input_topic must be a string")
-            if args["input_topic"]:
-                supplied_topics = [*supplied_topics, args["input_topic"]]
-        external_topics = {topic for port, topic in wired.items() if port != "imu"}
-        if (missing or invalid or len(set(wired.values())) != len(wired)
-                or (supplied_topics and set(supplied_topics) != external_topics)):
-            return self._error("invalid_canvas_wiring", "missing, invalid or conflicting input topics")
+        def invalid(message):
+            return self._error("invalid_canvas_wiring", message)
+
+        def valid_topic(topic):
+            return isinstance(topic, str) and len(topic) <= 255 and bool(_ABSOLUTE_ROS_TOPIC_RE.fullmatch(topic))
+
+        topics = args.get("input_topics", [])
+        if not isinstance(topics, list) or any(not valid_topic(t) for t in topics) or len(set(topics)) != len(topics):
+            return invalid("input_topics must be a unique array of absolute ROS topics")
+        single = args.get("input_topic", "")
+        if not isinstance(single, str) or (single and not valid_topic(single)):
+            return invalid("input_topic must be an absolute ROS topic")
+        if topics and single and single not in topics:
+            return invalid("input_topic conflicts with input_topics")
+        supplied = set(topics or ([single] if single else []))
         if "input_bindings" in args:
             bindings = args["input_bindings"]
-            if (not isinstance(bindings, list)
-                    or any(not isinstance(b, dict) or not isinstance(b.get("port"), str)
-                           or not isinstance(b.get("topic"), str) for b in bindings)
-                    or len(bindings) != len(external_topics)
-                    or {b["port"]: b["topic"] for b in bindings}
-                    != {port: topic for port, topic in wired.items() if port != "imu"}):
-                return self._error("invalid_canvas_wiring", "input bindings conflict with descriptors")
+            if not isinstance(bindings, list):
+                return invalid("input_bindings must be an array")
+            wired = {}
+            for item in bindings:
+                if (not isinstance(item, dict) or set(item) != {"port", "topic"}
+                        or item.get("port") not in ("lidar", "rgb", "imu")
+                        or item["port"] in wired or not valid_topic(item.get("topic"))):
+                    return invalid("invalid or duplicate input binding")
+                wired[item["port"]] = item["topic"]
+            if ("input_topics" in args or single) and supplied != set(wired.values()):
+                return invalid("input topics conflict with input_bindings")
+        else:
+            expected = {
+                "lidar": self._topic_config["lidar_topic"] or f"/{self._namespace}/navigation/lidar",
+                "rgb": self._topic_config["rgb_topic"] or f"/{self._namespace}/camera/rgb",
+                "imu": self._topic_config["imu_topic"] or f"/{self._namespace}/navigation/imu",
+            }
+            wired = {port: topic for port, topic in expected.items() if topic in supplied}
+            if supplied != set(wired.values()):
+                return invalid("input topics do not match configured lidar/rgb/imu topics")
+        if ("lidar" not in wired or "imu" not in wired
+                or len(set(wired.values())) != len(wired)):
+            return invalid("missing lidar or imu, or conflicting input topics")
         return {"wired_topics": wired}
 
     def _handle_semantic_goal(
@@ -886,6 +883,7 @@ class ControlledSemanticSpatialPlugin:
             wiring_unknown = self._wiring_transition_unknown
             config_error = self._config_error
             last_terminal_stop_error = self._last_terminal_stop_error
+            topic_config = dict(self._topic_config)
         discovery = requested_instance_id is None or requested_instance_id == ""
         instance_match = bool(started and instance_id and requested_instance_id == instance_id)
         if discovery:
@@ -940,6 +938,7 @@ class ControlledSemanticSpatialPlugin:
                 else "none"
             ),
             "last_terminal_stop_error": last_terminal_stop_error,
+            "topic_config": topic_config,
             "runtime": runtime_info,
             "mapping": self._mapping.dispatch("fast_livo2", {"action": "info"}),
             "planning": self._planning.dispatch("nav2", {"action": "info"}),
