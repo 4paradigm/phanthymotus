@@ -722,16 +722,6 @@ async def acp_complete(request: fastapi.Request):
         payload=dict(_event),
     )
 
-    # The event bus wakes the LLM, but the browser activity stream is a
-    # separate channel.  Broadcast the same terminal event explicitly so the
-    # frontend can show ACP completions even when no new LLM turn is started.
-    from api.motus_stream import push_event
-    await push_event({
-        'type': 'action_complete',
-        'mcp_id': body.get('tool'),
-        'payload': dict(_event),
-    })
-
     return {'ok': True, 'action_id': action_id}
 
 

@@ -13,9 +13,6 @@ export function summarizeEvent(event) {
   switch (event.type) {
     case 'mcp_call':       return `${p.tool || ''}(${_trunc(JSON.stringify(p.args || {}), 200)})`;
     case 'mcp_result':     return `← ${_trunc(JSON.stringify(p.result), 400)}`;
-    case 'action_complete':
-      return `✓ ${p.action_id || ''} ${p.status || ''}`
-        + (p.result ? ` ${_trunc(JSON.stringify(p.result), 300)}` : '');
     case 'agent_thought':  return p.text || '';
     // 单独一类，不并进 agent_thought：本功能最坏的失败模式是汇报里编造一个不存在的
     // 发现，得能和模型自己的想法分开看才抓得住。
