@@ -122,6 +122,7 @@ def _client(fake):
     """绕过 _init_clients，只装一个假 endpoint。"""
     c = llm_mod.Client.__new__(llm_mod.Client)
     c.client_list = [fake]
+    c.config_list = list(config.main['client']['llm'])
     c._endpoint_dead = [False]
     return c
 
@@ -672,3 +673,22 @@ def test_stream_can_be_turned_off():
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+# ── client 与配置的下标对齐 ───────────────────────────────────────────────────
+
+def test_endpoint_without_key_does_not_shift_model_onto_next_client():
+    """没填 key 的条目在 _init_clients 里被跳过。__call__ 以前重新读整张配置表，
+    下标就错开一位：第 1 条的 client 拿着第 0 条的 model 去请求。"""
+    config.main['client'] = {'llm': [
+        {'url': 'http://127.0.0.1:9/v1', 'key': '', 'model': 'skipped-model'},
+        {'url': 'https://real/v1', 'key': 'sk-x', 'model': 'real-model'},
+    ]}
+    c = llm_mod.Client()
+    assert [cfg['model'] for cfg in c.config_list] == ['real-model']
+    assert str(c.client_list[0].base_url).startswith('https://real/v1')
+
+    fake = _FakeClient([_chunk('ok'), _chunk(finish_reason='stop')])
+    c.client_list = [fake]  # 换成假的，看它实际收到的 model
+    asyncio.run(c(message_list=[], tool_list=[]))
+    assert fake.kwargs['model'] == 'real-model'

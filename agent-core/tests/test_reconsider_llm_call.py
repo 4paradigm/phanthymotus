@@ -59,6 +59,7 @@ def _client():
     task_list to be empty, not a real client construction path."""
     c = _llm_module.Client.__new__(_llm_module.Client)
     c.client_list = []
+    c.config_list = []
     c._endpoint_dead = []
     return c
 

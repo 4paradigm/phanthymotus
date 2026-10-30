@@ -571,7 +571,15 @@ class Client():
         self._init_clients()
 
     def _init_clients(self):
-        """从配置创建 OpenAI client 列表。"""
+        """从配置创建 OpenAI client 列表。
+
+        config_list 与 client_list 一一对应，下标同义。__call__ 必须用它，不能
+        再去读 config.main['client']['llm']：没填 key 的条目在这里被跳过，原表
+        的下标就和 client_list 错开了——跳过第 0 条，第 1 条的 client 就会拿着
+        第 0 条的 model 去请求，后面每条都错一位。
+        """
+        self.config_list = [c for c in config.main['client']['llm']
+                            if c.get('key')]  # 跳过未配置 credentials 的条目
         self.client_list = [
             openai.AsyncOpenAI(
                 base_url=config_it['url'],
@@ -584,8 +592,7 @@ class Client():
                     event_hooks={"request": [_log_request]},
                 ),
             )
-            for config_it in config.main['client']['llm']
-            if config_it.get('key')  # 跳过未配置 credentials 的条目
+            for config_it in self.config_list
         ]
         # 跟踪每个 endpoint 的健康状态
         self._endpoint_dead: list[bool] = [False] * len(self.client_list)
@@ -801,7 +808,7 @@ class Client():
                 return await _go_stream(client, model, think_mode, attempt)
             return await _go_blocking(client, model, think_mode, attempt)
 
-        configs = config.main['client']['llm']
+        configs = self.config_list
         last_error = None
         max_retries = 2  # 重试上限
 
