@@ -592,7 +592,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )
         self.assertIn("ros2 pkg prefix segmented_controller", dockerfile)
 
-    def test_costmaps_combine_confirmed_static_map_and_live_clearing(self) -> None:
+    def test_global_static_and_local_live_costmaps(self) -> None:
         params = (PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text(
             encoding="utf-8"
         )
@@ -601,7 +601,7 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("data_type: LaserScan", params)
         self.assertEqual(params.count("topic: /ubuntu/navigation/cloud_registered"), 2)
         self.assertNotIn("topic: /ubuntu/navigation/obstacle_map", params)
-        self.assertEqual(params.count("map_topic: /ubuntu/navigation/static_map"), 2)
+        self.assertEqual(params.count("map_topic: /ubuntu/navigation/static_map"), 1)
         self.assertEqual(params.count("data_type: PointCloud2"), 2)
         self.assertIn("min_obstacle_height: -3.0", params)
         self.assertIn("max_obstacle_height: 3.0", params)
@@ -614,13 +614,9 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         global_map = params.split("global_costmap:\n", 1)[1].split(
             "\nplanner_server:", 1
         )[0]
-        self.assertIn("plugins: [static_layer, obstacle_layer, inflation_layer]", local)
-        self.assertIn("plugin: nav2_costmap_2d::StaticLayer", local)
-        self.assertIn("map_topic: /ubuntu/navigation/static_map", local)
-        self.assertIn("map_subscribe_transient_local: true", local)
-        self.assertIn("subscribe_to_updates: false", local)
-        self.assertIn("footprint_clearing_enabled: false", local)
-        self.assertIn("combination_method: 1", local)
+        self.assertIn("plugins: [obstacle_layer, inflation_layer]", local)
+        self.assertNotIn("static_layer", local)
+        self.assertNotIn("/ubuntu/navigation/static_map", local)
         self.assertIn("sensor_frame: base_link", local)
         self.assertIn("clearing: true", local)
         self.assertIn("raytrace_max_range: 8.5", local)
@@ -640,21 +636,16 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertGreater(0.55 - footprint_radius, 0.12)
         self.assertLess(0.55 - footprint_radius, 0.13)
 
-    def test_local_costmap_static_layer_structured_configuration(self) -> None:
+    def test_local_live_and_global_static_layer_configuration(self) -> None:
         params = yaml.safe_load((PACKAGE_ROOT / "config" / "nav2_params.yaml").read_text())
         local = params["local_costmap"]["local_costmap"]["ros__parameters"]
         global_map = params["global_costmap"]["global_costmap"]["ros__parameters"]
         self.assertTrue(local["rolling_window"])
-        self.assertEqual(local["plugins"], ["static_layer", "obstacle_layer", "inflation_layer"])
-        static = local["static_layer"]
-        self.assertEqual(static["plugin"], "nav2_costmap_2d::StaticLayer")
-        self.assertTrue(static["enabled"])
-        self.assertEqual(static["map_topic"], global_map["static_layer"]["map_topic"])
-        self.assertTrue(static["map_subscribe_transient_local"])
-        self.assertFalse(static["subscribe_to_updates"])
-        self.assertFalse(static["footprint_clearing_enabled"])
+        self.assertEqual(local["plugins"], ["obstacle_layer", "inflation_layer"])
+        self.assertNotIn("static_layer", local)
+        self.assertIn("static_layer", global_map["plugins"])
+        self.assertEqual(global_map["static_layer"]["map_topic"], "/ubuntu/navigation/static_map")
         obstacle = local["obstacle_layer"]
-        self.assertEqual(obstacle["combination_method"], 1)
         self.assertTrue(obstacle["registered_cloud"]["marking"])
         self.assertTrue(obstacle["registered_cloud"]["clearing"])
 

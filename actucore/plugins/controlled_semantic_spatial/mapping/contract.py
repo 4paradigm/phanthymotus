@@ -227,9 +227,9 @@ def fast_livo2_tool_definition(namespace: str) -> dict:
                 "max_age_ms": 500,
                 "desc": (
                     "Canonical base pose derived from Driver-owned base_link to "
-                    "sensor_frame TF; twist is the base_link body twist "
-                    "differentiated from source-stamped poses, and an unavailable "
-                    "twist is all-NaN with covariance diagonal -1, never zero"
+                    "sensor_frame TF; twist and covariance are passed through "
+                    "from raw FAST-LIVO2 odometry without frame conversion or "
+                    "validity verification; zero is not proof of physical rest"
                 ),
             },
             {

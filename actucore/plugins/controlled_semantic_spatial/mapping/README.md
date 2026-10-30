@@ -109,26 +109,14 @@ cloud、静态累计和 Nav2 输入全部 fail-closed。
 
 ### canonical odom 速度契约
 
-FAST-LIVO2 raw odom 的 twist 不可信（真机恒为零），adapter 不再透传，而是在
-session 帧内用 FAST-LIVO2 源时间戳和 `base_link` 规范位姿做 SE(3) 对数差分，
-输出 `base_link` body-frame 完整六维 twist（`linear.xyz`、`angular.xyz`）；
-平面消费者取 `vx`、`vy`、`wz`。重定位只改变 `map_from_session`，不影响 body
-twist。参考样本取最近一个间隔不小于 `odom_twist_min_interval_sec`（默认
-`0.02 s`）的已接受样本，间隔超过 `odom_twist_max_interval_sec`（默认
-`0.35 s`）视为断档。
+adapter 对输出 odom 的 `twist`（含协方差）直接透传 FAST-LIVO2 raw odom，
+不再根据位姿差分估计速度，也不对该速度进行坐标转换或可信度校验。raw twist
+曾被记录为真机恒为零；因此即使消息中速度为零，也**不能作为物理停稳的证据**，
+其坐标系、有效性和实际数值需按现场链路独立核实。消费者需自行检查有限性、
+源时间戳和接收时效；无消息或零速度均不证明停稳。
 
-- 可靠：六分量全部有限，`twist.covariance` 对角线有限且大于零。该方差是按
-  假定位姿抖动（`0.01 m`、`0.005 rad`）推得的名义值，不是标定不确定度。
-- 不可用：六分量全部为 `NaN`，`twist.covariance` 对角线为 `-1`。首个样本、
-  源时间间隔过大（含 odom 暂停后恢复）、过密且无旧参考、`base_link -> sensor`
-  外参变化、reset/建图/加载/重定位、raw odom 被拒绝后的首个样本、非有限输入
-  或结果都属于此类，绝不输出貌似可靠的零速度。
-- 重复或早于已发布样本的时间戳整条丢弃（位姿、twist 和 TF 都不发布）；跨越
-  reset 的回调样本也丢弃。
-- 消费者必须要求六分量全部有限（建议同时检查 `covariance[0] >= 0`），并独立
-  检查消息源时间戳与接收时效：odom 暂停时不会有消息，沉默不能当作停稳证明。
-  每条消息的 twist 自包含，BEST_EFFORT 下游丢包不会破坏后续 twist 的含义。
-- diagnostics 的 `odom_twist` 字段给出当前原因和各原因计数。
+位姿仍转换为 `map -> base_link`；重复或早于已发布样本的时间戳整条丢弃，
+跨越 reset 的回调样本也丢弃。
 
 adapter 先按 `0.10 m` 体素把同一帧命中去重；导航高度带和有效距离内的体素
 首次出现即写入累计静态图，不等待多帧确认、不跟踪动态分量，也不通过后续

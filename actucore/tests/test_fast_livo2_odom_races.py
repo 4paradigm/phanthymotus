@@ -51,7 +51,8 @@ class OdomRaceTest(unittest.TestCase):
         a._base_to_sensor = identity
         a._map_from_session = identity
         a._odom_health = module.OdomHealthMonitor()
-        a._odom_twist = module.BodyTwistEstimator()
+        a._odom_epoch = 0
+        a._last_published_odom = None
         a._latest_session_pose = a._latest_pose = None
         a._last_odom_monotonic = a._last_odom_source_age = None
         a._pose_history = deque(maxlen=128)
@@ -106,11 +107,11 @@ class OdomRaceTest(unittest.TestCase):
         old = self.start("old-odom", lambda: a._on_odom(raw(1, 0.0)))
         reset_done = threading.Event()
         def reset():
-            # Same critical section and estimator resets as _on_reset; the
+            # Same critical section and epoch update as _on_reset; the
             # identity alignment deliberately remains equal across sessions.
             with a._lock:
                 a._odom_health.reset()
-                a._odom_twist.reset("localization_reset")
+                a._odom_epoch += 1
                 a._pose_history.clear()
                 a._latest_pose = a._latest_session_pose = None
             reset_done.set()
@@ -147,14 +148,14 @@ class OdomRaceTest(unittest.TestCase):
                 self.assertTrue(self.entered.wait(TIMEOUT))
                 with a._lock:
                     a._odom_health.reset()
-                    a._odom_twist.reset("localization_reset")
+                    a._odom_epoch += 1
                 new = self.start("new-odom", lambda: a._on_odom(raw(2, 0.1)))
                 new.join(TIMEOUT)
                 self.assertFalse(new.is_alive())
-                epoch = a._odom_twist.epoch
+                epoch = a._odom_epoch
             finally:
                 self.finish(*([old, new] if new else [old]))
-        self.assertEqual(a._odom_twist.epoch, epoch)
+        self.assertEqual(a._odom_epoch, epoch)
         self.assertEqual([stamp for stamp, _ in a._pose_history], [2_000_000_000])
         self.assertEqual([m.header.stamp.sec for m in self.published], [2])
 

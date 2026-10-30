@@ -77,10 +77,8 @@ def test_launch_wires_json_as_string(monkeypatch):
     group = next(item for item in items if item.kwargs.get('scoped') is True)
     actions = group.kwargs['actions']
     odom_remaps = [item for item in actions if item.kwargs.get('src') in ('/odom', 'odom')]
-    assert {item.kwargs['src'] for item in odom_remaps} == {'/odom', 'odom'}
-    assert all(item.kwargs['dst'].args == ('odom_topic',) for item in odom_remaps)
+    assert odom_remaps == []
     include_index = next(i for i, item in enumerate(actions) if 'launch_arguments' in item.kwargs)
-    assert all(actions.index(item) < include_index for item in odom_remaps)
     rewritten = dict(actions[include_index].kwargs['launch_arguments'])['params_file']
     assert rewritten.kwargs['convert_types'] is True
     assert rewritten.kwargs['param_rewrites']['rotate_reengage_rad'].args == ('rotate_reengage_rad',)

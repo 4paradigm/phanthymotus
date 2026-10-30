@@ -59,15 +59,12 @@ registered cloud 的接收 age 推过 500 ms。BT 和分段控制器均为 20 Hz
 可以用最新位姿在每个控制周期检查过点、转向和障碍；标准输出频率由下游接口
 协商，停车零速不等待下一次周期发布。
 
-Nav2 controller server 的 `odom` 通过启动 remap 接到上述 canonical odometry，
-分段控制器使用 Nav2 传入的速度，不独立订阅或检查速度的有效性与新鲜度。
-FAST-LIVO2 原始 twist 不可用，adapter 根据 `base_link` 位姿和源时间差分估计
-体坐标速度；有效估计的六个 twist 分量必须有限且协方差对角线全部为正。
-协方差为名义值，不是经过标定的精度保证；旧版全零协方差不是有效速度标记。
-能够发布的无效估计用非有限 twist / 负对角线标识；上游坏帧被 adapter 丢弃
-或发布者失联时可能没有无效消息。连续两个控制周期速度接近零不要求不同样本，
-也不是六轴完全静止检查或物理停车证明。位姿差分不能识别定位冻结时机器人
-仍在运动；速度估计依赖上游位姿及传感器外参真实可靠。
+Nav2 启动配置不再将 controller server 的 `odom` 显式 remap 到 canonical
+odometry；其实际订阅与发布者关系须在运行环境中核验。分段控制器使用 Nav2
+传入的速度，不独立订阅或检查速度的有效性与新鲜度。adapter 的 canonical
+odometry 速度字段直接透传 FAST-LIVO2 原始 twist，未做速度估计或坐标转换；
+原始值曾在真机上被记录为恒零，其可靠性须独立核实。连续两个控制周期速度
+接近零不要求不同样本，也不是六轴完全静止检查或物理停车证明。
 Nav2 的 `SimpleGoalChecker` 是独立位置/朝向判断，不提供反馈新鲜度或物理
 停稳保证；action 成功不可作为停车确认。下游仍须有独立 TTL、停车及急停保护。
 
@@ -152,13 +149,15 @@ mapping/localization 运行模式。其他未知配置字段仍会拒绝。
   独立错误，不再进入长时间恢复流程。成功回执包含 `goal_cell`。Canvas 代价图
   只把同一拒绝阈值 `>=99` 的格子标红；`1..98` 的软 inflation 仍由 Nav2 用于
   路径评分，但不再渲染成类似不可通行区域。
-- global/local costmap 都是 rolling window，插件顺序均为
-  `StaticLayer -> live ObstacleLayer -> InflationLayer`：两张图的 StaticLayer 消费
-  `/ubuntu/navigation/static_map`，live layer 消费实时
-  `/ubuntu/navigation/cloud_registered` 并开启 marking/raytrace clearing。局部图
-  显式以 maximum 合并 live layer，避免实时清空抹除静态障碍；这只能覆盖已发布且
-  正确定位的静态图，不能保证未知、漏建或高度带之外障碍安全。
-  live layer 表达当前动态环境并依靠 raytrace clearing 更新。FAST-LIVO2
+- global/local costmap 都是 rolling window，但层组成不同：global 为
+  `StaticLayer -> live ObstacleLayer -> InflationLayer`，StaticLayer 消费
+  `/ubuntu/navigation/static_map`；local 只有 `live ObstacleLayer ->
+  InflationLayer`，不叠加静态图，因此局部避障完全依赖实时
+  `/ubuntu/navigation/cloud_registered`。live layer 在两张图上都开启
+  marking/raytrace clearing。局部图去掉静态层后，当前未被实时点云观测到的
+  已知静态障碍不再由局部层保护，只能依靠全局静态图规划绕行；遮挡、盲区和
+  漏建区域仍可能被局部实时层视为可通行。live layer 表达当前动态环境并依靠
+  raytrace clearing 更新。FAST-LIVO2
   adapter 的静态图则恢复为直接累计：同一扫描按 `0.10 m` 体素去重，有效
   高度带内的体素首次出现即写入 StaticLayer，不等待多帧确认、不做动态分量
   跟踪，也不通过后续自由射线删除。该模式保留稀疏墙面证据，但建图期间出现
