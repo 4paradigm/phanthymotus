@@ -31,188 +31,20 @@ def odom_sample(stamp_ns, *, velocity=None, diagonal=None):
             linear=vector(velocity[:3]), angular=vector(velocity[3:])), covariance=covariance))
 
 
-@pytest.mark.parametrize('velocity,diagonal', [
-    ([float('nan'), 0, 0, 0, 0, 0], [0.01] * 6),
-    ([0, 0, 0, 0, float('inf'), 0], [0.01] * 6),
-    ([0] * 6, [0] * 6),
-    ([0] * 6, [-1] * 6),
-    ([0] * 6, [0.01, 0.01, 0.01, float('nan'), 0.01, 0.01]),
-])
-def test_invalid_odom_blocks_recovery_and_new_valid_sample_recovers(
-        planner_module, monkeypatch, velocity, diagonal):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    stamp = time.time_ns() - 10_000_000
-    node._on_odom(odom_sample(stamp, velocity=velocity, diagonal=diagonal))
-    node._on_shadow_velocity(shadow_twist(.5))  # Includes Nav2 recovery commands.
-    node._publish_latest_control_velocity()
-    assert latest(node)['values'] == [0] * 6
-    node._on_odom(odom_sample(stamp + 1))
-    node._on_shadow_velocity(shadow_twist(.5))
-    node._publish_latest_control_velocity()
-    assert latest(node)['values'][0] == .5
-
-
-def test_motion_gate_uses_velocity_validity(planner_module):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    node._readiness = Mock(return_value={
-        'navigation_ready': True, 'odom_status_age_sec': .1,
-        'odom_source_age_sec': .1, 'odom_velocity_valid': False,
-    })
-    node._on_shadow_velocity(shadow_twist(.5))
-    assert node._latest_shadow_candidate['velocity'] == planner_module.Velocity.zero()
-    assert latest(node)['values'] == [0] * 6
-
-
-def test_missing_odom_twist_blocks_and_terminal_zero_survives(planner_module, monkeypatch):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    sample = odom_sample(time.time_ns() - 10_000_000)
-    del sample.twist
-    node._on_odom(sample)
-    node._on_shadow_velocity(shadow_twist(.5))
-    node._publish_latest_control_velocity()
-    assert latest(node)['values'] == [0] * 6
-    node._on_result('nav-1', 1, result_future(5))
-    assert latest(node)['values'] == [0] * 6
-    assert node._emit.call_args.args[0]['status'] == 'stopped'
-
-
 @pytest.mark.parametrize('delta', [0, -1])
-def test_duplicate_or_reordered_odom_blocks_until_new_high_water(planner_module, monkeypatch, delta):
+def test_odom_duplicate_and_invalid_twist_do_not_clear_candidate(planner_module, monkeypatch, delta):
     node = make_node(planner_module)
     setup_control(node, planner_module)
     monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
     stamp = time.time_ns() - 10_000_000
     node._on_odom(odom_sample(stamp))
-    node._on_odom(odom_sample(stamp + delta))
     node._on_shadow_velocity(shadow_twist(.5))
-    node._publish_latest_control_velocity()
-    assert latest(node)['values'] == [0] * 6
-    node._on_odom(odom_sample(stamp + 1))
-    node._on_shadow_velocity(shadow_twist(.5))
+    candidate = node._latest_shadow_candidate
+    node._last_odom_monotonic -= 1.0  # A receive gap does not invalidate the candidate.
+    node._on_odom(odom_sample(stamp + delta, velocity=[float('nan')] * 6, diagonal=[0] * 6))
+    assert node._latest_shadow_candidate is candidate
     node._publish_latest_control_velocity()
     assert latest(node)['values'][0] == .5
-
-
-@pytest.mark.parametrize('recover_before_publish', [False, True])
-def test_invalid_odom_between_readiness_and_publish_blocks_race(planner_module, monkeypatch, recover_before_publish):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    stamp = time.time_ns() - 10_000_000
-    node._on_odom(odom_sample(stamp))
-    node._on_shadow_velocity(shadow_twist(.5))
-    entered, release = threading.Event(), threading.Event()
-    def readiness():
-        entered.set()
-        assert release.wait(2)
-        return {}
-    node._readiness = readiness
-    thread = threading.Thread(target=node._publish_latest_control_velocity, daemon=True)
-    thread.start()
-    try:
-        assert entered.wait(2)
-        node._on_odom(odom_sample(stamp + 1, diagonal=[-1] * 6))
-        assert latest(node)['values'] == [0] * 6
-        if recover_before_publish:
-            node._on_odom(odom_sample(stamp + 2))
-        release.set()
-        thread.join(2)
-        assert not thread.is_alive()
-        assert latest(node)['values'] == [0] * 6
-    finally:
-        release.set()
-        thread.join(2)
-
-
-@pytest.mark.parametrize('invalid_kind', ['velocity', 'reordered', 'frame', 'receipt_gap'])
-def test_invalid_then_valid_clears_cached_command_immediately(planner_module, monkeypatch, invalid_kind):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    stamp = time.time_ns() - 10_000_000
-    node._on_odom(odom_sample(stamp))
-    node._on_shadow_velocity(shadow_twist(.5))
-    node._publish_latest_control_velocity()
-    assert latest(node)['values'][0] == .5
-    if invalid_kind == 'velocity':
-        invalid = odom_sample(stamp + 1, diagonal=[-1] * 6)
-    elif invalid_kind == 'reordered':
-        invalid = odom_sample(stamp - 1)
-    else:
-        invalid = odom_sample(stamp + 1)
-        if invalid_kind == 'frame':
-            invalid.child_frame_id = 'wrong_frame'
-        else:
-            node._last_odom_monotonic -= 1.0
-    node._on_odom(invalid)
-    assert node._latest_shadow_candidate is None
-    assert latest(node)['values'] == [0] * 6
-    node._on_odom(odom_sample(stamp + 2))
-    count = node._control_pub.publish.call_count
-    node._publish_latest_control_velocity()
-    assert node._control_pub.publish.call_count == count
-    node._on_shadow_velocity(shadow_twist(.4))
-    node._publish_latest_control_velocity()
-    assert latest(node)['values'][0] == .4
-
-
-def test_bad_source_age_then_valid_does_not_replay_candidate(planner_module, monkeypatch):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    stamp = time.time_ns() - 10_000_000
-    node._on_odom(odom_sample(stamp))
-    node._on_shadow_velocity(shadow_twist(.5))
-    node._publish_latest_control_velocity()
-    assert latest(node)['values'][0] == .5
-    node._source_age = Mock(side_effect=[-.15, .01])
-    node._on_odom(odom_sample(stamp + 1))
-    assert node._latest_shadow_candidate is None
-    assert latest(node)['values'] == [0] * 6
-    node._on_odom(odom_sample(stamp + 2))
-    count = node._control_pub.publish.call_count
-    node._publish_latest_control_velocity()
-    assert node._control_pub.publish.call_count == count
-
-
-def test_shadow_snapshot_cannot_reinsert_after_invalid_then_valid(planner_module, monkeypatch):
-    node = make_node(planner_module)
-    setup_control(node, planner_module)
-    monkeypatch.setattr(planner_module, 'control_odom_motion_blocker', lambda *a, **kw: None)
-    stamp = time.time_ns() - 10_000_000
-    node._on_odom(odom_sample(stamp))
-    entered, release = threading.Event(), threading.Event()
-    def readiness():
-        entered.set()
-        assert release.wait(2)
-        return {}
-    node._readiness = readiness
-    thread = threading.Thread(target=node._on_shadow_velocity, args=(shadow_twist(.5),), daemon=True)
-    thread.start()
-    try:
-        assert entered.wait(2)
-        node._on_odom(odom_sample(stamp + 1, diagonal=[-1] * 6))
-        # No candidate had been published, so this must not emit an unsolicited stop.
-        node._control_pub.publish.assert_not_called()
-        node._on_odom(odom_sample(stamp + 2))
-        release.set()
-        thread.join(2)
-        assert not thread.is_alive()
-        assert node._latest_shadow_candidate is None
-        node._publish_latest_control_velocity()
-        node._control_pub.publish.assert_not_called()
-        node._readiness = Mock(return_value={})
-        node._on_result('nav-1', 1, result_future(5))
-        assert latest(node)['values'] == [0] * 6
-        assert node._emit.call_args.args[0]['status'] == 'stopped'
-    finally:
-        release.set()
-        thread.join(2)
 
 
 def test_launch_wires_json_as_string(monkeypatch):

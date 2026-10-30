@@ -2,7 +2,6 @@
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
-#include <array>
 #include <cassert>
 #include <cmath>
 #include <limits>
@@ -15,39 +14,18 @@ int main()
   using segmented_controller::segment_crossed;
   using segmented_controller::segment_reached;
   using segmented_controller::same_goal_endpoint;
-  using segmented_controller::odometry_fresh;
-  using segmented_controller::observe_stopped_sample;
-  using segmented_controller::velocity_covariance_valid;
+  using segmented_controller::observe_stopped_cycle;
 
-  std::array<double, 36> covariance{};
-  assert(!velocity_covariance_valid(covariance));  // Legacy all-zero raw twist.
-  for (std::size_t i = 0; i < 6; ++i) {
-    covariance[i * 7] = 1.0;
-  }
-  assert(velocity_covariance_valid(covariance));
-  covariance[35] = -1.0;
-  assert(!velocity_covariance_valid(covariance));
-  covariance[35] = std::numeric_limits<double>::quiet_NaN();
-  assert(!velocity_covariance_valid(covariance));
-
-  assert(odometry_fresh(0.2, 0.4, 0.6));
-  assert(!odometry_fresh(-0.001, 0.1, 0.6));
-  assert(!odometry_fresh(0.61, 0.1, 0.6));
-  assert(!odometry_fresh(0.1, 0.61, 0.6));
-  assert(!odometry_fresh(0.1, 0.1, 0.0));
-  assert(!odometry_fresh(std::numeric_limits<double>::quiet_NaN(), 0.1, 0.6));
-  std::int64_t stamp = 10;
   int stopped = 0;
-  observe_stopped_sample(true, 10, stamp, stopped);
-  assert(stopped == 0);  // A pre-stop sample cannot prove a stop.
-  observe_stopped_sample(true, 11, stamp, stopped);
-  observe_stopped_sample(true, 11, stamp, stopped);
-  assert(stopped == 1);  // One sample cannot count twice at 20 Hz.
-  observe_stopped_sample(false, 12, stamp, stopped);
+  observe_stopped_cycle(true, stopped);
+  assert(stopped == 1);
+  observe_stopped_cycle(false, stopped);
+  assert(stopped == 0);  // Motion breaks the consecutive sequence.
+  observe_stopped_cycle(true, stopped);
+  observe_stopped_cycle(true, stopped);
+  assert(stopped == 2);  // Two cycles may use the same velocity sample.
+  observe_stopped_cycle(false, stopped);
   assert(stopped == 0);
-  observe_stopped_sample(true, 13, stamp, stopped);
-  observe_stopped_sample(true, 14, stamp, stopped);
-  assert(stopped == 2);
 
   assert(same_goal_endpoint(1.0, 2.0, 3.13, 1.0005, 1.9995, -3.13, 0.001, 0.03));
   assert(!same_goal_endpoint(1.0, 2.0, 0.0, 1.01, 2.0, 0.0, 0.001, 0.001));

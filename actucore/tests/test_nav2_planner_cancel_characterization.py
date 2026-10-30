@@ -86,8 +86,6 @@ def make_node(module):
     node._last_odom_source_stamp_ns = node._last_obstacle_source_stamp_ns = time.time_ns()
     node._last_odom_monotonic = node._last_obstacle_monotonic = time.monotonic()
     node._last_odom_frame_ready = node._last_obstacle_frame_ready = True
-    node._last_odom_velocity_valid = True
-    node._odom_stamp_high_water_ns = None
     node._base_frame = 'base_link'
     node.get_clock = Mock(return_value=types.SimpleNamespace(now=lambda: types.SimpleNamespace(nanoseconds=time.time_ns())))
     node.get_parameter = Mock(return_value=types.SimpleNamespace(value=False))

@@ -256,7 +256,6 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             odom_received_at=9.8,
             odom_source_age_sec=0.2,
             odom_frame_ready=True,
-            odom_velocity_valid=True,
             obstacle_received_at=9.8,
             obstacle_source_age_sec=0.2,
             obstacle_frame_ready=True,
@@ -276,13 +275,13 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             )
         )
 
-        missing_velocity = dict(ready)
-        missing_velocity.pop("odom_velocity_valid")
-        self.assertEqual(
-            control_odom_motion_blocker(missing_velocity, receive_max_age_sec=0.6,
-                                        source_max_age_sec=0.8),
-            "navigation_not_ready:control_odom_velocity_invalid",
-        )
+        future_odom = dict(ready, odom_source_age_sec=-0.1)
+        self.assertIsNone(control_odom_motion_blocker(
+            future_odom, receive_max_age_sec=0.6, source_max_age_sec=0.8))
+        future_odom["odom_source_age_sec"] = -0.101
+        self.assertEqual(control_odom_motion_blocker(
+            future_odom, receive_max_age_sec=0.6, source_max_age_sec=0.8),
+            "navigation_not_ready:control_odom_stale")
 
         scheduling_spike = dict(ready)
         scheduling_spike["odom_status_age_sec"] = 0.316
@@ -649,10 +648,22 @@ class Nav2CompanionCoreTest(unittest.TestCase):
             "approach_speed_mps: 0.30",
             "cruise_speed_mps: 1.0",
             "segment_tolerance_m: 0.18",
+            "stop_linear_mps: 0.05",
+            "stop_yaw_rps: 0.10",
             "stop_cycles_required: 2",
             "status_topic: /ubuntu/navigation/nav2/segment_status",
         ):
             self.assertIn(expected, follow_path)
+        self.assertNotIn("stop_min_duration_sec", follow_path)
+        self.assertNotIn("stop_min_duration_sec", source)
+        self.assertNotIn("motion_generation", source)
+        self.assertIn("if (stopped_cycles_ >= stop_cycles_required_)", source)
+        self.assertIn("observe_stopped_cycle(", source)
+        self.assertIn("const geometry_msgs::msg::Twist & velocity,", source)
+        self.assertNotIn("odom_max_age_sec", follow_path)
+        self.assertNotIn("odom_max_age_sec", source)
+        self.assertNotIn("receiveOdometry", source)
+        self.assertNotIn("odom_unavailable_or_stale", source)
         self.assertNotIn("RotationShimController", follow_path)
         self.assertNotIn("DWBLocalPlanner", follow_path)
         for phase in (

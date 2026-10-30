@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
-#include <functional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -64,13 +63,9 @@ void SegmentedController::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, parameter("stop_cycles_required"), rclcpp::ParameterValue(stop_cycles_required_));
   nav2_util::declare_parameter_if_not_declared(
-    node, parameter("stop_min_duration_sec"), rclcpp::ParameterValue(stop_min_duration_sec_));
-  nav2_util::declare_parameter_if_not_declared(
     node, parameter("preserve_endpoint_m"), rclcpp::ParameterValue(preserve_endpoint_m_));
   nav2_util::declare_parameter_if_not_declared(
     node, parameter("forward_preview_min_m"), rclcpp::ParameterValue(forward_preview_min_m_));
-  nav2_util::declare_parameter_if_not_declared(
-    node, parameter("odom_max_age_sec"), rclcpp::ParameterValue(odom_max_age_sec_));
   nav2_util::declare_parameter_if_not_declared(
     node, parameter("status_topic"),
     rclcpp::ParameterValue("/ubuntu/navigation/nav2/segment_status"));
@@ -86,10 +81,8 @@ void SegmentedController::configure(
   node->get_parameter(parameter("stop_linear_mps"), stop_linear_mps_);
   node->get_parameter(parameter("stop_yaw_rps"), stop_yaw_rps_);
   node->get_parameter(parameter("stop_cycles_required"), stop_cycles_required_);
-  node->get_parameter(parameter("stop_min_duration_sec"), stop_min_duration_sec_);
   node->get_parameter(parameter("preserve_endpoint_m"), preserve_endpoint_m_);
   node->get_parameter(parameter("forward_preview_min_m"), forward_preview_min_m_);
-  node->get_parameter(parameter("odom_max_age_sec"), odom_max_age_sec_);
   const auto status_topic = node->get_parameter(parameter("status_topic")).as_string();
 
   if (!(std::isfinite(rotate_exit_rad_) && std::isfinite(rotate_reengage_rad_) &&
@@ -103,26 +96,13 @@ void SegmentedController::configure(
     approach_speed_mps_ > 0.0 && cruise_speed_mps_ >= approach_speed_mps_ &&
     segment_tolerance_m_ > 0.0 && final_yaw_tolerance_rad_ > 0.0 &&
     stop_linear_mps_ >= 0.0 && stop_yaw_rps_ >= 0.0 && stop_cycles_required_ > 0 &&
-    std::isfinite(stop_min_duration_sec_) && stop_min_duration_sec_ > 0.0 &&
     preserve_endpoint_m_ >= segment_tolerance_m_ &&
     std::isfinite(forward_preview_min_m_) && forward_preview_min_m_ > 0.0 &&
-    std::isfinite(odom_max_age_sec_) && odom_max_age_sec_ > 0.0 &&
     !status_topic.empty()))
   {
     throw std::runtime_error("invalid stop-turn-drive controller parameters");
   }
   speed_limit_mps_ = cruise_speed_mps_;
-  odom_state_ = std::make_shared<OdometryState>();
-  odom_state_->clock = clock_;
-  odom_state_->base_frame = costmap_ros_->getBaseFrameID();
-  odom_state_->max_age_sec = odom_max_age_sec_;
-  odom_state_->stop_linear_mps = stop_linear_mps_;
-  odom_state_->stop_yaw_rps = stop_yaw_rps_;
-  odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
-    "odom", rclcpp::SensorDataQoS(),
-    [state = odom_state_](const nav_msgs::msg::Odometry::SharedPtr message) {
-      receiveOdometry(state, message);
-    });
   status_pub_ = node->create_publisher<std_msgs::msg::String>(
     status_topic, rclcpp::QoS(1).best_effort().durability_volatile());
 }
@@ -130,13 +110,6 @@ void SegmentedController::configure(
 void SegmentedController::cleanup()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (odom_state_) {
-    std::lock_guard<std::mutex> odom_lock(odom_state_->mutex);
-    odom_state_->active = false;
-    odom_state_->valid = false;
-  }
-  odom_sub_.reset();
-  odom_state_.reset();
   status_pub_.reset();
   collision_checker_.reset();
   costmap_ros_.reset();
@@ -147,13 +120,6 @@ void SegmentedController::cleanup()
 void SegmentedController::activate()
 {
   std::lock_guard<std::mutex> state_lock(mutex_);
-  if (odom_state_) {
-    std::lock_guard<std::mutex> lock(odom_state_->mutex);
-    odom_state_->active = true;
-    odom_state_->valid = false;
-    odom_state_->stamp_ns = 0;
-    ++odom_state_->motion_generation;
-  }
   if (status_pub_) {
     status_pub_->on_activate();
   }
@@ -162,53 +128,9 @@ void SegmentedController::activate()
 void SegmentedController::deactivate()
 {
   std::lock_guard<std::mutex> state_lock(mutex_);
-  if (odom_state_) {
-    std::lock_guard<std::mutex> lock(odom_state_->mutex);
-    odom_state_->active = false;
-    odom_state_->valid = false;
-    ++odom_state_->motion_generation;
-  }
   if (status_pub_) {
     status_pub_->on_deactivate();
   }
-}
-
-void SegmentedController::receiveOdometry(
-  const std::shared_ptr<OdometryState> & state,
-  const nav_msgs::msg::Odometry::SharedPtr message)
-{
-  const auto & velocity = message->twist.twist;
-  const std::int64_t stamp =
-    static_cast<std::int64_t>(message->header.stamp.sec) * 1000000000LL +
-    message->header.stamp.nanosec;
-  std::lock_guard<std::mutex> lock(state->mutex);
-  if (!state->active) {
-    return;
-  }
-  const double source_age = static_cast<double>(state->clock->now().nanoseconds() - stamp) * 1e-9;
-  if (message->child_frame_id != state->base_frame || stamp <= state->stamp_ns ||
-    !odometry_fresh(source_age, 0.0, state->max_age_sec) ||
-    !velocity_covariance_valid(message->twist.covariance) ||
-    !std::isfinite(velocity.linear.x) || !std::isfinite(velocity.linear.y) ||
-    !std::isfinite(velocity.linear.z) || !std::isfinite(velocity.angular.x) ||
-    !std::isfinite(velocity.angular.y) || !std::isfinite(velocity.angular.z))
-  {
-    // Keep a high-water mark even for invalid samples: a delayed earlier
-    // valid message must not erase a later producer fault.
-    state->stamp_ns = std::max(state->stamp_ns, stamp);
-    state->valid = false;
-    ++state->motion_generation;
-    return;
-  }
-  if (std::hypot(velocity.linear.x, velocity.linear.y) > state->stop_linear_mps ||
-    std::abs(velocity.angular.z) > state->stop_yaw_rps)
-  {
-    ++state->motion_generation;
-  }
-  state->velocity = velocity;
-  state->stamp_ns = stamp;
-  state->received = std::chrono::steady_clock::now();
-  state->valid = true;
 }
 
 void SegmentedController::setPlan(const nav_msgs::msg::Path & path)
@@ -259,37 +181,13 @@ void SegmentedController::setPlan(const nav_msgs::msg::Path & path)
 
 geometry_msgs::msg::TwistStamped SegmentedController::computeVelocityCommands(
   const geometry_msgs::msg::PoseStamped & pose,
-  const geometry_msgs::msg::Twist & /* nav2_unstamped_velocity */,
+  const geometry_msgs::msg::Twist & velocity,
   nav2_core::GoalChecker *)
 {
   std::lock_guard<std::mutex> state_lock(mutex_);
   geometry_msgs::msg::TwistStamped command;
   command.header.stamp = clock_->now();
   command.header.frame_id = costmap_ros_->getBaseFrameID();
-
-  geometry_msgs::msg::Twist velocity;
-  std::int64_t velocity_stamp_ns = 0;
-  std::uint64_t motion_generation = 0;
-  bool velocity_fresh = false;
-  if (odom_state_) {
-    std::lock_guard<std::mutex> odom_lock(odom_state_->mutex);
-    velocity = odom_state_->velocity;
-    velocity_stamp_ns = odom_state_->stamp_ns;
-    motion_generation = odom_state_->motion_generation;
-    const double source_age =
-      static_cast<double>(clock_->now().nanoseconds() - odom_state_->stamp_ns) * 1e-9;
-    const double receipt_age = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - odom_state_->received).count();
-    velocity_fresh = odom_state_->active && odom_state_->valid &&
-      odometry_fresh(source_age, receipt_age, odom_max_age_sec_);
-  }
-  if (!velocity_fresh) {
-    if (!plan_.poses.empty() && phase_ != Phase::BLOCKED && phase_ != Phase::ARRIVED) {
-      enterStopCheck(Phase::SELECT, "odom_unavailable_or_stale");
-    }
-    publishStatus(pose, 0.0, 0.0);
-    return command;
-  }
 
   const double x = pose.pose.position.x;
   const double y = pose.pose.position.y;
@@ -310,26 +208,10 @@ geometry_msgs::msg::TwistStamped SegmentedController::computeVelocityCommands(
 
   for (int transitions = 0; transitions < 3; ++transitions) {
     if (phase_ == Phase::STOP_CHECK) {
-      if (motion_generation != stopped_motion_generation_) {
-        stopped_cycles_ = 0;
-        first_stopped_stamp_ns_ = 0;
-        stopped_motion_generation_ = motion_generation;
-      }
-      const int previous_count = stopped_cycles_;
-      observe_stopped_sample(
+      observe_stopped_cycle(
         std::hypot(velocity.linear.x, velocity.linear.y) <= stop_linear_mps_ &&
-        std::abs(velocity.angular.z) <= stop_yaw_rps_,
-        velocity_stamp_ns, stopped_sample_stamp_ns_, stopped_cycles_);
-      if (stopped_cycles_ == 0) {
-        first_stopped_stamp_ns_ = 0;
-      } else if (previous_count == 0) {
-        first_stopped_stamp_ns_ = velocity_stamp_ns;
-      }
-      const double stable_duration =
-        static_cast<double>(velocity_stamp_ns - first_stopped_stamp_ns_) * 1e-9;
-      if (stopped_cycles_ >= stop_cycles_required_ && first_stopped_stamp_ns_ > 0 &&
-        stable_duration >= stop_min_duration_sec_)
-      {
+        std::abs(velocity.angular.z) <= stop_yaw_rps_, stopped_cycles_);
+      if (stopped_cycles_ >= stop_cycles_required_) {
         phase_ = after_stop_;
         stopped_cycles_ = 0;
       }
@@ -611,12 +493,6 @@ void SegmentedController::enterStopCheck(Phase next, const std::string & reason)
   phase_ = Phase::STOP_CHECK;
   after_stop_ = next;
   stopped_cycles_ = 0;
-  first_stopped_stamp_ns_ = 0;
-  if (odom_state_) {
-    std::lock_guard<std::mutex> lock(odom_state_->mutex);
-    stopped_sample_stamp_ns_ = odom_state_->stamp_ns;
-    stopped_motion_generation_ = odom_state_->motion_generation;
-  }
   stop_reason_ = reason;
 }
 

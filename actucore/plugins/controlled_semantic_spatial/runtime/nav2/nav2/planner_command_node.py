@@ -51,7 +51,7 @@ from .costmap_validation import (
     GoalCellRejected,
     validated_goal_cell_receipt,
 )
-from .readiness import control_odom_motion_blocker, evaluate_readiness, odom_twist_valid
+from .readiness import control_odom_motion_blocker, evaluate_readiness
 
 
 _TERMINAL_STATES = {
@@ -343,9 +343,6 @@ class PlannerCommandNode(Node):
         self._last_odom_monotonic: float | None = None
         self._last_odom_source_stamp_ns: int | None = None
         self._last_odom_frame_ready = False
-        self._last_odom_velocity_valid = False
-        self._odom_invalid_generation = 0
-        self._odom_stamp_high_water_ns: int | None = None
         self._segment_status: dict = {}
         self._last_obstacle_monotonic: float | None = None
         self._last_obstacle_source_stamp_ns: int | None = None
@@ -365,42 +362,12 @@ class PlannerCommandNode(Node):
     def _on_odom(self, message: Odometry) -> None:
         stamp_ns = _stamp_ns(message)
         with self._lock:
-            now = time.monotonic()
-            previous_receive = self._last_odom_monotonic
-            gap = (previous_receive is not None and
-                   not 0 <= now - previous_receive <= self._control_odom_max_age_sec)
-            try:
-                source_age = self._source_age(stamp_ns)
-            except Exception:
-                source_age = None
-            newer = (stamp_ns is not None and
-                     (self._odom_stamp_high_water_ns is None or
-                      stamp_ns > self._odom_stamp_high_water_ns))
-            if newer:
-                self._odom_stamp_high_water_ns = stamp_ns
-            self._last_odom_velocity_valid = (
-                newer and source_age is not None and
-                0 <= source_age <= self._control_odom_source_max_age_sec and
-                odom_twist_valid(getattr(message, "twist", None))
-            )
-            self._last_odom_monotonic = now
+            self._last_odom_monotonic = time.monotonic()
             self._last_odom_source_stamp_ns = stamp_ns
             self._last_odom_frame_ready = (
                 message.header.frame_id.strip("/") == self._global_frame.strip("/")
                 and message.child_frame_id.strip("/") == self._base_frame.strip("/")
             )
-            if gap or not self._last_odom_velocity_valid or not self._last_odom_frame_ready:
-                self._odom_invalid_generation = getattr(self, "_odom_invalid_generation", 0) + 1
-                candidate = self._latest_shadow_candidate
-                self._latest_shadow_candidate = None
-                # Avoid unsolicited stops when no navigation candidate is active.
-                if (candidate is not None and hasattr(self, "_control_pub")
-                    and shadow_context_is_publishable(
-                        self._active, nav_id=candidate.get("nav_id"),
-                        attempt=candidate.get("attempt"),
-                        status=candidate.get("navigation_status"),
-                    )):
-                    self._publish_control_velocity(Velocity.zero(), stop=True)
 
     def _on_segment_status(self, message: String) -> None:
         try:
@@ -480,7 +447,6 @@ class PlannerCommandNode(Node):
             odom_received_at = self._last_odom_monotonic
             odom_source_stamp_ns = self._last_odom_source_stamp_ns
             odom_frame_ready = self._last_odom_frame_ready
-            odom_velocity_valid = self._last_odom_velocity_valid
             obstacle_received_at = self._last_obstacle_monotonic
             obstacle_source_stamp_ns = self._last_obstacle_source_stamp_ns
             obstacle_frame_ready = self._last_obstacle_frame_ready
@@ -513,7 +479,6 @@ class PlannerCommandNode(Node):
             odom_received_at=odom_received_at,
             odom_source_age_sec=odom_source_age,
             odom_frame_ready=odom_frame_ready,
-            odom_velocity_valid=odom_velocity_valid,
             obstacle_received_at=obstacle_received_at,
             obstacle_source_age_sec=obstacle_source_age,
             obstacle_frame_ready=obstacle_frame_ready,
@@ -582,7 +547,6 @@ class PlannerCommandNode(Node):
                 for received in sensor_snapshot[2:4]
             ):
                 sensor_snapshot = None
-            odom_invalid_generation = getattr(self, "_odom_invalid_generation", 0)
             nav_id = self._active.get("nav_id")
             attempt = self._active.get("attempt")
             status = self._active.get("status", "error")
@@ -618,13 +582,12 @@ class PlannerCommandNode(Node):
                     max_forward_mps=forward_speed_limit,
                 )
             with self._lock:
-                if (odom_invalid_generation != getattr(self, "_odom_invalid_generation", 0)
-                    or not shadow_context_is_publishable(
-                        self._active,
-                        nav_id=nav_id,
-                        attempt=attempt,
-                        status=status,
-                    )):
+                if not shadow_context_is_publishable(
+                    self._active,
+                    nav_id=nav_id,
+                    attempt=attempt,
+                    status=status,
+                ):
                     return
                 previous = self._latest_shadow_candidate
                 if (
@@ -648,7 +611,6 @@ class PlannerCommandNode(Node):
                     "reason": reason,
                     "received_monotonic_ns": received_monotonic_ns,
                     "sensor_snapshot": sensor_snapshot,
-                    "odom_invalid_generation": odom_invalid_generation,
                 }
                 self._latest_shadow_candidate = candidate
                 if velocity == Velocity.zero():
@@ -1378,28 +1340,6 @@ class PlannerCommandNode(Node):
         if not hasattr(self, "_control_pub"):
             return  # Older mock fixtures and transitional callers.
         unix_now_ns = time.time_ns()
-        # The readiness result was obtained outside this lock. Recheck the
-        # current odometry under the same lock held through publication, so a
-        # newer invalid sample cannot race a nonzero command to the driver.
-        if velocity != Velocity.zero():
-            try:
-                current_age = self._source_age(self._last_odom_source_stamp_ns)
-            except Exception:
-                current_age = None
-            receive_age = (time.monotonic() - self._last_odom_monotonic
-                           if self._last_odom_monotonic is not None else None)
-            if (not self._last_odom_velocity_valid or not self._last_odom_frame_ready
-                    or receive_age is None
-                    or not 0 <= receive_age <= self._control_odom_max_age_sec
-                    or current_age is None
-                    or not 0 <= current_age <= self._control_odom_source_max_age_sec):
-                # Do not let a cached command resume if the clock or stream
-                # becomes healthy again before a new Nav2 command arrives.
-                self._odom_invalid_generation = getattr(self, "_odom_invalid_generation", 0) + 1
-                self._latest_shadow_candidate = None
-                velocity = Velocity.zero()
-                stop = True
-                sensor_snapshot = None
         try:
             ros_now_ns = self.get_clock().now().nanoseconds if sensor_snapshot is not None else None
             real_time = (sensor_snapshot is not None and
@@ -1466,24 +1406,18 @@ class PlannerCommandNode(Node):
         received_ns = candidate.get("received_monotonic_ns")
         age_ns = (time.monotonic_ns() - received_ns
                   if isinstance(received_ns, int) and not isinstance(received_ns, bool) else -1)
-        odom_blocked = False
         if age_ns < 0 or age_ns > _SHADOW_MAX_AGE_NS:
             velocity = Velocity.zero()
         elif control_odom_motion_blocker(
             self._readiness(), receive_max_age_sec=self._control_odom_max_age_sec,
             source_max_age_sec=self._control_odom_source_max_age_sec,
         ) is not None:
-            odom_blocked = True
             velocity = Velocity.zero()
         with self._lock:
             if (self._latest_shadow_candidate is not candidate or
-                candidate.get("odom_invalid_generation", 0) != getattr(self, "_odom_invalid_generation", 0) or
                 not shadow_context_is_publishable(self._active, nav_id=nav_id,
                                                      attempt=attempt, status=status)):
                 return
-            if odom_blocked:
-                self._odom_invalid_generation = getattr(self, "_odom_invalid_generation", 0) + 1
-                self._latest_shadow_candidate = None
             age_ns = (time.monotonic_ns() - received_ns
                       if isinstance(received_ns, int) and not isinstance(received_ns, bool) else -1)
             if age_ns < 0 or age_ns > _SHADOW_MAX_AGE_NS:

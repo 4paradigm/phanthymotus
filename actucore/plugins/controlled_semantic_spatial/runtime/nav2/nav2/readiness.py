@@ -2,23 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
-
-def odom_twist_valid(twist_with_covariance) -> bool:
-    """Validate the canonical six-axis velocity and covariance producer contract."""
-    try:
-        twist = twist_with_covariance.twist
-        values = (twist.linear.x, twist.linear.y, twist.linear.z,
-                  twist.angular.x, twist.angular.y, twist.angular.z)
-        covariance = twist_with_covariance.covariance
-        return (all(math.isfinite(value) for value in values)
-                and len(covariance) == 36
-                and all(math.isfinite(covariance[i]) and covariance[i] > 0
-                        for i in (0, 7, 14, 21, 28, 35)))
-    except (AttributeError, TypeError, ValueError, IndexError):
-        return False
-
 
 def _age(now: float, received_at: float | None) -> float | None:
     if received_at is None:
@@ -42,7 +25,6 @@ def evaluate_readiness(
     lifecycle_states: dict[str, int],
     action_server_ready: bool,
     global_to_base_ready: bool,
-    odom_velocity_valid: bool = False,
 ) -> dict:
     """Evaluate the planner/controller boundary against FAST-LIVO2 outputs."""
 
@@ -90,7 +72,6 @@ def evaluate_readiness(
         "odom_status_age_sec": odom_receive_age,
         "odom_source_age_sec": odom_source_age_sec,
         "odom_frame_ready": odom_frame_ready,
-        "odom_velocity_valid": odom_velocity_valid,
         "registered_cloud_receive_age_sec": obstacle_receive_age,
         "registered_cloud_source_age_sec": obstacle_source_age_sec,
         "registered_cloud_frame_ready": obstacle_frame_ready,
@@ -126,15 +107,13 @@ def control_odom_motion_blocker(
     blocker = navigation_motion_blocker(readiness)
     if blocker is not None:
         return blocker
-    if readiness.get("odom_velocity_valid") is not True:
-        return "navigation_not_ready:control_odom_velocity_invalid"
     receive_age = readiness.get("odom_status_age_sec")
     source_age = readiness.get("odom_source_age_sec")
     if (
         not isinstance(receive_age, (int, float))
-        or not 0 <= receive_age <= receive_max_age_sec
+        or receive_age > receive_max_age_sec
         or not isinstance(source_age, (int, float))
-        or not 0 <= source_age <= source_max_age_sec
+        or not -0.1 <= source_age <= source_max_age_sec
     ):
         return "navigation_not_ready:control_odom_stale"
     return None

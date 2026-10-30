@@ -1,9 +1,7 @@
 #ifndef SEGMENTED_CONTROLLER__SEGMENTED_CONTROLLER_HPP_
 #define SEGMENTED_CONTROLLER__SEGMENTED_CONTROLLER_HPP_
 
-#include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -14,7 +12,6 @@
 #include "nav2_core/controller.hpp"
 #include "nav2_costmap_2d/costmap_2d_ros.hpp"
 #include "nav2_costmap_2d/footprint_collision_checker.hpp"
-#include "nav_msgs/msg/odometry.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
@@ -60,10 +57,6 @@ private:
   bool commandedForwardSafe(double x, double y, double yaw, double remaining);
   bool rotationSafe(double x, double y, double from_yaw, double to_yaw);
   void enterStopCheck(Phase next, const std::string & reason);
-  struct OdometryState;
-  static void receiveOdometry(
-    const std::shared_ptr<OdometryState> & state,
-    const nav_msgs::msg::Odometry::SharedPtr message);
   void publishStatus(
     const geometry_msgs::msg::PoseStamped & pose,
     double remaining_distance,
@@ -79,26 +72,6 @@ private:
     nav2_costmap_2d::FootprintCollisionChecker<nav2_costmap_2d::Costmap2D *>>
   collision_checker_;
   rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::String>::SharedPtr status_pub_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  // Callbacks own this state independently of the controller's lifetime.
-  struct OdometryState
-  {
-    std::mutex mutex;
-    geometry_msgs::msg::Twist velocity;
-    std::chrono::steady_clock::time_point received{};
-    std::int64_t stamp_ns{0};
-    std::uint64_t motion_generation{0};
-    bool valid{false};
-    bool active{false};
-    rclcpp::Clock::SharedPtr clock;
-    std::string base_frame;
-    double max_age_sec{0.6};
-    double stop_linear_mps{0.05};
-    double stop_yaw_rps{0.10};
-  };
-  std::shared_ptr<OdometryState> odom_state_;
-  double odom_max_age_sec_{0.6};
-
   std::mutex mutex_;
   nav_msgs::msg::Path plan_;
   std::size_t segment_index_{0};
@@ -113,9 +86,6 @@ private:
   Phase after_stop_{Phase::SELECT};
   Phase last_status_phase_{Phase::BLOCKED};
   int stopped_cycles_{0};
-  std::int64_t stopped_sample_stamp_ns_{0};
-  std::int64_t first_stopped_stamp_ns_{0};
-  std::uint64_t stopped_motion_generation_{0};
   std::string stop_reason_{"waiting_for_plan"};
   rclcpp::Time last_status_time_{0, 0, RCL_ROS_TIME};
 
@@ -130,7 +100,6 @@ private:
   double stop_linear_mps_{0.05};
   double stop_yaw_rps_{0.10};
   int stop_cycles_required_{2};
-  double stop_min_duration_sec_{0.3};
   double preserve_endpoint_m_{0.25};
   // A preview floor, not a validated stopping distance.
   double forward_preview_min_m_{0.50};

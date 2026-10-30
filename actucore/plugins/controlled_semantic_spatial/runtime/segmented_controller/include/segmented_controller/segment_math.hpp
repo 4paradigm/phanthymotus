@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <cstddef>
 
 namespace segmented_controller
@@ -62,39 +61,9 @@ inline bool segment_crossed(const SegmentProgress & progress)
   return progress.length > 1e-9 && progress.along >= progress.length;
 }
 
-// Nonzero finite diagonal marks a velocity estimated by the new producer.
-// Default all-zero raw FAST-LIVO2 twist/covariance must never mean "stopped".
-template<typename Covariance>
-bool velocity_covariance_valid(const Covariance & covariance)
+inline void observe_stopped_cycle(bool stopped, int & stopped_cycles)
 {
-  for (std::size_t index = 0; index < 6; ++index) {
-    const double value = covariance[index * 7];
-    if (!std::isfinite(value) || value <= 0.0) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// Require both source-stamp freshness and time since local reception. A paused
-// ROS clock cannot make an old sample valid indefinitely.
-inline bool odometry_fresh(double source_age, double receipt_age, double max_age)
-{
-  return std::isfinite(source_age) && std::isfinite(receipt_age) &&
-         std::isfinite(max_age) && max_age > 0.0 && source_age >= 0.0 &&
-         source_age <= max_age && receipt_age >= 0.0 && receipt_age <= max_age;
-}
-
-inline void observe_stopped_sample(
-  bool stopped, std::int64_t stamp, std::int64_t & last_stamp, int & stopped_samples)
-{
-  if (!stopped) {
-    stopped_samples = 0;
-    last_stamp = stamp;
-  } else if (stamp > last_stamp) {
-    ++stopped_samples;
-    last_stamp = stamp;
-  }
+  stopped_cycles = stopped ? stopped_cycles + 1 : 0;
 }
 
 // Check the straight motion commanded along the current body heading. This
