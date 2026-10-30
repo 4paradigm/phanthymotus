@@ -59,9 +59,12 @@ Nav2 客户端将请求登记与响应读取串行化，避免旧版 rclpy 在�
 
 | port | topic | 必需 |
 | --- | --- | --- |
-| `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `rgb` | `/ubuntu/camera/rgb` | 否；连接时启用语义导航 |
+| `lidar` | `/ubuntu/navigation/lidar` | 是 |
 | `imu` | `/ubuntu/navigation/imu` | 是 |
+
+输入顺序为 RGB、LiDAR、IMU；相较旧版，RGB 与 LiDAR 的端口索引已交换。
+升级时须先停止项目，删除旧导航卡并重新添加、接线和保存，不能沿用旧连线。
 
 Driver 卡片合并后的连线：
 

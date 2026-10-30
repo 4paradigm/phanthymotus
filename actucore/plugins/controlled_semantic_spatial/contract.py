@@ -165,15 +165,13 @@ def controlled_semantic_spatial_tool_definition(namespace: str) -> dict:
         f"/{namespace.strip('/')}/navigation/odom",
         status_topic=f"/{namespace.strip('/')}/navigation/fast_livo2/status",
     )
-    external_inputs = [deepcopy(item) for item in mapping["topic_in"] if item["port"] == "lidar"]
-    for item in external_inputs:
-        item["required"] = True
     rgb_input = deepcopy(semantic["topic_in"][0])
     rgb_input["required"] = False
-    external_inputs.append(rgb_input)
+    lidar_input = deepcopy(next(item for item in mapping["topic_in"] if item["port"] == "lidar"))
+    lidar_input["required"] = True
     imu_input = deepcopy(next(item for item in mapping["topic_in"] if item["port"] == "imu"))
     imu_input["required"] = True
-    external_inputs.append(imu_input)
+    external_inputs = [rgb_input, lidar_input, imu_input]
     component_outputs = {
         str(item.get("port", "")): item
         for item in [*mapping["topic_out"], *planning["topic_out"]]

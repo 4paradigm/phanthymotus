@@ -250,7 +250,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertEqual(tool["displayName"], "controlled_semantic_spatial")
         self.assertEqual(
             [item["port"] for item in tool["topic_in"]],
-            ["lidar", "rgb", "imu"],
+            ["rgb", "lidar", "imu"],
         )
         optional_inputs = {
             item["port"]

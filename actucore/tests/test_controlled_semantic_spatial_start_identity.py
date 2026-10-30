@@ -148,7 +148,7 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
     def test_default_topics_without_rgb_are_bound_to_runtime_and_mapper(self):
         self.make_plugin()
         ports = self.plugin.get_tools()[0]["topic_in"]
-        self.assertEqual([p["port"] for p in ports], ["lidar", "rgb", "imu"])
+        self.assertEqual([p["port"] for p in ports], ["rgb", "lidar", "imu"])
         self.assertEqual(ports[2]["format"], "sensor/imu")
         self.assertTrue(ports[2]["required"])
         defaults = {p["port"]: p["topic"] for p in ports}
@@ -202,11 +202,11 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
                 channel.manager = types.SimpleNamespace(sync_from_canvas=lambda: None, _adapters={})
                 channel._get_channel_configs = lambda: []
                 layout = {"cards": [
-                    {"id": "nav-card", "toolName": self.plugin.PREFIX, "mcpId": "nav", "topicIn": [{"port": "lidar"}, {"port": "rgb"}, {"port": "imu"}]},
+                    {"id": "nav-card", "toolName": self.plugin.PREFIX, "mcpId": "nav", "topicIn": [{"port": "rgb"}, {"port": "lidar"}, {"port": "imu"}]},
                     {"id": "lidar-source", "toolName": "lidar", "mcpId": "source"},
                     {"id": "imu-source", "toolName": "imu", "mcpId": "source"},
                 ], "connections": [
-                    {"fromCardId": "lidar-source", "toCardId": "nav-card", "fromPortIdx": 0, "toPortIdx": 0,
+                    {"fromCardId": "lidar-source", "toCardId": "nav-card", "fromPortIdx": 0, "toPortIdx": 1,
                      "fromPort": "navigation_lidar", "toPort": "lidar", "format": sources["lidar-source"]["format"]},
                     {"fromCardId": "imu-source", "toCardId": "nav-card", "fromPortIdx": 0, "toPortIdx": 2,
                      "fromPort": "navigation_imu", "toPort": "imu", "format": sources["imu-source"]["format"]},
