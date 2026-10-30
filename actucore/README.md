@@ -519,3 +519,15 @@ ttl  = negotiate.ttl_ms(rate, descriptor)
 
 这两个模块原本在 `plugins/vla/` 下，第二个消费者出现时提到了 `control_stream/`；
 `plugins/vla/` 留了两个 re-export shim，所以照旧从那里 import 的代码不用改。
+
+## 通用人物头部视觉跟随（headfollow）
+
+新插件 `plugins/headfollow/` 接 Perception 的 VOP 检测，输出既有 `motus.control/1`
+头部目标。接线为 `头部相机 → VOP → headfollow → 机器人头部执行卡片`。
+显式执行默认 follow 才开始跟随，确认无人后回到驱动声明的回正点；项目启动不自动运动。
+不安装另一套YOLO，不依赖私有推理端点，不写机器人SDK或机型分支。
+
+下游需声明 `head_tracking` 轴顺序/方向/限位/速度/neutral/反馈话题，提供真实到位及结果确认。
+没有可动头部的机器会拒绝协商，不自动改成底盘或机械臂动作。TRON2有配套适配；不同双轴和
+单轴云台的通用性已作假接口测试，不宣称其它机器人均已实机支持。完整契约、VOP时间戳限制、
+迁移与测试见 [通用人物视觉跟随](plugins/headfollow/README.md)。原有navi/VLA配置和行为不改。

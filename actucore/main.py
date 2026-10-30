@@ -142,6 +142,11 @@ class ActuCoreBundle:
             self._plugins.append(NaviPlugin(plugins_cfg["navi"], executor))
             log.info("NaviPlugin loaded")
 
+        if plugins_cfg.get("headfollow", {}).get("enabled", False):
+            from plugins.headfollow import HeadFollowPlugin
+            self._plugins.append(HeadFollowPlugin(plugins_cfg["headfollow"], executor))
+            log.info("HeadFollowPlugin loaded")
+
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 

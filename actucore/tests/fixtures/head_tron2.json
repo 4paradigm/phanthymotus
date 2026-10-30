@@ -1,0 +1,67 @@
+{
+  "control_interface": "motus.control/1",
+  "mode": "joint_position",
+  "dof": 2,
+  "joint_names": [
+    "head_pitch_Joint",
+    "head_yaw_Joint"
+  ],
+  "units": {
+    "angle": "rad",
+    "time": "s"
+  },
+  "limits": {
+    "lower": [
+      -0.5235987755982988,
+      -0.7853981633974483
+    ],
+    "upper": [
+      0.9599310885968813,
+      0.7853981633974483
+    ],
+    "max_velocity": [
+      0.10471975511965978,
+      0.10471975511965978
+    ]
+  },
+  "rate": {
+    "expected_hz": 2,
+    "max_hz": 10,
+    "watchdog_ms": 500,
+    "max_obs_age_ms": 1500
+  },
+  "force_torque": null,
+  "groups": [
+    {
+      "name": "head",
+      "offset": 0,
+      "count": 2,
+      "unit": "rad",
+      "resource": "head"
+    }
+  ],
+  "head_tracking": {
+    "schema": "motus.head-tracking/1",
+    "axes": {
+      "pitch": {
+        "index": 0,
+        "sign": -1,
+        "image_axis": 1,
+        "gain_rad": 0.22
+      },
+      "yaw": {
+        "index": 1,
+        "sign": 1,
+        "image_axis": 0,
+        "gain_rad": 0.26
+      }
+    },
+    "neutral": [
+      0.0,
+      0.0
+    ],
+    "max_duration_s": 15.0,
+    "camera_topic": "/limx_tron2/camera",
+    "feedback_topic": "/limx_tron2/head_state"
+  }
+}
