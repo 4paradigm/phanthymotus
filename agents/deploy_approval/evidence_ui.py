@@ -125,7 +125,7 @@ progress{{display:block;width:100%;height:8px;margin:12px 0 7px;accent-color:#00
 <fieldset id="writes" disabled hidden><legend>上传附件</legend>
 <label id="dropzone" for="file"><strong>选择文件，或拖放到这里</strong><span class="file-hint">最多 20 个文件 · 单个文件最大 512 MiB · 总计最大 10 GiB</span><input id="file" type="file" multiple></label>
 <div class="secondary"><div class="secondary-fields">
-<label class="control" for="note">文件说明或独立备注<textarea id="note" aria-describedby="note-help"></textarea><span id="note-help" class="file-hint">最多 5000 字，支持 Markdown；短备注可随文件保存或单独保存。超出后，点击“单独保存备注”或“上传文件”都会将原文完整转为 UTF-8 TXT 附件。图片可作为独立附件上传。配额按当前可见附件及本浏览器未完成任务估算；其他并发上传以服务端最终校验为准。</span></label>
+<label class="control" for="note">文件说明或独立备注<textarea id="note" aria-describedby="note-help"></textarea><span id="note-help" class="file-hint">最多 5000 字，支持 Markdown；短备注可随文件保存或单独保存。超出后，点击“单独保存备注”或“上传文件”都会将原文完整转为 UTF-8 TXT 附件。图片可作为独立附件上传。</span></label>
 <label class="control" for="replace">附件操作<select id="replace"><option value="">新增附件（保留已有附件）</option><optgroup id="replace-targets" label="替换指定附件（旧记录保留历史）"></optgroup></select></label>
 </div></div>
 <div class="primary-row"><button id="save-note" type="button">单独保存备注</button><button id="upload" class="primary" type="button">上传所选文件</button></div>
@@ -227,8 +227,8 @@ _JAVASCRIPT = r'''"use strict";
     return includeTime ? formatted + "（北京时间）" : formatted;
   }
   const jobStatusLabel = status => ({
-    排队中: "等待上传", 核对中: "校验中", running: "上传中", verifying: "校验中",
-    waiting: "等待恢复", succeeded: "已完成", failed: "失败", paused: "已暂停"
+    排队中: "等待上传", 核对中: "校验中", running: "文件发送中", verifying: "正在归档附件",
+    waiting: "等待恢复", succeeded: "附件已确认保存成功", failed: "失败", paused: "已暂停"
   }[status] || "处理中");
   function proofTransportAllowed(target) {
     if (target.origin !== window.location.origin) return false;
@@ -300,8 +300,7 @@ _JAVASCRIPT = r'''"use strict";
     if (path === "/uploads" && method === "POST") return "初始化上传";
     if (path === "/notes") return "保存备注";
     if (/\/resume$/.test(path)) return "恢复上传";
-    if (/\/complete$/.test(path)) return "提交 COS 校验";
-    if (/\/parts\/\d+\/url$/.test(path)) return "获取分片签名";
+    if (/\/complete$/.test(path)) return "上传完成，正在归档附件";
     if (/\/uploads\/[^/]+$/.test(path)) return "查询 COS 分片状态";
     return method === "GET" ? "查询附件状态" : "保存附件记录";
   }
@@ -310,7 +309,6 @@ _JAVASCRIPT = r'''"use strict";
     if (path === "/uploads" && method === "POST" || /\/resume$/.test(path) ||
         path === "/notes") return 60000;
     if (/\/complete$/.test(path)) return 120000;
-    if (/\/parts\/\d+\/url$/.test(path)) return 30000;
     return 20000;
   }
   function evidenceRequestHeaders(target, method, authMode = "auto") {
@@ -339,7 +337,10 @@ _JAVASCRIPT = r'''"use strict";
     if (target.origin !== window.location.origin) throw new Error("拒绝跨站 Evidence 请求。");
     const headers = evidenceRequestHeaders(target, method, authMode);
     if (write) headers["Content-Type"] = "application/json";
-    const stage = requestStage(path, method), boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+    let stage = requestStage(path, method);
+    if (job && job.status === "verifying" && method === "GET" && /\/uploads\/[^/]+$/.test(path))
+      stage = "上传完成，正在归档附件";
+    const boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
       ? timeoutMs : requestTimeout(path, method);
     if (job) {
       job.statusText = stage;
@@ -398,77 +399,13 @@ _JAVASCRIPT = r'''"use strict";
       throw error;
     } finally { clearTimeout(timeout); active.delete(controller); if (job) job.requests.delete(controller); }
   }
-  function trustedCosPartUrl(signed) {
-    if (!signed || signed.method !== "PUT" || typeof signed.url !== "string" || signed.url.length > 8192)
-      throw new Error("COS 未返回有效的分片 PUT 地址。");
-    let target;
-    try { target = new URL(signed.url); } catch (_) { throw new Error("COS 分片地址格式无效。"); }
-    if (target.protocol !== "https:" || target.username || target.password || target.hash ||
-        (target.port && target.port !== "443") ||
-        !/^[a-z0-9][a-z0-9-]{0,62}\.cos\.[a-z0-9-]+\.myqcloud\.com$/i.test(target.hostname))
-      throw new Error("COS 分片地址不是受信任的 HTTPS COS 地址。");
-    return target;
-  }
-  function uploadCosPart(target, blob, job, onProgress) {
-    return new Promise((resolve, reject) => {
-      if (!writable()) return reject(new Error("当前轮不可写，请刷新并核对 HEAD/round。"));
-      job.statusText = "COS 直传分片 " + (job.currentPart || "");
-      job.detailNode.textContent = job.statusText + "…";
-      const xhr = new XMLHttpRequest(); active.add(xhr); job.requests.add(xhr);
-      let finished = false;
-      const cleanup = () => {
-        if (finished) return;
-        finished = true; active.delete(xhr); job.requests.delete(xhr);
-      };
-      try {
-        xhr.open("PUT", target.href); xhr.withCredentials = false; xhr.timeout = 120000;
-        xhr.setRequestHeader("Content-Type", "application/octet-stream");
-      } catch (error) {
-        cleanup(); reject(new Error("COS 直传请求无法启动；未回退到 Controller 代理。")); return;
-      }
-      xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(event.loaded); };
-      xhr.onload = () => {
-        cleanup();
-        let responseOrigin = null;
-        if (xhr.responseURL) {
-          try { responseOrigin = new URL(xhr.responseURL).origin; } catch (_) { responseOrigin = "invalid"; }
-        }
-        if (xhr.status >= 200 && xhr.status < 300 && (responseOrigin === null || responseOrigin === target.origin))
-          return resolve({uploaded: true});
-        const error = new ApiError(xhr.status, xhr.status === 403
-          ? "COS 拒绝分片直传；请确认签名有效及 COS CORS 允许当前 HTTPS 来源。"
-          : "COS 分片直传失败（HTTP " + xhr.status + "）。");
-        error.fallbackEligible = xhr.status === 0;
-        reject(error);
-      };
-      xhr.onerror = () => {
-        cleanup();
-        const error = new Error("COS 分片网络中断，结果未知；将先查询 COS 分片状态。");
-        error.fallbackEligible = true; reject(error);
-      };
-      xhr.ontimeout = () => {
-        cleanup();
-        const error = new Error("COS 分片上传超时（120 秒），结果未知；将先查询 COS 分片状态。");
-        error.fallbackEligible = true; reject(error);
-      };
-      xhr.onabort = () => {
-        cleanup();
-        reject(new Error(xhr._evidenceAbortReason === "halt"
-          ? "HEAD/round 或权限状态已变化，上传已停止。"
-          : xhr._evidenceAbortReason === "pagehide"
-            ? "页面离开导致分片请求中断；结果未知，将先查询 COS 分片状态。"
-            : "上传已暂停；继续前会先查询 COS 分片状态。"));
-      };
-      xhr.send(blob);
-    });
-  }
   function uploadControllerPart(uploadId, partNumber, blob, job, onProgress) {
     return new Promise((resolve, reject) => {
       if (!writable()) return reject(new Error("当前轮不可写，请刷新并核对 HEAD/round。"));
       const path = "/uploads/" + id(uploadId) + "/parts/" + partNumber + "/data";
       const target = new URL(api + path, window.location.href);
       if (target.origin !== window.location.origin || target.protocol !== "https:")
-        return reject(new Error("备用分片上传只允许当前 HTTPS 来源。"));
+        return reject(new Error("分片上传只允许当前 HTTPS 来源。"));
       target.searchParams.set("head_sha", bound.head_sha);
       target.searchParams.set("round_id", bound.round_id);
       let headers;
@@ -476,7 +413,7 @@ _JAVASCRIPT = r'''"use strict";
         headers = evidenceRequestHeaders(target, "PUT");
         headers["Content-Type"] = "application/octet-stream";
       } catch (error) { return reject(error); }
-      job.statusText = "同源备用上传分片 " + partNumber;
+      job.statusText = "文件发送中 · 分片 " + partNumber;
       job.detailNode.textContent = job.statusText + "…";
       const xhr = new XMLHttpRequest(); active.add(xhr); job.requests.add(xhr);
       let finished = false;
@@ -488,19 +425,22 @@ _JAVASCRIPT = r'''"use strict";
         xhr.open("PUT", target.href); xhr.withCredentials = true; xhr.timeout = 120000;
         for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
       } catch (_) {
-        cleanup(); reject(new Error("同源备用分片请求无法启动。")); return;
+        cleanup(); reject(new Error("同源分片请求无法启动。")); return;
       }
       xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress(event.loaded); };
       xhr.onload = () => {
         cleanup();
         let value = {};
         try { value = JSON.parse(xhr.responseText || "{}"); } catch (_) {}
-        if (xhr.status >= 200 && xhr.status < 300 && value.uploaded === true &&
-            Number(value.part_number) === partNumber && Number(value.size) === blob.size)
-          return resolve(value);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          if (value.uploaded === true && Number(value.part_number) === partNumber && Number(value.size) === blob.size)
+            return resolve(value);
+          const error = new ApiError(503, "同源分片响应结果不明确。", "unclear_upload_result");
+          error.resultUnclear = true; return reject(error);
+        }
         const detail = typeof value.detail === "string" ? value.detail : "";
         if (xhr.status === 401) return reject(new ApiError(401, "上传授权无效或已过期。", detail));
-        if (xhr.status === 403) return reject(new ApiError(403, "备用上传被服务端拒绝；权限未绕过。", detail));
+        if (xhr.status === 403) return reject(new ApiError(403, "上传被服务端拒绝；权限未绕过。", detail));
         if (xhr.status === 409) {
           if (["round_changed", "context_not_writable", "pr_closed", "pr_closed_or_mismatched",
             "pr_draft", "state_unavailable"].includes(detail))
@@ -508,18 +448,29 @@ _JAVASCRIPT = r'''"use strict";
           return reject(new ApiError(409, "服务端拒绝该分片；请先核对当前上传状态。", detail));
         }
         if (xhr.status === 413) return reject(new ApiError(413, "分片超过服务端大小限制。", detail));
-        if (xhr.status === 503) return reject(new ApiError(503, "附件服务暂时不可用；分片状态尚待核对。", detail));
-        reject(new ApiError(xhr.status || 503, "同源备用分片上传未确认成功。", detail));
+        if (xhr.status === 503) {
+          const error = new ApiError(503, "附件服务暂时不可用；分片状态尚待核对。", detail);
+          error.resultUnclear = true; return reject(error);
+        }
+        const error = new ApiError(xhr.status || 503, "同源分片上传未确认成功。", detail);
+        error.resultUnclear = xhr.status === 0 || xhr.status >= 500;
+        reject(error);
       };
-      xhr.onerror = () => { cleanup(); reject(new ApiError(0, "同源备用分片网络中断；将先查询 COS 状态。")); };
-      xhr.ontimeout = () => { cleanup(); reject(new ApiError(0, "同源备用分片超时（120 秒）；结果未知，将先查询 COS 状态。")); };
+      xhr.onerror = () => {
+        cleanup(); const error = new ApiError(0, "同源分片网络中断；结果未知。");
+        error.resultUnclear = true; reject(error);
+      };
+      xhr.ontimeout = () => {
+        cleanup(); const error = new ApiError(0, "同源分片超时（120 秒）；结果未知。");
+        error.resultUnclear = true; reject(error);
+      };
       xhr.onabort = () => {
         cleanup();
         reject(new Error(xhr._evidenceAbortReason === "halt"
-          ? "HEAD/round 或权限状态已变化，备用上传已停止。"
+          ? "HEAD/round 或权限状态已变化，上传已停止。"
           : xhr._evidenceAbortReason === "pagehide"
-            ? "页面离开导致备用分片中断；结果未知，将先查询 COS 状态。"
-            : "备用上传已暂停；继续前会先查询 COS 状态。"));
+            ? "页面离开导致分片中断；结果未知，将先查询 COS 状态。"
+            : "上传已暂停；继续前会先查询 COS 状态。"));
       };
       xhr.send(blob);
     });
@@ -724,13 +675,11 @@ _JAVASCRIPT = r'''"use strict";
       parent.append(li);
     }
   }
-  function deploymentList(rows, parent, headSha) {
+  function deploymentList(rows, parent) {
     parent.replaceChildren();
     if (!Array.isArray(rows) || !rows.length) return;
     const heading = document.createElement("h3"); heading.className = "list-heading";
-    heading.textContent = headSha
-      ? "部署记录 · 镜像对应 Commit：" + String(headSha)
-      : "部署记录";
+    heading.textContent = "部署记录";
     parent.append(heading);
     const wrap = document.createElement("div"), table = document.createElement("table");
     wrap.className = "deployment-table-wrap"; table.className = "deployment-table";
@@ -756,7 +705,8 @@ _JAVASCRIPT = r'''"use strict";
   }
   function render() {
     const state = typeof context.status === "string" ? context.status : "";
-    const pageAvailable = !!context && typeof state === "string" && !!state;
+    const pageAvailable = !!context && (typeof state === "string" && !!state ||
+      roundMatches(context) || Array.isArray(context.rounds) || Array.isArray(context.history));
     // Lifecycle labels control writes; trusted current and archived evidence
     // remain readable throughout every supported phase.
     const stageAvailable = pageAvailable;
@@ -774,6 +724,10 @@ _JAVASCRIPT = r'''"use strict";
     const oldRounds = (context.rounds || context.history || []).filter(round =>
       !roundMatches(round) && round && testStatuses.has(round.status));
     oldRounds.sort((a, b) => {
+      const aNumber = Number.isSafeInteger(a.round_number) && a.round_number > 0 ? a.round_number : null;
+      const bNumber = Number.isSafeInteger(b.round_number) && b.round_number > 0 ? b.round_number : null;
+      if (aNumber !== null && bNumber !== null && aNumber !== bNumber) return bNumber - aNumber;
+      if (aNumber !== bNumber) return aNumber === null ? 1 : -1;
       const getTime = round => {
         const value = Date.parse(round && (round.archived_at || round.ended_at || round.round_started_at || round.started_at || round.created_at) || "");
         return Number.isFinite(value) ? value : 0;
@@ -782,8 +736,13 @@ _JAVASCRIPT = r'''"use strict";
     });
     const roundNumber = Number.isSafeInteger(context.round_number) && context.round_number > 0
       ? context.round_number : null;
+    const latestRoundNumber = Math.max(roundNumber || 0, ...oldRounds.map(round =>
+      Number.isSafeInteger(round.round_number) && round.round_number > 0 ? round.round_number : 0));
+    const selectedIsLatestRound = roundNumber === null || roundNumber === latestRoundNumber;
     if (stageAvailable) {
-      $("round-title").textContent = (roundNumber ? "第 " + roundNumber + " 轮 · " : "当前轮 · ") + "附件";
+      $("round-title").textContent = roundNumber
+        ? "第 " + roundNumber + " 轮" + (selectedIsLatestRound ? "（当前轮次）" : "")
+        : (selectedIsLatestRound ? "当前轮（当前轮次）" : "当前轮");
       $("summary").textContent = state === "testing" && !writable()
         ? "当前为查看模式。如需上传，请从 PR Summary 的「打开附件页」进入。"
         : "本轮附件与说明。";
@@ -791,7 +750,7 @@ _JAVASCRIPT = r'''"use strict";
       $("round-status").textContent = "状态：" +
         (context.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(state));
       $("round-time").textContent = "测试时间：" + formatDate(context.round_started_at, true);
-      deploymentList(context.display_deployments, $("current-deployments"), context.head_sha);
+      deploymentList(context.display_deployments, $("current-deployments"));
     } else {
       $("writes").hidden = true; $("writes").disabled = true;
     }
@@ -808,7 +767,7 @@ _JAVASCRIPT = r'''"use strict";
     for (let index = 0; index < oldRounds.length; index++) {
       const round = oldRounds[index];
       const details = document.createElement("details"), summary = document.createElement("summary"), content = document.createElement("div");
-      const rawRoundDate = round.created_at || round.started_at || round.round_started_at || round.archived_at || round.ended_at;
+      const rawRoundDate = round.round_started_at || round.started_at || round.created_at || round.archived_at || round.ended_at;
       const roundDate = rawRoundDate && Number.isFinite(Date.parse(rawRoundDate)) ? formatDate(rawRoundDate) : "";
       const hasAttachmentDetails = Array.isArray(round.attachments);
       const count = hasAttachmentDetails ? round.attachments.filter(item => item && !isDeletedAttachment(item)).length : null;
@@ -824,12 +783,17 @@ _JAVASCRIPT = r'''"use strict";
       summary.textContent = summaryParts.join(" · ");
       details.append(summary);
       content.className = "history-content";
-      const status = document.createElement("p"); status.className = "muted";
-      status.textContent = "Commit：" + String(round.head_sha || "—") + " · 状态：" +
-        (round.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(round.status)) +
-        " · 测试时间：" + (roundDate || "时间未知"); content.append(status);
+      const facts = document.createElement("div"); facts.className = "round-facts";
+      for (const [label, value] of [
+        ["Commit", String(round.head_sha || "—")],
+        ["状态", round.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(round.status)],
+        ["测试时间", formatDate(rawRoundDate, true)]
+      ]) {
+        const fact = document.createElement("p"); fact.textContent = label + "：" + value; facts.append(fact);
+      }
+      content.append(facts);
       const deploymentRows = document.createElement("div");
-      deploymentList(round.display_deployments, deploymentRows, round.head_sha); content.append(deploymentRows);
+      deploymentList(round.display_deployments, deploymentRows); content.append(deploymentRows);
       if (hasAttachmentDetails) {
         const ul = document.createElement("ul"); attachmentList(round.attachments, ul, false); content.append(ul);
       } else {
@@ -903,6 +867,8 @@ _JAVASCRIPT = r'''"use strict";
     } catch (_) { savedUploads = {}; }
   }
   async function fileFingerprint(file, job) {
+    if (typeof job.fingerprint === "string" && /^[0-9a-f]{64}$/.test(job.fingerprint))
+      return job.fingerprint;
     let chain = new Uint8Array(32);
     for (let start = 0; start < file.size; start += 4 * 1024 * 1024) {
       if (job.paused || stopped) throw new Error("已暂停文件核对。");
@@ -916,7 +882,9 @@ _JAVASCRIPT = r'''"use strict";
     }
     const metadata = new TextEncoder().encode(JSON.stringify([file.name, file.size, file.type, file.lastModified]));
     const last = new Uint8Array(chain.length + metadata.length); last.set(chain); last.set(metadata, chain.length);
-    return [...new Uint8Array(await crypto.subtle.digest("SHA-256", last))].map(v => v.toString(16).padStart(2, "0")).join("");
+    job.fingerprint = [...new Uint8Array(await crypto.subtle.digest("SHA-256", last))]
+      .map(v => v.toString(16).padStart(2, "0")).join("");
+    return job.fingerprint;
   }
   const partsOf = value => (Array.isArray(value.uploaded_parts || value.parts) ? (value.uploaded_parts || value.parts) : [])
     .map(row => typeof row === "number" ? {part_number: row} : row);
@@ -949,7 +917,11 @@ _JAVASCRIPT = r'''"use strict";
     }
     throw lastError || new Error("上传状态查询已暂停；重试时会重新核对 COS 状态。");
   }
-  const terminalReady = value => value && value.status === "ready" && value.verified === true;
+  const terminalReady = value => value && value.status === "ready" &&
+    (value.verified === true || value.cos_content_verified === true);
+  const verifiedReady = value => terminalReady(value) &&
+    typeof value.sha256 === "string" && /^[0-9a-f]{64}$/.test(value.sha256) &&
+    value.head_sha === bound.head_sha && value.round_id === bound.round_id;
   function updateJob(job, text) {
     job.statusNode.textContent = jobStatusLabel(job.status);
     if (text !== undefined) job.detailNode.textContent = text;
@@ -1112,20 +1084,17 @@ _JAVASCRIPT = r'''"use strict";
     job.detailNode.textContent = (job.statusText || "上传中") + " · " + job.progress.value.toFixed(1) +
       "% · " + formatBytes(bytes) + " / " + formatBytes(job.file.size);
   }
-  async function waitReady(job, attachmentId = "") {
+  async function waitReady(job, initialStatus = null, attachmentId = "") {
     job.status = "verifying";
-    updateJob(job, "COS 已接收；等待服务端 SHA256 校验。");
+    job.statusText = "上传完成，正在归档附件";
+    updateJob(job, job.statusText + "。");
+    let status = initialStatus;
     for (let count = 0; count < 30 && !stopped && !job.paused; count++) {
-      const status = await uploadStateWithRetry(job);
-      const verifiedSha = typeof status.sha256 === "string" && /^[0-9a-f]{64}$/.test(status.sha256);
-      if (terminalReady(status)) {
-        if (!verifiedSha || status.head_sha !== bound.head_sha || status.round_id !== bound.round_id) {
-          job.status = "waiting";
-          updateJob(job, "服务端 ready 状态缺少匹配的 HEAD/round 或合法 SHA256；未标记成功，上传记录已保留。");
-          return false;
-        }
+      if (!status) status = await uploadStateWithRetry(job);
+      if (verifiedReady(status)) {
         job.progress.value = 100; job.completeUnknown = false; job.status = "succeeded";
-        job.statusText = "上传成功 · COS 已校验 · SHA256 " + status.sha256;
+        job.statusText = "附件已确认保存成功 · SHA256 " + status.sha256;
+        const confirmedText = job.statusText;
         const key = job.fingerprint + ":" + (job.replacesId || "new") + ":" + job.noteDigest;
         delete savedUploads[key]; try { localStorage.setItem(storageKey, JSON.stringify({uploads: savedUploads})); } catch (_) {}
         // COS verification is authoritative for file success. Refresh only
@@ -1135,10 +1104,20 @@ _JAVASCRIPT = r'''"use strict";
           const current = await refresh(job);
           summaryUpdated = current.summary_updated === true;
         } catch (_) {}
-        job.statusText += summaryUpdated ? " · GitHub Summary 已同步" : " · GitHub Summary 同步中";
+        job.statusText = confirmedText + (summaryUpdated ? " · GitHub Summary 已同步" : " · GitHub Summary 同步中");
         updateJob(job, job.statusText);
         return true;
       }
+      if (status && status.status === "ready") {
+        if (status === initialStatus) {
+          initialStatus = null; status = null;
+          continue;
+        }
+        job.status = "waiting";
+        updateJob(job, "服务端 ready 状态缺少匹配的 HEAD/round 或合法 SHA256；未标记成功，上传记录已保留。");
+        return false;
+      }
+      status = null;
       await delay(2000);
     }
     job.status = "waiting";
@@ -1161,14 +1140,19 @@ _JAVASCRIPT = r'''"use strict";
       job.completeUnknown = saved.complete_unknown === true;
     } else job.initKey = uid();
     persist(job);
+    let state;
     if (!job.uploadId) {
       const initialized = await request("/uploads", {method: "POST", key: job.initKey,
         body: {filename: job.file.name, size: job.file.size, content_type: job.file.type || "application/octet-stream",
           note: job.note, replaces_id: job.replacesId || null}, job});
+      if (initialized.head_sha !== bound.head_sha || initialized.round_id !== bound.round_id) {
+        halt("上传属于其他 HEAD/round，已停止。请刷新后重试。");
+        throw new Error("轮次不匹配");
+      }
       id(initialized.upload_id); job.uploadId = initialized.upload_id;
-      job.state = {...initialized, parts: partsOf(initialized)}; persist(job);
-    }
-    let state = await uploadStateWithRetry(job);
+      state = {...initialized, parts: partsOf(initialized)};
+      job.state = state; persist(job);
+    } else state = await uploadStateWithRetry(job);
     if (state.status === "initializing" || state.initialization_pending === true) {
       const resumed = await request("/uploads/" + id(job.uploadId) + "/resume", {
         method: "POST", key: job.uploadId + ":resume", body: {}, job
@@ -1176,8 +1160,9 @@ _JAVASCRIPT = r'''"use strict";
       if (resumed.upload_id && resumed.upload_id !== job.uploadId) throw new Error("恢复结果上传标识不匹配");
       state = await uploadStateWithRetry(job);
     }
-    if (terminalReady(state)) return waitReady(job, state.attachment_id || "");
-    if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, state.attachment_id || "");
+    if (state.status === "ready") return waitReady(job, state, state.attachment_id || "");
+    if (["completing", "verifying", "processing"].includes(state.status))
+      return waitReady(job, state, state.attachment_id || "");
     return state;
   }
   async function uploadParts(job, state) {
@@ -1202,99 +1187,94 @@ _JAVASCRIPT = r'''"use strict";
       if (Number(found.size) !== blob.size) throw new ApiError(409, "COS 已有分片大小冲突，已停止该文件。");
       done.set(number, found); return true;
     }
-    async function worker() {
-      while (cursor < queue.length && !job.paused && !stopped && !pageLeaving) {
-        const number = queue[cursor++], blob = job.file.slice((number - 1) * partBytes, Math.min(number * partBytes, job.file.size));
-        job.currentPart = number + "/" + count;
-        let complete = false;
-        for (let attempt = 0; attempt < 3 && !job.paused && !stopped && !pageLeaving; attempt++) {
-          try {
-            job.statusText = "上传分片 " + number + "/" + count;
-            job.detailNode.textContent = job.statusText + "…";
-            const signPath = "/uploads/" + id(job.uploadId) + "/parts/" + number + "/url";
-            const signed = await request(signPath, {
-              method: "POST", key: job.uploadId + ":sign:" + number + ":" + attempt, body: {}, job
-            });
-            const target = trustedCosPartUrl(signed);
-            await uploadCosPart(target, blob, job, amount => { inflight.set(number, amount); update(); });
-            done.set(number, {part_number: number, size: blob.size}); complete = true;
-          } catch (error) {
-            inflight.delete(number); update();
-            if (job.paused || stopped || pageLeaving) break;
-            if ([401, 403, 409, 413].includes(error.status)) throw error;
-            const checked = await uploadStateWithRetry(job);
-            if (acceptListedPart(checked, number, blob)) complete = true;
-            else if (error.fallbackEligible === true) {
-              let fallbackError = null;
-              try {
-                await uploadControllerPart(job.uploadId, number, blob, job,
-                  amount => { inflight.set(number, amount); update(); });
-              } catch (backupError) { fallbackError = backupError; }
+    let workerFailure = null;
+    async function runWorker() {
+      try {
+        while (!workerFailure && cursor < queue.length && !job.paused && !stopped && !pageLeaving) {
+          const number = queue[cursor++], blob = job.file.slice((number - 1) * partBytes, Math.min(number * partBytes, job.file.size));
+          let complete = false;
+          for (let attempt = 0; attempt < 3 && !job.paused && !stopped && !pageLeaving; attempt++) {
+            try {
+              job.statusText = "文件发送中 · 分片 " + number + "/" + count;
+              job.detailNode.textContent = job.statusText + "…";
+              const uploaded = await uploadControllerPart(job.uploadId, number, blob, job,
+                amount => { inflight.set(number, amount); update(); });
+              done.set(number, uploaded); complete = true;
+            } catch (error) {
+              inflight.delete(number); update();
               if (job.paused || stopped || pageLeaving) break;
-              // Resolve an uncertain response only through authenticated
-              // status, which reflects the COS ListParts result.
-              const afterFallback = await uploadStateWithRetry(job);
-              if (acceptListedPart(afterFallback, number, blob)) complete = true;
-              else if (fallbackError) {
-                if ([401, 403, 409, 413].includes(fallbackError.status)) throw fallbackError;
-                if (attempt < 2) await delay((attempt + 1) * 500);
-                else throw fallbackError;
-              } else {
-                throw new ApiError(503, "备用上传响应未能在 COS 分片列表中确认；请重试以恢复该分片。");
-              }
-            } else if (attempt < 2) await delay((attempt + 1) * 500);
-            else throw error;
+              if ([401, 403, 409, 413].includes(error.status)) throw error;
+              if (error.resultUnclear === true) {
+                const checked = await uploadStateWithRetry(job);
+                if (acceptListedPart(checked, number, blob)) {
+                  complete = true;
+                } else if (attempt < 2) await delay((attempt + 1) * 500);
+                else throw error;
+              } else if (attempt < 2 && temporaryNetworkFailure(error)) await delay((attempt + 1) * 500);
+              else throw error;
+            }
+            if (complete) { inflight.delete(number); update(); break; }
           }
-          if (complete) { inflight.delete(number); update(); break; }
+          if (!complete && !job.paused && !stopped && !pageLeaving)
+            throw new Error("分片重试次数已用完。");
         }
-        if (!complete && !job.paused && !stopped && !pageLeaving) throw new Error("分片重试次数已用完。");
+      } catch (error) {
+        if (!workerFailure) workerFailure = error;
       }
     }
-    const results = await Promise.allSettled([worker(), worker()]);
-    const failed = results.find(result => result.status === "rejected");
+    await Promise.all([runWorker(), runWorker()]);
     job.parts = done; progressJob(job, done, inflight, partBytes);
-    if (failed) throw failed.reason;
+    if (workerFailure) throw workerFailure;
     if (job.paused || stopped || pageLeaving) throw new Error(pageLeaving
       ? "页面离开导致上传中断；重新打开后会先查询 COS 状态。"
       : "文件上传已暂停。");
     return done;
   }
-  async function completeUpload(job, attachmentId = "") {
-    let state = await uploadStateWithRetry(job);
-    if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
-    if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
+  async function completeUpload(job, initialState = null, attachmentId = "") {
+    let state = initialState || await uploadStateWithRetry(job);
+    if (state.status === "ready") return waitReady(job, state, attachmentId || state.attachment_id || "");
+    if (["completing", "verifying", "processing"].includes(state.status))
+      return waitReady(job, state, attachmentId || state.attachment_id || "");
     if (job.completeUnknown && state.status !== "uploading") throw new Error("完成状态仍未明确；未重复提交 complete。");
     job.completeUnknown = true; persist(job);
+    let result;
     try {
-      const result = await request("/uploads/" + id(job.uploadId) + "/complete", {
+      result = await request("/uploads/" + id(job.uploadId) + "/complete", {
         method: "POST", key: job.uploadId + ":complete", body: {}, job
       });
-      if (result.attachment_id) attachmentId = result.attachment_id;
-      if (terminalReady(result)) return waitReady(job, attachmentId);
-      state = await uploadStateWithRetry(job);
-      if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
-      if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
-      throw new Error("complete 后 COS 尚未 ready；已先查询状态，没有盲目重试。");
     } catch (error) {
+      if ([401, 403, 409, 413, 429].includes(error.status) || !temporaryNetworkFailure(error)) throw error;
       try {
         state = await uploadStateWithRetry(job);
-        if (terminalReady(state)) return waitReady(job, attachmentId || state.attachment_id || "");
-        if (["completing", "verifying", "processing"].includes(state.status)) return waitReady(job, attachmentId || state.attachment_id || "");
+        if (state.status === "ready" || ["completing", "verifying", "processing"].includes(state.status))
+          return waitReady(job, state, attachmentId || state.attachment_id || "");
       } catch (_) { /* Preserve the uncertain marker for an explicit retry. */ }
       throw error;
     }
+    if (result && result.attachment_id) attachmentId = result.attachment_id;
+    if (verifiedReady(result) || result && (result.status === "ready" ||
+        ["completing", "verifying", "processing"].includes(result.status)))
+      return waitReady(job, result, attachmentId || result.attachment_id || "");
+    state = await uploadStateWithRetry(job);
+    if (state.status === "ready" || ["completing", "verifying", "processing"].includes(state.status))
+      return waitReady(job, state, attachmentId || state.attachment_id || "");
+    throw new Error("complete 后服务端尚未确认归档；已查询一次状态，没有盲目重试。");
   }
   async function uploadOne(job) {
     if (!(job.file.size >= 1 && job.file.size <= MAX_BYTES)) throw new Error("单个文件必须为 1..512 MiB。");
     let state = await startOrRestore(job);
     if (job.status === "succeeded") return;
+    if (!state || typeof state !== "object") return;
     if (["failed", "deleted", "aborted", "expired", "invalid"].includes(state.status))
       throw new Error("服务端上传状态不可继续：" + state.status);
-    await uploadParts(job, state);
-    const completed = await uploadStateWithRetry(job), partBytes = Number(completed.part_bytes || PART_BYTES);
+    const done = await uploadParts(job, state), partBytes = Number(state.part_bytes || PART_BYTES);
     const count = Math.ceil(job.file.size / partBytes);
-    if ((completed.parts || []).length < count) throw new Error("COS 尚未确认全部分片；请继续重试。");
-    await completeUpload(job, completed.attachment_id || "");
+    if (done.size !== count) throw new Error("本地分片记录不完整；请继续重试上传。");
+    job.progress.value = 100;
+    job.status = "verifying";
+    job.statusText = "上传完成，正在归档附件";
+    updateJob(job, job.statusText + " · 100% · 文件字节已发送，等待服务端归档确认");
+    await completeUpload(job, state, state.attachment_id || "");
   }
   async function processJob(job) {
     if (job.running || !writable()) return;

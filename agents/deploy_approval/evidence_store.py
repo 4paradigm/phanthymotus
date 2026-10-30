@@ -85,6 +85,17 @@ class CosAttachmentStore:
                 Timeout=30, VerifySSL=True), retry=0, session=session)
         return self._client
 
+    @staticmethod
+    def _cos_failure_is_ambiguous(exc):
+        try:
+            from qcloud_cos import CosServiceError
+            if isinstance(exc, CosServiceError):
+                status = exc.get_status_code()
+                return not (type(status) is int and 400 <= status < 500 and status != 408)
+        except Exception:
+            pass
+        return True
+
     def _key(self, key):
         if (not isinstance(key, str) or not key.startswith('phanthymotus_pr/')
                 or any(c in key for c in ('\\', '\r', '\n', '\x00'))
@@ -226,9 +237,12 @@ class CosAttachmentStore:
                     return await asyncio.to_thread(function, **kwargs)
                 except (ValueError, EvidenceStoreError):
                     raise
-                except Exception:
-                    if attempt + 1 == attempts:
-                        raise EvidenceStoreError('COS operation unavailable') from None
+                except Exception as exc:
+                    ambiguous = self._cos_failure_is_ambiguous(exc)
+                    if not ambiguous or attempt + 1 == attempts:
+                        error = EvidenceStoreError('COS operation unavailable')
+                        error.ambiguous = ambiguous
+                        raise error from None
                     await asyncio.sleep(0.25)
 
     @staticmethod
@@ -309,47 +323,49 @@ class CosAttachmentStore:
             etag = str(existing.get('etag', '')).strip('"').lower()
             return existing['size'] == content_length and etag == expected_etag
 
-        parts = await self.list_parts(key=key, upload_id=upload_id)
-        existing = next((p for p in parts if p['part_number'] == part_number), None)
-        if existing is not None:
-            return {'conflict': not matching_part(parts), 'uploaded': matching_part(parts) is True,
-                    'part_number': part_number, 'size': content_length}
+        async def reconcile_part():
+            parts = await self.list_parts(key=key, upload_id=upload_id)
+            return matching_part(parts)
+
         try:
             result = await self._io(self._sdk().upload_part,
                 Bucket=self.config.cos_bucket, Key=key, UploadId=upload_id,
                 PartNumber=part_number, Body=body)
-        except EvidenceStoreError:
-            # The response may be lost after COS stored the part. Reconcile by
-            # listing it and comparing both size and the COS part MD5 ETag.
-            reconciled = await self.list_parts(key=key, upload_id=upload_id)
-            present = next((p for p in reconciled if p['part_number'] == part_number), None)
-            if present is None:
+        except EvidenceStoreError as exc:
+            if getattr(exc, 'ambiguous', True) is False:
                 raise
-            matches = matching_part(reconciled)
+            # The response may be lost after COS stored the part. Confirm only
+            # this part by number, size, and its COS MD5 ETag.
+            matches = await reconcile_part()
+            if matches is None:
+                raise
             return {'conflict': not matches, 'uploaded': bool(matches),
                     'part_number': part_number, 'size': content_length}
         etag = result.get('ETag') if isinstance(result, dict) else None
-        if not isinstance(etag, str) or not etag:
-            reconciled = await self.list_parts(key=key, upload_id=upload_id)
-            present = next((p for p in reconciled if p['part_number'] == part_number), None)
-            if present is None:
+        if (not isinstance(etag, str) or not etag
+                or etag.strip('"').lower() != expected_etag):
+            # Missing or inconsistent SDK confirmation is ambiguous. A single
+            # bounded listing can accept only the exact uploaded part.
+            matches = await reconcile_part()
+            if matches is None:
                 raise EvidenceStoreError('COS multipart part was not confirmed')
-            matches = matching_part(reconciled)
             return {'conflict': not matches, 'uploaded': bool(matches),
                     'part_number': part_number, 'size': content_length}
         return {'uploaded': True, 'part_number': part_number, 'size': content_length}
 
-    async def complete_upload(self, *, key, upload_id, size, metadata, sha256=None, part_bytes=None, **_):
+    async def complete_upload(self, *, key, upload_id, size, metadata, sha256=None,
+                              part_bytes=None, probe_existing=True, **_):
         """Reconcile uncertain complete via real HEAD/GET; never recreate/overwrite."""
         self._key(key)
         if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= self.config.evidence_max_file_bytes:
             raise ValueError('invalid object size')
-        # A prior complete may have succeeded while its response was lost.
-        # Verify the final object before touching multipart state again.
-        try:
-            return await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha256)
-        except EvidenceStoreError:
-            pass
+        if probe_existing:
+            # A prior complete may have succeeded while its response was lost.
+            # Verify the final object before touching multipart state again.
+            try:
+                return await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha256)
+            except EvidenceStoreError:
+                pass
         try:
             parts = await self.list_parts(key=key, upload_id=upload_id)
         except EvidenceStoreError:
@@ -583,14 +599,15 @@ class CosAttachmentStore:
             if operation.get('status') in {'completing', 'verifying', 'processing', 'ready'}:
                 try:
                     return await self.verify_object(key=key, size=size, metadata=metadata, sha256=sha)
-                except EvidenceStoreError:
+                except EvidenceStoreError as exc:
                     if not operation.get('upload_id'):
                         raise
                     # An uncertain complete may be retried only against the
                     # same UploadId, after this real object probe.
                     return await self.complete_upload(key=key, upload_id=operation['upload_id'],
                         size=size, metadata=metadata, sha256=sha,
-                        part_bytes=operation.get('part_bytes', self.config.evidence_part_bytes))
+                        part_bytes=operation.get('part_bytes', self.config.evidence_part_bytes),
+                        probe_existing=getattr(exc, 'ambiguous', True))
             upload_id = operation.get('upload_id')
             if not upload_id:
                 try:
@@ -615,5 +632,7 @@ class CosAttachmentStore:
                 content_length=payload['content_length'])
         if action == 'complete':
             return await self.complete_upload(key=key, upload_id=operation['upload_id'], size=size,
-                metadata=metadata, sha256=sha, part_bytes=operation.get('part_bytes', self.config.evidence_part_bytes))
+                metadata=metadata, sha256=sha,
+                part_bytes=operation.get('part_bytes', self.config.evidence_part_bytes),
+                probe_existing=False)
         raise ValueError('unsupported store action')

@@ -28,20 +28,6 @@ def beijing_now_str() -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def last_lifecycle_event_line(timestamp: str = "") -> str:
-    """Last lifecycle event line. Only updated on meaningful business events.
-
-    Args:
-        timestamp: Timestamp string in "YYYY-MM-DD HH:MM:SS" format (Asia/Shanghai)
-    Returns:
-        "Last lifecycle event: YYYY-MM-DD HH:MM:SS (UTC+08:00, Asia/Shanghai)"
-        If timestamp is empty, uses beijing_now_str().
-    """
-    if not timestamp:
-        timestamp = beijing_now_str()
-    return f"Last lifecycle event: {timestamp} (UTC+08:00, Asia/Shanghai)"
-
-
 def lifecycle_marker(repo: str, pr_number: int) -> str:
     return f"<!-- deploy-approval-lifecycle:{repo}:{pr_number} -->"
 
@@ -236,8 +222,7 @@ def _testing_next_action(evidence_complete: bool) -> str:
         return ("**Machine Owner**\n\n测试完成后，请执行 `/request_acceptance`，"
                 "由名单中的独立验收人记录最终结果。")
     return ("**PR developer and deployed Machine Owner**\n\n"
-            "请先为当前 HEAD 和轮次上传附件；完成检查后，由 Machine Owner 执行 "
-            "`/request_acceptance` 请求独立验收。")
+            "完成本轮验证后，由 Machine Owner 执行 `/request_acceptance` 请求独立验收。")
 
 
 # ── History helpers ──────────────────────────────────────────────
@@ -289,8 +274,6 @@ def review_required(
         "### Current Deployment",
         "",
         "No deployment has been requested yet.",
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
     ])
 
 
@@ -315,8 +298,6 @@ def reviewing(
         "**Waiting for Review Agent**",
         "",
         "No action required.",
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
     ])
 
 
@@ -369,8 +350,6 @@ def deploy_ready(
         "### Components",
         "",
         _build_table(builds),
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
     ])
     return _lifecycle_body(lines)
 
@@ -454,8 +433,6 @@ def deploy_requested(
         f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
     ]
-    if last_lifecycle_event:
-        lines.append(f"**Last lifecycle event:** {last_lifecycle_event} (UTC+08:00, Asia/Shanghai)")
     lines.extend([
         "",
         "### Workflow",
@@ -489,11 +466,6 @@ def deploy_requested(
     ))
     lines.extend(_attempt_lines(attempt))
 
-    lines.extend([
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
-    ])
-
     return _lifecycle_body(lines)
 
 
@@ -523,7 +495,6 @@ def testing(
         "",
         ("**Status:** `testing` · 测试完成 · 待验收"
          if acceptance_pending else "**Status:** `testing`"),
-        f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
         "",
         "### Workflow",
@@ -535,23 +506,19 @@ def testing(
         "### Next action",
         "",
         *next_action.split("\n"),
-        "",
-        "### Current Deployment",
     ]
-    if deployments:
-        lines.extend(["", _deployment_table(deployments, components, machine_groups)])
-    else:
-        lines.extend(["", "No deployment record is available for this round yet."])
+    if not (deployments_complete is True and deployments):
+        lines.extend(["", "### Current Deployment", ""])
+        if deployments:
+            lines.append(_deployment_table(deployments, components, machine_groups))
+        else:
+            lines.append("No deployment record is available for this round yet.")
     if case_result:
         lines.extend([
             "",
             f"**Automated case results:** {case_result}",
             "Fixed Case results are advisory only.",
         ])
-    lines.extend([
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
-    ])
     lines.extend(_attempt_lines(attempt))
     return _lifecycle_body(lines)
 
@@ -571,7 +538,6 @@ def succeeded_comment(
         "### Deploy Approval \u2014 Lifecycle",
         "",
         "**Status:** \u2705 `succeeded`",
-        f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
         "",
         "### Workflow",
@@ -582,17 +548,8 @@ def succeeded_comment(
         "",
         "**None. Deployment lifecycle is complete.**",
         "",
-        "### Current Deployment",
-        "",
     ]
-    lines.append(_deployment_table(deployments, components, machine_groups)
-                 if deployments else "Deployment completed; deployment records unavailable.")
-
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
-    lines.extend([
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
-    ])
     return _lifecycle_body(lines)
 
 
@@ -612,7 +569,6 @@ def failed_comment(
         "### Deploy Approval \u2014 Lifecycle",
         "",
         "**Status:** \u274c `failed`",
-        f"**Bound HEAD:** `{_short(head_sha)}`",
         f"**Repository:** `{repo}`",
         "",
         "### Workflow",
@@ -628,10 +584,6 @@ def failed_comment(
     if error:
         lines.append(f"**Error:** {_escape(error)}")
     lines.extend(_cos_evidence_block(cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url))
-    lines.extend([
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
-    ])
     lines.extend(_attempt_lines(attempt))
     if deployments:
         lines.extend(["### Deployment records", _deployment_table(deployments, components, machine_groups)])
@@ -664,7 +616,6 @@ def superseded_comment(
         "",
         "`/request_bot_review`",
         "",
-        last_lifecycle_event_line(last_lifecycle_event),
     ])
 
 
@@ -697,8 +648,6 @@ def uncertain_comment(
         "`/approve_deploy machine=<alias-or-ip>`",
         "",
         "Only a NEW `/approve_deploy` starts recovery validation.",
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
     ]
     lines.extend(_attempt_lines(attempt))
     if deployments:
@@ -741,10 +690,6 @@ def deploy_status_comment(
     lines.extend(_cos_evidence_block(
         cos_object_key, cos_bundle_sha256, cos_bundle_size, cos_download_url,
     ))
-    lines.extend([
-        "",
-        last_lifecycle_event_line(last_lifecycle_event),
-    ])
     return _lifecycle_body(lines)
 
 
@@ -1477,8 +1422,6 @@ def render_evidence_section(
                     lines.append("该轮未保存附件")
             elif state.get("status") in {"succeeded", "failed"}:
                 lines.append("本轮未保存附件")
-            else:
-                lines.append("本轮暂无附件，上传后会显示")
         if group.get("deployments"):
             lines.extend(["", "### 部署记录", "",
                           _deployment_table(group["deployments"], group.get("components"),

@@ -835,12 +835,21 @@ class EvidenceService:
             if action in {'init', 'sign_part', 'put_part', 'complete', 'note', 'delete'}:
                 if 'head_sha' not in payload or 'round_id' not in payload:
                     raise EvidenceError('explicit_context_required', 400)
-            round_id = payload.get('round_id', active_round)
             if action in {'download', 'preview'} and 'round_id' not in payload:
-                targets = [r['data'] for r in records if r['kind'] == 'attachment'
-                           and r['data'].get('attachment_id') == payload.get('attachment_id')]
-                if targets:
-                    round_id = targets[-1]['round_id']
+                claims = principal.get('capability')
+                attachment_resource = 'attachment:' + str(payload.get('attachment_id', ''))
+                if (isinstance(claims, dict)
+                        and claims.get('purpose') == DOWNLOAD_PURPOSE
+                        and claims.get('resource') == attachment_resource):
+                    payload.setdefault('head_sha', claims.get('head'))
+                    payload['round_id'] = claims.get('round')
+                else:
+                    targets = [r['data'] for r in records if r['kind'] == 'attachment'
+                               and r['data'].get('attachment_id') == payload.get('attachment_id')]
+                    if targets:
+                        payload.setdefault('head_sha', targets[-1].get('head_sha'))
+                        payload['round_id'] = targets[-1].get('round_id')
+            round_id = payload.get('round_id', active_round)
             selected = state
             if round_id != active_round:
                 if round_id not in round_numbers:
@@ -882,6 +891,14 @@ class EvidenceService:
 
             invite_allowed = (action in {'context', 'status'} or write) and invite_context_matches(
                 pr, selected, round_id)
+            write_context_allowed = bool(
+                (authorized_writer or invite_allowed)
+                and round_id == active_round
+                and selected.get('status') == 'testing'
+                and selected.get('head_sha') == pr.get('head', {}).get('sha')
+                and pr.get('state') == 'open' and not pr.get('merged')
+                and not pr.get('draft')
+            )
             invite_read_context = bool(
                 action == 'context' and isinstance(invite, dict)
                 and invite.get('purpose') == UPLOAD_PURPOSE
@@ -933,11 +950,15 @@ class EvidenceService:
                                 or legacy_read_capability))):
                     raise EvidenceError('capability_context_mismatch', 403)
             latest = {}
+            latest_by_identity = {}
             operations = {}
             for record in records:
                 data = record['data']
                 if record['kind'] == 'attachment':
                     latest[data['attachment_id']] = data
+                    latest_by_identity[(data.get('repo'), data.get('pr_number'),
+                                        data.get('head_sha'), data.get('round_id'),
+                                        data['attachment_id'])] = data
                 if record['kind'] == 'operation':
                     operation_id = data.get('operation_id')
                     upload_ref = data.get('upload_ref')
@@ -1004,6 +1025,45 @@ class EvidenceService:
                                           'attachment_id', 'upload_ref', 'actor_id')):
                         raise EvidenceError('operation_identity_conflict', 503)
                     operations[operation_id] = data
+
+            archived_latest_by_identity = {}
+            for record in records:
+                if record['kind'] != 'round':
+                    continue
+                archive = record['data']
+                if not isinstance(archive, dict):
+                    continue
+                archive_head = archive.get('head_sha')
+                archive_round = archive.get('round_id')
+                if (not isinstance(archive_head, str)
+                        or not isinstance(archive_round, str)
+                        or archive_round not in round_numbers
+                        or archive.get('repo') != repo
+                        or archive.get('pr_number') != pr_number
+                        or not isinstance(archive.get('attachment_records'), list)):
+                    continue
+                for wrapper in archive['attachment_records']:
+                    if not isinstance(wrapper, dict) or wrapper.get('kind') != 'attachment':
+                        continue
+                    data = wrapper.get('data')
+                    attachment_id = data.get('attachment_id') if isinstance(data, dict) else None
+                    if (not isinstance(data, dict)
+                            or not isinstance(wrapper.get('key'), str)
+                            or not isinstance(wrapper.get('sha256'), str)
+                            or not re.fullmatch(r'[0-9a-f]{64}', wrapper['sha256'])
+                            or data.get('repo') != repo
+                            or type(data.get('pr_number')) is not int
+                            or data.get('pr_number') != pr_number
+                            or data.get('head_sha') != archive_head
+                            or data.get('round_id') != archive_round
+                            or not isinstance(attachment_id, str)
+                            or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', attachment_id)):
+                        continue
+                    identity = (repo, pr_number, archive_head, archive_round, attachment_id)
+                    archived_latest_by_identity[identity] = data
+            # Live records win over their archived copies, especially for
+            # deletion tombstones written after a round snapshot was captured.
+            latest_by_identity = {**archived_latest_by_identity, **latest_by_identity}
             if action == 'put_part':
                 ref = payload.get('operation_id')
                 source = next((r['data'] for r in reversed(records)
@@ -1018,7 +1078,8 @@ class EvidenceService:
                         or isinstance(principal.get('upload_invite'), dict)
                         and source.get('upload_method') != 'signed_invite'):
                     raise EvidenceError('upload_owner_mismatch', 403)
-                saved = latest.get(source.get('attachment_id'))
+                saved = latest_by_identity.get((repo, pr_number, source.get('head_sha'),
+                                                source.get('round_id'), source.get('attachment_id')))
                 if (source.get('status') != 'uploading' or saved
                         and saved.get('status') in {'deleted', 'invalid'}):
                     raise EvidenceError('upload_not_writable', 409)
@@ -1055,7 +1116,9 @@ class EvidenceService:
                         await self._consume_auth_nonce(principal)
                         nonce_consumed = True
 
-                await current_part()
+                if not invite_allowed:
+                    await self._consume_auth_nonce(principal)
+                    nonce_consumed = True
                 with tempfile.SpooledTemporaryFile(max_size=256 * 1024, mode='w+b') as body:
                     length = 0
                     async for block in body_stream:
@@ -1075,7 +1138,6 @@ class EvidenceService:
                     result = await self._store('put_part', source, {
                         'part_number': part, 'body': body, 'content_length': length,
                     })
-                await current_part()
                 if result.get('conflict') is True:
                     raise EvidenceError('part_conflict', 409)
                 return {'uploaded': True, 'part_number': part, 'size': length}
@@ -1091,6 +1153,9 @@ class EvidenceService:
                     enriched = self.controller._enrich_deployments_for_render(
                         deployment_rows if isinstance(deployment_rows, list) else [],
                         historical=historical,
+                        historical_machine_groups=(
+                            snapshot.get('machine_groups') if historical else None
+                        ),
                     )
                     output = []
                     for deployment in enriched:
@@ -1138,21 +1203,31 @@ class EvidenceService:
                                      note=display_note)
                         value['display_note_complete'] = bool(complete)
                     value['can_delete'] = bool(
-                        authorized_writer or invite_allowed
-                        and row.get('actor_id') == principal['id']
-                        and row.get('upload_method') == 'signed_invite')
+                        write_context_allowed
+                        and (authorized_writer or invite_allowed
+                             and row.get('actor_id') == principal['id']
+                             and row.get('upload_method') == 'signed_invite'))
                     return value
 
-                current_attachments = [await context_attachment(r) for r in latest.values()
-                                       if r['round_id'] == round_id]
+                current_attachments = [await context_attachment(row)
+                                       for (row_repo, row_pr, row_head, row_round, _), row
+                                       in latest_by_identity.items()
+                                       if row_repo == repo and row_pr == pr_number
+                                       and row_head == selected.get('head_sha')
+                                       and row_round == round_id]
                 round_attachments = {}
                 for row in records:
                     if row['kind'] != 'round' or row['data'].get('round_id') not in round_numbers:
                         continue
+                    row_head = row['data'].get('head_sha')
                     row_round = row['data']['round_id']
                     round_attachments[row_round] = [
-                        await context_attachment(a) for a in latest.values()
-                        if a['round_id'] == row_round]
+                        await context_attachment(attachment)
+                        for (attachment_repo, attachment_pr, attachment_head,
+                             attachment_round, _), attachment
+                        in latest_by_identity.items()
+                        if attachment_repo == repo and attachment_pr == pr_number
+                        and attachment_head == row_head and attachment_round == row_round]
 
                 return {'repo': repo, 'pr_number': pr_number, 'head_sha': selected['head_sha'], 'round_id': round_id,
                         'round_number': round_numbers.get(round_id),
@@ -1163,16 +1238,15 @@ class EvidenceService:
                         'github_user_authenticated': bool(
                             principal.get('actor_verified') is True
                             and principal.get('github_user_authenticated') is True),
-                        'can_write': bool((authorized_writer or invite_allowed) and selected.get('status') == 'testing'
-                                          and selected.get('head_sha') == pr.get('head', {}).get('sha')
-                                          and pr.get('state') == 'open' and not pr.get('merged')
-                                          and not pr.get('draft')),
+                        'can_write': write_context_allowed,
                         'acceptance_pending': bool(
                             isinstance(selected.get('acceptance_request'), dict)
                             and selected['acceptance_request'].get('status') == 'pending'
                             and selected['acceptance_request'].get('head_sha') == selected.get('head_sha')
                             and selected['acceptance_request'].get('round_id') == round_id),
-                        'display_deployments': display_deployments(selected),
+                        'display_deployments': display_deployments(
+                            selected, historical=(round_id != active_round),
+                        ),
                         'upload_invite': bool(invite_allowed),
                         'upload_identity_label': ('分享链接上传，GitHub 身份未验证'
                                                   if invite_allowed else ''),
@@ -1197,8 +1271,14 @@ class EvidenceService:
                         'operations': [{k: v for k, v in r.items() if k != 'upload_id'}
                                        for r in operations.values() if not r.get('auth_nonce_marker')
                                        and not r.get('native_attachment')
+                                       and r.get('head_sha') == selected.get('head_sha')
                                        and r.get('round_id') == round_id
-                                       and r.get('actor_id') == principal['id']], 'records': [r for r in latest.values() if r['round_id'] == round_id],
+                                       and r.get('actor_id') == principal['id']],
+                        'records': [row for (row_repo, row_pr, row_head, row_round, _), row
+                                    in latest_by_identity.items()
+                                    if row_repo == repo and row_pr == pr_number
+                                    and row_head == selected.get('head_sha')
+                                    and row_round == round_id],
                         # Evidence history is projected from verified round data;
                         # storage comment URLs/IDs are intentionally not exposed.
                         'archive_links': []}
@@ -1207,7 +1287,8 @@ class EvidenceService:
                     raise EvidenceError('round_changed', 409)
                 if source.get('status') == 'invalid':
                     raise EvidenceError('round_changed', 409)
-                saved = latest.get(source.get('attachment_id'))
+                saved = latest_by_identity.get((repo, pr_number, source.get('head_sha'),
+                                                source.get('round_id'), source.get('attachment_id')))
                 if saved and saved.get('status') == 'deleted':
                     raise EvidenceError('attachment_deleted', 410)
                 operation = copy.deepcopy(saved if saved and saved.get('status') == 'ready' else source)
@@ -1264,8 +1345,9 @@ class EvidenceService:
                         raise EvidenceError('log_not_ready', 404)
                     operation = {'repo': repo, 'pr_number': pr_number, 'head_sha': expected_head, 'round_id': round_id, **obj}
                 else:
-                    operation = latest.get(payload.get('attachment_id'))
-                    if not operation or operation['round_id'] != round_id:
+                    operation = latest_by_identity.get((repo, pr_number, expected_head,
+                                                        round_id, payload.get('attachment_id')))
+                    if not operation:
                         raise EvidenceError('attachment_not_found', 404)
                     if operation['status'] == 'deleted':
                         raise EvidenceError('attachment_deleted', 410)
@@ -1286,8 +1368,16 @@ class EvidenceService:
                 validate_context(fresh, selected, expected_head, round_id, write=False)
                 if action in {'download', 'preview'}:
                     revisions = await self.proxy.read_evidence_records(repo, pr_number)
-                    deleted = any(r['kind'] == 'attachment' and r['data'].get('attachment_id') == operation['attachment_id']
-                                  and r['data'].get('status') == 'deleted' for r in revisions)
+                    deleted = any(
+                        r['kind'] == 'attachment'
+                        and (r['data'].get('repo'), r['data'].get('pr_number'),
+                             r['data'].get('head_sha'), r['data'].get('round_id'),
+                             r['data'].get('attachment_id'))
+                        == (repo, pr_number, expected_head, round_id,
+                            operation['attachment_id'])
+                        and r['data'].get('status') == 'deleted'
+                        for r in revisions
+                    )
                     if deleted:
                         raise EvidenceError('attachment_deleted', 410)
                 return result
@@ -1303,7 +1393,11 @@ class EvidenceService:
 
             if invite_allowed and action in {'init', 'note'} and existing is None:
                 invite_rows = {}
-                for row in [*latest.values(), *operations.values()]:
+                round_rows = [row for (row_repo, row_pr, row_head, row_round, _), row
+                              in latest_by_identity.items()
+                              if row_repo == repo and row_pr == pr_number
+                              and row_head == expected_head and row_round == round_id]
+                for row in [*round_rows, *operations.values()]:
                     if (row.get('upload_method') != 'signed_invite' or row.get('round_id') != round_id
                             or not isinstance(row.get('attachment_id'), str)):
                         continue
@@ -1343,6 +1437,22 @@ class EvidenceService:
                 value['part_bytes'] = operation.get('part_bytes', self.config.evidence_part_bytes)
                 value['uploaded_parts'] = (result or {}).get('uploaded_parts', [])
                 value['parts'] = value['uploaded_parts']
+                head_sha = operation.get('head_sha')
+                round_id = operation.get('round_id')
+                persisted_ready = (
+                    operation.get('status') == 'ready'
+                    and operation.get('cos_content_verified') is True
+                    and isinstance(operation.get('object_key'), str) and bool(operation['object_key'])
+                    and type(operation.get('size')) is int and operation['size'] > 0
+                    and isinstance(operation.get('sha256'), str)
+                    and re.fullmatch(r'[0-9a-f]{64}', operation['sha256']) is not None
+                    and isinstance(head_sha, str)
+                    and re.fullmatch(r'[0-9a-f]{40}', head_sha) is not None
+                    and isinstance(round_id, str)
+                    and re.fullmatch(re.escape(head_sha) + r'-[0-9]+', round_id) is not None
+                )
+                if (result or {}).get('verified') is True or persisted_ready:
+                    value['verified'] = True
                 return value
 
             nonce_consumed = False
@@ -1367,7 +1477,8 @@ class EvidenceService:
                     raise EvidenceError('upload_owner_mismatch', 403)
                 if source['status'] == 'invalid':
                     raise EvidenceError('round_changed', 409)
-                saved = latest.get(source['attachment_id'])
+                saved = latest_by_identity.get((repo, pr_number, source.get('head_sha'),
+                                                source.get('round_id'), source.get('attachment_id')))
                 if saved and saved['status'] == 'deleted':
                     raise EvidenceError('attachment_deleted', 410)
                 if saved and saved['status'] == 'ready':
@@ -1443,10 +1554,12 @@ class EvidenceService:
                         or type(size) is not int or not 1 <= size <= self.config.evidence_max_file_bytes):
                     raise EvidenceError('invalid_file_metadata', 400)
                 replaces = payload.get('replaces_id') or ''
-                if replaces and (replaces not in latest or latest[replaces]['round_id'] != round_id):
+                replacement = (latest_by_identity.get((repo, pr_number, expected_head,
+                                                       round_id, replaces)) if replaces else None)
+                if replaces and replacement is None:
                     raise EvidenceError('replacement_not_found', 404)
                 if (invite_allowed and replaces
-                        and latest[replaces].get('actor_id') != principal['id']):
+                        and replacement.get('actor_id') != principal['id']):
                     raise EvidenceError('upload_owner_mismatch', 403)
                 from .evidence_builder import _redact_secrets
                 note = payload.get('note', '')
@@ -1481,10 +1594,12 @@ class EvidenceService:
                 source = next((r['data'] for r in reversed(records) if r['kind'] == 'operation'
                                and r['data'].get('upload_ref') == ref), operations.get(ref))
                 if action == 'delete':
-                    source = latest.get(payload.get('attachment_id'))
+                    source = latest_by_identity.get((repo, pr_number, expected_head,
+                                                     round_id, payload.get('attachment_id')))
                 if not source or source.get('round_id') != round_id or source.get('head_sha') != expected_head:
                     raise EvidenceError('operation_not_found', 404)
-                current_attachment = latest.get(source['attachment_id'])
+                current_attachment = latest_by_identity.get((repo, pr_number, expected_head,
+                                                             round_id, source['attachment_id']))
                 if source.get('status') == 'invalid':
                     raise EvidenceError('round_changed', 409)
                 if current_attachment and current_attachment.get('status') == 'deleted':
@@ -1539,7 +1654,9 @@ class EvidenceService:
                         operation['status'] = 'completing'
                         await current()
                         await self._save(repo, pr_number, 'operation', operation, 'completing')
-                store_action = 'resume' if existing or action == 'resume' else 'complete'
+                store_action = ('resume' if existing or action == 'resume'
+                                or source.get('status') in {'completing', 'verifying', 'processing', 'ready'}
+                                else 'complete')
                 store_payload = {}
             await current()
             result = await self._store(store_action, operation, store_payload)
