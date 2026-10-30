@@ -21,6 +21,13 @@ test('背景语音带上说话人、语种和情绪', () => {
     '👂 "今天天气不错" · 云强 · zh · HAPPY');
 });
 
+test('ACP 完成事件显示动作状态和结果', () => {
+  assert.equal(
+    summarizeEvent({ type: 'action_complete', payload: {
+      action_id: 's10_move_123', status: 'completed', result: { state: 'completed' } } }),
+    '✓ s10_move_123 completed {"state":"completed"}');
+});
+
 test('背景语音没有附加字段时只有那句话', () => {
   assert.equal(
     summarizeEvent({ type: 'asr_background', payload: { text: 'The.' } }),

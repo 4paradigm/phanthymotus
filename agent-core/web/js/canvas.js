@@ -1277,32 +1277,48 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     // x-action-params: 根据选中的 action 动态显隐参数字段
     const actionParams = schema?.['x-action-params'];
-    if (actionParams) {
+    const _visibleWhen = Object.fromEntries(Object.entries(props)
+      .filter(([, def]) => def && def['x-visible-when'])
+      .map(([key, def]) => [key, def['x-visible-when']]));
+    const _fieldValue = (key) => {
+      const input = el.querySelector(`.canvas-field-input[data-key="${CSS.escape(key)}"]`);
+      if (!input) return undefined;
+      if (input.type === 'checkbox') return input.checked;
+      return input.value;
+    };
+    const _matchesVisibleWhen = (key) => {
+      const condition = _visibleWhen[key];
+      if (!condition) return true;
+      return Object.entries(condition).every(([otherKey, allowed]) => {
+        const value = _fieldValue(otherKey);
+        return (Array.isArray(allowed) ? allowed : [allowed]).some(item => String(item) === String(value));
+      });
+    };
+    const _applyFields = () => {
+      const selected = actionSelect?.value;
+      const paramKeys = actionParams?.[selected]?.params || null;
+      el.querySelectorAll('.canvas-field').forEach(field => {
+        const key = field.querySelector('.canvas-field-input')?.dataset?.key;
+        if (!key || key === 'action') return;
+        const allowed = paramKeys === null || paramKeys.includes(key);
+        field.style.display = allowed && _matchesVisibleWhen(key) ? '' : 'none';
+      });
+      _scheduleRedraw();
+    };
+    if (actionParams || Object.keys(_visibleWhen).length) {
       const actionSelect = el.querySelector('.canvas-field-input[data-key="action"]');
-      if (actionSelect) {
-        const _applyActionParams = () => {
-          const selected = actionSelect.value;
-          const paramKeys = actionParams[selected]?.params || [];
-          el.querySelectorAll('.canvas-field').forEach(field => {
-            const key = field.querySelector('.canvas-field-input')?.dataset?.key;
-            if (!key || key === 'action') return;
-            field.style.display = paramKeys.includes(key) ? '' : 'none';
-          });
-          // Showing/hiding fields changes the card's height, which moves every
-          // port on it. The card ResizeObserver (_syncGeometryObservers) now
-          // covers this, but ask explicitly too so the behaviour does not
-          // depend on ResizeObserver being available.
-          _scheduleRedraw();
-        };
-        actionSelect.addEventListener('change', async () => {
+      if (actionSelect) actionSelect.addEventListener('change', async () => {
           if (!(await _ensureEdit())) {
-            _applyActionParams();  // revert visual to match current state
+            _applyFields();  // revert visual to match current state
             return;
           }
-          _applyActionParams();
+          _applyFields();
         });
-        _applyActionParams();  // 初始应用
-      }
+      Object.keys(_visibleWhen).forEach(key => {
+        const input = el.querySelector(`.canvas-field-input[data-key="${CSS.escape(key)}"]`);
+        input?.addEventListener('change', _applyFields);
+      });
+      _applyFields();  // 初始应用
     }
 
     el.querySelector('.canvas-card-info-btn').addEventListener('click', (e) => {
