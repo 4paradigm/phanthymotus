@@ -1986,3 +1986,81 @@ async def test_review_author_runtime_trust_provenance_fail_closed(tmp_path, monk
         secrets.write_text(yaml.safe_dump(invalid))
         with pytest.raises(ValueError, match="review_comment_trust"):
             config_mod.load_config()
+
+
+@pytest.mark.parametrize(
+    ("already_reviewed_commit", "expected_run_binding"),
+    [
+        ("ed171d8", True),
+        ("dff61cb", False),
+    ],
+)
+def test_already_reviewed_noop_request_does_not_poison_next_review_run(
+    already_reviewed_commit, expected_run_binding,
+):
+    """A skipped duplicate request is ignored only for the preceding run SHA."""
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    already_reviewed = textwrap.dedent(f"""\
+    <!-- pr-review-agent -->
+
+    ## PR Review Agent — Already reviewed
+
+    {already_reviewed_commit} was already reviewed on 2026-10-30 10:54 UTC (result: review_done). This request
+    was skipped rather than rebuilding an unchanged commit.
+    """)
+
+    comments = [
+        _make_comment(
+            old_build, cid=1001,
+            created_at="2026-10-30T03:55:00Z",
+            updated_at="2026-10-30T03:55:00Z",
+        ),
+        _make_comment(
+            _CODE_REVIEW_BODY, cid=1002,
+            created_at="2026-10-30T03:57:00Z",
+            updated_at="2026-10-30T03:57:00Z",
+        ),
+        _make_comment(
+            "/request_bot_review", cid=1003,
+            created_at="2026-10-30T03:58:00Z",
+            updated_at="2026-10-30T03:58:00Z",
+            author_id="184792454", author_login="Haohao-end",
+        ),
+        _make_comment(
+            already_reviewed, cid=1004,
+            created_at="2026-10-30T03:59:00Z",
+            updated_at="2026-10-30T03:59:00Z",
+        ),
+        _make_comment(
+            "/request_bot_review", cid=1005,
+            created_at="2026-10-30T04:00:00Z",
+            updated_at="2026-10-30T04:00:00Z",
+            author_id="184792454", author_login="Haohao-end",
+        ),
+        _make_comment(
+            new_build, cid=1006,
+            created_at="2026-10-30T04:01:00Z",
+            updated_at="2026-10-30T04:01:00Z",
+        ),
+        _make_comment(
+            _CODE_REVIEW_BODY, cid=1007,
+            created_at="2026-10-30T04:02:00Z",
+            updated_at="2026-10-30T04:02:00Z",
+        ),
+    ]
+
+    evidence = extract_review_evidence(
+        comments,
+        TRUSTED_AUTHOR_ID,
+        TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+
+    assert evidence is not None
+    assert evidence.build_comment_id == 1006
+    assert evidence.code_review_comment_id == 1007
+    assert evidence.request_comment["id"] == 1005
+    assert evidence.run_binding_valid is expected_run_binding

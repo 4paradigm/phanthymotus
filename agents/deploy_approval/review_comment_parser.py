@@ -386,12 +386,13 @@ def _is_noop_review_request(
     request_positions: list[tuple[datetime, int]],
     trusted_comments: list[dict],
     review_run_positions: list[tuple[datetime, int]],
-    expected_commit: str,
+    previous_run_commit: str,
 ) -> bool:
     """Ignore only a request explicitly answered as skipped without a new run.
 
     The response must be the sole Already reviewed response after this request
-    and before the next review request, must name this HEAD, and must not have
+    and before the next review request, must name the immediately preceding
+    completed review run's commit, and must not have
     a review-run anchor between the request and response. Edited or ambiguous
     comments remain blocking; real new runs are never hidden by this rule.
     """
@@ -421,7 +422,11 @@ def _is_noop_review_request(
             continue
         responses.append((commit_prefix, position))
 
-    return len(responses) == 1 and _same_commit(responses[0][0], expected_commit)
+    return (
+        len(responses) == 1
+        and bool(previous_run_commit)
+        and _same_commit(responses[0][0], previous_run_commit)
+    )
 
 
 def _run_id(body: str) -> str:
@@ -907,6 +912,16 @@ def extract_review_evidence(
     if any(position is None or position >= anchor_position for position in prior_positions):
         return None
     previous_position = max(prior_positions) if prior_positions else None
+    previous_run_commit = ""
+    if previous_position is not None:
+        previous_anchor = next(
+            (c for c in other_anchors if _comment_position(c) == previous_position),
+            None,
+        )
+        if previous_anchor is not None:
+            previous_run_commit = _extract_review_job_commit_prefix(
+                str(previous_anchor.get("body", "") or "")
+            )
     request_candidates = []
     request_positions = []
     request_entries = []
@@ -926,7 +941,7 @@ def extract_review_evidence(
     for c, position in request_entries:
         if _is_noop_review_request(
             c, position, request_positions, trusted_comments,
-            review_run_positions, expected_commit,
+            review_run_positions, previous_run_commit,
         ):
             continue
         if previous_position is not None and position <= previous_position:
