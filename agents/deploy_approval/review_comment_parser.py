@@ -424,6 +424,19 @@ def _is_noop_review_request(
         or not _SHORT_SHA_RE.fullmatch(previous_commit)
     ):
         return False
+    previous_builds = parse_all_build_results(previous_anchor.body)
+    previous_build_keys = {
+        (build.target, build.driver_path, build.variant)
+        for build in previous_builds
+    }
+    if (
+        not previous_builds
+        or (
+            command["expected"] is not None
+            and previous_build_keys != command["expected"]
+        )
+    ):
+        return False
 
     # The run being referenced must already have a complete, unambiguous Code
     # Review before this request. A delayed Code Review cannot retroactively

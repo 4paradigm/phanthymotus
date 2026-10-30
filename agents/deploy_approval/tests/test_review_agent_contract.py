@@ -2250,3 +2250,155 @@ def test_malformed_already_reviewed_response_fails_closed():
     )
     assert evidence is not None
     assert evidence.run_binding_valid is False
+
+
+def test_edited_already_reviewed_response_fails_closed():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    comments = [
+        _make_comment(old_build, cid=6001,
+                      created_at="2026-10-30T03:55:00Z",
+                      updated_at="2026-10-30T03:56:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=6002,
+                      created_at="2026-10-30T03:57:00Z",
+                      updated_at="2026-10-30T03:57:00Z"),
+        _make_comment("/request_bot_review", cid=6003,
+                      created_at="2026-10-30T03:58:00Z",
+                      updated_at="2026-10-30T03:58:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(_already_reviewed_body_for_test("ed171d8"), cid=6004,
+                      created_at="2026-10-30T03:59:00Z",
+                      updated_at="2026-10-30T04:00:00Z"),
+        _make_comment("/request_bot_review", cid=6005,
+                      created_at="2026-10-30T04:01:00Z",
+                      updated_at="2026-10-30T04:01:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(new_build, cid=6006,
+                      created_at="2026-10-30T04:02:00Z",
+                      updated_at="2026-10-30T04:03:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=6007,
+                      created_at="2026-10-30T04:04:00Z",
+                      updated_at="2026-10-30T04:04:00Z"),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is False
+
+
+def test_noop_request_without_completed_prior_code_review_fails_closed():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    comments = [
+        _make_comment(old_build, cid=7001,
+                      created_at="2026-10-30T03:55:00Z",
+                      updated_at="2026-10-30T03:56:00Z"),
+        _make_comment("/request_bot_review", cid=7002,
+                      created_at="2026-10-30T03:57:00Z",
+                      updated_at="2026-10-30T03:57:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(_already_reviewed_body_for_test("ed171d8"), cid=7003,
+                      created_at="2026-10-30T03:58:00Z",
+                      updated_at="2026-10-30T03:58:00Z"),
+        _make_comment("/request_bot_review", cid=7004,
+                      created_at="2026-10-30T03:59:00Z",
+                      updated_at="2026-10-30T03:59:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(new_build, cid=7005,
+                      created_at="2026-10-30T04:00:00Z",
+                      updated_at="2026-10-30T04:01:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=7006,
+                      created_at="2026-10-30T04:02:00Z",
+                      updated_at="2026-10-30T04:02:00Z"),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is False
+
+
+def test_untrusted_already_reviewed_response_does_not_suppress_request():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    comments = [
+        _make_comment(old_build, cid=8001,
+                      created_at="2026-10-30T03:55:00Z",
+                      updated_at="2026-10-30T03:56:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=8002,
+                      created_at="2026-10-30T03:57:00Z",
+                      updated_at="2026-10-30T03:57:00Z"),
+        _make_comment("/request_bot_review", cid=8003,
+                      created_at="2026-10-30T03:58:00Z",
+                      updated_at="2026-10-30T03:58:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(
+            _already_reviewed_body_for_test("ed171d8"), cid=8004,
+            created_at="2026-10-30T03:59:00Z",
+            updated_at="2026-10-30T03:59:00Z",
+            author_id="123456", author_login="untrusted-reviewer",
+        ),
+        _make_comment("/request_bot_review", cid=8005,
+                      created_at="2026-10-30T04:00:00Z",
+                      updated_at="2026-10-30T04:00:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(new_build, cid=8006,
+                      created_at="2026-10-30T04:01:00Z",
+                      updated_at="2026-10-30T04:02:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=8007,
+                      created_at="2026-10-30T04:03:00Z",
+                      updated_at="2026-10-30T04:03:00Z"),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is False
+
+
+def test_already_reviewed_noop_with_different_requested_build_matrix_fails_closed():
+    from agents.deploy_approval.review_comment_parser import extract_review_evidence
+
+    old_build = _BUILD_COMMENT_BODY.replace("abcdef1", "ed171d8")
+    new_build = _BUILD_COMMENT_BODY.replace("abcdef1", "59a83a0")
+    comments = [
+        _make_comment(old_build, cid=9001,
+                      created_at="2026-10-30T03:55:00Z",
+                      updated_at="2026-10-30T03:56:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=9002,
+                      created_at="2026-10-30T03:57:00Z",
+                      updated_at="2026-09-30T03:57:00Z"),
+        _make_comment("/request_bot_review core", cid=9003,
+                      created_at="2026-10-30T03:58:00Z",
+                      updated_at="2026-10-30T03:58:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(_already_reviewed_body_for_test("ed171d8"), cid=9004,
+                      created_at="2026-10-30T03:59:00Z",
+                      updated_at="2026-10-30T03:59:00Z"),
+        _make_comment("/request_bot_review", cid=9005,
+                      created_at="2026-10-30T04:00:00Z",
+                      updated_at="2026-10-30T04:00:00Z",
+                      author_id="184792454", author_login="Haohao-end"),
+        _make_comment(new_build, cid=9006,
+                      created_at="2026-10-30T04:01:00Z",
+                      updated_at="2026-10-30T04:02:00Z"),
+        _make_comment(_CODE_REVIEW_BODY, cid=9007,
+                      created_at="2026-10-30T04:03:00Z",
+                      updated_at="2026-10-30T04:03:00Z"),
+    ]
+    evidence = extract_review_evidence(
+        comments, TRUSTED_AUTHOR_ID, TRUSTED_AUTHOR_LOGIN,
+        head_sha="59a83a0" + "0" * 33,
+    )
+    assert evidence is not None
+    assert evidence.run_binding_valid is False
