@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import threading
 import time
 import uuid
+from dataclasses import replace
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
@@ -296,8 +298,8 @@ class NaviPlugin:
                         "description": "配置跟随增益、搜索转速、速度上限和横移。"
                                        "只更新填写的参数；配置保留到本进程后续"
                                        "启动，容器重启后需由画布配置或 YAML 恢复。"
-                                       "速度上限与搜索转速修改后应停止并重新启动"
-                                       "卡片，让它重新协商下游底盘限制",
+                                       "运行中修改也会重新按下游底盘限制调整；"
+                                       "返回 config 为请求值、effective_config 为实际值",
                     },
                 },
                 # Unlike the vla card, this one finishes: arriving is an answer.
@@ -732,11 +734,39 @@ class NaviPlugin:
             # how a field ends up holding the wrong type for a year.
             cast = (bool if field.type in ("bool", bool)
                     else int if field.type in ("int", int) else float)
-            setattr(self._config, key, cast(value))
-            changed[key] = getattr(self._config, key)
-            # Preserve user-configured values across subsequent starts.
-            self._cfg[key] = changed[key]
-        return {"status": "configured", "config": changed}
+            try:
+                if key == "use_lateral" and not isinstance(value, bool):
+                    raise ValueError("must be a boolean")
+                if key in _TUNING_FIELDS and key != "use_lateral" and isinstance(value, bool):
+                    raise ValueError("must be a finite nonnegative number")
+                changed[key] = cast(value)
+                if key in _TUNING_FIELDS and key != "use_lateral":
+                    if not math.isfinite(changed[key]) or changed[key] < 0:
+                        raise ValueError("must be a finite nonnegative number")
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._error(f"配置 {key} 无效：{error}")
+
+        with self._lock:
+            # Stage a complete replacement so the policy never observes half
+            # of a config request. Copy effective geometry adopted from the
+            # camera/chassis; rebuilding from YAML would discard that reading.
+            candidate = replace(self._config, **changed)
+            notes = self._limit_notes
+            if self._running and changed:
+                # Restore requested ceilings before adoption, including those
+                # unchanged by this request. Otherwise an already-clamped
+                # ceiling loses its explanatory note on the next gain change.
+                for key in ("vx_max", "vy_max", "wz_max", "search_rate"):
+                    setattr(candidate, key, changed.get(
+                        key, self._cfg.get(
+                            key, policy_mod.Config.__dataclass_fields__[key].default)))
+                notes = policy_mod.adopt_limits(candidate, self._descriptor)
+            self._config = candidate
+            self._cfg.update(changed)
+            self._limit_notes = notes
+            return {"status": "configured", "config": changed,
+                    "effective_config": {key: getattr(candidate, key)
+                                         for key in changed}}
 
     def _info(self):
         with self._lock:
