@@ -7,25 +7,24 @@ ActuCore 把意图/目标变成运动指令。执行模型（VLA、导航、抓�
 whole-body control）以卡片（插件）的形式挂在这里，聚合成一个 MCP HTTP server
 对外暴露，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-当前版本不带任何卡片 —— 这是骨架 + 全链路（注册、探活、部署）打通。
+当前挂载的卡片：`controlled_semantic_spatial`（配置键和公开工具名一致）——
+FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2
+作为子进程跑在本容器内，对外提供 map_view 和 control_velocity；
+同时注册上游 `vla` 卡片。
 新增卡片的完整步骤见 README.md。
 
-MCP 工具命名规则：{plugin_prefix}_{tool_name}
-  例：vla_info, vla_start, nav_goto
+MCP 工具命名规则：{plugin_prefix}_{tool_name}；工具名等于 PREFIX 时不加前缀
+  例：vla_info、vla_start、controlled_semantic_spatial
 
 MCP server 端口: config.mcp_port（默认 15730）
 """
 
 from __future__ import annotations
 
-# First, before anything can write to stdout: make every log line one atomic,
-# control-character-free write, so concurrent writers cannot tear a Docker log
-# record. Without this, actucore produced a log the daemon could not read back at
-# all — `docker logs` failed outright with "log message is too large
-# (1952739189 > 1000000)", i.e. the framing had come apart and a length prefix
-# was being read out of garbage. Same module perception installs; the Dockerfile
-# copies it out of perception/utils/ rather than keeping a fourth duplicate.
+# Install before any thread, ROS runtime, or HTTP handler can write a partial
+# Docker log record. The Dockerfile supplies perception's shared implementation.
 import logsafe
+
 logsafe.install()
 
 import json
@@ -33,6 +32,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -45,6 +45,7 @@ import yaml
 
 import rclpy
 import rclpy.executors
+from rclpy._rclpy_pybind11 import InvalidHandle
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
@@ -53,24 +54,10 @@ log = logging.getLogger(__name__)
 for _quiet in ('urllib3', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
-# Cap on how much of an MCP argument/result dict reaches the log. Card configs
-# carry whole maps and voxel grids, so an unbounded repr here is how a single log
-# line grows past the point where Docker can frame it — the result side was
-# already capped, the argument side was not.
-_LOG_ARG_CHARS = 500
-
 # How often the register thread says it is still alive when nothing has changed.
 # The heartbeat itself stays at 30s; this only governs how often that fact
 # reaches the log, so "quiet" cannot mean both "healthy" and "thread died".
 REGISTER_ALIVE_INTERVAL_S = 1800.0
-
-
-def _brief(obj) -> str:
-    """One-line, length-capped repr for logging an MCP payload."""
-    text = repr(obj)
-    if len(text) <= _LOG_ARG_CHARS:
-        return text
-    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
 
 
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
@@ -125,13 +112,37 @@ class ActuCoreBundle:
         #            self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
         #            log.info("XPlugin loaded")
         #
-        # 需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步，参照
-        # perception/main.py 里 vop 的写法：namespace 为空时用
-        # re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname()) 兜底。
+        # 需要 ROS 命名空间的卡片必须在自己的注册块里校验运行时支持范围。
         #
-        # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。
+        # 卡片契约（action.enum 必须含 "info" 等）见 README.md。
         # ──────────────────────────────────────────────────────────────────
 
+        if "navigation" in plugins_cfg:
+            raise ValueError("plugins.navigation was renamed to plugins.controlled_semantic_spatial; update the configuration")
+        navigation_cfg = plugins_cfg.get("controlled_semantic_spatial", {})
+        if not isinstance(navigation_cfg, dict):
+            raise ValueError("plugins.controlled_semantic_spatial must be an object")
+        if navigation_cfg.get("enabled", False):
+            namespace = navigation_cfg.get("namespace", "ubuntu")
+            if not isinstance(namespace, str):
+                raise ValueError("plugins.controlled_semantic_spatial.namespace must be a string")
+            namespace = namespace.strip().strip("/")
+            if namespace != "ubuntu":
+                raise ValueError(
+                    "built-in navigation runtime currently requires namespace=ubuntu"
+                )
+            from plugins.controlled_semantic_spatial import ControlledSemanticSpatialPlugin
+            plugin = ControlledSemanticSpatialPlugin(
+                navigation_cfg,
+                namespace,
+                executor,
+                completion_callback=sse_push,
+            )
+            self._plugins.append(plugin)
+            log.info(
+                "ControlledSemanticSpatialPlugin loaded (single-container runtime, namespace=%s)",
+                namespace,
+            )
         if plugins_cfg.get("vla", {}).get("enabled", False):
             from plugins.vla import VLAPlugin
             self._plugins.append(VLAPlugin(plugins_cfg["vla"], executor))
@@ -173,12 +184,59 @@ class ActuCoreBundle:
         return tools
 
     def dispatch(self, full_name: str, args: dict) -> dict | None:
-        prefix, sep, tool_name = full_name.partition("_")
-        name = tool_name if sep else prefix
-        for p in self._plugins:
-            if p.PREFIX == prefix:
-                return p.dispatch(name, args)
-        return None
+        matches = (
+            p for p in self._plugins
+            if full_name == p.PREFIX or full_name.startswith(p.PREFIX + "_")
+        )
+        plugin = max(matches, key=lambda p: len(p.PREFIX), default=None)
+        if plugin is None:
+            return None
+        name = full_name if full_name == plugin.PREFIX else full_name[len(plugin.PREFIX) + 1:]
+        return plugin.dispatch(name, args)
+
+    def stop(self) -> bool:
+        """Best-effort release for every card that owns runtime resources.
+
+        执行模型卡片常常持有真实资源（导航卡片在容器内跑 FAST-LIVO2 / Nav2
+        子进程），进程退出时必须收回，否则重启会撞上残留的 ROS 节点。
+        """
+
+        all_confirmed = True
+        for plugin in reversed(self._plugins):
+            stop = getattr(plugin, "stop", None)
+            if callable(stop):
+                confirmed = False
+                for attempt in range(3):
+                    try:
+                        result = stop()
+                    except Exception:
+                        log.exception("failed to stop card %s", plugin.PREFIX)
+                        break
+                    confirmed = (
+                        isinstance(result, dict)
+                        and (
+                            result.get("terminal_confirmed") is True
+                            or (result.get("status") or result.get("state"))
+                            in {"idle", "stopped", "disabled"}
+                        )
+                    )
+                    if confirmed:
+                        break
+                    if not (
+                        isinstance(result, dict)
+                        and result.get("retryable") is True
+                        and (
+                            result.get("state") == "error"
+                            or result.get("status") == "error"
+                        )
+                    ):
+                        break
+                    if attempt < 2:
+                        time.sleep(0.25)
+                if not confirmed:
+                    all_confirmed = False
+                    log.error("card %s stop remained unconfirmed", plugin.PREFIX)
+        return all_confirmed
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -205,7 +263,7 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
-            if self.path.split("?")[0] == "/sse":
+            if self.path.split("?")[0] == "/mcp/sse":
                 # SSE streaming endpoint for ACP completion events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -278,23 +336,28 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
-                    # info action is heartbeat probe — log at DEBUG to reduce noise
-                    is_info = (args.get('action') == 'info')
+                    # Only fixed metadata reaches the shared MCP log; neither
+                    # request fields nor plugin results are safe to log.
+                    is_info = args.get('action') == 'info'
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
+                        log.info("[mcp] tools/call received")
                     result = _bundle.dispatch(name, args)
                     if result is None:
+                        if not is_info:
+                            log.info("[mcp] tools/call: unknown tool")
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            log.info("[mcp] tools/call completed")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
             except BrokenPipeError:
                 log.debug(f"Client disconnected before response")
             except Exception as e:
-                log.error(f"RPC error: {e}", exc_info=True)
+                # Exception messages and tracebacks may contain request or plugin
+                # payloads; preserve the RPC response without logging either.
+                log.error("RPC handler failed")
                 try:
                     err(-32603, str(e))
                 except BrokenPipeError:
@@ -359,6 +422,19 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
+def _spin_executor(executor) -> None:
+    """Keep the shared executor alive across concurrent ROS node teardown."""
+
+    while True:
+        try:
+            executor.spin()
+            return
+        except InvalidHandle:
+            if not rclpy.ok():
+                return
+            log.warning("ROS node was removed during spin; continuing executor")
+
+
 def main():
     global _bundle
 
@@ -377,10 +453,12 @@ def main():
     executor = rclpy.executors.MultiThreadedExecutor()
     _bundle  = ActuCoreBundle(cfg, executor)
 
-    def _spin():
-        executor.spin()
-
-    spin_thread = threading.Thread(target=_spin, daemon=True, name="actucore_spin")
+    spin_thread = threading.Thread(
+        target=_spin_executor,
+        args=(executor,),
+        daemon=True,
+        name="actucore_spin",
+    )
     spin_thread.start()
 
     _start_registration(mcp_port, "ActuCore", "actucore")
@@ -398,6 +476,11 @@ def main():
     try:
         server.serve_forever()
     finally:
+        if not _bundle.stop():
+            log.critical(
+                "one or more card stops remained unconfirmed after retries; "
+                "forcing process shutdown so the container supervisor can recover"
+            )
         # 关机顺序是有讲究的：spin 线程还停在 `executor.spin()` 里面（rclpy 的 C++
         # 代码里）时，解释器一旦开始 finalize，就会 `terminate called without an
         # active exception` → `Fatal Python error: Aborted`，容器退出码 134。

@@ -1,0 +1,90 @@
+/**:
+  ros__parameters:
+    common:
+      img_topic: "/left_camera/image"
+      lid_topic: "/livox/lidar"
+      imu_topic: "/livox/imu"
+      img_en: 0
+      lidar_en: 1
+      ros_driver_bug_fix: false
+      enable_image_processing: false
+    camera:
+      model: Pinhole
+      width: 640
+      height: 480
+      scale: 1.0
+      fx: 525.0
+      fy: 525.0
+      cx: 319.5
+      cy: 239.5
+      d0: 0.0
+      d1: 0.0
+      d2: 0.0
+      d3: 0.0
+    extrin_calib:
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+      Rcl: [1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0]
+      Pcl: [0.0, 0.0, 0.0]
+    time_offset:
+      imu_time_offset: 0.0
+      img_time_offset: 0.0
+      exposure_time_init: 0.0
+    preprocess:
+      point_filter_num: 1
+      filter_size_surf: 0.1
+      lidar_type: 7
+      scan_line: 4
+      blind: 0.5
+    vio:
+      max_iterations: 5
+      outlier_threshold: 1000
+      img_point_cov: 100
+      patch_size: 8
+      patch_pyrimid_level: 4
+      normal_en: true
+      raycast_en: false
+      inverse_composition_en: false
+      exposure_estimate_en: false
+      inv_expo_cov: 0.1
+    imu:
+      imu_en: true
+      imu_int_frame: 30
+      acc_cov: 0.8
+      gyr_cov: 0.5
+      b_acc_cov: 0.001
+      b_gyr_cov: 0.001
+    lio:
+      max_iterations: 5
+      dept_err: 0.02
+      beam_err: 0.15
+      min_eigen_value: 0.005
+      voxel_size: 0.5
+      max_layer: 2
+      max_points_num: 50
+      layer_init_num: [5, 5, 5, 5, 5]
+    local_map:
+      map_sliding_en: false
+      half_map_size: 100
+      sliding_thresh: 8.0
+    uav:
+      imu_rate_odom: false
+      gravity_align_en: true
+    publish:
+      dense_map_en: false
+      pub_effect_point_en: false
+      pub_plane_en: false
+      pub_scan_num: 1
+      blind_rgb_points: 0.0
+    evo:
+      seq_name: "navigation_fast_livo2"
+      pose_output_en: false
+    pcd_save:
+      pcd_save_en: false
+      colmap_output_en: false
+      filter_size_pcd: 0.15
+      interval: -1

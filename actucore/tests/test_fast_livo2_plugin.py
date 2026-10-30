@@ -1,0 +1,543 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+ACTUCORE_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ACTUCORE_ROOT))
+
+from plugins.controlled_semantic_spatial.mapping.core import FastLivo2BackendError  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.plugin import FastLivo2Plugin  # noqa: E402
+
+
+class ReadyBackend:
+    def __init__(self, subscribers: int = 1) -> None:
+        self.subscribers = subscribers
+        self.info_calls = 0
+        self.stop_calls = 0
+        self.calls: list[tuple[str, dict]] = []
+
+    def info(self) -> dict:
+        self.info_calls += 1
+        return {
+            "state": "ready",
+            "status": "ready",
+            "backend": "fast_livo2_ros_topic",
+            "bridge_subscribers": self.subscribers,
+        }
+
+    def execute(self, action: str, args: dict) -> dict:
+        self.calls.append((action, dict(args)))
+        if action == "configure_obstacle_filter":
+            return {
+                "status": "configured",
+                "obstacle_height_range_m": [
+                    args["min_height_m"],
+                    args["max_height_m"],
+                ],
+            }
+        if action == "start_mapping":
+            return {"status": "mapping", "map_name": args["map_name"]}
+        if action == "load_map":
+            return {"status": "map_loaded", "map_name": args["map_name"]}
+        if action == "unload_map":
+            return {"status": "unloaded", "map_name": args["map_name"]}
+        return {"status": "saved", "map_name": args["map_name"]}
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+
+
+
+class ObstacleFilterRejectingBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "configure_obstacle_filter":
+            self.calls.append((action, dict(args)))
+            return {
+                "status": "error",
+                "error_code": "invalid_obstacle_filter",
+                "error": "adapter rejected height limits",
+            }
+        return super().execute(action, args)
+
+
+
+
+class RetryableMappingStopBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "stop_mapping":
+            self.calls.append((action, dict(args)))
+            raise FastLivo2BackendError(
+                "manifest_write_failed",
+                "temporary persistence failure",
+                details={"retryable": True},
+            )
+        return super().execute(action, args)
+
+
+class RetryableLocalizationStopBackend(ReadyBackend):
+    def execute(self, action: str, args: dict) -> dict:
+        if action == "unload_map":
+            self.calls.append((action, dict(args)))
+            raise FastLivo2BackendError(
+                "fast_livo2_response_timeout",
+                "adapter unload is still converging",
+                details={
+                    "retryable": True,
+                    "loaded_map": "office",
+                    "runtime_mode": "localization",
+                },
+            )
+        return super().execute(action, args)
+
+
+
+
+
+
+
+
+def _bindings(plugin: FastLivo2Plugin) -> list[dict]:
+    return [
+        {"port": item["port"], "topic": item["topic"]}
+        for item in plugin.get_tools()[0]["topic_in"]
+    ]
+
+
+class FastLivo2PluginTest(unittest.TestCase):
+    def test_info_reports_actual_bound_sensor_topics(self) -> None:
+        plugin = FastLivo2Plugin({}, None, backend=ReadyBackend())
+        topics = {"lidar": "/robot/cloud", "imu": "/robot/imu"}
+        result = plugin.dispatch("fast_livo2", {
+            "action": "start",
+            "input_bindings": [{"port": port, "topic": topic} for port, topic in topics.items()],
+        })
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual({item["port"]: item["topic"] for item in result["topic_in"] if item["connected"]}, topics)
+
+    def test_info_is_lazy_and_start_requires_exact_wiring(self) -> None:
+        backend = ReadyBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        self.assertEqual(plugin.dispatch("fast_livo2", {"action": "info"})["state"], "idle")
+        self.assertEqual(backend.info_calls, 0)
+
+        missing = plugin.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(plugin)[:1]},
+        )
+        self.assertEqual(missing["error_code"], "invalid_canvas_wiring")
+        self.assertEqual(backend.info_calls, 0)
+
+        duplicate = plugin.dispatch(
+            "fast_livo2",
+            {
+                "action": "start",
+                "input_bindings": [
+                    _bindings(plugin)[0],
+                    _bindings(plugin)[0],
+                    _bindings(plugin)[1],
+                ],
+            },
+        )
+        self.assertEqual(duplicate["error_code"], "invalid_canvas_wiring")
+
+        ready = plugin.dispatch(
+            "fast_livo2",
+            {
+                "action": "start",
+                "instance_id": "mapping-card",
+                "input_bindings": _bindings(plugin),
+            },
+        )
+        self.assertEqual(ready["state"], "ready")
+        self.assertTrue(ready["canvas_wired"])
+        self.assertTrue(all(item["connected"] for item in ready["topic_in"]))
+        self.assertEqual(backend.calls[0][0], "configure_obstacle_filter")
+        self.assertEqual(
+            backend.calls[0][1],
+            {
+                "min_height_m": -0.30,
+                "max_height_m": 0.30,
+                "lidar_qos_depth": 2,
+                "imu_qos_depth": 400,
+                "map_view_enabled": True,
+                "fault_capture_enabled": True,
+            },
+        )
+
+        plugin.dispatch("fast_livo2", {"action": "stop"})
+        custom = _bindings(plugin)
+        custom[0]["topic"] = "/robot/lidar"
+        custom[1]["topic"] = "/robot/imu"
+        ready = plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": custom}
+        )
+        self.assertEqual(ready["state"], "ready")
+        self.assertTrue(all(item["connected"] for item in ready["topic_in"]))
+
+    def test_canvas_stop_finalizes_mapping_before_backend_release(self) -> None:
+        backend = ReadyBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start_mapping", "map_name": "office"}
+        )
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(stopped["state"], "idle")
+        self.assertEqual(stopped["stop_result"]["status"], "saved")
+        self.assertEqual(
+            [call[0] for call in backend.calls],
+            [
+                "configure_obstacle_filter",
+                "start_mapping",
+                "stop_mapping",
+            ],
+        )
+        self.assertEqual(backend.stop_calls, 1)
+
+
+
+
+
+
+
+
+    def test_mapping_stop_retryability_survives_backend_core_and_plugin(self) -> None:
+        backend = RetryableMappingStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start_mapping", "map_name": "office"}
+        )
+
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["stop_result"]["error_code"], "manifest_write_failed")
+        self.assertTrue(result["stop_result"]["retryable"])
+        self.assertEqual(backend.stop_calls, 0)
+        info = plugin.dispatch("fast_livo2", {"action": "info"})
+        self.assertTrue(info["canvas_wired"])
+        self.assertEqual(info["active_map"], "office")
+
+    def test_unconfirmed_stop_mapping_keeps_core_for_retry(self) -> None:
+        for payload in ({"status": "rejected"}, {"status": "stopping"}, {},
+                        {"status": "saved", "terminal_confirmed": False},
+                        {"status": "saved", "error_code": "map_write_failed"}):
+            with self.subTest(payload=payload):
+                class UnconfirmedBackend(ReadyBackend):
+                    def execute(self, action: str, args: dict) -> dict:
+                        if action == "stop_mapping":
+                            return dict(payload)
+                        return super().execute(action, args)
+
+                backend = UnconfirmedBackend()
+                plugin = FastLivo2Plugin({}, None, backend=backend)
+                plugin.dispatch("fast_livo2", {
+                    "action": "start", "input_bindings": _bindings(plugin),
+                })
+                plugin.dispatch("fast_livo2", {
+                    "action": "start_mapping", "map_name": "office",
+                })
+                result = plugin.dispatch("fast_livo2", {"action": "stop"})
+                self.assertEqual(result["error_code"], "canvas_stop_failed")
+                self.assertTrue(result["retryable"])
+                self.assertFalse(result["terminal_confirmed"])
+                self.assertTrue(result["canvas_wired"])
+                self.assertEqual(backend.stop_calls, 0)
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "info"})[
+                    "active_map"], "office")
+                payload = {"status": "saved"}
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "stop"})[
+                    "status"], "idle")
+                self.assertEqual(backend.stop_calls, 1)
+
+    def test_localization_pending_algorithm_error_survives_adapter_retry(self) -> None:
+        algorithm_error = {"status": "error", "error_code": "algorithm_stop_failed",
+                           "error": "bad exit"}
+
+        class RetryUnloadBackend(ReadyBackend):
+            def __init__(self):
+                super().__init__()
+                self.unload_calls = 0
+
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "unload_map":
+                    self.unload_calls += 1
+                    if self.unload_calls == 1:
+                        raise FastLivo2BackendError(
+                            "adapter_unavailable", "not unloaded",
+                            details={"loaded_map": "office", "runtime_mode": "localization",
+                                     "algorithm_stop_error": algorithm_error})
+                    raise FastLivo2BackendError(
+                        "algorithm_stop_failed", "bad exit",
+                        details={"loaded_map": None, "runtime_mode": "idle",
+                                 "terminal_confirmed": True, "retryable": False})
+                return super().execute(action, args)
+
+        backend = RetryUnloadBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch("fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)})
+        plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+        pending = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertFalse(pending["terminal_confirmed"])
+        self.assertEqual(backend.stop_calls, 0)
+        self.assertEqual(plugin.dispatch("fast_livo2", {"action": "info"})["loaded_map"], "office")
+        final = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertTrue(final["terminal_confirmed"])
+        self.assertEqual(final["status"], "error")
+        self.assertEqual(final["terminal_stop_failures"]["mapping"]["error_code"],
+                         "algorithm_stop_failed")
+        self.assertEqual(backend.stop_calls, 1)
+
+    def test_unconfirmed_localization_stop_retains_loaded_map(self) -> None:
+        for payload in ({"status": "stopping"},
+                        {"status": "unloaded", "terminal_confirmed": False},
+                        {"status": "unloaded", "error_code": "unload_failed"}):
+            with self.subTest(payload=payload):
+                class UnconfirmedUnloadBackend(ReadyBackend):
+                    def execute(self, action: str, args: dict) -> dict:
+                        if action == "unload_map":
+                            return dict(payload)
+                        return super().execute(action, args)
+
+                backend = UnconfirmedUnloadBackend()
+                plugin = FastLivo2Plugin({}, None, backend=backend)
+                plugin.dispatch("fast_livo2", {
+                    "action": "start", "input_bindings": _bindings(plugin),
+                })
+                plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+                result = plugin.dispatch("fast_livo2", {"action": "stop"})
+                self.assertTrue(result["retryable"])
+                self.assertEqual(backend.stop_calls, 0)
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "info"})[
+                    "loaded_map"], "office")
+                payload = {"status": "unloaded"}
+                self.assertEqual(plugin.dispatch("fast_livo2", {"action": "stop"})[
+                    "status"], "idle")
+                self.assertEqual(backend.stop_calls, 1)
+
+
+
+    def test_mapping_stopped_with_algorithm_error_reports_terminal_failure(self) -> None:
+        class AbnormalStopBackend(ReadyBackend):
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "stop_mapping":
+                    return {
+                        "status": "stopped", "terminal_confirmed": True,
+                        "map_saved": False, "warning_code": "static_map_not_ready",
+                        "algorithm_stop_error": {
+                            "status": "error", "error_code": "algorithm_stop_failed",
+                            "error": "FAST-LIVO2 exited abnormally",
+                        },
+                    }
+                return super().execute(action, args)
+
+        backend = AbnormalStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch("fast_livo2", {
+            "action": "start", "input_bindings": _bindings(plugin),
+        })
+        plugin.dispatch("fast_livo2", {"action": "start_mapping", "map_name": "office"})
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["canvas_wired"])
+        self.assertEqual(result["stop_result"]["algorithm_stop_error"]["error_code"],
+                         "algorithm_stop_failed")
+        self.assertEqual(backend.stop_calls, 1)
+
+
+    def test_mapping_warning_without_algorithm_error_remains_successful_stop(self) -> None:
+        class WarningBackend(ReadyBackend):
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "stop_mapping":
+                    return {"status": "stopped", "terminal_confirmed": True,
+                            "map_saved": False, "warning_code": "static_map_not_ready",
+                            "algorithm_stop_error": None}
+                return super().execute(action, args)
+
+        backend = WarningBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch("fast_livo2", {
+            "action": "start", "input_bindings": _bindings(plugin),
+        })
+        plugin.dispatch("fast_livo2", {"action": "start_mapping", "map_name": "office"})
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+        self.assertEqual(result["status"], "idle")
+        self.assertFalse(result["stop_result"]["map_saved"])
+        self.assertEqual(result["stop_result"]["warning_code"], "static_map_not_ready")
+
+    def test_confirmed_mapping_stop_failure_releases_card_backend(self) -> None:
+        class PermanentStopBackend(ReadyBackend):
+            def execute(self, action: str, args: dict) -> dict:
+                if action == "stop_mapping":
+                    raise FastLivo2BackendError(
+                        "static_map_accumulation_failed",
+                        "static evidence exceeded its safety limit",
+                        details={"retryable": False, "terminal_confirmed": True},
+                    )
+                return super().execute(action, args)
+
+        backend = PermanentStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch(
+            "fast_livo2", {"action": "start_mapping", "map_name": "office"}
+        )
+
+        result = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(result["error_code"], "canvas_stop_failed")
+        self.assertFalse(result["retryable"])
+        self.assertTrue(result["terminal_confirmed"])
+        self.assertFalse(result["canvas_wired"])
+        self.assertEqual(backend.stop_calls, 1)
+        self.assertFalse(
+            plugin.dispatch("fast_livo2", {"action": "info"})["canvas_wired"]
+        )
+
+    def test_missing_runtime_and_invalid_config_fail_closed(self) -> None:
+        unavailable = FastLivo2Plugin(
+            {"discovery_timeout_sec": 0.5}, None, backend=ReadyBackend(0)
+        )
+        result = unavailable.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(unavailable)},
+        )
+        self.assertEqual(result["error_code"], "fast_livo2_runtime_unavailable")
+
+        invalid = FastLivo2Plugin({"map_max_points": 80_000}, None, backend=ReadyBackend())
+        info = invalid.dispatch("fast_livo2", {"action": "info"})
+        self.assertEqual(info["error_code"], "invalid_config")
+
+        inverted = FastLivo2Plugin(
+            {"obstacle_min_height_m": 0.5, "obstacle_max_height_m": 0.2},
+            None,
+            backend=ReadyBackend(),
+        )
+        info = inverted.dispatch("fast_livo2", {"action": "info"})
+        self.assertEqual(info["error_code"], "invalid_config")
+
+        configurable_backend = ReadyBackend()
+        configurable = FastLivo2Plugin({}, None, backend=configurable_backend)
+        configured = configurable.dispatch(
+            "fast_livo2",
+            {
+                "action": "config",
+                "obstacle_min_height_m": -0.8,
+                "obstacle_max_height_m": 0.4,
+                "lidar_qos_depth": 3,
+                "imu_qos_depth": 600,
+            },
+        )
+        self.assertEqual(configured["state"], "configured")
+        self.assertEqual(configured["config"]["obstacle_min_height_m"], -0.8)
+        self.assertEqual(configured["config"]["obstacle_max_height_m"], 0.4)
+        self.assertEqual(configured["config"]["lidar_qos_depth"], 3)
+        self.assertEqual(configured["config"]["imu_qos_depth"], 600)
+        started = configurable.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(configurable)},
+        )
+        self.assertEqual(started["state"], "ready")
+        self.assertEqual(
+            configurable_backend.calls[0],
+            (
+                "configure_obstacle_filter",
+                {
+                    "min_height_m": -0.8,
+                    "max_height_m": 0.4,
+                    "lidar_qos_depth": 3,
+                    "imu_qos_depth": 600,
+                    "map_view_enabled": True,
+                    "fault_capture_enabled": True,
+                },
+            ),
+        )
+
+        for key, value in (
+            ("lidar_qos_depth", 0),
+            ("lidar_qos_depth", 33),
+            ("imu_qos_depth", True),
+            ("imu_qos_depth", 4001),
+        ):
+            with self.subTest(key=key, value=value):
+                rejected = FastLivo2Plugin(
+                    {key: value}, None, backend=ReadyBackend()
+                ).dispatch("fast_livo2", {"action": "info"})
+                self.assertEqual(rejected["error_code"], "invalid_config")
+
+    def test_obstacle_filter_failure_prevents_canvas_ready(self) -> None:
+        backend = ObstacleFilterRejectingBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+
+        result = plugin.dispatch(
+            "fast_livo2",
+            {"action": "start", "input_bindings": _bindings(plugin)},
+        )
+
+        self.assertEqual(result["error_code"], "invalid_obstacle_filter")
+        self.assertEqual(backend.stop_calls, 1)
+        self.assertFalse(plugin.dispatch("fast_livo2", {"action": "info"})["canvas_wired"])
+
+    def test_canvas_stop_unloads_localization_before_backend_release(self) -> None:
+        backend = ReadyBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(stopped["stop_result"]["status"], "unloaded")
+        self.assertEqual(
+            [call[0] for call in backend.calls],
+            [
+                "configure_obstacle_filter",
+                "load_map",
+                "unload_map",
+            ],
+        )
+        self.assertEqual(backend.stop_calls, 1)
+
+    def test_localization_stop_timeout_keeps_card_retryable(self) -> None:
+        backend = RetryableLocalizationStopBackend()
+        plugin = FastLivo2Plugin({}, None, backend=backend)
+        plugin.dispatch(
+            "fast_livo2", {"action": "start", "input_bindings": _bindings(plugin)}
+        )
+        plugin.dispatch("fast_livo2", {"action": "load_map", "map_name": "office"})
+
+        stopped = plugin.dispatch("fast_livo2", {"action": "stop"})
+
+        self.assertEqual(stopped["error_code"], "canvas_stop_failed")
+        self.assertTrue(stopped["retryable"])
+        self.assertTrue(stopped["canvas_wired"])
+        self.assertEqual(
+            stopped["stop_result"]["error_code"],
+            "fast_livo2_response_timeout",
+        )
+        self.assertTrue(stopped["stop_result"]["retryable"])
+        self.assertEqual(stopped["stop_result"]["loaded_map"], "office")
+        self.assertEqual(backend.stop_calls, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

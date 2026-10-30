@@ -9,7 +9,11 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前有一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
+**当前卡片及配置键：`controlled_semantic_spatial`**，公开工具名相同 —— FAST-LIVO2 建图/里程计 + Nav2 规划/控制 + 语义航点；FAST-LIVO2 与 Nav2 由卡片在**本容器内**作为 ROS 子进程托管（不用 companion 容器、运行时不碰 docker socket）。公开输出为 `map_view` 和 Navi 格式 `control_velocity`；本卡片与 Navi 不得同时向相同 topic 发布，物理执行仍由下游负责。完整 action / topic / 配置 / 构建 / 许可证见 [plugins/controlled_semantic_spatial/README.md](plugins/controlled_semantic_spatial/README.md)。
+
+该卡片的公开契约可复用于不同机器人；当前 runtime adapter 使用兼容性
+`ubuntu` namespace，各本体由 Driver 提供符合契约的 topic、frame、标定和执行器。
+**另一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
 
 ## `vla` 卡片
 
@@ -86,7 +90,7 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 | | |
 |---|---|
 | MCP HTTP | `http://<host>:15730/mcp` |
-| SSE（ACP 完成事件） | `http://<host>:15730/sse` |
+| SSE（ACP 完成事件） | `http://<host>:15730/mcp/sse` |
 | 容器 | `embodied-actucore` |
 | 镜像 | `<registry>/<namespace>/actucore:<tag>` |
 | 注册类别 | `actucore` |
@@ -397,24 +401,50 @@ range 读出来是 `d0/cos θ`。形状本身就是答案，而且如果是 rang
 
 ## 构建与运行
 
-只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
+只有 Jetson 版 —— 执行模型多数要 GPU（VLA、抓取策略、locomotion），没有 CPU 变体。`controlled_semantic_spatial` 卡片本身不用 GPU，但和它们共用这一个镜像。
 
 ```bash
-./deploy/build_actucore.sh                    # JetPack 5.11（默认，与 build_perception.sh 一致）
-./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1，带本机推理
-./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
+./deploy/build_actucore.sh                 # JetPack 5.11（默认）
+./deploy/build_actucore.sh --mirror tuna   # 指定 pip / apt 源
+./deploy/build_actucore.sh --jp-version 6.1 # 保留 VLA 本地推理，新 navigation 未启用
 ```
 
-**同一份 Dockerfile，两个 base**，应用层逐字节一样：
+两个平台使用同一个 `Dockerfile.jetson`，脚本按 JetPack 选择直接继承的基座。
+JetPack 5.11 默认继承已发布、按 `@sha256` 锁定的 `actucore-navigation-base`，
+提供 navigation 与 VLA `mock` / `vla_cloud`，不提供本地 SmolVLA 推理。
+JetPack 6.1 继承原有 `jetson-base-actucore:jp61-torch`，保留 torch / lerobot
+本地推理、`vla`、`navi` 和工具；新 navigation 默认关闭，尚未验证或提供其运行时，
+不接受 navigation base 覆盖。镜像保留 ROS 源设置以及 colcon/empy 和 audio_msgs
+的构建步骤。JP6 最终镜像构造未启动的 Bundle，检查公开工具为 `vla`、`navi`
+且新 navigation 默认关闭；这不会启动 ROS、HTTP、模型推理或卡片。外部自定义
+配置不受该默认值限制，不应在 JP6.1 上启用尚未提供运行时的新 navigation。
+直接调用 `docker build` 时 `Dockerfile.jetson` 默认使用 JP5 基座；推荐通过上述
+脚本选择平台。
 
-| | base | 可用 provider | 大小 |
-|---|---|---|---|
-| jp5.11（默认） | `jetson-base`（共享的那个） | `mock` + `vla_cloud` | ~13.8 GB |
-| jp6.1 | `jetson-base-actucore`（CUDA torch 2.9 + lerobot） | 全部 | ~18.6 GB |
+JP5 基座预编译锁定版本的 FAST-LIVO2、Nav2 和系统依赖；日常镜像直接继承它，
+只重编仓库自有 ROS 包。基座包含日常构建所需编译依赖，并非最终镜像仅有
+install space；第三方源码和 build/log 不保留。临时验证另一个 JP5 基线时可显式
+设置 `ACTUCORE_NAVIGATION_BASE_IMAGE`，覆盖值仍必须是精确的 `@sha256` 引用。
+`BASE_REGISTRY` 和 `BASE_NAMESPACE` 可选择镜像仓库；JP5 的基座引用固定 digest，
+该仓库必须包含对应 digest。只有导航依赖锁、补丁或系统依赖变化时，镜像维护者才
+重新构建基础镜像；配置推送时脚本也会推送：
 
-这个差别是**被迫的，不是取舍**：jp5.11 是 CUDA 11.4，而 lerobot 要 `torch >= 2.2.1`，PyTorch 官方矩阵里 torch 2.2 的最低 CUDA 是 11.8 —— 那条线上**不可能**有本机推理。`smolvla` 在那里会在 start 时直接拒绝并说明原因。完整调研见 `deploy/prepare_actucore_base.sh`。
+```bash
+GIT_MIRROR_PREFIX=https://ghfast.top/ \
+  ./deploy/build_actucore.sh --base --mirror tuna
+```
 
-jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）。加本机模型卡片时，如果它的依赖不在 base 里，放在它自己的 `RUN` 层，不要预装在共享基础层里。
+最终镜像阶段会检查 FAST-LIVO2 与 Nav2 原生节点的动态链接、加载配置中的全部
+BT 插件，并导入 ActuCore 主入口；JP6.1 同样检查主入口导入。缺失共享库或 Python
+模块会使构建失败，不能用 builder 阶段或挂载源码后的测试代替最终镜像检查。
+
+在 8 GB 等小内存 ARM64 构建机上可设置 `BUILD_JOBS=2`；该值会同时传给
+navigation base 和日常 ActuCore 的 C++ 编译步骤。
+
+基础镜像不是可部署服务，也不注册到 Resource Center。加新卡片时须考虑两个
+平台的依赖差异；只有稳定且可复用、已经成为构建瓶颈的第三方导航栈才进入
+`Dockerfile.base`。基础镜像必须在原生 ARM64 构建，脚本拒绝
+再次走耗时且容易超时的 x86 QEMU 交叉编译。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 
@@ -435,7 +465,7 @@ jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）�
 
 ### 四个必须知道的坑
 
-1. **`PREFIX` 不能含下划线。** `dispatch()` 用 `full_name.partition("_")` 拆前缀，所以 `PREFIX = "vla"` 可以，`PREFIX = "grasp_policy"` 永远匹配不上。
+1. **`PREFIX` 可以含下划线。** `dispatch()` 按完整名称或最长的 `PREFIX_` 边界匹配；避免不同卡片注册相同前缀或有歧义的工具名。
 2. **`inputSchema.properties.action.enum` 必须包含 `"info"`。** Agent Core 靠它探活 —— 它会挑出 action enum 里有 `info` 的工具，用 `{"action": "info"}` 调一次（`agent-core/src/api/mcp_manage.py`）。没有 `info` 的卡片会一直是离线状态。
 3. **`dispatch()` 必须返回 plain dict**，例如 `{"state": "running"}`。MCP HTTP handler 会自己包成 JSON-RPC 的 content 格式。**不要**返回已经包好的 `[{"type": "text", ...}]`，那会二次编码并让前端解析失败。
 4. **`x-completion` / `x-hooks` 放在 `inputSchema` 里面**，不是工具顶层。
@@ -475,7 +505,7 @@ TOOLS = [
 ]
 ```
 
-**`type` 的含义** —— 它决定 Agent Core 怎么调度这个工具：`sensor` 连续调用会被批量并行；`actuator` 和 `processor` 要过 ACP barrier，dispatch 前会等所有 pending 动作完成；`resource` 是静态资源（如 URDF）。没声明 `type` 的工具默认按需要 barrier 处理（安全侧）。判定逻辑在 `agent-core/src/event/llm.py` 的 `_needs_barrier()`。
+**`type` 的含义** —— 它决定 Agent Core 怎么调度这个工具：`sensor` 连续调用会被批量并行；`actuator` 和 `processor` 要过 ACP barrier，按上游 `x-resource` 和调用者顺序等待冲突动作；未声明资源时保守互斥；`resource` 是静态资源（如 URDF）。没声明 `type` 的工具默认按需要 barrier 处理（安全侧）。判定逻辑在 `agent-core/src/event/llm.py` 的 `_needs_barrier()`。
 
 **`configSchema` 的 `scope`** —— `shared` 是整个卡片共享一份配置，`instance` 是每张画布卡片一份。
 
@@ -492,12 +522,13 @@ TOOLS = [
        self._plugins.append(XPlugin(plugins_cfg["<name>"], executor))
        log.info("XPlugin loaded")
    ```
-4. 该卡片需要的依赖加到 `Dockerfile`（以及 `Dockerfile.jetson`，如果要跑 GPU）
+4. 该卡片需要的依赖加到 `Dockerfile.jetson` 自己的 `RUN` 层
 5. 重建镜像、重新部署，确认 Dashboard 侧边栏「执行」分区里出现了它
 
-需要 ROS 命名空间的卡片（topic 里要带机器人名）多一步：namespace 为空时用 hostname 兜底，写法参照 `perception/main.py` 里 vop 的注册块。
+需要 ROS 命名空间的卡片（topic 里要带机器人名）必须在注册块中校验类型和该
+runtime adapter 的支持范围；不要用 hostname 猜测机器人 namespace。
 
-完整的、带 ROS 节点的卡片实现可以直接看 `perception/plugins/vop.py` —— 它是最干净的范例。
+本层最完整的范例是 `plugins/controlled_semantic_spatial/`：一张卡片对外只暴露一个工具名，内部拆成 mapping / planning / semantic 三个子组件，并在同容器里托管 ROS 子进程。只需要单个 ROS 节点的简单卡片可以看 `perception/plugins/vop.py`。
 
 ### 要发 `motus.control/1` 指令流的卡片
 
