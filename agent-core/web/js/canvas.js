@@ -1248,6 +1248,12 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     // Determine if there are any usable fields/actions left
     const hasUsableFields = fieldsHtml.replace(/\s/g, '').length > 0;
+    // Empty object schemas are valid executable actuator entries. Keep lifecycle-only
+    // action schemas hidden: their properties are nonempty even when all fields filter out.
+    const hasNoArgumentAction = effectiveType === 'actuator'
+      && schema?.type === 'object' && schema.properties
+      && Object.keys(props).length === 0 && required.length === 0;
+    const canExecute = hasUsableFields || hasNoArgumentAction;
 
     // Any card that *produces* a stream gets a "查看数据流" button — the renderer
     // is chosen by the topic's `format`, which does not care about the card's
@@ -1274,8 +1280,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         </div>
         ${fieldsHtml ? `<div class="canvas-card-body">${fieldsHtml}</div>` : ''}
         <div class="canvas-card-footer"${!fieldsHtml ? ' style="padding:8px 10px"' : ''}>
-          ${hasUsableFields ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
-          ${hasUsableFields && showViewBtn ? '<hr class="canvas-footer-divider">' : ''}
+          ${canExecute ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
+          ${canExecute && showViewBtn ? '<hr class="canvas-footer-divider">' : ''}
           ${showViewBtn ? '<button class="canvas-view-btn">📡 查看数据流</button>' : ''}
         </div>
       </div>
