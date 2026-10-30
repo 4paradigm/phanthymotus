@@ -32,6 +32,14 @@ from .evidence_models import (
 UPLOAD_MAX_NOTES = 20
 
 
+class _NoopAsyncContext:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
 class EvidenceService:
     def __init__(self, *, config, github, proxy, policy, controller, store):
         self.config, self.github, self.proxy = config, github, proxy
@@ -802,7 +810,11 @@ class EvidenceService:
         # A process-local serialization lock is scheduling, not persistence.
         # Operation identities and recovery facts live in Git Notes records;
         # the lifecycle comment remains the sole business-state projection.
-        async with self.controller._evidence_lock:
+        lock_context = (
+            self.controller._evidence_lock
+            if action != 'put_part' else _NoopAsyncContext()
+        )
+        async with lock_context:
             pr = self._require_pr_snapshot(await self.proxy.get_pr(repo, pr_number), repo)
             state = await self.proxy.read_hidden_state(repo, pr_number)
             if not isinstance(state, dict):
@@ -1112,6 +1124,35 @@ class EvidenceService:
                     if not (fresh_authorized or invite_allowed and invite_context_matches(
                             fresh_pr, fresh_state, round_id)):
                         raise EvidenceError('evidence_write_permission_required', 403)
+                    fresh_records = await self.proxy.read_evidence_records(repo, pr_number)
+                    if not isinstance(fresh_records, (list, tuple)):
+                        raise EvidenceError('evidence_records_unavailable', 503)
+                    fresh_source = next((record['data'] for record in reversed(fresh_records)
+                                         if record['kind'] == 'operation'
+                                         and record['data'].get('upload_ref') == source.get('upload_ref')),
+                                        None)
+                    identity_fields = (
+                        'operation_id', 'upload_ref', 'attachment_id', 'repo',
+                        'pr_number', 'head_sha', 'round_id', 'actor_id',
+                        'object_key', 'upload_id',
+                    )
+                    if (not fresh_source
+                            or any(fresh_source.get(field) != source.get(field)
+                                   for field in identity_fields)
+                            or fresh_source.get('status') != 'uploading'):
+                        raise EvidenceError('upload_not_writable', 409)
+                    fresh_attachment = next((record['data'] for record in reversed(fresh_records)
+                                             if record['kind'] == 'attachment'
+                                             and (record['data'].get('repo'),
+                                                  record['data'].get('pr_number'),
+                                                  record['data'].get('head_sha'),
+                                                  record['data'].get('round_id'),
+                                                  record['data'].get('attachment_id'))
+                                             == (repo, pr_number, expected_head, round_id,
+                                                 source.get('attachment_id'))), None)
+                    if (fresh_attachment
+                            and fresh_attachment.get('status') in {'deleted', 'invalid', 'ready'}):
+                        raise EvidenceError('upload_not_writable', 409)
                     if not nonce_consumed and not invite_allowed:
                         await self._consume_auth_nonce(principal)
                         nonce_consumed = True
