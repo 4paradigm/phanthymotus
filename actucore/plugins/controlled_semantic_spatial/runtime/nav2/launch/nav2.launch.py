@@ -15,6 +15,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
 from launch_ros.parameter_descriptions import ParameterValue
+from nav2_common.launch import RewrittenYaml
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -22,6 +23,15 @@ def generate_launch_description() -> LaunchDescription:
     nav2_share = get_package_share_directory("nav2_bringup")
 
     params_file = LaunchConfiguration("params_file")
+    controller_params = RewrittenYaml(
+        source_file=params_file,
+        root_key="",
+        param_rewrites={
+            "rotate_reengage_rad": LaunchConfiguration("rotate_reengage_rad"),
+            "rotate_exit_rad": LaunchConfiguration("rotate_exit_rad"),
+        },
+        convert_types=True,
+    )
     odom_topic = LaunchConfiguration("odom_topic")
     obstacle_cloud_topic = LaunchConfiguration("obstacle_cloud_topic")
     cmd_vel_raw_topic = LaunchConfiguration("cmd_vel_raw_topic")
@@ -56,6 +66,8 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/actucore/navi/cmd",
             ),
             DeclareLaunchArgument("control_interface_json", default_value="{}"),
+            DeclareLaunchArgument("rotate_reengage_rad", default_value="0.15"),
+            DeclareLaunchArgument("rotate_exit_rad", default_value="0.05"),
             DeclareLaunchArgument(
                 "command_topic",
                 default_value="/ubuntu/navigation/nav2/command",
@@ -89,7 +101,7 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         launch_arguments={
                             "use_sim_time": "false",
-                            "params_file": params_file,
+                            "params_file": controller_params,
                             "autostart": "true",
                             "use_composition": "False",
                         }.items(),

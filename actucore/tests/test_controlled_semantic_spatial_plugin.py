@@ -684,6 +684,47 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             semantic_plugin=semantic or FakeComponent("semantic"),
         )
 
+    def test_invalid_planning_config_does_not_start_runtime(self):
+        class InvalidPlanning(FakeComponent):
+            def dispatch(self, prefix, args):
+                if args.get("action") == "info":
+                    return {"state": "error", "error_code": "invalid_config", "error": "bad threshold"}
+                return super().dispatch(prefix, args)
+
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime, planning=InvalidPlanning("planning"))
+        result = plugin.dispatch(plugin.PREFIX, {
+            "action": "start", "input_bindings": _external_bindings_for_start()})
+        self.assertEqual(result["error_code"], "invalid_config")
+        self.assertIsNone(runtime.start_kwargs)
+
+    def test_heading_threshold_config_reaches_runtime_on_next_start(self):
+        class ConfigurablePlanning(FakeComponent):
+            def __init__(self):
+                super().__init__("planning")
+                self.config = {}
+
+            def dispatch(self, prefix, args):
+                if args.get("action") == "config":
+                    self.config.update({k: v for k, v in args.items() if k != "action"})
+                    return {"state": "configured", "config": dict(self.config)}
+                if args.get("action") == "info":
+                    return {"state": "ready" if self.started else "idle", "config": dict(self.config)}
+                return super().dispatch(prefix, args)
+
+        runtime = FakeRuntime()
+        plugin = self.make_plugin(runtime=runtime, planning=ConfigurablePlanning())
+        configured = plugin.dispatch(plugin.PREFIX, {"action": "config", "rotate_reengage_rad": 0.12})
+        self.assertEqual(configured["state"], "configured")
+        request = {"action": "start", "input_bindings": _external_bindings_for_start()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, request)["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["rotate_reengage_rad"], 0.12)
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "rotate_reengage_rad": 0.2})["error_code"], "config_while_running")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "stop"})["state"], "idle")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "rotate_reengage_rad": 0.2})["state"], "configured")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, request)["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["rotate_reengage_rad"], 0.2)
+
     def test_mainline_start_and_info_with_camera_metadata(self):
         plugin = self.make_plugin()
         topics = ["/ubuntu/navigation/lidar", "/ubuntu/camera/rgb", "/ubuntu/navigation/imu"]
@@ -2079,6 +2120,20 @@ class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
         self.assertNotIn("motion_sequence_topic", arguments)
         self.assertEqual(arguments["control_velocity_topic"], "/actucore/navi/cmd")
         self.assertEqual(json.loads(arguments["control_interface_json"]), {})
+
+    def test_heading_threshold_launch_arguments_and_validation(self):
+        for value, exit_value in ((0.15, 0.05), (0.05, 0.025), (0.3, 0.05)):
+            with self.subTest(value=value):
+                args = dict(item.split(":=", 1) for item in
+                            ControlledSemanticSpatialRuntime._launch_arguments(
+                                "ubuntu", {}, rotate_reengage_rad=value)["nav2"])
+                self.assertAlmostEqual(float(args["rotate_reengage_rad"]), value)
+                self.assertAlmostEqual(float(args["rotate_exit_rad"]), exit_value)
+                self.assertLess(float(args["rotate_exit_rad"]), value)
+        for invalid in (True, float("nan"), float("inf"), 0.049, 0.351):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                ControlledSemanticSpatialRuntime._launch_arguments(
+                    "ubuntu", {}, rotate_reengage_rad=invalid)
 
     def test_minimal_descriptor_round_trips_into_bridge_configuration(self):
         # Load the ROS-free helper through its independent package path, just as

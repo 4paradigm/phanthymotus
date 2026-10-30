@@ -265,6 +265,16 @@ class ControlledSemanticSpatialPlugin:
             if self._config_error and not already_started:
                 return self._error("invalid_config", self._config_error)
         wiring = self._validate_external_wiring(args)
+        planning_info = self._planning.dispatch("nav2", {"action": "info"})
+        if self._config_failed(planning_info):
+            return self._error(
+                "invalid_config", str(planning_info.get("error") or "invalid planning config")
+                if isinstance(planning_info, dict) else "invalid planning config"
+            )
+        try:
+            planning_config = validated_planning_config(planning_info.get("config", {}), {})
+        except (PlanningConfigError, TypeError, ValueError) as exc:
+            return self._error("invalid_config", str(exc))
         with self._lock:
             # Stop signals before acquiring the transition lock, including
             # while validation is inspecting the mapping configuration.
@@ -301,6 +311,7 @@ class ControlledSemanticSpatialPlugin:
                 namespace=self._namespace,
                 input_topics=wiring["wired_topics"],
                 control_interface=descriptor,
+                rotate_reengage_rad=planning_config["rotate_reengage_rad"],
             )
             if runtime_result.get("state") != "running":
                 raise RuntimeError("navigation child processes did not stay running")
@@ -690,6 +701,7 @@ class ControlledSemanticSpatialPlugin:
                 for source, target in (
                     ("planning_request_timeout_sec", "request_timeout_sec"),
                     ("planning_discovery_timeout_sec", "discovery_timeout_sec"),
+                    ("rotate_reengage_rad", "rotate_reengage_rad"),
                     ("min_x_mps", "min_x_mps"),
                     ("max_x_mps", "max_x_mps"),
                     ("min_y_mps", "min_y_mps"),

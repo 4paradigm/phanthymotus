@@ -52,6 +52,7 @@ def _config_properties() -> dict:
         "fault_capture_enabled": deepcopy(mapping["fault_capture_enabled"]),
         "planning_request_timeout_sec": deepcopy(planning["request_timeout_sec"]),
         "planning_discovery_timeout_sec": deepcopy(planning["discovery_timeout_sec"]),
+        "rotate_reengage_rad": deepcopy(planning["rotate_reengage_rad"]),
     }
     for key in (
         "min_x_mps",

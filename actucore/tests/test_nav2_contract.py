@@ -180,6 +180,7 @@ class Nav2ContractTest(unittest.TestCase):
                 "backend",
                 "request_timeout_sec",
                 "discovery_timeout_sec",
+                "rotate_reengage_rad",
                 "min_x_mps",
                 "max_x_mps",
                 "min_y_mps",

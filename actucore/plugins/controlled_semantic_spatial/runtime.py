@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -85,6 +86,7 @@ class ControlledSemanticSpatialRuntime:
         namespace: str = "ubuntu",
         input_topics: dict[str, str] | None = None,
         control_interface: dict | None = None,
+        rotate_reengage_rad: float = 0.15,
     ) -> dict:
         with self._lock:
             running = [child for child in self._children if self._is_running(child)]
@@ -95,7 +97,9 @@ class ControlledSemanticSpatialRuntime:
 
             started: list[_Child] = []
             try:
-                launch_arguments = self._launch_arguments(namespace, input_topics, control_interface)
+                launch_arguments = self._launch_arguments(
+                    namespace, input_topics, control_interface, rotate_reengage_rad
+                )
                 for child in self._children:
                     command = [
                         *child.command,
@@ -132,7 +136,14 @@ class ControlledSemanticSpatialRuntime:
     def _launch_arguments(
         namespace: str, input_topics: dict[str, str] | None,
         control_interface: dict | None = None,
+        rotate_reengage_rad: float = 0.15,
     ) -> dict[str, tuple[str, ...]]:
+        if (isinstance(rotate_reengage_rad, bool) or
+                not isinstance(rotate_reengage_rad, (int, float)) or
+                not math.isfinite(rotate_reengage_rad) or
+                not 0.05 <= rotate_reengage_rad <= 0.35):
+            raise ValueError("rotate_reengage_rad must be within [0.05, 0.35] radians")
+        rotate_exit_rad = min(0.05, rotate_reengage_rad / 2.0)
         input_topics = input_topics if input_topics is not None else {}
         root = "/" + str(namespace or "ubuntu").strip("/")
         navigation = f"{root}/navigation"
@@ -160,6 +171,8 @@ class ControlledSemanticSpatialRuntime:
             "status_topic": f"{fast_livo2}/status",
         }
         nav2_values = {
+            "rotate_reengage_rad": str(float(rotate_reengage_rad)),
+            "rotate_exit_rad": str(rotate_exit_rad),
             "odom_topic": f"{navigation}/odom",
             "obstacle_cloud_topic": f"{navigation}/cloud_registered",
             "cmd_vel_raw_topic": f"{nav2}/cmd_vel_raw",

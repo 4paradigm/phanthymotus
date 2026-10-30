@@ -19,6 +19,7 @@ _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_/-]{0,127}$")
 _NUMBER_RANGES = {
     "request_timeout_sec": (1.0, 120.0),
     "discovery_timeout_sec": (0.5, 30.0),
+    "rotate_reengage_rad": (0.05, 0.35),
     "min_x_mps": (0.0, 1.0),
     "max_x_mps": (0.0, 1.0),
     "min_y_mps": (0.0, 1.0),

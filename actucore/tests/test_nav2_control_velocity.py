@@ -63,6 +63,7 @@ def test_launch_wires_json_as_string(monkeypatch):
     module('launch.substitutions', LaunchConfiguration=Capture)
     module('launch_ros.actions', Node=Capture, SetRemap=Capture)
     module('launch_ros.parameter_descriptions', ParameterValue=Capture)
+    module('nav2_common.launch', RewrittenYaml=Capture)
     path = Path(__file__).resolve().parents[1] / 'plugins/controlled_semantic_spatial/runtime/nav2/launch/nav2.launch.py'
     spec = importlib.util.spec_from_file_location('test_control_launch', path)
     launch = importlib.util.module_from_spec(spec)
@@ -80,6 +81,12 @@ def test_launch_wires_json_as_string(monkeypatch):
     assert all(item.kwargs['dst'].args == ('odom_topic',) for item in odom_remaps)
     include_index = next(i for i, item in enumerate(actions) if 'launch_arguments' in item.kwargs)
     assert all(actions.index(item) < include_index for item in odom_remaps)
+    rewritten = dict(actions[include_index].kwargs['launch_arguments'])['params_file']
+    assert rewritten.kwargs['convert_types'] is True
+    assert rewritten.kwargs['param_rewrites']['rotate_reengage_rad'].args == ('rotate_reengage_rad',)
+    assert rewritten.kwargs['param_rewrites']['rotate_exit_rad'].args == ('rotate_exit_rad',)
+    assert declarations['rotate_reengage_rad'] == '0.15'
+    assert declarations['rotate_exit_rad'] == '0.05'
     node = next(item for item in items if item.kwargs.get('executable') == 'planner_command_bridge')
     params = node.kwargs['parameters'][0]
     assert params['control_velocity_topic'].args == ('control_velocity_topic',)

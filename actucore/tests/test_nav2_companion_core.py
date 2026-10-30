@@ -643,8 +643,8 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         )[0]
         for expected in (
             "plugin: segmented_controller::SegmentedController",
-            "rotate_exit_rad: 0.15",
-            "rotate_reengage_rad: 0.35",
+            "rotate_exit_rad: 0.05",
+            "rotate_reengage_rad: 0.15",
             "approach_speed_mps: 0.30",
             "cruise_speed_mps: 1.0",
             "segment_tolerance_m: 0.18",

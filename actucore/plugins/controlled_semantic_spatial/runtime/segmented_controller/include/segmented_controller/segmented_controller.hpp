@@ -88,8 +88,8 @@ private:
   std::string stop_reason_{"waiting_for_plan"};
   rclcpp::Time last_status_time_{0, 0, RCL_ROS_TIME};
 
-  double rotate_exit_rad_{0.15};
-  double rotate_reengage_rad_{0.35};
+  double rotate_exit_rad_{0.05};
+  double rotate_reengage_rad_{0.15};
   double rotate_speed_rps_{1.0};
   double approach_distance_m_{0.50};
   double approach_speed_mps_{0.30};

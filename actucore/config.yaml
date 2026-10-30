@@ -25,6 +25,7 @@ plugins:
       shadow_only: true
       request_timeout_sec: 30.0
       discovery_timeout_sec: 5.0
+      rotate_reengage_rad: 0.15
       input_max_age_ms: 500
       min_x_mps: 0.30
       max_x_mps: 1.0
