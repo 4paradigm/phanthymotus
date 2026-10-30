@@ -18,7 +18,7 @@ import config as _config
 
 router = fastapi.APIRouter(prefix='/drivers', tags=['drivers'])
 
-# Fixed service endpoints for core/perception/actucore (not hardware drivers).
+# Fixed service endpoints for core/perception/actucore/modelhub (not hardware drivers).
 # Keyed by registryImage — the same string the build scripts register with.
 _SERVICE_ENDPOINTS: dict[str, dict] = {
     'core':       {'host_port': 15678},
@@ -26,6 +26,11 @@ _SERVICE_ENDPOINTS: dict[str, dict] = {
                    'volumes': {os.environ.get('MODELS_PATH', '/opt/embodied/models'):
                                {'bind': '/models', 'mode': 'rw'}}},
     'actucore':   {'port': 15730, 'mcp_url': 'http://localhost:15730/mcp',
+                   'volumes': {os.environ.get('MODELS_PATH', '/opt/embodied/models'):
+                               {'bind': '/models', 'mode': 'rw'}}},
+    # 本机大模型服务（4paradigm/phanthymotus-modelhub）。15740 是 MCP 管理面；
+    # 它的 OpenAI 兼容出口在 15741，那是 agent-core 的 LLM 客户端直接请求的，不经过这里。
+    'modelhub':   {'port': 15740, 'mcp_url': 'http://localhost:15740/mcp',
                    'volumes': {os.environ.get('MODELS_PATH', '/opt/embodied/models'):
                                {'bind': '/models', 'mode': 'rw'}}},
 }

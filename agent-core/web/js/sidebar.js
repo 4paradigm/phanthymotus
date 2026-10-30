@@ -18,6 +18,7 @@ import { makeQrField, isDisplayOnly } from './qr-field.js';
  *   agentcore  芯片 —— 做决定的那颗核
  *   perception 眼睛 —— 这一层负责"接收"
  *   actucore   闪电 —— 这一层负责"动"
+ *   modelhub   立方体 —— 本机跑的大模型（LLM/VLM），给决策核心提供推理
  *   driver     插头 —— 通往某台具体硬件的那根线
  *
  * driver 的颜色继续表示在线状态（原来由圆点承担），所以侧栏收起成窄条时，一眼
@@ -33,6 +34,8 @@ const ICONS = {
   perception: `<svg ${_ICON_ATTRS}><path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12z"/>` +
     `<circle cx="12" cy="12" r="2.6"/></svg>`,
   actucore: `<svg ${_ICON_ATTRS}><path d="M13.2 2.5 5 13.8h5.6L9.8 21.5 18 10.2h-5.6l.8-7.7z"/></svg>`,
+  modelhub: `<svg ${_ICON_ATTRS}><path d="M12 2.8 20.2 7.4v9.2L12 21.2 3.8 16.6V7.4z"/>` +
+    `<path d="M3.8 7.4 12 12l8.2-4.6M12 12v9.2"/></svg>`,
   driver: `<svg ${_ICON_ATTRS}><path d="M9 2.8v5.4M15 2.8v5.4"/>` +
     `<path d="M5.6 8.2h12.8v3.2a6.4 6.4 0 0 1-12.8 0V8.2z"/><path d="M12 17.8v3.4"/></svg>`,
 };
@@ -131,10 +134,12 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
   const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
   const actucores = allMcps.filter(m => m.category === 'actucore' && m.online === true);
+  const modelhubs = allMcps.filter(m => m.category === 'modelhub' && m.online === true);
 
   _scroll.innerHTML = '';
 
-  if (!controllers.length && !drivers.length && !perceptions.length && !actucores.length) {
+  if (!controllers.length && !drivers.length && !perceptions.length && !actucores.length
+      && !modelhubs.length) {
     _scroll.appendChild(_empty);
     return;
   }
@@ -156,6 +161,13 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   if (actucores.length) {
     _scroll.appendChild(_buildMergedSection(actucores, {
       cls: 'sidebar-section-actucore', icon: ICONS.actucore, iconCls: 'actucore', label: '执行',
+    }));
+  }
+
+  // ModelHub section
+  if (modelhubs.length) {
+    _scroll.appendChild(_buildMergedSection(modelhubs, {
+      cls: 'sidebar-section-modelhub', icon: ICONS.modelhub, iconCls: 'modelhub', label: '模型',
     }));
   }
 

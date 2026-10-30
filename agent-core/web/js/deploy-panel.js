@@ -11,7 +11,7 @@ import { startDeploy } from './deploy-progress.js';
 let _overlay  = null;
 let _polling  = null;
 
-let _catalog  = { core: [], perception: [], actucore: [], driver: [] };
+let _catalog  = { core: [], perception: [], actucore: [], modelhub: [], driver: [] };
 
 // Fallback descriptions, used when resource-center didn't supply one
 const _CAT_DESC = {
@@ -20,6 +20,7 @@ const _CAT_DESC = {
   // field existed, and the two saying different things is worse than either.
   perception: '感知套件 — 语音：ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测；视觉：物体检测 + 单目深度 + OCR 文字识别 + 人脸识别',
   actucore:   '执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制',
+  modelhub:   '本机大模型服务 — LLM（vLLM），OpenAI 兼容接口 :15741',
 };
 let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
 
@@ -231,6 +232,7 @@ function _renderMyServices() {
     ...(_catalog.core || []).map(it => ({ ...it, _cat: 'core' })),
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
     ...(_catalog.actucore || []).map(it => ({ ...it, _cat: 'actucore' })),
+    ...(_catalog.modelhub || []).map(it => ({ ...it, _cat: 'modelhub' })),
     ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
   ];
 
@@ -469,6 +471,7 @@ function _renderMarketplace() {
   const allItems = [
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
     ...(_catalog.actucore || []).map(it => ({ ...it, _cat: 'actucore' })),
+    ...(_catalog.modelhub || []).map(it => ({ ...it, _cat: 'modelhub' })),
     ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
   ];
 

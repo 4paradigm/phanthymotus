@@ -30,6 +30,7 @@ _TEGRA_KERNEL_TO_ACC = {
     '4.9': 'jetson-jp4',    # L4T 32.x（未实测，暂无 jp4 镜像）
     '5.10': 'jetson-jp5',   # L4T 35.x
     '5.15': 'jetson-jp6',   # L4T 36.x
+    '6.8': 'jetson-jp7',    # L4T 39.x（Thor 实测：6.8.12-1021-tegra，R39.2.1 / JetPack 7.2.1）
 }
 
 _TEGRA_RE = re.compile(r'(\d+)\.(\d+)\.\d+\S*-tegra')
@@ -45,7 +46,7 @@ def _kernel_string() -> str:
 
 @functools.cache
 def acc_arch() -> str:
-    """加速器架构：jetson-jp5 / jetson-jp6 / none。
+    """加速器架构：jetson-jp5 / jetson-jp6 / jetson-jp7 / none。
 
     ACC_ARCH 环境变量可覆盖（误判时不必重新构建镜像；install.sh 生成的 compose
     已带 env_file: .env）。
