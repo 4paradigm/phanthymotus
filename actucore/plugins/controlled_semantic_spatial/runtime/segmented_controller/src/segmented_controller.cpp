@@ -65,8 +65,6 @@ void SegmentedController::configure(
   nav2_util::declare_parameter_if_not_declared(
     node, parameter("preserve_endpoint_m"), rclcpp::ParameterValue(preserve_endpoint_m_));
   nav2_util::declare_parameter_if_not_declared(
-    node, parameter("forward_preview_min_m"), rclcpp::ParameterValue(forward_preview_min_m_));
-  nav2_util::declare_parameter_if_not_declared(
     node, parameter("status_topic"),
     rclcpp::ParameterValue("/ubuntu/navigation/nav2/segment_status"));
 
@@ -82,7 +80,6 @@ void SegmentedController::configure(
   node->get_parameter(parameter("stop_yaw_rps"), stop_yaw_rps_);
   node->get_parameter(parameter("stop_cycles_required"), stop_cycles_required_);
   node->get_parameter(parameter("preserve_endpoint_m"), preserve_endpoint_m_);
-  node->get_parameter(parameter("forward_preview_min_m"), forward_preview_min_m_);
   const auto status_topic = node->get_parameter(parameter("status_topic")).as_string();
 
   if (!(std::isfinite(rotate_exit_rad_) && std::isfinite(rotate_reengage_rad_) &&
@@ -96,9 +93,7 @@ void SegmentedController::configure(
     approach_speed_mps_ > 0.0 && cruise_speed_mps_ >= approach_speed_mps_ &&
     segment_tolerance_m_ > 0.0 && final_yaw_tolerance_rad_ > 0.0 &&
     stop_linear_mps_ >= 0.0 && stop_yaw_rps_ >= 0.0 && stop_cycles_required_ > 0 &&
-    preserve_endpoint_m_ >= segment_tolerance_m_ &&
-    std::isfinite(forward_preview_min_m_) && forward_preview_min_m_ > 0.0 &&
-    !status_topic.empty()))
+    preserve_endpoint_m_ >= segment_tolerance_m_ && !status_topic.empty()))
   {
     throw std::runtime_error("invalid stop-turn-drive controller parameters");
   }
@@ -284,24 +279,6 @@ geometry_msgs::msg::TwistStamped SegmentedController::computeVelocityCommands(
         publishStatus(pose, remaining, heading_error, true);
         return command;
       }
-      // A straight-line preview does not model residual rotation, sideslip or
-      // reverse motion. Stop and reselect rather than commanding forward while
-      // the velocity input contradicts that model. Its source must be verified.
-      if (!std::isfinite(velocity.linear.x) || !std::isfinite(velocity.linear.y) ||
-        !std::isfinite(velocity.angular.z) || velocity.linear.x < -stop_linear_mps_ ||
-        std::abs(velocity.linear.y) > stop_linear_mps_ ||
-        std::abs(velocity.angular.z) > stop_yaw_rps_)
-      {
-        enterStopCheck(Phase::SELECT, "motion_not_straight");
-        publishStatus(pose, remaining, heading_error, true);
-        return command;
-      }
-      if (!commandedForwardSafe(x, y, yaw, remaining)) {
-        phase_ = Phase::BLOCKED;
-        stop_reason_ = "forward_motion_blocked";
-        publishStatus(pose, remaining, heading_error, true);
-        return command;
-      }
       const double desired = remaining <= approach_distance_m_ ? approach_speed_mps_ : cruise_speed_mps_;
       command.twist.linear.x = std::min(desired, speed_limit_mps_);
       publishStatus(pose, remaining, heading_error);
@@ -433,28 +410,6 @@ bool SegmentedController::straightPathSafe(
     }
   }
   return true;
-}
-
-bool SegmentedController::commandedForwardSafe(
-  double x, double y, double yaw, double remaining)
-{
-  const auto footprint = costmap_ros_->getRobotFootprint();
-  if (footprint.size() < 3 || !std::all_of(
-      footprint.begin(), footprint.end(), [](const auto & point) {
-        return std::isfinite(point.x) && std::isfinite(point.y);
-      }))
-  {
-    return false;
-  }
-  const double resolution = costmap_ros_->getCostmap()->getResolution();
-  const double distance = std::max(remaining, forward_preview_min_m_);
-  return forward_motion_safe(
-    x, y, yaw, distance, resolution * 0.5,
-    [this, &footprint](double sample_x, double sample_y, double sample_yaw) {
-      const double cost = collision_checker_->footprintCostAtPose(
-        sample_x, sample_y, sample_yaw, footprint);
-      return std::isfinite(cost) && cost >= 0.0 && cost < nav2_costmap_2d::LETHAL_OBSTACLE;
-    });
 }
 
 bool SegmentedController::rotationSafe(

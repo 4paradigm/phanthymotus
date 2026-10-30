@@ -4,7 +4,6 @@
 #endif
 #include <cassert>
 #include <cmath>
-#include <limits>
 
 #include "segmented_controller/segment_math.hpp"
 
@@ -46,46 +45,5 @@ int main()
   assert(segment_crossed(missed));
   assert(!segment_reached(missed, std::hypot(0.05, 0.4), 0.18));
 
-  using segmented_controller::forward_motion_safe;
-  const double yaw = 0.34;
-  const double obstacle_x = 0.5 * std::cos(yaw);
-  const double obstacle_y = 0.5 * std::sin(yaw);
-  const auto obstacle_free = [=](double x, double y, double) {
-      return std::hypot(x - obstacle_x, y - obstacle_y) > 0.02;
-    };
-  // The old segment heading misses the obstacle, the commanded heading sees it.
-  assert(forward_motion_safe(0.0, 0.0, 0.0, 1.0, 0.025, obstacle_free));
-  assert(!forward_motion_safe(0.0, 0.0, yaw, 1.0, 0.025, obstacle_free));
-  // The opposite yaw and a laterally offset starting pose must use their own
-  // actual world-frame ray and preserve the current footprint orientation.
-  const auto verify_pose = [=](double x, double y, double theta) {
-      assert(std::abs(theta + yaw) < 1e-12);
-      assert(std::abs((y - 1.0) + x * std::tan(yaw)) < 1e-12);
-      return true;
-    };
-  assert(forward_motion_safe(0.0, 1.0, -yaw, 1.0, 0.025, verify_pose));
-  int checks = 0;
-  const auto fail_at_start = [&checks](double, double, double) {
-      ++checks;
-      return false;
-    };
-  assert(!forward_motion_safe(0.0, 0.0, 0.0, 1.0, 0.025, fail_at_start));
-  assert(checks == 1);
-  int total_checks = 0;
-  const auto fail_at_end = [&total_checks](double x, double, double) {
-      ++total_checks;
-      return x < 1.0;
-    };
-  assert(!forward_motion_safe(0.0, 0.0, 0.0, 1.0, 0.3, fail_at_end));
-  assert(total_checks == 5);  // Both endpoints and all three intermediate poses.
-  const auto inside_map = [](double x, double, double) {return x <= 0.5;};
-  assert(!forward_motion_safe(0.0, 0.0, 0.0, 1.0, 0.025, inside_map));
-  const auto safe = [](double, double, double) {return true;};
-  assert(forward_motion_safe(0.0, 0.0, 0.0, 0.0, 0.025, safe));
-  assert(!forward_motion_safe(0.0, 0.0, 0.0, -1.0, 0.025, safe));
-  assert(!forward_motion_safe(0.0, 0.0, 0.0, 1.0, 0.0, safe));
-  assert(!forward_motion_safe(0.0, 0.0, 0.0, 1.0, 1e-12, safe));
-  assert(!forward_motion_safe(0.0, 0.0, std::numeric_limits<double>::quiet_NaN(), 1.0, 0.025, safe));
-  assert(!forward_motion_safe(0.0, 0.0, 0.0, std::numeric_limits<double>::infinity(), 0.025, safe));
   return 0;
 }

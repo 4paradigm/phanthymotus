@@ -54,7 +54,6 @@ private:
 
   bool selectSegment(const geometry_msgs::msg::PoseStamped & pose);
   bool straightPathSafe(double x, double y, double yaw, double end_x, double end_y);
-  bool commandedForwardSafe(double x, double y, double yaw, double remaining);
   bool rotationSafe(double x, double y, double from_yaw, double to_yaw);
   void enterStopCheck(Phase next, const std::string & reason);
   void publishStatus(
@@ -101,8 +100,6 @@ private:
   double stop_yaw_rps_{0.10};
   int stop_cycles_required_{2};
   double preserve_endpoint_m_{0.25};
-  // A preview floor, not a validated stopping distance.
-  double forward_preview_min_m_{0.50};
   double speed_limit_mps_{1.0};
 };
 

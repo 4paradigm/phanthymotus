@@ -664,6 +664,12 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("odom_max_age_sec", source)
         self.assertNotIn("receiveOdometry", source)
         self.assertNotIn("odom_unavailable_or_stale", source)
+        self.assertNotIn("motion_not_straight", source)
+        self.assertNotIn("forward_motion_blocked", source)
+        self.assertNotIn("forward_preview_min_m", source)
+        self.assertNotIn("commandedForwardSafe", source)
+        self.assertIn('stop_reason_ = "segment_blocked"', source)
+        self.assertIn('stop_reason_ = "rotation_in_collision"', source)
         self.assertNotIn("RotationShimController", follow_path)
         self.assertNotIn("DWBLocalPlanner", follow_path)
         for phase in (

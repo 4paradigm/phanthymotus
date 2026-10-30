@@ -66,38 +66,6 @@ inline void observe_stopped_cycle(bool stopped, int & stopped_cycles)
   stopped_cycles = stopped ? stopped_cycles + 1 : 0;
 }
 
-// Check the straight motion commanded along the current body heading. This
-// geometrical preview is not a measured braking-distance or dynamics guarantee.
-template<typename IsPoseSafe>
-bool forward_motion_safe(
-  double x, double y, double yaw, double distance, double step, IsPoseSafe is_pose_safe)
-{
-  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(yaw) ||
-    !std::isfinite(distance) || distance < 0.0 || !std::isfinite(step) || step <= 0.0)
-  {
-    return false;
-  }
-  const double raw_samples = std::ceil(distance / step);
-  // Bound work done while the costmap mutex is held, and fail closed on overflow.
-  if (!std::isfinite(raw_samples) || raw_samples > 100000.0) {
-    return false;
-  }
-  const auto samples = static_cast<std::size_t>(std::max(1.0, raw_samples));
-  const double dx = std::cos(yaw);
-  const double dy = std::sin(yaw);
-  for (std::size_t sample = 0; sample <= samples; ++sample) {
-    const double traveled = distance * static_cast<double>(sample) / static_cast<double>(samples);
-    const double sample_x = x + traveled * dx;
-    const double sample_y = y + traveled * dy;
-    if (!std::isfinite(sample_x) || !std::isfinite(sample_y) ||
-      !is_pose_safe(sample_x, sample_y, yaw))
-    {
-      return false;
-    }
-  }
-  return true;
-}
-
 }  // namespace segmented_controller
 
 #endif  // SEGMENTED_CONTROLLER__SEGMENT_MATH_HPP_
