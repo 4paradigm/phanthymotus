@@ -5,6 +5,29 @@ import vm from 'node:vm';
 
 const canvas = readFileSync(new URL('../web/js/canvas.js', import.meta.url), 'utf8');
 const skeleton = readFileSync(new URL('../web/js/renderers/skeleton.js', import.meta.url), 'utf8');
+const detailPanel = readFileSync(new URL('../web/js/detail-panel.js', import.meta.url), 'utf8');
+
+function realTopicDetailHandoff() {
+  const mounts = [], connections = [];
+  const renderer = { canRender: () => true, mount: (_body, id) => mounts.push(id) };
+  const body = { style: {}, appendChild() {} };
+  const context = {
+    _cleanup() {}, _panel: { classList: { remove() {} } },
+    openDetailPanelMobile() {},
+    document: { getElementById: id => id === 'detail-body' ? body : {},
+      createElement: () => ({ style: {} }) },
+    RENDERERS: [renderer], ActivityRenderer: {}, TextRenderer: {},
+    _textLike: false, _renderer: null, _frames: 0, _status: null,
+    _CENTERED: '', _setStatus() {}, _session: 1,
+    _connect: (...args) => connections.push(args), console,
+  };
+  const start = detailPanel.indexOf('export function showTopicDetail(');
+  assert.ok(start >= 0);
+  const source = detailPanel.slice(start, detailPanel.indexOf('\n}\n', start) + 2)
+    .replace('export function', 'function');
+  const show = vm.runInNewContext(`(${source})`, context);
+  return { show, mounts, connections };
+}
 
 function functionSource(name) {
   const start = canvas.indexOf(`async function ${name}(`);
@@ -14,31 +37,39 @@ function functionSource(name) {
 
 test('live stream details use the producing driver to fetch its model', async () => {
   const el = {};
-  const calls = [];
+  const panel = realTopicDetailHandoff();
   const context = {
     _cards: [{ el, id: 'card-left', toolName: 'glove_teleop' }],
     inputArgs: () => ({}), _inputTopicsFor: () => [],
     fetch: async () => ({ json: async () => ({ topic_out: [{ topic: '/hands', format: 'sensor/skeleton' }] }) }),
     _parseMcpCallResult: value => value,
-    showTopicDetail: (...args) => calls.push(args),
+    showTopicDetail: panel.show,
     console,
   };
   const open = vm.runInNewContext(`(${functionSource('_openTopicDetailFor')})`, context);
   await open(el, 'mcp-glove', []);
-  assert.deepEqual(calls, [['/hands', 'sensor/skeleton', 'mcp-glove']]);
+  assert.deepEqual(panel.mounts, ['mcp-glove']);
+  assert.deepEqual(panel.connections, [['/hands', 'sensor/skeleton', 1]]);
 });
 
 test('cached stream details retain the same model provider', async () => {
-  const calls = [];
+  const panel = realTopicDetailHandoff();
   const context = {
     _cards: [], _allMcps: [], console,
-    showTopicDetail: (...args) => calls.push(args),
+    showTopicDetail: panel.show,
     _showToast: () => assert.fail('a cached topic exists'),
   };
   const el = { querySelectorAll: () => [] };
   const open = vm.runInNewContext(`(${functionSource('_openTopicDetailFor')})`, context);
   await open(el, 'mcp-glove', [{ topic: '/hands', format: 'sensor/skeleton' }]);
-  assert.deepEqual(calls, [['/hands', 'sensor/skeleton', 'mcp-glove']]);
+  assert.deepEqual(panel.mounts, ['mcp-glove']);
+  assert.deepEqual(panel.connections, [['/hands', 'sensor/skeleton', 1]]);
+});
+
+test('topic detail remains compatible with callers without a model provider', () => {
+  const panel = realTopicDetailHandoff();
+  panel.show('/log', 'text');
+  assert.deepEqual(panel.mounts, ['detail']);
 });
 
 test('generic execute button sends the bound card identity', async () => {

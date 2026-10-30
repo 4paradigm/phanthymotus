@@ -87,7 +87,7 @@ function _armStaleTimer() {
   }, STALE_MS);
 }
 
-export function showTopicDetail(topicPath, format) {
+export function showTopicDetail(topicPath, format, mcpId = 'detail') {
   _cleanup();
 
   _panel.classList.remove('hidden');
@@ -103,7 +103,7 @@ export function showTopicDetail(topicPath, format) {
   _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
-  _renderer.mount(body, 'detail');
+  _renderer.mount(body, mcpId);
 
   _frames = 0;
   _status = document.createElement('div');
