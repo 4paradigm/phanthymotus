@@ -36,7 +36,7 @@ def test_control_and_state_formats_resolve_to_string(fmt):
     assert ros2_bridge._resolve_msg_type(fmt) is _msg.String
 
 
-@pytest.mark.parametrize("fmt", ["data/json", "json", "sensor/imu"])
+@pytest.mark.parametrize("fmt", ["data/json", "json", "sensor/imu", "sensor/tactile"])
 def test_the_formats_that_already_worked_still_do(fmt):
     assert ros2_bridge._resolve_msg_type(fmt) is _msg.String
 
