@@ -810,77 +810,57 @@ class ControlledSemanticSpatialPlugin:
             for item in tool["topic_in"]
             if item["required"]
         }
-        bindings = args.get("input_bindings") or []
-        raw_topics = args.get("input_topics") or []
-        if isinstance(raw_topics, str):
-            raw_topics = [raw_topics]
-        if bindings:
-            if not isinstance(bindings, list) or any(
-                not isinstance(item, dict) for item in bindings
-            ):
-                return self._error(
-                    "invalid_canvas_wiring", "input_bindings must be an array"
-                )
-            ports = [str(item.get("port", "")) for item in bindings]
-            if len(ports) != len(set(ports)):
-                return self._error(
-                    "invalid_canvas_wiring", "input_bindings contains duplicate ports"
-                )
-            wired = {
-                str(item.get("port", "")): str(item.get("topic", "")).strip()
-                for item in bindings
-            }
-        else:
-            if not isinstance(raw_topics, list) or any(
-                not isinstance(topic, str) for topic in raw_topics
-            ):
-                return self._error(
-                    "invalid_canvas_wiring", "input_topics must be an array"
-                )
-            input_topic = args.get("input_topic")
-            if input_topic:
-                if not isinstance(input_topic, str):
-                    return self._error(
-                        "invalid_canvas_wiring", "input_topic must be a string"
-                    )
-                raw_topics = [*raw_topics, input_topic]
-            selected = {topic.strip() for topic in raw_topics}
-            wired = {
-                port: topic for port, topic in expected.items() if topic in selected
-            }
-        unknown = sorted(set(wired) - set(expected))
+        descriptors = args.get("input_descriptors")
+        if not isinstance(descriptors, list):
+            return self._error("invalid_canvas_wiring", "live input_descriptors are required; reconnect inputs")
+        wired = {}
+        for binding in descriptors:
+            if not isinstance(binding, dict):
+                return self._error("invalid_canvas_wiring", "invalid input descriptor")
+            port, topic, descriptor = binding.get("port"), binding.get("topic"), binding.get("descriptor")
+            if (not isinstance(port, str) or port not in expected or port in wired
+                    or not isinstance(topic, str) or not isinstance(descriptor, dict)
+                    or descriptor.get("topic") != topic
+                    or descriptor.get("format") != next(item["format"] for item in tool["topic_in"] if item["port"] == port)):
+                return self._error("invalid_canvas_wiring", "conflicting input descriptor")
+            wired[port] = topic
+            if port == "lidar":
+                imu = descriptor.get("associated_imu")
+                if (descriptor.get("ros_type") != "sensor_msgs/msg/PointCloud2"
+                        or not isinstance(imu, dict)
+                        or imu.get("format") != "sensor/imu"
+                        or imu.get("ros_type") != "sensor_msgs/msg/Imu"
+                        or not isinstance(imu.get("topic"), str)
+                        or imu.get("topic") == topic):
+                    return self._error("invalid_canvas_wiring", "lidar descriptor requires associated MID360 IMU")
+                wired["imu"] = imu["topic"]
         missing = sorted(port for port in required if not wired.get(port))
-        empty = sorted(
-            port
-            for port, topic in wired.items()
-            if port in expected and not topic
-        )
-        invalid = sorted(
-            port
-            for port, topic in wired.items()
-            if port in expected
-            and topic
-            and (
-                len(topic) > 255
-                or _ABSOLUTE_ROS_TOPIC_RE.fullmatch(topic) is None
-            )
-        )
-        if unknown or missing or empty or invalid:
-            details = []
-            if missing:
-                details.append("missing=" + ",".join(missing))
-            if empty:
-                details.append("empty_topic=" + ",".join(empty))
-            if invalid:
-                details.append("invalid_topic=" + ",".join(invalid))
-            if unknown:
-                details.append("unexpected=" + ",".join(unknown))
-            return self._error(
-                "invalid_canvas_wiring",
-                "controlled_semantic_spatial requires port-aware external bindings ("
-                + "; ".join(details)
-                + ")",
-            )
+        invalid = sorted(port for port, topic in wired.items()
+                         if not isinstance(topic, str) or len(topic) > 255
+                         or _ABSOLUTE_ROS_TOPIC_RE.fullmatch(topic) is None)
+        supplied_topics = args.get("input_topics", [])
+        if (not isinstance(supplied_topics, list)
+                or any(not isinstance(t, str) for t in supplied_topics)
+                or len(set(supplied_topics)) != len(supplied_topics)):
+            return self._error("invalid_canvas_wiring", "input_topics must be a unique array of strings")
+        if "input_topic" in args:
+            if not isinstance(args["input_topic"], str):
+                return self._error("invalid_canvas_wiring", "input_topic must be a string")
+            if args["input_topic"]:
+                supplied_topics = [*supplied_topics, args["input_topic"]]
+        external_topics = {topic for port, topic in wired.items() if port != "imu"}
+        if (missing or invalid or len(set(wired.values())) != len(wired)
+                or (supplied_topics and set(supplied_topics) != external_topics)):
+            return self._error("invalid_canvas_wiring", "missing, invalid or conflicting input topics")
+        if "input_bindings" in args:
+            bindings = args["input_bindings"]
+            if (not isinstance(bindings, list)
+                    or any(not isinstance(b, dict) or not isinstance(b.get("port"), str)
+                           or not isinstance(b.get("topic"), str) for b in bindings)
+                    or len(bindings) != len(external_topics)
+                    or {b["port"]: b["topic"] for b in bindings}
+                    != {port: topic for port, topic in wired.items() if port != "imu"}):
+                return self._error("invalid_canvas_wiring", "input bindings conflict with descriptors")
         return {"wired_topics": wired}
 
     def _handle_semantic_goal(

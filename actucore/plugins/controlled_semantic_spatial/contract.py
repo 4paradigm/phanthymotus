@@ -117,6 +117,20 @@ def _action_properties() -> dict:
         ),
         "additionalProperties": {"type": "object"},
     }
+    result["input_descriptors"] = {
+        "type": "array",
+        "description": "Live upstream descriptors for explicitly connected input ports",
+        "items": {
+            "type": "object",
+            "properties": {
+                "port": {"type": "string"},
+                "topic": {"type": "string"},
+                "descriptor": {"type": "object"},
+            },
+            "required": ["port", "topic", "descriptor"],
+            "additionalProperties": False,
+        },
+    }
     result["control_interface"] = {
         "type": "object",
         "description": (
@@ -144,7 +158,7 @@ CONTROLLED_SEMANTIC_SPATIAL_ACTION_PARAMS = {
         "description": "Configure mapping, planning and semantic navigation",
     },
     "start": {
-        "params": ["instance_id", "input_topics", "input_bindings", "control_interface"],
+        "params": ["instance_id", "input_topics", "input_bindings", "input_descriptors", "control_interface"],
         "description": "Start the in-container runtime and acquire card resources",
     },
     "stop": {
@@ -162,7 +176,7 @@ def controlled_semantic_spatial_tool_definition(namespace: str) -> dict:
         f"/{namespace.strip('/')}/navigation/odom",
         status_topic=f"/{namespace.strip('/')}/navigation/fast_livo2/status",
     )
-    external_inputs = [deepcopy(item) for item in mapping["topic_in"]]
+    external_inputs = [deepcopy(item) for item in mapping["topic_in"] if item["port"] == "lidar"]
     for item in external_inputs:
         item["required"] = True
     rgb_input = deepcopy(semantic["topic_in"][0])

@@ -94,7 +94,7 @@ function _showToast(msg) {
 }
 
 // Connection state
-let _connections = [];  // [{id, fromCardId, fromPortIdx, toCardId, toPortIdx, format, fromTopic}]
+let _connections = [];  // [{id, fromCardId, fromPortIdx, fromPort, toCardId, toPortIdx, toPort, format, fromTopic}]
 let _execConnections = []; // [{id, fromCardId, toCardId, toToolName, toMcpId}]
 let _draggingConn = null; // {fromCardId, fromPortEl, format, topic, tempPath, type?}
 
@@ -974,14 +974,14 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const inPortsHtml = topicIn.map((t, i) => {
     const fmt = t.format || '';
     const colorCls = _fmtColorClass(fmt);
-    return `<div class="canvas-port in ${colorCls}" data-dir="in" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-idx="${i}"></div>`;
+    return `<div class="canvas-port in ${colorCls}" data-dir="in" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-port="${_esc(t.port || '')}" data-idx="${i}"></div>`;
   }).join('');
 
   const outPortsHtml = topicOut.map((t, i) => {
     const fmt = t.format || '';
     const colorCls = _fmtColorClass(fmt);
     const staticAttr = t.topic ? `data-static-topic="${_esc(t.topic)}"` : '';
-    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}"></div>`;
+    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-port="${_esc(t.port || '')}" ${staticAttr} data-idx="${i}"></div>`;
   }).join('');
 
   if (effectiveType === 'controller') {
@@ -1553,6 +1553,12 @@ function _setupPortDrag() {
     });
     _connSvg.classList.remove('dragging-active');
 
+    // Project state can change while a connection is being drawn.
+    if (_refuseEdit()) {
+      if (_draggingConn.tempPath) _draggingConn.tempPath.remove();
+      _draggingConn = null;
+      return;
+    }
     const target = document.elementFromPoint(e.clientX, e.clientY);
 
     if (_draggingConn.type === 'executor') {
@@ -1596,8 +1602,10 @@ function _setupPortDrag() {
           id: connId,
           fromCardId: _draggingConn.fromCardId,
           fromPortIdx: _draggingConn.fromPortEl.dataset.idx,
+          fromPort: _draggingConn.fromPortEl.dataset.port || '',
           toCardId: toCard.dataset.cardId,
           toPortIdx: inPort.dataset.idx,
+          toPort: inPort.dataset.port || '',
           format: _draggingConn.format,
           fromTopic: _draggingConn.topic,
         });

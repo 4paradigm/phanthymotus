@@ -319,9 +319,10 @@ FAST-LIVO2 adapter 在拒绝 LiDAR、IMU、odom 或 registered cloud 时发布
 
 ## 统一卡片连线与构建
 
-Canvas 把 Driver `lidar_cloud` 的标准 PointCloud2、`lidar_imu` 和
-`camera_rgb` 的标准 JPEG CompressedImage 输出接到公开
-`controlled_semantic_spatial` 卡片；RGB 用于语义导航。原机身 `imu` 不能替代 `lidar_imu`。
+Canvas 把合并 LiDAR 卡片的 `navigation_lidar` 标准 PointCloud2 和可选的
+标准 JPEG CompressedImage 接到公开 `controlled_semantic_spatial` 卡片；RGB 用于语义导航。
+对应 MID360 IMU 由 LiDAR 实时描述符的 `associated_imu` 提供，不单独连线；
+原机身 `imu` 不能替代该 MID360 IMU。
 `livo_odom`、registered cloud、obstacle map 都在同一容器内
 交给 planning/semantic 模块。机器诊断由内部 topic 提供，
 统一卡片公开 `map_view` 和 Navi 格式 `control_velocity`。
