@@ -37,7 +37,7 @@ from .agent_core_client import (
 from .case_runner import CaseRunner
 from .config import (
     Config, DEFAULT_GITHUB_REPOS, is_evidence_ingress_url,
-    is_stable_public_base_url, validate_repository_names,
+    is_stable_public_base_url, validate_repository_names, _LOGIN_RE,
 )
 from .cos_client import CosClient
 from .evidence_builder import EvidenceBuilder
@@ -2190,21 +2190,45 @@ class DeployController:
                 return False
 
             existing = state.get("acceptance_request")
-            if (isinstance(existing, dict) and existing.get("status") == "pending"
-                    and existing.get("head_sha") == head and existing.get("round_id") == round_id):
-                await self.proxy.persist_cursor(repo, pr_number, comment_id)
-                return True
+            refresh_pending_request = (
+                isinstance(existing, dict) and existing.get("status") == "pending"
+                and existing.get("head_sha") == head and existing.get("round_id") == round_id
+            )
 
             original = copy.deepcopy(state)
-            state["acceptance_request"] = {
-                "head_sha": head,
-                "round_id": round_id,
-                "status": "pending",
-                "requested_by": actor,
-                "requested_by_id": owner_id,
-                "comment_id": comment_id,
-                "requested_at": comment["created_at"],
-            }
+            if not refresh_pending_request:
+                state["acceptance_request"] = {
+                    "head_sha": head,
+                    "round_id": round_id,
+                    "status": "pending",
+                    "requested_by": actor,
+                    "requested_by_id": owner_id,
+                    "comment_id": comment_id,
+                    "requested_at": comment["created_at"],
+                }
+
+            configured_reviewers = getattr(self.config, "test_reviewers", [])
+            requester = (
+                existing.get("requested_by") if refresh_pending_request
+                and isinstance(existing.get("requested_by"), str) else actor
+            )
+            requester_key = requester.strip().casefold()
+            eligible_reviewers = []
+            seen_reviewers = set()
+            if isinstance(configured_reviewers, list):
+                for reviewer in configured_reviewers:
+                    if (not isinstance(reviewer, str)
+                            or not _LOGIN_RE.fullmatch(reviewer.strip())
+                            or reviewer.strip().casefold().endswith("[bot]")
+                            or reviewer.strip().casefold() == requester_key
+                            or self._is_deployed_machine_owner(reviewer, state)):
+                        continue
+                    reviewer_key = reviewer.strip().casefold()
+                    if reviewer_key in seen_reviewers:
+                        continue
+                    seen_reviewers.add(reviewer_key)
+                    eligible_reviewers.append(reviewer.strip())
+
             state["command"] = {
                 "comment_id": comment_id,
                 "kind": "request_acceptance",
@@ -2218,16 +2242,19 @@ class DeployController:
                 components=state.get("components", []),
                 deployments_complete=True,
                 acceptance_pending=True,
-                acceptance_reviewers_configured=bool(getattr(self.config, "test_reviewers", [])),
+                acceptance_reviewers_configured=bool(configured_reviewers),
+                acceptance_reviewers=eligible_reviewers,
             )
-            event = {
-                "event": "Independent acceptance requested",
-                "lifecycle": "`testing` · 测试完成 · 待独立验收",
-                "machine": next((d.get("machine", "") for d in state.get("deployments", [])
-                                 if isinstance(d, dict) and d.get("phase") == "deployed"), ""),
-                "timestamp": comments_mod.beijing_now_str(),
-            }
-            await self._preflight_archive_for_event(repo, pr_number, markdown, reserved_event=event)
+            event = None
+            if not refresh_pending_request:
+                event = {
+                    "event": "Independent acceptance requested",
+                    "lifecycle": "`testing` · 测试完成 · 待独立验收",
+                    "machine": next((d.get("machine", "") for d in state.get("deployments", [])
+                                     if isinstance(d, dict) and d.get("phase") == "deployed"), ""),
+                    "timestamp": comments_mod.beijing_now_str(),
+                }
+                await self._preflight_archive_for_event(repo, pr_number, markdown, reserved_event=event)
             written = await self._write_lifecycle_with_history(
                 repo, pr_number, state, markdown, event=event,
                 expected_acceptance_state=original,

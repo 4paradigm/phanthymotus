@@ -482,12 +482,58 @@ def testing(
     record_test_complete: bool = False,
     acceptance_pending: bool = False,
     acceptance_reviewers_configured: bool = True,
+    acceptance_reviewers: list[str] | None = None,
 ) -> str:
-    next_action = (_testing_next_action(evidence_complete)
-                   if not acceptance_pending else (
-                       "等待独立验收人确认。" if acceptance_reviewers_configured
-                       else "独立验收名单待配置；配置前不能记录最终验收结果。"
-                   ))
+    if acceptance_pending:
+        reviewers = [name for name in acceptance_reviewers or []
+                     if isinstance(name, str) and name.strip()]
+        next_action = ["### 独立验收人", ""]
+        if reviewers:
+            next_action.extend([
+                "本轮可验收的 GitHub 用户："
+                + "、".join(f"`@{_escape(name.strip())}`" for name in reviewers),
+            ])
+            acceptance_instruction = (
+                "请名单中的任意一位独立验收人，在当前 PR 的 Conversation 新建一条评论，"
+                "以下两条命令二选一。"
+            )
+        else:
+            if not acceptance_reviewers_configured:
+                reason = (
+                    "现有 `test_reviewers.yaml` 名单未加载或为空。请管理员修复现有名单；"
+                    "当前没有可执行独立验收的人选。"
+                )
+            else:
+                reason = (
+                    "现有名单中的候选人均为本轮验收请求发起者或已部署机器的 Machine Owner，"
+                    "没有符合独立验收条件的人选。请管理员检查现有 `test_reviewers.yaml` 名单和本轮 Machine Owner 配置。"
+                )
+            next_action.extend([reason])
+            acceptance_instruction = (
+                "名单恢复可用前，暂不能执行验收命令。之后请名单中的任意一位独立验收人，"
+                "在当前 PR 的 Conversation 新建一条评论，以下两条命令二选一。"
+            )
+        next_action.extend([
+            "",
+            "### 验收操作",
+            "",
+            acceptance_instruction,
+            "",
+            "- 验收成功：`/record_test result=pass`",
+            "- 验收失败：`/record_test result=fail`",
+            "",
+            "只需执行其中一条。`summary` 是可选参数，用于补充验收说明。"
+            "将命令作为评论正文从第一列开始输入；不要加引用前缀，也不要放进 Markdown 代码块。",
+            "Machine Owner 不得执行 `/record_test`；GitHub Review 的 Approve 按钮不能替代此业务命令。",
+            "",
+            "### 结果说明",
+            "",
+            "- `pass`：本轮状态变为 `succeeded`，验收通过。",
+            "- `fail`：本轮状态变为 `failed`，验收失败。",
+        ])
+        next_action = "\n".join(next_action)
+    else:
+        next_action = _testing_next_action(evidence_complete)
     lines = [
         BOT_MARKER,
         lifecycle_marker(repo, pr_number),
