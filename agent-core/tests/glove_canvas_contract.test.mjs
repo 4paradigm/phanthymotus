@@ -67,6 +67,56 @@ function rotate(vector, axis, angle) {
   return [c*x-s*y, s*x+c*y, z];
 }
 
+function previewRenderer() {
+  const context = { TextDecoder };
+  const source = skeleton.replace(/^import .*;\s*$/gm, '')
+    .replace('export const SkeletonRenderer =', 'globalThis.renderer =');
+  vm.runInNewContext(source, context);
+  const renderer = context.renderer;
+  renderer._loaded = true;
+  renderer._gloveTargets = {};
+  renderer._lastAnimationAt = null;
+  const angles = [];
+  renderer._joints = { finger: { userData: { axis: {} },
+    quaternion: { setFromAxisAngle: (_axis, value) => angles.push(value) } } };
+  const send = (q, glove = true) => renderer.onData(Buffer.from(JSON.stringify({
+    preview_is_glove_target: glove, joints: [{ name: 'finger', q }],
+  })));
+  return { renderer, angles, send };
+}
+
+test('glove display interpolates to the latest target without overshoot or extrapolation', () => {
+  const { renderer, angles, send } = previewRenderer();
+  send(0);
+  renderer._advanceGlovePreview(0);
+  send(1);
+  renderer._advanceGlovePreview(16);
+  assert.ok(angles.at(-1) > 0 && angles.at(-1) < 1);
+  send(0.2); // A newer frame replaces the previous target, without queuing it.
+  for (let t = 32; t < 1000; t += 16) renderer._advanceGlovePreview(t);
+  assert.ok(Math.abs(angles.at(-1) - 0.2) < 1e-9);
+  assert.ok(angles.every(a => a >= 0 && a <= 1));
+});
+
+test('glove interpolation is independent of display refresh rate', () => {
+  const valueAfter = step => {
+    const { renderer, angles, send } = previewRenderer();
+    send(0); renderer._advanceGlovePreview(0); send(1);
+    for (let t = step; t <= 160; t += step) renderer._advanceGlovePreview(t);
+    return angles.at(-1);
+  };
+  assert.ok(Math.abs(valueAfter(8) - valueAfter(16)) < 1e-10);
+});
+
+test('other robot streams retain direct joint updates and cancel glove smoothing', () => {
+  const { renderer, angles, send } = previewRenderer();
+  send(0); send(1);
+  send(-0.5, false);
+  assert.equal(angles.at(-1), -0.5);
+  renderer._advanceGlovePreview(100);
+  assert.equal(angles.at(-1), -0.5);
+});
+
 for (const yaw of [1.8064, -1.8076]) {
   test(`URDF thumb origin uses fixed-axis RPY, yaw=${yaw}`, () => {
     class Group {
