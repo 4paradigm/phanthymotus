@@ -34,6 +34,14 @@ BUILD_HEADING = "## PR Review Agent — Build Result"
 TEST_HEADING = "## PR Review Agent — Test Results"
 CODE_REVIEW_HEADING = "## PR Review Agent — Code Review"
 ERROR_HEADING = "## PR Review Agent — Error"
+_ALREADY_REVIEWED_HEADING = "## PR Review Agent — Already reviewed"
+_ALREADY_REVIEWED_SKIP_RE = re.compile(
+    r"\bThis request\s+was skipped rather than rebuilding an unchanged commit\.",
+    re.I,
+)
+_ALREADY_REVIEWED_COMMIT_RE = re.compile(
+    r"(?im)^\s*(?:\x60)?([0-9a-f]{7,40})(?:\x60)?\s+was already reviewed\b"
+)
 # Published by agents/pr_review/models.py DEFAULT_JP_VERSION. The isolated
 # Controller image does not ship that package; keep the protocol default here.
 _DEFAULT_REQUEST_VARIANT = "5.11"
@@ -347,6 +355,73 @@ def _parse_review_request(body: str) -> dict | None:
 def _same_commit(value: str, expected: str) -> bool:
     return bool(_SHORT_SHA_RE.fullmatch(value) and _SHORT_SHA_RE.fullmatch(expected)
                 and (value.lower().startswith(expected.lower()) or expected.lower().startswith(value.lower())))
+
+
+def _already_reviewed_response_commit(body: str) -> str:
+    """Return the commit named by an explicit Review Agent no-op response.
+
+    An ordinary review result, progress message, or free-text mention is not
+    sufficient. The exact protocol marker, heading, skip explanation and one
+    unambiguous commit prefix are all required.
+    """
+    if (
+        not isinstance(body, str)
+        or body.count(PR_REVIEW_MARKER) != 1
+        or body.count(_ALREADY_REVIEWED_HEADING) != 1
+        or not _ALREADY_REVIEWED_SKIP_RE.search(body)
+        or any(heading in body for heading in (
+            BUILD_HEADING, TEST_HEADING, CODE_REVIEW_HEADING, ERROR_HEADING,
+        ))
+    ):
+        return ""
+    prefixes = _ALREADY_REVIEWED_COMMIT_RE.findall(body)
+    if len(prefixes) != 1 or not _SHORT_SHA_RE.fullmatch(prefixes[0]):
+        return "!ambiguous"
+    return prefixes[0]
+
+
+def _is_noop_review_request(
+    request: dict,
+    request_position: tuple[datetime, int],
+    request_positions: list[tuple[datetime, int]],
+    trusted_comments: list[dict],
+    review_run_positions: list[tuple[datetime, int]],
+    expected_commit: str,
+) -> bool:
+    """Ignore only a request explicitly answered as skipped without a new run.
+
+    The response must be the sole Already reviewed response after this request
+    and before the next review request, must name this HEAD, and must not have
+    a review-run anchor between the request and response. Edited or ambiguous
+    comments remain blocking; real new runs are never hidden by this rule.
+    """
+    if request.get("updated_at") != request.get("created_at"):
+        return False
+
+    next_request = min(
+        (position for position in request_positions if position > request_position),
+        default=None,
+    )
+    responses = []
+    for comment in trusted_comments:
+        commit_prefix = _already_reviewed_response_commit(
+            str(comment.get("body", "") or "")
+        )
+        if not commit_prefix:
+            continue
+        position = _comment_position(comment)
+        if position is None or position <= request_position:
+            continue
+        if next_request is not None and position >= next_request:
+            continue
+        if comment.get("updated_at") != comment.get("created_at"):
+            continue
+        if any(request_position < run_position < position
+               for run_position in review_run_positions):
+            continue
+        responses.append((commit_prefix, position))
+
+    return len(responses) == 1 and _same_commit(responses[0][0], expected_commit)
 
 
 def _run_id(body: str) -> str:
@@ -834,6 +909,7 @@ def extract_review_evidence(
     previous_position = max(prior_positions) if prior_positions else None
     request_candidates = []
     request_positions = []
+    request_entries = []
     run_valid = True
     for c in comments:
         body = c.get("body", "")
@@ -844,10 +920,19 @@ def extract_review_evidence(
             run_valid = False
             continue
         request_positions.append(position)
+        request_entries.append((c, position))
+
+    review_run_positions = [anchor_position, *prior_positions]
+    for c, position in request_entries:
+        if _is_noop_review_request(
+            c, position, request_positions, trusted_comments,
+            review_run_positions, expected_commit,
+        ):
+            continue
         if previous_position is not None and position <= previous_position:
             continue
         if position >= anchor_position:
-            run_valid = False  # A newer request supersedes this chain; no fallback.
+            run_valid = False  # A newer effective request supersedes this chain.
             continue
         request_candidates.append(c)
     request = request_candidates[0] if len(request_candidates) == 1 else None
