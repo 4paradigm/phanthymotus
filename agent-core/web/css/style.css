@@ -499,6 +499,7 @@ html, body {
 }
 .sidebar-section-icon.controller { color: var(--emerald); }
 .sidebar-section-icon.actucore   { color: var(--blue); }
+.sidebar-section-icon.modelhub   { color: var(--purple); }
 /* driver 的颜色表示在线状态 —— 这件事原来由一个圆点承担。 */
 .sidebar-section-icon.driver          { color: var(--text-dim); }
 .sidebar-section-icon.driver.online   { color: var(--green); }

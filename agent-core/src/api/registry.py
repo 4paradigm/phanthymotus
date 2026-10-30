@@ -18,7 +18,7 @@ RESOURCE_CENTER_URL = os.environ.get('RESOURCE_CENTER_URL', 'https://motus.phant
 
 # Service categories, in display order. A catalog item whose category is not in
 # this tuple is dropped — adding a new kind of service means adding it here.
-CATEGORIES = ('core', 'perception', 'actucore', 'driver')
+CATEGORIES = ('core', 'perception', 'actucore', 'modelhub', 'driver')
 
 
 def empty_catalog() -> dict:

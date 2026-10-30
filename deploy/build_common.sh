@@ -62,6 +62,11 @@ select_mirror() {
 # x86_64:     docker buildx build --platform linux/arm64（交叉编译）
 #
 # 使用 PUSH_ENABLED 环境变量控制是否推送（默认 true）
+#
+# EXTRA_BUILD_FLAGS（可选，bash 数组）原样追加到 docker build 上。给仓库外的调用方
+# 用：phanthymotus-modelhub 的 build_modelhub.sh source 这个文件，用它传
+# `--build-context phanthymotus=<检出>`，从这里拷 logsafe / model_downloader 而不是
+# 另存一份。
 do_build() {
     local dockerfile="$1"; shift
     local context="$1"; shift
@@ -75,6 +80,8 @@ do_build() {
     while [[ $# -gt 0 ]]; do
         build_args+=(--build-arg "$1"); shift
     done
+    # set -u 下空数组展开会报 unbound，用 ${a[@]+...} 兜住
+    build_args+=(${EXTRA_BUILD_FLAGS[@]+"${EXTRA_BUILD_FLAGS[@]}"})
 
     if ${IS_ARM64}; then
         echo "[native ARM64] docker build"
@@ -135,8 +142,8 @@ parse_mirror_arg() {
 }
 
 # ── JetPack 线 ────────────────────────────────────────────────────────
-# jetpack_vars <5.11|6.1> —— 把一条 JetPack 线的构建期事实解析出来，设置：
-#   JP_ARG    传给 Dockerfile 的 JP_VERSION build arg（511 / 61），它同时选定
+# jetpack_vars <5.11|6.1|7.2> —— 把一条 JetPack 线的构建期事实解析出来，设置：
+#   JP_ARG    传给 Dockerfile 的 JP_VERSION build arg（511 / 61 / 72），它同时选定
 #             base 镜像，并在镜像内解析出 numpy pin 与 sherpa wheel
 #             （见 perception/Dockerfile.jetson 的 /etc/jetpack.env）
 #   ACC_ARCH  resource-center 的过滤依据（大版本粒度，见 resource-center/lib/arch.ts）：
@@ -148,8 +155,9 @@ jetpack_vars() {
     case "$1" in
         5.11) JP_ARG=511; ACC_ARCH="jetson-jp5" ;;
         6.1)  JP_ARG=61;  ACC_ARCH="jetson-jp6" ;;
+        7.2)  JP_ARG=72;  ACC_ARCH="jetson-jp7" ;;
         *)
-            echo "Unknown JetPack version: $1 (support: 5.11, 6.1)" >&2
+            echo "Unknown JetPack version: $1 (support: 5.11, 6.1, 7.2)" >&2
             return 1
             ;;
     esac
