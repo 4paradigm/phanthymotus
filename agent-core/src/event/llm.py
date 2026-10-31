@@ -2350,6 +2350,9 @@ class Event:
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
         system_tools = list(self._sys_tools.values())
+        from event.desktop import search_configured
+        if not search_configured():
+            system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools

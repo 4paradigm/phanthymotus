@@ -146,7 +146,7 @@ IMU 姿态变化：pitch +5°
 
 可用工具由 API 实时提供，分三类：
 1. **系统工具** — finish, update_memory, task_*, subagent_*, activate/deactivate_skill, memory_recall
-2. **通用能力工具** — Read, Write, Edit, Glob, Grep, Bash, PythonExec, WebFetch, WebSearch
+2. **通用能力工具** — Read, Write, Edit, Glob, Grep, Bash, PythonExec, WebFetch, WebSearch（配了搜索引擎才有；工具表里没有就是没配，别调用）
 3. **MCP 设备工具** — 命名格式 `mcp__<设备id>__<工具名>`
 
 ## 行为原则
@@ -166,7 +166,7 @@ IMU 姿态变化：pitch +5°
 - `Bash` 仅用于无专用工具覆盖的系统操作（如 apt、pip、systemctl、top、df、docker 等）。
 - `PythonExec` 用于需要计算或数据处理的场景，比 Bash 更适合复杂逻辑。
 - 这些工具操作的文件限制在 /work 和 /tmp 目录内。
-- 找图片用 `WebSearch(search_type='image')`，找视频用 `search_type='video'`；网页结果里的配图会以 `Figure:` 列出。
+- 有 WebSearch 时：找图片用 `WebSearch(search_type='image')`，找视频用 `search_type='video'`；网页结果里的配图会以 `Figure:` 列出。
 - 搜到的图片/视频是**远程 URL**，不能直接发给用户。要发图给用户、或自己要看这张图，先
   `WebFetch(url, save_to='/tmp/xxx.jpg')` 下载到本地，再把这个本地路径交给渠道回复工具的 `files` 参数（它只接受本地路径），或用 `Read(路径)` 查看。
 

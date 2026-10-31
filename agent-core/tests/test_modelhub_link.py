@@ -95,7 +95,26 @@ def test_decision_core_schema_declares_the_source_field():
     assert "'format': 'llm-source'" in src
     assert "'x-required-when': {'llm_source': 'cloud'}" in src
     # 选本机时云端那组隐藏、但照样保存，切回云端不用重填
-    assert src.count("'x-keep-when-hidden': True") == 6
+    assert src.count("'x-keep-when-hidden': True") == 3
+
+
+def test_search_is_offered_only_when_configured():
+    """没配搜索引擎时 WebSearch 不进工具表 —— 否则模型一调就是「未配置」的报错。
+    搜索和用云端还是本机模型无关。"""
+    from event.desktop import search_configured
+    saved = config.main.get('desktop_tools')
+    try:
+        config.main['desktop_tools'] = {'search': {'type': 'none'}}
+        assert search_configured() is False
+        config.main['desktop_tools'] = {}
+        assert search_configured() is False
+        config.main['desktop_tools'] = {'search': {'type': 'baidu_search', 'base_url': 'u'}}
+        assert search_configured() is True
+    finally:
+        config.main['desktop_tools'] = saved
+    src = (pathlib.Path(__file__).resolve().parents[1] / 'src' / 'start.py').read_text()
+    line = next(l for l in src.splitlines() if "'search_type':" in l)
+    assert 'llm_source' not in line          # 两种大模型都能配搜索
 
 
 def test_card_config_in_local_mode_keeps_the_cloud_credentials():

@@ -122,7 +122,7 @@ def _register_core_mcp(silent=False):
                     'properties': {
                         # 云端或本机，二选一。选本机不挑具体模型 —— 用 ModelHub 当前加载的那个，
                         # 换模型在 LLM 卡片里做。见 modelhub_link.py。
-                        # 云端那组字段在选本机时隐藏但照样保存（x-keep-when-hidden），切回来不用重填。
+                        # 云端 URL / Key / 模型在选本机时隐藏但照样保存（x-keep-when-hidden），切回来不用重填。
                         # 取值 'cloud' | 'modelhub'。不写 enum：表单渲染器见到 enum 就画成下拉，
                         # 轮不到 format 那条分支
                         'llm_source': {'type': 'string', 'format': 'llm-source', 'default': 'cloud',
@@ -135,14 +135,11 @@ def _register_core_mcp(silent=False):
                                       'x-required-when': {'llm_source': 'cloud'}},
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称',
                                       'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True},
-                        'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none',
-                                        'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True},
-                        'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)',
-                                            'x-show-when': {'llm_source': 'cloud', 'search_type': 'baidu_search'},
-                                            'x-keep-when-hidden': True},
-                        'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password',
-                                           'x-show-when': {'llm_source': 'cloud', 'search_type': 'baidu_search'},
-                                           'x-keep-when-hidden': True},
+                        # 搜索和用哪个大模型无关：本机模型也可能要联网拿外部信息，所以两种都显示。
+                        # 选 none 时 WebSearch 不进模型的工具表（event.desktop.search_configured）。
+                        'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
+                        'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
+                        'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': '思考模式：开启后模型会先推理再回答，但只给各家支持的最低推理档位（延迟仍高于关闭）；关闭则完全不推理，响应最快', 'default': False},
                         'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},

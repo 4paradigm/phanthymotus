@@ -248,6 +248,9 @@ class Subagent:
         allowed = set(_DESKTOP_TOOLS)
         if getattr(self.spec, 'hop_count', 0) > 0:
             allowed.discard('peer_call')
+        from event.desktop import search_configured
+        if not search_configured():
+            allowed.discard('WebSearch')     # 没配搜索引擎就别给，免得一调就报「未配置」
         return [
             info['schema']
             for name, info in _event_instance._sys_tools.items()
