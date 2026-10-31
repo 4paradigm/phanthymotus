@@ -214,6 +214,7 @@ Dashboard（`http://<设备IP>:15678`）提供：
 | Perception WebSocket | 15721 |
 | ActuCore MCP | 15730 |
 | PR Review Agent（可选） | 25000 |
+| Deploy Approval Agent（可选） | 25001 |
 
 硬件驱动端口请参见 [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)。
 
@@ -231,6 +232,8 @@ Dashboard（`http://<设备IP>:15678`）提供：
 ## 贡献
 
 参见 [CONTRIBUTING.md](CONTRIBUTING.md) 了解开发环境搭建、架构细节和贡献指南。
+
+在人工审批门禁后部署已评审、已构建的镜像，是一个可选、独立的部署控制面服务，不属于机器人 `sense → think → act` 主数据面。详见 [DEPLOY_APPROVAL_AGENT.md](DEPLOY_APPROVAL_AGENT.md)。
 
 ## 许可证
 

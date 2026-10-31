@@ -767,6 +767,7 @@ services:
 | Perception WebSocket | 15721 |
 | ActuCore MCP | 15730 |
 | PR Review Agent (optional) | 25000 |
+| Deploy Approval Agent (optional) | 25001 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
 
@@ -871,6 +872,11 @@ Pull requests can be built and reviewed automatically by commenting
 `/request_bot_review` on the PR — see
 [PR_REVIEW_AGENT.md](PR_REVIEW_AGENT.md) for what it does, how to run it, and
 its dashboard.
+
+Deploying a reviewed, built image behind a human approval gate is an optional,
+independent deployment control-plane service — see
+[DEPLOY_APPROVAL_AGENT.md](DEPLOY_APPROVAL_AGENT.md). It is not part of the
+robot's `sense → think → act` data plane.
 
 ## License
 
