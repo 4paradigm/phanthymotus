@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import threading
 import time
 import uuid
+from dataclasses import replace
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
@@ -69,6 +71,12 @@ _DEPTH_TYPE_WAIT_S = 5.0
 # name them even with no chassis wired, instead of leaving the renderer to call
 # them joint1..joint6.
 TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
+
+# These policy fields are shared by the operator's config dialog and the
+# config action. Defaults come from startup configuration, before a particular
+# downstream chassis adopts/clamps the effective policy limits.
+_TUNING_FIELDS = ("stop_distance_m", "stop_tolerance_m", "k_yaw", "k_fwd",
+                  "search_rate", "vx_max", "vy_max", "wz_max", "use_lateral")
 
 
 def _sensor_qos():
@@ -187,6 +195,52 @@ class NaviPlugin:
     # ── tool ─────────────────────────────────────────────────────────────────
 
     def get_tools(self) -> list:
+        tuning_properties = {
+            "stop_distance_m": {"type": "number", "minimum": 0,
+                                "title": "目标停止距离 stop_distance_m（m）",
+                                "description": "期望停在目标前的距离，按相机到目标"
+                                               "计算；到达距离阈值为此值加停止容差"},
+            "stop_tolerance_m": {"type": "number", "minimum": 0,
+                                 "title": "停止距离容差 stop_tolerance_m（m）",
+                                 "description": "允许在停止距离外多远判定到达。"
+                                                "例如停止距离 1.2 m、容差 0.1 m，"
+                                                "距离不大于 1.3 m 即满足距离条件；"
+                                                "仍需有效观测及原有对正条件。"
+                                                "默认 0，保持原行为"},
+            "k_yaw": {"type": "number", "minimum": 0,
+                      "title": "转向增益 k_yaw",
+                      "description": "目标偏离画面中心时的转向响应。越大纠正越快，"
+                                     "过大可能左右摆动；最终角速度仍受 wz_max 限制"},
+            "k_fwd": {"type": "number", "minimum": 0,
+                      "title": "前进增益 k_fwd",
+                      "description": "按目标距离误差计算前进速度的比例（1/s）。"
+                                     "越大接近越快；最终速度仍受 vx_max、避障和"
+                                     "下游底盘限制"},
+            "search_rate": {"type": "number", "minimum": 0,
+                            "title": "搜索转速 search_rate（rad/s）",
+                            "description": "目标不在视野时原地搜索的角速度幅值；"
+                                           "0 表示不转身搜索。启动时会按下游"
+                                           "允许的双向转速和死区调整"},
+            "vx_max": {"type": "number", "minimum": 0,
+                       "title": "前进速度上限 vx_max（m/s）",
+                       "description": "导航前进速度上限，启动时会按下游底盘的"
+                                      "允许范围和最小可执行速度调整"},
+            "vy_max": {"type": "number", "minimum": 0,
+                       "title": "横移速度上限 vy_max（m/s）",
+                       "description": "导航横移速度上限；底盘不支持横移时该轴"
+                                      "自动停用"},
+            "wz_max": {"type": "number", "minimum": 0,
+                       "title": "转向速度上限 wz_max（rad/s）",
+                       "description": "跟随和避障的角速度上限。参数名是 wz_max；"
+                                      "启动时会按下游底盘的允许范围和死区调整"},
+            "use_lateral": {"type": "boolean", "title": "允许横移 use_lateral",
+                            "description": "允许支持横移的底盘边转向边横移；"
+                                           "天轶轮式底盘应关闭，且始终以下游"
+                                           "声明的自由度为准"},
+        }
+        for key, spec in tuning_properties.items():
+            spec["default"] = self._cfg.get(
+                key, policy_mod.Config.__dataclass_fields__[key].default)
         return [{
             "name": "navi",
             "type": "processor",
@@ -205,8 +259,7 @@ class NaviPlugin:
                                "description": "要走过去的东西。用 list_visible_objects "
                                               "返回的 key（如 chair#azure）最准；"
                                               "也接受纯名字，但同名多个时挑哪一个不保证"},
-                    "stop_distance_m": {"type": "number",
-                                        "description": "在目标前多远停下，默认 1.2 m"},
+                    **{key: dict(spec) for key, spec in tuning_properties.items()},
                     # Handed over by agent-core from the card wired downstream.
                     # Not operator-editable: it is a reading of another card,
                     # and a hand-typed copy is a copy that goes stale.
@@ -227,7 +280,7 @@ class NaviPlugin:
                                        "存在性检查。",
                     },
                     "navigate_to": {
-                        "params": ["target", "stop_distance_m"],
+                        "params": ["target", "stop_distance_m", "stop_tolerance_m"],
                         "description":
                             "朝目标走过去。**目标不必现在就看得见** —— 看不见时会"
                             "自行原地转身搜索，转满一圈仍未找到才算失败，所以不要"
@@ -249,6 +302,14 @@ class NaviPlugin:
                                         "description": "停止导航，放弃当前目标"},
                     "pause": {"params": [], "description": "暂停，保留目标"},
                     "resume": {"params": [], "description": "继续"},
+                    "config": {
+                        "params": list(_TUNING_FIELDS),
+                        "description": "配置跟随增益、搜索转速、速度上限和横移。"
+                                       "只更新填写的参数；配置保留到本进程后续"
+                                       "启动，容器重启后需由画布配置或 YAML 恢复。"
+                                       "运行中修改也会重新按下游底盘限制调整；"
+                                       "返回 config 为请求值、effective_config 为实际值",
+                    },
                 },
                 # Unlike the vla card, this one finishes: arriving is an answer.
                 "x-completion": {"actions": ["navigate_to"], "timeout": 300},
@@ -257,38 +318,23 @@ class NaviPlugin:
                 "x-is-dangerous": True,
                 "x-resource": ["base"],
             },
-            # **Three knobs, not twenty-two.**
-            #
-            # Everything else lives in `actucore/config.yaml`, where it has the
-            # paragraph of explanation it needs, and stays reachable through the
-            # `config` action for anyone tuning. What it must not be is a form
-            # field: an operator asked to pick `release_frac` or
-            # `bearingless_std_factor` has no way to judge the answer, and the
-            # dialog's length hides the three that actually matter.
-            #
-            # There is a second, sharper reason. **agent-core sends every field
-            # in this schema on every config call, defaults included** — so a
-            # key here silently overrides the same key in config.yaml. On r1_sz
-            # the file said `vx_max: 0.6` and the card reported 0.4, because the
-            # schema default won. Every field removed from here is one fewer
-            # place for the file to be quietly ignored; every field kept has to
-            # carry the same default the file does, which `test_navi_card.py`
-            # now checks.
+            # agent-core submits schema defaults along with dialog values.
+            # Tuning defaults must therefore reflect this card's startup YAML,
+            # rather than overwrite it or copy a previous chassis's limits.
             "configSchema": {
                 "type": "object",
                 "properties": {
                     "rate_hz": {"type": "number", "default": 10,
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
-                    "stop_distance_m": {"type": "number", "default": 0.8,
-                                        "description": "走到目标前多远算到达（米）",
-                                        "scope": "instance"},
                     "obstacle_stop_m": {"type": "number", "default": 0.6,
                                         "description": "正前方障碍近于这个距离就完全"
                                                        "不前进（米）。必须小于 "
                                                        "stop_distance_m，否则机器人会"
                                                        "被它正要走向的目标挡停",
                                         "scope": "instance"},
+                    **{key: {**spec, "scope": "instance"}
+                       for key, spec in tuning_properties.items()},
                 },
                 "required": [],
             },
@@ -568,8 +614,24 @@ class NaviPlugin:
             if not self._running:
                 return {"state": "idle",
                         "message": "卡片未在运行，请先在画布上启动"}
-            if "stop_distance_m" in args and args["stop_distance_m"] is not None:
-                self._config.stop_distance_m = float(args["stop_distance_m"])
+            distance_updates = {}
+            for key in ("stop_distance_m", "stop_tolerance_m"):
+                if key not in args or args[key] is None:
+                    continue
+                try:
+                    if isinstance(args[key], bool):
+                        raise ValueError("must be a finite nonnegative number")
+                    value = float(args[key])
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError("must be a finite nonnegative number")
+                    distance_updates[key] = value
+                except (TypeError, ValueError, OverflowError) as error:
+                    return self._error(f"配置 {key} 无效：{error}")
+            try:
+                candidate = replace(self._config, **distance_updates)
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._error(f"停止距离配置无效：{error}")
+            self._config = candidate
             # A new target discards everything remembered about the old one —
             # the search direction and the stuck timer both refer to a target
             # that is no longer being chased.
@@ -583,6 +645,9 @@ class NaviPlugin:
             # `args` — which is what this did first — finds nothing, so no
             # pending is ever registered and no completion can be matched.
             self._acp_action_id = f"navi_{uuid.uuid4().hex[:12]}"
+            arrival = {"stop_distance_m": self._config.stop_distance_m,
+                       "stop_tolerance_m": self._config.stop_tolerance_m,
+                       "arrival_distance_m": self._config.arrival_distance_m}
         log.info("navi navigate_to: target=%r", target)
         out = {"state": "running", "target": target, "topic": self._topic,
                # agent-core reads this back out to register the pending action.
@@ -590,7 +655,7 @@ class NaviPlugin:
                # as the barrier is concerned, and the completion POST below
                # later refers to an id nobody is waiting on.
                "action_id": self._acp_action_id,
-               "stop_distance_m": self._config.stop_distance_m,
+               **arrival,
                "degraded": self._degradations()}
 
         # Answer "is this target visible right now" immediately.
@@ -694,11 +759,42 @@ class NaviPlugin:
             # how a field ends up holding the wrong type for a year.
             cast = (bool if field.type in ("bool", bool)
                     else int if field.type in ("int", int) else float)
-            setattr(self._config, key, cast(value))
-            changed[key] = getattr(self._config, key)
-            # Preserve user-configured values across subsequent starts.
-            self._cfg[key] = changed[key]
-        return {"status": "configured", "config": changed}
+            try:
+                if key == "use_lateral" and not isinstance(value, bool):
+                    raise ValueError("must be a boolean")
+                if key in _TUNING_FIELDS and key != "use_lateral" and isinstance(value, bool):
+                    raise ValueError("must be a finite nonnegative number")
+                changed[key] = cast(value)
+                if key in _TUNING_FIELDS and key != "use_lateral":
+                    if not math.isfinite(changed[key]) or changed[key] < 0:
+                        raise ValueError("must be a finite nonnegative number")
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._error(f"配置 {key} 无效：{error}")
+
+        with self._lock:
+            # Stage a complete replacement so the policy never observes half
+            # of a config request. Copy effective geometry adopted from the
+            # camera/chassis; rebuilding from YAML would discard that reading.
+            try:
+                candidate = replace(self._config, **changed)
+            except (TypeError, ValueError, OverflowError) as error:
+                return self._error(f"停止距离配置无效：{error}")
+            notes = self._limit_notes
+            if self._running and changed:
+                # Restore requested ceilings before adoption, including those
+                # unchanged by this request. Otherwise an already-clamped
+                # ceiling loses its explanatory note on the next gain change.
+                for key in ("vx_max", "vy_max", "wz_max", "search_rate"):
+                    setattr(candidate, key, changed.get(
+                        key, self._cfg.get(
+                            key, policy_mod.Config.__dataclass_fields__[key].default)))
+                notes = policy_mod.adopt_limits(candidate, self._descriptor)
+            self._config = candidate
+            self._cfg.update(changed)
+            self._limit_notes = notes
+            return {"status": "configured", "config": changed,
+                    "effective_config": {key: getattr(candidate, key)
+                                         for key in changed}}
 
     def _info(self):
         with self._lock:
@@ -726,6 +822,9 @@ class NaviPlugin:
                                "format": "image/jpeg"}],
                 "target": self._state.target,
                 "rate_hz": self._rate_hz,
+                "config": {**{key: getattr(self._config, key)
+                              for key in _TUNING_FIELDS},
+                           "arrival_distance_m": self._config.arrival_distance_m},
                 "published": self._published,
                 # (width, height) of the frame vop's boxes are in. (0, 0) means
                 # no declaration arrived and boxes cannot be used — see

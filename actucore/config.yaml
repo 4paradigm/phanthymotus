@@ -200,19 +200,10 @@ plugins:
   # 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。
 
   navi:
-    # **这个文件是这张卡片绝大多数参数唯一的家。**
-    #
-    # 卡片的 configSchema 只暴露三个：rate_hz、stop_distance_m、obstacle_stop_m
-    # —— 操作员能判断的那三个。其余全在这里，因为它们需要的是一段解释而不是一个
-    # 输入框；要调的人仍然可以用 config 动作改。
-    #
-    # 还有一条更要紧的理由：**agent-core 每次 config 调用都会把 schema 里的字段
-    # 连同默认值一起下发**，所以出现在 schema 里的键会静默覆盖这里的同名键。
-    # r1_sz 上这里写着 vx_max: 0.6 而卡片报的是 0.4，就是 schema 默认值赢了 ——
-    # 唯一的痕迹是一条读起来像「这个文件从没被改过」的 degraded 提示。
-    #
-    # 所以往 schema 里加字段之前先想清楚：加进去就等于把这里的对应项变成装饰。
-    # test_navi_card.py 有一条测试盯着两边的默认值必须一致。
+    # 常用跟随参数也可在卡片配置中调整：k_yaw、k_fwd、search_rate、
+    # vx_max、vy_max、wz_max、use_lateral；其余策略细节仍在本文件。
+    # 画布每次 config 会带上 schema 默认值，因此这些字段的表单默认值读取
+    # 本文件的启动配置，不能用另一套常量覆盖它，也不能沿用旧底盘协商后的值。
     #
     # 视觉导航。enabled 只决定这张卡片出不出现在工具列表和侧边栏里，不决定它动
     # 不动 —— 和 vla 一样，真正的门槛都在别处：
@@ -267,6 +258,10 @@ plugins:
     # align_tol 不在这一组里：画布上跑的 0.08 是被裁掉的旧 schema 默认值一直在
     # 覆盖这里，而 0.15 才是为了解开近距离死锁调上去的值（见下）。
     stop_distance_m: 0.8
+    # 距离容差（米）：到达距离阈值为 stop_distance_m + stop_tolerance_m。
+    # 默认 0.0 保持原行为；例如 1.2 + 0.1 表示距离不大于 1.3 m 满足距离条件。
+    # 仍需有效观测及原有对正条件，不会用容差跳过这些判断。
+    stop_tolerance_m: 0.0
     # 全速前进所允许的横向偏移。**不是硬门** —— 超过它按比例减速，到
     # align_full_stop 才完全不前进。
     #

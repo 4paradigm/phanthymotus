@@ -314,6 +314,112 @@ def test_it_does_not_arrive_while_still_misaligned():
     assert state.arrived is False
 
 
+@pytest.mark.parametrize("distance,arrived", [(1.25, True), (1.3, True), (1.301, False)])
+def test_arrival_tolerance_accepts_only_distances_within_the_extended_threshold(distance, arrived):
+    config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.1)
+    decision = _step(detections=_detections(_obj(bbox=(0.4, 0.4, 0.6, 0.6))),
+                     depth=_depth(map_=_solid_depth(distance)), config=config)
+    assert (decision.status == P.ARRIVED) is arrived
+    if arrived:
+        assert decision.values == [0.0] * 6
+        assert "threshold 1.30 m" in decision.reason
+        assert "0.10 m tolerance" in decision.reason
+
+
+def test_zero_tolerance_keeps_the_nominal_distance_threshold():
+    config = _cfg(stop_distance_m=1.2)
+    decision = _step(detections=_detections(_obj()),
+                     depth=_depth(map_=_solid_depth(1.25)), config=config)
+    assert config.stop_tolerance_m == 0
+    assert decision.status != P.ARRIVED
+
+
+def test_tolerance_arrival_emits_one_zero_and_stays_complete_if_distance_changes():
+    config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.1)
+    detections = _detections(_obj(bbox=(0.4, 0.4, 0.6, 0.6)))
+    depth = _depth(map_=_solid_depth(1.25))
+    state = seed(_state(), detections, depth, config)
+    first = _step(detections=detections, depth=depth, state=state, config=config)
+    assert first.status == P.ARRIVED and first.values == [0.0] * 6
+    later = _step(detections=_next_frame(detections),
+                  depth=_depth(map_=_solid_depth(1.35)), state=state, config=config)
+    assert later.status == P.ARRIVED and later.values is None
+
+
+def test_tolerance_band_stops_translation_while_existing_heading_patience_runs():
+    config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.1,
+                  arrive_align_tol=0.01, arrive_patience_s=0.5)
+    detections = _detections(_obj(x=0.25, bbox=(0.5, 0.4, 0.7, 0.6)))
+    depth = _depth(map_=_solid_depth(1.25))
+    state = seed(_state(), detections, depth, config)
+    first = _step(detections=detections, depth=depth, state=state, config=config)
+    assert first.status != P.ARRIVED
+    assert first.values[:2] == [0.0, 0.0]
+    for _ in range(8):
+        decision = _step(detections=_next_frame(detections), depth=depth,
+                         state=state, config=config)
+        if decision.status == P.ARRIVED:
+            break
+        assert decision.values[:2] == [0.0, 0.0]
+    assert decision.status == P.ARRIVED and decision.values == [0.0] * 6
+
+
+def test_tolerance_does_not_complete_a_coasted_target_or_missing_observation():
+    config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.1)
+    detections = _detections(_obj(bbox=(0.4, 0.4, 0.6, 0.6)))
+    depth = _depth(map_=_solid_depth(1.25))
+    state = seed(_state(), detections, depth, config)
+    prediction = _step(detections=_detections(), depth=depth, state=state, config=config)
+    assert state.tracker.track is not None and not state.tracker.track.observed
+    assert prediction.status != P.ARRIVED and not state.arrived
+    blind = _step(detections=None, depth=depth, state=state, config=config)
+    assert blind.status == P.BLIND and blind.values is None and not state.arrived
+
+
+@pytest.mark.parametrize("tolerance", [0.0, 0.1])
+def test_tolerance_hold_also_stops_avoidance_translation_without_disabling_yaw(monkeypatch, tolerance):
+    config = _cfg(stop_distance_m=1.2, stop_tolerance_m=tolerance,
+                  arrive_align_tol=0.01, arrive_patience_s=5.0)
+
+    def clearance(depth, config, lateral_offset_m=0.0):
+        # A near pillar in the forward corridor, and clear space to its side.
+        return (0.4 if lateral_offset_m == 0 else 5.0), 1.0
+
+    monkeypatch.setattr(P, "_clearance", clearance)
+    decision = _step(detections=_detections(_obj(x=0.25, bbox=(0.5, 0.4, 0.7, 0.6))),
+                     depth=_depth(map_=_solid_depth(1.25)), config=config)
+    assert decision.status != P.ARRIVED and decision.values[5] != 0
+    if tolerance:
+        assert decision.values[:2] == [0.0, 0.0]
+        assert "holding translation" in decision.reason
+    else:
+        assert decision.values[1] != 0  # The default retains the old avoidance.
+
+
+def test_approach_finishes_in_tolerance_band_without_creeping_to_nominal_distance():
+    config = _cfg(stop_distance_m=1.2, stop_tolerance_m=0.1, k_fwd=0.1)
+    sim = Sim(range_m=1.6, config=config)
+    state = seed(_state(), *sim.observe(), config)
+    for _ in range(500):
+        decision = sim.run(state, ticks=1, dt=0.1, odom=False)
+        if state.arrived:
+            break
+    assert state.arrived
+    assert config.stop_distance_m + 0.08 < sim.relative()[0] <= config.arrival_distance_m + 0.01
+
+
+@pytest.mark.parametrize("key", ["stop_distance_m", "stop_tolerance_m"])
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf"), True, None, "bad"])
+def test_arrival_distances_reject_invalid_configuration(key, value):
+    with pytest.raises(ValueError, match=key):
+        _cfg(**{key: value})
+
+
+def test_arrival_distance_sum_cannot_overflow_to_infinity():
+    with pytest.raises(ValueError, match="must be finite"):
+        _cfg(stop_distance_m=1e308, stop_tolerance_m=1e308)
+
+
 # ── obstacles ────────────────────────────────────────────────────────────────
 
 # These pass a depth *map* (which is where the target's own distance comes

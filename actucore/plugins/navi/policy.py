@@ -18,7 +18,7 @@ bad at both.
   2. travel towards it      vx and vy, decomposed along its bearing
   3. turn to face it        wz from the same bearing, at the same time
   4. slow and sidestep for obstacles the depth bands report
-  5. stop at `stop_distance_m`, and say so
+  5. stop within `stop_distance_m + stop_tolerance_m`, and say so
 
 ── all three axes move together, and that is the whole point ────────────────
 
@@ -105,6 +105,10 @@ class Config:
     """
 
     stop_distance_m: float = 0.8
+    # Arrival may finish this far before the nominal camera-to-target distance.
+    # Zero preserves the existing threshold. Live target/heading requirements
+    # still apply; this is not a tolerance for stale or predicted observations.
+    stop_tolerance_m: float = 0.0
     slow_distance_m: float = 1.5
     obstacle_stop_m: float = 0.6
     # Lateral offset that still allows full speed. **Not a gate** — past it the
@@ -319,6 +323,26 @@ class Config:
     # "the robot weaves left and right on its way to a target it is already
     # facing" turned out to be.
     floor_wz_moving: float = 0.0
+
+    def __post_init__(self):
+        for key in ("stop_distance_m", "stop_tolerance_m"):
+            value = getattr(self, key)
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"{key} must be a finite nonnegative number") from error
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            setattr(self, key, value)
+        if not math.isfinite(self.arrival_distance_m):
+            raise ValueError("stop_distance_m + stop_tolerance_m must be finite")
+
+    @property
+    def arrival_distance_m(self):
+        """Maximum camera-to-target range that satisfies the distance test."""
+        return self.stop_distance_m + self.stop_tolerance_m
 
 
 @dataclass
@@ -856,7 +880,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # settled. See `floor_wz_moving`.
     raw_wz = _clamp(-config.k_yaw * bearing, config.wz_max)
 
-    within = distance is not None and distance <= config.stop_distance_m
+    within = distance is not None and distance <= config.arrival_distance_m
     if within:
         state.close_for_s += dt
     else:
@@ -886,6 +910,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
         # should not look like a dropped link in the driver's log.
         return Decision(_twist(0.0, 0.0, 0.0), ARRIVED,
                         f"target at {distance:.2f} m, stop distance reached"
+                        + f" (threshold {config.arrival_distance_m:.2f} m = "
+                          f"{config.stop_distance_m:.2f} m + "
+                          f"{config.stop_tolerance_m:.2f} m tolerance)"
                         + ("" if abs(bearing) <= config.arrive_align_tol else
                            f" (still {bearing:+.2f} off-centre after "
                            f"{state.close_for_s:.1f}s in range; not waiting to "
@@ -918,6 +945,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                * (distance - config.stop_distance_m) * align))
         reason = f"target at {distance:.2f} m"
 
+    if within:
+        # Distance is already acceptable. Wait for the existing heading/live
+        # conditions without creeping towards the nominal, tighter distance.
+        speed = 0.0
+
     if within and not live:
         # Inside the stop distance by the tracker's reckoning, but the position
         # is a prediction. Do not walk into whatever is actually there, and do
@@ -944,6 +976,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
                        state, dt)
     vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
                                             status, reason, state)
+    if within and config.stop_tolerance_m > 0 and (vx or vy):
+        # Avoidance may propose a sidestep after the approach has stopped.
+        # A configured arrival tolerance also holds that translation while
+        # heading/live-fix checks finish; retain the avoidance yaw decision.
+        vx = vy = 0.0
+        reason += "; holding translation within arrival tolerance"
 
     # **Blocked is an outcome, not a mood.** Trying to get round something is
     # the right first response, and it is what `_avoid` just did — but a robot
