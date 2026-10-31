@@ -92,6 +92,9 @@ async def hubs(force: bool = False) -> list[dict]:
             serving = info.get('serving') or {}
             hub['base_url'] = serving.get('base_url') or ''
             hub['loaded'] = list(serving.get('models') or [])
+            # 本机已下载的模型；老版本 ModelHub 不报这一项，记为 None（说不清有没有）
+            hub['installed'] = (list(serving.get('installed') or [])
+                                if 'installed' in serving else None)
             hub['state'] = info.get('state', '')
             hub['message'] = info.get('message', '')
         except Exception as e:      # noqa: BLE001 — 一个不回应的 hub 不该拖垮推理
@@ -130,6 +133,14 @@ async def status(force: bool = False) -> dict:
         name = m.get('title') or m.get('id') or ''
         return {'state': 'loading', 'title': name,
                 'message': hub.get('message') or f'{name} 正在加载。'}
+    # 没加载模型时分两种：一个都没下载（得先下载），和下载了没启动（启动就行）
+    installed = hub.get('installed')
+    if installed == []:
+        return {'state': 'idle', 'downloaded': 0,
+                'message': 'ModelHub 里还没有模型。在侧边栏「模型」里打开模型管理，下载并启动一个。'}
+    if installed:
+        return {'state': 'idle', 'downloaded': len(installed),
+                'message': f'已下载 {len(installed)} 个模型，还没有启动。在模型管理里启动一个。'}
     return {'state': 'idle',
             'message': 'ModelHub 还没有加载模型。在侧边栏「模型」里打开模型管理，启动一个模型。'}
 

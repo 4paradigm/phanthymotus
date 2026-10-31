@@ -368,3 +368,21 @@ def test_decision_core_start_and_info_report_llm_readiness():
         assert info['data']['state'] == 'loading'
     finally:
         config.main['tool_config:agentcore:decision_core'] = saved
+
+
+def test_idle_tells_no_model_downloaded_apart_from_not_started():
+    """装了 ModelHub 但一个模型都没下载时，要做的是下载，不是启动。"""
+    _hub_answers(_info([], installed=[], state='idle'))
+    st = asyncio.run(modelhub_link.status(force=True))
+    assert (st['state'], st['downloaded']) == ('idle', 0) and '下载' in st['message']
+
+    _hub_answers(_info([], installed=[{'id': 'qwen3-0.6b'}, {'id': 'qwen3-4b'}], state='idle'))
+    st = asyncio.run(modelhub_link.status(force=True))
+    assert st['downloaded'] == 2 and '已下载 2 个模型' in st['message']
+
+    # 老版本 ModelHub 不报 installed：说不清，就不猜
+    async def old_hub(url):
+        return {'state': 'idle', 'serving': {'base_url': 'http://127.0.0.1:15741/v1', 'models': []}}
+    modelhub_link.fetch_info = old_hub
+    st = asyncio.run(modelhub_link.status(force=True))
+    assert 'downloaded' not in st and st['state'] == 'idle'

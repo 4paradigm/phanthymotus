@@ -828,6 +828,10 @@ function _llmSourceInput(key, saved) {
   const status = document.createElement('div');
   status.className = 'llm-source-status';
   status.setAttribute('aria-live', 'polite');
+  // 操作放在状态框外面：框里只说「现在是什么情况」，按钮是对整个 ModelHub 的操作，
+  // 放进框里会读成「对这个模型做点什么」
+  const actions = document.createElement('div');
+  actions.className = 'llm-source-actions';
 
   const buttons = _LLM_SOURCES.map(({ value, label }) => {
     const b = document.createElement('button');
@@ -854,9 +858,10 @@ function _llmSourceInput(key, saved) {
   }
 
   function renderStatus() {
-    status.hidden = input.value !== 'modelhub';
+    status.hidden = actions.hidden = input.value !== 'modelhub';
     if (status.hidden) return;
     status.innerHTML = '';
+    actions.innerHTML = '';
     const dot = document.createElement('span');
     dot.className = 'llm-source-dot';
     const main = document.createElement('div');
@@ -890,21 +895,32 @@ function _llmSourceInput(key, saved) {
       dot.dataset.state = 'down';
       main.textContent = 'ModelHub 没有回应';
       note.textContent = '它已经装了，但现在不在线。到「设置 → 部署 → 我的服务」看看它是否在运行。';
-    } else {
+    } else if (local.state === 'loading') {
       dot.dataset.state = 'loading';
-      main.textContent = local.state === 'loading' ? (local.title || '本机模型') + ' 正在加载'
-                                                   : 'ModelHub 还没有加载模型';
-      note.textContent = local.state === 'loading'
-        ? (local.message || '')
-        : '在模型管理里下载并启动一个模型，这里会自动用上。';
-      action = _openConsoleButton(local.state === 'loading' ? '打开模型管理' : '去模型管理启动一个');
+      main.textContent = (local.title || '本机模型') + ' 正在加载';
+      note.textContent = local.message || '';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.downloaded === 0) {
+      // 装了 ModelHub 但一个模型都没下载：要做的是「下载」，不是「启动」
+      dot.dataset.state = 'off';
+      main.textContent = 'ModelHub 里还没有模型';
+      note.textContent = '先在模型管理里下载一个模型并启动，这里会自动用上。';
+      action = _openConsoleButton('去模型管理下载模型');
+    } else {
+      dot.dataset.state = 'off';
+      main.textContent = local.downloaded
+        ? `已下载 ${local.downloaded} 个模型，还没有启动`
+        : 'ModelHub 还没有启动模型';
+      note.textContent = '在模型管理里启动一个模型，这里会自动用上。';
+      action = _openConsoleButton('去模型管理启动模型');
     }
     status.append(dot, main);
     if (note.textContent) status.appendChild(note);
-    if (action) status.appendChild(action);
+    if (action) actions.appendChild(action);
+    actions.hidden = !action;
   }
 
-  wrap.append(input, seg, status);
+  wrap.append(input, seg, status, actions);
   select(input.value);
 
   const load = () => fetch('/api/config/local-llm')
