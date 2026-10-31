@@ -142,8 +142,8 @@ parse_mirror_arg() {
 }
 
 # ── JetPack 线 ────────────────────────────────────────────────────────
-# jetpack_vars <5.11|6.1|7.2> —— 把一条 JetPack 线的构建期事实解析出来，设置：
-#   JP_ARG    传给 Dockerfile 的 JP_VERSION build arg（511 / 61 / 72），它同时选定
+# jetpack_vars <5.11|6.1|7.1|7.2> —— 把一条 JetPack 线的构建期事实解析出来，设置：
+#   JP_ARG    传给 Dockerfile 的 JP_VERSION build arg（511 / 61 / 71 / 72），它同时选定
 #             base 镜像，并在镜像内解析出 numpy pin 与 sherpa wheel
 #             （见 perception/Dockerfile.jetson 的 /etc/jetpack.env）
 #   ACC_ARCH  resource-center 的过滤依据（大版本粒度，见 resource-center/lib/arch.ts）：
@@ -155,9 +155,15 @@ jetpack_vars() {
     case "$1" in
         5.11) JP_ARG=511; ACC_ARCH="jetson-jp5" ;;
         6.1)  JP_ARG=61;  ACC_ARCH="jetson-jp6" ;;
+        # 7.1 和 7.2 的 ACC_ARCH 相同（resource-center 只按大版本过滤），但两条线的
+        # 驱动 CUDA 不同（R38.4 是 13.0，R39.2 是 13.2），镜像里的 CUDA 不能高于驱动 ——
+        # 7.2 的镜像装到 7.1 的机器上会在 vLLM 初始化时报 PTX 不支持。agent-core 从
+        # 内核版本也分不出这两条线（都是 6.8），所以市场过滤目前拦不住，镜像 tag 后缀
+        # -jetson-jp7.1 / -jetson-jp7.2 是唯一的区分。
+        7.1)  JP_ARG=71;  ACC_ARCH="jetson-jp7" ;;
         7.2)  JP_ARG=72;  ACC_ARCH="jetson-jp7" ;;
         *)
-            echo "Unknown JetPack version: $1 (support: 5.11, 6.1, 7.2)" >&2
+            echo "Unknown JetPack version: $1 (support: 5.11, 6.1, 7.1, 7.2)" >&2
             return 1
             ;;
     esac
