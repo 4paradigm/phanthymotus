@@ -120,8 +120,14 @@ def _register_core_mcp(silent=False):
                 'configSchema': {
                     'type': 'object',
                     'properties': {
-                        'llm_url':   {'type': 'string', 'description': 'LLM API URL'},
-                        'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password'},
+                        # 选项由 /api/config/llm-sources 现查（本机 ModelHub 上有哪些模型），
+                        # 存的是引用而不是地址，见 modelhub_link.py
+                        'llm_source': {'type': 'string', 'format': 'llm-source', 'default': 'cloud',
+                                       'description': '大模型：云端 API，或本机 ModelHub 上的模型（选本机时，下面的云端配置作为本机不可用时的后备，可以不填）'},
+                        'llm_url':   {'type': 'string', 'description': 'LLM API URL',
+                                      'x-required-when': {'llm_source': 'cloud'}},
+                        'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password',
+                                      'x-required-when': {'llm_source': 'cloud'}},
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': '思考模式：开启后模型会先推理再回答，但只给各家支持的最低推理档位（延迟仍高于关闭）；关闭则完全不推理，响应最快', 'default': False},

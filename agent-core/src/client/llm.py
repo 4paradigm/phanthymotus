@@ -60,10 +60,19 @@ STREAM_ENABLED = os.environ.get('LLM_STREAM', '1').strip().lower() not in ('0', 
 FIRST_TOKEN_TIMEOUTS_S = _env_floats('LLM_FIRST_TOKEN_TIMEOUT', [10.0, 20.0, 60.0])
 
 
-def _first_token_timeout(attempt: int) -> float:
+def _first_token_timeout(attempt: int, ladder: list | None = None) -> float:
     """第 attempt 次尝试（从 0 起）的首 token 期限；超出阶梯长度就沿用最后一级。"""
-    ladder = FIRST_TOKEN_TIMEOUTS_S or [10.0]
+    ladder = ladder or FIRST_TOKEN_TIMEOUTS_S or [10.0]
     return ladder[min(attempt, len(ladder) - 1)]
+
+
+# 本机模型（ModelHub）的首 token 阶梯。上面那条是按托管 router 定的（36k 的 prompt
+# 首字 2–3 秒），本机是另一个量级：Thor 上 4B 模型对 80k token 的冷 prompt，prefill
+# 实测 87.8 秒，前缀命中之后 0.38 秒。拿 10 秒去卡它，长会话的第一轮就会在 prefill
+# 中途被打断、再重发同一个重请求 —— 正是上面说的 #7069 死锁。所以本机第一级就要盖住
+# 一次冷 prefill，并且只重试一次：本机真挂了该做的是转去云端，不是再等三轮。
+LOCAL_FIRST_TOKEN_TIMEOUTS_S = _env_floats('LLM_LOCAL_FIRST_TOKEN_TIMEOUT', [180.0, 300.0])
+LOCAL_MAX_RETRIES = 1
 # chunk 间隔期限：生成中途断流。已经开始出字之后，token 是连着来的，间隔远小于
 # 1 秒，所以 10 秒的静默只可能是断流。注意这一闸管的是「两帧之间」，不是总时长，
 # 长回答不受影响；唯一的误伤场景是服务端在推理阶段一帧都不发（think_mode=True
@@ -578,8 +587,15 @@ class Client():
         的下标就和 client_list 错开了——跳过第 0 条，第 1 条的 client 就会拿着
         第 0 条的 model 去请求，后面每条都错一位。
         """
-        self.config_list = [c for c in config.main['client']['llm']
-                            if c.get('key')]  # 跳过未配置 credentials 的条目
+        import modelhub_link
+        entries = list(config.main['client']['llm'] or [])
+        # 本机模型那条没有 url/key —— 地址每次请求前按引用现查，见 _local_endpoint
+        self.local_cfg = next((c for c in entries
+                               if modelhub_link.is_local(c.get('source'))), None)
+        self._local_clients: dict = {}
+        self._local_unavailable = None    # 上一次「本机用不了」的原因，变了才打日志
+        self.config_list = [c for c in entries
+                            if not c.get('source') and c.get('key')]  # 跳过未配置 credentials 的条目
         self.client_list = [
             openai.AsyncOpenAI(
                 base_url=config_it['url'],
@@ -680,11 +696,12 @@ class Client():
                         kwargs.pop('extra_body', None)
                     continue
 
-        async def _go_stream(client, model, think_mode: bool, attempt: int) -> dict:
+        async def _go_stream(client, model, think_mode: bool, attempt: int,
+                             ladder: list | None = None) -> dict:
             url = str(client.base_url)
             t0 = time.perf_counter()
             acc = _StreamAccumulator()
-            first_timeout = _first_token_timeout(attempt)
+            first_timeout = _first_token_timeout(attempt, ladder)
             kwargs = dict(
                 model=model,
                 messages=message_list,
@@ -803,14 +820,158 @@ class Client():
                 print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
                 raise
 
-        async def _go(client, model, think_mode: bool, attempt: int = 0) -> dict:
+        async def _go(client, model, think_mode: bool, attempt: int = 0,
+                      ladder: list | None = None) -> dict:
             if STREAM_ENABLED:
-                return await _go_stream(client, model, think_mode, attempt)
+                return await _go_stream(client, model, think_mode, attempt, ladder)
             return await _go_blocking(client, model, think_mode, attempt)
 
+        async def _race(configs, client_list, endpoint_dead, max_retries: int,
+                        ladder: list | None = None, _override_model: str | None = None) -> dict:
+            """在一组 endpoint 上竞速 + 按错误类型重试。endpoint_dead 原地改写。"""
+            last_error = None
+            for attempt in range(max_retries + 1):
+                # 筛选存活的 endpoint
+                alive = [
+                    (i, client_list[i], configs[i])
+                    for i in range(len(client_list))
+                    if not endpoint_dead[i]
+                ]
+                if not alive:
+                    # 全部标记为 dead，重置后再试
+                    endpoint_dead = [False] * len(client_list)
+                    alive = [(i, client_list[i], configs[i]) for i in range(len(client_list))]
+
+                # 竞速调用所有存活 endpoint
+                task_list = [
+                    asyncio.create_task(_go(c, _override_model or cfg['model'],
+                                            cfg.get('think_mode', False), attempt, ladder))
+                    for _, c, cfg in alive
+                ]
+
+                # 如果有 cancel_event / reconsider_event，加入哨兵 task 实现用户消息抢占
+                cancel_task = None
+                reconsider_task = None
+                wait_tasks = list(task_list)
+                if cancel_event:
+                    cancel_task = asyncio.create_task(cancel_event.wait())
+                    wait_tasks.append(cancel_task)
+                if reconsider_event:
+                    reconsider_task = asyncio.create_task(reconsider_event.wait())
+                    wait_tasks.append(reconsider_task)
+
+                done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+
+                # 如果 cancel 先完成 → 中断当前 turn
+                if cancel_task and cancel_task in done:
+                    for t in task_list:
+                        t.cancel()
+                    from event.llm import TurnCancelled
+                    raise TurnCancelled("Interrupted by user message during LLM call")
+
+                # reconsider 先完成 → 这次请求作废，但 turn 不结束，调用方原地重问
+                if reconsider_task and reconsider_task in done:
+                    for t in task_list:
+                        t.cancel()
+                    from event.llm import RoundReconsider
+                    raise RoundReconsider("Higher-priority input arrived during LLM call")
+
+                # 检查是否有成功的
+                for t in done:
+                    if not t.exception():
+                        return t.result()
+
+                # 所有 done 的都失败了，取第一个错误做分类
+                error = next(iter(done)).exception()
+                last_error = error
+                kind, retry_after = _classify_error(error)
+
+                print(f'[llm] error classified as {kind} (attempt {attempt + 1}/{max_retries + 1})')
+
+                if kind == LLMErrorKind.BILLING:
+                    # 标记触发 402 的 endpoint 为 dead，切换到下一个
+                    for idx, _, cfg in alive:
+                        endpoint_dead[idx] = True
+                    print(f'[llm] billing error — marked endpoint(s) dead, trying others')
+                    continue  # 立即重试剩余 endpoint
+
+                if kind == LLMErrorKind.AUTH:
+                    # 认证错误不可恢复
+                    for idx, _, cfg in alive:
+                        endpoint_dead[idx] = True
+                    print(f'[llm] auth error — marked endpoint(s) dead')
+                    continue
+
+                if kind == LLMErrorKind.RATE_LIMIT:
+                    if attempt < max_retries:
+                        wait = min(retry_after or 10.0, 30.0)
+                        print(f'[llm] rate limited — waiting {wait:.1f}s before retry')
+                        await asyncio.sleep(wait)
+                        continue
+
+                if kind == LLMErrorKind.SERVER_ERROR:
+                    if attempt < max_retries:
+                        wait = retry_after or (3.0 * (attempt + 1))  # 递增退避
+                        print(f'[llm] server error — waiting {wait:.1f}s before retry')
+                        await asyncio.sleep(wait)
+                        continue
+
+                if kind == LLMErrorKind.TIMEOUT:
+                    if attempt < max_retries:
+                        print(f'[llm] timeout — retrying immediately '
+                              f'(first-token budget {_first_token_timeout(attempt + 1, ladder):.0f}s)')
+                        continue
+
+                if kind == LLMErrorKind.CONNECTION:
+                    if attempt < max_retries:
+                        wait = retry_after or 2.0
+                        print(f'[llm] connection failed — retrying in {wait:.1f}s (check network)')
+                        await asyncio.sleep(wait)
+                        continue
+                    else:
+                        print(f'[llm] connection failed after {max_retries + 1} attempts — LLM unreachable, check network connectivity')
+
+                if kind == LLMErrorKind.CONTEXT_OVERFLOW:
+                    # 上下文溢出：不重试，由调用方处理（需要压缩历史）
+                    print(f'[llm] context overflow — caller should compress history')
+                    raise error
+
+                # UNKNOWN：不重试
+                break
+
+            raise last_error
+
+        # ── 本机模型优先，云端兜底 ────────────────────────────────────────────
+        # 选了本机模型时先只问本机；它没就绪、没回应、或者这一次彻底失败了，才去
+        # 问云端。不能和云端一起竞速：托管 router 几乎总是先回第一个字，本机就永远
+        # 轮不到，白占着十几 GB 统一内存。
+        local = await self._local_endpoint(model_override)
+        if local is not None:
+            lclient, lcfg, target = local
+            try:
+                msg = await _race([lcfg], [lclient], [False], LOCAL_MAX_RETRIES,
+                                  LOCAL_FIRST_TOKEN_TIMEOUTS_S)
+            except Exception as e:
+                kind, _ = _classify_error(e)
+                # 抢占不是失败；上下文溢出要由调用方压缩历史 —— 换到云端只是把同一个
+                # 超长请求再发一遍
+                if (type(e).__name__ in ('TurnCancelled', 'RoundReconsider')
+                        or kind == LLMErrorKind.CONTEXT_OVERFLOW or not self.client_list):
+                    raise
+                print(f'[llm] local model {lcfg["model"]} failed ({kind}) — falling back to cloud')
+            else:
+                if isinstance(msg.get('_usage'), dict):
+                    # 给主循环按本机的上下文容量提前压缩历史用，见 event/llm.py
+                    msg['_usage']['served_by'] = 'modelhub'
+                    msg['_usage']['context_tokens'] = target.get('context_tokens')
+                return msg
+        elif getattr(self, 'local_cfg', None) and not self.client_list:
+            raise RuntimeError(f'本机模型现在用不了（{self._local_unavailable}），'
+                               f'也没有配置云端后备')
+
         configs = self.config_list
-        last_error = None
-        max_retries = 2  # 重试上限
 
         # model_override: select matching endpoints or override model on first endpoint
         _override_model = None
@@ -830,115 +991,34 @@ class Client():
             client_list = self.client_list
             endpoint_dead = self._endpoint_dead
 
-        for attempt in range(max_retries + 1):
-            # 筛选存活的 endpoint
-            alive = [
-                (i, client_list[i], configs[i])
-                for i in range(len(client_list))
-                if not endpoint_dead[i]
-            ]
-            if not alive:
-                # 全部标记为 dead，重置后再试
-                endpoint_dead = [False] * len(client_list)
-                alive = [(i, client_list[i], configs[i]) for i in range(len(client_list))]
+        return await _race(configs, client_list, endpoint_dead, 2, None, _override_model)
 
-            # 竞速调用所有存活 endpoint
-            task_list = [
-                asyncio.create_task(_go(c, _override_model or cfg['model'],
-                                        cfg.get('think_mode', False), attempt))
-                for _, c, cfg in alive
-            ]
-
-            # 如果有 cancel_event / reconsider_event，加入哨兵 task 实现用户消息抢占
-            cancel_task = None
-            reconsider_task = None
-            wait_tasks = list(task_list)
-            if cancel_event:
-                cancel_task = asyncio.create_task(cancel_event.wait())
-                wait_tasks.append(cancel_task)
-            if reconsider_event:
-                reconsider_task = asyncio.create_task(reconsider_event.wait())
-                wait_tasks.append(reconsider_task)
-
-            done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
-
-            # 如果 cancel 先完成 → 中断当前 turn
-            if cancel_task and cancel_task in done:
-                for t in task_list:
-                    t.cancel()
-                from event.llm import TurnCancelled
-                raise TurnCancelled("Interrupted by user message during LLM call")
-
-            # reconsider 先完成 → 这次请求作废，但 turn 不结束，调用方原地重问
-            if reconsider_task and reconsider_task in done:
-                for t in task_list:
-                    t.cancel()
-                from event.llm import RoundReconsider
-                raise RoundReconsider("Higher-priority input arrived during LLM call")
-
-            # 检查是否有成功的
-            for t in done:
-                if not t.exception():
-                    return t.result()
-
-            # 所有 done 的都失败了，取第一个错误做分类
-            error = next(iter(done)).exception()
-            last_error = error
-            kind, retry_after = _classify_error(error)
-
-            print(f'[llm] error classified as {kind} (attempt {attempt + 1}/{max_retries + 1})')
-
-            if kind == LLMErrorKind.BILLING:
-                # 标记触发 402 的 endpoint 为 dead，切换到下一个
-                for idx, _, cfg in alive:
-                    endpoint_dead[idx] = True
-                print(f'[llm] billing error — marked endpoint(s) dead, trying others')
-                continue  # 立即重试剩余 endpoint
-
-            if kind == LLMErrorKind.AUTH:
-                # 认证错误不可恢复
-                for idx, _, cfg in alive:
-                    endpoint_dead[idx] = True
-                print(f'[llm] auth error — marked endpoint(s) dead')
-                continue
-
-            if kind == LLMErrorKind.RATE_LIMIT:
-                if attempt < max_retries:
-                    wait = min(retry_after or 10.0, 30.0)
-                    print(f'[llm] rate limited — waiting {wait:.1f}s before retry')
-                    await asyncio.sleep(wait)
-                    continue
-
-            if kind == LLMErrorKind.SERVER_ERROR:
-                if attempt < max_retries:
-                    wait = retry_after or (3.0 * (attempt + 1))  # 递增退避
-                    print(f'[llm] server error — waiting {wait:.1f}s before retry')
-                    await asyncio.sleep(wait)
-                    continue
-
-            if kind == LLMErrorKind.TIMEOUT:
-                if attempt < max_retries:
-                    print(f'[llm] timeout — retrying immediately '
-                          f'(first-token budget {_first_token_timeout(attempt + 1):.0f}s)')
-                    continue
-
-            if kind == LLMErrorKind.CONNECTION:
-                if attempt < max_retries:
-                    wait = retry_after or 2.0
-                    print(f'[llm] connection failed — retrying in {wait:.1f}s (check network)')
-                    await asyncio.sleep(wait)
-                    continue
-                else:
-                    print(f'[llm] connection failed after {max_retries + 1} attempts — LLM unreachable, check network connectivity')
-
-            if kind == LLMErrorKind.CONTEXT_OVERFLOW:
-                # 上下文溢出：不重试，由调用方处理（需要压缩历史）
-                print(f'[llm] context overflow — caller should compress history')
-                raise error
-
-            # UNKNOWN：不重试
-            break
-
-        raise last_error
+    async def _local_endpoint(self, model_override):
+        """(client, cfg, target)，或 None：没选本机、本机现在用不了、或者点名要了别的模型。"""
+        cfg = getattr(self, 'local_cfg', None)
+        if not cfg:
+            return None
+        import modelhub_link
+        target, why = await modelhub_link.resolve(cfg.get('source', ''))
+        if target and model_override and model_override != target['model']:
+            return None     # 子代理点名要的是别的（云端）模型
+        if target is None:
+            if why != self._local_unavailable:
+                print(f'[llm] local model unavailable: {why}'
+                      + (' — using cloud' if self.client_list else ''))
+            self._local_unavailable = why
+            return None
+        if self._local_unavailable is not None:
+            print(f'[llm] local model {target["model"]} is back')
+            self._local_unavailable = None
+        client = self._local_clients.get(target['base_url'])
+        if client is None:
+            client = openai.AsyncOpenAI(
+                base_url=target['base_url'],
+                api_key='modelhub',        # 网关不验 key，但 SDK 要求非空
+                max_retries=0,
+                timeout=httpx.Timeout(connect=5.0, read=600.0, write=10.0, pool=10.0),
+                http_client=httpx.AsyncClient(event_hooks={"request": [_log_request]}),
+            )
+            self._local_clients[target['base_url']] = client
+        return client, {**cfg, 'model': target['model']}, target

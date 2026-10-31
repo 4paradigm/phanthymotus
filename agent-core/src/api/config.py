@@ -1432,6 +1432,26 @@ async def config_get():
     }
 
 
+@router.get('/llm-sources')
+async def llm_sources(current: str = ''):
+    """decision_core 卡片「大模型」下拉的选项，以及现在实际在用哪一个。
+
+    选项现查本机 ModelHub（modelhub_link），所以刚在 ModelHub 里下好、加载好的模型
+    打开配置就能看到，不用重启 agent-core。
+    """
+    import modelhub_link
+    source = current or (config.main.get('services', {}).get('llm', {}).get('source')
+                         or modelhub_link.SOURCE_CLOUD)
+    active = {'source': source, 'local': None, 'reason': ''}
+    if modelhub_link.is_local(source):
+        target, why = await modelhub_link.resolve(source)
+        active['local'], active['reason'] = target, why
+    return {'code': 200, 'data': {
+        'options': await modelhub_link.source_options(current),
+        'active': active,
+    }}
+
+
 @router.post('')
 async def config_save(req: ConfigSaveRequest):
     services = config.main.get('services', {})
@@ -1439,21 +1459,23 @@ async def config_save(req: ConfigSaveRequest):
     # LLM
     existing_key = services.get('llm', {}).get('key', '')
     new_key = req.services.llm.key if (req.services.llm.key and req.services.llm.key != '****') else existing_key
+    # 设置页的表单不管「用本机还是云端模型」——那是 decision_core 卡片上选的。
+    # 这里照原样留着，否则在设置页点一次保存就把本机模型悄悄换回了云端。
+    import modelhub_link
+    source = services.get('llm', {}).get('source') or modelhub_link.SOURCE_CLOUD
     services['llm'] = {
         'url':   _normalize_llm_url(req.services.llm.url),
         'key':   new_key,
         'model': req.services.llm.model,
         'think_mode': req.services.llm.think_mode,
+        'source': source,
     }
 
     # Sync to client.llm (operational LLM config)
     client_cfg = config.main.get('client', {})
-    client_cfg['llm'] = [{
-        'url':   services['llm']['url'],
-        'key':   services['llm']['key'],
-        'model': services['llm']['model'],
-        'think_mode': services['llm']['think_mode'],
-    }]
+    client_cfg['llm'] = modelhub_link.client_entries(
+        source, services['llm']['url'], services['llm']['key'],
+        services['llm']['model'], services['llm']['think_mode'])
     config.main['client'] = client_cfg
     # Reinitialize the LLM client with new config
     import client as client_mod

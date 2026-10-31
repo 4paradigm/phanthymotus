@@ -710,6 +710,40 @@ export function hasSharedRequired(configSchema) {
   return required.some(k => props[k] && props[k].scope !== 'instance');
 }
 
+/**
+ * decision_core 的「大模型」下拉：云端，或本机 ModelHub 上的模型。
+ *
+ * 选项不写在 schema 里，打开时现查 —— 刚在 ModelHub 里下好、加载好的模型马上就能
+ * 选，不用重启 agent-core。存的是引用（'modelhub' / 'modelhub:<id>'），不是地址。
+ */
+function _llmSourceInput(key, saved) {
+  const input = document.createElement('select');
+  input.className = 'tool-config-input';
+  input.dataset.key = key;
+  const keep = document.createElement('option');
+  keep.value = saved;
+  keep.textContent = '正在查本机模型…';
+  input.appendChild(keep);
+  input.value = saved;
+  fetch(`/api/config/llm-sources?current=${encodeURIComponent(saved)}`)
+    .then(r => r.json())
+    .then(json => {
+      const options = (json.data && json.data.options) || [];
+      input.innerHTML = '';
+      for (const o of options) {
+        const opt = document.createElement('option');
+        opt.value = o.value;
+        opt.textContent = o.label;
+        opt.disabled = !!o.disabled && o.value !== saved;
+        input.appendChild(opt);
+      }
+      input.value = saved;
+      input.dispatchEvent(new Event('change'));
+    })
+    .catch(() => { keep.textContent = `${saved}（查不到本机模型）`; });
+  return input;
+}
+
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
@@ -744,7 +778,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
-    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -798,6 +832,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
         key, savedValues[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1108,7 +1144,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     // were one field, so a description written to explain a trade-off became
     // the label and the form turned into an essay. A schema with no title
     // still falls back to its description, as before.
-    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -1162,6 +1198,8 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
         key, vals[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';

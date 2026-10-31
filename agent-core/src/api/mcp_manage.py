@@ -940,9 +940,13 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         llm_key = req.arguments.get('llm_key', '')
         llm_model = req.arguments.get('llm_model', '')
         think_mode = req.arguments.get('think_mode', False)
-        if llm_url and llm_key:
+        # 'cloud' / 'modelhub' / 'modelhub:<model>'。没带这个键的老配置就是云端。
+        import modelhub_link
+        llm_source = req.arguments.get('llm_source') or modelhub_link.SOURCE_CLOUD
+        if (llm_url and llm_key) or modelhub_link.is_local(llm_source):
             client_cfg = config.main.get('client', {})
-            client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model, 'think_mode': think_mode}]
+            client_cfg['llm'] = modelhub_link.client_entries(
+                llm_source, llm_url, llm_key, llm_model, think_mode)
             config.main['client'] = client_cfg
 
             # Mirror into services.llm as well. The dashboard has two places
@@ -962,8 +966,9 @@ async def _handle_agentcore_call(req: MCPCallRequest):
                 # Preserve fields this card does not expose rather than
                 # dropping them; think_mode is set here, others are not.
                 'think_mode': think_mode,
+                'source': llm_source,
                 **{k: v for k, v in existing_llm.items()
-                   if k not in ('url', 'key', 'model', 'think_mode')},
+                   if k not in ('url', 'key', 'model', 'think_mode', 'source')},
             }
             config.main['services'] = services_cfg
 
