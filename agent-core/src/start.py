@@ -462,6 +462,11 @@ async def lifespan(app):
     import hostarch
     print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
 
+    # 上一次 agent-core 升级留下的 restart helper 容器：等它结束、记下结果、删掉。
+    # 后台跑 —— 它这时可能还在对本进程做 compose up，不能等它
+    import api.system as _system_api
+    loop.run_in_executor(None, _system_api.cleanup_restart_helper)
+
     # Put the DDS profile in place *before* anything creates a participant —
     # FastDDS reads it once, at first participant creation, so provisioning it
     # after ros2_bridge.start() would have no effect until the next restart.

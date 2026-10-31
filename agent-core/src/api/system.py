@@ -22,6 +22,87 @@ from api.deploy_stream import begin_run, emit_threadsafe, end_run
 
 router = fastapi.APIRouter(prefix='/system', tags=['system'])
 
+# ── restart helper ───────────────────────────────────────────────────────────
+#
+# helper 换掉的是本进程，所以以前用 remove=True 起它、发完「容器即将切换」就不管了，
+# 成败由前端重连后看镜像 tag 判断。可 helper 失败时本进程**根本没被换掉**：2026-11-01
+# thor_pack 上 helper 的 docker 客户端太旧（API 1.43），新 Docker 直接拒绝，helper
+# 一秒内退出，错误随 remove=True 一起消失，进度窗口停在 90% 不动。
+#
+# 现在 helper 有固定名字、不自动删除，本进程启动它之后盯着它：失败就把它的退出码和
+# 日志推给前端；成功的话本进程会被换掉，盯着的这段代码自然停下。新进程起来后
+# cleanup_restart_helper() 收掉留下的容器。
+HELPER_NAME = 'phanthy-motus-restart-helper'
+HELPER_WATCH_S = 180
+
+
+def _helper_reason(logs: str) -> str:
+    """helper 日志 → 一句给人看的原因。认得的说人话，不认得的给最后一行。"""
+    if 'client version' in logs and 'too old' in logs:
+        return ('restart helper 里的 docker 客户端太旧，这台机器的 Docker 不再接受它。'
+                '需要更新 restart helper 镜像（deploy/build_restart.sh）。')
+    lines = [l.strip() for l in logs.splitlines() if l.strip()]
+    errors = [l for l in lines if 'ERROR' in l or 'Error' in l or 'error' in l]
+    return (errors or lines or ['没有输出'])[-1][:300]
+
+
+def _watch_helper(helper, timeout_s: float = HELPER_WATCH_S, poll_s: float = 2.0) -> None:
+    """盯着 helper 直到它退出。走到失败分支时本进程一定还活着，说明升级没完成。"""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        try:
+            helper.reload()
+        except Exception:
+            return              # 容器已经不在了：新进程起来后清掉的，升级完成
+        if helper.status not in ('exited', 'dead'):
+            continue
+        code = (helper.attrs.get('State') or {}).get('ExitCode')
+        try:
+            logs = helper.logs(tail=30).decode('utf-8', errors='replace')
+        except Exception:
+            logs = ''
+        if code == 0:
+            _set_error('restart helper 报告完成，但 agent-core 没有被替换',
+                       suggestion=f'到机器上看 docker logs {HELPER_NAME}。')
+        else:
+            print(f'[system] restart helper exited {code}:\n{logs}')
+            _set_error(f'升级没有完成：restart helper 退出（code {code}）。{_helper_reason(logs)}',
+                       suggestion='当前版本没有变，仍在运行。')
+            try:
+                helper.remove()
+            except Exception:
+                pass
+        return
+    _set_error(f'升级超过 {int(timeout_s // 60)} 分钟没有完成',
+               suggestion=f'到机器上看 docker logs {HELPER_NAME}。')
+
+
+def cleanup_restart_helper(client=None, wait_s: float = 120) -> None:
+    """新进程启动时收掉上一次升级留下的 helper 容器，把它的结果记进日志。"""
+    try:
+        if client is None:
+            import docker as docker_sdk
+            client = docker_sdk.from_env()
+        helper = client.containers.get(HELPER_NAME)
+    except Exception:
+        return
+    deadline = time.monotonic() + wait_s
+    while helper.status == 'running' and time.monotonic() < deadline:
+        time.sleep(2)               # 它正在 compose up 本进程，等它退出
+        try:
+            helper.reload()
+        except Exception:
+            return
+    code = (helper.attrs.get('State') or {}).get('ExitCode')
+    print(f'[system] previous restart helper finished with exit code {code}')
+    if helper.status != 'running':
+        try:
+            helper.remove()
+        except Exception:
+            pass
+
+
 # ── In-memory update progress ─────────────────────────────────────────────────
 
 _update_state: dict = {'step': '', 'error': '', 'ts': 0}
@@ -228,10 +309,20 @@ def _pull_and_restart_sync(image: str) -> None:
                   percent=85, stage='start')
         compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
         container_name = os.environ.get('CONTAINER_NAME', 'phanthy-motus-agent-core-1')
-        client.containers.run(
+        try:
+            stale = client.containers.get(HELPER_NAME)
+        except Exception:
+            stale = None
+        if stale is not None:
+            if stale.status == 'running':
+                _set_error('上一次升级还没有结束', suggestion='等它结束后再试。')
+                return
+            stale.remove(force=True)
+        helper = client.containers.run(
             restart_image,
+            name=HELPER_NAME,
             detach=True,
-            remove=True,
+            remove=False,           # 失败时要读它的退出码和日志，见 _watch_helper
             network_mode='host',
             volumes={
                 '/var/run/docker.sock': {'bind': '/var/run/docker.sock', 'mode': 'rw'},
@@ -245,11 +336,14 @@ def _pull_and_restart_sync(image: str) -> None:
                 'CONTAINER_NAME': container_name,
             },
         )
-        # 这是本进程能发出的最后一条消息：restart helper 接下来就把它换掉。没有 done
-        # 事件 —— 升级是否成功要由重连后的 tag 判断，见 web/js/deploy-panel.js。
+        # 成功时这是本进程能发出的最后一条消息：restart helper 接下来就把它换掉。没有
+        # done 事件 —— 升级是否成功要由重连后的 tag 判断，见 web/js/deploy-progress.js。
+        # 失败时本进程还活着，_watch_helper 会把原因推出来。
         _set_step('restart helper 已启动，容器即将切换…', percent=90, stage='restart')
     except Exception as e:
         _set_error(f'启动 restart helper 失败: {e}')
+        return
+    _watch_helper(helper)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
