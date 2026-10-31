@@ -1432,6 +1432,39 @@ async def config_get():
     }
 
 
+@router.get('/local-llm')
+async def local_llm():
+    """本机模型（ModelHub）现在的状态：能不能用、是哪个模型、上下文多长。
+
+    决策核心配置里选「本机」时显示的那一行。现查，不走缓存 —— 刚在 ModelHub 里
+    加载好的模型，打开配置就该看到。
+    """
+    import modelhub_link
+    st = await modelhub_link.status(force=True)
+    if st['state'] == 'absent':
+        st['install'] = await _modelhub_install_option()
+    return {'code': 200, 'data': st}
+
+
+async def _modelhub_install_option() -> dict:
+    """没装 ModelHub 时，这台机器能不能从「部署」里装一个。
+
+    部署列表已经按本机的加速器过滤过（resource-center 只返回这台机器跑得了的镜像），
+    所以列表里有 ModelHub 就能装；没有时分两种说法：机器本身不是 Thor（ModelHub 目前
+    只有 JetPack 7 的镜像），或者是 Thor 但还没有发布可用版本。
+    """
+    from api.registry import registry_catalog
+    try:
+        res = await registry_catalog()
+    except Exception:       # noqa: BLE001 — 查不到部署列表就只给通用说法
+        return {'available': False, 'reason': 'unknown'}
+    acc = ((res or {}).get('facets') or {}).get('acc_arch') or ''
+    if ((res or {}).get('data') or {}).get('modelhub'):
+        return {'available': True, 'acc_arch': acc}
+    return {'available': False, 'acc_arch': acc,
+            'reason': 'not_published' if acc == 'jetson-jp7' else 'unsupported'}
+
+
 @router.post('')
 async def config_save(req: ConfigSaveRequest):
     services = config.main.get('services', {})
@@ -1439,21 +1472,23 @@ async def config_save(req: ConfigSaveRequest):
     # LLM
     existing_key = services.get('llm', {}).get('key', '')
     new_key = req.services.llm.key if (req.services.llm.key and req.services.llm.key != '****') else existing_key
+    # 设置页的表单不管「用本机还是云端模型」——那是 decision_core 卡片上选的。
+    # 这里照原样留着，否则在设置页点一次保存就把本机模型悄悄换回了云端。
+    import modelhub_link
+    source = services.get('llm', {}).get('source') or modelhub_link.SOURCE_CLOUD
     services['llm'] = {
         'url':   _normalize_llm_url(req.services.llm.url),
         'key':   new_key,
         'model': req.services.llm.model,
         'think_mode': req.services.llm.think_mode,
+        'source': source,
     }
 
     # Sync to client.llm (operational LLM config)
     client_cfg = config.main.get('client', {})
-    client_cfg['llm'] = [{
-        'url':   services['llm']['url'],
-        'key':   services['llm']['key'],
-        'model': services['llm']['model'],
-        'think_mode': services['llm']['think_mode'],
-    }]
+    client_cfg['llm'] = modelhub_link.client_entries(
+        source, services['llm']['url'], services['llm']['key'],
+        services['llm']['model'], services['llm']['think_mode'])
     config.main['client'] = client_cfg
     # Reinitialize the LLM client with new config
     import client as client_mod

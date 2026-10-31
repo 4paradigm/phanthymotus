@@ -535,6 +535,28 @@ html, body {
 }
 
 /* ── Tool card ─────────────────────────────────────────────────────────── */
+.sidebar-console-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.sidebar-console-entry:hover { background: var(--bg-hover); border-color: var(--border-med); }
+.sidebar-console-entry:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.console-entry-name { font-size: 13px; font-weight: 600; }
+.console-entry-desc { font-size: 11px; color: var(--text-muted); }
+@media (pointer: coarse) { .sidebar-console-entry { min-height: 48px; padding: 10px 12px; } }
+
 .sidebar-tool-card {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -834,6 +856,97 @@ html, body {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+
+/* ── 决策核心的「大模型」：云端 / 本机 ──────────────────────────────────────
+   一个二选一的切换，和输入框同高、同底色，放在表单里不显得是另一套控件。
+   选本机时下面一行状态：现在跑的是哪个模型、上下文多长，或者为什么用不了。 */
+.llm-source-seg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  height: 40px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+}
+.llm-source-opt {
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, box-shadow 0.15s;
+}
+.llm-source-opt:hover:not(.active):not(:disabled) { color: var(--text); }
+.llm-source-opt.active {
+  background: var(--bg-card);
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+}
+.llm-source-opt:disabled { color: var(--text-dim); cursor: not-allowed; }
+.llm-source-opt:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.llm-source-status {
+  display: grid;
+  grid-template-columns: 8px 1fr;
+  column-gap: 10px;
+  row-gap: 4px;
+  align-items: center;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+}
+.llm-source-status[hidden] { display: none; }   /* 上面的 display:grid 会盖过 hidden 属性 */
+.llm-source-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.llm-source-dot[data-state="ready"]   { background: var(--green);  box-shadow: 0 0 0 3px var(--green-bg); }
+.llm-source-dot[data-state="loading"] { background: var(--yellow); box-shadow: 0 0 0 3px var(--yellow-bg); }
+.llm-source-dot[data-state="down"]    { background: var(--red);    box-shadow: 0 0 0 3px var(--red-bg); }
+.llm-source-dot[data-state="off"]     { background: var(--border-med); }
+.llm-source-main {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.llm-source-ctx {
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+.llm-source-note {
+  grid-column: 2;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.llm-source-actions { margin-top: 8px; }
+.llm-source-actions[hidden] { display: none; }
+.llm-source-action {
+  padding: 6px 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.llm-source-action:hover { background: var(--accent-dim); }
+.llm-source-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ── 配置表单里的二维码字段（format: "qr"）──────────────────────────────────
    插件说"拿手机扫一下"的地方：一排选项 + 码面 + 解析后的地址。

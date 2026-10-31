@@ -85,6 +85,17 @@ def _truncate(text: str, max_bytes: int = _MAX_OUTPUT) -> str:
     return truncated + f'\n\n... [output truncated at {max_bytes} bytes]'
 
 
+def search_configured() -> bool:
+    """有没有配搜索引擎。没配时 WebSearch 不该出现在模型的工具表里。
+
+    以前它照样给模型，模型一调就拿回「Web search is not configured」，看起来就是
+    「搜索坏了」—— 用本机模型、没配搜索的机器上每轮都会碰到。搜索和用哪个大模型
+    无关：本机模型也可以配搜索引擎去拿外部信息。
+    """
+    search = (config.main.get('desktop_tools') or {}).get('search') or {}
+    return bool(search.get('type')) and search.get('type') != 'none'
+
+
 # ── WebSearch 结果格式化 ─────────────────────────────────────────────────────────
 #
 # 搜索后端对三种 search_type 返回**三种不同形状**的结果，只有 web 那种是

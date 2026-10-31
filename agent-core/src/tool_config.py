@@ -67,7 +67,26 @@ def missing_required_config(tool_obj: dict, merged_cfg: dict) -> list[str]:
     return [
         key for key in (schema.get('required') or [])
         if key in props and merged_cfg.get(key) in (None, '')
+        and required_applies(props, key, merged_cfg)
     ]
+
+
+def required_applies(props: dict, key: str, cfg: dict) -> bool:
+    """`x-required-when: {field: value | [values]}` 收窄一个 required 字段的适用条件。
+
+    decision_core 的云端 URL / Key 只在「大模型」选了云端时必填 —— 选本机模型时它们
+    是后备，留空也该能启动。控制字段没存值时按它的 default 算。
+    """
+    cond = (props.get(key) or {}).get('x-required-when')
+    if not cond:
+        return True
+    for ctrl, want in cond.items():
+        actual = cfg.get(ctrl)
+        if actual in (None, ''):
+            actual = (props.get(ctrl) or {}).get('default', '')
+        if actual not in (want if isinstance(want, list) else [want]):
+            return False
+    return True
 
 
 def plan_config_calls(tool_obj: dict, saved_shared: dict, saved_instance: dict,

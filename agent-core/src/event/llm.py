@@ -890,6 +890,14 @@ _COMPRESS_PROMPT = """你是一个对话历史压缩器。请将以下对话历�
 """
 
 
+def _context_pressured(pressure, ratio: float) -> bool:
+    """(上一轮 prompt_tokens, 本机模型一个会话的容量) 是否已过 ratio。容量未知就不算。"""
+    if not pressure:
+        return False
+    prompt_tokens, context_tokens = pressure
+    return bool(context_tokens) and prompt_tokens >= ratio * context_tokens
+
+
 async def _compress_turns(turns: list[list[dict]]) -> str:
     """用 LLM 压缩旧的 turns 为文本摘要。"""
     text = _turns_to_text(turns)
@@ -1575,6 +1583,7 @@ def get_recent_context_rich(max_turns: int = 20, max_chars: int = 6000) -> str:
 class Event:
     def __init__(self):
         self._turns: list[list[dict]] = []  # 每轮对话的消息列表
+        self._context_pressure = None  # (prompt_tokens, context_tokens)：本机模型答的上一轮
         self._sys_tools:   dict       = {}
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
@@ -2019,6 +2028,19 @@ class Event:
         # 触发条件2: 字符超限（兜底）
         if not need_compress:
             need_compress = _estimate_chars(self._turns) > threshold
+        # 触发条件3: 本机模型的上下文快满了。云端模型上下文大、溢出了再压缩（见
+        # CONTEXT_OVERFLOW 分支）也来得及；本机的上下文受 KV cache 容量限制，可能只有
+        # 几万 token，而且溢出那一下是一次白跑的长 prefill。所以按上一轮实际的
+        # prompt_tokens 提前压，不等撞墙。
+        pressured = _context_pressured(getattr(self, '_context_pressure', None),
+                                       llm_cfg.get('context_compress_ratio', 0.75))
+        if pressured:
+            need_compress = True
+            # 轮数可能不多、但每轮都很长：这时最近 max_kept 轮就已经塞满了，得多压一些
+            max_kept = min(max_kept, max(2, len(self._turns) // 2))
+            prompt_tokens, context_tokens = self._context_pressure
+            print(f'[decision] local context {prompt_tokens}/{context_tokens} tokens — '
+                  f'compressing ahead of overflow')
         if not need_compress:
             return
         if len(self._turns) <= max_kept:
@@ -2036,6 +2058,8 @@ class Event:
 
         self._summary = summary
         self._turns = recent_turns
+        if pressured:
+            self._context_pressure = None   # 下一轮的 usage 会重新报，别拿旧数再压一次
         print(f'[decision] compressed: kept {len(recent_turns)} recent turns, summary={len(summary)} chars')
 
     async def _report_progress(self) -> None:
@@ -2326,6 +2350,9 @@ class Event:
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
         system_tools = list(self._sys_tools.values())
+        from event.desktop import search_configured
+        if not search_configured():
+            system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools
@@ -2566,6 +2593,10 @@ class Event:
             # ── 用量广播 ──────────────────────────────────────────────────
             _usage = response.get('_usage')
             if _usage:
+                # 本机模型答的这一轮：记下 prompt 占了它上下文的多少，轮末据此提前压缩
+                self._context_pressure = (
+                    (_usage.get('prompt_tokens') or 0, _usage.get('context_tokens'))
+                    if _usage.get('served_by') == 'modelhub' else None)
                 _turn_usage['prompt_tokens'] += _usage.get('prompt_tokens') or 0
                 _turn_usage['completion_tokens'] += _usage.get('completion_tokens') or 0
                 _turn_usage['total_tokens'] += _usage.get('total_tokens') or 0

@@ -7,6 +7,7 @@
 import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
+import { openDeployPanel } from './deploy-panel.js';
 
 /**
  * 分区图标。
@@ -168,6 +169,7 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   if (modelhubs.length) {
     _scroll.appendChild(_buildMergedSection(modelhubs, {
       cls: 'sidebar-section-modelhub', icon: ICONS.modelhub, iconCls: 'modelhub', label: '模型',
+      consoleEntries: true,
     }));
   }
 
@@ -216,7 +218,7 @@ function _buildSection(mcp) {
  * grouped by tool type. Used for perception and actucore, which each may be
  * served by more than one container but read as a single layer in the sidebar.
  */
-function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
+function _buildMergedSection(mcps, { cls, icon, iconCls = '', label, consoleEntries = false }) {
   const section = document.createElement('div');
   section.className = `sidebar-section ${cls}`;
 
@@ -244,9 +246,18 @@ function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
   const grid = document.createElement('div');
   grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
 
+  // 有运维页的常驻服务（ModelHub）列在最前，不挂「ACTUATOR」这类分组标签 ——
+  // 它是一个入口，不是一张能连线的执行卡
+  if (consoleEntries) {
+    for (const tool of allTools.filter(t => t.inputSchema?.['x-workbench'])) {
+      grid.appendChild(_buildConsoleEntry(tool._mcp, tool));
+    }
+  }
+  const rest = consoleEntries ? allTools.filter(t => !t.inputSchema?.['x-workbench']) : allTools;
+
   // Group and render
   const groups = {};
-  for (const tool of allTools) {
+  for (const tool of rest) {
     const t = tool.type || '';
     (groups[t] = groups[t] || []).push(tool);
   }
@@ -350,6 +361,34 @@ function sidebarOwnsConfig(mcpId, tool) {
   if (!props.some(def => def.scope === 'instance')) return true;
 
   return cardsForTool(mcpId, tool.name).length === 0;
+}
+
+/**
+ * ModelHub 这类常驻服务在侧边栏是一个入口，不是可以拖上画布的卡片。
+ *
+ * 它不跟着智能控制起停（start/stop 只是查状态），决策核心也是自己找到它、
+ * 不靠画布连线 —— 放上画布唯一的用处是能点开运维页，而那一步本身就是绕路。
+ * 点这里直接打开模型管理，开启控制前后都能用。
+ */
+function _buildConsoleEntry(mcp, tool) {
+  const entry = document.createElement('button');
+  entry.type = 'button';
+  entry.className = 'sidebar-console-entry';
+  entry.dataset.mcpId = mcp.id;
+  entry.dataset.toolName = tool.name;
+  const title = tool.inputSchema['x-workbench'].title || '模型管理';
+  entry.innerHTML = `
+    <span class="console-entry-name">${_esc(title)}</span>
+    <span class="console-entry-desc">下载、启动、对话、性能测试、监控</span>`;
+  entry.addEventListener('click', async () => {
+    try {
+      const { openToolConsole } = await import('./workbench.js');
+      await openToolConsole(mcp.id, tool);
+    } catch (err) {
+      alert(`打不开${title}：${err.message}`);
+    }
+  });
+  return entry;
 }
 
 function _buildChip(mcp, tool) {
@@ -710,10 +749,204 @@ export function hasSharedRequired(configSchema) {
   return required.some(k => props[k] && props[k].scope !== 'instance');
 }
 
+/**
+ * decision_core 的「大模型」：云端或本机，二选一。
+ *
+ * 选本机时不挑具体模型 —— 用 ModelHub 当前加载的那个，换模型在模型管理里做。
+ * 所以这里只显示一行状态：现在跑的是哪个模型、上下文多长；用不了时说清楚为什么、
+ * 去哪里处理。状态打开时现查，ModelHub 那边刚加载好的模型不用重启 agent-core。
+ *
+ * 值放在一个隐藏 input 上（带 data-key），切换时派发 change —— 保存按 [data-key]
+ * 收值、x-show-when 按它的 value 判断，和其他字段走同一条路。
+ */
+const _LLM_SOURCES = [
+  { value: 'cloud',    label: '云端' },
+  { value: 'modelhub', label: '本机' },
+];
+
+/** 没装 ModelHub 时，按这台机器能不能装，给一句该怎么办。 */
+function _modelhubInstallHint(install) {
+  if (install.available) {
+    return { canInstall: true,
+             text: '本机模型由 ModelHub 提供。装好后在模型管理里下载并启动一个模型，这里会自动用上。' };
+  }
+  if (install.reason === 'unsupported') {
+    return { unsupported: true,
+             text: '本机模型由 ModelHub 提供，它目前只支持 Jetson Thor（JetPack 7）。这台机器请用云端模型。' };
+  }
+  if (install.reason === 'not_published') {
+    return { text: '部署列表里还没有这台机器能用的 ModelHub 版本，请管理员先发布。现在请先用云端模型。' };
+  }
+  return { text: '本机模型由 ModelHub 提供，请先在「设置 → 部署」里安装。' };
+}
+
+/** 「打开模型管理」：运维页叠在设置框上面打开，关掉后回到这里，状态自动刷新。 */
+let _refreshLlmStatus = null;
+function _openConsoleButton(label) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = label;
+  b.addEventListener('click', async () => {
+    try {
+      const { openModelConsole } = await import('./workbench.js');
+      await openModelConsole(() => _refreshLlmStatus?.());
+    } catch (err) {
+      alert(`打不开模型管理：${err.message}`);
+    }
+  });
+  return b;
+}
+
+function _installModelhubButton() {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = '去部署里安装 ModelHub';
+  b.addEventListener('click', () => {
+    // 先关掉配置框：部署面板是另一个 modal，叠在上面会把两个框的按钮搅在一起
+    document.getElementById('tool-config-overlay')?.classList.add('hidden');
+    openDeployPanel({ tab: 'marketplace', query: 'modelhub' });
+  });
+  return b;
+}
+
+function _llmSourceInput(key, saved) {
+  const wrap = document.createElement('div');
+  wrap.className = 'llm-source';
+
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.dataset.key = key;
+  input.value = saved === 'modelhub' ? 'modelhub' : 'cloud';
+
+  const seg = document.createElement('div');
+  seg.className = 'llm-source-seg';
+  seg.setAttribute('role', 'radiogroup');
+  seg.setAttribute('aria-label', '大模型');
+
+  const status = document.createElement('div');
+  status.className = 'llm-source-status';
+  status.setAttribute('aria-live', 'polite');
+  // 操作放在状态框外面：框里只说「现在是什么情况」，按钮是对整个 ModelHub 的操作，
+  // 放进框里会读成「对这个模型做点什么」
+  const actions = document.createElement('div');
+  actions.className = 'llm-source-actions';
+
+  const buttons = _LLM_SOURCES.map(({ value, label }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'llm-source-opt';
+    b.dataset.value = value;
+    b.setAttribute('role', 'radio');
+    b.textContent = label;
+    b.addEventListener('click', () => select(value));
+    seg.appendChild(b);
+    return b;
+  });
+
+  let local = null;     // 最近一次查到的本机状态
+  function select(value) {
+    input.value = value;
+    for (const b of buttons) {
+      const on = b.dataset.value === value;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    }
+    renderStatus();
+    input.dispatchEvent(new Event('change'));
+  }
+
+  function renderStatus() {
+    status.hidden = actions.hidden = input.value !== 'modelhub';
+    if (status.hidden) return;
+    status.innerHTML = '';
+    actions.innerHTML = '';
+    const dot = document.createElement('span');
+    dot.className = 'llm-source-dot';
+    const main = document.createElement('div');
+    main.className = 'llm-source-main';
+    const note = document.createElement('div');
+    note.className = 'llm-source-note';
+    let action = null;
+    if (!local) {
+      dot.dataset.state = 'pending';
+      main.textContent = '正在查本机模型…';
+    } else if (local.state === 'ready') {
+      dot.dataset.state = 'ready';
+      main.textContent = local.title;
+      if (local.context_tokens) {
+        const ctx = document.createElement('span');
+        ctx.className = 'llm-source-ctx';
+        ctx.textContent = `上下文 ${Math.round(local.context_tokens / 1000)}k`;
+        main.appendChild(ctx);
+      }
+      note.textContent = 'ModelHub 当前加载的模型。换模型在模型管理里操作，这里自动跟上。';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.state === 'absent') {
+      // 没装不是故障：灰点。说清楚本机模型从哪来、这台机器上该怎么办
+      dot.dataset.state = 'off';
+      const how = _modelhubInstallHint(local.install || {});
+      // 装不了的机器别说「还没装」—— 那句话暗示装上就行
+      main.textContent = how.unsupported ? '这台机器用不了本机模型' : '这台机器还没装 ModelHub';
+      note.textContent = how.text;
+      if (how.canInstall) action = _installModelhubButton();
+    } else if (local.state === 'unreachable') {
+      dot.dataset.state = 'down';
+      main.textContent = 'ModelHub 没有回应';
+      note.textContent = '它已经装了，但现在不在线。到「设置 → 部署 → 我的服务」看看它是否在运行。';
+    } else if (local.state === 'loading') {
+      dot.dataset.state = 'loading';
+      main.textContent = (local.title || '本机模型') + ' 正在加载';
+      note.textContent = local.message || '';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.downloaded === 0) {
+      // 装了 ModelHub 但一个模型都没下载：要做的是「下载」，不是「启动」
+      dot.dataset.state = 'off';
+      main.textContent = 'ModelHub 里还没有模型';
+      note.textContent = '先在模型管理里下载一个模型并启动，这里会自动用上。';
+      action = _openConsoleButton('去模型管理下载模型');
+    } else {
+      dot.dataset.state = 'off';
+      main.textContent = local.downloaded
+        ? `已下载 ${local.downloaded} 个模型，还没有启动`
+        : 'ModelHub 还没有启动模型';
+      note.textContent = '在模型管理里启动一个模型，这里会自动用上。';
+      action = _openConsoleButton('去模型管理启动模型');
+    }
+    status.append(dot, main);
+    if (note.textContent) status.appendChild(note);
+    if (action) actions.appendChild(action);
+    actions.hidden = !action;
+  }
+
+  wrap.append(input, seg, status, actions);
+  select(input.value);
+
+  const load = () => fetch('/api/config/local-llm')
+    .then(r => r.json())
+    .then(json => {
+      local = (json && json.data) || { state: 'unreachable', message: '查不到本机模型。' };
+      // 没装 ModelHub 时「本机」照样能点：点了才看得到为什么不能用、该怎么办。
+      // 置灰 + 悬停提示在触屏和 Safari 上等于什么都没说。
+      renderStatus();
+    })
+    .catch(() => {
+      local = { state: 'unreachable', message: '查不到本机模型，检查 agent-core 是否在线。' };
+      renderStatus();
+    });
+  _refreshLlmStatus = () => { local = null; renderStatus(); load(); };
+  load();
+  return wrap;
+}
+
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
-  if (isProjectRunning()) {
+  // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
+  // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
+  const liveEditable = mcpId === 'agentcore' && toolName === 'decision_core';
+  if (isProjectRunning() && !liveEditable) {
     alert('Stop agent before modifying');
     return;
   }
@@ -744,7 +977,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
-    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -798,6 +1031,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
         key, savedValues[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -902,7 +1137,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
       try {
         values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
       } catch (err) {
@@ -1108,7 +1344,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     // were one field, so a description written to explain a trade-off became
     // the label and the form turned into an essay. A schema with no title
     // still falls back to its description, as before.
-    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -1162,6 +1398,8 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
         key, vals[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -1240,7 +1478,8 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
       try {
         values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
       } catch (err) {
