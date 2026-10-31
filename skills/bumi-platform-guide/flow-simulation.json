@@ -1,0 +1,95 @@
+{
+  "simulated": true,
+  "robot_connected": false,
+  "physical_motion_verified": false,
+  "audibility_verified": false,
+  "input": "人物出现 → 请问五号车厢在哪边？",
+  "events": [
+    {
+      "event": "start",
+      "value": 101
+    },
+    {
+      "event": "exit",
+      "value": 101
+    },
+    {
+      "event": "say",
+      "value": "您好，我可以提供车厢问路和候车提醒。"
+    },
+    {
+      "event": "start",
+      "value": 104
+    },
+    {
+      "event": "say",
+      "value": "模拟场景，请沿A标识方向前往。"
+    },
+    {
+      "event": "exit",
+      "value": 104
+    },
+    {
+      "event": "say",
+      "value": "请在安全区域候车，留意现场广播。请先下后上，注意列车与站台之间的间隙。"
+    },
+    {
+      "event": "say",
+      "value": "请在安全区域候车，留意现场广播。请先下后上，注意列车与站台之间的间隙。"
+    },
+    {
+      "event": "say",
+      "value": "请在安全区域候车，留意现场广播。请先下后上，注意列车与站台之间的间隙。"
+    },
+    {
+      "event": "closed",
+      "value": null
+    }
+  ],
+  "states": [
+    {
+      "state": "waving",
+      "broadcasts": 0
+    },
+    {
+      "state": "welcoming",
+      "broadcasts": 0
+    },
+    {
+      "state": "idle",
+      "broadcasts": 0
+    },
+    {
+      "state": "answering",
+      "broadcasts": 0
+    },
+    {
+      "state": "pointing",
+      "broadcasts": 0
+    },
+    {
+      "state": "reminding",
+      "broadcasts": 0
+    },
+    {
+      "state": "reminding",
+      "broadcasts": 1
+    },
+    {
+      "state": "reminding",
+      "broadcasts": 2
+    },
+    {
+      "state": "reminding",
+      "broadcasts": 3
+    },
+    {
+      "state": "idle",
+      "broadcasts": 3
+    },
+    {
+      "state": "stopped",
+      "broadcasts": 3
+    }
+  ]
+}

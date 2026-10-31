@@ -1,0 +1,32 @@
+{
+  "mode": "demo",
+  "site_type": "railway",
+  "station_name": "演示站",
+  "platform_name": "模拟1站台",
+  "train_id": null,
+  "carriage_count": 16,
+  "direction_reference": "站在演示接待点，面向A标识",
+  "forward_landmark": "A标识方向",
+  "backward_landmark": "B标识方向",
+  "carriage_routes": [
+    {
+      "from": 1,
+      "to": 6,
+      "direction": "forward"
+    },
+    {
+      "from": 7,
+      "to": 16,
+      "direction": "backward"
+    }
+  ],
+  "staff_confirmed": false,
+  "phase": "waiting",
+  "periodic_enabled": false,
+  "routine_interval_s": 120,
+  "visual_enabled": false,
+  "config_version": "demo-railway-v1",
+  "scene_id": "demo-railway-16-v1",
+  "confirmed_scene_id": null,
+  "confirmed_config_sha256": null
+}
