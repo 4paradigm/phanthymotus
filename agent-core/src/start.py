@@ -120,23 +120,32 @@ def _register_core_mcp(silent=False):
                 'configSchema': {
                     'type': 'object',
                     'properties': {
-                        # 选项由 /api/config/llm-sources 现查（本机 ModelHub 上有哪些模型），
-                        # 存的是引用而不是地址，见 modelhub_link.py
+                        # 云端或本机，二选一。选本机不挑具体模型 —— 用 ModelHub 当前加载的那个，
+                        # 换模型在 LLM 卡片里做。见 modelhub_link.py。
+                        # 云端那组字段在选本机时隐藏但照样保存（x-keep-when-hidden），切回来不用重填。
                         'llm_source': {'type': 'string', 'format': 'llm-source', 'default': 'cloud',
-                                       'description': '大模型：云端 API，或本机 ModelHub 上的模型（选本机时，下面的云端配置作为本机不可用时的后备，可以不填）'},
+                                       'enum': ['cloud', 'modelhub'], 'title': '大模型'},
                         'llm_url':   {'type': 'string', 'description': 'LLM API URL',
+                                      'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True,
                                       'x-required-when': {'llm_source': 'cloud'}},
                         'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password',
+                                      'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True,
                                       'x-required-when': {'llm_source': 'cloud'}},
-                        'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
+                        'llm_model': {'type': 'string', 'description': 'LLM 模型名称',
+                                      'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True},
+                        'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none',
+                                        'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True},
+                        'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)',
+                                            'x-show-when': {'llm_source': 'cloud', 'search_type': 'baidu_search'},
+                                            'x-keep-when-hidden': True},
+                        'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password',
+                                           'x-show-when': {'llm_source': 'cloud', 'search_type': 'baidu_search'},
+                                           'x-keep-when-hidden': True},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': '思考模式：开启后模型会先推理再回答，但只给各家支持的最低推理档位（延迟仍高于关闭）；关闭则完全不推理，响应最快', 'default': False},
                         'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
                         'auto_narration': {'type': 'boolean', 'description': '自动播报：模型长时间不出声时，由系统自动生成一句进展汇报并通过已注册的语音/灯效等输出播报给用户', 'default': True},
                         'narration_silence_seconds': {'type': 'integer', 'description': '主动播报：距上次对用户说话多少秒后自动汇报一次进展（0 = 关闭）', 'default': 15, 'x-show-when': {'auto_narration': 'true'}},
-                        'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
-                        'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
-                        'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
                     },
                     'required': ['llm_url', 'llm_key']
                 },

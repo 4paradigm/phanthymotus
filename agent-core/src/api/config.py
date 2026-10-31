@@ -1432,24 +1432,15 @@ async def config_get():
     }
 
 
-@router.get('/llm-sources')
-async def llm_sources(current: str = ''):
-    """decision_core 卡片「大模型」下拉的选项，以及现在实际在用哪一个。
+@router.get('/local-llm')
+async def local_llm():
+    """本机模型（ModelHub）现在的状态：能不能用、是哪个模型、上下文多长。
 
-    选项现查本机 ModelHub（modelhub_link），所以刚在 ModelHub 里下好、加载好的模型
-    打开配置就能看到，不用重启 agent-core。
+    决策核心配置里选「本机」时显示的那一行。现查，不走缓存 —— 刚在 ModelHub 里
+    加载好的模型，打开配置就该看到。
     """
     import modelhub_link
-    source = current or (config.main.get('services', {}).get('llm', {}).get('source')
-                         or modelhub_link.SOURCE_CLOUD)
-    active = {'source': source, 'local': None, 'reason': ''}
-    if modelhub_link.is_local(source):
-        target, why = await modelhub_link.resolve(source)
-        active['local'], active['reason'] = target, why
-    return {'code': 200, 'data': {
-        'options': await modelhub_link.source_options(current),
-        'active': active,
-    }}
+    return {'code': 200, 'data': await modelhub_link.status(force=True)}
 
 
 @router.post('')

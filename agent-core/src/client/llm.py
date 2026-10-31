@@ -70,7 +70,7 @@ def _first_token_timeout(attempt: int, ladder: list | None = None) -> float:
 # 首字 2–3 秒），本机是另一个量级：Thor 上 4B 模型对 80k token 的冷 prompt，prefill
 # 实测 87.8 秒，前缀命中之后 0.38 秒。拿 10 秒去卡它，长会话的第一轮就会在 prefill
 # 中途被打断、再重发同一个重请求 —— 正是上面说的 #7069 死锁。所以本机第一级就要盖住
-# 一次冷 prefill，并且只重试一次：本机真挂了该做的是转去云端，不是再等三轮。
+# 一次冷 prefill，并且只重试一次：本机真挂了，再等三轮也等不回来。
 LOCAL_FIRST_TOKEN_TIMEOUTS_S = _env_floats('LLM_LOCAL_FIRST_TOKEN_TIMEOUT', [180.0, 300.0])
 LOCAL_MAX_RETRIES = 1
 # chunk 间隔期限：生成中途断流。已经开始出字之后，token 是连着来的，间隔远小于
@@ -116,6 +116,10 @@ def _valid_tool_call(tc) -> bool:
         return False
     fn = tc.get('function')
     return isinstance(fn, dict) and bool(fn.get('name'))
+
+
+class LocalModelUnavailable(RuntimeError):
+    """选了本机模型，而 ModelHub 现在给不出（没加载、在加载、没回应、不存在）。"""
 
 
 class LLMErrorKind:
@@ -943,33 +947,19 @@ class Client():
 
             raise last_error
 
-        # ── 本机模型优先，云端兜底 ────────────────────────────────────────────
-        # 选了本机模型时先只问本机；它没就绪、没回应、或者这一次彻底失败了，才去
-        # 问云端。不能和云端一起竞速：托管 router 几乎总是先回第一个字，本机就永远
-        # 轮不到，白占着十几 GB 统一内存。
-        local = await self._local_endpoint(model_override)
-        if local is not None:
-            lclient, lcfg, target = local
-            try:
-                msg = await _race([lcfg], [lclient], [False], LOCAL_MAX_RETRIES,
-                                  LOCAL_FIRST_TOKEN_TIMEOUTS_S)
-            except Exception as e:
-                kind, _ = _classify_error(e)
-                # 抢占不是失败；上下文溢出要由调用方压缩历史 —— 换到云端只是把同一个
-                # 超长请求再发一遍
-                if (type(e).__name__ in ('TurnCancelled', 'RoundReconsider')
-                        or kind == LLMErrorKind.CONTEXT_OVERFLOW or not self.client_list):
-                    raise
-                print(f'[llm] local model {lcfg["model"]} failed ({kind}) — falling back to cloud')
-            else:
-                if isinstance(msg.get('_usage'), dict):
-                    # 给主循环按本机的上下文容量提前压缩历史用，见 event/llm.py
-                    msg['_usage']['served_by'] = 'modelhub'
-                    msg['_usage']['context_tokens'] = target.get('context_tokens')
-                return msg
-        elif getattr(self, 'local_cfg', None) and not self.client_list:
-            raise RuntimeError(f'本机模型现在用不了（{self._local_unavailable}），'
-                               f'也没有配置云端后备')
+        # ── 本机模型 ──────────────────────────────────────────────────────────
+        # 选了本机就只问本机，不和云端竞速、也不拿云端兜底：托管 router 几乎总是
+        # 先回第一个字，竞速等于本机永远轮不到；兜底则会让一个选了本机、本不想让
+        # 对话离开这台机器的人，在不知情时把对话发去了云端。
+        if getattr(self, 'local_cfg', None):
+            lclient, lcfg, target = await self._local_endpoint()
+            msg = await _race([lcfg], [lclient], [False], LOCAL_MAX_RETRIES,
+                              LOCAL_FIRST_TOKEN_TIMEOUTS_S)
+            if isinstance(msg.get('_usage'), dict):
+                # 给主循环按本机的上下文容量提前压缩历史用，见 event/llm.py
+                msg['_usage']['served_by'] = 'modelhub'
+                msg['_usage']['context_tokens'] = target.get('context_tokens')
+            return msg
 
         configs = self.config_list
 
@@ -993,21 +983,19 @@ class Client():
 
         return await _race(configs, client_list, endpoint_dead, 2, None, _override_model)
 
-    async def _local_endpoint(self, model_override):
-        """(client, cfg, target)，或 None：没选本机、本机现在用不了、或者点名要了别的模型。"""
-        cfg = getattr(self, 'local_cfg', None)
-        if not cfg:
-            return None
+    async def _local_endpoint(self):
+        """(client, cfg, target)。本机用不了就抛 LocalModelUnavailable，说清楚为什么。
+
+        子代理的 model_override 在这里不起作用：本机只有 ModelHub 加载的那一个模型，
+        换模型在 LLM 卡片里做。
+        """
         import modelhub_link
-        target, why = await modelhub_link.resolve(cfg.get('source', ''))
-        if target and model_override and model_override != target['model']:
-            return None     # 子代理点名要的是别的（云端）模型
+        target, why = await modelhub_link.resolve(self.local_cfg.get('source', ''))
         if target is None:
             if why != self._local_unavailable:
-                print(f'[llm] local model unavailable: {why}'
-                      + (' — using cloud' if self.client_list else ''))
+                print(f'[llm] local model unavailable: {why}')
             self._local_unavailable = why
-            return None
+            raise LocalModelUnavailable(why)
         if self._local_unavailable is not None:
             print(f'[llm] local model {target["model"]} is back')
             self._local_unavailable = None
@@ -1021,4 +1009,4 @@ class Client():
                 http_client=httpx.AsyncClient(event_hooks={"request": [_log_request]}),
             )
             self._local_clients[target['base_url']] = client
-        return client, {**cfg, 'model': target['model']}, target
+        return client, {**self.local_cfg, 'model': target['model']}, target

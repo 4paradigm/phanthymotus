@@ -711,37 +711,114 @@ export function hasSharedRequired(configSchema) {
 }
 
 /**
- * decision_core 的「大模型」下拉：云端，或本机 ModelHub 上的模型。
+ * decision_core 的「大模型」：云端或本机，二选一。
  *
- * 选项不写在 schema 里，打开时现查 —— 刚在 ModelHub 里下好、加载好的模型马上就能
- * 选，不用重启 agent-core。存的是引用（'modelhub' / 'modelhub:<id>'），不是地址。
+ * 选本机时不挑具体模型 —— 用 ModelHub 当前加载的那个，换模型在 LLM 卡片里做。
+ * 所以这里只显示一行状态：现在跑的是哪个模型、上下文多长；用不了时说清楚为什么、
+ * 去哪里处理。状态打开时现查，ModelHub 那边刚加载好的模型不用重启 agent-core。
+ *
+ * 值放在一个隐藏 input 上（带 data-key），切换时派发 change —— 保存按 [data-key]
+ * 收值、x-show-when 按它的 value 判断，和其他字段走同一条路。
  */
+const _LLM_SOURCES = [
+  { value: 'cloud',    label: '云端' },
+  { value: 'modelhub', label: '本机' },
+];
+
 function _llmSourceInput(key, saved) {
-  const input = document.createElement('select');
-  input.className = 'tool-config-input';
+  const wrap = document.createElement('div');
+  wrap.className = 'llm-source';
+
+  const input = document.createElement('input');
+  input.type = 'hidden';
   input.dataset.key = key;
-  const keep = document.createElement('option');
-  keep.value = saved;
-  keep.textContent = '正在查本机模型…';
-  input.appendChild(keep);
-  input.value = saved;
-  fetch(`/api/config/llm-sources?current=${encodeURIComponent(saved)}`)
+  input.value = saved === 'modelhub' ? 'modelhub' : 'cloud';
+
+  const seg = document.createElement('div');
+  seg.className = 'llm-source-seg';
+  seg.setAttribute('role', 'radiogroup');
+  seg.setAttribute('aria-label', '大模型');
+
+  const status = document.createElement('div');
+  status.className = 'llm-source-status';
+  status.setAttribute('aria-live', 'polite');
+
+  const buttons = _LLM_SOURCES.map(({ value, label }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'llm-source-opt';
+    b.dataset.value = value;
+    b.setAttribute('role', 'radio');
+    b.textContent = label;
+    b.addEventListener('click', () => select(value));
+    seg.appendChild(b);
+    return b;
+  });
+
+  let local = null;     // 最近一次查到的本机状态
+  function select(value) {
+    input.value = value;
+    for (const b of buttons) {
+      const on = b.dataset.value === value;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    }
+    renderStatus();
+    input.dispatchEvent(new Event('change'));
+  }
+
+  function renderStatus() {
+    status.hidden = input.value !== 'modelhub';
+    if (status.hidden) return;
+    status.innerHTML = '';
+    const dot = document.createElement('span');
+    dot.className = 'llm-source-dot';
+    const main = document.createElement('div');
+    main.className = 'llm-source-main';
+    const note = document.createElement('div');
+    note.className = 'llm-source-note';
+    if (!local) {
+      dot.dataset.state = 'pending';
+      main.textContent = '正在查本机模型…';
+    } else if (local.state === 'ready') {
+      dot.dataset.state = 'ready';
+      main.textContent = local.title;
+      if (local.context_tokens) {
+        const ctx = document.createElement('span');
+        ctx.className = 'llm-source-ctx';
+        ctx.textContent = `上下文 ${Math.round(local.context_tokens / 1000)}k`;
+        main.appendChild(ctx);
+      }
+      note.textContent = '用 ModelHub 当前加载的模型。换模型请到 LLM 卡片里操作，这里会自动跟上。';
+    } else {
+      dot.dataset.state = local.state === 'loading' ? 'loading' : 'down';
+      main.textContent = local.state === 'loading' ? (local.title || '本机模型') + ' 正在加载'
+                                                   : '本机模型现在用不了';
+      note.textContent = local.message || '';
+    }
+    status.append(dot, main);
+    if (note.textContent) status.appendChild(note);
+  }
+
+  wrap.append(input, seg, status);
+  select(input.value);
+
+  fetch('/api/config/local-llm')
     .then(r => r.json())
     .then(json => {
-      const options = (json.data && json.data.options) || [];
-      input.innerHTML = '';
-      for (const o of options) {
-        const opt = document.createElement('option');
-        opt.value = o.value;
-        opt.textContent = o.label;
-        opt.disabled = !!o.disabled && o.value !== saved;
-        input.appendChild(opt);
-      }
-      input.value = saved;
-      input.dispatchEvent(new Event('change'));
+      local = (json && json.data) || { state: 'unreachable', message: '查不到本机模型。' };
+      // 没有 ModelHub 就别让人选一个必然失败的选项；已经存成本机的照样留着，好看到原因
+      const absent = local.state === 'absent';
+      const localBtn = buttons.find(b => b.dataset.value === 'modelhub');
+      localBtn.disabled = absent && input.value !== 'modelhub';
+      if (localBtn.disabled) localBtn.title = local.message;
+      renderStatus();
     })
-    .catch(() => { keep.textContent = `${saved}（查不到本机模型）`; });
-  return input;
+    .catch(() => {
+      local = { state: 'unreachable', message: '查不到本机模型，检查 agent-core 是否在线。' };
+      renderStatus();
+    });
+  return wrap;
 }
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
@@ -938,7 +1015,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
       try {
         values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
       } catch (err) {
@@ -1278,7 +1356,8 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
       try {
         values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
       } catch (err) {
