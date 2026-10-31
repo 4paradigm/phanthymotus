@@ -93,7 +93,6 @@ def test_cloud_url_is_only_required_when_cloud_is_chosen():
 def test_decision_core_schema_declares_the_source_field():
     src = (pathlib.Path(__file__).resolve().parents[1] / 'src' / 'start.py').read_text()
     assert "'format': 'llm-source'" in src
-    assert "'enum': ['cloud', 'modelhub']" in src
     assert "'x-required-when': {'llm_source': 'cloud'}" in src
     # 选本机时云端那组隐藏、但照样保存，切回云端不用重填
     assert src.count("'x-keep-when-hidden': True") == 6

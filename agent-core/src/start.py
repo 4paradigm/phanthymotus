@@ -123,8 +123,10 @@ def _register_core_mcp(silent=False):
                         # 云端或本机，二选一。选本机不挑具体模型 —— 用 ModelHub 当前加载的那个，
                         # 换模型在 LLM 卡片里做。见 modelhub_link.py。
                         # 云端那组字段在选本机时隐藏但照样保存（x-keep-when-hidden），切回来不用重填。
+                        # 取值 'cloud' | 'modelhub'。不写 enum：表单渲染器见到 enum 就画成下拉，
+                        # 轮不到 format 那条分支
                         'llm_source': {'type': 'string', 'format': 'llm-source', 'default': 'cloud',
-                                       'enum': ['cloud', 'modelhub'], 'title': '大模型'},
+                                       'title': '大模型'},
                         'llm_url':   {'type': 'string', 'description': 'LLM API URL',
                                       'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True,
                                       'x-required-when': {'llm_source': 'cloud'}},
