@@ -7,6 +7,7 @@
 import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
+import { openDeployPanel } from './deploy-panel.js';
 
 /**
  * 分区图标。
@@ -725,6 +726,34 @@ const _LLM_SOURCES = [
   { value: 'modelhub', label: '本机' },
 ];
 
+/** 没装 ModelHub 时，按这台机器能不能装，给一句该怎么办。 */
+function _modelhubInstallHint(install) {
+  if (install.available) {
+    return { canInstall: true,
+             text: '本机模型由 ModelHub 提供。装好后在 LLM 卡片里下载并启动一个模型，这里会自动用上。' };
+  }
+  if (install.reason === 'unsupported') {
+    return { text: 'ModelHub 目前只支持 Jetson Thor（JetPack 7），这台机器装不了。请用云端模型。' };
+  }
+  if (install.reason === 'not_published') {
+    return { text: '部署列表里还没有这台机器能用的 ModelHub 版本，请管理员先发布。现在请先用云端模型。' };
+  }
+  return { text: '本机模型由 ModelHub 提供，请先在「设置 → 部署」里安装。' };
+}
+
+function _installModelhubButton() {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = '去部署里安装 ModelHub';
+  b.addEventListener('click', () => {
+    // 先关掉配置框：部署面板是另一个 modal，叠在上面会把两个框的按钮搅在一起
+    document.getElementById('tool-config-overlay')?.classList.add('hidden');
+    openDeployPanel({ tab: 'marketplace', query: 'modelhub' });
+  });
+  return b;
+}
+
 function _llmSourceInput(key, saved) {
   const wrap = document.createElement('div');
   wrap.className = 'llm-source';
@@ -777,6 +806,7 @@ function _llmSourceInput(key, saved) {
     main.className = 'llm-source-main';
     const note = document.createElement('div');
     note.className = 'llm-source-note';
+    let action = null;
     if (!local) {
       dot.dataset.state = 'pending';
       main.textContent = '正在查本机模型…';
@@ -790,14 +820,28 @@ function _llmSourceInput(key, saved) {
         main.appendChild(ctx);
       }
       note.textContent = 'ModelHub 当前加载的模型。换模型到 LLM 卡片里操作，这里自动跟上。';
+    } else if (local.state === 'absent') {
+      // 没装不是故障：灰点。说清楚本机模型从哪来、这台机器上该怎么办
+      dot.dataset.state = 'off';
+      main.textContent = '这台机器还没装 ModelHub';
+      const how = _modelhubInstallHint(local.install || {});
+      note.textContent = how.text;
+      if (how.canInstall) action = _installModelhubButton();
+    } else if (local.state === 'unreachable') {
+      dot.dataset.state = 'down';
+      main.textContent = 'ModelHub 没有回应';
+      note.textContent = '它已经装了，但现在不在线。到「设置 → 部署 → 我的服务」看看它是否在运行。';
     } else {
-      dot.dataset.state = local.state === 'loading' ? 'loading' : 'down';
+      dot.dataset.state = 'loading';
       main.textContent = local.state === 'loading' ? (local.title || '本机模型') + ' 正在加载'
-                                                   : '本机模型现在用不了';
-      note.textContent = local.message || '';
+                                                   : 'ModelHub 还没有加载模型';
+      note.textContent = local.state === 'loading'
+        ? (local.message || '')
+        : '到 LLM 卡片里下载并启动一个模型，这里会自动用上。';
     }
     status.append(dot, main);
     if (note.textContent) status.appendChild(note);
+    if (action) status.appendChild(action);
   }
 
   wrap.append(input, seg, status);
@@ -807,11 +851,8 @@ function _llmSourceInput(key, saved) {
     .then(r => r.json())
     .then(json => {
       local = (json && json.data) || { state: 'unreachable', message: '查不到本机模型。' };
-      // 没有 ModelHub 就别让人选一个必然失败的选项；已经存成本机的照样留着，好看到原因
-      const absent = local.state === 'absent';
-      const localBtn = buttons.find(b => b.dataset.value === 'modelhub');
-      localBtn.disabled = absent && input.value !== 'modelhub';
-      if (localBtn.disabled) localBtn.title = local.message;
+      // 没装 ModelHub 时「本机」照样能点：点了才看得到为什么不能用、该怎么办。
+      // 置灰 + 悬停提示在触屏和 Safari 上等于什么都没说。
       renderStatus();
     })
     .catch(() => {

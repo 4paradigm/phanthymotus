@@ -890,6 +890,7 @@ html, body {
 .llm-source-dot[data-state="ready"]   { background: var(--green);  box-shadow: 0 0 0 3px var(--green-bg); }
 .llm-source-dot[data-state="loading"] { background: var(--yellow); box-shadow: 0 0 0 3px var(--yellow-bg); }
 .llm-source-dot[data-state="down"]    { background: var(--red);    box-shadow: 0 0 0 3px var(--red-bg); }
+.llm-source-dot[data-state="off"]     { background: var(--border-med); }
 .llm-source-main {
   font-size: 13px;
   font-weight: 600;
@@ -909,6 +910,22 @@ html, body {
   line-height: 1.5;
   color: var(--text-muted);
 }
+.llm-source-action {
+  grid-column: 2;
+  justify-self: start;
+  margin-top: 4px;
+  padding: 6px 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.llm-source-action:hover { background: var(--accent-dim); }
+.llm-source-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ── 配置表单里的二维码字段（format: "qr"）──────────────────────────────────
    插件说"拿手机扫一下"的地方：一排选项 + 码面 + 解析后的地址。

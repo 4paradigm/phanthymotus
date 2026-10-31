@@ -289,3 +289,27 @@ def test_context_pressure_threshold():
     assert _context_pressured((20000, 40960), 0.75) is False
     assert _context_pressured((99999, None), 0.75) is False     # 容量未知不算
     assert _context_pressured(None, 0.75) is False
+
+
+# ── 没装 ModelHub 时怎么提示 ──────────────────────────────────────────────────
+
+@pytest.mark.parametrize('catalog, expected', [
+    ({'data': {'modelhub': [{'id': 'modelhub'}]}, 'facets': {'acc_arch': 'jetson-jp7'}},
+     {'available': True, 'acc_arch': 'jetson-jp7'}),
+    ({'data': {'modelhub': []}, 'facets': {'acc_arch': 'jetson-jp7'}},
+     {'available': False, 'acc_arch': 'jetson-jp7', 'reason': 'not_published'}),
+    ({'data': {'modelhub': []}, 'facets': {'acc_arch': 'jetson-jp6'}},
+     {'available': False, 'acc_arch': 'jetson-jp6', 'reason': 'unsupported'}),
+])
+def test_absent_modelhub_says_whether_this_machine_can_install_it(monkeypatch, catalog, expected):
+    """部署列表已按本机加速器过滤：有 ModelHub 就能装；没有时分「不是 Thor」和「没发布」。"""
+    import api.config as cfg_api
+    import api.registry as reg
+
+    async def fake_catalog(refresh=False):
+        return catalog
+    monkeypatch.setattr(reg, 'registry_catalog', fake_catalog)
+    config.main['services'] = {'mcp': []}
+    res = asyncio.run(cfg_api.local_llm())
+    assert res['data']['state'] == 'absent'
+    assert res['data']['install'] == expected

@@ -1440,7 +1440,29 @@ async def local_llm():
     加载好的模型，打开配置就该看到。
     """
     import modelhub_link
-    return {'code': 200, 'data': await modelhub_link.status(force=True)}
+    st = await modelhub_link.status(force=True)
+    if st['state'] == 'absent':
+        st['install'] = await _modelhub_install_option()
+    return {'code': 200, 'data': st}
+
+
+async def _modelhub_install_option() -> dict:
+    """没装 ModelHub 时，这台机器能不能从「部署」里装一个。
+
+    部署列表已经按本机的加速器过滤过（resource-center 只返回这台机器跑得了的镜像），
+    所以列表里有 ModelHub 就能装；没有时分两种说法：机器本身不是 Thor（ModelHub 目前
+    只有 JetPack 7 的镜像），或者是 Thor 但还没有发布可用版本。
+    """
+    from api.registry import registry_catalog
+    try:
+        res = await registry_catalog()
+    except Exception:       # noqa: BLE001 — 查不到部署列表就只给通用说法
+        return {'available': False, 'reason': 'unknown'}
+    acc = ((res or {}).get('facets') or {}).get('acc_arch') or ''
+    if ((res or {}).get('data') or {}).get('modelhub'):
+        return {'available': True, 'acc_arch': acc}
+    return {'available': False, 'acc_arch': acc,
+            'reason': 'not_published' if acc == 'jetson-jp7' else 'unsupported'}
 
 
 @router.post('')

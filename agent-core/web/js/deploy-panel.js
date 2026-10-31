@@ -136,6 +136,18 @@ function _open() {
   _polling = setInterval(_loadStatuses, 5000);
 }
 
+/**
+ * 从别处直接打开部署面板的某一页 —— 决策核心选「本机」而这台机器没装 ModelHub 时，
+ * 提示里的「去安装」按钮用它把人带到驱动市场，并预先搜好。
+ */
+export function openDeployPanel({ tab = 'my-services', query = '' } = {}) {
+  const search = document.getElementById('marketplace-search');
+  if (search) search.value = query;
+  _activeFilter = null;
+  _open();
+  _switchTab(tab);
+}
+
 function _close() {
   _overlay.classList.add('hidden');
   clearInterval(_polling);
@@ -501,7 +513,8 @@ function _renderMarketplace() {
       const model = (it.model || '').toLowerCase();
       const provider = (it.provider || '').toLowerCase();
       const name = (it.name || '').toLowerCase();
-      return model.includes(q) || provider.includes(q) || name.includes(q);
+      // 类别也算：搜 modelhub / perception 能找到那一类，不管镜像起的是什么名字
+      return model.includes(q) || provider.includes(q) || name.includes(q) || it._cat === q;
     });
   }
 
