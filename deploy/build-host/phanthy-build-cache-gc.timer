@@ -1,0 +1,11 @@
+# Daily, at night. Persistent: a run missed while the host was down happens at boot.
+[Unit]
+Description=Daily prune of old Docker build cache on the build host
+
+[Timer]
+OnCalendar=*-*-* 04:17
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+# Prunes old BuildKit cache on the VPC build host. See build-cache-gc.sh for
+# what is and is not removed, and why.
+#
+#   sudo cp build-cache-gc.sh /opt/phanthy-motus/
+#   sudo cp phanthy-build-cache-gc.service phanthy-build-cache-gc.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now phanthy-build-cache-gc.timer
+#
+# Last run and how much it freed: journalctl -u phanthy-build-cache-gc
+[Unit]
+Description=Phanthy Motus: prune old Docker build cache on the build host
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/phanthy-motus/build-cache-gc.sh
+# A large prune runs for tens of minutes; don't let it slow a build that is running
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=6h
