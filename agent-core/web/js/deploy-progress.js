@@ -614,6 +614,11 @@ async function restoreActiveDeployments() {
             const elapsed = Math.floor(deployment.elapsed || 0);
             progressWindow._addLog(`重新连接到部署会话 (已运行 ${elapsed}s)`, 'info');
             progressWindow.attach(deployment.run_id || '');
+            // 恢复出来的 agent-core 升级窗口也要盯着重启并带超时 —— 以前只接回事件流，
+            // helper 失败时窗口就永远停在 90%
+            if (deployment.driver_id === 'core' && deployment.image) {
+                _watchCoreRestart(deployment.driver_id, deployment.image, progressWindow);
+            }
         }
     } catch (error) {
         console.error('[DeployProgress] Error restoring deployments:', error);
