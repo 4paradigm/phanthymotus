@@ -1,0 +1,8 @@
+# Overlay only. Apply to the matching existing project/service, never standalone.
+services:
+  ubtrobot-u1-pro:
+    image: ${U1_DRIVER_IMAGE:?Set the reviewed U1 driver image}
+  perception:
+    image: ${U1_PERCEPTION_IMAGE:?Set the reviewed Jetson perception image}
+    environment:
+      U1_ASR_RECEIPT_DIRECTION_EXPERIMENT: "1"
