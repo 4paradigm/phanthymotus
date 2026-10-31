@@ -895,6 +895,11 @@ function _llmSourceInput(key, saved) {
       dot.dataset.state = 'down';
       main.textContent = 'ModelHub 没有回应';
       note.textContent = '它已经装了，但现在不在线。到「设置 → 部署 → 我的服务」看看它是否在运行。';
+    } else if (local.state === 'error') {
+      dot.dataset.state = 'down';
+      main.textContent = `${local.title || '本机模型'} 启动失败`;
+      note.textContent = local.message || '';
+      action = _openConsoleButton('打开模型管理');
     } else if (local.state === 'loading') {
       dot.dataset.state = 'loading';
       main.textContent = (local.title || '本机模型') + ' 正在加载';

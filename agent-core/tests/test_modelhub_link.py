@@ -386,3 +386,13 @@ def test_idle_tells_no_model_downloaded_apart_from_not_started():
     modelhub_link.fetch_info = old_hub
     st = asyncio.run(modelhub_link.status(force=True))
     assert 'downloaded' not in st and st['state'] == 'idle'
+
+
+def test_a_failed_local_model_is_an_error_not_loading():
+    """以前启动失败也算 loading：黄点 + 一段堆栈，开启控制还要干等 15 分钟。"""
+    reason = '这个 ModelHub 镜像是给 JetPack 7.2 做的，这台机器是 JetPack 7.1。'
+    _hub_answers(_info([{**QWEN4B, 'state': 'error'}], state='error', message=reason))
+    st = asyncio.run(modelhub_link.status(force=True))
+    assert (st['state'], st['title'], st['message']) == ('error', 'Qwen3 4B', reason)
+    state, message = _readiness([{'source': 'modelhub', 'model': '', 'think_mode': False}])
+    assert state == 'error' and reason in message and '启动失败' in message
