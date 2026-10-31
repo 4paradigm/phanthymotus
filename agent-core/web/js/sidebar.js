@@ -246,9 +246,18 @@ function _buildMergedSection(mcps, { cls, icon, iconCls = '', label, consoleEntr
   const grid = document.createElement('div');
   grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
 
+  // 有运维页的常驻服务（ModelHub）列在最前，不挂「ACTUATOR」这类分组标签 ——
+  // 它是一个入口，不是一张能连线的执行卡
+  if (consoleEntries) {
+    for (const tool of allTools.filter(t => t.inputSchema?.['x-workbench'])) {
+      grid.appendChild(_buildConsoleEntry(tool._mcp, tool));
+    }
+  }
+  const rest = consoleEntries ? allTools.filter(t => !t.inputSchema?.['x-workbench']) : allTools;
+
   // Group and render
   const groups = {};
-  for (const tool of allTools) {
+  for (const tool of rest) {
     const t = tool.type || '';
     (groups[t] = groups[t] || []).push(tool);
   }
@@ -257,10 +266,6 @@ function _buildMergedSection(mcps, { cls, icon, iconCls = '', label, consoleEntr
     grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
     for (const tool of groups[type]) {
       const mcp = tool._mcp;
-      if (consoleEntries && tool.inputSchema?.['x-workbench']) {
-        grid.appendChild(_buildConsoleEntry(mcp, tool));
-        continue;
-      }
       grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
     }
   }
