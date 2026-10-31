@@ -888,7 +888,14 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             config.main['event'] = event_cfg
             for t in all_topics:
                 topic_subscriber.subscribe(t)
-        return {'code': 200, 'data': f'subscribed to {all_topics}' if all_topics else 'started'}
+        data = {'subscribed': all_topics}
+        if req.tool == 'decision_core':
+            # 大模型不可用就别报「已就绪」：state=error 让这次启动回滚并显示原因，
+            # loading（本机模型还在加载）由启动流程轮询 info 直到就绪
+            import modelhub_link
+            state, message = await modelhub_link.llm_readiness(force=True)
+            data.update(state=state, message=message)
+        return {'code': 200, 'data': data}
 
     elif action == 'stop':
         event_cfg = config.main.get('event', {})
@@ -919,7 +926,11 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         topic_in_list = [{'topic': t, 'format': 'data/json'} for t in sub_topics] if sub_topics else [{'topic': '', 'format': 'data/json'}]
         # 延迟 import：event.llm 拉起整个 agent loop，模块顶层导入会成环。
         from event.llm import _narration_thresholds
+        import modelhub_link
+        # 大模型能不能用。启动时本机模型还在加载的话，启动流程靠轮询这里等它就绪
+        llm_state, llm_message = await modelhub_link.llm_readiness()
         return {'code': 200, 'data': {
+            'state': llm_state, 'message': llm_message,
             'description': '决策核心 — 接收多路 DDS 输入，LLM 推理后执行动作',
             'topic_in': topic_in_list,
             'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],

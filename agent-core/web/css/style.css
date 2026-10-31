@@ -535,6 +535,28 @@ html, body {
 }
 
 /* ── Tool card ─────────────────────────────────────────────────────────── */
+.sidebar-console-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.sidebar-console-entry:hover { background: var(--bg-hover); border-color: var(--border-med); }
+.sidebar-console-entry:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.console-entry-name { font-size: 13px; font-weight: 600; }
+.console-entry-desc { font-size: 11px; color: var(--text-muted); }
+@media (pointer: coarse) { .sidebar-console-entry { min-height: 48px; padding: 10px 12px; } }
+
 .sidebar-tool-card {
   background: var(--bg);
   border: 1px solid var(--border);

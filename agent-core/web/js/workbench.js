@@ -32,6 +32,31 @@ async function invoke(target, args) {
   return parsed;
 }
 
+/**
+ * 不经过画布，直接打开一个工具的运维页。
+ *
+ * ModelHub 这类常驻服务不参与画布的起停，放上画布只是为了能点开它的运维页 ——
+ * 侧边栏和决策核心的「打开模型管理」走这里，先调它的入口动作拿到页面再打开。
+ */
+export async function openToolConsole(mcpId, tool, onClose) {
+  const spec = tool?.inputSchema?.['x-workbench'];
+  if (spec?.protocol !== VERSION) throw new Error('这个工具没有运维页');
+  const target = {mcp: mcpId, tool: tool.name, instanceId: ''};
+  const ui = await invoke(target, {action: spec.entry});
+  await openWorkbench(target, spec, ui, onClose);
+}
+
+/** 本机 ModelHub 的模型管理页：找到在线的那个、有运维页的工具，打开它。 */
+export async function openModelConsole(onClose) {
+  const mcps = await api('/api/mcp');
+  for (const m of mcps || []) {
+    if (m.category !== 'modelhub' || m.online === false) continue;
+    const tool = (m.tools || []).find(t => typeof t === 'object' && t.inputSchema?.['x-workbench']);
+    if (tool) return openToolConsole(m.id, tool, onClose);
+  }
+  throw new Error('这台机器没有在线的 ModelHub');
+}
+
 export async function openWorkbench(target, spec, ui, onClose) {
   if (opened) throw new Error('请先关闭已打开的工作台再继续。草稿已保留。');
   if (spec.protocol !== VERSION || !Array.isArray(spec.actions) ||

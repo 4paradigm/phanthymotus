@@ -157,7 +157,7 @@ def test_status_says_what_is_wrong_and_where_to_fix_it():
 
     _hub_answers(_info([], state='idle'))
     st = asyncio.run(modelhub_link.status(force=True))
-    assert st['state'] == 'idle' and 'LLM 卡片' in st['message']
+    assert st['state'] == 'idle' and '模型管理' in st['message']
 
     _hub_answers(ConnectionRefusedError('refused'))
     st = asyncio.run(modelhub_link.status(force=True))
@@ -266,7 +266,7 @@ def test_local_failure_is_not_handed_to_the_cloud():
 
 
 def test_a_subagent_model_override_still_uses_the_local_model():
-    """本机只有一个模型；子代理点名的模型名在这里没有意义，换模型在 LLM 卡片里做。"""
+    """本机只有一个模型；子代理点名的模型名在这里没有意义，换模型在模型管理里做。"""
     _hub_answers(_info([QWEN4B]))
     local = _Endpoint('local', answer='本机')
     msg = asyncio.run(_client(local)(message_list=[], tool_list=[],
@@ -313,3 +313,58 @@ def test_absent_modelhub_says_whether_this_machine_can_install_it(monkeypatch, c
     res = asyncio.run(cfg_api.local_llm())
     assert res['data']['state'] == 'absent'
     assert res['data']['install'] == expected
+
+
+# ── 开启智能控制前先看大模型能不能用 ──────────────────────────────────────────
+
+def _readiness(entries):
+    config.main['client'] = {'llm': entries}
+    return asyncio.run(modelhub_link.llm_readiness(force=True))
+
+
+def test_unconfigured_llm_blocks_the_start_and_says_what_is_missing():
+    state, message = _readiness([{'url': '', 'key': '', 'model': ''}])
+    assert state == 'error' and '还没有配置大模型' in message
+    assert _readiness([{'url': 'https://x/v1', 'key': 'k', 'model': 'm'}]) == ('running', '')
+
+
+def test_local_llm_readiness_by_modelhub_state():
+    local = [{'source': 'modelhub', 'model': '', 'think_mode': False}]
+    _hub_answers(_info([QWEN4B]))
+    assert _readiness(local) == ('running', '')
+
+    # 开机自启时模型通常还在加载：等它，不算失败
+    _hub_answers(_info([{**QWEN4B, 'state': 'loading'}], state='loading', message='加载中 40%'))
+    assert _readiness(local) == ('loading', '加载中 40%')
+    # 两个容器一起开机，agent-core 常先起来：ModelHub 没回应也先等
+    _hub_answers(ConnectionRefusedError('refused'))
+    assert _readiness(local)[0] == 'loading'
+
+    # 没加载模型不会自己好：不让启动，说去哪里处理
+    _hub_answers(_info([], state='idle'))
+    state, message = _readiness(local)
+    assert state == 'error' and '模型管理' in message
+
+    config.main['services'] = {'mcp': []}
+    state, message = _readiness(local)
+    assert state == 'error' and '没有 ModelHub' in message
+
+
+def test_decision_core_start_and_info_report_llm_readiness():
+    """启动流程看 start 的 state 决定成败，loading 时靠轮询 info 等它就绪。"""
+    from api.mcp_manage import MCPCallRequest, _handle_agentcore_call
+    config.main['client'] = {'llm': [{'url': '', 'key': '', 'model': ''}]}
+    saved = config.main.get('tool_config:agentcore:decision_core')
+    config.main['tool_config:agentcore:decision_core'] = None
+    try:
+        res = asyncio.run(_handle_agentcore_call(MCPCallRequest(
+            tool='decision_core', arguments={'action': 'start'})))
+        assert res['data']['state'] == 'error' and '还没有配置大模型' in res['data']['message']
+
+        config.main['client'] = {'llm': [{'source': 'modelhub', 'model': '', 'think_mode': False}]}
+        _hub_answers(_info([{**QWEN4B, 'state': 'loading'}], state='loading', message='加载中'))
+        info = asyncio.run(_handle_agentcore_call(MCPCallRequest(
+            tool='decision_core', arguments={'action': 'info'})))
+        assert info['data']['state'] == 'loading'
+    finally:
+        config.main['tool_config:agentcore:decision_core'] = saved

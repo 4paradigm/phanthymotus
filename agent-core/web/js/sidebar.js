@@ -169,6 +169,7 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   if (modelhubs.length) {
     _scroll.appendChild(_buildMergedSection(modelhubs, {
       cls: 'sidebar-section-modelhub', icon: ICONS.modelhub, iconCls: 'modelhub', label: '模型',
+      consoleEntries: true,
     }));
   }
 
@@ -217,7 +218,7 @@ function _buildSection(mcp) {
  * grouped by tool type. Used for perception and actucore, which each may be
  * served by more than one container but read as a single layer in the sidebar.
  */
-function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
+function _buildMergedSection(mcps, { cls, icon, iconCls = '', label, consoleEntries = false }) {
   const section = document.createElement('div');
   section.className = `sidebar-section ${cls}`;
 
@@ -256,6 +257,10 @@ function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
     grid.appendChild(_buildSubgroupLabel(type, groups[type].length));
     for (const tool of groups[type]) {
       const mcp = tool._mcp;
+      if (consoleEntries && tool.inputSchema?.['x-workbench']) {
+        grid.appendChild(_buildConsoleEntry(mcp, tool));
+        continue;
+      }
       grid.appendChild(useChip ? _buildChip(mcp, tool) : _buildToolCard(mcp, tool));
     }
   }
@@ -351,6 +356,34 @@ function sidebarOwnsConfig(mcpId, tool) {
   if (!props.some(def => def.scope === 'instance')) return true;
 
   return cardsForTool(mcpId, tool.name).length === 0;
+}
+
+/**
+ * ModelHub 这类常驻服务在侧边栏是一个入口，不是可以拖上画布的卡片。
+ *
+ * 它不跟着智能控制起停（start/stop 只是查状态），决策核心也是自己找到它、
+ * 不靠画布连线 —— 放上画布唯一的用处是能点开运维页，而那一步本身就是绕路。
+ * 点这里直接打开模型管理，开启控制前后都能用。
+ */
+function _buildConsoleEntry(mcp, tool) {
+  const entry = document.createElement('button');
+  entry.type = 'button';
+  entry.className = 'sidebar-console-entry';
+  entry.dataset.mcpId = mcp.id;
+  entry.dataset.toolName = tool.name;
+  const title = tool.inputSchema['x-workbench'].title || '模型管理';
+  entry.innerHTML = `
+    <span class="console-entry-name">${_esc(title)}</span>
+    <span class="console-entry-desc">下载、启动、对话、性能测试、监控</span>`;
+  entry.addEventListener('click', async () => {
+    try {
+      const { openToolConsole } = await import('./workbench.js');
+      await openToolConsole(mcp.id, tool);
+    } catch (err) {
+      alert(`打不开${title}：${err.message}`);
+    }
+  });
+  return entry;
 }
 
 function _buildChip(mcp, tool) {
@@ -714,7 +747,7 @@ export function hasSharedRequired(configSchema) {
 /**
  * decision_core 的「大模型」：云端或本机，二选一。
  *
- * 选本机时不挑具体模型 —— 用 ModelHub 当前加载的那个，换模型在 LLM 卡片里做。
+ * 选本机时不挑具体模型 —— 用 ModelHub 当前加载的那个，换模型在模型管理里做。
  * 所以这里只显示一行状态：现在跑的是哪个模型、上下文多长；用不了时说清楚为什么、
  * 去哪里处理。状态打开时现查，ModelHub 那边刚加载好的模型不用重启 agent-core。
  *
@@ -730,7 +763,7 @@ const _LLM_SOURCES = [
 function _modelhubInstallHint(install) {
   if (install.available) {
     return { canInstall: true,
-             text: '本机模型由 ModelHub 提供。装好后在 LLM 卡片里下载并启动一个模型，这里会自动用上。' };
+             text: '本机模型由 ModelHub 提供。装好后在模型管理里下载并启动一个模型，这里会自动用上。' };
   }
   if (install.reason === 'unsupported') {
     return { unsupported: true,
@@ -740,6 +773,24 @@ function _modelhubInstallHint(install) {
     return { text: '部署列表里还没有这台机器能用的 ModelHub 版本，请管理员先发布。现在请先用云端模型。' };
   }
   return { text: '本机模型由 ModelHub 提供，请先在「设置 → 部署」里安装。' };
+}
+
+/** 「打开模型管理」：运维页叠在设置框上面打开，关掉后回到这里，状态自动刷新。 */
+let _refreshLlmStatus = null;
+function _openConsoleButton(label) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = label;
+  b.addEventListener('click', async () => {
+    try {
+      const { openModelConsole } = await import('./workbench.js');
+      await openModelConsole(() => _refreshLlmStatus?.());
+    } catch (err) {
+      alert(`打不开模型管理：${err.message}`);
+    }
+  });
+  return b;
 }
 
 function _installModelhubButton() {
@@ -820,7 +871,8 @@ function _llmSourceInput(key, saved) {
         ctx.textContent = `上下文 ${Math.round(local.context_tokens / 1000)}k`;
         main.appendChild(ctx);
       }
-      note.textContent = 'ModelHub 当前加载的模型。换模型到 LLM 卡片里操作，这里自动跟上。';
+      note.textContent = 'ModelHub 当前加载的模型。换模型在模型管理里操作，这里自动跟上。';
+      action = _openConsoleButton('打开模型管理');
     } else if (local.state === 'absent') {
       // 没装不是故障：灰点。说清楚本机模型从哪来、这台机器上该怎么办
       dot.dataset.state = 'off';
@@ -839,7 +891,8 @@ function _llmSourceInput(key, saved) {
                                                    : 'ModelHub 还没有加载模型';
       note.textContent = local.state === 'loading'
         ? (local.message || '')
-        : '到 LLM 卡片里下载并启动一个模型，这里会自动用上。';
+        : '在模型管理里下载并启动一个模型，这里会自动用上。';
+      action = _openConsoleButton(local.state === 'loading' ? '打开模型管理' : '去模型管理启动一个');
     }
     status.append(dot, main);
     if (note.textContent) status.appendChild(note);
@@ -849,7 +902,7 @@ function _llmSourceInput(key, saved) {
   wrap.append(input, seg, status);
   select(input.value);
 
-  fetch('/api/config/local-llm')
+  const load = () => fetch('/api/config/local-llm')
     .then(r => r.json())
     .then(json => {
       local = (json && json.data) || { state: 'unreachable', message: '查不到本机模型。' };
@@ -861,13 +914,18 @@ function _llmSourceInput(key, saved) {
       local = { state: 'unreachable', message: '查不到本机模型，检查 agent-core 是否在线。' };
       renderStatus();
     });
+  _refreshLlmStatus = () => { local = null; renderStatus(); load(); };
+  load();
   return wrap;
 }
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
-  if (isProjectRunning()) {
+  // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
+  // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
+  const liveEditable = mcpId === 'agentcore' && toolName === 'decision_core';
+  if (isProjectRunning() && !liveEditable) {
     alert('Stop agent before modifying');
     return;
   }

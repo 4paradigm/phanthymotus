@@ -121,7 +121,7 @@ def _register_core_mcp(silent=False):
                     'type': 'object',
                     'properties': {
                         # 云端或本机，二选一。选本机不挑具体模型 —— 用 ModelHub 当前加载的那个，
-                        # 换模型在 LLM 卡片里做。见 modelhub_link.py。
+                        # 换模型在 ModelHub 的模型管理里做。见 modelhub_link.py。
                         # 云端 URL / Key / 模型在选本机时隐藏但照样保存（x-keep-when-hidden），切回来不用重填。
                         # 取值 'cloud' | 'modelhub'。不写 enum：表单渲染器见到 enum 就画成下拉，
                         # 轮不到 format 那条分支

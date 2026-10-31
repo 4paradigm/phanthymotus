@@ -5,7 +5,7 @@ ModelHub 是和 perception / actucore 并列的一层：一张 `llm` 卡片在�
 模型统一挂在一个 OpenAI 兼容网关后面。
 
 决策核心的「大模型」只有两个选择：云端，或本机。选本机时 agent-core **不选具体模型**
-—— 用的永远是 ModelHub 当前加载的那一个。换模型是 LLM 卡片的事：加载一个模型要占
+—— 用的永远是 ModelHub 当前加载的那一个。换模型是 ModelHub 模型管理页的事：加载一个模型要占
 十几 GB 统一内存，那是 ModelHub 运维页上由人做的决定，不该在两个地方各有一个开关。
 
 所以存的是引用 'modelhub' 而不是地址，每次请求前现查（有几秒缓存）：ModelHub 换了
@@ -131,7 +131,7 @@ async def status(force: bool = False) -> dict:
         return {'state': 'loading', 'title': name,
                 'message': hub.get('message') or f'{name} 正在加载。'}
     return {'state': 'idle',
-            'message': 'ModelHub 还没有加载模型。到 LLM 卡片里启动一个，这里会自动跟上。'}
+            'message': 'ModelHub 还没有加载模型。在侧边栏「模型」里打开模型管理，启动一个模型。'}
 
 
 async def resolve(source: str) -> tuple[dict | None, str]:
@@ -140,3 +140,31 @@ async def resolve(source: str) -> tuple[dict | None, str]:
     if st['state'] != 'ready':
         return None, st['message']
     return {k: st[k] for k in ('base_url', 'model', 'title', 'context_tokens')}, ''
+
+
+async def llm_readiness(force: bool = False) -> tuple[str, str]:
+    """决策核心现在有没有大模型可用：('running' | 'loading' | 'error', 给人看的一句话)。
+
+    开启智能控制时问它：以前大模型没配好也照样启动成功，机器人只是不说话 ——
+    要停掉、配好、再开一次才能用。现在没配好就不让启动，并说清楚缺什么。
+
+    本机模型还在加载算 loading，不算 error：开机自启时模型通常正在加载，那时把
+    启动判失败就等于开机自启永远起不来。ModelHub 没回应也按 loading 等它：
+    两个容器一起开机，agent-core 往往先起来。等不到时启动流程自己有 15 分钟上限。
+    """
+    entries = (config.main.get('client') or {}).get('llm') or []
+    if any(is_local(e.get('source')) for e in entries):
+        st = await status(force=force)
+        if st['state'] == 'ready':
+            return 'running', ''
+        if st['state'] == 'loading':
+            return 'loading', st.get('message') or '本机模型正在加载'
+        if st['state'] == 'unreachable':
+            return 'loading', '等待 ModelHub 响应…'
+        if st['state'] == 'absent':
+            return 'error', ('大模型选了本机，但这台机器没有 ModelHub。'
+                             '在决策核心的设置里改用云端，或者先安装 ModelHub。')
+        return 'error', st.get('message') or '本机模型现在用不了'
+    if any(e.get('url') and e.get('key') for e in entries):
+        return 'running', ''
+    return 'error', '还没有配置大模型。打开决策核心的设置，选云端并填好 URL 和 Key，或者选本机。'
