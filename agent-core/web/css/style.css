@@ -880,6 +880,7 @@ html, body {
   border-radius: var(--radius-sm);
   background: var(--bg-card);
 }
+.llm-source-status[hidden] { display: none; }   /* 上面的 display:grid 会盖过 hidden 属性 */
 .llm-source-dot {
   width: 8px;
   height: 8px;

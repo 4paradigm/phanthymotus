@@ -789,7 +789,7 @@ function _llmSourceInput(key, saved) {
         ctx.textContent = `上下文 ${Math.round(local.context_tokens / 1000)}k`;
         main.appendChild(ctx);
       }
-      note.textContent = '用 ModelHub 当前加载的模型。换模型请到 LLM 卡片里操作，这里会自动跟上。';
+      note.textContent = 'ModelHub 当前加载的模型。换模型到 LLM 卡片里操作，这里自动跟上。';
     } else {
       dot.dataset.state = local.state === 'loading' ? 'loading' : 'down';
       main.textContent = local.state === 'loading' ? (local.title || '本机模型') + ' 正在加载'
