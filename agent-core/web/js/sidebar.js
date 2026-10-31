@@ -733,7 +733,8 @@ function _modelhubInstallHint(install) {
              text: '本机模型由 ModelHub 提供。装好后在 LLM 卡片里下载并启动一个模型，这里会自动用上。' };
   }
   if (install.reason === 'unsupported') {
-    return { text: 'ModelHub 目前只支持 Jetson Thor（JetPack 7），这台机器装不了。请用云端模型。' };
+    return { unsupported: true,
+             text: '本机模型由 ModelHub 提供，它目前只支持 Jetson Thor（JetPack 7）。这台机器请用云端模型。' };
   }
   if (install.reason === 'not_published') {
     return { text: '部署列表里还没有这台机器能用的 ModelHub 版本，请管理员先发布。现在请先用云端模型。' };
@@ -823,8 +824,9 @@ function _llmSourceInput(key, saved) {
     } else if (local.state === 'absent') {
       // 没装不是故障：灰点。说清楚本机模型从哪来、这台机器上该怎么办
       dot.dataset.state = 'off';
-      main.textContent = '这台机器还没装 ModelHub';
       const how = _modelhubInstallHint(local.install || {});
+      // 装不了的机器别说「还没装」—— 那句话暗示装上就行
+      main.textContent = how.unsupported ? '这台机器用不了本机模型' : '这台机器还没装 ModelHub';
       note.textContent = how.text;
       if (how.canInstall) action = _installModelhubButton();
     } else if (local.state === 'unreachable') {
