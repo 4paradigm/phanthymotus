@@ -558,7 +558,7 @@ Two rules follow, both of which were learned the hard way:
   having had the canvas page open — which is why the ASR panel used not to be there
   until you visited the canvas.
 
-Frontend tests: `node --test "agent-core/web/js/*.test.mjs"` (no dependencies).
+Frontend tests: `node --test agent-core/web/js/*.test.mjs` (no dependencies; run from the repository root so the shell expands the glob).
 
 #### Stopping is two stages, and they have different guarantees
 

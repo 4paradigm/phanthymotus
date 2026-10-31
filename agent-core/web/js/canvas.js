@@ -1350,7 +1350,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         if (!(await _ensureEdit())) return;
-        await _executeCard(el, mcpId, toolName);
+        await _executeCard(el, mcpId, toolName, id);
       });
     }
 
@@ -2594,7 +2594,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
       const parsed = _parseMcpCallResult(await resp.json());
       const liveTopic = parsed?.topic_out?.find(t => t && t.topic);
       if (liveTopic) {
-        showTopicDetail(liveTopic.topic, liveTopic.format || '');
+        showTopicDetail(liveTopic.topic, liveTopic.format || '', mcpId);
         return;
       }
     } catch (e) {
@@ -2610,7 +2610,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
     _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
     return;
   }
-  showTopicDetail(candidate.topic, candidate.format || '');
+  showTopicDetail(candidate.topic, candidate.format || '', mcpId);
 }
 
 /**

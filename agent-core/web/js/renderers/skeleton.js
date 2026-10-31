@@ -55,6 +55,8 @@ export const SkeletonRenderer = {
     this._joints = {};
     this._links = {};
     this._loaded = false;
+    this._gloveTargets = {};
+    this._lastAnimationAt = null;
     this._el = document.createElement('div');
     this._el.className = 'renderer-skeleton';
     container.appendChild(this._el);
@@ -214,7 +216,8 @@ export const SkeletonRenderer = {
         jointGroup.position.set(j.origin.x, j.origin.y, j.origin.z);
 
         // Apply base RPY rotation (static offset)
-        const euler = new THREE.Euler(j.rpy.x, j.rpy.y, j.rpy.z, 'XYZ');
+        // URDF fixed-axis roll/pitch/yaw composes as Rz(yaw) Ry(pitch) Rx(roll).
+        const euler = new THREE.Euler(j.rpy.x, j.rpy.y, j.rpy.z, 'ZYX');
         jointGroup.rotation.copy(euler);
 
         parentObj.add(jointGroup);
@@ -513,6 +516,8 @@ export const SkeletonRenderer = {
 
       const joints = data.joints;
       if (!Array.isArray(joints)) return;
+      const interpolate = data.preview_is_glove_target === true;
+      if (!interpolate) this._gloveTargets = {};
 
       for (const j of joints) {
         // Prefer name-based matching (R1 sends joint names), fallback to index map (G1)
@@ -522,9 +527,18 @@ export const SkeletonRenderer = {
         if (!obj) continue;
 
         const angle = j.q;
+        if (!Number.isFinite(angle)) continue;
         const axis = obj.userData.axis;
         if (!axis) continue;
 
+        // Only glove previews opt in; other robot streams keep their direct updates.
+        this._gloveTargets ??= {};
+        const previous = this._gloveTargets[jointName];
+        if (interpolate && previous) {
+          previous.target = angle;
+          continue;
+        }
+        if (interpolate) this._gloveTargets[jointName] = { value: angle, target: angle };
         // Apply rotation around the joint axis from identity
         obj.quaternion.setFromAxisAngle(axis, angle);
       }
@@ -533,9 +547,22 @@ export const SkeletonRenderer = {
     }
   },
 
+  _advanceGlovePreview(now) {
+    const dt = this._lastAnimationAt == null ? 0 : Math.max(0, Math.min(0.05, (now - this._lastAnimationAt) / 1000));
+    this._lastAnimationAt = now;
+    // 30 ms time constant: smooth frame steps without predicting future motion.
+    const alpha = 1 - Math.exp(-dt / 0.03);
+    for (const [name, state] of Object.entries(this._gloveTargets || {})) {
+      state.value += (state.target - state.value) * alpha;
+      const obj = this._joints[name];
+      if (obj?.userData.axis) obj.quaternion.setFromAxisAngle(obj.userData.axis, state.value);
+    }
+  },
+
   _animate() {
     if (!this._threeRenderer) return;
     this._raf = requestAnimationFrame(() => this._animate());
+    this._advanceGlovePreview(performance.now());
     this._controls?.update();
     this._threeRenderer.render(this._scene, this._camera);
   },
@@ -575,6 +602,8 @@ export const SkeletonRenderer = {
     this._joints = {};
     this._links = {};
     this._el = null;
+    this._gloveTargets = {};
+    this._lastAnimationAt = null;
     this._raf = null;
     this._ro = null;
     this._loaded = false;
