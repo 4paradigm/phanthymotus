@@ -49,7 +49,9 @@ export async function openWorkbench(target, spec, ui, onClose) {
   const title = spec.title || target.tool;
   overlay.querySelector('.modal-title').textContent = title;
   overlay.querySelector('section').setAttribute('aria-label', title);
-  const frame = overlay.querySelector('iframe'); frame.title = title;
+  // aria-label, not title: Safari shows an iframe's title as a tooltip wherever the pointer
+  // rests inside the frame, so a workbench page had "本地大模型" floating over its own UI.
+  const frame = overlay.querySelector('iframe'); frame.setAttribute('aria-label', title);
   // A later meta cannot relax this policy; the opaque-origin page has no token.
   frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'">${ui.html}`;
   let port, busy = false, closed = false;
