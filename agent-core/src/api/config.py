@@ -1462,7 +1462,7 @@ async def _modelhub_install_option() -> dict:
     if ((res or {}).get('data') or {}).get('modelhub'):
         return {'available': True, 'acc_arch': acc}
     return {'available': False, 'acc_arch': acc,
-            'reason': 'not_published' if acc == 'jetson-jp7' else 'unsupported'}
+            'reason': 'not_published' if acc.startswith('jetson-jp7') else 'unsupported'}
 
 
 @router.post('')

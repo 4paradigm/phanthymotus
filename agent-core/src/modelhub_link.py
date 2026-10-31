@@ -111,7 +111,7 @@ def invalidate() -> None:
 async def status(force: bool = False) -> dict:
     """本机模型现在能不能用、用的是哪个 —— 卡片配置里「本机」那一栏显示的就是它。
 
-    state：ready 能用；loading 正在下载或加载；idle 没有加载模型；
+    state：ready 能用；loading 正在下载或加载；error 启动失败；idle 没有加载模型；
            unreachable ModelHub 没回应；absent 这台机器没有 ModelHub。
     message 是给人看的一句话，说清楚现在怎样、要做什么。
     """
@@ -128,6 +128,13 @@ async def status(force: bool = False) -> dict:
         return {'state': 'ready', 'model': m['id'], 'title': m.get('title') or m['id'],
                 'context_tokens': m.get('context_tokens'), 'base_url': hub['base_url'],
                 'message': ''}
+    # 启动失败不是「在加载」：以前这里一律算 loading，于是决策核心显示一个黄点和一段
+    # vLLM 堆栈，开启智能控制还要干等 15 分钟才报失败
+    failed = [m for m in hub['loaded'] if m.get('state') == 'error']
+    if failed or hub.get('state') == 'error':
+        m = (failed or hub['loaded'] or [{}])[0]
+        return {'state': 'error', 'title': m.get('title') or m.get('id') or '',
+                'message': hub.get('message') or '本机模型启动失败，详情见模型管理。'}
     if hub['loaded'] or hub.get('state') == 'loading':
         m = (hub['loaded'] or [{}])[0]
         name = m.get('title') or m.get('id') or ''
@@ -172,6 +179,8 @@ async def llm_readiness(force: bool = False) -> tuple[str, str]:
             return 'loading', st.get('message') or '本机模型正在加载'
         if st['state'] == 'unreachable':
             return 'loading', '等待 ModelHub 响应…'
+        if st['state'] == 'error':
+            return 'error', f"本机模型 {st.get('title') or ''} 启动失败：{st.get('message')}"
         if st['state'] == 'absent':
             return 'error', ('大模型选了本机，但这台机器没有 ModelHub。'
                              '在决策核心的设置里改用云端，或者先安装 ModelHub。')

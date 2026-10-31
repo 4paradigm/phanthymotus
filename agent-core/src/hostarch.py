@@ -1,7 +1,8 @@
 """hostarch.py — 在容器内探测宿主的加速器 / CPU 架构。
 
 用途：向 resource-center 请求镜像目录时带上本机架构，让它只返回能在本机运行的镜像
-（perception / actucore 是 Jetson 专用镜像，按 JetPack 大版本分别构建，不能混装）。
+（perception / actucore 是 Jetson 专用镜像，按 JetPack 大版本分别构建，不能混装；
+ModelHub 在 JetPack 7 上还要分小版本，见 _jp7_line）。
 
 为什么读 /proc/version：已在 JetPack 6 真机（L4T 36.4）验证，agent-core 容器内
 /proc/device-tree 和 /etc/nv_tegra_release **都不存在**，但 /proc/version 仍显示
@@ -30,8 +31,24 @@ _TEGRA_KERNEL_TO_ACC = {
     '4.9': 'jetson-jp4',    # L4T 32.x（未实测，暂无 jp4 镜像）
     '5.10': 'jetson-jp5',   # L4T 35.x
     '5.15': 'jetson-jp6',   # L4T 36.x
-    '6.8': 'jetson-jp7',    # L4T 39.x（Thor 实测：6.8.12-1021-tegra，R39.2.1 / JetPack 7.2.1）
+    '6.8': 'jetson-jp7',    # L4T 38.x / 39.x，小版本见 _jp7_line
 }
+
+# JetPack 7 的两条线内核都是 6.8（Thor 实测：R39.2.1 是 6.8.12-1021-tegra，星源智 N4
+# 的 R38.4 是 6.8.12-rt-tegra），从内核分不出。分得出、也真正要紧的是 GPU 驱动：
+# 7.1（R38）的驱动只支持到 CUDA 13.0，7.2（R39）到 13.2，而 Jetson 的 CUDA 没有
+# 前向兼容 —— 给 7.2 构建的镜像装到 7.1 上，vLLM 启动就报
+# CUDA_ERROR_SYSTEM_DRIVER_MISMATCH。2026-10-31 thor_pack 就这么装上了 jp7.2 的
+# ModelHub，因为两条线都只报 jetson-jp7。
+#
+# 驱动版本读 /sys/module/nvidia/version：和 /proc/version 一样不受容器隔离，agent-core
+# 容器里读得到（thor_pack 实测 580.00 = CUDA 13.0）。/proc/driver/nvidia/version 在
+# 厂商自编的 BSP 上是 "TempVersion"，靠不住。
+#
+# 读不到或不认识时按 7.1 算：新驱动能跑旧 CUDA 的镜像，所以把 7.2 的机器当成 7.1
+# 只会少看到几个镜像，反过来才会装上跑不了的。
+_JP71_MAX_DRIVER = 580      # R38.x 的驱动大版本；更新的驱动是 R39 / JetPack 7.2
+_NVIDIA_DRIVER_VERSION = '/sys/module/nvidia/version'
 
 _TEGRA_RE = re.compile(r'(\d+)\.(\d+)\.\d+\S*-tegra')
 
@@ -44,9 +61,28 @@ def _kernel_string() -> str:
         return platform.release()  # 容器内同样是宿主内核
 
 
+def _nvidia_driver_major() -> int | None:
+    try:
+        with open(_NVIDIA_DRIVER_VERSION) as f:
+            return int(f.read().strip().split('.')[0])
+    except (OSError, ValueError):
+        return None
+
+
+def _jp7_line() -> str:
+    major = _nvidia_driver_major()
+    if major is not None and major > _JP71_MAX_DRIVER:
+        return 'jetson-jp7.2'
+    if major is None:
+        print('[hostarch] cannot read the NVIDIA driver version; assuming JetPack 7.1')
+    return 'jetson-jp7.1'
+
+
 @functools.cache
 def acc_arch() -> str:
-    """加速器架构：jetson-jp5 / jetson-jp6 / jetson-jp7 / none。
+    """加速器架构：jetson-jp5 / jetson-jp6 / jetson-jp7.1 / jetson-jp7.2 / none。
+
+    JetPack 7 报到小版本（见 _jp7_line），其余报大版本。
 
     ACC_ARCH 环境变量可覆盖（误判时不必重新构建镜像；install.sh 生成的 compose
     已带 env_file: .env）。
@@ -65,6 +101,8 @@ def acc_arch() -> str:
     if not acc:
         print(f'[hostarch] unknown tegra kernel {line}; treating host as {ACC_NONE}')
         return ACC_NONE
+    if acc == 'jetson-jp7':
+        return _jp7_line()
     return acc
 
 
