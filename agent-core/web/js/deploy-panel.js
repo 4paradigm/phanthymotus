@@ -828,6 +828,7 @@ const _ACC_LABEL = {
   'jetson-jp4': 'JetPack 4',
   'jetson-jp5': 'JetPack 5',
   'jetson-jp6': 'JetPack 6',
+  'jetson-jp7': 'JetPack 7',
   'agnostic':   '通用',
   'none':       '无 NVIDIA 加速器',
 };

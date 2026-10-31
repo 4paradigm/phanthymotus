@@ -54,6 +54,7 @@ curl -fsSL https://motus.phanthy.com/install.sh | sudo bash -s <tag>
 - **驱动层（L1）** —— 每个设备一个 MCP Server。每个工具都要声明 `type`，Agent Core 按类型区别对待：`sensor`（数据流）、`actuator`（可执行动作）、`processor`（数据处理）、`resource`（静态资源，如 URDF）。sensor 和 actuator 工具通常在**同一个**驱动进程里 —— 图上把它们分列两侧是按数据流方向画的，不代表要部署两份。
 - **感知层（L2，端口 15720 / 15721）** —— 把原始流转成语义：ASR、TTS、VLM 描述、视觉理解、人脸识别。
 - **ActuCore（L2，端口 15730）** —— 同一层的执行模型侧，随本仓库的 [`actucore/`](actucore/) 一起发布：VLA 策略、导航、抓取、运动控制、全身控制。它是一个卡片宿主，结构与 Perception 完全一致 —— 每个执行模型以 `processor` 卡片接入，所以任何「输入目标、输出运动指令」的模型都能用同一套方式挂上来。**当前不带任何卡片**，具体用哪些模型按机器人选型决定。卡片契约见 [`actucore/README.md`](actucore/README.md)。
+- **ModelHub（端口 15740 / 15741）** —— 在机器人本机上运行 Agent Loop 自己用来思考的大模型，在独立仓库维护：**[phanthymotus-modelhub](https://github.com/4paradigm/phanthymotus-modelhub)**。第一张卡片是基于 vLLM 的 LLM：精选模型列表、可续传的下载、启动配置、对话试用、标准 benchmark 和 30 天监控，都在 dashboard 里这张卡片的控制台上管理。所有模型统一挂在 15741 的 OpenAI 兼容网关后面，Agent Loop 用连云端 LLM 一样的方式连它。VLM、VLA 卡片后续加入。
 - **Agent Loop（L3，端口 15678）** —— FastAPI + `ros2_bridge.py`：事件采集器、L1–L4 分层 Prompt、工具分发、ACP barrier、历史压缩、Steering / 打断、任务存储、子 Agent 管理、Skills、记忆。
 - **两条旁路** —— Loop 可以直接调 `sensor` 工具，绕过感知层；也可以直接用 MCP JSON-RPC 驱动 `actuator` 工具，绕过 ActuCore。简单查询和单次指令走的就是这两条路。
 - **Web Dashboard** —— 通过 `/ws/bus/{topic}` 订阅总线上的全部 DDS Topic，通过 `/ws/motus` 订阅 Agent 的决策流。
@@ -213,6 +214,8 @@ Dashboard（`http://<设备IP>:15678`）提供：
 | Perception MCP | 15720 |
 | Perception WebSocket | 15721 |
 | ActuCore MCP | 15730 |
+| ModelHub MCP | 15740 |
+| ModelHub OpenAI 网关 | 15741 |
 | PR Review Agent（可选） | 25000 |
 
 硬件驱动端口请参见 [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)。
