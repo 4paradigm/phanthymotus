@@ -272,9 +272,24 @@ class ControlledSemanticSpatialPlugin:
                     "invalid_config", str(planning_info.get("error") or "invalid planning config")
                     if isinstance(planning_info, dict) else "invalid planning config"
                 )
+            mapping_info = self._mapping.dispatch("fast_livo2", {"action": "info"})
+            if self._config_failed(mapping_info):
+                return self._error(
+                    "invalid_config", str(mapping_info.get("error") or "invalid mapping config")
+                    if isinstance(mapping_info, dict) else "invalid mapping config"
+                )
+            mapping_values = mapping_info.get("config")
+            if (not isinstance(mapping_values, dict) or any(
+                name not in mapping_values
+                for name in ("obstacle_min_height_m", "obstacle_max_height_m")
+            )):
+                return self._error(
+                    "invalid_config", "mapping info must report both effective obstacle height limits"
+                )
             try:
                 planning_config = validated_planning_config(planning_info.get("config", {}), {})
-            except (PlanningConfigError, TypeError, ValueError) as exc:
+                mapping_config = validated_mapping_config(mapping_values, {})
+            except (MappingConfigError, PlanningConfigError, TypeError, ValueError) as exc:
                 return self._error("invalid_config", str(exc))
         with self._lock:
             # Stop signals before acquiring the transition lock, including
@@ -313,6 +328,8 @@ class ControlledSemanticSpatialPlugin:
                 input_topics=wiring["wired_topics"],
                 control_interface=descriptor,
                 rotate_reengage_rad=planning_config["rotate_reengage_rad"],
+                obstacle_min_height_m=mapping_config["obstacle_min_height_m"],
+                obstacle_max_height_m=mapping_config["obstacle_max_height_m"],
             )
             if runtime_result.get("state") != "running":
                 raise RuntimeError("navigation child processes did not stay running")

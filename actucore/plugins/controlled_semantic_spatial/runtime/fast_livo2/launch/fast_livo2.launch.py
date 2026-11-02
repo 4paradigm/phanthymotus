@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -29,6 +30,10 @@ def generate_launch_description() -> LaunchDescription:
     topics = {name: LaunchConfiguration(name) for name in defaults}
     return LaunchDescription(
         [
+            # Required: the lifecycle owner supplies the card's single height band.
+            # Standalone launches must also make that choice explicitly.
+            DeclareLaunchArgument("obstacle_min_height_m"),
+            DeclareLaunchArgument("obstacle_max_height_m"),
             *[
                 DeclareLaunchArgument(name, default_value=value)
                 for name, value in defaults.items()
@@ -55,7 +60,15 @@ def generate_launch_description() -> LaunchDescription:
                             "map_control_topic",
                             "map_control_status_topic",
                         )
-                    }
+                    },
+                    {
+                        "obstacle_min_height_m": ParameterValue(
+                            LaunchConfiguration("obstacle_min_height_m"), value_type=float
+                        ),
+                        "obstacle_max_height_m": ParameterValue(
+                            LaunchConfiguration("obstacle_max_height_m"), value_type=float
+                        ),
+                    },
                 ],
             ),
             Node(

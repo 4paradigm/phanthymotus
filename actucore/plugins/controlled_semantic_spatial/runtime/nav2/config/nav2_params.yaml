@@ -121,6 +121,12 @@ local_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
+        # Template fallback only: nav2.launch rewrites layer AND source bands
+        # from the single mapping-card height configuration before node startup.
+        # Layer marking and source buffering must share the same map-z limits;
+        # otherwise some points can clear without being eligible for marking.
+        min_obstacle_height: -0.30
+        max_obstacle_height: 0.30
         observation_sources: registered_cloud
         registered_cloud:
           topic: /ubuntu/navigation/cloud_registered
@@ -131,9 +137,9 @@ local_costmap:
           sensor_frame: base_link
           clearing: true
           marking: true
-          # FAST-LIVO2 adapter already applies the card-configured Z band.
-          min_obstacle_height: -3.0
-          max_obstacle_height: 3.0
+          # Template fallback; overwritten alongside the layer band at launch.
+          min_obstacle_height: -0.30
+          max_obstacle_height: 0.30
           obstacle_min_range: 0.20
           obstacle_max_range: 8.0
           raytrace_min_range: 0.20
@@ -169,6 +175,12 @@ global_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
+        # Template fallback only: nav2.launch rewrites layer AND source bands
+        # from the single mapping-card height configuration before node startup.
+        # Layer marking and source buffering must share the same map-z limits;
+        # otherwise some points can clear without being eligible for marking.
+        min_obstacle_height: -0.30
+        max_obstacle_height: 0.30
         observation_sources: registered_cloud
         registered_cloud:
           topic: /ubuntu/navigation/cloud_registered
@@ -179,9 +191,9 @@ global_costmap:
           sensor_frame: base_link
           clearing: true
           marking: true
-          # FAST-LIVO2 adapter already applies the card-configured Z band.
-          min_obstacle_height: -3.0
-          max_obstacle_height: 3.0
+          # Template fallback; overwritten alongside the layer band at launch.
+          min_obstacle_height: -0.30
+          max_obstacle_height: 0.30
           obstacle_min_range: 0.20
           obstacle_max_range: 8.0
           raytrace_min_range: 0.20

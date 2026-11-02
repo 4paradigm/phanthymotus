@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from .mapping.contract import FAST_LIVO2_CONFIG_DEFAULTS
+
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +66,7 @@ class ControlledSemanticSpatialRuntime:
         self._stop_timeout_sec = float(stop_timeout_sec)
         self._startup_grace_sec = float(startup_grace_sec)
         self._lock = threading.RLock()
+        self._launch_obstacle_height_range_m: tuple[float, float] | None = None
         self._children = [
             _Child(
                 "fast_livo2",
@@ -87,19 +90,27 @@ class ControlledSemanticSpatialRuntime:
         input_topics: dict[str, str] | None = None,
         control_interface: dict | None = None,
         rotate_reengage_rad: float = 0.15,
+        obstacle_min_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_min_height_m"],
+        obstacle_max_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_max_height_m"],
     ) -> dict:
         with self._lock:
+            # Validate before acquiring or stopping any child. Both launches must
+            # receive exactly the mapping card's band, including persisted overrides.
+            launch_arguments = self._launch_arguments(
+                namespace, input_topics, control_interface, rotate_reengage_rad,
+                obstacle_min_height_m, obstacle_max_height_m,
+            )
+            height_range = (float(obstacle_min_height_m), float(obstacle_max_height_m))
             running = [child for child in self._children if self._is_running(child)]
             if len(running) == len(self._children):
+                if height_range != self._launch_obstacle_height_range_m:
+                    raise ValueError("stop navigation before changing the obstacle height band")
                 return self.info(already_started=True)
             if any(child.process is not None for child in self._children):
                 self._stop_locked()
 
             started: list[_Child] = []
             try:
-                launch_arguments = self._launch_arguments(
-                    namespace, input_topics, control_interface, rotate_reengage_rad
-                )
                 for child in self._children:
                     command = [
                         *child.command,
@@ -130,6 +141,7 @@ class ControlledSemanticSpatialRuntime:
             except Exception:
                 self._terminate(started)
                 raise
+            self._launch_obstacle_height_range_m = height_range
             return self.info()
 
     @staticmethod
@@ -137,7 +149,16 @@ class ControlledSemanticSpatialRuntime:
         namespace: str, input_topics: dict[str, str] | None,
         control_interface: dict | None = None,
         rotate_reengage_rad: float = 0.15,
+        obstacle_min_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_min_height_m"],
+        obstacle_max_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_max_height_m"],
     ) -> dict[str, tuple[str, ...]]:
+        for name, value in (("obstacle_min_height_m", obstacle_min_height_m),
+                            ("obstacle_max_height_m", obstacle_max_height_m)):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not -3.0 <= value <= 3.0):
+                raise ValueError(f"{name} must be a finite number within [-3.0, 3.0]")
+        if obstacle_min_height_m >= obstacle_max_height_m:
+            raise ValueError("obstacle_min_height_m must be less than obstacle_max_height_m")
         if (isinstance(rotate_reengage_rad, bool) or
                 not isinstance(rotate_reengage_rad, (int, float)) or
                 not math.isfinite(rotate_reengage_rad) or
@@ -153,7 +174,12 @@ class ControlledSemanticSpatialRuntime:
         def topic(port: str, default: str) -> str:
             return str(input_topics.get(port) or "").strip() or default
 
+        height_values = {
+            "obstacle_min_height_m": str(float(obstacle_min_height_m)),
+            "obstacle_max_height_m": str(float(obstacle_max_height_m)),
+        }
         fast_values = {
+            **height_values,
             "lidar_topic": topic("lidar", f"{navigation}/lidar"),
             "imu_topic": topic("imu", f"{navigation}/imu"),
             "raw_odom_topic": f"{fast_livo2}/raw/odom",
@@ -171,6 +197,7 @@ class ControlledSemanticSpatialRuntime:
             "status_topic": f"{fast_livo2}/status",
         }
         nav2_values = {
+            **height_values,
             "rotate_reengage_rad": str(float(rotate_reengage_rad)),
             "rotate_exit_rad": str(rotate_exit_rad),
             "odom_topic": f"{navigation}/odom",
@@ -464,6 +491,11 @@ class ControlledSemanticSpatialRuntime:
                 "already_started": already_started,
                 "container_model": "single_actucore_container",
                 "docker_runtime_dependency": False,
+                # Launch evidence, not an assertion of live ROS read-back.
+                "launch_obstacle_height_range_m": (
+                    list(self._launch_obstacle_height_range_m)
+                    if self._launch_obstacle_height_range_m is not None else None
+                ),
                 "children": children,
             }
 

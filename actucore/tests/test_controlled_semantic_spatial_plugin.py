@@ -23,6 +23,7 @@ sys.path.insert(0, str(ACTUCORE_ROOT))
 from plugins.controlled_semantic_spatial.contract import CONTROLLED_SEMANTIC_SPATIAL_ACTIONS, controlled_semantic_spatial_tool_definition  # noqa: E402
 from plugins.controlled_semantic_spatial.mapping.backend import RosTopicFastLivo2Backend  # noqa: E402
 from plugins.controlled_semantic_spatial.mapping.core import FastLivo2BackendError  # noqa: E402
+from plugins.controlled_semantic_spatial.mapping.contract import FAST_LIVO2_CONFIG_DEFAULTS  # noqa: E402
 from plugins.controlled_semantic_spatial.mapping.plugin import FastLivo2Plugin  # noqa: E402
 from plugins.controlled_semantic_spatial.plugin import ControlledSemanticSpatialPlugin  # noqa: E402
 from plugins.controlled_semantic_spatial.runtime import (  # noqa: E402
@@ -81,7 +82,10 @@ class FakeComponent:
                 return dict(self.stop_result)
             return {"state": "idle", "status": "idle"}
         if action == "info":
-            return {"state": "ready" if self.started else "idle"}
+            result = {"state": "ready" if self.started else "idle"}
+            if self.name == "mapping":
+                result["config"] = dict(FAST_LIVO2_CONFIG_DEFAULTS)
+            return result
         return {"status": action, "component": self.name}
 
 

@@ -203,8 +203,17 @@ Canvas 的 `config` 动作还提供 `obstacle_min_height_m` 和
 体素单独累计或从已加载 raw PCD 恢复，只用于 Canvas；它们不会进入
 registered cloud、静态障碍图或 Nav2 costmap。高度带默认值是
 `-0.30...+0.30 m`；它采用 canonical `map` frame，不能按雷达物理安装高度
-直接填写。直接累计不会清除已经由错误高度带写入的静态占用，修改上下界后
-必须新建地图。
+直接填写，持久化卡片配置优先于默认值。默认值不是现场安全验收结论；应先核对
+变换、真实地面及低矮障碍。下界过低会把地面点纳入占用；直接累计不会清除
+已写入的静态占用，修改上下界后必须新建地图。
+
+统一启动时以 mapping 组件报告的这两个配置值为唯一来源，显式传给 FAST-LIVO2
+adapter 及 Nav2 两个 launch。Nav2 参数重写同时设置 local/global 的 obstacle layer
+和 registered_cloud source，合计八个高度叶子；旧 YAML 缺少 layer 级键时也补齐，
+不再静默退回 Nav2 的 `0..2 m` 默认。两图必须使用 `map` frame 及标准 ObstacleLayer；
+不兼容的自定义参数结构拒绝启动。配置缺失、非有限或倒序在创建子进程前拒绝。
+运行中仍禁止更改，停卡后配置、下次启动生效；不提供跨节点热更新。
+只统一高度语义，不承诺累计静态图与实时局部图逐格相等。
 `map_view_enabled` 和 `fault_capture_enabled` 默认均为 `true`，用于真机
 性能 A/B；只能停卡后配置，并在下次启动生效。关闭前者只停止 Canvas 点云
 编码/发布，不改变 FAST-LIVO2 或 Nav2 输入；关闭后者只停止短时故障快照。

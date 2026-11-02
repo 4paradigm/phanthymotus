@@ -16,6 +16,19 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
+from nav2.height_band import apply_obstacle_height_band
+
+
+class HeightBandRewrittenYaml(RewrittenYaml):
+    """Also fill missing layer keys in legacy YAML, not just existing leaves."""
+
+    def substitute_params(self, data, param_rewrites):
+        super().substitute_params(data, param_rewrites)
+        apply_obstacle_height_band(
+            data,
+            self.convert(param_rewrites["min_obstacle_height"]),
+            self.convert(param_rewrites["max_obstacle_height"]),
+        )
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -23,12 +36,16 @@ def generate_launch_description() -> LaunchDescription:
     nav2_share = get_package_share_directory("nav2_bringup")
 
     params_file = LaunchConfiguration("params_file")
-    controller_params = RewrittenYaml(
+    controller_params = HeightBandRewrittenYaml(
         source_file=params_file,
         root_key="",
         param_rewrites={
             "rotate_reengage_rad": LaunchConfiguration("rotate_reengage_rad"),
             "rotate_exit_rad": LaunchConfiguration("rotate_exit_rad"),
+            # RewrittenYaml leaf rewrites apply to BOTH costmaps and BOTH
+            # layer/source bands (eight scalar leaves). No independent Nav2 band.
+            "min_obstacle_height": LaunchConfiguration("obstacle_min_height_m"),
+            "max_obstacle_height": LaunchConfiguration("obstacle_max_height_m"),
         },
         convert_types=True,
     )
@@ -66,6 +83,8 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/actucore/navi/cmd",
             ),
             DeclareLaunchArgument("control_interface_json", default_value="{}"),
+            DeclareLaunchArgument("obstacle_min_height_m"),
+            DeclareLaunchArgument("obstacle_max_height_m"),
             DeclareLaunchArgument("rotate_reengage_rad", default_value="0.15"),
             DeclareLaunchArgument("rotate_exit_rad", default_value="0.05"),
             DeclareLaunchArgument(
