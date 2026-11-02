@@ -2036,13 +2036,27 @@ class GitHubCommandWatcher:
             return (effective_cutoff is not None
                     and current_ready_cutoff <= effective_cutoff)
 
-        initial_state = await self.proxy.read_hidden_state(repo, pr_number)
+        try:
+            initial_state = await self.proxy.read_hidden_state(repo, pr_number)
+        except Exception as exc:
+            logger.warning(
+                "watcher baseline state read failed %s#%s error=%s",
+                repo, pr_number, type(exc).__name__,
+            )
+            return False
         expected_state = initial_state
 
         baseline_id = 0
         if _needs_initial_comment_baseline(initial_state):
             # --- First-observation / baseline-incomplete path ---
-            pr_info = await self.proxy.get_pr(repo, pr_number)
+            try:
+                pr_info = await self.proxy.get_pr(repo, pr_number)
+            except Exception as exc:
+                logger.warning(
+                    "watcher baseline PR read failed %s#%s error=%s",
+                    repo, pr_number, type(exc).__name__,
+                )
+                return False
             if (not pr_info or pr_info.get("state") != "open"
                     or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
@@ -2125,12 +2139,98 @@ class GitHubCommandWatcher:
             # --- Existing baselined PR \u2014 reactivation cursor advance ---
             # The PR has a real cursor state. Advance cursor to max(old, observed)
             # without resetting business fields.
-            pr_info = await self.proxy.get_pr(repo, pr_number)
+            try:
+                pr_info = await self.proxy.get_pr(repo, pr_number)
+            except Exception as exc:
+                logger.warning(
+                    "watcher baseline PR read failed %s#%s error=%s",
+                    repo, pr_number, type(exc).__name__,
+                )
+                return False
             if (not pr_info or pr_info.get("state") != "open"
                     or pr_info.get("merged") or pr_info.get("draft")):
                 if initial_state is None:
                     await self.controller.reconcile_pr(repo, pr_number)
                 return False
+
+            pr_head = ((pr_info.get("head") or {}).get("sha")
+                       if isinstance(pr_info, dict) else None)
+            if (not isinstance(pr_head, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", pr_head) is None):
+                logger.warning("watcher baseline invalid PR HEAD %s#%s", repo, pr_number)
+                return False
+            if (self.config.auth_valid is not True
+                    or repo not in self.config.active_repos
+                    or repo not in self.config.github_repos):
+                logger.warning("watcher baseline authorization rejected %s#%s", repo, pr_number)
+                return False
+            old_head = initial_state.get("head_sha")
+            if old_head != pr_head:
+                try:
+                    old_round = round_id_for_state(initial_state)
+                except (ValueError, TypeError):
+                    return False
+                logger.info(
+                    "watcher baseline HEAD drift detected %s#%s old_head=%s new_head=%s",
+                    repo, pr_number, old_head if isinstance(old_head, str) else "invalid", pr_head,
+                )
+                try:
+                    before_reconcile = await self.proxy.read_hidden_state(repo, pr_number)
+                    if before_reconcile != initial_state:
+                        logger.warning("watcher baseline state replaced %s#%s", repo, pr_number)
+                        return False
+                    if not baseline_boundary_current():
+                        logger.warning("watcher baseline authorization rejected %s#%s", repo, pr_number)
+                        return False
+                    await self.controller.reconcile_pr(repo, pr_number)
+                    state_after = await self.proxy.read_hidden_state(repo, pr_number)
+                    pr_after = await self.proxy.get_pr(repo, pr_number)
+                except Exception as e:
+                    logger.warning(
+                        "watcher baseline reconcile failed %s#%s error=%s",
+                        repo, pr_number, type(e).__name__,
+                    )
+                    return False
+                archive = state_after.get("round_archive") if isinstance(state_after, dict) else None
+                archive_keys = set(archive) if isinstance(archive, dict) else set()
+                legacy_archive = archive_keys == {"round_id", "sha256", "comment_id", "url"}
+                archive_valid = (
+                    archive_keys in ({"round_id", "sha256"},
+                                     {"round_id", "sha256", "comment_id", "url"})
+                    and archive.get("round_id") == old_round
+                    and isinstance(archive.get("sha256"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", archive["sha256"]) is not None
+                    and (not legacy_archive or (type(archive.get("comment_id")) is int
+                         and archive["comment_id"] > 0
+                         and isinstance(archive.get("url"), str)
+                         and archive["url"].startswith("https://github.com/")))
+                )
+                old_cursor = initial_state.get("last_processed_comment_id")
+                new_cursor = state_after.get("last_processed_comment_id") if isinstance(state_after, dict) else None
+                if (not isinstance(state_after, dict) or not isinstance(pr_after, dict)
+                        or pr_after.get("state") != "open" or pr_after.get("merged")
+                        or pr_after.get("draft")
+                        or (pr_after.get("head") or {}).get("sha") != pr_head
+                        or state_after.get("head_sha") != pr_head
+                        or state_after.get("status") != "review-required"
+                        or state_after.get("review_evidence") != {}
+                        or state_after.get("components") != []
+                        or state_after.get("deployments") != []
+                        or not archive_valid
+                        or type(old_cursor) is not int or old_cursor < 0
+                        or type(new_cursor) is not int or new_cursor < old_cursor
+                        or state_after.get("command") != {
+                            "comment_id": new_cursor, "kind": "",
+                            "phase": "completed", "args": {},
+                        }):
+                    logger.warning("watcher baseline reconcile incomplete %s#%s", repo, pr_number)
+                    return False
+                if not baseline_boundary_current():
+                    logger.warning("watcher baseline authorization rejected %s#%s", repo, pr_number)
+                    return False
+                expected_state = state_after
+                pr_info = pr_after
+                logger.info("watcher baseline reconcile completed %s#%s", repo, pr_number)
 
             try:
                 comments = await self.proxy.get_issue_comments(repo, pr_number)
@@ -2169,11 +2269,11 @@ class GitHubCommandWatcher:
             # evidence from the active testing round. Recover only ordinary
             # comments newer than round_started_at; command comments remain
             # governed by the baseline and are never dispatched here.
-            if initial_state.get("status") == "testing":
-                head_sha = initial_state.get("head_sha")
+            if expected_state.get("status") == "testing":
+                head_sha = expected_state.get("head_sha")
                 try:
-                    round_id = round_id_for_state(initial_state)
-                    round_started_at = initial_state.get("round_started_at")
+                    round_id = round_id_for_state(expected_state)
+                    round_started_at = expected_state.get("round_started_at")
                     round_started = datetime.fromisoformat(
                         str(round_started_at).replace("Z", "+00:00")
                     )
@@ -2312,7 +2412,13 @@ class GitHubCommandWatcher:
                 or (latest_pr.get("head") or {}).get("sha") != expected_head
                 or not isinstance(latest_state, dict)
                 or latest_state.get("head_sha") != expected_head
-                or latest_state.get("status") != expected_status):
+                or latest_state.get("status") != expected_status
+                or (expected_state is not initial_state and any(
+                    latest_state.get(field) != expected_state.get(field)
+                    for field in ("round_archive", "round_id", "command",
+                                  "review_evidence", "components", "deployments",
+                                  "last_processed_comment_id")
+                ))):
             return False
         if not baseline_boundary_current():
             logger.warning(
@@ -2350,6 +2456,11 @@ class GitHubCommandWatcher:
                 repo, pr_number, persisted_cid, baseline_id,
             )
             return False
+        logger.info(
+            "watcher baseline persisted %s#%s cursor=%s previous_cursor=%s",
+            repo, pr_number, persisted_cid,
+            old_cursor if isinstance(old_cursor, int) else 0,
+        )
         if not baseline_boundary_current():
             logger.warning(
                 "watcher baseline boundary changed after cursor write %s#%s \u2014 retry required",
