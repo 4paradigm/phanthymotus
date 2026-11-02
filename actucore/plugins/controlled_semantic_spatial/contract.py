@@ -30,6 +30,15 @@ CONTROLLED_SEMANTIC_SPATIAL_PUBLIC_OUTPUT_PORTS = (
 )
 
 
+# Accepted only by config for saved-card compatibility, never shown as options.
+LEGACY_CONFIG_FIELDS = (
+    "lidar_topic", "rgb_topic", "imu_topic",
+    "mapping_request_timeout_sec", "mapping_discovery_timeout_sec",
+    "planning_request_timeout_sec", "planning_discovery_timeout_sec",
+    "lidar_qos_depth", "imu_qos_depth", "map_voxel_size_m",
+)
+
+
 def _config_properties() -> dict:
     mapping = fast_livo2_tool_definition("ubuntu")["configSchema"]["properties"]
     planning = nav2_tool_definition("ubuntu")["configSchema"]["properties"]
@@ -38,20 +47,18 @@ def _config_properties() -> dict:
         "/ubuntu/navigation/odom",
     )["configSchema"]["properties"]
     result = {
-        "lidar_topic": {"type": "string", "default": "", "description": "Expected LiDAR topic for topic-only Canvas input; empty uses the namespace default"},
-        "rgb_topic": {"type": "string", "default": "", "description": "Expected RGB topic for topic-only Canvas input; empty uses the namespace default"},
-        "imu_topic": {"type": "string", "default": "", "description": "Expected IMU topic for topic-only Canvas input; empty uses /<namespace>/navigation/imu"},
-        "mapping_request_timeout_sec": deepcopy(mapping["request_timeout_sec"]),
-        "mapping_discovery_timeout_sec": deepcopy(mapping["discovery_timeout_sec"]),
-        "lidar_qos_depth": deepcopy(mapping["lidar_qos_depth"]),
-        "imu_qos_depth": deepcopy(mapping["imu_qos_depth"]),
-        "map_voxel_size_m": deepcopy(mapping["map_voxel_size_m"]),
+        "inflation_radius_m": {
+            "type": "number", "exclusiveMinimum": 0, "maximum": 2.0,
+            "default": 0.55, "title": "共享膨胀半径（m，下次启动生效）",
+            "description": (
+                "局部与全局共用，下次启动生效；不是 footprint 或安全净空。"
+                "小于机器人外接尺寸可能不保守；2 m 为卡片防误填限制，0 不用于关闭膨胀。"
+            ),
+        },
         "obstacle_min_height_m": deepcopy(mapping["obstacle_min_height_m"]),
         "obstacle_max_height_m": deepcopy(mapping["obstacle_max_height_m"]),
         "map_view_enabled": deepcopy(mapping["map_view_enabled"]),
         "fault_capture_enabled": deepcopy(mapping["fault_capture_enabled"]),
-        "planning_request_timeout_sec": deepcopy(planning["request_timeout_sec"]),
-        "planning_discovery_timeout_sec": deepcopy(planning["discovery_timeout_sec"]),
         "rotate_reengage_rad": deepcopy(planning["rotate_reengage_rad"]),
     }
     for key in (
@@ -76,6 +83,19 @@ def _config_properties() -> dict:
             "vlm_timeout_sec": deepcopy(semantic["timeout_sec"]),
         }
     )
+    for key, title in {
+        "obstacle_min_height_m": "障碍最低高度（m）",
+        "obstacle_max_height_m": "障碍最高高度（m）",
+        "map_view_enabled": "地图预览",
+        "fault_capture_enabled": "故障采集",
+        "rotate_reengage_rad": "重新转向偏差（rad）",
+        "min_x_mps": "X 输出死区（m/s）", "max_x_mps": "X 最大速度（m/s）",
+        "min_y_mps": "Y 输出死区（m/s）", "max_y_mps": "Y 最大速度（m/s）",
+        "rotate_speed_rps": "固定转向角速度幅值（rad/s）",
+        "vlm_base_url": "VLM 服务地址", "vlm_api_key": "VLM API 密钥",
+        "vlm_model": "VLM 模型", "vlm_timeout_sec": "VLM 超时（s）",
+    }.items():
+        result[key]["title"] = title
     return result
 
 
@@ -113,6 +133,9 @@ def _action_properties() -> dict:
                 result.setdefault(key, deepcopy(value))
     for key, value in CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA["properties"].items():
         result[key] = deepcopy(value)
+    for key in LEGACY_CONFIG_FIELDS:
+        # Ignore even malformed saved values; only exact names are accepted.
+        result[key] = {"description": "Legacy config only; ignored in favor of internal defaults"}
     result["camera_info"] = {
         "type": "object",
         "description": (

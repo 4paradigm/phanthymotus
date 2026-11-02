@@ -235,12 +235,74 @@ class HeightBandLaunchTest(unittest.TestCase):
         for name in ('local_costmap','global_costmap'):
             layer=data[name][name]['ros__parameters']['obstacle_layer'];del layer['min_obstacle_height'],layer['max_obstacle_height']
         # Actual subclass + pure helper are exercised; only the launch/ROS base is a harness.
-        params.substitute_params(data,{'min_obstacle_height':'-0.5','max_obstacle_height':'0.3','rotate_reengage_rad':'0.12'})
+        params.substitute_params(data,{'min_obstacle_height':'-0.5','max_obstacle_height':'0.3','rotate_reengage_rad':'0.12','inflation_radius':'0.55'})
         self.assertEqual(limits(data),[(-.5,.3)]*4)
         self.assertEqual(data['controller_server']['ros__parameters']['FollowPath']['rotate_reengage_rad'],.12)
         for name in ('obstacle_min_height_m','obstacle_max_height_m'):
             declaration=next(x for x in objects if x.args==(name,))
             self.assertNotIn('default_value',declaration.kwargs)
+
+
+class InflationRadiusLaunchTest(unittest.TestCase):
+    def test_nondefault_radius_rewrites_only_two_float_leaves_with_legacy_support(self):
+        ns = load_launch(NAV2 / 'launch/nav2.launch.py')
+        objects = list(captured_objects(ns['generate_launch_description']()))
+        params = dict(next(x for x in objects if 'launch_arguments' in x.kwargs).kwargs['launch_arguments'])['params_file']
+        self.assertEqual(params.kwargs['param_rewrites']['inflation_radius'].name, 'inflation_radius_m')
+        declaration = next(x for x in objects if x.args == ('inflation_radius_m',))
+        self.assertNotIn('default_value', declaration.kwargs)
+        for radius in (.45, .55, .8, 1):
+            for legacy in (False, True):
+                with self.subTest(radius=radius, legacy=legacy):
+                    data = template()
+                    before = copy.deepcopy(data)
+                    data['unrelated'] = {'inflation_radius': 17.}
+                    if legacy:
+                        for name in ('local_costmap', 'global_costmap'):
+                            del data[name][name]['ros__parameters']['inflation_layer']['inflation_radius']
+                    params.substitute_params(data, {'min_obstacle_height': '-0.5', 'max_obstacle_height': '0.3',
+                                                   'inflation_radius': str(radius)})
+                    for name in ('local_costmap', 'global_costmap'):
+                        p = data[name][name]['ros__parameters']
+                        self.assertEqual(p['inflation_layer']['inflation_radius'], radius)
+                        self.assertIs(type(p['inflation_layer']['inflation_radius']), float)
+                        self.assertEqual(p['inflation_layer']['cost_scaling_factor'], before[name][name]['ros__parameters']['inflation_layer']['cost_scaling_factor'])
+                        self.assertEqual(p['footprint'], before[name][name]['ros__parameters']['footprint'])
+                    self.assertEqual(data['unrelated']['inflation_radius'], 17.)
+                    self.assertEqual(limits(data), [(-.5, .3)] * 4)
+
+    def test_invalid_radius_and_layers_fail_before_radius_mutation(self):
+        from nav2.height_band import apply_inflation_radius
+        for bad in (None, True, '0.8', 0, -.1, 2.01, float('nan'), float('inf'), 10**1000):
+            data = template(); before = copy.deepcopy(data)
+            with self.assertRaises(ValueError): apply_inflation_radius(data, bad)
+            self.assertEqual(data, before)
+        for mutate in (lambda p: p.pop('inflation_layer'),
+                       lambda p: p['inflation_layer'].update(plugin='wrong::Layer'),
+                       lambda p: p.update(plugins=['obstacle_layer'])):
+            data = template()
+            mutate(data['global_costmap']['global_costmap']['ros__parameters'])
+            before = copy.deepcopy(data)
+            with self.assertRaises(ValueError): apply_inflation_radius(data, .8)
+            self.assertEqual(data, before)
+
+    def test_runtime_launch_arguments_and_live_change_guard(self):
+        factory = mock.Mock(side_effect=lambda command, **kw: fixtures.ControlledSemanticSpatialRuntimeTest.Process(command))
+        runtime = ControlledSemanticSpatialRuntime(popen_factory=factory, startup_grace_sec=0)
+        for bad in (None, True, '0.8', 0, -.1, 2.01, float('nan'), float('inf'), 10**1000):
+            with self.assertRaises(ValueError): runtime.start(inflation_radius_m=bad)
+        factory.assert_not_called()
+        for radius in (.45, .55, .8, 1):
+            args = ControlledSemanticSpatialRuntime._launch_arguments('ubuntu', {}, inflation_radius_m=radius)
+            self.assertIn('inflation_radius_m:=' + str(float(radius)), args['nav2'])
+            self.assertFalse(any('inflation_radius' in value for value in args['fast_livo2']))
+        with mock.patch.object(runtime, '_start_descendant_monitor'):
+            self.assertEqual(runtime.start(inflation_radius_m=.8)['launch_inflation_radius_m'], .8)
+            self.assertTrue(runtime.start(inflation_radius_m=.8)['already_started'])
+            with mock.patch.object(runtime, '_stop_locked') as stop:
+                with self.assertRaises(ValueError): runtime.start(inflation_radius_m=.45)
+                stop.assert_not_called()
+        self.assertEqual(factory.call_count, 2)
 
 
 if __name__=='__main__':unittest.main()

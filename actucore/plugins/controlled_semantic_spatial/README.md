@@ -80,23 +80,16 @@ Driver 卡片合并后的连线：
 
 本卡无需 Core 修改，也不要求 live `input_descriptors`。原版 Core 传单个
 `input_topic`，多输入时传 `input_topics`（以及其中一个 `input_topic`）；卡片
-按配置中的 topic 对照识别端口，不按输入顺序推测。以下配置在卡片 `config`
-中设置，空字符串恢复 namespace 默认；均须为空或合法 ROS 绝对 topic：
-
-| 配置 | 空值默认（namespace 为 `ubuntu`） | 用途 |
-| --- | --- | --- |
-| `lidar_topic` | `/ubuntu/navigation/lidar` | topic-only 输入的雷达对照 |
-| `rgb_topic` | `/ubuntu/camera/rgb` | topic-only 输入的可选 RGB 对照 |
-| `imu_topic` | `/ubuntu/navigation/imu` | topic-only 输入的 IMU 对照 |
-
-例如自定义设备先配置 `lidar_topic=/robot/lidar/cloud`、
-`rgb_topic=/robot/camera/jpeg`（有 RGB 时）、`imu_topic=/robot/lidar/imu`，
-然后分别连接雷达和 IMU 两条线并启动。topic-only 集合必须匹配已配置的雷达、
-IMU 和可选 RGB；未知、重复或冲突的 topic、缺雷达或 IMU 均拒绝启动。直接调用可用
+按内部固定的 namespace 默认 topic 对照识别端口，不按输入顺序推测。
+上表的 topic 是 namespace 为 `ubuntu` 时的默认；不再提供 topic 卡片配置。
+正常 Canvas 连线与可选 RGB 行为保留，topic-only 集合必须匹配默认雷达、IMU 和
+可选 RGB；未知、重复或冲突的 topic、缺雷达或 IMU 均拒绝启动。
+自定义 topic 的直接调用仍可用
 `input_bindings=[{"port":"lidar","topic":"/robot/lidar/cloud"},
 {"port":"imu","topic":"/robot/lidar/imu"}]`，不依赖顺序；若同时传 topic
-参数，集合必须一致。直调绑定显式指定端口。配置只能在停止时改变；配置不自动
-发现任意 IMU，默认值也只是假设，其他设备必须由操作者核对并配置正确的 topic。
+参数，集合必须一致。此绑定须显式指定端口，不是自动发现能力。
+旧卡片的自定义 topic 值不会继续生效；不支持传显式绑定的 Core 必须使用默认
+生产者 topic，或在升级前由操作者处理接线，不能静默按类型猜测任意设备。
 Core 传给卡片的是去重后的 topic 集合，不包含目标端口身份，且可能回退到保存的
 来源 topic；因此本卡只能校验收到的集合，不能独立证明每根线的目标端口、
 来源当前在线或去重前没有重复。请在画布核对两根线并验证实际 ROS 数据。
@@ -196,6 +189,56 @@ Nav2 规划控制；连接 RGB 后才启动语义导航。未连 RGB 时，`capt
 完整的静态插件配置样例见 [config.example.json](config.example.json)，内容放在
 ActuCore 配置的 `plugins.controlled_semantic_spatial` 下。旧键 `plugins.navigation`
 不再接受，须迁移后启动；其中 `semantic.vlm.api_key` 必须通过部署配置或环境注入真实值，不能提交凭据。
+### 卡片配置（15 项）
+
+以下配置仅在停卡时修改、下次启动生效；无热更新：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `inflation_radius_m` | `0.55` | 局部/全局共用膨胀半径，米 |
+| `obstacle_min_height_m` | `-0.30` | map frame 障碍高度下界，米 |
+| `obstacle_max_height_m` | `0.30` | map frame 障碍高度上界，米 |
+| `map_view_enabled` | `true` | Canvas 地图预览 |
+| `fault_capture_enabled` | `true` | 开发故障采集；正式发布门槛见下文 |
+| `rotate_reengage_rad` | `0.15` | 重新转向偏差，弧度 |
+| `min_x_mps` | `0.3` | X 非零输出死区，非最低巡航速度 |
+| `max_x_mps` | `1.0` | X 最大输出速度，米/秒 |
+| `min_y_mps` | `0.0` | Y 非零输出死区，非最低巡航速度 |
+| `max_y_mps` | `0.0` | Y 最大输出速度，米/秒 |
+| `rotate_speed_rps` | `0.3` | 固定转向角速度幅值，弧度/秒 |
+| `vlm_base_url` | `https://ark.cn-beijing.volces.com/api/v3` | VLM 服务地址，敏感配置 |
+| `vlm_api_key` | 空 | VLM 密钥，敏感配置 |
+| `vlm_model` | `doubao-seed-2-1-pro-260628` | VLM 模型 |
+| `vlm_timeout_sec` | `18.0` | VLM 请求超时，秒 |
+
+`inflation_radius_m` 必须为有限数，`0 < r <= 2.0 m`；不接受 bool、空值、
+字符串或 NaN/inf，0 不提供关闭膨胀的入口。2 m 是本卡片防误填的产品限制，
+不是 Nav2 硬限制。半径不是 footprint，也不保证机器人安全净空；小于机器人
+外接尺寸可能不保守，不能仅凭配置范围认定安全。默认仍为 `0.55 m`。
+它由卡片事务配置持有，经 runtime 明确传入 Nav2 launch；只设置
+local/global 两个 `inflation_layer.inflation_radius` 叶子，写入类型为 float，
+旧 YAML 缺半径键时补齐，缺层或不兼容的插件结构则拒绝。不会改变 footprint、
+cost_scaling_factor 或高度过滤。`info.inflation_radius_m` 是已配置值，
+`runtime.launch_inflation_radius_m` 只是最近成功启动的传参证据，不是实时 ROS 读回。
+静态配置中半径非法时 info/start 报 `invalid_config`；空配置和仅旧字段不能解除，
+须显式配置有效半径且整个事务成功后才清除该半径错误。
+
+从原卡片移除的十项为 `lidar_topic`、`rgb_topic`、`imu_topic`、
+`mapping_request_timeout_sec`、`mapping_discovery_timeout_sec`、
+`planning_request_timeout_sec`、`planning_discovery_timeout_sec`、
+`lidar_qos_depth`、`imu_qos_depth`、`map_voxel_size_m`。
+通信超时固定为 mapping `130/5 s`、planning `30/5 s`，QoS 深度固定为
+LiDAR `2`、IMU `400`，地图体素固定为 `0.10 m`；不是隐藏后继续采用旧自定义值。
+旧 MCP `config` 请求仅兼容上述精确字段名，忽略其值（包括畸形值）；其他 action
+携带旧字段仍拒绝，拼写错误等未知字段也拒绝。响应和 info 通过
+`ignored_legacy_fields` 只报告字段名、`legacy_config_policy=fixed_internal_defaults`
+说明策略，不输出旧值；info 的字段名集合累计到本插件实例结束。
+静态 nested `mapping/planning` 中对应旧字段也在创建组件前归一为内部默认，
+保留高度、开关、运动和语义等其他配置。旧字段不在 configSchema，精确兼容键
+仅保留在 inputSchema，不重新暴露为卡片选项或 LLM config 参数；Core 无需修改。
+Core 的持久化旧值不因此自动删除，新版 Core 按当前 schema 过滤；直接 MCP/旧
+调用方仍可经上述兼容入口使用，但旧自定义行为已被明确移除。
+
 Canvas 的 `config` 动作还提供 `obstacle_min_height_m` 和
 `obstacle_max_height_m`。它们控制实时与稳定静态二维障碍的 `map` frame
 高度带，必须在卡片停止时修改；`map_view` 会把最新扫描的范围外点用
@@ -217,10 +260,13 @@ adapter 及 Nav2 两个 launch。Nav2 参数重写同时设置 local/global 的 
 `map_view_enabled` 和 `fault_capture_enabled` 默认均为 `true`，用于真机
 性能 A/B；只能停卡后配置，并在下次启动生效。关闭前者只停止 Canvas 点云
 编码/发布，不改变 FAST-LIVO2 或 Nav2 输入；关闭后者只停止短时故障快照。
+**正式 release 的发布门槛：`fault_capture_enabled` 默认必须为 `false`。**
+当前开发基线仍为 `true`，本次保留用于开发采集，仅记录该待发布门槛；不引入
+开发/生产模式或擅自切换默认，不能将本次修改称为已满足正式发布条件。
 
 Canvas 的转向速度只暴露单一 `rotate_speed_rps`，默认
-`0.3 rad/s`。非零 yaw proposal 保留方向并固定为该幅值；不再让
-操作者分别配置易混淆的 yaw 最小值和最大值。该配置只能在
+`0.3 rad/s`。小于设定幅值的非零 yaw proposal 归零，达到阈值后保留方向并
+按该幅值限幅；不再让操作者分别配置易混淆的 yaw 最小值和最大值。该配置只能在
 卡片停止时修改，下次启动生效。
 
 建图恢复为直接累计模式：FAST-LIVO2 adapter 对每帧注册点云按 `0.10 m`

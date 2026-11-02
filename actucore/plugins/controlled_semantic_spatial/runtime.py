@@ -24,6 +24,14 @@ from .mapping.contract import FAST_LIVO2_CONFIG_DEFAULTS
 log = logging.getLogger(__name__)
 
 
+def validated_inflation_radius_m(value) -> float:
+    """The card's input limit, not a Nav2/footprint safety guarantee."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not 0 < value <= 2.0 or not math.isfinite(value)):
+        raise ValueError("inflation_radius_m must be a finite number within (0, 2.0]")
+    return float(value)
+
+
 _DESCENDANT_SIGINT_GRACE_SEC = 0.25
 _DESCENDANT_SIGTERM_TIMEOUT_SEC = 2.0
 _DESCENDANT_SIGKILL_TIMEOUT_SEC = 2.0
@@ -67,6 +75,7 @@ class ControlledSemanticSpatialRuntime:
         self._startup_grace_sec = float(startup_grace_sec)
         self._lock = threading.RLock()
         self._launch_obstacle_height_range_m: tuple[float, float] | None = None
+        self._launch_inflation_radius_m: float | None = None
         self._children = [
             _Child(
                 "fast_livo2",
@@ -92,19 +101,23 @@ class ControlledSemanticSpatialRuntime:
         rotate_reengage_rad: float = 0.15,
         obstacle_min_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_min_height_m"],
         obstacle_max_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_max_height_m"],
+        inflation_radius_m: float = 0.55,
     ) -> dict:
         with self._lock:
             # Validate before acquiring or stopping any child. Both launches must
             # receive exactly the mapping card's band, including persisted overrides.
             launch_arguments = self._launch_arguments(
                 namespace, input_topics, control_interface, rotate_reengage_rad,
-                obstacle_min_height_m, obstacle_max_height_m,
+                obstacle_min_height_m, obstacle_max_height_m, inflation_radius_m,
             )
+            inflation_radius_m = validated_inflation_radius_m(inflation_radius_m)
             height_range = (float(obstacle_min_height_m), float(obstacle_max_height_m))
             running = [child for child in self._children if self._is_running(child)]
             if len(running) == len(self._children):
                 if height_range != self._launch_obstacle_height_range_m:
                     raise ValueError("stop navigation before changing the obstacle height band")
+                if inflation_radius_m != self._launch_inflation_radius_m:
+                    raise ValueError("stop navigation before changing the inflation radius")
                 return self.info(already_started=True)
             if any(child.process is not None for child in self._children):
                 self._stop_locked()
@@ -142,6 +155,7 @@ class ControlledSemanticSpatialRuntime:
                 self._terminate(started)
                 raise
             self._launch_obstacle_height_range_m = height_range
+            self._launch_inflation_radius_m = inflation_radius_m
             return self.info()
 
     @staticmethod
@@ -151,6 +165,7 @@ class ControlledSemanticSpatialRuntime:
         rotate_reengage_rad: float = 0.15,
         obstacle_min_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_min_height_m"],
         obstacle_max_height_m: float = FAST_LIVO2_CONFIG_DEFAULTS["obstacle_max_height_m"],
+        inflation_radius_m: float = 0.55,
     ) -> dict[str, tuple[str, ...]]:
         for name, value in (("obstacle_min_height_m", obstacle_min_height_m),
                             ("obstacle_max_height_m", obstacle_max_height_m)):
@@ -164,6 +179,7 @@ class ControlledSemanticSpatialRuntime:
                 not math.isfinite(rotate_reengage_rad) or
                 not 0.05 <= rotate_reengage_rad <= 0.35):
             raise ValueError("rotate_reengage_rad must be within [0.05, 0.35] radians")
+        inflation_radius_m = validated_inflation_radius_m(inflation_radius_m)
         rotate_exit_rad = min(0.05, rotate_reengage_rad / 2.0)
         input_topics = input_topics if input_topics is not None else {}
         root = "/" + str(namespace or "ubuntu").strip("/")
@@ -198,6 +214,7 @@ class ControlledSemanticSpatialRuntime:
         }
         nav2_values = {
             **height_values,
+            "inflation_radius_m": str(inflation_radius_m),
             "rotate_reengage_rad": str(float(rotate_reengage_rad)),
             "rotate_exit_rad": str(rotate_exit_rad),
             "odom_topic": f"{navigation}/odom",
@@ -492,6 +509,7 @@ class ControlledSemanticSpatialRuntime:
                 "container_model": "single_actucore_container",
                 "docker_runtime_dependency": False,
                 # Launch evidence, not an assertion of live ROS read-back.
+                "launch_inflation_radius_m": self._launch_inflation_radius_m,
                 "launch_obstacle_height_range_m": (
                     list(self._launch_obstacle_height_range_m)
                     if self._launch_obstacle_height_range_m is not None else None

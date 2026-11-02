@@ -13,25 +13,36 @@ from .contract import (
     CONTROLLED_SEMANTIC_SPATIAL_ACTIONS,
     CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA,
     SEMANTIC_ACTIONS,
+    LEGACY_CONFIG_FIELDS,
     controlled_semantic_spatial_tool_definition,
 )
-from .mapping.contract import FAST_LIVO2_ACTIONS
+from .mapping.contract import FAST_LIVO2_ACTIONS, FAST_LIVO2_CONFIG_DEFAULTS
 from .mapping.plugin import (
     ConfigError as MappingConfigError,
     FastLivo2Plugin,
     _validated_config as validated_mapping_config,
 )
-from .planning.contract import NAV2_ACTIONS
+from .planning.contract import NAV2_ACTIONS, NAV2_CONFIG_DEFAULTS
 from .planning.plugin import (
     ConfigError as PlanningConfigError,
     Nav2Plugin,
     _validated_config as validated_planning_config,
 )
-from .runtime import ControlledSemanticSpatialRuntime
+from .runtime import ControlledSemanticSpatialRuntime, validated_inflation_radius_m
 from .semantic.plugin import VisionAndLanguageNavigationPlugin
 
 
 log = logging.getLogger(__name__)
+_FIXED_MAPPING_FIELDS = {
+    "mapping_request_timeout_sec": "request_timeout_sec",
+    "mapping_discovery_timeout_sec": "discovery_timeout_sec",
+    "lidar_qos_depth": "lidar_qos_depth", "imu_qos_depth": "imu_qos_depth",
+    "map_voxel_size_m": "map_voxel_size_m",
+}
+_FIXED_PLANNING_FIELDS = {
+    "planning_request_timeout_sec": "request_timeout_sec",
+    "planning_discovery_timeout_sec": "discovery_timeout_sec",
+}
 _ABSOLUTE_ROS_TOPIC_RE = re.compile(
     r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$"
 )
@@ -73,12 +84,29 @@ class ControlledSemanticSpatialPlugin:
             "namespace": self._namespace,
             **dict(raw_cfg.pop("semantic", {}) or {}),
         }
+        self._ignored_legacy_fields = set()
+        for config, fields, defaults in (
+            (mapping_cfg, _FIXED_MAPPING_FIELDS, FAST_LIVO2_CONFIG_DEFAULTS),
+            (planning_cfg, _FIXED_PLANNING_FIELDS, NAV2_CONFIG_DEFAULTS),
+        ):
+            for public_name, internal_name in fields.items():
+                if internal_name in config:
+                    self._ignored_legacy_fields.add(public_name)
+                config[internal_name] = defaults[internal_name]
+        radius = raw_cfg.pop("inflation_radius_m", 0.55)
+        radius_error = None
+        try:
+            self._inflation_radius_m = validated_inflation_radius_m(radius)
+        except ValueError as exc:
+            self._inflation_radius_m = 0.55
+            radius_error = str(exc)
         self._config_error = (
             "unsupported navigation config sections: "
             + ",".join(sorted(raw_cfg))
             if raw_cfg
             else None
         )
+        self._radius_config_error = radius_error
         legacy_semantic_options = sorted(
             {"goal_topic", "subscriber_timeout_sec"}.intersection(semantic_cfg)
         )
@@ -139,6 +167,8 @@ class ControlledSemanticSpatialPlugin:
         if not isinstance(args, dict):
             return self._error("invalid_argument", "arguments must be an object")
         action = args.get("action")
+        if action != "config" and set(LEGACY_CONFIG_FIELDS).intersection(args):
+            return self._error("invalid_argument", "legacy fields are accepted only by config")
         if action == "info":
             return self._info(args.get("instance_id"))
         if action == "config":
@@ -262,8 +292,9 @@ class ControlledSemanticSpatialPlugin:
                     "a different instance",
                     instance_id=self._instance_id,
                 )
-            if self._config_error and not already_started:
-                return self._error("invalid_config", self._config_error)
+            config_error = self._config_error or self._radius_config_error
+            if config_error and not already_started:
+                return self._error("invalid_config", config_error)
         wiring = self._validate_external_wiring(args)
         if not already_started:
             planning_info = self._planning.dispatch("nav2", {"action": "info"})
@@ -330,6 +361,7 @@ class ControlledSemanticSpatialPlugin:
                 rotate_reengage_rad=planning_config["rotate_reengage_rad"],
                 obstacle_min_height_m=mapping_config["obstacle_min_height_m"],
                 obstacle_max_height_m=mapping_config["obstacle_max_height_m"],
+                inflation_radius_m=self._inflation_radius_m,
             )
             if runtime_result.get("state") != "running":
                 raise RuntimeError("navigation child processes did not stay running")
@@ -670,10 +702,11 @@ class ControlledSemanticSpatialPlugin:
                     "config_while_running",
                     "stop controlled_semantic_spatial before changing config",
                 )
+        ignored_legacy = set(LEGACY_CONFIG_FIELDS).intersection(args)
         updates = {
             key: value
             for key, value in args.items()
-            if key not in {"action", "instance_id"}
+            if key not in {"action", "instance_id"} and key not in ignored_legacy
         }
         unknown = sorted(
             set(updates) - set(CONTROLLED_SEMANTIC_SPATIAL_CONFIG_SCHEMA["properties"])
@@ -683,27 +716,19 @@ class ControlledSemanticSpatialPlugin:
                 "invalid_config",
                 "unsupported navigation config fields: " + ",".join(unknown),
             )
-        topic_config = {**self._topic_config, **{key: updates[key] for key in self._topic_config if key in updates}}
-        for key, value in topic_config.items():
-            if not isinstance(value, str) or (value and (len(value) > 255 or not _ABSOLUTE_ROS_TOPIC_RE.fullmatch(value))):
-                return self._error("invalid_config", f"{key} must be empty or an absolute ROS topic")
-        resolved = [topic_config[key] or default for key, default in (
-            ("lidar_topic", f"/{self._namespace}/navigation/lidar"),
-            ("rgb_topic", f"/{self._namespace}/camera/rgb"),
-            ("imu_topic", f"/{self._namespace}/navigation/imu"),
-        )]
-        if len(set(resolved)) != len(resolved):
-            return self._error("invalid_config", "lidar, rgb and imu topics must be distinct")
+        if self._radius_config_error and "inflation_radius_m" not in updates:
+            return self._error("invalid_config", self._radius_config_error)
+        try:
+            inflation_radius_m = validated_inflation_radius_m(
+                updates.get("inflation_radius_m", self._inflation_radius_m)
+            )
+        except ValueError as exc:
+            return self._error("invalid_config", str(exc))
         mapping_updates = {
             "action": "config",
             **{
                 target: updates[source]
                 for source, target in (
-                    ("mapping_request_timeout_sec", "request_timeout_sec"),
-                    ("mapping_discovery_timeout_sec", "discovery_timeout_sec"),
-                    ("lidar_qos_depth", "lidar_qos_depth"),
-                    ("imu_qos_depth", "imu_qos_depth"),
-                    ("map_voxel_size_m", "map_voxel_size_m"),
                     ("obstacle_min_height_m", "obstacle_min_height_m"),
                     ("obstacle_max_height_m", "obstacle_max_height_m"),
                     ("map_view_enabled", "map_view_enabled"),
@@ -717,8 +742,6 @@ class ControlledSemanticSpatialPlugin:
             **{
                 target: updates[source]
                 for source, target in (
-                    ("planning_request_timeout_sec", "request_timeout_sec"),
-                    ("planning_discovery_timeout_sec", "discovery_timeout_sec"),
                     ("rotate_reengage_rad", "rotate_reengage_rad"),
                     ("min_x_mps", "min_x_mps"),
                     ("max_x_mps", "max_x_mps"),
@@ -833,12 +856,18 @@ class ControlledSemanticSpatialPlugin:
                 )
             applied.append((name, component, prefix, request, previous))
         with self._lock:
-            self._topic_config = topic_config
+            self._inflation_radius_m = inflation_radius_m
+            if "inflation_radius_m" in updates:
+                self._radius_config_error = None
+            self._ignored_legacy_fields.update(ignored_legacy)
         return {
             "state": "configured",
             "status": "configured",
             "component_results": results,
             "topic_config": dict(self._topic_config),
+            "inflation_radius_m": self._inflation_radius_m,
+            "ignored_legacy_fields": sorted(ignored_legacy),
+            "legacy_config_policy": "fixed_internal_defaults",
             "takes_effect": "next_start",
             "control_output_can_drive_hardware": True,
         }
@@ -907,9 +936,11 @@ class ControlledSemanticSpatialPlugin:
             instance_id = self._instance_id
             wired = dict(self._external_wiring)
             wiring_unknown = self._wiring_transition_unknown
-            config_error = self._config_error
+            config_error = self._config_error or self._radius_config_error
             last_terminal_stop_error = self._last_terminal_stop_error
             topic_config = dict(self._topic_config)
+            inflation_radius_m = self._inflation_radius_m
+            ignored_legacy_fields = sorted(self._ignored_legacy_fields)
         discovery = requested_instance_id is None or requested_instance_id == ""
         instance_match = bool(started and instance_id and requested_instance_id == instance_id)
         if discovery:
@@ -965,6 +996,9 @@ class ControlledSemanticSpatialPlugin:
             ),
             "last_terminal_stop_error": last_terminal_stop_error,
             "topic_config": topic_config,
+            "inflation_radius_m": inflation_radius_m,
+            "ignored_legacy_fields": ignored_legacy_fields,
+            "legacy_config_policy": "fixed_internal_defaults",
             "runtime": runtime_info,
             "mapping": self._mapping.dispatch("fast_livo2", {"action": "info"}),
             "planning": self._planning.dispatch("nav2", {"action": "info"}),

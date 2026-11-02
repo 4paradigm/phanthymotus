@@ -116,13 +116,14 @@ class ControlledSemanticSpatialStartIdentityTest(unittest.TestCase):
         for value in (None, "", "   ", "default"):
             self.assertTrue(self.call("start", instance_id=value, input_bindings=self.direct_bindings)["already_started"])
 
-    def test_topic_only_requires_configured_match_and_is_order_independent(self):
+    def test_topic_only_rejects_legacy_custom_topics_but_direct_binding_remains_valid(self):
         self.make_plugin()
         topics = [b["topic"] for b in self.bindings]
         self.assertEqual(self.call("start", input_topics=topics)["error_code"], "invalid_canvas_wiring")
         self.assertEqual(self.call("config", lidar_topic=topics[0], rgb_topic=topics[1], imu_topic=topics[2])["state"], "configured")
-        self.assertEqual(self.call("start", instance_id="a", input_topics=list(reversed(topics)), input_topic=topics[1])["state"], "ready")
-        self.assertTrue(self.call("start", instance_id="a", input_bindings=list(reversed(self.bindings)), input_topics=topics)["already_started"])
+        self.assertEqual(self.call("start", instance_id="a", input_topics=list(reversed(topics)), input_topic=topics[1])["error_code"], "invalid_canvas_wiring")
+        self.assertEqual(self.call("start", instance_id="a", input_bindings=list(reversed(self.bindings)), input_topics=topics)["state"], "ready")
+        self.assertTrue(self.call("start", instance_id="a", input_bindings=self.bindings, input_topics=topics)["already_started"])
         self.assertEqual(self.call("start", instance_id="a", input_bindings=self.bindings, input_topics=topics[:1])["error_code"], "invalid_canvas_wiring")
         self.assert_owner("a", self.expected())
 

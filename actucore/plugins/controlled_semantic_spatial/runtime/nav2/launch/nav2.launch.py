@@ -16,14 +16,19 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
 from launch_ros.parameter_descriptions import ParameterValue
 from nav2_common.launch import RewrittenYaml
-from nav2.height_band import apply_obstacle_height_band
+from nav2.height_band import apply_obstacle_height_band, apply_inflation_radius
 
 
 class HeightBandRewrittenYaml(RewrittenYaml):
     """Also fill missing layer keys in legacy YAML, not just existing leaves."""
 
     def substitute_params(self, data, param_rewrites):
-        super().substitute_params(data, param_rewrites)
+        # Never rewrite an unrelated same-named leaf in a custom YAML.
+        super().substitute_params(data, {
+            key: value for key, value in param_rewrites.items()
+            if key != "inflation_radius"
+        })
+        apply_inflation_radius(data, self.convert(param_rewrites["inflation_radius"]))
         apply_obstacle_height_band(
             data,
             self.convert(param_rewrites["min_obstacle_height"]),
@@ -46,6 +51,7 @@ def generate_launch_description() -> LaunchDescription:
             # layer/source bands (eight scalar leaves). No independent Nav2 band.
             "min_obstacle_height": LaunchConfiguration("obstacle_min_height_m"),
             "max_obstacle_height": LaunchConfiguration("obstacle_max_height_m"),
+            "inflation_radius": LaunchConfiguration("inflation_radius_m"),
         },
         convert_types=True,
     )
@@ -85,6 +91,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("control_interface_json", default_value="{}"),
             DeclareLaunchArgument("obstacle_min_height_m"),
             DeclareLaunchArgument("obstacle_max_height_m"),
+            DeclareLaunchArgument("inflation_radius_m"),
             DeclareLaunchArgument("rotate_reengage_rad", default_value="0.15"),
             DeclareLaunchArgument("rotate_exit_rad", default_value="0.05"),
             DeclareLaunchArgument(

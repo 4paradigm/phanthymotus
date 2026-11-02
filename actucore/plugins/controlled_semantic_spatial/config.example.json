@@ -1,14 +1,10 @@
 {
   "enabled": true,
   "namespace": "ubuntu",
+  "inflation_radius_m": 0.55,
   "mapping": {
     "backend": "ros_topic",
-    "request_timeout_sec": 130.0,
-    "discovery_timeout_sec": 5.0,
     "input_max_age_ms": 500,
-    "lidar_qos_depth": 2,
-    "imu_qos_depth": 400,
-    "map_voxel_size_m": 0.1,
     "obstacle_min_height_m": -0.3,
     "obstacle_max_height_m": 0.3,
     "map_view_enabled": true,
@@ -17,8 +13,6 @@
   "planning": {
     "backend": "ros_topic",
     "shadow_only": true,
-    "request_timeout_sec": 30.0,
-    "discovery_timeout_sec": 5.0,
     "rotate_reengage_rad": 0.15,
     "input_max_age_ms": 500,
     "min_x_mps": 0.3,

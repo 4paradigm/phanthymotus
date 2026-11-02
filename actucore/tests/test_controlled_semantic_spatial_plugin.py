@@ -345,8 +345,10 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
         self.assertIn("obstacle_max_height_m", properties)
         self.assertTrue(properties["map_view_enabled"]["default"])
         self.assertTrue(properties["fault_capture_enabled"]["default"])
-        self.assertEqual(properties["lidar_qos_depth"]["default"], 2)
-        self.assertEqual(properties["imu_qos_depth"]["default"], 400)
+        self.assertNotIn("lidar_qos_depth", config_fields)
+        self.assertNotIn("imu_qos_depth", config_fields)
+        self.assertNotIn("default", properties["lidar_qos_depth"])
+        self.assertNotIn("default", properties["imu_qos_depth"])
         self.assertIn("rotate_speed_rps", properties)
         self.assertEqual(
             tool["configSchema"]["properties"]["rotate_speed_rps"],
@@ -356,6 +358,7 @@ class ControlledSemanticSpatialContractTest(unittest.TestCase):
                 "maximum": 2.0,
                 "default": 0.3,
                 "description": "Fixed magnitude of every nonzero yaw proposal",
+                "title": "固定转向角速度幅值（rad/s）",
             },
         )
         self.assertNotIn("min_yaw_rps", properties)
@@ -1351,7 +1354,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(plugin._validate_external_wiring(args)["error_code"], "invalid_canvas_wiring")
 
-    def test_topic_config_validation_and_namespace_defaults(self):
+    def test_legacy_topics_are_ignored_and_namespace_defaults_stay_fixed(self):
         runtime = FakeRuntime()
         plugin = ControlledSemanticSpatialPlugin({}, "robot", None, runtime=runtime,
             mapping_plugin=FakeComponent("mapping"), planning_plugin=FakeComponent("planning"),
@@ -1359,14 +1362,17 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         for updates in ({"imu_topic": "relative"}, {"imu_topic": None},
                         {"lidar_topic": "/robot/navigation/imu"},
                         {"rgb_topic": "/same", "imu_topic": "/same"}):
-            self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", **updates})["error_code"], "invalid_config")
+            result = plugin.dispatch(plugin.PREFIX, {"action": "config", **updates})
+            self.assertEqual(result["state"], "configured")
+            self.assertEqual(result["ignored_legacy_fields"], sorted(updates))
         self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "start", "input_topics": ["/robot/navigation/lidar", "/robot/navigation/imu"]})["state"], "ready")
         self.assertEqual(runtime.start_kwargs["input_topics"], {"lidar": "/robot/navigation/lidar", "imu": "/robot/navigation/imu"})
         self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": "/other"})["error_code"], "config_while_running")
         plugin.dispatch(plugin.PREFIX, {"action": "stop"})
         self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "config", "imu_topic": "/other/imu"})["state"], "configured")
-        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "start", "input_topics": ["/robot/navigation/lidar", "/other/imu"]})["state"], "ready")
-        self.assertEqual(runtime.start_kwargs["input_topics"]["imu"], "/other/imu")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "start", "input_topics": ["/robot/navigation/lidar", "/other/imu"]})["error_code"], "invalid_canvas_wiring")
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {"action": "start", "input_topics": ["/robot/navigation/lidar", "/robot/navigation/imu"]})["state"], "ready")
+        self.assertEqual(runtime.start_kwargs["input_topics"]["imu"], "/robot/navigation/imu")
 
     def test_start_rejects_legacy_goal_topic_config(self):
         for key in ("goal_topic", "subscriber_timeout_sec", "sensor_sync_mode"):
@@ -2027,8 +2033,6 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
                     "action": "config",
                     "obstacle_min_height_m": -0.8,
                     "obstacle_max_height_m": 0.4,
-                    "lidar_qos_depth": 3,
-                    "imu_qos_depth": 600,
                     "map_view_enabled": False,
                     "fault_capture_enabled": False,
                 },
@@ -2063,7 +2067,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             "controlled_semantic_spatial",
             {
                 "action": "config",
-                "mapping_request_timeout_sec": 77.0,
+                "obstacle_min_height_m": -0.8,
                 "rotate_speed_rps": 99.0,
             },
         )
@@ -2093,7 +2097,7 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
             "controlled_semantic_spatial",
             {
                 "action": "config",
-                "mapping_request_timeout_sec": 77.0,
+                "obstacle_min_height_m": -0.8,
                 "rotate_speed_rps": 0.3,
                 "vlm_base_url": "https://vlm.example.test/v1",
                 "vlm_api_key": "test-secret",
@@ -2113,6 +2117,127 @@ class ControlledSemanticSpatialPluginTest(unittest.TestCase):
         self.assertEqual(
             set(result["rollback_component_results"]), {"mapping", "planning"}
         )
+
+
+class SimplifiedNavigationConfigTest(unittest.TestCase):
+    LEGACY = {
+        'lidar_topic': '/old/lidar', 'rgb_topic': '/old/rgb', 'imu_topic': '/old/imu',
+        'mapping_request_timeout_sec': 77., 'mapping_discovery_timeout_sec': 9.,
+        'planning_request_timeout_sec': 45., 'planning_discovery_timeout_sec': 8.,
+        'lidar_qos_depth': 6, 'imu_qos_depth': 800, 'map_voxel_size_m': .25,
+    }
+
+    def make_plugin(self, **kwargs):
+        return ControlledSemanticSpatialPlugin({}, 'ubuntu', None, runtime=FakeRuntime(),
+            semantic_plugin=FakeComponent('semantic'), **kwargs)
+
+    def test_card_has_exactly_fifteen_options_and_legacy_only_in_input_schema(self):
+        tool = controlled_semantic_spatial_tool_definition('ubuntu')
+        props = tool['configSchema']['properties']
+        self.assertEqual(set(props), {
+            'obstacle_min_height_m', 'obstacle_max_height_m', 'map_view_enabled',
+            'fault_capture_enabled', 'rotate_reengage_rad', 'min_x_mps', 'max_x_mps',
+            'min_y_mps', 'max_y_mps', 'rotate_speed_rps', 'vlm_base_url', 'vlm_api_key',
+            'vlm_model', 'vlm_timeout_sec', 'inflation_radius_m'})
+        radius = props['inflation_radius_m']
+        self.assertEqual((radius['type'], radius['default'], radius['exclusiveMinimum'], radius['maximum']),
+                         ('number', .55, 0, 2.))
+        self.assertEqual(props['vlm_api_key']['format'], 'password')
+        self.assertTrue(set(self.LEGACY) <= set(tool['inputSchema']['properties']))
+        if jsonschema:
+            jsonschema.validate({'action': 'config', **{k: None for k in self.LEGACY}}, tool['inputSchema'])
+            for bad in (None, True, 0, -1, 2.01):
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate({'inflation_radius_m': bad}, tool['configSchema'])
+
+    def test_legacy_values_are_ignored_observably_without_leaking_values(self):
+        plugin = self.make_plugin()
+        for values in (self.LEGACY, {k: {'untrusted': 'do-not-echo'} for k in self.LEGACY}):
+            result = plugin.dispatch(plugin.PREFIX, {'action': 'config', **values})
+            self.assertEqual(result['state'], 'configured')
+            self.assertEqual(result['ignored_legacy_fields'], sorted(values))
+            self.assertNotIn('do-not-echo', repr(result))
+            info = plugin.dispatch(plugin.PREFIX, {'action': 'info'})
+            self.assertEqual(info['ignored_legacy_fields'], sorted(values))
+            self.assertEqual(info['mapping']['config']['request_timeout_sec'], 130.)
+            self.assertEqual(info['mapping']['config']['map_voxel_size_m'], .1)
+            self.assertEqual(info['mapping']['config']['lidar_qos_depth'], 2)
+            self.assertEqual(info['mapping']['config']['imu_qos_depth'], 400)
+            self.assertEqual(info['planning']['config']['request_timeout_sec'], 30.)
+            self.assertEqual(info['topic_config'], dict.fromkeys(('lidar_topic', 'rgb_topic', 'imu_topic'), ''))
+        result = plugin.dispatch(plugin.PREFIX, {'action': 'config', 'inflation_raduis_m': .8, 'vlm_api_key': 'do-not-echo'})
+        self.assertEqual(result['error_code'], 'invalid_config')
+        self.assertNotIn('do-not-echo', repr(result))
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'info', 'imu_topic': '/old'})['error_code'], 'invalid_argument')
+
+    def test_nested_legacy_config_is_fixed_without_mutating_caller_or_height(self):
+        cfg = {'inflation_radius_m': .8,
+               'mapping': {'request_timeout_sec': None, 'discovery_timeout_sec': 9.,
+                           'lidar_qos_depth': 6, 'imu_qos_depth': 800,
+                           'map_voxel_size_m': .25, 'obstacle_min_height_m': -.5},
+               'planning': {'request_timeout_sec': 45., 'discovery_timeout_sec': 8.}}
+        before = json.dumps(cfg)
+        plugin = ControlledSemanticSpatialPlugin(cfg, 'ubuntu', None, runtime=FakeRuntime(), semantic_plugin=FakeComponent('semantic'))
+        info = plugin.dispatch(plugin.PREFIX, {'action': 'info'})
+        self.assertEqual(info['state'], 'idle')
+        self.assertEqual(info['inflation_radius_m'], .8)
+        self.assertEqual(info['mapping']['config']['request_timeout_sec'], 130.)
+        self.assertEqual(info['mapping']['config']['discovery_timeout_sec'], 5.)
+        self.assertEqual(info['mapping']['config']['obstacle_min_height_m'], -.5)
+        self.assertEqual(info['planning']['config']['request_timeout_sec'], 30.)
+        self.assertEqual(info['planning']['config']['discovery_timeout_sec'], 5.)
+        self.assertEqual(json.dumps(cfg), before)
+        broken = ControlledSemanticSpatialPlugin({'mapping': {'map_voxel_szie_m': .2}}, 'ubuntu', None,
+            runtime=FakeRuntime(), semantic_plugin=FakeComponent('semantic'))
+        self.assertEqual(broken.dispatch(broken.PREFIX, {'action': 'start', 'input_bindings': _external_bindings()})['error_code'], 'invalid_config')
+
+    def test_radius_validation_is_atomic_and_success_reaches_runtime(self):
+        plugin = ControlledSemanticSpatialPlugin({}, 'ubuntu', None, runtime=FakeRuntime(),
+            mapping_plugin=FakeComponent('mapping'), planning_plugin=FakeComponent('planning'),
+            semantic_plugin=FakeComponent('semantic'))
+        for bad in (None, True, False, '0.8', float('nan'), float('inf'), -float('inf'), 0, -.1, 2.01, 10**1000):
+            with self.subTest(bad=bad):
+                result = plugin.dispatch(plugin.PREFIX, {'action': 'config', 'inflation_radius_m': bad, 'obstacle_min_height_m': -.8})
+                self.assertEqual(result['error_code'], 'invalid_config')
+                self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'info'})['inflation_radius_m'], .55)
+        self.assertFalse(any(a['action'] == 'config' for _, a in plugin._mapping.calls))
+        for radius in (.45, .55, .8, 1, 2.):
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'config', 'inflation_radius_m': radius})['state'], 'configured')
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'info'})['inflation_radius_m'], radius)
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'start', 'input_bindings': _external_bindings()})['state'], 'ready')
+            self.assertEqual(plugin._runtime.start_kwargs['inflation_radius_m'], radius)
+            self.assertIs(type(plugin._runtime.start_kwargs['inflation_radius_m']), float)
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'config', 'inflation_radius_m': .9})['error_code'], 'config_while_running')
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'config', 'imu_topic': None})['error_code'], 'config_while_running')
+            plugin.dispatch(plugin.PREFIX, {'action': 'stop'})
+
+    def test_invalid_static_radius_requires_explicit_successful_correction(self):
+        plugin = ControlledSemanticSpatialPlugin({'inflation_radius_m': None}, 'ubuntu', None,
+            runtime=FakeRuntime(), mapping_plugin=FakeComponent('mapping'),
+            planning_plugin=FakeComponent('planning'), semantic_plugin=FakeComponent('semantic'))
+        start = {'action': 'start', 'input_bindings': _external_bindings()}
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'info'})['error_code'], 'invalid_config')
+        for request in ({'action': 'config'}, {'action': 'config', 'imu_topic': None}):
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, request)['error_code'], 'invalid_config')
+            self.assertEqual(plugin.dispatch(plugin.PREFIX, start)['error_code'], 'invalid_config')
+        plugin._semantic = FailingConfigComponent('semantic')
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'config', 'inflation_radius_m': .8,
+            'vlm_model': 'test-model'})['error_code'], 'invalid_config')
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)['error_code'], 'invalid_config')
+        plugin._semantic = FakeComponent('semantic')
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, {'action': 'config', 'inflation_radius_m': .8})['state'], 'configured')
+        self.assertEqual(plugin.dispatch(plugin.PREFIX, start)['state'], 'ready')
+
+    def test_failed_component_does_not_commit_radius_or_legacy_report(self):
+        plugin = ControlledSemanticSpatialPlugin({}, 'ubuntu', None, runtime=FakeRuntime(),
+            semantic_plugin=FailingConfigComponent('semantic'))
+        result = plugin.dispatch(plugin.PREFIX, {'action': 'config', 'inflation_radius_m': .8,
+            'imu_topic': '/old', 'obstacle_min_height_m': -.8, 'vlm_model': 'test-model'})
+        self.assertEqual(result['error_code'], 'invalid_config')
+        info = plugin.dispatch(plugin.PREFIX, {'action': 'info'})
+        self.assertEqual(info['inflation_radius_m'], .55)
+        self.assertEqual(info['ignored_legacy_fields'], [])
+        self.assertEqual(info['mapping']['config']['obstacle_min_height_m'], -.3)
 
 
 class ControlledSemanticSpatialRuntimeTest(unittest.TestCase):
