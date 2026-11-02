@@ -44,3 +44,39 @@ def test_rejects_unusable_samples(change):
     change(data)
     with pytest.raises(ValueError):
         decode_bumi_odom(data)
+
+
+def standard_sample():
+    data = sample()
+    data['units'] = {'length': 'm', 'linear': 'm/s', 'angular': 'rad/s'}
+    data['vendor'] = {'motus_slam': {
+        'status': 'tracking', 'segment_id': 'run-1',
+        'stamp_source': 'measurement', 'clock_id': 'robot-clock',
+    }}
+    data['pose']['covariance'] = None
+    return data
+
+
+def test_standard_pose_accepts_unknown_covariance_and_preserves_clock():
+    from plugins.pointcloud_slam_odom import decode_slam_odom
+    result = decode_slam_odom(standard_sample())
+    assert result.segment_id == 'run-1'
+    assert result.clock_id == 'robot-clock'
+    assert result.covariance is None
+
+
+@pytest.mark.parametrize('change', [
+    lambda s: s.update(pose=None),
+    lambda s: s['units'].update(length='cm'),
+    lambda s: s.update(units=None),
+    lambda s: s['vendor']['motus_slam'].update(status='lost'),
+    lambda s: s['vendor']['motus_slam'].update(stamp_source='received'),
+    lambda s: s['vendor']['motus_slam'].update(clock_id=''),
+    lambda s: s['vendor']['motus_slam'].update(segment_id=''),
+])
+def test_standard_pose_rejects_unusable_or_unproven_inputs(change):
+    from plugins.pointcloud_slam_odom import decode_slam_odom
+    data = standard_sample()
+    change(data)
+    with pytest.raises(ValueError):
+        decode_slam_odom(data)

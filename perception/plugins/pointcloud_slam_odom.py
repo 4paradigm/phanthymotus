@@ -17,6 +17,7 @@ class PoseSample:
     position: tuple
     quaternion: tuple
     covariance: tuple
+    clock_id: str = None
 
 
 def _vector(value, length):
@@ -50,3 +51,33 @@ def decode_bumi_odom(sample):
         raise ValueError("quaternion is not normalized")
     covariance = _vector(pose.get("covariance"), 36)
     return PoseSample(stamp, frame, child, segment, position, quaternion, covariance)
+
+
+def decode_slam_odom(sample):
+    """Decode the common SLAM profile; stream freshness is checked separately."""
+    if not isinstance(sample, dict) or sample.get("schema") != "motus.odom/1":
+        raise ValueError("unsupported odometry schema")
+    units = sample.get("units")
+    if not isinstance(units, dict) or units.get("length") != "m":
+        raise ValueError("pose length must be in meters")
+    stamp = sample.get("stamp_ms")
+    if type(stamp) is not int or stamp <= 0:
+        raise ValueError("invalid odometry timestamp")
+    pose, vendor = sample.get("pose"), sample.get("vendor")
+    quality = vendor.get("motus_slam") if isinstance(vendor, dict) else None
+    if not isinstance(pose, dict) or not isinstance(quality, dict):
+        raise ValueError("pose and SLAM metadata are required")
+    if quality.get("status") != "tracking" or quality.get("stamp_source") != "measurement":
+        raise ValueError("odometry is not a tracking measurement")
+    frame, child = pose.get("frame_id"), pose.get("child_frame_id")
+    segment, clock = quality.get("segment_id"), quality.get("clock_id")
+    if any(not isinstance(v, str) or not v.strip() for v in (frame, child, segment, clock)):
+        raise ValueError("pose frames, segment and clock are required")
+    position = _vector(pose.get("position"), 3)
+    quaternion = _vector(pose.get("quaternion"), 4)
+    if abs(sum(v * v for v in quaternion) - 1.0) > 0.002:
+        raise ValueError("quaternion is not normalized")
+    covariance = pose.get("covariance")
+    if covariance is not None:
+        covariance = _vector(covariance, 36)
+    return PoseSample(stamp, frame, child, segment, position, quaternion, covariance, clock)
