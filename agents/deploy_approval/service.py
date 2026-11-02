@@ -23,7 +23,7 @@ import asyncio
 import logging
 import time
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 from zoneinfo import ZoneInfo
@@ -501,6 +501,7 @@ class DeployController:
             head_sha, int(state.get("last_processed_comment_id", 0) or 0),
         )
         state["round_started_at"] = utc_now()
+        state.pop("deployment_logs", None)
         state["status"] = status
         state["review_evidence"] = dict(review_evidence or {})
         state["components"] = []
@@ -1763,6 +1764,7 @@ class DeployController:
                 await self._write_lifecycle_with_history(
                     repo, pr_number, state, markdown, event=deploy_event,
                 )
+                await self._save_deployed_machine_log(repo, pr_number, state, machine_alias)
                 await self.proxy.project_status_label(repo, pr_number, "deploy-requested")
                 return True
 
@@ -1801,6 +1803,7 @@ class DeployController:
                 events=[event_all, last_machine_event],
             )
             # Project status label "testing" SECOND
+            await self._save_deployed_machine_log(repo, pr_number, state, machine_alias)
             await self.proxy.project_status_label(repo, pr_number, "testing")
 
             return True
@@ -2925,6 +2928,184 @@ class DeployController:
                     result[source_key] = "[RUNTIME_LOG_SNAPSHOT_UNAVAILABLE]"
         return result
 
+    async def _save_deployed_machine_log(self, repo: str, pr_number: int,
+                                        state: dict, machine_alias: str) -> None:
+        """Persist and best-effort upload logs for this newly verified machine."""
+        try:
+            head = state.get("head_sha", "")
+            round_id = round_id_for_state(state)
+            deployments = [d for d in state.get("deployments", [])
+                           if d.get("phase") == "deployed" and d.get("machine") == machine_alias]
+            if not deployments:
+                return
+            current = await self.proxy.read_hidden_state(repo, pr_number)
+            if not isinstance(current, dict) or current.get("head_sha") != head or round_id_for_state(current) != round_id:
+                return
+            deployments = [d for d in current.get("deployments", [])
+                           if d.get("phase") == "deployed" and d.get("machine") == machine_alias]
+            if not deployments:
+                return
+            logs = current.get("deployment_logs", {})
+            prior = logs.get(machine_alias) if isinstance(logs, dict) else None
+            if isinstance(prior, dict) and (prior.get("head_sha"), prior.get("round_id")) == (head, round_id):
+                if prior.get("status") != "pending":
+                    return
+                task = copy.deepcopy(prior)
+            else:
+                task = {"head_sha": head, "round_id": round_id, "status": "pending",
+                        "collected_at": "",
+                        "object_key": "", "sha256": "", "size": 0}
+                if not await self._write_machine_log_state(repo, pr_number, current, machine_alias, task):
+                    return
+            # The pending CAS is durable; refresh its exact result before any
+            # log collection or subsequent state transition.
+            state = await self.proxy.read_hidden_state(repo, pr_number)
+            if (not isinstance(state, dict) or state.get("head_sha") != head
+                    or round_id_for_state(state) != round_id
+                    or state.get("deployment_logs", {}).get(machine_alias) != task
+                    or not any(d.get("phase") == "deployed" and d.get("machine") == machine_alias
+                               for d in state.get("deployments", []))):
+                return
+            if task.get("collected_at"):
+                object_key = self.cos.build_object_key(
+                    repo, pr_number, head, machine_alias=machine_alias, round_id=round_id,
+                    now=datetime.fromisoformat(task["collected_at"].replace("Z", "+00:00")),
+                )
+                try:
+                    existing_bytes = await self.cos.download_evidence_archive(object_key, 10 * 1024 * 1024)
+                except Exception as exc:
+                    existing_bytes = None
+                    cause = exc
+                    while cause is not None:
+                        getter = getattr(cause, "get_status_code", None)
+                        try:
+                            status = getter() if callable(getter) else None
+                        except Exception:
+                            status = None
+                        if status == 404:
+                            break
+                        cause = getattr(cause, "__cause__", None)
+                    else:
+                        if self.cos._fake and str(exc) == "fake COS object not found":
+                            cause = None
+                        else:
+                            # A failed read is not evidence that the object is
+                            # absent. Keep the fixed task pending without recapture.
+                            return
+                if existing_bytes is not None:
+                    existing_sha = hashlib.sha256(existing_bytes).hexdigest()
+                    identity_error = CosClient._validate_evidence_identity(
+                        object_key, existing_bytes, expected_sha256=existing_sha,
+                        expected_size=len(existing_bytes), repo=repo, pr_number=pr_number,
+                        head_sha=head, expected_result="deployed", machine_alias=machine_alias,
+                        round_id=round_id,
+                    )
+                    if identity_error is None:
+                        ready = copy.deepcopy(task)
+                        ready.update(status="ready", object_key=object_key,
+                                     sha256=existing_sha, size=len(existing_bytes))
+                        if await self._write_machine_log_state(repo, pr_number, state, machine_alias, ready):
+                            return
+                        return
+                    # A key occupied by different or unverifiable content is
+                    # immutable. Never attempt a replacement upload.
+                    return
+                if existing_bytes is None and task.get("collected_at"):
+                    # A confirmed 404 permits a fresh collection only after
+                    # clearing the former collection identity via CAS.
+                    task = copy.deepcopy(task)
+                    task["collected_at"] = ""
+                    if not await self._write_machine_log_state(repo, pr_number, state, machine_alias, task):
+                        return
+                    state = await self.proxy.read_hidden_state(repo, pr_number)
+                    if (not isinstance(state, dict) or state.get("head_sha") != head
+                            or round_id_for_state(state) != round_id
+                            or state.get("deployment_logs", {}).get(machine_alias) != task):
+                        return
+            all_logs = await asyncio.wait_for(
+                self._snapshot_terminal_runtime_logs(state.get("components", []), deployments),
+                timeout=20,
+            )
+            machine_logs = {k: v for k, v in all_logs.items() if k.startswith(machine_alias + "/")}
+            if not machine_logs or any("SNAPSHOT_UNAVAILABLE" in v for v in machine_logs.values()):
+                unavailable = copy.deepcopy(task)
+                unavailable["status"] = "unavailable"
+                await self._write_machine_log_state(repo, pr_number, state, machine_alias, unavailable)
+                return
+            if not task.get("collected_at"):
+                task = copy.deepcopy(task)
+                task["collected_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                if not await self._write_machine_log_state(repo, pr_number, state, machine_alias, task):
+                    return
+                state = await self.proxy.read_hidden_state(repo, pr_number)
+                if (not isinstance(state, dict) or state.get("head_sha") != head
+                        or round_id_for_state(state) != round_id
+                        or state.get("deployment_logs", {}).get(machine_alias) != task):
+                    return
+            object_key = self.cos.build_object_key(
+                repo, pr_number, head, machine_alias=machine_alias, round_id=round_id,
+                now=datetime.fromisoformat(task["collected_at"].replace("Z", "+00:00")),
+            )
+            pr_now = await self.proxy.get_pr(repo, pr_number)
+            state_now = await self.proxy.read_hidden_state(repo, pr_number)
+            if (not isinstance(pr_now, dict) or pr_now.get("state") != "open"
+                    or pr_now.get("merged") or pr_now.get("draft")
+                    or pr_now.get("head", {}).get("sha") != head
+                    or state_now != state or not self.config.auth_valid
+                    or repo not in self.config.active_repos or repo not in self.config.github_repos):
+                return
+            meta = await asyncio.wait_for(
+                self._upload_evidence(repo, pr_number, head, state, "deployed",
+                                      runtime_logs=machine_logs, object_key=object_key,
+                                      machine_alias=machine_alias, round_id=round_id,
+                                      collected_at=task["collected_at"]),
+                timeout=20,
+            )
+            if (not meta or meta.get("object_key") != object_key
+                    or not isinstance(meta.get("sha256"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", meta["sha256"])
+                    or type(meta.get("size")) is not int or meta["size"] <= 0):
+                return
+            ready = copy.deepcopy(task)
+            ready.update(status="ready", object_key=meta["object_key"],
+                         sha256=meta["sha256"], size=meta["size"])
+            await self._write_machine_log_state(repo, pr_number, state, machine_alias, ready)
+        except Exception:
+            logger.warning("machine deployment log save failed %s#%s machine=%s", repo, pr_number, machine_alias)
+
+    async def _write_machine_log_state(self, repo: str, pr_number: int, expected: dict,
+                                       machine_alias: str, task: dict) -> bool:
+        """CAS one machine-log transition into the existing trusted Lifecycle comment."""
+        try:
+            pr = await self.proxy.get_pr(repo, pr_number)
+            comment = await self.proxy.find_trusted_lifecycle_comment(repo, pr_number)
+            fresh = await self.proxy.read_hidden_state(repo, pr_number)
+            if (not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("merged")
+                    or pr.get("draft") or pr.get("head", {}).get("sha") != expected.get("head_sha")
+                    or fresh != expected or not self.config.auth_valid
+                    or repo not in self.config.active_repos or repo not in self.config.github_repos
+                    or not isinstance(comment, dict)):
+                return False
+            dep_exists = any(isinstance(d, dict) and d.get("phase") == "deployed"
+                             and d.get("machine") == machine_alias for d in fresh.get("deployments", []))
+            if not dep_exists or task.get("head_sha") != fresh.get("head_sha") \
+                    or task.get("round_id") != round_id_for_state(fresh):
+                return False
+            new_state = copy.deepcopy(fresh)
+            new_state.setdefault("deployment_logs", {})[machine_alias] = copy.deepcopy(task)
+            from .github_state_proxy import HIDDEN_STATE_MARKER
+            visible = comment.get("body", "").split(HIDDEN_STATE_MARKER, 1)[0].rstrip()
+            written = await self.proxy.write_hidden_state(
+                repo, pr_number, visible, new_state,
+                expected_comment=(comment.get("id"), comment.get("body")),
+            )
+            if not isinstance(written, dict):
+                return False
+            after = await self.proxy.read_hidden_state(repo, pr_number)
+            return after == new_state
+        except Exception:
+            return False
+
     async def _check_approval_permissions(
         self, machine, actor: str, repo: str,
     ) -> None:
@@ -3284,6 +3465,9 @@ class DeployController:
         deploy_error: str = "",
         runtime_logs: dict | None = None,
         object_key: str = "",
+        machine_alias: str = "",
+        round_id: str = "",
+        collected_at: str = "",
     ) -> dict:
         """Upload COS evidence bundle. Returns metadata dict.
 
@@ -3294,9 +3478,13 @@ class DeployController:
             # Retries keep the originally published key, including its date.
             # ensure_evidence_archive verifies/reuses it without replacing bytes.
             object_key = object_key or (state.get("cos", {}) or {}).get("object_key") or self.cos.build_object_key(
-                repo, pr_number, head_sha,
+                repo, pr_number, head_sha, machine_alias=machine_alias, round_id=round_id,
+                now=(datetime.fromisoformat(collected_at.replace("Z", "+00:00")) if collected_at else None),
             )
-            CosClient.validate_object_key(repo, pr_number, head_sha, object_key)
+            CosClient.validate_object_key(
+                repo, pr_number, head_sha, object_key,
+                machine_alias=machine_alias, round_id=round_id,
+            )
             archive_bytes = b""
             sha256 = ""
             size = 0
@@ -3313,6 +3501,7 @@ class DeployController:
                     summary=summary,
                     deploy_error=deploy_error,
                     runtime_logs=runtime_logs,
+                    machine_alias=machine_alias, round_id=round_id, collected_at=collected_at,
                 )
             except Exception as e:
                 logger.warning(
@@ -3327,6 +3516,7 @@ class DeployController:
                     pr_number=pr_number,
                     head_sha=head_sha,
                     result=result,
+                    machine_alias=machine_alias, round_id=round_id,
                 )
             return {"object_key": "", "sha256": "", "size": 0}
         except Exception as e:
@@ -5288,6 +5478,7 @@ class DeployController:
                 if head_changed or (lost_fields and not round_changed):
                     state["round_id"] = make_round_id(state["head_sha"], state.get("command", {}).get("comment_id", 0))
                     state["round_started_at"] = utc_now()
+                    state.pop("deployment_logs", None)
                     state.pop("acceptance_request", None)
             if "round_started_at" not in state and old.get("round_started_at") and not head_changed and not round_changed:
                 state["round_started_at"] = old["round_started_at"]
@@ -5550,6 +5741,7 @@ class DeployController:
         )
         state.pop("acceptance_request", None)
         state["round_started_at"] = utc_now()
+        state.pop("deployment_logs", None)
         state["review_evidence"] = {}
         state["components"] = []
         state["deployments"] = []
@@ -5612,6 +5804,7 @@ class DeployController:
             state["head_sha"] = head_sha
             state["round_id"] = make_round_id(head_sha, comment_id)
             state["round_started_at"] = utc_now()
+            state.pop("deployment_logs", None)
             state["round_archive"] = archived
             state.pop("acceptance_request", None)
         state["review_evidence"] = {}
@@ -5759,6 +5952,17 @@ class DeployController:
             return
 
         if state is not None:
+            pending_logs = state.get("deployment_logs", {})
+            if isinstance(pending_logs, dict):
+                for machine_alias, log_task in list(pending_logs.items()):
+                    if (isinstance(log_task, dict) and log_task.get("status") == "pending"
+                            and log_task.get("head_sha") == state.get("head_sha")
+                            and log_task.get("round_id") == state.get("round_id")):
+                        await self._save_deployed_machine_log(repo, pr_number, state, machine_alias)
+                        refreshed = await self.proxy.read_hidden_state(repo, pr_number)
+                        if not isinstance(refreshed, dict) or refreshed.get("head_sha") != current_head:
+                            return
+                        state = refreshed
             cmd = state.get("command", {})
             cmd_phase = cmd.get("phase", "")
             same_head = current_head == state.get("head_sha", "")
@@ -6373,8 +6577,14 @@ class DeployController:
             repo, pr_number, refreshed, markdown, event=event,
             expected_terminal_state=state,
         )
-        if written and state.get("status") != refreshed.get("status"):
-            await self.proxy.project_status_label(repo, pr_number, refreshed["status"])
+        if written:
+            if recovered_ids and machine_alias:
+                try:
+                    await self._save_deployed_machine_log(repo, pr_number, refreshed, machine_alias)
+                except Exception:
+                    logger.warning("recovered machine log save failed %s#%s", repo, pr_number)
+            if state.get("status") != refreshed.get("status"):
+                await self.proxy.project_status_label(repo, pr_number, refreshed["status"])
 
     async def _refresh_uncertain_state(
         self, repo: str, pr_number: int, state: dict,
@@ -6413,6 +6623,7 @@ class DeployController:
             state["status"] = "review-required"
             state["round_id"] = make_round_id(current_head, comment_id)
             state["round_started_at"] = utc_now()
+            state.pop("deployment_logs", None)
             state.pop("acceptance_request", None)
             state["review_evidence"] = {}
             state["components"] = []
@@ -6683,10 +6894,26 @@ class DeployController:
             build_id = review_evidence_data.get("build_comment_id") or comment_id
             updated_state["round_id"] = make_round_id(current_head, build_id)
             updated_state["round_started_at"] = utc_now()
+            updated_state.pop("deployment_logs", None)
             updated_state.pop("acceptance_request", None)
+        old_deployment_facts = copy.deepcopy(state.get("deployments", []))
         if not snapshot_reset and not await self._recover_uncertain_deployments(state, updated_state):
             logger.warning("uncertain deployment remains pending; refusing repeated POST %s#%s", repo, pr_number)
             return "uncertain"
+        recovered_machines = set()
+        if not snapshot_reset:
+            old_facts = {
+                (dep.get("machine"), tuple(dep.get("component_ids", ())))
+                for dep in old_deployment_facts
+                if isinstance(dep, dict) and dep.get("phase") == "deployed"
+            }
+            recovered_machines = {
+                dep.get("machine")
+                for dep in updated_state.get("deployments", [])
+                if isinstance(dep, dict) and dep.get("phase") == "deployed"
+                and isinstance(dep.get("machine"), str) and dep.get("machine")
+                and (dep.get("machine"), tuple(dep.get("component_ids", ()))) not in old_facts
+            }
         if not await self._fresh_review_evidence_matches_state(
             repo, pr_number, current_head, review_evidence_data,
             expected_components=updated_state.get("components", []),
@@ -6733,10 +6960,18 @@ class DeployController:
             "event": "Restart recovery: evidence refreshed",
             "timestamp": comments_mod.beijing_now_str(),
         }
-        await self._write_lifecycle_with_history(
+        lifecycle_written = await self._write_lifecycle_with_history(
             repo, pr_number, state, markdown, event=event,
         )
-        await self.proxy.project_status_label(repo, pr_number, state["status"])
+        if lifecycle_written:
+            for recovered_machine in sorted(recovered_machines):
+                try:
+                    await self._save_deployed_machine_log(
+                        repo, pr_number, state, recovered_machine,
+                    )
+                except Exception:
+                    logger.warning("refreshed machine log save failed %s#%s", repo, pr_number)
+            await self.proxy.project_status_label(repo, pr_number, state["status"])
         return state["status"]
 
     async def _resolve_review_evidence_for_head(

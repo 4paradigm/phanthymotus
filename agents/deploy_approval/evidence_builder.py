@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import re
+from datetime import datetime, timezone
 
 from .config import Config
 
@@ -208,10 +209,38 @@ class EvidenceBuilder:
         summary: str = "",
         deploy_error: str = "",
         runtime_logs: dict[str, str] | None = None,
+        machine_alias: str = "",
+        round_id: str = "",
+        collected_at: str = "",
     ) -> tuple[bytes, str, int]:
         """Build evidence.log, gzip it, return (gzip_bytes, sha256, size)."""
+        if machine_alias:
+            if (not isinstance(machine_alias, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine_alias)
+                    or ".." in machine_alias):
+                raise ValueError("invalid machine_alias")
+            if not re.fullmatch(re.escape(head_sha) + r"-[1-9][0-9]*", round_id):
+                raise ValueError("round_id must be HEAD followed by a positive integer")
+            if result != "deployed":
+                raise ValueError("machine deployment evidence requires result=deployed")
+            if not isinstance(runtime_logs, dict) or not any(
+                isinstance(value, str) and value.strip() for value in runtime_logs.values()
+            ):
+                raise ValueError("machine deployment evidence requires collected runtime logs")
+            if not collected_at:
+                raise ValueError("machine deployment evidence requires fixed collected_at")
+            try:
+                parsed = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset().total_seconds() != 0:
+                    raise ValueError
+                collected_at = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            except (ValueError, AttributeError):
+                raise ValueError("collected_at must be an explicit UTC timestamp") from None
+        elif round_id:
+            raise ValueError("round_id requires machine_alias")
         fixed_header = self._build_fixed_header(
             repo, pr_number, head_sha, state, result, summary, deploy_error,
+            machine_alias=machine_alias, round_id=round_id, collected_at=collected_at,
         )
         variable_body = self._build_variable_body(runtime_logs)
         gzip_bytes = self._fit_evidence_archive(fixed_header, variable_body)
@@ -228,6 +257,9 @@ class EvidenceBuilder:
         result: str,
         summary: str,
         deploy_error: str = "",
+        machine_alias: str = "",
+        round_id: str = "",
+        collected_at: str = "",
     ) -> str:
         safe_summary = _bound_text(_sanitize_for_evidence(summary), 4096)
         lines: list[str] = [
@@ -242,6 +274,8 @@ class EvidenceBuilder:
             f"review_resolved_head_sha={state.get('review_evidence', {}).get('resolved_head_sha', '')}",
             f"review_author_id={state.get('review_evidence', {}).get('review_author_id', '')}",
             f"result={result}",
+            *( [f"round={round_id}", f"machine={machine_alias}"] if machine_alias else [] ),
+            *( [f"collected_at={collected_at}"] if machine_alias else [] ),
             "",
             "[deploy]",
         ]

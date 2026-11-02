@@ -23,6 +23,12 @@ def _identity(value, label):
     return value
 
 
+def _machine_alias(value):
+    return (isinstance(value, str)
+            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', value) is not None
+            and '..' not in value)
+
+
 def _repo(owner, repo, pr):
     try:
         canonical = validate_repository_names([f'{owner}/{repo}'])[0]
@@ -47,11 +53,16 @@ def _validate(payload, action, config):
                     'put_part': {'upload_id', 'part_number'},
                     'complete': {'upload_id'}, 'download': {'attachment_id'},
                     'preview': {'attachment_id'},
+                    'machine_log_download': {'machine_alias'},
                     'delete': {'attachment_id'}}.get(action, set())
     if not isinstance(payload, dict) or payload.keys() - (_BASE | extras | route_fields):
         raise HTTPException(400, detail='invalid_evidence_payload')
     if 'round_id' in payload:
         _identity(payload['round_id'], 'round_id')
+    if action == 'machine_log_download':
+        alias = payload.get('machine_alias')
+        if not _machine_alias(alias):
+            raise HTTPException(400, detail='invalid_machine')
     if 'head_sha' in payload:
         if not isinstance(payload.get('head_sha'), str) or not re.fullmatch('[0-9a-f]{40}', payload['head_sha']):
             raise HTTPException(400, detail='invalid_head_sha')
@@ -141,8 +152,8 @@ def _public_attachment(row, *, operation_context=None):
     allowed = {'attachment_id', 'filename', 'size', 'sha256', 'note', 'display_note',
                'display_note_complete', 'evidence_kind', 'round_id', 'head_sha',
                'status', 'created_at', 'updated_at', 'completed_at', 'deleted_at', 'replaces_id',
-               'actor', 'actor_login', 'actor_verified', 'cos_content_verified',
-               'submitter', 'upload_method', 'download_capability', 'can_delete'}
+               'cos_content_verified', 'upload_method', 'download_capability', 'can_delete',
+               'internal_bot_note'}
     result = {k: v for k, v in row.items() if k in allowed}
     upload_ref = row.get('upload_ref')
     if (operation_context is not None and isinstance(upload_ref, str)
@@ -293,7 +304,7 @@ async def _trusted_summary_page_capability(request, repo, pr, *, target_head=Non
 
 async def _dispatch(request, owner, repo, pr, action, **path):
     canonical = _repo(owner, repo, pr)
-    purpose = (evidence_auth.DOWNLOAD_PURPOSE if action in {'download', 'preview', 'log_download'}
+    purpose = (evidence_auth.DOWNLOAD_PURPOSE if action in {'download', 'preview', 'log_download', 'machine_log_download'}
                else evidence_auth.UPLOAD_PURPOSE if action in {
                    'context', 'status', 'init', 'resume', 'sign_part', 'put_part',
                    'complete', 'note', 'delete'} else evidence_auth.PURPOSE)
@@ -302,6 +313,8 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         resource = 'attachment:' + path.get('attachment_id', '')
     elif action == 'log_download':
         resource = 'log:' + path.get('round_id', '')
+    elif action == 'machine_log_download':
+        resource = 'log:' + path.get('round_id', '') + ':' + path.get('machine_alias', '')
     principal, _ = await evidence_auth.verified_principal(
         request, canonical, pr, write=request.method in ('POST', 'PUT', 'DELETE'),
         purpose=purpose, resource=resource)
@@ -330,7 +343,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         if candidates:
             row = candidates[-1]
             payload.update(head_sha=row['head_sha'], round_id=row['round_id'])
-    if action in {'resume', 'download', 'preview', 'log_download'}:
+    if action in {'resume', 'download', 'preview', 'log_download', 'machine_log_download'}:
         if action == 'resume' and not _BASE <= payload.keys():
             raise HTTPException(400, detail='evidence_context_required')
     if action in {'init', 'resume', 'sign_part', 'put_part', 'complete', 'note', 'delete'}:
@@ -341,7 +354,7 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         # Compatibility with the current browser UI: a display name is not
         # an identity source. The service records only the verified /user login.
         payload.pop('submitter', None)
-    if action in {'download', 'preview', 'log_download'}:
+    if action in {'download', 'preview', 'log_download', 'machine_log_download'}:
         payload.setdefault('idempotency_key', hashlib.sha256(
             json.dumps([action, path], sort_keys=True).encode()).hexdigest())
     try:
@@ -371,6 +384,47 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         raise HTTPException(503, detail='evidence_operation_unavailable') from None
     if not isinstance(result, dict):
         raise HTTPException(503, detail='invalid_evidence_service_response')
+    if action == 'context' and result.get('evidence_degraded') is True:
+        if result.get('can_write') is not False:
+            raise HTTPException(503, detail='invalid_degraded_evidence_context')
+        head, round_id = result.get('head_sha'), result.get('round_id')
+        if (not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)
+                or not isinstance(round_id, str)
+                or not re.fullmatch(re.escape(head) + r'-[1-9][0-9]*', round_id)):
+            raise HTTPException(503, detail='incomplete_degraded_evidence_context')
+        current_logs = {}
+        for alias, log in (result.get('deployment_logs', {}) or {}).items():
+            if (not _machine_alias(alias) or not isinstance(log, dict)
+                    or log.get('head_sha') != head or log.get('round_id') != round_id
+                    or log.get('status') not in {'ready', 'pending', 'unavailable'}):
+                continue
+            item = {k: log[k] for k in ('status', 'collected_at', 'size', 'sha256') if k in log}
+            if log.get('status') == 'ready':
+                from .evidence_auth import issue_capability
+                item['capability'] = issue_capability(
+                    request.app.state.config, canonical, pr, head, round_id,
+                    purpose=evidence_auth.DOWNLOAD_PURPOSE,
+                    resource='log:' + round_id + ':' + alias)
+            current_logs[alias] = item
+        allowed = {'head_sha', 'round_id', 'round_number', 'round_started_at', 'status',
+                   'acceptance_pending', 'display_deployments'}
+        result = {k: result[k] for k in allowed if k in result}
+        result.update({
+            'can_write': False, 'evidence_degraded': True,
+            'attachments': [], 'rounds': [], 'history': [], 'archive_links': [],
+            'deployment_logs': current_logs,
+            'authenticated': True, 'enabled': True,
+            'github_user_authenticated': bool(principal.get('github_user_authenticated')),
+            'actor_verified': principal.get('actor_verified') is True,
+            'auth_method': principal.get('auth_method', 'github_comment_proof'),
+            'readiness': evidence_auth.readiness(
+                request.app.state.config, request.app.state.evidence_service, request=request),
+            'repo': canonical, 'pr_number': pr, 'summary_updated': None,
+            'max_file_bytes': request.app.state.config.evidence_max_file_bytes,
+            'part_bytes': request.app.state.config.evidence_part_bytes,
+        })
+        if not {'head_sha', 'round_id', 'status', 'can_write', 'evidence_degraded'} <= result.keys():
+            raise HTTPException(503, detail='incomplete_degraded_evidence_context')
     # Internal recovery facts (COS keys, actor IDs) never need to reach the
     # browser. A durable operation ID is the only browser upload handle.
     if action in {'init', 'resume', 'complete', 'note'}:
@@ -382,7 +436,20 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         # COS multipart UploadId and signed URLs are never public state.
         result = {k: result[k] for k in ('status', 'uploaded_parts', 'size', 'filename',
                                          'head_sha', 'round_id', 'verified', 'sha256') if k in result}
-    if action == 'context':
+    if action == 'context' and result.get('evidence_degraded') is not True:
+        current_logs = {}
+        for alias, log in (result.get('deployment_logs', {}) or {}).items():
+            if not _machine_alias(alias) or not isinstance(log, dict):
+                continue
+            item = {k: log[k] for k in ('status', 'collected_at', 'size', 'sha256') if k in log}
+            if log.get('status') == 'ready' and log.get('head_sha') == result.get('head_sha') and log.get('round_id') == result.get('round_id'):
+                from .evidence_auth import issue_capability
+                item['capability'] = issue_capability(
+                    request.app.state.config, canonical, pr, result['head_sha'], result['round_id'],
+                    purpose=evidence_auth.DOWNLOAD_PURPOSE,
+                    resource='log:' + result['round_id'] + ':' + alias)
+            current_logs[alias] = item
+        result['deployment_logs'] = current_logs
         def scoped(rows):
             from .evidence_auth import issue_capability
             output = []
@@ -409,12 +476,26 @@ async def _dispatch(request, owner, repo, pr, action, **path):
         attachments = scoped(rows)
         rounds = []
         for row in result.get('rounds', []):
+            machine_logs = {}
+            for alias, log in (row.get('deployment_logs', {}) or {}).items():
+                if (not _machine_alias(alias)
+                        or not isinstance(log, dict) or log.get('status') not in {'ready', 'pending', 'unavailable'}):
+                    continue
+                public_log = {k: log.get(k) for k in ('status', 'collected_at', 'size', 'sha256') if k in log}
+                if log.get('status') == 'ready' and log.get('head_sha') == row.get('head_sha') and log.get('round_id') == row.get('round_id'):
+                    from .evidence_auth import issue_capability
+                    public_log['capability'] = issue_capability(
+                        request.app.state.config, canonical, pr, row['head_sha'], row['round_id'],
+                        purpose=evidence_auth.DOWNLOAD_PURPOSE,
+                        resource='log:' + row['round_id'] + ':' + alias)
+                machine_logs[alias] = public_log
             round_value = {**{k: v for k, v in row.items() if k in {
                 'head_sha', 'round_id', 'round_number', 'status', 'created_at', 'started_at',
                 'round_started_at', 'ended_at', 'archived_at', 'acceptance_pending',
                 'display_deployments'}},
                 'attachments': scoped(row.get('attachments', [])),
-                'log_available': bool(row.get('cos', {}).get('object_key'))}
+                'log_available': bool(row.get('cos', {}).get('object_key')),
+                'deployment_logs': machine_logs}
             head, round_id = round_value.get('head_sha'), round_value.get('round_id')
             if isinstance(head, str) and isinstance(round_id, str) and head == round_id.rsplit('-', 1)[0]:
                 from .evidence_auth import issue_capability
@@ -430,7 +511,9 @@ async def _dispatch(request, owner, repo, pr, action, **path):
             _public_attachment(row, operation_context=operation_context)
             for row in result.get('operations', [])
         ]
-        result['summary_updated'] = await _summary_updated(request, canonical, pr, result)
+        # Summary synchronization is presentation-only; do not hold the page
+        # response on a second GitHub comment read/render.
+        result['summary_updated'] = None
         result = {**result, 'authenticated': True, 'enabled': True,
                   'github_user_authenticated': bool(principal.get('github_user_authenticated')),
                   'actor_verified': principal.get('actor_verified') is True,
@@ -522,6 +605,13 @@ async def preview(request: Request, owner: str, repo: str, pr: int, attachment_i
 @router.get(_PREFIX + '/rounds/{round_id}/log/download')
 async def log_download(request: Request, owner: str, repo: str, pr: int, round_id: str):
     return await _download(request, owner, repo, pr, 'log_download', round_id=round_id)
+
+
+@router.get(_PREFIX + '/rounds/{round_id}/machines/{machine_alias}/log/download')
+async def machine_log_download(request: Request, owner: str, repo: str, pr: int,
+                               round_id: str, machine_alias: str):
+    return await _download(request, owner, repo, pr, 'machine_log_download',
+                           round_id=round_id, machine_alias=machine_alias)
 
 
 @router.get('/evidence/{owner}/{repo}/pulls/{pr}', response_class=HTMLResponse)

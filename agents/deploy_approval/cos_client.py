@@ -195,6 +195,8 @@ class CosClient:
         head_sha: str,
         *,
         now: datetime | None = None,
+        machine_alias: str = "",
+        round_id: str = "",
     ) -> str:
         """Build a deterministic COS object key for evidence.log.gz.
 
@@ -236,17 +238,32 @@ class CosClient:
         tz = ZoneInfo("Asia/Shanghai")
 
         if now is None:
+            if machine_alias:
+                raise ValueError("machine evidence key requires persisted collected_at via now")
             now = datetime.now(tz)
         elif now.tzinfo is None:
+            if machine_alias:
+                raise ValueError("machine evidence collected_at must include a timezone")
             now = now.replace(tzinfo=tz)
         else:
             now = now.astimezone(tz)
         month = now.strftime("%Y-%m")
         day = now.strftime("%Y-%m-%d")
 
+        suffix = ""
+        if machine_alias:
+            if (not isinstance(machine_alias, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine_alias)
+                    or ".." in machine_alias):
+                raise ValueError("invalid machine_alias")
+            if not isinstance(round_id, str) or not re.fullmatch(re.escape(head_sha) + r"-[1-9][0-9]*", round_id):
+                raise ValueError("round_id must be HEAD followed by a positive integer")
+            suffix = f"-{round_id.rsplit('-', 1)[1]}-{machine_alias}"
+        elif round_id:
+            raise ValueError("round_id requires machine_alias")
         return (
             f"{COS_ROOT}{repo_dir}/{month}/{day}/"
-            f"pr-{pr_number}/evidence-{head_sha}.log.gz"
+            f"pr-{pr_number}/evidence-{head_sha}{suffix}.log.gz"
         )
 
     async def upload_evidence_archive(
@@ -317,7 +334,13 @@ class CosClient:
                         head_sha=self._head_sha_from_key(object_key),
                         expected_result=expected_result,
                     )
-                    if err is None:
+                    incoming_identity = CosClient._parse_evidence_identity(archive_bytes)
+                    existing_identity = CosClient._parse_evidence_identity(existing)
+                    identity_fields = ("repo", "pr", "head", "result", "round", "machine", "collected_at")
+                    if err is None and all(
+                        incoming_identity.get(field) == existing_identity.get(field)
+                        for field in identity_fields
+                    ):
                         return True
                     # Identity mismatch or corruption — reject overwrite.
                     logger.warning(
@@ -578,6 +601,16 @@ class CosClient:
                         object_key, validation_err,
                     )
                     return False
+                incoming_identity = CosClient._parse_evidence_identity(archive_bytes)
+                existing_identity = CosClient._parse_evidence_identity(existing_bytes)
+                identity_fields = ("repo", "pr", "head", "result", "round", "machine", "collected_at")
+                if any(incoming_identity.get(field) != existing_identity.get(field)
+                       for field in identity_fields):
+                    logger.warning(
+                        "COS category=OBJECT_CONFLICT %s: existing business identity differs — rejecting reuse",
+                        object_key,
+                    )
+                    return False
 
                 # Existing object has valid identity — reuse it (idempotent).
                 # Different compressed bytes are acceptable when identity is valid.
@@ -722,8 +755,9 @@ class CosClient:
         filename = object_key.split("/")[-1]
         if filename.startswith("evidence-") and filename.endswith(".log.gz"):
             sha_part = filename[len("evidence-"):-len(".log.gz")]
-            if re.fullmatch(r"[0-9a-f]{40}", sha_part):
-                return sha_part
+            match = re.fullmatch(r"([0-9a-f]{40})(?:-[1-9][0-9]*-[A-Za-z0-9][A-Za-z0-9._-]{0,63})?", sha_part)
+            if match:
+                return match.group(1)
         return ""
 
     @staticmethod
@@ -765,7 +799,7 @@ class CosClient:
                 continue
             if not in_metadata:
                 continue
-            for field in ("repo", "pr", "head", "result"):
+            for field in ("repo", "pr", "head", "result", "round", "machine", "collected_at"):
                 key = f"{field}="
                 if stripped.lower().startswith(key):
                     identity[field] = stripped[len(key):].strip()
@@ -782,6 +816,8 @@ class CosClient:
         pr_number: int,
         head_sha: str,
         expected_result: str = "",
+        machine_alias: str = "",
+        round_id: str = "",
     ) -> str | None:
         """Return an error reason string when the evidence is invalid, else None.
 
@@ -847,7 +883,8 @@ class CosClient:
         # This prevents substring mismatches (e.g. INVALID-10 directory,
         # path traversal, wrong year/month segments) from being accepted.
         try:
-            CosClient.validate_object_key(repo, pr_number, head_sha, key)
+            CosClient.validate_object_key(repo, pr_number, head_sha, key,
+                                          machine_alias=machine_alias, round_id=round_id)
         except ValueError:
             return "key_layout_invalid"
 
@@ -857,6 +894,14 @@ class CosClient:
             return "repo_mismatch"
         if identity.get("head") != head_sha:
             return "head_mismatch"
+        if not machine_alias and key.rsplit("/", 1)[-1] != f"evidence-{head_sha}.log.gz":
+            suffix = re.fullmatch(rf"evidence-{head_sha}-([1-9][0-9]*)-([A-Za-z0-9][A-Za-z0-9._-]{{0,63}})\.log\.gz", key.rsplit("/", 1)[-1])
+            if not suffix:
+                return "key_layout_invalid"
+            round_id = f"{head_sha}-{suffix.group(1)}"
+            machine_alias = suffix.group(2)
+        if machine_alias and (identity.get("machine") != machine_alias or identity.get("round") != round_id):
+            return "machine_or_round_mismatch"
 
         # identity["pr"] should be plain decimal (e.g. "42")
         try:
@@ -870,8 +915,30 @@ class CosClient:
         if expected_result:
             if identity.get("result") != expected_result:
                 return "result_mismatch"
-        elif identity.get("result") not in ("pass", "fail"):
+        elif identity.get("result") not in ("pass", "fail", "deployed"):
             return "result_unrecognized"
+        if machine_alias and identity.get("machine") != machine_alias:
+            return "machine_mismatch"
+        if round_id and identity.get("round") != round_id:
+            return "round_mismatch"
+        if identity.get("result") == "deployed":
+            if not machine_alias or not round_id or not identity.get("collected_at"):
+                return "deployment_identity_missing"
+            try:
+                timestamp = datetime.fromisoformat(identity["collected_at"].replace("Z", "+00:00"))
+                if timestamp.tzinfo is None or timestamp.utcoffset().total_seconds() != 0:
+                    return "invalid_collected_at"
+                canonical_time = timestamp.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+                if identity["collected_at"] != canonical_time:
+                    return "invalid_collected_at"
+                key_parts = key.split("/")
+                collection_day = timestamp.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+                if len(key_parts) != 6 or key_parts[3] != collection_day or key_parts[2] != collection_day[:7]:
+                    return "collection_date_mismatch"
+            except (ValueError, AttributeError):
+                return "invalid_collected_at"
+        elif machine_alias:
+            return "machine_requires_deployed_result"
 
         return None
 
@@ -1052,6 +1119,7 @@ class CosClient:
     @staticmethod
     def validate_object_key(
         repo: str, pr_number: int, head_sha: str, object_key: str,
+        *, machine_alias: str = "", round_id: str = "",
     ) -> str:
         expected = CosClient._expected_object_key_prefix(repo, pr_number, head_sha)
         if not isinstance(object_key, str) or ".." in object_key or "\\" in object_key:
@@ -1071,7 +1139,25 @@ class CosClient:
             raise ValueError("invalid COS object key date") from exc
         if parsed_day.strftime("%Y-%m-%d") != parts[3] or parsed_day.strftime("%Y-%m") != parts[2]:
             raise ValueError("invalid COS object key date")
-        if parts[5] != f"evidence-{head_sha}.log.gz":
+        filename = parts[5] if len(parts) == 6 else ""
+        if not machine_alias and filename != f"evidence-{head_sha}.log.gz":
+            match = re.fullmatch(rf"evidence-{head_sha}-([1-9][0-9]*)-([A-Za-z0-9][A-Za-z0-9._-]{{0,63}})\.log\.gz", filename)
+            if not match:
+                raise ValueError("invalid machine evidence key")
+            machine_alias = match.group(2)
+            round_id = f"{head_sha}-{match.group(1)}"
+        expected_name = f"evidence-{head_sha}.log.gz"
+        if machine_alias:
+            if (not isinstance(machine_alias, str)
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine_alias)
+                    or ".." in machine_alias):
+                raise ValueError("invalid machine_alias")
+            if not isinstance(round_id, str) or not re.fullmatch(re.escape(head_sha) + r"-[1-9][0-9]*", round_id):
+                raise ValueError("invalid round_id")
+            expected_name = f"evidence-{head_sha}-{round_id.rsplit('-', 1)[1]}-{machine_alias}.log.gz"
+        elif round_id:
+            raise ValueError("round_id requires machine_alias")
+        if parts[5] != expected_name:
             raise ValueError("COS object key does not match requested HEAD")
         return object_key
 
@@ -1157,6 +1243,7 @@ class CosClient:
     async def ensure_evidence_archive(
         self, *, object_key: str, archive_bytes: bytes,
         repo: str, pr_number: int, head_sha: str, result: str,
+        machine_alias: str = "", round_id: str = "",
     ) -> dict:
         """Ensure an evidence archive exists in COS with identity validation.
 
@@ -1185,6 +1272,7 @@ class CosClient:
                 pr_number=pr_number,
                 head_sha=head_sha,
                 expected_result=result,
+                machine_alias=machine_alias, round_id=round_id,
             )
             if validation_err is not None:
                 logger.warning(
@@ -1220,6 +1308,7 @@ class CosClient:
                     pr_number=key_pr,
                     head_sha=key_head,
                     expected_result=result,
+                    machine_alias=machine_alias, round_id=round_id,
                 )
                 if err is not None:
                     logger.warning(

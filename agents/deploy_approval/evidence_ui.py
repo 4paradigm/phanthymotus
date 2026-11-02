@@ -155,6 +155,7 @@ _JAVASCRIPT = r'''"use strict";
   const MAX_FILES = 20, MAX_TOTAL_BYTES = 10 * 1024 * 1024 * 1024;
   const active = new Set(), jobs = [];
   let context = null, stopped = false, pageLeaving = false, busy = false, proofSecret = "", clientKey = "", savedUploads = {};
+  let contextAuthorized = false;
   let noteOperation = null;
   const fragment = new URLSearchParams(window.location.hash.slice(1));
   const incomingProof = fragment.get("proof");
@@ -248,7 +249,7 @@ _JAVASCRIPT = r'''"use strict";
       context.actor_verified === false && context.github_user_authenticated === false;
     const proofUser = context && context.actor_verified === true &&
       context.github_user_authenticated === true && !!proofSecret;
-    return context && roundMatches(context) && context.enabled !== false && context.evidence_enabled !== false &&
+    return contextAuthorized && context && roundMatches(context) && context.enabled !== false && context.evidence_enabled !== false &&
       context.can_write === true && context.status === "testing" &&
       (secureInvite || (invite && proofTransportAllowed(new URL(api, window.location.href))) || proofUser) &&
       context.readiness && context.readiness.COS_READY === true &&
@@ -285,8 +286,10 @@ _JAVASCRIPT = r'''"use strict";
   });
   window.addEventListener("pageshow", event => {
     if (!event.persisted || !pageLeaving) return;
-    pageLeaving = false; controls();
-    refresh().catch(() => message("页面已恢复；暂时无法确认附件状态，请稍后重试。"));
+    contextAuthorized = false;
+    pageLeaving = false;
+    controls();
+    refresh().catch(refreshFailure);
   });
   class ApiError extends Error {
     constructor(status, text, detail = "") { super(text); this.status = status; this.detail = detail; }
@@ -590,9 +593,7 @@ _JAVASCRIPT = r'''"use strict";
     }
   }
   function syntheticBotNote(item, note) {
-    if (!item || item.actor_verified !== true) return false;
-    const actor = String(item.actor_login || item.actor || "");
-    if (actor.toLowerCase() !== "4pd-pr-assistant[bot]") return false;
+    if (!item || item.internal_bot_note !== true) return false;
     const normalized = String(note || "").trim().replace(/\s+/g, " ").toLowerCase();
     return [
       "server-side cos multipart acceptance",
@@ -618,11 +619,9 @@ _JAVASCRIPT = r'''"use strict";
       size.textContent = formatBytes(item.size);
       heading.append(title); if (size.textContent) heading.append(size);
       li.append(heading);
-      const actor = item.actor_verified === true ? (item.actor_login || item.actor || "已验证用户") :
-        item.upload_method === "signed_invite" ? "分享链接（身份未验证）" : "身份未验证";
       const meta = document.createElement("p");
       meta.className = "attachment-meta-inline";
-      meta.textContent = actor + " · " + formatDate(item.created_at || item.uploaded_at, true);
+      meta.textContent = formatDate(item.created_at || item.uploaded_at, true);
       li.append(meta);
       if (deleted) {
         const badge = document.createElement("p"); badge.className = "muted";
@@ -703,13 +702,36 @@ _JAVASCRIPT = r'''"use strict";
     }
     table.append(body); wrap.append(table); parent.append(wrap);
   }
+  function machineLogList(logs, roundId, parent) {
+    if (!logs || typeof logs !== "object" || !roundId) return;
+    const section = document.createElement("div"); section.className = "history-links";
+    const heading = document.createElement("h4"); heading.textContent = "机器部署日志"; section.append(heading);
+    for (const [alias, log] of Object.entries(logs)) {
+      const row = document.createElement("p"); row.textContent = alias + "：";
+      if (log && log.status === "ready" && typeof log.capability === "string" && log.capability) {
+        row.append(anchor("下载日志", "/rounds/" + id(roundId) + "/machines/" + encodeURIComponent(alias) +
+          "/log/download?cap=" + encodeURIComponent(log.capability)));
+      } else row.append(document.createTextNode(log && log.status === "pending" ? "保存中" : "日志不可获取"));
+      section.append(row);
+    }
+    if (Object.keys(logs).length) parent.append(section);
+  }
   function render() {
+    const degraded = context && context.evidence_degraded === true;
     const state = typeof context.status === "string" ? context.status : "";
     const pageAvailable = !!context && (typeof state === "string" && !!state ||
       roundMatches(context) || Array.isArray(context.rounds) || Array.isArray(context.history));
     // Lifecycle labels control writes; trusted current and archived evidence
     // remain readable throughout every supported phase.
     const stageAvailable = pageAvailable;
+    if (degraded) {
+      contextAuthorized = false;
+      message("");
+      const label = document.createTextNode("历史附件暂未加载，写入已禁用。请重试以恢复完整可信数据。 ");
+      const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试";
+      retry.addEventListener("click", () => refresh().catch(refreshFailure));
+      $("message").append(label, retry);
+    } else message("");
     $("current-section").hidden = !stageAvailable;
     $("history-section").hidden = true;
     $("attachments").replaceChildren(); $("history").replaceChildren();
@@ -743,7 +765,9 @@ _JAVASCRIPT = r'''"use strict";
       $("round-title").textContent = roundNumber
         ? "第 " + roundNumber + " 轮" + (selectedIsLatestRound ? "（当前轮次）" : "")
         : (selectedIsLatestRound ? "当前轮（当前轮次）" : "当前轮");
-      $("summary").textContent = state === "testing" && !writable()
+      $("summary").textContent = degraded
+        ? "历史附件暂未加载，写入已禁用，请重试并等待完整可信状态恢复。"
+        : state === "testing" && !writable()
         ? "当前为查看模式。如需上传，请从 PR Summary 的「打开附件页」进入。"
         : "本轮附件与说明。";
       $("round-head").textContent = "Commit：" + String(context.head_sha || "—");
@@ -751,6 +775,7 @@ _JAVASCRIPT = r'''"use strict";
         (context.acceptance_pending ? "测试完成 · 待验收" : lifecycleLabel(state));
       $("round-time").textContent = "测试时间：" + formatDate(context.round_started_at, true);
       deploymentList(context.display_deployments, $("current-deployments"));
+      machineLogList(context.deployment_logs, context.round_id, $("current-deployments"));
     } else {
       $("writes").hidden = true; $("writes").disabled = true;
     }
@@ -759,12 +784,13 @@ _JAVASCRIPT = r'''"use strict";
     replacementGroup.id = "replace-targets";
     replacementGroup.label = "替换指定附件（旧记录保留历史）";
     $("replace").replaceChildren(new Option("新增附件（保留已有附件）", ""), replacementGroup);
-    if (stageAvailable) attachmentList(context.attachments || [], $("attachments"), true);
-    if (stageAvailable && !$("attachments").childNodes.length) {
+    if (stageAvailable && Array.isArray(context.attachments))
+      attachmentList(context.attachments, $("attachments"), true);
+    if (stageAvailable && !degraded && Array.isArray(context.attachments) && !$("attachments").childNodes.length) {
       const empty = document.createElement("li"); empty.className = "empty-state";
       empty.textContent = "本轮暂无附件；上传完成后会显示在这里。"; $("attachments").append(empty);
     }
-    for (let index = 0; index < oldRounds.length; index++) {
+    for (let index = 0; !degraded && index < oldRounds.length; index++) {
       const round = oldRounds[index];
       const details = document.createElement("details"), summary = document.createElement("summary"), content = document.createElement("div");
       const rawRoundDate = round.round_started_at || round.started_at || round.created_at || round.archived_at || round.ended_at;
@@ -794,6 +820,7 @@ _JAVASCRIPT = r'''"use strict";
       content.append(facts);
       const deploymentRows = document.createElement("div");
       deploymentList(round.display_deployments, deploymentRows); content.append(deploymentRows);
+      machineLogList(round.deployment_logs, round.round_id, content);
       if (hasAttachmentDetails) {
         const ul = document.createElement("ul"); attachmentList(round.attachments, ul, false); content.append(ul);
       } else {
@@ -818,7 +845,7 @@ _JAVASCRIPT = r'''"use strict";
         p.append(a); p.className = "history-links"; $("history").append(p); archiveCount++;
       } catch (_) {}
     }
-    $("history-section").hidden = oldRounds.length === 0 && archiveCount === 0;
+    $("history-section").hidden = degraded || oldRounds.length === 0 && archiveCount === 0;
     if ([...$("replace").options].some(o => o.value === replacement)) $("replace").value = replacement;
     controls();
   }
@@ -844,6 +871,7 @@ _JAVASCRIPT = r'''"use strict";
     }
     if (useProofFallback) next = await request("/context", {job, authMode: "proof", timeoutMs});
     context = next;
+    contextAuthorized = next.evidence_degraded !== true;
     if (!roundMatches(next)) halt("当前 HEAD/round 已变化，已停止写入。请刷新 PR Summary 并打开最新上传链接。");
     else if (next.auth_method === "signed_invite") clearProof();
     render(); return next;
@@ -1352,13 +1380,20 @@ _JAVASCRIPT = r'''"use strict";
       catch (_) { message("浏览器无法读取拖入文件；请使用文件选择框。"); }
     }
   });
-  restore(); refresh().catch(error => {
+  function refreshFailure(error) {
+    contextAuthorized = false; controls();
     const status = error && Number(error.status || 0);
-    const detail = String(error && error.message || "");
-    $("current-section").hidden = true; $("history-section").hidden = true;
-    if ([401, 403].includes(status) || /invalid_evidence_capability|invalid_evidence/i.test(detail))
-      message("此附件链接当前不可用。请从可信 PR Summary 重新打开或刷新链接。");
-    else message("暂时无法读取附件，请稍后从 PR Summary 重新打开。");
-  });
+    const text = status === 401 ? "授权已失效，请从可信 PR Summary 重新打开附件页。"
+      : status === 403 ? "当前账号无权读取或修改附件；写入操作已禁用。"
+      : status === 409 ? "PR 或轮次状态已变化，请重试以获取可信数据。"
+      : status === 503 || status === 0 ? "服务暂不可用或网络超时；已保留已确认内容。"
+      : "当前数据暂不可用；已保留已确认内容。";
+    message("");
+    const label = document.createTextNode(text + " ");
+    const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重试";
+    retry.addEventListener("click", () => refresh().catch(refreshFailure));
+    $("message").append(label, retry);
+  }
+  restore(); refresh().catch(refreshFailure);
 })();
 '''

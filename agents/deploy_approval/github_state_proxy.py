@@ -250,6 +250,7 @@ def _validate_hidden_state(data: dict) -> dict:
         "approve_attempts_truncated",
         "case_results", "test_result", "cos", "command", "last_processed_comment_id",
         "round_id", "round_started_at", "round_archive",
+        "deployment_logs",
         "acceptance_request",
     }
     extra_keys = set(data.keys()) - allowed_keys
@@ -274,6 +275,52 @@ def _validate_hidden_state(data: dict) -> dict:
                 raise ValueError("timestamp requires timezone")
         except ValueError as exc:
             raise MalformedHiddenStateError("invalid round_started_at") from exc
+    if "deployment_logs" in data:
+        logs = data["deployment_logs"]
+        if not isinstance(logs, dict) or len(logs) > 32:
+            raise MalformedHiddenStateError("invalid deployment_logs")
+        for machine, item in logs.items():
+            if (not isinstance(machine, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", machine)
+                    or ".." in machine
+                    or not isinstance(item, dict)
+                    or set(item) != {"head_sha", "round_id", "status", "collected_at", "object_key", "sha256", "size"}
+                    or item.get("head_sha") != data.get("head_sha")
+                    or item.get("round_id") != data.get("round_id")
+                    or not isinstance(item.get("round_id"), str)
+                    or not re.fullmatch(re.escape(str(data.get("head_sha", ""))) + r"-[1-9][0-9]*", item.get("round_id", ""))
+                    or not any(isinstance(dep, dict) and dep.get("machine") == machine
+                               and dep.get("phase") == "deployed"
+                               for dep in data.get("deployments", []))
+                    or item.get("status") not in {"pending", "ready", "unavailable"}
+                    or not isinstance(item.get("collected_at"), str)
+                    or not isinstance(item.get("object_key"), str)
+                    or not isinstance(item.get("sha256"), str)
+                    or type(item.get("size")) is not int or item["size"] < 0):
+                raise MalformedHiddenStateError("invalid deployment_logs entry")
+            if item["status"] == "ready":
+                if (not item["object_key"] or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                        or item["size"] <= 0 or not item["collected_at"]):
+                    raise MalformedHiddenStateError("invalid ready deployment log")
+                from datetime import datetime
+                try:
+                    collected = datetime.fromisoformat(item["collected_at"].replace("Z", "+00:00"))
+                    if collected.utcoffset() is None or collected.utcoffset().total_seconds() != 0:
+                        raise ValueError
+                except (TypeError, ValueError, AttributeError):
+                    raise MalformedHiddenStateError("invalid deployment log collected_at") from None
+                filename = item["object_key"].rsplit("/", 1)[-1]
+                expected = f"evidence-{item['head_sha']}-{item['round_id'].rsplit('-', 1)[1]}-{machine}.log.gz"
+                key_parts = item["object_key"].split("/")
+                if (filename != expected or ".." in item["object_key"] or "\\" in item["object_key"]
+                        or len(key_parts) != 6 or key_parts[0] != "phanthymotus_pr"
+                        or not re.fullmatch(r"[A-Za-z0-9_-]+", key_parts[1])
+                        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}", key_parts[2])
+                        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", key_parts[3])
+                        or key_parts[2] != key_parts[3][:7]
+                        or not re.fullmatch(r"pr-[1-9][0-9]*", key_parts[4])):
+                    raise MalformedHiddenStateError("deployment log COS key identity mismatch")
+            elif item["object_key"] or item["sha256"] or item["size"]:
+                raise MalformedHiddenStateError("unfinished deployment log has COS metadata")
     if "round_archive" in data:
         link = data["round_archive"]
         legacy_archive = isinstance(link, dict) and set(link) == {"round_id", "comment_id", "url", "sha256"}

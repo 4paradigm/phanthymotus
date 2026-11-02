@@ -1370,7 +1370,7 @@ def render_evidence_section(
                           *test_details, "", "</details>"])
         lines.extend(["", "### 附件", ""])
         if items:
-            lines.extend(["| 文件 | 大小 | 上传者 | 上传时间 |", "|---|---:|---|---|"])
+            lines.extend(["| 文件 | 大小 | 上传时间 |", "|---|---:|---|"])
         notes = []
         seen_notes = set()
         for item in items:
@@ -1387,12 +1387,6 @@ def render_evidence_section(
             size = item.get("size", "—")
             if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
                 size = _human_size(size)
-            if item.get("actor_verified") is True and item.get("upload_method") != "signed_invite":
-                actor = item.get("actor_login") or item.get("actor") or "已验证用户"
-            elif item.get("upload_method") == "signed_invite":
-                actor = "分享链接（身份未验证）"
-            else:
-                actor = "身份未验证"
             uploaded_at = summary_time(first_valid_time(item.get("created_at"), item.get("uploaded_at")))
             if deleted:
                 filename = filename + "（已删除）"
@@ -1404,7 +1398,7 @@ def render_evidence_section(
             if download_url:
                 filename_cell = f"[{filename_cell}](<{download_url}>)"
             lines.append("| " + " | ".join((
-                filename_cell, _escape(size), _escape(actor), _escape(uploaded_at),
+                filename_cell, _escape(size), _escape(uploaded_at),
             )) + " |")
             note = item.get("note") or (item.get("text") if status == "text" else "")
             if is_internal_test_note(item):
