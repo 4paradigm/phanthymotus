@@ -603,9 +603,11 @@ class Nav2CompanionCoreTest(unittest.TestCase):
         self.assertNotIn("topic: /ubuntu/navigation/obstacle_map", params)
         self.assertEqual(params.count("map_topic: /ubuntu/navigation/static_map"), 1)
         self.assertEqual(params.count("data_type: PointCloud2"), 2)
-        self.assertIn("min_obstacle_height: -3.0", params)
-        self.assertIn("max_obstacle_height: 3.0", params)
-        self.assertIn("adapter already applies the card-configured Z band", params)
+        # Both costmaps' layer and source templates use the mapping default;
+        # the launch rewriter replaces all four bands with the configured band.
+        self.assertEqual(params.count("min_obstacle_height: -0.30"), 4)
+        self.assertEqual(params.count("max_obstacle_height: 0.30"), 4)
+        self.assertEqual(params.count("from the single mapping-card height configuration"), 2)
         self.assertIn("global_frame: map", params)
         self.assertIn("rolling_window: true", params)
         local = params.split("local_costmap:\n", 1)[1].split(
