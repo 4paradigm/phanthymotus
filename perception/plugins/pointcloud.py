@@ -343,8 +343,9 @@ class _PointCloudNode(Node):
                     # 哪个来数据用哪个（摄像头驱动只会发其中一种）。
                     self._subs.append(self.create_subscription(
                         Image, self._input_topic, self._depth_image_cb, _LOW_LAT_QOS))
-                    self._subs.append(self.create_subscription(
-                        CompressedImage, self._input_topic, self._depth_comp_cb, _LOW_LAT_QOS))
+                    if not self._metric_cloud_enabled:
+                        self._subs.append(self.create_subscription(
+                            CompressedImage, self._input_topic, self._depth_comp_cb, _LOW_LAT_QOS))
                 elif self._mode == "auto":
                     # 话题名不说明载的是什么（"/camera/image_raw" 也可能是
                     # z16 深度）：Image + CompressedImage 都订上，回调按消息

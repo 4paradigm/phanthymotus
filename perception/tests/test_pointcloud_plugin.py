@@ -146,6 +146,15 @@ def test_global_config_can_enable_metric_cloud():
     executor.nodes[0].stop()
 
 
+def test_metric_depth_subscribes_only_to_image_type():
+    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
+        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    node = executor.nodes[0]
+    assert [s.callback.__name__ for s in node.subscriptions] == ["_depth_image_cb"]
+    node.stop()
+
+
 def test_metric_cloud_keeps_source_header_through_worker_queue():
     plugin, executor = _plugin({"metric_cloud": True, "fps": 1000, "calibration": {
         "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
