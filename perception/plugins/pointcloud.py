@@ -1565,6 +1565,13 @@ class PointCloudPerceptionPlugin:
                     self._resolve_mode(args, instance_id)
             except ValueError as error:
                 return {"state": "error", "message": str(error)}
+            node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+            icfg = self._instance_configs.get(node_key, {})
+            metric_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
+            # Canvas start supplies the resolved topic but not `mode`; the
+            # metric contract itself unambiguously requires float depth.
+            if metric_enabled and mode == "auto":
+                mode = "depth"
             if mode == "stereo":
                 if not (input_topic and right_topic):
                     return {"state": "error",
@@ -1625,9 +1632,6 @@ class PointCloudPerceptionPlugin:
                     _pinhole_params(calibration, 640, 480)
                 except ValueError as error:
                     return {"state": "error", "message": str(error)}
-            node_key = instance_id or input_topic or _DEFAULT_INSTANCE
-            icfg = self._instance_configs.get(node_key, {})
-            metric_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
             if metric_enabled:
                 if mode != "depth" or not isinstance(calibration, dict):
                     return {"state": "error", "message": "metric_cloud requires depth mode and measured intrinsics"}

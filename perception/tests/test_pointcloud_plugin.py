@@ -146,6 +146,28 @@ def test_global_config_can_enable_metric_cloud():
     executor.nodes[0].stop()
 
 
+def test_canvas_metric_config_starts_depth_without_mode_argument():
+    plugin, executor = _plugin()
+    calibration = {"fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}
+    plugin.dispatch("pointcloud", {"action": "config", "instance_id": "card-1",
+                                   "metric_cloud": True, "calibration": calibration})
+    result = plugin.dispatch("pointcloud", {"action": "start", "instance_id": "card-1",
+                                            "input_topic": "/depth"})
+    assert result["state"] == "running"
+    node = executor.nodes[0]
+    assert node._mode == "depth"
+    assert [s.callback.__name__ for s in node.subscriptions] == ["_depth_image_cb"]
+    node.stop()
+
+
+def test_explicit_mono_mode_cannot_enable_metric_cloud():
+    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
+        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
+    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "mono", "input_topic": "/depth"})
+    assert result["state"] == "error"
+    assert not executor.nodes
+
+
 def test_metric_depth_subscribes_only_to_image_type():
     plugin, executor = _plugin({"metric_cloud": True, "calibration": {
         "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
