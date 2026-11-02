@@ -139,6 +139,7 @@ def test_calibration_uses_real_odom_and_guarded_command_stream_then_persists(rig
     assert completion["k_fwd"] == 0.9
     assert completion["elapsed_s"] == pytest.approx(10.0)
     assert completion["samples"] > 0
+    assert info["calibration"]["commanded_wz_rad_s"] == pytest.approx(0.5)
     assert info["gains"]["forward"]["base"] == 0.9
     assert info["gains"]["yaw"]["source"] == "calibrated"
     assert info["gains"]["yaw"]["base"] == info["calibration"]["profile"]["k_yaw"]
@@ -229,8 +230,9 @@ def test_calibration_feedback_budget_does_not_relax_live_odom_freshness(rig):
 
 
 @pytest.mark.parametrize("problem", ["offline", "paused", "goal", "dry_run", "no_descriptor",
-                                     "no_odom", "low_rate", "high_deadband", "narrow_limits"])
-def test_calibration_refuses_execution_contracts_that_cannot_support_a_small_pulse(rig, problem):
+                                     "no_odom", "low_rate", "unsupported_deadband",
+                                     "narrow_limits", "configured_cap"])
+def test_calibration_refuses_execution_contracts_that_cannot_support_a_safe_pulse(rig, problem):
     card = rig.card()
     if problem == "offline":
         card._running = False
@@ -246,12 +248,65 @@ def test_calibration_refuses_execution_contracts_that_cannot_support_a_small_pul
         card._binding.pop("odom")
     elif problem == "low_rate":
         card._rate_hz = 5
-    elif problem == "high_deadband":
-        card._config.floor_wz = 0.6
-    else:
+    elif problem == "unsupported_deadband":
+        card._descriptor["limits"]["min_magnitude"] = [0, 0, 0, 0, 0, 1.1]
+    elif problem == "narrow_limits":
         card._descriptor["limits"]["upper"][5] = 0.1
+    else:
+        card._descriptor["limits"]["min_magnitude"] = [0, 0, 0, 0, 0, 1.0]
+        card._config.wz_max = 0.9
     assert _begin(card)["state"] == "error"
     assert card._calibration is None and not card._publisher.commands
+
+
+def test_calibration_uses_the_stationary_deadband_for_an_r1_style_chassis(rig):
+    card = rig.card()
+    card._descriptor["limits"].update(
+        lower=[-1.0, -1.0, 0, 0, 0, -2.0],
+        upper=[1.0, 1.0, 0, 0, 0, 2.0],
+        min_magnitude=[0.4, 0.4, 0, 0, 0, 1.0],
+        # Calibration is stationary and must not mistake this moving-gait
+        # threshold for the speed that can start an in-place turn.
+        min_magnitude_moving=[0.4, 0.4, 0, 0, 0, 0.05],
+    )
+    card._config.wz_max = 1.0
+
+    started = _begin(card)
+
+    assert started["state"] == "running", started
+    assert card._calibration.speed == pytest.approx(1.0)
+    assert started["calibration"]["commanded_wz_rad_s"] == pytest.approx(1.0)
+    assert "±1rad/s" in started["message"]
+    card._tick()
+    assert card._publisher.commands[-1]["values"][5] == 0.0
+
+
+def test_r1_style_chassis_completes_the_full_dynamic_speed_calibration(rig):
+    card = rig.card()
+    card._descriptor["limits"].update(
+        lower=[-1.0, -1.0, 0, 0, 0, -2.0],
+        upper=[1.0, 1.0, 0, 0, 0, 2.0],
+        min_magnitude=[0.4, 0.4, 0, 0, 0, 1.0],
+        min_magnitude_moving=[0.4, 0.4, 0, 0, 0, 0.05],
+    )
+    card._config.wz_max = 1.0
+
+    info, commands = _complete(rig, card)
+
+    report = info["calibration"]
+    assert report["status"] == "completed", report
+    assert report["commanded_wz_rad_s"] == pytest.approx(1.0)
+    assert report["profile"]["response_gain"] == pytest.approx(1.0)
+    assert {command["values"][5] for command in commands} == {-1.0, 0.0, 1.0}
+    assert commands[-1]["values"] == [0.0] * 6
+
+
+def test_calibration_without_a_declared_deadband_keeps_the_half_rad_per_second_pulse(rig):
+    card = rig.card()
+    started = _begin(card)
+    assert started["state"] == "running", started
+    assert card._calibration.speed == pytest.approx(0.5)
+    assert started["calibration"]["commanded_wz_rad_s"] == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("payload", [{"stamp_ms": None}, {"stamp_ms": 1},

@@ -62,6 +62,40 @@ def test_a_successful_action_keeps_the_quantities_it_could_not_know():
     assert out['result'] == {'elapsed_s': 31.2, 'distance_m': 12.4}
 
 
+def test_a_successful_yaw_calibration_keeps_its_learned_p_in_the_work_log():
+    """标定结果不是调用参数回声；P 和样本质量正是操作者要从工作日志看到的结果。
+
+    大块 profile / diagnostics 仍应丢弃，完整诊断留给 navi info，避免一次成功回调
+    把活动流撑到截断。
+    """
+    out = _slim({
+        'type': 'action_complete',
+        'action_id': 'navi_cal_1',
+        'status': 'completed',
+        'result': {
+            'status': 'completed',
+            'p': 0.619,
+            'k_yaw': 0.619,
+            'k_fwd': 0.9,
+            'samples': 41,
+            'noisy_odom': True,
+            'elapsed_s': 10.03,
+            'profile': {'response_gain': 0.758, 'delay_s': 1.137},
+            'diagnostics': {'directions': {'left': {'samples': 8}}},
+            'saved_to': '/models/navi/calibration/yaw-example.json',
+        },
+    })
+
+    assert out['result'] == {
+        'elapsed_s': 10.03,
+        'p': 0.619,
+        'k_yaw': 0.619,
+        'k_fwd': 0.9,
+        'samples': 41,
+        'noisy_odom': True,
+    }
+
+
 def test_an_overlong_reason_is_truncated_and_says_so():
     """不写明截断，LLM 会把半句话当成全部。"""
     out = _slim({'type': 'action_complete', 'action_id': 'a', 'status': 'error',
@@ -77,3 +111,4 @@ def test_cancelled_counts_as_a_non_success():
                  'result': {'reason': 'superseded by new navigate'}})
 
     assert out['result']['reason'] == 'superseded by new navigate'
+

@@ -12,9 +12,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from plugins.navi import yaw_calibration as C  # noqa: E402
 
 
-def _run(*, left=1.0, right=1.0, delay=0.0, tau=0.0, override=None, dt=0.1):
+def _run(*, left=1.0, right=1.0, delay=0.0, tau=0.0, override=None,
+         dt=0.1, speed=0.5):
     """A command/measurement loop with a simple delayed first-order plant."""
-    session = C.YawCalibration(now=0.0, robot_key="robot-one")
+    session = C.YawCalibration(now=0.0, robot_key="robot-one", speed=speed)
     issued, results = [], []
     measured = 0.0
     for tick in range(150):
@@ -74,6 +75,32 @@ def test_nominal_two_pulse_response_completes_with_zero_and_a_bounded_profile():
     assert turns[first_negative - 1] == 0.5
     assert 0.0 not in turns[first_positive:first_negative]
     assert session.step(100.0, 1.0, "ignored") == result
+
+
+def test_r1_speed_uses_shorter_pulses_and_completes_at_the_same_ten_second_bound():
+    session, result, history = _run(speed=1.0)
+    assert result.status == "completed", result.reason
+    assert result.elapsed_s == pytest.approx(10.0)
+    assert result.values == [0.0] * 6
+    assert result.profile["response_gain"] == pytest.approx(1.0)
+    assert result.diagnostics["commanded_wz_rad_s"] == 1.0
+    assert max(sample.values[5] for sample in history) == 1.0
+    assert min(sample.values[5] for sample in history) == -1.0
+    assert session._pulses == ((1.0, 2.75, 1.0), (2.75, 4.75, -1.0))
+    assert session.max_observed_wz == pytest.approx(1.5)
+    assert session.max_single_angle == pytest.approx(2.4)
+    assert session.max_total_angle == pytest.approx(4.5)
+
+
+def test_response_gain_and_p_are_normalized_across_calibration_speeds():
+    half = _run(speed=0.5)[1].profile
+    full = _run(speed=1.0)[1].profile
+    assert full["response_gain"] == pytest.approx(half["response_gain"])
+    assert full["left_gain"] == pytest.approx(half["left_gain"])
+    assert full["right_gain"] == pytest.approx(half["right_gain"])
+    # Phase boundaries land between 10 Hz ticks at 1.0 rad/s, so final settling
+    # can differ by one sample while the normalized controller gain stays close.
+    assert full["k_yaw"] == pytest.approx(half["k_yaw"], abs=0.01)
 
 
 def test_faster_or_delayed_response_chooses_a_more_conservative_gain():
@@ -218,6 +245,25 @@ def test_observed_rate_limit_aborts_immediately():
     _, result, _ = _run(override=lambda now, measured: 0.76 if now >= 0.6 else measured)
     assert result.status == "failed" and "0.75 rad/s" in result.reason
     assert result.values == [0.0] * 6
+
+
+def test_r1_observed_rate_guard_scales_but_remains_bounded():
+    _, healthy, _ = _run(speed=1.0)
+    assert healthy.status == "completed", healthy.reason
+    _, runaway, _ = _run(speed=1.0,
+                          override=lambda now, measured:
+                          1.51 if now >= 0.6 else measured)
+    assert runaway.status == "failed"
+    assert "1.5 rad/s" in runaway.reason
+    assert runaway.values == [0.0] * 6
+
+
+def test_r1_dynamic_angle_guard_still_stops_a_bounded_rate_runaway():
+    _, result, _ = _run(
+        speed=1.0,
+        override=lambda now, measured: 1.49 if 1.1 <= now < 4.7 else measured)
+    assert result.status == "failed" and "angle limit" in result.reason
+    assert result.elapsed_s < 4.75 and result.values == [0.0] * 6
 
 
 def test_observed_angle_limit_includes_motion_even_before_rest():
@@ -431,7 +477,11 @@ def test_directory_fsync_failure_after_commit_reports_success_with_a_durability_
     assert not list(tmp_path.glob("*.tmp"))
 
 
-@pytest.mark.parametrize("speed", [0.0, -0.2, 0.51, float("nan"), True])
+@pytest.mark.parametrize("speed", [0.0, -0.2, 1.01, float("nan"), True])
 def test_constructor_rejects_unsafe_pulse_speeds(speed):
     with pytest.raises(ValueError):
         C.YawCalibration(now=0.0, robot_key="r", speed=speed)
+
+
+def test_constructor_accepts_the_r1_calibration_speed():
+    assert C.YawCalibration(now=0.0, robot_key="r", speed=1.0).speed == 1.0

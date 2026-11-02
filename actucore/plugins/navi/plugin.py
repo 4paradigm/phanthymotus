@@ -86,6 +86,8 @@ _STARTUP_GAIN_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw", "adaptive_
                                  "calibrated_yaw_gain", "yaw_damping"))
 _CALIBRATION_FEEDBACK_MAX_AGE_MS = 650
 _DAMPING_FEEDBACK_MAX_AGE_MS = 300
+_CALIBRATION_MIN_WZ = 0.5
+_CALIBRATION_MAX_WZ = 1.0
 
 
 def _sensor_qos():
@@ -260,7 +262,8 @@ class NaviPlugin:
                             "路上按深度减速避障，到设定距离停下。"
                             "前进P固定为0.9；未标定的默认转向P为0.6，转向P可用 "
                             "calibrate_yaw 按本机实测响应自动标定。标定约10秒，"
-                            "会在同一速度动作内以±0.5rad/s左右转动并在结束后停车。"
+                            "会按底盘静止转向死区自动选择±0.5～1.0rad/s，"
+                            "在同一速度动作内转动并在结束后停车。"
                             "卡片不提供手动增益或前进距离自适应选项，info 可查看"
                             "两个P的基准值、当前实际值和标定状态。"),
             "inputSchema": {
@@ -319,7 +322,8 @@ class NaviPlugin:
                         "description": "一键转向校准：卡片运行且无导航目标时，先向一侧"
                                        "转动，再保持同一底盘速度动作直接平滑反转，按实测"
                                        "里程计生成并保存本机转向P。"
-                                       "约10秒，会使底盘以±0.5rad/s转动；只能由操作者在"
+                                       "约10秒，会按底盘静止转向死区自动选择"
+                                       "±0.5～1.0rad/s；只能由操作者在"
                                        "离开充电桩的空旷场地手动发起，失败后不得自动重试。"
                                        "要求连接非空跑底盘及有效 odom.wz；实测反馈允许"
                                        "最长650ms抖动，指令流仍要求300ms内连续。info 查看"
@@ -817,6 +821,52 @@ class NaviPlugin:
             measured_at = time.monotonic() - age / 1000.0
             return self._odom_feedback_wz, stamp, measured_at, ""
 
+    def _calibration_speed(self):
+        """Choose a bounded pulse the stationary chassis can actually execute.
+
+        A legged chassis can have a much larger yaw deadband before a gait has
+        started than while it is already translating.  Calibration is an
+        in-place manoeuvre, so the authoritative value is the static
+        ``min_magnitude[5]`` from the downstream descriptor, never
+        ``min_magnitude_moving``.  The hard 1 rad/s ceiling keeps an unfamiliar
+        chassis from turning faster merely because it advertises a large
+        hardware limit.
+        """
+        limits = (self._descriptor or {}).get("limits") or {}
+        try:
+            lower, upper = limits["lower"], limits["upper"]
+            lo, hi = lower[5], upper[5]
+            configured = self._config.wz_max
+        except (TypeError, IndexError, KeyError) as error:
+            raise ValueError("下游没有声明可用的双向 wz 转速范围") from error
+
+        values = (lo, hi, configured)
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in values):
+            raise ValueError("下游双向 wz 转速范围或当前 wz_max 不是有限数值")
+
+        floor = 0.0
+        declared_floor = limits.get("min_magnitude")
+        if declared_floor is not None:
+            try:
+                floor = declared_floor[5]
+            except (TypeError, IndexError) as error:
+                raise ValueError("下游 min_magnitude 没有声明 wz 轴") from error
+            if (isinstance(floor, bool) or not isinstance(floor, (int, float))
+                    or not math.isfinite(floor) or floor < 0):
+                raise ValueError("下游静止转向死区必须是有限的非负数")
+
+        speed = max(_CALIBRATION_MIN_WZ, float(floor))
+        bidirectional_cap = min(-float(lo), float(hi), float(configured),
+                                _CALIBRATION_MAX_WZ)
+        if bidirectional_cap + 1e-9 < speed:
+            raise ValueError(
+                "下游无法安全执行双向转向标定："
+                f"静止转向需要 {speed:g} rad/s，可用双向上限只有 "
+                f"{max(0.0, bidirectional_cap):g} rad/s（标定安全范围 "
+                f"{_CALIBRATION_MIN_WZ:g}～{_CALIBRATION_MAX_WZ:g} rad/s）")
+        return speed
+
     def _calibrate_yaw(self):
         with self._lock:
             if (self._starting or not self._running or self._paused
@@ -835,14 +885,7 @@ class NaviPlugin:
                 return self._error("转向校准需要至少 10Hz 的指令频率")
             try:
                 key = self._calibration_key()
-                limits = self._descriptor.get("limits") or {}
-                lower, upper = limits.get("lower"), limits.get("upper")
-                lo, hi = lower[5], upper[5]
-                if (any(isinstance(v, bool) or not isinstance(v, (int, float))
-                        or not math.isfinite(v) for v in (lo, hi))
-                        or lo > -0.5 or hi < 0.5 or self._config.wz_max < 0.5
-                        or self._config.floor_wz > 0.5):
-                    raise ValueError("下游双向转速范围或静止死区不支持 0.5 rad/s 转向校准")
+                speed = self._calibration_speed()
             except (ValueError, TypeError, IndexError, KeyError) as error:
                 return self._error(str(error))
             measured, _, _, problem = self._calibration_feedback(stationary=True)
@@ -851,22 +894,32 @@ class NaviPlugin:
             if abs(measured) > 0.03:
                 return self._error("请先让底盘停止，再开始转向校准")
             self._calibration = yaw_cal.YawCalibration(now=time.monotonic(),
-                                                       robot_key=key, speed=0.5)
+                                                       robot_key=key, speed=speed)
             self._calibration_action_id = f"navi_cal_{uuid.uuid4().hex[:12]}"
             self._calibration_report = {"status": "running", "phase": "settle",
                                         "action_id": self._calibration_action_id,
-                                        "robot_key": key, "samples": 0}
+                                        "robot_key": key, "samples": 0,
+                                        "commanded_wz_rad_s": speed}
             self._last_error = ""
             self._state = policy_mod.State()
             return {"state": "running", "action_id": self._calibration_action_id,
                     "calibration": dict(self._calibration_report),
-                    "message": "10秒双向转向校准已开始（±0.5rad/s），完成后保持停车"}
+                    "message": (f"10秒双向转向校准已开始（±{speed:g}rad/s），"
+                                "完成后保持停车")}
 
     def _finish_calibration(self, result):
         """Called after the session has already spent its final phase at zero."""
         report = {"status": result.status, "phase": result.phase,
                   "reason": result.reason, "elapsed_s": result.elapsed_s,
                   "samples": result.samples}
+        calibration_speed = getattr(self._calibration, "speed", None)
+        if calibration_speed is not None:
+            # Keep the selected chassis-specific pulse visible after the
+            # session finishes as well as while it is running.  Otherwise an
+            # R1 result says only that calibration completed, not whether it
+            # actually used the 1.0 rad/s pulse needed to leave its standstill
+            # yaw deadband.
+            report["commanded_wz_rad_s"] = calibration_speed
         if result.diagnostics is not None:
             report["diagnostics"] = result.diagnostics
         if result.status == "completed":

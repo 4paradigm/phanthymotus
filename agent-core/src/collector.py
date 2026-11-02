@@ -577,7 +577,13 @@ _ACP_RESULT_CHARS = 600
 
 # 成功时也值得留的那几个：它们是**量**，不是回声。LLM 发出的是「去 A」，回来的
 # 「走了 12.4 m、用了 31 秒」它猜不到，而下一步要不要调整节奏就看这个。
-_ACP_KEEP_ON_SUCCESS = ('elapsed_s', 'distance_m', 'duration_s')
+_ACP_KEEP_ON_SUCCESS = (
+    'elapsed_s', 'distance_m', 'duration_s',
+    # A successful yaw calibration produces controller measurements, not an
+    # echo of the request.  Dropping these made the work log say only that the
+    # ten-second action ended, while hiding the P value it had just learned.
+    'p', 'k_yaw', 'k_fwd', 'samples', 'noisy_odom',
+)
 
 
 def _slim_acp_result(status, result):
@@ -1019,3 +1025,4 @@ def start():
     asyncio.ensure_future(_bg_trigger_loop())
     interval = event_cfg.get('trigger_interval_ms', 1000)
     print(f'[collector] started: dual-queue mode, bg_interval={interval}ms, interrupt_mode={_interrupt_mode}, barge_in={_barge_in_threshold_ms}ms')
+

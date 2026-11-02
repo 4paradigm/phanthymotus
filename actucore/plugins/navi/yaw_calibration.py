@@ -32,21 +32,26 @@ MAX_COMMAND_GAP_S = 0.3
 # REST odometry and command dispatch are independent clocks. A slower fresh
 # sensor sample does not mean that the low-speed command heartbeat stopped.
 MAX_SAMPLE_AGE_S = 0.65
-MAX_OBSERVED_WZ = 0.75
-# The fixed 10 s sequence below reaches about 0.9 rad on the first side and
-# 1.1 rad while reversing at the slowest supported 1 rad/s² limiter.  These
-# independent hard bounds still stop a runaway response before either side can
-# reach 86 degrees or total absolute motion can reach 160 degrees.
-MAX_SINGLE_ANGLE_RAD = 1.5
-MAX_TOTAL_ANGLE_RAD = 2.8
+# The measured-rate and angle guards are derived per session from the command
+# selected for that chassis.  At the reference 0.5 rad/s they remain exactly
+# the original 0.75 / 1.5 / 2.8 limits; an R1 needs 1.0 rad/s merely to leave
+# its standstill yaw deadband, so fixed 0.5-specific guards would reject a
+# healthy response before it could be measured.
+_REFERENCE_SPEED = 0.5
+_MAX_CALIBRATION_SPEED = 1.0
+_MAX_RESPONSE_RATIO = 1.5
+_ANGLE_MARGIN = 1.2
+_BASE_MAX_SINGLE_ANGLE_RAD = 1.5
+_BASE_MAX_TOTAL_ANGLE_RAD = 2.8
 MAX_SESSION_S = 12.0
 SETTLED_WZ = 0.03
 _EPSILON = 1e-9
-_PHASES = (("settle", 0.0, 1.0, 0.0),
-           ("left", 1.0, 3.0, 1.0),
-           ("right", 3.0, 5.5, -1.0),
-           ("rest_right", 5.5, 10.0, 0.0))
-_PULSES = ((1.0, 3.0, 1.0), (3.0, 5.5, -1.0))
+_SESSION_DURATION_S = 10.0
+_SETTLE_S = 1.0
+_BASE_LEFT_S = 2.0
+_BASE_RIGHT_S = 2.5
+_MIN_LEFT_S = 1.75
+_MIN_RIGHT_S = 2.0
 _STABLE_WINDOW_S = 1.25
 _REST_S = 1.5
 _REVERSAL_TRANSIENT_S = 1.2
@@ -225,13 +230,39 @@ class YawCalibration:
     Keys must identify distinct odometry samples, not controller tick numbers.
     """
 
-    duration_s = _PHASES[-1][2]
+    duration_s = _SESSION_DURATION_S
 
     def __init__(self, *, now, robot_key, speed=0.5):
         self.robot_key = _identity(robot_key)
         self.speed = _number(speed, "calibration speed")
-        if not 0.05 <= self.speed <= 0.5:
-            raise ValueError("calibration speed must be between 0.05 and 0.5 rad/s")
+        if not 0.05 <= self.speed <= _MAX_CALIBRATION_SPEED:
+            raise ValueError("calibration speed must be between 0.05 and 1.0 rad/s")
+
+        # Keep the proven Tianyi timings unchanged at and below 0.5 rad/s.  A
+        # faster chassis gets shorter pulses, but never so short that the last
+        # 1.25 s window lacks several distinct R1 10 Hz odometry samples.  The
+        # rest phase absorbs the saved time, so every session still ends at
+        # ten seconds and spends longer, not shorter, proving that it stopped.
+        ratio = min(1.0, _REFERENCE_SPEED / self.speed)
+        left_s = max(_MIN_LEFT_S, _BASE_LEFT_S * ratio)
+        right_s = max(_MIN_RIGHT_S, _BASE_RIGHT_S * ratio)
+        left_begin = _SETTLE_S
+        left_end = left_begin + left_s
+        right_end = left_end + right_s
+        self._pulses = ((left_begin, left_end, 1.0),
+                        (left_end, right_end, -1.0))
+        self._phases = (("settle", 0.0, left_begin, 0.0),
+                        ("left", left_begin, left_end, 1.0),
+                        ("right", left_end, right_end, -1.0),
+                        ("rest_right", right_end, self.duration_s, 0.0))
+
+        self.max_observed_wz = _MAX_RESPONSE_RATIO * self.speed
+        planned_angles = [self.speed * (end - begin)
+                          for begin, end, _direction in self._pulses]
+        self.max_single_angle = max(_BASE_MAX_SINGLE_ANGLE_RAD,
+                                    _ANGLE_MARGIN * max(planned_angles))
+        self.max_total_angle = max(_BASE_MAX_TOTAL_ANGLE_RAD,
+                                   _ANGLE_MARGIN * sum(planned_angles))
         self.started_at = self._last_step = _number(now, "now")
         self._last_sample_stamp = None
         self._last_wz = 0.0
@@ -273,8 +304,10 @@ class YawCalibration:
         self._last_step = now
         if stamp > now + 0.05 or now - stamp > MAX_SAMPLE_AGE_S + _EPSILON:
             return self._fail(now, "yaw observation is stale or future-dated")
-        if abs(measured) > MAX_OBSERVED_WZ:
-            return self._fail(now, "measured yaw rate exceeded 0.75 rad/s")
+        if abs(measured) > self.max_observed_wz:
+            return self._fail(
+                now,
+                f"measured yaw rate exceeded {self.max_observed_wz:g} rad/s")
         if sample_key is None:
             return self._fail(now, "yaw observation has no distinct sample key")
         try:
@@ -297,7 +330,7 @@ class YawCalibration:
                 # Count the full measured arc, including residual rotation in
                 # rest phases, rather than only the commanded pulse duration.
                 angle = (abs(self._last_wz) + abs(measured)) * 0.5 * interval
-                group = 1 if offset < _PULSES[1][0] else 2
+                group = 1 if offset < self._pulses[1][0] else 2
                 if group != self._angle_group:
                     # This interval straddles the command sign change. Count it
                     # in the total physical-motion budget, but not wholly as
@@ -309,8 +342,8 @@ class YawCalibration:
                 else:
                     self._single_angle += angle
                 self._total_angle += angle
-                if (self._single_angle > MAX_SINGLE_ANGLE_RAD + _EPSILON
-                        or self._total_angle > MAX_TOTAL_ANGLE_RAD + _EPSILON):
+                if (self._single_angle > self.max_single_angle + _EPSILON
+                        or self._total_angle > self.max_total_angle + _EPSILON):
                     return self._fail(now, "measured rotation exceeded calibration angle limit")
             self._seen_keys.add(sample_key)
             self._samples.append((offset, measured))
@@ -322,7 +355,7 @@ class YawCalibration:
         if elapsed > MAX_SESSION_S:
             return self._fail(now, "yaw calibration exceeded its twelve-second duration bound")
         if elapsed >= self.duration_s - _EPSILON:
-            if not self._settled_recently(_PULSES[-1][1]):
+            if not self._settled_recently(self._pulses[-1][1]):
                 return self._fail(now, "chassis has not stopped at the end of calibration")
             try:
                 profile, diagnostics = self._profile()
@@ -334,11 +367,11 @@ class YawCalibration:
                                           "completed", profile=profile,
                                           diagnostics=diagnostics)
             return self._terminal
-        for phase, begin, end, direction in _PHASES:
+        for phase, begin, end, direction in self._phases:
             if begin - _EPSILON <= elapsed < end - _EPSILON:
                 if phase == "settle" and abs(measured) > SETTLED_WZ:
                     return self._fail(now, "chassis was already turning during initial settle")
-                if phase == "left" and not self._samples_before(_PULSES[0][0]):
+                if phase == "left" and not self._samples_before(self._pulses[0][0]):
                     return self._fail(now, "insufficient initial stationary yaw observations")
                 direction_guard_s = (_REVERSAL_TRANSIENT_S if phase == "right" else 0.15)
                 if (direction and elapsed - begin >= direction_guard_s
@@ -363,7 +396,7 @@ class YawCalibration:
                        "required_response_rad_s": response_floor,
                        "directions": {}}
         windows = []
-        for name, (begin, end, direction) in zip(("left", "right"), _PULSES):
+        for name, (begin, end, direction) in zip(("left", "right"), self._pulses):
             stable = [direction * wz for at, wz in self._samples
                       if end - _STABLE_WINDOW_S - _EPSILON <= at < end - _EPSILON]
 
@@ -460,7 +493,7 @@ class YawCalibration:
         # reacquiring Tianyi's SDK action, which is precisely what this
         # calibration must avoid.  Reversal onset is already captured by the
         # second direction's delay; settling is measured after the final zero.
-        final_end = _PULSES[-1][1]
+        final_end = self._pulses[-1][1]
         threshold = max(0.01, self.speed * 0.15)
         rest = [(at - final_end, abs(wz)) for at, wz in self._samples
                 if final_end - _EPSILON <= at <= final_end + _REST_S + _EPSILON]
