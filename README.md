@@ -54,14 +54,11 @@ The platform runs a single **sense → think → act** loop:
 
 - **Drivers (L1)** — One MCP server per device. Every tool declares a `type`, and the Agent Core treats each type differently: `sensor` (data streams), `actuator` (executable actions), `processor` (data transforms), `resource` (static assets such as URDF). Sensor and actuator tools normally live in the **same** driver process — the diagram splits them by direction of data flow, not by deployment.
 - **Perception (L2, ports 15720 / 15721)** — Turns raw streams into semantics: ASR, TTS, VLM captions, vision understanding, face recognition.
-- **ActuCore (L2, port 15730)** — The execution-model side of the same layer, shipped in this repository as [`actucore/`](actucore/): VLA policies, navigation, grasping, locomotion, whole-body control. It is a card host, structurally identical to Perception — each execution model attaches as a `processor` card, so any model that takes a goal and emits motion commands plugs in the same way. See [`actucore/README.md`](actucore/README.md) for the card contract.
+- **ActuCore (L2, port 15730)** — The execution-model side of the same layer, shipped in this repository as [`actucore/`](actucore/): VLA policies, navigation, grasping, locomotion, whole-body control. It is a card host, structurally identical to Perception — each execution model attaches as a `processor` card, so any model that takes a goal and emits motion commands plugs in the same way. It ships the robot-independent `controlled_semantic_spatial` navigation contract; the bundled FAST-LIVO2/Nav2 adapter and current hardware acceptance cover G1, while other bodies require compatible adapters and their own acceptance. See [`actucore/README.md`](actucore/README.md) for the card contract.
+- **ModelHub (ports 15740 / 15741)** — On-robot serving for the large models the loop itself thinks with, maintained in a separate repository: **[phanthymotus-modelhub](https://github.com/4paradigm/phanthymotus-modelhub)**. Its first card is an LLM on vLLM: a curated model list with resumable downloads, launch config, a playground, a standard benchmark and 30-day monitoring, all managed from the card's console in the dashboard. Every model is served behind one OpenAI-compatible gateway on 15741, so the Agent Loop reaches it the same way it reaches a cloud LLM. VLM and VLA cards come later.
 - **Agent Loop (L3, port 15678)** — FastAPI + `ros2_bridge.py`: event collector, layered L1–L4 prompt, tool dispatch, ACP barrier, history compaction, steering / interrupt, task store, subagent manager, skills, memory.
 - **Two bypass lanes** — The loop can call `sensor` tools directly, skipping perception; and it can drive `actuator` tools over MCP JSON-RPC directly, skipping ActuCore. Both are the common path for simple queries and one-shot commands.
 - **Web Dashboard** — Subscribes to every DDS topic on the bus via `/ws/bus/{topic}`, and to the agent's decision stream via `/ws/motus`.
-
-ActuCore ships the robot-independent `controlled_semantic_spatial` navigation contract;
-the bundled FAST-LIVO2/Nav2 adapter and current hardware acceptance cover G1, while
-other bodies require compatible adapters and their own acceptance.
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
