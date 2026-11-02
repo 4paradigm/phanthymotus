@@ -716,8 +716,9 @@ def test_nominal_gains_and_yaw_mode_are_read_only_not_public_controls():
     assert info["k_fwd"] == 0.9 and info["k_yaw"] == 1.2
     assert info["adaptive_k_yaw"] is True
     assert info["adaptive_k_fwd"] is False
-    assert "前进P默认固定0.9" in tool["description"]
-    assert "转向P自动调节" in tool["description"]
+    assert "前进P固定为0.9" in tool["description"]
+    assert "calibrate_yaw" in tool["description"]
+    assert "转向P可用" in tool["description"] and "自动标定" in tool["description"]
 
 
 def test_startup_yaml_can_still_supply_advanced_nominal_gains_and_yaw_mode():

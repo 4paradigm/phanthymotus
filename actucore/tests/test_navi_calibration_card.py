@@ -98,7 +98,7 @@ def _complete(rig, card, *, begin=True):
         assert result["state"] == "running", result
     publisher = card._publisher
     card._tick()
-    for _ in range(40):
+    for _ in range(80):
         if card._calibration is None:
             break
         wz = publisher.commands[-1]["values"][5]
@@ -106,6 +106,14 @@ def _complete(rig, card, *, begin=True):
         rig.feed(card, wz)
         card._tick()
     return card._info(), publisher.commands
+
+
+def _camera_frame(rig, card):
+    card._on_string("objects", SimpleNamespace(data=json.dumps({
+        "timestamp": rig.clock.wall(), "objects": [
+            {"name": "person", "position": [0.2, 0.0], "confidence": 0.9}]})))
+    card._depth_bands = {"left": 5.0, "center": 5.0, "right": 5.0}
+    card._depth_ms = int(rig.clock.wall() * 1000)
 
 
 def test_calibration_uses_real_odom_and_guarded_command_stream_then_persists(rig):
@@ -142,6 +150,29 @@ def test_same_connection_reloads_its_profile_without_resuming_a_goal(rig):
     assert second._state.target == "" and len(second._publisher.commands) == before
 
 
+def test_four_hz_odometry_with_ten_hz_command_ticks_calibrates_and_persists(rig):
+    card = rig.card()
+    assert _begin(card)["state"] == "running"
+    card._tick()
+    # Independent event clocks: an ODOM callback can arrive between two
+    # command ticks. Re-reading its cached value never creates another sample.
+    for event in range(1, 161):
+        rig.clock.advance(0.05)
+        if event % 5 == 0:
+            rig.feed(card, card._publisher.commands[-1]["values"][5])
+        if event % 2 == 0:
+            card._tick()
+        if card._calibration is None:
+            break
+    report = card._info()["calibration"]
+    assert report["status"] == "completed", report
+    assert report["elapsed_s"] == pytest.approx(5.2)
+    assert report["samples"] == 21
+    assert len(card._publisher.commands) == 53
+    assert card._publisher.commands[-1]["values"] == [0.0] * 6
+    assert list(rig.directory.glob("yaw-*.json"))
+
+
 def test_stopping_a_normal_navigation_goal_clears_its_completion_lease_before_calibrating(rig):
     card = rig.card()
     navigation = card.dispatch("navi", {"action": "navigate_to", "target": "person"})
@@ -161,11 +192,7 @@ def test_normal_following_reports_actual_calibrated_yaw_gain_and_fixed_forward_g
     for _ in range(6):
         rig.clock.advance()
         rig.feed(card, 0.0)
-        card._on_string("objects", SimpleNamespace(data=json.dumps({
-            "timestamp": rig.clock.wall(), "objects": [
-                {"name": "person", "position": [0.2, 0.0], "confidence": 0.9}]})))
-        card._depth_bands = {"left": 5.0, "center": 5.0, "right": 5.0}
-        card._depth_ms = int(rig.clock.wall() * 1000)
+        _camera_frame(rig, card)
         card._tick()
     gains = card._info()["gains"]
     assert gains["forward"] == {"base": 0.9, "effective": 0.9}
@@ -173,6 +200,24 @@ def test_normal_following_reports_actual_calibrated_yaw_gain_and_fixed_forward_g
     assert gains["yaw"]["damping_effective"] == profile["yaw_damping"]
     assert card._publisher.commands[-1]["values"][0] > 0.0
     assert card._publisher.commands[-1]["values"][5] < 0.0
+
+
+def test_calibration_feedback_budget_does_not_relax_live_damping_freshness(rig):
+    card = rig.card()
+    _complete(rig, card)
+    card.dispatch("navi", {"action": "navigate_to", "target": "person"})
+    for _ in range(6):
+        rig.clock.advance()
+        rig.feed(card, 0.02)
+        _camera_frame(rig, card)
+        card._tick()
+    assert card._info()["gains"]["yaw"]["damping_effective"] > 0
+    rig.clock.advance(0.301)
+    _camera_frame(rig, card)
+    assert card._calibration_feedback()[3] == ""  # 301 ms fits calibration's 650 ms bound.
+    assert card.observation()[2]["wz"] is None  # Live damping retains its 300 ms bound.
+    card._tick()
+    assert card._info()["gains"]["yaw"]["damping_effective"] == 0.0
 
 
 @pytest.mark.parametrize("problem", ["offline", "paused", "goal", "dry_run", "no_descriptor",
@@ -223,7 +268,7 @@ def test_feedback_loss_or_dispatch_gap_aborts_to_an_explicit_zero(rig, kind):
         rig.feed(card)
     else:
         stamp = int(rig.clock.wall() * 1000)
-        for _ in range(4):
+        for _ in range(7):
             rig.clock.advance()
             if kind == "duplicate":
                 rig.feed(card, stamp_ms=stamp)
@@ -231,9 +276,25 @@ def test_feedback_loss_or_dispatch_gap_aborts_to_an_explicit_zero(rig, kind):
     card._tick()
     assert card._calibration is None
     assert card._info()["calibration"]["status"] == "failed"
+    assert card._info()["calibration"]["phase"] == "failed"
+    if kind == "stale":
+        assert "角速度测量已过期" in card._info()["calibration"]["reason"]
     assert card._publisher.commands[-1]["values"] == [0.0] * 6
     assert card.events[-1][1] == "failed"
     assert card._state.target == ""
+
+
+def test_calibration_failure_reports_a_receipt_gap_separately_from_source_age(rig):
+    card = rig.card()
+    assert _begin(card)["state"] == "running"
+    card._tick()
+    card._odom_feedback_received = rig.clock.monotonic() - 0.701
+    card._tick()
+    report = card._info()["calibration"]
+    assert report["status"] == "failed" and report["phase"] == "failed"
+    assert "角速度反馈断流" in report["reason"]
+    assert "650ms" in report["reason"]
+    assert card._publisher.commands[-1]["values"] == [0.0] * 6
 
 
 def test_translation_detected_during_calibration_aborts_to_zero(rig):

@@ -22,21 +22,26 @@ import time
 log = logging.getLogger(__name__)
 SCHEMA = "navi.yaw-calibration/1"
 MAX_COMMAND_GAP_S = 0.3
-MAX_SAMPLE_AGE_S = 0.3
+# REST odometry and command dispatch are independent clocks. A slower fresh
+# sensor sample does not mean that the low-speed command heartbeat stopped.
+MAX_SAMPLE_AGE_S = 0.65
 MAX_OBSERVED_WZ = 0.5
 MAX_SINGLE_ANGLE_RAD = 0.3
 MAX_TOTAL_ANGLE_RAD = 0.6
 MAX_SESSION_S = 8.0
 SETTLED_WZ = 0.03
 _EPSILON = 1e-9
-_PHASES = (("settle", 0.0, 0.5, 0.0),
-           ("left", 0.5, 1.3, 1.0),
-           ("rest_left", 1.3, 1.9, 0.0),
-           ("right", 1.9, 2.7, -1.0),
-           ("rest_right", 2.7, 3.3, 0.0))
+_PHASES = (("settle", 0.0, 0.8, 0.0),
+           ("left", 0.8, 2.1, 1.0),
+           ("rest_left", 2.1, 3.0, 0.0),
+           ("right", 3.0, 4.3, -1.0),
+           ("rest_right", 4.3, 5.2, 0.0))
+_PULSES = ((0.8, 2.1, 1.0), (3.0, 4.3, -1.0))
+_STABLE_WINDOW_S = 0.7
+_REST_S = 0.9
 _PROFILE_BOUNDS = {"k_yaw": (0.2, 1.2), "yaw_damping": (0.1, 0.5),
-                   "response_gain": (0.15, 2.5), "delay_s": (0.0, 0.6),
-                   "settling_s": (0.0, 0.6), "left_gain": (0.15, 2.5),
+                   "response_gain": (0.15, 2.5), "delay_s": (0.0, 0.65),
+                   "settling_s": (0.0, 0.9), "left_gain": (0.15, 2.5),
                    "right_gain": (0.15, 2.5)}
 
 
@@ -153,7 +158,11 @@ class CalibrationResult:
 
 
 class YawCalibration:
-    """One wall-clock session: settle, +yaw, rest, -yaw, rest (3.3 s).
+    """One wall-clock session: settle, +yaw, rest, -yaw, rest (5.2 s).
+
+    Longer bounded pulses yield three stable samples at 4 Hz; commands still
+    have their own 300 ms dispatch guard. Missing samples never become new
+    evidence, and the measured-angle limits can terminate a pulse early.
 
     ``sample_stamp`` is in monotonic seconds using the same clock as ``now``.
     When omitted, a new unique sample is assumed to have just been received.
@@ -227,30 +236,30 @@ class YawCalibration:
             if self._last_sample_stamp is not None:
                 interval = stamp - self._last_sample_stamp
                 if interval > MAX_SAMPLE_AGE_S + _EPSILON:
-                    return self._fail(now, "no fresh yaw observation for 300 ms")
+                    return self._fail(now, "no fresh yaw observation for 650 ms")
                 # Count the full measured arc, including residual rotation in
                 # rest phases, rather than only the commanded pulse duration.
                 angle = (abs(self._last_wz) + abs(measured)) * 0.5 * interval
-                group = 1 if offset < 1.9 else 2
+                group = 1 if offset < 3.0 else 2
                 if group != self._angle_group:
                     self._single_angle = 0.0
                     self._angle_group = group
                 self._single_angle += angle
                 self._total_angle += angle
-                if (self._single_angle > MAX_SINGLE_ANGLE_RAD
-                        or self._total_angle > MAX_TOTAL_ANGLE_RAD):
+                if (self._single_angle > MAX_SINGLE_ANGLE_RAD + _EPSILON
+                        or self._total_angle > MAX_TOTAL_ANGLE_RAD + _EPSILON):
                     return self._fail(now, "measured rotation exceeded calibration angle limit")
             self._seen_keys.add(sample_key)
             self._samples.append((offset, measured))
             self._last_sample_stamp, self._last_wz = stamp, measured
         elif self._last_sample_stamp is None or now - self._last_sample_stamp > MAX_SAMPLE_AGE_S + _EPSILON:
-            return self._fail(now, "no fresh yaw observation for 300 ms")
+            return self._fail(now, "no fresh yaw observation for 650 ms")
 
         elapsed = now - self.started_at
         if elapsed > MAX_SESSION_S:
             return self._fail(now, "yaw calibration exceeded its eight-second duration bound")
         if elapsed >= self.duration_s - _EPSILON:
-            if not self._settled_recently(2.7):
+            if not self._settled_recently(4.3):
                 return self._fail(now, "chassis has not stopped at the end of calibration")
             try:
                 profile = self._profile()
@@ -263,10 +272,10 @@ class YawCalibration:
             if begin - _EPSILON <= elapsed < end - _EPSILON:
                 if phase == "settle" and abs(measured) > SETTLED_WZ:
                     return self._fail(now, "chassis was already turning during initial settle")
-                if phase == "left" and not self._samples_before(0.5):
+                if phase == "left" and not self._samples_before(0.8):
                     return self._fail(now, "insufficient initial stationary yaw observations")
                 if phase == "right" and not self._left_rest_verified:
-                    if not self._settled_recently(1.3):
+                    if not self._settled_recently(2.1):
                         return self._fail(now, "chassis has not stopped before reversing calibration")
                     self._left_rest_verified = True
                 if direction and elapsed - begin >= 0.15 and measured * direction < -max(0.03, self.speed * 0.2):
@@ -284,9 +293,9 @@ class YawCalibration:
 
     def _profile(self):
         gains, delays, settling = [], [], []
-        for begin, end, direction in ((0.5, 1.3, 1.0), (1.9, 2.7, -1.0)):
+        for begin, end, direction in _PULSES:
             stable = [direction * wz for at, wz in self._samples
-                      if begin + 0.45 - _EPSILON <= at < end - _EPSILON]
+                      if end - _STABLE_WINDOW_S - _EPSILON <= at < end - _EPSILON]
             if len(stable) < 3:
                 raise ValueError("insufficient distinct stable yaw samples in both directions")
             response = statistics.median(stable)
@@ -302,11 +311,11 @@ class YawCalibration:
             onset = next((at - begin for at, wz in self._samples
                           if begin - _EPSILON <= at < end - _EPSILON
                           and direction * wz >= threshold), None)
-            if onset is None or onset > 0.6:
+            if onset is None or onset > 0.65 + _EPSILON:
                 raise ValueError("yaw response onset was missing or too delayed")
             delays.append(max(0.0, onset))
             rest = [(at - end, abs(wz)) for at, wz in self._samples
-                    if end - _EPSILON <= at <= end + 0.6 + _EPSILON]
+                    if end - _EPSILON <= at <= end + _REST_S + _EPSILON]
             # Require two consecutive near-zero readings. A single zero amidst
             # residual motion cannot claim that the chassis has settled.
             settled = next((rest[index][0] for index in range(len(rest) - 1)

@@ -84,7 +84,8 @@ _BOOL_TUNING_FIELDS = frozenset(("use_lateral",))
 # scheduling modes belong to startup YAML, not runtime operator controls.
 _STARTUP_GAIN_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw", "adaptive_k_fwd",
                                  "calibrated_yaw_gain", "yaw_damping"))
-_CALIBRATION_MAX_AGE_MS = 300
+_CALIBRATION_FEEDBACK_MAX_AGE_MS = 650
+_DAMPING_FEEDBACK_MAX_AGE_MS = 300
 
 
 def _sensor_qos():
@@ -257,7 +258,10 @@ class NaviPlugin:
             "description": ("视觉导航：朝一个目标走过去。目标不在视野里时会**自行"
                             "原地转身搜索**，所以不需要先手动转动机器人。"
                             "路上按深度减速避障，到设定距离停下。"
-                            "前进P默认固定0.9，转向P自动调节。"),
+                            "前进P固定为0.9；转向P可用 calibrate_yaw 按本机实测响应"
+                            "自动标定。标定约5.2秒，会低速左右转动并在结束后停车。"
+                            "卡片不提供手动增益或前进距离自适应选项，info 可查看"
+                            "两个P的基准值、当前实际值和标定状态。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -313,9 +317,11 @@ class NaviPlugin:
                         "params": [],
                         "description": "一键转向校准：卡片运行且无导航目标时，低速左右"
                                        "各转一小段，按实测里程计生成并保存本机转向P和阻尼。"
-                                       "会使底盘转动，请预留旋转空间。要求连接非空跑底盘及"
-                                       "有效 odom.wz；info 查看进度，stop_navigation 中止。"
-                                       "校准结束停车，不自动开始跟随。",
+                                       "约5.2秒，会使底盘以±0.2rad/s转动，请预留旋转空间。"
+                                       "要求连接非空跑底盘及有效 odom.wz；实测反馈允许"
+                                       "最长650ms抖动，指令流仍要求300ms内连续。info 查看"
+                                       "进度，stop_navigation 中止。校准结束停车，不自动"
+                                       "开始跟随。",
                     },
                     "stop_navigation": {"params": [],
                                         "description": "停止导航或转向校准，放弃当前目标"},
@@ -785,7 +791,8 @@ class NaviPlugin:
                 self._calibration_report = {"status": "not_calibrated",
                                             "reason": str(error)}
 
-    def _calibration_feedback(self, *, stationary=False):
+    def _calibration_feedback(self, *, stationary=False,
+                              max_age_ms=_CALIBRATION_FEEDBACK_MAX_AGE_MS):
         """Only distinct, recent source-stamped odometry can tune a controller."""
         with self._obs_lock:
             stamp = self._odom_feedback_stamp
@@ -795,10 +802,14 @@ class NaviPlugin:
             if stationary and any(isinstance(v, (int, float)) and not isinstance(v, bool)
                                   and math.isfinite(v) and abs(v) > 0.05 for v in linear):
                 return None, None, None, "转向校准期间检测到底盘平移，请先停车"
-            if (self._odom_feedback_wz is None
-                    or age is None or not 0 <= age <= _CALIBRATION_MAX_AGE_MS
-                    or not 0 <= receipt_age <= _CALIBRATION_MAX_AGE_MS / 1000):
-                return None, None, None, self._odom_feedback_problem or "角速度反馈已过期"
+            if self._odom_feedback_wz is None or age is None:
+                return None, None, None, self._odom_feedback_problem or "没有有效角速度反馈"
+            if not 0 <= age <= max_age_ms:
+                return None, None, None, f"角速度测量已过期（{age}ms，要求不超过 {max_age_ms}ms）"
+            receipt_age_ms = int(receipt_age * 1000)
+            if not 0 <= receipt_age_ms <= max_age_ms:
+                return None, None, None, (f"角速度反馈断流（{receipt_age_ms}ms，要求不超过 "
+                                          f"{max_age_ms}ms）")
             # Map the wall-clock source age into the monotonic phase clock.
             measured_at = time.monotonic() - age / 1000.0
             return self._odom_feedback_wz, stamp, measured_at, ""
@@ -1511,7 +1522,8 @@ class NaviPlugin:
                 units = payload.get("units")
                 if (not isinstance(units, dict) or units.get("angular") != "rad/s"
                         or isinstance(stamp, bool) or not isinstance(stamp, (int, float))
-                        or not math.isfinite(stamp) or not 0 <= now - stamp <= _CALIBRATION_MAX_AGE_MS
+                        or not math.isfinite(stamp)
+                        or not 0 <= now - stamp <= _CALIBRATION_FEEDBACK_MAX_AGE_MS
                         or isinstance(wz, bool) or not isinstance(wz, (int, float))
                         or not math.isfinite(wz)):
                     self._odom_feedback_problem = "角速度缺失、非有限值或测量时间戳已过期"
@@ -1586,7 +1598,8 @@ class NaviPlugin:
                      if fresh_depth else None)
             odom = self._odom if now - self._odom_ms <= max_age else None
             if odom is not None and self._yaw_profile is not None:
-                measured_wz, _, _, problem = self._calibration_feedback()
+                measured_wz, _, _, problem = self._calibration_feedback(
+                    max_age_ms=_DAMPING_FEEDBACK_MAX_AGE_MS)
                 odom = {**odom, "wz": None if problem else measured_wz}
         return objects, depth, odom
 
@@ -1603,7 +1616,8 @@ class NaviPlugin:
         if self._calibration is not None:
             wz, sample_key, measured_at, problem = self._calibration_feedback(stationary=True)
             if problem:
-                result = replace(self._calibration.cancel(problem), status="failed")
+                result = replace(self._calibration.cancel(problem), status="failed",
+                                 phase="failed")
             else:
                 result = self._calibration.step(time.monotonic(), wz, sample_key, measured_at)
             self._calibration_report.update(status=result.status, phase=result.phase,
