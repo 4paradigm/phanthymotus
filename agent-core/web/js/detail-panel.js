@@ -12,6 +12,7 @@ import { VideoRenderer }    from './renderers/video.js';
 import { ImageRenderer }    from './renderers/image.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
+import { OdomRenderer } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { Pose2dRenderer }   from './renderers/pose2d.js';
@@ -19,7 +20,7 @@ import { TactileRenderer }  from './renderers/tactile.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;

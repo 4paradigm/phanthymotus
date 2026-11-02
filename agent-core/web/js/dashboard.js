@@ -11,9 +11,10 @@ import { ImageRenderer }    from './renderers/image.js';
 import { CameraRenderer }   from './renderers/camera.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
+import { OdomRenderer, odomPreview } from './renderers/odom.js';
 import { ControlRenderer }  from './renderers/control.js';
 
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, OdomRenderer, TextRenderer, ActivityRenderer];
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 
@@ -101,6 +102,10 @@ const _lastSkillEvents = {};
 
 function _ensureBuffer(skillId, wsUrl, hint, side /* 'out'|'in' */) {
   if (!_buffers[skillId]) _buffers[skillId] = { out: null, in: null };
+  if (_buffers[skillId][side] && wsUrl && _buffers[skillId][side]._wsUrl !== wsUrl) {
+    _buffers[skillId][side].destroy();
+    _buffers[skillId][side] = null;
+  }
   if (!_buffers[skillId][side] && wsUrl) {
     _buffers[skillId][side] = new SkillBuffer(wsUrl, hint);
   }
@@ -278,13 +283,12 @@ function _wsUrlFor(path) {
 
 function _startPreviewBuffers(skill) {
   if (!skill.online) return;
-  const topicOut = skill.topic_out?.[0];
+  const preview = odomPreview(skill);
   const topicIn  = skill.topic_in?.[0];
 
   // out buffer: skill.ws_path (the primary stream)
-  if (skill.ws_path) {
-    const hint = skill.render_hint || 'activity';
-    _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out');
+  if (preview.path) {
+    _ensureBuffer(skill.id, _wsUrlFor(preview.path), preview.hint, 'out');
   }
   // in buffer: /ws/bus + topic_in path
   if (topicIn?.topic) {
@@ -366,11 +370,12 @@ function mountRenderer(skill) {
     _inRenderer = null;
   }
 
-  const hint     = skill.render_hint || 'activity';
+  const preview  = odomPreview(skill);
+  const hint     = preview.hint;
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
 
   const topicIn  = skill.topic_in?.[0]  || null;
-  const topicOut = skill.topic_out?.[0] || null;
+  const topicOut = preview.topic;
   const hasIn    = !!(topicIn?.topic || topicIn?.format);
   const hasOut   = !!(topicOut?.topic || topicOut?.format);
   const isSplit  = hasIn && hasOut;
@@ -487,7 +492,7 @@ function mountRenderer(skill) {
 
   // Attach to background preview buffer (replay + live stream)
   // For devices with only topic_in (e.g. speaker), fall back to inBuf.
-  const outBuf = _buffers[skill.id]?.out;
+  const outBuf = preview.path ? _ensureBuffer(skill.id, _wsUrlFor(preview.path), hint, 'out') : null;
   const inBuf  = _buffers[skill.id]?.in;
   const activeBuf = outBuf || (!skill.ws_path && hasIn ? inBuf : null);
   console.log(`[attach] skill=${skill.id} outBuf=${!!outBuf} inBuf=${!!inBuf} activeBuf=${!!activeBuf} ws_path=${skill.ws_path}`);
@@ -502,9 +507,9 @@ function mountRenderer(skill) {
       }
     });
     console.log(`[attach] attached to activeBuf, replay frames will be silent`);
-  } else if (skill.ws_path) {
+  } else if (preview.path) {
     // Buffer not ready yet — create on demand
-    const buf = _ensureBuffer(skill.id, _wsUrlFor(skill.ws_path), hint, 'out');
+    const buf = _ensureBuffer(skill.id, _wsUrlFor(preview.path), hint, 'out');
     console.log(`[attach] created on-demand outBuf for ws_path=${skill.ws_path}`);
     buf?.attach((b, fmt, isReplay) => isReplay ? _activeRenderer?.onDataSilent?.(b) : _activeRenderer?.onData?.(b, fmt));
   } else if (hasIn && topicIn?.topic) {
