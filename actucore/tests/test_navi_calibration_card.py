@@ -123,6 +123,11 @@ def test_calibration_uses_real_odom_and_guarded_command_stream_then_persists(rig
     assert info["calibration"]["status"] == "completed", info["calibration"]
     assert commands[-1]["values"] == [0.0] * 6
     assert {command["values"][5] for command in commands} == {-0.2, 0.0, 0.2}
+    turns = [command["values"][5] for command in commands]
+    first_positive = next(index for index, value in enumerate(turns) if value > 0)
+    first_negative = next(index for index, value in enumerate(turns) if value < 0)
+    assert turns[first_negative - 1] == 0.2
+    assert 0.0 not in turns[first_positive:first_negative]
     assert all(command["values"][:5] == [0.0] * 5 for command in commands)
     assert all(command["schema"] == "motus.control/1" for command in commands)
     assert [command["seq"] for command in commands] == list(range(1, len(commands) + 1))

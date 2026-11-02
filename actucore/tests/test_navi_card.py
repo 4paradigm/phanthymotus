@@ -713,7 +713,7 @@ def test_nominal_gains_and_yaw_mode_are_read_only_not_public_controls():
         assert all(key not in action["params"]
                    for action in tool["inputSchema"]["x-action-params"].values())
     info = _card()._info()["config"]
-    assert info["k_fwd"] == 0.9 and info["k_yaw"] == 1.2
+    assert info["k_fwd"] == 0.9 and info["k_yaw"] == 0.6
     assert info["adaptive_k_yaw"] is True
     assert info["adaptive_k_fwd"] is False
     assert "前进P固定为0.9" in tool["description"]
@@ -781,7 +781,7 @@ def test_all_exposed_tuning_fields_update_and_can_be_read_back():
     assert card._info()["config"] == {**configured, "stop_distance_m": 0.8,
                                       "stop_tolerance_m": 0.0, "arrival_distance_m": 0.8,
                                       "adaptive_k_fwd": False, "obstacle_stop_m": 0.6,
-                                      "k_fwd": 0.9, "k_yaw": 1.2, "adaptive_k_yaw": True,
+                                      "k_fwd": 0.9, "k_yaw": 0.6, "adaptive_k_yaw": True,
                                       "calibrated_yaw_gain": None, "yaw_damping": 0.0,
                                       "slow_distance_m": 1.5}
     schema = card.get_tools()[0]["configSchema"]["properties"]

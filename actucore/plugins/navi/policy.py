@@ -154,7 +154,7 @@ class Config:
     # above 0 keeps the robot moving through the correction, which is what makes
     # the path an arc instead of a sequence of stops.
     align_min_scale: float = 0.45
-    k_yaw: float = 1.2
+    k_yaw: float = 0.6
     k_fwd: float = 0.9
     adaptive_k_fwd: bool = False
     adaptive_k_yaw: bool = True

@@ -180,7 +180,7 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 
 ### 转向P与一键转向标定
 
-未标定时，转向采用有界增益调度：目标偏离画面中心较远时，使用名义 `k_yaw`（默认 1.2）；
+未标定时，转向采用有界增益调度：目标偏离画面中心较远时，使用名义 `k_yaw`（默认 0.6）；
 靠近中心时逐步降至名义值的 0.5 倍，减轻反复纠偏。倍率在 0.5–1 之间，每秒最多变化 2。
 这是基于当前目标偏移的 P 增益调度，不含积分、微分或在线模型辨识。
 短暂遮挡且仍处于预测跟随时，转向倍率保持上一拍的有界值；真正进入搜索、观测过期或
@@ -212,9 +212,11 @@ curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"j
 curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"navi","arguments":{"action":"calibrate_yaw"}}}'
 ```
 
-正常序列约 5.2 秒：先零速 0.8 秒，以 +0.2rad/s 转 1.3 秒，零速 0.9 秒，再以
-−0.2rad/s 转 1.3 秒，最后零速 0.9 秒。较长的采样窗口可以在约 4Hz 的实测反馈下
-取得足够样本；期间仍检查反馈、指令连续性、累计转角与停止情况，异常会
+正常序列约 5.2 秒：先零速 0.8 秒，以 +0.2rad/s 转 1.2 秒，然后在同一个底盘
+速度动作内直接请求 −0.2rad/s，由下游限加速度平滑跨过零点；反向阶段持续 1.2 秒，
+最后零速 2.0 秒。中间不发布显式全零，避免天轶 SDK 取消动作后立刻重新争抢主权。
+较长的采样窗口可以在约 4Hz 的实测反馈下取得足够样本；期间仍检查反馈、指令连续性、
+累计转角与最终停止情况，异常会
 结束标定。动作异步返回 `action_id`，完成或失败通过 `action_complete` 回调报告。
 调用 `pause`、`stop` 或 `stop_navigation` 会先发送零速再取消。标定结束保持停车，
 不会自动恢复之前的导航目标；需要导航时重新调用 `navigate_to`。
@@ -231,7 +233,7 @@ curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"j
 {
   "gains": {
     "forward": {"base": 0.9, "effective": null},
-    "yaw": {"base": 1.2, "effective": null, "damping": 0.0, "damping_effective": null, "source": "default"}
+    "yaw": {"base": 0.6, "effective": null, "damping": 0.0, "damping_effective": null, "source": "default"}
   },
   "calibration": {"status": "not_calibrated"}
 }

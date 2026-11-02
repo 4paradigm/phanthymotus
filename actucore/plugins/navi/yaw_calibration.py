@@ -4,6 +4,13 @@ The caller owns command delivery, odometry freshness and chassis arbitration.
 This module adds independent time/sample/motion bounds and always returns a
 zero twist on failure, cancellation or completion. It derives conservative
 gains from two short pulses; it does not identify a complete plant or tune PID.
+
+The two pulses reverse directly.  An intermediate explicit zero would make the
+Tianyi Slamware adapter cancel its velocity action; reacquiring that action less
+than a second later is not a continuous servo update and can leave the second
+pulse unexecuted.  The downstream ControlSink still ramps the sign change
+through zero, while the requested command remains non-zero and therefore keeps
+the same SDK action.  A real zero is sent only before motion and at the end.
 """
 from __future__ import annotations
 
@@ -32,13 +39,13 @@ MAX_SESSION_S = 8.0
 SETTLED_WZ = 0.03
 _EPSILON = 1e-9
 _PHASES = (("settle", 0.0, 0.8, 0.0),
-           ("left", 0.8, 2.1, 1.0),
-           ("rest_left", 2.1, 3.0, 0.0),
-           ("right", 3.0, 4.3, -1.0),
-           ("rest_right", 4.3, 5.2, 0.0))
-_PULSES = ((0.8, 2.1, 1.0), (3.0, 4.3, -1.0))
-_STABLE_WINDOW_S = 0.7
+           ("left", 0.8, 2.0, 1.0),
+           ("right", 2.0, 3.2, -1.0),
+           ("rest_right", 3.2, 5.2, 0.0))
+_PULSES = ((0.8, 2.0, 1.0), (2.0, 3.2, -1.0))
+_STABLE_WINDOW_S = 0.8
 _REST_S = 0.9
+_REVERSAL_TRANSIENT_S = 0.6
 _PROFILE_BOUNDS = {"k_yaw": (0.2, 1.2), "yaw_damping": (0.1, 0.5),
                    "response_gain": (0.15, 2.5), "delay_s": (0.0, 0.65),
                    "settling_s": (0.0, 0.9), "left_gain": (0.15, 2.5),
@@ -158,7 +165,7 @@ class CalibrationResult:
 
 
 class YawCalibration:
-    """One wall-clock session: settle, +yaw, rest, -yaw, rest (5.2 s).
+    """One wall-clock session: settle, +yaw, direct -yaw, rest (5.2 s).
 
     Longer bounded pulses yield three stable samples at 4 Hz; commands still
     have their own 300 ms dispatch guard. Missing samples never become new
@@ -183,7 +190,6 @@ class YawCalibration:
         self._samples = []  # (monotonic offset, measured yaw rate)
         self._single_angle = self._total_angle = 0.0
         self._angle_group = None
-        self._left_rest_verified = False
         self._terminal = None
 
     def _result(self, now, status, reason, phase, wz=0.0, profile=None):
@@ -240,11 +246,17 @@ class YawCalibration:
                 # Count the full measured arc, including residual rotation in
                 # rest phases, rather than only the commanded pulse duration.
                 angle = (abs(self._last_wz) + abs(measured)) * 0.5 * interval
-                group = 1 if offset < 3.0 else 2
+                group = 1 if offset < _PULSES[1][0] else 2
                 if group != self._angle_group:
+                    # This interval straddles the command sign change. Count it
+                    # in the total physical-motion budget, but not wholly as
+                    # the new direction's arc: doing so double-attributes the
+                    # previous pulse and trips the unchanged 0.3 rad per-side
+                    # limit during a nominal direct reversal.
                     self._single_angle = 0.0
                     self._angle_group = group
-                self._single_angle += angle
+                else:
+                    self._single_angle += angle
                 self._total_angle += angle
                 if (self._single_angle > MAX_SINGLE_ANGLE_RAD + _EPSILON
                         or self._total_angle > MAX_TOTAL_ANGLE_RAD + _EPSILON):
@@ -259,7 +271,7 @@ class YawCalibration:
         if elapsed > MAX_SESSION_S:
             return self._fail(now, "yaw calibration exceeded its eight-second duration bound")
         if elapsed >= self.duration_s - _EPSILON:
-            if not self._settled_recently(4.3):
+            if not self._settled_recently(_PULSES[-1][1]):
                 return self._fail(now, "chassis has not stopped at the end of calibration")
             try:
                 profile = self._profile()
@@ -274,11 +286,9 @@ class YawCalibration:
                     return self._fail(now, "chassis was already turning during initial settle")
                 if phase == "left" and not self._samples_before(0.8):
                     return self._fail(now, "insufficient initial stationary yaw observations")
-                if phase == "right" and not self._left_rest_verified:
-                    if not self._settled_recently(2.1):
-                        return self._fail(now, "chassis has not stopped before reversing calibration")
-                    self._left_rest_verified = True
-                if direction and elapsed - begin >= 0.15 and measured * direction < -max(0.03, self.speed * 0.2):
+                direction_guard_s = (_REVERSAL_TRANSIENT_S if phase == "right" else 0.15)
+                if (direction and elapsed - begin >= direction_guard_s
+                        and measured * direction < -max(0.03, self.speed * 0.2)):
                     return self._fail(now, "measured yaw direction disagrees with calibration command")
                 return self._result(now, "running", "measuring yaw response", phase, direction * self.speed)
         return self._fail(now, "invalid calibration phase")
@@ -292,7 +302,7 @@ class YawCalibration:
         return len(recent) == 2 and all(abs(wz) <= SETTLED_WZ for at, wz in recent)
 
     def _profile(self):
-        gains, delays, settling = [], [], []
+        gains, delays = [], []
         for begin, end, direction in _PULSES:
             stable = [direction * wz for at, wz in self._samples
                       if end - _STABLE_WINDOW_S - _EPSILON <= at < end - _EPSILON]
@@ -314,17 +324,23 @@ class YawCalibration:
             if onset is None or onset > 0.65 + _EPSILON:
                 raise ValueError("yaw response onset was missing or too delayed")
             delays.append(max(0.0, onset))
-            rest = [(at - end, abs(wz)) for at, wz in self._samples
-                    if end - _EPSILON <= at <= end + _REST_S + _EPSILON]
-            # Require two consecutive near-zero readings. A single zero amidst
-            # residual motion cannot claim that the chassis has settled.
-            settled = next((rest[index][0] for index in range(len(rest) - 1)
-                            if rest[index][1] <= threshold and rest[index + 1][1] <= threshold), None)
-            if settled is None:
-                raise ValueError("yaw response did not settle during the rest phase")
-            settling.append(max(0.0, settled))
+        # Only the final pulse is followed by a real zero.  Measuring a
+        # "settling" time at the sign-change would require cancelling and
+        # reacquiring Tianyi's SDK action, which is precisely what this
+        # calibration must avoid.  Reversal onset is already captured by the
+        # second direction's delay; settling is measured after the final zero.
+        final_end = _PULSES[-1][1]
+        threshold = max(0.01, self.speed * 0.15)
+        rest = [(at - final_end, abs(wz)) for at, wz in self._samples
+                if final_end - _EPSILON <= at <= final_end + _REST_S + _EPSILON]
+        # Require two consecutive near-zero readings. A single zero amidst
+        # residual motion cannot claim that the chassis has settled.
+        settled = next((rest[index][0] for index in range(len(rest) - 1)
+                        if rest[index][1] <= threshold and rest[index + 1][1] <= threshold), None)
+        if settled is None:
+            raise ValueError("yaw response did not settle during the final rest phase")
         response_gain = statistics.mean(gains)
-        delay, settle = max(delays), max(settling)
+        delay, settle = max(delays), max(0.0, settled)
         # Conservative heuristic, intentionally bounded by the former nominal
         # gain. Fast response, delay and residual motion all reduce gain.
         k_yaw = max(0.2, min(1.2, 1.2 / (max(1.0, response_gain)

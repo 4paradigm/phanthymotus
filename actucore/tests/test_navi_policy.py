@@ -2071,7 +2071,7 @@ def test_default_gains_use_adaptive_yaw_and_fixed_forward_point_nine():
     config = _cfg()
     assert config.k_fwd == 0.9
     assert config.adaptive_k_fwd is False
-    assert config.k_yaw == 1.2
+    assert config.k_yaw == 0.6
     assert config.adaptive_k_yaw is True
 
 
@@ -2290,7 +2290,7 @@ def test_calibrated_target_gain_is_fixed_independent_of_bearing_schedule(adaptiv
                               (-0.1, False, 0.1), (0.2, True, 5.0)):
         assert P._yaw_gain(config, state, bearing, live, dt) == 0.7
         assert state.adaptive_yaw_scale == 1.0
-    assert config.k_yaw == 1.2  # Nominal gap-turn gain was not overwritten.
+    assert config.k_yaw == 0.6  # Nominal gap-turn gain was not overwritten.
 
 
 @pytest.mark.parametrize("bearing", [-0.2, 0.2])

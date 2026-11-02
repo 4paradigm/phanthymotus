@@ -65,9 +65,14 @@ def test_nominal_two_pulse_response_completes_with_zero_and_a_bounded_profile():
     assert 0.2 <= profile["k_yaw"] <= 1.2
     assert 0.1 <= profile["yaw_damping"] <= 0.5
     assert {sample.phase for sample in history} >= {
-        "settle", "left", "rest_left", "right", "rest_right", "completed"}
+        "settle", "left", "right", "rest_right", "completed"}
     assert all(sample.values[:5] == [0.0] * 5 for sample in history)
     assert max(abs(sample.values[5]) for sample in history) == 0.2
+    turns = [sample.values[5] for sample in history]
+    first_positive = next(index for index, value in enumerate(turns) if value > 0)
+    first_negative = next(index for index, value in enumerate(turns) if value < 0)
+    assert turns[first_negative - 1] == 0.2
+    assert 0.0 not in turns[first_positive:first_negative]
     assert session.step(100.0, 1.0, "ignored") == result
 
 
@@ -157,11 +162,12 @@ def test_observed_angle_limit_includes_motion_even_before_rest():
     assert result.elapsed_s < 3.0 and result.values == [0.0] * 6
 
 
-def test_reversal_requires_the_chassis_to_have_stopped():
+def test_reversal_that_never_changes_measured_direction_is_rejected():
     _, result, history = _run(override=lambda now, measured:
-                             0.04 if 2.7 <= now <= 3.0 else measured)
-    assert result.status == "failed" and "before reversing" in result.reason
-    assert all(sample.values[5] >= 0 for sample in history)
+                             0.05 if 2.7 <= now <= 3.0 else measured)
+    assert result.status == "failed" and "direction" in result.reason
+    assert any(sample.values[5] < 0 for sample in history)
+    assert result.values == [0.0] * 6
 
 
 def test_completion_requires_two_current_stationary_samples():

@@ -77,7 +77,7 @@ def test_default_gains_and_retired_canvas_values_reach_the_actual_command():
     assert command is not None and command["values"][0] > 0
     assert -0.5 <= command["values"][5] < 0
     gain = info["last"]["k_yaw_effective"]
-    assert 0.6 <= gain < 1.2
+    assert 0.3 <= gain < 0.6
     assert command["values"][5] == pytest.approx(-gain * info["last"]["bearing"])
 
 
