@@ -62,6 +62,7 @@ def test_default_gains_and_retired_canvas_values_reach_the_actual_command():
     card = _card(use_lateral=False, vx_max=0.3, wz_max=0.5)
     result = card.dispatch("navi", {
         "action": "config", "k_fwd": 0.1, "k_yaw": 10.0,
+        "adaptive_k_fwd": True,
     })
     assert result["status"] == "configured"
     card._running = True
@@ -70,6 +71,8 @@ def test_default_gains_and_retired_canvas_values_reach_the_actual_command():
         command = feed(card, 2.0, bearing=0.1)
     info = card.dispatch("navi", {"action": "info"})
     assert info["config"]["k_fwd"] == 0.9
+    assert info["config"]["adaptive_k_fwd"] is False
+    assert info["last"]["k_fwd_effective"] == 0.9
     assert info["config"]["adaptive_k_yaw"] is True
     assert command is not None and command["values"][0] > 0
     assert -0.5 <= command["values"][5] < 0

@@ -158,6 +158,10 @@ class Config:
     k_fwd: float = 0.9
     adaptive_k_fwd: bool = False
     adaptive_k_yaw: bool = True
+    # A measured, per-robot tracking profile. Keep the nominal k_yaw above for
+    # obstacle-gap turns; search continues to use search_rate independently.
+    calibrated_yaw_gain: float | None = None
+    yaw_damping: float = 0.0
     vx_max: float = 1.0
     vy_max: float = 1.0
     wz_max: float = 1.5
@@ -335,6 +339,21 @@ class Config:
     floor_wz_moving: float = 0.0
 
     def __post_init__(self):
+        for key in ("calibrated_yaw_gain", "yaw_damping"):
+            value = getattr(self, key)
+            if key == "calibrated_yaw_gain" and value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(f"{key} must be a finite nonnegative number") from error
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{key} must be a finite nonnegative number")
+            if key == "yaw_damping" and value > 1:
+                raise ValueError("yaw_damping must be between 0 and 1")
+            setattr(self, key, value)
         for flag in ("adaptive_k_fwd", "adaptive_k_yaw"):
             if type(getattr(self, flag)) is not bool:
                 raise ValueError(f"{flag} must be a boolean")
@@ -433,6 +452,7 @@ class State:
     commanded_vx: float = 0.0
     adaptive_fwd_scale: float = 1.0
     adaptive_yaw_scale: float = 1.0
+    avoidance_yaw_override: bool = False
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
     idle_for_s: float = 0.0
@@ -454,6 +474,7 @@ class Decision:
     bearing: float | None = None
     k_fwd_effective: float | None = None
     k_yaw_effective: float | None = None
+    yaw_damping_effective: float | None = None
 
     @property
     def publishes(self) -> bool:
@@ -855,6 +876,9 @@ def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
     gain limits repeated over-corrections. This uses no turn history or latency
     compensation; search speed and obstacle-gap turns remain separate laws.
     """
+    if config.calibrated_yaw_gain is not None:
+        state.adaptive_yaw_scale = 1.0
+        return config.calibrated_yaw_gain
     if not config.adaptive_k_yaw:
         state.adaptive_yaw_scale = 1.0
         return config.k_yaw
@@ -874,6 +898,22 @@ def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
     return config.k_yaw * state.adaptive_yaw_scale
 
 
+def _measured_yaw_rate(odom):
+    """Actual angular feedback only; never substitute the command for damping.
+
+    Freshness is enforced by the card before this observation reaches policy.
+    JSON booleans, missing axes and non-finite readings are not measurements.
+    """
+    value = (odom or {}).get("wz")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        value = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _ego_twist(odom, state: State):
     """Our own motion, for the tracker's predict step. Returns (twist, measured).
 
@@ -891,7 +931,7 @@ def _ego_twist(odom, state: State):
         return commanded, False
     out, measured = [], True
     for index, name in enumerate(("vx", "vy", "wz")):
-        value = odom.get(name)
+        value = _measured_yaw_rate(odom) if name == "wz" else odom.get(name)
         if value is None:
             measured = False
             out.append(commanded[index])
@@ -971,7 +1011,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # settled. See `floor_wz_moving`.
     live = track.observed
     yaw_gain = _yaw_gain(config, state, bearing, live, dt)
-    raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
+    yaw_damping = 0.0
+    measured_wz = _measured_yaw_rate(odom)
+    if config.calibrated_yaw_gain is not None and measured_wz is not None:
+        yaw_damping = config.yaw_damping
+    # Angular-rate damping opposes actual chassis rotation. This is not the
+    # derivative of moving-target bearing, and it never feeds back our command.
+    raw_wz = _clamp(-yaw_gain * bearing
+                    - yaw_damping * (measured_wz if measured_wz is not None else 0.0),
+                    config.wz_max)
 
     within = distance is not None and distance <= config.arrival_distance_m
     if within:
@@ -1029,7 +1077,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         return Decision(_twist(0.0, 0.0, wz), ALIGNING,
                         f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
                         distance_m=distance, bearing=bearing,
-                        k_yaw_effective=yaw_gain)
+                        k_yaw_effective=yaw_gain,
+                        yaw_damping_effective=yaw_damping)
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
@@ -1069,6 +1118,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config,
                        state, dt)
     tracking_wz = raw_wz
+    state.avoidance_yaw_override = False
     vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
                                             status, reason, state)
     if within and config.stop_tolerance_m > 0 and (vx or vy):
@@ -1102,10 +1152,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
         return Decision(None, FAILED, stuck, distance_m=distance, bearing=bearing)
 
     state.commanded_vx = vx
+    tracking_yaw_used = raw_wz == tracking_wz and not state.avoidance_yaw_override
     return Decision(_twist(vx, vy, wz), status, reason,
                     distance_m=distance, bearing=bearing,
                     k_fwd_effective=forward_gain if distance is not None and not within else None,
-                    k_yaw_effective=yaw_gain if raw_wz == tracking_wz else None)
+                    k_yaw_effective=yaw_gain if tracking_yaw_used else None,
+                    yaw_damping_effective=yaw_damping if tracking_yaw_used else None)
 
 
 def _account_idle(decision: Decision, state: State, config: Config,
@@ -1423,6 +1475,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None):
         # — bounded, derived, and about a third of what wz_max was commanding.
         gap_angle = math.atan2(keep, max(ahead, 0.1))
         wz = _clamp(-sign * config.k_yaw * gap_angle, config.wz_max)
+        if state is not None:
+            state.avoidance_yaw_override = True
         # `sign` indexes the **offset corridor** (+1 = the one displaced to the
         # right), while the body frame has y pointing **left** — so the sidestep
         # takes the opposite sign. Getting this wrong steps into the obstacle it

@@ -2264,3 +2264,155 @@ def test_adaptive_yaw_flag_is_strictly_boolean(value):
 def test_adaptive_yaw_rejects_invalid_nominal_gain(gain):
     with pytest.raises(ValueError, match="k_yaw"):
         _cfg(adaptive_k_yaw=True, k_yaw=gain)
+
+
+# ── calibrated target gain with actual angular-rate damping ────────────────
+
+def _profiled_frame(config, *, bearing=0.2, odom=None, distance=2.0, state=None):
+    state = state or _adaptive_ready(config, distance=distance, bearing=bearing)
+    return _step(detections=_detections(_obj(x=bearing, bbox=(0.4, 0.4, 0.6, 0.6))),
+                 depth=_depth(map_=_solid_depth(distance)), odom=odom,
+                 config=config, state=state, dt=0.1)
+
+
+def test_uncalibrated_defaults_have_no_profile_or_angular_rate_damping():
+    config = _cfg()
+    assert config.calibrated_yaw_gain is None
+    assert config.yaw_damping == 0.0
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_calibrated_target_gain_is_fixed_independent_of_bearing_schedule(adaptive):
+    config = _cfg(calibrated_yaw_gain=0.7, yaw_damping=0.2,
+                  adaptive_k_yaw=adaptive)
+    state = _state(adaptive_yaw_scale=0.5)
+    for bearing, live, dt in ((0.0, True, 0.1), (0.9, True, 0.1),
+                              (-0.1, False, 0.1), (0.2, True, 5.0)):
+        assert P._yaw_gain(config, state, bearing, live, dt) == 0.7
+        assert state.adaptive_yaw_scale == 1.0
+    assert config.k_yaw == 1.2  # Nominal gap-turn gain was not overwritten.
+
+
+@pytest.mark.parametrize("bearing", [-0.2, 0.2])
+def test_calibrated_tracking_damps_actual_rotation_and_advances_simultaneously(bearing, monkeypatch):
+    config = _cfg(calibrated_yaw_gain=0.8, yaw_damping=0.25,
+                  use_lateral=False, floor_wz=0.0)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    measured_wz = math.copysign(0.2, -bearing)
+    decision = _profiled_frame(config, bearing=bearing,
+                               odom={"vx": 0.0, "vy": 0.0, "wz": measured_wz})
+    proportional = -0.8 * decision.bearing
+    assert decision.values[0] > 0.0 and decision.values[1] == 0.0
+    assert decision.values[5] == pytest.approx(proportional - 0.25 * measured_wz)
+    assert abs(decision.values[5]) < abs(proportional)
+    assert decision.values[5] * bearing < 0.0
+    assert decision.k_yaw_effective == 0.8
+    assert decision.yaw_damping_effective == 0.25
+
+
+@pytest.mark.parametrize("measured_wz", [-5.0, 5.0])
+def test_calibrated_tracking_damping_stays_inside_the_same_angular_limit(measured_wz, monkeypatch):
+    config = _cfg(calibrated_yaw_gain=1.0, yaw_damping=0.5,
+                  use_lateral=False, floor_wz=0.0, wz_max=0.15)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    decision = _profiled_frame(config, odom={"wz": measured_wz})
+    assert abs(decision.values[5]) <= config.wz_max
+    assert decision.values[5] == pytest.approx(
+        max(-config.wz_max, min(config.wz_max,
+                               -decision.bearing - 0.5 * measured_wz)))
+
+
+@pytest.mark.parametrize("odom", [None, {}, {"wz": None}, {"wz": float("nan")},
+                                 {"wz": float("inf")}, {"wz": -float("inf")},
+                                 {"wz": True}, {"wz": False}, {"wz": "0.2"},
+                                 {"wz": {}}, {"wz": 10 ** 400}])
+def test_missing_or_invalid_actual_yaw_never_damps_commanded_rotation(odom, monkeypatch):
+    config = _cfg(calibrated_yaw_gain=0.8, yaw_damping=0.5,
+                  use_lateral=False, floor_wz=0.0)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    state = _adaptive_ready(config, distance=2.0, bearing=0.2)
+    state.commanded = (0.0, 0.0, 0.8)
+    decision = _profiled_frame(config, odom=odom, state=state)
+    assert decision.values[5] == pytest.approx(-0.8 * decision.bearing)
+    assert decision.yaw_damping_effective == 0.0
+    assert all(math.isfinite(value) for value in decision.values)
+
+
+def test_uncalibrated_tracking_keeps_the_old_law_even_if_damping_is_configured(monkeypatch):
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    actual = {"vx": 0.1, "vy": 0.0, "wz": 0.3}
+    plain = _profiled_frame(_cfg(use_lateral=False), odom=actual)
+    unused = _profiled_frame(_cfg(use_lateral=False, yaw_damping=0.8), odom=actual)
+    assert unused.values == pytest.approx(plain.values)
+    assert unused.k_yaw_effective == plain.k_yaw_effective
+    assert unused.yaw_damping_effective == 0.0
+
+
+def test_calibrated_alignment_uses_the_same_measured_rate_law(monkeypatch):
+    config = _cfg(calibrated_yaw_gain=0.8, yaw_damping=0.3,
+                  align_min_scale=0.0, floor_wz=0.0)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    measured_wz = -0.2
+    decision = _profiled_frame(config, bearing=0.9, odom={"wz": measured_wz})
+    assert decision.status == P.ALIGNING
+    assert decision.values[:2] == [0.0, 0.0]
+    assert decision.values[5] == pytest.approx(-0.8 * decision.bearing - 0.3 * measured_wz)
+    assert decision.k_yaw_effective == 0.8
+    assert decision.yaw_damping_effective == 0.3
+
+
+def test_calibrated_profile_leaves_search_rate_and_its_diagnostics_unchanged():
+    config = _cfg(calibrated_yaw_gain=0.3, yaw_damping=0.7, search_rate=0.35)
+    state = _state(missing_frames=config.lost_frames)
+    decision = _step(detections=_detections(), depth=_depth(),
+                     odom={"wz": 0.2}, config=config, state=state)
+    assert decision.status == P.SEARCHING
+    assert decision.values[5] == -0.35
+    assert decision.k_yaw_effective is None and decision.yaw_damping_effective is None
+
+
+def test_calibrated_profile_does_not_change_obstacle_gap_turns(monkeypatch):
+    config = _cfg(calibrated_yaw_gain=0.3, yaw_damping=0.7, use_lateral=False,
+                  stop_distance_m=0.3, floor_wz=0.0)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs:
+                        (5.0, 1.0) if kwargs.get("lateral_offset_m") else (0.4, 1.0))
+    decision = _profiled_frame(config, distance=1.2, bearing=0.02, odom={"wz": 0.2})
+    expected = min(config.wz_max, config.k_yaw * math.atan2(P._keepout_m(config), 0.4))
+    assert decision.status == P.AVOIDING
+    assert decision.values[0] == 0.0
+    assert abs(decision.values[5]) == pytest.approx(expected)
+    assert decision.k_yaw_effective is None and decision.yaw_damping_effective is None
+
+
+def test_gap_turn_does_not_claim_tracking_gains_when_both_turns_equal_the_cap(monkeypatch):
+    config = _cfg(calibrated_yaw_gain=0.8, yaw_damping=0.3, use_lateral=False,
+                  stop_distance_m=0.3, floor_wz=0.0, wz_max=0.1)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs:
+                        (5.0, 1.0) if kwargs.get("lateral_offset_m") else (0.4, 1.0))
+    state = _adaptive_ready(config, distance=1.2, bearing=-0.9)
+    decision = _profiled_frame(config, distance=1.2, bearing=-0.9,
+                               odom={"wz": 0.1}, state=state)
+    assert decision.status == P.AVOIDING
+    assert -config.calibrated_yaw_gain * decision.bearing - 0.3 * 0.1 > config.wz_max
+    assert decision.values[5] == config.wz_max
+    assert decision.k_yaw_effective is None and decision.yaw_damping_effective is None
+
+
+def test_calibrated_profile_does_not_prevent_arrival_or_emit_damping_after_arrival():
+    config = _cfg(calibrated_yaw_gain=0.8, yaw_damping=0.3)
+    decision = _profiled_frame(config, distance=0.7, bearing=0.0, odom={"wz": 0.1})
+    assert decision.status == P.ARRIVED
+    assert decision.values == [0.0] * 6
+    assert decision.k_yaw_effective is None and decision.yaw_damping_effective is None
+
+
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf"), True, {}, "bad"])
+def test_calibrated_tracking_gain_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="calibrated_yaw_gain"):
+        _cfg(calibrated_yaw_gain=value)
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.01, float("nan"), float("inf"), True, None, {}, "bad"])
+def test_angular_rate_damping_is_finite_and_bounded_zero_to_one(value):
+    with pytest.raises(ValueError, match="yaw_damping"):
+        _cfg(yaw_damping=value)

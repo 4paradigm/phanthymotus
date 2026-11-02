@@ -33,6 +33,7 @@ an answer, so this one does, and pushes the ACP callback when it gets there.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import queue
@@ -46,6 +47,7 @@ from ..control_stream import negotiate
 from . import depth as depth_mod
 from . import odom as odom_mod
 from . import policy as policy_mod
+from . import yaw_calibration as yaw_cal
 
 log = logging.getLogger(__name__)
 
@@ -75,12 +77,14 @@ TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 # These policy fields are shared by the operator's config dialog and the
 # config action. Defaults come from startup configuration, before a particular
 # downstream chassis adopts/clamps the effective policy limits.
-_TUNING_FIELDS = ("stop_distance_m", "stop_tolerance_m", "adaptive_k_fwd",
+_TUNING_FIELDS = ("stop_distance_m", "stop_tolerance_m",
                   "search_rate", "vx_max", "vy_max", "wz_max", "use_lateral")
-_BOOL_TUNING_FIELDS = frozenset(("use_lateral", "adaptive_k_fwd"))
-# Older saved canvases still send these keys on start. Nominal gains and the
-# automatic yaw mode belong to startup YAML, not runtime operator controls.
-_STARTUP_GAIN_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw"))
+_BOOL_TUNING_FIELDS = frozenset(("use_lateral",))
+# Older saved canvases still send these keys on start. Nominal gains and gain
+# scheduling modes belong to startup YAML, not runtime operator controls.
+_STARTUP_GAIN_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw", "adaptive_k_fwd",
+                                 "calibrated_yaw_gain", "yaw_damping"))
+_CALIBRATION_MAX_AGE_MS = 300
 
 
 def _sensor_qos():
@@ -136,6 +140,8 @@ class NaviPlugin:
         self._publisher = None
         self._timer = None
         self._running = False
+        self._starting = False
+        self._start_cancelled = False
         self._paused = False
         self._rate_hz = 10.0
         self._ttl_ms = 300
@@ -182,6 +188,14 @@ class NaviPlugin:
         self._depth_ms = 0
         self._odom = None
         self._odom_ms = 0
+        self._odom_feedback_stamp = None
+        self._odom_feedback_received = 0.0
+        self._odom_feedback_wz = None
+        self._odom_feedback_problem = "尚未收到带有效时间戳的角速度反馈"
+        self._calibration = None
+        self._calibration_action_id = ""
+        self._calibration_report = {"status": "not_calibrated"}
+        self._yaw_profile = None
         self._binding = {}
         self._acp_action_id = ""
         self._limit_notes: list = []
@@ -211,12 +225,6 @@ class NaviPlugin:
                                                 "距离不大于 1.3 m 即满足距离条件；"
                                                 "仍需有效观测及原有对正条件。"
                                                 "默认 0，保持原行为"},
-            "adaptive_k_fwd": {"type": "boolean",
-                               "title": "前进P自适应（按距离）",
-                               "description": "根据剩余距离平滑调整前进P增益；"
-                                              "接近目标时可升至 k_fwd 的3倍，"
-                                              "仍受速度上限、避障和到达条件限制。"
-                                              "默认关闭；不能修正深度测距偏差"},
             "search_rate": {"type": "number", "minimum": 0,
                             "title": "搜索转速 search_rate（rad/s）",
                             "description": "目标不在视野时原地搜索的角速度幅值；"
@@ -248,14 +256,16 @@ class NaviPlugin:
             "multiInstance": False,
             "description": ("视觉导航：朝一个目标走过去。目标不在视野里时会**自行"
                             "原地转身搜索**，所以不需要先手动转动机器人。"
-                            "路上按深度减速避障，到设定距离停下。"),
+                            "路上按深度减速避障，到设定距离停下。"
+                            "前进P默认固定0.9，转向P自动调节。"),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
                                "enum": ["start", "stop", "list_visible_objects",
                                         "navigate_to", "stop_navigation",
-                                        "pause", "resume", "info", "config"]},
+                                        "pause", "resume", "info", "config",
+                                        "calibrate_yaw"]},
                     "target": {"type": "string",
                                "description": "要走过去的东西。用 list_visible_objects "
                                               "返回的 key（如 chair#azure）最准；"
@@ -299,13 +309,21 @@ class NaviPlugin:
                             "「跟着那个人」），用普通名字即可，不必先 "
                             "list_visible_objects —— 那一步在这里只是多一次往返。",
                     },
+                    "calibrate_yaw": {
+                        "params": [],
+                        "description": "一键转向校准：卡片运行且无导航目标时，低速左右"
+                                       "各转一小段，按实测里程计生成并保存本机转向P和阻尼。"
+                                       "会使底盘转动，请预留旋转空间。要求连接非空跑底盘及"
+                                       "有效 odom.wz；info 查看进度，stop_navigation 中止。"
+                                       "校准结束停车，不自动开始跟随。",
+                    },
                     "stop_navigation": {"params": [],
-                                        "description": "停止导航，放弃当前目标"},
+                                        "description": "停止导航或转向校准，放弃当前目标"},
                     "pause": {"params": [], "description": "暂停，保留目标"},
                     "resume": {"params": [], "description": "继续"},
                     "config": {
                         "params": list(_TUNING_FIELDS),
-                        "description": "配置跟随增益、搜索转速、速度上限和横移。"
+                        "description": "配置停止距离、容差、搜索转速、速度上限和横移。"
                                        "只更新填写的参数；配置保留到本进程后续"
                                        "启动，容器重启后需由画布配置或 YAML 恢复。"
                                        "运行中修改也会重新按下游底盘限制调整；"
@@ -313,7 +331,7 @@ class NaviPlugin:
                     },
                 },
                 # Unlike the vla card, this one finishes: arriving is an answer.
-                "x-completion": {"actions": ["navigate_to"], "timeout": 300},
+                "x-completion": {"actions": ["navigate_to", "calibrate_yaw"], "timeout": 300},
                 "x-hooks": {"on_interrupt_all": {"action": "stop_navigation"},
                             "on_interrupt_motion": {"action": "stop_navigation"}},
                 "x-is-dangerous": True,
@@ -373,6 +391,8 @@ class NaviPlugin:
             return self._list_visible_objects()
         if action == "navigate_to":
             return self._navigate_to(args)
+        if action == "calibrate_yaw":
+            return self._calibrate_yaw()
         if action == "stop_navigation":
             return self._stop_navigation()
         if action == "pause":
@@ -400,6 +420,24 @@ class NaviPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict):
+        with self._lock:
+            if self._running or self._starting:
+                return self._error("already running")
+            self._starting = True
+            self._start_cancelled = False
+        try:
+            result = self._start_impl(args)
+            with self._lock:
+                cancelled = self._start_cancelled
+            if cancelled:
+                self._unwind()
+                return {"state": "idle", "message": "启动已取消"}
+            return result
+        finally:
+            with self._lock:
+                self._starting = False
+
+    def _start_impl(self, args: dict):
         # No downstream is **not** a reason to refuse starting.
         #
         # "Don't wire the chassis yet, I just want to see what it computes" is a
@@ -490,6 +528,7 @@ class NaviPlugin:
             return self._error(camera_problem)
 
         self._binding = binding
+        self._load_yaw_profile()
         log.info("navi started: topic=%s %.1f Hz ttl=%d ms inputs=%s",
                  self._topic, rate, self._ttl_ms, binding)
         return {"state": "running", "topic": self._topic, "rate_hz": rate,
@@ -613,6 +652,8 @@ class NaviPlugin:
         if not target:
             return self._error("navigate_to 需要 target —— 一个 vop 认得的名字")
         with self._lock:
+            if self._starting or self._calibration is not None:
+                return self._error("转向校准中，请先等待完成或 stop_navigation")
             if not self._running:
                 return {"state": "idle",
                         "message": "卡片未在运行，请先在画布上启动"}
@@ -696,17 +737,191 @@ class NaviPlugin:
         return any(wanted == k.lower() or wanted in k.split("#")[0].lower()
                    for k in keys)
 
+    def _calibration_key(self):
+        """A local deployment/connection identity, not a hardware serial number.
+
+        /models is host-local persistent storage. Including the full execution
+        contract and camera geometry prevents another connection from silently
+        inheriting the same gains; moving that volume to another robot still
+        requires a new calibration.
+        """
+        if not self._binding.get("odom") or not self._descriptor:
+            raise ValueError("转向校准需要连接 state/odom 和下游底盘")
+        fields = ("control_interface", "mode", "dof", "joint_names", "frame",
+                  "units", "limits")
+        identity = {"odom": self._binding["odom"],
+                    "depth": self._binding.get("depth_map"),
+                    "objects": self._binding.get("objects"),
+                    "half_fov_rad": self._config.half_fov_rad,
+                    "control": {key: self._descriptor.get(key) for key in fields}}
+        return hashlib.sha256(json.dumps(identity, sort_keys=True,
+                                         allow_nan=False).encode()).hexdigest()
+
+    def _calibration_directory(self):
+        return str(self._cfg.get("calibration_dir") or "/models/navi/calibration")
+
+    def _apply_yaw_profile(self, profile):
+        self._config = replace(self._config, calibrated_yaw_gain=profile["k_yaw"],
+                               yaw_damping=profile["yaw_damping"], adaptive_k_yaw=False)
+        self._state.adaptive_yaw_scale = 1.0
+        self._yaw_profile = dict(profile)
+
+    def _load_yaw_profile(self):
+        with self._lock:
+            self._yaw_profile = None
+            self._config = replace(self._config, calibrated_yaw_gain=None,
+                                   yaw_damping=0.0,
+                                   adaptive_k_yaw=self._cfg.get("adaptive_k_yaw", True))
+            try:
+                key = self._calibration_key()
+                profile = yaw_cal.load_profile(self._calibration_directory(), key)
+                if profile is None:
+                    self._calibration_report = {"status": "not_calibrated"}
+                    return
+                self._apply_yaw_profile(profile)
+                self._calibration_report = {"status": "loaded", "robot_key": key,
+                                            "profile": dict(profile)}
+            except (OSError, ValueError, TypeError) as error:
+                self._calibration_report = {"status": "not_calibrated",
+                                            "reason": str(error)}
+
+    def _calibration_feedback(self, *, stationary=False):
+        """Only distinct, recent source-stamped odometry can tune a controller."""
+        with self._obs_lock:
+            stamp = self._odom_feedback_stamp
+            age = int(time.time() * 1000) - stamp if stamp is not None else None
+            receipt_age = time.monotonic() - self._odom_feedback_received
+            linear = ((self._odom or {}).get("vx"), (self._odom or {}).get("vy"))
+            if stationary and any(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                  and math.isfinite(v) and abs(v) > 0.05 for v in linear):
+                return None, None, None, "转向校准期间检测到底盘平移，请先停车"
+            if (self._odom_feedback_wz is None
+                    or age is None or not 0 <= age <= _CALIBRATION_MAX_AGE_MS
+                    or not 0 <= receipt_age <= _CALIBRATION_MAX_AGE_MS / 1000):
+                return None, None, None, self._odom_feedback_problem or "角速度反馈已过期"
+            # Map the wall-clock source age into the monotonic phase clock.
+            measured_at = time.monotonic() - age / 1000.0
+            return self._odom_feedback_wz, stamp, measured_at, ""
+
+    def _calibrate_yaw(self):
+        with self._lock:
+            if (self._starting or not self._running or self._paused
+                    or self._publisher is None):
+                return self._error("请先启动 navi，并保持卡片运行")
+            if self._calibration is not None:
+                return self._error("转向校准正在进行，请通过 info 查看或 stop_navigation 中止")
+            if self._state.target or self._acp_action_id:
+                return self._error("请先 stop_navigation，再开始转向校准")
+            if (not self._descriptor or self._descriptor.get("dry_run") is not False):
+                return self._error("转向校准要求下游明确声明 dry_run=false")
+            units = self._descriptor.get("units")
+            if not isinstance(units, dict) or units.get("angular") != "rad/s":
+                return self._error("转向校准要求下游角速度单位为 rad/s")
+            if self._rate_hz < 10:
+                return self._error("转向校准需要至少 10Hz 的指令频率")
+            try:
+                key = self._calibration_key()
+                limits = self._descriptor.get("limits") or {}
+                lower, upper = limits.get("lower"), limits.get("upper")
+                lo, hi = lower[5], upper[5]
+                if (any(isinstance(v, bool) or not isinstance(v, (int, float))
+                        or not math.isfinite(v) for v in (lo, hi))
+                        or lo > -0.2 or hi < 0.2 or self._config.wz_max < 0.2
+                        or self._config.floor_wz > 0.2):
+                    raise ValueError("下游双向转速范围或静止死区不支持 0.2 rad/s 低速校准")
+            except (ValueError, TypeError, IndexError, KeyError) as error:
+                return self._error(str(error))
+            measured, _, _, problem = self._calibration_feedback(stationary=True)
+            if problem or measured is None:
+                return self._error("无法校准：" + (problem or "没有实测角速度"))
+            if abs(measured) > 0.03:
+                return self._error("请先让底盘停止，再开始转向校准")
+            self._calibration = yaw_cal.YawCalibration(now=time.monotonic(),
+                                                       robot_key=key, speed=0.2)
+            self._calibration_action_id = f"navi_cal_{uuid.uuid4().hex[:12]}"
+            self._calibration_report = {"status": "running", "phase": "settle",
+                                        "action_id": self._calibration_action_id,
+                                        "robot_key": key, "samples": 0}
+            self._last_error = ""
+            self._state = policy_mod.State()
+            return {"state": "running", "action_id": self._calibration_action_id,
+                    "calibration": dict(self._calibration_report),
+                    "message": "低速双向转向校准已开始，完成后保持停车"}
+
+    def _finish_calibration(self, result):
+        """Called after the session has already spent its final phase at zero."""
+        report = {"status": result.status, "phase": result.phase,
+                  "reason": result.reason, "elapsed_s": result.elapsed_s,
+                  "samples": result.samples}
+        if result.status == "completed":
+            try:
+                key = self._calibration_key()
+                if result.profile.get("robot_key") != key:
+                    raise ValueError("校准期间底盘连接配置发生变化")
+                path = yaw_cal.save_profile(self._calibration_directory(), key,
+                                            result.profile)
+                self._apply_yaw_profile(result.profile)
+                report.update(profile=dict(result.profile), saved_to=str(path))
+            except (OSError, ValueError, TypeError) as error:
+                report.update(status="failed", reason=f"校准参数未保存：{error}")
+        self._calibration = None
+        self._state = policy_mod.State()
+        self._calibration_report = report
+        action_id, self._calibration_action_id = self._calibration_action_id, ""
+        if action_id:
+            status = "completed" if report["status"] == "completed" else "failed"
+            threading.Thread(target=self._post_acp, args=(action_id, status, dict(report)),
+                             daemon=True, name="navi_cal_acp").start()
+
+    def _cancel_calibration(self, reason):
+        if self._calibration is None:
+            return False
+        result = self._calibration.cancel(reason)
+        stop_error = self._publish_calibration_zero()
+        if stop_error:
+            result = replace(result, reason=result.reason + "; 零速发布失败，"
+                             "等待下游看门狗停车：" + stop_error)
+        self._finish_calibration(result)
+        return True
+
+    def _publish_calibration_zero(self):
+        if self._publisher is not None:
+            try:
+                from std_msgs.msg import String
+                payload = String()
+                now = time.time()
+                payload.data = json.dumps(self._command_message([0.0] * 6, now,
+                                                               int(now * 1000)))
+                self._publisher.publish(payload)
+                self._published += 1
+            except Exception as error:                        # noqa: BLE001
+                self._last_error = str(error)
+                log.warning("calibration stop publish failed: %s", error)
+                return str(error)
+        return ""
+
     def _stop_navigation(self):
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
+            self._cancel_calibration("用户停止转向校准")
+            action_id, self._acp_action_id = self._acp_action_id, ""
+            target = self._state.target
             self._state = policy_mod.State()
+            if action_id:
+                result = {"status": "cancelled", "reason": "用户停止导航", "target": target}
+                threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
+                                 daemon=True, name="navi_acp").start()
         return {"state": "running", "message": "已停止导航，卡片仍在运行"}
 
     def _halt(self, halted: bool):
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
+            if self._calibration is not None:
+                if not halted:
+                    return self._error("校准过程中不能 resume，请先等待或 stop_navigation")
+                self._cancel_calibration("用户暂停卡片，转向校准已中止")
             # A paused policy does not tick, so it cannot clear its own gain
             # schedule before resume. Keep the track, but restart gain gently.
             self._state.adaptive_fwd_scale = 1.0
@@ -715,10 +930,13 @@ class NaviPlugin:
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
 
-    def _stop(self):
+    def _stop(self, *, cancel_start=True):
         with self._lock:
+            if self._starting and cancel_start:
+                self._start_cancelled = True
             if not self._running:
                 return {"state": "idle"}
+            self._cancel_calibration("卡片停止，转向校准已中止")
             self._running = False
             self._paused = False
             node, self._node = self._node, None
@@ -745,7 +963,7 @@ class NaviPlugin:
 
     def _unwind(self):
         self._stop_view_thread()
-        self._stop()
+        self._stop(cancel_start=False)
 
     def _stop_view_thread(self):
         self._view_stop.set()
@@ -786,6 +1004,8 @@ class NaviPlugin:
                 return self._error(f"配置 {key} 无效：{error}")
 
         with self._lock:
+            if (self._starting or self._calibration is not None) and changed:
+                return self._error("转向校准中不能修改执行参数，请先 stop_navigation")
             # Stage a complete replacement so the policy never observes half
             # of a config request. Copy effective geometry adopted from the
             # camera/chassis; rebuilding from YAML would discard that reading.
@@ -804,7 +1024,7 @@ class NaviPlugin:
                             key, policy_mod.Config.__dataclass_fields__[key].default)))
                 notes = policy_mod.adopt_limits(candidate, self._descriptor)
             if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
-                   for key in ("adaptive_k_fwd", "stop_distance_m",
+                   for key in ("stop_distance_m",
                                "stop_tolerance_m", "slow_distance_m")):
                 # A successful gain/boundary change starts a fresh schedule;
                 # tracker state and unrelated navigation counters stay intact.
@@ -815,6 +1035,8 @@ class NaviPlugin:
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
+            if self._yaw_profile is not None and "half_fov_rad" in changed:
+                self._load_yaw_profile()
             result = {"status": "configured", "config": changed,
                       "effective_config": {key: getattr(candidate, key)
                                            for key in changed}}
@@ -852,11 +1074,25 @@ class NaviPlugin:
                               for key in _TUNING_FIELDS},
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
+                           "adaptive_k_fwd": self._config.adaptive_k_fwd,
                            "k_yaw": self._config.k_yaw,
+                           "calibrated_yaw_gain": self._config.calibrated_yaw_gain,
+                           "yaw_damping": self._config.yaw_damping,
                            "adaptive_k_yaw": self._config.adaptive_k_yaw,
                            "obstacle_stop_m": self._config.obstacle_stop_m,
                            "slow_distance_m": self._config.slow_distance_m},
                 "published": self._published,
+                "gains": {
+                    "forward": {"base": self._config.k_fwd,
+                                "effective": getattr(decision, "k_fwd_effective", None)},
+                    "yaw": {"base": (self._config.calibrated_yaw_gain
+                                      if self._config.calibrated_yaw_gain is not None
+                                      else self._config.k_yaw),
+                            "effective": getattr(decision, "k_yaw_effective", None),
+                            "damping": self._config.yaw_damping,
+                            "damping_effective": getattr(decision, "yaw_damping_effective", None),
+                            "source": "calibrated" if self._yaw_profile else "default"}},
+                "calibration": dict(self._calibration_report),
                 # (width, height) of the frame vop's boxes are in. (0, 0) means
                 # no declaration arrived and boxes cannot be used — see
                 # `_degradations`.
@@ -876,7 +1112,8 @@ class NaviPlugin:
                           "distance_m": decision.distance_m,
                           "bearing": decision.bearing,
                           "k_fwd_effective": getattr(decision, "k_fwd_effective", None),
-                          "k_yaw_effective": getattr(decision, "k_yaw_effective", None)}
+                          "k_yaw_effective": getattr(decision, "k_yaw_effective", None),
+                          "yaw_damping_effective": getattr(decision, "yaw_damping_effective", None)}
                          if decision else None),
                 # **Coasting has to be visible here.** A robot walking towards a
                 # prediction and a robot walking towards something it can see
@@ -1243,6 +1480,8 @@ class NaviPlugin:
             payload = json.loads(message.data)
         except Exception:                                     # noqa: BLE001
             return          # one bad frame must not take the stream down
+        if not isinstance(payload, dict):
+            return
         now = int(time.time() * 1000)
         with self._obs_lock:
             if role == "objects":
@@ -1267,6 +1506,23 @@ class NaviPlugin:
                 self._odom = {axis: odom_mod.axis_of(payload, axis)
                               for axis in ("vx", "vy", "wz")}
                 self._odom_ms = now
+                stamp = payload.get("stamp_ms")
+                wz = self._odom["wz"]
+                units = payload.get("units")
+                if (not isinstance(units, dict) or units.get("angular") != "rad/s"
+                        or isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                        or not math.isfinite(stamp) or not 0 <= now - stamp <= _CALIBRATION_MAX_AGE_MS
+                        or isinstance(wz, bool) or not isinstance(wz, (int, float))
+                        or not math.isfinite(wz)):
+                    self._odom_feedback_problem = "角速度缺失、非有限值或测量时间戳已过期"
+                    self._odom_feedback_wz = None
+                elif self._odom_feedback_stamp is not None and stamp <= self._odom_feedback_stamp:
+                    self._odom_feedback_problem = "角速度时间戳重复或倒退"
+                else:
+                    self._odom_feedback_stamp = stamp
+                    self._odom_feedback_wz = float(wz)
+                    self._odom_feedback_received = time.monotonic()
+                    self._odom_feedback_problem = ""
 
     def _on_image(self, message):
         """The raw camera frame, kept compressed until something draws it."""
@@ -1329,6 +1585,9 @@ class NaviPlugin:
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
                      if fresh_depth else None)
             odom = self._odom if now - self._odom_ms <= max_age else None
+            if odom is not None and self._yaw_profile is not None:
+                measured_wz, _, _, problem = self._calibration_feedback()
+                odom = {**odom, "wz": None if problem else measured_wz}
         return objects, depth, odom
 
     def next_command(self):
@@ -1340,6 +1599,22 @@ class NaviPlugin:
         now = time.time()
         dt = (now - self._last_tick) if self._last_tick else 1.0 / self._rate_hz
         self._last_tick = now
+
+        if self._calibration is not None:
+            wz, sample_key, measured_at, problem = self._calibration_feedback(stationary=True)
+            if problem:
+                result = replace(self._calibration.cancel(problem), status="failed")
+            else:
+                result = self._calibration.step(time.monotonic(), wz, sample_key, measured_at)
+            self._calibration_report.update(status=result.status, phase=result.phase,
+                                            reason=result.reason, elapsed_s=result.elapsed_s,
+                                            samples=result.samples)
+            self._last_decision = policy_mod.Decision(result.values, "calibrating",
+                                                      result.reason)
+            if result.status != "running":
+                self._finish_calibration(result)
+            return self._command_message(result.values, now,
+                                         int(sample_key or now * 1000))
 
         objects, depth, odom = self.observation()
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
@@ -1363,8 +1638,12 @@ class NaviPlugin:
         values = policy_mod.apply_deadband(decision.values,
                                            self._deadband_for(decision.values))
 
-        self._seq += 1
         obs_ms = self._objects_ms or int(now * 1000)
+        return self._command_message(values, now, obs_ms)
+
+    def _command_message(self, values, now, obs_ms):
+        """Normal following and calibration share the same guarded transport."""
+        self._seq += 1
         message = build_message(
             seq=self._seq,
             values=values,
@@ -1422,19 +1701,23 @@ class NaviPlugin:
         return list(moving)
 
     def _tick(self):
-        publisher = self._publisher
-        if publisher is None or not self._running or self._paused:
-            # Publishing nothing is how a halt reaches the chassis: the
-            # driver's watchdog stops it within watchdog_ms. Commanding a stop
-            # from here would fight that.
-            return
-        try:
-            message = self.next_command()
-        except Exception as error:                            # noqa: BLE001
-            with self._lock:
+        with self._lock:
+            publisher = self._publisher
+            if publisher is None or not self._running or self._paused:
+                return
+            try:
+                message = self.next_command()
+                if message is not None:
+                    from std_msgs.msg import String
+                    payload = String()
+                    payload.data = json.dumps(message, ensure_ascii=False)
+                    publisher.publish(payload)
+                    self._published += 1
+            except Exception as error:                        # noqa: BLE001
                 self._last_error = f"{type(error).__name__}: {error}"
-            log.warning("navi tick failed: %s", error)
-            return
+                self._cancel_calibration("校准指令生成或发布失败：" + self._last_error)
+                log.warning("navi tick failed: %s", error)
+                return
         # **Before the early return, not after it.** The tick publishes nothing
         # when the decision is to publish nothing — blind, searching, arrived,
         # refused — and those are exactly the moments somebody wants the picture
@@ -1442,17 +1725,6 @@ class NaviPlugin:
         # precisely when the robot stops explaining itself.
         self._publish_view()
 
-        if message is None:
-            self._maybe_complete()
-            return
-
-        from std_msgs.msg import String
-
-        payload = String()
-        payload.data = json.dumps(message, ensure_ascii=False)
-        publisher.publish(payload)
-        with self._lock:
-            self._published += 1
         self._maybe_complete()
 
     def _publish_view(self):
