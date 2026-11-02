@@ -1903,3 +1903,163 @@ def test_a_base_with_no_lateral_deadband_is_not_gated_at_all():
     P.adopt_limits(config, {"limits": {"lower": [-1.0] * 6, "upper": [1.0] * 6}})
     assert config.floor_vy == 0.0
     assert P._worth_strafing(0.01, config, None, 0.1) is True
+
+
+# ── bounded forward-P distance schedule ────────────────────────────────────
+
+def _adaptive_ready(config, distance=1.0, bearing=0.0):
+    observations = _detections(_obj(x=bearing, bbox=(0.4, 0.4, 0.6, 0.6)))
+    depth = _depth(map_=_solid_depth(distance))
+    return seed(_state(), observations, depth, config)
+
+
+def _adaptive_frame(config, state, distance=1.0, bearing=0.0, dt=0.1):
+    return _step(detections=_detections(_obj(x=bearing, bbox=(0.4, 0.4, 0.6, 0.6))),
+                 depth=_depth(map_=_solid_depth(distance)),
+                 odom={"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                 config=config, state=state, dt=dt)
+
+
+def test_adaptive_forward_defaults_off_and_keeps_the_fixed_p_law(monkeypatch):
+    config = _cfg(k_fwd=0.2, vx_max=0.3, use_lateral=False)
+    state = _adaptive_ready(config, distance=1.2)
+    state.adaptive_fwd_scale = 3.0  # Disabling also clears a previous schedule.
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    decision = _adaptive_frame(config, state, distance=1.2)
+    assert config.adaptive_k_fwd is False
+    assert decision.values[0] == pytest.approx(0.2 * (1.2 - 0.8), abs=1e-7)
+    assert decision.k_fwd_effective == 0.2
+    assert state.adaptive_fwd_scale == 1.0
+
+
+def test_forward_gain_is_bounded_and_increases_only_smoothly_near_the_target():
+    config = _cfg(adaptive_k_fwd=True, k_fwd=0.4, stop_tolerance_m=0.05)
+    far = _state()
+    assert P._forward_gain(config, far, 3.0, True, False, 0.1) == config.k_fwd
+    near = _state()
+    gains = []
+    for _ in range(20):
+        previous = near.adaptive_fwd_scale
+        gains.append(P._forward_gain(config, near, 0.86, True, False, 0.1))
+        assert abs(near.adaptive_fwd_scale - previous) <= 0.2 + 1e-12
+    assert gains[-1] > gains[0] > config.k_fwd
+    assert all(config.k_fwd <= gain <= 3 * config.k_fwd for gain in gains)
+
+
+def test_forward_schedule_does_not_jump_after_a_long_tick_gap():
+    config = _cfg(adaptive_k_fwd=True)
+    state = _state()
+    gain = P._forward_gain(config, state, 0.81, True, False, 30.0)
+    assert gain <= config.k_fwd * 1.4
+    before = state.adaptive_fwd_scale
+    P._forward_gain(config, state, 0.81, True, False, -1.0)
+    assert state.adaptive_fwd_scale == before
+
+
+def test_settled_adaptive_p_speed_decreases_with_distance_error():
+    config = _cfg(adaptive_k_fwd=True, k_fwd=0.1, stop_tolerance_m=0.05)
+    speeds = []
+    for distance in (3.0, 1.6, 1.4, 1.2, 1.0, 0.86):
+        state = _state()
+        for _ in range(25):
+            gain = P._forward_gain(config, state, distance, True, False, 0.1)
+        speeds.append(gain * (distance - config.stop_distance_m))
+    assert all(a > b for a, b in zip(speeds, speeds[1:]))
+
+
+@pytest.mark.parametrize("kind", ["blind", "coasting", "aligning", "within"])
+def test_forward_schedule_resets_when_the_live_forward_approach_stops(kind):
+    config = _cfg(adaptive_k_fwd=True, align_min_scale=0.0, stop_tolerance_m=0.05)
+    state = _adaptive_ready(config)
+    for _ in range(8):
+        _adaptive_frame(config, state)
+    assert state.adaptive_fwd_scale > 1
+    if kind == "blind":
+        result = _step(detections=None, depth=_depth(), config=config, state=state)
+        assert result.status == P.BLIND and result.values is None
+    elif kind == "coasting":
+        result = _step(detections=_detections(), depth=_depth(map_=_solid_depth(1.0)),
+                       config=config, state=state)
+        assert state.tracker.track is not None and not state.tracker.track.observed
+        assert result.k_fwd_effective == config.k_fwd
+    elif kind == "aligning":
+        # A fresh target session cannot inherit the previous approach gain.
+        state = _adaptive_ready(config, distance=1.0, bearing=0.9)
+        state.adaptive_fwd_scale = 2.0
+        result = _adaptive_frame(config, state, bearing=0.9)
+        assert result.status == P.ALIGNING
+    else:
+        state = _adaptive_ready(config, distance=0.84)
+        state.adaptive_fwd_scale = 2.0
+        result = _adaptive_frame(config, state, distance=0.84)
+        assert result.status == P.ARRIVED and result.values == [0.0] * 6
+        assert result.k_fwd_effective is None
+    assert state.adaptive_fwd_scale == 1.0
+
+
+def test_unknown_range_and_zero_baseline_gain_do_not_acquire_an_artificial_floor():
+    config = _cfg(adaptive_k_fwd=True)
+    state = _state()
+    state.adaptive_fwd_scale = 2.5
+    assert P._forward_gain(config, state, None, True, False, 0.1) == config.k_fwd
+    assert state.adaptive_fwd_scale == 1
+    zero = _cfg(adaptive_k_fwd=True, k_fwd=0, floor_vx=0.4)
+    state = _adaptive_ready(zero, distance=1.2)
+    decision = _adaptive_frame(zero, state, distance=1.2)
+    assert decision.values[0] == 0.0 and decision.k_fwd_effective == 0
+
+
+def test_a_blocked_corridor_does_not_accumulate_forward_gain():
+    config = _cfg(adaptive_k_fwd=True, stop_distance_m=0.4, stop_tolerance_m=0.05,
+                  k_fwd=0.4, use_lateral=False)
+    state = _adaptive_ready(config, distance=0.58)
+    gains = []
+    for _ in range(10):
+        decision = _adaptive_frame(config, state, distance=0.58)
+        assert decision.status == P.AVOIDING
+        assert decision.values[:2] == [0.0, 0.0]
+        assert state.adaptive_fwd_scale == 1.0
+        gains.append(decision.k_fwd_effective)
+    assert gains == pytest.approx([gains[0]] * len(gains))
+
+
+def test_adaptive_forward_cannot_cross_a_conflicting_obstacle_stop_threshold():
+    config = _cfg(adaptive_k_fwd=True, stop_distance_m=0.4, stop_tolerance_m=0.05,
+                  vx_max=0.3, use_lateral=False, k_fwd=0.4)
+    sim = Sim(range_m=1.2, config=config)
+    state = seed(_state(), *sim.observe(), config)
+    for _ in range(200):
+        decision = sim.run(state, ticks=1, dt=0.1, odom=False)
+        if decision.values is not None:
+            assert 0 <= decision.values[0] <= config.vx_max
+    assert not state.arrived and sim.relative()[0] >= config.obstacle_stop_m - 0.001
+
+
+def test_adaptive_forward_finishes_a_gentle_ideal_approach_sooner_and_stops_in_tolerance():
+    def run(adaptive):
+        config = _cfg(adaptive_k_fwd=adaptive, k_fwd=0.1, vx_max=0.3,
+                      stop_distance_m=1.2, stop_tolerance_m=0.1, use_lateral=False)
+        sim = Sim(range_m=1.6, config=config)
+        state = seed(_state(), *sim.observe(), config)
+        for tick in range(600):
+            decision = sim.run(state, ticks=1, dt=0.1, odom=False)
+            if decision.values is not None:
+                assert 0 <= decision.values[0] <= config.vx_max
+            if state.arrived:
+                assert decision.values == [0.0] * 6
+                assert config.stop_distance_m <= sim.relative()[0] <= config.arrival_distance_m + 0.01
+                return tick
+        pytest.fail("ideal approach never completed")
+    assert run(True) < run(False)
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_adaptive_forward_flag_is_strictly_boolean(value):
+    with pytest.raises(ValueError, match="adaptive_k_fwd"):
+        _cfg(adaptive_k_fwd=value)
+
+
+@pytest.mark.parametrize("gain", [-0.1, float("nan"), float("inf"), True, 1e308])
+def test_adaptive_forward_rejects_invalid_or_unbounded_baseline_gain(gain):
+    with pytest.raises(ValueError, match="k_fwd"):
+        _cfg(adaptive_k_fwd=True, k_fwd=gain)

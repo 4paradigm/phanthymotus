@@ -82,6 +82,12 @@ BLIND = "blind"          # no usable observation — distinct from "nothing seen
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
 
+# A distance schedule, not online plant identification. Bounds are fixed so a
+# stalled chassis cannot learn an ever-larger command or a new speed floor.
+ADAPTIVE_FWD_MAX_SCALE = 3.0
+ADAPTIVE_FWD_SCALE_RATE = 2.0  # maximum scale change per second
+ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
+
 
 @dataclass
 class Config:
@@ -148,6 +154,7 @@ class Config:
     align_min_scale: float = 0.45
     k_yaw: float = 1.2
     k_fwd: float = 0.6
+    adaptive_k_fwd: bool = False
     vx_max: float = 1.0
     vy_max: float = 1.0
     wz_max: float = 1.5
@@ -325,6 +332,19 @@ class Config:
     floor_wz_moving: float = 0.0
 
     def __post_init__(self):
+        if type(self.adaptive_k_fwd) is not bool:
+            raise ValueError("adaptive_k_fwd must be a boolean")
+        if self.adaptive_k_fwd:
+            if isinstance(self.k_fwd, bool):
+                raise ValueError("adaptive k_fwd must be finite and nonnegative")
+            try:
+                base_gain = float(self.k_fwd)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError("adaptive k_fwd must be finite and nonnegative") from error
+            if (not math.isfinite(base_gain) or base_gain < 0
+                    or not math.isfinite(base_gain * ADAPTIVE_FWD_MAX_SCALE)):
+                raise ValueError("adaptive k_fwd and its maximum must be finite and nonnegative")
+            self.k_fwd = base_gain
         for key in ("stop_distance_m", "stop_tolerance_m"):
             value = getattr(self, key)
             if isinstance(value, bool):
@@ -404,6 +424,7 @@ class State:
     searching_for_s: float = 0.0
     searched_rad: float = 0.0
     commanded_vx: float = 0.0
+    adaptive_fwd_scale: float = 1.0
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
     idle_for_s: float = 0.0
@@ -423,6 +444,7 @@ class Decision:
     reason: str = ""
     distance_m: float | None = None
     bearing: float | None = None
+    k_fwd_effective: float | None = None
 
     @property
     def publishes(self) -> bool:
@@ -773,6 +795,11 @@ def step(*, detections, depth, odom, config: Config, state: State,
          dt: float) -> Decision:
     decision = _account_idle(_decide(detections, depth, odom, config, state, dt),
                              state, config, dt)
+    if (decision.values is None or decision.values[0] <= 0
+            or decision.status in (ARRIVED, FAILED, IDLE, BLIND, SEARCHING, ALIGNING)):
+        # Do not carry an increased approach gain through a hold, search or
+        # blocked corridor and release it as a jump on the next approach.
+        state.adaptive_fwd_scale = 1.0
     # Remember what we asked for, so the tracker can compensate for our own
     # motion on the next tick even with no odometry wired.
     if decision.values is not None:
@@ -781,6 +808,31 @@ def step(*, detections, depth, odom, config: Config, state: State,
     else:
         state.commanded = (0.0, 0.0, 0.0)
     return decision
+
+
+def _forward_gain(config: Config, state: State, distance, live: bool,
+                  within: bool, dt: float) -> float:
+    """Bounded distance-based gain scheduling for a live forward approach.
+
+    The nominal distance error and all later avoidance/speed limits are
+    untouched. Closer targets use up to three times the configured P gain,
+    approached at a bounded rate; no observation or motor bias is calibrated.
+    """
+    if (not config.adaptive_k_fwd or not live or distance is None or within
+            or config.k_fwd == 0):
+        state.adaptive_fwd_scale = 1.0
+        return config.k_fwd
+    window = max(0.1, config.slow_distance_m - config.stop_distance_m)
+    error = max(0.0, distance - config.stop_distance_m)
+    # This rational schedule keeps the settled, unsaturated P speed monotone
+    # in distance error: approaching the target does not increase that speed.
+    target = ADAPTIVE_FWD_MAX_SCALE / (
+        1.0 + (ADAPTIVE_FWD_MAX_SCALE - 1.0) * min(1.0, error / window))
+    previous = max(1.0, min(ADAPTIVE_FWD_MAX_SCALE, state.adaptive_fwd_scale))
+    elapsed = min(ADAPTIVE_FWD_MAX_DT, max(0.0, dt)) if math.isfinite(dt) else 0.0
+    change = ADAPTIVE_FWD_SCALE_RATE * elapsed
+    state.adaptive_fwd_scale = max(previous - change, min(previous + change, target))
+    return config.k_fwd * state.adaptive_fwd_scale
 
 
 def _ego_twist(odom, state: State):
@@ -940,8 +992,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
+    forward_gain = _forward_gain(config, state, distance, live, within, dt)
     if distance is not None:
-        speed = min(speed, max(0.0, config.k_fwd
+        speed = min(speed, max(0.0, forward_gain
                                * (distance - config.stop_distance_m) * align))
         reason = f"target at {distance:.2f} m"
 
@@ -1008,7 +1061,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     state.commanded_vx = vx
     return Decision(_twist(vx, vy, wz), status, reason,
-                    distance_m=distance, bearing=bearing)
+                    distance_m=distance, bearing=bearing,
+                    k_fwd_effective=forward_gain if distance is not None and not within else None)
 
 
 def _account_idle(decision: Decision, state: State, config: Config,

@@ -75,8 +75,9 @@ TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 # These policy fields are shared by the operator's config dialog and the
 # config action. Defaults come from startup configuration, before a particular
 # downstream chassis adopts/clamps the effective policy limits.
-_TUNING_FIELDS = ("stop_distance_m", "stop_tolerance_m", "k_yaw", "k_fwd",
+_TUNING_FIELDS = ("stop_distance_m", "stop_tolerance_m", "k_yaw", "k_fwd", "adaptive_k_fwd",
                   "search_rate", "vx_max", "vy_max", "wz_max", "use_lateral")
+_BOOL_TUNING_FIELDS = frozenset(("use_lateral", "adaptive_k_fwd"))
 
 
 def _sensor_qos():
@@ -216,6 +217,12 @@ class NaviPlugin:
                       "description": "按目标距离误差计算前进速度的比例（1/s）。"
                                      "越大接近越快；最终速度仍受 vx_max、避障和"
                                      "下游底盘限制"},
+            "adaptive_k_fwd": {"type": "boolean",
+                               "title": "前进P自适应（按距离）",
+                               "description": "根据剩余距离平滑调整前进P增益；"
+                                              "接近目标时可升至 k_fwd 的3倍，"
+                                              "仍受速度上限、避障和到达条件限制。"
+                                              "默认关闭；不能修正深度测距偏差"},
             "search_rate": {"type": "number", "minimum": 0,
                             "title": "搜索转速 search_rate（rad/s）",
                             "description": "目标不在视野时原地搜索的角速度幅值；"
@@ -327,11 +334,12 @@ class NaviPlugin:
                     "rate_hz": {"type": "number", "default": 10,
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
-                    "obstacle_stop_m": {"type": "number", "default": 0.6,
+                    "obstacle_stop_m": {"type": "number",
+                                        "default": self._cfg.get("obstacle_stop_m", 0.6),
                                         "description": "正前方障碍近于这个距离就完全"
-                                                       "不前进（米）。必须小于 "
-                                                       "stop_distance_m，否则机器人会"
-                                                       "被它正要走向的目标挡停",
+                                                       "不前进（米）。达到或超过到达"
+                                                       "距离阈值时，目标可能先被当作"
+                                                       "障碍挡停；请结合底盘实际外廓核对",
                                         "scope": "instance"},
                     **{key: {**spec, "scope": "instance"}
                        for key, spec in tuning_properties.items()},
@@ -705,6 +713,9 @@ class NaviPlugin:
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
+            # A paused policy does not tick, so it cannot clear its own gain
+            # schedule before resume. Keep the track, but restart gain gently.
+            self._state.adaptive_fwd_scale = 1.0
             self._paused = bool(halted)
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
@@ -752,7 +763,11 @@ class NaviPlugin:
         changed = {}
         for key, value in (args or {}).items():
             field = policy_mod.Config.__dataclass_fields__.get(key)
-            if field is None or value is None:
+            if field is None:
+                continue
+            if value is None:
+                if key in _BOOL_TUNING_FIELDS:
+                    return self._error(f"配置 {key} 无效：must be a boolean")
                 continue
             # Coerce to the field's own type. Blanket `float()` turned
             # `use_lateral` into 1.0 — truthy, so it worked, which is exactly
@@ -760,12 +775,12 @@ class NaviPlugin:
             cast = (bool if field.type in ("bool", bool)
                     else int if field.type in ("int", int) else float)
             try:
-                if key == "use_lateral" and not isinstance(value, bool):
+                if key in _BOOL_TUNING_FIELDS and not isinstance(value, bool):
                     raise ValueError("must be a boolean")
-                if key in _TUNING_FIELDS and key != "use_lateral" and isinstance(value, bool):
+                if key in _TUNING_FIELDS and key not in _BOOL_TUNING_FIELDS and isinstance(value, bool):
                     raise ValueError("must be a finite nonnegative number")
                 changed[key] = cast(value)
-                if key in _TUNING_FIELDS and key != "use_lateral":
+                if key in _TUNING_FIELDS and key not in _BOOL_TUNING_FIELDS:
                     if not math.isfinite(changed[key]) or changed[key] < 0:
                         raise ValueError("must be a finite nonnegative number")
             except (TypeError, ValueError, OverflowError) as error:
@@ -778,7 +793,7 @@ class NaviPlugin:
             try:
                 candidate = replace(self._config, **changed)
             except (TypeError, ValueError, OverflowError) as error:
-                return self._error(f"停止距离配置无效：{error}")
+                return self._error(f"配置无效：{error}")
             notes = self._limit_notes
             if self._running and changed:
                 # Restore requested ceilings before adoption, including those
@@ -789,6 +804,12 @@ class NaviPlugin:
                         key, self._cfg.get(
                             key, policy_mod.Config.__dataclass_fields__[key].default)))
                 notes = policy_mod.adopt_limits(candidate, self._descriptor)
+            if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
+                   for key in ("adaptive_k_fwd", "k_fwd", "stop_distance_m",
+                               "stop_tolerance_m", "slow_distance_m")):
+                # A successful gain/boundary change starts a fresh schedule;
+                # tracker state and unrelated navigation counters stay intact.
+                self._state.adaptive_fwd_scale = 1.0
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
@@ -824,7 +845,9 @@ class NaviPlugin:
                 "rate_hz": self._rate_hz,
                 "config": {**{key: getattr(self._config, key)
                               for key in _TUNING_FIELDS},
-                           "arrival_distance_m": self._config.arrival_distance_m},
+                           "arrival_distance_m": self._config.arrival_distance_m,
+                           "obstacle_stop_m": self._config.obstacle_stop_m,
+                           "slow_distance_m": self._config.slow_distance_m},
                 "published": self._published,
                 # (width, height) of the frame vop's boxes are in. (0, 0) means
                 # no declaration arrived and boxes cannot be used — see
@@ -843,7 +866,8 @@ class NaviPlugin:
                 "degraded": self._degradations(),
                 "last": ({"status": decision.status, "reason": decision.reason,
                           "distance_m": decision.distance_m,
-                          "bearing": decision.bearing}
+                          "bearing": decision.bearing,
+                          "k_fwd_effective": getattr(decision, "k_fwd_effective", None)}
                          if decision else None),
                 # **Coasting has to be visible here.** A robot walking towards a
                 # prediction and a robot walking towards something it can see
@@ -861,6 +885,12 @@ class NaviPlugin:
         if not self._running:
             return []
         out = []
+        if self._config.obstacle_stop_m >= self._config.arrival_distance_m:
+            out.append(
+                f"障碍停车距离 obstacle_stop_m={self._config.obstacle_stop_m:g} m "
+                f"达到或超过到达阈值 arrival_distance_m={self._config.arrival_distance_m:g} m；"
+                "目标可能先触发避障停车而无法到达。请结合实际底盘外廓核对距离设置；"
+                "自适应P不会降低避障停车距离")
         if not self._binding.get("depth_map"):
             out.append("只接了深度摘要，没有深度图 —— 距离按目标所在的三分之一"
                        "画面估计，精度明显变差；避障也退回按画面三等分判断，"
