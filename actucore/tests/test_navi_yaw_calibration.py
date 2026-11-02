@@ -87,6 +87,25 @@ def test_faster_or_delayed_response_chooses_a_more_conservative_gain():
     assert delayed["yaw_damping"] > nominal["yaw_damping"]
 
 
+def test_seven_hundred_fifty_ms_sdk_response_delay_is_measured_not_rejected():
+    # Match the observed Tianyi trace: the first pulse stays below the useful
+    # response threshold for about 0.75 s, then reaches a normal plateau.  This
+    # is an onset/ramp delay, not a 0.75 s transport delay applied forever.
+    _, result, _ = _run(override=lambda now, measured:
+                         0.0 if 1.0 <= now < 1.75 else measured)
+    assert result.status == "completed", result.reason
+    assert 0.65 < result.profile["delay_s"] <= 1.25
+    assert result.profile["k_yaw"] < _run()[1].profile["k_yaw"]
+
+
+def test_response_starting_after_the_one_point_two_five_second_bound_is_rejected():
+    _, result, _ = _run(override=lambda now, measured:
+                         0.0 if 1.0 <= now < 2.3 else measured)
+    assert result.status == "failed"
+    assert "left yaw response onset was missing or too delayed" == result.reason
+    assert result.values == [0.0] * 6 and result.profile is None
+
+
 def test_slow_but_measurable_response_is_not_tuned_above_the_nominal_gain():
     _, result, _ = _run(left=0.4, right=0.5, tau=0.15)
     assert result.status == "completed", result.reason

@@ -50,7 +50,12 @@ _PULSES = ((1.0, 3.0, 1.0), (3.0, 5.5, -1.0))
 _STABLE_WINDOW_S = 1.25
 _REST_S = 1.5
 _REVERSAL_TRANSIENT_S = 1.2
-_ONSET_LIMIT_S = (0.65, 1.25)
+# Tianyi's SDK action plus the chassis acceleration limiter can take roughly
+# 0.75 s before odometry first clears the 15% response threshold, even on the
+# initial pulse.  Use the same bounded limit as the stored delay profile for
+# both directions; the independent 300 ms command-heartbeat and 650 ms fresh-
+# observation guards still reject an actual control or feedback outage.
+_ONSET_LIMIT_S = (1.25, 1.25)
 _PROFILE_BOUNDS = {"k_yaw": (0.2, 1.2), "yaw_damping": (0.1, 0.5),
                    "response_gain": (0.15, 2.5), "delay_s": (0.0, 1.25),
                    "settling_s": (0.0, 1.5), "left_gain": (0.15, 2.5),
