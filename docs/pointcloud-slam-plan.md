@@ -11,17 +11,19 @@ the robot image before implementation and deployment.
 
 ### Implementation under review
 
-The feature branch merges PR #269 at the snapshot above. For Bumi the proposed
-path is the existing VO camera branch's `32FC1` depth image, whose depth source
-timestamp and aligned optical frame are already attached before publication.
-The companion Driver branch adds its runtime declaration. This branch is enabled
-only while the VO card's raw-input control is enabled; it is not an independent
-camera and is not a new SLAM input. The older public compressed depth still has
-publication timestamps and must not be used for the computational output.
+The feature branch merges PR #269 at the snapshot above. The independent Bumi
+Driver branch proposes a second Depth-card output: `32FC1` in metres, with the
+depth source's mapped capture timestamp, the aligned optical frame and a
+topic-specific runtime intrinsics declaration. It shares the existing camera
+pipeline and its frame-time mapper with VO but does not depend on the VO card's
+enable switch. The older public compressed depth still has publication
+timestamps and must not be used for the computational output.
 
-The point-cloud card's opt-in `metric_cloud: true` expects `mode: depth`,
-`sensor/depth-f32`, and explicitly configured measured `fx`, `fy`, `cx`, `cy`,
-`width`, and `height` for the actual aligned depth image. Enabling it asserts
+The point-cloud card's opt-in `metric_cloud: true` expects `sensor/depth-f32`
+and measured `fx`, `fy`, `cx`, `cy`, `width`, and `height` for the actual
+aligned depth image. They may come from explicit configuration or a matching
+runtime pinhole camera declaration; FOV fallbacks and unknown distortion are
+rejected. Canvas starts metric mode as depth automatically. Enabling it asserts
 that the upstream timestamp is capture time in a clock domain compatible with
 odometry; a ROS header alone cannot prove that assertion. It publishes
 `<input>/pointcloud_metric` as `sensor/pointcloud2` (`PointCloud2`, float32
@@ -34,6 +36,8 @@ queue to the cloud unchanged; no callback-arrival timestamp is substituted.
 The Core bridge maps `sensor/depth-f32` to Image and `sensor/pointcloud2` to
 PointCloud2. Canvas receives a JSON metadata preview (not a geometry stream)
 for these new formats; full messages including headers are consumed over ROS.
+Registration alone does not eagerly subscribe to these large streams; opening
+their preview does.
 The existing `sensor/pointcloud` visualization wire format remains unchanged.
 The new declarations and this bridge must be deployed together. This is a
 proposed integration for review by the point-cloud owner, not an agreed upstream

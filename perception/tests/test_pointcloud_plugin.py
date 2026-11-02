@@ -160,6 +160,56 @@ def test_canvas_metric_config_starts_depth_without_mode_argument():
     node.stop()
 
 
+def test_metric_cloud_accepts_calibrated_depth_declaration():
+    plugin, executor = _plugin()
+    plugin.dispatch("pointcloud", {"action": "config", "instance_id": "card-1", "metric_cloud": True})
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+                   "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
+                   "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.],
+                   "vendor": {"depth_unit": "m", "timestamp_semantics": "source_capture_mapped"}}
+    result = plugin.dispatch("pointcloud", {"action": "start", "instance_id": "card-1",
+                                            "input_topic": "/depth", "camera_info": [declaration]})
+    assert result["state"] == "running"
+    assert executor.nodes[0]._calibration == {"fx": 2., "fy": 2., "cx": 0., "cy": 0.,
+                                               "width": 2, "height": 1}
+    executor.nodes[0].stop()
+
+
+@pytest.mark.parametrize('source,model', [('manual', 'pinhole'), ('derived-from-K', 'unknown')])
+def test_metric_cloud_rejects_unverified_or_distorted_declaration(source, model):
+    plugin, executor = _plugin({"metric_cloud": True})
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+                   "id": "optical", "source": source, "distortion_model": model,
+                   "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
+    result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
+                                            "camera_info": [declaration]})
+    assert result["state"] == "error"
+    assert not executor.nodes
+
+
+def test_metric_cloud_rejects_declaration_without_capture_time_semantics():
+    plugin, executor = _plugin({"metric_cloud": True})
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+                   "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
+                   "width": 2, "height": 1, "K": [2., 0., 0., 0., 2., 0., 0., 0., 1.]}
+    result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
+                                            "camera_info": [declaration]})
+    assert result["state"] == "error"
+    assert not executor.nodes
+
+
+def test_metric_cloud_rejects_intrinsics_with_unhandled_skew():
+    plugin, executor = _plugin({"metric_cloud": True})
+    declaration = {"schema": "motus.camera/1", "topic": "/depth", "format": "sensor/depth-f32",
+                   "id": "optical", "source": "derived-from-K", "distortion_model": "pinhole",
+                   "width": 2, "height": 1, "K": [2., .2, 0., 0., 2., 0., 0., 0., 1.],
+                   "vendor": {"depth_unit": "m", "timestamp_semantics": "source_capture_mapped"}}
+    result = plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/depth",
+                                            "camera_info": [declaration]})
+    assert result["state"] == "error"
+    assert not executor.nodes
+
+
 def test_explicit_mono_mode_cannot_enable_metric_cloud():
     plugin, executor = _plugin({"metric_cloud": True, "calibration": {
         "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})

@@ -1572,6 +1572,27 @@ class PointCloudPerceptionPlugin:
             # metric contract itself unambiguously requires float depth.
             if metric_enabled and mode == "auto":
                 mode = "depth"
+            if metric_enabled and calibration is None and input_topic:
+                from plugins.camera_info import for_topic as _camera_for_topic
+                declared = _camera_for_topic(args.get("camera_info"), input_topic)
+                K = declared.get("K")
+                vendor = declared.get("vendor") or {}
+                try:
+                    matrix = np.asarray(K, dtype=float).reshape(3, 3)
+                    supported_K = (np.isfinite(matrix).all() and
+                                   np.allclose(matrix[2], [0., 0., 1.]) and
+                                   abs(matrix[0, 1]) < 1e-9 and abs(matrix[1, 0]) < 1e-9)
+                except (TypeError, ValueError):
+                    supported_K = False
+                if (declared.get("schema") == "motus.camera/1"
+                        and declared.get("format") == "sensor/depth-f32"
+                        and declared.get("source") == "derived-from-K"
+                        and declared.get("distortion_model") == "pinhole"
+                        and isinstance(vendor, dict) and vendor.get("depth_unit") == "m"
+                        and vendor.get("timestamp_semantics") == "source_capture_mapped"
+                        and isinstance(K, (list, tuple)) and len(K) == 9 and supported_K):
+                    calibration = dict(fx=K[0], fy=K[4], cx=K[2], cy=K[5],
+                                       width=declared.get("width"), height=declared.get("height"))
             if mode == "stereo":
                 if not (input_topic and right_topic):
                     return {"state": "error",
