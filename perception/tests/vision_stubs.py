@@ -157,6 +157,19 @@ class _FakeImage:
         self.height = height
         self.step = step
         self.is_bigendian = is_bigendian
+        self.header = _FakeHeader()
+
+
+class _FakePointCloud2:
+    def __init__(self):
+        self.header = _FakeHeader()
+
+
+class _FakePointField:
+    FLOAT32 = 7
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 class _FakeAudioChunk:
@@ -203,6 +216,8 @@ def _install_fake_ros():
     sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
     sensor_msgs_msg.CompressedImage = _FakeCompressedImage
     sensor_msgs_msg.Image = _FakeImage
+    sensor_msgs_msg.PointCloud2 = _FakePointCloud2
+    sensor_msgs_msg.PointField = _FakePointField
     std_msgs = types.ModuleType("std_msgs")
     std_msgs_msg = types.ModuleType("std_msgs.msg")
     std_msgs_msg.String = _FakeString

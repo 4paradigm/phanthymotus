@@ -45,7 +45,7 @@ from typing import Optional
 import numpy as np
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import CompressedImage, Image, PointCloud2, PointField
 from std_msgs.msg import String, UInt8MultiArray
 
 from plugins.pointcloud_math import (
@@ -176,6 +176,8 @@ TOOLS = [
                 "min_depth_m": {"type": "number", "description": "最近有效距离（米）", "default": 0.1, "scope": "instance"},
                 "max_depth_m": {"type": "number", "description": "最远有效距离（米）", "default": 10.0, "scope": "instance"},
                 "calibration": {"type": "string", "description": "标定 JSON 或 /models 下的标定文件路径", "scope": "instance"},
+                "metric_cloud": {"type": "boolean", "default": False, "scope": "instance",
+                                 "description": "启用计算输出；仅用于时间戳为采集时刻的 32FC1 米制深度和对应的实测内参"},
                 "cal_a": {"type": "number", "description": "mono 模式站点标定指数 a（d^a），同 visual_depth", "default": 1.0, "scope": "instance"},
                 "cal_b": {"type": "number", "description": "mono 模式站点标定偏移 b（乘 e^b），同 visual_depth", "default": 0.0, "scope": "instance"},
             },
@@ -184,10 +186,12 @@ TOOLS = [
             {"format": "image/jpeg", "desc": "mono / stereo（左右两路）输入"},
             {"format": "image/depth-z16", "desc": "16-bit 深度图输入（毫米）"},
             {"format": "image/depth-zlib", "desc": "zlib 压缩深度图输入"},
+            {"format": "sensor/depth-f32", "desc": "32FC1 米制深度图，计算模式要求采集时间和物理 frame"},
         ],
         "topic_out": [
             {"format": "sensor/pointcloud", "desc": "XYZ 点云二进制包（point_step=12, float32 LE）"},
             {"format": "data/json", "desc": "点数/范围/三区最近障碍摘要"},
+            {"format": "sensor/pointcloud2", "desc": "可选：带采集时间和物理坐标系的米制计算点云"},
         ],
     }
 ]
@@ -210,14 +214,19 @@ def _decode_depth_message(msg) -> tuple[Optional[np.ndarray], str]:
     global _zlib_fail_count
 
     if isinstance(msg, Image):
-        if msg.encoding not in ("16UC1", "mono16"):
+        if msg.encoding not in ("16UC1", "mono16", "32FC1"):
             return None, msg.encoding
+        itemsize = 4 if msg.encoding == "32FC1" else 2
         needed = int(msg.height) * int(msg.step)
-        if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2 or len(msg.data) < needed:
+        if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * itemsize or len(msg.data) < needed:
             return None, msg.encoding
-        dtype = np.dtype(">u2" if msg.is_bigendian else "<u2")
-        depth = np.frombuffer(msg.data[:needed], dtype=dtype).reshape(msg.height, msg.step // 2)
-        depth = depth[:, :msg.width].astype(np.float32) * 0.001
+        dtype = np.dtype((">" if msg.is_bigendian else "<") +
+                         ("f4" if itemsize == 4 else "u2"))
+        depth = np.ndarray((msg.height, msg.width), dtype=dtype,
+                           buffer=bytes(msg.data[:needed]), strides=(msg.step, itemsize))
+        depth = depth.astype(np.float32)
+        if itemsize == 2:
+            depth *= 0.001
         return depth, msg.encoding
 
     # CompressedImage: image/depth-zlib
@@ -288,6 +297,9 @@ class _PointCloudNode(Node):
 
         self._cloud_pub = self.create_publisher(UInt8MultiArray, self._cloud_topic, _PUB_QOS)
         self._summary_pub = self.create_publisher(String, self._summary_topic, _PUB_QOS)
+        self._metric_cloud_enabled = False
+        self._metric_cloud_topic = (input_topic or "/perception") + "/pointcloud_metric"
+        self._metric_cloud_pub = None
 
         self._subs: list = []
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -539,6 +551,38 @@ class _PointCloudNode(Node):
         xyz = backproject_depth(depth_m, fx, fy, cx, cy, stride,
                                  self._min_depth_m, self._max_depth_m)
         self._publish(xyz)
+        if self._metric_cloud_enabled and enc == "32FC1":
+            self._publish_metric(xyz, msg, w, h)
+
+    def _publish_metric(self, xyz, source, width, height):
+        # An opt-in asserts that this source's stamp is capture time. A header
+        # alone cannot distinguish capture time from publication time.
+        calibration = self._calibration
+        header = getattr(source, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if (not xyz.size or not isinstance(calibration, dict)
+                or calibration.get("width") != width or calibration.get("height") != height
+                or not all(k in calibration for k in ("fx", "fy", "cx", "cy"))
+                or not getattr(header, "frame_id", "") or stamp is None
+                or getattr(stamp, "sec", 0) <= 0
+                or not 0 <= getattr(stamp, "nanosec", -1) < 1_000_000_000):
+            return
+        try:
+            intrinsics = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
+            if not all(np.isfinite(intrinsics)) or min(intrinsics[:2]) <= 0:
+                return
+        except (TypeError, ValueError):
+            return
+        cloud = PointCloud2()
+        cloud.header = header
+        cloud.height, cloud.width = 1, len(xyz)
+        cloud.fields = [PointField(name=name, offset=i * 4, datatype=PointField.FLOAT32, count=1)
+                        for i, name in enumerate(("x", "y", "z"))]
+        cloud.is_bigendian = False
+        cloud.point_step, cloud.row_step = 12, 12 * len(xyz)
+        cloud.is_dense = True
+        cloud.data = np.ascontiguousarray(xyz, dtype="<f4").tobytes()
+        self._metric_cloud_pub.publish(cloud)
 
     # B: RGB → 单目深度引擎 → 反投影
     def _emit_mono(self, jpeg_bytes: bytes):
@@ -1113,6 +1157,9 @@ class PointCloudPerceptionPlugin:
                 cal_b=float(icfg.get("cal_b", self._cal_b)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
             )
+            node._metric_cloud_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
+            if node._metric_cloud_enabled:
+                node._metric_cloud_pub = node.create_publisher(PointCloud2, node._metric_cloud_topic, _PUB_QOS)
             if mode == "mono":
                 node._mono_model = self._model
             elif mode == "auto":
@@ -1447,14 +1494,16 @@ class PointCloudPerceptionPlugin:
             if instance_id and instance_id in nodes:
                 node = nodes[instance_id]
                 if node._input_topic:
-                    topics_in.append({"topic": node._input_topic, "format": "image/jpeg"})
+                    topics_in.append({"topic": node._input_topic,
+                                      "format": "sensor/depth-f32" if node._metric_cloud_enabled else "image/jpeg"})
                 if node._input_topic_right:
                     topics_in.append({"topic": node._input_topic_right, "format": "image/jpeg"})
             else:
                 for node in nodes.values():
                     if node._input_topic and all(t["topic"] != node._input_topic for t in topics_in):
                         topics_in.append({"topic": node._input_topic,
-                                          "format": "image/depth-z16" if node._mode == "depth" else "image/jpeg"})
+                                          "format": "sensor/depth-f32" if node._metric_cloud_enabled else
+                                                    "image/depth-z16" if node._mode == "depth" else "image/jpeg"})
                     if node._input_topic_right and all(t["topic"] != node._input_topic_right for t in topics_in):
                         topics_in.append({"topic": node._input_topic_right, "format": "image/jpeg"})
             # 每实例一对输出话题；多实例时不再用 output_topics_for(None)
@@ -1465,12 +1514,17 @@ class PointCloudPerceptionPlugin:
                     {"topic": node._cloud_topic, "format": "sensor/pointcloud"},
                     {"topic": node._summary_topic, "format": "data/json"},
                 ]
+                if node._metric_cloud_enabled:
+                    topics_out.append({"topic": node._metric_cloud_topic, "format": "sensor/pointcloud2"})
             else:
                 seen: set[str] = set()
                 topics_out: list[dict[str, str]] = []
                 for node in nodes.values():
-                    for topic, fmt in ((node._cloud_topic, "sensor/pointcloud"),
-                                       (node._summary_topic, "data/json")):
+                    outputs = [(node._cloud_topic, "sensor/pointcloud"),
+                               (node._summary_topic, "data/json")]
+                    if node._metric_cloud_enabled:
+                        outputs.append((node._metric_cloud_topic, "sensor/pointcloud2"))
+                    for topic, fmt in outputs:
                         if topic and topic not in seen:
                             seen.add(topic)
                             topics_out.append({"topic": topic, "format": fmt})
@@ -1571,6 +1625,19 @@ class PointCloudPerceptionPlugin:
                 except ValueError as error:
                     return {"state": "error", "message": str(error)}
             node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+            icfg = self._instance_configs.get(node_key, {})
+            metric_enabled = icfg.get("metric_cloud", self._plugin_cfg.get("metric_cloud", False)) is True
+            if metric_enabled:
+                if mode != "depth" or not isinstance(calibration, dict):
+                    return {"state": "error", "message": "metric_cloud requires depth mode and measured intrinsics"}
+                try:
+                    values = [float(calibration[k]) for k in ("fx", "fy", "cx", "cy")]
+                    dimensions = [calibration[k] for k in ("width", "height")]
+                    if (not all(np.isfinite(values)) or min(values[:2]) <= 0 or
+                            any(type(v) is not int or v <= 0 for v in dimensions)):
+                        raise ValueError
+                except (KeyError, TypeError, ValueError):
+                    return {"state": "error", "message": "metric_cloud requires finite measured fx/fy/cx/cy and image width/height"}
             # 先记录再起节点（同 visual_depth）：loading 期间 info() 也能回答；
             # 空声明同样记录 —— 重启不再带声明时要替换旧值而不是留过期镜头。
             # stereo 两路各记一份：声明层标定（_stereo_blob_from_declarations）
@@ -1681,6 +1748,8 @@ class PointCloudPerceptionPlugin:
                 self._max_depth_m = float(cfg["max_depth_m"])
             if "calibration" in cfg:
                 self._calibration = load_calibration_blob(cfg["calibration"])
+            if "metric_cloud" in cfg:
+                self._plugin_cfg["metric_cloud"] = cfg["metric_cloud"]
             if any(k in cfg for k in ("cal_a", "cal_b")):
                 self._cal_a = float(cfg.get("cal_a", self._cal_a))
                 self._cal_b = float(cfg.get("cal_b", self._cal_b))

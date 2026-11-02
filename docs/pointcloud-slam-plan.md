@@ -9,6 +9,39 @@ the robot image before implementation and deployment.
 
 ## Interface decisions and outstanding agreements
 
+### Implementation under review
+
+The feature branch merges PR #269 at the snapshot above. For Bumi the proposed
+path is the existing VO camera branch's `32FC1` depth image, whose depth source
+timestamp and aligned optical frame are already attached before publication.
+The companion Driver branch adds its runtime declaration. This branch is enabled
+only while the VO card's raw-input control is enabled; it is not an independent
+camera and is not a new SLAM input. The older public compressed depth still has
+publication timestamps and must not be used for the computational output.
+
+The point-cloud card's opt-in `metric_cloud: true` expects `mode: depth`,
+`sensor/depth-f32`, and explicitly configured measured `fx`, `fy`, `cx`, `cy`,
+`width`, and `height` for the actual aligned depth image. Enabling it asserts
+that the upstream timestamp is capture time in a clock domain compatible with
+odometry; a ROS header alone cannot prove that assertion. It publishes
+`<input>/pointcloud_metric` as `sensor/pointcloud2` (`PointCloud2`, float32
+little-endian XYZ in metres in the input's physical optical frame), while
+retaining both existing visualization and summary outputs. It rejects missing
+frame/stamp and uncalibrated or different-sized input. Only `32FC1` produces
+the computational output. The input header travels through the bounded worker
+queue to the cloud unchanged; no callback-arrival timestamp is substituted.
+
+The Core bridge maps `sensor/depth-f32` to Image and `sensor/pointcloud2` to
+PointCloud2. Canvas receives a JSON metadata preview (not a geometry stream)
+for these new formats; full messages including headers are consumed over ROS.
+The existing `sensor/pointcloud` visualization wire format remains unchanged.
+The new declarations and this bridge must be deployed together. This is a
+proposed integration for review by the point-cloud owner, not an agreed upstream
+contract. Real camera timestamp propagation, optics, TF, image build, and actual
+Canvas behavior still require target verification. In particular a hardware
+clock is mapped with an arrival-derived offset, an approximation rather than
+exposure synchronization; never describe this as exact absolute time.
+
 * Exactly two required connections: a pose-bearing odometry stream and a
   timestamped metric point cloud. Discover topics from runtime `info`; no
   robot-specific topic name or connection-order inference.

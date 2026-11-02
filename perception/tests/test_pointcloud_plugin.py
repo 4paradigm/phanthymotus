@@ -64,6 +64,106 @@ def _decode_cloud(raw: bytes) -> np.ndarray:
     return np.frombuffer(raw[8:], dtype="<f4").reshape(n, 3)
 
 
+@pytest.mark.parametrize("endian,big", [("<", 0), (">", 1)])
+def test_metric_float_depth_keeps_metres_with_row_padding(endian, big):
+    rows = [np.array([1.0, 2.5, 99.0], dtype=endian + "f4").tobytes(),
+            np.array([3.0, 4.0, 99.0], dtype=endian + "f4").tobytes()]
+    msg = _FakeImage(data=b"".join(rows), encoding="32FC1", width=2,
+                     height=2, step=12, is_bigendian=big)
+    result, encoding = pc._decode_depth_message(msg)
+    assert encoding == "32FC1"
+    np.testing.assert_allclose(result, [[1.0, 2.5], [3.0, 4.0]])
+
+
+def test_metric_float_depth_rejects_short_rows():
+    msg = _FakeImage(data=b"\0" * 12, encoding="32FC1", width=2,
+                     height=2, step=6)
+    assert pc._decode_depth_message(msg)[0] is None
+
+
+def test_metric_cloud_preserves_header_and_optical_coordinates():
+    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
+        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 2, "height": 1}})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    node = executor.nodes[0]
+    msg = _FakeImage(data=np.array([2., 2.], dtype="<f4").tobytes(),
+                     encoding="32FC1", width=2, height=1, step=8)
+    msg.header.frame_id = "rgb_optical"
+    msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+    node._emit_depth(msg)
+    pub = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
+    cloud = pub.raw_messages[0]
+    assert cloud.header.frame_id == "rgb_optical"
+    assert (cloud.header.stamp.sec, cloud.header.stamp.nanosec) == (123, 456)
+    assert cloud.point_step == 12 and cloud.row_step == 24
+    np.testing.assert_allclose(np.frombuffer(cloud.data, dtype="<f4").reshape(-1, 3),
+                               [[0, 0, 2], [1, 0, 2]])
+    assert _cloud_pub(node).messages  # existing visualization stays available
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert {"topic": "/depth/pointcloud_metric", "format": "sensor/pointcloud2"} in info["topic_out"]
+    assert {"topic": "/depth", "format": "sensor/depth-f32"} in info["topic_in"]
+    node.stop()
+
+
+def test_metric_cloud_refuses_unknown_frame_or_inferred_calibration():
+    plugin, executor = _plugin({"metric_cloud": True, "calibration": {
+        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    node = executor.nodes[0]
+    msg = _FakeImage(data=np.array([2.], dtype="<f4").tobytes(),
+                     encoding="32FC1", width=1, height=1, step=4)
+    msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+    node._emit_depth(msg)
+    pub = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
+    assert not pub.messages
+    msg.header.frame_id = "optical"
+    msg.header.stamp = types.SimpleNamespace(sec=0, nanosec=0)
+    node._emit_depth(msg)
+    assert not pub.messages
+    msg.header.stamp = types.SimpleNamespace(sec=123, nanosec=456)
+    msg.width = 2
+    msg.step = 8
+    msg.data = np.array([2., 2.], dtype="<f4").tobytes()
+    node._emit_depth(msg)
+    assert not pub.messages
+    node.stop()
+
+
+def test_metric_cloud_does_not_start_with_inferred_intrinsics():
+    plugin, executor = _plugin({"metric_cloud": True})
+    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    assert result["state"] == "error"
+    assert not executor.nodes
+
+
+def test_global_config_can_enable_metric_cloud():
+    plugin, executor = _plugin()
+    calibration = {"fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}
+    plugin.dispatch("pointcloud", {"action": "config", "metric_cloud": True, "calibration": calibration})
+    result = plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    assert result["state"] == "running"
+    assert executor.nodes[0]._metric_cloud_enabled
+    executor.nodes[0].stop()
+
+
+def test_metric_cloud_keeps_source_header_through_worker_queue():
+    plugin, executor = _plugin({"metric_cloud": True, "fps": 1000, "calibration": {
+        "fx": 2., "fy": 2., "cx": 0., "cy": 0., "width": 1, "height": 1}})
+    plugin.dispatch("pointcloud", {"action": "start", "mode": "depth", "input_topic": "/depth"})
+    node = executor.nodes[0]
+    msg = _FakeImage(data=np.array([2.], dtype="<f4").tobytes(),
+                     encoding="32FC1", width=1, height=1, step=4)
+    msg.header.frame_id = "optical"
+    msg.header.stamp = types.SimpleNamespace(sec=456, nanosec=789)
+    node._depth_image_cb(msg)
+    pub = next(p for p in node.publishers if p.topic == "/depth/pointcloud_metric")
+    assert _wait_until(lambda: bool(pub.raw_messages))
+    assert pub.raw_messages[0].header.stamp.sec == 456
+    assert pub.raw_messages[0].header.stamp.nanosec == 789
+    assert pub.raw_messages[0].header.frame_id == "optical"
+    node.stop()
+
+
 def _wait_cloud_and_summary(node):
     """等一对输出。_publish 先发云再发摘要，只等云就断言摘要会撞上
     中间态（review 指出的竞态），两个都等到才算一帧完整落地。"""
