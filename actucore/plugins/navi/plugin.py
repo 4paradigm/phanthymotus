@@ -75,9 +75,12 @@ TWIST_AXES = ["vx", "vy", "vz", "wx", "wy", "wz"]
 # These policy fields are shared by the operator's config dialog and the
 # config action. Defaults come from startup configuration, before a particular
 # downstream chassis adopts/clamps the effective policy limits.
-_TUNING_FIELDS = ("stop_distance_m", "stop_tolerance_m", "k_yaw", "k_fwd", "adaptive_k_fwd",
+_TUNING_FIELDS = ("stop_distance_m", "stop_tolerance_m", "adaptive_k_fwd",
                   "search_rate", "vx_max", "vy_max", "wz_max", "use_lateral")
 _BOOL_TUNING_FIELDS = frozenset(("use_lateral", "adaptive_k_fwd"))
+# Older saved canvases still send these keys on start. Nominal gains and the
+# automatic yaw mode belong to startup YAML, not runtime operator controls.
+_STARTUP_GAIN_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw"))
 
 
 def _sensor_qos():
@@ -208,15 +211,6 @@ class NaviPlugin:
                                                 "距离不大于 1.3 m 即满足距离条件；"
                                                 "仍需有效观测及原有对正条件。"
                                                 "默认 0，保持原行为"},
-            "k_yaw": {"type": "number", "minimum": 0,
-                      "title": "转向增益 k_yaw",
-                      "description": "目标偏离画面中心时的转向响应。越大纠正越快，"
-                                     "过大可能左右摆动；最终角速度仍受 wz_max 限制"},
-            "k_fwd": {"type": "number", "minimum": 0,
-                      "title": "前进增益 k_fwd",
-                      "description": "按目标距离误差计算前进速度的比例（1/s）。"
-                                     "越大接近越快；最终速度仍受 vx_max、避障和"
-                                     "下游底盘限制"},
             "adaptive_k_fwd": {"type": "boolean",
                                "title": "前进P自适应（按距离）",
                                "description": "根据剩余距离平滑调整前进P增益；"
@@ -716,6 +710,7 @@ class NaviPlugin:
             # A paused policy does not tick, so it cannot clear its own gain
             # schedule before resume. Keep the track, but restart gain gently.
             self._state.adaptive_fwd_scale = 1.0
+            self._state.adaptive_yaw_scale = 1.0
             self._paused = bool(halted)
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
@@ -761,7 +756,11 @@ class NaviPlugin:
 
     def _config_action(self, args: dict):
         changed = {}
+        ignored = []
         for key, value in (args or {}).items():
+            if key in _STARTUP_GAIN_FIELDS:
+                ignored.append(key)
+                continue
             field = policy_mod.Config.__dataclass_fields__.get(key)
             if field is None:
                 continue
@@ -805,17 +804,23 @@ class NaviPlugin:
                             key, policy_mod.Config.__dataclass_fields__[key].default)))
                 notes = policy_mod.adopt_limits(candidate, self._descriptor)
             if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
-                   for key in ("adaptive_k_fwd", "k_fwd", "stop_distance_m",
+                   for key in ("adaptive_k_fwd", "stop_distance_m",
                                "stop_tolerance_m", "slow_distance_m")):
                 # A successful gain/boundary change starts a fresh schedule;
                 # tracker state and unrelated navigation counters stay intact.
                 self._state.adaptive_fwd_scale = 1.0
+            if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
+                   for key in ("align_full_stop", "wz_max")):
+                self._state.adaptive_yaw_scale = 1.0
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
-            return {"status": "configured", "config": changed,
-                    "effective_config": {key: getattr(candidate, key)
-                                         for key in changed}}
+            result = {"status": "configured", "config": changed,
+                      "effective_config": {key: getattr(candidate, key)
+                                           for key in changed}}
+            if ignored:
+                result["ignored_parameters"] = ignored
+            return result
 
     def _info(self):
         with self._lock:
@@ -846,6 +851,9 @@ class NaviPlugin:
                 "config": {**{key: getattr(self._config, key)
                               for key in _TUNING_FIELDS},
                            "arrival_distance_m": self._config.arrival_distance_m,
+                           "k_fwd": self._config.k_fwd,
+                           "k_yaw": self._config.k_yaw,
+                           "adaptive_k_yaw": self._config.adaptive_k_yaw,
                            "obstacle_stop_m": self._config.obstacle_stop_m,
                            "slow_distance_m": self._config.slow_distance_m},
                 "published": self._published,
@@ -867,7 +875,8 @@ class NaviPlugin:
                 "last": ({"status": decision.status, "reason": decision.reason,
                           "distance_m": decision.distance_m,
                           "bearing": decision.bearing,
-                          "k_fwd_effective": getattr(decision, "k_fwd_effective", None)}
+                          "k_fwd_effective": getattr(decision, "k_fwd_effective", None),
+                          "k_yaw_effective": getattr(decision, "k_yaw_effective", None)}
                          if decision else None),
                 # **Coasting has to be visible here.** A robot walking towards a
                 # prediction and a robot walking towards something it can see

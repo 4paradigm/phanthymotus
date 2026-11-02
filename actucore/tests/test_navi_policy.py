@@ -2063,3 +2063,204 @@ def test_adaptive_forward_flag_is_strictly_boolean(value):
 def test_adaptive_forward_rejects_invalid_or_unbounded_baseline_gain(gain):
     with pytest.raises(ValueError, match="k_fwd"):
         _cfg(adaptive_k_fwd=True, k_fwd=gain)
+
+
+# ── bounded bearing-P yaw schedule ────────────────────────────────────────
+
+def test_default_gains_use_adaptive_yaw_and_fixed_forward_point_nine():
+    config = _cfg()
+    assert config.k_fwd == 0.9
+    assert config.adaptive_k_fwd is False
+    assert config.k_yaw == 1.2
+    assert config.adaptive_k_yaw is True
+
+
+def test_yaw_schedule_has_a_lower_gain_near_centre_and_never_exceeds_nominal():
+    config = _cfg()
+    settled = []
+    for bearing in (0.0, 0.1, 0.3, config.align_full_stop, 0.9):
+        state = _state()
+        for _ in range(10):
+            gain = P._yaw_gain(config, state, bearing, True, 0.1)
+            assert 0.5 * config.k_yaw <= gain <= config.k_yaw
+        settled.append(gain)
+    assert settled[0] == pytest.approx(0.5 * config.k_yaw)
+    assert all(a < b for a, b in zip(settled[:3], settled[1:4]))
+    assert settled[-2:] == pytest.approx([config.k_yaw, config.k_yaw])
+    positive, negative = _state(), _state()
+    assert P._yaw_gain(config, positive, 0.1, True, 0.1) == P._yaw_gain(
+        config, negative, -0.1, True, 0.1)
+
+
+def test_yaw_gain_changes_at_a_bounded_rate_in_both_directions():
+    config = _cfg()
+    state = _state()
+    P._yaw_gain(config, state, 0.0, True, 0.1)
+    assert state.adaptive_yaw_scale == pytest.approx(0.8)
+    for _ in range(8):
+        P._yaw_gain(config, state, 0.0, True, 0.1)
+    assert state.adaptive_yaw_scale == 0.5
+    P._yaw_gain(config, state, 1.0, True, 0.1)
+    assert state.adaptive_yaw_scale == pytest.approx(0.7)
+    P._yaw_gain(config, state, 1.0, True, 0.1)
+    assert state.adaptive_yaw_scale == pytest.approx(0.9)
+
+
+def test_yaw_schedule_does_not_jump_after_a_long_gap_or_nonpositive_tick():
+    config = _cfg()
+    state = _state()
+    P._yaw_gain(config, state, 0.0, True, 30.0)
+    assert state.adaptive_yaw_scale == pytest.approx(0.6)
+    for elapsed in (-1.0, 0.0, float("nan"), float("inf")):
+        before = state.adaptive_yaw_scale
+        P._yaw_gain(config, state, 0.0, True, elapsed)
+        assert state.adaptive_yaw_scale == before
+
+
+@pytest.mark.parametrize("bearing", [-0.2, 0.2])
+def test_adaptive_target_yaw_keeps_its_sign_and_can_turn_while_advancing(bearing, monkeypatch):
+    config = _cfg(use_lateral=False, floor_wz=0.0, wz_max=0.1)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    state = _adaptive_ready(config, distance=2.0, bearing=bearing)
+    decision = _adaptive_frame(config, state, distance=2.0, bearing=bearing)
+    assert decision.values[0] > 0.0
+    assert decision.values[5] * bearing < 0.0
+    assert abs(decision.values[5]) <= config.wz_max
+    assert 0.5 * config.k_yaw <= decision.k_yaw_effective <= config.k_yaw
+
+
+def test_fixed_yaw_mode_preserves_the_original_tracking_p_law(monkeypatch):
+    config = _cfg(adaptive_k_yaw=False, use_lateral=False, floor_wz=0.0)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    state = _adaptive_ready(config, distance=2.0, bearing=0.1)
+    state.adaptive_yaw_scale = 0.5
+    decision = _adaptive_frame(config, state, distance=2.0, bearing=0.1)
+    assert decision.values[5] == pytest.approx(-config.k_yaw * decision.bearing)
+    assert decision.k_yaw_effective == config.k_yaw
+    assert state.adaptive_yaw_scale == 1.0
+
+
+def test_turning_in_place_retains_the_scheduled_yaw_gain():
+    config = _cfg(align_min_scale=0.0, floor_wz=0.0)
+    state = _adaptive_ready(config, distance=2.0, bearing=0.9)
+    state.adaptive_yaw_scale = 0.5
+    decision = _adaptive_frame(config, state, distance=2.0, bearing=0.9)
+    assert decision.status == P.ALIGNING
+    assert decision.values[:2] == [0.0, 0.0]
+    assert state.adaptive_yaw_scale == pytest.approx(0.7)
+    assert decision.k_yaw_effective == pytest.approx(0.7 * config.k_yaw)
+
+
+def test_one_missed_frame_freezes_yaw_gain_and_reobservation_resumes_smoothly():
+    config = _cfg(use_lateral=False)
+    state = _adaptive_ready(config, distance=2.0, bearing=0.02)
+    for _ in range(6):
+        _adaptive_frame(config, state, distance=2.0, bearing=0.02)
+    before = state.adaptive_yaw_scale
+    assert before < 1.0
+    coast = _step(detections=_detections(), depth=_depth(map_=_solid_depth(2.0)),
+                  odom={"vx": 0.0, "vy": 0.0, "wz": 0.0}, config=config, state=state)
+    assert state.tracker.track is not None and not state.tracker.track.observed
+    assert coast.k_yaw_effective == pytest.approx(before * config.k_yaw)
+    assert state.adaptive_yaw_scale == before
+    resumed = _adaptive_frame(config, state, distance=2.0, bearing=0.02)
+    assert abs(state.adaptive_yaw_scale - before) <= 0.2 + 1e-12
+    assert resumed.k_yaw_effective is not None
+
+
+def test_an_in_range_prediction_also_freezes_gain_until_the_target_is_live(monkeypatch):
+    config = _cfg(use_lateral=False)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    state = _adaptive_ready(config, distance=1.0, bearing=0.02)
+    state.adaptive_yaw_scale = 0.6
+    # The old track is now inside the requested distance, but no fresh fix
+    # supports arrival. Its SEARCHING status is not a lost-track search sweep.
+    config.stop_distance_m = 1.1
+    decision = _step(detections=_detections(), depth=_depth(map_=_solid_depth(1.0)),
+                     odom={"vx": 0.0, "vy": 0.0, "wz": 0.0}, config=config, state=state)
+    assert decision.status == P.SEARCHING and not state.arrived
+    assert state.tracker.track is not None
+    assert state.adaptive_yaw_scale == 0.6
+
+
+@pytest.mark.parametrize("kind", ["blind", "arrived", "idle", "failed", "lost"])
+def test_yaw_schedule_resets_for_a_stopped_or_lost_target_session(kind):
+    config = _cfg(use_lateral=False)
+    state = _adaptive_ready(config, distance=2.0, bearing=0.02)
+    state.adaptive_yaw_scale = 0.6
+    if kind == "blind":
+        decision = _step(detections=None, depth=_depth(), config=config, state=state)
+        assert decision.status == P.BLIND
+    elif kind == "arrived":
+        state = _adaptive_ready(config, distance=0.79)
+        state.adaptive_yaw_scale = 0.6
+        decision = _adaptive_frame(config, state, distance=0.79)
+        assert decision.status == P.ARRIVED
+    elif kind == "idle":
+        state.target = ""
+        decision = _adaptive_frame(config, state, distance=2.0)
+        assert decision.status == P.IDLE
+    elif kind == "failed":
+        state.failed_reason = "test failure"
+        decision = _adaptive_frame(config, state, distance=2.0)
+        assert decision.status == P.FAILED
+    else:
+        for _ in range(30):
+            decision = _step(detections=_detections(), depth=_depth(),
+                             odom={"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                             config=config, state=state)
+            if state.tracker.track is None:
+                break
+        assert state.tracker.track is None and decision.status == P.SEARCHING
+    assert state.adaptive_yaw_scale == 1.0
+    assert decision.k_yaw_effective is None
+    assert _state(target="another target").adaptive_yaw_scale == 1.0
+
+
+def test_search_speed_does_not_use_the_target_bearing_gain():
+    outputs = []
+    for adaptive in (False, True):
+        config = _cfg(adaptive_k_yaw=adaptive, search_rate=0.3)
+        state = _state(missing_frames=config.lost_frames)
+        state.adaptive_yaw_scale = 0.5
+        decision = _step(detections=_detections(), depth=_depth(), config=config, state=state)
+        assert decision.status == P.SEARCHING
+        assert decision.k_yaw_effective is None
+        assert state.adaptive_yaw_scale == 1.0
+        outputs.append(decision.values[5])
+    assert outputs == pytest.approx([-0.3, -0.3])
+
+
+def test_obstacle_gap_turns_keep_their_nominal_gain_and_do_not_claim_tracking_gain(monkeypatch):
+    config = _cfg(use_lateral=False, stop_distance_m=0.3, floor_wz=0.0)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs:
+                        (5.0, 1.0) if kwargs.get("lateral_offset_m") else (0.4, 1.0))
+    state = _adaptive_ready(config, distance=1.2, bearing=0.02)
+    state.adaptive_yaw_scale = 0.5
+    decision = _adaptive_frame(config, state, distance=1.2, bearing=0.02)
+    expected = min(config.wz_max, config.k_yaw * math.atan2(P._keepout_m(config), 0.4))
+    assert decision.status == P.AVOIDING
+    assert decision.values[0] == 0.0
+    assert abs(decision.values[5]) == pytest.approx(expected)
+    assert decision.k_yaw_effective is None
+
+
+def test_zero_nominal_yaw_gain_does_not_acquire_an_artificial_target_turn(monkeypatch):
+    config = _cfg(k_yaw=0.0, use_lateral=False, floor_wz=0.4)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (5.0, 1.0))
+    state = _adaptive_ready(config, distance=2.0, bearing=0.2)
+    decision = _adaptive_frame(config, state, distance=2.0, bearing=0.2)
+    assert decision.values[5] == 0.0
+    assert decision.k_yaw_effective == 0.0
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_adaptive_yaw_flag_is_strictly_boolean(value):
+    with pytest.raises(ValueError, match="adaptive_k_yaw"):
+        _cfg(adaptive_k_yaw=value)
+
+
+@pytest.mark.parametrize("gain", [-0.1, float("nan"), float("inf"), True])
+def test_adaptive_yaw_rejects_invalid_nominal_gain(gain):
+    with pytest.raises(ValueError, match="k_yaw"):
+        _cfg(adaptive_k_yaw=True, k_yaw=gain)

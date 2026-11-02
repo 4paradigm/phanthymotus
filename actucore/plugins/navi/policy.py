@@ -87,6 +87,8 @@ IDLE = "idle"
 ADAPTIVE_FWD_MAX_SCALE = 3.0
 ADAPTIVE_FWD_SCALE_RATE = 2.0  # maximum scale change per second
 ADAPTIVE_FWD_MAX_DT = 0.2     # a long scheduling gap must not jump the gain
+ADAPTIVE_YAW_MIN_SCALE = 0.5
+ADAPTIVE_YAW_MAX_SCALE = 1.0
 
 
 @dataclass
@@ -153,8 +155,9 @@ class Config:
     # the path an arc instead of a sequence of stops.
     align_min_scale: float = 0.45
     k_yaw: float = 1.2
-    k_fwd: float = 0.6
+    k_fwd: float = 0.9
     adaptive_k_fwd: bool = False
+    adaptive_k_yaw: bool = True
     vx_max: float = 1.0
     vy_max: float = 1.0
     wz_max: float = 1.5
@@ -332,19 +335,23 @@ class Config:
     floor_wz_moving: float = 0.0
 
     def __post_init__(self):
-        if type(self.adaptive_k_fwd) is not bool:
-            raise ValueError("adaptive_k_fwd must be a boolean")
-        if self.adaptive_k_fwd:
-            if isinstance(self.k_fwd, bool):
-                raise ValueError("adaptive k_fwd must be finite and nonnegative")
+        for flag in ("adaptive_k_fwd", "adaptive_k_yaw"):
+            if type(getattr(self, flag)) is not bool:
+                raise ValueError(f"{flag} must be a boolean")
+        for key, adaptive, maximum in (("k_fwd", self.adaptive_k_fwd, ADAPTIVE_FWD_MAX_SCALE),
+                                       ("k_yaw", self.adaptive_k_yaw, ADAPTIVE_YAW_MAX_SCALE)):
+            if not adaptive:
+                continue
+            if isinstance(getattr(self, key), bool):
+                raise ValueError(f"adaptive {key} must be finite and nonnegative")
             try:
-                base_gain = float(self.k_fwd)
+                base_gain = float(getattr(self, key))
             except (TypeError, ValueError, OverflowError) as error:
-                raise ValueError("adaptive k_fwd must be finite and nonnegative") from error
+                raise ValueError(f"adaptive {key} must be finite and nonnegative") from error
             if (not math.isfinite(base_gain) or base_gain < 0
-                    or not math.isfinite(base_gain * ADAPTIVE_FWD_MAX_SCALE)):
-                raise ValueError("adaptive k_fwd and its maximum must be finite and nonnegative")
-            self.k_fwd = base_gain
+                    or not math.isfinite(base_gain * maximum)):
+                raise ValueError(f"adaptive {key} and its maximum must be finite and nonnegative")
+            setattr(self, key, base_gain)
         for key in ("stop_distance_m", "stop_tolerance_m"):
             value = getattr(self, key)
             if isinstance(value, bool):
@@ -425,6 +432,7 @@ class State:
     searched_rad: float = 0.0
     commanded_vx: float = 0.0
     adaptive_fwd_scale: float = 1.0
+    adaptive_yaw_scale: float = 1.0
     moving_for_s: float = 0.0
     close_for_s: float = 0.0
     idle_for_s: float = 0.0
@@ -445,6 +453,7 @@ class Decision:
     distance_m: float | None = None
     bearing: float | None = None
     k_fwd_effective: float | None = None
+    k_yaw_effective: float | None = None
 
     @property
     def publishes(self) -> bool:
@@ -800,6 +809,9 @@ def step(*, detections, depth, odom, config: Config, state: State,
         # Do not carry an increased approach gain through a hold, search or
         # blocked corridor and release it as a jump on the next approach.
         state.adaptive_fwd_scale = 1.0
+    if (decision.values is None
+            or decision.status in (ARRIVED, FAILED, IDLE, BLIND)):
+        state.adaptive_yaw_scale = 1.0
     # Remember what we asked for, so the tracker can compensate for our own
     # motion on the next tick even with no odometry wired.
     if decision.values is not None:
@@ -833,6 +845,33 @@ def _forward_gain(config: Config, state: State, distance, live: bool,
     change = ADAPTIVE_FWD_SCALE_RATE * elapsed
     state.adaptive_fwd_scale = max(previous - change, min(previous + change, target))
     return config.k_fwd * state.adaptive_fwd_scale
+
+
+def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
+              dt: float) -> float:
+    """Schedule only the gain applied to the current target's bearing.
+
+    Large offsets retain the nominal response. Near the image centre, reducing
+    gain limits repeated over-corrections. This uses no turn history or latency
+    compensation; search speed and obstacle-gap turns remain separate laws.
+    """
+    if not config.adaptive_k_yaw:
+        state.adaptive_yaw_scale = 1.0
+        return config.k_yaw
+    previous = max(ADAPTIVE_YAW_MIN_SCALE,
+                   min(ADAPTIVE_YAW_MAX_SCALE, state.adaptive_yaw_scale))
+    if not live:
+        # Brief coasting still emits a predicted turn. Keep its last gain,
+        # rather than jumping back to nominal on a single missed observation.
+        # A true loss of track resets the schedule in `_search`.
+        state.adaptive_yaw_scale = previous
+        return config.k_yaw * previous
+    fraction = min(1.0, max(0.0, abs(bearing) / max(1e-6, config.align_full_stop)))
+    target = ADAPTIVE_YAW_MIN_SCALE + (ADAPTIVE_YAW_MAX_SCALE - ADAPTIVE_YAW_MIN_SCALE) * fraction
+    elapsed = min(ADAPTIVE_FWD_MAX_DT, max(0.0, dt)) if math.isfinite(dt) else 0.0
+    change = ADAPTIVE_FWD_SCALE_RATE * elapsed
+    state.adaptive_yaw_scale = max(previous - change, min(previous + change, target))
+    return config.k_yaw * state.adaptive_yaw_scale
 
 
 def _ego_twist(odom, state: State):
@@ -930,7 +969,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # depends on something not known yet at this point — whether the robot ends
     # up translating — so the decision is deferred to `_finalise_yaw` once vx is
     # settled. See `floor_wz_moving`.
-    raw_wz = _clamp(-config.k_yaw * bearing, config.wz_max)
+    live = track.observed
+    yaw_gain = _yaw_gain(config, state, bearing, live, dt)
+    raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
 
     within = distance is not None and distance <= config.arrival_distance_m
     if within:
@@ -953,7 +994,6 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # declare the journey over, so arrival needs a live fix. Without one the
     # code below falls through to the obstacle logic, which will stop for the
     # thing that is actually there and say so.
-    live = track.observed
     if within and live and (abs(bearing) <= config.arrive_align_tol
                             or state.close_for_s >= config.arrive_patience_s):
         state.arrived = True
@@ -988,7 +1028,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         wz = _finalise_yaw(raw_wz, False, bearing, config, state, dt)
         return Decision(_twist(0.0, 0.0, wz), ALIGNING,
                         f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
-                        distance_m=distance, bearing=bearing)
+                        distance_m=distance, bearing=bearing,
+                        k_yaw_effective=yaw_gain)
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
@@ -1027,6 +1068,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     vx, vy = _approach(speed if driving else 0.0, bearing, depth, config,
                        state, dt)
+    tracking_wz = raw_wz
     vx, vy, raw_wz, status, reason = _avoid(vx, vy, raw_wz, depth, config,
                                             status, reason, state)
     if within and config.stop_tolerance_m > 0 and (vx or vy):
@@ -1062,7 +1104,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     state.commanded_vx = vx
     return Decision(_twist(vx, vy, wz), status, reason,
                     distance_m=distance, bearing=bearing,
-                    k_fwd_effective=forward_gain if distance is not None and not within else None)
+                    k_fwd_effective=forward_gain if distance is not None and not within else None,
+                    k_yaw_effective=yaw_gain if raw_wz == tracking_wz else None)
 
 
 def _account_idle(decision: Decision, state: State, config: Config,
@@ -1466,6 +1509,7 @@ def _search(config: Config, state: State, dt: float, odom=None) -> Decision:
     every extra second of spin sweeps the shoulders through space no corridor
     has checked.
     """
+    state.adaptive_yaw_scale = 1.0
     state.missing_frames += 1
     if state.missing_frames < config.lost_frames:
         # Briefly occluded — a person walking past. Emitting nothing for a few

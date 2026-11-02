@@ -200,7 +200,7 @@ plugins:
   # 卡片名要和 main.py 里 ActuCoreBundle 的注册块、以及插件的 PREFIX 对上。
 
   navi:
-    # 常用跟随参数也可在卡片配置中调整：k_yaw、k_fwd、adaptive_k_fwd、search_rate、
+    # 常用跟随参数也可在卡片配置中调整：adaptive_k_fwd、search_rate、
     # vx_max、vy_max、wz_max、use_lateral；其余策略细节仍在本文件。
     # 画布每次 config 会带上 schema 默认值，因此这些字段的表单默认值读取
     # 本文件的启动配置，不能用另一套常量覆盖它，也不能沿用旧底盘协商后的值。
@@ -262,6 +262,11 @@ plugins:
     # 默认 0.0 保持原行为；例如 1.2 + 0.1 表示距离不大于 1.3 m 满足距离条件。
     # 仍需有效观测及原有对正条件，不会用容差跳过这些判断。
     stop_tolerance_m: 0.0
+    # 前进P基准（1/s），不再提供手动增益表单；高级启动配置仍可覆盖。
+    k_fwd: 0.9
+    # 转向P按目标偏移有界调度：名义 k_yaw 默认 1.2，倍率 0.5–1，
+    # 每秒最多变化 2；搜索/避障转向规则和角速度上限保持原有约束。
+    adaptive_k_yaw: true
     # 前进P按距离有界调度：倍率为 k_fwd 的 1–3 倍，每秒最多变化 2。
     # 不改变限速、避障或到达阈值；不能修正深度测距偏差。
     adaptive_k_fwd: false
