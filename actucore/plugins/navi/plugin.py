@@ -318,7 +318,7 @@ class NaviPlugin:
                         "params": [],
                         "description": "一键转向校准：卡片运行且无导航目标时，先向一侧"
                                        "转动，再保持同一底盘速度动作直接平滑反转，按实测"
-                                       "里程计生成并保存本机转向P和阻尼。"
+                                       "里程计生成并保存本机转向P。"
                                        "约10秒，会使底盘以±0.5rad/s转动；只能由操作者在"
                                        "离开充电桩的空旷场地手动发起，失败后不得自动重试。"
                                        "要求连接非空跑底盘及有效 odom.wz；实测反馈允许"
@@ -771,7 +771,7 @@ class NaviPlugin:
 
     def _apply_yaw_profile(self, profile):
         self._config = replace(self._config, calibrated_yaw_gain=profile["k_yaw"],
-                               yaw_damping=profile["yaw_damping"], adaptive_k_yaw=False)
+                               yaw_damping=0.0, adaptive_k_yaw=False)
         self._state.adaptive_yaw_scale = 1.0
         self._yaw_profile = dict(profile)
 
@@ -886,7 +886,20 @@ class NaviPlugin:
         action_id, self._calibration_action_id = self._calibration_action_id, ""
         if action_id:
             status = "completed" if report["status"] == "completed" else "failed"
-            threading.Thread(target=self._post_acp, args=(action_id, status, dict(report)),
+            completion = dict(report)
+            if status == "completed":
+                profile = report["profile"]
+                # Keep the successful ACP result short enough for the collector
+                # to show it in full. Detailed samples remain available via
+                # navi info, while the value the operator needs is top-level.
+                completion = {"status": "completed",
+                              "p": profile["k_yaw"],
+                              "k_yaw": profile["k_yaw"],
+                              "k_fwd": self._config.k_fwd,
+                              "noisy_odom": profile.get("noisy_odom", False),
+                              "elapsed_s": result.elapsed_s,
+                              "samples": result.samples}
+            threading.Thread(target=self._post_acp, args=(action_id, status, completion),
                              daemon=True, name="navi_cal_acp").start()
 
     def _cancel_calibration(self, reason):
@@ -1093,7 +1106,6 @@ class NaviPlugin:
                            "adaptive_k_fwd": self._config.adaptive_k_fwd,
                            "k_yaw": self._config.k_yaw,
                            "calibrated_yaw_gain": self._config.calibrated_yaw_gain,
-                           "yaw_damping": self._config.yaw_damping,
                            "adaptive_k_yaw": self._config.adaptive_k_yaw,
                            "obstacle_stop_m": self._config.obstacle_stop_m,
                            "slow_distance_m": self._config.slow_distance_m},
@@ -1105,8 +1117,6 @@ class NaviPlugin:
                                       if self._config.calibrated_yaw_gain is not None
                                       else self._config.k_yaw),
                             "effective": getattr(decision, "k_yaw_effective", None),
-                            "damping": self._config.yaw_damping,
-                            "damping_effective": getattr(decision, "yaw_damping_effective", None),
                             "source": "calibrated" if self._yaw_profile else "default"}},
                 "calibration": dict(self._calibration_report),
                 # (width, height) of the frame vop's boxes are in. (0, 0) means
@@ -1128,8 +1138,7 @@ class NaviPlugin:
                           "distance_m": decision.distance_m,
                           "bearing": decision.bearing,
                           "k_fwd_effective": getattr(decision, "k_fwd_effective", None),
-                          "k_yaw_effective": getattr(decision, "k_yaw_effective", None),
-                          "yaw_damping_effective": getattr(decision, "yaw_damping_effective", None)}
+                          "k_yaw_effective": getattr(decision, "k_yaw_effective", None)}
                          if decision else None),
                 # **Coasting has to be visible here.** A robot walking towards a
                 # prediction and a robot walking towards something it can see

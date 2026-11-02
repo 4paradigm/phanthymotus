@@ -782,7 +782,7 @@ def test_all_exposed_tuning_fields_update_and_can_be_read_back():
                                       "stop_tolerance_m": 0.0, "arrival_distance_m": 0.8,
                                       "adaptive_k_fwd": False, "obstacle_stop_m": 0.6,
                                       "k_fwd": 0.9, "k_yaw": 0.6, "adaptive_k_yaw": True,
-                                      "calibrated_yaw_gain": None, "yaw_damping": 0.0,
+                                      "calibrated_yaw_gain": None,
                                       "slow_distance_m": 1.5}
     schema = card.get_tools()[0]["configSchema"]["properties"]
     assert {key: schema[key]["default"] for key in configured} == configured

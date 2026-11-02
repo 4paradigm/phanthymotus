@@ -131,7 +131,7 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 | `use_lateral` | 允许横移；天轶轮式底盘设为 false | true |
 
 前进P默认固定为 0.9（1/s）。转向未标定时按目标偏移调度，标定后采用该机器人测得的
-固定P与实测角速度阻尼。表单和 `config` 不再提供
+固定P；运行控制始终是纯P。表单和 `config` 不再提供
 前进/转向增益或前进P自适应开关。`info.config` 仍返回 `k_fwd`、`k_yaw`、
 `adaptive_k_fwd` 和 `adaptive_k_yaw` 的只读值。旧画布发送这四个参数会被忽略，返回
 `ignored_parameters`，同一批中的其他有效参数照常应用。高级启动 YAML 的兼容项保留，
@@ -187,11 +187,12 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 任务结束会重置。切换目标、停止导航或暂停/恢复也会重置调度，保留原有跟踪与停车条件。
 
 `calibrate_yaw` 会让底盘原地进行两次转向，测量实际响应。成功后，目标跟随改用
-固定的标定P（0.2–1.2）与角速度阻尼系数（0–0.5）：
-`wz = 限幅(-P × 目标偏移 - 阻尼 × 实测 odom.wz)`。
-无有效实测角速度时不使用阻尼，不会拿上一次指令速度冒充反馈。搜索仍使用
+固定的标定P（0.2–1.2），运行控制保持纯P：
+`wz = 限幅(-P × 目标偏移)`。
+`odom.wz` 只用于标定和自身运动估计，不再反馈到转向命令。搜索仍使用
 `search_rate`，绕障转向仍按原有规则与名义增益，最终转速受 `wz_max` 和底盘限制。
 这是一种有界、保守的转向响应启发式标定，不保证最优，不是完整 PID 整定或在线学习。
+旧 profile 中的 `yaw_damping` 只为文件兼容而读取，加载时强制归零，不再参与控制。
 若里程计通过 REST 读取且只有接收时间戳，估计的延迟会包含采样与传输延迟。
 
 开始前，`navi` 须已启动且未暂停、无活动导航目标；先调用 `stop_navigation`。
@@ -199,8 +200,8 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 0.5rad/s，导航转速上限不低于 0.5rad/s，指令频率至少 10Hz。
 `state/odom` 须提供有限的实测 `wz` 与持续变化的样本时间戳。标定脉冲期间允许
 反馈最长间隔 650ms，以兼容天轶 REST 聚合轮询的抖动；10Hz 指令流本身仍要求相邻
-指令不超过 300ms。标定后用于实时转向阻尼的反馈仍要求不超过 300ms；
-开始时底盘须停止（实测角速度不超过 0.03rad/s）。这些前提不满足时会拒绝标定。
+指令不超过 300ms。开始时底盘须停止（实测角速度不超过 0.03rad/s）。
+这些前提不满足时会拒绝标定。
 
 先由操作者把机器人移出充电桩，确认周围可原地转向且没有人员、线缆或障碍，再依次调用
 下面两条命令。标定会实际驱动底盘，不需要设置目标；失败后不得由 Agent 自动重试：
@@ -221,16 +222,18 @@ curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"j
 1.5rad、总计 2.8rad 和实测角速度 0.75rad/s 为硬上限，超出立即失败并发送零速。
 较长的采样窗口可以在约 4Hz 的实测反馈下取得足够样本；期间仍检查反馈、指令连续性、
 累计转角与最终停止情况。两侧首次有效角速度响应允许最多 1.25 秒，并把实测延迟计入
-最终转向P和阻尼；这不会放宽 300ms 指令连续性或 650ms 反馈新鲜度检查。异常会
+最终转向P；这不会放宽 300ms 指令连续性或 650ms 反馈新鲜度检查。异常会
 结束标定。动作异步返回 `action_id`，完成或失败通过 `action_complete` 回调报告。
+成功回调保持为短结果，直接返回 `p`/`k_yaw`、固定前进P `k_fwd`、样本数与耗时；
+完整样本诊断留在 `navi info`，避免成功日志因过长而看不到最终P。
 若某侧末尾四个同方向有效读数中只有一个尖峰，标定可剔除该点，但剩余三个仍须通过
-原来的严格稳定性检查；此时只保存稳健估计的转向P，设置 `noisy_odom: true` 并将
-`yaw_damping` 置零，避免把同一路反馈噪声重新注入控制。零值、反向、交替振荡或两个
+原来的严格稳定性检查；此时保存稳健估计的转向P并设置 `noisy_odom: true`。
+零值、反向、交替振荡或两个
 异常点仍会拒绝标定。
 调用 `pause`、`stop` 或 `stop_navigation` 会先发送零速再取消。标定结束保持停车，
 不会自动恢复之前的导航目标；需要导航时重新调用 `navigate_to`。
 
-用 `info` 查看进度、两个P及阻尼，无需展开长日志：
+用 `info` 查看进度和两个P，无需展开长日志：
 
 ```bash
 curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"navi","arguments":{"action":"info"}}}' | python3 -c 'import json,sys; r=json.load(sys.stdin); d=json.loads(r["result"]["content"][0]["text"]); print(json.dumps({k:d.get(k) for k in ("gains","calibration")},ensure_ascii=False,indent=2))'
@@ -242,15 +245,14 @@ curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"j
 {
   "gains": {
     "forward": {"base": 0.9, "effective": null},
-    "yaw": {"base": 0.6, "effective": null, "damping": 0.0, "damping_effective": null, "source": "default"}
+    "yaw": {"base": 0.6, "effective": null, "source": "default"}
   },
   "calibration": {"status": "not_calibrated"}
 }
 ```
 
 `base` 是当前基准，`effective` 是最近一拍实际使用的P；没有使用该增益时返回 null。
-`damping_effective` 是该拍实际使用的阻尼：无有效实测角速度时为 0，不处于目标转向时
-为 null。`source: calibrated` 表示已应用标定结果。`calibration.status` 报告当前状态，
+`source: calibrated` 表示已应用标定结果。`calibration.status` 报告当前状态，
 标定期间还会提供 `phase` 与 `samples`；成功或加载已有结果后，`profile` 给出实测响应
 与所选参数。`info.last.k_fwd_effective`、`k_yaw_effective` 也保留用于逐拍诊断。
 

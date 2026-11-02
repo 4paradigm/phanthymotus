@@ -63,7 +63,7 @@ def test_nominal_two_pulse_response_completes_with_zero_and_a_bounded_profile():
     assert C.validate_profile(profile, "robot-one") == profile
     assert profile["response_gain"] == pytest.approx(1.0)
     assert 0.2 <= profile["k_yaw"] <= 1.2
-    assert 0.1 <= profile["yaw_damping"] <= 0.5
+    assert profile["yaw_damping"] == 0.0
     assert {sample.phase for sample in history} >= {
         "settle", "left", "right", "rest_right", "completed"}
     assert all(sample.values[:5] == [0.0] * 5 for sample in history)
@@ -84,7 +84,7 @@ def test_faster_or_delayed_response_chooses_a_more_conservative_gain():
     assert fast["k_yaw"] < nominal["k_yaw"]
     assert delayed["delay_s"] > nominal["delay_s"]
     assert delayed["k_yaw"] < nominal["k_yaw"]
-    assert delayed["yaw_damping"] > nominal["yaw_damping"]
+    assert delayed["yaw_damping"] == nominal["yaw_damping"] == 0.0
 
 
 def test_seven_hundred_fifty_ms_sdk_response_delay_is_measured_not_rejected():
@@ -335,7 +335,7 @@ def test_profile_round_trip_is_per_robot_and_path_components_are_hashed(tmp_path
         assert path.stat().st_mode & 0o777 == 0o600
 
 
-def test_legacy_profile_without_noise_marker_loads_with_damping_enabled(tmp_path):
+def test_legacy_profile_without_noise_marker_loads_with_damping_disabled(tmp_path):
     profile = dict(_run()[1].profile)
     profile.pop("noisy_odom")
     path = C.profile_path(tmp_path, "robot-one")
@@ -343,7 +343,7 @@ def test_legacy_profile_without_noise_marker_loads_with_damping_enabled(tmp_path
     path.write_text(json.dumps(profile), encoding="utf-8")
     loaded = C.load_profile(tmp_path, "robot-one")
     assert loaded["noisy_odom"] is False
-    assert loaded["yaw_damping"] > 0
+    assert loaded["yaw_damping"] == 0.0
 
 
 @pytest.mark.parametrize("field,value", [
@@ -359,10 +359,9 @@ def test_invalid_profiles_are_rejected_before_writing(tmp_path, field, value):
     assert not list(tmp_path.iterdir())
 
 
-def test_noisy_profile_cannot_reenable_raw_odom_damping():
+def test_legacy_nonzero_damping_is_normalized_to_zero():
     profile = dict(_run()[1].profile, noisy_odom=True, yaw_damping=0.1)
-    with pytest.raises(ValueError, match="must disable yaw damping"):
-        C.validate_profile(profile, "robot-one")
+    assert C.validate_profile(profile, "robot-one")["yaw_damping"] == 0.0
 
 
 def test_invalid_json_and_wrong_identity_remain_reportable_load_errors(tmp_path):

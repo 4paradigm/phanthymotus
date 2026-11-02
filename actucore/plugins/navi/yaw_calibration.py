@@ -97,11 +97,13 @@ def validate_profile(profile, robot_key):
         if not lower <= value <= upper:
             raise ValueError(f"{name} is outside calibration bounds [{lower}, {upper}]")
         result[name] = value
+    # v1 profiles created by earlier images may contain a non-zero D-like
+    # angular-rate damping term.  Accept the file for its measured P, but never
+    # reactivate that retired feedback path.
+    result["yaw_damping"] = 0.0
     noisy_odom = profile.get("noisy_odom", False)
     if type(noisy_odom) is not bool:
         raise ValueError("noisy_odom must be a boolean")
-    if noisy_odom and result["yaw_damping"] != 0.0:
-        raise ValueError("a noisy odom profile must disable yaw damping")
     result["noisy_odom"] = noisy_odom
     low, high = sorted((result["left_gain"], result["right_gain"]))
     if high > 2.5 * low:
@@ -453,12 +455,9 @@ class YawCalibration:
         # gain. Fast response, delay and residual motion all reduce gain.
         k_yaw = max(0.2, min(1.2, 1.2 / (max(1.0, response_gain)
                                         * (1.0 + 4.0 * delay + 1.5 * settle))))
-        damping = (0.0 if filtered_outlier else
-                   max(0.1, min(0.5, 0.1 + 0.4 * delay + 0.4 * settle
-                                + 0.1 * max(0.0, response_gain - 1.0))))
         profile = {"schema": SCHEMA, "robot_key": self.robot_key,
                    "created_at_ms": int(time.time() * 1000), "k_yaw": k_yaw,
-                   "yaw_damping": damping, "response_gain": response_gain,
+                   "yaw_damping": 0.0, "response_gain": response_gain,
                    "delay_s": delay, "settling_s": settle,
                    "left_gain": gains[0], "right_gain": gains[1],
                    "noisy_odom": filtered_outlier}

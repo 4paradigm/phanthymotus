@@ -134,10 +134,16 @@ def test_calibration_uses_real_odom_and_guarded_command_stream_then_persists(rig
     assert all(command["obs_stamp_ms"] == command["stamp_ms"] for command in commands)
     assert info["target"] == "" and card._calibration is None
     assert card.events[-1][0:2] == (result["action_id"], "completed")
+    completion = card.events[-1][2]
+    assert completion["p"] == completion["k_yaw"] == info["calibration"]["profile"]["k_yaw"]
+    assert completion["k_fwd"] == 0.9
+    assert completion["elapsed_s"] == pytest.approx(10.0)
+    assert completion["samples"] > 0
     assert info["gains"]["forward"]["base"] == 0.9
     assert info["gains"]["yaw"]["source"] == "calibrated"
     assert info["gains"]["yaw"]["base"] == info["calibration"]["profile"]["k_yaw"]
-    assert info["gains"]["yaw"]["damping"] > 0
+    assert info["calibration"]["profile"]["yaw_damping"] == 0.0
+    assert "damping" not in info["gains"]["yaw"]
     assert list(rig.directory.glob("yaw-*.json"))
 
 
@@ -202,12 +208,12 @@ def test_normal_following_reports_actual_calibrated_yaw_gain_and_fixed_forward_g
     gains = card._info()["gains"]
     assert gains["forward"] == {"base": 0.9, "effective": 0.9}
     assert gains["yaw"]["effective"] == profile["k_yaw"]
-    assert gains["yaw"]["damping_effective"] == profile["yaw_damping"]
+    assert "damping_effective" not in gains["yaw"]
     assert card._publisher.commands[-1]["values"][0] > 0.0
     assert card._publisher.commands[-1]["values"][5] < 0.0
 
 
-def test_calibration_feedback_budget_does_not_relax_live_damping_freshness(rig):
+def test_calibration_feedback_budget_does_not_relax_live_odom_freshness(rig):
     card = rig.card()
     _complete(rig, card)
     card.dispatch("navi", {"action": "navigate_to", "target": "person"})
@@ -216,13 +222,10 @@ def test_calibration_feedback_budget_does_not_relax_live_damping_freshness(rig):
         rig.feed(card, 0.02)
         _camera_frame(rig, card)
         card._tick()
-    assert card._info()["gains"]["yaw"]["damping_effective"] > 0
     rig.clock.advance(0.301)
     _camera_frame(rig, card)
     assert card._calibration_feedback()[3] == ""  # 301 ms fits calibration's 650 ms bound.
-    assert card.observation()[2]["wz"] is None  # Live damping retains its 300 ms bound.
-    card._tick()
-    assert card._info()["gains"]["yaw"]["damping_effective"] == 0.0
+    assert card.observation()[2]["wz"] is None  # Live ego-motion still uses 300 ms.
 
 
 @pytest.mark.parametrize("problem", ["offline", "paused", "goal", "dry_run", "no_descriptor",
@@ -458,7 +461,7 @@ def test_manual_gain_controls_stay_hidden_while_info_reports_both_readonly_gains
     assert card._config == before and not card._publisher.commands
     assert info["gains"]["forward"]["base"] == 0.9
     assert "effective" in info["gains"]["yaw"]
-    assert "damping_effective" in info["gains"]["yaw"]
+    assert "damping_effective" not in info["gains"]["yaw"]
 
 
 def test_publisher_open_during_startup_does_not_allow_calibration_or_a_second_start(rig, monkeypatch):

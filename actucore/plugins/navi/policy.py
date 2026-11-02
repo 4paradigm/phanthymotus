@@ -353,6 +353,10 @@ class Config:
                 raise ValueError(f"{key} must be a finite nonnegative number")
             if key == "yaw_damping" and value > 1:
                 raise ValueError("yaw_damping must be between 0 and 1")
+            if key == "yaw_damping":
+                # Retired compatibility input.  Older YAML and persisted
+                # profiles may still carry it, but navigation is pure P now.
+                value = 0.0
             setattr(self, key, value)
         for flag in ("adaptive_k_fwd", "adaptive_k_yaw"):
             if type(getattr(self, flag)) is not bool:
@@ -898,7 +902,7 @@ def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
 
 
 def _measured_yaw_rate(odom):
-    """Actual angular feedback only; never substitute the command for damping.
+    """Actual angular feedback for ego-motion tracking and calibration.
 
     Freshness is enforced by the card before this observation reaches policy.
     JSON booleans, missing axes and non-finite readings are not measurements.
@@ -1010,15 +1014,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # settled. See `floor_wz_moving`.
     live = track.observed
     yaw_gain = _yaw_gain(config, state, bearing, live, dt)
-    yaw_damping = 0.0
-    measured_wz = _measured_yaw_rate(odom)
-    if config.calibrated_yaw_gain is not None and measured_wz is not None:
-        yaw_damping = config.yaw_damping
-    # Angular-rate damping opposes actual chassis rotation. This is not the
-    # derivative of moving-target bearing, and it never feeds back our command.
-    raw_wz = _clamp(-yaw_gain * bearing
-                    - yaw_damping * (measured_wz if measured_wz is not None else 0.0),
-                    config.wz_max)
+    # Pure proportional steering.  odom.wz remains an observation for
+    # calibration and ego-motion tracking, but is never fed back into the
+    # command: the Tianyi REST rate can spike and a D-like term made the robot
+    # resist its own final alignment.
+    raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
 
     within = distance is not None and distance <= config.arrival_distance_m
     if within:
@@ -1077,7 +1077,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
                         f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
                         distance_m=distance, bearing=bearing,
                         k_yaw_effective=yaw_gain,
-                        yaw_damping_effective=yaw_damping)
+                        yaw_damping_effective=0.0)
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
@@ -1156,7 +1156,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
                     distance_m=distance, bearing=bearing,
                     k_fwd_effective=forward_gain if distance is not None and not within else None,
                     k_yaw_effective=yaw_gain if tracking_yaw_used else None,
-                    yaw_damping_effective=yaw_damping if tracking_yaw_used else None)
+                    yaw_damping_effective=0.0 if tracking_yaw_used else None)
 
 
 def _account_idle(decision: Decision, state: State, config: Config,
