@@ -56,7 +56,7 @@ _REVERSAL_TRANSIENT_S = 1.2
 # both directions; the independent 300 ms command-heartbeat and 650 ms fresh-
 # observation guards still reject an actual control or feedback outage.
 _ONSET_LIMIT_S = (1.25, 1.25)
-_PROFILE_BOUNDS = {"k_yaw": (0.2, 1.2), "yaw_damping": (0.1, 0.5),
+_PROFILE_BOUNDS = {"k_yaw": (0.2, 1.2), "yaw_damping": (0.0, 0.5),
                    "response_gain": (0.15, 2.5), "delay_s": (0.0, 1.25),
                    "settling_s": (0.0, 1.5), "left_gain": (0.15, 2.5),
                    "right_gain": (0.15, 2.5)}
@@ -97,6 +97,12 @@ def validate_profile(profile, robot_key):
         if not lower <= value <= upper:
             raise ValueError(f"{name} is outside calibration bounds [{lower}, {upper}]")
         result[name] = value
+    noisy_odom = profile.get("noisy_odom", False)
+    if type(noisy_odom) is not bool:
+        raise ValueError("noisy_odom must be a boolean")
+    if noisy_odom and result["yaw_damping"] != 0.0:
+        raise ValueError("a noisy odom profile must disable yaw damping")
+    result["noisy_odom"] = noisy_odom
     low, high = sorted((result["left_gain"], result["right_gain"]))
     if high > 2.5 * low:
         raise ValueError("yaw response is too asymmetric")
@@ -295,13 +301,14 @@ class YawCalibration:
             if not self._settled_recently(_PULSES[-1][1]):
                 return self._fail(now, "chassis has not stopped at the end of calibration")
             try:
-                profile = self._profile()
+                profile, diagnostics = self._profile()
             except CalibrationFitError as error:
                 return self._fail(now, str(error), error.diagnostics)
             except ValueError as error:
                 return self._fail(now, str(error))
             self._terminal = self._result(now, "completed", "yaw response measured; save before applying",
-                                          "completed", profile=profile)
+                                          "completed", profile=profile,
+                                          diagnostics=diagnostics)
             return self._terminal
         for phase, begin, end, direction in _PHASES:
             if begin - _EPSILON <= elapsed < end - _EPSILON:
@@ -326,6 +333,7 @@ class YawCalibration:
 
     def _profile(self):
         gains, delays = [], []
+        filtered_outlier = False
         response_floor = max(0.01, self.speed * 0.15)
         diagnostics = {"commanded_wz_rad_s": self.speed,
                        "required_response_rad_s": response_floor,
@@ -334,17 +342,58 @@ class YawCalibration:
         for name, (begin, end, direction) in zip(("left", "right"), _PULSES):
             stable = [direction * wz for at, wz in self._samples
                       if end - _STABLE_WINDOW_S - _EPSILON <= at < end - _EPSILON]
-            tail = stable[-3:]
-            response = statistics.median(tail) if tail else None
-            spread = (statistics.median(abs(value - response) for value in tail)
-                      if tail else None)
-            tolerance = (max(0.03, response * 0.25)
-                         if response is not None else None)
+
+            def metrics(values):
+                response = statistics.median(values) if values else None
+                spread = (statistics.median(abs(value - response) for value in values)
+                          if values else None)
+                tolerance = (max(0.03, response * 0.25)
+                             if response is not None else None)
+                valid = bool(values) and response >= response_floor
+                if valid:
+                    valid = (spread <= max(0.02, response * 0.2)
+                             and all(value >= response_floor
+                                     and abs(value - response) <= tolerance
+                                     for value in values))
+                return response, spread, tolerance, valid
+
+            raw_tail = stable[-3:]
+            tail = raw_tail
+            response, spread, tolerance, valid = metrics(tail)
+            fit_method = "strict_tail3"
+            excluded = None
+            # A low-rate REST feed can occasionally contribute one positive
+            # spike at the pulse boundary.  Only recover when the last four
+            # readings are all genuine same-direction responses and dropping
+            # exactly one leaves three readings that pass the unchanged strict
+            # plateau test.  Zeros, reversals, alternating noise and two bad
+            # points therefore remain failures.
+            fit_window = stable[-4:] if len(stable) >= 4 else list(raw_tail)
+            if (not valid and len(fit_window) == 4
+                    and all(value >= response_floor for value in fit_window)):
+                candidates = []
+                for index in range(4):
+                    candidate = fit_window[:index] + fit_window[index + 1:]
+                    fit = metrics(candidate)
+                    if fit[3]:
+                        normalized_spread = fit[1] / max(fit[0], response_floor)
+                        candidates.append((normalized_spread, index, candidate, fit))
+                if candidates:
+                    _, index, tail, fit = min(candidates, key=lambda item: (item[0], item[1]))
+                    response, spread, tolerance, valid = fit
+                    fit_method = "tail4_drop_one"
+                    excluded = {"index": index,
+                                "wz_rad_s": round(fit_window[index], 4)}
+                    filtered_outlier = True
             diagnostics["directions"][name] = {
                 "samples": len(stable),
                 "window_s": [round(end - _STABLE_WINDOW_S, 3), round(end, 3)],
                 "signed_wz_rad_s": [round(value, 4) for value in stable[-8:]],
-                "tail_wz_rad_s": [round(value, 4) for value in tail],
+                "tail_wz_rad_s": [round(value, 4) for value in raw_tail],
+                "fit_window_wz_rad_s": [round(value, 4) for value in fit_window],
+                "used_tail_wz_rad_s": [round(value, 4) for value in tail],
+                "fit_method": fit_method,
+                "excluded_outlier": excluded,
                 "median_response_rad_s": (round(response, 4)
                                             if response is not None else None),
                 "median_abs_deviation_rad_s": (round(spread, 4)
@@ -353,9 +402,10 @@ class YawCalibration:
                                            if tolerance is not None else None),
             }
             windows.append((name, begin, end, direction, stable, tail,
-                            response, spread, tolerance))
+                            response, spread, tolerance, valid))
+        diagnostics["outlier_filtered"] = filtered_outlier
         for pulse_index, (name, begin, end, direction, stable, tail,
-                          response, spread, tail_tolerance) in enumerate(windows):
+                          response, spread, tail_tolerance, valid) in enumerate(windows):
             if len(stable) < 3:
                 raise CalibrationFitError(
                     f"{name} has fewer than three distinct stable yaw samples", diagnostics)
@@ -364,14 +414,11 @@ class YawCalibration:
             # and require all three to agree with that plateau.  This
             # ignores at most an early transition point without accepting a
             # tail that is still oscillating or has already dropped to zero.
-            if response < response_floor:
+            if response is None or response < response_floor:
                 raise CalibrationFitError(
                     f"{name} median yaw response is below {response_floor:.3f} rad/s",
                     diagnostics)
-            if (spread > max(0.02, response * 0.2)
-                    or any(value < response_floor
-                           or abs(value - response) > tail_tolerance
-                           for value in tail)):
+            if not valid:
                 raise CalibrationFitError(
                     f"{name} tail yaw response was not stable enough to calibrate",
                     diagnostics)
@@ -406,14 +453,16 @@ class YawCalibration:
         # gain. Fast response, delay and residual motion all reduce gain.
         k_yaw = max(0.2, min(1.2, 1.2 / (max(1.0, response_gain)
                                         * (1.0 + 4.0 * delay + 1.5 * settle))))
-        damping = max(0.1, min(0.5, 0.1 + 0.4 * delay + 0.4 * settle
-                               + 0.1 * max(0.0, response_gain - 1.0)))
+        damping = (0.0 if filtered_outlier else
+                   max(0.1, min(0.5, 0.1 + 0.4 * delay + 0.4 * settle
+                                + 0.1 * max(0.0, response_gain - 1.0))))
         profile = {"schema": SCHEMA, "robot_key": self.robot_key,
                    "created_at_ms": int(time.time() * 1000), "k_yaw": k_yaw,
                    "yaw_damping": damping, "response_gain": response_gain,
                    "delay_s": delay, "settling_s": settle,
-                   "left_gain": gains[0], "right_gain": gains[1]}
+                   "left_gain": gains[0], "right_gain": gains[1],
+                   "noisy_odom": filtered_outlier}
         try:
-            return validate_profile(profile, self.robot_key)
+            return validate_profile(profile, self.robot_key), diagnostics
         except ValueError as error:
             raise CalibrationFitError(str(error), diagnostics) from error

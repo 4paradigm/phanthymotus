@@ -113,6 +113,31 @@ def test_slow_but_measurable_response_is_not_tuned_above_the_nominal_gain():
     assert result.profile["k_yaw"] <= 1.2
 
 
+def test_one_positive_tail_spike_is_filtered_without_reusing_noisy_odom_for_damping():
+    observed = {2.6: 0.3803, 2.7: 0.3971, 2.8: 0.4237, 2.9: 0.6214}
+    _, result, _ = _run(override=lambda now, measured:
+                         observed.get(round(now, 1), measured))
+    assert result.status == "completed", result.reason
+    assert result.profile["left_gain"] == pytest.approx(0.3971 / 0.5)
+    assert result.profile["noisy_odom"] is True
+    assert result.profile["yaw_damping"] == 0.0
+    assert result.diagnostics["outlier_filtered"] is True
+    left = result.diagnostics["directions"]["left"]
+    assert left["fit_method"] == "tail4_drop_one"
+    assert left["fit_window_wz_rad_s"] == [0.3803, 0.3971, 0.4237, 0.6214]
+    assert left["used_tail_wz_rad_s"] == [0.3803, 0.3971, 0.4237]
+    assert left["excluded_outlier"] == {"index": 3, "wz_rad_s": 0.6214}
+
+
+def test_tail_without_any_stable_three_point_subset_is_still_rejected():
+    observed = {2.6: 0.3953, 2.7: 0.2382, 2.8: 0.1801, 2.9: 0.5749}
+    _, result, _ = _run(override=lambda now, measured:
+                         observed.get(round(now, 1), measured))
+    assert result.status == "failed"
+    assert "left tail yaw response was not stable enough" in result.reason
+    assert result.profile is None and result.values == [0.0] * 6
+
+
 @pytest.mark.parametrize("gain", [0.0, 0.05])
 def test_no_reliable_response_never_produces_a_profile(gain):
     _, result, _ = _run(left=gain, right=gain)
@@ -310,16 +335,34 @@ def test_profile_round_trip_is_per_robot_and_path_components_are_hashed(tmp_path
         assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_legacy_profile_without_noise_marker_loads_with_damping_enabled(tmp_path):
+    profile = dict(_run()[1].profile)
+    profile.pop("noisy_odom")
+    path = C.profile_path(tmp_path, "robot-one")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile), encoding="utf-8")
+    loaded = C.load_profile(tmp_path, "robot-one")
+    assert loaded["noisy_odom"] is False
+    assert loaded["yaw_damping"] > 0
+
+
 @pytest.mark.parametrize("field,value", [
     ("k_yaw", 1.21), ("k_yaw", 0.19), ("yaw_damping", 0.51),
     ("response_gain", float("nan")), ("delay_s", -0.01),
-    ("settling_s", 1.51), ("left_gain", True), ("created_at_ms", 0),
+    ("settling_s", 1.51), ("left_gain", True), ("noisy_odom", "yes"),
+    ("created_at_ms", 0),
     ("schema", "other/1"), ("robot_key", "other-robot")])
 def test_invalid_profiles_are_rejected_before_writing(tmp_path, field, value):
     profile = dict(_run()[1].profile, **{field: value})
     with pytest.raises(ValueError):
         C.save_profile(tmp_path, "robot-one", profile)
     assert not list(tmp_path.iterdir())
+
+
+def test_noisy_profile_cannot_reenable_raw_odom_damping():
+    profile = dict(_run()[1].profile, noisy_odom=True, yaw_damping=0.1)
+    with pytest.raises(ValueError, match="must disable yaw damping"):
+        C.validate_profile(profile, "robot-one")
 
 
 def test_invalid_json_and_wrong_identity_remain_reportable_load_errors(tmp_path):
