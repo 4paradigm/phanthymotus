@@ -113,6 +113,26 @@ def test_slow_but_measurable_response_is_not_tuned_above_the_nominal_gain():
     assert result.profile["k_yaw"] <= 1.2
 
 
+def test_real_tianyi_measurement_gets_a_useful_but_bounded_p_gain():
+    value = C._calibrated_p(0.7578488290309906,
+                            1.1370033120001608,
+                            0.5259313470014604)
+    assert value == pytest.approx(0.6185, abs=0.0001)
+    assert 0.6 < value < 0.65
+
+
+def test_old_saved_floor_value_is_recomputed_from_its_measurements():
+    profile = dict(_run()[1].profile,
+                   k_yaw=0.2,
+                   response_gain=0.7578488290309906,
+                   delay_s=1.1370033120001608,
+                   settling_s=0.5259313470014604,
+                   left_gain=0.7269704341888428,
+                   right_gain=0.7887272238731384)
+    normalized = C.validate_profile(profile, "robot-one")
+    assert normalized["k_yaw"] == pytest.approx(0.6185, abs=0.0001)
+
+
 def test_one_positive_tail_spike_is_filtered_without_reusing_noisy_odom_for_damping():
     observed = {2.6: 0.3803, 2.7: 0.3971, 2.8: 0.4237, 2.9: 0.6214}
     _, result, _ = _run(override=lambda now, measured:
@@ -403,7 +423,7 @@ def test_directory_fsync_failure_after_commit_reports_success_with_a_durability_
         return original_fsync(descriptor)
 
     monkeypatch.setattr(C.os, "fsync", fail_directory_fsync)
-    replacement = dict(profile, k_yaw=0.3)
+    replacement = dict(profile, created_at_ms=profile["created_at_ms"] + 1)
     path = C.save_profile(tmp_path, "robot-one", replacement)
     assert path.exists()
     assert C.load_profile(tmp_path, "robot-one") == replacement

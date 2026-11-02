@@ -60,6 +60,23 @@ _PROFILE_BOUNDS = {"k_yaw": (0.2, 1.2), "yaw_damping": (0.0, 0.5),
                    "response_gain": (0.15, 2.5), "delay_s": (0.0, 1.25),
                    "settling_s": (0.0, 1.5), "left_gain": (0.15, 2.5),
                    "right_gain": (0.15, 2.5)}
+_NOMINAL_YAW_P = 0.6
+
+
+def _calibrated_p(response_gain, delay_s, settling_s):
+    """Compensate plant gain, then conservatively discount slow response.
+
+    The old formula started from 1.2 and multiplied delay by four, which drove
+    the measured Tianyi profile to the 0.2 floor even though its left/right
+    gains agreed.  The runtime nominal is now 0.6: correct that value for the
+    measured plant gain, then apply a bounded, gentler delay/settling penalty.
+    """
+    effective_gain = max(0.5, min(2.5, response_gain))
+    # Delay matters, but it must not overwhelm the measured gain: doing so made
+    # a weak-but-well-behaved chassis less responsive than the uncalibrated
+    # 0.6 default. Keep a modest margin for its phase lag instead.
+    penalty = 1.0 + 0.2 * delay_s + 0.1 * settling_s
+    return max(0.2, min(1.2, (_NOMINAL_YAW_P / effective_gain) / penalty))
 
 
 def _number(value, name):
@@ -97,6 +114,11 @@ def validate_profile(profile, robot_key):
         if not lower <= value <= upper:
             raise ValueError(f"{name} is outside calibration bounds [{lower}, {upper}]")
         result[name] = value
+    # k_yaw is derived from the measured fields. Recompute it when loading an
+    # older profile so a robot does not remain pinned to the obsolete 0.2-floor
+    # formula merely because the measurement file already exists.
+    result["k_yaw"] = _calibrated_p(result["response_gain"], result["delay_s"],
+                                    result["settling_s"])
     # v1 profiles created by earlier images may contain a non-zero D-like
     # angular-rate damping term.  Accept the file for its measured P, but never
     # reactivate that retired feedback path.
@@ -451,10 +473,7 @@ class YawCalibration:
                 "yaw response did not settle during the final rest phase", diagnostics)
         response_gain = statistics.mean(gains)
         delay, settle = max(delays), max(0.0, settled)
-        # Conservative heuristic, intentionally bounded by the former nominal
-        # gain. Fast response, delay and residual motion all reduce gain.
-        k_yaw = max(0.2, min(1.2, 1.2 / (max(1.0, response_gain)
-                                        * (1.0 + 4.0 * delay + 1.5 * settle))))
+        k_yaw = _calibrated_p(response_gain, delay, settle)
         profile = {"schema": SCHEMA, "robot_key": self.robot_key,
                    "created_at_ms": int(time.time() * 1000), "k_yaw": k_yaw,
                    "yaw_damping": 0.0, "response_gain": response_gain,
