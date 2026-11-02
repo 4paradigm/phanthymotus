@@ -1,0 +1,2281 @@
+"""
+tests/test_pointcloud_plugin.py — pointcloud 插件层测试（host-side, no GPU）。
+
+三条 load-bearing 回归，对应 review 的三个 issue：
+
+    1. raw 档标定不再从 P1[0,3] 推基线（恒 0 → Q 除零，worker 每帧报错
+       却不发布）——用假 cv2 验证 stereoRectify 之后 Tx 来自 T；
+    2. auto 模式按消息真实类型分派，不再嗅探话题名——z16 深度 Image 发在
+       不含 "depth" 的话题上也必须出云；
+    3. calibrate 的 name 不允许路径穿越。
+
+Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests -q
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+import threading
+import types
+import zlib
+
+import numpy as np
+import pytest
+
+from vision_stubs import (
+    _FakeCompressedImage,
+    _FakeExecutor,
+    _FakeImage,
+    _FakeNode,
+    _wait_until,
+    frame_bytes,
+)
+
+import plugins.pointcloud as pc  # noqa: E402
+
+RAW_BLOB = {
+    "K1": [[300, 0, 160], [0, 300, 120], [0, 0, 1]],
+    "D1": [0, 0, 0, 0],
+    "K2": [[300, 0, 160], [0, 300, 120], [0, 0, 1]],
+    "D2": [0, 0, 0, 0],
+    "T": [[-0.05], [0], [0]],
+}
+RECTIFIED_BLOB = {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0.05}
+
+
+def _plugin(cfg=None):
+    executor = _FakeExecutor()
+    plugin = pc.PointCloudPerceptionPlugin(cfg or {}, "testns", executor)
+    return plugin, executor
+
+
+def _cloud_pub(node):
+    return next(p for p in node.publishers if p.topic.endswith("/pointcloud"))
+
+
+def _summary_pub(node):
+    return next(p for p in node.publishers if p.topic.endswith("/pointcloud_summary"))
+
+
+def _decode_cloud(raw: bytes) -> np.ndarray:
+    magic, n = struct.unpack("<II", raw[:8])
+    assert magic == 12
+    return np.frombuffer(raw[8:], dtype="<f4").reshape(n, 3)
+
+
+def _wait_cloud_and_summary(node):
+    """等一对输出。_publish 先发云再发摘要，只等云就断言摘要会撞上
+    中间态（review 指出的竞态），两个都等到才算一帧完整落地。"""
+    cloud_pub = _cloud_pub(node)
+    summary_pub = _summary_pub(node)
+    assert _wait_until(
+        lambda: bool(cloud_pub.messages) and bool(summary_pub.messages))
+    return cloud_pub.messages[0], json.loads(summary_pub.messages[0])
+
+
+# ── review issue 2：auto 按消息类型分派，不嗅探话题名 ─────────────────────────
+
+def test_auto_mode_subscribes_to_both_image_and_compressed():
+    plugin, executor = _plugin()
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/image_raw"})
+    node = executor.nodes[0]
+    kinds = [type(s.msg_type).__name__ if hasattr(s, "msg_type") else None
+             for s in node.subscriptions]
+    # fake subscription 没存 msg_type，按回调区分即可
+    cbs = {s.callback.__name__ for s in node.subscriptions}
+    assert cbs == {"_auto_image_cb", "_auto_comp_cb"}
+    assert len(node.subscriptions) == 2
+
+
+def test_auto_mode_depth_image_on_rgb_named_topic_publishes():
+    """z16 Image 发在 '/camera/image_raw'（不含 'depth'）也必须出云。
+
+    旧实现按 '"depth" in input_topic' 判成 mono，只订 CompressedImage，
+    Image 帧静默丢弃、一帧云都不出——review issue 2 的原始复现。
+    """
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/camera/image_raw"})
+    node = executor.nodes[0]
+
+    depth_mm = np.full((4, 4), 1500, dtype="<u2")
+    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
+                     width=4, height=4, step=8)
+    image_cb = next(s.callback for s in node.subscriptions
+                    if s.callback.__name__ == "_auto_image_cb")
+    image_cb(msg)
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["mode"] == "depth"
+    assert summary["nearest"] == pytest.approx(1.5, abs=1e-3)
+
+
+def test_auto_mode_depth_zlib_compressed_image_publishes():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/whatever"})
+    node = executor.nodes[0]
+
+    raw = np.full((480, 640), 2500, dtype="<u2").tobytes()
+    msg = _FakeCompressedImage(zlib.compress(raw), fmt="depth-zlib; compressedDepth")
+    comp_cb = next(s.callback for s in node.subscriptions
+                   if s.callback.__name__ == "_auto_comp_cb")
+    comp_cb(msg)
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["mode"] == "depth"
+    assert summary["nearest"] == pytest.approx(2.5, abs=1e-3)
+
+
+def test_auto_mode_recognizes_visual_depth_producer_format():
+    """review 第 9 轮：栈内生产者 visual_depth 发的格式串是
+    "16UC1; compressedDepth zlib"（visual_depth.py _publish），不含小写
+    "depth" —— 旧实现按 `"depth" in fmt` 匹配把它判成 JPEG：触发 TRT
+    引擎下载、JPEG 解码失败、一帧云都不出。小写归一化后必须出云。
+    """
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/depth_raw"})
+    node = executor.nodes[0]
+
+    raw = np.full((480, 640), 3000, dtype="<u2").tobytes()
+    msg = _FakeCompressedImage(zlib.compress(raw), fmt="16UC1; compressedDepth zlib")
+    comp_cb = next(s.callback for s in node.subscriptions
+                   if s.callback.__name__ == "_auto_comp_cb")
+    comp_cb(msg)
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["mode"] == "depth"
+    assert summary["nearest"] == pytest.approx(3.0, abs=1e-3)
+
+
+def test_auto_mode_jpeg_frame_routes_to_mono():
+    class _FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        @property
+        def input_size(self):
+            return (4, 4)
+
+        def infer(self, frame):
+            self.calls += 1
+            from plugins.vision_runtime import LetterboxMeta
+            return [np.full(frame.shape[:2], 2.0, dtype=np.float32)], \
+                LetterboxMeta(1.0, 0, 0, frame.shape[1], frame.shape[0])
+
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    model = _FakeModel()
+    plugin._model = model  # start 已过，经 _plugin_model 钩子被 worker 取到
+
+    comp_cb = next(s.callback for s in node.subscriptions
+                   if s.callback.__name__ == "_auto_comp_cb")
+    comp_cb(_FakeCompressedImage(frame_bytes(8, 8), fmt="jpeg"))
+
+    pub = _cloud_pub(node)
+    assert _wait_until(lambda: bool(pub.messages) and model.calls >= 1)
+    summary = json.loads(_summary_pub(node).messages[0])
+    assert summary["mode"] == "mono"
+
+
+def test_auto_mode_cold_start_jpeg_triggers_lazy_load_and_publishes():
+    """review issue 1 的回归：auto 节点冷启动、引擎未就绪时，首帧 jpeg
+    必须触发 worker 里的懒加载并在加载完成后出云 —— 旧实现回调先改
+    _mode，worker 的懒加载分支永远轮不到，帧被静默丢。"""
+    class _FakeModel:
+        @property
+        def input_size(self):
+            return (4, 4)
+
+        def infer(self, frame):
+            from plugins.vision_runtime import LetterboxMeta
+            return [np.full(frame.shape[:2], 2.0, dtype=np.float32)], \
+                LetterboxMeta(1.0, 0, 0, frame.shape[1], frame.shape[0])
+
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+
+    load_started = threading.Event()
+    release_load = threading.Event()
+
+    def _blocking_loader():
+        load_started.set()
+        release_load.wait(timeout=5.0)
+        plugin._model = _FakeModel()   # 加载"完成"：引擎就位
+
+    node._ensure_mono_model = _blocking_loader
+
+    comp_cb = next(s.callback for s in node.subscriptions
+                   if s.callback.__name__ == "_auto_comp_cb")
+    comp_cb(_FakeCompressedImage(frame_bytes(8, 8), fmt="jpeg"))
+
+    assert load_started.wait(timeout=3.0), "worker never triggered lazy load"
+    # 加载期间 info 报 loading（review issue 2）—— 但这里的加载没走
+    # _load_model_sync，状态位由下面的显式 mono 测试覆盖。
+    assert _cloud_pub(node).messages == []  # 引擎没就绪，不该有云
+    release_load.set()
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["mode"] == "mono"
+
+
+def test_info_reports_loading_while_explicit_mono_engine_loads():
+    """review issue 2 的回归：显式 mono 后台加载期间 info 必须报 loading
+    （带下载进度），而不是 idle。用假 _ensure_model 卡住加载窗口。"""
+    plugin, executor = _plugin()
+
+    load_started = threading.Event()
+    release_load = threading.Event()
+
+    def _fake_ensure_model():
+        load_started.set()
+        release_load.wait(timeout=5.0)
+        plugin._model = object()
+
+    plugin._ensure_model = _fake_ensure_model
+    reply = plugin.dispatch("pointcloud",
+                            {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+    assert reply["state"] == "loading"
+
+    assert load_started.wait(timeout=3.0)
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert info["state"] == "loading"
+
+    release_load.set()
+    assert _wait_until(
+        lambda: plugin.dispatch("pointcloud", {"action": "info"})["state"] == "running")
+    # 节点在引擎就绪后才创建
+    assert len(executor.nodes) == 1
+
+
+def test_concurrent_mono_starts_launch_both_instances(monkeypatch):
+    """review 第 13 轮的双 mono 并发竞争：冷启动时两个 start 都看到
+    _model is None and not _model_loading，各 spawn 一个 _bg_start，
+    只有赢下 _load_model_sync 的线程会起 node——另一实例永远停在
+    'loading'、不订阅不发布。加载改成秒成功（不碰 GPU）后，两条路都必须
+    有 node（并各有一对订阅 + 一对输出）。"""
+    import utils.model_downloader as downloader
+    import plugins.vision_runtime as runtime
+
+    class _FakeSession:
+        def __init__(self, engine_path, **kw):
+            self.path = engine_path
+
+        @property
+        def input_size(self):
+            return (4, 4)
+
+    plugin, executor = _plugin()
+
+    def _fake_ensure_model():
+        # 与 test_real_path_mono_load_does_not_deadlock 同款桩：真下载路径
+        # 在主机上会走 tensorrt_family → TensorRTError，直接接管实例方法。
+        plugin._model = _FakeSession("/models/depth/fake.engine")
+
+    monkeypatch.setattr(downloader, "ensure_depth_model",
+                        lambda dir_, **kw: {"yolo26n-depth.engine": "/models/depth/fake.engine"})
+    monkeypatch.setattr(runtime, "VisionEngineSession", _FakeSession)
+    plugin._ensure_model = _fake_ensure_model
+
+    r1 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c1", "mode": "mono"})
+    r2 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c2", "mode": "mono"})
+    # 冷启动时两条路都走了后台加载：赢家的 _bg_start 必须把两条登记都
+    # 落成 node（加载慢时它们都停在 loading 回复，加载快时后一条直接起
+    # 节点——两种情况最后都要有双节点）。
+    assert _wait_until(lambda: len(executor.nodes) == 2)
+
+    def nodes_for(topic):
+        return [n for n in executor.nodes if any(
+            s.topic == topic for s in n.subscriptions)]
+
+    # mono 节点的订阅只有 jpeg_cb 一路（auto 才是双路回调）。
+    assert len(nodes_for("/cam/c1")) == 1
+    assert len(nodes_for("/cam/c2")) == 1
+    for node in executor.nodes:
+        kinds = {s.callback.__name__ for s in node.subscriptions}
+        assert kinds == {"_jpeg_cb"}, kinds
+        assert node._mode == "mono"
+
+
+def test_stop_cancels_pending_mono_start(monkeypatch):
+    """review 第 14 轮：冷启动的 mono 只把参数登记进 _model_pending_starts，
+    加载落地后 _bg_start 仍会把**已停掉**的卡片按旧 topic 重新拉起
+    （订阅+发布都恢复）。stop 必须把该卡片的 pending 条目清走——loader 落
+    完加载后队列里不再有它，也不会再被落成节点。"""
+    import threading
+
+    plugin, executor = _plugin()
+
+    block = threading.Event()
+
+    def _blocked_ensure_model():
+        block.wait()  # 永远阻塞，直到测试放行
+
+    plugin._ensure_model = _blocked_ensure_model
+
+    r1 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c1", "mode": "mono"})
+    assert r1["state"] == "loading"
+    assert _wait_until(
+        lambda: any(e[0] == "/cam/c1"
+                    for e in plugin._model_pending_starts), timeout=2.0)
+
+    stop = plugin.dispatch("pointcloud",
+                           {"action": "stop", "instance_id": "/cam/c1"})
+    assert stop["state"] == "idle"
+    assert "/cam/c1" not in plugin._nodes
+    # pending 条目（及任何已落地的节点）都不再存在：loader 落完加载也
+    # 不会把已停掉的卡片重新拉起。
+    assert not any(e[0] == "/cam/c1" for e in plugin._model_pending_starts)
+
+    block.set()  # loader 走完最后一步，队列已空，不会 resurrect 任何节点
+    assert _wait_until(lambda: len(executor.nodes) == 0, timeout=2.0)
+
+
+def test_stop_without_instance_cancels_all_pending_mono_starts(monkeypatch):
+    """review 第 15 轮：全停（不带 instance_id）同样要清 _model_pending_starts。
+    一张卡在等共享模型下载、另一张已落地时调用全停——回复 idle 后 loader
+    落完加载不能把等待中的那张卡重新拉起。"""
+    import threading
+
+    plugin, executor = _plugin()
+
+    block = threading.Event()
+
+    def _blocked_ensure_model():
+        block.wait()  # 永远阻塞，直到测试放行
+
+    plugin._ensure_model = _blocked_ensure_model
+
+    r1 = plugin.dispatch("pointcloud",
+                         {"action": "start", "input_topic": "/cam/c1", "mode": "mono"})
+    assert r1["state"] == "loading"
+    assert _wait_until(
+        lambda: any(e[0] == "/cam/c1"
+                    for e in plugin._model_pending_starts), timeout=2.0)
+
+    stop = plugin.dispatch("pointcloud", {"action": "stop"})
+    assert stop["state"] == "idle"
+    assert "/cam/c1" not in plugin._nodes
+    # pending 队列被整个清空：loader 落完加载后无任何条目可拉起。
+    assert plugin._model_pending_starts == []
+
+    block.set()  # loader 走完最后一步，不会再有节点被创建
+    assert _wait_until(lambda: len(executor.nodes) == 0, timeout=2.0)
+
+
+def test_info_reports_error_when_engine_load_fails():
+    plugin, _ = _plugin()
+
+    def _failing_ensure_model():
+        raise RuntimeError("download failed: no route to host")
+
+    plugin._ensure_model = _failing_ensure_model
+    reply = plugin.dispatch("pointcloud",
+                            {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+    assert reply["state"] == "loading"
+
+    assert _wait_until(
+        lambda: plugin.dispatch("pointcloud", {"action": "info"})["state"] == "error")
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert "download failed" in info["desc"]
+    # 失败后再次 start 直接报错，而不是再挂一次加载
+    reply = plugin.dispatch("pointcloud",
+                            {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+    assert reply["state"] == "error"
+
+
+def test_rectify_pair_rejects_zero_baseline():
+    """坏标定（基线 0）在 _rectify_pair 就报 ValueError，而不是 worker
+    每帧撞 Q 除零（review 建议）。"""
+    fake = _install_fake_stereo_rectify()
+    try:
+        blob = json.loads(json.dumps(RAW_BLOB))
+        blob["T"] = [[0.0], [0], [0]]
+        blob["Tx"] = 0.0
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        with pytest.raises(ValueError, match="基线"):
+            pc._rectify_pair(left, right, blob)
+    finally:
+        fake.restore()
+
+
+def test_real_path_mono_load_does_not_deadlock(monkeypatch, caplog):
+    """review 第 6 轮指控：_load_model_sync 持非重入锁调 _ensure_model
+    → 重入死锁，真冷启动永远 loading。缩进上其实没有（state-guard 的
+    with 块在调 _ensure_model 前已退出），但旧测试全用假 _ensure_model
+    绕过了真实路径 —— 重构一旦真把调用挪进锁里，只有这条能抓住：
+    它会卡在 loading 直到 _wait_until 超时。下载器与会话都换成桩，
+    锁路径保持原样。"""
+    import logging as _logging
+
+    import utils.model_downloader as downloader
+    import plugins.vision_runtime as runtime
+
+    class _FakeSession:
+        def __init__(self, engine_path, **kw):
+            self.path = engine_path
+
+        @property
+        def input_size(self):
+            return (4, 4)
+
+    monkeypatch.setattr(downloader, "ensure_depth_model",
+                        lambda dir_, **kw: {"yolo26n-depth.engine": "/models/depth/fake.engine"})
+    monkeypatch.setattr(runtime, "VisionEngineSession", _FakeSession)
+
+    plugin, executor = _plugin()
+    with caplog.at_level(_logging.WARNING, logger="plugins.pointcloud"):
+        reply = plugin.dispatch("pointcloud",
+                                {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+        assert reply["state"] == "loading"
+        assert _wait_until(
+            lambda: plugin.dispatch("pointcloud", {"action": "info"})["state"] == "running")
+        assert len(executor.nodes) == 1
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert info["instances"]["/cam/rgb"]["mode"] == "mono"
+    assert isinstance(plugin._model, _FakeSession)
+
+
+def test_raw_blob_forwards_calibrated_R_to_stereoRectify():
+    """review 第 6 轮 issue 2：raw 档 stereoRectify 以前恒传 np.eye(3)，
+    标定出的 R（相机间相对旋转）被丢掉 —— 有转角的双目校正映射错，
+    SGBM 极线不水平，视差全是噪声。blob 带 R 时必须原样转发。"""
+    fake = _install_fake_stereo_rectify()
+    seen = {}
+    real_rectify = fake._cv2().stereoRectify
+
+    def capturing_rectify(K1, D1, K2, D2, size, R, T, flags=0, alpha=0.0):
+        seen["R"] = np.asarray(R)
+        return real_rectify(K1, D1, K2, D2, size, R, T, flags=flags, alpha=alpha)
+
+    fake._cv2().stereoRectify = capturing_rectify
+    try:
+        blob = json.loads(json.dumps(RAW_BLOB))
+        theta = np.deg2rad(30.0)
+        blob["R"] = [[np.cos(theta), -np.sin(theta), 0.0],
+                     [np.sin(theta), np.cos(theta), 0.0],
+                     [0.0, 0.0, 1.0]]
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        pc._rectify_pair(left, right, blob)
+        assert "R" in seen, "stereoRectify 没被调用"
+        np.testing.assert_allclose(seen["R"], np.asarray(blob["R"]), atol=1e-12)
+    finally:
+        fake.restore()
+
+
+def test_legacy_raw_blob_without_R_falls_back_to_identity():
+    """老 blob 没有 R 字段：退单位阵（= 旧行为，两相机按共线假设），
+    不拒收。"""
+    fake = _install_fake_stereo_rectify()
+    seen = {}
+    real_rectify = fake._cv2().stereoRectify
+
+    def capturing_rectify(K1, D1, K2, D2, size, R, T, flags=0, alpha=0.0):
+        seen["R"] = np.asarray(R)
+        return real_rectify(K1, D1, K2, D2, size, R, T, flags=flags, alpha=alpha)
+
+    fake._cv2().stereoRectify = capturing_rectify
+    try:
+        blob = json.loads(json.dumps(RAW_BLOB))
+        assert "R" not in blob
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        fx, cx, cy, Tx, _L, _R = pc._rectify_pair(left, right, blob)
+        assert Tx == pytest.approx(-0.05)
+        np.testing.assert_allclose(seen["R"], np.eye(3), atol=1e-12)
+    finally:
+        fake.restore()
+
+
+def test_explicit_depth_mode_still_subscribes_image_and_compressed():
+    plugin, executor = _plugin()
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+    cbs = {s.callback.__name__ for s in node.subscriptions}
+    assert cbs == {"_depth_image_cb", "_depth_comp_cb"}
+
+
+def test_explicit_mono_mode_subscribes_compressed_only():
+    plugin, executor = _plugin()
+    plugin._model = object()  # mono 启动前必须就绪引擎，测试里直接注入
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/rgb", "mode": "mono"})
+    node = executor.nodes[0]
+    cbs = {s.callback.__name__ for s in node.subscriptions}
+    assert cbs == {"_jpeg_cb"}
+
+
+# ── 深度链路本身（A 路）──────────────────────────────────────────────────────
+
+def test_depth_z16_image_publishes_cloud():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    depth_mm = np.full((4, 4), 2000, dtype="<u2")
+    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
+                     width=4, height=4, step=8)
+    node._depth_image_cb(msg)
+
+    raw_cloud, summary = _wait_cloud_and_summary(node)
+    cloud = _decode_cloud(raw_cloud)
+    assert cloud.shape[0] > 0
+    assert summary["nearest"] == pytest.approx(2.0, abs=1e-3)
+
+
+def test_depth_zlib_compressed_publishes_cloud():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    raw = np.full((480, 640), 3000, dtype="<u2").tobytes()
+    node._depth_comp_cb(_FakeCompressedImage(zlib.compress(raw), fmt="depth-zlib"))
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["nearest"] == pytest.approx(3.0, abs=1e-3)
+
+
+def test_depth_image_with_wrong_encoding_is_ignored():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    msg = _FakeImage(data=b"\x00" * 32, encoding="rgb8",
+                     width=4, height=4, step=12)
+    node._depth_image_cb(msg)
+    time_wait = _wait_until(lambda: False, timeout=0.2)
+    assert _cloud_pub(node).messages == []
+
+
+def test_truncated_depth_image_is_ignored():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    msg = _FakeImage(data=b"\x00" * 4, encoding="16UC1",
+                     width=4, height=4, step=8)
+    node._depth_image_cb(msg)
+    _wait_until(lambda: False, timeout=0.2)
+    assert _cloud_pub(node).messages == []
+
+
+def test_depth_respects_min_max_range():
+    plugin, executor = _plugin(cfg={"fps": 1000, "min_depth_m": 1.0, "max_depth_m": 3.0})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    depth_mm = np.array([[500, 2000, 3500]], dtype="<u2")  # 0.5 / 2.0 / 3.5 m
+    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
+                     width=3, height=1, step=6)
+    node._depth_image_cb(msg)
+
+    _, summary = _wait_cloud_and_summary(node)
+    assert summary["nearest"] == pytest.approx(2.0, abs=1e-3)
+    # 1x3 图 stride=1，只有中间那点落在 [1, 3] m
+    assert summary["points"] == 1
+
+
+def test_max_points_cap_is_honoured():
+    plugin, executor = _plugin(cfg={"fps": 1000, "max_points": 100})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    depth_mm = np.full((60, 60), 2000, dtype="<u2")  # 3600 点 > 100
+    msg = _FakeImage(data=depth_mm.tobytes(), encoding="16UC1",
+                     width=60, height=60, step=120)
+    node._depth_image_cb(msg)
+
+    _, summary = _wait_cloud_and_summary(node)
+    # ceil(sqrt(3600/100)) = 6 → (60/6)^2 = 100 点
+    assert summary["points"] == 100
+
+
+def test_stereo_cap_is_honoured_on_the_flattened_cloud():
+    """review 第 11 轮：stereo 抽稀以前把 2-D 图像步长
+    ceil(sqrt(w*h/max_points)) 用在已展平的 (N,3) 云上 —— 步长差 sqrt(N)
+    倍，密集 640x480 云实际发 ~76800 点（max_points=20000），超渲染器
+    40000 上限。抽稀必须按点数本身：ceil(N/max_points)。
+
+    SGBM 反投影路径用假 cv2 走通：均匀视差 → 全帧有效 → 密集云。"""
+    plugin, executor = _plugin(cfg={"fps": 1000,
+                                    "max_points": 200,
+                                    "calibration": json.dumps(RECTIFIED_BLOB)})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    import cv2
+    if not getattr(cv2, "__motus_fake__", False):
+        pytest.skip("SGBM/reprojectImageTo3D stubs only exist on the fake cv2")
+
+    def sgbm_compute(_self, left_u, right_u):
+        # 均匀视差 1.0 → 每个像素的深度都在 [min, max] 内 → 全帧有效
+        return np.full(left_u.shape, 16, dtype=np.int16)
+
+    fake_sgbm = type("FakeSGBM", (), {"compute": sgbm_compute})
+    real_create = getattr(cv2, "StereoSGBM_create", None)
+    real_reproject = getattr(cv2, "reprojectImageTo3D", None)
+    real_mode = getattr(cv2, "STEREO_SGBM_MODE_SGBM_3WAY", None)
+
+    def fake_create(**kwargs):
+        return fake_sgbm()
+
+    def fake_reproject(disp, Q, handleMissingValues=False):
+        # Q[2,3]=fx, Q[3,2]=-1/Tx：Z = fx·Tx/d，均匀视差 → 恒定正深度
+        h, w = disp.shape
+        pts = np.zeros((h, w, 3), dtype=np.float32)
+        pts[..., 0] = np.arange(w, dtype=np.float32)[None, :] - Q[0, 3]
+        pts[..., 1] = np.arange(h, dtype=np.float32)[:, None] - Q[1, 3]
+        pts[..., 2] = Q[2, 3] * Q[3, 2] * -1.0  # fx · (1/Tx) · 常数视差
+        return pts * 0 + 2.0  # 深度恒 2.0 m，落在 [min, max] 内
+
+    cv2.StereoSGBM_create = fake_create
+    cv2.reprojectImageTo3D = fake_reproject
+    cv2.STEREO_SGBM_MODE_SGBM_3WAY = 1
+    try:
+        # 40x40 = 1600 点 >> max_points=200，逼出真实抽稀
+        left = np.full((40, 40, 3), 128, dtype=np.uint8)
+        right = np.full((40, 40, 3), 128, dtype=np.uint8)
+        node._emit_stereo(left, right)
+    finally:
+        if real_create is not None:
+            cv2.StereoSGBM_create = real_create
+        elif hasattr(cv2, "StereoSGBM_create"):
+            del cv2.StereoSGBM_create
+        if real_reproject is not None:
+            cv2.reprojectImageTo3D = real_reproject
+        elif hasattr(cv2, "reprojectImageTo3D"):
+            del cv2.reprojectImageTo3D
+        if real_mode is not None:
+            cv2.STEREO_SGBM_MODE_SGBM_3WAY = real_mode
+        elif hasattr(cv2, "STEREO_SGBM_MODE_SGBM_3WAY"):
+            del cv2.STEREO_SGBM_MODE_SGBM_3WAY
+
+    _, summary = _wait_cloud_and_summary(node)
+    # 1600 点 > max_points=200 → ceil(1600/200)=8 → 200 点
+    assert summary["points"] == 200
+    assert summary["mode"] == "stereo"
+
+
+def test_decimation_stride_on_flattened_cloud_matches_ceil_n_over_max():
+    """review 第 11 轮：decimation_stride(1, N, max_points) 必须退化为
+    ceil(N/max_points)，不是 sqrt(N/max_points)（2-D 网格用的 sqrt 形式）。
+
+    注意：插件把 max_points 下限clamp到 100（pointcloud.py:740），
+    所以端到端测试无法透传 16 这种小值，直接单元测试抽稀步长公式。"""
+    from plugins.pointcloud_math import decimation_stride
+
+    # 2-D 图像网格：60x60，max_points=100 → ceil(sqrt(3600/100)) = 6
+    assert decimation_stride(60, 60, 100) == 6
+    # 1-D 已展平云：48 点，max_points=16 → ceil(48/16) = 3
+    assert decimation_stride(1, 48, 16) == 3
+    # 1-D 整除边界
+    assert decimation_stride(1, 32, 16) == 2
+    # 1-D 不足整除进一
+    assert decimation_stride(1, 33, 16) == 3
+    # 1-D 点数不足 max_points → stride 1，不抽稀
+    assert decimation_stride(1, 48, 100) == 1
+
+
+# ── stereo 生命周期与 info 契约 ───────────────────────────────────────────────
+
+def test_stereo_start_without_calibration_runs_capture_only():
+    """review 指出的死锁回归：calibrate 要运行中的 stereo 节点，stereo 又
+    要求先有标定 → 新卡片永远进不了第一次标定。无标定 stereo 现在以
+    capture-only 启动（订阅/配对/存帧，不出云），calibrate 可用。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._mode == "stereo"
+
+    # 左右帧照常配对存帧（calibrate 的输入），但 unknown 档不出云
+    node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    assert _wait_until(lambda: node._last_stereo_pair is not None)
+    _wait_until(lambda: False, timeout=0.2)
+    assert _cloud_pub(node).messages == []
+
+    # calibrate 不再报 "no stereo instance"，而是走到棋盘检测。
+    # fake cv2 没实现棋盘 API → cv2_unavailable；真 cv2 下 8×6 帧放不下
+    # 9×6 棋盘，尺寸预检 → no_checkerboard（此前直接 cv2.error 炸掉
+    # 整个请求 —— review 指出、镜像里复现的崩溃）。两者都说明已越过
+    # "没有实例"这一步。
+    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "first"})
+    assert reply["ok"] is False
+    assert reply["reason"] in ("no_checkerboard", "cv2_unavailable")
+
+
+def test_stereo_start_requires_both_topics():
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RAW_BLOB)})
+    # 不带 mode：单路 auto 合法（首帧判深度/单目），stereo 才要求两路
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "mode": "stereo", "input_topics": ["/cam/left"]})
+    assert reply["state"] == "error"
+
+
+def test_stereo_info_reports_both_input_topics():
+    """agent-core 的 _dropped_inputs 在 wanted≥2 时按 info() 判定：
+    双目必须报出两路，否则卡片以'忽略了一路输入'失败。"""
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RAW_BLOB)})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    topics = [t["topic"] for t in info["topic_in"]]
+    assert topics == ["/cam/left", "/cam/right"]
+
+
+def test_stereo_frame_pairing_requires_sync_window():
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RECTIFIED_BLOB),
+                                    "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    with node._left_lock:
+        # 存的是编码字节（review 第 19 轮：配对成功才解码）——放一段
+        # 假字节即可，窗口校验在解码之前。
+        node._left_latest = (0.0, frame_bytes(8, 6))
+    node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+    _wait_until(lambda: False, timeout=0.2)
+    assert node._stereo_queue.empty()
+
+
+def _stamped(data: bytes, sec: int, nanosec: int = 0) -> _FakeCompressedImage:
+    msg = _FakeCompressedImage(data, fmt="jpeg")
+    msg.header.stamp = types.SimpleNamespace(sec=sec, nanosec=nanosec)
+    return msg
+
+
+def test_stereo_pairing_uses_capture_stamps_not_arrival_time():
+    """review 第 16 轮：配对以前用回调到达时刻——右帧传输延迟会把**旧右帧**
+    配上新左帧（两回调都在 50 ms 内到达就放行），SGBM 出错视差、发几何
+    无效的云；调度抖动超窗时真同步对又被误丢。配对必须用拍摄时刻
+    （header.stamp），stamp 缺失才退回到达时间。"""
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RECTIFIED_BLOB),
+                                    "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    # CI 镜像里有真 cv2：worker 会拿配上的 6x8 帧跑真 SGBM，在 qemu 下
+    # 直接把 OpenCV 干 abort（套件 61% 处硬中止就是它）。本测试只关心
+    # 配对逻辑，emit 换 no-op —— 与 test_stereo_pairing_publishes_with_
+    # rectified_blob 同一做法。
+    def _noop_emit(self_inner, left, right):
+        pass
+
+    original = type(node)._emit_stereo
+    type(node)._emit_stereo = _noop_emit
+    try:
+        # 场景 1：右帧迟到——拍摄时刻差 1 s（远超 50 ms 窗口），但两条
+        # 回调背靠背到达（旧实现会放行这对错配帧）。
+        node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_000))
+        node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_001))
+        _wait_until(lambda: False, timeout=0.2)
+        assert node._stereo_queue.empty(), "拍摄时刻差 1 s 的帧不得配对"
+        assert node._stereo_pair_seq == 0, "错配帧不得进 worker"
+
+        # 场景 2：真同步对——拍摄时刻同刻（stamp 相同），即使左帧回调早
+        # 到达（模拟传输/调度抖动），也必须配对成功。用 seq 断言而不是
+        # 队列非空：worker 取走队列极快，查队列是竞态。
+        node._left_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
+        _wait_until(lambda: False, timeout=0.05)   # 左帧先到，右帧在"路上"
+        node._right_cb(_stamped(frame_bytes(8, 6), sec=1_000_000_010))
+        assert _wait_until(lambda: node._stereo_pair_seq >= 1), \
+            "同刻拍摄、回调错峰到达的帧必须配对"
+
+        # 场景 3：无 stamp（老驱动不写 header）→ 退回到达时刻，窗口内仍
+        # 可配对。重置节流时钟：场景 2 的右帧刚消耗了配额，1 ms 内的下一
+        # 帧会被 _throttled 误丢（fps=1000）。
+        node._left_latest = None
+        node._last_emit_time = 0.0
+        node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+        node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+        assert _wait_until(lambda: node._stereo_pair_seq >= 2)
+    finally:
+        type(node)._emit_stereo = original
+
+
+def test_stereo_pairing_publishes_with_rectified_blob():
+    """rectified 档端到端：左右同帧 → 配对 → worker → 发布。
+
+    fake cv2 没实现 SGBM/reprojectImageTo3D，这里在实例上替换
+    _emit_stereo，只验证链路（回调→配对→worker→发布）与协议格式。
+    """
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RECTIFIED_BLOB),
+                                    "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    def _fake_emit_stereo(self_inner, left, right):
+        xyz = np.array([[0.0, 0.0, 2.5]], dtype=np.float32)
+        self_inner._publish(xyz)
+
+    original = type(node)._emit_stereo
+    type(node)._emit_stereo = _fake_emit_stereo
+    try:
+        node._left_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+        node._right_cb(_FakeCompressedImage(frame_bytes(8, 6), fmt="jpeg"))
+        pub = _cloud_pub(node)
+        assert _wait_until(lambda: bool(pub.messages))
+        cloud = _decode_cloud(pub.messages[0])
+        assert cloud.shape == (1, 3)
+        summary = json.loads(_summary_pub(node).messages[0])
+        assert summary["mode"] == "stereo"
+    finally:
+        type(node)._emit_stereo = original
+
+
+# ── review issue 1：raw 档基线来自 T，不再除零 ────────────────────────────────
+
+def test_rectify_pair_raw_tier_takes_baseline_from_T():
+    """raw 档的 Tx 必须来自外参 T（stereoRectify 把平移放 P2[0,3]，
+    P1[0,3] 恒 0 —— 旧实现 -1/0 直接 ZeroDivisionError，worker 每帧
+    报错但永不发布）。主机无真 cv2，用假 stereoRectify 复现符号。"""
+    fake = _install_fake_stereo_rectify()
+    try:
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        fx, cx, cy, Tx, L, R = pc._rectify_pair(left, right, RAW_BLOB)
+        # 基线长度 = |T[0]| = 0.05，符号归一到负
+        assert Tx == pytest.approx(-0.05)
+        assert fx == pytest.approx(300.0)
+        assert cx == pytest.approx(160.0) and cy == pytest.approx(120.0)
+        # make_Q 里 -1/Tx 不再除零：Q[3,2] > 0
+        Q = pc.Q_from_baseline(fx, cx, cy, Tx)
+        assert Q[3, 2] == pytest.approx(20.0)  # 1/0.05
+    finally:
+        fake.restore()
+
+
+def test_rectify_pair_normalizes_positive_T_before_stereoRectify():
+    """review 第 20 轮 Issue：厂商出厂标定常给正 T[0]，OpenCV 的
+    stereoCalibrate 给负。stereoRectify 的视差约定是 d = -fx·T[0]/Z：
+    正 T → 校正后视差为负，而 SGBM minDisparity=0 / 自建 Q 要 d≥0
+    才有正深度 —— 正 T 的云要么全空要么深度错。修复：正 T 先翻负
+    再进 stereoRectify，出口的基线长度/Q 符号不变。"""
+    fake = _install_fake_stereo_rectify()
+    seen = {}
+    real_rectify = fake._cv2().stereoRectify
+
+    def capturing_rectify(K1, D1, K2, D2, size, R, T, flags=0, alpha=0.0):
+        seen["T"] = np.asarray(T, dtype=np.float64).ravel().copy()
+        seen["P"] = real_rectify(K1, D1, K2, D2, size, R, T, flags=flags, alpha=alpha)
+        return seen["P"]
+
+    fake._cv2().stereoRectify = capturing_rectify
+    try:
+        # 厂商约定的正 T（同样 5 cm 基线）
+        blob = json.loads(json.dumps(RAW_BLOB))
+        blob["T"] = [[0.05], [0], [0]]
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        fx, cx, cy, Tx, _L, _R = pc._rectify_pair(left, right, blob)
+
+        # 进 stereoRectify 的 T 已翻成 OpenCV 负号约定
+        assert seen["T"][0] == pytest.approx(-0.05), \
+            "正 T 必须在 stereoRectify 之前归一成负号"
+        # 假 rectify 与 OpenCV 同式：P2[0,3] = -fx·T[0] → 负 T 得正偏移，
+        # 视差 d = x_L - x_R = fx·|T|/Z ≥ 0，与 SGBM/Q 约定一致
+        R1, R2, P1, P2, Q, _, _ = seen["P"]
+        assert P2[0, 3] > 0, "归一后右相机校正偏移必须产生非负视差"
+        # 出口不变：基线长度、Q 反投影深度为正
+        assert Tx == pytest.approx(-0.05)
+        assert pc.Q_from_baseline(fx, cx, cy, Tx)[3, 2] == pytest.approx(20.0)
+
+        # 负 T（OpenCV 原生）不走翻转，原样通过
+        seen.clear()
+        pc._rectify_pair(left, right, RAW_BLOB)
+        assert seen["T"][0] == pytest.approx(-0.05), "负 T 保持原样"
+    finally:
+        fake.restore()
+
+
+def test_rectify_pair_raw_tier_maps_cached_per_size():
+    """review 指出：docstring 说缓存 rectify 映射、代码却每帧重算
+    stereoRectify + initUndistortRectifyMap。缓存以帧尺寸为键：同尺寸
+    第二帧不再碰 stereoRectify，换尺寸重算一次。"""
+    fake = _install_fake_stereo_rectify()
+    calls = {"rectify": 0}
+
+    real_rectify = fake._cv2().stereoRectify
+
+    def counting_rectify(*args, **kwargs):
+        calls["rectify"] += 1
+        return real_rectify(*args, **kwargs)
+
+    fake._cv2().stereoRectify = counting_rectify
+    try:
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        cache = {}
+        pc._rectify_pair(left, right, RAW_BLOB, cache)
+        pc._rectify_pair(left, right, RAW_BLOB, cache)
+        assert calls["rectify"] == 1  # 同尺寸：命中缓存
+        bigger = np.zeros((12, 16, 3), dtype=np.uint8)
+        pc._rectify_pair(bigger, bigger.copy(), RAW_BLOB, cache)
+        assert calls["rectify"] == 2  # 换尺寸：重算
+    finally:
+        fake.restore()
+
+
+def test_rectify_pair_rectified_tier_uses_blob_tx():
+    fake = _install_fake_stereo_rectify()
+    try:
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        fx, cx, cy, Tx, L, R = pc._rectify_pair(left, right, RECTIFIED_BLOB)
+        assert Tx == pytest.approx(-0.05)  # abs → 负号归一
+    finally:
+        fake.restore()
+
+
+def test_rectify_pair_rectified_tier_rejects_zero_tx():
+    """review 指出：rectified 档 Tx=0 以前直接 -abs(0) 放行，
+    Q_from_baseline 的 -1/Tx 每帧除零。worker 侧必须拦下。"""
+    fake = _install_fake_stereo_rectify()
+    try:
+        left = np.zeros((6, 8, 3), dtype=np.uint8)
+        right = np.zeros((6, 8, 3), dtype=np.uint8)
+        blob = {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0}
+        with pytest.raises(ValueError, match="Tx"):
+            pc._rectify_pair(left, right, blob)
+    finally:
+        fake.restore()
+
+
+class _FakeStereoRectify:
+    """把 cv2.stereoRectify / initUndistortRectifyMap / remap / cvtColor
+    打上最小假实现，使 raw 档路径能离线走到 Q 构造。"""
+
+    def __init__(self):
+        import sys
+        self._sys = sys
+        try:
+            import cv2
+            self._real = cv2
+        except ImportError:
+            self._real = None
+        self._stubs = {}
+
+    def _cv2(self):
+        return self._sys.modules.get("cv2")
+
+    def install(self):
+        cv2 = self._cv2()
+        assert cv2 is not None, "vision_stubs must be imported first"
+        self._saved = {name: getattr(cv2, name, None) for name in (
+            "stereoRectify", "initUndistortRectifyMap", "remap",
+            "cvtColor", "COLOR_BGR2GRAY", "INTER_LINEAR",
+            "CALIB_ZERO_DISPARITY", "CV_32FC1")}
+        cv2.COLOR_BGR2GRAY = 6
+        cv2.CALIB_ZERO_DISPARITY = 1 << 17
+        cv2.CV_32FC1 = 5
+        cv2.INTER_LINEAR = 1
+
+        def stereoRectify(K1, D1, K2, D2, size, R, T, flags=0, alpha=0.0):
+            # 与 OpenCV 相同的关键行为：以左目为参考系，平移落在 P2[0,3]，
+            # P1[0,3] == 0 —— 这是旧 bug 的前提。
+            w, h = size
+            fx = float(K1[0, 0]); cx = float(K1[0, 2]); cy = float(K1[1, 2])
+            P1 = np.eye(4, dtype=np.float64) * 0
+            P1[0, 0] = fx; P1[1, 1] = fx; P1[2, 2] = 1
+            P1[0, 2] = cx; P1[1, 2] = cy
+            P2 = P1.copy()
+            P2[0, 3] = -float(np.asarray(T).ravel()[0]) * fx
+            Q = np.zeros((4, 4))
+            return np.eye(3), np.eye(3), P1, P2, Q, None, None
+
+        def initUndistortRectifyMap(K, D, R, P, size, m1type):
+            return np.zeros(size, dtype=np.float32), np.zeros(size, dtype=np.float32)
+
+        def remap(src, m1, m2, interp):
+            return src
+
+        def cvtColor(src, code):
+            return src
+
+        cv2.stereoRectify = stereoRectify
+        cv2.initUndistortRectifyMap = initUndistortRectifyMap
+        cv2.remap = remap
+        cv2.cvtColor = cvtColor
+        return self
+
+    def restore(self):
+        cv2 = self._cv2()
+        for name, value in self._saved.items():
+            if value is not None:
+                setattr(cv2, name, value)
+            else:
+                if hasattr(cv2, name) and name not in ("COLOR_BGR2GRAY",):
+                    delattr(cv2, name)
+
+
+def _install_fake_stereo_rectify():
+    return _FakeStereoRectify().install()
+
+
+# ── review issue 3：calibrate 文件名校验 ──────────────────────────────────────
+
+def test_calibrate_rejects_a_traversal_name():
+    """'../../x' 之类 name 会写出 /models/stereo_calib 之外 —— 必须拒绝。"""
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RAW_BLOB),
+                                    "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    depth = np.zeros((6, 8, 3), dtype=np.uint8)
+    node._last_stereo_pair = (depth, depth.copy())
+
+    # 找不到棋盘格也无所谓：name 校验在棋盘检测之前，坏名先被拒。
+    reply = plugin.dispatch("pointcloud", {
+        "action": "calibrate", "name": "../../evil"})
+    assert reply["ok"] is False
+    assert reply["reason"] == "bad_name"
+
+
+def test_calibrate_rejects_path_like_and_dotted_names():
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(RAW_BLOB),
+                                    "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+    depth = np.zeros((6, 8, 3), dtype=np.uint8)
+    node._last_stereo_pair = (depth, depth.copy())
+
+    for bad in ("a/b", "a\\b", "..", ".", "x;rm", "pct%"):
+        reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": bad})
+        assert reply["ok"] is False, bad
+        assert reply["reason"] == "bad_name", bad
+
+
+def test_calibrate_without_stereo_instance_says_so():
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {"action": "calibrate"})
+    assert reply["ok"] is False
+
+
+def test_calibrate_rejects_frame_too_small_for_board():
+    """review 指出、镜像里复现的崩溃：8×6 帧配 9×6 棋盘时
+    findChessboardCorners 的 adaptiveThreshold 断言失败抛 cv2.error，
+    dispatch 只接 ValueError → MCP 请求直接异常。尺寸预检 + cv2.error
+    捕获后都按 no_checkerboard 契约回复。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    small = np.zeros((6, 8, 3), dtype=np.uint8)  # 8 列 < board_w=9
+    node._last_stereo_pair = (small, small.copy())
+    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "t"})
+    if reply["reason"] == "cv2_unavailable":
+        pytest.skip("fake cv2 has no chessboard API — size precheck untested here")
+    assert reply["ok"] is False
+    assert reply["reason"] == "no_checkerboard"
+
+
+def test_calibrate_rejects_cv2_error_as_no_checkerboard(monkeypatch):
+    """真 cv2 下图能容纳棋盘仍可能断言失败（纯色/过小）—— cv2.error
+    必须落回 no_checkerboard 契约，不能让请求抛异常。用假检测触发。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    big = np.zeros((60, 80, 3), dtype=np.uint8)  # 放得下 9×6，过尺寸预检
+    node._last_stereo_pair = (big, big.copy())
+
+    import cv2
+
+    class _Cv2Error(Exception):
+        pass
+
+    def _boom(gray, pattern, flags):
+        raise _Cv2Error("adaptiveThreshold assertion failed")
+
+    monkeypatch.setattr(cv2, "findChessboardCorners", _boom, raising=False)
+    # fake cv2 没有 cv2.error 名字 —— 插件里 except cv2.error 需要它存在
+    monkeypatch.setattr(cv2, "error", _Cv2Error, raising=False)
+    # flags 常量同样缺（在 try 之外取值，缺了会先撞 AttributeError）
+    monkeypatch.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
+    monkeypatch.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
+    reply = plugin.dispatch("pointcloud", {"action": "calibrate", "name": "t"})
+    assert reply["ok"] is False
+    assert reply["reason"] == "no_checkerboard"
+
+
+def test_calibrate_rejects_degenerate_parameters():
+    """review 第 13 轮：board_w=0 / board_h<0 / square_m=0 / pairs=0 等
+    退化参数不得到达 OpenCV（square=0 时物方点全为零、pattern_size
+    非法），必须在任何 cv2 调用前按 bad_input 契约回复。"""
+    plugin, _ = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    for bad in ({"board_w": 0}, {"board_h": -1}, {"square_m": 0.0}, {"pairs": 0}):
+        reply = plugin.dispatch("pointcloud", {"action": "calibrate", **bad})
+        if reply.get("reason") == "cv2_unavailable":
+            pytest.skip("fake cv2 has no chessboard API")
+        assert reply["ok"] is False
+        assert reply["reason"] == "bad_input"
+        assert "board_w" in str(reply["detail"])
+
+
+def test_calibrate_same_pair_is_not_a_new_pose():
+    """review 指出的重复采样：连打 15 次 calibrate 不挪棋盘，会采到 15 份
+    相同观测，stereoCalibrate 拟合出貌似成功的退化标定。同一对帧（seq
+    未变）必须被拒（same_pose），新帧才算新姿态。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+
+    # 假棋盘检测：图够大就"找到"角点，坐标随灰度图尺寸变（模拟不同姿态）。
+    import cv2
+
+    def _fake_find(gray, pattern, flags):
+        pts = np.array([[[(i % gray.shape[1]), (j % gray.shape[0])]]
+                        for i in range(pattern[0]) for j in range(pattern[1])],
+                       dtype=np.float32)
+        return True, pts
+
+    def _fake_subpix(gray, corners, win, zone, crit):
+        return corners
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cv2, "findChessboardCorners", _fake_find, raising=False)
+    monkey.setattr(cv2, "cornerSubPix", _fake_subpix, raising=False)
+    # fake cv2 缺棋盘检测用的常量与 cv2.error —— 一并补上
+    monkey.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
+    monkey.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
+    monkey.setattr(cv2, "error", Exception, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_EPS", 1, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_MAX_ITER", 2, raising=False)
+    try:
+        node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
+        node._stereo_pair_seq = 1
+        first = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 3, "name": "t"})
+        # 采集未满 3 对会停在 collecting（不碰 stereoCalibrate）。
+        assert first["ok"] is True
+        assert first["state"] == "collecting"
+        assert first["pairs_used"] == 1
+
+        # 同一对帧（seq 没变）：拒绝，不计数
+        again = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 3, "name": "t"})
+        assert again["ok"] is False
+        assert again["reason"] == "same_pose"
+        assert again["pairs_used"] == 1
+
+        # 新帧（seq 变了）：重新计数，pairs_used 前进
+        node._stereo_pair_seq = 2
+        fresh = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 3, "name": "t"})
+        assert fresh["ok"] is True
+        assert fresh["pairs_used"] == 2
+    finally:
+        monkey.undo()
+
+
+def _calib_monkeypatch():
+    """calibrate 走通全程需要的假 cv2 棋盘 API：能"找到"角点（坐标随
+    灰度图尺寸变，模拟不同姿态）+ 假 stereoCalibrate 返回 9 元组。"""
+    import cv2
+
+    def _fake_find(gray, pattern, flags):
+        pts = np.array([[(i % gray.shape[1]), (j % gray.shape[0])]
+                        for i in range(pattern[0]) for j in range(pattern[1])],
+                       dtype=np.float32).reshape(-1, 1, 2)
+        return True, pts
+
+    def _fake_subpix(gray, corners, win, zone, crit):
+        return corners
+
+    def _fake_stereo_calibrate(obj, l, r, K1, D1, K2, D2, size, criteria=None):
+        # 与真 stereoCalibrate 同构的 9 元组返回；K/D 就用初值。
+        return (0.5,
+                np.asarray(K1, dtype=np.float64).copy(),
+                np.asarray(D1, dtype=np.float64).copy(),
+                np.asarray(K2, dtype=np.float64).copy(),
+                np.asarray(D2, dtype=np.float64).copy(),
+                np.eye(3, dtype=np.float64),
+                np.array([[-0.05], [0.0], [0.0]], dtype=np.float64),
+                np.eye(3, dtype=np.float64),
+                np.eye(3, dtype=np.float64))
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(cv2, "findChessboardCorners", _fake_find, raising=False)
+    monkey.setattr(cv2, "cornerSubPix", _fake_subpix, raising=False)
+    monkey.setattr(cv2, "stereoCalibrate", _fake_stereo_calibrate, raising=False)
+    monkey.setattr(cv2, "CALIB_CB_ADAPTIVE_THRESH", 1, raising=False)
+    monkey.setattr(cv2, "CALIB_CB_NORMALIZE_IMAGE", 2, raising=False)
+    monkey.setattr(cv2, "error", Exception, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_EPS", 1, raising=False)
+    monkey.setattr(cv2, "TERM_CRITERIA_MAX_ITER", 2, raising=False)
+    return monkey
+
+
+def _collect_calib_pairs(plugin, node, target):
+    """推进采集到 target 对（每对前自增 seq 模拟新帧）。"""
+    reply = None
+    for seq in range(1, target + 1):
+        node._stereo_pair_seq = seq
+        reply = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": target, "name": "t"})
+    return reply
+
+
+def test_calibrate_done_keeps_raw_blob_by_default():
+    """review High：旧的"rectify 后量 Δy 分档"是同义反复 —— stereoRectify
+    本来就把两图行对齐，任何标定 rectify 后 Δy ≈ 0，必然落 rectified 档、
+    把刚算出的 raw K1/K2/D1/D2/R/T 丢掉 → 运行时跳过去畸变，SGBM 吃
+    畸变图。默认必须保留 raw blob。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+    node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
+
+    monkey = _calib_monkeypatch()
+    try:
+        reply = _collect_calib_pairs(plugin, node, 3)
+        assert reply["ok"] is True
+        assert reply["state"] == "done"
+        assert reply["tier"] == "raw"
+        blob = reply["calibration"]
+        for key in ("K1", "D1", "K2", "D2", "R", "T"):
+            assert key in blob, key
+        assert "epipolar_dy_px" not in reply
+        assert "epipolar_dy_px" not in blob
+    finally:
+        monkey.undo()
+
+
+def test_calibrate_pre_rectified_flag_lands_rectified_shortcut():
+    """只有调用方显式 pre_rectified=true（上游保证两路已立体校正）才落
+    rectified 快捷档 —— blob 只剩 Q 反投影四要素。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    node = executor.nodes[0]
+    node._last_stereo_pair = (np.zeros((60, 80, 3), dtype=np.uint8),) * 2
+
+    monkey = _calib_monkeypatch()
+    try:
+        node._stereo_pair_seq = 1
+        reply = plugin.dispatch("pointcloud", {
+            "action": "calibrate", "pairs": 1, "name": "t",
+            "pre_rectified": True})
+        assert reply["ok"] is True
+        assert reply["tier"] == "rectified"
+        assert set(reply["calibration"]) == {"fx", "cx", "cy", "Tx",
+                                             "rms", "pairs_used"}
+        assert reply["calibration"]["Tx"] == pytest.approx(0.05)
+    finally:
+        monkey.undo()
+
+
+# ── review issue 2：rectified 档 Tx=0 启动即拒 ────────────────────────────────
+
+def test_start_rejects_rectified_calibration_with_zero_tx():
+    """review Medium：Tx=0 的 rectified 标定以前 start 照收，worker 里
+    Q_from_baseline 的 -1/Tx 每帧除零。必须在 start 就报配置错误。"""
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(
+        {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0})})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "Tx" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_rectified_calibration_with_nonfinite_tx():
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(
+        {"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": "abc"})})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "Tx" in reply["message"]
+
+
+@pytest.mark.parametrize("fx,why", [
+    (0, "fx=0 → 反投影深度恒 0"),
+    (float("nan"), "fx=NaN"),
+    ("abc", "fx 非数值"),
+    (None, "fx 缺失"),
+])
+def test_start_rejects_rectified_calibration_with_unusable_fx(fx, why):
+    """review 第 10 轮 Medium：rectified 预检以前只查 Tx。
+
+    fx=0 的 blob start 照收，Q[2,3]=fx=0 → Z=fx·Tx/w 恒 0，云被
+    filter_cloud 全剔光 —— 卡片 running 却一帧不出，无任何报错。fx
+    缺失/非数值则在 _rectify_pair 里每帧抛异常，外部同样静默。
+    JSON 不能表达 NaN/None，走 start 参数传入标定 blob。
+    """
+    import math
+    blob = {"fx": fx, "cx": 160.0, "cy": 120.0, "Tx": 0.05}
+    if fx is None:
+        del blob["fx"]
+    if isinstance(fx, float) and math.isnan(fx):
+        # json.dumps 会把 NaN 写成 NaN（非严格 JSON），load_calibration_blob
+        # 用的是宽容解析，直接喂 float 也一样；这里经 start 参数绕开 JSON。
+        plugin, executor = _plugin()
+        reply = plugin.dispatch("pointcloud", {
+            "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+            "calibration": blob})
+    else:
+        plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+        reply = plugin.dispatch("pointcloud", {
+            "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error", why
+    assert "fx" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_rectified_calibration_with_nonfinite_principal_point():
+    """cx/cy 非有限 → 反投影坐标全 NaN，云被剔光，同样要当场拒绝。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": {"fx": 300.0, "cx": float("inf"), "cy": 120.0,
+                        "Tx": 0.05}})
+    assert reply["state"] == "error"
+    assert "主点" in reply["message"]
+    assert executor.nodes == []
+
+
+# ── review 建议：mode / input_topics 数量校验 ─────────────────────────────────
+
+def test_start_rejects_unknown_mode():
+    """mode 拼错（如 detph）以前静默当 mono 处理 —— z16 帧永远收不到。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "detph"})
+    assert reply["state"] == "error"
+    assert "mode" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_more_than_two_input_topics():
+    """第三路以前被静默忽略 —— 双目只认前两路，宁拒不错。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/a", "/b", "/c"]})
+    assert reply["state"] == "error"
+    assert "input_topics" in reply["message"]
+    assert executor.nodes == []
+
+
+@pytest.mark.parametrize("mode", ["depth", "mono"])
+def test_start_rejects_explicit_mode_without_any_input(mode):
+    """review 第 8 轮：缺输入的检查以前只盖 mode == "auto"。
+
+    显式 mode="depth"/"mono" 不带 input_topic 会一路走到 _start_node ——
+    start() 一条订阅都不建却把自己标成 running，从此卡片报 running 却
+    永远 idle，且没有任何报错可查。stereo 已有自己的双路检查；这里把
+    其余模式也钉死。
+    """
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {"action": "start", "mode": mode})
+    assert reply["state"] == "error"
+    assert "input_topic" in reply["message"]
+    assert executor.nodes == []
+
+
+# ── review 第 6 轮：start 预检 raw blob，坏配置当场报错 ─────────────────────
+
+def test_start_rejects_raw_blob_with_missing_K2():
+    """K2 缺了以前 start 照收（只查档位），首帧才在 worker 里炸 ——
+    卡片显示 running 却一云不出。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    del blob["K2"]
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "raw" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_raw_blob_with_malformed_K1():
+    """K1 不是 9 元素（3x3 reshape 失败）同理当场报错。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob["K1"] = [300, 0, 160, 0, 300, 120]  # 6 元素：reshape(3,3) 必炸
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "K1/K2" in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_rejects_raw_blob_with_zero_baseline():
+    """T 全零且没有 Tx：Q 反投影必然除零，start 拒收（与 rectified 档
+    的 Tx 校验同一契约）。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob["T"] = [[0.0], [0], [0]]
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "error"
+    assert "基线" in reply["message"]
+    assert executor.nodes == []
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("D1", [0, float("inf"), 0, 0]),
+    ("R", [[float("nan"), 0, 0], [0, 1, 0], [0, 0, 1]]),
+])
+def test_start_rejects_raw_blob_with_nonfinite_extrinsics(field, bad):
+    """review 第 10 轮建议：K 以前已查有限值，D/R 没查 —— 一个 NaN 让
+    stereoRectify 输出全 NaN，映射全废，云一帧不出且无报错。
+
+    inf/nan 过不了 JSON，走 start 参数直接传 dict。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob[field] = bad
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": blob})
+    assert reply["state"] == "error"
+    assert field in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_accepts_a_good_raw_blob():
+    """预检不误伤：合法 raw blob（含 R）照常启动 —— R 本身有 30° 转角
+    也照样收，因为转角正是要交给 stereoRectify 处理的东西。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    theta = np.deg2rad(30.0)
+    blob["R"] = [[np.cos(theta), -np.sin(theta), 0.0],
+                 [np.sin(theta), np.cos(theta), 0.0],
+                 [0.0, 0.0, 1.0]]
+    plugin, executor = _plugin(cfg={"calibration": json.dumps(blob),
+                                    "fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    assert len(executor.nodes) == 1
+
+
+# ── review 第 16 轮建议：start/config 预检 pinhole 标定（depth/mono） ──────
+
+@pytest.mark.parametrize("field,bad,needle", [
+    ("fx", 0, "fx"),
+    ("fx", float("nan"), "fx"),
+    ("fx", "abc", "标定数值异常"),
+    ("fy", float("inf"), "fy"),
+    ("cx", float("nan"), "主点"),
+    ("cy", float("inf"), "主点"),
+    ("hfov", 0, "hfov"),      # hfov=0 → 焦距无穷
+    ("hfov", 180, "hfov"),    # hfov=180 → 焦距为 0
+    ("hfov", float("nan"), "hfov"),
+])
+def test_start_rejects_invalid_pinhole_calibration(field, bad, needle):
+    """review 第 16 轮建议：depth/mono 的显式 pinhole 内参以前 start 照收
+    —— fx=0/NaN 让反投影深度恒 0 或全 NaN，云被 filter_cloud 剔光，卡片
+    running 却一帧不出（与 stereo 的 raw/rectified 预检同一个坑）。
+    start 参数直接传 blob，绕开 JSON 对 NaN/inf 的限制。"""
+    blob = {"fx": 300.0, "fy": 300.0, "cx": 160.0, "cy": 120.0}
+    if field == "hfov":
+        blob = {"hfov": bad}
+    else:
+        blob[field] = bad
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
+        "calibration": blob})
+    assert reply["state"] == "error", f"{field}={bad} 应被拒收"
+    assert needle in reply["message"]
+    assert executor.nodes == []
+
+
+def test_start_accepts_good_pinhole_calibration():
+    """预检不误伤：完整 fx/fy/cx/cy 与 hfov 档都照常启动（mono 起节点需要
+    引擎，这里用 depth 档走纯订阅路径）。fy 缺省取 fx、cx/cy 缺省放行——
+    与 pinhole_of 的缺省规则一致。"""
+    plugin, executor = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
+        "calibration": {"fx": 300.0, "cx": 160.0, "cy": 120.0}})
+    assert reply["state"] == "running"
+    assert len(executor.nodes) == 1
+
+    plugin2, executor2 = _plugin()
+    reply2 = plugin2.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth",
+        "calibration": {"hfov": 90.0}})
+    assert reply2["state"] == "running"
+    assert len(executor2.nodes) == 1
+
+
+def test_config_rejects_invalid_pinhole_calibration():
+    """config 同一份预检：坏标定当场报错且不落库 —— 卡片不会以为配置已
+    生效，下一次 start 也不会再踩一遍。"""
+    plugin, _ = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "calibration": json.dumps({"fx": 0, "cx": 160})})
+    assert reply["state"] == "error"
+    assert plugin._calibration is None  # 未落库
+
+    # hfov 档同理
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "calibration": json.dumps({"hfov": 0})})
+    assert reply["state"] == "error"
+
+    # 合法 blob 照常落库
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config",
+        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})})
+    assert reply["status"] == "configured"
+    assert plugin._calibration["fx"] == 300.0
+
+
+# ── review 第 17 轮：实例 config 校验 / shutdown / 数值范围 ─────────────────
+
+def test_instance_config_rejects_invalid_calibration_without_retiring():
+    """review 第 17 轮 Issue 1：实例分支以前不校验就落库并撤节点——运行中
+    的卡片被换成 {"fx": 0} 后回复 configured 且节点已停，下次 start 才被
+    预检拒绝：卡片已静默停掉、还留着自己已知不可用的配置。坏标定必须
+    当场拒收：不落库、不撤节点。raw/rectified 档同理。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+    assert len(executor.nodes) == 1
+
+    # pinhole 坏值：拒收、节点还在跑、实例配置没被污染
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps({"fx": 0, "cx": 160})})
+    assert reply["state"] == "error"
+    assert len(executor.nodes) == 1          # 没撤节点
+    assert executor.nodes[0] is node
+    with plugin._nodes_lock:
+        assert "/cam/depth" not in plugin._instance_configs  # 没落库
+
+    # rectified 坏值（Tx=0）：同样拒收
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0})})
+    assert reply["state"] == "error"
+    assert "Tx" in reply["message"]
+
+    # raw 坏值（K2 缺失）：同样拒收
+    blob = json.loads(json.dumps(RAW_BLOB))
+    del blob["K2"]
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps(blob)})
+    assert reply["state"] == "error"
+
+    # 合法实例标定照常：落库 + 撤节点（等重启生效，原契约）
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/depth",
+        "calibration": json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})})
+    assert reply["status"] == "configured"
+    assert len(executor.nodes) == 0
+    with plugin._nodes_lock:
+        stored = plugin._instance_configs["/cam/depth"]
+    assert stored["calibration"] == json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0})
+
+
+@pytest.mark.parametrize("cfg,needle", [
+    ({"min_depth_m": 5.0, "max_depth_m": 3.0}, "深度范围"),   # min > max
+    ({"min_depth_m": 11.0}, "深度范围"),                       # 11 > 默认 max 10
+    ({"max_depth_m": 0.05}, "深度范围"),                       # 0.05 < 默认 min 0.1
+    ({"min_depth_m": -1.0}, "深度范围"),                       # 负距离
+    ({"fps": 0}, "fps"),                                       # 0 fps → 静默钳 0.1
+    ({"fps": -3}, "fps"),
+    ({"fps": "abc"}, "数值异常"),
+])
+def test_config_rejects_invalid_ranges(cfg, needle):
+    """review 第 17 轮 Issue 3：min>=max / 非正 fps 以前照收 configured——
+    filter_cloud 的 z 窗口为空，卡片 running 却一帧云不出；fps<=0 被静默
+    钳到 0.1 fps。实例与全局同一条检查。"""
+    plugin, _ = _plugin()
+    reply = plugin.dispatch("pointcloud", {"action": "config", **cfg})
+    assert reply["state"] == "error", f"{cfg} 应被拒收"
+    assert needle in reply["message"]
+    # 未落库
+    assert plugin._fps == 2
+    assert plugin._min_depth_m == 0.1
+    assert plugin._max_depth_m == 10.0
+
+    # 实例分支同一条检查
+    plugin2, executor2 = _plugin()
+    reply = plugin2.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/x", **cfg})
+    assert reply["state"] == "error"
+    assert executor2.nodes == []
+
+
+def test_config_accepts_valid_ranges_and_stepwise_updates():
+    """预检不误伤：合法范围照常落库；只改一侧、与现值组合仍合法也放行
+    （允许分两步把 (0.1, 10) 改成 (5, 20)）。"""
+    plugin, _ = _plugin()
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "min_depth_m": 5.0})  # 与默认 max=10 组合合法
+    assert reply["status"] == "configured"
+    assert plugin._min_depth_m == 5.0
+
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "max_depth_m": 20.0, "fps": 5})
+    assert reply["status"] == "configured"
+    assert plugin._max_depth_m == 20.0
+    assert plugin._fps == 5
+
+
+def test_plugin_shutdown_retires_all_nodes_and_clears_pending():
+    """review 第 17 轮 Issue 2：插件以前没有 shutdown()——SIGTERM 走到
+    executor/rclpy 关停时订阅、发布和 worker 线程还全活着，worker 还可能
+    对着已关的 ROS context 发布。shutdown 必须撤掉全部节点并清 pending
+    队列（等模型下载的 start 不该在关停中途被 _bg_start 拉起）。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/a", "mode": "depth"})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/b", "mode": "depth"})
+    assert len(executor.nodes) == 2
+    with plugin._pending_lock:
+        plugin._model_pending_starts = [("/cam/pending", "mono", "/cam/p", None, None)]
+
+    plugin.shutdown()
+
+    assert plugin._nodes == {}
+    assert executor.nodes == []
+    with plugin._pending_lock:
+        assert plugin._model_pending_starts == []
+    # 幂等：再调一次不炸
+    plugin.shutdown()
+
+
+# ── review 第 18 轮：实例 config 合并语义 / 有界解压 ─────────────────────────
+
+def test_instance_config_patches_instead_of_replacing():
+    """review 第 18 轮 Issue 1：实例配置是补丁不是替换（OCR 的语义）——
+    存了双目标定后只改 fps，旧实现存成 {"fps": ...} 把标定丢掉，下次
+    stereo start 静默落回 capture-only、一帧云不出。"""
+    plugin, _ = _plugin()
+    calib = json.dumps({"fx": 300.0, "cx": 160.0, "cy": 120.0, "Tx": 0.05})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "calibration": calib})
+    # 第二次只改 fps：标定必须还在
+    reply = plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "fps": 5})
+    assert reply["status"] == "configured"
+    with plugin._nodes_lock:
+        stored = plugin._instance_configs["/cam/left"]
+    assert stored["calibration"] == calib, "只改 fps 不得丢掉已存标定"
+    assert stored["fps"] == 5
+    # 回复里带合并后的完整配置，卡片能看到最终生效值
+    assert reply["config"] == stored
+
+    # 端到端：合并后的配置真被下一次 start 用上（stereo 拿到 rectified 档
+    # 而不是 capture-only）
+    plugin2, executor2 = _plugin(cfg={"fps": 1000})
+    plugin2.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "calibration": calib})
+    plugin2.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left", "max_points": 500})
+    reply = plugin2.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor2.nodes[0]
+    assert node._calibration["Tx"] == 0.05  # 标定活过了第二次 config
+
+
+def test_depth_zlib_decompress_is_bounded():
+    """review 第 18 轮 Issue 2：zlib.decompress 以前无上限——几百 KB 的
+    压缩包能声明几十 MB 的解压产物，在回调里把 perception 进程 OOM。
+    有界解压：正常 614400 B 帧放行，超 1 MiB 上限（解压炸弹）拒收，
+    截断流照旧报错。"""
+    import zlib
+    from plugins.pointcloud import zlib_decompress
+
+    # 正常帧：640x480 uint16 = 614400 B
+    good = zlib.compress(b"\x27\x10" * 307200, 1)
+    assert len(zlib_decompress(good)) == 614400
+
+    # 解压炸弹：40 MB 的零压到几 KB，必须在 1 MiB 处被截停
+    bomb = zlib.compress(b"\x00" * (40 << 20), 9)
+    assert len(bomb) < 100_000  # 压缩端确实很小
+    with pytest.raises(ValueError, match="1 MiB"):
+        zlib_decompress(bomb)
+
+    # 略超上限：1.25 MB —— 同样拒收（unconsumed_tail 非空）
+    over = zlib.compress(b"\x01" * (1 << 20) + b"\x02" * (1 << 18), 1)
+    with pytest.raises(ValueError, match="1 MiB"):
+        zlib_decompress(over)
+
+    # 截断流：解不出来，照旧抛 zlib 的错误（外部有 fail_count 兜底）
+    with pytest.raises(Exception):
+        zlib_decompress(good[:len(good) // 2])
+
+
+def test_depth_zlib_oversized_payload_does_not_reach_worker():
+    """超大压缩帧在解码处被拒（返回 None），不会以任何形式进 worker ——
+    回调侧的防线：坏帧只计数告警，进程不倒。"""
+    import zlib
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    bomb = zlib.compress(b"\x00" * (40 << 20), 9)
+    msg = _FakeCompressedImage(bomb, fmt="16UC1; compressedDepth zlib")
+    # _depth_comp_cb 只节流入队，解码发生在 worker —— 直接调解码入口
+    from plugins.pointcloud import _decode_depth_message
+    depth, enc = _decode_depth_message(msg)
+    assert depth is None, "超限解压必须被拒，不得产出深度图"
+
+
+# ── review 第 7 轮：标定优先级 start 参数 > 实例 config > 全局 ────────────────
+
+def test_instance_calibration_beats_global_calibration():
+    """全局 plugins.pointcloud.calibration 配了标定时，卡片经 action=config
+    配的实例标定必须赢 —— 以前 _resolve_mode 先取全局，实例档只有全局为
+    空才轮得到，双目会拿错内参/基线出歪云。"""
+    global_blob = json.loads(json.dumps(RAW_BLOB))
+    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]  # 标记值
+    instance_blob = json.loads(json.dumps(RAW_BLOB))
+    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
+    plugin, executor = _plugin(
+        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left",
+        "calibration": json.dumps(instance_blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 222  # 实例档胜出
+
+
+def test_start_param_beats_instance_and_global_calibration():
+    """start 参数直接带标定时最高优先：现场换标定不用先改配置。"""
+    global_blob = json.loads(json.dumps(RAW_BLOB))
+    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]
+    instance_blob = json.loads(json.dumps(RAW_BLOB))
+    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
+    inline_blob = json.loads(json.dumps(RAW_BLOB))
+    inline_blob["K1"] = [[333, 0, 160], [0, 333, 120], [0, 0, 1]]
+    plugin, executor = _plugin(
+        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left",
+        "calibration": json.dumps(instance_blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": json.dumps(inline_blob)})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 333
+
+
+def test_global_calibration_still_applies_without_instance_one():
+    """没有实例标定时全局档照常兜底 —— 修优先级不能把全局配置弄丢。"""
+    global_blob = json.loads(json.dumps(RAW_BLOB))
+    global_blob["K1"] = [[111, 0, 160], [0, 111, 120], [0, 0, 1]]
+    plugin, executor = _plugin(
+        cfg={"calibration": json.dumps(global_blob), "fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 111
+
+
+# ── 驱动声明层：stereo_peer + 两条输入的 K/D 自动拼标定 ───────────────────────
+
+_STEREO_K = [300.0, 0.0, 160.0, 0.0, 300.0, 120.0, 0.0, 0.0, 1.0]
+
+
+def _decl(topic, cam_id, *, K=None, D=None, stereo_peer=None, **over):
+    out = {"schema": "motus.camera/1", "topic": topic, "format": "image/jpeg",
+           "id": cam_id, "width": 320, "height": 240,
+           "distortion_model": "unknown", "D": D,
+           "K": K, "half_fov_rad": None, "half_fov_v_rad": None,
+           "stereo_peer": stereo_peer, "source": "measured",
+           "measured_on": "factory", "pipeline": [cam_id], "vendor": {}}
+    out.update(over)
+    return out
+
+
+def _stereo_declarations():
+    """左目带 stereo_peer（R/T + 指向右目 id），两路各带 K/D —— 型号级
+    出厂标定在声明里的完整形态。"""
+    return [
+        _decl("/cam/left", "unitree/r1/camera_left", K=_STEREO_K, D=[0.0, 0.0, 0.0, 0.0],
+              stereo_peer={"id": "unitree/r1/camera_right",
+                           "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                           "T": [[-0.05], [0], [0]],
+                           "source": "measured"}),
+        _decl("/cam/right", "unitree/r1/camera_right", K=_STEREO_K, D=[0.0, 0.0, 0.0, 0.0]),
+    ]
+
+
+def test_stereo_start_uses_declared_calibration_without_any_config():
+    """零配置双目：驱动声明了 stereo_peer + K/D，卡片不带任何标定也能出
+    raw 档标定（型号级出厂标定的消费路径）。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration is not None
+    assert pc.calibration_tier(node._calibration) == "raw"
+    assert node._calibration["T"] == [[-0.05], [0], [0]]
+    assert node._calibration["K1"] == [[300.0, 0.0, 160.0],
+                                       [0.0, 300.0, 120.0],
+                                       [0.0, 0.0, 1.0]]
+    assert node._calibration["K2"][0][0] == 300.0
+    # 拼出的 blob 过得了 start 的 raw 预检（_raw_stereo_params 全量校验）
+    K1, _D1, K2, _D2, _R, T = pc._raw_stereo_params(node._calibration)
+    assert float(T[0]) == pytest.approx(-0.05)
+    assert K1[0, 0] == pytest.approx(300.0) and K2[0, 0] == pytest.approx(300.0)
+
+
+def test_declared_calibration_reports_its_source_in_info():
+    """声明层与用户配置的标定在 info() 里可区分 —— 出云错了，一个要找
+    驱动数据的人，一个要找标定的人。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    (inst,) = info["instances"].values()
+    assert inst["calibration_source"] == "measured"
+
+    # 对照：用户配置的标定不带 source 字段 → "configured"
+    plugin2, _ = _plugin(cfg={"fps": 1000,
+                              "calibration": json.dumps(RAW_BLOB)})
+    plugin2.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    info2 = plugin2.dispatch("pointcloud", {"action": "info"})
+    (inst2,) = info2["instances"].values()
+    assert inst2["calibration_source"] == "configured"
+
+
+def test_instance_calibration_beats_the_declared_one():
+    """优先级链：用户/实例标定 > 驱动声明 —— 用户自己标的一定比型号常量
+    新鲜（摔过/换过镜头后重标）。"""
+    instance_blob = json.loads(json.dumps(RAW_BLOB))
+    instance_blob["K1"] = [[222, 0, 160], [0, 222, 120], [0, 0, 1]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "config", "instance_id": "/cam/left",
+        "calibration": json.dumps(instance_blob)})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._calibration["K1"][0][0] == 222  # 实例档胜出，声明层没上场
+
+
+def test_declared_calib_missing_peer_falls_back_to_capture_only_with_error():
+    """带了声明但差件套（左目没有 stereo_peer）→ 按错误拒绝而不是静默
+    capture-only：驱动数据坏了不能藏成"用户没标定"。"""
+    decls = _stereo_declarations()
+    decls[0] = _decl("/cam/left", "unitree/r1/camera_left", K=_STEREO_K)
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "stereo_peer" in reply["message"]
+
+
+def test_declared_calib_peer_id_mismatch_rejects_swapped_inputs():
+    """peer 用 id 匹配：右目声明的 id 对不上 peer.id（左右接反/不是一对）
+    必须拒收 —— 这是"双目接反了"唯一能被自动发现的地点。"""
+    decls = _stereo_declarations()
+    # 右目换成第三个相机：id 对不上左目声明的 peer
+    decls[1] = _decl("/cam/right", "unitree/r1/camera_depth", K=_STEREO_K)
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "接反" in reply["message"] or "不配对" in reply["message"]
+
+
+def test_short_T_in_config_blob_is_rejected_at_start():
+    """review 第 21 轮 Issue：{"T": [[-0.05]]} 以前过得了 start 预检
+    （T[0] 有限非零），worker 里 T.reshape(3, 1) 每帧炸 —— 卡片 running
+    却一云不出。平移向量必须恰为 3 元，start 当场报清楚。"""
+    blob = json.loads(json.dumps(RAW_BLOB))
+    blob["T"] = [[-0.05]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "calibration": json.dumps(blob)})
+    assert reply["state"] == "error"
+    assert "T 不是 3 元素" in reply["message"]
+
+
+def test_short_T_in_declared_peer_is_rejected_at_start():
+    """review 第 21 轮建议：stereo_peer 只查非 None 不够 —— 声明里 1 元素
+    的 T 会在拼 blob 后带进 worker 每帧炸。拼完当场用与配置 blob 同一份
+    解析器预检，坏驱动数据在 start 报清楚。"""
+    decls = _stereo_declarations()
+    decls[0]["stereo_peer"]["T"] = [[-0.05]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "畸形" in reply["message"] and "T" in reply["message"]
+
+
+def test_nan_in_declared_peer_R_is_rejected_at_start():
+    """同一条预检的有限值面：声明层 peer 的 R 里一个 NaN 以前会带进
+    stereoRectify 输出全 NaN、映射全废、云一帧不出且无报错。"""
+    decls = _stereo_declarations()
+    decls[0]["stereo_peer"]["R"] = [[1, 0, float("nan")], [0, 1, 0], [0, 0, 1]]
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "畸形" in reply["message"]
+
+
+def test_declared_calib_missing_right_k_reports_the_gap():
+    """右目声明没带 K：成套才用、缺件报清楚（unknown is null, never a
+    guess —— 拼半套标定与错误标定下游不可区分）。"""
+    decls = _stereo_declarations()
+    decls[1] = _decl("/cam/right", "unitree/r1/camera_right", K=None)
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": decls})
+    assert reply["state"] == "error"
+    assert "右目" in reply["message"] and "K" in reply["message"]
+
+
+def test_no_declarations_at_all_still_starts_capture_only():
+    """两条输入都没声明（旧驱动）→ 维持老契约：capture-only 启动，
+    calibrate 照常可用。声明层是加分项不是新门槛。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"]})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert not node._calibration  # capture-only：unknown 档不出云
+    # 无标定即无来源（info() 里报 None）
+    assert getattr(node, "_calibration_source", None) is None
+
+
+def test_auto_mode_two_inputs_also_uses_declared_calibration():
+    """auto + 两路输入判成 stereo 的路径同样吃声明层标定 —— _resolve_mode
+    里 auto→stereo 的改判先于声明层拼装。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    reply = plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "mode": "auto",
+        "camera_info": _stereo_declarations()})
+    assert reply["state"] == "running"
+    node = executor.nodes[0]
+    assert node._mode == "stereo"
+    assert pc.calibration_tier(node._calibration) == "raw"
+
+
+def test_right_declaration_is_recorded_and_retired_with_the_node():
+    """右目声明随节点走（同 _upstream_camera 的契约，按 node_key 记）：
+    重新接线后不留过期镜头。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {
+        "action": "start", "input_topics": ["/cam/left", "/cam/right"],
+        "camera_info": _stereo_declarations()})
+    node_key = "/cam/left"  # 无 instance_id 时 node_key = 左路话题
+    assert plugin._upstream_camera[node_key]["id"] == "unitree/r1/camera_left"
+    assert plugin._upstream_camera_right[node_key]["id"] == "unitree/r1/camera_right"
+    plugin.dispatch("pointcloud", {"action": "stop"})
+    assert node_key not in plugin._upstream_camera_right
+
+
+# ── review 第 6 轮：每帧日志节流，坏流不淹容器日志 ───────────────────────────
+
+def test_zlib_decode_failure_logs_once_then_samples(caplog):
+    """畸形 depth-zlib 帧以前每回调一条 warning —— 2 fps 的坏流一天
+    十几万行。现在第 1 条记录、之后每第 100 条采样，好帧复位计数。"""
+    import logging as _logging
+
+    pc._zlib_fail_count = 0
+    bad = _FakeCompressedImage(b"not-zlib-at-all", fmt="depth-zlib")
+    good = _FakeCompressedImage(
+        zlib.compress(np.full((480, 640), 1500, dtype="<u2").tobytes()),
+        fmt="depth-zlib")
+
+    with caplog.at_level(_logging.WARNING, logger="plugins.pointcloud"):
+        for _ in range(199):
+            depth, _ = pc._decode_depth_message(bad)
+            assert depth is None
+        # 第 1 条与第 100 条；2..99、101..199 静默
+        warns = [r for r in caplog.records if "depth-zlib" in r.message]
+        assert len(warns) == 2
+        assert "第 1 帧" in warns[0].message
+        assert "第 100 帧" in warns[1].message
+        # 好帧复位：之后的第一条坏帧是新一轮的第 1 条
+        depth, _ = pc._decode_depth_message(good)
+        assert depth is not None
+        depth, _ = pc._decode_depth_message(bad)
+        warns = [r for r in caplog.records if "depth-zlib" in r.message]
+        assert len(warns) == 3
+        assert "第 1 帧" in warns[2].message
+    pc._zlib_fail_count = 0
+
+
+def test_worker_error_logs_full_trace_once_then_samples(caplog):
+    """worker 异常以前每帧一条完整 traceback。现在首条带 traceback、
+    之后每第 100 条采样且有界，处理成功即复位。"""
+    import logging as _logging
+
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+
+    def _boom(self_inner, msg):
+        raise RuntimeError("kaboom " + "x" * 500)
+
+    original = pc._PointCloudNode._emit_depth
+    pc._PointCloudNode._emit_depth = _boom
+    try:
+        with caplog.at_level(_logging.ERROR, logger="plugins.pointcloud"):
+            for _ in range(150):
+                node._frame_queue.put(("depth_z16", "fake"))
+                assert _wait_until(lambda: node._frame_queue.empty(), timeout=2.0)
+            errors = [r for r in caplog.records if "worker error" in r.message]
+            assert len(errors) == 2
+            assert errors[0].exc_info is not None  # 首条带 traceback
+            assert "worker error" in errors[0].message  # 首条无计数标记，是状态转换
+            assert len(errors[0].message) > 300  # 首条带完整错误详情
+            assert "第 100 帧" in errors[1].message
+            assert len(errors[1].message) < 300  # 采样条只有有界摘要
+            # 好帧复位：之后第一条 worker 错误是新一轮的第 1 条（带 traceback）
+            pc._PointCloudNode._emit_depth = original
+            good = _FakeImage(data=np.full((4, 4), 2000, dtype="<u2").tobytes(),
+                              encoding="16UC1", width=4, height=4, step=8)
+            node._frame_queue.put(("depth_z16", good))
+            assert _wait_until(lambda: bool(_cloud_pub(node).messages), timeout=2.0)
+            # worker 先 publish 后才复位计数，主线程必须等 reset 可见，
+            # 否则微秒级的竞争窗口会让这条好帧断言失败。
+            assert _wait_until(lambda: node._worker_error_count == 0, timeout=2.0)
+            pc._PointCloudNode._emit_depth = _boom
+            node._frame_queue.put(("depth_z16", "fake"))
+            assert _wait_until(lambda: node._worker_error_count == 1, timeout=2.0)
+            errors = [r for r in caplog.records
+                      if "worker error" in r.message and r.exc_info is not None]
+            assert len(errors) == 2  # 新一轮首条又是完整 traceback
+    finally:
+        pc._PointCloudNode._emit_depth = original
+        node.request_stop()
+
+
+# ── review issue 3：camera_info 声明沿链路传递 ────────────────────────────────
+
+_UPSTREAM_DECL = {
+    "schema": "motus.camera/1", "topic": "/cam/rgb", "format": "image/jpeg",
+    "id": "unitree/r1/camera_main", "width": 1280, "height": 720,
+    "distortion_model": "unknown", "D": None,
+    "K": [700.0, 0.0, 640.0, 0.0, 700.0, 360.0, 0.0, 0.0, 1.0],
+    "half_fov_rad": 0.888, "half_fov_v_rad": None, "source": "measured",
+    "measured_on": "r1_sz", "pipeline": ["unitree/r1/camera_main"], "vendor": {},
+}
+
+
+def test_start_records_upstream_declaration_and_info_carries_it():
+    """review Medium：以前 start 不收 camera_info、info() 也不传 ——
+    上游声明了真实内参，反投影却按 90° hfov 硬算，下游拿不到任何
+    motus.camera/1 声明。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    entries = info["camera_info"]
+    assert [e["topic"] for e in entries] == [
+        "/cam/rgb/pointcloud", "/cam/rgb/pointcloud_summary"]
+    assert all(e["schema"] == "motus.camera/1" for e in entries)
+    assert all(e["pipeline"][-1] == "perception/pointcloud" for e in entries)
+    # 点云不裁剪不缩放（抽稀只丢点不丢视场）：K 与 half_fov_rad 原样继承
+    assert all(e["K"] == _UPSTREAM_DECL["K"] for e in entries)
+    assert all(e["half_fov_rad"] == 0.888 for e in entries)
+    assert all(e["width"] == 1280 and e["height"] == 720 for e in entries)
+    assert "camera_info_note" not in info
+
+
+def test_info_without_upstream_declaration_says_whose_problem_it_is():
+    """"上游没声明"和"本卡弄丢了"在下游看来一样，只有前者该找相机卡片
+    的人 —— note 必须区分。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    assert "camera_info" not in info
+    assert "上游相机没有声明" in info["camera_info_note"]
+
+
+def test_retire_node_drops_the_upstream_declaration():
+    """重新接线的卡片拿着已不喂它的相机的光学参数回答 info()，比不答
+    还糟 —— 声明随节点走。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    assert "/cam/rgb" in plugin._upstream_camera
+    plugin.dispatch("pointcloud", {"action": "stop"})
+    assert "/cam/rgb" not in plugin._upstream_camera
+
+
+def test_restart_without_declaration_replaces_the_stale_one():
+    """重启不再带声明时必须替换旧值，而不是留着过期镜头。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    plugin.dispatch("pointcloud", {"action": "stop"})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    assert "camera_info" not in info
+    assert "上游相机没有声明" in info["camera_info_note"]
+
+
+def test_loading_info_still_carries_the_declaration():
+    """loading 早退分支不能把声明丢在地上（visual_depth/vop 的教训）。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    plugin._model_loading = True  # 模拟 mono 引擎加载窗口
+    info = plugin.dispatch("pointcloud", {"action": "info",
+                                          "input_topic": "/cam/rgb"})
+    assert info["state"] == "loading"
+    assert [e["topic"] for e in info["camera_info"]] == [
+        "/cam/rgb/pointcloud", "/cam/rgb/pointcloud_summary"]
+
+
+def test_pinhole_for_uses_upstream_k_rescaled_across_resolutions():
+    """A/B 模式反投影：上游声明了 K 就用它（按分辨率缩放），而不是按
+    90° hfov 硬算横向坐标。无上游无标定时才落 90° 兜底。"""
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start",
+                                   "input_topic": "/cam/rgb",
+                                   "camera_info": [_UPSTREAM_DECL]})
+    node = executor.nodes[0]
+    # 同分辨率：原样 K
+    fx, fy, cx, cy = node._pinhole_for(1280, 720)
+    assert fx == pytest.approx(700.0) and fy == pytest.approx(700.0)
+    assert cx == pytest.approx(640.0) and cy == pytest.approx(360.0)
+    # 半分辨率：K 按像素缩一半
+    fx, fy, cx, cy = node._pinhole_for(640, 360)
+    assert fx == pytest.approx(350.0) and fy == pytest.approx(350.0)
+    assert cx == pytest.approx(320.0) and cy == pytest.approx(180.0)
+
+
+def test_pinhole_for_falls_back_to_90deg_without_anything():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    fx, fy, cx, cy = node._pinhole_for(640, 360)
+    assert fx == pytest.approx(320.0)  # 90° hfov → w/2
+    assert cx == pytest.approx(320.0) and cy == pytest.approx(180.0)
+
+
+# ── info / config / 生命周期 ─────────────────────────────────────────────────
+
+def test_info_of_idle_plugin_is_idle():
+    plugin, _ = _plugin()
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert info["state"] == "idle"
+    assert info["topic_in"] == []
+
+
+def test_info_reports_depth_format_for_depth_mode():
+    plugin, executor = _plugin(cfg={"fps": 1000})
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    assert info["topic_in"][0]["format"] == "image/depth-z16"
+    assert info["instances"]["/cam/depth"]["mode"] == "depth"
+
+
+def test_stop_destroys_the_node():
+    plugin, executor = _plugin()
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+    plugin.dispatch("pointcloud", {"action": "stop"})
+    assert executor.nodes == []
+    assert node.destroyed is True
+
+
+def test_config_updates_global_defaults():
+    plugin, _ = _plugin()
+    plugin.dispatch("pointcloud",
+                    {"action": "config", "fps": 5, "max_points": 500, "max_depth_m": 4.0})
+    assert plugin._fps == 5
+    assert plugin._max_points == 500
+    assert plugin._max_depth_m == 4.0
+
+
+def test_output_topics_follow_input():
+    plugin, executor = _plugin()
+    plugin.dispatch("pointcloud",
+                    {"action": "start", "input_topic": "/cam/depth", "mode": "depth"})
+    node = executor.nodes[0]
+    assert node._cloud_topic == "/cam/depth/pointcloud"
+    assert node._summary_topic == "/cam/depth/pointcloud_summary"
+
+
+def test_multi_instance_info_never_reports_default_topics():
+    """review 第 12 轮：多实例时 info() 不再把默认话题 /perception/...
+    塞进 topic_out —— 每个节点只发自己的 {input}/... 对，Agent Core 按
+    topic_out 接线，默认话题会把第二张卡之后的下游引向不存在的话题。"""
+    plugin, executor = _plugin()
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/a",
+                                    "mode": "depth"})
+    plugin.dispatch("pointcloud", {"action": "start", "input_topic": "/cam/b",
+                                    "mode": "depth"})
+    assert len(executor.nodes) == 2
+
+    # 不指定实例：全部实例的成对输出，且不含任何默认话题
+    info = plugin.dispatch("pointcloud", {"action": "info"})
+    out = [t["topic"] for t in info["topic_out"]]
+    assert "/cam/a/pointcloud" in out
+    assert "/cam/a/pointcloud_summary" in out
+    assert "/cam/b/pointcloud" in out
+    assert "/cam/b/pointcloud_summary" in out
+    assert "/perception/pointcloud" not in out
+    assert "/perception/pointcloud_summary" not in out
+
+    # 指定实例：只有该实例的一对，没有杂音
+    info_a = plugin.dispatch("pointcloud",
+                             {"action": "info", "instance_id": "/cam/a"})
+    assert [t["topic"] for t in info_a["topic_out"]] == [
+        "/cam/a/pointcloud", "/cam/a/pointcloud_summary"]
