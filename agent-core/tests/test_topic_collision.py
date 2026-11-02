@@ -19,6 +19,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import types
 
 import pytest
 
@@ -97,3 +98,55 @@ def test_a_consumer_still_cannot_change_the_format(clean):
     _register(TOPIC, 'image/depth-zlib', 'mcp-perception')
     _register(TOPIC, 'image/jpeg', 'mcp-ocr', producer=False)
     assert inspection._topic_registry[TOPIC]['format'] == 'image/depth-zlib'
+
+
+@pytest.mark.parametrize('fmt', ['sensor/depth-f32', 'sensor/pointcloud2'])
+def test_large_computation_topics_do_not_subscribe_at_registration(clean, fmt):
+    _register(TOPIC, fmt, 'mcp-producer')
+    _register(TOPIC, fmt, 'mcp-consumer', producer=False)
+    assert inspection._topic_registry[TOPIC]['format'] == fmt
+    assert clean == []
+
+
+def test_large_topic_preview_releases_subscription_when_connection_closes(monkeypatch):
+    topic = '/metric-depth'
+    inspection._topic_registry[topic] = {'format': 'sensor/depth-f32'}
+    unsubscribed = []
+    monkeypatch.setattr(inspection, '_ensure_primary_sub',
+                        lambda topic, fmt, loop: inspection._active_primary_subs.add(topic))
+    monkeypatch.setattr(inspection.ros2_bridge, 'unsubscribe', unsubscribed.append)
+
+    async def accept():
+        pass
+
+    async def send_text(_text):
+        raise inspection.fastapi.WebSocketDisconnect()
+
+    ws = types.SimpleNamespace(accept=accept, send_text=send_text)
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        inspection.bus_ws(ws, topic.lstrip('/')))
+    assert unsubscribed == ['__primary__#' + topic]
+    assert topic not in inspection._active_primary_subs
+
+
+def test_large_topic_keeps_subscription_for_another_viewer(monkeypatch):
+    topic = '/metric-depth-two-viewers'
+    inspection._topic_registry[topic] = {'format': 'sensor/depth-f32'}
+    other_viewer = asyncio.Queue()
+    inspection._topic_queues[topic] = [other_viewer]
+    unsubscribed = []
+    monkeypatch.setattr(inspection, '_ensure_primary_sub',
+                        lambda topic, fmt, loop: inspection._active_primary_subs.add(topic))
+    monkeypatch.setattr(inspection.ros2_bridge, 'unsubscribe', unsubscribed.append)
+
+    async def accept():
+        pass
+
+    async def send_text(_text):
+        raise inspection.fastapi.WebSocketDisconnect()
+
+    ws = types.SimpleNamespace(accept=accept, send_text=send_text)
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        inspection.bus_ws(ws, topic.lstrip('/')))
+    assert not unsubscribed
+    assert inspection._topic_queues.pop(topic) == [other_viewer]

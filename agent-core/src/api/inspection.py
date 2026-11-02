@@ -124,6 +124,13 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
     print(f'[inspection] started primary sub: {topic}')
 
 
+def _ensure_registered_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
+    # Large computational streams are subscribed only when a viewer opens
+    # them; registering a port must not duplicate continuous camera traffic.
+    if fmt not in ('sensor/depth-f32', 'sensor/pointcloud2'):
+        _ensure_primary_sub(topic, fmt, loop)
+
+
 # ── Internal API (called by mcp_manage directly) ───────────────────────────────
 
 async def register_topic_internal(topic: str, fmt: str, mcp_id: str,
@@ -165,14 +172,14 @@ async def register_topic_internal(topic: str, fmt: str, mcp_id: str,
                   f'refused {fmt!r} from {mcp_id}. Two producers are publishing '
                   f'to one topic under different formats — one of them needs '
                   f'renaming, and until then the other one is unreadable.')
-        _ensure_primary_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
+        _ensure_registered_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
         return
     if existing and not producer:
         if existing.get('format') != fmt:
             print(f'[inspection] ignored consumer format {fmt!r} for {topic} '
                   f'(producer says {existing.get("format")!r}, from {existing.get("mcp_id")})')
         # 格式不动，但仍要确保订阅健康
-        _ensure_primary_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
+        _ensure_registered_sub(topic, existing.get('format', ''), asyncio.get_event_loop())
         return
     if not (existing and existing.get('format') == fmt and existing.get('mcp_id') == mcp_id):
         # 格式变了 → 订阅要重建：msg type 是按 format 选的，旧订阅还挂在错误的类型上
@@ -189,7 +196,7 @@ async def register_topic_internal(topic: str, fmt: str, mcp_id: str,
         print(f'[inspection] registered topic={topic} format={fmt} mcp_id={mcp_id}')
     # Always check health of primary sub (even on duplicate registration)
     loop = asyncio.get_event_loop()
-    _ensure_primary_sub(topic, fmt, loop)
+    _ensure_registered_sub(topic, fmt, loop)
 
 
 async def publish_to_topic(topic: str, data: str | bytes) -> None:
@@ -289,27 +296,22 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
     # Ensure DDS subscription is active (no-op if already running)
     _ensure_primary_sub(topic, fmt, loop)
 
-    await websocket.send_text(json.dumps({
-        'type':   'meta',
-        'ts':     time.time(),
-        'topic':  topic,
-        'format': fmt,
-    }))
-
-    # Push cached snapshot immediately (so page refresh shows current map)
-    snapshot = _last_frame.get(topic)
-    if snapshot:
-        if fmt in ('sensor/pointcloud', 'sensor/mapping'):
-            await websocket.send_bytes(snapshot)
-        elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
-            await websocket.send_text(snapshot.decode('utf-8', errors='replace'))
-        else:
-            await websocket.send_bytes(snapshot)
-
     q: asyncio.Queue = asyncio.Queue(maxsize=4096)
     _topic_queues.setdefault(topic, []).append(q)
 
     try:
+        await websocket.send_text(json.dumps({
+            'type': 'meta', 'ts': time.time(), 'topic': topic, 'format': fmt,
+        }))
+        # Push cached snapshot immediately (so page refresh shows current map).
+        snapshot = _last_frame.get(topic)
+        if snapshot:
+            if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+                await websocket.send_bytes(snapshot)
+            elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
+                await websocket.send_text(snapshot.decode('utf-8', errors='replace'))
+            else:
+                await websocket.send_bytes(snapshot)
         while True:
             try:
                 data = await asyncio.wait_for(q.get(), timeout=5.0)
@@ -332,3 +334,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
         queues = _topic_queues.get(topic, [])
         if q in queues:
             queues.remove(q)
+        if not queues and fmt in ('sensor/depth-f32', 'sensor/pointcloud2'):
+            ros2_bridge.unsubscribe(f'__primary__#{topic}')
+            _active_primary_subs.discard(topic)
+            _last_frame.pop(topic, None)
