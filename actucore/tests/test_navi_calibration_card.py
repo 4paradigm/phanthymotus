@@ -98,7 +98,7 @@ def _complete(rig, card, *, begin=True):
         assert result["state"] == "running", result
     publisher = card._publisher
     card._tick()
-    for _ in range(80):
+    for _ in range(130):
         if card._calibration is None:
             break
         wz = publisher.commands[-1]["values"][5]
@@ -122,11 +122,11 @@ def test_calibration_uses_real_odom_and_guarded_command_stream_then_persists(rig
     info, commands = _complete(rig, card, begin=False)
     assert info["calibration"]["status"] == "completed", info["calibration"]
     assert commands[-1]["values"] == [0.0] * 6
-    assert {command["values"][5] for command in commands} == {-0.2, 0.0, 0.2}
+    assert {command["values"][5] for command in commands} == {-0.5, 0.0, 0.5}
     turns = [command["values"][5] for command in commands]
     first_positive = next(index for index, value in enumerate(turns) if value > 0)
     first_negative = next(index for index, value in enumerate(turns) if value < 0)
-    assert turns[first_negative - 1] == 0.2
+    assert turns[first_negative - 1] == 0.5
     assert 0.0 not in turns[first_positive:first_negative]
     assert all(command["values"][:5] == [0.0] * 5 for command in commands)
     assert all(command["schema"] == "motus.control/1" for command in commands)
@@ -161,7 +161,7 @@ def test_four_hz_odometry_with_ten_hz_command_ticks_calibrates_and_persists(rig)
     card._tick()
     # Independent event clocks: an ODOM callback can arrive between two
     # command ticks. Re-reading its cached value never creates another sample.
-    for event in range(1, 161):
+    for event in range(1, 241):
         rig.clock.advance(0.05)
         if event % 5 == 0:
             rig.feed(card, card._publisher.commands[-1]["values"][5])
@@ -171,9 +171,9 @@ def test_four_hz_odometry_with_ten_hz_command_ticks_calibrates_and_persists(rig)
             break
     report = card._info()["calibration"]
     assert report["status"] == "completed", report
-    assert report["elapsed_s"] == pytest.approx(5.2)
-    assert report["samples"] == 21
-    assert len(card._publisher.commands) == 53
+    assert report["elapsed_s"] == pytest.approx(10.0)
+    assert report["samples"] == 41
+    assert len(card._publisher.commands) == 101
     assert card._publisher.commands[-1]["values"] == [0.0] * 6
     assert list(rig.directory.glob("yaw-*.json"))
 
@@ -244,7 +244,7 @@ def test_calibration_refuses_execution_contracts_that_cannot_support_a_small_pul
     elif problem == "low_rate":
         card._rate_hz = 5
     elif problem == "high_deadband":
-        card._config.floor_wz = 0.3
+        card._config.floor_wz = 0.6
     else:
         card._descriptor["limits"]["upper"][5] = 0.1
     assert _begin(card)["state"] == "error"
@@ -302,6 +302,23 @@ def test_calibration_failure_reports_a_receipt_gap_separately_from_source_age(ri
     assert card._publisher.commands[-1]["values"] == [0.0] * 6
 
 
+def test_fit_diagnostics_reach_info_and_the_action_complete_result(rig):
+    card = rig.card()
+    started = _begin(card)
+    diagnostics = {"commanded_wz_rad_s": 0.5,
+                   "required_response_rad_s": 0.075,
+                   "directions": {"left": {"samples": 4},
+                                  "right": {"samples": 4}}}
+    result = P.yaw_cal.CalibrationResult(
+        [0.0] * 6, "failed", "left tail response unstable", "failed",
+        10.0, 40, diagnostics=diagnostics)
+    card._finish_calibration(result)
+    report = card._info()["calibration"]
+    assert report["diagnostics"] == diagnostics
+    assert card.events[-1][0:2] == (started["action_id"], "failed")
+    assert card.events[-1][2]["diagnostics"] == diagnostics
+
+
 def test_translation_detected_during_calibration_aborts_to_zero(rig):
     card = rig.card()
     assert _begin(card)["state"] == "running"
@@ -320,7 +337,7 @@ def test_manual_stop_actions_cancel_calibration_with_zero_and_never_follow_autom
     card = rig.card()
     assert _begin(card)["state"] == "running"
     publisher = card._publisher
-    for _ in range(8):
+    for _ in range(12):
         rig.clock.advance()
         rig.feed(card)
         card._tick()

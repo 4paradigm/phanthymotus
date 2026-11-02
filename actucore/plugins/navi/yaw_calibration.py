@@ -32,23 +32,28 @@ MAX_COMMAND_GAP_S = 0.3
 # REST odometry and command dispatch are independent clocks. A slower fresh
 # sensor sample does not mean that the low-speed command heartbeat stopped.
 MAX_SAMPLE_AGE_S = 0.65
-MAX_OBSERVED_WZ = 0.5
-MAX_SINGLE_ANGLE_RAD = 0.3
-MAX_TOTAL_ANGLE_RAD = 0.6
-MAX_SESSION_S = 8.0
+MAX_OBSERVED_WZ = 0.75
+# The fixed 10 s sequence below reaches about 0.9 rad on the first side and
+# 1.1 rad while reversing at the slowest supported 1 rad/s² limiter.  These
+# independent hard bounds still stop a runaway response before either side can
+# reach 86 degrees or total absolute motion can reach 160 degrees.
+MAX_SINGLE_ANGLE_RAD = 1.5
+MAX_TOTAL_ANGLE_RAD = 2.8
+MAX_SESSION_S = 12.0
 SETTLED_WZ = 0.03
 _EPSILON = 1e-9
-_PHASES = (("settle", 0.0, 0.8, 0.0),
-           ("left", 0.8, 2.0, 1.0),
-           ("right", 2.0, 3.2, -1.0),
-           ("rest_right", 3.2, 5.2, 0.0))
-_PULSES = ((0.8, 2.0, 1.0), (2.0, 3.2, -1.0))
-_STABLE_WINDOW_S = 0.8
-_REST_S = 0.9
-_REVERSAL_TRANSIENT_S = 0.6
+_PHASES = (("settle", 0.0, 1.0, 0.0),
+           ("left", 1.0, 3.0, 1.0),
+           ("right", 3.0, 5.5, -1.0),
+           ("rest_right", 5.5, 10.0, 0.0))
+_PULSES = ((1.0, 3.0, 1.0), (3.0, 5.5, -1.0))
+_STABLE_WINDOW_S = 1.25
+_REST_S = 1.5
+_REVERSAL_TRANSIENT_S = 1.2
+_ONSET_LIMIT_S = (0.65, 1.25)
 _PROFILE_BOUNDS = {"k_yaw": (0.2, 1.2), "yaw_damping": (0.1, 0.5),
-                   "response_gain": (0.15, 2.5), "delay_s": (0.0, 0.65),
-                   "settling_s": (0.0, 0.9), "left_gain": (0.15, 2.5),
+                   "response_gain": (0.15, 2.5), "delay_s": (0.0, 1.25),
+                   "settling_s": (0.0, 1.5), "left_gain": (0.15, 2.5),
                    "right_gain": (0.15, 2.5)}
 
 
@@ -162,12 +167,21 @@ class CalibrationResult:
     elapsed_s: float
     samples: int
     profile: dict | None = None
+    diagnostics: dict | None = None
+
+
+class CalibrationFitError(ValueError):
+    """A fit refusal that carries the bounded evidence used to refuse it."""
+
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 class YawCalibration:
-    """One wall-clock session: settle, +yaw, direct -yaw, rest (5.2 s).
+    """One wall-clock session: settle, +yaw, longer direct -yaw, rest (10 s).
 
-    Longer bounded pulses yield three stable samples at 4 Hz; commands still
+    Longer bounded pulses yield several stable samples at 4 Hz; commands still
     have their own 300 ms dispatch guard. Missing samples never become new
     evidence, and the measured-angle limits can terminate a pulse early.
 
@@ -178,11 +192,11 @@ class YawCalibration:
 
     duration_s = _PHASES[-1][2]
 
-    def __init__(self, *, now, robot_key, speed=0.2):
+    def __init__(self, *, now, robot_key, speed=0.5):
         self.robot_key = _identity(robot_key)
         self.speed = _number(speed, "calibration speed")
-        if not 0.05 <= self.speed <= 0.2:
-            raise ValueError("calibration speed must be between 0.05 and 0.2 rad/s")
+        if not 0.05 <= self.speed <= 0.5:
+            raise ValueError("calibration speed must be between 0.05 and 0.5 rad/s")
         self.started_at = self._last_step = _number(now, "now")
         self._last_sample_stamp = None
         self._last_wz = 0.0
@@ -192,13 +206,15 @@ class YawCalibration:
         self._angle_group = None
         self._terminal = None
 
-    def _result(self, now, status, reason, phase, wz=0.0, profile=None):
+    def _result(self, now, status, reason, phase, wz=0.0, profile=None,
+                diagnostics=None):
         return CalibrationResult([0.0, 0.0, 0.0, 0.0, 0.0, wz], status, reason,
                                  phase, max(0.0, now - self.started_at),
-                                 len(self._samples), profile)
+                                 len(self._samples), profile, diagnostics)
 
-    def _fail(self, now, reason):
-        self._terminal = self._result(now, "failed", reason, "failed")
+    def _fail(self, now, reason, diagnostics=None):
+        self._terminal = self._result(now, "failed", reason, "failed",
+                                      diagnostics=diagnostics)
         return self._terminal
 
     def cancel(self, reason="yaw calibration cancelled"):
@@ -223,7 +239,7 @@ class YawCalibration:
         if stamp > now + 0.05 or now - stamp > MAX_SAMPLE_AGE_S + _EPSILON:
             return self._fail(now, "yaw observation is stale or future-dated")
         if abs(measured) > MAX_OBSERVED_WZ:
-            return self._fail(now, "measured yaw rate exceeded 0.5 rad/s")
+            return self._fail(now, "measured yaw rate exceeded 0.75 rad/s")
         if sample_key is None:
             return self._fail(now, "yaw observation has no distinct sample key")
         try:
@@ -251,8 +267,8 @@ class YawCalibration:
                     # This interval straddles the command sign change. Count it
                     # in the total physical-motion budget, but not wholly as
                     # the new direction's arc: doing so double-attributes the
-                    # previous pulse and trips the unchanged 0.3 rad per-side
-                    # limit during a nominal direct reversal.
+                    # previous pulse and can trip the independent per-side
+                    # safety budget during a nominal direct reversal.
                     self._single_angle = 0.0
                     self._angle_group = group
                 else:
@@ -269,12 +285,14 @@ class YawCalibration:
 
         elapsed = now - self.started_at
         if elapsed > MAX_SESSION_S:
-            return self._fail(now, "yaw calibration exceeded its eight-second duration bound")
+            return self._fail(now, "yaw calibration exceeded its twelve-second duration bound")
         if elapsed >= self.duration_s - _EPSILON:
             if not self._settled_recently(_PULSES[-1][1]):
                 return self._fail(now, "chassis has not stopped at the end of calibration")
             try:
                 profile = self._profile()
+            except CalibrationFitError as error:
+                return self._fail(now, str(error), error.diagnostics)
             except ValueError as error:
                 return self._fail(now, str(error))
             self._terminal = self._result(now, "completed", "yaw response measured; save before applying",
@@ -284,7 +302,7 @@ class YawCalibration:
             if begin - _EPSILON <= elapsed < end - _EPSILON:
                 if phase == "settle" and abs(measured) > SETTLED_WZ:
                     return self._fail(now, "chassis was already turning during initial settle")
-                if phase == "left" and not self._samples_before(0.8):
+                if phase == "left" and not self._samples_before(_PULSES[0][0]):
                     return self._fail(now, "insufficient initial stationary yaw observations")
                 direction_guard_s = (_REVERSAL_TRANSIENT_S if phase == "right" else 0.15)
                 if (direction and elapsed - begin >= direction_guard_s
@@ -303,26 +321,63 @@ class YawCalibration:
 
     def _profile(self):
         gains, delays = [], []
-        for begin, end, direction in _PULSES:
+        response_floor = max(0.01, self.speed * 0.15)
+        diagnostics = {"commanded_wz_rad_s": self.speed,
+                       "required_response_rad_s": response_floor,
+                       "directions": {}}
+        windows = []
+        for name, (begin, end, direction) in zip(("left", "right"), _PULSES):
             stable = [direction * wz for at, wz in self._samples
                       if end - _STABLE_WINDOW_S - _EPSILON <= at < end - _EPSILON]
+            tail = stable[-3:]
+            response = statistics.median(tail) if tail else None
+            spread = (statistics.median(abs(value - response) for value in tail)
+                      if tail else None)
+            tolerance = (max(0.03, response * 0.25)
+                         if response is not None else None)
+            diagnostics["directions"][name] = {
+                "samples": len(stable),
+                "window_s": [round(end - _STABLE_WINDOW_S, 3), round(end, 3)],
+                "signed_wz_rad_s": [round(value, 4) for value in stable[-8:]],
+                "tail_wz_rad_s": [round(value, 4) for value in tail],
+                "median_response_rad_s": (round(response, 4)
+                                            if response is not None else None),
+                "median_abs_deviation_rad_s": (round(spread, 4)
+                                                 if spread is not None else None),
+                "tail_tolerance_rad_s": (round(tolerance, 4)
+                                           if tolerance is not None else None),
+            }
+            windows.append((name, begin, end, direction, stable, tail,
+                            response, spread, tolerance))
+        for pulse_index, (name, begin, end, direction, stable, tail,
+                          response, spread, tail_tolerance) in enumerate(windows):
             if len(stable) < 3:
-                raise ValueError("insufficient distinct stable yaw samples in both directions")
-            response = statistics.median(stable)
-            if response < max(0.01, self.speed * 0.15):
-                raise ValueError("no reliable yaw response in both directions")
-            spread = statistics.median(abs(value - response) for value in stable)
-            peak_spread = max(abs(value - response) for value in stable)
-            if (spread > max(0.01, response * 0.25)
-                    or peak_spread > max(0.02, response * 0.35)):
-                raise ValueError("yaw response was not stable enough to calibrate")
+                raise CalibrationFitError(
+                    f"{name} has fewer than three distinct stable yaw samples", diagnostics)
+            # At 4 Hz the beginning of this window can still contain the
+            # acceleration/reversal transition.  Fit the last three readings,
+            # and require all three to agree with that plateau.  This
+            # ignores at most an early transition point without accepting a
+            # tail that is still oscillating or has already dropped to zero.
+            if response < response_floor:
+                raise CalibrationFitError(
+                    f"{name} median yaw response is below {response_floor:.3f} rad/s",
+                    diagnostics)
+            if (spread > max(0.02, response * 0.2)
+                    or any(value < response_floor
+                           or abs(value - response) > tail_tolerance
+                           for value in tail)):
+                raise CalibrationFitError(
+                    f"{name} tail yaw response was not stable enough to calibrate",
+                    diagnostics)
             gains.append(response / self.speed)
             threshold = max(0.01, self.speed * 0.15)
             onset = next((at - begin for at, wz in self._samples
                           if begin - _EPSILON <= at < end - _EPSILON
                           and direction * wz >= threshold), None)
-            if onset is None or onset > 0.65 + _EPSILON:
-                raise ValueError("yaw response onset was missing or too delayed")
+            if onset is None or onset > _ONSET_LIMIT_S[pulse_index] + _EPSILON:
+                raise CalibrationFitError(
+                    f"{name} yaw response onset was missing or too delayed", diagnostics)
             delays.append(max(0.0, onset))
         # Only the final pulse is followed by a real zero.  Measuring a
         # "settling" time at the sign-change would require cancelling and
@@ -338,7 +393,8 @@ class YawCalibration:
         settled = next((rest[index][0] for index in range(len(rest) - 1)
                         if rest[index][1] <= threshold and rest[index + 1][1] <= threshold), None)
         if settled is None:
-            raise ValueError("yaw response did not settle during the final rest phase")
+            raise CalibrationFitError(
+                "yaw response did not settle during the final rest phase", diagnostics)
         response_gain = statistics.mean(gains)
         delay, settle = max(delays), max(0.0, settled)
         # Conservative heuristic, intentionally bounded by the former nominal
@@ -352,4 +408,7 @@ class YawCalibration:
                    "yaw_damping": damping, "response_gain": response_gain,
                    "delay_s": delay, "settling_s": settle,
                    "left_gain": gains[0], "right_gain": gains[1]}
-        return validate_profile(profile, self.robot_key)
+        try:
+            return validate_profile(profile, self.robot_key)
+        except ValueError as error:
+            raise CalibrationFitError(str(error), diagnostics) from error

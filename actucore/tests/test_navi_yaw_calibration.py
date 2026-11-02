@@ -17,7 +17,7 @@ def _run(*, left=1.0, right=1.0, delay=0.0, tau=0.0, override=None, dt=0.1):
     session = C.YawCalibration(now=0.0, robot_key="robot-one")
     issued, results = [], []
     measured = 0.0
-    for tick in range(100):
+    for tick in range(150):
         now = round(tick * dt, 9)
         history = [command for at, command in issued if at <= now - delay + 1e-9]
         wanted = history[-1] if history else 0.0
@@ -38,7 +38,7 @@ def _run_independent_feedback(sample_period):
     issued = []
     next_sample = 0.0
     latest_stamp, latest_wz = None, 0.0
-    for tick in range(80):
+    for tick in range(150):
         now = round(tick * 0.1, 9)
         while next_sample <= now + 1e-9:
             latest_stamp = round(next_sample, 9)
@@ -57,8 +57,8 @@ def test_nominal_two_pulse_response_completes_with_zero_and_a_bounded_profile():
     session, result, history = _run()
     assert result.status == "completed", result.reason
     assert result.values == [0.0] * 6
-    assert result.elapsed_s == pytest.approx(5.2)
-    assert result.samples == 53
+    assert result.elapsed_s == pytest.approx(10.0)
+    assert result.samples == 101
     profile = result.profile
     assert C.validate_profile(profile, "robot-one") == profile
     assert profile["response_gain"] == pytest.approx(1.0)
@@ -67,11 +67,11 @@ def test_nominal_two_pulse_response_completes_with_zero_and_a_bounded_profile():
     assert {sample.phase for sample in history} >= {
         "settle", "left", "right", "rest_right", "completed"}
     assert all(sample.values[:5] == [0.0] * 5 for sample in history)
-    assert max(abs(sample.values[5]) for sample in history) == 0.2
+    assert max(abs(sample.values[5]) for sample in history) == 0.5
     turns = [sample.values[5] for sample in history]
     first_positive = next(index for index, value in enumerate(turns) if value > 0)
     first_negative = next(index for index, value in enumerate(turns) if value < 0)
-    assert turns[first_negative - 1] == 0.2
+    assert turns[first_negative - 1] == 0.5
     assert 0.0 not in turns[first_positive:first_negative]
     assert session.step(100.0, 1.0, "ignored") == result
 
@@ -107,7 +107,7 @@ def test_four_five_and_ten_hz_samples_complete_with_the_longer_bounded_pulses(dt
     _, result, _ = _run(dt=dt)
     assert result.status == "completed", result.reason
     assert result.values == [0.0] * 6
-    assert 5.2 <= result.elapsed_s <= 5.2 + dt
+    assert 10.0 <= result.elapsed_s <= 10.0 + dt
     assert result.profile["response_gain"] == pytest.approx(1.0)
 
 
@@ -115,17 +115,17 @@ def test_four_five_and_ten_hz_samples_complete_with_the_longer_bounded_pulses(dt
 def test_slow_feedback_does_not_become_a_command_gap_or_duplicate_fit_evidence(sample_period):
     result, commands = _run_independent_feedback(sample_period)
     assert result.status == "completed", result.reason
-    assert result.elapsed_s == pytest.approx(5.2)
-    assert result.samples <= 1 + int(5.2 / sample_period)
-    assert len(commands) == 53
+    assert result.elapsed_s == pytest.approx(10.0)
+    assert result.samples <= 1 + int(10.0 / sample_period)
+    assert len(commands) == 101
     assert commands[-1][1] == 0.0
     assert result.profile["response_gain"] == pytest.approx(1.0)
 
 
-def test_three_hz_feedback_is_too_sparse_to_claim_a_stable_calibration():
+def test_three_hz_feedback_has_enough_evidence_with_the_longer_stable_windows():
     result, commands = _run_independent_feedback(1 / 3)
-    assert result.status == "failed" and "insufficient distinct stable" in result.reason
-    assert result.profile is None and commands[-1][1] == 0.0
+    assert result.status == "completed", result.reason
+    assert result.profile is not None and commands[-1][1] == 0.0
 
 
 def test_a_fresh_sample_after_a_long_observation_gap_fails_even_with_continuous_commands():
@@ -151,20 +151,20 @@ def test_wrong_direction_aborts_before_the_full_pulse():
 
 
 def test_observed_rate_limit_aborts_immediately():
-    _, result, _ = _run(override=lambda now, measured: 0.51 if now >= 0.6 else measured)
-    assert result.status == "failed" and "0.5 rad/s" in result.reason
+    _, result, _ = _run(override=lambda now, measured: 0.76 if now >= 0.6 else measured)
+    assert result.status == "failed" and "0.75 rad/s" in result.reason
     assert result.values == [0.0] * 6
 
 
 def test_observed_angle_limit_includes_motion_even_before_rest():
-    _, result, _ = _run(override=lambda now, measured: 0.49 if 0.9 <= now < 3.0 else measured)
+    _, result, _ = _run(override=lambda now, measured: 0.74 if 1.1 <= now < 4.0 else measured)
     assert result.status == "failed" and "angle limit" in result.reason
-    assert result.elapsed_s < 3.0 and result.values == [0.0] * 6
+    assert result.elapsed_s < 5.5 and result.values == [0.0] * 6
 
 
 def test_reversal_that_never_changes_measured_direction_is_rejected():
     _, result, history = _run(override=lambda now, measured:
-                             0.05 if 2.7 <= now <= 3.0 else measured)
+                             0.11 if 4.3 <= now <= 4.8 else measured)
     assert result.status == "failed" and "direction" in result.reason
     assert any(sample.values[5] < 0 for sample in history)
     assert result.values == [0.0] * 6
@@ -172,7 +172,7 @@ def test_reversal_that_never_changes_measured_direction_is_rejected():
 
 def test_completion_requires_two_current_stationary_samples():
     _, result, _ = _run(override=lambda now, measured:
-                       -0.04 if now >= 4.9 else measured)
+                       -0.04 if now >= 9.7 else measured)
     assert result.status == "failed" and "at the end" in result.reason
     assert result.profile is None and result.values == [0.0] * 6
 
@@ -186,9 +186,14 @@ def test_initial_motion_is_rejected_before_any_nonzero_command():
 def test_unstable_response_cannot_be_saved_as_a_good_calibration():
     _, result, _ = _run(override=lambda now, measured:
                        measured * (0.3 if round(now * 10) % 2 else 1.5)
-                       if 1.4 <= now < 2.1 else measured)
+                       if 2.0 <= now < 3.0 else measured)
     assert result.status == "failed", result
     assert result.profile is None
+    assert result.diagnostics["commanded_wz_rad_s"] == 0.5
+    assert result.diagnostics["required_response_rad_s"] == pytest.approx(0.075)
+    assert set(result.diagnostics["directions"]) == {"left", "right"}
+    assert result.diagnostics["directions"]["left"]["samples"] >= 3
+    assert len(result.diagnostics["directions"]["left"]["tail_wz_rad_s"]) == 3
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), None, True])
@@ -289,7 +294,7 @@ def test_profile_round_trip_is_per_robot_and_path_components_are_hashed(tmp_path
 @pytest.mark.parametrize("field,value", [
     ("k_yaw", 1.21), ("k_yaw", 0.19), ("yaw_damping", 0.51),
     ("response_gain", float("nan")), ("delay_s", -0.01),
-    ("settling_s", 0.91), ("left_gain", True), ("created_at_ms", 0),
+    ("settling_s", 1.51), ("left_gain", True), ("created_at_ms", 0),
     ("schema", "other/1"), ("robot_key", "other-robot")])
 def test_invalid_profiles_are_rejected_before_writing(tmp_path, field, value):
     profile = dict(_run()[1].profile, **{field: value})
@@ -345,7 +350,7 @@ def test_directory_fsync_failure_after_commit_reports_success_with_a_durability_
     assert not list(tmp_path.glob("*.tmp"))
 
 
-@pytest.mark.parametrize("speed", [0.0, -0.2, 0.21, float("nan"), True])
+@pytest.mark.parametrize("speed", [0.0, -0.2, 0.51, float("nan"), True])
 def test_constructor_rejects_unsafe_pulse_speeds(speed):
     with pytest.raises(ValueError):
         C.YawCalibration(now=0.0, robot_key="r", speed=speed)

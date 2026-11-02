@@ -259,8 +259,8 @@ class NaviPlugin:
                             "原地转身搜索**，所以不需要先手动转动机器人。"
                             "路上按深度减速避障，到设定距离停下。"
                             "前进P固定为0.9；未标定的默认转向P为0.6，转向P可用 "
-                            "calibrate_yaw 按本机实测响应自动标定。标定约5.2秒，"
-                            "会在同一速度动作内低速左右转动并在结束后停车。"
+                            "calibrate_yaw 按本机实测响应自动标定。标定约10秒，"
+                            "会在同一速度动作内以±0.5rad/s左右转动并在结束后停车。"
                             "卡片不提供手动增益或前进距离自适应选项，info 可查看"
                             "两个P的基准值、当前实际值和标定状态。"),
             "inputSchema": {
@@ -316,10 +316,11 @@ class NaviPlugin:
                     },
                     "calibrate_yaw": {
                         "params": [],
-                        "description": "一键转向校准：卡片运行且无导航目标时，先低速向一侧"
+                        "description": "一键转向校准：卡片运行且无导航目标时，先向一侧"
                                        "转动，再保持同一底盘速度动作直接平滑反转，按实测"
                                        "里程计生成并保存本机转向P和阻尼。"
-                                       "约5.2秒，会使底盘以±0.2rad/s转动，请预留旋转空间。"
+                                       "约10秒，会使底盘以±0.5rad/s转动；只能由操作者在"
+                                       "离开充电桩的空旷场地手动发起，失败后不得自动重试。"
                                        "要求连接非空跑底盘及有效 odom.wz；实测反馈允许"
                                        "最长650ms抖动，指令流仍要求300ms内连续。info 查看"
                                        "进度，stop_navigation 中止。校准结束停车，不自动"
@@ -839,9 +840,9 @@ class NaviPlugin:
                 lo, hi = lower[5], upper[5]
                 if (any(isinstance(v, bool) or not isinstance(v, (int, float))
                         or not math.isfinite(v) for v in (lo, hi))
-                        or lo > -0.2 or hi < 0.2 or self._config.wz_max < 0.2
-                        or self._config.floor_wz > 0.2):
-                    raise ValueError("下游双向转速范围或静止死区不支持 0.2 rad/s 低速校准")
+                        or lo > -0.5 or hi < 0.5 or self._config.wz_max < 0.5
+                        or self._config.floor_wz > 0.5):
+                    raise ValueError("下游双向转速范围或静止死区不支持 0.5 rad/s 转向校准")
             except (ValueError, TypeError, IndexError, KeyError) as error:
                 return self._error(str(error))
             measured, _, _, problem = self._calibration_feedback(stationary=True)
@@ -850,7 +851,7 @@ class NaviPlugin:
             if abs(measured) > 0.03:
                 return self._error("请先让底盘停止，再开始转向校准")
             self._calibration = yaw_cal.YawCalibration(now=time.monotonic(),
-                                                       robot_key=key, speed=0.2)
+                                                       robot_key=key, speed=0.5)
             self._calibration_action_id = f"navi_cal_{uuid.uuid4().hex[:12]}"
             self._calibration_report = {"status": "running", "phase": "settle",
                                         "action_id": self._calibration_action_id,
@@ -859,13 +860,15 @@ class NaviPlugin:
             self._state = policy_mod.State()
             return {"state": "running", "action_id": self._calibration_action_id,
                     "calibration": dict(self._calibration_report),
-                    "message": "低速双向转向校准已开始，完成后保持停车"}
+                    "message": "10秒双向转向校准已开始（±0.5rad/s），完成后保持停车"}
 
     def _finish_calibration(self, result):
         """Called after the session has already spent its final phase at zero."""
         report = {"status": result.status, "phase": result.phase,
                   "reason": result.reason, "elapsed_s": result.elapsed_s,
                   "samples": result.samples}
+        if result.diagnostics is not None:
+            report["diagnostics"] = result.diagnostics
         if result.status == "completed":
             try:
                 key = self._calibration_key()

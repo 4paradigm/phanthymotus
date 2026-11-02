@@ -2065,6 +2065,12 @@ def test_adaptive_forward_rejects_invalid_or_unbounded_baseline_gain(gain):
         _cfg(adaptive_k_fwd=True, k_fwd=gain)
 
 
+@pytest.mark.parametrize("gain", [-0.1, float("nan"), float("inf"), True])
+def test_fixed_forward_rejects_invalid_baseline_gain(gain):
+    with pytest.raises(ValueError, match="k_fwd"):
+        _cfg(adaptive_k_fwd=False, k_fwd=gain)
+
+
 # ── bounded bearing-P yaw schedule ────────────────────────────────────────
 
 def test_default_gains_use_adaptive_yaw_and_fixed_forward_point_nine():
@@ -2264,6 +2270,12 @@ def test_adaptive_yaw_flag_is_strictly_boolean(value):
 def test_adaptive_yaw_rejects_invalid_nominal_gain(gain):
     with pytest.raises(ValueError, match="k_yaw"):
         _cfg(adaptive_k_yaw=True, k_yaw=gain)
+
+
+@pytest.mark.parametrize("gain", [-0.1, float("nan"), float("inf"), True])
+def test_fixed_yaw_rejects_invalid_nominal_gain(gain):
+    with pytest.raises(ValueError, match="k_yaw"):
+        _cfg(adaptive_k_yaw=False, k_yaw=gain)
 
 
 # ── calibrated target gain with actual angular-rate damping ────────────────

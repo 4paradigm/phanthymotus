@@ -359,16 +359,15 @@ class Config:
                 raise ValueError(f"{flag} must be a boolean")
         for key, adaptive, maximum in (("k_fwd", self.adaptive_k_fwd, ADAPTIVE_FWD_MAX_SCALE),
                                        ("k_yaw", self.adaptive_k_yaw, ADAPTIVE_YAW_MAX_SCALE)):
-            if not adaptive:
-                continue
             if isinstance(getattr(self, key), bool):
-                raise ValueError(f"adaptive {key} must be finite and nonnegative")
+                raise ValueError(f"{key} must be finite and nonnegative")
             try:
                 base_gain = float(getattr(self, key))
             except (TypeError, ValueError, OverflowError) as error:
-                raise ValueError(f"adaptive {key} must be finite and nonnegative") from error
-            if (not math.isfinite(base_gain) or base_gain < 0
-                    or not math.isfinite(base_gain * maximum)):
+                raise ValueError(f"{key} must be finite and nonnegative") from error
+            if not math.isfinite(base_gain) or base_gain < 0:
+                raise ValueError(f"{key} must be finite and nonnegative")
+            if adaptive and not math.isfinite(base_gain * maximum):
                 raise ValueError(f"adaptive {key} and its maximum must be finite and nonnegative")
             setattr(self, key, base_gain)
         for key in ("stop_distance_m", "stop_tolerance_m"):
