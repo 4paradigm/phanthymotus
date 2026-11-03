@@ -113,61 +113,43 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 **这是反应式视觉伺服，不是导航栈。** 没有地图、没有全局路径、绕不过 U 形障碍，
 也不会后退（深度图对身后一无所知）。要建图规划是另一条路线。
 
-### 在卡片上调整跟随参数
+### 卡片参数与 Driver 能力
 
 `navi` 位于 **ActuCore**，修改后构建、部署 ActuCore 镜像。Perception 继续提供检测和
 深度数据，这些参数不需要修改 Perception 镜像。
 
-卡片配置和 `config` 动作都提供以下参数；角速度上限的字段名为 `wz_max`。
+卡片配置只保留通用策略参数：
 
 | 参数 | 含义 | 默认值 |
 |---|---|---|
 | `stop_distance_m` | 期望停止距离，相机到目标的距离，m | 0.8 |
-| `stop_tolerance_m` | 停止距离外允许的到达容差，m | 0.0 |
-| `search_rate` | 目标不在视野时的搜索转速幅值，rad/s；0 关闭转身搜索 | 1.0 |
-| `vx_max` | 前进速度上限，m/s | 1.0 |
-| `vy_max` | 横移速度上限，m/s | 1.0 |
-| `wz_max` | 跟随、避障的角速度上限，rad/s | 1.5 |
-| `use_lateral` | 允许横移；天轶轮式底盘设为 false | true |
+| `stop_tolerance_m` | **仅限单次 `navigate_to`** 的到达容差，不是卡片 `config`，m | 0.05 |
 
-前进P默认固定为 0.9（1/s）。转向未标定时按目标偏移调度，标定后采用该机器人测得的
-固定P；运行控制始终是纯P。表单和 `config` 不再提供
-前进/转向增益或前进P自适应开关。`info.config` 仍返回 `k_fwd`、`k_yaw`、
-`adaptive_k_fwd` 和 `adaptive_k_yaw` 的只读值。旧画布发送这四个参数会被忽略，返回
-`ignored_parameters`，同一批中的其他有效参数照常应用。高级启动 YAML 的兼容项保留，
-已有启动配置不会被清除。
+前进P默认 0.9，转向P默认 0.6，搜索转速默认 0.6rad/s。这些不再放到
+画布配置表单中。`navi` 启动时从下游 `control_interface` 读取速度上限、
+横移能力、死区和可选的 `response.wz`，再得到实际有效值。因此机器人差异属于
+Driver，不需要在通用 navi 中加机型分支。`info.config` 会返回协商后的只读值。
 
-表单读取当前卡片的启动配置；YAML 已设置的公开参数会出现在表单中。
-`info.config` 返回当前实际策略值。`config` 响应中，`config` 是本次请求值，
-`effective_config` 是按下游底盘限制调整后的实际值。例如：
+设置默认停止距离：
 
 ```json
 {
   "name": "navi",
   "arguments": {
     "action": "config",
-    "stop_distance_m": 1.2,
-    "stop_tolerance_m": 0.1,
-    "search_rate": 0.3,
-    "vx_max": 0.2,
-    "wz_max": 0.6,
-    "use_lateral": false
+    "stop_distance_m": 1.2
   }
 }
 ```
 
-`config` 会更新本进程内的设置；容器重启后保留设置需保存到画布配置或部署 YAML。
-运行中修改搜索转速、速度上限，也会按当前底盘描述符重新调整，避免发出超限或不支持的
-横移指令。配置中的请求值保留下来，换底盘重新启动时会重新协商。新开放的数值参数要求
-有限且非负，`use_lateral` 要求布尔值；一批配置有一项无效，整批不更新。
-跟踪目标选择、避障和指令频率保持不变；停止容差为 0 时，到达距离要求与原版本相同。
+`config` 只更新默认停止距离；容器重启后保留设置需保存到画布或部署 YAML。
 
 `stop_tolerance_m` 也可在 `navigate_to` 动作中单次指定。到达的距离条件为
 `距离 <= stop_distance_m + stop_tolerance_m`：例如停止距离 1.2 m、容差 0.1 m，
 距离不大于 1.3 m 即满足距离条件。仍要求有效的当前观测，并保留原有对正/等待判据；
-容差不允许用预测轨迹或过旧数据判定到达。默认容差为 0，保留原来的距离要求。
+容差不允许用预测轨迹或过旧数据判定到达。默认容差为 0.05m，用于容纳相机测距误差。
 `navigate_to` 返回值和 `info.config` 都提供这两个参数及其和 `arrival_distance_m`。
-动作中省略距离或容差会保留当前值；动作中的覆盖值不写入部署配置。
+每次动作省略容差时都恢复 0.05m；覆盖值不写入卡片或部署配置。
 
 ### 默认前进P与高级启动兼容
 
@@ -178,104 +160,25 @@ camera ─┬─→ vop ────────────(data/json 检测+bb
 仅为兼容已有高级部署，启动 YAML 仍保留名义增益和 `adaptive_k_fwd`；画布与运行时
 `config` 均不提供这些选项。默认保持前进增益固定，不执行按距离自适应。
 
-### 转向P与一键转向标定
+### 转向 P 与 Driver 响应
 
-未标定时，转向采用有界增益调度：目标偏离画面中心较远时，使用名义 `k_yaw`（默认 0.6）；
-靠近中心时逐步降至名义值的 0.5 倍，减轻反复纠偏。倍率在 0.5–1 之间，每秒最多变化 2。
-这是基于当前目标偏移的 P 增益调度，不含积分、微分或在线模型辨识。
-短暂遮挡且仍处于预测跟随时，转向倍率保持上一拍的有界值；真正进入搜索、观测过期或
-任务结束会重置。切换目标、停止导航或暂停/恢复也会重置调度，保留原有跟踪与停车条件。
+目标跟随默认使用 `k_yaw=0.6`，并按目标在画面中的偏移在 0.5–1 倍之间有界调度；
+靠近中心时减小增益以抑制反复纠偏。控制保持纯 P，不在 navi 中做在线辨识、
+机型特判或主动转向标定。
 
-`calibrate_yaw` 会让底盘原地进行两次转向，测量实际响应。成功后，目标跟随改用
-固定的标定P（0.2–1.2），运行控制保持纯P：
-`wz = 限幅(-P × 目标偏移)`。
-`odom.wz` 只用于标定和自身运动估计，不再反馈到转向命令。搜索仍使用
-`search_rate`，绕障转向仍按原有规则与名义增益，最终转速受 `wz_max` 和底盘限制。
-这是一种有界、保守的转向响应启发式标定，不保证最优，不是完整 PID 整定或在线学习。
-旧 profile 中的 `yaw_damping` 只为文件兼容而读取，加载时强制归零，不再参与控制。
-转向P以默认 `0.6` 为基准：先按左右实测响应增益补偿，再用较温和的延迟和停稳时间
-惩罚，最终限制在 0.2–1.2。旧 profile 会用已保存的响应、延迟和停稳数据重新计算P，
-无需仅为公式升级再次驱动机器人标定。当前天轶实测的增益约 0.758、延迟约 1.137 秒、
-停稳约 0.526 秒时，新公式得到约 0.619，而不是旧公式触及下限的 0.2。
-若里程计通过 REST 读取且只有接收时间戳，估计的延迟会包含采样与传输延迟。
+若下游 Driver 在 `control_interface.response.wz` 声明 `source`、`gain`、
+`delay_s` 和 `settling_s`，navi 会据此派生有效转向 P。`source` 只接受
+`measured`、`vendor-spec` 或 `estimate`；声明缺失或无效时回到通用 0.6。
+速度范围、横移能力、搜索转速上限和死区同样来自 Driver 描述符。
+`info.gains.yaw.source` 为 `driver_response` 或 `adaptive_default`，
+并在 `info.config` 中显示最终采用的只读值。
 
-开始前，`navi` 须已启动且未暂停、无活动导航目标；先调用 `stop_navigation`。
-下游须明确声明 `dry_run: false`，静止转向死区不高于 1.0rad/s，且正反向限速与
-当前导航 `wz_max` 均须覆盖 navi 据此选出的 0.5–1.0rad/s 标定转速；指令频率至少
-10Hz。
-`state/odom` 须提供有限的实测 `wz` 与持续变化的样本时间戳。标定脉冲期间允许
-反馈最长间隔 650ms，以兼容天轶 REST 聚合轮询的抖动；10Hz 指令流本身仍要求相邻
-指令不超过 300ms。开始时底盘须停止（实测角速度不超过 0.03rad/s）。
-这些前提不满足时会拒绝标定。
-
-先由操作者把机器人移出充电桩，确认周围可原地转向且没有人员、线缆或障碍，再依次调用
-下面两条命令。标定会实际驱动底盘，不需要设置目标；失败后不得由 Agent 自动重试：
-
-```bash
-curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"navi","arguments":{"action":"stop_navigation"}}}'
-```
-
-```bash
-curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"navi","arguments":{"action":"calibrate_yaw"}}}'
-```
-
-正常序列约 10 秒。navi 从下游描述符的静止 `min_magnitude[wz]` 选择可执行的
-双向标定转速，安全范围为 0.5–1.0rad/s；不能使用行进中的较低转向死区。没有声明
-死区的轮式底盘仍用 ±0.5rad/s；R1 的静止死区为 1.0rad/s，因此自动使用
-±1.0rad/s。若正反向限速、当前 `wz_max` 或 1.0rad/s 安全上限容不下静止死区，
-标定会在运动前明确拒绝。
-
-0.5rad/s 时序保持不变：先零速 1.0 秒，正向 2.0 秒，然后在同一个底盘速度动作内
-直接请求反向，由下游限加速度平滑跨过零点；反向阶段持续 2.5 秒，最后零速 4.5 秒
-确认完全停车。更高转速会缩短两段非零脉冲并把余下时间用于停车，同时保留稳定尾部
-样本；中间仍不发布显式全零，避免天轶 SDK 取消动作后立刻重新争抢主权。
-实测角速度与单侧/累计转角保护会按所选转速和计划脉冲同步调整，超出立即失败并发送
-零速；`navi info` 的 `calibration.commanded_wz_rad_s` 会显示本次实际采用的转速。
-较长的采样窗口可以在约 4Hz 的实测反馈下取得足够样本；期间仍检查反馈、指令连续性、
-累计转角与最终停止情况。两侧首次有效角速度响应允许最多 1.25 秒，并把实测延迟计入
-最终转向P；这不会放宽 300ms 指令连续性或 650ms 反馈新鲜度检查。异常会
-结束标定。动作异步返回 `action_id`，完成或失败通过 `action_complete` 回调报告。
-成功回调保持为短结果，直接返回 `p`/`k_yaw`、固定前进P `k_fwd`、样本数与耗时；
-完整样本诊断留在 `navi info`，避免成功日志因过长而看不到最终P。
-若某侧末尾四个同方向有效读数中只有一个尖峰，标定可剔除该点，但剩余三个仍须通过
-原来的严格稳定性检查；此时保存稳健估计的转向P并设置 `noisy_odom: true`。
-零值、反向、交替振荡或两个
-异常点仍会拒绝标定。
-调用 `pause`、`stop` 或 `stop_navigation` 会先发送零速再取消。标定结束保持停车，
-不会自动恢复之前的导航目标；需要导航时重新调用 `navigate_to`。
-
-用 `info` 查看进度和两个P，无需展开长日志：
-
-```bash
-curl -fsS http://127.0.0.1:15730/mcp -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"navi","arguments":{"action":"info"}}}' | python3 -c 'import json,sys; r=json.load(sys.stdin); d=json.loads(r["result"]["content"][0]["text"]); print(json.dumps({k:d.get(k) for k in ("gains","calibration")},ensure_ascii=False,indent=2))'
-```
-
-例如尚未标定、当前没有跟随指令时，相关只读字段为：
-
-```json
-{
-  "gains": {
-    "forward": {"base": 0.9, "effective": null},
-    "yaw": {"base": 0.6, "effective": null, "source": "default"}
-  },
-  "calibration": {"status": "not_calibrated"}
-}
-```
-
-`base` 是当前基准，`effective` 是最近一拍实际使用的P；没有使用该增益时返回 null。
-`source: calibrated` 表示已应用标定结果。`calibration.status` 报告当前状态，
-标定期间还会提供 `phase` 与 `samples`；成功或加载已有结果后，`profile` 给出实测响应
-与所选参数。`info.last.k_fwd_effective`、`k_yaw_effective` 也保留用于逐拍诊断。
-
-成功结果自动保存到容器 `/models/navi/calibration`，现有模型目录挂载对应宿主机
-`/opt/embodied/models/navi/calibration`，重启后按当前连接自动加载。隐藏的启动 YAML
-`calibration_dir` 可以更改存储目录，画布不提供该字段。文件键由里程计话题、底盘描述符
-执行约定和相机视场/输入绑定散列得到；这是本机部署标识，不是硬件序列号。
-复制模型目录到另一台机器人、更换底盘后应重新标定，不能仅因话题名称相同就沿用。
-
-本次功能只需构建、部署 ActuCore，Driver 与 Perception 无需修改。天轶使用 JetPack
-6.1 时选择 `actucore:...-jetson-jp6.1` 镜像；PR 构建评论由部署者自行发送。
-
+接入 `state/odom` 时，Agent Core 会把上游 `odom_interface` 按实际话题传给 navi。
+navi 校验 `motus.odom/1` 契约（`timing.stamp_source` 只接受 `robot` 或
+`received`），并按 `rate_hz`、`timing.stamp_source` 和
+`timing.max_measurement_delay_ms` 计算里程计有效期：
+`max(100ms, 3 × 周期 + 最大测量延迟)`。旧 Driver 未声明时使用 500ms，并在
+`degraded` 中说明；缺失声明不会阻断项目启动。
 `info.config` 同时返回实际 `obstacle_stop_m`、`slow_distance_m` 和
 `arrival_distance_m`。若障碍停车距离达到或超过到达阈值，`degraded` 会提示目标可能
 先被当作障碍挡停。例如停止距离 0.4m、容差 0.05m 的到达阈值是 0.45m，若障碍停车

@@ -31,12 +31,12 @@ stop-turn-go gait, which on r1_sz read as a lurch at every bearing correction.
 
 ── the robot cannot move slowly, and that shapes everything above ───────────
 
-A legged base has to assemble a whole gait cycle, so below some speed it does
-not move at all — R1 needs 0.4 m/s and 1.0 rad/s, and under that the SDK accepts
-the command, returns 0, and nothing happens. So a proportional law cannot make a
-small correction *slowly*; it can only make it *briefly*. Every axis is
-therefore a switch with hysteresis (`Gate`) whose magnitude, once on, is lifted
-to at least the floor (`_lift`).
+A legged base may have to assemble a whole gait cycle, so below its declared
+minimum magnitude it does not move at all even though the SDK accepted the
+command. A proportional law then cannot make a small correction *slowly*; it
+can only make it *briefly*. Every axis is therefore a switch with hysteresis
+(`Gate`) whose magnitude, once on, is lifted to the Driver-declared floor
+(`_lift`).
 
 Two consequences that are not obvious and were both bugs here:
 
@@ -114,9 +114,10 @@ class Config:
 
     stop_distance_m: float = 0.8
     # Arrival may finish this far before the nominal camera-to-target distance.
-    # Zero preserves the existing threshold. Live target/heading requirements
-    # still apply; this is not a tolerance for stale or predicted observations.
-    stop_tolerance_m: float = 0.0
+    # Five centimetres is the generic camera-depth tolerance. Live
+    # target/heading requirements still apply; this is not a tolerance for
+    # stale or predicted observations. Callers may request zero per action.
+    stop_tolerance_m: float = 0.05
     slow_distance_m: float = 1.5
     obstacle_stop_m: float = 0.6
     # Lateral offset that still allows full speed. **Not a gate** — past it the
@@ -158,10 +159,10 @@ class Config:
     k_fwd: float = 0.9
     adaptive_k_fwd: bool = False
     adaptive_k_yaw: bool = True
-    # A measured, per-robot tracking profile. Keep the nominal k_yaw above for
-    # obstacle-gap turns; search continues to use search_rate independently.
-    calibrated_yaw_gain: float | None = None
-    yaw_damping: float = 0.0
+    # Optional effective P derived from the downstream Driver's declared yaw
+    # response.  Navi never measures or persists a robot-specific plant model;
+    # the component that owns the hardware owns that declaration.
+    response_yaw_gain: float | None = None
     vx_max: float = 1.0
     vy_max: float = 1.0
     wz_max: float = 1.5
@@ -207,14 +208,10 @@ class Config:
     # ...and stays engaged at least this long, so one noisy frame cannot end a
     # turn that has only just started.
     min_dwell_s: float = 0.25
-    # Searching turns at this rate. It must clear the robot's deadband or the
-    # search commands are snapped to zero and the robot simply stands there
-    # while the card reports "searching" — which is what happened on r1_sz once
-    # the deadband handling went in: R1 needs 1.0 rad/s and this was 0.4.
-    #
-    # Every speed in this file has to be read against `min_magnitude`; a value
-    # that looks conservatively slow may be one the robot cannot execute at all.
-    search_rate: float = 1.0
+    # Generic search rate. Driver limits safety-clamp it at start and the shared
+    # command path applies the declared yaw deadband, so this policy does not
+    # carry a robot-specific search speed.
+    search_rate: float = 0.6
     # Backstop only. The sweep below is what normally ends a search, because it
     # is behavioural — "I have turned all the way round and it is not here" —
     # whereas a clock says nothing about what the robot did with the time.
@@ -339,9 +336,9 @@ class Config:
     floor_wz_moving: float = 0.0
 
     def __post_init__(self):
-        for key in ("calibrated_yaw_gain", "yaw_damping"):
+        for key in ("response_yaw_gain",):
             value = getattr(self, key)
-            if key == "calibrated_yaw_gain" and value is None:
+            if value is None:
                 continue
             if isinstance(value, bool):
                 raise ValueError(f"{key} must be a finite nonnegative number")
@@ -351,12 +348,6 @@ class Config:
                 raise ValueError(f"{key} must be a finite nonnegative number") from error
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{key} must be a finite nonnegative number")
-            if key == "yaw_damping" and value > 1:
-                raise ValueError("yaw_damping must be between 0 and 1")
-            if key == "yaw_damping":
-                # Retired compatibility input.  Older YAML and persisted
-                # profiles may still carry it, but navigation is pure P now.
-                value = 0.0
             setattr(self, key, value)
         for flag in ("adaptive_k_fwd", "adaptive_k_yaw"):
             if type(getattr(self, flag)) is not bool:
@@ -477,7 +468,6 @@ class Decision:
     bearing: float | None = None
     k_fwd_effective: float | None = None
     k_yaw_effective: float | None = None
-    yaw_damping_effective: float | None = None
 
     @property
     def publishes(self) -> bool:
@@ -488,12 +478,10 @@ def apply_deadband(values, min_magnitude) -> list:
     """Lift each axis out of the robot's deadband, or drop it to zero.
 
     Some robots do nothing at all below a threshold — a legged base has to
-    assemble a whole gait cycle, so there is no "creep slowly" regime. R1 needs
-    0.4 m/s and 1.0 rad/s. Below that the SDK accepts the command, returns 0,
-    and the robot stands still, so a policy emitting a smooth ramp towards zero
-    spends its entire life commanding motion and producing none — with every
-    layer in between reporting success. That is exactly how it presented on
-    r1_sz: 159 commands applied, no errors anywhere, a motionless robot.
+    assemble a whole gait cycle, so there may be no "creep slowly" regime.
+    Below its threshold the SDK may accept the command while the robot stands
+    still, so a policy emitting a smooth ramp towards zero can spend its entire
+    life commanding motion and producing none.
 
     The threshold is the robot's, declared in its descriptor, so this function
     takes it as data rather than knowing any robot's numbers.
@@ -645,12 +633,11 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     who set `vx_max: 0.2` is owed the news that this robot cannot go that slowly,
     rather than a robot that ignores the setting.
 
-    Two directions, and both were real failures on r1_sz:
+    Two directions are handled:
 
-    * **Up, off the deadband.** `wz_max` defaulted to 0.8 against a 1.0 rad/s
-      floor, so the policy's entire output range was unexecutable and every turn
-      command snapped to 0 or ±1.0. Nothing reported anything — the SDK accepted
-      all of it.
+    * **Up, off the deadband.** A ceiling below the Driver-declared floor makes
+      the policy's entire output range unexecutable and every nonzero command
+      snap to that floor.
     * **Down, into the descriptor's limits.** A ceiling above `limits.upper` is
       a command `ControlSink` rejects, at the full command rate, for the whole
       run.
@@ -661,6 +648,15 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     floors = list(limits.get("min_magnitude") or [])
     lower = list(limits.get("lower") or [])
     upper = list(limits.get("upper") or [])
+
+    # Whether lateral motion exists is a hardware fact. Hidden UI defaults
+    # must not be able to turn a pinned vy axis back on (or disable one that the
+    # downstream explicitly exposes).
+    try:
+        config.use_lateral = not (
+            float(lower[1]) == 0.0 and float(upper[1]) == 0.0)
+    except (IndexError, TypeError, ValueError):
+        pass
 
     def at(row, index):
         try:
@@ -727,9 +723,8 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
         # not make the robot creep around its own deadband.  It is still a
         # chassis command and alternates signs while sweeping, so its usable
         # magnitude is the smaller of the positive and negative yaw bounds.
-        # Bumi exposed this gap: its 0.83 rad/s yaw limit accepted normal
-        # steering after negotiation while the default 1.0 rad/s search was
-        # rejected at every tick.
+        # Without this separate clamp, normal steering may negotiate correctly
+        # while a fixed-rate search is rejected at every tick.
         if index == 5:
             yaw_lower = signed_at(lower, index)
             yaw_upper = signed_at(upper, index)
@@ -741,20 +736,64 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
                 search_cap = max(0.0, -yaw_lower)
             else:
                 search_cap = None
+            # Search uses the generic 0.6 rad/s default and is safety-clamped
+            # by the Driver's executable bidirectional yaw envelope. Deadband
+            # lifting happens later, per command, in the shared control path.
             candidate = config.search_rate
             if search_cap is not None:
                 candidate = min(candidate, search_cap)
-            if floor and candidate < floor:
+            if (floor and search_cap is not None
+                    and search_cap + 1e-9 < floor):
                 if config.search_rate != 0.0:
                     notes.append(
-                        f"search_rate 的可用上限 {candidate:g} 低于偏航最小可执行量 "
-                        f"{floor:g}，已停用搜索转身")
+                        f"search_rate 的双向上限 {search_cap:g} 低于偏航最小"
+                        f"可执行量 {floor:g}，已停用搜索转身")
                 config.search_rate = 0.0
-            elif candidate < config.search_rate:
+            elif candidate != config.search_rate:
                 notes.append(f"search_rate 超过下游双向允许的 {candidate:g}，已压回")
                 config.search_rate = candidate
 
     return notes
+
+
+def adopt_response(config: Config, descriptor: dict) -> list[str]:
+    """Adopt the Driver-owned yaw response declaration, when present.
+
+    ``response.wz`` describes the plant behind the velocity interface.  Navi
+    uses it to choose an effective proportional gain, but does not calibrate,
+    persist, or identify that plant itself. Missing data keeps the generic
+    0.6 P controller and its target-offset schedule.
+    """
+    response = (descriptor or {}).get("response") or {}
+    yaw = response.get("wz") if isinstance(response, dict) else None
+    config.response_yaw_gain = None
+    if yaw is None:
+        return []
+    if not isinstance(yaw, dict):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+    try:
+        source = yaw["source"]
+        numeric = (yaw["gain"], yaw["delay_s"], yaw["settling_s"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+    if (not isinstance(source, str)
+            or any(isinstance(value, bool)
+                   or not isinstance(value, (int, float)) for value in numeric)):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+    source = source.strip().lower()
+    gain, delay_s, settling_s = map(float, numeric)
+    if (source not in {"measured", "vendor-spec", "estimate"}
+            or not all(math.isfinite(value) for value in (gain, delay_s, settling_s))
+            or gain <= 0 or delay_s < 0 or settling_s < 0):
+        return ["下游 response.wz 声明无效，已使用通用 k_yaw=0.6"]
+
+    effective_gain = max(0.5, min(2.5, gain))
+    penalty = 1.0 + 0.2 * delay_s + 0.1 * settling_s
+    config.response_yaw_gain = max(
+        0.2, min(1.2, (config.k_yaw / effective_gain) / penalty))
+    return [f"已采用下游 response.wz：转向P={config.response_yaw_gain:.3f}"
+            f"（source={source}, gain={gain:g}, delay={delay_s:g}s, "
+            f"settling={settling_s:g}s）"]
 
 
 def select_target(objects, name: str, config: Config):
@@ -879,9 +918,9 @@ def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
     gain limits repeated over-corrections. This uses no turn history or latency
     compensation; search speed and obstacle-gap turns remain separate laws.
     """
-    if config.calibrated_yaw_gain is not None:
+    if config.response_yaw_gain is not None:
         state.adaptive_yaw_scale = 1.0
-        return config.calibrated_yaw_gain
+        return config.response_yaw_gain
     if not config.adaptive_k_yaw:
         state.adaptive_yaw_scale = 1.0
         return config.k_yaw
@@ -902,7 +941,7 @@ def _yaw_gain(config: Config, state: State, bearing: float, live: bool,
 
 
 def _measured_yaw_rate(odom):
-    """Actual angular feedback for ego-motion tracking and calibration.
+    """Actual angular feedback for ego-motion tracking.
 
     Freshness is enforced by the card before this observation reaches policy.
     JSON booleans, missing axes and non-finite readings are not measurements.
@@ -1014,10 +1053,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # settled. See `floor_wz_moving`.
     live = track.observed
     yaw_gain = _yaw_gain(config, state, bearing, live, dt)
-    # Pure proportional steering.  odom.wz remains an observation for
-    # calibration and ego-motion tracking, but is never fed back into the
-    # command: the Tianyi REST rate can spike and a D-like term made the robot
-    # resist its own final alignment.
+    # Pure proportional steering. odom.wz remains an observation for
+    # ego-motion tracking, but is never fed back into the command as a hidden
+    # D-like term.
     raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
 
     within = distance is not None and distance <= config.arrival_distance_m
@@ -1076,8 +1114,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         return Decision(_twist(0.0, 0.0, wz), ALIGNING,
                         f"目标偏离画面中心 {bearing:+.2f}（归一化），先原地转正",
                         distance_m=distance, bearing=bearing,
-                        k_yaw_effective=yaw_gain,
-                        yaw_damping_effective=0.0)
+                        k_yaw_effective=yaw_gain)
 
     speed = config.vx_max * align
     status, reason = APPROACHING, "approaching"
@@ -1155,8 +1192,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     return Decision(_twist(vx, vy, wz), status, reason,
                     distance_m=distance, bearing=bearing,
                     k_fwd_effective=forward_gain if distance is not None and not within else None,
-                    k_yaw_effective=yaw_gain if tracking_yaw_used else None,
-                    yaw_damping_effective=0.0 if tracking_yaw_used else None)
+                    k_yaw_effective=yaw_gain if tracking_yaw_used else None)
 
 
 def _account_idle(decision: Decision, state: State, config: Config,
